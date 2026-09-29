@@ -6,7 +6,7 @@
  * links ONLY against the fat library -- so the sole way `main` can resolve
  * `dss_input_answer` is if the merge carried this member across. Returns 42.
  *
- * D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM -- WHY THIS BODY IS NOT
+ * THE `dependsOn` RELEASE ARM -- WHY THIS BODY IS NOT
  * `return 42;`. This is the member `main` actually references, so it is the
  * one whose code reaches the linked exec, and `expected.json`'s `release` arm
  * compares that exec against its baseline with

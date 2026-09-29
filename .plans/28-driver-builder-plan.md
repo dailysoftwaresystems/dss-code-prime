@@ -543,43 +543,8 @@ Recorded, not silently assumed. **None of these edits has been made** — each i
 
 These **35** anchors are **reserved/future** — they live here until the plan opens, then move into [`_deferred-anchor-registry-production`](./_deferred-anchor-registry-production.md) as active four-cell rows. Reserved-plan anchors are not yet cited in `src/`, so the CI anchor-guard does not require registry rows today. Every ID carries ≥3 hyphen-separated segments after `D-`, which is what the guard's `D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}` shape requires to treat it as a real anchor rather than an informal label.
 
-| Anchor | Owns |
-|--------|------|
-| `D-DRV-OSDRIVER-CONTRACT` | the `IOSDriver` up-call family + the registered device-class vocabulary |
-| `D-DRV-HOST-SERVICES-CONTRACT` | `IDriverHost` — MMIO / DMA / IRQ / memory / time / power down-calls |
-| `D-DRV-EXECUTION-CONTEXT-EFFECT` | atomic-context vs may-sleep as an effect-system contract, not a comment |
-| `D-DRV-BUS-TRANSPORT-AXIS` | bus/transport modelled orthogonally to device class |
-| `D-DRV-EXECUTION-MODE-AXIS` | kernel/user co-equal; mode is a format property, never a profile name |
-| `D-DRV-VEHICLE-ENUMERATOR` | `driverVehicle` enumerator + its engine arm (never data) |
-| `D-DRV-ENTRY-VERBS` | `driver-entry` / `module-init` entry materialization |
-| `D-DRV-KERNEL-LIBRARY-ROLE` | `kernelLibrary` + `driverFramework` runtime-library roles |
-| `D-DRV-FREESTANDING-LANGUAGE-PROFILE` | ★ the subtractable-runtime lock (cross-plan: 24 + 21) |
-| `D-DRV-GRAPHICS-CLASS-SCOPE-LIMIT` | `IGraphicsDriver` is display-only; accelerated 3D is not claimed |
-| `D-DRV-LINUX-KERNEL-ABI-PINNING` | vermagic / symbol CRCs / per-kernel build inputs |
-| `D-DRV-LINUX-GPL-SYMBOL-GATING` | `EXPORT_SYMBOL_GPL` + `MODULE_LICENSE` — a licensing consequence |
-| `D-DRV-WINDOWS-ATTESTATION-SIGNING` | EV certificate + Microsoft hardware-portal submission |
-| `D-DRV-WINDOWS-INF-DRIVER-PACKAGE` | INF + catalog packaging |
-| `D-DRV-DARWIN-DRIVERKIT-ENTITLEMENT` | Apple-granted DriverKit family entitlements |
-| `D-DRV-DEXT-BUNDLE-PACKAGING` | `.dext` bundle inside a host app's system-extension directory |
-| `D-DRV-DSSOS-NATIVE-VEHICLE` | the DSS OS driver model, defined to fit the contract natively |
-| `D-DRV-VM-LEG-HARNESS` | the VM execution leg, in **both** corpus runners |
-| `D-DRV-DARWIN-VM-LEG-EXTERNALLY-GATED` | the named uncovered cell (§8.1) |
-| `D-BOOT-IBOOT-CONTRACT` | the `IBoot` interface + `BootContext` |
-| `D-BOOT-VEHICLE-ENUMERATOR` | `bootVehicle` enumerator + engine arm; third-party vehicles |
-| `D-BOOT-NONHOSTED-SPINE` | a non-hosted `ExitMechanism` + a declinable entry trampoline; the empty `runtimeLibraries` table |
-| `D-BOOT-ENTRY-VERBS` | `efi-main`; `none` for a flat reset image |
-| `D-BOOT-FLAT-CONTAINER` | `container: "flat"` — a headerless raw image |
-| `D-BOOT-PE-BASE-RELOCATIONS` | `.reloc` must stay unconditional (**MEASURED**: exists today) |
-| `D-BOOT-ARTIFACT-NOT-HOSTED-EXECUTABLE` | ★ the structural half of the security block (§5.5a), incl. the weak ELF cell |
-| `D-BOOT-INSTALL-REQUIRES-SYSTEM-PRIVILEGE` | ★ the deployment half (§5.5b) — system, never user permission |
-| `D-BOOT-NO-SELF-INSTALLING-ARTIFACT` | a boot payload that installs itself is a build-time refusal |
-| `D-BOOT-SECUREBOOT-KEY-ENROLLMENT` | Secure Boot key trust — owner-enrolled, never bypassed |
-| `D-BOOT-PAYLOAD-BINDING` | ★ `bootPayload` — `linked-symbol` vs `loaded-image`; format declares mechanisms, project names the kernel |
-| `D-BOOT-HANDOFF-PROTOCOL-VERSIONED` | the vehicle↔payload ABI, versioned and checked at build **and** run time |
-| `D-BOOT-EARLY-FAILURE-CONSOLE` | ★ fail-loud at the boot tier — report and halt, **never jump** to an unvalidated payload |
-| `D-BOOT-IMAGE-READER-SHARED-WITH-FFI` | one runtime object-format reader, shared with `D-FF1-*-READER`, never two |
-| `D-BOOT-PAYLOAD-CHAIN-VERIFICATION` | ★ `loaded-image` verifies the payload before jumping; the security block covers the whole chain |
-| `D-BOOT-OVMF-VM-LEG` | QEMU + OVMF execution witness |
+> **The deferral rows that were listed here have moved into the anchor registries.** The open ones are in `.plans/_deferred-anchor-registry-production.md` and the closed ones in `.plans/_deferred-anchor-registry-done.md`, under `D-DRV-*`, `D-BOOT-*`. A row whose id this plan spelled in a form no registry could hold carries its former spelling in its `Cross-refs` cell. Read the registry, never this document, for what is still open.
+
 
 ---
 

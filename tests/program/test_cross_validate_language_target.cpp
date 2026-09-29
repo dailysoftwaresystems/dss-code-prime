@@ -792,6 +792,11 @@ TEST(CrossValidateLanguageTargetResolver, X86AsmDependencyRefusedByArm64Consumer
            "where the operator's fix goes";
     EXPECT_TRUE(someIsaMessageContains(rep, "x86_64"));
     EXPECT_TRUE(someIsaMessageContains(rep, "aarch64"));
+    // No missing input may sit underneath the one code this pin asserts — a
+    // refusal that is ALSO a failure to find its own fixture proves nothing
+    // about the gate ([[D-TEST-ISA-GATE-ACCEPT-FIXTURE-NEVER-COMPILED-ITS-OWN-SOURCE]]).
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 0u)
+        << messageFor(rep, DiagnosticCode::D_FileNotFound);
 }
 
 // ★★ THE INVERSION, AND IT IS WHAT MAKES THE PIN ABOVE NON-VACUOUS. Identical
@@ -812,16 +817,34 @@ TEST(CrossValidateLanguageTargetResolver, X86AsmDependencyAcceptedByX86Consumer)
     Program prog;
     prog.setOutputDir(dir.path() / "out");
     DiagnosticReporter rep;
-    (void) prog.compileProject(fx.proj.string(), rep);
+    int const rc = prog.compileProject(fx.proj.string(), rep);
 
-    // The pin is on the CODE, not on the exit status, and deliberately so: this
-    // fixture's assembly is a stub, so the build may still fail further
-    // downstream for reasons that have nothing to do with this axis. What must
-    // be true is that the ARCHITECTURE GATE did not object.
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_LanguageTargetIsaMismatch), 0u)
         << "an x86 assembly dependency under an x86_64 consumer must pass the "
            "ISA gate untouched; got: "
         << messageFor(rep, DiagnosticCode::D_LanguageTargetIsaMismatch);
+
+    // ★ AND THE BUILD MUST GO ALL THE WAY THROUGH, which is what makes the
+    // verdict above an ACCEPT rather than an absence.
+    // [[D-TEST-ISA-GATE-ACCEPT-FIXTURE-NEVER-COMPILED-ITS-OWN-SOURCE]]:
+    // ✔MEASURED, this pin used to assert the gate's code alone "because the
+    // build may still fail further downstream" — and the build DID fail, for a
+    // reason that had nothing to do with the gate: the root's `main.c`, spelled
+    // relative in a manifest outside the test's working directory, was opened
+    // against that working directory, so the build died with `D_FileNotFound`
+    // before the root compiled a line. A gate that let the dependency through
+    // into a build that never happened was never exercised past resolution.
+    // Every path now resolves against its manifest's directory, so the root
+    // compiles, the stub archive is built and linked, and the artifact exists.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 0u)
+        << "the fixture must find its own inputs; got: "
+        << messageFor(rep, DiagnosticCode::D_FileNotFound);
+    EXPECT_EQ(rc, 0) << "the accepted pairing must build end to end; error count "
+                     << rep.errorCount();
+    auto const& paths = prog.artifactPaths();
+    ASSERT_EQ(paths.size(), 1u);
+    ASSERT_TRUE(paths[0].has_value());
+    EXPECT_TRUE(fs::exists(*paths[0])) << paths[0]->generic_string();
 }
 
 // ★ THE SourceMerge ARM. This is the half that would be silently unguarded if
@@ -854,4 +877,8 @@ TEST(CrossValidateLanguageTargetResolver, SourceMergeArmIsGatedToo) {
         << "the SOURCE-MERGE arm must be gated as well — a gate living in "
            "`deriveFormat_` would never run for this composition verb and the "
            "dependency's x86 text would be spliced into an arm64 build";
+    // As in the ArtifactLink refusal: no missing input underneath the one code
+    // this pin asserts ([[D-TEST-ISA-GATE-ACCEPT-FIXTURE-NEVER-COMPILED-ITS-OWN-SOURCE]]).
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 0u)
+        << messageFor(rep, DiagnosticCode::D_FileNotFound);
 }

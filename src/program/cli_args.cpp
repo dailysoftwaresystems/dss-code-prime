@@ -325,15 +325,28 @@ std::string cliHelpText() {
             "`ulimit -s` property) -- a request a format cannot carry is "
             "REFUSED, never silently dropped. The `=`-form is also "
             "accepted.\n"
+        "  --rpath <dir>          a directory the emitted image records for "
+            "its loader to search for the libraries it needs (repeatable, in "
+            "order; gcc's -Wl,-rpath / ld64's -rpath). Recorded VERBATIM, "
+            "except that a leading ${ORIGIN} -- the directory of the image "
+            "that carries the path -- is written in the target format's own "
+            "spelling ($ORIGIN on ELF, @loader_path on Mach-O). A project "
+            "manifest's `runpaths` key is the portable, file-driven "
+            "equivalent; the two ACCUMULATE, manifest first. A format that "
+            "records no runpath (PE: its loader searches the application "
+            "directory) accepts the request with a warning. The `=`-form is "
+            "also accepted.\n"
         "\n"
         "Diagnostic options:\n"
         "  --warnings-as-errors   promote every Warning to Error\n"
         "  --suppress=<code>      suppress a specific diagnostic code "
-            "(repeatable; accepts D_FileNotFound or 0xD001). A few codes are "
-            "PROTECTED because silencing them would let a wrong artifact ship "
-            "green, or a build fail with nothing said; naming one is refused "
-            "with a warning saying which and why, and the build continues "
-            "normally.\n"
+            "(repeatable; accepts D_FileNotFound or 0xD001). It silences "
+            "WARNINGS and NOTES only: an ERROR stops the build whether or not "
+            "it is reported, so it is reported anyway, with a one-time warning "
+            "that the request had no effect. A few codes are PROTECTED even as "
+            "warnings, because silencing them would let a wrong artifact ship "
+            "green; naming one is refused with a warning saying which and why, "
+            "and the build continues normally.\n"
         // The operator half of the `P_TooManyDiagnostics` remedy sentence. The
         // DEFAULT IS FORMATTED FROM `DiagnosticReporter::Config` rather than
         // typed here: a hard-coded `1000` in this string would be the second
@@ -755,7 +768,7 @@ parseCliArgs(int argc, char* argv[]) {
             // which fails loud on a missing/unreadable file or an absent
             // symbol.
             //
-            // D-FFI-DECLARED-IMPORT-NAME: the value's OPTIONAL `=<import-name>`
+            // Declared import names: the value's OPTIONAL `=<import-name>`
             // suffix STATES the runtime identity to record for every symbol
             // read out of `<path>`, outranking the binary's own embedded
             // soname (`ffi::BinaryLibrarySource` docblock). SPELLING CHOICE:
@@ -943,6 +956,22 @@ parseCliArgs(int argc, char* argv[]) {
             }
         }
         {
+            // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: `--rpath <dir>` /
+            // `--rpath=<dir>`, repeatable — a directory the emitted image
+            // records for its loader. gcc's LITERAL semantics: the value is
+            // kept verbatim and in order, with no validation beyond the
+            // generic non-empty value `valueFlag` already enforces. Whether an
+            // entry can be recorded is the linker gate's question (one rule,
+            // `runpathEntryRefusal`), and whether the chosen format records
+            // runpaths at all is the format document's — neither is known here.
+            auto m = valueFlag(a, i, "--rpath");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                out.runpaths.push_back(std::move(**m));
+                continue;
+            }
+        }
+        {
             // `--max-diagnostics <count>` / `--max-diagnostics=<count>` — the
             // run-wide global cap (`DiagnosticReporter::Config::maxDiagnostics`).
             // Mirrors the `--stack-reserve` arm above verbatim in shape: one
@@ -1108,6 +1137,21 @@ parseCliArgs(int argc, char* argv[]) {
             "--dump-predefined-macros / --dump-hir-kinds emit nothing, so the "
             "request would be silently discarded."));
     }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: `--rpath` asks the emitted IMAGE to
+    // record a directory, so it takes the `--stack-reserve` gate above, for
+    // the same reason: in a mode that emits no image nothing would ever
+    // receive the request — not even the warning a format that records none
+    // earns — and it would be discarded in silence. Mode::None is left to the
+    // generic no-mode guard below, which lists `runpaths` for that reason.
+    if (!out.runpaths.empty() && mode != Mode::None && mode != Mode::Compile
+     && mode != Mode::Directory && mode != Mode::Project) {
+        return std::unexpected(make_error(
+            CliArgsError::NoModeSelected,
+            "--rpath asks the emitted IMAGE to record where its libraries are, "
+            "so it is only meaningful for a mode that produces one (--compile "
+            "/ --directory / --project); in any other mode nothing receives "
+            "it and the request would be silently discarded."));
+    }
     // AP6: `--force-git-cache` acts on a `.dss-project.json`'s `dependsOn`
     // list, which ONLY `--project` reads. Every other mode has no manifest at
     // all — `--compile` / `--directory` take file paths, `--transpile` writes
@@ -1223,10 +1267,15 @@ parseCliArgs(int argc, char* argv[]) {
          // AP6: --force-git-cache without a mode flag would silently discard
          // the request (no manifest is ever read).
          || out.forceGitCache
-         || out.jobs != 0  // D-PERF-4: --jobs supplied without a mode flag
+         || out.jobs != 0  // D-PERF-4-CU-PARALLELISM: --jobs supplied without a mode flag
          // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve without a
          // mode flag would silently discard the request.
          || out.stackReserveBytes.has_value()
+         // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: --rpath without a mode flag
+         // would silently discard the request, exactly as --stack-reserve
+         // would — the `--rpath` mode gate below leaves Mode::None to THIS
+         // guard, so leaving it out of this list was a silent drop.
+         || !out.runpaths.empty()
          // --max-diagnostics without a mode flag would silently discard the
          // requested cap (no compile, so no reporter is ever built from it).
          || out.maxDiagnostics.has_value()

@@ -1,0 +1,35 @@
+{
+  "$comment": "`_Complex long double` objects with STATIC storage — a whole object, the product and the quotient of two constants, an integer past 2^53, a struct member and an array element — each image checked against the same value computed at RUN TIME from mutable globals, so a component folded at the wrong precision or placed at the wrong offset fails its own exit code (11-16, listed in `main.c`). Check 13's `0.1L` has no binary64 value, so a fold carried through `double` fails it; check 14's 2^53 + 1 is exact in `long double` on both Linux targets and not in `double` (D-CSUBSET-COMPLEX-LONG-DOUBLE-STATIC-INITIALIZER-REFUSED). ✔MEASURED 2026-09-21: gcc 13.3.0 and clang 18.1.3, each separately, run it to 42 at -O0 and -O2 on x86_64 and aarch64 Linux. The P68 round-8 base refused it on both Linux targets, debug and release: no `_Complex long double` initializer was folded, the array of them failed at MIR lowering (`H_UnsupportedLoweringForKind`, an aggregate initializer lowered as a bare value), and `static _Complex long double z = 40.0L;` on its own was refused at the static-data producer as a runtime initializer; on Windows and Apple arm64 `long double` IS `double`, so those arms exercise the `double _Complex` fold that already worked. ★ The `release` arm: every object is read through a `volatile` pointer and every comparison value is computed from mutable globals, so the optimized pipeline reads the emitted IMAGE.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

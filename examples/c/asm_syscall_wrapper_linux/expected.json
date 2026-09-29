@@ -1,0 +1,25 @@
+{
+  "$comment": "A LINUX SYSCALL WRAPPER built from GNU local register variables — musl's `__syscallN` shape — on the two Linux targets (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED; `svc #0` is D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). The exit code 42 is delivered by the raw `exit` system call itself, so a wrong syscall number or argument register returns into `main` and exits 11–14 instead. ✔MEASURED 2026-09-19: gcc 13.3.0 and clang 18.1.3 exit 42 at -O0 and -O2 (x86_64 natively, aarch64 under qemu-aarch64); the P68 round-7 base REFUSED it (`unknown mnemonic 'syscall'` / `'svc'`), and ignored the labels, so the binding shapes alone compiled rc=0 with the number and arguments in arbitrary registers. ⓘ No PE or Mach-O arm: Linux's syscall ABI is the documented, stable one (`syscall(2)`); Apple documents none and Windows renumbers between builds. ★ The `release` arm runs the optimized pipeline over `volatile` arguments, so the bound registers are still loaded from values the optimizer cannot fold.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

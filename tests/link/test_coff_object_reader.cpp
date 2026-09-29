@@ -46,7 +46,9 @@
 #include "scratch_dir.hpp"
 
 // The native-witness skip-vs-fail vocabulary, shared with the two ABI conformance
-// witnesses under tests/core (D-TEST-NATIVE-ORACLE-INERT-ON-POSIX). Spelled relative
+// witnesses under tests/core: a native oracle that skips on error is a broken
+// oracle reporting success, so ABSENT is a skip and PRESENT-and-failing is a red.
+// Spelled relative
 // because only `tests/test_support` is on this target's include path; the header's
 // natural long-term home IS `tests/test_support/`, and moving it there would drop this
 // `../` — deliberately left for whoever owns that shared directory.
@@ -302,7 +304,13 @@ TEST(CoffObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
                                "vs a dropped symbol parse)";
     ASSERT_NE(rGreet, nullptr);
     EXPECT_EQ(rAdd->bytes, add.bytes) << "`.text` sliced by sorted Value";
-    EXPECT_EQ(rGreet->bytes, greet.bytes);
+    // ★ The relocation FIELDS come back holding their addends, not the NOP
+    // filler. COFF keeps an addend in the patched field (`relocationAddends:
+    // inPlace`), so the writer stamps each relocation's addend (0 here) into
+    // its field. The filler bytes that used to survive there would have been
+    // READ AS ADDENDS by any COFF linker. The three fields (REL32 at 0, ADDR64
+    // over [4, 12), REL32 at 8) cover all 12 bytes, so all 12 are the addend 0.
+    EXPECT_EQ(rGreet->bytes, std::vector<std::uint8_t>(12, 0x00));
     EXPECT_TRUE(rAdd->relocations.empty());
 
     // -- `.text` relocations (offset relative to function start, kind mapped
@@ -738,10 +746,29 @@ TEST(CoffObjectReader, EmitOnlyAliasIsHonouredNotRefused) {
                     std::istreambuf_iterator<char>{});
     }
     ASSERT_FALSE(text.empty());
-    ASSERT_EQ(text.find("\"emitOnly\""), std::string::npos)
-        << "no shipped PE document declares an emission alias -- if one now "
-           "does, this fixture is no longer the 'plus one row' it claims to "
-           "be, and the gap it pins was no longer latent";
+    // ⓘ THE SHIPPED DOCUMENT NOW DECLARES AN EMISSION ALIAS OF ITS OWN (P68
+    // round 9): `IMAGE_REL_AMD64_REL32_RIPREL`, the target's `riprel32` written
+    // as REL32. So the gap this test pins is no longer latent, and the CONTROL
+    // below already reads through a real alias. The fixture stays "the shipped
+    // rows plus exactly one more". What is asserted here is that every alias
+    // the document ships shares the wire id of a row that DECODES, which is
+    // the only shape `relocationDecodeTable` accepts.
+    {
+        nlohmann::json const shipped = nlohmann::json::parse(text);
+        std::vector<std::uint32_t> decodable;
+        for (auto const& row : shipped.at("relocations")) {
+            if (!row.value("emitOnly", false)) {
+                decodable.push_back(row.at("nativeId").get<std::uint32_t>());
+            }
+        }
+        for (auto const& row : shipped.at("relocations")) {
+            if (!row.value("emitOnly", false)) continue;
+            EXPECT_NE(std::ranges::find(decodable, row.at("nativeId").get<std::uint32_t>()),
+                      decodable.end())
+                << "shipped emission alias '" << row.at("name").get<std::string>()
+                << "' names a wire id no decoding row owns";
+        }
+    }
 
     // CONTROL: unmodified, these bytes decode to kind 1. Without this the
     // assertion below could not be attributed to the added row.
@@ -1227,11 +1254,20 @@ TEST(CoffForeignObject, CrossObjectComdatAnyDedupsInMerge) {
 namespace {
 
 #if defined(_WIN32)
-// The vcvars64-entered cl.exe/lib.exe environment. LOCATING it is not done here —
-// `native_probe::locateMsvcToolchain` is the single implementation, shared with the ABI
-// conformance witnesses; this struct only USES what that returns.
+// The cl.exe/lib.exe/link.exe these witnesses drive come from `native_c_probe.hpp`:
+// `native_probe::locateMsvcToolchain` finds the installation, `native_probe::msvcToolsIn`
+// hands back its tools, run under the process's ONE developer environment. Nothing in
+// this file locates or enters anything.
 //
-// D-TEST-NATIVE-ORACLE-INERT-ON-POSIX — a native oracle that skips on error is a broken oracle that reports success.
+// A native oracle that skips on error is a broken oracle that reports success.
+//
+// ★★ THIS FILE USED TO CARRY ITS OWN `MsvcEnv`, AND IT COST MORE THAN THE WITNESSES DID. It
+// wrote a batch that CALLed vcvars64.bat in a FRESH cmd.exe for EVERY tool line — 11
+// entries per run of this file, 1.2–2.4 s each alone and 3.9–16.2 s beside a concurrent
+// build (✔MEASURED by lane mig, 2026-09-19) — and that is how this entry timed out at 315 s
+// in a gate run beside another lane's build, with no witness changed. Every `env.run(...)`
+// below is still the same command line, in the same directory, asserted the same way; the
+// environment it runs in is entered once, and `MsvcDeveloperEnvironment` pins that count.
 //
 // The lookup used to be written TWICE — once here, once inside `native_c_probe.hpp`'s
 // `findCompiler` — and the copies disagreed about the same machine: this one reddened
@@ -1242,22 +1278,6 @@ namespace {
 // NOTE the asymmetry with the ABI witnesses: the SECOND stage here was always correct.
 // `env.run(...)` is consumed by `ASSERT_TRUE(...)` at every call site, so a failing
 // `cl`/`lib` already went red. Only the lookup conflated, and only the lookup changed.
-struct MsvcEnv {
-    std::filesystem::path vcvars;
-    std::filesystem::path work;
-    [[nodiscard]] bool run(std::string const& cmdline) const {
-        auto const bat = work / "dss_c53_build.bat";
-        {
-            std::ofstream b{bat};
-            b << "@echo off\r\n"
-              << "call \"" << vcvars.string() << "\" >nul 2>&1\r\n"
-              << "cd /d \"" << work.string() << "\"\r\n"
-              << cmdline << " >nul 2>&1\r\n";
-        }
-        std::string const sys = "\"\"" + bat.string() + "\"\"";
-        return std::system(sys.c_str()) == 0;
-    }
-};
 
 [[nodiscard]] std::vector<std::uint8_t> readFile(std::filesystem::path const& p) {
     std::ifstream in{p, std::ios::binary};
@@ -1266,6 +1286,49 @@ struct MsvcEnv {
 #endif  // _WIN32
 
 }  // namespace
+
+// -- THE COST PIN: the developer environment is entered ONCE per process -----
+//
+// COUNTED, NEVER TIMED. This file's native witnesses cost the number of vcvars64.bat
+// entries they made (11 per run) times a price that load multiplies; this pins the NUMBER,
+// which no machine's speed can move. Two tool lines in two different scratch directories
+// stand in for two cases, so a helper that re-entered per LINE (the old `MsvcEnv`) or per
+// DIRECTORY is red here whichever cases ran before it and in whatever order — the tallies
+// belong to the process. vswhere is counted too: it used to start once per case.
+TEST(MsvcDeveloperEnvironment, IsEnteredOncePerProcessAndHandedToEveryTool) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "enters vcvars64.bat; Windows only";
+#else
+    test_support::ScratchDir first{test_support::Location::InsideRepo, "coff-foreign"};
+    test_support::ScratchDir second{test_support::Location::InsideRepo, "coff-foreign"};
+    auto const msvc = native_probe::locateMsvcToolchain(first.path());
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    auto const again = native_probe::locateMsvcToolchain(second.path());
+    ASSERT_TRUE(again.ok()) << again.describe();
+
+    auto const inFirst = native_probe::msvcToolsIn(msvc, first.path());
+    ASSERT_TRUE(inFirst.ready()) << inFirst.describe();
+    auto const inSecond = native_probe::msvcToolsIn(again, second.path());
+    ASSERT_TRUE(inSecond.ready()) << inSecond.describe();
+    { std::ofstream f{first.path() / "once.c"};  f << "int once_first(void) { return 1; }\n"; }
+    { std::ofstream f{second.path() / "once.c"}; f << "int once_second(void) { return 2; }\n"; }
+    ASSERT_TRUE(inFirst.run("cl /nologo /c once.c")) << "cl must compile in the FIRST directory";
+    ASSERT_TRUE(inSecond.run("cl /nologo /c once.c")) << "cl must compile in the SECOND directory";
+    // Each line ran where it was sent — the `cd /d` the old batch spelled on its own line.
+    EXPECT_TRUE(std::filesystem::exists(first.path() / "once.obj"));
+    EXPECT_TRUE(std::filesystem::exists(second.path() / "once.obj"));
+
+    EXPECT_EQ(native_probe::msvcEnvironmentEntries(), 1u)
+        << "this process entered vcvars64.bat " << native_probe::msvcEnvironmentEntries()
+        << " time(s). Each entry is a fresh cmd.exe running the whole VS developer-prompt "
+           "setup, the cost that timed this suite out under load; ONE per process is the "
+           "design, and 0 would mean the tally no longer sees the entry at all.";
+    EXPECT_EQ(native_probe::msvcToolchainQueries(), 1u)
+        << "this process asked vswhere " << native_probe::msvcToolchainQueries()
+        << " time(s); an installation cannot move mid-process, so ONE is the design.";
+#endif
+}
 
 // -- Structural: a real `cl /c /GS-` `.obj` reconstructs (Gate 1 + Gate 2) ---
 TEST(CoffForeignObjectNative, RealClObjReconstructsFunctionAndSkipsMetadata) {
@@ -1277,7 +1340,8 @@ TEST(CoffForeignObjectNative, RealClObjReconstructsFunctionAndSkipsMetadata) {
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
 
@@ -1318,7 +1382,8 @@ TEST(CoffForeignObjectNative, RealGyObjComdatFunctionAssociativeMetadataSkipped)
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
 
@@ -1357,7 +1422,8 @@ TEST(CoffForeignObjectNative, SingleClObjStaticLinkExitsFortyTwo) {
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     { std::ofstream f{dir / "foo.c"}; f << "int foo(void){ return 42; }\n"; }
     ASSERT_TRUE(env.run("cl /nologo /c /GS- foo.c")) << "cl must compile foo.c";
@@ -1399,7 +1465,8 @@ TEST(CoffForeignObjectNative, MultiMemberComdatDedupExitsFortyTwo) {
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     // a.c + b.c each define a DISTINCT function AND the SAME selectany COMDAT
     // datum `shared_w` (ANY selection). main references BOTH functions -> BOTH
@@ -1566,12 +1633,12 @@ TEST(CoffLocalFunctionInArchive, DssBuiltLibMemberCallingAStaticHelperExitsForty
     // leg. EXECUTING that image is a host CAPABILITY, and only Windows has it --
     // the same split `tests/program/test_static_link.cpp` already spells for its
     // pe / elf / Mach-O run arms.
-    // ⚠ D-TEST-COFF-ARCHIVE-RUN-ARM-NOT-HOST-GATED: this arm shipped ungated and
-    // TWO of the three legs then in use hid it. Windows runs a PE natively; WSL
-    // runs one through the interop binfmt handler, so `posix_spawn` succeeds
-    // there and the arm reads as portable. ✔MEASURED 2026-08-21 on the native
-    // aarch64 VPS, which has neither: `posix_spawn(main.exe) failed: rc=8`
-    // (ENOEXEC) -- a red that says nothing about the reader this file tests.
+    // ⚠ THIS ARM SHIPPED UNGATED, and TWO of the three legs then in use hid it.
+    // Windows runs a PE natively; WSL runs one through the interop binfmt
+    // handler, so `posix_spawn` succeeds there and the arm reads as portable.
+    // ✔MEASURED 2026-08-21 on the native aarch64 VPS, which has neither:
+    // `posix_spawn(main.exe) failed: rc=8` (ENOEXEC) -- a red that says nothing
+    // about the reader this file tests.
     // ★ The general shape: A CROSS-COMPILE TEST THAT SPAWNS ITS OUTPUT IS TWO
     // TESTS, and only the second one is about the host.
 #if defined(_WIN32)
@@ -1601,7 +1668,8 @@ TEST(CoffForeignObjectNative, ClObjLibMemberCallingAStaticHelperExitsFortyTwo) {
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     { std::ofstream f{dir / "loc.c"};
       f << "static int helper(int x){ return x + 7; }\n"
@@ -2665,10 +2733,10 @@ namespace {
 
 #if defined(_WIN32)
 // A mingw gcc on PATH, or nothing. LOCATE, then PROVE IT BUILDS -- the same
-// skip-vs-fail discipline as `native_probe::locateMsvcToolchain`
-// (D-TEST-NATIVE-ORACLE-INERT-ON-POSIX): a tool that is ABSENT is a skip, a tool
-// that is PRESENT and fails is a RED. Gating on `where gcc` alone would call a
-// broken install "absent" and quietly retire the witness.
+// skip-vs-fail discipline as `native_probe::locateMsvcToolchain`: a tool that is
+// ABSENT is a skip, a tool that is PRESENT and fails is a RED. Gating on
+// `where gcc` alone would call a broken install "absent" and quietly retire the
+// witness.
 struct MingwGcc {
     bool        usable = false;
     std::string detail;
@@ -2827,8 +2895,11 @@ TEST(CoffWeakExternalNative, RealMingwWeakAliasBindsBothNamesToOneBody) {
 // clang 18.1.3 emits the weak external for BOTH forms and BOTH windows triples.
 // The fixture below is the FUNCTION form, which is the half gcc gets right.
 //
-// ⚠⚠ AND THE OBJECT STILL DOES NOT READ — FOR A DIFFERENT, PRE-EXISTING REASON
-// THAT THIS PIN NOW NAMES INSTEAD OF HIDING. Flipping the weak arm exposed it:
+// ✅ RESOLVED P68 round 9: the long section name below is now read from the
+// string table, the object READS, and the pin was flipped as it asked. The
+// paragraph is kept because it is the measurement that named the blocker.
+// ⚠⚠ AND THE OBJECT STILL DID NOT READ — FOR A DIFFERENT, PRE-EXISTING REASON
+// THAT THIS PIN THEN NAMED INSTEAD OF HIDING. Flipping the weak arm exposed it:
 // mingw routes the address of `maybe` through a COMDAT indirection section
 // `.rdata$.refptr.maybe`, whose LONG name the reader surfaces unresolved as
 // `/15`, and the section-kind gate refuses a body it cannot classify. ✔MEASURED
@@ -2874,18 +2945,25 @@ TEST(CoffWeakExternalNative, RealMingwWeakUndefinedReferenceNoLongerRefusesOnWea
         << "and it must no longer cite the row that has been closed by carrying "
            "the missing fact";
 
-    // (2) THE REMAINING BLOCKER, PINNED BY NAME so it cannot be mistaken for the
-    // one above. When this goes red because `.refptr` gained a section kind, this
-    // test must FLIP to asserting the read and the import's Weak binding -- the
-    // same flip its own two predecessors made.
-    EXPECT_FALSE(got.has_value())
-        << "if a mingw `.refptr` object now reads, delete this expectation and "
-           "assert `externImports` carries `maybe` with SymbolBinding::Weak";
-    EXPECT_TRUE(sawDetail(rep, "no known code/data section kind"))
-        << "the ONLY refusal left on this object must be the section-kind gate on "
-           "mingw's `.rdata$.refptr.<name>` COMDAT indirection -- a pre-existing "
-           "limitation that fires on any object using `.refptr`, weak or not, and "
-           "is a loud refusal of the whole object rather than a silent drop.";
+    // (2) THE BLOCKER IS GONE, AND THE FLIP THIS TEST ASKED FOR IS MADE (P68
+    // round 9). The blocker was never `.refptr` itself. The section is
+    // `.rdata$.refptr.maybe`, longer than 8 bytes, so its header spells it
+    // "/15", a DECIMAL offset into the string table (PE/COFF §4). The reader
+    // read "/15" as the NAME, and a name that is not a section name resolves
+    // to no kind. With the header's long name decoded, the section resolves
+    // through its base name `.rdata` like any other, and the object reads.
+    ASSERT_TRUE(got.has_value())
+        << "a mingw `.refptr` object must read once its section's long name is "
+           "decoded; errors=" << rep.errorCount();
+    EXPECT_FALSE(sawDetail(rep, "no known code/data section kind"));
+    bool sawMaybe = false;
+    for (auto const& ext : got->externImports) {
+        if (ext.mangledName != "maybe") continue;
+        sawMaybe = true;
+        EXPECT_EQ(ext.binding, SymbolBinding::Weak)
+            << "`maybe` is a WEAK undefined reference: it may resolve to nothing";
+    }
+    EXPECT_TRUE(sawMaybe) << "the weak reference must read back as an import of `maybe`";
 #endif
 }
 
@@ -2931,7 +3009,8 @@ TEST(CoffWeakExternalNative, ForeignLinkerConsumesADssReEmittedWeakAlias) {
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     // 1. gcc writes a weak alias of a strong definition.
     std::filesystem::path src;

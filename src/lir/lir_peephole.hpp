@@ -64,8 +64,9 @@
 // allocator emitting the copies, and nothing re-derived it. Restated per
 // TARGET, because a single combined figure cannot be checked against either
 // leg, and re-derivable from the tree by the instrument named above rather
-// than by hand — that is the whole of
-// D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT.
+// than by hand — because a figure with no instrument attached is not a
+// measurement: it cannot be re-derived by the reader, so it decays silently in
+// the direction of looking authoritative.
 //
 // The width clause is the second, independent guard on the same hazard: a
 // copy NARROWER than the register it names is a truncation with a
@@ -141,8 +142,7 @@
 // per target are all DELETABLE and R1 takes them, which is why the
 // post-callconv residue below is IDENTICAL to what that measurement recorded
 // (arm64 34 `mov` + 3 `fmov`, x86_64 36 `mov` + 3 `movaps`). Two honest numbers
-// from two trees, kept side by side rather than one overwritten
-// (D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT).
+// from two trees, kept side by side rather than one overwritten.
 //
 // ★★★ ✔MEASURED 2026-09-02 AT THE CALLCONV BOUNDARY ALONE:
 // `materializeCallingConvention` mints EXACTLY ZERO identity class moves.
@@ -156,8 +156,7 @@
 // strictly worse than no table at all.
 //
 // ⚠⚠ THE EVIDENCE THAT USED TO STAND HERE COULD NOT TEST THAT SENTENCE, AND
-// BEING RIGHT IS NOT THE SAME AS BEING MEASURED
-// (D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT). It read:
+// BEING RIGHT IS NOT THE SAME AS BEING MEASURED. It read:
 // *"✔MEASURED over all 585 dumping examples of `examples/c/**`, 2026-08-25:
 // the identity class-move count is 5575 at post-rewrite and 5575 at
 // post-callconv — callconv mints exactly ZERO of them."* `post-rewrite` and

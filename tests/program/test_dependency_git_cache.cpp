@@ -7,7 +7,11 @@
 // FAILURES, which a real-git test could not reach deterministically — you
 // cannot ask a working network to fail on cue, and a CI leg that tried would
 // be flaky in the direction that reads as green. The seam exists so the state
-// machine can be driven, and this file is the reason it exists.
+// machine can be driven, and this file is the reason it exists. The ONE
+// exception is `SystemGitRunnerIsolation`: B.7 layer 2, real `git` and still no
+// network, because what it pins is what the REAL runner hands the real tool
+// (which repository, which environment). Skipped, and saying why, where `git`
+// is not on PATH.
 //
 // ── WHAT BREAKS SILENTLY HERE, WHICH IS WHY THE PINS LOOK PARANOID ──────────
 //
@@ -45,6 +49,7 @@
 //     `depsDir / ".."` is the consumer's own project directory. Nothing about
 //     the character check catches them, so the reserved-name arm is separate.
 
+#include "core/substrate/process_spawn.hpp"  // the offline real-git witness
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "program/dependency_cache.hpp"
@@ -52,16 +57,31 @@
 #include "program/git_acquire.hpp"
 
 #include "diagnostic_count.hpp"
+#include "scoped_env.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+// `getpid` — the lockfile's scratch names carry the process id, and the
+// occupied-name pin must name the FIRST one this process would claim.
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 using dss::CacheOutcome;
 using dss::DependencyCache;
@@ -85,12 +105,16 @@ namespace {
 // ── THE FAKE ────────────────────────────────────────────────────────────────
 //
 // It keeps its state ON THE FILESYSTEM — a `HEAD` file inside the checkout —
-// rather than in a path-keyed map, and that is deliberate rather than cute.
-// The cache clones into a STAGING directory and renames it into place, so a
-// map keyed by path would go stale at exactly the moment the mechanism under
-// test does its most interesting work, and the fake would then be testing its
-// own bookkeeping. A file inside the tree survives the rename for the same
-// reason git's own `.git` directory does.
+// rather than in a path-keyed map, and that is deliberate rather than cute: the
+// answer to "what is checked out here" must come from the tree the cache is
+// actually looking at, or the fake would be testing its own bookkeeping. (The
+// cache used to clone into a staging directory and rename it into place, which
+// made a path-keyed map go stale mid-mechanism; it now clones in place, and the
+// on-disk state is still the honest answer.)
+//
+// `onClone` runs inside a SUCCESSFUL clone, after the tree is written — the seam
+// the landing and concurrency pins use to hold a file open inside the fresh
+// checkout, or to pause one acquisition mid-clone by handshake.
 class FakeGitRunner final : public dss::IGitRunner {
 public:
     // ── scripted outcomes ──
@@ -104,6 +128,7 @@ public:
     // "commit-<rev>", which keeps a test that does not care from having to
     // populate the map.
     std::map<std::string, std::string> commitByRev;
+    std::function<void(fs::path const& dest)> onClone;
 
     // ── observations ──
     int                      isAvailableCalls = 0;
@@ -128,6 +153,7 @@ public:
         fs::create_directories(dest, ec);
         if (ec) return failure("fake clone could not create " + dest.string());
         writeHead(dest, clonedCommit);
+        if (onClone) onClone(dest);
         return success();
     }
 
@@ -224,6 +250,29 @@ void writeFile(fs::path const& p, std::string_view text) {
     fs::create_directories(p.parent_path(), ec);
     std::ofstream out{p, std::ios::binary | std::ios::trunc};
     out << text;
+}
+
+// Every entry beside `lockPath` whose name starts `<lockfile name>.tmp` — both
+// the unique `<lock>.tmp-<pid>-<n>` scheme and the old fixed `<lock>.tmp`. Sorted.
+[[nodiscard]] std::vector<std::string> scratchFilesBeside(fs::path const& lockPath) {
+    std::string const        prefix = lockPath.filename().string() + ".tmp";
+    std::vector<std::string> found;
+    std::error_code          ec;
+    for (auto const& e : fs::directory_iterator(lockPath.parent_path(), ec)) {
+        auto const name = e.path().filename().string();
+        if (name.rfind(prefix, 0) == 0) found.push_back(name);
+    }
+    EXPECT_FALSE(static_cast<bool>(ec)) << ec.message();
+    std::sort(found.begin(), found.end());
+    return found;
+}
+
+[[nodiscard]] unsigned long thisProcessId() {
+#ifdef _WIN32
+    return static_cast<unsigned long>(_getpid());
+#else
+    return static_cast<unsigned long>(getpid());
+#endif
 }
 
 } // namespace
@@ -366,29 +415,241 @@ TEST(GitArgv, CloneSeparatesOptionsFromTheUserSuppliedUrl) {
                                         fs::path{"/tmp/dest"}.string()}));
 }
 
+// The two options every command on a CHECKOUT carries, BEFORE the subcommand
+// (git's global options must precede it) — so git is told the repository and
+// never discovers one by walking up from the working directory.
+// [[D-DEPS-GIT-RUNNER-DISCOVERS-AN-ENCLOSING-REPOSITORY-AND-FORCE-CHECKS-IT-OUT]]
+namespace {
+
+[[nodiscard]] std::vector<std::string>
+namedRepository(std::string const& gitExe, fs::path const& checkout) {
+    return {gitExe, "--git-dir=" + (checkout / ".git").string(),
+            "--work-tree=" + checkout.string()};
+}
+
+[[nodiscard]] std::vector<std::string>
+concat(std::vector<std::string> head, std::vector<std::string> const& tail) {
+    head.insert(head.end(), tail.begin(), tail.end());
+    return head;
+}
+
+} // namespace
+
 TEST(GitArgv, FetchNamesTheRefExplicitlyAndFallsBackToRemoteHead) {
-    EXPECT_EQ(dss::gitFetchArgv("git", "v1.2.0"),
-              (std::vector<std::string>{"git", "fetch", "--force", "--tags",
-                                        "origin", "v1.2.0"}));
+    fs::path const dir{"/work/.dss-deps/bar"};
+    EXPECT_EQ(dss::gitFetchArgv("git", dir, "v1.2.0"),
+              concat(namedRepository("git", dir),
+                     {"fetch", "--force", "--tags", "origin", "v1.2.0"}));
     // An absent ref asks the remote for its own default branch, which is what
     // a `{git}`-with-no-`ref` manifest entry means.
-    EXPECT_EQ(dss::gitFetchArgv("git", ""),
-              (std::vector<std::string>{"git", "fetch", "--force", "--tags",
-                                        "origin", "HEAD"}));
+    EXPECT_EQ(dss::gitFetchArgv("git", dir, ""),
+              concat(namedRepository("git", dir),
+                     {"fetch", "--force", "--tags", "origin", "HEAD"}));
 }
 
 // ★ `--detach` IS THE PIN. Checking out a BRANCH name leaves HEAD attached to
 // a local branch, and the next fetch+checkout of that same branch moves
 // nothing — `--force-git-cache` would cost a round trip and change nothing.
 TEST(GitArgv, CheckoutAlwaysDetaches) {
-    EXPECT_EQ(dss::gitCheckoutArgv("git", "FETCH_HEAD"),
-              (std::vector<std::string>{"git", "checkout", "--detach",
-                                        "--force", "FETCH_HEAD"}));
+    fs::path const dir{"/work/.dss-deps/bar"};
+    EXPECT_EQ(dss::gitCheckoutArgv("git", dir, "FETCH_HEAD"),
+              concat(namedRepository("git", dir),
+                     {"checkout", "--detach", "--force", "FETCH_HEAD"}));
 }
 
 TEST(GitArgv, RevParseAsksForOneRevision) {
-    EXPECT_EQ(dss::gitRevParseArgv("git", "HEAD"),
-              (std::vector<std::string>{"git", "rev-parse", "HEAD"}));
+    fs::path const dir{"/work/.dss-deps/bar"};
+    EXPECT_EQ(dss::gitRevParseArgv("git", dir, "HEAD"),
+              concat(namedRepository("git", dir), {"rev-parse", "HEAD"}));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⛔ THE RUNNER NEVER OPERATES ON A REPOSITORY IT WAS NOT HANDED.
+// [[D-DEPS-GIT-RUNNER-DISCOVERS-AN-ENCLOSING-REPOSITORY-AND-FORCE-CHECKS-IT-OUT]]
+//
+// ✔MEASURED 2026-09-18 (lane `rw`), on the author's own worktree: a checkout
+// whose `.git` had lost its `HEAD` made git DISCOVER the enclosing repository;
+// the cache read that repository's HEAD as the dependency's, fetched its remote
+// and ran `git checkout --detach --force FETCH_HEAD` over it — the reflog reads
+// `checkout: moving from 7df54cc1… to FETCH_HEAD`, and the uncommitted work was
+// gone. `.dss-deps/` lives INSIDE the consuming project, which is almost always
+// a repository, so this is the user's case.
+//
+// REAL git, fully offline — plan 06 §B.7 layer 2 ("real `git`, … still no
+// network"): an enclosing repository with a commit and an UNCOMMITTED edit, and
+// a dependency checkout under it whose `.git` is not a repository. Skipped, and
+// saying why, when `git` is not on PATH — never green without having run.
+// RED ON DISABLE: drop the `--git-dir` / `--work-tree` pair from the argv
+// builders — `rev-parse` then answers with the ENCLOSING commit and the forced
+// checkout wipes the uncommitted edit, so all three assertions go red.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST(SystemGitRunnerIsolation, AnInvalidCheckoutNeverResolvesToTheEnclosingRepository) {
+    auto const gitExe = dss::substrate::resolveExecutableOnPath("git");
+    if (!gitExe) {
+        GTEST_SKIP() << "`git` is not on PATH, so the offline real-git witness "
+                        "(plan 06 §B.7 layer 2) cannot run on this host";
+    }
+    ScratchDir     scratch{Location::Temp, "dep-git-isolation"};
+    fs::path const project = scratch.path() / "consumer";
+    fs::create_directories(project);
+    auto const run = [&](std::vector<std::string> args) {
+        std::vector<std::string> argv{gitExe->string(), "-c", "user.name=dss-test",
+                                      "-c", "user.email=dss-test@example.invalid"};
+        argv.insert(argv.end(), args.begin(), args.end());
+        return dss::substrate::spawnAndWaitInherit(argv, project);
+    };
+    ASSERT_EQ(run({"init", "--quiet"}).exitCode, 0);
+    writeFile(project / "tracked.txt", "committed\n");
+    ASSERT_EQ(run({"add", "tracked.txt"}).exitCode, 0);
+    ASSERT_EQ(run({"commit", "--quiet", "-m", "the user's project"}).exitCode, 0);
+    writeFile(project / "tracked.txt", "UNCOMMITTED WORK\n");
+
+    // The dependency: a directory whose `.git` is NOT a repository — the
+    // measured shape (its `HEAD` gone, objects left).
+    fs::path const dep = project / ".dss-deps" / "bar";
+    fs::create_directories(dep / ".git" / "objects");
+    writeFile(dep / "scale.c", "int dss_scale_by_seven(int v) { return v * 7; }\n");
+
+    dss::SystemGitRunner git;
+    auto const head = git.revParse(dep, "HEAD");
+    EXPECT_FALSE(head.ok)
+        << "rev-parse answered '" << head.output << "' for a checkout that is not "
+        << "a repository — that is the ENCLOSING project's commit, and the cache "
+        << "would treat the user's own repository as the dependency";
+    auto const co = git.checkout(dep, "HEAD");
+    EXPECT_FALSE(co.ok) << "a forced checkout aimed at a dependency ran somewhere";
+    EXPECT_EQ(readFile(project / "tracked.txt"), "UNCOMMITTED WORK\n")
+        << "the user's uncommitted edit was DISCARDED by a forced checkout aimed "
+        << "at a dependency";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⛔ AND NO `git` THE RUNNER SPAWNS INHERITS GIT'S OWN REPOSITORY VARIABLES.
+// [[D-DEPS-GIT-RUNNER-INHERITS-GITS-REPOSITORY-VARIABLES-AND-WRITES-THE-USERS-INDEX]]
+//
+// ✔MEASURED 2026-09-18 (lane `rw`, Git for Windows 2.55.0): a `pre-commit` hook
+// in a LINKED WORKTREE exports `GIT_DIR` and an ABSOLUTE `GIT_INDEX_FILE`, both
+// naming the worktree's own repository. A build run from that hook — its
+// dependency checkout already naming its repository with `--git-dir` — still had
+// its `checkout` (refresh) and its `clone` (first acquisition) write the
+// DEPENDENCY's index into the USER's worktree index. The staged work was gone,
+// the commit failed `invalid object … for '.dss-project.json'`, and `git status`
+// refused the repository. `--git-dir` outranks `GIT_DIR`; nothing on a command
+// line outranks `GIT_INDEX_FILE`.
+//
+// REAL git, offline (§B.7 layer 2), skipped with the reason when git is absent.
+// The pin builds that exact shape: a user repository, a LINKED WORKTREE of it
+// with a STAGED file, and the two variables git exports to a hook there, set in
+// this process for the duration of the runner's three calls (restored after).
+// The worktree's index must be byte-identical afterwards, and every call must
+// have worked on the DEPENDENCY.
+// RED ON DISABLE: stop withholding `gitRepositoryLocalVariables()` in the
+// runner (or make the substrate's environment arm a no-op). The clone's and the
+// checkout's index then land in the worktree's index file.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST(SystemGitRunnerIsolation, GitsOwnRepositoryVariablesNeverReachTheDependencysGit) {
+    auto const gitExe = dss::substrate::resolveExecutableOnPath("git");
+    if (!gitExe) {
+        GTEST_SKIP() << "`git` is not on PATH, so the offline real-git witness "
+                        "(plan 06 §B.7 layer 2) cannot run on this host";
+    }
+    ScratchDir scratch{Location::Temp, "dep-git-environment"};
+    auto const gitIn = [&](fs::path const& dir, std::vector<std::string> args) {
+        std::vector<std::string> argv{gitExe->string(), "-c", "user.name=dss-test",
+                                      "-c", "user.email=dss-test@example.invalid"};
+        argv.insert(argv.end(), args.begin(), args.end());
+        return dss::substrate::spawnAndWaitInherit(argv, dir);
+    };
+
+    // The dependency's upstream: one commit.
+    fs::path const origin = scratch.path() / "origin";
+    fs::create_directories(origin);
+    ASSERT_EQ(gitIn(origin, {"init", "--quiet"}).exitCode, 0);
+    writeFile(origin / "scale.c", "int dss_scale_by_seven(int v) { return v * 7; }\n");
+    ASSERT_EQ(gitIn(origin, {"add", "scale.c"}).exitCode, 0);
+    ASSERT_EQ(gitIn(origin, {"commit", "--quiet", "-m", "the dependency"}).exitCode, 0);
+
+    // The user's repository, and a LINKED WORKTREE of it holding a STAGED file —
+    // the index a `pre-commit` hook's commit is about to record.
+    fs::path const user = scratch.path() / "user";
+    fs::create_directories(user);
+    ASSERT_EQ(gitIn(user, {"init", "--quiet"}).exitCode, 0);
+    writeFile(user / "a.txt", "committed\n");
+    ASSERT_EQ(gitIn(user, {"add", "a.txt"}).exitCode, 0);
+    ASSERT_EQ(gitIn(user, {"commit", "--quiet", "-m", "the user's project"}).exitCode, 0);
+    fs::path const worktree = scratch.path() / "wt";
+    ASSERT_EQ(gitIn(user, {"worktree", "add", "--quiet", "--detach", worktree.string()})
+                  .exitCode,
+              0);
+    writeFile(worktree / "staged.txt", "STAGED WORK\n");
+    ASSERT_EQ(gitIn(worktree, {"add", "staged.txt"}).exitCode, 0);
+    fs::path const worktreeGitDir = user / ".git" / "worktrees" / "wt";
+    fs::path const worktreeIndex  = worktreeGitDir / "index";
+    std::string const indexBefore = readFile(worktreeIndex);
+    ASSERT_FALSE(indexBefore.empty()) << worktreeIndex.string();
+
+    // Where the cache puts a dependency: inside the user's own tree.
+    fs::path const dep = worktree / ".dss-deps" / "scale";
+    GitCommandResult cloned;
+    GitCommandResult checkedOut;
+    GitCommandResult head;
+    {
+        // Exactly the two variables git exported to the measured hook.
+        dss::test_support::ScopedEnv const gitDir{"GIT_DIR", worktreeGitDir.string()};
+        dss::test_support::ScopedEnv const index{"GIT_INDEX_FILE", worktreeIndex.string()};
+        dss::SystemGitRunner git;
+        cloned     = git.clone(origin.string(), dep);
+        checkedOut = git.checkout(dep, "HEAD");
+        head       = git.revParse(dep, "HEAD");
+    }
+    EXPECT_TRUE(cloned.ok) << cloned.detail;
+    EXPECT_TRUE(checkedOut.ok) << checkedOut.detail;
+    EXPECT_TRUE(head.ok) << head.detail;
+    EXPECT_EQ(readFile(worktreeIndex), indexBefore)
+        << "the user's worktree index was REWRITTEN by a git aimed at a dependency "
+        << "— the inherited GIT_INDEX_FILE reached it, and the staged work is gone";
+    EXPECT_TRUE(fs::exists(dep / ".git" / "index"))
+        << "the dependency's own index was never written, so its git wrote it "
+        << "somewhere else";
+}
+
+// The list the runner withholds must cover everything the INSTALLED git calls
+// repository-local (`git rev-parse --local-env-vars`), less the two config
+// carriers git's own `sanitize_repo_env` keeps. A git that adds a variable fails
+// here, on a developer's machine, instead of reaching a user's repository.
+TEST(SystemGitRunnerIsolation, TheWithheldListCoversEverythingTheInstalledGitCallsRepositoryLocal) {
+    auto const gitExe = dss::substrate::resolveExecutableOnPath("git");
+    if (!gitExe) {
+        GTEST_SKIP() << "`git` is not on PATH, so the installed git cannot be asked "
+                        "which variables it calls repository-local";
+    }
+    ScratchDir     scratch{Location::Temp, "dep-git-local-env"};
+    fs::path const out = scratch.path() / "local-env-vars.txt";
+    auto const     r   = dss::substrate::spawnAndWaitRedirectStdout(
+        {gitExe->string(), "rev-parse", "--local-env-vars"}, scratch.path(), out);
+    ASSERT_TRUE(r.spawned && r.exitCode == 0) << r.diagnostic;
+
+    auto const&              ours = dss::gitRepositoryLocalVariables();
+    std::istringstream       lines{readFile(out)};
+    std::size_t              reported = 0;
+    std::vector<std::string> handedOn;
+    for (std::string name; std::getline(lines, name);) {
+        if (!name.empty() && name.back() == '\r') name.pop_back();
+        if (name.empty()) continue;
+        ++reported;
+        if (name == "GIT_CONFIG_PARAMETERS" || name == "GIT_CONFIG_COUNT") continue;
+        if (std::find(ours.begin(), ours.end(), name) == ours.end()) {
+            handedOn.push_back(name);
+        }
+    }
+    EXPECT_GT(reported, 0u) << "git named no variable at all, so nothing was compared";
+    std::string missing;
+    for (auto const& name : handedOn) missing += " " + name;
+    EXPECT_TRUE(handedOn.empty())
+        << "the installed git calls these repository-local, and the runner would "
+        << "hand them to a dependency's git:" << missing;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -455,9 +716,74 @@ TEST(DependencyLockfileTest, SaveReplacesTheDocumentAndLeavesNoScratchFile) {
         << "the file must be OVERWRITTEN — the artifact writer's "
            "exclusive-create discipline does not transfer to a file that is "
            "rewritten on every build";
-    EXPECT_FALSE(fs::exists(fs::path{path}.replace_extension(".json.tmp")))
-        << "the temp-then-rename scratch file must not survive a successful "
-           "save";
+    // Every scratch name the save could have used — the unique
+    // `dss-lock.json.tmp-<pid>-<n>` and the old fixed `dss-lock.json.tmp` —
+    // must be gone. Scanned, not probed by one spelling, so a renamed scheme
+    // cannot make this vacuous.
+    EXPECT_TRUE(scratchFilesBeside(path).empty())
+        << "a temp-then-rename scratch file survived a successful save";
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// ── [[D-DEPS-LOCKFILE-STAGES-THROUGH-ONE-FIXED-TEMP-NAME]] ─────────────────
+//
+// The save used to stage through ONE fixed name, `dss-lock.json.tmp`, opened
+// truncating, so two builds saving at once wrote the SAME file. ✔MEASURED
+// (lane `rw`, the pre-fix sequence replicated, two writers, 30 s): 3500 times a
+// TORN document was committed — and an unparseable lockfile abandons the next
+// build (U-4). Each save now CLAIMS a unique `dss-lock.json.tmp-<pid>-<n>` with
+// an exclusive create. A file another writer holds is simulated here by a
+// sentinel sitting at the name — the only deterministic way to be "another
+// save, mid-write" without a timer.
+//
+// RED ON DISABLE, per mechanism — each test reds under exactly one mutant:
+//   * back to the fixed `.tmp` name      -> `…NeverWritesThroughTheOldFixed…`;
+//   * unique names, but opened TRUNCATING -> `…StepsOverAnOccupiedScratchName…`.
+
+TEST(DependencyLockfileTest, ASaveNeverWritesThroughTheOldFixedScratchName) {
+    ScratchDir         scratch{Location::Temp, "dep-lock"};
+    DiagnosticReporter rep;
+    auto const         path     = scratch.path() / "dss-lock.json";
+    auto const         fixed    = scratch.path() / "dss-lock.json.tmp";
+    std::string const  sentinel = "another save's document, mid-write\n";
+    writeFile(fixed, sentinel);
+
+    DependencyLockfile lock;
+    lock.record("bar", LockedDependency{kUrl, std::nullopt, "aaa111"});
+    ASSERT_TRUE(lock.save(path, rep)) << "the save itself must succeed";
+    EXPECT_EQ(readFile(fixed), sentinel)
+        << "the save wrote through the old FIXED scratch name — two builds "
+           "saving at once share it, and a torn document gets committed";
+    auto const read = DependencyLockfile::load(path, rep);
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(read->find("bar")->resolvedCommit, "aaa111");
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(DependencyLockfileTest, ASaveStepsOverAnOccupiedScratchNameAndNeverTruncatesIt) {
+    ScratchDir         scratch{Location::Temp, "dep-lock"};
+    DiagnosticReporter rep;
+    auto const         path = scratch.path() / "dss-lock.json";
+    // The FIRST name this process's save would claim — held by "another save".
+    auto const occupied =
+        scratch.path() / ("dss-lock.json.tmp-" + std::to_string(thisProcessId()) + "-0");
+    std::string const sentinel = "another save's document, mid-write\n";
+    writeFile(occupied, sentinel);
+
+    DependencyLockfile lock;
+    lock.record("bar", LockedDependency{kUrl, std::nullopt, "bbb222"});
+    ASSERT_TRUE(lock.save(path, rep)) << "an occupied name must be stepped over, "
+                                         "not reported";
+    EXPECT_EQ(readFile(occupied), sentinel)
+        << "the save opened a scratch name it did not create — a claim must be "
+           "EXCLUSIVE, or two saves share one file again";
+    auto const read = DependencyLockfile::load(path, rep);
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(read->find("bar")->resolvedCommit, "bbb222");
+    auto const left = scratchFilesBeside(path);
+    EXPECT_EQ(left, (std::vector<std::string>{occupied.filename().string()}))
+        << "only the occupant may remain: the save's own scratch file must be "
+           "gone, and the occupant must not";
     EXPECT_EQ(rep.errorCount(), 0u);
 }
 
@@ -1038,4 +1364,217 @@ TEST(DependencyCacheLockfile, CacheLivesBesideTheConsumingProjectsManifest) {
     ASSERT_TRUE(cache->save(rep));
     EXPECT_TRUE(fs::exists(scratch.path() / ".dss-deps" / "dss-lock.json"));
     EXPECT_TRUE(fs::is_directory(scratch.path() / ".dss-deps" / "bar"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LANDING A CHECKOUT — IN PLACE, MARKED, AND ONE ACQUISITION AT A TIME.
+//
+// The cache used to clone into a fixed `+staging/<name>` and RENAME the
+// populated directory into `.dss-deps/<name>`. Three measured defects came
+// with it, and each mechanism of the fix has its own pin here:
+//
+//   * IN PLACE — [[D-DEPS-CACHE-LANDS-A-CHECKOUT-BY-RENAMING-A-DIRECTORY-A-SCANNER-CAN-HOLD]]:
+//     Windows refuses to rename a directory while ANY file beneath it is open,
+//     and a real-time scan of the freshly written checkout is such a holder
+//     (✔MEASURED, 6 of 500 landings refused under load). ⇒ the checkout is
+//     cloned straight into `.dss-deps/<name>` (Go since 1.16, cargo).
+//   * THE MARKER — an in-place tree an interrupted build left can answer
+//     `rev-parse` perfectly well; `+partial/<name>` is the only thing that knows
+//     it is incomplete (Go's `.partial`).
+//   * THE LOCK — [[D-DEPS-CONCURRENT-ACQUISITIONS-OF-ONE-DEPENDENCY-SHARE-A-PATH-AND-CAN-HANG]]:
+//     two builds acquiring one dependency shared the fixed staging path,
+//     `remove_all`-ed it under each other, and on the MinGW build one HUNG
+//     (✔MEASURED, 688 s of CPU in libstdc++'s `remove_all`). ⇒ a per-dependency
+//     cross-process lock held for the whole acquisition.
+//
+// RED ON DISABLE, per mechanism:
+//   * back to stage-then-rename -> `AFileHeldOpenInsideTheFreshCheckout…` (on
+//     WINDOWS only: POSIX `rename(2)` of a directory does not care about open
+//     files, so there the pin states the property and cannot red);
+//   * the usability probe ignores the marker -> `ACheckoutMarkedIncomplete…`;
+//   * no lock -> `ASecondAcquisitionWaitsAndNeverDisturbsTheFirst`.
+// Every wait below is a HANDSHAKE on a condition the code under test signals —
+// no sleep and no clock anywhere.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+[[nodiscard]] std::string allMessages(DiagnosticReporter const& rep) {
+    std::string joined;
+    for (auto const& d : rep.all()) {
+        joined += d.actual;
+        joined += '\n';
+    }
+    return joined;
+}
+
+} // namespace
+
+TEST(DependencyCacheLanding, AFileHeldOpenInsideTheFreshCheckoutNeverFailsTheLanding) {
+    ScratchDir    scratch{Location::Temp, "dep-git-landing"};
+    FakeGitRunner git;
+    // The real-time scan of the fresh tree, as measured: a handle on a file the
+    // clone just wrote, still open when the checkout is landed.
+    std::optional<std::ifstream> holder;
+    git.onClone = [&holder](fs::path const& dest) {
+        holder.emplace(dest / "HEAD", std::ios::binary);
+    };
+    DiagnosticReporter rep;
+
+    auto cache = DependencyCache::open(scratch.path(), git, false, rep);
+    ASSERT_TRUE(cache.has_value());
+    auto const name = cache->registerGitDependency(kUrl, std::string{"v1"}, rep);
+    ASSERT_TRUE(name.has_value());
+    auto const got = cache->acquire(*name, rep);
+
+    ASSERT_TRUE(holder.has_value() && holder->is_open())
+        << "premise: a file inside the fresh checkout must be held during the "
+           "landing, or this pin proves nothing";
+    EXPECT_EQ(got.outcome, CacheOutcome::Miss)
+        << "a file held open inside the fresh checkout failed the acquisition:\n"
+        << allMessages(rep);
+    EXPECT_EQ(got.checkout, cache->depsDir() / "bar")
+        << "the checkout lives at `.dss-deps/<name>/` — the documented path";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_DependencyGitAcquireFailed), 0u);
+    EXPECT_FALSE(fs::exists(cache->depsDir() / "+partial" / "bar"))
+        << "a completed landing must take its completeness marker down";
+    holder.reset();
+}
+
+TEST(DependencyCacheLanding, ACheckoutMarkedIncompleteIsNeverTrusted) {
+    ScratchDir     scratch{Location::Temp, "dep-git-partial"};
+    FakeGitRunner  git;
+    fs::path const deps = scratch.path() / ".dss-deps";
+    // The residue of an interrupted acquisition: a tree that ANSWERS rev-parse
+    // (git writes HEAD before the working tree is complete) — and the marker.
+    auto const leaveResidue = [&deps] {
+        fs::create_directories(deps / "bar");
+        FakeGitRunner::writeHead(deps / "bar", "commit-half-written");
+        writeFile(deps / "+partial" / "bar", "");
+    };
+
+    // (1) OFFLINE: there is nothing to fall back ON. 0xD01E, never 0xD01F.
+    leaveResidue();
+    git.cloneSucceeds = false;
+    git.fetchSucceeds = false;
+    {
+        DiagnosticReporter rep;
+        auto cache = DependencyCache::open(scratch.path(), git, false, rep);
+        ASSERT_TRUE(cache.has_value());
+        auto const name = cache->registerGitDependency(kUrl, std::nullopt, rep);
+        ASSERT_TRUE(name.has_value());
+        auto const got = cache->acquire(*name, rep);
+        EXPECT_EQ(got.outcome, CacheOutcome::AcquireFailed)
+            << "a tree an interrupted acquisition left was treated as a usable "
+               "checkout:\n"
+            << allMessages(rep);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::D_DependencyGitFetchFallback), 0u)
+            << "the build must not PROCEED on a half-written tree";
+        EXPECT_EQ(git.fetchCalls, 0)
+            << "an untrusted tree is not refreshed, it is replaced";
+    }
+
+    // (2) ONLINE: the residue is removed and the dependency acquired afresh.
+    leaveResidue();
+    git.cloneSucceeds = true;
+    {
+        DiagnosticReporter rep;
+        auto cache = DependencyCache::open(scratch.path(), git, false, rep);
+        ASSERT_TRUE(cache.has_value());
+        auto const name = cache->registerGitDependency(kUrl, std::nullopt, rep);
+        ASSERT_TRUE(name.has_value());
+        auto const got = cache->acquire(*name, rep);
+        EXPECT_EQ(got.outcome, CacheOutcome::Miss) << allMessages(rep);
+        EXPECT_EQ(got.resolvedCommit, "commit-default")
+            << "the residue's commit must never be what the build records";
+        EXPECT_FALSE(fs::exists(deps / "+partial" / "bar"));
+    }
+}
+
+TEST(DependencyCacheConcurrency, ASecondAcquisitionWaitsAndNeverDisturbsTheFirst) {
+    ScratchDir    scratch{Location::Temp, "dep-git-concurrent"};
+    FakeGitRunner gitA;
+    FakeGitRunner gitB;
+
+    std::mutex              m;
+    std::condition_variable cv;
+    bool                    aInClone   = false;
+    bool                    releaseA   = false;
+    bool                    bContended = false;
+    bool                    bCloning   = false;
+    bool                    bDone      = false;
+    fs::path                aTree;
+
+    // A pauses INSIDE its clone — its tree half-written, whatever it holds
+    // held — until the test has seen what B does.
+    gitA.onClone = [&](fs::path const& dest) {
+        writeFile(dest / "owner-A", "A's clone, in progress\n");
+        std::unique_lock<std::mutex> lk(m);
+        aTree    = dest;
+        aInClone = true;
+        cv.notify_all();
+        cv.wait(lk, [&] { return releaseA; });
+    };
+    // Reached only if B clones while A is still in progress (no lock).
+    gitB.onClone = [&](fs::path const&) {
+        std::lock_guard<std::mutex> lk(m);
+        bCloning = true;
+        cv.notify_all();
+    };
+
+    DiagnosticReporter repA;
+    DiagnosticReporter repB;
+    auto cacheA = DependencyCache::open(scratch.path(), gitA, false, repA);
+    auto cacheB = DependencyCache::open(scratch.path(), gitB, false, repB);
+    ASSERT_TRUE(cacheA.has_value());
+    ASSERT_TRUE(cacheB.has_value());
+    ASSERT_TRUE(cacheA->registerGitDependency(kUrl, std::nullopt, repA).has_value());
+    ASSERT_TRUE(cacheB->registerGitDependency(kUrl, std::nullopt, repB).has_value());
+    // The handshake the lock offers: B reports that it found A's acquisition
+    // in progress, just BEFORE it blocks on it.
+    cacheB->setLockContentionObserver([&](std::string const&) {
+        std::lock_guard<std::mutex> lk(m);
+        bContended = true;
+        cv.notify_all();
+    });
+
+    dss::ResolvedGitDependency gotA;
+    dss::ResolvedGitDependency gotB;
+    std::thread                ta([&] { gotA = cacheA->acquire("bar", repA); });
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return aInClone; });
+    }
+    std::thread tb([&] {
+        gotB = cacheB->acquire("bar", repB);
+        std::lock_guard<std::mutex> lk(m);
+        bDone = true;
+        cv.notify_all();
+    });
+
+    bool bWaitedForA       = false;
+    bool aIntactWhenBMoved = false;
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return bContended || bCloning || bDone; });
+        bWaitedForA       = bContended && !bCloning;
+        aIntactWhenBMoved = fs::exists(aTree / "owner-A");
+        releaseA          = true;
+        cv.notify_all();
+    }
+    ta.join();
+    tb.join();
+
+    EXPECT_TRUE(bWaitedForA)
+        << "the second acquisition did not wait for the first one — it "
+        << (bCloning ? "CLONED while the first was mid-clone"
+                     : "returned without contending")
+        << ":\n"
+        << allMessages(repB);
+    EXPECT_TRUE(aIntactWhenBMoved)
+        << "the second acquisition REMOVED the first one's in-progress clone";
+    EXPECT_EQ(gotA.outcome, CacheOutcome::Miss) << allMessages(repA);
+    EXPECT_NE(gotB.outcome, CacheOutcome::AcquireFailed) << allMessages(repB);
+    EXPECT_TRUE(fs::exists(scratch.path() / ".dss-deps" / "bar" / "HEAD"));
+    EXPECT_FALSE(fs::exists(scratch.path() / ".dss-deps" / "+partial" / "bar"));
 }

@@ -29,10 +29,10 @@
 // libstdc++ (the toolchain this repo's Windows build actually uses) returns an
 // 8.3 SHORT NAME UNCHANGED and WITH NO ERROR:
 //
-//     input            : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1
+//     input            : C:\Users\<user>\AppData\Local\Temp\DSS-SC~1
 //     exists           : yes
-//     weakly_canonical : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1   ec: <none>
-//     canonical        : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1   ec: <none>
+//     weakly_canonical : C:\Users\<user>\AppData\Local\Temp\DSS-SC~1   ec: <none>
+//     canonical        : C:\Users\<user>\AppData\Local\Temp\DSS-SC~1   ec: <none>
 //
 // libstdc++ resolves `.`/`..` and symlinks and has no concept of an 8.3 alias,
 // so two spellings of ONE directory survived as TWO keys. The MSVC STL happens
@@ -59,8 +59,8 @@ namespace dss::core {
 // SILENTLY RENAMES THE FILE ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]).
 // ✔MEASURED with the toolchain that builds DSS (libstdc++ 13.2, MinGW), all
 // three printed from the SAME path object:
-//     .string()          '\\wsl.localhost\Ubuntu\home\rafael\p\uncprobe.h'
-//     .generic_string()  '/wsl.localhost/Ubuntu/home/rafael/p/uncprobe.h'
+//     .string()          '\\wsl.localhost\Ubuntu\home\<user>\p\uncprobe.h'
+//     .generic_string()  '/wsl.localhost/Ubuntu/home/<user>/p/uncprobe.h'
 //     exists()           true
 // The leading separator RUN is collapsed to one, so the authority is demoted to
 // an ordinary component and the result names a path on the local drive root
@@ -125,9 +125,9 @@ genericSpellingU8(std::filesystem::path const& p);
 //
 // ★★★ THE DEFECT THIS EXISTS FOR, ✔MEASURED 2026-08-28 on the toolchain that
 // builds DSS (libstdc++ 13.2, MinGW-w64 UCRT), printed from one path object:
-//     input        : //wsl.localhost/Ubuntu/home/rafael/p44_unc_inc
+//     input        : //wsl.localhost/Ubuntu/home/<user>/p44_unc_inc
 //     is_absolute  : false        has_root_name : false   root_name : <empty>
-//     absolute()   : C:\wsl.localhost\Ubuntu\home\rafael\p44_unc_inc
+//     absolute()   : C:\wsl.localhost\Ubuntu\home\<user>\p44_unc_inc
 //     exists(input): true         exists(absolute()) : false
 // It does NOT merely prepend the cwd -- it RE-ROOTS a path naming another
 // machine onto the local drive, silently and with no error. This path model

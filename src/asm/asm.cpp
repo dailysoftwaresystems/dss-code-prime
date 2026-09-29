@@ -9,11 +9,11 @@
 #include "core/types/type_lattice/type_layout.hpp"   // computeLayout, scalarByteSize
 #include "lir/lir_pass_util.hpp"
 
+#include <algorithm>  // D-CSUBSET-LONG-BRANCH: sort / unique / binary_search over the promoted set
 #include <bit>
 #include <cmath>     // D-MIR-OVERLAP-STRUCT-ZERO-INIT: std::signbit (rejects -0.0)
 #include <cstring>
 #include <format>
-#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -48,6 +48,11 @@ using dss::report;
                               std::vector<walker_util::BlockRelPatch>& blockPatches,
                               std::vector<walker_util::BlockSymPatch>& blockSymPatches,
                               std::span<MirInstId const> lirToMir,
+                              // D-CSUBSET-LONG-BRANCH: the sorted set of
+                              // `LirInstId.v` this function's relaxation
+                              // fixed point has promoted to their escape
+                              // form. Empty on pass 0 of every function.
+                              std::span<std::uint32_t const> relaxedInsts,
                               DiagnosticReporter&     reporter) {
     auto const opcode = lir.instOpcode(inst);
     auto const* info  = schema.opcodeInfo(opcode);
@@ -63,6 +68,44 @@ using dss::report;
                std::format("opcode {} is not declared in target schema '{}'",
                            opcode, schema.name()));
         return false;
+    }
+
+    // ★★ AN EARLY-CLOBBER RESULT THAT IS ALSO AN OPERAND HAS NO ENCODING THAT
+    // IS A PROGRAM (P68 round 8, `TargetOpcodeInfo::resultEarlyClobber`), and
+    // this is the one place every encoder passes, so no format can emit one.
+    // The allocator never produces the overlap (the builder marks the result
+    // early); what reaches here is a register the programmer WROTE, or an
+    // inline-asm output the allocator was free to share because it carried no
+    // `&`. Identity is the physical register's — `wzr` and `sp` encode the same
+    // field and are two registers — so only a TRUE overlap is refused.
+    if (info->resultEarlyClobber) {
+        LirReg const result = lir.instResult(inst);
+        if (result.valid() && result.isPhysical) {
+            for (LirOperand const& op : lir.instOperands(inst)) {
+                if (op.kind != LirOperandKind::Reg || !op.reg.valid()
+                    || !op.reg.isPhysical || op.reg.id != result.id) {
+                    continue;
+                }
+                auto const* reg = schema.registerInfo(
+                    static_cast<std::uint16_t>(result.id));
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format(
+                           "opcode '{}': its result register '{}' is also one of "
+                           "the registers it reads, and target '{}' declares that "
+                           "this instruction's result must differ from every "
+                           "register operand (the architecture makes the "
+                           "overlapping encoding UNPREDICTABLE, and clang refuses "
+                           "it) — write a different register, or give an "
+                           "inline-asm output written here the early-clobber "
+                           "constraint (`=&r`) so it is never shared with an input",
+                           info->mnemonic,
+                           reg != nullptr ? std::string_view{reg->name}
+                                          : std::string_view{"?"},
+                           schema.name()));
+                return false;
+            }
+        }
     }
 
     // SourceMapEntry stamping (plan 13 AS6). Capture the byte
@@ -95,7 +138,7 @@ using dss::report;
         case TargetEncodingShape::Fixed32:
             return fixed32::encode(lir, schema, inst, info, lirToMir,
                                     out, relocs, srcMap, blockPatches,
-                                    blockSymPatches, reporter);
+                                    blockSymPatches, relaxedInsts, reporter);
         }
 
         // Enum-drift fallback. A new `TargetEncodingShape` value
@@ -220,6 +263,139 @@ AssembledModule assemble(Lir const&                 lir,
 
         std::uint32_t const blockCount = lir.funcBlockCount(fn);
 
+        // ─────────────────────────────────────────────────────────────
+        // D-CSUBSET-LONG-BRANCH — BRANCH RELAXATION AS A FIXED POINT
+        // ─────────────────────────────────────────────────────────────
+        //
+        // ★★★ A SINGLE PATCHING PASS CANNOT BE RIGHT, AND THE ROW SAID SO
+        // BEFORE THE CODE DID. An intra-function branch whose displacement
+        // leaves its field's reach is rescued by an ESCAPE — real extra
+        // instructions the encoder emits. Emitting them changes the
+        // function's byte layout, so every block offset captured before
+        // them is stale, so the decision cannot be made by the resolver
+        // after the block-offset table is built. Worse, the growth is not
+        // local: widening one branch pushes the spans that CONTAIN it
+        // further apart, and a branch that was exactly in reach falls out
+        // of it. That is why this is a LOOP and not a fix-up.
+        //
+        // ★★★ WHY IT TERMINATES, AND WHY THE BOUND IS A BACKSTOP RATHER
+        // THAN THE ARGUMENT. `relaxedInsts` is MONOTONE: an instruction is
+        // promoted to its escape form and never demoted, and the loop only
+        // takes another pass when the pass just finished promoted at least
+        // one instruction that was not already in the set. So the set
+        // strictly grows every iteration, and it is bounded above by the
+        // number of instructions in the function. The iteration count is
+        // therefore at most `instCount + 1` by construction, with no appeal
+        // to displacements shrinking or to any convergence property of the
+        // layout. `relaxBound` re-states that same number and refuses
+        // LOUDLY if it is ever reached — because a monotonicity argument
+        // that is true of the code today is not a guarantee about the code
+        // tomorrow, and an assembler that spins is worse than one that
+        // refuses. There is no recursion here and no input-proportional
+        // stack: one `for`, one explicit vector.
+        //
+        // ⚠ THE COMMON PATH IS EXACTLY ONE PASS. A function whose branches
+        // all fit promotes nothing, so `relaxedInsts` stays empty, so the
+        // encode is the encode that ran before this loop existed and the
+        // bytes are identical to the byte. The scan below is arithmetic
+        // over the patch list; it writes nothing and reports nothing.
+        std::vector<std::uint32_t> relaxedInsts;
+        std::uint32_t const relaxBound = [&] {
+            std::uint32_t n = 1;
+            for (std::uint32_t bi = 0; bi < blockCount; ++bi)
+                n += lir.blockInstCount(lir.funcBlockAt(fn, bi));
+            return n;
+        }();
+
+        // ─────────────────────────────────────────────────────────────
+        // D-CSUBSET-LONG-BRANCH — THE SECOND MONOTONE SET: BRANCH ISLANDS
+        // ─────────────────────────────────────────────────────────────
+        //
+        // ★★★ THE WIDEST FIELD NEEDS A NEARER TARGET, NOT A WIDER FIELD.
+        // The escape above rescues a branch by MOVING IT INTO A WIDER FIELD,
+        // which is why the widest field has no escape and why the row this
+        // anchor names concluded the residue needed an absolute address — a
+        // multi-word veneer, a relocation, a synthetic symbol the assembler
+        // cannot mint. It does not. The residue is INTRA-FUNCTION: every byte
+        // offset in this function is known right here, so aiming the SAME
+        // field at a nearer point of the SAME function is the same
+        // subtraction. That nearer point is an ISLAND holding the branch
+        // again — `B island` / `island: B far`, the same field twice, chained
+        // as far as the distance demands. It is what ld64 does for AArch64
+        // text over 128 MiB, and it needs NO scratch register, which is what
+        // makes it available to an assembler running after register
+        // allocation with no liveness to consult.
+        //
+        // ★★★ WHAT IS MONOTONE, AND WHAT IS RE-DERIVED EVERY PASS. A SITE
+        // ("after LIR instruction I, place a landing pad for block T") is
+        // monotone: once requested it is never withdrawn, and its identity is
+        // a LIR instruction id, which survives a re-layout exactly as
+        // `relaxedInsts`'s members do. Everything positional — where the
+        // cluster landed, which islands exist at which byte offsets — is
+        // re-derived from scratch on every pass, because byte offsets do not
+        // survive relaxation. That split is the same one the promoted set
+        // already makes, which is why islands ride this loop rather than
+        // needing one of their own.
+        //
+        // ★★★ THE ISLAND BOUND, AS ARITHMETIC.
+        //   Let R be the field's byte reach and S = R/2 its placement STRIDE
+        //   (`blockRelIslandStride`; the half is what leaves a placed island
+        //   slack against later layout growth). The resolver only ever aims at
+        //   an island STRICTLY CLOSER to the target than the site it is
+        //   standing on, and it only requests one S bytes further along, so
+        //   every hop of a chain advances at least S bytes and no target is
+        //   further away than the function's own size N. One branch's chain
+        //   therefore holds at most ceil(N / S) islands, and over the
+        //   function's B block-relative branches:
+        //
+        //       islandBound = B * (ceil(N / S) + 1)
+        //
+        //   The `+ 1` is SLACK, not arithmetic: the bound is re-derived each
+        //   pass from a layout the previous pass just grew, and without the
+        //   cushion it could refuse a placement it had already justified. The
+        //   argument is `B * ceil(N / S)`; the cushion is the `+ 1`, and which
+        //   is which is said rather than left for a reader to reconcile
+        //   against the code.
+        //
+        //   `islandCap` below restates exactly that and refuses LOUDLY if it
+        //   is ever exceeded, for the same reason `relaxBound` does: a
+        //   termination argument true of today's code is not a guarantee
+        //   about tomorrow's, and an assembler that spins is worse than one
+        //   that refuses. The chain cannot cycle either — each hop strictly
+        //   decreases a non-negative integer (the distance to the target) —
+        //   but that argument, too, is backed by a counter rather than
+        //   trusted. One `for`, explicit vectors: no recursion anywhere.
+        struct IslandSite {
+            std::uint32_t                 afterInstV;   // emitted after this inst
+            std::uint32_t                 targetBlock;  // where it branches
+            walker_util::BranchIslandBody body;         // what it is made of
+        };
+        auto const siteKeyLess = [](IslandSite const& a, IslandSite const& b) {
+            if (a.afterInstV != b.afterInstV) return a.afterInstV < b.afterInstV;
+            if (a.targetBlock != b.targetBlock) return a.targetBlock < b.targetBlock;
+            return static_cast<std::uint8_t>(a.body.kind)
+                 < static_cast<std::uint8_t>(b.body.kind);
+        };
+        std::vector<IslandSite> islandSites;
+
+        // ⓘ THE LOOP BODY IS DELIBERATELY NOT RE-INDENTED, and the closing
+        // brace below says so again. Indenting the ~280 lines this loop now
+        // wraps would have produced a whitespace-only diff large enough to
+        // hide the six lines that actually changed — and the block it wraps
+        // is the pre-existing per-function encode, unchanged except where
+        // this comment's anchor is named.
+        for (std::uint32_t relaxPass = 0; ; ++relaxPass) {
+        // Every pass re-encodes the function FROM SCRATCH. Nothing survives
+        // a pass except `relaxedInsts` — carrying stale bytes, relocations,
+        // source-map entries or block symbols into a re-layout is precisely
+        // the partial-output failure `D-ASM-PATCH-PARTIAL-OUTPUT-FAILLOUD`
+        // exists to prevent, one tier up.
+        outFn.bytes.clear();
+        outFn.relocations.clear();
+        outFn.sourceMap.clear();
+        outFn.blockSymbols.clear();
+        outFn.blockByteOffsets.clear();
+
         // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
         // intra-function block-relative branch patching. Build the
         // block-offset table while emitting block-by-block, then
@@ -235,6 +411,37 @@ AssembledModule assemble(Lir const&                 lir,
         // into `outFn.blockSymbols` once `blockOffsets` is complete (after
         // the funcEncodeOk check), mirroring the `blockPatches` discipline.
         std::vector<walker_util::BlockSymPatch> blockSymPatches;
+
+        // D-CSUBSET-LONG-BRANCH: the POSITIONAL half of the island machinery,
+        // rebuilt from scratch every pass because byte offsets do not survive
+        // a re-layout. `instEnds` is the offset→instruction index the site
+        // request needs (it is built in emit order, so it is sorted by offset
+        // by construction); `emittedIslands` is where this pass's landing pads
+        // actually landed, which is what an out-of-reach patch aims at.
+        struct EmittedIsland {
+            std::uint32_t                  bodyStart;    // first byte of the pad
+            std::uint32_t                  fieldOffset;  // its field's patch site
+            std::uint32_t                  targetBlock;
+            walker_util::BlockRelPatchKind kind;
+        };
+        std::vector<EmittedIsland> emittedIslands;
+        struct InstEnd { std::uint32_t endOffset; std::uint32_t instV; };
+        std::vector<InstEnd> instEnds;
+        instEnds.reserve(relaxBound);
+        // P68 round 9 — where THIS build's code layout is the reference
+        // assembler's, for an address that adds a constant to a location of
+        // this function (`adr x7, .-4`, `adr x2, 1f+4`). Within a block, up
+        // to (not including) its terminator, every instruction is one source
+        // line encoded as that line's reference encoding; the terminator may
+        // be a jump this build SYNTHESIZED (a label reached by falling, a
+        // conditional branch's fall-through word —
+        // [[D-ASM-FALLTHROUGH-INTO-A-LABEL-EMITS-A-JUMP]]), and a branch-island
+        // cluster is bytes no source line wrote. `runEnd` is the start of each
+        // block's terminator, `runTakesTerminator` whether that first byte is
+        // still source-for-source, `clusterStarts` where each cluster begins.
+        std::unordered_map<std::uint32_t, std::uint32_t> runEnd;
+        std::unordered_map<std::uint32_t, bool>          runTakesTerminator;
+        std::vector<std::uint32_t> clusterStarts;
 
         // D-ASM-ENCODE-FAILURE-FUNCTION-ROLLBACK (step 13.5 cycle 1
         // post-fold, silent-failure-hunter CRITICAL #2): track
@@ -257,13 +464,156 @@ AssembledModule assemble(Lir const&                 lir,
             for (std::uint32_t ii = 0; ii < instCount; ++ii) {
                 LirInstId const inst = lir.blockInstAt(blk, ii);
                 std::size_t const preInstByteCount = outFn.bytes.size();
+                std::size_t const prePatchCount = blockPatches.size();
+                // The block's last instruction is its terminator (a LIR
+                // invariant): the run of source-for-source code ends at it,
+                // and takes its first byte too unless it is an unconditional
+                // branch to the block laid out next — the shape of the jump
+                // this build synthesizes for a label reached by falling, which
+                // no source line wrote.
+                if (ii + 1 == instCount) {
+                    runEnd[blk.v] = static_cast<std::uint32_t>(preInstByteCount);
+                    auto const* tinfo = schema.opcodeInfo(lir.instOpcode(inst));
+                    auto const succ = lir.blockSuccessors(blk);
+                    bool const fallsToNext =
+                        tinfo != nullptr
+                        && tinfo->terminatorKind == TargetTerminatorKind::Br
+                        && succ.size() == 1 && bi + 1 < blockCount
+                        && succ[0].v == lir.funcBlockAt(fn, bi + 1).v;
+                    runTakesTerminator[blk.v] = !fallsToNext;
+                }
                 bool const ok = encodeInst(lir, schema, inst,
                                  outFn.bytes, outFn.relocations,
                                  outFn.sourceMap, blockPatches,
-                                 blockSymPatches, lirToMir, reporter);
+                                 blockSymPatches, lirToMir,
+                                 relaxedInsts, reporter);
+                // D-CSUBSET-LONG-BRANCH: stamp the originating instruction
+                // on every patch this instruction just appended. Done HERE,
+                // once, rather than in each walker: the promoted set is
+                // keyed on instruction identity because byte offsets do not
+                // survive a re-layout, and a walker that forgot to stamp
+                // would silently key the whole fixed point on instruction 0.
+                // P68 round 9: a self-relative patch (the location counter)
+                // names the block its instruction sits in, stamped here too.
+                for (std::size_t pi = prePatchCount; pi < blockPatches.size(); ++pi) {
+                    blockPatches[pi].instV = inst.v;
+                    if (blockPatches[pi].selfRelative) {
+                        blockPatches[pi].targetBlock = blk.v;
+                    }
+                }
                 if (!ok) {
                     outFn.bytes.resize(preInstByteCount);
                     funcEncodeOk = false;
+                    continue;
+                }
+                instEnds.push_back(InstEnd{
+                    static_cast<std::uint32_t>(outFn.bytes.size()), inst.v});
+                // ── D-CSUBSET-LONG-BRANCH: THE ISLAND CLUSTER ────────────
+                //
+                // Every site requested after THIS instruction is materialized
+                // here, as one cluster:
+                //
+                //     B over        <- the jump-over, same declared body
+                //     B far         <- island, one per (target, field) site
+                //     B far'
+                //   over:           <- the next instruction, untouched
+                //
+                // ⚠ THE JUMP-OVER IS NOT OPTIONAL AND IT IS NOT A DETAIL.
+                // A landing pad is reached ONLY by a branch aimed at it; the
+                // instruction before it has no idea it is there. Without the
+                // jump-over the instruction stream falls straight into the
+                // first pad and takes a branch nobody asked for — valid
+                // bytes, wrong destination, no diagnostic. Its displacement
+                // is the cluster's own size, which is known HERE, at emit
+                // time, so it is written here rather than queued as a patch:
+                // a patch names a target BLOCK, and the landing point of a
+                // jump-over is a byte offset that belongs to no block.
+                //
+                // ⓘ A CLUSTER CARRIES NO SOURCE-MAP ENTRY, DELIBERATELY. The
+                // CFI producer derives each unwind range from consecutive
+                // `sourceMap` byte offsets, so an unmapped cluster extends the
+                // PRECEDING instruction's range over it — which is the correct
+                // description, because a branch changes no unwind state: it
+                // touches neither the stack pointer nor a callee-saved
+                // register. Attributing these bytes to a LIR instruction that
+                // did not emit them would be the false claim.
+                if (islandSites.empty()) continue;
+                auto const siteLo = std::lower_bound(
+                    islandSites.begin(), islandSites.end(), inst.v,
+                    [](IslandSite const& s, std::uint32_t v) {
+                        return s.afterInstV < v;
+                    });
+                auto siteHi = siteLo;
+                while (siteHi != islandSites.end()
+                       && siteHi->afterInstV == inst.v)
+                    ++siteHi;
+                if (siteLo == siteHi) continue;
+                std::size_t padBytes = 0;
+                for (auto it = siteLo; it != siteHi; ++it)
+                    padBytes += it->body.byteCount;
+                auto const appendBody =
+                    [&](walker_util::BranchIslandBody const& b) {
+                        for (std::uint8_t k = 0; k < b.byteCount; ++k)
+                            outFn.bytes.push_back(b.bytes[k]);
+                    };
+                auto const& over = siteLo->body;
+                auto const overStart =
+                    static_cast<std::uint32_t>(outFn.bytes.size());
+                clusterStarts.push_back(overStart);
+                appendBody(over);
+                {
+                    auto const g =
+                        walker_util::blockRelFieldGeometry(over.kind);
+                    auto const field = overStart + over.fieldOffset;
+                    std::int64_t const landing =
+                        static_cast<std::int64_t>(overStart)
+                      + over.byteCount + static_cast<std::int64_t>(padBytes);
+                    std::int64_t const hop =
+                        (landing - (static_cast<std::int64_t>(field) + g.pcBias))
+                            >> g.scaleLog2;
+                    // ⚠ A CLUSTER BIG ENOUGH TO OUTRUN ITS OWN JUMP-OVER IS A
+                    // REFUSAL, NOT A MASKED WRITE. The field write below
+                    // truncates to the field's width by construction, so an
+                    // unrepresentable hop would silently land somewhere inside
+                    // the cluster and execute a branch nobody asked for. It
+                    // cannot happen while the island bound holds — that is the
+                    // point of checking it rather than assuming it.
+                    if (hop < walker_util::blockRelFieldMin(g)
+                     || hop > walker_util::blockRelFieldMax(g)) {
+                        report(reporter, DiagnosticCode::A_FunctionEncodeAborted,
+                               DiagnosticSeverity::Error,
+                               std::format("function symbol id {} dropped — a "
+                                           "branch-island cluster of {} byte(s) "
+                                           "is larger than its own jump-over's "
+                                           "field can span, so control could "
+                                           "not be carried past it "
+                                           "(D-CSUBSET-LONG-BRANCH)",
+                                           outFn.symbol.v,
+                                           over.byteCount + padBytes));
+                        funcEncodeOk = false;
+                        continue;
+                    }
+                    walker_util::writeBlockRelField(outFn.bytes, field, g, hop);
+                }
+                for (auto it = siteLo; it != siteHi; ++it) {
+                    auto const start =
+                        static_cast<std::uint32_t>(outFn.bytes.size());
+                    appendBody(it->body);
+                    // The pad's OWN branch is an ordinary block-relative
+                    // patch, which is what makes a CHAIN free: if this pad
+                    // cannot reach the target either, the scan below asks for
+                    // one nearer, and this one aims at that.
+                    blockPatches.push_back(walker_util::BlockRelPatch{
+                        start + it->body.fieldOffset,
+                        it->targetBlock,
+                        it->body.kind,
+                        /*relaxable=*/false,
+                        /*widerFieldDeclared=*/false,
+                        /*instV=*/it->afterInstV,
+                        it->body});
+                    emittedIslands.push_back(EmittedIsland{
+                        start, it->body.fieldOffset, it->targetBlock,
+                        it->body.kind});
                 }
             }
         }
@@ -281,17 +631,18 @@ AssembledModule assemble(Lir const&                 lir,
                    std::format("function symbol id {} dropped from "
                                "AssembledModule — at least one "
                                "instruction failed to encode (see "
-                               "preceding diagnostic); D-ASM-ENCODE-"
-                               "FAILURE-FUNCTION-ROLLBACK preserves "
-                               "byte-offset integrity by aborting the "
-                               "function on first per-inst failure",
+                               "preceding diagnostic); "
+                               "D-ASM-ENCODE-FAILURE-FUNCTION-ROLLBACK "
+                               "preserves byte-offset integrity by "
+                               "aborting the function on first per-inst "
+                               "failure",
                                outFn.symbol.v));
             // Clear the function's bytes/relocs entirely so the
             // partial output cannot leak past assemble().
             outFn.bytes.clear();
             outFn.relocations.clear();
             outFn.sourceMap.clear();
-            continue;  // skip patch resolution for this function
+            break;  // leave the relaxation loop — this function is dropped
         }
 
         // D-OPT-SWITCH-JUMP-TABLE (c70): publish the completed block-byte-offset
@@ -340,8 +691,8 @@ AssembledModule assemble(Lir const&                 lir,
                        DiagnosticSeverity::Error,
                        std::format("block-address binding in fn '{}' targets "
                                    "block id {} which is not in the function's "
-                                   "block list — malformed LIR (D-CSUBSET-"
-                                   "COMPUTED-GOTO)",
+                                   "block list — malformed LIR ("
+                                   "D-CSUBSET-COMPUTED-GOTO)",
                                    outFn.symbol.v, bsp.targetBlock));
                 blockSymOk = false;
                 break;
@@ -355,15 +706,15 @@ AssembledModule assemble(Lir const&                 lir,
             outFn.relocations.clear();
             outFn.sourceMap.clear();
             outFn.blockSymbols.clear();
-            continue;  // skip branch-patch resolution for this function
+            break;  // leave the relaxation loop — this function is dropped
         }
 
         // Resolve intra-function block-relative branch patches now
         // that every block's byte offset is known. Each patch wrote
-        // 4 zero placeholder bytes; we overwrite them with the
-        // signed 32-bit displacement `target_offset - (patch_offset
-        // + 4)` (the x86 convention: rel32 is relative to the byte
-        // AFTER the displacement).
+        // 4 zero placeholder bytes; we overwrite the field the
+        // patch's GEOMETRY ROW describes with the displacement that
+        // row's own formula produces — `(target - (patch + pcBias))
+        // >> scaleLog2`, written whole or as a bit-window.
         //
         // D-ASM-PATCH-PARTIAL-OUTPUT-FAILLOUD (post-fold, silent-
         // failure-hunter HIGH #3): on ANY patch failure, abort the
@@ -371,14 +722,254 @@ AssembledModule assemble(Lir const&                 lir,
         // The previous shape `continue`-d past failures and shipped
         // a partial-patched binary — a missing-target patch left 4
         // zero bytes (rel32=0 → branch-to-self → infinite loop).
-        // Dispatch via patch.kind so the shared resolver does NOT
-        // bake in x86 rel32-after-disp arithmetic. Each ISA's
-        // walker tags its patches with the appropriate kind; the
-        // resolver dispatches accordingly. Architect FOLD-NOW post-
+        // `patch.kind` selects a ROW rather than a code path, so the
+        // shared resolver bakes in no ISA's arithmetic at all: every
+        // number it uses is data, and the SAME data the scan phase
+        // and the escape election read. Architect FOLD-NOW post-
         // fold: pre-fix the `target - (patch + 4)` formula and
         // 4-byte LE write lived as raw arithmetic here — an
         // agnosticism break per the project's standing rules
         // (shared substrate, zero CPU-name branches).
+        // ── D-CSUBSET-LONG-BRANCH: THE SCAN PHASE ────────────────────
+        //
+        // A pure arithmetic sweep of the patch list that WRITES NOTHING and
+        // REPORTS NOTHING. Its only question is: does this layout ask a
+        // field to hold a displacement it cannot hold, when an escape for
+        // that field exists and has not been taken yet? Every such patch's
+        // instruction joins the promoted set and the function is re-encoded.
+        //
+        // ★★★ IT RUNS IN FRONT OF THE RESOLVER RATHER THAN INSIDE IT, AND
+        // THAT IS DELIBERATE. The resolver below is byte-for-byte the code
+        // that shipped before relaxation existed — same range checks, same
+        // refusals, same diagnostics. Folding the promotion decision into it
+        // would have made every out-of-range path conditional on a fixed
+        // point that, for every function in the corpus today, never runs.
+        // Kept separate, an unrelaxed function reaches the resolver having
+        // been asked one extra subtraction per branch.
+        //
+        // ⚠ A NON-ESCAPABLE OVERFLOW IS NOT REPORTED FROM HERE. If this pass
+        // promotes anything, the layout it just measured is PROVISIONAL and
+        // every other displacement in it is provisional too — reporting a
+        // refusal against a layout that is about to change would name a
+        // number the final binary never had. Relaxation only ever GROWS the
+        // function, so an out-of-reach non-escapable branch cannot come back
+        // into reach: it will be measured again, against the settled layout,
+        // and refused there with the number that is actually true.
+        //
+        // ★★★ WHERE A PATCH ACTUALLY AIMS — its target block, or the best
+        // island standing in for it. ONE function, read by the scan phase and
+        // by the resolver alike, for the same reason the geometry row is read
+        // by both: two components deciding one displacement from two rules
+        // agree only by review, and their disagreement is a valid instruction
+        // with the wrong destination.
+        //
+        // ⚠ AN ISLAND IS ADMISSIBLE ONLY IF IT IS STRICTLY CLOSER TO THE
+        // TARGET THAN THIS PATCH SITE IS. Each hop then strictly decreases a
+        // non-negative integer, so a chain terminates and no cycle of pads can
+        // form however they are laid out.
+        //
+        // ⚠ AND A PAD IS EXCLUDED FROM ITS OWN AIM BY THE IDENTITY TEST BELOW,
+        // NOT BY THAT STRICTNESS — a claim this comment made until a mutant
+        // refuted it. ✔MEASURED 2026-09-17: relaxing the gap comparison from
+        // `>=` to `>` left the whole suite GREEN, because the identity test is
+        // what stops a pad resolving to ITSELF (a branch to itself, the
+        // infinite loop D-ASM-PATCH-PARTIAL-OUTPUT-FAILLOUD keeps out of a
+        // binary) and the strictness only ever decided TIES between two
+        // different pads. Both lines stay — one is the termination argument,
+        // the other the self-exclusion — but they are no longer described as
+        // one thing doing two jobs.
+        auto const aimOffsetFor =
+            [&](walker_util::BlockRelPatch const& patch,
+                std::int64_t targetOffset) -> std::optional<std::int64_t> {
+            auto const g = walker_util::blockRelFieldGeometry(patch.kind);
+            std::int64_t const alignMask =
+                (std::int64_t{1} << g.scaleLog2) - 1;
+            auto const inReach = [&](std::int64_t dest) {
+                std::int64_t const delta =
+                    dest - (static_cast<std::int64_t>(patch.patchOffset)
+                            + g.pcBias);
+                if ((delta & alignMask) != 0) return false;
+                std::int64_t const disp = delta >> g.scaleLog2;
+                return disp >= walker_util::blockRelFieldMin(g)
+                    && disp <= walker_util::blockRelFieldMax(g);
+            };
+            if (inReach(targetOffset)) return targetOffset;
+            std::optional<std::int64_t> best;
+            std::int64_t bestGap =
+                targetOffset > static_cast<std::int64_t>(patch.patchOffset)
+                    ? targetOffset - static_cast<std::int64_t>(patch.patchOffset)
+                    : static_cast<std::int64_t>(patch.patchOffset) - targetOffset;
+            // ⚠ A PAD'S OWN FIELD KIND IS NOT FILTERED ON, AND THAT IS
+            // DELIBERATE. What this patch needs is a landing point IT can
+            // encode a displacement to — which `inReach` asks with THIS
+            // patch's geometry — and which is closer to the target than it is.
+            // How far the pad's own branch reaches is the pad's own problem:
+            // its field is an ordinary patch and resolves through this same
+            // function, chaining again if it must. Filtering on kind would
+            // make a narrow branch unable to use a wide pad standing right
+            // next to it.
+            for (auto const& pad : emittedIslands) {
+                if (pad.targetBlock != patch.targetBlock) continue;
+                if (pad.bodyStart + pad.fieldOffset == patch.patchOffset)
+                    continue;  // this patch IS that pad's own branch
+                std::int64_t const at = static_cast<std::int64_t>(pad.bodyStart);
+                std::int64_t const gap =
+                    targetOffset > at ? targetOffset - at : at - targetOffset;
+                if (gap >= bestGap) continue;
+                if (!inReach(at)) continue;
+                best    = at;
+                bestGap = gap;
+            }
+            return best;
+        };
+
+        std::vector<std::uint32_t> newlyPromoted;
+        std::vector<IslandSite>    newSites;
+        for (auto const& patch : blockPatches) {
+            auto const it = blockOffsets.find(patch.targetBlock);
+            if (it == blockOffsets.end()) continue;  // resolver reports this
+            auto const target = static_cast<std::int64_t>(it->second);
+            bool const escapable =
+                patch.relaxable
+                && !std::binary_search(relaxedInsts.begin(), relaxedInsts.end(),
+                                       patch.instV);
+            // ⚠ THE ORDER IS NOT ARBITRARY. A patch that can escape into a
+            // WIDER field is escaped first: that costs one appended word and
+            // no jump-over, where an island costs a cluster and a second hop.
+            // Islands are what the widest field has INSTEAD of an escape, not
+            // a cheaper alternative to one.
+            if (escapable) {
+                auto const g = walker_util::blockRelFieldGeometry(patch.kind);
+                std::int64_t const delta =
+                    target - (static_cast<std::int64_t>(patch.patchOffset)
+                              + g.pcBias);
+                std::int64_t const disp = delta >> g.scaleLog2;
+                if (disp >= walker_util::blockRelFieldMin(g)
+                 && disp <= walker_util::blockRelFieldMax(g))
+                    continue;
+                newlyPromoted.push_back(patch.instV);
+                continue;
+            }
+            if (!patch.island.declared()) continue;  // resolver refuses it
+            if (aimOffsetFor(patch, target).has_value()) continue;
+            // ── ASK FOR A LANDING PAD, ONE STRIDE ALONG THE WAY ──────────
+            // Half the field's reach towards the target, at the nearest
+            // instruction boundary. The stride cannot overshoot the target:
+            // control only arrives here when the target is further away than
+            // the WHOLE reach, and the stride is half of it.
+            std::int64_t const stride =
+                walker_util::blockRelIslandStride(patch.kind);
+            std::int64_t const from =
+                static_cast<std::int64_t>(patch.patchOffset);
+            std::int64_t desired = target >= from ? from + stride
+                                                  : from - stride;
+            if (desired < 0) desired = 0;
+            if (instEnds.empty()) continue;  // nothing encoded to hang it on
+            auto const nearest = [&]() -> std::uint32_t {
+                auto lo = std::lower_bound(
+                    instEnds.begin(), instEnds.end(), desired,
+                    [](InstEnd const& e, std::int64_t v) {
+                        return static_cast<std::int64_t>(e.endOffset) < v;
+                    });
+                if (lo == instEnds.end()) return instEnds.back().instV;
+                if (lo == instEnds.begin()) return lo->instV;
+                auto const prev = std::prev(lo);
+                std::int64_t const dHi =
+                    static_cast<std::int64_t>(lo->endOffset) - desired;
+                std::int64_t const dLo =
+                    desired - static_cast<std::int64_t>(prev->endOffset);
+                return dLo <= dHi ? prev->instV : lo->instV;
+            }();
+            newSites.push_back(IslandSite{nearest, patch.targetBlock,
+                                          patch.island});
+        }
+        if (!newSites.empty()) {
+            std::sort(newSites.begin(), newSites.end(), siteKeyLess);
+            newSites.erase(
+                std::unique(newSites.begin(), newSites.end(),
+                            [&](IslandSite const& a, IslandSite const& b) {
+                                return !siteKeyLess(a, b) && !siteKeyLess(b, a);
+                            }),
+                newSites.end());
+            std::size_t const before = islandSites.size();
+            for (auto const& s : newSites) {
+                auto const at = std::lower_bound(islandSites.begin(),
+                                                 islandSites.end(), s,
+                                                 siteKeyLess);
+                if (at != islandSites.end() && !siteKeyLess(s, *at)) continue;
+                islandSites.insert(at, s);
+            }
+            // A pass that asked only for sites it already has made no
+            // progress; let it fall through to the resolver, which refuses
+            // loudly against this settled layout rather than looping.
+            if (islandSites.size() == before) newSites.clear();
+        }
+        if (!newlyPromoted.empty() || !newSites.empty()) {
+            std::sort(newlyPromoted.begin(), newlyPromoted.end());
+            newlyPromoted.erase(
+                std::unique(newlyPromoted.begin(), newlyPromoted.end()),
+                newlyPromoted.end());
+            relaxedInsts.insert(relaxedInsts.end(),
+                                newlyPromoted.begin(), newlyPromoted.end());
+            std::sort(relaxedInsts.begin(), relaxedInsts.end());
+            // ── THE ISLAND BOUND, EVALUATED ─────────────────────────────
+            // `B * ceil(N / S)` from the block comment at the top of this
+            // loop, with N this pass's byte size, S the narrowest stride any
+            // declared field has, and B the function's own branches — the
+            // patch count MINUS one patch per island, because each island
+            // contributes exactly one and counting them would let the bound
+            // chase its own tail.
+            std::uint64_t const islandCap = [&] {
+                std::int64_t stride = walker_util::blockRelIslandStride(
+                    static_cast<walker_util::BlockRelPatchKind>(0));
+                for (std::size_t k = 1;
+                     k < walker_util::kBlockRelPatchKindCount; ++k) {
+                    auto const s = walker_util::blockRelIslandStride(
+                        static_cast<walker_util::BlockRelPatchKind>(k));
+                    if (s < stride) stride = s;
+                }
+                std::uint64_t const branches =
+                    blockPatches.size() >= islandSites.size()
+                        ? blockPatches.size() - islandSites.size()
+                        : 0u;
+                std::uint64_t const hops =
+                    (static_cast<std::uint64_t>(outFn.bytes.size())
+                     + static_cast<std::uint64_t>(stride) - 1u)
+                    / static_cast<std::uint64_t>(stride);
+                return branches * (hops + 1u);
+            }();
+            // The monotonicity backstop. Reaching it means the two monotone
+            // sets between them grew more times than the instruction count
+            // plus the island bound allows, which no sequence of promotions
+            // and placements can do — so it is an internal-invariant
+            // violation, not a large program, and it is said that way.
+            if (islandSites.size() > islandCap
+             || relaxPass + 1 >= relaxBound + islandCap) {
+                report(reporter, DiagnosticCode::A_FunctionEncodeAborted,
+                       DiagnosticSeverity::Error,
+                       std::format("function symbol id {} dropped — long-"
+                                   "branch relaxation did not reach a fixed "
+                                   "point within {} passes ({} branch(es) "
+                                   "promoted, {} branch island(s) placed "
+                                   "against a bound of {}). Both sets are "
+                                   "monotone — one bounded by the instruction "
+                                   "count, the other by branches x ceil(bytes "
+                                   "/ half-reach) — so exceeding this bound is "
+                                   "an internal-invariant violation, not an "
+                                   "oversized function (D-CSUBSET-LONG-BRANCH)",
+                                   outFn.symbol.v, relaxBound + islandCap,
+                                   relaxedInsts.size(), islandSites.size(),
+                                   islandCap));
+                outFn.bytes.clear();
+                outFn.relocations.clear();
+                outFn.sourceMap.clear();
+                outFn.blockSymbols.clear();
+                outFn.blockByteOffsets.clear();
+                break;
+            }
+            continue;  // re-encode with the larger promoted set
+        }
+
         bool patchOk = true;
         for (auto const& patch : blockPatches) {
             auto it = blockOffsets.find(patch.targetBlock);
@@ -393,112 +984,214 @@ AssembledModule assemble(Lir const&                 lir,
                 patchOk = false;
                 break;
             }
-            switch (patch.kind) {
-                case walker_util::BlockRelPatchKind::X86Rel32: {
-                    std::int64_t const disp =
-                        static_cast<std::int64_t>(it->second)
-                      - static_cast<std::int64_t>(patch.patchOffset + 4);
-                    if (disp < std::numeric_limits<std::int32_t>::min()
-                     || disp > std::numeric_limits<std::int32_t>::max()) {
-                        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-                               DiagnosticSeverity::Error,
-                               std::format("intra-function branch in fn '{}' "
-                                           "needs displacement {} which exceeds "
-                                           "rel32 range — function body too large "
-                                           "for 32-bit branch reach (anchor "
-                                           "D-CSUBSET-LONG-BRANCH for thunks)",
-                                           outFn.symbol.v, disp));
-                        patchOk = false;
-                        break;
+            // ── D-CSUBSET-LONG-BRANCH: ONE RESOLVER, ONE GEOMETRY ROW ───
+            //
+            // ★★★ THE `switch` THIS REPLACES CARRIED A SECOND COPY OF EVERY
+            // NUMBER IN `blockRelFieldGeometry`, AND NOTHING KEPT THE TWO IN
+            // STEP. The scan phase above was converted to read the table when
+            // relaxation landed; the resolver was not, so it still derived
+            // `lsb`/`width` from `isImm19 ? 5u : 0u` / `isImm19 ? 19u : 26u`
+            // and spelled the scale as a bare `>> 2` and x86's PC bias as a
+            // bare `+ 4`. Two components deciding the SAME field's shape from
+            // two sources is the N-transforms-on-one-value shape: correcting a
+            // width in the table would have moved the promotion boundary while
+            // the bytes kept landing at the old one, and the disagreement
+            // emits VALID INSTRUCTIONS WITH THE WRONG DISPLACEMENT — no
+            // diagnostic, no crash. The table is now the only source.
+            //
+            // ⚠ AND THE `switch` HAD NO `default`. A fourth `BlockRelPatchKind`
+            // matched no arm, left `patchOk` true, and shipped the four ZERO
+            // placeholder bytes the walker wrote — `B #0` (a branch to itself)
+            // on a fixed-width ISA, `rel32 = 0` on x86. The table's documented
+            // enum-drift backstop (an unknown kind yields a ZERO-WIDTH field,
+            // whose signed range is empty) was therefore INERT, because the
+            // component it protects never asked it. Reading the row makes the
+            // backstop live: a kind with no row now refuses every displacement
+            // loudly instead of silently writing none.
+            auto const g = walker_util::blockRelFieldGeometry(patch.kind);
+            // D-CSUBSET-LONG-BRANCH: what this field actually holds is a
+            // displacement to the AIM POINT — the target block when it is in
+            // reach, and otherwise the landing pad standing in for it. When
+            // neither is in reach the aim falls back to the target itself, so
+            // the refusal below quotes the displacement the programmer's
+            // branch really needs rather than a pad's.
+            // P68 round 9: the location counter aims at its OWN instruction
+            // (`BlockRelPatch::selfRelative`); every other patch at its block.
+            // Neither an address nor the location counter ever has a pad.
+            std::int64_t const base =
+                patch.selfRelative ? static_cast<std::int64_t>(patch.instStart)
+                                   : static_cast<std::int64_t>(it->second);
+            auto const aim = patch.selfRelative
+                                 ? std::optional<std::int64_t>{base}
+                                 : aimOffsetFor(patch, base);
+            // ★★ A CONSTANT ADDED TO A LOCATION OF THIS FUNCTION (`adr x7, .-4`,
+            // `adr x2, 1f+4`) IS A BYTE DISTANCE IN THE REFERENCE ASSEMBLER'S
+            // LAYOUT, and this build's layout is the reference's only across
+            // source-for-source code: inside one block, short of its terminator
+            // (which may be a jump this build synthesized), and across no
+            // branch-island cluster (`runEnd`, `clusterStarts`). ✔MEASURED
+            // 2026-09-23: `nop; 1: adr x7, .-4` put x7 on a synthesized `b` in
+            // front of `1:` where gas 2.42 puts it on the `nop` — a wrong
+            // address with a clean build log. Such an address is refused, by
+            // name, never written: the refusal lifts where the layouts agree
+            // ([[D-ASM-FALLTHROUGH-INTO-A-LABEL-EMITS-A-JUMP]]).
+            if (patch.selfRelative || patch.addend != 0) {
+                std::int64_t const target = base + patch.addend;
+                std::int64_t const lo = std::min(base, target);
+                std::int64_t const hi = std::max(base, target);
+                auto const run = runEnd.find(patch.targetBlock);
+                bool inRun =
+                    run != runEnd.end()
+                    && lo >= static_cast<std::int64_t>(it->second)
+                    && (hi < static_cast<std::int64_t>(run->second)
+                        || (hi == static_cast<std::int64_t>(run->second)
+                            && runTakesTerminator[patch.targetBlock]));
+                for (auto const c : clusterStarts) {
+                    if (static_cast<std::int64_t>(c) >= lo
+                        && static_cast<std::int64_t>(c) <= hi) {
+                        inRun = false;
                     }
-                    asm_byte_emit::writeU32LEAt(outFn.bytes, patch.patchOffset,
-                        static_cast<std::uint32_t>(static_cast<std::int32_t>(disp)));
-                    break;
                 }
-                case walker_util::BlockRelPatchKind::Arm64Imm19:
-                case walker_util::BlockRelPatchKind::Arm64Imm26: {
-                    // D-AS3-BLOCK-REL-IMM19/26: AArch64 intra-function
-                    // branch resolution. The displacement is PC-relative
-                    // TO THE INSTRUCTION ITSELF (no +4 bias, unlike x86's
-                    // rel32-after-disp) and SCALED by 4 (branch targets
-                    // are word-aligned). Imm19 (B.cond) occupies bits
-                    // 5..23; Imm26 (B) occupies bits 0..25. We READ-
-                    // MODIFY-WRITE only that bit-field so the opcode /
-                    // cond-nibble / register bits already emitted into
-                    // the word survive (writeU32LEAt over all 4 bytes
-                    // would clobber them).
-                    bool const isImm19 =
-                        patch.kind == walker_util::BlockRelPatchKind::Arm64Imm19;
-                    std::uint32_t const lsb   = isImm19 ? 5u : 0u;
-                    std::uint32_t const width = isImm19 ? 19u : 26u;
-                    std::int64_t const delta =
-                        static_cast<std::int64_t>(it->second)
-                      - static_cast<std::int64_t>(patch.patchOffset);
-                    // 4-byte alignment is a hard invariant — every ARM64
-                    // instruction (and thus every block boundary) is
-                    // word-aligned. A non-multiple delta means the
-                    // block-offset table or the patch offset is corrupt;
-                    // fail loud rather than silently drop the low bits.
-                    if ((delta & 0x3) != 0) {
-                        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-                               DiagnosticSeverity::Error,
-                               std::format("intra-function ARM64 branch in fn "
-                                           "'{}' has unaligned displacement {} "
-                                           "(not a multiple of 4) — block "
-                                           "offsets must be word-aligned "
-                                           "(D-AS3-BLOCK-REL-IMM19/26)",
-                                           outFn.symbol.v, delta));
-                        patchOk = false;
-                        break;
-                    }
-                    std::int64_t const disp = delta >> 2;  // arithmetic, signed
-                    // Signed range derived from the field WIDTH:
-                    // Imm19 ∈ [-(1<<18), (1<<18)-1]; Imm26 ∈
-                    // [-(1<<25), (1<<25)-1]. Out-of-range = the function
-                    // body exceeds the branch's reach; fail loud (a long-
-                    // branch thunk is the future generalization, anchored
-                    // D-CSUBSET-LONG-BRANCH).
-                    std::int64_t const lo = -(std::int64_t{1} << (width - 1));
-                    std::int64_t const hi =  (std::int64_t{1} << (width - 1)) - 1;
-                    if (disp < lo || disp > hi) {
-                        report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
-                               DiagnosticSeverity::Error,
-                               std::format("intra-function ARM64 branch in fn "
-                                           "'{}' needs scaled displacement {} "
-                                           "which exceeds the signed {}-bit "
-                                           "field range [{}..{}] — function "
-                                           "body too large for branch reach "
-                                           "(anchor D-CSUBSET-LONG-BRANCH for "
-                                           "inverted-cond + long B thunks)",
-                                           outFn.symbol.v, disp, width, lo, hi));
-                        patchOk = false;
-                        break;
-                    }
-                    // READ the existing 32-bit LE word at the patch site,
-                    // OR in the masked displacement, write the whole word
-                    // back. The mask clears only the [lsb, lsb+width) bits.
-                    std::uint32_t const o = patch.patchOffset;
-                    std::uint32_t word =
-                        static_cast<std::uint32_t>(outFn.bytes[o])
-                      | (static_cast<std::uint32_t>(outFn.bytes[o + 1]) << 8)
-                      | (static_cast<std::uint32_t>(outFn.bytes[o + 2]) << 16)
-                      | (static_cast<std::uint32_t>(outFn.bytes[o + 3]) << 24);
-                    std::uint32_t const mask = (width >= 32u)
-                        ? 0xFFFFFFFFu
-                        : ((1u << width) - 1u);
-                    word = (word & ~(mask << lsb))
-                         | ((static_cast<std::uint32_t>(disp) & mask) << lsb);
-                    asm_byte_emit::writeU32LEAt(outFn.bytes, o, word);
+                if (!inRun) {
+                    report(reporter, DiagnosticCode::A_AsmTextUnsupported,
+                           DiagnosticSeverity::Error,
+                           std::format("fn '{}': an address {} {} bytes {} "
+                                       "reaches outside the run of source "
+                                       "instructions it starts in — past a "
+                                       "block's first or last instruction, or "
+                                       "across a branch-island cluster — where "
+                                       "this build lays code out differently "
+                                       "from the reference assembler (a jump it "
+                                       "synthesizes at a block's end), so the "
+                                       "byte it names is not the one the "
+                                       "reference's would be; name the "
+                                       "instruction with a label instead",
+                                       outFn.symbol.v,
+                                       patch.addend >= 0 ? "adding" : "subtracting",
+                                       patch.addend >= 0 ? patch.addend
+                                                         : -std::int64_t{patch.addend},
+                                       patch.selfRelative
+                                           ? "to the location counter"
+                                           : "to a label of this function"));
+                    patchOk = false;
                     break;
                 }
             }
-            if (!patchOk) break;
+            std::int64_t const delta =
+                aim.value_or(base)
+              + static_cast<std::int64_t>(patch.addend)
+              - (static_cast<std::int64_t>(patch.patchOffset)
+                 + static_cast<std::int64_t>(g.pcBias));
+            // A scaled field cannot represent a displacement that is not a
+            // multiple of its scale. On a fixed-width ISA that is a hard
+            // invariant (every block boundary is instruction-aligned), so a
+            // non-multiple delta means the block-offset table or the patch
+            // offset is corrupt; fail loud rather than silently drop the low
+            // bits. An UNSCALED field (x86 rel32, scaleLog2 = 0) has an empty
+            // mask, so this check never fires there — byte-identical to the
+            // arm it replaces, which did not perform it at all.
+            std::int64_t const alignMask =
+                (std::int64_t{1} << g.scaleLog2) - 1;
+            if ((delta & alignMask) != 0) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("intra-function branch in fn '{}' has "
+                                   "displacement {} which is not a multiple "
+                                   "of this field's scale ({} bytes) — block "
+                                   "offsets must be instruction-aligned "
+                                   "(D-AS3-BLOCK-REL-IMM19-26)",
+                                   outFn.symbol.v, delta, alignMask + 1));
+                patchOk = false;
+                break;
+            }
+            std::int64_t const disp = delta >> g.scaleLog2;  // arithmetic, signed
+            std::int64_t const lo = walker_util::blockRelFieldMin(g);
+            std::int64_t const hi = walker_util::blockRelFieldMax(g);
+            if (disp < lo || disp > hi) {
+                // ★★★ THE REMEDY IS CARRIED, NOT REMEMBERED. Both arms used to
+                // end with a fixed prescription — "for thunks" on x86, "for
+                // inverted-cond + long B thunks" on AArch64 — and the second
+                // one is WRONG for the wider of the two fields it served: an
+                // `Imm26` overflow cannot be rescued by a long `B`, because
+                // `B` IS the Imm26 form. Which case this is can only be
+                // answered by the OPCODE's own encoding variants, so the
+                // walker stamps the answer and the resolver quotes it.
+                // ★★★ AND THE PRESCRIPTION CHANGED WHEN THE FRAME DID. It used
+                // to end, for the widest field, with "the escape is then a
+                // different ADDRESSING MODE (an indirect branch through a
+                // materialized absolute address), which needs a per-block
+                // symbol the assembler cannot mint". That is REFUTED: the
+                // widest field escapes into a NEARER TARGET, not a wider one,
+                // and a landing pad is a copy of a branch this opcode already
+                // declares. So the remaining ways to be here are three, and
+                // each names something a reader can actually do.
+                bool const escapableInPrinciple = patch.widerFieldDeclared;
+                report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                       DiagnosticSeverity::Error,
+                       std::format("intra-function branch in fn '{}' needs "
+                                   "displacement {} (scaled by {}) which "
+                                   "exceeds its signed {}-bit field range "
+                                   "[{}..{}] — function body too large for "
+                                   "this branch's reach. {} "
+                                   "(anchor D-CSUBSET-LONG-BRANCH)",
+                                   outFn.symbol.v, disp, alignMask + 1,
+                                   g.width, lo, hi,
+                                   escapableInPrinciple
+                                     ? "This opcode DOES declare a wider "
+                                       "block-relative word, and this wire is "
+                                       "not the one the escape rescues: wire "
+                                       "it to the wider slot, or make it the "
+                                       "narrowest block-relative field of the "
+                                       "instruction so the election picks it"
+                                     : patch.island.declared()
+                                     ? "This opcode declares a branch island "
+                                       "body and the resolver still could not "
+                                       "place one within reach of this site — "
+                                       "an internal-invariant violation of the "
+                                       "island placement, not a property of "
+                                       "the program: report it against this "
+                                       "anchor"
+                                     : "This opcode declares NO self-contained "
+                                       "unconditional-branch word. That word "
+                                       "is what both remedies are made of: a "
+                                       "WIDER one is an escape, and one of "
+                                       "EQUAL reach is a branch island, which "
+                                       "rescues even the target's widest "
+                                       "field by standing nearer. Declare the "
+                                       "unconditional branch on this opcode's "
+                                       "encoding row — one self-contained word "
+                                       "(or, on a byte-oriented shape, one "
+                                       "wire whose `prefixOpcodeBytes` are a "
+                                       "whole unconditional branch) — and both "
+                                       "elections will find it"));
+                patchOk = false;
+                break;
+            }
+            // The two write disciplines (whole 4-byte field vs. a bit-window
+            // read-modify-write) live in `walker_util::writeBlockRelField`,
+            // because the island cluster's jump-over writes the same shape at
+            // emit time and two spellings of one write is the same
+            // N-transforms-on-one-value shape the geometry table exists to
+            // close.
+            walker_util::writeBlockRelField(outFn.bytes, patch.patchOffset,
+                                            g, disp);
+            // (The trailing `if (!patchOk) break;` this loop used to carry was
+            // the `switch`'s exit door: a failing arm's `break` left the SWITCH
+            // and needed a second one to leave the loop. Without the switch,
+            // every refusal above breaks the loop directly, so the re-test is
+            // unreachable — and an unreachable guard reads as a live one.)
         }
         if (!patchOk) {
             outFn.bytes.clear();
             outFn.relocations.clear();
             outFn.sourceMap.clear();
         }
+        // D-CSUBSET-LONG-BRANCH: THE FIXED POINT. Control only arrives here
+        // when the scan promoted nothing, which means every block-relative
+        // field in this layout holds a displacement it can hold — so the
+        // layout is settled and the bytes above are final.
+        break;
+        }  // relaxation loop
     }
 
     return result;
@@ -566,6 +1259,106 @@ bool validateAssembledData(std::span<AssembledData const> items,
     return ok;
 }
 
+bool validateInputSectionUnits(AssembledModule const& module,
+                               DiagnosticReporter&    reporter) {
+    auto refuse = [&](std::string msg) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_InputSectionSplit;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::move(msg);
+        reporter.report(std::move(d));
+    };
+    bool ok = true;
+
+    // CODE: consecutive, in increasing offset, contiguous — what a writer's
+    // back-to-back concatenation needs to reproduce the section. A unit whose
+    // members are not together has been split. So has one whose next member
+    // does not start where the previous one's bytes end, because the
+    // concatenation would close the gap.
+    std::unordered_set<std::uint32_t> closedUnits;
+    for (std::size_t k = 0; k < module.functions.size(); ++k) {
+        auto const& slice = module.functions[k].inputSection;
+        if (!slice.has_value()) continue;
+        bool const continues =
+            k > 0 && module.functions[k - 1].inputSection.has_value()
+            && module.functions[k - 1].inputSection->section == slice->section;
+        if (!continues) {
+            if (!closedUnits.insert(slice->section).second) {
+                refuse(std::format(
+                    "code unit #{} (one input section of a relocatable object) "
+                    "resumes at function #{} after other code: its members are "
+                    "not consecutive, so the writers' concatenation would put "
+                    "other bytes inside the section and move every member after "
+                    "them.",
+                    slice->section, k));
+                ok = false;
+            }
+            continue;
+        }
+        auto const& prev = module.functions[k - 1];
+        std::uint64_t const prevEnd = prev.inputSection->offset + prev.bytes.size();
+        if (slice->offset != prevEnd) {
+            refuse(std::format(
+                "code unit #{} (one input section of a relocatable object): "
+                "function #{} starts at section offset {}, but the member before "
+                "it ends at {}. Concatenated, the section would not keep its "
+                "layout, and code the producer assembled against it would reach "
+                "the wrong bytes.",
+                slice->section, k, slice->offset, prevEnd));
+            ok = false;
+        }
+    }
+
+    // DATA: one data-section kind per unit, and members that do not overlap.
+    // `buildExecDataSection` places a unit's members by their offsets.
+    struct DataMember {
+        std::uint64_t   offset = 0;
+        std::uint64_t   size   = 0;
+        std::size_t     index  = 0;
+        DataSectionKind kind   = DataSectionKind::Rodata;
+    };
+    std::unordered_map<std::uint32_t, std::vector<DataMember>> dataUnits;
+    for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+        auto const& d = module.dataItems[i];
+        if (!d.inputSection.has_value()) continue;
+        dataUnits[d.inputSection->section].push_back(DataMember{
+            d.inputSection->offset, d.sizeInSection(), i, d.section});
+    }
+    for (auto& [unit, members] : dataUnits) {
+        std::sort(members.begin(), members.end(),
+                  [](DataMember const& a, DataMember const& b) {
+                      return a.offset < b.offset;
+                  });
+        for (std::size_t k = 0; k < members.size(); ++k) {
+            if (members[k].kind != members.front().kind) {
+                refuse(std::format(
+                    "data unit #{} (one input section of a relocatable object) "
+                    "holds item #{} in section kind '{}' and item #{} in '{}'. "
+                    "One input section is laid out as one block, so it cannot "
+                    "be placed in two output sections.",
+                    unit, members.front().index,
+                    dataSectionKindName(members.front().kind), members[k].index,
+                    dataSectionKindName(members[k].kind)));
+                ok = false;
+                break;
+            }
+            if (k > 0 && members[k].offset < members[k - 1].offset + members[k - 1].size) {
+                refuse(std::format(
+                    "data unit #{} (one input section of a relocatable object): "
+                    "item #{} at section offset {} overlaps item #{}, which "
+                    "runs from {} to {}. Two items cannot own the same bytes of "
+                    "one section.",
+                    unit, members[k].index, members[k].offset,
+                    members[k - 1].index, members[k - 1].offset,
+                    members[k - 1].offset + members[k - 1].size));
+                ok = false;
+                break;
+            }
+        }
+    }
+    return ok;
+}
+
 namespace {
 
 // ── D-CSUBSET-ENUM-GLOBAL-CODEGEN: the MATERIAL kind a type ENCODES as ──
@@ -630,8 +1423,9 @@ namespace {
 // a core INTEGER kind (the semantic tier rejects anything else), and every arm
 // below already handles those correctly INCLUDING their walls. ✔MEASURED on the
 // widest case: `enum E : __int128 g = B;` reaches the dedicated 16-byte arm and
-// EMITS, while the same enum as a struct MEMBER hits the pre-existing aggregate
-// refusal LOUD — byte-for-byte the behaviour a plain `__int128` already gets.
+// EMITS; since P68 round 8 the same enum as a struct MEMBER emits too, through
+// the same 16-byte producer — byte-for-byte what a plain `__int128` member gets
+// (pinned by `AsmDataSection.Int128AggregateMemberEmitsItsSixteenBytesAtItsOffset`).
 //
 // ★ THE FILE-WIDE INVARIANT THIS ESTABLISHES, and it is the greppable form of
 // the multi-site contract: in this file, EVERY `scalarByteSize(...)` and
@@ -668,9 +1462,9 @@ primitiveByteSize(TypeKind k) noexcept {
         case TypeKind::I64: case TypeKind::U64: case TypeKind::F64:
             return 8u;
         // F80 (D-CSUBSET-LONG-DOUBLE): 16-byte storage like binary128 — the
-        // x87 format pads to 16/16. Sized here so LAYOUT-only uses work; a
-        // VALUE encode still fails loud (decodeScalarLiteralBits has no
-        // F80 arm — no lossless `double` backing).
+        // x87 format pads to 16/16. Sized here for LAYOUT; a VALUE of any of
+        // these four kinds is encoded by `appendSixteenByteScalarImage`, never
+        // by the u64 `decodeScalarLiteralBits` (which refuses all four).
         case TypeKind::I128: case TypeKind::U128: case TypeKind::F80:
         case TypeKind::F128:
             return 16u;
@@ -691,9 +1485,9 @@ primitiveByteSize(TypeKind k) noexcept {
 // shipped host arches the masked shift count REPEATS the low 8 bytes into the
 // high 8, so an over-wide call writes plausible-looking WRONG bytes rather
 // than crashing. Corrected in TF-C94 — D-CSUBSET-INT128-DATA-GLOBAL.)
-// Every 16-byte scalar kind is walled BEFORE reaching here: F80/F128 have
-// dedicated widen+append paths (appendF80Extended / the binary128 arm) and
-// I128/U128 fail loud at the kind-keyed 128-bit gate, so the only widths that
+// Every 16-byte scalar kind is routed BEFORE reaching here — by the scalar-global
+// arm and the aggregate-member leaf alike — to `appendSixteenByteScalarImage`,
+// which calls this only at width 8, once per limb; so the only widths that
 // arrive are the 1/2/4/8-byte ones this loop can encode.
 //
 // ★ THE LOOP ITSELF MOVED TO `asm.hpp::appendLittleEndianBytes` when the
@@ -712,13 +1506,11 @@ void appendLE(std::vector<std::uint8_t>& bytes,
 // binary64) LOSSLESSLY into the x87 80-bit extended format and append its 16
 // on-disk bytes (10 significant + 6 zero pad — the SysV/darwin 16-byte,
 // 16-aligned slot `scalarByteSize(F80)` reserves). This is 80-bit, WIDER than
-// the u64 `decodeScalarLiteralBits` yields, so F80 has this dedicated
-// widen+append path rather than routing through that chokepoint (which stays
-// nullopt for F80, keeping the aggregate-member leaf recursion walled — a struct/
-// array long-double MEMBER in a rodata global is a DISTINCT deferral,
-// D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL, NOT the scalar arithmetic const-fold
-// this cycle's LD-3 closed: a 16-byte leaf cannot flow through the u64
-// decodeScalarLiteralBits chokepoint the aggregate recursion uses).
+// the u64 `decodeScalarLiteralBits` yields, so it is reached only through
+// `appendSixteenByteScalarImage` — the one producer the scalar-global arm AND
+// the aggregate-member leaf both call (D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL,
+// closed P68 round 8: a `long double` MEMBER was refused while the same value
+// as a whole global was emitted, because only the scalar arm had a path).
 // The x87 extended memory layout is little-endian:
 //   bytes 0-7  = the 64-bit significand with an EXPLICIT integer bit (bit 63),
 //   bytes 8-9  = sign (bit 15) | 15-bit exponent,
@@ -866,6 +1658,78 @@ void appendWideFloatBits(std::vector<std::uint8_t>& bytes, WideFloatValue const&
         bytes.push_back(static_cast<std::uint8_t>((p.hi >> (i * 8)) & 0xFFu));
 }
 
+// ── THE 16-BYTE SCALAR IMAGE: ONE PRODUCER, TWO CALL SITES ──────────────────────
+// (D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL, and its 128-bit integer twin
+// D-CSUBSET-INT128-AGGREGATE-MEMBER-STATIC-INITIALIZER-REFUSED — both closed P68
+// round 8.) An F80 / F128 `long double` and an I128 / U128 integer each occupy
+// 16 bytes, WIDER than the `std::uint64_t` `decodeScalarLiteralBits` returns, so
+// none of them can pass through that chokepoint. The SCALAR-global arm of
+// `lowerMirGlobalsToDataItems` used to carry three private copies of this
+// encoding (F80, F128, 128-bit) and the aggregate-member LEAF had none — so
+// `struct S { char c; long double x; } g = {'a', 40.5L};`, `static long double
+// t[3] = {…};` and `struct { __int128 v; } w = {-3};` were REFUSED at the leaf
+// while the same values as whole globals were emitted. ✔MEASURED at the P68
+// round-8 base: refused on ELF x86_64 and ELF aarch64 (the 128-bit members on
+// all four shipped formats), debug and release; gcc 13.3.0 and clang 18.1.3,
+// each separately, run the same source to 42 at -O0 and -O2 on both processors.
+// ★ Both sites now ask HERE — the `encodeBitIntImage` shape — so a value and
+// the same value as a member cannot be encoded two ways.
+// Appends exactly 16 bytes and returns true, or appends NOTHING and returns
+// false when `v` is in no arm kind `k` can be read from:
+//   * F80 / F128 — a const-folded `WideFloatValue` OF THE SAME KIND (its `pack()`
+//     IS the on-disk layout: x87 10 significant bytes + 6 zero pad, or
+//     binary128), or a host `double` widened losslessly (`appendF80Extended` /
+//     `appendF128`). A `WideFloatValue` of the OTHER wide kind is refused: an
+//     F128 pattern in an F80 slot is a different number, not a rounding.
+//   * I128 / U128 — the two little-endian 64-bit limbs of a `BitIntValue` (at
+//     most two; a third would be bits the slot cannot hold), a plain
+//     `std::uint64_t` (zero-extended), a `std::int64_t` (SIGN-extended — a
+//     negative value's high limb is all ones) or a `bool`. Keyed on the
+//     declared KIND, never on the variant: a fits-in-64 `__int128` folds into a
+//     plain integer arm (D-CSUBSET-INT128-DATA-GLOBAL's recorded lesson).
+[[nodiscard]] bool
+appendSixteenByteScalarImage(std::vector<std::uint8_t>& bytes,
+                             MirLiteralValue const& v, TypeKind k) {
+    if (k == TypeKind::F80 || k == TypeKind::F128) {
+        if (auto const* wf = std::get_if<WideFloatValue>(&v.value)) {
+            if (wf->kind() != k) return false;
+            appendWideFloatBits(bytes, *wf);
+            return true;
+        }
+        if (auto const* dv = std::get_if<double>(&v.value)) {
+            if (k == TypeKind::F80) appendF80Extended(bytes, *dv);
+            else                    appendF128(bytes, *dv);
+            return true;
+        }
+        return false;
+    }
+    if (k != TypeKind::I128 && k != TypeKind::U128) return false;
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+    if (auto const* bv = std::get_if<BitIntValue>(&v.value)) {
+        auto const& limbs = bv->limbs();
+        if (limbs.size() > 2) return false;
+        lo = limbs.size() > 0 ? limbs[0] : 0ull;
+        hi = limbs.size() > 1 ? limbs[1] : 0ull;
+        // A 1-limb payload declared 128 bits wide still needs its high limb
+        // materialized; `BitIntValue` keeps its limbs sign-clean, so the
+        // extension is the sign of the declared value.
+        if (limbs.size() < 2 && bv->isSigned() && (lo >> 63) != 0) hi = ~0ull;
+    } else if (auto const* uv = std::get_if<std::uint64_t>(&v.value)) {
+        lo = *uv;                       // zero-extends
+    } else if (auto const* iv = std::get_if<std::int64_t>(&v.value)) {
+        lo = static_cast<std::uint64_t>(*iv);
+        if (*iv < 0) hi = ~0ull;        // sign-extends
+    } else if (auto const* bo = std::get_if<bool>(&v.value)) {
+        lo = *bo ? 1ull : 0ull;
+    } else {
+        return false;
+    }
+    appendLE(bytes, lo, 8);
+    appendLE(bytes, hi, 8);
+    return true;
+}
+
 // Decode a SCALAR literal to the little-endian bit pattern to emit (zero-
 // extended into a u64; the writer takes the low `width` bytes). Handles
 // bool / signed / unsigned integers and F32/F64 — a `double`-arm value is
@@ -875,13 +1739,12 @@ void appendWideFloatBits(std::vector<std::uint8_t>& bytes, WideFloatValue const&
 // wider than F64 or otherwise without a lossless host-`double` arm (F80 joined
 // with FC17.9(e)) — or a non-scalar / monostate variant (string /
 // MirAggregateValue / a LD-3 `WideFloatValue` folded leaf / unknown). The SOLE
-// scalar-encode chokepoint — the scalar-global arm and the aggregate-leaf
-// recursion both route through it, so the int/float value semantics can never
-// drift between the two encoders. A folded F80/F128 SCALAR global is handled
-// BEFORE this chokepoint (the dedicated appendWideFloatBits arm, LD-3); a folded
-// F80/F128 leaf reaching HERE inside an AGGREGATE correctly stays nullopt → the
-// aggregate recursion fails loud (D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL, a
-// 16-byte leaf cannot pass through this u64 chokepoint).
+// scalar-encode chokepoint for the widths a u64 can carry — the scalar-global
+// arm and the aggregate-leaf recursion both route through it, so the int/float
+// value semantics can never drift between the two encoders. The four 16-byte
+// kinds (F80/F128/I128/U128) are sent by BOTH callers to
+// `appendSixteenByteScalarImage` before this chokepoint; the nullopt it returns
+// for them is the backstop that keeps a u64 from standing in for 16 bytes.
 [[nodiscard]] std::optional<std::uint64_t>
 decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
     // D-CSUBSET-INT128-DATA-GLOBAL (TF-C94): a 128-bit integer is 16 bytes —
@@ -889,11 +1752,9 @@ decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
     // exactly like F80/F128. Checked FIRST, before the integer arms, because a
     // 128-bit value's folded literal IS a plain u64/i64 arm (it is the CONTAINER
     // that is too narrow, not the variant that is wrong): without this the u64
-    // arm below would happily return the low 8 bytes and the aggregate-leaf
-    // recursion would write them as if they were the whole value. Returning
-    // nullopt makes a `struct { __uint128_t x; }` global fail loud at that
-    // recursion; the scalar top-level global is walled by the dedicated
-    // kind-keyed arm in `lowerMirGlobalsToDataItems`.
+    // arm below would happily return the low 8 bytes and a caller would write
+    // them as if they were the whole value. Both callers send these kinds to
+    // `appendSixteenByteScalarImage` first; this is the backstop.
     if (k == TypeKind::I128 || k == TypeKind::U128) return std::nullopt;
     // Same argument for the >64-bit FLOAT kinds, and it closes a real mismatch
     // between this function's contract and its code: the header above has always
@@ -1227,7 +2088,7 @@ encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
 // closing over a `DiagnosticReporter` local to `lowerMirGlobalsToDataItems`).
 // Every `return false` therefore surfaced through ONE generic caller message
 // that enumerates the causes it knew about ("a type↔value shape mismatch or an
-// unencodable leaf — e.g. f16/f80/f128, or an address-relocated leaf…"). The
+// unencodable leaf — e.g. an f16 leaf, or an address-relocated leaf…"). The
 // overlapping-struct refusal below is NONE of those, so a user hitting it —
 // MEASURED reachable today as `static ULARGE_INTEGER g = {1,0,0};` on pe64,
 // `windows.json`'s explicit-offset OVERLAY — was pointed at the wrong thing. An
@@ -1444,20 +2305,22 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     // TWO element-float components, real first — so this arm is the Array arm with
     // the count FIXED at 2 and the component type taken from the interner.
     //
-    // ★ THE OFFSETS ARE `elemLay->size`, NOT THE ALIGNED STRIDE, and the difference
-    // is deliberate: `computeLayout`'s own Complex arm returns `StructLayout{es * 2,
+    // ★ THE OFFSETS ARE `elemLay->size`, NOT THE ALIGNED STRIDE, and the choice is
+    // deliberate: `computeLayout`'s own Complex arm returns `StructLayout{es * 2,
     // elem->align, …}` — it lays the imaginary component at exactly `es`, where the
-    // Array arm rounds `es` UP to the element's alignment first. They coincide for
-    // F32 and F64 (size == align), and they DIVERGE for an x87 F80 element (10 bytes,
-    // align 16), so copying the Array arm's stride would silently place `im` six
-    // bytes past where every reader — `complexParts`/`loadComplex` in hir_to_mir,
-    // `collectLeaves` in aggregate_abi — expects it. This arm matches the LAYOUT
-    // AUTHORITY's formula, exactly as the Array arm matches its own.
-    // ⓘ F80/F128 elements still cannot REACH here with a value: the MIR classifier
-    // that mints this literal folds only F32/F64 components and refuses the rest
-    // loud, matching the wall complex ARITHMETIC already hits at those widths. The
-    // formula is written correctly anyway, because a layout rule copied wrong is
-    // the kind of defect that surfaces one cycle after the gate it would have passed.
+    // Array arm rounds `es` UP to the element's alignment first. For every element
+    // the layout authority sizes today the two coincide — F32 and F64 have size ==
+    // align, and an x87 F80 is STORED 16/16 (10 significant bytes + 6 pad; this note
+    // used to call it a 10-byte element, a size the authority never answers) — but
+    // this arm keeps the LAYOUT AUTHORITY's formula, exactly as the Array arm keeps
+    // its own, so no element can land `im` off the offset every reader —
+    // `complexParts`/`loadComplex` in hir_to_mir, `collectLeaves` in aggregate_abi —
+    // expects.
+    // ⓘ F80/F128 elements DO reach here since P68 round 8: the MIR classifier folds
+    // their components as `WideFloatValue`s
+    // (D-CSUBSET-COMPLEX-LONG-DOUBLE-STATIC-INITIALIZER-REFUSED), and each lands in
+    // the 16-byte leaf arm below — the imaginary one at 16, the element's second
+    // 16-byte slot.
     //
     // ⚠ A SHORT VALUE IS NOT A ZERO IMAGINARY PART BY ACCIDENT — it is one BY
     // CONSTRUCTION: `buf` is pre-zeroed to the layout size by the caller, so a
@@ -1608,13 +2471,49 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         return true;
     }
 
+    // ── D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL + its 128-bit integer twin ──
+    // A 16-byte leaf — the `long double` member of `struct S { char c; long
+    // double x; }`, an element of `static long double t[3]`, the first member of
+    // `union U { long double x; int i; }`, an `__int128` member, the component
+    // of a `_Complex long double` — takes the SAME producer as the scalar-global
+    // arm. ★ MUST PRECEDE the `scalarByteSize` / `decodeScalarLiteralBits` pair
+    // below: that chokepoint returns a u64 and refuses all four kinds, which is
+    // exactly how these members came to be refused while the same values as
+    // whole globals were emitted. The image fills the whole 16-byte slot
+    // `computeLayout` reserves (an x87 F80 leaf: 10 significant bytes + 6 zero
+    // pad — the Complex arm above places an F80 imaginary part at
+    // `elemLay->size`, i.e. at 16, the same slot).
+    if (k == TypeKind::F80 || k == TypeKind::F128
+        || k == TypeKind::I128 || k == TypeKind::U128) {
+        std::vector<std::uint8_t> img;
+        if (!appendSixteenByteScalarImage(img, v, k)) {
+            why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                    std::format("a 16-byte member (TypeKind={}) has an initializer "
+                                "in no literal arm that kind can be read from — "
+                                "refusing rather than writing a fabricated image "
+                                "(D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL)",
+                                static_cast<int>(k)));
+            return false;
+        }
+        auto const w = scalarByteSize(k, dm);
+        if (!w.has_value() || img.size() != *w || base + img.size() > buf.size()) {
+            why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                    "a 16-byte member's image does not fill exactly the slot the "
+                    "layout reserves for it — the encoder and the layout disagree "
+                    "(D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL)");
+            return false;
+        }
+        for (std::size_t j = 0; j < img.size(); ++j) buf[base + j] = img[j];
+        return true;
+    }
+
     // Scalar / pointer leaf: write the literal's LE bytes at `base`. Width
     // comes from `scalarByteSize` (the SAME sizing `computeLayout` used for
     // the offsets, so leaf width and field offset can never disagree).
     auto const wOpt = scalarByteSize(k, dm);
     if (!wOpt.has_value()) return false;             // FnSig/Slice/Void/... → fail loud
     auto const bits = decodeScalarLiteralBits(v, k);
-    if (!bits.has_value()) return false;             // F16/F80/F128/non-scalar → fail loud
+    if (!bits.has_value()) return false;             // F16/non-scalar → fail loud
     if (base + *wOpt > buf.size()) return false;     // layout↔encoder disagreement → fail loud
     for (std::uint64_t j = 0; j < *wOpt; ++j)
         buf[base + j] = static_cast<std::uint8_t>((*bits >> (j * 8)) & 0xFFu);
@@ -1719,8 +2618,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                  std::format("lowerMirGlobalsToDataItems: global "
                              "SymbolId={{ {} }} has a runtime "
                              "initializer (__module_init__-driven) "
-                             "— anchored under D-LK4-RODATA-"
-                             "PRODUCER-RUNTIME-INIT; today's cycle "
+                             "— anchored under "
+                             "D-LK4-RODATA-PRODUCER-RUNTIME-INIT; today's cycle "
                              "scope emits no AssembledData for "
                              "this shape.",
                              sym.v));
@@ -2017,8 +2916,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                                  "SymbolId={{ {} }} is an aggregate "
                                  "(TypeKind={}) but the target declared no "
                                  "`aggregateLayout` block — cannot compute "
-                                 "its byte layout (D-LK4-RODATA-PRODUCER-"
-                                 "AGGREGATE-GLOBAL).",
+                                 "its byte layout ("
+                                 "D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
                                  sym.v, static_cast<int>(k)));
                 continue;
             }
@@ -2029,8 +2928,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                      std::format("lowerMirGlobalsToDataItems: global "
                                  "SymbolId={{ {} }} has an un-sizeable "
                                  "aggregate type (TypeKind={}) — incomplete "
-                                 "or out-of-scope (D-LK4-RODATA-PRODUCER-"
-                                 "AGGREGATE-GLOBAL).",
+                                 "or out-of-scope ("
+                                 "D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
                                  sym.v, static_cast<int>(k)));
                 continue;
             }
@@ -2061,8 +2960,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                          ? std::format("lowerMirGlobalsToDataItems: global "
                                        "SymbolId={{ {} }} aggregate initializer "
                                        "could not be encoded (a type↔value shape "
-                                       "mismatch or an unencodable leaf — e.g. "
-                                       "f16/f80/f128, or an address-relocated leaf when "
+                                       "mismatch or an unencodable leaf — e.g. an "
+                                       "f16 leaf, or an address-relocated leaf when "
                                        "the target declares no abs64 reloc) "
                                        "(D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
                                        sym.v)
@@ -2101,105 +3000,61 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             continue;
         }
 
-        // D-CSUBSET-INT128-DATA-GLOBAL (TF-C94): a 128-bit integer DATA-global is
-        // a DEFERRAL boundary — its on-disk byte layout is not yet emitted. This
-        // gate keys on the TYPE KIND, deliberately NOT on the value's variant arm,
-        // and that distinction is the whole point: the neighbouring `_BitInt` wall
-        // above keys on `holds_alternative<BitIntValue>`, and MIRRORING it here
-        // would MISS the common case. For `__uint128_t g = 5;` the folded value is
-        // a plain `std::uint64_t`, so a variant-keyed gate never fires and control
-        // reaches `appendLE(d.bytes, *bits, *widthOpt)` below with width 16 — and
-        // `appendLE` computes `(value >> (j*8))` on a `std::uint64_t` for
-        // j ∈ [0,16), so every j ≥ 8 is a shift of 64..120 bits: UNDEFINED
-        // BEHAVIOUR, which on both shipped host arches masks the shift count and
-        // REPEATS the low 8 bytes into the high 8. Wrong bytes, silently.
-        // Placed BEFORE the `widthOpt` unwrap so the wall stands whatever
-        // `scalarByteSize` reports, and BEFORE the `_BitInt` VARIANT arm below so
-        // the message matches the declared TYPE: once a >64-bit 128-bit fold
-        // lands in the `BitIntValue` pool arm (it is the only arm wide enough to
-        // carry one), a variant-keyed dispatch would claim a `__uint128_t` global
-        // is a `_BitInt` one. Keying on `k` — the global's declared kind — and
-        // going first keeps the two deferrals honestly labelled.
-        // `decodeScalarLiteralBits` returns nullopt for
-        // these kinds too, so a `struct { __uint128_t x; }` global walls at the
-        // aggregate-leaf recursion rather than slipping through this scalar path.
-        // ★ THE 16 BYTES ARE NOW EMITTED. This arm used to be a fail-loud
-        // DEFERRAL wall; it is a producer. What made the wall necessary was that
-        // `appendLE` takes a `std::uint64_t`, so a width-16 append computed
-        // `(value >> (j*8))` for j in [0,16) -- a shift of 64..120 bits, UB,
-        // which on both shipped host arches masks the count to 6 bits and
-        // REPEATS the low 8 bytes into the high 8. The fix is not a wider shift
-        // but a wider SOURCE: read the value as two little-endian 64-bit limbs
-        // and append each at its own width, so no shift ever exceeds 56.
-        //
-        // ⓘ THE TWO PAYLOAD ARMS ARE BOTH REAL AND NEITHER IMPLIES THE OTHER --
-        // this is the distinction the row recorded as the one a naive gate
-        // misses. `__uint128_t g = 5;` folds into a PLAIN `std::uint64_t` (the
-        // narrowest arm that holds it), while a value needing more than 64 bits
-        // folds into the `BitIntValue` pool arm carrying an I128/U128 core. A
-        // dispatch keyed on the VARIANT would silently miss the first; keying on
-        // the declared KIND `k`, as this arm does, catches both.
-        //
-        // ⓘ SIGN MATTERS FOR THE HIGH LIMB. A negative `__int128` folded into
-        // the int64 arm must fill its high limb with 1s, not zeros -- so the
-        // extension is taken from the VALUE's signedness, not assumed.
-        //
-        // ⚠ THE AGGREGATE LEAF STAYS WALLED, DELIBERATELY. `decodeScalarLiteralBits`
-        // still returns nullopt for these kinds, so `struct { __uint128_t x; }`
-        // fails LOUD at the aggregate-leaf recursion rather than slipping
-        // through: that chokepoint returns a `std::uint64_t` and structurally
-        // cannot carry 16 bytes. This mirrors the shipped F80 arm exactly (the
-        // sole F80 scalar-global producer, with F80 struct members walled the
-        // same way). A remaining site that is LOUD is a deferral; a remaining
-        // site that is SILENT would be the half-shipped multi-site contract this
-        // cycle exists to stop.
-        if (k == TypeKind::I128 || k == TypeKind::U128) {
-            std::uint64_t lo = 0;
-            std::uint64_t hi = 0;
-            if (auto const* bv = std::get_if<BitIntValue>(&v.value)) {
-                auto const& limbs = bv->limbs();
-                lo = limbs.size() > 0 ? limbs[0] : 0ull;
-                hi = limbs.size() > 1 ? limbs[1] : 0ull;
-                // A 1-limb payload declared 128 bits wide still needs its high
-                // limb materialized; `BitIntValue` keeps its limbs sign-clean, so
-                // the extension is the sign of the declared value.
-                if (limbs.size() < 2 && bv->isSigned()
-                    && (lo >> 63) != 0) hi = ~0ull;
-            } else if (auto const* uv = std::get_if<std::uint64_t>(&v.value)) {
-                lo = *uv;                       // zero-extends
-            } else if (auto const* iv = std::get_if<std::int64_t>(&v.value)) {
-                lo = static_cast<std::uint64_t>(*iv);
-                if (*iv < 0) hi = ~0ull;        // sign-extends
-            } else if (auto const* bo = std::get_if<bool>(&v.value)) {
-                lo = *bo ? 1ull : 0ull;
-            } else {
+        // ── THE FOUR 16-BYTE SCALAR KINDS: F80 / F128 `long double`, I128 / U128 ──
+        // (D-CSUBSET-LONG-DOUBLE-X87-ARITH LD-1, -IEEE128-ARITH LD-2, LD-3's folded
+        // `WideFloatValue`, D-CSUBSET-INT128-DATA-GLOBAL.) Each is 16 bytes, WIDER
+        // than the u64 `decodeScalarLiteralBits` returns, so each is encoded by
+        // `appendSixteenByteScalarImage` — the ONE producer the aggregate-member
+        // leaf calls too (D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL, P68 round 8), so a
+        // global and the same value as a member cannot be encoded two ways. This
+        // arm used to be three: a 128-bit one here and an F80 and an F128 one
+        // after the width unwrap, each with its own copy of the encoding.
+        // ⚠ KEYED ON THE DECLARED KIND `k`, NEVER ON THE VALUE'S VARIANT, and
+        // placed FIRST: `__uint128_t g = 5;` folds into a PLAIN `std::uint64_t`,
+        // so a variant-keyed gate would miss it and `appendLE` would be asked for
+        // width 16 — a shift of 64..120 bits, UB that on both shipped host arches
+        // REPEATS the low 8 bytes into the high 8 (TF-C94's recorded lesson).
+        // BEFORE the `_BitInt` arm, so a 128-bit value folded into the
+        // `BitIntValue` pool arm keeps its declared kind's treatment.
+        // ⓘ A negative `__int128` folded into the int64 arm gets a SIGN-extended
+        // high limb; a folded `WideFloatValue` of the OTHER wide kind is refused.
+        if (k == TypeKind::F80 || k == TypeKind::F128
+            || k == TypeKind::I128 || k == TypeKind::U128) {
+            bool const isInt = (k == TypeKind::I128 || k == TypeKind::U128);
+            std::size_t const before = d.bytes.size();
+            if (!appendSixteenByteScalarImage(d.bytes, v, k)) {
                 emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                     std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
-                                 "has a 128-bit integer type (TypeKind={}) but its "
-                                 "initializer is in no integer literal arm — refusing "
-                                 "rather than emitting a fabricated 16-byte image "
-                                 "(D-CSUBSET-INT128-DATA-GLOBAL).",
-                                 sym.v, static_cast<int>(k)));
+                     isInt
+                         ? std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
+                                       "has a 128-bit integer type (TypeKind={}) but its "
+                                       "initializer is in no integer literal arm — refusing "
+                                       "rather than emitting a fabricated 16-byte image "
+                                       "(D-CSUBSET-INT128-DATA-GLOBAL).",
+                                       sym.v, static_cast<int>(k))
+                         : std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
+                                       "has a wide-float type (TypeKind={}) but its "
+                                       "initializer is neither a `double` nor a folded "
+                                       "value of that kind — refusing rather than emitting "
+                                       "a fabricated 16-byte image "
+                                       "(D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL).",
+                                       sym.v, static_cast<int>(k)));
                 continue;
             }
-            std::size_t const before = d.bytes.size();
-            appendLE(d.bytes, lo, 8);
-            appendLE(d.bytes, hi, 8);
             // The layout and the encoder must agree; a disagreement is a wrong
             // image, so it fails loud rather than shipping a short/long record.
-            auto const w128 = scalarByteSize(k, dataModel);
-            if (!w128.has_value() || d.bytes.size() - before != *w128) {
+            auto const w16 = scalarByteSize(k, dataModel);
+            if (!w16.has_value() || d.bytes.size() - before != *w16) {
                 emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                     std::format("lowerMirGlobalsToDataItems: 128-bit global "
+                     std::format("lowerMirGlobalsToDataItems: 16-byte global "
                                  "SymbolId={{ {} }} encoded to {} bytes but "
-                                 "scalarByteSize reserves {} — the 128-bit encoder "
+                                 "scalarByteSize reserves {} — the 16-byte encoder "
                                  "and the layout disagree.",
                                  sym.v, d.bytes.size() - before,
-                                 w128.has_value() ? *w128 : 0));
+                                 w16.has_value() ? *w16 : 0));
                 continue;
             }
             d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
-                static_cast<std::uint32_t>(*w128)));
+                static_cast<std::uint32_t>(*w16)));
             out.push_back(std::move(d));
             continue;
         }
@@ -2291,126 +3146,18 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                  std::format("lowerMirGlobalsToDataItems: global "
                              "SymbolId={{ {} }} has TypeKind={} "
                              "— non-primitive global types are "
-                             "anchored under D-LK4-RODATA-PRODUCER-"
-                             "AGGREGATE-GLOBAL.",
+                             "anchored under "
+                             "D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL.",
                              sym.v, static_cast<int>(k)));
             continue;
-        }
-        // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): an x87 80-bit `long double`
-        // global — the widened extended value is 10 significant + 6 pad = 16
-        // bytes, WIDER than the u64 `decodeScalarLiteralBits` returns, so it
-        // has this dedicated widen+append path (the SOLE F80 scalar-global
-        // producer — F80 struct members stay walled at the aggregate-leaf
-        // recursion, LD-3). The double→extended widen is lossless (the pool
-        // carries the value as a host `double`, exactly representable for the
-        // l-suffixed literals this slice exercises). `*widthOpt` is 16 by
-        // construction (scalarByteSize(F80)); assert-guard the invariant.
-        if (k == TypeKind::F80) {
-            // LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): a CONST-FOLDED F80
-            // global — the value lives in the `WideFloatValue` pool arm at true
-            // 80-bit precision. Checked FIRST; `pack()` yields the identical 16-byte
-            // x87 layout, so it shares the size-check + alignment path.
-            if (auto const* wf = std::get_if<WideFloatValue>(&v.value)) {
-                std::size_t const before = d.bytes.size();
-                appendWideFloatBits(d.bytes, *wf);
-                if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                         std::format("lowerMirGlobalsToDataItems: F80 folded global "
-                                     "SymbolId={{ {} }} packed to {} bytes but "
-                                     "scalarByteSize reserves {} — the wide-float "
-                                     "encoder and the layout disagree.",
-                                     sym.v, d.bytes.size() - before, *widthOpt));
-                    continue;
-                }
-                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
-                    static_cast<std::uint32_t>(*widthOpt)));
-                out.push_back(std::move(d));
-                continue;
-            }
-            if (auto const* dv = std::get_if<double>(&v.value)) {
-                std::size_t const before = d.bytes.size();
-                appendF80Extended(d.bytes, *dv);
-                if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                         std::format("lowerMirGlobalsToDataItems: F80 global "
-                                     "SymbolId={{ {} }} widened to {} bytes but "
-                                     "scalarByteSize reserves {} — the x87 "
-                                     "extended encoder and the layout disagree.",
-                                     sym.v, d.bytes.size() - before, *widthOpt));
-                    continue;
-                }
-                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
-                    static_cast<std::uint32_t>(*widthOpt)));
-                out.push_back(std::move(d));
-                continue;
-            }
-            // A non-`double`, non-`WideFloatValue` F80 initializer is a malformed
-            // pool entry — fall through to the decode chokepoint's fail-loud
-            // below. (TF-C94: that fail-loud is now REAL. This comment used to
-            // describe a wall the chokepoint did not provide — its u64/i64/bool
-            // arms returned a value regardless of `k`, so a malformed F80 entry
-            // reached `appendLE` with width 16 on a u64 and hit the >>64 UB.
-            // `decodeScalarLiteralBits` now returns nullopt for F16/F80/F128 by
-            // KIND, honouring the contract its own header always stated.)
-        }
-        // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an IEEE binary128 `long
-        // double` global — the widened quad value is 16 bytes, WIDER than the
-        // u64 `decodeScalarLiteralBits` returns, so (like F80) it has this
-        // dedicated widen+append path (the SOLE F128 scalar-global producer;
-        // F128 struct members stay walled at the aggregate-leaf recursion). The
-        // double->binary128 widen is lossless for the l-suffixed literals this
-        // slice exercises. `*widthOpt` is 16 by construction (scalarByteSize
-        // (F128)); assert-guard the invariant, exactly as the F80 arm does.
-        if (k == TypeKind::F128) {
-            // LD-3: a CONST-FOLDED F128 global — the value lives in the
-            // `WideFloatValue` pool arm at true 113-bit precision. Checked FIRST;
-            // `pack()` yields the identical 16-byte binary128 layout.
-            if (auto const* wf = std::get_if<WideFloatValue>(&v.value)) {
-                std::size_t const before = d.bytes.size();
-                appendWideFloatBits(d.bytes, *wf);
-                if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                         std::format("lowerMirGlobalsToDataItems: F128 folded global "
-                                     "SymbolId={{ {} }} packed to {} bytes but "
-                                     "scalarByteSize reserves {} — the wide-float "
-                                     "encoder and the layout disagree.",
-                                     sym.v, d.bytes.size() - before, *widthOpt));
-                    continue;
-                }
-                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
-                    static_cast<std::uint32_t>(*widthOpt)));
-                out.push_back(std::move(d));
-                continue;
-            }
-            if (auto const* dv = std::get_if<double>(&v.value)) {
-                std::size_t const before = d.bytes.size();
-                appendF128(d.bytes, *dv);
-                if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                         std::format("lowerMirGlobalsToDataItems: F128 global "
-                                     "SymbolId={{ {} }} widened to {} bytes but "
-                                     "scalarByteSize reserves {} — the binary128 "
-                                     "encoder and the layout disagree.",
-                                     sym.v, d.bytes.size() - before, *widthOpt));
-                    continue;
-                }
-                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
-                    static_cast<std::uint32_t>(*widthOpt)));
-                out.push_back(std::move(d));
-                continue;
-            }
-            // A non-`double`, non-`WideFloatValue` F128 initializer is a malformed
-            // pool entry — fall through to the decode chokepoint's fail-loud
-            // below. (TF-C94: real as of this cycle — see the F80 arm's note;
-            // `decodeScalarLiteralBits` walls F16/F80/F128 by KIND now, not only
-            // on its `double` arm.)
         }
         // Decode the scalar value through the shared chokepoint (the SAME
         // int/float semantics the aggregate-leaf recursion uses, incl. the
         // mandatory `double → float` narrow for an F32 global — writing the
         // low 4 bytes of the binary64 pattern would be garbage). A nullopt
-        // means either an f16/f80/f128 `double` (the pool can't represent it) or
-        // a non-scalar / monostate variant — distinguished HERE for a precise
+        // means either an f16 `double` (the pool can't represent it; the four
+        // 16-byte kinds were taken by their own arm above) or a non-scalar /
+        // monostate variant — distinguished HERE for a precise
         // diagnostic (the `MirAggregateValue` arm already fired above, so a
         // non-scalar here is monostate). (Code-reviewer F1 audit fold — the
         // silent-miscompile guard for `float g = 1.0f;` at file scope.)
@@ -2422,9 +3169,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                                  "global SymbolId={{ {} }} has "
                                  "TypeKind={} with a `double` "
                                  "literal — the pool cannot "
-                                 "represent f16/f80/f128 losslessly "
-                                 "(D-LK4-RODATA-PRODUCER-EXOTIC-"
-                                 "FLOAT).",
+                                 "represent f16 losslessly "
+                                 "(D-LK4-RODATA-PRODUCER-EXOTIC-FLOAT).",
                                  sym.v, static_cast<int>(k)));
             } else {
                 emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
@@ -2432,8 +3178,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                                  "SymbolId={{ {} }} has a literal "
                                  "value of an unhandled variant arm "
                                  "(monostate) — anchored under "
-                                 "D-LK4-RODATA-PRODUCER-AGGREGATE-"
-                                 "GLOBAL.",
+                                 "D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL.",
                                  sym.v));
             }
             continue;

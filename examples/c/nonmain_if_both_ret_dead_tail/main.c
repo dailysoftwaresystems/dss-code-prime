@@ -1,5 +1,5 @@
 // Regression corpus for the MIR Block-lowering fresh-dead-block path via its
-// SECOND entry: a both-arms-return `if` (the D-HIR-SEALED-JOIN shape) seals its
+// SECOND entry: a both-arms-return `if` (the D-HIR-SEALED-JOIN-UNREACHABLE-BLOCK shape) seals its
 // join with `Unreachable`, and a `return 99` follows it. Neither a `Block`
 // wrapper nor an `IfStmt` is an unconditional terminator, so the HIR dead-code
 // rule lets the trailing sibling through to MIR — where it previously aborted

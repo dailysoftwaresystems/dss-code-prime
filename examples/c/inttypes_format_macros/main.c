@@ -1,7 +1,10 @@
 // TF-C66 (D-FFI-SHIPPED-LIBS-OS-ONLY testfixture recipe): the C99 <inttypes.h>
-// format-length macros ship as an OS/libc descriptor (inttypes.json). The
-// sqlite full-source testfixture uses exactly these four (PRIi64/PRIu32/PRIi32/
-// PRIu64 -- e.g. wal.c's `"...:%" PRIi64` adjacent-string concat). Each expands
+// format-length macros ship as an OS/libc descriptor (inttypes.json) -- four of
+// them, PRIi64/PRIu32/PRIi32/PRIu64. This comment used to say the sqlite
+// full-source testfixture uses exactly these four, "e.g. wal.c's `"...:%"
+// PRIi64` adjacent-string concat"; MEASURED 2026-09-24 false over sqlite
+// f544d3599a10: no src/ file has spelled PRIi64 in the clone's whole history,
+// and the four macros' only users are in ext/wasm/libcmpp.c. Each expands
 // to a STRING-LITERAL FRAGMENT that adjacent-string-concats into a format
 // string. The 64-bit prefix is PER-FORMAT (#47-class): glibc LP64 -> "l..."
 // (int64_t is `long`); Apple/Windows -> "ll..." (int64_t is `long long`). BOTH

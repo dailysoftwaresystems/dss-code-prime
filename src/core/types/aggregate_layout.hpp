@@ -7,7 +7,7 @@
 #include <optional>
 #include <string_view>
 
-// ── Aggregate layout parameters (FC6, plan 23 — the D-FF3-1 layout half) ──
+// ── Aggregate layout parameters (FC6, plan 23 — the D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS layout half) ──
 //
 // The per-ABI PARAMETERS the generic `type_layout` engine reads to compute
 // struct/union/array byte layout (field offsets, alignment, padding, total

@@ -2,7 +2,7 @@
 
 ## 5. The Schema and `.lang.json` System
 
-See [`docs/language-config-spec.md`](../../../docs/language-config-spec.md) for the authoring guide.
+See [`docs/language-config-spec.md`](../../../../docs/language-config-spec.md) for the authoring guide.
 
 ### 5.1 Loading
 

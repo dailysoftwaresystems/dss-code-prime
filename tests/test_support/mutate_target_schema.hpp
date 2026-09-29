@@ -44,9 +44,9 @@
 // hardcoded target string in this helper.
 //
 // ─────────────────────────────────────────────────────────────────
-// ★★★ D-TEST-SCHEMA-MUTATION-HELPER-FAILS-OPEN — THE MUTATION
-// CONTRACT (2026-08-14). THIS HELPER IS THE PROJECT'S PRIMARY
-// DEFENCE AGAINST VACUOUS TESTS, AND IT USED TO BE FAIL-OPEN.
+// ★★★ THE MUTATION CONTRACT (2026-08-14). THIS HELPER IS THE
+// PROJECT'S PRIMARY DEFENCE AGAINST VACUOUS TESTS, AND IT USED TO
+// FAIL OPEN.
 //
 // Until this cycle the helper could mutate NOTHING and report
 // success, by THREE separate routes:

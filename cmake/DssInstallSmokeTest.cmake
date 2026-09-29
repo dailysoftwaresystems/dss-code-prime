@@ -1,4 +1,4 @@
-# ── The closing test for D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE ────────
+# ── The closing test for "no packaging path ships the config tree" ────────
 #
 # Install to a scratch prefix and compile — and RUN — a hello-world from the
 # INSTALLED tree, with the source tree genuinely out of reach.

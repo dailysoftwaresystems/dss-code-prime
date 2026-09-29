@@ -1,5 +1,5 @@
-// D-TEST-SCHEMA-MUTATION-HELPER-FAILS-OPEN — the self-test for the mutation
-// instrument itself.
+// THE SCHEMA-MUTATION HELPER USED TO FAIL OPEN — the self-test for the
+// mutation instrument itself.
 //
 // WHY THIS FILE EXISTS. `mutate_target_schema.hpp` is this project's primary
 // defence against vacuous tests: ~54 call sites build a MUTANT schema and pin

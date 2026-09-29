@@ -1,0 +1,33 @@
+{
+  "$comment": "P68 round 9 (lane `cs`) — `_Generic` associations differing only in a pointee qualifier (the round's row of that name; its closing names this example). `_Generic` matches by COMPATIBLE type after the controlling expression's lvalue conversion and array / function decay (C23 6.5.1.1p3), and two pointer types are compatible only when their pointed-to types are identically qualified (6.7.6.1p2). Nine selections, each adding its share only when it took the association C names: a `const int *` and an `int *` controlling object beside both, an `int *volatile *` beside `int **`, a `const int[2]` and a string literal decayed, `&f` of a function taking `const char *` beside one taking `char *`, an array member of a const object, `*&cp`, and an `int` beside a `const int` association (which no lvalue-converted expression can match). ✔MEASURED 2026-09-23, each reference separately, this file compiled and RUN: gcc 13.3.0 and clang 18.1.3 at -std=c17 -pedantic-errors and -std=c2x, mingw-w64 13.2.0 at both, and MSVC 19.51 at /std:c17 and /std:clatest exit 42 (clang warns the `const int` association is unreachable). DSS before this round refused the file with five S_GenericSelectionAmbiguous (✔MEASURED, the lane's WSL tree at the P0 fold, ELF x86_64: `const` is not interned, so `int *` and `const int *` were one TypeId), and in single-association forms selected the wrong arm in silence (`.temp/probe/g` g03, g04, g13-g15). exit 42 = every selection took C's association.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

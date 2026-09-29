@@ -245,6 +245,67 @@ TEST(TreeBuilder, EmptySpaceTokensCarryFlag) {
     EXPECT_FALSE(isEmptySpace(t.flags(vdKids[4])));    // ;
 }
 
+// ★ A NODE'S SPAN ENDS AT ITS LAST TOKEN, AND STARTS AT ITS FIRST (P68 round 12, lane `cs`,
+// D-PARSE-A-NODES-SPAN-RAN-ON-OVER-THE-TRIVIA-AFTER-ITS-LAST-TOKEN). The parser pushes trivia into
+// whichever frame is open, and a rule ending in an OPTIONAL tail looks past the trivia before it can
+// decide the tail is empty — so trivia lands INSIDE the frame after its last token (and, symmetrically,
+// can land before its first). The leaves stay children (the tree still covers every byte); they never
+// widen a span, so `text(node)` is exactly what the rule matched. Measured before the fix: C's
+// `enum E : struct Foo {` clause reported `: struct Foo ` — its range ran on over the space before `{`.
+TEST(TreeBuilder, ANodesSpanRunsFromItsFirstTokenToItsLastNeverOverTrivia) {
+    auto h = Harness::make(" var x; ");
+
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        auto stmt = b.open(h.schema->rules().find("statement"));
+        auto vd   = b.open(h.schema->rules().find("varDecl"));
+        b.pushToken(h.tok(" ",   0, CoreTokenKind::Whitespace));   // trivia BEFORE the first token
+        b.pushToken(h.tok("var", CoreTokenKind::Word));
+        b.pushToken(h.tok(" ",   4, CoreTokenKind::Whitespace));
+        b.pushToken(h.tok("x",   CoreTokenKind::Word));
+        b.pushToken(h.tok(";"));
+        b.pushToken(h.tok(" ",   7, CoreTokenKind::Whitespace));   // trivia AFTER the last token
+    }
+    Tree t = std::move(b).finish();
+
+    NodeId const vd = t.children(t.children(t.root())[0])[0];
+    ASSERT_EQ(t.children(vd).size(), 6u) << "trivia stays a child — the tree covers every byte";
+    EXPECT_EQ(t.text(vd), "var x;");
+    EXPECT_EQ(t.span(vd), SourceSpan::of(1, 7));
+    EXPECT_EQ(t.text(t.root()), "var x;") << "every enclosing node's span ends where its content does";
+}
+
+// The same answer for a whitespace byte the lexeme table does NOT list (a form feed): the tokenizer
+// pre-resolves it to the language's Whitespace kind, which the parser skips as trivia, and the builder
+// resolves it through a synthetic meaning that carries no flags — so it is marked `EmptySpace` by the
+// parser's own test (`isTriviaToken`) and, like every declared whitespace, widens no span.
+TEST(TreeBuilder, AWhitespaceByteTheLexemeTableDoesNotListIsTriviaToo) {
+    auto h = Harness::make("var x;\f");
+
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        auto stmt = b.open(h.schema->rules().find("statement"));
+        auto vd   = b.open(h.schema->rules().find("varDecl"));
+        b.pushToken(h.tok("var", CoreTokenKind::Word));
+        b.pushToken(h.tok(" ",   3, CoreTokenKind::Whitespace));
+        b.pushToken(h.tok("x",   CoreTokenKind::Word));
+        b.pushToken(h.tok(";"));
+        Token ff = h.tok("\f", 6, CoreTokenKind::Whitespace);
+        ff.schemaKind = h.schema->schemaTokens().find("Whitespace");
+        b.pushToken(ff);
+    }
+    Tree t = std::move(b).finish();
+
+    NodeId const vd = t.children(t.children(t.root())[0])[0];
+    auto const kids = t.children(vd);
+    ASSERT_EQ(kids.size(), 5u);
+    EXPECT_TRUE(isEmptySpace(t.flags(kids[4]))) << "the form feed is trivia, as the parser reads it";
+    EXPECT_EQ(t.text(vd), "var x;");
+    EXPECT_EQ(t.diagnostics().errorCount(), 0u);
+}
+
 // ── (e) Ambiguous-token tiebreak ─────────────────────────────────────────
 
 TEST(TreeBuilder, AmbiguousMeaningsTieBreakOnFirstDeclared) {
@@ -418,6 +479,121 @@ TEST(TreeBuilder, OpensScopeTokenMutatesScopeStack) {
     EXPECT_EQ(t.diagnostics().errorCount(), 0u);
 }
 
+// ── A frame's scopes are the frame's to close ───────────────────────────
+//
+// [[D-PARSE-BUILDER-INVARIANT-PRINTED-AFTER-A-CORRECT-REFUSAL]]. The scope stack
+// is driven by tokens and the frames by the parser, so a parse that never
+// reaches a closer (panic recovery consumed it, an unterminated literal
+// swallowed it, the input ended) used to leave the opener's scope behind, and
+// `finish()` printed its internal "scope stack non-empty" to the user beside
+// the real error — ✔MEASURED on 9 of 15 refusal shapes. A frame now closes the
+// scopes it opened: silently when it erred (the user holds that error), and as
+// an INTERNAL invariant when it closed clean, which only a grammar splitting an
+// opener from its closer, or a builder bug, can do.
+
+namespace {
+[[nodiscard]] std::size_t countInvariantsSaying(Tree const& t, std::string_view words) {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        t.diagnostics().all(), [words](ParseDiagnostic const& d) {
+            return d.code == DiagnosticCode::P_BuilderInvariant
+                && d.actual.find(words) != std::string::npos;
+        }));
+}
+} // namespace
+
+TEST(TreeBuilder, AnErroredFrameClosesTheScopesItOpened) {
+    auto h = Harness::make("{ x");
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    auto root = b.open(h.schema->rules().find("root"));
+    b.pushToken(h.tok("{"));
+    ASSERT_EQ(b.scopeStack().size(), 1u);
+    b.pushErrorNode(SourceSpan::of(2, 3));   // recovery: the `}` never comes
+    root.close();                            // the frame closes WITH an error
+    EXPECT_TRUE(b.scopeStack().empty()) << "recovery closes what it opened";
+    Tree t = std::move(b).finish();
+    EXPECT_EQ(countCode(t.diagnostics().all(), DiagnosticCode::P_BuilderInvariant), 0u)
+        << "the user already holds the error; the builder has nothing to add";
+}
+
+TEST(TreeBuilder, ACleanFrameClosingOverItsOwnOpenScopeIsStillAnInvariant) {
+    auto h = Harness::make("{");
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    auto root = b.open(h.schema->rules().find("root"));
+    b.pushToken(h.tok("{"));
+    root.close();                            // CLEAN, with its `{` still open
+    EXPECT_TRUE(b.scopeStack().empty()) << "repaired, so it is reported once";
+    Tree t = std::move(b).finish();
+    EXPECT_EQ(countCode(t.diagnostics().all(), DiagnosticCode::P_BuilderInvariant), 1u);
+    EXPECT_EQ(countInvariantsSaying(t, "closed cleanly"), 1u)
+        << "a clean frame over an unclosed scope is an opener split from its "
+           "closer — the check that proves no shipped grammar does that";
+}
+
+// ★ THE ORDER IN `finish()` IS THE FIX. A frame still open at finish is closed
+// by the end-of-input cascade, which reports it (`P_PrematureEndOfInput`) and
+// closes the scopes it opened. The leftover-scope check used to run BEFORE that
+// cascade, so the same input was reported twice — once to the user, once as
+// the builder's own invariant. It runs after it now.
+// RED-ON-DISABLE: move the check back ahead of the cascade and the invariant
+// returns beside the end-of-input report.
+TEST(TreeBuilder, AFrameLeftOpenAtFinishIsReportedOnceAsEndOfInput) {
+    auto h = Harness::make("{");
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    auto root = b.open(h.schema->rules().find("root"));
+    b.pushToken(h.tok("{"));                 // the `}` never comes
+    Tree t = std::move(b).finish();          // `root` is still open
+    EXPECT_GE(countCode(t.diagnostics().all(), DiagnosticCode::P_PrematureEndOfInput), 1u)
+        << "the user's report of the missing closer";
+    EXPECT_EQ(countCode(t.diagnostics().all(), DiagnosticCode::P_BuilderInvariant), 0u)
+        << "and not the builder's invariant beside it";
+}
+
+TEST(TreeBuilder, AScopeNoFrameOwnsIsStillAnInvariantAtFinish) {
+    auto h = Harness::make("");
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    b.pushScope(ScopeKind::Block);           // no frame to own it
+    Tree t = std::move(b).finish();
+    EXPECT_EQ(countInvariantsSaying(t, "scope stack non-empty at finish"), 1u);
+}
+
+// ★ SPECULATION. The depth a frame records is trailed with the frame, so a
+// branch whose frame ERRED and closed its scopes, and was then ROLLED BACK,
+// leaves the scope stack exactly as it was before the checkpoint — and the
+// check is still armed afterwards: the next CLEAN frame over an open scope
+// still trips it.
+TEST(TreeBuilder, ARolledBackErroredFrameRestoresTheScopeStackAndTheCheckStaysArmed) {
+    auto h = Harness::make("{ ( x } {");
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    auto root = b.open(h.schema->rules().find("root"));
+    b.pushToken(h.tok("{", 0, CoreTokenKind::Operator));   // root's own scope
+    std::vector<ScopeKind> const before(b.scopeStack().begin(), b.scopeStack().end());
+    ASSERT_EQ(before.size(), 1u);
+
+    auto cp = b.checkpoint();
+    {
+        auto branch = b.open(h.schema->rules().find("statement"));
+        b.pushToken(h.tok("("));
+        ASSERT_EQ(b.scopeStack().size(), 2u);
+        b.pushErrorNode(SourceSpan::of(4, 5));   // the branch errs...
+    }                                            // ...and closes its `(` with it
+    EXPECT_EQ(b.scopeStack().size(), 1u);
+    b.rollback(std::move(cp));                   // the branch is refuted
+    EXPECT_EQ(std::vector<ScopeKind>(b.scopeStack().begin(), b.scopeStack().end()), before)
+        << "a rollback restores the scope stack the checkpoint saw";
+
+    b.pushToken(h.tok("}"));                     // root's own closer
+    EXPECT_TRUE(b.scopeStack().empty());
+    {
+        auto misuse = b.open(h.schema->rules().find("statement"));
+        b.pushToken(h.tok("{", 8, CoreTokenKind::Operator));
+    }                                            // CLEAN, over its open `{`
+    root.close();
+    Tree t = std::move(b).finish();
+    EXPECT_EQ(countInvariantsSaying(t, "closed cleanly"), 1u)
+        << "the check is armed after the rollback";
+    EXPECT_EQ(countCode(t.diagnostics().all(), DiagnosticCode::P_BuilderInvariant), 1u);
+}
+
 // ── pushError API ───────────────────────────────────────────────────────
 
 TEST(TreeBuilder, PushErrorEmitsUnexpectedTokenWithExpectedFields) {
@@ -587,7 +763,9 @@ TEST(TreeBuilder, PriorityWinnerWithOpensScopeMutatesStack) {
 
     root.close();
     Tree t = std::move(b).finish();
-    // We left Generic open — finish() flags the leftover.
+    // We left Generic open in a frame that closed CLEAN — the frame's close
+    // flags it and repairs it (the clean-frame check), so `finish()` finds no
+    // leftover and the imbalance is reported exactly ONCE.
     EXPECT_EQ(countCode(t.diagnostics().all(),
                        DiagnosticCode::P_BuilderInvariant), 1u);
 }

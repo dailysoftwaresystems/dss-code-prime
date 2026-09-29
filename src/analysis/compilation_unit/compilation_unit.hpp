@@ -21,6 +21,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
+#include "core/types/include_path_resolve.hpp"  // HeaderSearchCache — this build's one view of the include tree
 #include "core/types/line_map.hpp"           // LineMap (D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES)
 #include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
@@ -582,9 +583,19 @@ public:
     // preprocessor's `__has_include(<h>)` (and the descriptor macro-splice) report
     // PER-TARGET availability — a header whose descriptor excludes this format is
     // NOT available, agreeing with the `#include` semantic gate. UNSET (the
-    // default) ⇒ pure-existence `__has_include` (LSP / direct-API / tests). Because
-    // it changes the preprocessed token stream, the driver builds the CU ONCE per
-    // distinct object-format. Aborts if called after finish().
+    // default) ⇒ pure-existence `__has_include` (direct-API / tests; the driver,
+    // the LSP and the FFI header parser declare it through
+    // `applyTargetFormatPair`). Because it changes the preprocessed token stream,
+    // the driver builds the CU ONCE per distinct object-format. Aborts if called
+    // after finish().
+    //
+    // ★ REFUSES `ObjectFormatKind::Unknown`, which is the invalid SENTINEL and not
+    // a format. "This build has no format" has exactly one spelling here — never
+    // calling this — so a default-constructed kind handed in by mistake aborts at
+    // the door instead of travelling on as a second spelling of "no format" that
+    // every availability test downstream would answer as "unavailable
+    // everywhere". A loaded `ObjectFormatSchema` can never yield it (its loader
+    // refuses a document whose kind resolves no backend).
     void setActiveFormat(ObjectFormatKind fmt);
 
     // D-PP-HEADER-CASE-INSENSITIVE-PE: declare how the active object format
@@ -653,6 +664,16 @@ public:
     // driver's CU cache key carries the format NAME and not only the kind.
     // Aborts if called after finish().
     void setFormatPredefinedMacros(std::vector<PredefinedMacroDef> macros);
+
+    // P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): declare the
+    // active (target, format) pair's facts for the language's `type-size`
+    // predefined macros — the format's data model and `long double` format, the
+    // target's ABI typedefs for this format — so `__SIZEOF_LONG__` and its
+    // family realize to the sizes `sizeof` gives on this pair. UNSET (the
+    // default) ⇒ no pair ⇒ no `type-size` macro is defined at all, which is what
+    // a caller that names no target should see. Set by `applyTargetFormatPair`.
+    // Aborts if called after finish().
+    void setPredefinedTypeFacts(PredefinedTypeFacts facts);
 
     // Single-use, rvalue-qualified (L6). The `finished_` latch catches the
     // `std::move(b).finish(); std::move(b).finish();` corner case — `std::move`
@@ -780,12 +801,19 @@ private:
     std::optional<ObjectFormatKind>      activeFormat_; // c9: per-target __has_include
     // D-PP-HEADER-CASE-INSENSITIVE-PE: the active format's header-NAME case rule.
     HeaderNameMatching                   headerNameMatching_ = kDefaultHeaderNameMatching;
+    // [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]: THIS
+    // build's view of the include tree — every directory its searches read, listed
+    // once, and every candidate probed once, shared by every file's preprocess
+    // pass, the import resolvers and the shipped-surface check, and gone with the
+    // builder. One per compile: never global, never carried into the next build.
+    HeaderSearchCache                    headerSearch_;
     // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the active (target x format)'s
     // plain-`char` sign, relayed to `preprocess()` for the `#if` fold.
     std::optional<bool>                  charIsUnsigned_{};
     std::vector<std::string>             userDefines_;  // c105: --define NAME[=VALUE]
     std::vector<PredefinedMacroDef>      targetPredefinedMacros_;  // TF-C74: per-arch identity predefines
     std::vector<PredefinedMacroDef>      formatPredefinedMacros_;  // TF-C97: per-format data-model predefines
+    std::optional<PredefinedTypeFacts>   predefinedTypeFacts_;     // P68: the pair's facts for `type-size` predefines
     std::vector<TreeParseSidecar>        sidecars_;     // FC2; parallel to trees_
     // FC13: the C preprocessor's origin buffers (original main + every spliced
     // header), accumulated across every preprocessed file, handed to the CU as
@@ -816,5 +844,53 @@ private:
 // ⚠ CALL IT BEFORE `finish()`, like every other `UnitBuilder` mutator: it
 // forwards to `addSystemDir`, which aborts after `finish()`.
 DSS_EXPORT void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar);
+
+class TargetSchema;         // core/types/target_schema.hpp
+class ObjectFormatSchema;   // link/object_format_schema.hpp
+
+// Declare on `builder` EVERYTHING one `<target>:<format>` pair decides about how
+// a compilation unit is built:
+//   * the object-format KIND (`setActiveFormat`) — `__has_include` and the
+//     descriptor macro-splice answer per-format availability;
+//   * the format FILE's header-NAME case rule (`setHeaderNameMatching`);
+//   * the target's plain-`char` signedness under this format
+//     (`setCharIsUnsigned`) — the `#if` constant-expression fold;
+//   * the target's predefined macros (`setTargetPredefinedMacros`);
+//   * the format's predefined macros (`setFormatPredefinedMacros`);
+//   * the pair's facts for the language's `type-size` predefined macros
+//     (`setPredefinedTypeFacts`) — the format's data model and `long double`
+//     format, and the target's ABI typedefs resolved for this format.
+//
+// ★★★ ONE PAIR, ONE FUNCTION, EVERY CHANNEL —
+// [[D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE]]. These were five setters, and
+// each channel that builds a CU called the ones it had a reason to: the driver
+// all five, the LSP and the FFI header parser none. So on a pe64 workspace the
+// editor refused `#include <Windows.h>` while the build accepted it, and the
+// fourth setter (`setCharIsUnsigned`) arrived after the row naming the first
+// three had been written and never reached the editor at all — the class
+// recurring exactly as that row predicted. A channel now names its PAIR and this
+// function derives the consequences, so a sixth pair-decided setting added here
+// reaches the driver's builder sites (`program.cpp`), the LSP and the FFI header
+// parser at once. The semantic tier's half of the same pair — the data model,
+// aggregate layout, `long double`, `va_list`, format availability — is
+// `analyzeForTargetFormat` (`analysis/semantic/target_format_analysis.hpp`).
+//
+// The kind comes from `format.kind()`, which a loaded schema never leaves at
+// the sentinel; `setActiveFormat` refuses it anyway.
+//
+// ⚠ CALL IT BEFORE `finish()`: it forwards to five mutators that abort after it.
+DSS_EXPORT void applyTargetFormatPair(UnitBuilder&              builder,
+                                      TargetSchema const&       target,
+                                      ObjectFormatSchema const& format);
+
+// P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): the facts ONE
+// `<target>:<format>` pair contributes to the language's `type-size` predefined
+// macros — the format's data model and `long double` format, and the target's
+// ABI typedefs resolved for the format's kind. The ONE computation of them:
+// `applyTargetFormatPair` declares its result on the builder, and
+// `--dump-predefined-macros` passes it to the same merge, so the instrument
+// cannot describe a different pair than the compile builds.
+DSS_EXPORT PredefinedTypeFacts predefinedTypeFactsFor(TargetSchema const&       target,
+                                                      ObjectFormatSchema const& format);
 
 } // namespace dss

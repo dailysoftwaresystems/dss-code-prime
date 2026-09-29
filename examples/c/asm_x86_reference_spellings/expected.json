@@ -1,0 +1,24 @@
+{
+  "$comment": "x86-64 inline-assembly spellings GNU as and clang accept, which DSS refused at the P68 round-7 base (D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS): unsuffixed `mov`/`add`/`lea`, `leal`, operand placeholders as a memory base and index, `testl` + `sete`, the cross-bank `movq`/`movd`, a scratch xmm register named beside an `\"x\"` operand, and `movapd`. Each template has its own exit code (11–21, listed in `main.c`). ✔MEASURED 2026-09-21: gcc 13.3.0 and clang 18.1.3 run it to 42 at -O0 and -O2 on x86_64 Linux, mingw-w64 gcc 13.2.0 on Windows. ★ The `release` arm: every input comes from a `volatile`, so the optimized pipeline keeps each template's operands real.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

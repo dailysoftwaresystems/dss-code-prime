@@ -50,8 +50,7 @@
  * `c_inline_asm_width_and_direction`, whose shapes 1 and 2 are written so a
  * swapped direction is a wrong answer rather than a lucky one.
  * ⇒ A CROSS-LANE CITATION OF AN OPEN ROW IS A CLAIM WITH AN EXPIRY DATE, AND
- * THE FOLD IS WHEN IT EXPIRES
- * (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+ * THE FOLD IS WHEN IT EXPIRES.
  *
  * ★★★ WHY EVERY SHAPE ASSERTS A VALUE AND NOT AN ABSENCE OF ERRORS. A memory-
  * destination encoding differs from its memory-SOURCE twin only in one opcode

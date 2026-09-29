@@ -1,0 +1,42 @@
+{
+  "$comment": "The GNU integer-type predefined macros — __*_TYPE__, __*_MAX__/__*_MIN__, __*_WIDTH__, __*_C(c) and __*_C_SUFFIX__ — used as types in declarations, as values in expressions and in #if, and as literal builders (P68 round 9, lane lm). Six groups set six bits (main.c lists them); the exit is 42 only when all hold. DSS defined NONE of these 122 names at HEAD 4d9a24c4 (no row in c.lang.json), and its <stdint.h> said int_fast16_t/int_fast32_t are short/int on every pair where glibc says long; each __X_TYPE__ now names the shipped typedef, which follows the platform's own header. ✔MEASURED 2026-09-23 on this file: gcc 13.3.0 and clang 18.1.3 on x86_64 Linux and on aarch64 Linux (cross, qemu), -O0 and -O2, `-std=c2x`/`-std=c23 -pedantic -Wall`, mingw-w64 gcc 13.2.0 at -O0 and -O2, and Apple clang 21.0.0 on arm64 and under `-arch x86_64` at -O0 and -O2 (the coordinator's Mac, 2026-09-24), all exit 42 — each with ONE `-Wall` warning, on `#if -1 < __UINT32_MAX__` (gcc: 'the left operand of \"<\" changes sign when promoted'; clang: 'left side of operator converted from negative value to unsigned'), the very conversion that line exists to test; the names only some references define stand behind #ifdef, and clang-on-Linux's documented __INT_FAST16/32_TYPE__ disagreement with glibc behind its own guard (the check always runs under DSS). MSVC defines none of these macros; the pe pair presents mingw's identity. DSS exits 42 on pe64, ELF x86_64 and ELF aarch64 (qemu), debug and release, and compiles both Mach-O pairs. The `release` arm runs the shipped optimizer pipeline over the same checks.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

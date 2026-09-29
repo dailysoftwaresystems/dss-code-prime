@@ -26,6 +26,7 @@
 // tree and points `$DSS_CONFIG_ROOT` at the copy, so a concurrent suite reading
 // the live tree cannot see anything this test does.
 
+#include "core/substrate/stack_sized_thread.hpp"
 #include "core/types/config_document_memo.hpp"
 #include "core/types/grammar_schema.hpp"
 
@@ -41,7 +42,6 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 using namespace dss;
@@ -353,10 +353,16 @@ TEST(ConfigDocumentMemo, ConcurrentLoadsOfOneDocumentAgree) {
     constexpr int kThreads = 16;
     std::vector<std::shared_ptr<GrammarSchema>> results(kThreads);
     std::atomic<bool> go{false};
-    std::vector<std::thread> workers;
+    // A STATED stack (D-SUBSTRATE-WORKER-THREADS-TAKE-THE-HOST-DEFAULT-STACK): every
+    // thread here performs a COLD schema build, main-thread work whose frame is
+    // 415,360 bytes under clang -O0 — a plain `std::thread` would run it on macOS's
+    // 512 KiB default. This document's build stays under that today (it passes on the
+    // Mac Debug gate leg with plain threads), so no red-on-disable is claimed here;
+    // the stack is stated because the path is the one that dies on a larger one.
+    std::vector<dss::substrate::StackSizedThread> workers;
     workers.reserve(kThreads);
     for (int i = 0; i < kThreads; ++i) {
-        workers.emplace_back([&, i] {
+        workers.emplace_back(dss::substrate::kMainThreadClassStackBytes, [&, i] {
             while (!go.load(std::memory_order_acquire)) { /* line them up */ }
             auto r = GrammarSchema::loadFromText(doc, "<memo-probe-threads>");
             if (r.has_value()) results[static_cast<std::size_t>(i)] = *r;

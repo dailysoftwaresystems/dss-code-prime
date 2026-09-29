@@ -1,0 +1,23 @@
+# PURPOSE: refuse a new `path:line` citation in the plans -- a citation names a stable reference, never a line number.
+name: check-plan-citations
+description: >-
+  The action holds positional citations to their ratchet, then proves every refusal can fire.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `plan_citations_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-plan-citations.py
+    successPattern: 'plan-citations: self-test OK'
+    requireInputsUnmoved: true
+  # The BURN-DOWN verb, run only where a run names it -- `dssharness run check-plan-citations-write`, the runner
+  # that runs it on ONE leg, this machine's own tree (config.json): it may only LOWER a ceiling, and it writes nothing when it refuses. It moves a tracked file by
+  # design, so it cannot carry requireInputsUnmoved; a plain run afterwards verifies.
+  - name: write
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-plan-citations.py --write
+    successPattern: '^check-plan-citations: re-baselined [0-9]+ document\(s\), [0-9]+ citation\(s\)'

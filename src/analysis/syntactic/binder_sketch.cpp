@@ -53,6 +53,21 @@ BinderSketch::BinderSketch(GrammarSchema const& schema) {
         }
         byRule_.emplace(decl.rule.v, row);
     }
+    // P68 round 9 (lane `cs`): a field row whose composite LIFTS its names into
+    // the enclosing scope (`fieldChildren.liftToEnclosingScope` — C's enumeration
+    // constants) is marked, so `record` binds those names where the analyzer
+    // republishes them rather than inside the composite body, where they would
+    // die with it and read as Unknown — which `sizeof(E)` then committed as a
+    // TYPE. The row is found through the SAME config link the analyzer follows.
+    for (auto const& decl : sem.declarations) {
+        if (!decl.fieldChildren.has_value()
+            || !decl.fieldChildren->liftToEnclosingScope
+            || !decl.fieldChildren->rule.valid())
+            continue;
+        if (auto it = byRule_.find(decl.fieldChildren->rule.v); it != byRule_.end()) {
+            it->second.liftToEnclosingScope = true;
+        }
+    }
     for (auto const& sc : sem.scopes) {
         if (sc.rule.valid()) scopeRules_.insert(sc.rule.v);
     }
@@ -64,12 +79,33 @@ BinderSketch::BinderSketch(GrammarSchema const& schema) {
     // dominator). `block` and friends carry no `declarations` row at all.
     for (auto rv : scopeRules_) {
         auto it = byRule_.find(rv);
-        if (it != byRule_.end() && !it->second.isType) {
+        if (it == byRule_.end()) continue;
+        if (!it->second.isType) {
             dominatorScopeRules_.insert(rv);
+        } else {
+            compositeScopeRules_.insert(rv);   // a composite BODY scope
         }
     }
     liveScopes_.push_back(0);   // the global scope, id 0, never popped
     liveScopeIsDominator_.push_back(false);   // global is a namespace scope
+    liveScopeIsComposite_.push_back(false);
+    // P68 round 9 (lane `cs`): the language's PREDEFINED identifiers — C 6.4.2.2's
+    // `__func__` and the GNU `__FUNCTION__` alias, from the config's
+    // `semantics.predefinedFunctionNames` — are ORDINARY identifiers the source
+    // never declares, so without an entry they read as Unknown and `sizeof(__func__)`
+    // committed as a type. Recorded as VALUES in the global scope: wherever such a
+    // name is visible at all it names an object, and where the analyzer does not
+    // bind it (outside a function body) the value reading is refused there as an
+    // undeclared identifier, which is the right refusal. A later declaration of the
+    // same spelling shadows the seed like any other binding.
+    for (std::string const& spelling : sem.predefinedFunctionNameIdentifiers) {
+        if (spelling.empty()) continue;
+        bindings_.push_back(Binding{
+            .name   = spelling,
+            .scope  = 0,
+            .isType = false,
+        });
+    }
 }
 
 BinderSketch::BinderDecl const*
@@ -85,6 +121,7 @@ bool BinderSketch::isScopeRule(RuleId rule) const noexcept {
 void BinderSketch::openScope(RuleId rule) {
     liveScopes_.push_back(nextScopeId_++);
     liveScopeIsDominator_.push_back(dominatorScopeRules_.contains(rule.v));
+    liveScopeIsComposite_.push_back(compositeScopeRules_.contains(rule.v));
 }
 
 void BinderSketch::closeScope() {
@@ -97,10 +134,34 @@ void BinderSketch::closeScope() {
     }
     liveScopes_.pop_back();
     liveScopeIsDominator_.pop_back();
+    liveScopeIsComposite_.pop_back();
 }
 
-void BinderSketch::record(std::string name, bool isType, SourceSpan span) {
+void BinderSketch::record(std::string name, bool isType, SourceSpan span,
+                          bool liftToEnclosingScope) {
     if (name.empty()) return;   // anonymous/malformed decl — nothing to bind
+    // P68 round 9 (lane `cs`): a LIFTED field name (an enumeration constant) is an
+    // ordinary identifier of the scope the composite specifier appears in — C
+    // 6.2.1p7 — so it binds in the nearest scope that is neither a composite BODY
+    // (its own enum, or a struct it is nested in) nor a declarator-dominator: the
+    // block or the file, as the analyzer's republication does. The global scope
+    // (slot 0) is neither, so the search always lands.
+    if (liftToEnclosingScope) {
+        std::uint32_t target = liveScopes_.front();
+        for (std::size_t i = liveScopes_.size(); i-- > 0;) {
+            if (!liveScopeIsDominator_[i] && !liveScopeIsComposite_[i]) {
+                target = liveScopes_[i];
+                break;
+            }
+        }
+        bindings_.push_back(Binding{
+            .name   = std::move(name),
+            .scope  = target,
+            .isType = isType,
+            .span   = span,
+        });
+        return;
+    }
     // A composite/typedef TYPE tag (C11 6.2.1) belongs to the nearest enclosing
     // NAMESPACE scope (block or file), not an interior declarator-dominator
     // scope it may have been minted inside (a file-scope `struct P { … } v;`
@@ -178,6 +239,7 @@ BinderSketch::Snapshot BinderSketch::snapshot() const {
         .candidateCount     = candidates_.size(),
         .liveScopes         = liveScopes_,
         .liveScopeDominator = liveScopeIsDominator_,
+        .liveScopeComposite = liveScopeIsComposite_,
         .nextScopeId        = nextScopeId_,
     };
 }
@@ -198,6 +260,7 @@ void BinderSketch::restore(Snapshot&& s) {
         candidates_.end());
     liveScopes_           = std::move(s.liveScopes);
     liveScopeIsDominator_ = std::move(s.liveScopeDominator);
+    liveScopeIsComposite_ = std::move(s.liveScopeComposite);
     nextScopeId_          = s.nextScopeId;
 }
 

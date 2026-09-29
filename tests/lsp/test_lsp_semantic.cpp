@@ -276,6 +276,43 @@ TEST(LspSemantic, CompletionListsInScopeSymbolsAndHidesNonVisibleParams) {
     EXPECT_EQ(addKind, 3);
 }
 
+// ★ THE FILE'S EDGES ARE AT FILE SCOPE (P68 round 12, lane `cs`,
+// D-PARSE-A-NODES-SPAN-RAN-ON-OVER-THE-TRIVIA-AFTER-ITS-LAST-TOKEN). A node's span now ends at its last
+// token, so the root's no longer runs over the blank lines before the first declaration or after the
+// last — and completion on such a line found NO scope and offered nothing. `scopeAtOffset` answers the
+// root scope where no anchored scope contains the offset, as its contract always said. Completion on a
+// leading blank line and on a blank line after the last declaration offers the file-scope names, and
+// never `main`'s local. (The position AFTER the document's last byte — line 4 below — answers nothing at
+// all, before and after this fix: the coordinate mapping has no image for it. That is its own row,
+// D-LSP-A-POSITION-AT-THE-END-OF-A-DOCUMENT-ANSWERS-NOTHING.)
+TEST(LspSemantic, CompletionOnABlankLineBeforeOrAfterEveryDeclarationOffersTheFileScope) {
+    constexpr std::string_view kEdges =
+        "\n"                                        // line 0: blank, before every token
+        "int gx;\n"                                 // line 1
+        "int main(void) { int local = gx; return local; }\n"   // line 2
+        "\n";                                       // line 3: blank; line 4: after the last byte
+    for (int const line : {0, 3}) {
+        SCOPED_TRACE(line);
+        LspTestHarness h;
+        h.push(lspInitialize(1));
+        h.push(didOpen("file:///edges.c", kEdges));
+        h.push(posRequest("textDocument/completion", 7, "file:///edges.c", line, 0));
+        h.push(lspShutdown(2));
+        h.push(std::string{lspExit});
+        EXPECT_EQ(h.runUntilExit(), 0);
+        auto msgs = h.takeServerMessages();
+        ASSERT_GE(msgs.size(), 3u);
+        json const reply = json::parse(msgs[2]);
+        ASSERT_TRUE(reply.contains("result"));
+        ASSERT_TRUE(reply.at("result").is_array()) << reply.dump();
+        std::set<std::string> labels;
+        for (auto const& it : reply.at("result")) labels.insert(it.at("label").get<std::string>());
+        EXPECT_TRUE(labels.contains("gx")) << reply.dump();
+        EXPECT_TRUE(labels.contains("main")) << reply.dump();
+        EXPECT_FALSE(labels.contains("local")) << "`local` is main's, not the file's";
+    }
+}
+
 // signatureHelp inside a call's arg list → the callee's signature label.
 // Driven on tsql, whose `callExpr` callRule + the COALESCE builtin FnSig
 // give a callable with a real signature. Asserts the EXACT label
@@ -320,7 +357,7 @@ TEST(LspSemantic, SignatureHelpReturnsExactCalleeSignature) {
 
 // SE7 staleness — directly drive the DocumentStore. After a model is
 // stored at gen N, an update() bumps the generation; a SUBSEQUENT
-// setSemanticModel against the old gen must be rejected (return false)
+// `setAnalyses` against the old gen must be rejected (return false)
 // and must NOT overwrite the stored model.
 //
 // Uses REAL SemanticModel instances (built via buildShippedUnit +
@@ -329,7 +366,7 @@ TEST(LspSemantic, SignatureHelpReturnsExactCalleeSignature) {
 // the same tiny source so they're distinct objects with distinct
 // addresses, letting the test pin "stored model unchanged" by pointer
 // identity.
-TEST(LspSemantic, StaleSetSemanticModelIsDropped) {
+TEST(LspSemantic, StaleStoredModelIsNotOverwritten) {
     using dss::sem_test::buildShippedUnit;
 
     auto cuOld = buildShippedUnit("c", {"int x;\n"});
@@ -340,10 +377,22 @@ TEST(LspSemantic, StaleSetSemanticModelIsDropped) {
         dss::analyze(cuNew, dss::DiagnosticBudget::libraryDefault()));
     ASSERT_NE(modelOld.get(), modelNew.get());
 
+    auto const analysesWith = [](std::shared_ptr<dss::SemanticModel const> m) {
+        dss::lsp::DocumentAnalysis a;
+        a.model = std::move(m);
+        std::vector<dss::lsp::DocumentAnalysis> out;
+        out.push_back(std::move(a));
+        return out;
+    };
+    auto const storedModel = [](DocumentStore const& s) {
+        auto const all = s.analysesFor("file:///s.c");
+        return all.empty() ? nullptr : all.front().model.get();
+    };
+
     DocumentStore store;
     store.open("file:///s.c", 1, "int x;\n", nullptr);
-    ASSERT_TRUE(store.setSemanticModel("file:///s.c", 0, modelOld));
-    EXPECT_EQ(store.semanticModelFor("file:///s.c").get(), modelOld.get());
+    ASSERT_TRUE(store.setAnalyses("file:///s.c", 0, analysesWith(modelOld)));
+    EXPECT_EQ(storedModel(store), modelOld.get());
 
     // An update bumps the generation — anything keyed on gen 0 is now stale.
     auto newGen = store.update("file:///s.c", 2, "int y;\n");
@@ -352,9 +401,9 @@ TEST(LspSemantic, StaleSetSemanticModelIsDropped) {
 
     // A delayed worker storing its (gen 0) model must be rejected AND
     // must not overwrite the stored one.
-    EXPECT_FALSE(store.setSemanticModel("file:///s.c", 0, modelNew));
-    EXPECT_EQ(store.semanticModelFor("file:///s.c").get(), modelOld.get())
-        << "stale setSemanticModel must NOT overwrite the stored model";
+    EXPECT_FALSE(store.setAnalyses("file:///s.c", 0, analysesWith(modelNew)));
+    EXPECT_EQ(storedModel(store), modelOld.get())
+        << "a stale `setAnalyses` must NOT overwrite the stored model";
 }
 
 // SE7 diagnostic union: didOpen of a c doc containing a

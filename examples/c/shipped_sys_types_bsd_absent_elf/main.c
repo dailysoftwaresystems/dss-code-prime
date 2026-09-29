@@ -26,9 +26,9 @@
 // measured harness defects rather than anything about these names:
 // D-DIAG-PE-SPAN-LINE-MAPPING-SYNTHETIC-LINES (on pe64 a spanned diagnostic's
 // reported LINE is shifted, and the in-process runner and the CLI disagree on the
-// COLUMN) and D-TEST-POSITIONED-FALSE-REQUIRES-SPANLESS-RENDERING (`positioned:
-// false` is unusable here because the integrated CLI arm greps for the SYMBOLIC
-// rendering, which only SPAN-LESS diagnostics get). The pe absence is pinned by
+// COLUMN), and `positioned:false` is no escape from it — the integrated CLI
+// arm greps for the SYMBOLIC rendering, which only SPAN-LESS diagnostics get,
+// so the key is a REQUIREMENT and not a relaxation. The pe absence is pinned by
 // ShippedLibDescriptor.RealSysTypesBsdSpellingGroupPerFormat instead, and that
 // arm reds ALONE when a pe variant is added.
 #include <sys/types.h>

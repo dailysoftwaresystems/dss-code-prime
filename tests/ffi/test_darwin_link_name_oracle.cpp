@@ -53,9 +53,10 @@
 //      the undefined symbol it emits.
 //
 // That measurement is `tests/ffi/data/darwin-link-names.tsv`, taken on the
-// operator's Mac — 236 identifiers x 2 arches on macOS 26.5.2 (2026-08-25) plus
-// ELEVEN more on macOS 26.6.2 (2026-08-31), 247 identifiers today. Both dates and
-// both host versions live in that file's header rather than here, because a
+// operator's Mac — 236 identifiers x 2 arches on macOS 26.5.2 (2026-08-25), ELEVEN
+// more on macOS 26.6.2 (2026-08-31) and THREE more (the getopt family, 2026-09-23),
+// 250 identifiers today. The dates and host versions live in that file's header
+// rather than here, because a
 // TABLE's provenance belongs with the table. This file is the machinery that
 // holds the descriptors to it on every gate, on every host — the table is DATA,
 // so the check runs on Windows and Linux where no Mach-O can even be executed.
@@ -362,7 +363,7 @@ readLinkNames(fs::path const& descriptor, std::string_view arch) {
 TEST(DarwinLinkNameOracle, TableLoadsAndIsSubstantial) {
     auto const oracle = loadOracle();
     ASSERT_GE(oracle.size(), 200u)
-        << "the measured table holds 247 identifiers; a much smaller one means "
+        << "the measured table holds 250 identifiers; a much smaller one means "
            "it was truncated or the parser stopped early, and every census "
            "below would then pass by measuring nothing";
     // The eight MEASURED divergences, spelled out — the table is data, and this

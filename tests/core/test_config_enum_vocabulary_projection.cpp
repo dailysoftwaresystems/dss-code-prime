@@ -40,8 +40,8 @@
 // the change these pins guard. Before it, deleting a name from a message
 // reddened nothing anywhere. Now deleting a row from `kDataModelTable` reds
 // (A) immediately, because the shipped `c.lang.json` declares
-// `coreByDataModel: {"LLP64": …}` at seven pointers and a
-// `signatureByDataModel: {"LLP64": …}` at an eighth; the message follows the
+// `coreByDataModel: {"LLP64": …}` at seven pointers and a `signature` arm
+// keyed `when: {"dataModel": "LLP64"}` at an eighth; the message follows the
 // table automatically, so it can no longer be wrong on its own.
 //
 // ⚠ MUST run through ctest, never a bare `.exe`: `findShippedConfig` walks the
@@ -49,6 +49,7 @@
 // binary reads whichever config tree the shell happens to stand in.
 
 #include "core/types/config_path_walk.hpp"
+#include "core/types/constant_form.hpp"
 #include "core/types/data_model.hpp"
 #include "core/types/entry_shape.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -91,8 +92,8 @@ constexpr char const* kBadSpelling = "zzNotAnyEnumSpelling";
 // * `ProjectionProbeError`, `shippedLanguageDoc`, `at`, `summarize`,
 // `quotedTokens` and `findVocabularyMessage` used to be file-local copies
 // here. They now have ONE owner, `vocabulary_projection_probe.hpp`, for the
-// reason this whole file exists:
-// D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE. Two of the
+// reason this whole file exists: a probe helper copied per file drifts per
+// file. Two of the
 // copies had already drifted from their siblings (`findVocabularyMessage`
 // returned a COPY of the message here and a pointer in the target-side file;
 // `shippedLanguageDoc` took no argument in the composite-kind file); the
@@ -180,12 +181,16 @@ constexpr char const* kIgnoreProbeOnly[]  = {kBadSpelling};
 
 // ✔MEASURED 2026-08-20 by walking `c.lang.json` for every enum-keyed
 // map: `coreByDataModel` occurs at 7 pointers, `coreByLongDoubleFormat` at 2,
-// `elementCoreByFormat` at 2, `signatureByDataModel` at 1, `synthesizedTypes`
-// at 1 (three roles). One representative pointer of each is probed here, and
-// `at()` re-validates it on every run.
+// `signatureByDataModel` at 1, `synthesizedTypes` at 1 (three roles). One
+// representative pointer of each is probed here, and `at()` re-validates it on
+// every run (P68 round 12: `enumerationCompatibleTypes`, keyed by format convention,
+// at 1). `elementCoreByFormat` — the one map keyed on OBJECT-FORMAT names —
+// occurred at 2 until P68 round 9 deleted it (the loader refuses it now), so it
+// occurs at 0 and its probe site is gone with it.
 inline std::vector<KeyedMapSite> keyedMapSites() {
     static constexpr auto kDataModelNames  = allNames(dss::kDataModelTable);
     static constexpr auto kLongDoubleNames = allNames(dss::kLongDoubleFormatTable);
+    static constexpr auto kEnumRuleNames   = allNames(dss::kEnumCompatibleTypeRuleTable);
     return {
         {"c", {"/semantics/builtinTypes/1/coreByDataModel"}, "\"I32\"",
          "coreByDataModel", kDataModelNames, kIgnoreProbeOnly},
@@ -197,10 +202,11 @@ inline std::vector<KeyedMapSite> keyedMapSites() {
         {"c", {"/semantics/synthesizedTypes/pointerDifference"},
          "\"int\"", "synthesizedTypes/pointerDifference", kDataModelNames,
          kIgnoreProbeOnly},
-        {"c",
-         {"/hirLowering/stringLiteralPrefixes/4/elementCoreByFormat"},
-         "\"I32\"", "elementCoreByFormat",
-         dss::kSelectableObjectFormatKindNames, kIgnoreProbeOnly},
+        // P68 round 12 (lane `cs`): keyed by the FORMAT CONVENTION an object format
+        // names in `enumCompatibleTypeRule` — every convention the table spells.
+        {"c", {"/semantics/enumerationCompatibleTypes"},
+         "{\"unsigned\": [\"unsigned int\"], \"signed\": [\"int\"]}",
+         "enumerationCompatibleTypes", kEnumRuleNames, kIgnoreProbeOnly},
     };
 }
 
@@ -334,6 +340,8 @@ inline std::vector<ScalarSite> scalarSites() {
     static constexpr auto kBindingNames = allNames(dss::kSymbolBindingTable);
     static constexpr auto kVisNames     = allNames(dss::kSymbolVisibilityTable);
     static constexpr auto kVerbNames    = allNames(dss::kEntryMaterializationTable);
+    // P68 round 13 (lane `cs`): the 6.6p10 constant forms a static initializer may take.
+    static constexpr auto kConstantFormNames = allNames(dss::kConstantFormTable);
     return {
         {"c",
          "/semantics/declarations/7/linkageSpecifiers/weak/binding",
@@ -346,6 +354,8 @@ inline std::vector<ScalarSite> scalarSites() {
          kIgnoreProbeOnly},
         {"c", "/semantics/declarations/7/entryFunctions/main/0/verb",
          "entryFunctions verb", kVerbNames, kIgnoreVerb},
+        {"c", "/semantics/staticInitializers/otherConstantForms/0",
+         "staticInitializers constant form", kConstantFormNames, kIgnoreProbeOnly},
     };
 }
 

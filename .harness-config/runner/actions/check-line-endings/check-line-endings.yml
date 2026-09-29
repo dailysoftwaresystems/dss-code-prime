@@ -1,0 +1,20 @@
+# PURPOSE: refuse a tracked text blob that carries a CR, and a CR instrument that cannot see one.
+name: check-line-endings
+description: >-
+  The action refuses a CR in any tracked text blob, then proves its own watchdog bounds a hang.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `line_endings_guard` and `line_endings_watchdog_guard`.
+steps:
+  - name: verify
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-line-endings.py
+    successPattern: 'line-endings: OK \(committed'
+    requireInputsUnmoved: true
+  - name: watchdog
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-line-endings.py --selftest-watchdog
+    successPattern: 'line-endings: watchdog OK'
+    requireInputsUnmoved: true

@@ -18,6 +18,8 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <optional>
+#include <string>
 #include <variant>
 
 using namespace dss;
@@ -1721,7 +1723,7 @@ TEST(ConstEval, IterativeDeepCastChainFoldsFlatAndByteIdentical) {
     });
 }
 
-// ── TF-C94 (D-CSUBSET-INT128-CONSTFOLD): 128-bit const-folds keep 128 bits ──
+// ── TF-C94 (D-CSUBSET-INT128-CONSTFOLD-WIDE): 128-bit const-folds keep 128 bits ──
 //
 // `__int128` / `__uint128_t` bind to TypeKind::I128/U128 — STANDARD integer types
 // (not `_BitInt`), but 128 bits wide, so they do not fit the engine's int64/uint64
@@ -2184,4 +2186,393 @@ TEST(ConstEvalAsInt64Magnitude, AnUnsignedWideValueNeverBridgesToANegative) {
     EXPECT_FALSE(detail::asInt64(wideLit({0x8000000000000000ULL}, 64, false,
                                          TypeKind::BitInt)).has_value())
         << "an unsigned _BitInt(64) above INT64_MAX must not bridge to INT64_MIN";
+}
+
+// ═══ P68 round 13 (lane `cs`, the static-initializer item): ADDRESS CONSTANTS ═════════════
+//
+// With `EvalOptions::foldAddressConstants` the engine folds C 6.6p9's address constants to
+// `HirAddressValue`s — {base symbol | NULL, byte offset}, the relocation the static-data
+// producer emits — and the 6.6p10 forms `admittedForms` names. The static-data producer's
+// five shape classifiers were deleted for it, so these pins are the producer's too; each
+// pin's RED-ON-DISABLE names the arm it guards. The address facts come from the caller
+// (`EvalEnvironment`): these fixtures answer them the way `classifyGlobals` does — which
+// symbols are addressable, which may be null, the strides and offsets of the layout.
+namespace {
+
+constexpr std::uint32_t kSymA = 7;        // `int a[4]`
+constexpr std::uint32_t kSymB = 8;        // `int b[2]`
+constexpr std::uint32_t kSymF = 9;        // `int f(void)`
+constexpr std::uint32_t kSymW = 10;       // a WEAK declaration with no definition
+constexpr std::uint32_t kSymLocal = 11;   // an automatic object: no address constant
+constexpr std::uint32_t kSymStr = 20;     // a string literal's rodata object
+
+struct AddrRig : Rig {
+    TypeId u64T() { return interner.primitive(TypeKind::U64); }
+    TypeId u32T() { return interner.primitive(TypeKind::U32); }
+    TypeId charT() { return interner.primitive(TypeKind::Char); }
+    TypeId voidPtrT() { return interner.pointer(interner.primitive(TypeKind::Void)); }
+    TypeId arrT(TypeId elem, std::int64_t n) { return interner.array(elem, n); }
+    HirNodeId ref(std::uint32_t sym, TypeId ty) { return builder.makeRef(ty, sym); }
+    // `&sym[i]` over an `int[n]` object.
+    HirNodeId elemAddr(std::uint32_t sym, std::int64_t n, std::int64_t i) {
+        HirNodeId const base = ref(sym, arrT(intT(), n));
+        HirNodeId const ix = builder.makeIndex(base, litInt(i, i64T()), intT());
+        return builder.makeAddressOf(ix, interner.pointer(intT()));
+    }
+    // The array designator `sym` decaying to `int *`.
+    HirNodeId decay(std::uint32_t sym, std::int64_t n) {
+        return builder.makeCast(ref(sym, arrT(intT(), n)), interner.pointer(intT()));
+    }
+    // `&sym` of an `int[n]` object, as `int (*)[n]`.
+    HirNodeId wholeAddr(std::uint32_t sym, std::int64_t n) {
+        return builder.makeAddressOf(ref(sym, arrT(intT(), n)), interner.pointer(arrT(intT(), n)));
+    }
+};
+
+EvalEnvironment addressEnv(TypeInterner& in) {
+    EvalEnvironment env;
+    env.resolveAddressableSymbol = [](SymbolId s) -> std::optional<AddressableSymbol> {
+        if (s.v == kSymA || s.v == kSymB || s.v == kSymF || s.v == kSymStr)
+            return AddressableSymbol{false};
+        if (s.v == kSymW) return AddressableSymbol{true};
+        return std::nullopt;   // kSymLocal: an automatic object has no link-time address
+    };
+    env.resolveStringLiteralSymbol = [](HirNodeId) -> std::optional<SymbolId> {
+        return SymbolId{kSymStr};
+    };
+    env.resolveElementStride = [&in](TypeId t) -> std::optional<std::uint64_t> {
+        switch (in.kind(t)) {
+            case TypeKind::Char: return 1;
+            case TypeKind::I32:  return 4;
+            case TypeKind::Void: return 1;   // GNU `void *` arithmetic
+            default:             return std::nullopt;
+        }
+    };
+    env.resolveTypeSize = [&in](TypeId t) -> std::optional<std::uint64_t> {
+        switch (in.kind(t)) {
+            case TypeKind::Ptr: return 8;    // LP64
+            case TypeKind::U64: case TypeKind::I64: return 8;
+            case TypeKind::U32: case TypeKind::I32: return 4;
+            default: return std::nullopt;
+        }
+    };
+    return env;
+}
+
+ConstEvalResult evalAddr(AddrRig& r, HirNodeId expr, ConstantForms forms,
+                         bool foldAddresses = true) {
+    Hir hir = r.finishWith(expr);
+    EvalOptions opts;
+    opts.charIsUnsigned       = false;
+    opts.foldAddressConstants = foldAddresses;
+    opts.admittedForms        = forms;
+    return evaluateConstant(hir, r.interner, r.literals, expr, addressEnv(r.interner), opts);
+}
+
+constexpr std::array<ConstantForm, 7> kEveryForm{
+    ConstantForm::ConstObjectRead, ConstantForm::CommaOperator,
+    ConstantForm::AddressAsInteger, ConstantForm::AddressTruthValue,
+    ConstantForm::AddressComparison, ConstantForm::AddressDifference,
+    ConstantForm::AddressIntegerAlgebra};
+
+ConstantForms allForms() {
+    ConstantForms f;
+    for (ConstantForm x : kEveryForm) f.admit(x);
+    return f;
+}
+
+ConstantForms allBut(ConstantForm off) {
+    ConstantForms f;
+    for (ConstantForm x : kEveryForm)
+        if (x != off) f.admit(x);
+    return f;
+}
+
+void expectAddress(ConstEvalResult const& res, std::uint32_t base, std::int64_t offset,
+                   TypeKind core = TypeKind::Ptr) {
+    ASSERT_TRUE(res.value.has_value()) << "failure " << static_cast<int>(res.failure);
+    auto const* a = std::get_if<HirAddressValue>(&res.value->value);
+    ASSERT_NE(a, nullptr) << "the value must be an address";
+    EXPECT_EQ(a->base, base);
+    EXPECT_EQ(a->byteOffset, offset);
+    EXPECT_EQ(res.value->core, core);
+}
+
+void expectInt(ConstEvalResult const& res, std::int64_t v) {
+    ASSERT_TRUE(res.value.has_value()) << "failure " << static_cast<int>(res.failure);
+    auto const bits = detail::asIntBits(*res.value);
+    ASSERT_TRUE(bits.has_value()) << "the value must be an integer";
+    EXPECT_EQ(*bits, v);
+}
+
+void expectRefused(ConstEvalResult const& res) {
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
+}
+
+} // namespace
+
+// `&a[2]` is `a` plus two elements at the runtime stride. RED-ON-DISABLE: the LIndex frame
+// (drop the stride term: offset 0).
+TEST(ConstEvalAddress, AnElementAddressIsItsSymbolPlusTheStride) {
+    AddrRig r;
+    expectAddress(evalAddr(r, r.elemAddr(kSymA, 4, 2), {}), kSymA, 8);
+}
+
+// The OFF switch: every consumer but the static-data producer keeps "a pointer is not
+// foldable". RED-ON-DISABLE: ignore `foldAddressConstants`.
+TEST(ConstEvalAddress, WithoutTheSwitchAnAddressIsNotAConstant) {
+    AddrRig r;
+    auto const res = evalAddr(r, r.elemAddr(kSymA, 4, 2), allForms(), /*foldAddresses=*/false);
+    EXPECT_FALSE(res.value.has_value());
+}
+
+// An array designator decays; `a + 1` and `1 + a` are both 6.6p7, and so is `&a[2] - 1`.
+// RED-ON-DISABLE: the Cast frame's decay path (the Ref would read the object's value).
+TEST(ConstEvalAddress, ADecayingArrayPlusOrMinusAnIntegerInEitherOrder) {
+    {
+        AddrRig r;
+        HirNodeId const e = r.binary(HirOpKind::Add, r.decay(kSymA, 4), r.litInt(1, r.i64T()),
+                                     r.interner.pointer(r.intT()));
+        expectAddress(evalAddr(r, e, {}), kSymA, 4);
+    }
+    {
+        AddrRig r;
+        HirNodeId const e = r.binary(HirOpKind::Add, r.litInt(1, r.i64T()), r.decay(kSymA, 4),
+                                     r.interner.pointer(r.intT()));
+        expectAddress(evalAddr(r, e, {}), kSymA, 4);
+    }
+    {
+        AddrRig r;
+        HirNodeId const e = r.binary(HirOpKind::Sub, r.elemAddr(kSymA, 4, 2),
+                                     r.litInt(1, r.i64T()), r.interner.pointer(r.intT()));
+        expectAddress(evalAddr(r, e, {}), kSymA, 4);
+    }
+}
+
+// A pointer cast keeps the address and re-strides it: `(char *)&a + 4` is 4 BYTES on.
+TEST(ConstEvalAddress, APointerCastKeepsTheAddressAndChangesTheStride) {
+    AddrRig r;
+    HirNodeId const asChar = r.cast(r.wholeAddr(kSymA, 4), r.interner.pointer(r.charT()));
+    HirNodeId const e = r.binary(HirOpKind::Add, asChar, r.litInt(4, r.i64T()),
+                                 r.interner.pointer(r.charT()));
+    expectAddress(evalAddr(r, e, {}), kSymA, 4);
+}
+
+// 6.6p9: an integer constant cast to a pointer is a NULL-base address (no relocation).
+TEST(ConstEvalAddress, AnIntegerConstantCastToAPointerIsANullBaseAddress) {
+    AddrRig r;
+    expectAddress(evalAddr(r, r.cast(r.litInt(0x10, r.i64T()), r.voidPtrT()), {}),
+                  HirAddressValue::kNullBase, 0x10);
+}
+
+// An automatic object has no address constant (the caller's facts say so).
+// RED-ON-DISABLE: default a symbol to addressable.
+TEST(ConstEvalAddress, AnAutomaticObjectsAddressIsNotAConstant) {
+    AddrRig r;
+    HirNodeId const e = r.builder.makeAddressOf(r.ref(kSymLocal, r.intT()),
+                                                r.interner.pointer(r.intT()));
+    expectRefused(evalAddr(r, e, allForms()));
+}
+
+// A `?:` folds only the arm its condition selects: `1 ? &a[0] : &local` IS a constant
+// (all four references build it; the unselected arm is not evaluated).
+TEST(ConstEvalAddress, AConditionSelectsOneAddressArm) {
+    AddrRig r;
+    HirNodeId const bad = r.builder.makeAddressOf(r.ref(kSymLocal, r.intT()),
+                                                  r.interner.pointer(r.intT()));
+    HirNodeId const e = r.ternary(r.litInt(1, r.intT()), r.elemAddr(kSymA, 4, 0), bad,
+                                  r.interner.pointer(r.intT()));
+    expectAddress(evalAddr(r, e, {}), kSymA, 0);
+}
+
+// `AddressAsInteger` (all four references): an address in an integer EXACTLY as wide as a
+// pointer, plus a constant. A narrower integer is refused by every reference, and so is the
+// form's absence. RED-ON-DISABLE: drop the width test (the `unsigned int` arm folds).
+TEST(ConstEvalAddress, AnAddressSurvivesOnlyInAPointerWideInteger) {
+    auto build = [](AddrRig& r, TypeId intTy) {
+        HirNodeId const asInt = r.cast(r.wholeAddr(kSymA, 4), intTy);
+        return r.binary(HirOpKind::Add, asInt, r.litInt(5, intTy), intTy);
+    };
+    {
+        AddrRig r;
+        expectAddress(evalAddr(r, build(r, r.u64T()), allForms()), kSymA, 5, TypeKind::U64);
+    }
+    {
+        AddrRig r;
+        expectRefused(evalAddr(r, build(r, r.u32T()), allForms()));
+    }
+    {
+        AddrRig r;
+        expectRefused(evalAddr(r, build(r, r.u64T()), allBut(ConstantForm::AddressAsInteger)));
+    }
+}
+
+// `AddressTruthValue` (gcc, clang, mingw-w64): `!&a[0]` is 0 — a static object's address is
+// never null — but a WEAK declaration's may be, so it has no truth value (gcc and clang
+// refuse it). RED-ON-DISABLE: ignore `baseMayBeNull` (the weak arm folds).
+TEST(ConstEvalAddress, AnAddressHasATruthValueUnlessItsSymbolMayBeNull) {
+    {
+        AddrRig r;
+        expectInt(evalAddr(r, r.unary(HirOpKind::Not, r.elemAddr(kSymA, 4, 0), r.intT()),
+                           allForms()), 0);
+    }
+    {
+        AddrRig r;
+        HirNodeId const w = r.builder.makeAddressOf(r.ref(kSymW, r.intT()),
+                                                    r.interner.pointer(r.intT()));
+        expectRefused(evalAddr(r, r.unary(HirOpKind::Not, w, r.intT()), allForms()));
+    }
+    {
+        AddrRig r;
+        expectRefused(evalAddr(r, r.unary(HirOpKind::Not, r.elemAddr(kSymA, 4, 0), r.intT()),
+                               allBut(ConstantForm::AddressTruthValue)));
+    }
+}
+
+// An ADDRESS as a CONDITION (a ternary's, a `&&` / `||` operand's) has the address's own truth
+// value: a static object's is true, a NULL base's is its integer's, a weak declaration's has none,
+// and without `AddressTruthValue` a symbol's has none either. C never hands the engine this shape
+// — the front end lowers a pointer condition to `p != (T *)0` because C's integer zero is a null
+// pointer constant — so it is a language without that rule (and only it) whose conditions reach
+// the engine as addresses, and only a HIR-level pin sees the arm. RED-ON-DISABLE: give an address
+// no truth value in a condition (`truthOf`'s address arm answers nothing) — every folding case
+// below is then refused.
+TEST(ConstEvalAddress, AnAddressAsAConditionHasItsOwnTruthValue) {
+    {
+        AddrRig r;   // &a[0] ? 42 : 1
+        HirNodeId const e = r.ternary(r.elemAddr(kSymA, 4, 0), r.litInt(42, r.intT()),
+                                      r.litInt(1, r.intT()), r.intT());
+        expectInt(evalAddr(r, e, allForms()), 42);
+    }
+    {
+        AddrRig r;   // (int *)0 ? 1 : 42 — a NULL base is its integer, 0: false
+        HirNodeId const nullBase = r.cast(r.litInt(0, r.intT()), r.interner.pointer(r.intT()));
+        HirNodeId const e = r.ternary(nullBase, r.litInt(1, r.intT()), r.litInt(42, r.intT()),
+                                      r.intT());
+        expectInt(evalAddr(r, e, allForms()), 42);
+    }
+    {
+        AddrRig r;   // &a[0] && 1, and 0 || &a[1]: the operand arms
+        expectInt(evalAddr(r, r.logAnd(r.elemAddr(kSymA, 4, 0), r.litInt(1, r.intT())), allForms()),
+                  1);
+        AddrRig r2;
+        expectInt(evalAddr(r2, r2.logOr(r2.litInt(0, r2.intT()), r2.elemAddr(kSymA, 4, 1)),
+                           allForms()),
+                  1);
+    }
+    {
+        AddrRig r;   // &w ? 1 : 2 — a weak declaration's address may be null: no truth value
+        HirNodeId const w = r.builder.makeAddressOf(r.ref(kSymW, r.intT()),
+                                                    r.interner.pointer(r.intT()));
+        HirNodeId const e = r.ternary(w, r.litInt(1, r.intT()), r.litInt(2, r.intT()), r.intT());
+        EXPECT_FALSE(evalAddr(r, e, allForms()).value.has_value());
+    }
+    {
+        AddrRig r;   // without the form a symbol's address has no truth value
+        HirNodeId const e = r.ternary(r.elemAddr(kSymA, 4, 0), r.litInt(42, r.intT()),
+                                      r.litInt(1, r.intT()), r.intT());
+        EXPECT_FALSE(evalAddr(r, e, allBut(ConstantForm::AddressTruthValue)).value.has_value());
+    }
+}
+
+// `AddressComparison` and `AddressDifference` (gcc, clang, mingw-w64): within one object by
+// offset; two objects are unequal; `<` or a difference ACROSS objects is refused by all four.
+TEST(ConstEvalAddress, ComparisonsAndDifferencesFollowTheObject) {
+    {
+        AddrRig r;   // &a[1] < &a[2]
+        HirNodeId const e = r.binary(HirOpKind::Lt, r.elemAddr(kSymA, 4, 1),
+                                     r.elemAddr(kSymA, 4, 2), r.intT());
+        expectInt(evalAddr(r, e, allForms()), 1);
+    }
+    {
+        AddrRig r;   // &a[0] == &b[0]
+        HirNodeId const e = r.binary(HirOpKind::Eq, r.elemAddr(kSymA, 4, 0),
+                                     r.elemAddr(kSymB, 2, 0), r.intT());
+        expectInt(evalAddr(r, e, allForms()), 0);
+    }
+    {
+        AddrRig r;   // &a[0] < &b[0] — across objects
+        HirNodeId const e = r.binary(HirOpKind::Lt, r.elemAddr(kSymA, 4, 0),
+                                     r.elemAddr(kSymB, 2, 0), r.intT());
+        expectRefused(evalAddr(r, e, allForms()));
+    }
+    {
+        AddrRig r;   // &a[3] - &a[1] == 2 elements
+        HirNodeId const e = r.binary(HirOpKind::Sub, r.elemAddr(kSymA, 4, 3),
+                                     r.elemAddr(kSymA, 4, 1), r.i64T());
+        expectInt(evalAddr(r, e, allForms()), 2);
+    }
+    {
+        AddrRig r;   // … refused without the form
+        HirNodeId const e = r.binary(HirOpKind::Sub, r.elemAddr(kSymA, 4, 3),
+                                     r.elemAddr(kSymA, 4, 1), r.i64T());
+        expectRefused(evalAddr(r, e, allBut(ConstantForm::AddressDifference)));
+    }
+    {
+        AddrRig r;   // &a[0] - &b[0] — across objects
+        HirNodeId const e = r.binary(HirOpKind::Sub, r.elemAddr(kSymA, 4, 0),
+                                     r.elemAddr(kSymB, 2, 0), r.i64T());
+        expectRefused(evalAddr(r, e, allForms()));
+    }
+}
+
+// `AddressIntegerAlgebra` (gcc, mingw-w64): only the identity and absorbing elements —
+// `* 0` is 0, `* 1` the address, `* 2` refused by every reference.
+TEST(ConstEvalAddress, AnAddressIntegerKeepsOnlyTheIdentityAndAbsorbingElements) {
+    auto build = [](AddrRig& r, HirOpKind op, std::int64_t k) {
+        return r.binary(op, r.cast(r.wholeAddr(kSymA, 4), r.u64T()), r.litInt(k, r.u64T()),
+                        r.u64T());
+    };
+    { AddrRig r; expectInt(evalAddr(r, build(r, HirOpKind::Mul, 0), allForms()), 0); }
+    { AddrRig r; expectAddress(evalAddr(r, build(r, HirOpKind::Mul, 1), allForms()), kSymA, 0,
+                               TypeKind::U64); }
+    { AddrRig r; expectRefused(evalAddr(r, build(r, HirOpKind::Mul, 2), allForms())); }
+    { AddrRig r; expectRefused(evalAddr(r, build(r, HirOpKind::Mul, 0),
+                                        allBut(ConstantForm::AddressIntegerAlgebra))); }
+}
+
+// A function designator is its address, and `*f` is the designator again (all four).
+TEST(ConstEvalAddress, AFunctionDesignatorAndItsDerefAreItsAddress) {
+    AddrRig r;
+    TypeId const fnTy = r.interner.fnSig({}, r.intT(), CallConv::CcSysV);
+    HirNodeId const e = r.builder.makeDeref(r.ref(kSymF, fnTy), fnTy);
+    expectAddress(evalAddr(r, e, {}), kSymF, 0);
+}
+
+// A string literal's address is its interned object's (`"x*" + 1`).
+TEST(ConstEvalAddress, AStringLiteralIsItsInternedObject) {
+    AddrRig r;
+    HirLiteralValue s;
+    s.value = std::string{"x*"};
+    s.core  = TypeKind::Char;
+    HirNodeId const lit = r.builder.makeLiteral(r.arrT(r.charT(), 3), r.literals.add(s));
+    HirNodeId const decayed = r.cast(lit, r.interner.pointer(r.charT()));
+    HirNodeId const e = r.binary(HirOpKind::Add, decayed, r.litInt(1, r.i64T()),
+                                 r.interner.pointer(r.charT()));
+    expectAddress(evalAddr(r, e, {}), kSymStr, 1);
+}
+
+// A SEQUENCE: its value alone (`({ 42; })`) needs no form; discarding an operand (`(1, 42)`)
+// is the `commaOperator` form. RED-ON-DISABLE: gate every sequence on the form (the first
+// arm is refused), or none (the third folds).
+TEST(ConstEvalAddress, ASequenceDiscardingNothingNeedsNoForm) {
+    {
+        AddrRig r;
+        std::array<HirNodeId, 0> none{};
+        HirNodeId const e = r.builder.makeSeqExpr(none, r.litInt(42, r.intT()), r.intT());
+        expectInt(evalAddr(r, e, {}), 42);
+    }
+    {
+        AddrRig r;
+        std::array<HirNodeId, 1> one{r.builder.makeExprStmt(r.litInt(1, r.intT()))};
+        HirNodeId const e = r.builder.makeSeqExpr(one, r.litInt(42, r.intT()), r.intT());
+        expectInt(evalAddr(r, e, allForms()), 42);
+    }
+    {
+        AddrRig r;
+        std::array<HirNodeId, 1> one{r.builder.makeExprStmt(r.litInt(1, r.intT()))};
+        HirNodeId const e = r.builder.makeSeqExpr(one, r.litInt(42, r.intT()), r.intT());
+        expectRefused(evalAddr(r, e, allBut(ConstantForm::CommaOperator)));
+    }
 }

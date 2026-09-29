@@ -1,5 +1,23 @@
 # The bar — non-negotiable, re-read every cycle
 
+## Contents
+A. The bar — non-negotiable, re-read every cycle:
+- §A.1 Source / target / linker agnostic — §A.1b reuse the pipeline's existing verbs
+- §A.2 Best long-term solution, no workarounds
+- §A.3 No follow-ups for the hard part — §A.3b the goal is to WORK
+- §A.4 Fail loud
+- §A.5 Strict-assertion tests — aggregate op-count pins · the red-on-disable demonstration needs its
+  own guard · a green red-on-disable is unproven until the mutant was READ · the restored bytes too · a
+  vacuous asm pin can survive both arms · drive the subject's real input path · multi-site contracts ·
+  the real-execution corpus example · cross-target runtime closure
+- §A.6 The full commit gate
+- §A.7 No un-anchored issue — (a) anchor it now · (b) address it properly · (c) the quick-fix rule
+
+This file numbers the steps the older way (Step 6 = `SKILL.md`'s step 7, Step 10 = its step 12); the
+crosswalk is at the top of `workflow-steps.md`.
+
+AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — where this file sends a FORK to the user as a §B decision, a meaning fork or a documented-behaviour change included, or a new engine mechanism at the plan's design audit, `SKILL.md`'s step 4, the agent now decides it by measurement and the references' own documentation, writes the rationale into the row and reports it veto-able. The gates' three ESCAPE HATCHES stay the operator's — a deferral, §A.7 clause c; carrying a net-open rise, the balance gate's escalation; growing a ratchet baseline, `UNCOVERED_BASELINE` and its kind — because standing orders govern all three: close, do not file; no follow-ups; a ratchet only comes down. Each is a PAUSE with one crisp question, never an agent decision (see SKILL.md, the decision gate)
+
 ## A. The bar — NON-NEGOTIABLE (re-read every cycle)
 
 These hold for every line of code, every test, every commit. A cycle that cannot meet the
@@ -9,7 +27,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    `if (schema.name() == "...")`, `if (arch == "...")`, `if (format == "...")`. Vocabulary
    is config-driven (`.lang.json` / `.target.json` / `.format.json`); the engine walks a
    closed verb set, never a language/CPU/format identity. This is a hard veto: if the only
-   way you see forward is an identity branch, that is a **decision gate** (§B), not a cycle.
+   way you see forward is an identity branch, that is a **decision gate** (§B), not a cycle. AMENDED 2026-09-21 by the decision gate — the only admissible decision here is NO identity branch, because this is a hard veto: the agent designs the config-driven form, and a case it cannot design is pause case a (see SKILL.md)
    - **★★★ 1b. REUSE THE PIPELINE'S EXISTING VERBS — a language-private verb set is the SLOW
      form of this same violation, and the grep above CANNOT SEE IT.** A new source language
      lands by binding its surface names to vocabulary that **already exists** in the
@@ -111,8 +129,8 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      whose own failure is unbounded: **a mutation that silently no-ops makes the pin report green,
      and that green reads exactly like earned confidence.** ✔MEASURED 2026-08-06: a mutator process
      was killed by a cygwin fork error before it edited anything; the pin passed, as it correctly
-     should have, and was briefly read as "the guard is not vacuous"
-     (`D-GATE-RED-ON-DISABLE-MUTATION-CAN-SILENTLY-NO-OP`). So every demonstration must be
+     should have, and was briefly read as "the guard is not vacuous".
+     So every demonstration must be
      **fail-closed**: the witness text is UNIQUE in the subject, the mutant DIFFERS byte-wise
      (`cmp`/hash — **never a line count**, which a same-length replacement slips straight past),
      the witness is ABSENT from the mutant, and the mutant still parses. Never infer that a mutator
@@ -129,8 +147,8 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      SAME MATCHER THE PIN USES**, not by eye and not by a different reader. Describe a mutation in
      the harness's output, never inside the mutated file.
      ★★ **AND AN EMPTY MUTATION ANCHOR MATCHES EVERYWHERE — SO A FAIL-CLOSED CHECK WRITTEN
-     AROUND ONE FIRES *AFTER* THE DAMAGE.** ⚠ ✔MEASURED 2026-08-20 (cycle P23,
-     `D-GATE-RED-ON-DISABLE-EMPTY-RESTORE-ANCHOR-MATCHES-EVERYWHERE`): a mutation whose replacement
+     AROUND ONE FIRES *AFTER* THE DAMAGE.** ⚠ ✔MEASURED 2026-08-20 (cycle P23):
+     a mutation whose replacement
      text was the empty string made the RESTORE anchor `""`, and `str.count("")` returns **`len + 1`**
      — 8,181 on the subject file. The uniqueness clause therefore tripped on the restore, *after*
      the forward half had already run, and the source was left mutated with a totality
@@ -148,18 +166,16 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      why the rule has to be about the *read*, not about any one layer:
      - **The mutant was never COMPILED IN.** `ninja -t deps <obj>` reported **`#deps 0`** — ninja had
        recorded zero header dependencies, so a header-only change did not rebuild its consumer.
-       **10 of 403 objects** in `build-dbg` were in that state
-       (`D-BUILD-NINJA-RECORDS-ZERO-HEADER-DEPS-UNDER-CONCURRENT-BUILDS`). ⇒ use the subject
+       **10 of 403 objects** in `build-dbg` were in that state. ⇒ use the subject
        **binary's mtime** as the build-success criterion. **Never a grep over build output** — the
        same lane's grep reported "BUILD OK" over a link that had failed.
      - **The mutant was never LOADED.** `findShippedConfig` reads `DSS_CONFIG_ROOT` *else* walks the
        cwd. `dss_add_test` sets that variable, so **ctest** reads the intended tree — but running a
        test `.exe` **directly** takes the cwd-walk and silently reads whichever tree the shell stands
        in, so a worktree binary run from the shared tree's cwd read the *shared* config and never saw
-       the mutant (`D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE`). ⇒ **a config-level
-       red-on-disable MUST run through `ctest`, never a bare `.exe`.**
-     - **The mutant was COMPILED IN — TO THE WRONG BINARY.** ✔MEASURED 2026-08-20 (cycle P23,
-       `D-TEST-RED-ON-DISABLE-MTIME-WITNESS-MUST-BE-THE-ARTIFACT-THAT-RUNS-THE-ASSERTION`): the
+       the mutant. ⇒ **a config-level
+       red-on-disable MUST run through `ctest`, never a bare `.exe`.** [→ today that is `dssharness test --filter <regex>`, which runs ctest — one mutant per call](dss-harness.md)
+     - **The mutant was COMPILED IN — TO THE WRONG BINARY.** ✔MEASURED 2026-08-20 (cycle P23): the
        mutated predicate was a **header inline**. A narrow build rebuilt the shared library and its
        mtime advanced — the instrument the clause above prescribes, behaving exactly as written
        — and the pin stayed **GREEN**, because the assertion under test calls the copy of the
@@ -172,8 +188,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
        another lane — **a mutant that reds the WRONG test is the same signal as one that reds
        nothing.** Read *which* test went red, never the count.
      - **The witness MOVED WITHOUT THE MUTANT — and this one indicts the instrument the first
-       bullet prescribes.** ✔MEASURED 2026-08-24 (cycle P31,
-       `D-TEST-A-PE-IMAGE-MD5-IS-NOT-A-COMPILED-IN-PROOF`): **a PE image carries a LINK TIMESTAMP**,
+       bullet prescribes.** ✔MEASURED 2026-08-24 (cycle P31): **a PE image carries a LINK TIMESTAMP**,
        so the shipped DLL's md5 moved **between two builds of IDENTICAL sources**
        (`5e6cbe74…` vs `10eb22ea…`), and moved for CONFIG-ONLY mutants that recompile
        nothing. ⇒ **a moved image md5 is NOT evidence the mutant compiled in — it is evidence
@@ -194,7 +209,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
        refusal it names** — a mutant can be compiled into the right artifact and still exercise
        nothing. Where the two disagree, the message wins.
      - **The OBJECT moved and the mutant still never ran — because the LINK failed.** ✔MEASURED
-       2026-08-24 (cycle P31, `D-TEST-A-MOVED-OBJECT-MD5-IS-NOT-A-REACHED-THE-BINARY-PROOF`), one
+       2026-08-24 (cycle P31), one
        cycle after the bullet above prescribed the object as the subject: a code mutant's ctest run
        came back GREEN twice with the object md5 correctly MOVED both times. The compile had
        succeeded; the link had not — `ld.exe: cannot open output file
@@ -218,7 +233,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      A red-on-disable makes **two** claims — *mutant RED* **and** *subject GREEN* — and a stale binary
      silently invalidates the second. The rule above is stated only for the mutate direction, and every
      word of it applies identically to the restore.
-     ✔MEASURED 2026-08-17 (`D-GATE-RED-ON-DISABLE-RESTORE-NOT-PROVEN-TO-REACH-THE-PROCESS`): a mutation
+     ✔MEASURED 2026-08-17: a mutation
      script restored the SOURCE in its `finally` and never rebuilt, so the next script's "UNMUTATED"
      column ran against a binary that still contained the mutant. **Both of its columns were therefore
      the mutant — and they agreed perfectly, which reads exactly like a stable measurement.** It
@@ -242,7 +257,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      tokens — clean by construction, in a shape the driver NEVER RECEIVES — and so could not see
      that the real path returned `ran\r` on Windows (Python writes stdout in text mode; `read -r`
      strips `\n` and keeps `\r`), which would have made the driver reject EVERY legitimate token
-     and fail every run (`D-TEST-A-PIN-THAT-STUBS-ITS-SUBJECTS-INPUT-IS-TESTING-THE-STUB`).
+     and fail every run.
      **A pin that supplies its subject's input in a form the subject never sees is testing the
      stub.** Extract and execute the shipped code path. Where a stub is genuinely unavoidable,
      assert the stub matches what the real path produces. ★ And prefer assertions on **CONTENT**
@@ -295,9 +310,11 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      proof" that byte-pinned green then SIGSEGV'd on the native-arm64 leg; `dbf84b0` was the x30
      fix). So such a feature is **NOT `✅ CLOSED` on local-green + byte-pins** — it stays
      *runtime-pending* until the binary has actually **executed on the target** and produced the
-     asserted exit/stdout. Each cross-target has a matching CI leg that builds AND runs `ctest`
-     **natively** — gate the closure on that leg going **green** (push, confirm via next cycle's
-     Step 0 baseline or `gh run watch`, then mark CLOSED; never on the push alone):
+     asserted exit/stdout. Gate the closure on the round's eight-run gate — `{Debug, Release} ×
+     four legs`, whose macOS arm64 and arm64 VPS legs build AND run `ctest` **natively** — going **green**,
+     plus a read of CI (`dssharness check-ci-legs`) when the operator has run it; never on the push alone,
+     and a cycle never triggers CI. The matching CI legs, which run only when the operator adds the
+     `Run Pipes` label:
        - **ARM64-Linux** → the native `ubuntu-24.04-arm` leg (`run-linux-arm64: true`); RISC-V /
          WASM → an emulator-gated leg.
        - **macOS-ARM64** → the **`macos-latest` (Apple Silicon) leg** (`run-macos: true`) — it
@@ -311,7 +328,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      one target with no off-Mac emulator** (nothing runs a Mach-O on Windows/Linux) — so from a
      non-Mac host (the loop's usual env) either hand the Mach-O to a Mac for a manual pre-push run
      (a 2-step, **§B** hand-off: present the binary + expected exit/stdout) or rely on the
-     `macos-latest` CI leg to execute it post-push.
+     `macos-latest` CI leg to execute it post-push. SUPERSEDED 2026-09-14 by the eight-run end-of-round gate — the macOS arm64 legs run on the Mac through dssharness, and CI runs only when the operator adds the Run Pipes label (see round-gate-and-ci.md)
      In every case ALSO ship a **host-independent** structural pin that is red-on-disable on
      *every* leg (e.g. the non-leaf frame puts the link register into `savedRegs`), so a
      regression is caught even when the one execution path is unavailable — the execution run is
@@ -330,9 +347,12 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    fix belongs to a later cycle.** "Not my cycle" / "I'll remember it" / "I excluded the failing
    test" / "it passes on the other leg" / "green modulo X" is *precisely the trigger to anchor*,
    never license to drop. Two obligations, BOTH mandatory, BOTH in **this** cycle:
-   - **(a) Anchor it now** — a real registry row in the deferred-anchor registry: `-production.md`
-     if a USER of the compiler could hit it, `-harness.md` if only WE can (name +
-     what/why + trigger + closing-work), committed THIS cycle. A prose-only note in a commit
+   - **(a) Anchor it now** — a real registry row in `-production.md` (name + what/why + trigger +
+     closing-work), committed THIS cycle. ⚠ **There is no second working registry to route to.**
+     Since 2026-09-16 `-harness.md` does not exist: a defect in **DssHarness itself** is reported to
+     repo-harness and never worked around here, and everything else — including a defect only WE can
+     hit, in this repository's build wiring, tests or plans — is a production row like any other.
+     A prose-only note in a commit
      message, a chat reply, or a code comment is **NOT** an anchor: an un-anchored issue is
      invisible to the next cycle, to the anchor guard, and to the plan sweep — so it *will* be
      silently lost. (If the issue is a live `D-*` you must also cite it in `src`/config; if it is
@@ -381,15 +401,16 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      - **REPORT THE OPEN COUNT AT STEP 10, EVERY CYCLE, WITH ITS DELTA.** A cycle that closes
        fewer rows than it opens is not automatically wrong — a real investigation legitimately
        opens rows — but a sustained positive delta means the quick-fix rule is being skipped, and
-       the number is what makes that visible instead of arguable. `scripts/check-anchor-registry/check-anchor-registry.sh`
-       already prints the total; the per-cycle honest line is "opened N, closed M, net ±K".
+       the number is what makes that visible instead of arguable. `dssharness check-anchor-balance`
+       already prints the OPEN total and the cycle's delta; the per-cycle honest line is "opened N,
+       closed M, net ±K".
    A workaround that *hides* an issue (excluding a failing test, catch-and-swallow, "it's green
    on the other leg so ignore it here") is the exact silent-failure the bar exists to prevent —
    it violates §A.2 (no workarounds) and §A.4 (fail loud) as well as this rule. **Motivating
    catch:** the TF-C51 fat-archive gate hit a real GNU-on-Windows COFF `-Wa,-mbig-obj` scope gap
    on an *unrelated* test TU (`test_mir_to_lir.cpp`, "file too big"); the first instinct —
    exclude that test from the Windows leg — was a workaround. Correct handling per §A.7:
-   root-cause → anchor `D-BUILD-GNU-WINDOWS-BIGOBJ-SCOPE` → fix it (project-wide flag) → witness
+   root-cause → anchor it → fix it (project-wide flag) → witness
    the TU now builds+passes → commit. **An orthogonal issue you merely *found* is still yours to
    anchor + handle** — the discovery is the obligation.
 

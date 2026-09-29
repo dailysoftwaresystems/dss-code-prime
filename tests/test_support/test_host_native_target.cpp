@@ -1,6 +1,6 @@
 // Self-test for the host-native-target chokepoint.
 //
-// D-TEST-HOST-SPAWNS-FOREIGN-BINARY. `hostNativeTarget()` selects its arm with
+// A HOST MUST NOT SPAWN A FOREIGN BINARY. `hostNativeTarget()` selects its arm with
 // the preprocessor, so ONLY the arm matching the machine running this test is
 // ever compiled. A typo or a stale spelling in any other arm is invisible here
 // and shows up as a CI red on that host — which is exactly how the arm64 arm

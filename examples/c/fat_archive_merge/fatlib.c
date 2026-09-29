@@ -7,7 +7,7 @@
  * the merged `dss_input_answer` (from input.a). Unreferenced here on purpose --
  * its presence proves the fat lib has its own member independent of the merge.
  *
- * D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM -- WHY THIS BODY IS NOT
+ * THE `dependsOn` RELEASE ARM -- WHY THIS BODY IS NOT
  * `return 7;`. `expected.json` now declares a `release` arm; with the runner
  * building each prerequisite library under the arm's OWN configuration, this
  * CU is compiled by the shipped release pipeline too. Giving it the

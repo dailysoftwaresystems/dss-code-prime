@@ -2603,12 +2603,12 @@ TEST(ParserCSmoke, TypedefPostKeywordAttributeRidesTheSpecifierPrefix) {
 // non-Token node` assertion — exit 0xc0000409, the whole binary dead, and every later
 // verdict in this suite lost, including the CONTROLS that prove the mutant was
 // targeted. A disable arm must FAIL, never RAISE.
-// ★ AND THE SAME LATENT HAZARD WAS THEN SWEPT OUT OF THIS WHOLE FILE — see
-// [[D-TEST-AN-EXPECT-ONLY-PARSE-GUARD-RAISES-AND-CANCELS-ITS-SUITES-CONTROLS]],
-// whose closest sibling is
-// [[D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT]] — the same
-// `0xC0000409`, the same lost reporter, the same root cause (a non-fatal assertion
-// where only a fatal one can stop the ONE test that needed stopping).
+// ★ AND THE SAME LATENT HAZARD WAS THEN SWEPT OUT OF THIS WHOLE FILE: an
+// EXPECT-only parse guard RAISES and so cancels its own suite's controls, whose
+// closest sibling is a TORN SHIPPED CONFIG crashing a suite instead of redding
+// it — the same `0xC0000409`, the same lost reporter, the same root cause (a
+// non-fatal assertion where only a fatal one can stop the ONE test that needed
+// stopping).
 // 85 sibling guards were
 // converted for exactly this reason and 12 were deliberately LEFT as `EXPECT_FALSE`,
 // under one stated rule: convert IF AND ONLY IF the guard is followed by TREE-STRUCTURE

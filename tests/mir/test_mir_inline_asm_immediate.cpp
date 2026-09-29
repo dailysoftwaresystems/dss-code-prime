@@ -113,8 +113,7 @@ struct Lowered {
     out.hir = lowerToHir(*out.model, out.hirReporter);
     if (out.hir == nullptr) return out;
 
-    MirLoweringConfig cfg;
-    cfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    MirLoweringConfig cfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
     if (out.target != nullptr) {
         cfg.aggregateLayout       = out.target->aggregateLayout();
         cfg.aggregateLayoutLoaded = out.target->aggregateLayoutLoaded();
@@ -357,7 +356,8 @@ TEST(MirInlineAsmImmediate, AnImmediateWiderThanTheFormIsRefusedByName) {
 //
 // ⚠ THE MUTATION IS VERIFIED, NOT ASSUMED: `mutateShippedTargetSchemaDoc`
 // THROWS on a byte-identical document, so an arm whose navigator missed its
-// container cannot pass by asserting nothing (D-TEST-SCHEMA-MUTATION-HELPER-FAILS-OPEN).
+// container cannot pass by asserting nothing — the mutation helper must not
+// fail OPEN.
 TEST(MirInlineAsmImmediate, TheFormIsReadFromTheTargetNotFromTheLetterSpelling) {
     for (char const* arch : {kX86, kArm}) {
         SCOPED_TRACE(arch);

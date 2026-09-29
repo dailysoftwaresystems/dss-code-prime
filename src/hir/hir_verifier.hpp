@@ -1,10 +1,13 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/parse_diagnostic.hpp"   // DiagnosticCode / DiagnosticSeverity (reportAt)
 #include "hir/hir.hpp"
 #include "hir/hir_inline_asm.hpp"   // HirInlineAsmPool (checkInlineAsm)
 #include "hir/hir_attrs.hpp"   // HirSourceMap
 
+#include <cstddef>
+#include <string>
 #include <vector>
 
 namespace dss {
@@ -309,12 +312,27 @@ public:
                 HirInlineAsmPool const*)                         = delete;
 
     // Run every rule, reporting each violation into `reporter`. Returns true
-    // iff THIS run emitted no Error-severity diagnostic (computed by delta on the
-    // reporter's error count, so a reporter carrying prior-phase errors doesn't
-    // make a clean module look dirty).
+    // iff THIS run found no violation the reporter's policy makes an Error — by
+    // the verifier's OWN count of such findings (each judged by
+    // `DiagnosticReporter::effectiveSeverity`, so a `--warnings-as-errors`
+    // promotion counts and a suppressed finding does not), AND by the delta on
+    // the reporter's error count, AND only when the reporter has not hit its
+    // cap. The own count is the verdict: a reporter drops a diagnostic identical
+    // to a recent one, or one past its caps, without storing it, so a verdict
+    // read off the reporter alone passed a module the verifier had refused
+    // (✔MEASURED P68: one module read twice into one reporter verified clean
+    // the second time). Not re-entrant on ONE verifier object.
     [[nodiscard]] bool verify(DiagnosticReporter& reporter) const;
 
 private:
+    // THE ONE WAY A RULE REPORTS — and the one place the verifier counts what it
+    // found (by the policy's effective severity), so `verify()`'s verdict never
+    // depends on what the reporter chose to STORE. Locates the diagnostic through
+    // the source map when one is present.
+    void reportAt(DiagnosticReporter& reporter, DiagnosticCode code, HirNodeId id,
+                  std::string actual, HirSourceMap const* sourceMap,
+                  DiagnosticSeverity severity = DiagnosticSeverity::Error) const;
+
     // Every node whose kind `requiresValidType` (the Expressions group + TypeRef
     // + the source-defined declarations VarDecl/Function/Global/TypeDecl) must
     // carry a `typeId.valid()`. A node flagged `HasError` is skipped (cascade
@@ -355,6 +373,18 @@ private:
     // violation emits `H_VerifierFailure`.
     void checkDeclarationShape(DiagnosticReporter& reporter) const;
 
+    // Declared signatures (P68): a `Function`'s type — and a TYPED
+    // `ExternFunction`'s; an untyped extern is legal — must be a `FnSig`
+    // (`H_VerifierFailure` otherwise) whose result and every parameter are
+    // resolved (`H_TypeUnresolved`, ONE per declaration naming every hole).
+    // Interner-gated; a `HasError` declaration is skipped (cascade suppression).
+    // Before this rule both gaps verified CLEAN, and an unresolved RESULT was
+    // worse: `checkReturnCompleteness` read its kind and aborted the process
+    // (`fn() -> invalid` read back from text did it). The compile pipeline lowers
+    // only a semantically clean model, so these fire where nothing upstream
+    // reported — text read from a file, or a lowering defect.
+    void checkFunctionSignatures(DiagnosticReporter& reporter) const;
+
     // Block dead-code (HR6, plan §2.8 "no fall-through past Return/Unreachable",
     // extended to all unconditional transfers): a statement following an
     // unconditional terminator (`Return`/`Unreachable`/`Break`/`Continue`) within
@@ -371,6 +401,7 @@ private:
     // `Unreachable`). Loops are conservatively non-terminating, so lowering must
     // append an `Unreachable` after a provably-infinite loop. Interner-gated (the
     // return type is read from the FnSig). Each violation emits `H_VerifierFailure`.
+    // A non-FnSig type or unresolved result is `checkFunctionSignatures`'; skipped here.
     void checkReturnCompleteness(DiagnosticReporter& reporter) const;
 
     // Call arguments (HR6, plan §2.8): a `Call`'s argument count and types must
@@ -434,6 +465,10 @@ private:
     // Inline-asm P5: optional; nullptr = the handle cannot be resolved, so
     // `checkInlineAsm` runs only its pool-free half and says so.
     HirInlineAsmPool const* inlineAsmPool_;
+    // The findings THIS run reported that the policy makes Errors; reset by
+    // `verify()`, bumped only by `reportAt`. `mutable` because every rule is
+    // `const` — the count is the verdict's bookkeeping, not the module's state.
+    mutable std::size_t errorsFound_ = 0;
 };
 
 } // namespace dss

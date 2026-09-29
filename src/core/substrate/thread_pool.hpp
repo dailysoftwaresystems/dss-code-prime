@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/stack_sized_thread.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -9,7 +10,6 @@
 #include <memory>
 #include <mutex>
 #include <queue>
-#include <thread>
 #include <vector>
 
 // Executor abstraction + two implementations (host/OS utility — NOT a
@@ -62,6 +62,14 @@ protected:
 
 // Production executor. `workerCount` worker threads spawned at
 // construction; each runs a loop pulling from the shared job queue.
+//
+// ★ EACH WORKER'S STACK IS STATED: `kMainThreadClassStackBytes`, never the host's
+// default. The jobs are main-thread work — an LSP parse, a CU's parse, semantic
+// analysis and MIR, and any schema build those reach — and the host default is
+// 8 MiB on Linux, 1 MiB on Windows and 512 KiB on macOS. ✔MEASURED 2026-09-25
+// (P68 round 12, D-SUBSTRATE-WORKER-THREADS-TAKE-THE-HOST-DEFAULT-STACK): a cold
+// schema build on a plain `std::thread` dies `Bus error` on macos-arm64-debug
+// every run; these workers were plain `std::thread`s.
 class DSS_EXPORT ThreadPool final : public IExecutor {
 public:
     explicit ThreadPool(std::size_t workerCount);
@@ -73,7 +81,7 @@ public:
 private:
     void workerLoop_();
 
-    std::vector<std::thread>           workers_;
+    std::vector<StackSizedThread>      workers_;
     std::queue<std::function<void()>>  jobs_;
     std::mutex                         mutex_;
     std::condition_variable            cv_;

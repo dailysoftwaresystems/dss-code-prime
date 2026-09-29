@@ -61,6 +61,16 @@ struct DSS_EXPORT StringStyle {
     EscapeKind   escapeKind         = EscapeKind::None;
     char         escapeChar         = 0;        // ASCII byte; valid iff escapeKind == Char
     bool         endsAtLongestMatch = false;
+    // Whether a NEW-LINE may appear in the body (docs/language-config-spec.md).
+    // FALSE, the default: the body ends at the first new-line its escape rule did
+    // not consume, UNTERMINATED — reported at the opener, the new-line left in
+    // the stream for the main scan — so a missing closer costs one line, never
+    // the rest of the file. That is C's character constant, string literal and
+    // header name (C23 6.4.4.4, 6.4.5, 6.4.7). TRUE: the body may span lines —
+    // a block comment, a SQL string. A style whose `endsAt` IS the new-line
+    // (a line comment) closes on it before this rule is asked.
+    // [[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]]: the tokenizer did not read
+    // this field until 2026-09-22, so every body ran across lines whatever it said.
     bool         multiline          = false;
     // When true, the `endsAt` delimiter TERMINATES the body but is NOT consumed:
     // the body ends just BEFORE it and the delimiter bytes are left in the stream

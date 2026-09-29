@@ -1,4 +1,4 @@
-// the FILE-SCOPE half of [[D-FF2-3]] (P65) — THE
+// the FILE-SCOPE half of [[D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE]] (P65) — THE
 // DEFINING translation unit. Every object here is declared `extern` AND
 // initialized, which C 6.9.2p1 makes a DEFINITION: "a declaration of an
 // identifier for an object that has file scope with an initializer is a

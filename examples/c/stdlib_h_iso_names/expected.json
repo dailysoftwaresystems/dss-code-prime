@@ -1,0 +1,16 @@
+{
+  "$comment": "<stdlib.h>'s everyday C23 7.24 surface on every pair (P68 round 12, D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES, fold S1): EXIT_SUCCESS, EXIT_FAILURE, RAND_MAX, MB_CUR_MAX, div_t/ldiv_t/lldiv_t with div/ldiv/lldiv, atoll, llabs, strtoull, strtof, mblen, quick_exit/at_quick_exit/_Exit — every one REFUSED on every pair before S1 (S_UndeclaredIdentifier). Each check exits with its own code, so a name bound to the wrong entry point, a struct in the wrong order or a macro of the wrong type is named by the exit code; the program ends through quick_exit(1), which the at_quick_exit handler turns into _Exit(42). RAND_MAX is the platform rand()'s own range (32767 in the UCRT, 2147483647 on glibc and Apple); MB_CUR_MAX is size_t on EVERY pair (a meaning fork — the UCRT and Apple spell it int — decided by C23 7.24p3, asserted with _Generic and sizeof); div/ldiv/lldiv return their structs through three ABIs (Win64 lldiv_t through a hidden pointer, SysV RAX:RDX, AAPCS64 X0/X1) with operands whose quot and rem differ in sign. References, ✔MEASURED: gcc 13.3.0 -std=c2x and clang 18.1.3 -std=c23 (x86_64) and aarch64-linux-gnu-gcc 13.3.0 (qemu), -O0/-O2 `-pedantic -Wall`, run it to 42 with no warning; MSVC 19.51 (/std:clatest, default and /O2) and mingw-w64 13.2.0 stop at exit 13 — their UCRT headers spell MB_CUR_MAX `int`, the meaning DSS decided against — and run a copy with only that check removed to 42. The offsets are read through <stddef.h>'s `offsetof`, which DSS's own header lacked until the same fold (D-FFI-OFFSETOF-MACRO, corrected). RED-ON-DISABLE (through ctest): drop the `lldiv` row from stdlib.json and every pair refuses the compile; MB_CUR_MAX on pe as the UCRT's `int` and the pe arm exits 13; drop <stddef.h>'s `offsetof` and every pair refuses the compile. Binding quick_exit unversioned is invisible here — on aarch64 the GLIBC_2.17 compat instance runs the handler too — so tests/ffi/test_stdlib_h_iso_surface.cpp pins the version.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" },
+    { "spec": "x86_64:macho64-x86_64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

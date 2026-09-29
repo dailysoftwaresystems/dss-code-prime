@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════════════════════
-//  THE DIFFERENTIAL ACCEPT/REJECT ORACLE — D-CONF-REFERENCE-DIFFERENTIAL-ORACLE
+//  THE DIFFERENTIAL ACCEPT/REJECT ORACLE — DSS AGAINST THE REFERENCE COMPILERS
 // ════════════════════════════════════════════════════════════════════════════
 //
 // The operator's standing rule: "WE MUST SUPPORT WHAT REFERENCE COMPILERS DO
@@ -33,10 +33,14 @@
 //      compiler"; this asks "which reference compilers exist, of which family,
 //      and at which measured standard level" — because a verdict is only as
 //      honest as the identity attached to it.
-//   2. It runs each oracle as ONE BATCH. A per-probe cl.exe invocation would pay
-//      the vcvars64 cost 76 times; one generated script per oracle pays it once
-//      and prints `@@PROBE <id> RC=<n>` after each compile, with `%ERRORLEVEL%` /
-//      `$?` read DIRECTLY on the following line and never after a pipe.
+//   2. It runs each oracle as ONE BATCH, and prints `@@PROBE <id> RC=<n>` after
+//      each compile, with `%ERRORLEVEL%` / `$?` read DIRECTLY on the following
+//      line and never after a pipe. The MSVC oracle's developer environment is
+//      not entered by any script: `native_probe::msvcEnvironment` enters
+//      vcvars64.bat ONCE per test process and every MSVC script runs under the
+//      environment it read back (`native_probe::systemUnder`). A per-probe
+//      entry would have paid that cost 76 times; one per SCRIPT still paid it
+//      three times per process (discovery, the level re-check, the census).
 //   3. It drives the REAL DSS CLI as a subprocess (`DSS_CLI_PATH`, baked from
 //      `$<TARGET_FILE:dsscp>`), not the library in-process. A pin on
 //      "what DSS accepts" that bypasses argv, the config resolver and the
@@ -72,7 +76,8 @@
 //
 // ── AND AN ABSENT ORACLE MUST NEVER READ LIKE A PASS ───────────────────────
 //
-// `D-TEST-NATIVE-ORACLE-INERT-ON-POSIX` is on record in this repo: an oracle that
+// This repo has already been burned by a native oracle that sat INERT on every
+// POSIX host while printing green: an oracle that
 // no-ops where its compiler is absent is indistinguishable from one that agreed.
 // So: every candidate that is not used is reported BY NAME WITH A REASON; the
 // corpus carries a SANITY PAIR (one trivially-valid and one trivially-invalid
@@ -105,7 +110,7 @@
 //     the reference compilers are held to: no entry point, no link step, so a
 //     declaration-only probe is a complete translation unit on both sides.
 
-#include "native_c_probe.hpp"   // locateMsvcToolchain, captureCmd, tailOf, ExecutedRows
+#include "native_c_probe.hpp"   // locateMsvcToolchain, msvcEnvironment, systemUnder, captureCmd, tailOf
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
@@ -359,8 +364,9 @@ struct StepOutcome {
 }
 
 // One command, the marker that publishes its exit code, and the file its OWN
-// output goes to. `marker` is empty for setup lines (`call vcvars`) that have no
-// verdict of their own.
+// output goes to. `marker` is empty for a line with no verdict of its own. (The
+// MSVC oracle's `call vcvars` setup line was one; it is gone — the environment
+// is the script's LAUNCH, see `runScript`.)
 //
 // * WHY EVERY STEP GETS ITS OWN OUTPUT FILE, and why "everything printed before a
 // marker belongs to that marker" is NOT good enough.
@@ -385,7 +391,7 @@ struct StepOutcome {
 struct Step {
     std::string command;
     std::string marker;
-    fs::path    outFile;   // this step's own stdout+stderr; empty for setup lines
+    fs::path    outFile;   // this step's own stdout+stderr; empty for a line with no verdict
 };
 
 // Render the steps into a script, run it with BOTH streams captured, and return
@@ -397,9 +403,8 @@ struct ScriptRun {
     std::string diagnostic;
     std::string scriptPath;
     std::map<std::string, StepOutcome> outcomes;   // marker -> verdict + its output
-    // ★ THE LOG PATH TRAVELS WITH THE RESULT.
-    // [D-TEST-NATIVE-PROBE-COMPILE-FAILURE-DISCARDS-ITS-OWN-OUTPUT,
-    // same shape.] A driver that launched and then
+    // ★ THE LOG PATH TRAVELS WITH THE RESULT — the same shape as a probe whose
+    // compile failure discards its own output. A driver that launched and then
     // produced no marker has an explanation sitting in its capture file, and the
     // first version of this file threw it away: the failure read `produced no
     // @@PROBE IDENT marker ... the shell could not run it`, which named a guess
@@ -408,9 +413,14 @@ struct ScriptRun {
     fs::path    logPath;
 };
 
+// `environment` is the MSVC developer environment the script runs under, or null
+// for a script that needs none (every gnu-family oracle). The script itself never
+// enters it: `native_probe::msvcEnvironment` did that ONCE for the process, and
+// the launch hands the environment it read back to the script's cmd.exe.
 [[nodiscard]] ScriptRun runScript(ShellKind kind, fs::path const& scriptFile,
                                   fs::path const& logFile,
-                                  std::vector<Step> const& steps) {
+                                  std::vector<Step> const& steps,
+                                  native_probe::MsvcEnvironment const* environment) {
     ScriptRun r;
     r.scriptPath = scriptFile.string();
     r.logPath    = logFile;
@@ -484,9 +494,14 @@ struct ScriptRun {
             break;
         }
     }
-    // rc is captured DIRECTLY from std::system; it is only used to explain a
-    // launch failure, because every per-probe verdict travels in a marker line.
-    int const status = std::system(native_probe::captureCmd(launch, logFile).c_str());
+    // rc is captured DIRECTLY from the launch; it is only used to explain a launch
+    // failure, because every per-probe verdict travels in a marker line. Under an
+    // environment the launch is `systemUnder` — the same cmd.exe `/c` line
+    // `std::system` runs, handed that environment instead of this process's own.
+    std::string const captured = native_probe::captureCmd(launch, logFile);
+    int const status = environment != nullptr
+                           ? native_probe::systemUnder(*environment, captured)
+                           : std::system(captured.c_str());
     std::ifstream in{logFile, std::ios::binary};
     if (!in) {
         r.diagnostic = "the driver ran (status " + std::to_string(status)
@@ -542,7 +557,10 @@ struct Oracle {
     Family      family      = Family::Gnu;
     ShellKind   shell       = ShellKind::PosixSh;
     std::string exe;           // as spelled INSIDE the script
-    std::string setupCommand;  // e.g. `call "vcvars64.bat" >nul 2>&1`; may be empty
+    // The MSVC developer environment its scripts run under (`cl.exe` is on ITS
+    // PATH); empty for an oracle that needs none. Entered once per process by
+    // `native_probe::msvcEnvironment`, never by a script.
+    std::optional<native_probe::MsvcEnvironment> environment;
     std::string ident;         // the compiler's own identification line
     std::string stdFlag;       // the flag that produced `stdcVersion`
     long        stdcVersion = 0;
@@ -595,7 +613,7 @@ struct Candidate {
     Family                   family = Family::Gnu;
     ShellKind                shell  = ShellKind::PosixSh;
     std::string              exe;
-    std::string              setupCommand;
+    std::optional<native_probe::MsvcEnvironment> environment;   // see `Oracle`
     std::string              identCommand;   // prints the compiler's identity
     std::vector<std::string> stdFlags;       // best-first
 };
@@ -625,7 +643,6 @@ proveCandidate(Candidate const& c, fs::path const& work, Oracle& out) {
     probeOracle.exe    = c.exe;
 
     std::vector<Step> steps;
-    if (!c.setupCommand.empty()) steps.push_back({c.setupCommand, "", {}});
     steps.push_back({c.identCommand, "IDENT", work / ("ident_" + c.id + ".txt")});
     for (auto const& flag : c.stdFlags) {
         fs::path const obj = work / ("verprobe_" + c.id + "_" + flag + ".o");
@@ -635,7 +652,8 @@ proveCandidate(Candidate const& c, fs::path const& work, Oracle& out) {
     }
 
     auto const run = runScript(c.shell, work / ("discover_" + c.id + shellSuffix(c.shell)),
-                               work / ("discover_" + c.id + ".log"), steps);
+                               work / ("discover_" + c.id + ".log"), steps,
+                               c.environment ? &*c.environment : nullptr);
     if (!run.launched) return run.diagnostic;
 
     auto const& outcomes = run.outcomes;
@@ -685,7 +703,7 @@ proveCandidate(Candidate const& c, fs::path const& work, Oracle& out) {
                "An unlabelled oracle is not used: a verdict without a level is a "
                "verdict this harness cannot report honestly.";
 
-    probeOracle.setupCommand = c.setupCommand;
+    probeOracle.environment = c.environment;
     out = probeOracle;
     return std::nullopt;
 }
@@ -725,19 +743,33 @@ proveCandidate(Candidate const& c, fs::path const& work, Oracle& out) {
 #if defined(_WIN32)
     // ── MSVC, through the ONE shared locator ──
     auto const msvc = native_probe::locateMsvcToolchain(work);
+    // ★ ENTERED HERE, ONCE PER PROCESS, and handed to every MSVC script
+    // (D-TEST-MSVC-NATIVE-WITNESSES-ENTER-VCVARS-PER-TOOL). A located toolchain
+    // whose environment cannot be entered is NOT an absent compiler — a step
+    // broke, and it goes red like a broken locator.
+    std::optional<native_probe::MsvcEnvironment> msvcEnv;
     if (msvc.ok()) {
+        msvcEnv = native_probe::msvcEnvironment(msvc, work);
+        if (!msvcEnv->ok()) {
+            set.broken.push_back(msvcEnv->describe());
+            msvcEnv.reset();
+        }
+    }
+    if (msvcEnv) {
         Candidate c;
         c.id           = "msvc-cl";
         c.family       = Family::Msvc;
         c.shell        = ShellKind::WinCmd;
-        c.exe          = "cl.exe";           // vcvars64 puts it on PATH
-        c.setupCommand = "call " + quoted(msvc.vcvars.string()) + " >nul 2>&1";
+        c.exe          = "cl.exe";           // the environment puts it on PATH
+        c.environment  = std::move(msvcEnv);
         // ⚠ NO PIPE. `%ERRORLEVEL%` after a pipe is the LAST command's, so
         // `cl | findstr` would publish findstr's status as cl's. The banner
         // goes into the captured log and the identity is parsed from there.
         c.identCommand = "cl.exe";
         c.stdFlags     = {"clatest", "c17", "c11"};
         candidates.push_back(c);
+    } else if (msvc.ok()) {
+        // located, environment refused: already recorded as broken above
     } else if (msvc.toolAbsent()) {
         set.absent.push_back({"msvc-cl (cl.exe)", msvc.detail});
     } else {
@@ -1282,7 +1314,7 @@ constexpr std::size_t kMinDirectionBProbes = 15;
 //  candidate std flag, and three of the four tests below need it; re-running it
 //  per TEST would triple that for no extra information. The scratch dir is
 //  ScratchDir's per-run one, so two concurrent ctest processes never share a
-//  path (D-TEST-FIXED-SCRATCH-PATH-POPULATION).
+//  path — a scratch path derived from a FIXED name is one they would both draw.
 // ═══════════════════════════════════════════════════════════════════════════
 namespace {
 
@@ -1464,7 +1496,8 @@ TEST(ReferenceConformance, OracleStandardLevelsAreMeasuredNotAssumed) {
 
     if (set.found.empty()) {
         // ★ A SKIP IS ITSELF FAIL-CLOSED. ctest scores a gtest SKIP as a pass, which
-        // is exactly the `D-TEST-NATIVE-ORACLE-INERT-ON-POSIX` shape — so the one
+        // is exactly the shape of an oracle that sits INERT and reports success —
+        // so the one
         // legitimate skip is only legitimate if discovery actually LOOKED. An empty
         // absent list means the candidate enumeration produced nothing at all, i.e.
         // a harness defect wearing a skip's clothes.
@@ -1474,8 +1507,8 @@ TEST(ReferenceConformance, OracleStandardLevelsAreMeasuredNotAssumed) {
                "toolchain-less host.";
         GTEST_SKIP() << "NO reference C compiler could be used on this host. This is the "
                         "ONE legitimate skip, and it is a skip rather than a pass on "
-                        "purpose (D-TEST-NATIVE-ORACLE-INERT-ON-POSIX). Every candidate "
-                        "and its reason:" << describeOracles(set);
+                        "purpose, so an absent oracle can never read like agreement. "
+                        "Every candidate and its reason:" << describeOracles(set);
     }
 
     for (auto const& o : set.found) {
@@ -1514,7 +1547,6 @@ TEST(ReferenceConformance, OracleStandardLevelsAreMeasuredNotAssumed) {
         write(overSrc, o.stdcVersion + 1);
 
         std::vector<Step> steps;
-        if (!o.setupCommand.empty()) steps.push_back({o.setupCommand, "", {}});
         steps.push_back({o.compileCommand(atSrc, work / ("level_at_" + o.id + ".o"),
                                           Mode::Strict, o.stdFlag), "AT",
                          work / ("level_at_" + o.id + ".txt")});
@@ -1522,7 +1554,8 @@ TEST(ReferenceConformance, OracleStandardLevelsAreMeasuredNotAssumed) {
                                           Mode::Strict, o.stdFlag), "OVER",
                          work / ("level_over_" + o.id + ".txt")});
         auto const run = runScript(o.shell, work / ("level_" + o.id + shellSuffix(o.shell)),
-                                   work / ("level_" + o.id + ".log"), steps);
+                                   work / ("level_" + o.id + ".log"), steps,
+                                   o.environment ? &*o.environment : nullptr);
         ASSERT_TRUE(run.launched) << o.id << ": level re-verification driver failed to "
                                              "launch: " << run.diagnostic
                                   << native_probe::tailOf(run.logPath, 25);
@@ -1562,6 +1595,87 @@ TEST(ReferenceConformance, OracleStandardLevelsAreMeasuredNotAssumed) {
         << "the C23 gating property was never exercised: either the corpus has no "
            "`@min-stdc 202311` probe left, or no oracle was found. Both make this "
            "assertion decorative.";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  2b. THE MSVC ORACLE ENTERS ITS DEVELOPER ENVIRONMENT ONCE PER PROCESS.
+//  [[D-TEST-MSVC-NATIVE-WITNESSES-ENTER-VCVARS-PER-TOOL]]: every MSVC script this
+//  file generates used to begin with `call vcvars64.bat` — three entries per
+//  process (discovery, the level re-check, the census), each a fresh cmd.exe
+//  paying the whole developer-environment setup. The environment is now entered
+//  once, by `native_probe::msvcEnvironment`, and handed to every script's launch.
+//
+//  COUNTED, NEVER TIMED: two more scripts of the census's shape run under the
+//  oracle's environment, and the process must still have entered it exactly once;
+//  and no script in the scratch directory may enter it again — a `call vcvars`
+//  line inside a script is invisible to the count, so the scripts are read too.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(ReferenceConformance, TheMsvcOracleEntersItsEnvironmentOncePerProcess) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "MSVC is a Windows oracle; nothing to count on this host";
+#else
+    auto const& set = harness().oracles;
+    for (auto const& b : set.broken) ADD_FAILURE() << b;
+    fs::path const work = harness().scratch.path();
+
+    // The locator is memoized per process, so asking again starts nothing. A
+    // located toolchain MUST have become an oracle: an environment that no longer
+    // reaches `cl.exe` would otherwise demote MSVC to "absent" and this pin to a
+    // skip that reads like a pass.
+    auto const msvc = native_probe::locateMsvcToolchain(work);
+    if (!msvc.ok()) {
+        ASSERT_TRUE(msvc.toolAbsent()) << msvc.describe();
+        GTEST_SKIP() << "no MSVC toolchain on this host: " << msvc.detail;
+    }
+    auto const oracle = std::find_if(set.found.begin(), set.found.end(),
+                                     [](Oracle const& o) { return o.family == Family::Msvc; });
+    ASSERT_NE(oracle, set.found.end())
+        << "MSVC is installed (" << msvc.vcvars.string() << ") but no MSVC oracle was "
+           "found:" << describeOracles(set);
+    ASSERT_TRUE(oracle->environment.has_value())
+        << "the MSVC oracle carries no developer environment, so its scripts cannot "
+           "reach cl.exe";
+
+    for (int i = 0; i < 2; ++i) {
+        std::string const tag = "envpin_" + std::to_string(i);
+        fs::path const src = work / (tag + ".c");
+        {
+            std::ofstream f{src, std::ios::binary | std::ios::trunc};
+            f << "int dss_env_pin_object;\n";
+        }
+        std::vector<Step> const steps{
+            {oracle->compileCommand(src, work / (tag + ".o"), Mode::Strict, oracle->stdFlag),
+             "PIN", work / (tag + ".txt")}};
+        auto const run = runScript(oracle->shell, work / (tag + shellSuffix(oracle->shell)),
+                                   work / (tag + ".log"), steps, &*oracle->environment);
+        ASSERT_TRUE(run.launched) << run.diagnostic << native_probe::tailOf(run.logPath, 25);
+        auto const it = run.outcomes.find("PIN");
+        ASSERT_NE(it, run.outcomes.end()) << native_probe::tailOf(run.logPath, 25);
+        EXPECT_TRUE(it->second.accepted)
+            << "cl.exe did not compile a one-line file under the oracle's environment:\n"
+            << it->second.output;
+    }
+    EXPECT_EQ(native_probe::msvcEnvironmentEntries(), 1u)
+        << "every MSVC script of this process — discovery's and the two above, and "
+           "the level re-check's and the census's when they ran first — must run under "
+           "the ONE environment entry";
+
+    std::size_t scripts = 0;
+    for (auto const& e : fs::directory_iterator{work}) {
+        if (e.path().extension() != ".bat") continue;
+        // The helper's own capture batch IS the one entry; it is the only file
+        // allowed to name vcvars64.bat.
+        if (e.path().filename() == "dss_msvc_environment.bat") continue;
+        ++scripts;
+        std::ifstream in{e.path(), std::ios::binary};
+        std::string const text{std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>()};
+        EXPECT_EQ(text.find("vcvars"), std::string::npos)
+            << e.path().filename().string() << " enters the developer environment itself";
+    }
+    EXPECT_GE(scripts, 3u) << "the scan read no generated script: discovery's and the "
+                              "two above must be there, or the scan checked nothing";
+#endif
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1774,7 +1888,6 @@ TEST(ReferenceConformance, DifferentialAcceptRejectCensus) {
     std::map<std::string, std::map<std::string, StepOutcome>> refVerdicts;
     for (auto const& o : set.found) {
         std::vector<Step> steps;
-        if (!o.setupCommand.empty()) steps.push_back({o.setupCommand, "", {}});
         for (auto const& p : probes) {
             if (p.families.count(o.family) == 0) continue;
             if (o.stdcVersion < p.minStdc) continue;
@@ -1783,7 +1896,8 @@ TEST(ReferenceConformance, DifferentialAcceptRejectCensus) {
                              work / (p.id + "." + o.id + ".txt")});
         }
         auto const run = runScript(o.shell, work / ("drive_" + o.id + shellSuffix(o.shell)),
-                                   work / ("drive_" + o.id + ".log"), steps);
+                                   work / ("drive_" + o.id + ".log"), steps,
+                                   o.environment ? &*o.environment : nullptr);
         ASSERT_TRUE(run.launched)
             << "ORACLE DRIVER FAILED TO LAUNCH for " << o.id << ": " << run.diagnostic
             << native_probe::tailOf(run.logPath, 25)

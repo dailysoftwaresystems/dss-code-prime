@@ -62,8 +62,8 @@ int main(void) {
     signed char    sc = (signed char)(-one);     /* -1;    low8  = 0xFF   */
     unsigned short us = (unsigned short)(-one);  /* 65535; low16 = 0xFFFF (same bits as ss) */
     /* A VOLATILE local seeds a runtime float WITHOUT an int->float cast — the
-     * value stays unfoldable, and we sidestep the deferred int->F32 codegen gap
-     * (D-CSUBSET-INT-TO-F32-CODEGEN) that `(float)someInt` would trip. */
+     * value stays unfoldable. (The cast was avoided while `(float)someInt` had no
+     * lowering; it has one since P68 round 12, D-CSUBSET-INT-TO-F32-CODEGEN.) */
     volatile float vf = -1.5f;
     float          f  = vf;                      /* -1.5f, runtime       */
 

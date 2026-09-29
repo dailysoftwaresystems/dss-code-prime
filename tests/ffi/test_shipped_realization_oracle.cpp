@@ -395,6 +395,64 @@ TEST(ShippedRealizationOracle, NoActiveFormatStatesNothingAndRefusesNothing) {
         << "a conflict was reported about rows no target selects";
 }
 
+// ── P68 round 12 (S2a-2a of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES): the
+//    hand-declared path reads with the PAIR's facts ──────────────────────────────
+//
+// A row whose signature names an ABI typedef (`wchar_t`) decodes only where the pair's
+// facts carry it. The `#include` path always passed them; this path passed none, so the
+// same row would have been skipped HERE alone — the name routed unbound for a program
+// that declares it by hand, and realized for one that includes its header. Both arms
+// are pinned: with the facts the row is Realized with the pair's `wchar_t`; without
+// them the descriptor cannot decode on this path and the name is not realized — the
+// asymmetry the facts close.
+TEST(ShippedRealizationOracle, TheHandDeclaredPathReadsWithThePairsFacts) {
+    ScratchDir dir{Location::Temp, "oracle-pair-facts"};
+    fs::path const libs = shippedLibsDirOf(dir);
+    writeDesc(libs, "wide.json", R"({ "header": "wide.h", "library": { "elf": "libc.so.6" },
+        "typedefs": [ { "name": "wchar_t", "abiTypedef": "wchar_t" } ],
+        "symbols": [ { "name": "wwidth", "signature": "fn(ptr<wchar_t>) -> i32" } ] })");
+    if (::testing::Test::HasFatalFailure()) return;
+
+    ScopedEnv const env{"DSS_CONFIG_ROOT", dir.path().string()};
+    std::vector<std::string> const names{"wwidth"};
+    auto realizeWith = [&](ShippedPairFacts const* facts, TypeInterner& interner,
+                           DiagnosticReporter& rep) {
+        TypeRegistry typeReg;
+        FixtureRoleResolver const roles{ObjectFormatKind::Elf};
+        return realizeShippedExternSymbols(names, interner, typeReg, rep, DataModel::Lp64,
+                                           std::optional<std::string_view>{"x86_64"},
+                                           ObjectFormatKind::Elf, {}, &roles, facts);
+    };
+    ShippedPairFacts facts;
+    facts.dataModel   = DataModel::Lp64;
+    facts.abiTypedefs = {{"wchar_t", TypeKind::I32}};
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        DiagnosticReporter rep;
+        auto const realized = realizeWith(&facts, interner, rep);
+        ASSERT_TRUE(realized.has_value());
+        auto const it = realized->find("wwidth");
+        ASSERT_NE(it, realized->end()) << "with the pair's facts the row is realized";
+        EXPECT_EQ(it->second.status, ShippedRealizationStatus::Realized);
+        ASSERT_EQ(interner.kind(it->second.signature), TypeKind::FnSig);
+        auto const params = interner.fnParams(it->second.signature);
+        ASSERT_EQ(params.size(), 1u);
+        ASSERT_EQ(interner.kind(params[0]), TypeKind::Ptr);
+        EXPECT_EQ(interner.kind(interner.operands(params[0])[0]), TypeKind::I32)
+            << "the pointee is the PAIR's wchar_t";
+    }
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        DiagnosticReporter rep;
+        auto const realized = realizeWith(nullptr, interner, rep);
+        ASSERT_TRUE(realized.has_value());
+        auto const it = realized->find("wwidth");
+        EXPECT_TRUE(it == realized->end()
+                    || it->second.status != ShippedRealizationStatus::Realized)
+            << "control: without the facts the row cannot decode here — the asymmetry";
+    }
+}
+
 // ── 4. THE REAL CORPUS — control, then the REMOVE-direction mutant ──────────
 
 namespace {

@@ -12,9 +12,9 @@
 // ⚠ Reverting `stack_sized_thread.cpp` to a plain `std::thread` does not make
 // this test FAIL — it makes it CRASH (SIGSEGV/SIGBUS, or a Windows stack
 // overflow). That is the correct and expected shape: a stack overflow has no
-// failing assertion to report, which is the entire reason
-// D-TEST-LSP-HARNESS-RAN-THE-SERVER-LOOP-ON-A-HOST-DEFAULT-STACK went unseen
-// for as long as it did. ctest reports the crash as a failed entry either way.
+// failing assertion to report, which is the entire reason the LSP harness ran
+// the server loop on the HOST'S DEFAULT stack unseen for as long as it did.
+// ctest reports the crash as a failed entry either way.
 
 #include "core/substrate/stack_sized_thread.hpp"
 

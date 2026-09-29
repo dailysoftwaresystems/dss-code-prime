@@ -1,0 +1,13 @@
+# PURPOSE: re-derive every corpus-manifest figure examples/README.md states, by parsing the manifests.
+name: examples-census
+description: >-
+  The action re-derives every corpus-manifest figure examples/README.md states.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+steps:
+  - name: census
+    workingDirectoryRoot: action
+    run: |
+      python3 ./examples-census.py
+    successPattern: 'examples-census: \d+ manifest\(s\)'
+    requireInputsUnmoved: true

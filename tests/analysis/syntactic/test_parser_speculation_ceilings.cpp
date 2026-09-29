@@ -501,16 +501,18 @@ TEST(ParserSpeculationCeilings, CeilingReportsOnceAndDoesNotCascade) {
         EXPECT_EQ(countCode(t, DiagnosticCode::P_BacktrackFailed), 0u)
             << "codes=[" << allCodes(t) << "]";
 
-        // Count only the PARSER's own recovery chatter. `P_BuilderInvariant`
-        // ("scope stack non-empty at finish") is deliberately EXCLUDED and
-        // deliberately not silenced: it is the builder's internal-invariant
-        // signal, it is PRE-EXISTING on this input (present in the pre-change
-        // baseline above), and shielding an instrument because it is
-        // inconvenient is how a gate stops meaning anything.
-        std::size_t parserChatter = 0;
-        for (auto const& d : t.diagnostics().all()) {
-            if (d.code != DiagnosticCode::P_BuilderInvariant) ++parserChatter;
-        }
+        // ★ NO BUILDER INVARIANT, AND NOTHING EXCLUDED FROM THE COUNT. This
+        // count used to leave `P_BuilderInvariant` ("scope stack non-empty at
+        // finish") out as PRE-EXISTING on this input — honestly flagged, never
+        // silenced, but frozen here (and in the corpus golden) as if it were an
+        // expected output. It was a real defect: an abandoned frame kept the
+        // scope its `(` opened, and the builder's internal check fired on user
+        // input ([[D-PARSE-BUILDER-INVARIANT-PRINTED-AFTER-A-CORRECT-REFUSAL]]).
+        // A frame now closes the scopes it opened, so the invariant is ABSENT
+        // and every diagnostic counts.
+        EXPECT_EQ(countCode(t, DiagnosticCode::P_BuilderInvariant), 0u)
+            << "codes=[" << allCodes(t) << "]";
+        std::size_t const parserChatter = t.diagnostics().all().size();
         EXPECT_LE(parserChatter, 2u)
             << "one honest ceiling report, not a cascade; codes=["
             << allCodes(t) << "]";
@@ -546,10 +548,14 @@ TEST(ParserSpeculationCeilings, ShieldDoesNotSwallowALaterStatementsError) {
     // `int z = ;` is a real error and must survive the shield raised by the
     // PREVIOUS statement. Any parser-tier error beyond the ceiling report is
     // the proof the shield came down at the `;`.
+    // The builder's invariant is no longer excluded here: it does not fire
+    // ([[D-PARSE-BUILDER-INVARIANT-PRINTED-AFTER-A-CORRECT-REFUSAL]]), and a
+    // count that skipped it would let it return unseen.
+    EXPECT_EQ(countCode(t, DiagnosticCode::P_BuilderInvariant), 0u)
+        << "codes=[" << allCodes(t) << "]";
     std::size_t beyondTheCeiling = 0;
     for (auto const& d : t.diagnostics().all()) {
-        if (d.code != DiagnosticCode::P_MaxSpeculationDepth
-            && d.code != DiagnosticCode::P_BuilderInvariant) {
+        if (d.code != DiagnosticCode::P_MaxSpeculationDepth) {
             ++beyondTheCeiling;
         }
     }

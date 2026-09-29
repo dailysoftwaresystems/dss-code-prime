@@ -1,19 +1,21 @@
 #include "mir/mir_text.hpp"
 
 #include "core/types/alignment.hpp"  // Alignment::kMaxBytes — the ONE owner of the representable align domain
+#include "core/types/arg_payload.hpp"  // arg_payload::kFieldMax — `addArg`'s own bound, asked before it aborts
 #include "core/types/config_key_vocabulary.hpp"  // renderAllowedList (the refusals project their table)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/enum_name_table.hpp"  // EnumNameTable / allNames — ONE owner per text spelling set
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"   // symbolBindingName / symbolVisibilityName
 #include "core/types/target_schema.hpp"  // callConvName / kCallConvTable
+#include "core/types/type_lattice/composite_definition.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_literal_pool.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_verifier.hpp"
 
-#include <algorithm>   // std::find / std::max — the emitters' explicit work stacks
+#include <algorithm>   // std::max — the emitters' explicit work stacks
 #include <array>
 #include <cctype>
 #include <cerrno>
@@ -22,10 +24,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -147,7 +151,11 @@ struct MirTextGlobalAttrs {
 
 namespace {
 
-constexpr int kVersion = 1;
+// v2 (P68 round 8, lane `ht`, part 1d): composites are `type <H>` references into a `types`
+// table, each DEFINED ONCE with every layout channel; v1 spelled each one inline at every use.
+// v3 (P68 round 12, lane `cs`): an enumeration's FIXED underlying type is spelled, `enum "E" fixed
+// i64` — `enum E : long` and `enum E` are different types (C23 6.2.7p1), and v2 wrote both `: i64`.
+constexpr int kVersion = 3;
 
 [[nodiscard]] std::string quote(std::string_view s) {
     std::string out;
@@ -243,13 +251,24 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextPrimTable));
 // copies of one set several hundred lines apart, and the reader's had no final
 // `else`: an unrecognized core spelling left `core` at `Void` and the parse
 // SUCCEEDED (`D-MIR-TEXT-UNKNOWN-LITERAL-CORE-SILENTLY-DEGRADED-TO-VOID`).
-inline constexpr EnumNameTable<TypeKind, 6> kMirTextLiteralCoreTable{{{
+inline constexpr EnumNameTable<TypeKind, 8> kMirTextLiteralCoreTable{{{
     { TypeKind::Struct, "struct" },
     { TypeKind::Union,  "union"  },
     { TypeKind::Array,  "array"  },
     { TypeKind::Ptr,    "ptr"    },
     { TypeKind::Ref,    "ref"    },
     { TypeKind::Enum,   "enum"   },
+    // ★ A `_BitInt` value's core (P68 round 8, lane `ht`, part 1c-b). Every
+    // `BitIntValue` literal carries `core == BitInt` (the HIR pool's contract,
+    // copied across by `toMirLiteral`), and this table had no row for it, so the
+    // writer refused EVERY `_BitInt` constant or initializer as a core "with no
+    // spelling in this format" and wrote `?`, which the reader refuses.
+    { TypeKind::BitInt, "bitint" },
+    // ★ A `_Complex` value's core (P68 round 8, lane `ht`, part 1d): a complex
+    // constant is an aggregate literal whose core is `Complex`, and without this
+    // row the writer refused it and wrote `?`. ✔MEASURED over the examples corpus:
+    // `complex_static_image` and `complex_long_double_static_image` did not read back.
+    { TypeKind::Complex, "complex" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -335,10 +354,10 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextMarkerTable));
 // every spelling this list advertises is driven back through `parseType` and must
 // not come back as `unknown type`, so the list cannot advertise a keyword the
 // ladder does not handle, nor go stale when one is added without it.
-inline constexpr std::array<std::string_view, 16> kMirTextTypeKeywords{
+inline constexpr std::array<std::string_view, 17> kMirTextTypeKeywords{
     "invalid", "ptr", "ref", "nullable", "optional", "slice", "complex",
     "arr", "tuple", "struct", "union", "enum", "fn", "_BitInt", "unsigned",
-    "ext",
+    "ext", "type",
 };
 DSS_CHECK_KEY_VOCABULARY(kMirTextTypeKeywords);
 
@@ -374,10 +393,38 @@ inline constexpr EnumNameTable<std::uint8_t, 3> kMirTextExhaustTable{{{
 DSS_CHECK_ENUM_NAME_TABLE(kMirTextExhaustTable);
 DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextExhaustTable));
 
+// ★★ THE INSTRUCTION FLAGS — ONE ROW PER `MirInstFlags` BIT (P68 round 8, lane
+// `ht`, part 1b). The format printed NO instruction flag at all: ✔MEASURED, a
+// `Volatile` load and a `ReturnsTwice` call were written `%v2 = load : i32 (%v1)`
+// and `%v4 = call : i32 (%v3)` and read back with flags 0 — ok=1, no diagnostic —
+// so a round trip turned a volatile access into a plain one and a `setjmp` call
+// into an ordinary call the optimizer may inline across. Spelled as a bracketed
+// list right after the mnemonic (`load [volatile] : i32 (%v1)`), written only
+// when a bit is set, so a flagless instruction reads exactly as before. A bit
+// with no row here is refused by the writer, not dropped.
+inline constexpr EnumNameTable<MirInstFlags, 4> kMirTextInstFlagTable{{{
+    { MirInstFlags::Synthetic,        "synthetic"          },
+    { MirInstFlags::Volatile,         "volatile"           },
+    { MirInstFlags::ReturnsTwice,     "returns_twice"      },
+    { MirInstFlags::AtomicInitExempt, "atomic_init_exempt" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kMirTextInstFlagTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextInstFlagTable));
+
+// ⚠ THE SLOT-0 SENTINEL IS NOT AN INSTRUCTION, SO IT HAS NO SPELLING HERE. Its
+// mnemonic `invalid` used to be looked up like any other, and the generic arm then
+// handed `MirOpcode::Invalid` to `MirBuilder::addInst`, which ABORTS on it
+// (✔MEASURED P68, lane `ht`: `%v1 = invalid : i32` killed the process). No module
+// holds one in a block, so no writer prints it; both walks below skip it, so the
+// refusal's accepted set cannot advertise it either.
+[[nodiscard]] constexpr bool hasTextSpelling(MirOpcode op) noexcept {
+    return op != MirOpcode::Invalid;
+}
+
 [[nodiscard]] std::optional<MirOpcode> opcodeFromMnemonic(std::string_view s) noexcept {
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(MirOpcode::Count_); ++i) {
         auto const op = static_cast<MirOpcode>(i);
-        if (opcodeInfo(op).mnemonic == s) return op;
+        if (hasTextSpelling(op) && opcodeInfo(op).mnemonic == s) return op;
     }
     return std::nullopt;
 }
@@ -395,7 +442,8 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextExhaustTable));
     std::vector<std::string_view> names;
     names.reserve(static_cast<std::size_t>(MirOpcode::Count_));
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(MirOpcode::Count_); ++i) {
-        names.push_back(opcodeInfo(static_cast<MirOpcode>(i)).mnemonic);
+        auto const op = static_cast<MirOpcode>(i);
+        if (hasTextSpelling(op)) names.push_back(opcodeInfo(op).mnemonic);
     }
     return detail::renderAllowedList(names);
 }
@@ -418,8 +466,15 @@ public:
         // and GlobalAddr instruction payloads. Each gets a stable handle
         // (its SymbolId.v value, so the parser can re-mint the same id).
         collectSymbols();
-        out_ += std::format("dssir {}\n", kVersion);
+        std::string const head = std::format("dssir {}\n", kVersion);
         emitSymbolsPreamble();
+        std::string symbols = takeOut();
+        // ★ THE BODY IS RENDERED BEFORE THE `types` SECTION THAT PRECEDES IT IN THE
+        // FILE, because the table is exactly the set of composites the body (and,
+        // transitively, the table itself) mentions, numbered in the order they are
+        // first mentioned — the HIR v5 writer's order, for the same reason: the mint
+        // happens at the mention, while the definitions still land first in the file,
+        // where a single-pass reader needs them.
         out_ += "module {\n";
         for (std::uint32_t i = 0; i < mir_.moduleGlobalCount(); ++i) {
             emitGlobal(mir_.globalAt(i));
@@ -428,6 +483,14 @@ public:
             emitFunction(mir_.funcAt(i));
         }
         out_ += "}\n";
+        std::string body = takeOut();
+        emitTypes();
+        std::string types = takeOut();
+        out_.reserve(head.size() + types.size() + symbols.size() + body.size());
+        out_ += head;
+        out_ += types;
+        out_ += symbols;
+        out_ += body;
         return std::move(out_);
     }
 
@@ -438,6 +501,79 @@ private:
     std::string           out_;
     std::vector<std::uint32_t> symOrder_;            // declaration-order list
     std::unordered_map<std::uint32_t, bool> symSet_; // dedup set
+    // The `types` table: material composite TypeId.v -> handle (1..N), and the
+    // composites in handle order. A handle is minted at a composite's FIRST mention.
+    std::unordered_map<std::uint32_t, std::uint32_t> typeHandle_;
+    std::vector<TypeId>                              typeOrder_;
+
+    // What has been rendered so far, handed over and cleared — the body and the
+    // preamble sections are rendered separately and assembled in file order.
+    [[nodiscard]] std::string takeOut() {
+        std::string taken = std::move(out_);
+        out_.clear();
+        return taken;
+    }
+
+    // The `types` handle of the material composite `t`, minted on first reference
+    // (which also queues its one definition — see `emitTypes`). 1-based: `type 0`
+    // is the reader's refusal, never a spelling this writer produces.
+    [[nodiscard]] std::uint32_t typeHandleOf(TypeId t) {
+        auto const [it, minted] = typeHandle_.try_emplace(
+            t.v, static_cast<std::uint32_t>(typeOrder_.size() + 1));
+        if (minted) typeOrder_.push_back(t);
+        return it->second;
+    }
+
+    // ── `types { … }` — every composite the module mentions, DEFINED ONCE ──────
+    //
+    // Drains `typeOrder_` IN HANDLE ORDER, and the loop re-reads the size on every
+    // turn on purpose: a definition's own fields may reference composites nothing
+    // before them mentioned, which mints the next handles and appends them here —
+    // so the table closes over exactly the composites the module reaches, each
+    // exactly once, and each definition costs its own field list and nothing else.
+    // Empty table ⇒ no section.
+    void emitTypes() {
+        if (typeOrder_.empty()) return;
+        out_ += "types {\n";
+        for (std::size_t i = 0; i < typeOrder_.size(); ++i) {
+            // A COPY, not a reference: rendering this definition may append to
+            // `typeOrder_`, which would invalidate a reference into it.
+            TypeId const composite = typeOrder_[i];
+            out_ += std::format("  type {} = ", i + 1);
+            appendCompositeDefinition(composite);
+            out_ += '\n';
+        }
+        out_ += "}\n";
+    }
+
+    // One composite's DEFINITION, spelled exactly as the HIR v5 `types` table spells
+    // it — `struct|union "<name>"`, then `opaque`, or `[packed] [aligned N] [pack N]
+    // { <type> [@N | ~N] [bits N] [packed], … }` — off the ONE owner of what a
+    // definition carries (`describeComposite`, `core/types/type_lattice/
+    // composite_definition.hpp`), whose `static_assert` pins the channel list to
+    // `TypeInterner::completeComposite`. v1 spelled only the field TYPES, so a packed,
+    // bit-field, aligned, `#pragma pack`, explicit-offset or member-aligned composite
+    // read back with a DIFFERENT layout while its round trip stayed byte-identical.
+    void appendCompositeDefinition(TypeId t) {
+        CompositeDefinition const def = describeComposite(*ctx_.interner, t);
+        out_ += def.kind == TypeKind::Struct ? "struct " : "union ";
+        out_ += quote(def.name);
+        if (def.opaque) { out_ += " opaque"; return; }
+        if (def.packed) out_ += " packed";
+        if (def.explicitAlign != 0) out_ += std::format(" aligned {}", def.explicitAlign);
+        if (def.maxFieldAlign != 0) out_ += std::format(" pack {}", def.maxFieldAlign);
+        out_ += " {";
+        for (std::size_t i = 0; i < def.fields.size(); ++i) {
+            CompositeFieldDefinition const& f = def.fields[i];
+            if (i != 0) out_ += ", ";
+            appendType(f.type);
+            if (f.offset.has_value())     out_ += std::format(" @{}", *f.offset);
+            else if (f.align.has_value()) out_ += std::format(" ~{}", *f.align);
+            if (f.bitWidth.has_value()) out_ += std::format(" bits {}", *f.bitWidth);
+            if (f.packed) out_ += " packed";
+        }
+        out_ += '}';
+    }
 
     // ★★ THE SEVERITY IS A REQUIRED ARGUMENT, and it used to default to Warning
     // here while the sibling `hir_text.cpp` helper defaulted to Error — so the
@@ -465,17 +601,58 @@ private:
         if (symSet_.emplace(v, true).second) symOrder_.push_back(v);
     }
 
+    // ★★ EVERY SYMBOL A RENDERED LITERAL NAMES, CLOSED OVER THE WHOLE VARIANT (P68
+    // round 8, lane `ht`, part 1c-b). `symaddr %N` is how a global initializer
+    // spells `&x`, and the `symbols` preamble never listed N unless x was also one
+    // of the module's functions or globals — an EXTERN named only by an initializer
+    // lost its name in the text. Of `MirLiteralValue`'s arms only
+    // `MirSymbolAddrValue` names a symbol and `MirAggregateValue` names one exactly
+    // when a field does; the `static_assert` stops the build until a new arm says
+    // which it is. An explicit work stack, not host recursion.
+    void noteLiteralSymbols(MirLiteralValue const& root) {
+        std::vector<MirLiteralValue const*> work{&root};
+        while (!work.empty()) {
+            MirLiteralValue const* const v = work.back();
+            work.pop_back();
+            std::visit([&](auto const& arm) {
+                using T = std::decay_t<decltype(arm)>;
+                if constexpr (std::is_same_v<T, MirSymbolAddrValue>) {
+                    noteSymbol(arm.symbol);
+                } else if constexpr (std::is_same_v<T, MirAggregateValue>) {
+                    for (std::size_t i = arm.fields.size(); i-- > 0;) work.push_back(&arm.fields[i]);
+                } else {
+                    static_assert(std::is_same_v<T, std::monostate> || std::is_same_v<T, bool>
+                                      || std::is_same_v<T, std::int64_t>
+                                      || std::is_same_v<T, std::uint64_t>
+                                      || std::is_same_v<T, double> || std::is_same_v<T, std::string>
+                                      || std::is_same_v<T, BitIntValue>
+                                      || std::is_same_v<T, WideFloatValue>,
+                                  "a new MirLiteralValue arm must say whether it names a symbol: "
+                                  "note it through noteSymbol above, or add it to this list of "
+                                  "the arms that name none");
+                }
+            }, v->value);
+        }
+    }
+
     void collectSymbols() {
         for (std::uint32_t i = 0; i < mir_.moduleFuncCount(); ++i) {
             noteSymbol(mir_.funcSymbol(mir_.funcAt(i)).v);
         }
         for (std::uint32_t i = 0; i < mir_.moduleGlobalCount(); ++i) {
-            noteSymbol(mir_.globalSymbol(mir_.globalAt(i)).v);
+            MirGlobalId const g = mir_.globalAt(i);
+            noteSymbol(mir_.globalSymbol(g).v);
+            // The initializer the writer renders (`emitGlobal`), in the same order.
+            if (std::uint32_t const litIdx = mir_.globalInitLiteralIndex(g); litIdx != UINT32_MAX) {
+                noteLiteralSymbols(mir_.literalValue(litIdx));
+            }
         }
         for (std::uint32_t i = 1; i < mir_.instCount(); ++i) {
             MirInstId const id{i, mir_.id().v};
             if (mir_.instOpcode(id) == MirOpcode::GlobalAddr) {
                 noteSymbol(mir_.globalAddrSymbol(id).v);
+            } else if (mir_.instOpcode(id) == MirOpcode::Const) {
+                noteLiteralSymbols(mir_.literalValue(mir_.constLiteralIndex(id)));
             }
         }
     }
@@ -484,13 +661,23 @@ private:
         if (symOrder_.empty()) return;
         out_ += "symbols {\n";
         for (std::uint32_t v : symOrder_) {
-            std::string_view name;
-            if (ctx_.symbolNames != nullptr && v < ctx_.symbolNames->size()) {
-                name = (*ctx_.symbolNames)[v];
-            }
-            out_ += std::format("  %{} {}\n", v, quote(name));
+            out_ += std::format("  %{} {}\n", v, quote(nameOf(v)));
         }
         out_ += "}\n";
+    }
+
+    // The context's dense table first, then its sparse one (what `parseMir`
+    // hands back); empty when neither names `v`.
+    [[nodiscard]] std::string_view nameOf(std::uint32_t v) const {
+        if (ctx_.symbolNames != nullptr && v < ctx_.symbolNames->size()) {
+            return (*ctx_.symbolNames)[v];
+        }
+        if (ctx_.symbolNameMap != nullptr) {
+            if (auto const it = ctx_.symbolNameMap->find(v); it != ctx_.symbolNameMap->end()) {
+                return it->second;
+            }
+        }
+        return {};
     }
 
     // ── THE STRUCTURAL TYPE EMITTER — AN EXPLICIT HEAP WORK STACK ────────────
@@ -520,48 +707,31 @@ private:
     //      structures in the compiler because big projects like sqlite will for
     //      sure explode the stack"*.
     //
-    //   2. A COMPOSITE THAT REACHES ITSELF IS REFUSED **LOUD**, BY NAME.
-    //      `openComposites_` holds the composites whose field list is currently
-    //      being expanded; re-entering one emits an `Error` naming it and the `?`
-    //      mark, which `parseType` refuses BY NAME on the way back in. That is
-    //      this file's own established discipline for a value the format cannot
-    //      spell — see the `TypeKind::Extension` arm, which likewise emits text
-    //      it says out loud the reader will not accept. Turning the crash into a
-    //      SILENT truncated type would have been worse than the crash: it would
-    //      round-trip a `struct S` whose `next` field had quietly lost its
-    //      pointee.
+    //   2. A COMPOSITE IS A REFERENCE, NEVER AN EXPANSION (`.dssir` v2, P68 round 8,
+    //      lane `ht`, part 1d). Its ONE definition lives in the `types` section
+    //      (`emitTypes`), and every mention — here, and inside other definitions —
+    //      is its handle, `type <H>`. That single decision makes the spelling
+    //      O(mentions + graph) instead of O(mentions × graph) — ✔MEASURED, v1's
+    //      per-use expansion took `emitMir` of sqlite3.c's module to 30 GB and
+    //      `std::bad_alloc` — and it makes a CYCLE ordinary: nothing expands, so
+    //      nothing can expand forever. The v1 cycle guard (an open-composite set
+    //      that refused a self-reaching composite with `?`) is gone with the
+    //      expansion it guarded; a linked-list node now round-trips.
     //
-    // ⚠ WHAT THIS DOES **NOT** DO, STATED RATHER THAN IMPLIED: it does not make a
-    // self-referential composite round-trip. It cannot, from here. `parseType`
-    // builds a composite with ONE call — `interner_.structType(name, fields)` —
-    // so a cyclic type is not representable by this reader at all; spelling one
-    // would need a two-phase (declare-tag-then-complete) interner entry point,
-    // i.e. a change to `src/core/types/**` and a matching grammar in BOTH text
-    // tiers. That is a format decision, not a bug fix, and it is recorded in the
-    // row rather than guessed at here.
-    //
-    // ⚠ THE TWIN IN `src/hir/hir_text.cpp`'s OWN `appendType` HAS THE IDENTICAL
-    // DEFECT — same inline field-list expansion, same absent cycle guard — and is
-    // OUTSIDE this lane's file set. It is named in the row, not silently left.
+    // The reader completes each entry through the same two-phase interner entry
+    // point the HIR v5 table uses (`forwardComposite`, then `completeComposite`),
+    // which is what lets a field name any handle — its own composite's included.
     bool internerWarned_ = false;
 
     // One unit of pending emit work. `Type` renders a type; `Text` appends a
-    // precomputed literal run (a closer, a separator, a formatted suffix);
-    // `CloseComposite` pops a tag off `openComposites_` once its field list is
-    // fully rendered. Tasks are pushed in REVERSE execution order.
+    // precomputed literal run (a closer, a separator, a formatted suffix). Tasks
+    // are pushed in REVERSE execution order.
     struct TypeEmitTask {
-        enum class Kind : std::uint8_t { Type, Text, CloseComposite };
+        enum class Kind : std::uint8_t { Type, Text };
         Kind          kind = Kind::Type;
         TypeId        type{};
-        std::uint32_t tag  = 0;
         std::string   text;
     };
-
-    // The composites whose field list is currently open. A vector and a linear
-    // scan on purpose: this is the NESTING depth of one type, which is small
-    // even for a pathological input, and a vector keeps the open set in the same
-    // order as the text so the diagnostic can name what it is inside of.
-    std::vector<std::uint32_t> openComposites_;
 
     void appendType(TypeId root) {
         std::vector<TypeEmitTask> stack;
@@ -575,21 +745,6 @@ private:
             switch (task.kind) {
                 case TypeEmitTask::Kind::Text:
                     out_ += task.text;
-                    continue;
-                case TypeEmitTask::Kind::CloseComposite:
-                    // The field list is finished; the composite is no longer an
-                    // ancestor of anything still to render.
-                    if (!openComposites_.empty()
-                        && openComposites_.back() == task.tag) {
-                        openComposites_.pop_back();
-                    } else {
-                        // Unreachable by construction (a CloseComposite is pushed
-                        // with, and only with, its own open entry). Fail loud
-                        // rather than silently desynchronize the cycle guard.
-                        report("internal: MIR type emitter's composite open-set "
-                               "desynchronized", DiagnosticSeverity::Error);
-                        openComposites_.clear();
-                    }
                     continue;
                 case TypeEmitTask::Kind::Type:
                     break;
@@ -653,35 +808,14 @@ private:
                 out_ += "complex<"; pushArgs(in.operands(t).first(1), ">"); return;
             case TypeKind::Tuple:
                 out_ += "tuple<"; pushArgs(in.operands(t), ">"); return;
+            // ★★★ v2: A COMPOSITE IS A REFERENCE, NEVER AN EXPANSION — its handle
+            // into the `types` table, minted here at the first mention. The handle
+            // names the MATERIAL composite (a qualifier skin is a property of a use,
+            // not of the definition).
             case TypeKind::Struct:
-            case TypeKind::Union: {
-                bool const isStruct = in.kind(t) == TypeKind::Struct;
-                out_ += isStruct ? "struct " : "union ";
-                out_ += quote(in.name(t));
-                // ★★ THE CYCLE GUARD. Reaching a composite that is already being
-                // expanded means the field list contains a path back to itself;
-                // expanding it again never terminates. Refuse it BY NAME, with
-                // the `?` mark the reader rejects, rather than truncating it into
-                // a type that would read back as something else.
-                if (std::find(openComposites_.begin(), openComposites_.end(), t.v)
-                    != openComposites_.end()) {
-                    report(std::format(
-                        "{} '{}' contains a path back to itself; this format "
-                        "expands a composite's field list inline and has no "
-                        "spelling for a self-referential type, so it is rendered "
-                        "as '?' and the text will NOT read back",
-                        isStruct ? "struct" : "union", in.name(t)),
-                        DiagnosticSeverity::Error);
-                    out_ += " ?";
-                    return;
-                }
-                openComposites_.push_back(t.v);
-                stack.push_back(TypeEmitTask{.kind = Kind::CloseComposite,
-                                             .tag  = t.v});
-                out_ += " {";
-                pushArgs(in.operands(t), "}");
+            case TypeKind::Union:
+                out_ += std::format("type {}", typeHandleOf(in.stripVolatile(t)));
                 return;
-            }
             // ★★ THE UNDERLYING KIND IS SPELLED BY NAME, NOT BY ITS ORDINAL, and
             // that is a correctness requirement rather than a readability one.
             // This arm used to write `std::to_string(sc[0])` — the raw `TypeKind`
@@ -697,6 +831,23 @@ private:
             // (D-TEXT-TIER-ENUM-UNDERLYING-SERIALIZED-AS-A-TYPEKIND-ORDINAL).
             case TypeKind::Enum: {
                 out_ += "enum "; out_ += quote(in.name(t));
+                // ★ A FIXED UNDERLYING TYPE (v3, P68 round 12, lane `cs`): `enum E :
+                // long` and `enum E` are different types (C23 6.2.7p1), so the fixed
+                // form says so — `enum "E" fixed <declared type>`, the HIR tier's
+                // spelling, printed by this tier's primitive arm (which, like every
+                // `.dssir` primitive, carries no vocabulary tag: `fixed i64`).
+                if (TypeId const declared = in.enumDeclaredUnderlying(t); declared.valid()) {
+                    out_ += " fixed ";
+                    pushType(declared);
+                    return;
+                }
+                // ★ …and a CHOSEN compatible type (the enumeration P1, same round):
+                // `enum "E" chosen u32` — a different record from `fixed` (C23 6.2.7p1).
+                if (TypeId const chosen = in.enumChosenUnderlying(t); chosen.valid()) {
+                    out_ += " chosen ";
+                    pushType(chosen);
+                    return;
+                }
                 auto sc = in.scalars(t);
                 if (!sc.empty() && static_cast<TypeKind>(sc[0]) != TypeKind::I32) {
                     auto const k = static_cast<TypeKind>(sc[0]);
@@ -734,10 +885,23 @@ private:
                 }
                 out_ += "fn(";
                 // Reverse execution order: the cc tail, then the result, then
-                // `) -> `, then the parameter list.
+                // `) -> `, then the variadic marker, then the parameter list.
                 if (!tail.empty()) pushText(std::move(tail));
                 pushType(in.fnResult(t));
-                pushArgs(in.fnParams(t), ") -> ");
+                pushText(") -> ");
+                // ★ THE VARIADIC MARKER (P68 round 8, lane `ht`, part 1d). The HIR tier
+                // has spelled it since c14 ("the scalars[1] flag would otherwise be lost
+                // on reparse"); this writer never did, so every variadic signature came
+                // back NON-variadic — a DIFFERENT TypeId — and the reader's own
+                // verify-on-load refused every call passing a variadic tail as the wrong
+                // arity. ✔MEASURED over the examples corpus: 57 modules (`printf` and
+                // its kin) did not read back for that reason alone.
+                auto const ps = in.fnParams(t);
+                if (in.fnIsVariadic(t)) pushText(ps.empty() ? "..." : ", ...");
+                for (std::size_t i = ps.size(); i-- > 0;) {
+                    pushType(ps[i]);
+                    if (i != 0) pushText(", ");
+                }
                 return;
             }
             // ★★ WRITE-ONLY SPELLING, MADE LOUD RATHER THAN LEFT AS A WARNING
@@ -867,9 +1031,20 @@ private:
                 // LD-3 folded F80/F128 value, again the HIR tier's spelling: the
                 // FORMAT BIT-WIDTH (80|128) is the stable discriminator, never the
                 // TypeKind ordinal.
+                // The width through its ONE owner (`WideFloatValue::kFormatBitWidths`,
+                // P68 round 8, lane `ht`, part 1c-b); a kind with no width is refused
+                // rather than spelled 80, which read back as a different value.
                 WideFloatValue::Packed const p = v.pack();
-                out_ += std::format("wfloat {} {} {}",
-                                    (v.kind() == TypeKind::F128) ? 128 : 80, p.hi, p.lo);
+                if (std::optional<std::uint32_t> const bits =
+                        WideFloatValue::formatBitWidth(v.kind());
+                    bits.has_value()) {
+                    out_ += std::format("wfloat {} {} {}", *bits, p.hi, p.lo);
+                } else {
+                    report(std::format("a wide-float literal of kind {} has no `wfloat` "
+                                       "width — accepted: {}", static_cast<int>(v.kind()),
+                                       WideFloatValue::formatBitWidthsAccepted()),
+                           DiagnosticSeverity::Error);
+                }
             } else {
                 // ★★★ THE ARM THAT DID NOT EXIST, AND ITS ABSENCE WAS SILENT.
                 // This chain had no final `else`, so the two arms above it — both
@@ -990,7 +1165,7 @@ private:
         out_ += '\n';
     }
 
-    // TF-C78 (D-CSUBSET-NOINLINE): the function-attribute list — the per-MirFunc
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the function-attribute list — the per-MirFunc
     // metadata that is NOT recoverable from the symbol + signature alone.
     //
     // ★ THIS PRINTER PREVIOUSLY DROPPED `binding` AND `visibility` OUTRIGHT.
@@ -1070,8 +1245,37 @@ private:
         out_ += "    }\n";
     }
 
+    // ` [flag, flag]` after an instruction's mnemonic — every set `MirInstFlags`
+    // bit by its `kMirTextInstFlagTable` spelling, in the table's order; nothing
+    // at all for a flagless instruction. A set bit the table does not spell is
+    // REFUSED rather than dropped: that drop is exactly the defect this closes.
+    void appendInstFlags(MirInstId id, std::string_view mnemonic) {
+        using U = std::underlying_type_t<MirInstFlags>;
+        U remaining = static_cast<U>(mir_.instFlags(id));
+        if (remaining == 0) return;
+        out_ += " [";
+        bool first = true;
+        for (auto const& [bit, name] : kMirTextInstFlagTable.rows) {
+            if ((remaining & static_cast<U>(bit)) == 0) continue;
+            if (!first) out_ += ", ";
+            out_ += name;
+            first = false;
+            remaining = static_cast<U>(remaining & ~static_cast<U>(bit));
+        }
+        out_ += ']';
+        if (remaining != 0) {
+            report(std::format(
+                "'{}' (mir inst #{}) carries instruction flag bits {:#x} that this "
+                "format does not spell — accepted: {}", mnemonic, id.v,
+                static_cast<unsigned>(remaining),
+                detail::renderAllowedList(allNames(kMirTextInstFlagTable))),
+                DiagnosticSeverity::Error);
+        }
+    }
+
     void emitInst(MirInstId id, MirBlockId block) {
         out_ += "      ";
+        bool spelledPayload2 = false;   // set by the ONE arm that spells `align=N`
         MirOpcode const op = mir_.instOpcode(id);
         MirOpcodeInfo const& info = opcodeInfo(op);
         bool const hasResult = mir_.instType(id).valid();
@@ -1079,6 +1283,7 @@ private:
             out_ += std::format("%v{} = ", id.v);
         }
         out_ += info.mnemonic;
+        appendInstFlags(id, info.mnemonic);
         if (hasResult) {
             out_ += " : ";
             appendType(mir_.instType(id));
@@ -1353,8 +1558,32 @@ private:
                  && op != MirOpcode::InsertValue) {
                     out_ += std::format(" payload {}", payload);
                 }
+                // ★★ THE SECONDARY PAYLOAD — AN ALIGNMENT — WAS NEVER WRITTEN
+                // (P68 round 8, lane `ht`, part 1b). `payload2` carries an
+                // `Alloca`'s effective alignment and an atomic access's PROVABLE
+                // alignment (the value `mir_to_lir` asks when it decides whether
+                // the native form is safe), and this arm printed neither: ✔MEASURED,
+                // a module whose alloca carried alignment 3 was written
+                // `%v1 = alloca : ptr<i32>`, so every over-aligned stack local
+                // came back from a `.dssir` round trip at its NATURAL alignment,
+                // with no diagnostic. Spelled like the global attribute
+                // (`align=N`, the same key), and only when not the default, so a
+                // default-aligned instruction reads exactly as before.
+                if (std::uint32_t const align = mir_.instPayload2(id); align != 0) {
+                    out_ += std::format(" {}={}", kMirTextAlignAttr, align);
+                    spelledPayload2 = true;
+                }
                 break;
             }
+        }
+        // ⚠ A SECONDARY PAYLOAD ON AN OPCODE WHOSE ARM DOES NOT SPELL IT is the
+        // same silent loss, one arm over — refused by name rather than dropped.
+        if (mir_.instPayload2(id) != 0 && !spelledPayload2) {
+            report(std::format(
+                "'{}' (mir inst #{}) carries a secondary payload (alignment {}) "
+                "that its arm of this format does not spell", info.mnemonic, id.v,
+                mir_.instPayload2(id)),
+                DiagnosticSeverity::Error);
         }
         out_ += '\n';
     }
@@ -1389,6 +1618,9 @@ enum class TokKind {
     Eq,
     Dot,            // `.` (for `icmp.eq` etc.)
     Minus,
+    Ellipsis,       // `...` — a variadic signature's tail, the last item of `fn(…)`
+    At,             // `@` — a `types` field's explicit offset (`@N`)
+    Tilde,          // `~` — a `types` field's member alignment (`~N`)
     Unknown,
 };
 
@@ -1420,7 +1652,12 @@ public:
         if (c == ':') { ++pos_; t.kind = TokKind::Colon;   return t; }
         if (c == ',') { ++pos_; t.kind = TokKind::Comma;   return t; }
         if (c == '=') { ++pos_; t.kind = TokKind::Eq;      return t; }
+        if (c == '.' && text_.substr(pos_, 3) == "...") {
+            pos_ += 3; t.kind = TokKind::Ellipsis; return t;
+        }
         if (c == '.') { ++pos_; t.kind = TokKind::Dot;     return t; }
+        if (c == '@') { ++pos_; t.kind = TokKind::At;      return t; }
+        if (c == '~') { ++pos_; t.kind = TokKind::Tilde;   return t; }
         if (c == '-') {
             if (pos_ + 1 < text_.size() && text_[pos_ + 1] == '>') {
                 pos_ += 2; t.kind = TokKind::Arrow; return t;
@@ -1429,6 +1666,16 @@ public:
             // by including the '-' in the text.
             std::size_t const start = pos_;
             ++pos_;
+            // `-inf` / `-nan` — what `std::format` writes for a negative non-finite
+            // double (P68 round 8, lane `ht`, part 1d). The scan below stops at the
+            // letter, so the token was a bare `-` and the value unreadable.
+            // ✔MEASURED: `float_literal_overflow_infinity` did not read back.
+            if (pos_ < text_.size() && std::isalpha(static_cast<unsigned char>(text_[pos_]))) {
+                while (pos_ < text_.size() && std::isalpha(static_cast<unsigned char>(text_[pos_]))) ++pos_;
+                t.text = std::string(text_.substr(start, pos_ - start));
+                t.kind = TokKind::Float;
+                return t;
+            }
             while (pos_ < text_.size() && (std::isdigit(static_cast<unsigned char>(text_[pos_]))
                                          || text_[pos_] == '.'
                                          || text_[pos_] == 'e' || text_[pos_] == 'E'
@@ -1540,15 +1787,20 @@ public:
     [[nodiscard]] std::unique_ptr<MirParseResult> run() {
         if (!expectIdent("dssir")) return makeEmptyResult();
         Tok const ver = lex_.take();
-        if (ver.kind != TokKind::Integer || ver.text != "1") {
+        if (ver.kind != TokKind::Integer || ver.text != std::to_string(kVersion)) {
+            // A v1 text spells composites inline and cannot be read by this grammar
+            // (and was never stored: no committed file carries a `.dss.mir` payload).
             ParseDiagnostic d;
             d.code     = DiagnosticCode::I_TextVersionMismatch;
             d.severity = DiagnosticSeverity::Error;
-            d.actual   = std::format("expected version 1, got '{}'", ver.text);
+            d.actual   = std::format("expected version {}, got '{}'", kVersion, ver.text);
             reporter_.report(std::move(d));
             return makeEmptyResult();
         }
-        // Optional `symbols { ... }` preamble.
+        // Optional `types { ... }` then `symbols { ... }` preamble.
+        if (peekIdent("types")) {
+            parseTypesSection();
+        }
         if (peekIdent("symbols")) {
             parseSymbolsPreamble();
         }
@@ -1592,10 +1844,27 @@ private:
     CompilationUnitId    cuId_;
     TypeInterner         interner_;
     MirBuilder           builder_;
-    std::vector<std::string> symbolNames_;     // SymbolId.v → name
+    // SymbolId.v → name, one entry per declaration — SPARSE (see
+    // `MirParseResult::symbolNames`), never sized by a slot's number.
+    std::unordered_map<std::uint32_t, std::string> symbolNames_;
     std::unordered_map<std::uint32_t, MirBlockId> blockMap_;  // text slot v → builder block id
     std::unordered_map<std::uint32_t, MirInstId>  valueMap_;  // text slot v → builder inst id
     std::unordered_map<std::uint32_t, MirFuncId>  funcMap_;   // text slot v → builder func id
+    // The `types` table: handle → the composite's TypeId (forward-minted by the
+    // section's first pass, completed by its second), and the handles defined.
+    std::unordered_map<std::uint64_t, TypeId>     typeHandles_;
+    std::unordered_set<std::uint64_t>             typeDefined_;
+    // The declSiteKey a `type <H>` handle is forward-minted under: its own ordinal
+    // in a range no compiler-minted key uses, so two handles never share a TypeId.
+    [[nodiscard]] static std::uint64_t handleDeclSiteKey(std::uint64_t handle) {
+        return handle | (std::uint64_t{1} << 60);
+    }
+    // The largest `type <H>` handle this reader takes — a handle is an ordinal of
+    // the artifact's own composites, and the bound is what keeps
+    // `handleDeclSiteKey` INJECTIVE (past bit 60 two handles would share a key,
+    // hence a TypeId, and completing the second with a different body would reach
+    // `completeComposite`'s ABORT rather than a diagnostic).
+    static constexpr std::uint64_t kMaxTypeHandle = 0xFFFFFFFFu;
     // Globals whose `initfunc` references a function-text-slot that
     // wasn't yet parsed at the time the global was declared. Resolved
     // at finalize() by replaying the global with the resolved MirFuncId.
@@ -1622,10 +1891,18 @@ private:
     };
     std::vector<PendingPhi> pendingPhis_;
     bool errors_ = false;
+    // Every refusal this reader emits, counted by the reader itself (the reporter
+    // may drop a repeat as a recent duplicate). A line whose count moved is a
+    // REFUSED line, and recovery consumes the rest of it (`skipRestOfLine`).
+    std::size_t refusals_ = 0;
+    // Functions whose body was skipped because a refusal was already on record
+    // (`parseFunction`): the builder numbers functions as it adds them, so an
+    // `initfunc %fN` naming one past a skip no longer means what the text says.
+    std::size_t skippedFunctions_ = 0;
 
     [[nodiscard]] std::unique_ptr<MirParseResult> makeEmptyResult() {
         return std::make_unique<MirParseResult>(
-            Mir{}, TypeInterner{cuId_}, std::vector<std::string>{});
+            Mir{}, TypeInterner{cuId_}, std::unordered_map<std::uint32_t, std::string>{});
     }
 
     void emitMalformed(std::string what) {
@@ -1635,6 +1912,7 @@ private:
         d.actual   = std::move(what);
         reporter_.report(std::move(d));
         errors_ = true;
+        ++refusals_;
     }
 
     void emitUnknownName(std::string what) {
@@ -1644,6 +1922,7 @@ private:
         d.actual   = std::move(what);
         reporter_.report(std::move(d));
         errors_ = true;
+        ++refusals_;
     }
 
     // Resolve a spelling against the vocabulary's OWN table, and REFUSE a miss
@@ -1696,6 +1975,11 @@ private:
         T v{};
         auto [ptr, ec] = std::from_chars(text.data(),
                                          text.data() + text.size(), v);
+        if (ec == std::errc::result_out_of_range) {
+            emitMalformed(std::format("{} value '{}' does not fit its {}-bit field",
+                                      what, text, sizeof(T) * 8));
+            return T{};
+        }
         if (ec != std::errc{} || ptr != text.data() + text.size()) {
             emitMalformed(std::format("malformed {} value '{}'", what, text));
         }
@@ -1708,7 +1992,15 @@ private:
         char* end = nullptr;
         errno = 0;
         double const d = std::strtod(buf.c_str(), &end);
-        if (errno == ERANGE || end == buf.c_str()) {
+        // ⚠ `ERANGE` ALONE IS NOT A REFUSAL (P68 round 8, lane `ht`, part 1d): strtod
+        // sets it for an UNDERFLOW, which includes a SUBNORMAL result it still returns
+        // exactly — the shortest spelling `std::format` writes for one reads back
+        // bit-identical. ✔MEASURED: `subnormal_double_literal_decode` did not read
+        // back. What IS refused is a value this writer cannot have produced: an
+        // overflow (±HUGE_VAL), a nonzero text that underflowed to zero, or a token
+        // not wholly consumed.
+        bool const overflowOrLost = errno == ERANGE && (std::isinf(d) || d == 0.0);
+        if (overflowOrLost || end != buf.c_str() + buf.size()) {
             emitMalformed(std::format("malformed float value '{}'", text));
         }
         return d;
@@ -1731,12 +2023,13 @@ private:
             // Could be `b3`, `v12` etc. — strip the prefix letter and
             // parse the rest as integer.
             std::string_view const num = t.text;
-            std::uint32_t v = 0;
             std::size_t i = 1;
-            while (i < num.size() && std::isdigit(static_cast<unsigned char>(num[i]))) {
-                v = v * 10 + static_cast<std::uint32_t>(num[i] - '0');
-                ++i;
-            }
+            while (i < num.size() && std::isdigit(static_cast<unsigned char>(num[i]))) ++i;
+            // The digits go through `parseNumber`, which refuses a value past 32
+            // bits by name — the hand-rolled `v = v * 10 + d` this replaces WRAPPED,
+            // so `%v4294967297` read back as `%v1` (P68, lane `ht`, part 1c).
+            std::uint32_t const v =
+                i > 1 ? parseNumber<std::uint32_t>(num.substr(1, i - 1), "% handle") : 0u;
             // ⚠ THE DIGITS ARE THE HANDLE; NO DIGITS IS NOT HANDLE ZERO. The loop
             // above used to be the whole arm, so `%b`, `%vx` or `%g_tmp` fell out
             // with `v == 0` and NO diagnostic — and 0 is a LIVE SLOT NUMBER here,
@@ -1763,12 +2056,221 @@ private:
         return 0;
     }
 
+    // ── `types { type <H> = … }` — the composite table (v2) ─────────────────────
+    //
+    // TWO PASSES OVER ONE SECTION, and the first is what makes a cycle — or any
+    // reference to a handle defined LATER — an ordinary case (the HIR v5 reader's
+    // shape, for the same reason). A definition's fields may name any handle, and
+    // building `ptr<type 2>` needs `type 2`'s TypeId; `forwardComposite` mints one
+    // from a kind and a name, which a reference does not carry. So `scanTypeHeads`
+    // reads every entry's HEAD first — silently — and mints each handle's forward
+    // id; then the lexer is rewound and the section is read for real, completing
+    // each forward id with its fields. Every diagnostic comes from the second pass,
+    // so an entry is reported once however malformed it is.
+    void parseTypesSection() {
+        (void)expectIdent("types");
+        if (!expect(TokKind::LBrace)) return;
+        std::size_t const firstEntry = lex_.pos();
+        scanTypeHeads();
+        lex_.setPos(firstEntry);
+        while (lex_.peek().kind != TokKind::RBrace && lex_.peek().kind != TokKind::End) {
+            std::size_t const at = lex_.pos();
+            parseTypeEntry();
+            if (lex_.pos() == at) lex_.take();   // progress guard
+        }
+        (void)expect(TokKind::RBrace);
+    }
+
+    // PASS 1: every well-formed `type <H> = struct|union "<name>"` head mints the
+    // forward composite for H. Says NOTHING — a malformed entry is left for pass 2
+    // to refuse — and stops at the first token it cannot place, because past that
+    // point it cannot tell a head from a field. A handle it does not reach is then
+    // reported by the reference that needs it.
+    void scanTypeHeads() {
+        for (;;) {
+            if (!peekIdent("type")) return;
+            lex_.take();
+            Tok const h = lex_.take();
+            if (h.kind != TokKind::Integer) return;
+            std::uint64_t handle = 0;
+            auto const [ptr, ec] = std::from_chars(h.text.data(), h.text.data() + h.text.size(), handle);
+            if (ec != std::errc{} || ptr != h.text.data() + h.text.size()) return;
+            if (lex_.take().kind != TokKind::Eq) return;
+            Tok const k = lex_.take();
+            if (k.kind != TokKind::Ident || (k.text != "struct" && k.text != "union")) return;
+            Tok const name = lex_.take();
+            if (name.kind != TokKind::String) return;
+            if (handle != 0 && handle <= kMaxTypeHandle && !typeHandles_.contains(handle)) {
+                typeHandles_.emplace(handle, interner_.forwardComposite(
+                    k.text == "struct" ? TypeKind::Struct : TypeKind::Union, name.text,
+                    handleDeclSiteKey(handle)));
+            }
+            if (peekIdent("opaque")) { lex_.take(); continue; }
+            // Step over the layout markers and the field list to the next head. A
+            // field list holds no brace of its own in a module (a composite is only
+            // ever `type <H>` there), so the depth count is a guard for a malformed
+            // input rather than a grammar case.
+            while (lex_.peek().kind != TokKind::LBrace && lex_.peek().kind != TokKind::RBrace
+                   && lex_.peek().kind != TokKind::End) {
+                lex_.take();
+            }
+            if (lex_.take().kind != TokKind::LBrace) return;
+            std::size_t depth = 1;
+            while (depth != 0 && lex_.peek().kind != TokKind::End) {
+                TokKind const tk = lex_.take().kind;
+                if (tk == TokKind::LBrace) ++depth;
+                else if (tk == TokKind::RBrace) --depth;
+            }
+        }
+    }
+
+    // PASS 2: one entry, for real. `type <H> = struct|union "<name>"` then either
+    // `opaque` or `[packed] [aligned N] [pack N] { <field>, … }`.
+    void parseTypeEntry() {
+        if (!peekIdent("type")) {
+            emitMalformed(std::format(
+                "expected `type <H> = struct|union \"<name>\" …` in the `types` "
+                "section, got '{}'", lex_.peek().text));
+            lex_.take();
+            return;
+        }
+        lex_.take();
+        Tok const h = lex_.take();
+        std::size_t const before = refusals_;
+        std::uint64_t const handle = h.kind == TokKind::Integer
+            ? parseNumber<std::uint64_t>(h.text, "type handle") : 0;
+        if (h.kind != TokKind::Integer) {
+            emitMalformed(std::format("expected a handle after `type`, got '{}'", h.text));
+        }
+        (void)expect(TokKind::Eq);
+        Tok const k = lex_.take();
+        TypeKind kind = TypeKind::Struct;
+        if (k.kind == TokKind::Ident && k.text == "struct") {
+            kind = TypeKind::Struct;
+        } else if (k.kind == TokKind::Ident && k.text == "union") {
+            kind = TypeKind::Union;
+        } else {
+            emitMalformed(std::format(
+                "a `types` entry defines a `struct` or a `union` — nothing else is a "
+                "composite in this format (got '{}')", k.text));
+            return;
+        }
+        Tok const name = lex_.take();
+        if (name.kind != TokKind::String) {
+            emitMalformed("expected struct/union name");
+            return;
+        }
+        bool usable = refusals_ == before;
+        if (usable && (handle == 0 || handle > kMaxTypeHandle)) {
+            emitMalformed(std::format(
+                "`type {}` is not a handle — handles are 1-based ordinals of at most {}",
+                handle, kMaxTypeHandle));
+            usable = false;
+        } else if (usable && !typeDefined_.insert(handle).second) {
+            emitMalformed(std::format(
+                "`type {}` is defined twice — a handle names ONE composite per text, so "
+                "a second body would describe a different type under the same name",
+                handle));
+            usable = false;
+        }
+        TypeId fwd = InvalidType;
+        if (usable) {
+            if (auto const it = typeHandles_.find(handle); it != typeHandles_.end()) {
+                fwd = it->second;
+            } else {
+                // Pass 1 stopped before this entry (an earlier one was malformed); it
+                // is still minted here so its own references resolve.
+                fwd = interner_.forwardComposite(kind, name.text, handleDeclSiteKey(handle));
+                typeHandles_.emplace(handle, fwd);
+            }
+        }
+        if (peekIdent("opaque")) { lex_.take(); return; }   // INCOMPLETE: stays forward-only
+        CompositeDefinition def;
+        def.kind = kind;
+        def.name = name.text;
+        if (peekIdent("packed")) { lex_.take(); def.packed = true; }
+        if (peekIdent("aligned")) { lex_.take(); def.explicitAlign = takeCompositeAlign("aligned"); }
+        if (peekIdent("pack")) { lex_.take(); def.maxFieldAlign = takeCompositeAlign("pack"); }
+        if (!expect(TokKind::LBrace)) return;
+        for (;;) {
+            TokKind const pk = lex_.peek().kind;
+            if (pk == TokKind::RBrace) break;
+            if (pk == TokKind::End) {
+                emitMalformed(std::format(
+                    "unterminated `types` entry — reached the end of the input with {} "
+                    "field(s) read and no closing '}}'; the composite was NOT completed",
+                    def.fields.size()));
+                return;
+            }
+            if (!def.fields.empty() && !expect(TokKind::Comma)) return;
+            std::size_t const at = lex_.pos();
+            readCompositeField(def);
+            if (lex_.pos() == at) lex_.take();   // progress guard
+        }
+        (void)expect(TokKind::RBrace);
+        if (!usable) return;
+        // The ONE owner (`composite_definition.hpp`, shared with the HIR v5 table)
+        // refuses, by name, every combination `completeComposite` would ABORT on or
+        // `computeLayout` would decline, then completes the forward id; a refusal
+        // leaves it forward-only, and the parse is already not ok.
+        if (auto const why = refuseCompositeDefinition(def)) {
+            emitMalformed(std::format("`type {}`: {}", handle, *why));
+            return;
+        }
+        completeCompositeDefinition(interner_, fwd, def);
+    }
+
+    // `aligned N` / `pack N` — a whole-composite byte alignment. 0 is refused: it is
+    // the writer's ABSENT value (the marker is omitted when there is none), so a
+    // text spelling it disagrees with this grammar. Representability is the ONE
+    // owner's check.
+    [[nodiscard]] std::uint32_t takeCompositeAlign(char const* marker) {
+        Tok const n = lex_.take();
+        std::size_t const before = refusals_;
+        std::uint32_t const v = n.kind == TokKind::Integer
+            ? parseNumber<std::uint32_t>(n.text, marker) : 0u;
+        if (n.kind != TokKind::Integer) {
+            emitMalformed(std::format("expected an alignment after `{}`, got '{}'", marker, n.text));
+        } else if (refusals_ == before && v == 0) {
+            emitMalformed(std::format(
+                "`{} 0` is not a composite alignment — the writer omits the marker when "
+                "there is none", marker));
+        }
+        return v;
+    }
+
+    // `<type> [@N | ~N] [bits N] [packed]` — one field of a definition, every
+    // per-field channel the grammar spells; the combinations are the ONE owner's.
+    void readCompositeField(CompositeDefinition& def) {
+        CompositeFieldDefinition f;
+        f.type = parseType();
+        if (lex_.peek().kind == TokKind::At) {
+            lex_.take();
+            Tok const n = lex_.take();
+            f.offset = parseNumber<std::uint64_t>(n.text, "field offset");
+        } else if (lex_.peek().kind == TokKind::Tilde) {
+            lex_.take();
+            Tok const n = lex_.take();
+            f.align = parseNumber<std::uint32_t>(n.text, "member alignment");
+        }
+        if (peekIdent("bits")) {
+            lex_.take();
+            Tok const n = lex_.take();
+            // The width travels VERBATIM — its legality is the layout engine's to
+            // decide — but it must fit the 32-bit channel `fieldBitWidth` returns.
+            f.bitWidth = parseNumber<std::uint32_t>(n.text, "bit-field width");
+        }
+        if (peekIdent("packed")) { lex_.take(); f.packed = true; }
+        def.fields.push_back(f);
+    }
+
     void parseSymbolsPreamble() {
         (void)expectIdent("symbols");
         if (!expect(TokKind::LBrace)) return;
         while (true) {
             Tok t = lex_.peek();
             if (t.kind == TokKind::RBrace || t.kind == TokKind::End) break;
+            std::size_t const refusalsBeforeSlot = refusals_;
             std::uint32_t const v = parsePercentValue();
             Tok name = lex_.take();
             if (name.kind != TokKind::String) {
@@ -1776,8 +2278,22 @@ private:
                     name.text));
                 continue;
             }
-            if (symbolNames_.size() <= v) symbolNames_.resize(v + 1);
-            symbolNames_[v] = name.text;
+            if (refusals_ != refusalsBeforeSlot) continue;   // the handle is refused already
+            // ★ ONE ENTRY PER DECLARATION, never a table sized by the slot's
+            // number: this was `resize(v + 1)` — ✔MEASURED P68 (lane `ht`, part
+            // 1c), `%4000000000 "x"` threw `std::bad_alloc` out of `parseMir`,
+            // `%4294967295` wrapped `v + 1` to 0 and wrote out of bounds
+            // (SIGSEGV), and 40 bytes of `%100000000 "x"` built a 3.2 GB table.
+            // The slots are raw CU ids and legitimately sparse, so no bound
+            // replaces it; the invalid sentinel and a repeat are refused.
+            if (v == 0) {
+                emitMalformed("symbol slot %0 is the invalid-symbol sentinel and "
+                              "names no symbol");
+                continue;
+            }
+            if (!symbolNames_.emplace(v, name.text).second) {
+                emitMalformed(std::format("symbol slot %{} is declared twice", v));
+            }
         }
         (void)expect(TokKind::RBrace);
     }
@@ -1811,6 +2327,7 @@ private:
         std::string          name;             // wrapper spelling / composite name
         bool                 isStruct = false; // Composite: struct vs union
         std::uint32_t        paramCount = 0;   // FnReturn: how many ops are params
+        bool                 isVariadic = false;   // FnParams: a `...` closed the list
         std::vector<TypeId>  ops;
     };
 
@@ -1897,8 +2414,23 @@ private:
             if (!isSigned && !expectIdent("_BitInt")) return true;
             if (!expect(TokKind::LParen)) return true;
             Tok const w = lex_.take();
+            // The width is a COUNT the model bounds — 1..`kBitIntMaxWidth`, the rule
+            // the HIR twin applies (P68 round 8, lane `ht`, part 1c-b) — and
+            // `TypeInterner::bitInt` decides nothing, so an unbounded or non-positive
+            // one was interned as it stood. Refused once: a width `parseNumber`
+            // already refused is not refused again.
+            std::size_t const before = refusals_;
             auto const width = parseNumber<std::int64_t>(w.text, "_BitInt width");
             (void)expect(TokKind::RParen);
+            if (refusals_ != before) { out = InvalidType; return true; }
+            if (width <= 0 || width > static_cast<std::int64_t>(kBitIntMaxWidth)) {
+                emitMalformed(std::format(
+                    "_BitInt width {} is not a _BitInt width — 1 to {} "
+                    "(__BITINT_MAXWIDTH__); a width is a count with no sentinel, so this "
+                    "names no type", width, kBitIntMaxWidth));
+                out = InvalidType;
+                return true;
+            }
             out = interner_.bitInt(width, isSigned);
             return true;
         }
@@ -1925,18 +2457,49 @@ private:
             stack.push_back(TypeParseFrame{.kind = TypeParseFrame::Kind::Tuple});
             return false;   // a (possibly empty) operand list comes next
         }
+        // v2: a composite is `type <H>`, an entry of the `types` section.
+        if (t.text == "type") {
+            Tok const h = lex_.take();
+            if (h.kind != TokKind::Integer) {
+                emitMalformed(std::format(
+                    "expected a handle after `type`, got '{}' — a composite reference "
+                    "is `type <H>`", h.text));
+                return true;
+            }
+            std::size_t const before = refusals_;
+            std::uint64_t const handle = parseNumber<std::uint64_t>(h.text, "type handle");
+            if (refusals_ != before) return true;
+            if (auto const it = typeHandles_.find(handle); it != typeHandles_.end()) {
+                out = it->second;
+                return true;
+            }
+            emitMalformed(std::format(
+                "`type {}` names no entry of this text's `types` section — every "
+                "composite a module mentions is defined there exactly once", handle));
+            return true;
+        }
+        // ★ THE v1 INLINE SPELLING IS REFUSED BY NAME, AND STILL READ TO ITS END.
+        // A composite in a `.dssir` v2 module is ONLY `type <H>`; an inline
+        // `struct "N" {…}` would be a SECOND, partial definition (field types only —
+        // no layout channel) of a type the table defines. It is refused at its head,
+        // and its field list is still consumed (the frame reduces to Invalid), so the
+        // rest of the line reads as the text says rather than as a cascade.
         if (t.text == "struct" || t.text == "union") {
             Tok name = lex_.take();
             if (name.kind != TokKind::String) {
                 emitMalformed("expected struct/union name");
                 return true;
             }
+            emitMalformed(std::format(
+                "an inline `{} {}` in a `.dssir` module — a composite is `type <H>`, "
+                "defined once in the `types` section (the inline spelling is v1's, and "
+                "it carried no layout channel)", t.text, quote(name.text)));
             if (!expect(TokKind::LBrace)) return true;
             stack.push_back(TypeParseFrame{
                 .kind = TypeParseFrame::Kind::Composite,
                 .name = std::move(name.text),
                 .isStruct = (t.text == "struct")});
-            return false;   // a (possibly empty) field list comes next
+            return false;   // its field list is still consumed, then refused
         }
         if (t.text == "enum") {
             Tok name = lex_.take();
@@ -1955,6 +2518,40 @@ private:
             // The spelling now comes off `kMirTextPrimTable`, the SAME table the
             // rest of this type grammar reads, so an unrecognized name is refused
             // with the accepted set projected from those rows.
+            // ★ `fixed <primitive>` — a FIXED underlying type (v3, P68 round 12, lane
+            // `cs`; the printer's arm says why). The kind is the declared type's.
+            if (lex_.peek().kind == TokKind::Ident && lex_.peek().text == "fixed") {
+                lex_.take();
+                Tok n = lex_.take();
+                TypeKind k = TypeKind::I32;
+                if (n.kind != TokKind::Ident) {
+                    emitMalformed(std::format(
+                        "expected a fixed enum underlying type name after 'fixed', got '{}'",
+                        n.text));
+                } else {
+                    k = orUnknownName(kMirTextPrimTable, n.text,
+                                      "fixed enum underlying type", TypeKind::I32);
+                }
+                out = interner_.enumType(name.text, k, interner_.primitive(k));
+                return true;
+            }
+            // ★ `chosen <primitive>` — a CHOSEN compatible type (the enumeration P1).
+            if (lex_.peek().kind == TokKind::Ident && lex_.peek().text == "chosen") {
+                lex_.take();
+                Tok n = lex_.take();
+                TypeKind k = TypeKind::I32;
+                if (n.kind != TokKind::Ident) {
+                    emitMalformed(std::format(
+                        "expected a chosen enum compatible type name after 'chosen', got '{}'",
+                        n.text));
+                } else {
+                    k = orUnknownName(kMirTextPrimTable, n.text,
+                                      "chosen enum compatible type", TypeKind::I32);
+                }
+                out = interner_.enumType(name.text, k, interner_.primitive(k),
+                                         TypeInterner::EnumUnderlyingOrigin::Chosen);
+                return true;
+            }
             TypeKind underlying = TypeKind::I32;
             if (lex_.peek().kind == TokKind::Colon) {
                 lex_.take();
@@ -2065,15 +2662,21 @@ private:
                     return false;
                 }
                 (void)expect(TokKind::RBrace);
-                out = f.isStruct ? interner_.structType(f.name, f.ops)
-                                 : interner_.unionType(f.name, f.ops);
+                out = InvalidType;   // refused at its head (the v1 inline spelling)
                 return true;
             case Kind::FnParams:
                 if (unterminatedList(f, "fn(…)", "')'", out)) return true;
                 if (lex_.peek().kind != TokKind::RParen) {
                     if (!f.ops.empty()) (void)expect(TokKind::Comma);
-                    needHead = true;
-                    return false;
+                    // `...` is the LAST item of a variadic signature — what follows it
+                    // is the `)`, and nothing else.
+                    if (lex_.peek().kind == TokKind::Ellipsis) {
+                        lex_.take();
+                        f.isVariadic = true;
+                    } else {
+                        needHead = true;
+                        return false;
+                    }
                 }
                 (void)expect(TokKind::RParen);
                 (void)expect(TokKind::Arrow);
@@ -2110,7 +2713,7 @@ private:
                             detail::renderAllowedList(allNames(kCallConvTable))));
                     }
                 }
-                out = interner_.fnSig(params, ret, cc);
+                out = interner_.fnSig(params, ret, cc, f.isVariadic);
                 return true;
             }
         }
@@ -2227,25 +2830,86 @@ private:
         } else if (tag.text == "bitint") {
             // C4b: the inverse of `appendLiteral`'s `bitint` arm, and the SAME
             // spelling `hir_text.cpp`'s `parseLiteralValue` reads —
-            // `bitint <width> <signed 0|1> <nLimbs> <limb…>`.
-            std::uint64_t const width  = parseNumber<std::uint64_t>(lex_.take().text, "bitint width");
+            // `bitint <width> <signed 0|1> <nLimbs> <limb…>` — held to the SAME rules
+            // (P68 round 8, lane `ht`, part 1c-b; the HIR twin closed in 1c-a): the
+            // width is 32-bit and the MODEL's to bound (`kBitIntMaxWidth` —
+            // `BitIntValue` re-wraps its limbs to it, so a width from the text would
+            // size that allocation), the signedness is 0 or 1, and the limbs are the
+            // ones the text HOLDS. The declared count used to `reserve` before one
+            // limb was read — `bitint 64 0 1000000000000 …` asked for 8 TB — and the
+            // loop then ran on at the end of the input, where `take` does not advance.
+            std::size_t const refusalsBefore = refusals_;
+            std::uint32_t const width  = parseNumber<std::uint32_t>(lex_.take().text, "bitint width");
             std::uint64_t const sgn    = parseNumber<std::uint64_t>(lex_.take().text, "bitint signedness");
             std::uint64_t const nLimbs = parseNumber<std::uint64_t>(lex_.take().text, "bitint limb count");
             std::vector<std::uint64_t> limbs;
-            limbs.reserve(static_cast<std::size_t>(nLimbs));
             for (std::uint64_t i = 0; i < nLimbs; ++i) {
+                if (lex_.peek().kind != TokKind::Integer) {
+                    emitMalformed(std::format(
+                        "bitint literal declares {} limbs and the text holds {}", nLimbs, i));
+                    break;
+                }
                 limbs.push_back(parseNumber<std::uint64_t>(lex_.take().text, "bitint limb"));
             }
-            lv.value = BitIntValue(std::move(limbs),
-                                   static_cast<std::uint32_t>(width), sgn != 0);
+            if (refusals_ == refusalsBefore && (width == 0 || width > kBitIntMaxWidth)) {
+                emitMalformed(std::format(
+                    "bitint literal width {} is not a _BitInt width — 1 to {} "
+                    "(__BITINT_MAXWIDTH__)", width, kBitIntMaxWidth));
+            }
+            if (refusals_ == refusalsBefore && sgn > 1) {
+                emitMalformed(std::format(
+                    "bitint literal signedness {} is not 0 (unsigned) or 1 (signed)", sgn));
+            }
+            if (refusals_ == refusalsBefore) {
+                lv.value = BitIntValue(std::move(limbs), width, sgn != 0);
+            }
         } else if (tag.text == "wfloat") {
             // LD-3: `wfloat <bits> <hi> <lo>`; the BIT-WIDTH selects the unpack
-            // layout, never a serialized TypeKind ordinal.
+            // layout, never a serialized TypeKind ordinal — through the ONE width
+            // table (`WideFloatValue::kFormatBitWidths`); a width it does not hold is
+            // refused, never read as F80 (P68 round 8, lane `ht`, part 1c-b).
             std::uint64_t const bits = parseNumber<std::uint64_t>(lex_.take().text, "wfloat bit width");
             std::uint64_t const hi   = parseNumber<std::uint64_t>(lex_.take().text, "wfloat high word");
             std::uint64_t const lo   = parseNumber<std::uint64_t>(lex_.take().text, "wfloat low word");
-            lv.value = WideFloatValue::fromPacked(
-                lo, hi, (bits == 128) ? TypeKind::F128 : TypeKind::F80);
+            if (std::optional<TypeKind> const k = WideFloatValue::kindOfFormatBitWidth(bits);
+                k.has_value()) {
+                lv.value = WideFloatValue::fromPacked(lo, hi, *k);
+            } else {
+                emitMalformed(std::format(
+                    "wfloat width {} is not a wide-float format this model defines — "
+                    "accepted: {}", bits, WideFloatValue::formatBitWidthsAccepted()));
+            }
+        } else if (tag.text == "symaddr") {
+            // F5: `symaddr %N [+ addend]` — the inverse of `appendLiteral`'s
+            // `MirSymbolAddrValue` arm, which is how a global initializer spells
+            // `&x`. ⚠ THIS ARM DID NOT EXIST (P68 round 8, lane `ht`, part 1c-b): the
+            // reader refused its own writer's output for every `&global` initializer
+            // as "unknown literal tag 'symaddr'". N is a raw SymbolId, as everywhere
+            // in this format, and must be one the `symbols` preamble declares — the
+            // writer's `collectSymbols` now declares every one a literal names.
+            std::size_t const before = refusals_;
+            std::uint32_t const sym = parsePercentValue();
+            if (refusals_ == before && sym == 0) {
+                emitMalformed("symaddr names symbol %0, the invalid-symbol sentinel");
+            } else if (refusals_ == before && !symbolNames_.contains(sym)) {
+                emitMalformed(std::format(
+                    "symaddr names symbol %{}, which the `symbols` preamble does not "
+                    "declare", sym));
+            }
+            std::int64_t addend = 0;
+            if (Tok const plus = lex_.peek();
+                plus.kind == TokKind::Unknown && plus.text == "+") {
+                lex_.take();
+                Tok const n = lex_.take();
+                if (n.kind != TokKind::Integer) {
+                    emitMalformed(std::format(
+                        "expected an integer addend after `symaddr %{} +`, got '{}'", sym,
+                        n.text));
+                } else {
+                    addend = parseNumber<std::int64_t>(n.text, "symaddr addend");
+                }
+            }
+            lv.value = MirSymbolAddrValue{sym, addend};
         } else if (tag.text == "monostate") {
             // monostate already default
         } else {
@@ -2278,13 +2942,10 @@ private:
         }
     }
 
-    // NOTE the `.dssmir` text format does not carry the per-global FLAG CLASS
-    // — binding/visibility, isConst, isThreadLocal (TLS C1), alignment — so a
-    // text round-trip re-mints every global with the defaults (Global/Default,
-    // mutable, process-shared, natural alignment). Precedent-consistent: the
-    // format is a test/debug surface for CFG + literal shapes, never a
-    // codegen input; a future flag-preserving text syntax would extend the
-    // grammar here AND the printer symmetrically.
+    // ⓘ P68 (lane `ht`): a NOTE here said the format "does not carry the
+    // per-global FLAG CLASS — binding/visibility, isConst, isThreadLocal,
+    // alignment"; the list below has carried all five since the row named next,
+    // so the note described a gap that was already closed.
     // D-MIRTEXT-GLOBAL-FLAGS-DROPPED-BY-ROUNDTRIP: the optional `[...]` list
     // `appendGlobalAttrs` emits, read back into the values `addGlobal` needs.
     // Unambiguous in this position for the same reason the function list is:
@@ -2294,6 +2955,223 @@ private:
     // An UNRECOGNIZED name FAILS LOUD rather than being skipped — a silently
     // ignored attribute here is precisely how these five fields went missing
     // for as long as they did.
+    // The value of an `align=N` — a global's attribute, or an instruction's
+    // secondary payload — after the `align` key: `=` and a byte count. ONE reader
+    // of the one spelling, so the two positions cannot disagree about it.
+    // ★ VALIDATED HERE BECAUSE, FOR A GLOBAL, NOTHING DOWNSTREAM DOES.
+    // `addGlobal` documents \"power of two ≤ 256\" and ✔MEASURED stores whatever
+    // it is handed, so an out-of-contract value read from text would reach the
+    // assembler unchallenged. ASK the type that owns the domain rather than
+    // restating its three conditions (non-zero, power of two, in range) — the
+    // `mir_verifier` Alloca arm's rule, and the reason the other four copies of
+    // this ladder are gone. `what` names the position ("global", or the
+    // instruction's mnemonic). nullopt ⇒ refused, and already reported.
+    [[nodiscard]] std::optional<std::uint32_t> takeAlignValue(std::string_view what) {
+        if (!expect(TokKind::Eq)) return std::nullopt;
+        Tok n = lex_.take();
+        if (n.kind != TokKind::Integer) {
+            emitMalformed(std::format(
+                "'{}' takes an integer byte count, got '{}'",
+                kMirTextAlignAttr, n.text));
+            return std::nullopt;
+        }
+        auto const bytes = parseNumber<std::uint32_t>(
+            n.text, std::format("{} alignment", what));
+        if (bytes != 0 && !Alignment::fromBytes(bytes).has_value()) {
+            emitMalformed(std::format(
+                "{} alignment {} is not a power of two in [1, {}]",
+                what, bytes, kMirTextMaxGlobalAlignBytes));
+            return std::nullopt;
+        }
+        if (bytes == 0) {
+            emitMalformed(std::format(
+                "{} alignment 0 is undefined — '{}' takes a power "
+                "of two in [1, {}]", what, kMirTextAlignAttr,
+                kMirTextMaxGlobalAlignBytes));
+            return std::nullopt;
+        }
+        return bytes;
+    }
+
+    // ── A REFUSAL RECOVERS TO THE END OF ITS LINE ────────────────────────────
+    //
+    // The `.dssir` grammar writes ONE INSTRUCTION PER LINE (the writer's rule,
+    // and `refuseUnconsumedOperandTail`'s stated one), so the line is the unit a
+    // refused instruction is dropped in: the next line is read as the next
+    // instruction, never as this one's leftovers re-tokenized one refusal at a
+    // time. These three are the whole mechanism.
+
+    // Whether `t` starts on the line that begins at `lineStart`.
+    [[nodiscard]] bool onLine(std::size_t lineStart, Tok const& t) const {
+        std::string_view const src = lex_.text();
+        if (t.off > src.size() || lineStart > t.off) return false;
+        return src.substr(lineStart, t.off - lineStart).find('\n') == std::string_view::npos;
+    }
+
+    // Consume the rest of a refused instruction's line, brace-balanced (an
+    // `indirectbr … { … }` tail goes whole), stopping at the end of the line, the
+    // end of the input, or a `}` that is not the line's own — that one closes
+    // the block and is left for it.
+    void skipRestOfLine(std::size_t lineStart) {
+        int depth = 0;
+        while (true) {
+            Tok const nx = lex_.peek();
+            if (nx.kind == TokKind::End || !onLine(lineStart, nx)) return;
+            if (nx.kind == TokKind::RBrace) {
+                if (depth == 0) return;
+                --depth;
+            } else if (nx.kind == TokKind::LBrace) {
+                ++depth;
+            }
+            lex_.take();
+        }
+    }
+
+    // Consume up to — not including — the `}` that closes the construct the
+    // cursor is inside, brace-balanced; stops at the end of the input.
+    void skipToClosingBrace() {
+        int depth = 0;
+        while (true) {
+            Tok const nx = lex_.peek();
+            if (nx.kind == TokKind::End) return;
+            if (nx.kind == TokKind::RBrace) {
+                if (depth == 0) return;
+                --depth;
+            } else if (nx.kind == TokKind::LBrace) {
+                ++depth;
+            }
+            lex_.take();
+        }
+    }
+
+    // ── THE BUILDER'S PRECONDITIONS, ASKED BEFORE IT IS CALLED ──────────────
+    //
+    // ★★★ `MirBuilder` ABORTS on every precondition below, and it is right to:
+    // from compiler code, a violation is a programming error. A reader of TEXT
+    // meets the same violations as ordinary malformed input, so it asks each
+    // question FIRST, from the builder's own rule — `opcodeInfo(op)`, the row
+    // `addInst` checks; `arg_payload::kFieldMax`; `SymbolId::valid`;
+    // `isBlockOfOpenFunction`, `isBlockUnopened`, `openBlockHasTerminator` —
+    // and refuses by name. ✔MEASURED P68 (lane `ht`, each case in an isolated
+    // child): 17 shapes of instruction text killed the process before these,
+    // three of them introduced by this lane's own flag list; the P28 row that
+    // fixed the same class for `parseGlobal`/`parseFunction` covered those two
+    // arms and never reached the instruction grammar.
+
+    // `opcodeInfo(op).result`: a Value opcode needs a type, a None opcode takes
+    // none. Returns false when the instruction cannot be built (a value with no
+    // type — nothing to build it with); a type written where none belongs is
+    // refused and DROPPED, so the instruction is still read and a terminator
+    // still seals its block.
+    [[nodiscard]] bool acceptResultType(MirOpcode op, std::string_view mnemonic,
+                                        bool typeWritten, TypeId& resultType) {
+        MirResultRule const rule = opcodeInfo(op).result;
+        if (rule == MirResultRule::Value && !resultType.valid()) {
+            // A type that was written and did not parse is already refused.
+            if (!typeWritten) {
+                emitMalformed(std::format(
+                    "'{}' produces a value, so its type is written ': <type>' after "
+                    "the mnemonic — this line has none", mnemonic));
+            }
+            return false;
+        }
+        if (rule == MirResultRule::None && typeWritten) {
+            emitMalformed(std::format(
+                "'{}' produces no value, so it takes no ': <type>' — the type "
+                "written here would be discarded", mnemonic));
+            resultType = InvalidType;
+        }
+        return true;
+    }
+
+    // `opcodeInfo(op)`'s operand bounds, the row `addInst` checks — for the arms
+    // that hand it an operand list read from the text.
+    [[nodiscard]] bool refuseOperandCount(MirOpcode op, std::string_view mnemonic,
+                                          std::size_t count) {
+        MirOpcodeInfo const info = opcodeInfo(op);
+        bool const unbounded = info.maxOperands == kMirUnboundedOperands;
+        if (count >= info.minOperands && (unbounded || count <= info.maxOperands)) {
+            return false;
+        }
+        if (unbounded) {
+            emitMalformed(std::format(
+                "'{}' takes at least {} operand(s) and this line lists {}",
+                mnemonic, info.minOperands, count));
+        } else {
+            emitMalformed(std::format(
+                "'{}' takes {} to {} operand(s) and this line lists {}",
+                mnemonic, info.minOperands, info.maxOperands, count));
+        }
+        return true;
+    }
+
+    // ⚠ A LIST MUST CLOSE ON ITS INSTRUCTION'S LINE. `Lexer::take` at the end of
+    // the input returns `End` WITHOUT advancing, so a list loop that only asks
+    // "is the next token my closer?" never terminates on truncated text:
+    // ✔MEASURED P68 (lane `ht`), the generic operand list, the phi incoming list
+    // and the switch case list each HUNG on a module cut inside them. P56 fixed
+    // the same shape for the TYPE lists only.
+    [[nodiscard]] bool listEndsUnclosed(Tok const& pk, std::size_t lineStart,
+                                        std::string_view what, std::string_view mnemonic) {
+        if (pk.kind != TokKind::End && onLine(lineStart, pk)) return false;
+        emitMalformed(std::format(
+            "'{}''s {} is not closed on its line — {}", mnemonic, what,
+            pk.kind == TokKind::End ? "the input ends inside it"
+                                    : "the line ends inside it"));
+        return true;
+    }
+
+    // The writer's ` [flag, flag]` after an instruction's mnemonic — the
+    // `kMirTextInstFlagTable` spellings, read back into `MirInstFlags`. Absent ⇒
+    // None, which is what every flagless instruction has always read as.
+    //
+    // ★ AN UNKNOWN NAME IS REFUSED BY NAME AND THE LIST IS STILL READ TO ITS `]`;
+    // A LIST NOT CLOSED ON ITS LINE IS REFUSED AS A LIST (nullopt). The first
+    // version stopped at the first unknown name and left the `]` in the stream,
+    // so the `: type` after it was never read and the builder got a value with
+    // no type — a process ABORT from a misspelt flag (✔MEASURED P68, lane `ht`:
+    // `alloca [voaltile] : ptr<i32>`; likewise an unterminated list and a
+    // non-name inside one).
+    [[nodiscard]] std::optional<MirInstFlags> parseInstFlags(std::string_view mnemonic,
+                                                             std::size_t lineStart) {
+        if (lex_.peek().kind != TokKind::LBracket) return MirInstFlags::None;
+        lex_.take();
+        MirInstFlags flags = MirInstFlags::None;
+        while (true) {
+            Tok const a = lex_.peek();
+            bool const here = a.kind != TokKind::End && onLine(lineStart, a);
+            if (here && a.kind == TokKind::RBracket) { lex_.take(); return flags; }
+            if (here && a.kind == TokKind::Comma)    { lex_.take(); continue; }
+            if (!here || a.kind != TokKind::Ident) {
+                emitMalformed(std::format(
+                    "'{}''s instruction-flag list is not closed on its line — "
+                    "expected a flag name, ',' or ']', got {}", mnemonic,
+                    here ? std::format("'{}'", a.text)
+                         : std::string{a.kind == TokKind::End ? "the end of the input"
+                                                              : "the end of the line"}));
+                return std::nullopt;
+            }
+            lex_.take();
+            if (auto const bit = kMirTextInstFlagTable.fromName(a.text); bit.has_value()) {
+                flags = flags | *bit;
+                continue;
+            }
+            emitUnknownName(std::format(
+                "unknown instruction flag '{}' on '{}' — accepted: {}", a.text, mnemonic,
+                detail::renderAllowedList(allNames(kMirTextInstFlagTable))));
+        }
+    }
+
+    // A terminator's builder entry takes no flags, so a module built through it
+    // can carry none — a flag list on one names a module this format's reader
+    // cannot rebuild, and is refused rather than silently dropped.
+    void refuseFlagsOnTerminator(std::string_view mnemonic, MirInstFlags flags) {
+        if (!any(flags)) return;
+        emitMalformed(std::format(
+            "'{}' is a terminator and carries no instruction flags — its builder "
+            "entry takes none, so no module this format writes has them", mnemonic));
+    }
+
     void parseGlobalAttrs(MirTextGlobalAttrs& attrs) {
         if (lex_.peek().kind != TokKind::LBracket) return;
         lex_.take();
@@ -2312,38 +3190,9 @@ private:
                 continue;
             }
             if (a.text == kMirTextAlignAttr) {
-                if (!expect(TokKind::Eq)) break;
-                Tok n = lex_.take();
-                if (n.kind != TokKind::Integer) {
-                    emitMalformed(std::format(
-                        "'{}' takes an integer byte count, got '{}'",
-                        kMirTextAlignAttr, n.text));
-                    break;
-                }
-                auto const bytes = parseNumber<std::uint32_t>(
-                    n.text, "global alignment");
-                // ★ VALIDATED HERE BECAUSE NOTHING DOWNSTREAM DOES.
-                // `addGlobal` documents \"power of two ≤ 256\" and ✔MEASURED
-                // stores whatever it is handed, so an out-of-contract value
-                // read from text would reach the assembler unchallenged.
-                // ASK the type that owns the domain rather than restating its
-                // three conditions (non-zero, power of two, in range) — the
-                // `mir_verifier` Alloca arm's rule, and the reason the other
-                // four copies of this ladder are gone.
-                if (bytes != 0 && !Alignment::fromBytes(bytes).has_value()) {
-                    emitMalformed(std::format(
-                        "global alignment {} is not a power of two in [1, {}]",
-                        bytes, kMirTextMaxGlobalAlignBytes));
-                    break;
-                }
-                if (bytes == 0) {
-                    emitMalformed(std::format(
-                        "global alignment 0 is undefined — '{}' takes a power "
-                        "of two in [1, {}]", kMirTextAlignAttr,
-                        kMirTextMaxGlobalAlignBytes));
-                    break;
-                }
-                attrs.alignmentBytes = bytes;
+                std::optional<std::uint32_t> const bytes = takeAlignValue("global");
+                if (!bytes.has_value()) break;
+                attrs.alignmentBytes = *bytes;
                 continue;
             }
             if (auto b = symbolBindingFromName(a.text); b.has_value()) {
@@ -2371,6 +3220,10 @@ private:
     }
 
     void parseGlobal() {
+        // A global is one line; a refused one is dropped to the end of it, so its
+        // initializer is not re-read as module items (P68, lane `ht`).
+        std::size_t const lineStart = lex_.peek().off;
+        std::size_t const refusalsBeforeSym = refusals_;
         std::uint32_t const sym = parsePercentValue();
         if (!expect(TokKind::Colon)) return;
         TypeId const ty = parseType();
@@ -2393,7 +3246,18 @@ private:
         // ⓘ No second diagnostic: `parseType` named the offending spelling and
         // this adds nothing an author does not already have. Returning here skips
         // the initializer, which is what a global with no type has anyway.
-        if (!ty.valid()) return;
+        if (!ty.valid()) { skipRestOfLine(lineStart); return; }
+        // The same, for the SYMBOL that fix did not reach: `addGlobal` ABORTS on
+        // `SymbolId::valid() == false`, i.e. `%0` (P68, lane `ht`). A malformed
+        // handle is already refused.
+        if (!SymbolId{sym}.valid()) {
+            if (refusals_ == refusalsBeforeSym) {
+                emitMalformed("a global names symbol %0, the invalid sentinel — "
+                              "symbols number from %1");
+            }
+            skipRestOfLine(lineStart);
+            return;
+        }
         Tok pk = lex_.peek();
         if (pk.kind == TokKind::Ident && pk.text == "zero") {
             lex_.take();
@@ -2429,7 +3293,7 @@ private:
         std::uint32_t const sym = parsePercentValue();
         if (!expect(TokKind::Colon)) return;
         TypeId const sig = parseType();
-        // TF-C78 (D-CSUBSET-NOINLINE): the optional `[...]` function-attribute
+        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the optional `[...]` function-attribute
         // list `appendFuncAttrs` emits. Unambiguous after the signature: types
         // bracket with `<>`, never `[]`. Absent ⇒ the (Global, Default, not-
         // noinline) defaults, which is what an un-annotated function prints as.
@@ -2551,6 +3415,21 @@ private:
         // burying the one diagnostic that matters under a cascade about a
         // construct that is perfectly well formed.
         if (!sig.valid()) { skipBracedBody(); return; }
+        // ★★ ONCE A REFUSAL IS ON RECORD, NO FURTHER FUNCTION IS BUILT. Adding one
+        // makes the builder CLOSE the previous function, and `closeFunction_`
+        // ABORTS on a function with no blocks or with a block never filled — the
+        // states a refused function is left in (✔MEASURED P68, lane `ht`: a
+        // branch to an undeclared block followed by a second function killed the
+        // process at the second `addFunction`; the P23 fix for that refusal had
+        // relied on `finalize()` never calling `finish()`, and missed that the
+        // NEXT FUNCTION closes the previous one first). The module is already
+        // discarded, so a later body is skipped whole rather than read; blocks
+        // WITHIN a refused function are still read (`parseBlock`).
+        if (errors_) {
+            ++skippedFunctions_;
+            skipBracedBody();
+            return;
+        }
         MirFuncId const f =
             builder_.addFunction(sig, SymbolId{sym}, binding, visibility, noInline,
                                  alwaysInline,    // TF-C81
@@ -2571,20 +3450,53 @@ private:
         // marker. Then rewind via the Lexer's `setPos` and parse the
         // bodies.
         std::size_t const bodyStart = lex_.pos();
-        scanBlockHeaders();
+        std::size_t const headers = scanBlockHeaders();
         lex_.setPos(bodyStart);
+        // `closeFunction_` ABORTS on a function with no blocks, and an empty
+        // body used to reach it with no diagnostic at all — `finalize()` then
+        // called `finish()` (✔MEASURED P68, lane `ht`). The refusal is what makes
+        // `finalize()` discard instead.
+        if (headers == 0) {
+            emitMalformed(std::format(
+                "function %{} has no blocks — a function body holds at least one "
+                "'block %bN {{ … }}'", sym));
+        }
         while (true) {
             Tok pk = lex_.peek();
             if (pk.kind == TokKind::RBrace || pk.kind == TokKind::End) break;
             if (pk.kind != TokKind::Ident || pk.text != "block") {
-                emitMalformed(std::format("expected 'block' inside function, got '{}'",
-                    pk.text));
-                lex_.take();
+                // ONE refusal, then on to the next header: re-offering every stray
+                // token here was one diagnostic PER TOKEN (✔MEASURED P68, lane
+                // `ht`: 12 of them for one unread block body).
+                emitMalformed(std::format(
+                    "expected 'block' inside function, got '{}' — skipped to the "
+                    "next block header", pk.text));
+                skipToNextBlockHeader();
                 continue;
             }
             parseBlock();
         }
         (void)expect(TokKind::RBrace);
+    }
+
+    // The function loop's recovery: consume up to the next `block` header at
+    // this depth, or up to — not including — the `}` that closes the function.
+    // Brace-balanced; always consumes at least the token it starts on (which is
+    // neither `block` nor a closing `}` — the loop checked).
+    void skipToNextBlockHeader() {
+        int depth = 0;
+        while (true) {
+            Tok const nx = lex_.peek();
+            if (nx.kind == TokKind::End) return;
+            if (depth == 0 && nx.kind == TokKind::Ident && nx.text == "block") return;
+            if (nx.kind == TokKind::RBrace) {
+                if (depth == 0) return;
+                --depth;
+            } else if (nx.kind == TokKind::LBrace) {
+                ++depth;
+            }
+            lex_.take();
+        }
     }
 
     // Consume a `{ … }` body without interpreting it, brace-balanced. The
@@ -2606,7 +3518,10 @@ private:
     // block (with its declared marker) in declaration order. Doesn't
     // parse instruction bodies; just consumes balanced braces past
     // each block. Stops at the matching `}` for the enclosing function.
-    void scanBlockHeaders() {
+    // Returns the number of `block` headers seen (a function with none is
+    // refused by the caller).
+    [[nodiscard]] std::size_t scanBlockHeaders() {
+        std::size_t headers = 0;
         int depth = 1;  // we're inside the function's `{`
         while (depth > 0) {
             Tok pk = lex_.peek();
@@ -2614,6 +3529,7 @@ private:
             if (pk.kind == TokKind::RBrace) { lex_.take(); --depth; continue; }
             if (pk.kind == TokKind::Ident && pk.text == "block" && depth == 1) {
                 lex_.take();  // consume `block`
+                ++headers;
                 std::uint32_t const slot = parsePercentValue();
                 StructCfMarker marker = StructCfMarker::Linear;
                 if (lex_.peek().kind == TokKind::LBracket) {
@@ -2659,20 +3575,26 @@ private:
             if (pk.kind == TokKind::LBrace) { lex_.take(); ++depth; continue; }
             lex_.take();  // skip any other token at this depth
         }
-    }
-
-    [[nodiscard]] MirBlockId ensureBlock(std::uint32_t slot,
-                                         StructCfMarker marker) {
-        auto it = blockMap_.find(slot);
-        if (it != blockMap_.end()) return it->second;
-        MirBlockId const b = builder_.createBlock(marker);
-        blockMap_[slot] = b;
-        return b;
+        return headers;
     }
 
     [[nodiscard]] MirBlockId resolveBlockRef(std::uint32_t slot) {
         auto it = blockMap_.find(slot);
-        if (it != blockMap_.end()) return it->second;
+        if (it != blockMap_.end()) {
+            if (builder_.isBlockOfOpenFunction(it->second)) return it->second;
+            // ★ BLOCK IDS ARE MODULE-WIDE (the writer prints `MirBlockId.v`), so
+            // `%bN` can name a block of ANOTHER function — which a branch target
+            // and a block address never may: `recordSuccessors_` and
+            // `addBlockAddress` ABORT on it (✔MEASURED P68, lane `ht`: `br %b1`
+            // into the previous function killed the process). The builder's own
+            // rule is asked here instead. The stand-in is a block of THIS
+            // function, never recorded, so the other function's mapping stands;
+            // `errors_` is set, so nothing past it is kept.
+            emitMalformed(std::format(
+                "%b{} is a block of another function — a branch target or a block "
+                "address names a block of its own function", slot));
+            return builder_.createBlock(StructCfMarker::Linear);
+        }
         // Reached only on MALFORMED input: a `br`/`condbr`/`switch` names a
         // block-slot that was not declared as a `block %bN` header.
         // `scanBlockHeaders` pre-creates every declared block, so a lookup miss
@@ -2718,65 +3640,80 @@ private:
         auto it = blockMap_.find(slot);
         if (it == blockMap_.end()) {
             emitUnknownName(std::format("block %b{} not pre-declared", slot));
+            skipBracedBody();
             return;
         }
         MirBlockId const b = it->second;
-        // Bail BEFORE `beginBlock` — otherwise a missing `{` leaves
-        // the builder with an Open-state block that finalize()'s
-        // `errors_` short-circuit relies on to avoid `MirBuilder::
-        // finish()`'s abort. Bailing first keeps the builder in a
-        // clean state regardless of the finalize() path.
+        // ★ THE TWO HEADERS `beginBlock` ABORTS ON, asked of the builder first
+        // (✔MEASURED P68, lane `ht`, both killed the process): block ids are
+        // module-wide, so a header can name ANOTHER function's block; and a
+        // header can repeat. Each body is skipped whole, so its tokens are not
+        // re-offered to the function loop one refusal at a time.
+        if (!builder_.isBlockOfOpenFunction(b)) {
+            emitMalformed(std::format(
+                "block %b{} is a block of another function — block ids are "
+                "module-wide, and this header reuses one", slot));
+            skipBracedBody();
+            return;
+        }
+        if (!builder_.isBlockUnopened(b)) {
+            emitMalformed(std::format(
+                "block %b{} is declared twice — a block is filled by exactly one "
+                "header", slot));
+            skipBracedBody();
+            return;
+        }
+        // Bail BEFORE `beginBlock` on a missing `{`: there is no body to read,
+        // and an opened block would have nothing to seal it.
         if (!expect(TokKind::LBrace)) return;
-        // ★★★ AND BAIL ON AN EARLIER ERROR TOO, BECAUSE finalize()'s GUARD IS IN
-        // THE WRONG PLACE TO CATCH THIS ONE.
+        // ★★★ NO `if (errors_) return;` HERE ANY MORE — IT WAS THE CASCADE.
         //
         // ✔MEASURED 2026-08-19 (cycle P20) on the first `.dssir` text ever emitted
         // containing an `inlineasmgoto`: the process ABORTED with
-        // `block MirBlockId=1 has no terminator`. Not in `finish()` — in
-        // `beginBlock`, HERE, which refuses to open a block while the previous one
-        // is unterminated.
+        // `block MirBlockId=1 has no terminator` — in `beginBlock`, which refuses
+        // to open a block while the previous one is unterminated. The answer then
+        // was to bail on ANY earlier refusal right here, after the `{` was taken.
+        // ⚠ That stopped the abort and started a cascade: the bail left the body
+        // in the stream, so every later block's every token reached the function
+        // loop as its own "expected 'block' inside function" — ✔MEASURED P68
+        // (lane `ht`): one unknown value handle in a condbr became 13
+        // diagnostics, and no later block was ever read.
         //
-        // ⚠ THE REFUSAL SITE'S OWN COMMENT NAMES THE RULE IT WAS BREAKING —
-        // *"a refusal that crashes is not a refusal"* — and it was right about the
-        // principle and wrong about the coverage: `finalize()` short-circuits on
-        // `errors_` and so never calls `finish()`, but an instruction refused
-        // mid-block leaves that block unterminated and the NEXT `%bN {` never
-        // reaches `finalize()` at all. The guard protected the last step of a walk
-        // that dies two steps earlier.
-        //
-        // ★ Stopping here rather than sealing the block with a synthesized
-        // `unreachable`: the module is already being discarded by `finalize()`, so
-        // a synthetic terminator would exist only to satisfy a builder invariant
-        // for a module nobody will read — and it would make a REFUSED parse and a
-        // SUCCESSFUL one produce structurally similar builders, which is how the
-        // discard path stops being obviously correct.
-        if (errors_) return;
+        // ★ THE HAZARD IS AN UNSEALED PREVIOUS BLOCK, AND THAT IS NOW CLOSED WHERE
+        // IT ARISES: a block that ends unsealed is sealed below, AFTER its refusal
+        // is on record. So a later block is safe to open, and it is READ — a
+        // second defect in it is reported too, and a clean one adds nothing. The
+        // synthetic terminator exists only on a path whose refusal has already
+        // set `errors_`, so `finalize()` discards that builder before `finish()`,
+        // and no successful parse can ever contain one.
         builder_.beginBlock(b);
         while (true) {
             Tok pk = lex_.peek();
             if (pk.kind == TokKind::RBrace || pk.kind == TokKind::End) break;
+            // `appendInst_` ABORTS on an instruction after the block's terminator
+            // (✔MEASURED P68, lane `ht`); the builder is asked first. The rest of
+            // the body is dropped whole — it belongs to no block.
+            if (builder_.openBlockHasTerminator()) {
+                emitMalformed(std::format(
+                    "block %b{} continues after its terminator — every instruction "
+                    "comes before the block's one terminator", slot));
+                skipToClosingBrace();
+                break;
+            }
+            std::size_t const refusalsBefore = refusals_;
             parseInstruction();
+            if (refusals_ != refusalsBefore) skipRestOfLine(pk.off);
         }
         (void)expect(TokKind::RBrace);
-        // ★★★ D-MIRTEXT-UNSEALED-BLOCK-ABORTS-WHEN-NOTHING-SET-ERRORS — THE
-        // SHAPES THE `errors_` GUARD ABOVE CANNOT SEE.
+        // ★★★ D-MIRTEXT-UNSEALED-BLOCK-ABORTS-WHEN-NOTHING-SET-ERRORS — A BLOCK
+        // THAT ENDS UNSEALED IS REFUSED, THEN SEALED.
         //
-        // That guard is this file's answer to the class it names two arms up
-        // (`D-LIR-TEXT-PARSE-UNSEALED-BLOCK-ABORT`), and for every DIAGNOSED
-        // malformation it is exactly right: an instruction the parser refused
-        // sets `errors_`, so the next block never reaches `beginBlock` and the
-        // kill is avoided. ⚠ BUT IT KEYS ON A DIAGNOSTIC HAVING BEEN EMITTED,
-        // AND TWO MALFORMED INPUTS EMIT NONE — a block holding only
-        // well-formed non-terminators, and an empty block. Both parse without
-        // a single complaint and leave the block unsealed, so `errors_` stays
-        // false, `beginBlock` runs, and `closeBlock_` kills the process with
-        // *"block MirBlockId=N has no terminator"*.
-        //
-        // ✔MEASURED 2026-08-28, both shapes, exit `0xc0000409` — on text whose
-        // only defect is a missing terminator, which is precisely what a
-        // reader owes a diagnostic for. The guard protected the last step of a
-        // walk that dies one step earlier, which is the identical sentence
-        // this file already writes about its own predecessor.
+        // Two malformed inputs emit no diagnostic on the way here — a block
+        // holding only well-formed non-terminators, and an empty block — and
+        // leave the block unsealed; the next `beginBlock` then killed the process
+        // with *"block MirBlockId=N has no terminator"* (✔MEASURED 2026-08-28,
+        // both shapes, exit `0xc0000409`). A refused terminator line (P68) ends
+        // the same way.
         //
         // ⓘ The predicate is the BUILDER's, not a parser-side mirror:
         // `currentlyOpenBlock()` returns invalid once a terminator has sealed
@@ -2784,17 +3721,16 @@ private:
         // sealed". State that mirrors the arena is state that can disagree
         // with it.
         //
-        // ★ REPORTING IS THE WHOLE FIX — no second unwind is added. `emitMalformed`
-        // sets `errors_`, which is what the guard above already consumes, so the
-        // next block bails before `beginBlock` and `finalize()` discards the
-        // module before `finish()`. One mechanism, reached from the one direction
-        // that could not reach it.
+        // ★ Refuse, then SEAL (P68): the refusal sets `errors_`, so `finalize()`
+        // discards this builder before `finish()`; the `unreachable` exists only
+        // so the next block can be opened and READ rather than skipped.
         if (builder_.currentlyOpenBlock().valid()) {
             emitMalformed(std::format(
                 "block %b{} closes without a terminator (every block must end "
                 "in br/condbr/switch/return/unreachable), and a `.dssir` reader "
                 "may not kill the process over text that does not",
                 slot));
+            builder_.addUnreachable();
         }
     }
 
@@ -2811,10 +3747,22 @@ private:
         //   `terminator [operands]` (br/condbr/switch/return/unreachable)
         Tok first = lex_.peek();
         std::size_t const lineStart = first.off;
+        std::size_t const refusalsAtStart = refusals_;
         std::uint32_t resultSlot = 0;
         if (first.kind == TokKind::Percent) {
             resultSlot = parsePercentValue();
             (void)expect(TokKind::Eq);
+            // A value handle is the module-wide id of the ONE instruction that
+            // defines it — the writer prints `MirInstId.v` — so a second definition
+            // has no meaning. It used to be read clean: the later definition
+            // silently replaced the earlier one for every use after it (✔MEASURED
+            // P68, lane `ht`: `ok=1`, no diagnostic).
+            if (resultSlot != 0 && valueMap_.contains(resultSlot)) {
+                emitMalformed(std::format(
+                    "value %v{} is defined twice — a value handle names the one "
+                    "instruction that defines it, so a second definition would "
+                    "silently shadow the first", resultSlot));
+            }
         }
         Tok mn = lex_.take();
         if (mn.kind != TokKind::Ident) {
@@ -2854,18 +3802,30 @@ private:
                 "this format does not yet spell", mnemonic));
             return;
         }
+        // The writer's ` [flag, flag]` (P68, part 1b) — every arm below hands
+        // `flags` to its builder call; a terminator arm, whose builder entry takes
+        // none, refuses a non-empty list by name instead of dropping it.
+        std::optional<MirInstFlags> const parsedFlags = parseInstFlags(mnemonic, lineStart);
+        if (!parsedFlags.has_value()) return;   // refused; the block loop drops the line
+        MirInstFlags const flags = *parsedFlags;
+        bool const typeWritten = lex_.peek().kind == TokKind::Colon;
         TypeId resultType = InvalidType;
-        if (lex_.peek().kind == TokKind::Colon) {
+        if (typeWritten) {
             lex_.take();
+            std::size_t const refusalsBeforeType = refusals_;
             resultType = parseType();
+            if (!resultType.valid() && refusals_ == refusalsBeforeType) {
+                emitMalformed(std::format("'{}''s result type did not parse", mnemonic));
+            }
         }
+        if (!acceptResultType(op, mnemonic, typeWritten, resultType)) return;
         // Per-opcode operand parsing.
         switch (op) {
             case MirOpcode::Const: {
                 if (!expect(TokKind::LParen)) return;
                 MirLiteralValue lv = parseLiteral();
                 (void)expect(TokKind::RParen);
-                MirInstId const id = builder_.addConst(std::move(lv), resultType);
+                MirInstId const id = builder_.addConst(std::move(lv), resultType, flags);
                 if (resultSlot != 0) valueMap_[resultSlot] = id;
                 break;
             }
@@ -2883,15 +3843,33 @@ private:
                     position = parseNumber<std::uint32_t>(p.text, "arg position");
                 }
                 (void)expect(TokKind::RParen);
-                MirInstId const id = builder_.addArg(idx, resultType, position);
+                // `addArg`'s own bound: both fields share one 32-bit payload.
+                if (idx > arg_payload::kFieldMax || position > arg_payload::kFieldMax) {
+                    emitMalformed(std::format(
+                        "arg ordinal {} / position {} does not fit the argument "
+                        "payload — each is at most {}", idx, position,
+                        arg_payload::kFieldMax));
+                    break;
+                }
+                MirInstId const id = builder_.addArg(idx, resultType, position, flags);
                 if (resultSlot != 0) valueMap_[resultSlot] = id;
                 break;
             }
             case MirOpcode::GlobalAddr: {
                 if (!expect(TokKind::LParen)) return;
+                std::size_t const refusalsBeforeSym = refusals_;
                 std::uint32_t const sym = parsePercentValue();
                 (void)expect(TokKind::RParen);
-                MirInstId const id = builder_.addGlobalAddr(SymbolId{sym}, resultType);
+                // `addGlobalAddr`'s own bound: `SymbolId::valid` — `%0` is the
+                // invalid sentinel. A malformed handle is already refused.
+                if (!SymbolId{sym}.valid()) {
+                    if (refusals_ == refusalsBeforeSym) {
+                        emitMalformed("globaladdr names symbol %0, the invalid "
+                                      "sentinel — symbols number from %1");
+                    }
+                    break;
+                }
+                MirInstId const id = builder_.addGlobalAddr(SymbolId{sym}, resultType, flags);
                 if (resultSlot != 0) valueMap_[resultSlot] = id;
                 break;
             }
@@ -2903,12 +3881,13 @@ private:
                 std::uint32_t const intrinId = parseNumber<std::uint32_t>(
                     idTok.text, "intrinsic id");
                 std::vector<MirInstId> operands;
-                while (lex_.peek().kind == TokKind::Comma) {
+                while (lex_.peek().kind == TokKind::Comma && onLine(lineStart, lex_.peek())) {
                     lex_.take();
                     operands.push_back(resolveValue(parsePercentValue()));
                 }
                 (void)expect(TokKind::RParen);
-                MirInstId const id = builder_.addInst(op, operands, resultType, intrinId);
+                if (refuseOperandCount(op, mnemonic, operands.size())) break;
+                MirInstId const id = builder_.addInst(op, operands, resultType, intrinId, flags);
                 if (resultSlot != 0) valueMap_[resultSlot] = id;
                 break;
             }
@@ -2917,6 +3896,7 @@ private:
                 std::vector<std::pair<std::uint32_t, std::uint32_t>> incs;
                 while (true) {
                     Tok pk = lex_.peek();
+                    if (listEndsUnclosed(pk, lineStart, "incoming list", mnemonic)) return;
                     if (pk.kind == TokKind::RBracket) break;
                     if (!incs.empty()) (void)expect(TokKind::Comma);
                     (void)expect(TokKind::LParen);
@@ -2927,7 +3907,7 @@ private:
                     incs.emplace_back(v, p);
                 }
                 (void)expect(TokKind::RBracket);
-                MirInstId const phi = builder_.addPhi(resultType);
+                MirInstId const phi = builder_.addPhi(resultType, {}, flags);
                 if (resultSlot != 0) valueMap_[resultSlot] = phi;
                 pendingPhis_.push_back({phi, std::move(incs)});
                 break;
@@ -2935,6 +3915,7 @@ private:
             case MirOpcode::Br: {
                 std::uint32_t const target = parsePercentValue();
                 MirBlockId const tBB = resolveBlockRef(target);
+                refuseFlagsOnTerminator(mnemonic, flags);
                 builder_.addBr(tBB);
                 break;
             }
@@ -2945,6 +3926,7 @@ private:
                 MirInstId const cond = resolveValue(condSlot);
                 MirBlockId const b1 = resolveBlockRef(t1);
                 MirBlockId const b2 = resolveBlockRef(t2);
+                refuseFlagsOnTerminator(mnemonic, flags);
                 builder_.addCondBr(cond, b1, b2);
                 break;
             }
@@ -2957,6 +3939,7 @@ private:
                 bool sawDefault = false;
                 while (true) {
                     Tok pk = lex_.peek();
+                    if (listEndsUnclosed(pk, lineStart, "case list", mnemonic)) return;
                     if (pk.kind == TokKind::RBrace) break;
                     if (!cases.empty() || sawDefault) (void)expect(TokKind::Comma);
                     Tok kw = lex_.take();
@@ -2997,6 +3980,7 @@ private:
                         "the last successor)", discSlot));
                     break;
                 }
+                refuseFlagsOnTerminator(mnemonic, flags);
                 builder_.addSwitch(disc, cases, defaultBB);
                 break;
             }
@@ -3005,18 +3989,24 @@ private:
                 // return). 0 → void `addReturn()`; N≥1 → `addReturnMulti` (which
                 // covers the scalar 1-operand case identically to `addReturn(v)`).
                 std::vector<MirInstId> vals;
-                while (lex_.peek().kind == TokKind::Percent) {
+                // Its OWN line's handles only: a `return %v1` followed by a line
+                // `%v2 = …` read `%v2` as a second return value (✔MEASURED P68,
+                // lane `ht`) — the one-instruction-per-line rule, again.
+                while (lex_.peek().kind == TokKind::Percent && onLine(lineStart, lex_.peek())) {
                     std::uint32_t const v = parsePercentValue();
                     vals.push_back(resolveValue(v));
                 }
                 if (vals.empty()) {
+                    refuseFlagsOnTerminator(mnemonic, flags);
                     builder_.addReturn();
                 } else {
+                    refuseFlagsOnTerminator(mnemonic, flags);
                     builder_.addReturnMulti(vals);
                 }
                 break;
             }
             case MirOpcode::Unreachable: {
+                refuseFlagsOnTerminator(mnemonic, flags);
                 builder_.addUnreachable();
                 break;
             }
@@ -3062,7 +4052,12 @@ private:
                         "never empty", addrSlot));
                     break;
                 }
-                if (errors_) break;
+                // A refusal on THIS line keeps it unbuilt. (It read `errors_` —
+                // any refusal ANYWHERE — which, once later blocks are read after a
+                // refusal (P68), would leave a well-formed indirectbr unbuilt and
+                // its block reported as unterminated.)
+                if (refusals_ != refusalsAtStart) break;
+                refuseFlagsOnTerminator(mnemonic, flags);
                 builder_.addIndirectBr(addr, targets);
                 break;
             }
@@ -3075,7 +4070,7 @@ private:
             case MirOpcode::BlockAddress: {
                 std::uint32_t const slot = parsePercentValue();
                 MirBlockId const target = resolveBlockRef(slot);
-                MirInstId const id = builder_.addBlockAddress(target, resultType);
+                MirInstId const id = builder_.addBlockAddress(target, resultType, flags);
                 if (resultSlot != 0) valueMap_[resultSlot] = id;
                 break;
             }
@@ -3110,12 +4105,14 @@ private:
                 std::uint8_t const cls = orUnknownName(
                     kMirTextExhaustTable, clsTok.text, "byvaluestackarg exhaust class",
                     kByValueStackArgExhaustNone);
-                if (errors_) break;
+                if (refusals_ != refusalsAtStart) break;   // this line's refusal only (see indirectbr)
+                if (refuseOperandCount(op, mnemonic, operands.size())) break;
                 MirInstId const id = builder_.addInst(
                     op, operands, resultType,
                     (bytes & kByValueStackArgSizeMask)
                         | (static_cast<std::uint32_t>(cls)
-                           << kByValueStackArgExhaustShift));
+                           << kByValueStackArgExhaustShift),
+                    flags);
                 if (resultSlot != 0) valueMap_[resultSlot] = id;
                 break;
             }
@@ -3126,6 +4123,7 @@ private:
                     rTok.text, "seh region id");
                 std::uint32_t const t1 = parsePercentValue();
                 std::uint32_t const t2 = parsePercentValue();
+                refuseFlagsOnTerminator(mnemonic, flags);
                 builder_.addSehTryBegin(resolveBlockRef(t1), resolveBlockRef(t2),
                                         region);
                 break;
@@ -3137,6 +4135,7 @@ private:
                     rTok.text, "seh region id");
                 std::uint32_t const vSlot = parsePercentValue();
                 std::uint32_t const tgt   = parsePercentValue();
+                refuseFlagsOnTerminator(mnemonic, flags);
                 builder_.addSehFilterReturn(resolveValue(vSlot),
                                             resolveBlockRef(tgt), region);
                 break;
@@ -3146,7 +4145,7 @@ private:
                 Tok rTok = lex_.take();
                 std::uint32_t const region = parseNumber<std::uint32_t>(
                     rTok.text, "seh region id");
-                builder_.addInst(op, {}, InvalidType, region);
+                builder_.addInst(op, {}, InvalidType, region, flags);
                 break;
             }
             default: {
@@ -3156,6 +4155,7 @@ private:
                     lex_.take();
                     while (true) {
                         Tok pk = lex_.peek();
+                        if (listEndsUnclosed(pk, lineStart, "operand list", mnemonic)) return;
                         if (pk.kind == TokKind::RParen) break;
                         if (!operands.empty()) (void)expect(TokKind::Comma);
                         std::uint32_t const v = parsePercentValue();
@@ -3169,12 +4169,26 @@ private:
                     Tok n = lex_.take();
                     payload = parseNumber<std::uint32_t>(n.text, "payload");
                 }
-                MirInstId const id = builder_.addInst(op, operands, resultType, payload);
+                // The writer's `align=N` tail — the SECONDARY payload (an
+                // alloca's alignment, an atomic access's provable alignment),
+                // which this arm used to have no way to receive (P68, part 1b).
+                std::uint32_t payload2 = 0;
+                if (peekIdent(kMirTextAlignAttr)) {
+                    lex_.take();
+                    std::optional<std::uint32_t> const align = takeAlignValue(mnemonic);
+                    if (!align.has_value()) break;
+                    payload2 = *align;
+                }
+                if (refuseOperandCount(op, mnemonic, operands.size())) break;
+                MirInstId const id = builder_.addInst(op, operands, resultType, payload,
+                                                      flags, payload2);
                 if (resultSlot != 0) valueMap_[resultSlot] = id;
                 break;
             }
         }
-        refuseUnconsumedOperandTail(mnemonic, lineStart);
+        // A tail left by an arm that REFUSED is that refusal's leftover, not a
+        // writer/reader disagreement; the block loop drops it with the line.
+        if (refusals_ == refusalsAtStart) refuseUnconsumedOperandTail(mnemonic, lineStart);
     }
 
     // ★★★ THE CLASS GUARD FOR
@@ -3200,11 +4214,9 @@ private:
     void refuseUnconsumedOperandTail(std::string_view mnemonic, std::size_t lineStart) {
         Tok const nx = lex_.peek();
         if (nx.kind == TokKind::End || nx.kind == TokKind::RBrace) return;
-        std::string_view const src = lex_.text();
-        if (nx.off > src.size() || lineStart > nx.off) return;
-        std::string_view const between = src.substr(lineStart, nx.off - lineStart);
-        if (between.find('\n') != std::string_view::npos) return;
+        if (!onLine(lineStart, nx)) return;
         // The leftover is whatever remains of the line from the next token on.
+        std::string_view const src = lex_.text();
         std::string_view rest = src.substr(nx.off);
         if (auto const nl = rest.find('\n'); nl != std::string_view::npos) {
             rest = rest.substr(0, nl);
@@ -3219,6 +4231,11 @@ private:
     [[nodiscard]] std::unique_ptr<MirParseResult> finalize() {
         // Resolve any pending `initfunc` globals whose target function
         // was declared after the global in the text.
+        // ⓘ Not when a function body was SKIPPED: `%fN` is the builder's number
+        // for the N-th function ADDED, so past a skip it names a different
+        // function or none, and a "never declared" here would blame the global
+        // for the refusal that caused the skip. The module is discarded anyway.
+        if (skippedFunctions_ != 0) pendingInitFuncGlobals_.clear();
         for (auto const& pg : pendingInitFuncGlobals_) {
             auto it = funcMap_.find(pg.initFuncSlot);
             if (it == funcMap_.end()) {
@@ -3261,10 +4278,13 @@ private:
         Mir module = std::move(builder_).finish();
         auto result = std::make_unique<MirParseResult>(
             std::move(module), std::move(interner_), std::move(symbolNames_));
-        // Verify-on-load.
+        // Verify-on-load. `ok` takes the verifier's OWN verdict, not only the
+        // delta: ✔MEASURED P68 (lane `ht`) a refusal the reporter drops as a
+        // recent duplicate left the delta at zero, so a module the verifier had
+        // refused read clean the second time into one reporter.
         MirVerifier verifier{result->mir, &result->interner};
-        (void)verifier.verify(reporter_);
-        result->ok = (reporter_.errorCount() == errBefore);
+        bool const verified = verifier.verify(reporter_);
+        result->ok = verified && reporter_.errorCount() == errBefore;
         return result;
     }
 };

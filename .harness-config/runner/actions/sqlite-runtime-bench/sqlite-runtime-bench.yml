@@ -1,0 +1,20 @@
+# PURPOSE: measure the RUNTIME of an emitted sqlite3 binary, the standing runtime-differential instrument.
+name: sqlite-runtime-bench
+description: >-
+  The action measures the runtime of an emitted sqlite3 binary on this leg's host.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+inputs:
+  binary:
+    description: 'the emitted sqlite3 binary to measure'
+    required: true
+  repeats:
+    description: 'runs per binary; the median is reported'
+    default: '7'
+steps:
+  - name: bench
+    workingDirectoryRoot: action
+    run: |
+      python3 ./sqlite-runtime-bench.py --binary {binary} --repeats {repeats}
+    successPattern: 'median='
+    requireInputsUnmoved: true

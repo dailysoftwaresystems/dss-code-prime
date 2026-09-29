@@ -1,8 +1,12 @@
 # The Tree / Node Model — core domain
 
+## Contents
+- 4. The Tree / Node model: 4.1 storage · 4.2 strong IDs · 4.3 the cursor · 4.4 visitor walks · 4.5
+  side-tables · 4.6 typed views · 4.7 diagnostics
+
 ## 4. The Tree / Node Model — Core Domain
 
-This is the heart of the project. Read [`docs/tree-model.md`](../../../docs/tree-model.md)
+This is the heart of the project. Read [`docs/tree-model.md`](../../../../docs/tree-model.md)
 before touching any of it.
 
 ### 4.1 Storage

@@ -314,7 +314,7 @@ TEST(ConfigPathWalk, DirAcceptsNestedSubdir) {
 
 // ── THE INSTALLED-LAYOUT ARM ────────────────────────────────────────────────
 //
-// [[D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE]]. Before this arm the
+// NO PACKAGING PATH SHIPS THE CONFIG TREE. Before this arm the
 // resolver knew only `$DSS_CONFIG_ROOT` and a cwd walk, so an installed `dsscp`
 // at `/usr/bin` invoked from a user's project walked THAT project's ancestors
 // and found nothing — a packaged compiler could not resolve `#include <stdio.h>`
@@ -764,9 +764,9 @@ TEST(ConfigRootProvenance, ExplicitOverrideAndInstalledLayoutAreSilent) {
 // same invisible-outcome class as a foreign tree, and it has already cost a
 // measured 5x false regression: the speedtest1 benchmark's pin was one
 // directory too deep, missed, and fell through to the very cwd walk it existed
-// to prevent. That row fixed its own pin and left the rest as "a production
-// question, raised rather than taken":
-// [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+// to prevent. That fix corrected the benchmark's own pin and left the rest as
+// "a production question, raised rather than taken" — a `DSS_CONFIG_ROOT` that
+// is SET but names no config tree still falls through without a word.
 TEST(ConfigRootProvenance, ASetButMissedOverrideIsRecordedAndTheWalkStillAnswers) {
     ScratchDir scratch(Location::Temp, "config-root-ignored");
     plantConfigDir(scratch.path(), "sources");

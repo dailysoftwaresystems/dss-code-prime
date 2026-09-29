@@ -1,5 +1,6 @@
 #include "asm/asm_text_to_lir.hpp"
 
+#include "asm/asm_local_labels.hpp"
 #include "asm/asm_template_to_lir.hpp"
 #include "asm/asm_variant_elect.hpp"
 #include "core/types/assembly_config.hpp"
@@ -48,11 +49,13 @@ public:
     AsmTextLowering(Tree const& tree, GrammarSchema const& grammar,
                     TargetSchema const& target,
                     std::span<std::string const> entryNames,
-                    DiagnosticReporter& reporter)
+                    DiagnosticReporter& reporter,
+                    std::optional<ObjectFormatKind> formatKind)
         : tree_(tree), grammar_(grammar), target_(target),
           cfg_(grammar.assembly()), entryNames_(entryNames),
           builder_(target), sink_(tree, grammar, target, reporter),
-          engine_(tree, grammar, target, builder_, sink_, *this) {}
+          engine_(tree, grammar, target, builder_, sink_, *this),
+          formatKind_(formatKind) {}
 
     std::optional<AsmTextModule> run() {
         // ⚠ NOT AN ASSERT. A driver that routes a non-dialect grammar here is a
@@ -155,6 +158,60 @@ public:
         return labels_[openFunctionLabel_].name;
     }
 
+    // ── the blocks that begin WITHOUT a label: answered from the BLOCK PLAN ──
+    //
+    // ★★ A CONDITIONAL BRANCH FALLS INTO THE BLOCK THE NEXT START OF THE TEXT
+    // BEGINS (P68 round 8,
+    // D-ASM-CONDITIONAL-BRANCH-FALLTHROUGH-LAID-OUT-AT-THE-FUNCTION-END) — the
+    // next label's, or the anonymous one its next line opens — which pass 1
+    // recorded (`planInstruction`) and `openFunction` created in text order. A
+    // false edge with no start after it in this function falls off the
+    // function's end: a block of its own, created last, which `closeFunction`
+    // refuses exactly as it refuses any other fall off the end.
+    [[nodiscard]] std::optional<Fallthrough>
+    fallthroughAfter(NodeId statement) override {
+        if (auto const it = fallStartOf_.find(statement.v);
+            it != fallStartOf_.end()) {
+            BlockStart const& next = starts_[it->second];
+            if (next.label == kNoLabel) {
+                if (!next.block.valid()) {
+                    sink_.fail(statement, planDisagreementMessage());
+                    return std::nullopt;
+                }
+                return Fallthrough{next.block, laidOutNext(next.block)};
+            }
+            auto const& L = labels_[next.label];
+            if (!L.isEntry && L.functionLabel == openFunctionLabel_) {
+                return Fallthrough{L.block, laidOutNext(L.block)};
+            }
+            // The next start opens ANOTHER function: this edge leaves this one.
+        }
+        if (!trailingFallthrough_.has_value()) {
+            trailingFallthrough_ = builder_.createBlock();
+        }
+        return Fallthrough{*trailingFallthrough_,
+                           laidOutNext(*trailingFallthrough_)};
+    }
+
+    // ★★ AN INSTRUCTION AFTER A TERMINATOR, WITH NO LABEL BETWEEN THEM, BEGINS
+    // THE ANONYMOUS BLOCK PASS 1 RECORDED FOR IT (P68 round 8,
+    // D-ASM-INSTRUCTION-AFTER-A-TERMINATOR-REFUSED) — where the text put it.
+    // Unless a conditional branch falls into it, nothing reaches it: it has no
+    // label for a branch to name.
+    [[nodiscard]] bool openBlockAfterTerminator(NodeId statement) override {
+        auto const it = anonStartAt_.find(statement.v);
+        if (it == anonStartAt_.end() || !starts_[it->second].block.valid()) {
+            sink_.fail(statement, planDisagreementMessage());
+            return false;
+        }
+        BlockStart& start = starts_[it->second];
+        builder_.beginBlock(start.block);
+        start.opened          = true;
+        openBlockUnreachable_ = !start.falseEdge;
+        onBlockOpened(start.block);
+        return true;
+    }
+
     // ★★★ M2 — THE TWO ADDRESS SHAPES, AND WHICH ONE A NAME GETS.
     //   * a DATA or FUNCTION label → `[SymbolRef]`, what `lowerGlobalAddr`
     //     emits for `&global`;
@@ -164,26 +221,21 @@ public:
     appendSymbolAddress(std::string const& symbol, NodeId at,
                         std::string_view mnemonic,
                         std::vector<LirOperand>& out) override {
-        auto const it = labelIndex_.find(symbol);
-        if (it == labelIndex_.end()) {
-            // ⚠ REFUSED RATHER THAN IMPORTED, for the reason
-            // `bindPendingDataSymbols` states: `ExternImport::isData` selects
-            // the linker's indirection slot and an address-materializing
-            // instruction says nothing about code-vs-data. Anchored:
-            // D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL.
-            sink_.fail(at,
-                 std::format("'{}' takes the address of '{}', which this file "
-                             "defines no label for. An undefined name would "
-                             "have to become an import, and an import states "
-                             "whether it is CODE or DATA — which selects the "
-                             "linker's indirection slot — while an address "
-                             "operand says neither. A CALL is the one reference "
-                             "that answers it, which is why only a call mints "
-                             "one today{}", mnemonic, symbol,
-                             sink_.pairSuffix()));
+        LabelHit const hit = lookupLabel(symbol, at);
+        if (hit.kind == LabelLookup::UnresolvedLocal) {
+            sink_.fail(at, unresolvedLocalMessage(symbol, mnemonic));
             return false;
         }
-        std::size_t const labelIdx = it->second;
+        if (hit.kind == LabelLookup::NotALabel) {
+            // A name this file does not define is an IMPORT whose kind the
+            // definition decides (`internExtern`,
+            // D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL). An address
+            // operand states no kind, and neither does gas's relocation for it.
+            out.push_back(LirOperand::makeSymbolRef(
+                internExtern(symbol, ExternReference::Address).v));
+            return true;
+        }
+        std::size_t const labelIdx = hit.index;
         auto const&       L        = labels_[labelIdx];
         if (L.isEntry || L.isData) {
             // Already carries its symbol — a function entry from
@@ -212,14 +264,99 @@ public:
         return true;
     }
 
+    // ★★★ THE SYMBOL A SYMBOLIC MEMORY DISPLACEMENT IS RELATIVE TO
+    // (`movq msg(%rip), %rax`, `leaq 1f(%rip), %rcx` —
+    // D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    //   * a DATA or FUNCTION label carries its symbol already;
+    //   * an INTERIOR label is a block: its symbol is minted here — making the
+    //     block address-taken, which is exactly what `leaq 1f(%rip), %rcx; jmp
+    //     *%rcx` means — and BOUND to the block after the emit walk, through
+    //     `blockSymbolBindings`, the channel a data slot naming one uses. There
+    //     is no trailing BlockRef on a memory operand for the encoder to bind
+    //     it from, and a label in ANOTHER function binds the same way, because
+    //     the binding names its function rather than a function-local slot.
+    [[nodiscard]] std::optional<SymbolId>
+    resolveDisplacementSymbol(std::string const& symbol, NodeId at,
+                              std::string_view mnemonic) override {
+        LabelHit const hit = lookupLabel(symbol, at);
+        if (hit.kind == LabelLookup::UnresolvedLocal) {
+            sink_.fail(at, unresolvedLocalMessage(symbol, mnemonic));
+            return std::nullopt;
+        }
+        if (hit.kind == LabelLookup::NotALabel) {
+            // An import whose kind the definition decides, exactly as for an
+            // address operand (`internExtern`): `movq x(%rip)` states no kind,
+            // and gas's relocation for it states none either.
+            return internExtern(symbol, ExternReference::Address);
+        }
+        std::size_t const labelIdx = hit.index;
+        auto const&       L        = labels_[labelIdx];
+        if (L.isEntry || L.isData) return L.symbol;
+        if (L.functionLabel == kNoLabel) {
+            sink_.fail(at,
+                 std::format("'{}' addresses memory relative to '{}', a label "
+                             "inside no function — its address is part of no "
+                             "function's bytes{}", mnemonic, symbol,
+                             sink_.pairSuffix()));
+            return std::nullopt;
+        }
+        SymbolId const sym = symbolForAddressedLabel(labelIdx);
+        displacedLabels_.push_back(DisplacedLabel{labelIdx, at});
+        return sym;
+    }
+
+    // The object format this unit is assembled for (P68 round 9) — only a key
+    // into the dialect's `symbolParts`; see the interface.
+    [[nodiscard]] std::optional<ObjectFormatKind>
+    objectFormatKind() const override {
+        return formatKind_;
+    }
+
+    // ★★ A BLOCK OF THE OPEN FUNCTION, FOR AN INSTRUCTION THAT ADDRESSES ONE IN
+    // A FIELD (P68 round 9: `adr x1, 1f`). An interior label of this function —
+    // named or numeric — is one; an entry, a data label, another function's
+    // label and a name this file does not define are not, and take the symbol
+    // route (nullopt, no diagnostic). The location counter never reaches here:
+    // the engine takes it as the instruction's own address.
+    // ★ ITS ADDRESS IS TAKEN, so it carries a symbol, bound to its block after
+    // the walk exactly as a symbolic displacement's label is: that symbol is
+    // what `derivableIndirectSuccessors` reads, and `adr x1, 1f` + `br x1` is
+    // the computed jump that needs the block in the indirect branch's set.
+    [[nodiscard]] std::optional<LirBlockId>
+    resolveLocalBlock(std::string const& symbol, NodeId at) override {
+        LabelHit const hit = lookupLabel(symbol, at);
+        if (hit.kind != LabelLookup::Found) return std::nullopt;
+        auto const& L = labels_[hit.index];
+        if (L.isEntry || L.isData || L.functionLabel != openFunctionLabel_
+            || L.functionLabel == kNoLabel) {
+            return std::nullopt;
+        }
+        (void)symbolForAddressedLabel(hit.index);
+        displacedLabels_.push_back(DisplacedLabel{hit.index, at});
+        return L.block;
+    }
+
+    // A function entry or a label inside a function — this file's CODE — as
+    // opposed to a data label or a name this file does not define. See the
+    // interface.
+    [[nodiscard]] bool namesCodeHere(std::string const& symbol,
+                                     NodeId at) const override {
+        LabelHit const hit = lookupLabel(symbol, at);
+        return hit.kind == LabelLookup::Found && isCodeLabel(labels_[hit.index]);
+    }
+
     // ⚠ A BRANCH TARGET IS FUNCTION-LOCAL: `LirOperand::makeBlockRef` names a
     // block slot, and a slot from another function would silently resolve to
     // whatever block sits at that index here.
     [[nodiscard]] std::optional<LirBlockId>
     resolveBranchTarget(std::string const& symbol, NodeId at,
                         std::string_view mnemonic) override {
-        auto const it = labelIndex_.find(symbol);
-        if (it == labelIndex_.end()) {
+        LabelHit const hit = lookupLabel(symbol, at);
+        if (hit.kind == LabelLookup::UnresolvedLocal) {
+            sink_.fail(at, unresolvedLocalMessage(symbol, mnemonic));
+            return std::nullopt;
+        }
+        if (hit.kind == LabelLookup::NotALabel) {
             sink_.fail(at,
                  std::format("'{}' branches to '{}', which this file defines no "
                              "label for — a branch out of the translation unit "
@@ -228,7 +365,7 @@ public:
                              sink_.pairSuffix()));
             return std::nullopt;
         }
-        auto const& L = labels_[it->second];
+        auto const& L = labels_[hit.index];
         if (L.isEntry || L.functionLabel != openFunctionLabel_) {
             sink_.fail(at,
                  std::format("'{}' branches to '{}', which belongs to a "
@@ -244,8 +381,16 @@ public:
     [[nodiscard]] std::optional<LirOperand>
     resolveCallee(std::string const& symbol, NodeId at,
                   std::string_view mnemonic) override {
-        auto const it = labelIndex_.find(symbol);
-        if (it != labelIndex_.end()) {
+        LabelHit const hit = lookupLabel(symbol, at);
+        // ⚠ A LOCAL-LABEL REFERENCE THAT RESOLVES TO NOTHING IS REFUSED, NEVER
+        // IMPORTED: `call 1f` with no later `1:` is a typo in THIS file, and
+        // minting an extern named `1f` would hand the linker a name no object
+        // can define.
+        if (hit.kind == LabelLookup::UnresolvedLocal) {
+            sink_.fail(at, unresolvedLocalMessage(symbol, mnemonic));
+            return std::nullopt;
+        }
+        if (hit.kind == LabelLookup::Found) {
             // ⚠ A LABEL THIS FILE DEFINES BUT DID NOT MARK AS A FUNCTION
             // ENTRY IS A **BLOCK**, AND A BLOCK IS NOT A CALL TARGET. It
             // has no module symbol (only function-entry labels are minted
@@ -253,7 +398,7 @@ public:
             // the alternatives are both silent: treating it as an extern
             // would import a name this very file defines, and treating it
             // as a function would call into the middle of another frame.
-            if (!labels_[it->second].isEntry) {
+            if (!labels_[hit.index].isEntry) {
                 sink_.fail(at,
                      std::format("'{}' calls '{}', which this file defines "
                                  "as a BLOCK inside another function rather "
@@ -269,13 +414,14 @@ public:
                                  sink_.pairSuffix()));
                 return std::nullopt;
             }
-            return LirOperand::makeSymbolRef(labels_[it->second].symbol.v);
+            return LirOperand::makeSymbolRef(labels_[hit.index].symbol.v);
         }
         // ★★★ AN UNDEFINED CALLEE IS AN EXTERN, WITH NO DIRECTIVE AND NO
         // GUESS. See `AsmTextModule::externImports` for why gas has no extern
         // directive and why `libraryPath` stays empty; the reference gate at
         // the link tier is what judges the reference.
-        return LirOperand::makeSymbolRef(internExtern(symbol).v);
+        return LirOperand::makeSymbolRef(
+            internExtern(symbol, ExternReference::Call).v);
     }
 
     [[nodiscard]] std::vector<LirBlockId>
@@ -306,6 +452,148 @@ private:
         return out;
     }
 
+    // ── labels: ONE lookup, for a name and for a numeric local reference ───
+    //
+    // ★★★ GNU as's NUMERIC LOCAL LABELS (P68 round 8,
+    // D-ASM-LABELS-INSIDE-A-TEMPLATE-AND-NUMERIC-LOCAL-LABELS-REFUSED). `1:` may
+    // be defined any number of times, and `1b` / `1f` name the nearest
+    // definition before / after the reference — asked of the ONE resolver
+    // (`asm/asm_local_labels.hpp`) the template host asks too. Every definition
+    // is an ordinary `LabelInfo` under a name no source can spell — `1:#2`, the
+    // second `1:`; a colon ENDS a label, so no written name contains one — and
+    // every later pass (functions, blocks, data items, addresses) therefore
+    // treats it exactly as it treats a named label.
+    enum class LabelLookup : std::uint8_t { Found, NotALabel, UnresolvedLocal };
+    struct LabelHit {
+        LabelLookup kind  = LabelLookup::NotALabel;
+        std::size_t index = static_cast<std::size_t>(-1);
+    };
+
+    // The dialect's reference spelling, if `symbol` is one (`1b`, `9f`, `0b`).
+    // A dialect declaring no local-label suffixes has no such spelling.
+    [[nodiscard]] std::optional<asm_local_labels::Reference>
+    localReference(std::string_view symbol) const {
+        if (cfg_.localLabelBackwardSuffix.empty()) return std::nullopt;
+        return asm_local_labels::parseReference(
+            symbol, asm_local_labels::Suffixes{cfg_.localLabelBackwardSuffix,
+                                               cfg_.localLabelForwardSuffix});
+    }
+
+    [[nodiscard]] std::uint32_t positionOf(NodeId at) const {
+        return static_cast<std::uint32_t>(tree_.span(at).start());
+    }
+
+    // Is `symbol` this dialect's location counter (`.` in GNU as)?
+    [[nodiscard]] bool isLocationCounter(std::string_view symbol) const {
+        return !cfg_.locationCounter.empty()
+            && cfg_.spellingMatches(cfg_.locationCounter, symbol);
+    }
+
+    [[nodiscard]] LabelHit lookupLabel(std::string const& symbol, NodeId at) const {
+        // ★★ THE LOCATION COUNTER NAMES THE LINE BEING LOWERED (P68 round 9):
+        // the block pass 1 planned to begin at it (`planInstruction`). A line
+        // that spells it and has no such block is a plan/walk disagreement,
+        // reported as an unresolved reference — never an import named `.`.
+        if (isLocationCounter(symbol)) {
+            if (auto const it = locationLabelAt_.find(loweringStatement_.v);
+                it != locationLabelAt_.end()) {
+                return LabelHit{LabelLookup::Found, it->second};
+            }
+            return LabelHit{LabelLookup::UnresolvedLocal};
+        }
+        if (auto const it = labelIndex_.find(symbol); it != labelIndex_.end()) {
+            return LabelHit{LabelLookup::Found, it->second};
+        }
+        if (auto const ref = localReference(symbol)) {
+            if (auto const hit = localLabels_.resolve(*ref, positionOf(at))) {
+                return LabelHit{LabelLookup::Found, *hit};
+            }
+            return LabelHit{LabelLookup::UnresolvedLocal};
+        }
+        return LabelHit{};
+    }
+
+    [[nodiscard]] std::string unresolvedLocalMessage(std::string const& symbol,
+                                                     std::string_view mnemonic) {
+        if (isLocationCounter(symbol)) {
+            return std::format(
+                "'{}' names the location counter `{}` where this build does not "
+                "resolve it — only a branch target, a field that takes a "
+                "location of its own function, or a data slot takes it{}",
+                mnemonic, symbol, sink_.pairSuffix());
+        }
+        auto const ref  = localReference(symbol);
+        bool const back = ref.has_value()
+                       && ref->direction == asm_local_labels::Direction::Backward;
+        std::uint64_t const n = ref.has_value() ? ref->number : 0;
+        return std::format(
+            "'{}' refers to the local label `{}`, and this file defines no `{}:` "
+            "{} it — `{}{}` names the NEAREST `{}:` BEFORE the reference and "
+            "`{}{}` the nearest AFTER it (GNU as's rule){}",
+            mnemonic, symbol, n, back ? "before" : "after", n,
+            cfg_.localLabelBackwardSuffix, n, n, cfg_.localLabelForwardSuffix,
+            sink_.pairSuffix());
+    }
+
+    // Record ONE numeric local-label definition (`1:`), as a `LabelInfo` whose
+    // name no source can spell (see the banner above), and register it with the
+    // resolver at its position. Returns false with a diagnostic on a malformed
+    // number.
+    bool collectNumericLabel(NodeId element) {
+        NodeId const numberTok = firstVisibleToken(tree_, element);
+        std::string_view const spelling =
+            numberTok.valid() ? tree_.text(numberTok) : std::string_view{};
+        auto const number = asm_local_labels::parseDefinitionNumber(spelling);
+        if (!number.has_value()) {
+            sink_.fail(element,
+                 std::format("`{}:` is not a numeric local label — a local "
+                             "label's number is decimal digits only (GNU as)",
+                             spelling));
+            return false;
+        }
+        std::uint32_t const ordinal = ++numericDefinitionCount_[*number];
+        std::size_t const   index   = labels_.size();
+        if (!collectLabel(std::format("{}:#{}", *number, ordinal), element)) {
+            return false;
+        }
+        if (!localLabels_.define(*number, positionOf(element), index)) {
+            sink_.fail(element,
+                 std::format("local label `{}:` was met out of text order — "
+                             "the resolver's nearest-before / nearest-after "
+                             "answer needs every definition in source order",
+                             *number));
+            return false;
+        }
+        numericLabelAt_.emplace(element.v, index);
+        return true;
+    }
+
+    // The element a numeric local label carries on its own line (`1: nop`), or
+    // invalid — through the SAME label-tail helper the named forms use.
+    [[nodiscard]] NodeId elementAfterNumericLabel(NodeId element) const {
+        NodeId const tail =
+            findDescendantOfRule(tree_, element, cfg_.labelTailRule);
+        return tail.valid() ? elementInLabelTail(tail) : NodeId{};
+    }
+
+    // The element a NAMED label carries on its own line (`a: ret`, `main:
+    // .globl main`, `a: 1: nop`), or invalid. The statement's second child is
+    // the dialect's tail wrapper, searched for the label-tail ARM by rule — the
+    // same descent `labelOf` makes, so the two cannot disagree about which
+    // statements are labels.
+    [[nodiscard]] NodeId elementAfterNamedLabel(NodeId statement) const {
+        auto const kids = visibleChildren(tree_, statement);
+        if (kids.size() < 2) return NodeId{};
+        NodeId const tail =
+            findDescendantOfRule(tree_, kids[1], cfg_.labelTailRule);
+        return tail.valid() ? elementInLabelTail(tail) : NodeId{};
+    }
+
+    [[nodiscard]] bool isNumericLabel(NodeId element) const {
+        return cfg_.numericLabelRule.valid()
+            && tree_.rule(element).v == cfg_.numericLabelRule.v;
+    }
+
     // ── pass 1: directives + labels ───────────────────────────────────────
     static constexpr std::size_t kNoLabel = static_cast<std::size_t>(-1);
 
@@ -317,6 +605,9 @@ private:
         std::size_t functionLabel = kNoLabel;  // index of the owning entry
         LirBlockId  block{};
         bool        opened = false;
+        // A CODE label's index in `starts_` (the block plan); a data label has
+        // none.
+        std::size_t start = kNoLabel;
         // ★ THE THIRD KIND OF LABEL (D-ASM-NO-DATA-DEFINING-DIRECTIVE). A label
         // seen while a DATA section is open names a data ITEM, not a function
         // and not a basic block: it gets a SymbolId and an `AssembledData` slot,
@@ -327,6 +618,36 @@ private:
         std::size_t dataItem = kNoLabel;   // index into `dataItems_`
     };
 
+    // Does this label name a location in this file's CODE — a function entry,
+    // or a label inside a function (P68 round 9, `namesCodeHere`)?
+    [[nodiscard]] static bool isCodeLabel(LabelInfo const& L) noexcept {
+        return L.isEntry || (!L.isData && L.functionLabel != kNoLabel);
+    }
+
+    // ★★★ THE BLOCK PLAN — WHERE EVERY BLOCK OF THE TEXT BEGINS, IN TEXT ORDER
+    // (P68 round 8,
+    // D-ASM-CONDITIONAL-BRANCH-FALLTHROUGH-LAID-OUT-AT-THE-FUNCTION-END and
+    // D-ASM-INSTRUCTION-AFTER-A-TERMINATOR-REFUSED).
+    //
+    // LIR lays a function's blocks out in the order they were CREATED, and
+    // nothing reorders them afterwards. A block begins at a code label, and
+    // also WITHOUT one: at the line after a conditional branch (its false
+    // edge) and at the line after any other terminator (code no fall-through
+    // reaches). The first kind was created up front and the other two were
+    // minted when the emit walk met them — after every label's block — so a
+    // conditional branch's fall-through code was laid out at the END of the
+    // function, behind two jumps. ✔MEASURED 2026-09-23 on
+    // `examples/asm/asm_x86_64_numeric_local_labels`: gas's 52-byte `main`
+    // was 139 bytes. Pass 1 now records all three kinds as it reads the text,
+    // and `openFunction` creates every block of the function from this list.
+    struct BlockStart {
+        std::size_t label = kNoLabel;  // a code label's start; kNoLabel: anonymous
+        NodeId      statement{};       // an anonymous start's first instruction
+        bool        falseEdge = false; // anonymous: a conditional branch falls into it
+        LirBlockId  block{};           // anonymous: created by `openFunction`
+        bool        opened = false;    // anonymous: begun by the emit walk
+    };
+
     // One `.quad Lw`-style data slot whose value is a symbol's ADDRESS, held
     // between the pass that read it and the passes that can resolve it.
     // D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET.
@@ -334,10 +655,17 @@ private:
         std::size_t    itemIndex  = 0;  // index into `dataItems_`
         std::uint32_t  byteOffset = 0;  // offset of the slot within that item
         std::string    name;            // the label the directive named
+        // The constant written after the name (`.quad table+8`), carried into
+        // the relocation's addend — the slot holds that address, never the
+        // label's.
+        std::int64_t   addend = 0;
         NodeId         at{};            // the operand's span, for the diagnostic
         RelocationKind kind{};          // the target's absolute reloc of this width
         std::string    spelling;        // the directive that wrote it
         std::size_t    labelIndex = kNoLabel;  // resolved in pass 1c
+        // Set instead of `labelIndex` when the name is one this file does not
+        // define: the import row it names (`internExtern`).
+        SymbolId       importSymbol{};
     };
 
     // ★★★ A DOT-PREFIXED NAME IS A LABEL WHENEVER IT CARRIES A LABEL TAIL.
@@ -395,53 +723,146 @@ private:
             info.isData   = true;
             info.symbol   = mintSymbol();
             info.dataItem = openDataItem(info.symbol);
+        } else {
+            // A CODE label begins a block (see `BlockStart`).
+            info.start = starts_.size();
+            recordStart(BlockStart{labels_.size()});
+            freshLabelStart_ = labels_.size();
         }
         labels_.push_back(std::move(info));
         return true;
     }
 
-    void scanElement(NodeId element) {
-        if (!sink_.ok()) return;
-        if (tree_.rule(element).v == cfg_.directiveRule.v) {
-            NodeId      labelTail{};
-            std::string const dotted = dotLabelName(element, labelTail);
-            if (!dotted.empty()) {
-                // D-ASM-DOT-PREFIXED-LABEL-NOT-DEFINED-BY-CONSUMER: the node is
-                // an `asmDirective` and the thing it DEFINES is a label. Routing
-                // it to the directive vocabulary is what produced `A0008 unknown
-                // assembler directive '.L3'` on every `gcc -S` output.
-                if (!collectLabel(dotted, element)) return;
-                if (NodeId const nested = elementInLabelTail(labelTail);
-                    nested.valid()) {
-                    scanElement(nested);
-                }
-                return;
-            }
-            applyDirective(element);
-            return;
+    // ── pass 1: the block plan (see `BlockStart`) ─────────────────────────
+    //
+    // Append one start. A conditional branch still waiting for its false edge
+    // falls into THIS start — the next one in the text, whatever kind it is.
+    void recordStart(BlockStart start) {
+        if (planCondBr_.valid()) {
+            fallStartOf_.emplace(planCondBr_.v, starts_.size());
+            planCondBr_ = NodeId{};
         }
-        // ⚠ THE CHAIN, NOT JUST THE FIRST LABEL. `a: b: ret` nests a second
-        // statement inside the first one's label tail, and `walkElements`
-        // only visits LINE-level elements — so collecting one label per
-        // line would silently drop every label after the first, and the
-        // emit pass would then fail on a label it had never minted.
+        planEffect_ = AsmBlockEffect::None;
+        starts_.push_back(start);
+    }
+
+    // One instruction line in the text: it begins an anonymous block when the
+    // instruction before it (with no label between) ended its block, and what
+    // IT does to the block structure is read from the row the emit walk will
+    // select (`AsmInstructionLowering::blockEffectOf`), so the plan and the
+    // lowering cannot disagree about a line. ⚠ The statement shape is read
+    // exactly as `emitElement` reads it. An instruction in a DATA section is
+    // refused by the emit walk and plans nothing.
+    //
+    // ★★ A LINE THAT BRANCHES TO THE LOCATION COUNTER (`b .`, `cbz x0, .` —
+    // P68 round 9) NAMES ITS OWN ADDRESS AS A SUCCESSOR, so a block must begin
+    // at it: the label just before it when it is the first line after one, and
+    // otherwise a label of its own, under a name no source can spell (`.#1`,
+    // the numeric labels' convention), which every later pass treats as the
+    // label it is — an interior block, entered by the emit walk before the
+    // line is lowered. ✔MEASURED 2026-09-23, gas 2.42 and clang 18: `b .` =
+    // 0x14000000, no relocation. ⚠ ONLY A BRANCH: a line that merely ADDRESSES
+    // the location counter (`adr x7, .+8`) takes it as the instruction's own
+    // address (`LirOperandKind::LocationCounter`) and begins no block, because
+    // a block here would put a fall-through jump in front of it and move every
+    // `.±N` that spans it (D-ASM-FALLTHROUGH-INTO-A-LABEL-EMITS-A-JUMP).
+    void planInstruction(NodeId statement) {
+        std::size_t const freshLabel = freshLabelStart_;
+        freshLabelStart_ = kNoLabel;
+        if (scanSection_.has_value()) return;
+        auto const kids = visibleChildren(tree_, statement);
+        if (kids.empty()) return;
+        NodeId const rawTail = kids.size() > 1 ? kids[1] : NodeId{};
+        NodeId const operandSeq =
+            findDescendantOfRule(tree_, rawTail, cfg_.operandSeqRule);
+        AsmBlockEffect const effect = engine_.blockEffectOf(kids.front(), operandSeq);
+        if (effect != AsmBlockEffect::None
+            && engine_.spellsLocationCounter(operandSeq)) {
+            if (planEffect_ == AsmBlockEffect::None && freshLabel != kNoLabel) {
+                locationLabelAt_.emplace(statement.v, freshLabel);
+            } else {
+                std::size_t const index = labels_.size();
+                if (!collectLabel(std::format("{}#{}", cfg_.locationCounter,
+                                              ++locationLabelCount_),
+                                  statement)) {
+                    return;
+                }
+                freshLabelStart_ = kNoLabel;
+                locationLabelAt_.emplace(statement.v, index);
+            }
+        } else if (planEffect_ != AsmBlockEffect::None) {
+            anonStartAt_.emplace(statement.v, starts_.size());
+            recordStart(BlockStart{kNoLabel, statement,
+                                   /*falseEdge=*/planCondBr_.valid()});
+        }
+        planEffect_ = effect;
+        if (planEffect_ == AsmBlockEffect::FallsThrough) planCondBr_ = statement;
+    }
+
+    // Is `block` laid out immediately after the open block? ⚠ ASKED OF THE
+    // LAYOUT, NOT OF THE PLAN THAT PRODUCED IT: a function's blocks are laid
+    // out in `createBlock` order and numbered in that order (one arena slot
+    // each, a function's blocks contiguous because one function is built at a
+    // time), so the answer holds whatever order the blocks were created in —
+    // a false claim here would drop a branch's written false edge and send
+    // control into whichever block happens to follow.
+    [[nodiscard]] bool laidOutNext(LirBlockId block) const {
+        return block.v == builder_.openBlock().v + 1;
+    }
+
+    [[nodiscard]] std::string planDisagreementMessage() const {
+        return std::format("internal: the block plan (pass 1) and the emit walk "
+                           "disagree about where a block of '{}' begins — the "
+                           "plan created no block for this line{}",
+                           enclosingFunctionName(), sink_.pairSuffix());
+    }
+
+    // ⚠ THE CHAIN, NOT JUST THE FIRST LABEL, AND A LOOP, NOT A RECURSION.
+    // `a: 1: .L3: b: ret` nests each element inside the previous label's tail,
+    // and `walkElements` only visits LINE-level elements — so collecting one
+    // label per line would silently drop every label after the first, and the
+    // emit pass would then fail on a label it had never minted. The chain is as
+    // long as its author wrote it, so it is walked ITERATIVELY: each arm names
+    // the element its label carries and the loop moves to it (the scan used to
+    // recurse through dotted labels and tail directives, one frame per link).
+    // ★ A LABEL CHAIN MAY END IN A DIRECTIVE (`main: .globl main`, `msg: .asciz
+    // "hi"`) AND THE DIRECTIVE MUST BE APPLIED HERE: `walkElements` never
+    // reaches it, and a dropped `.globl` emits the entry symbol LOCAL.
+    // Anchored: D-ASM-DIRECTIVE-AFTER-LABEL-ON-ONE-LINE-DROPPED.
+    void scanElement(NodeId element) {
         NodeId cur = element;
         while (cur.valid() && sink_.ok()) {
+            if (isNumericLabel(cur)) {
+                if (!collectNumericLabel(cur)) return;
+                cur = elementAfterNumericLabel(cur);
+                continue;
+            }
+            if (tree_.rule(cur).v == cfg_.directiveRule.v) {
+                NodeId      labelTail{};
+                std::string const dotted = dotLabelName(cur, labelTail);
+                if (!dotted.empty()) {
+                    // D-ASM-DOT-PREFIXED-LABEL-NOT-DEFINED-BY-CONSUMER: the node
+                    // is an `asmDirective` and the thing it DEFINES is a label.
+                    // Routing it to the directive vocabulary is what produced
+                    // `A0008 unknown assembler directive '.L3'` on every `gcc -S`
+                    // output.
+                    if (!collectLabel(dotted, cur)) return;
+                    cur = elementInLabelTail(labelTail);
+                    continue;
+                }
+                applyDirective(cur);
+                return;
+            }
+            // A statement: a named label (its tail may carry the next element)
+            // or an instruction, which this pass reads only for the block
+            // plan.
             NodeId const label = labelOf(cur);
-            if (!label.valid()) return;
+            if (!label.valid()) {
+                planInstruction(cur);
+                return;
+            }
             if (!collectLabel(std::string{tree_.text(label)}, label)) return;
-            // ★ A LABEL CHAIN MAY END IN A DIRECTIVE (`main: .globl main`,
-            // `msg: .asciz "hi"`) AND THE DIRECTIVE MUST BE APPLIED HERE.
-            // ⚠ THE COMMENT THAT USED TO SIT HERE SAID IT WAS "picked up
-            // when the walk reaches it" — measured FALSE: `walkElements`
-            // visits LINE-level elements only, and a directive nested in a
-            // label tail is never one, so `main: .globl main` silently
-            // dropped the export. The same shape now matters far more,
-            // because gas writes data on the label's own line.
-            // Anchored: D-ASM-DIRECTIVE-AFTER-LABEL-ON-ONE-LINE-DROPPED.
-            NodeId const tailDirective = nextDirectiveAfterLabel(cur);
-            if (tailDirective.valid()) scanElement(tailDirective);
-            cur = nextStatementAfterLabel(cur);
+            cur = elementAfterNamedLabel(cur);
         }
     }
 
@@ -913,11 +1334,48 @@ private:
                              sink_.pairSuffix()));
             return false;
         }
+        // A data slot holds a WHOLE address: a part of one (`.quad :lo12:msg`)
+        // is an instruction field's business (P68 round 9).
+        if (operand.symbolPart != SymbolAddressPart::Whole) {
+            sink_.fail(operand.node,
+                 std::format("'.{}' writes the {} of '{}', and a data slot holds "
+                             "a whole address — a part of one is what an "
+                             "instruction field takes{}",
+                             spelling, symbolAddressPartPhrase(operand.symbolPart),
+                             operand.symbol, sink_.pairSuffix()));
+            return false;
+        }
         auto& item = dataItems_[itemIdx];
         PendingDataReloc pending;
         pending.itemIndex  = itemIdx;
         pending.byteOffset = static_cast<std::uint32_t>(item.bytes.size());
         pending.name       = operand.symbol;
+        pending.addend     = operand.symbolAddend;
+        // ★★ THE LOCATION COUNTER IN A DATA SLOT IS THE SLOT'S OWN ADDRESS (P68
+        // round 9): ✔MEASURED 2026-09-23, gas 2.42 writes `.quad .` as
+        // R_AARCH64_ABS64 against the item at the slot's offset. So it
+        // relocates against the label that opened this item, the slot's offset
+        // added to what was written after the dot. An item no label opened has
+        // no symbol to be relative to, and is refused by name.
+        if (isLocationCounter(operand.symbol)) {
+            std::size_t opener = kNoLabel;
+            for (std::size_t l = 0; l < labels_.size(); ++l) {
+                if (labels_[l].isData && labels_[l].dataItem == itemIdx) {
+                    opener = l;
+                }
+            }
+            if (opener == kNoLabel) {
+                sink_.fail(operand.node,
+                     std::format("'.{}' names the location counter `{}` in data "
+                                 "no label opened, so there is no symbol its "
+                                 "address could be written relative to — label "
+                                 "the data{}",
+                                 spelling, operand.symbol, sink_.pairSuffix()));
+                return false;
+            }
+            pending.name    = labels_[opener].name;
+            pending.addend += static_cast<std::int64_t>(pending.byteOffset);
+        }
         pending.at         = operand.node;
         pending.kind       = *kind;
         pending.spelling   = std::string{spelling};
@@ -1172,84 +1630,89 @@ private:
         return sink_.ok();
     }
 
+    // One LINE, walked along its label chain exactly as `scanElement` walks it
+    // — a loop, never a recursion (see the banner there). Each label arm enters
+    // the block model and moves to the element its tail carries: a numeric
+    // label, a dot-label, a named label, a directive or an instruction, so
+    // `Lfoo: .L3: 1: ret` and `main: .text` lose nothing.
     void emitElement(NodeId element) {
-        {
-            if (!sink_.ok()) return;
+        NodeId cur = element;
+        while (cur.valid() && sink_.ok()) {
+            // A numeric local label enters the block model exactly as `Lfoo:`
+            // does — through the label index the scan recorded for THIS
+            // definition node, never by re-deriving a name.
+            if (isNumericLabel(cur)) {
+                auto const it = numericLabelAt_.find(cur.v);
+                if (it == numericLabelAt_.end()) {
+                    sink_.fail(cur, "local label was not collected");
+                    return;
+                }
+                enterLabelIndex(it->second, cur);
+                cur = elementAfterNumericLabel(cur);
+                continue;
+            }
             // Directives were applied in pass 1; re-applying them here would
             // double-report every directive diagnostic. ⚠ THE SECTION STATE IS
             // STILL RE-READ, because pass 2 must know whether an instruction
             // sits in code or in data — and re-reading the ROW (not re-applying
             // the directive) keeps one source of truth with no second report.
-            if (tree_.rule(element).v == cfg_.directiveRule.v) {
+            if (tree_.rule(cur).v == cfg_.directiveRule.v) {
                 NodeId      labelTail{};
-                std::string const dotted = dotLabelName(element, labelTail);
+                std::string const dotted = dotLabelName(cur, labelTail);
                 if (!dotted.empty()) {
                     // A dot-prefixed LABEL, not a directive - see
                     // `dotLabelName`. It enters the block model exactly as
                     // `Lfoo:` does, which is what makes `jmp .L3` reach a real
                     // LirBlockId once the dialect can spell the operand.
-                    enterLabel(dotted, element);
-                    if (!sink_.ok()) return;
-                    if (NodeId const nested = elementInLabelTail(labelTail);
-                        nested.valid()) {
-                        emitElement(nested);
-                    }
-                    return;
+                    enterLabel(dotted, cur);
+                    cur = elementInLabelTail(labelTail);
+                    continue;
                 }
-                trackSection(element);
+                trackSection(cur);
                 // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED: the call-frame
                 // family is applied HERE and only here, because the anchor a
                 // rule needs — the instruction it follows — exists only in this
                 // pass. See the family docblock beside `applyFrameDirective`.
-                applyFrameDirective(element);
+                applyFrameDirective(cur);
                 return;
             }
             // A statement: a label definition, an instruction, or a label
             // followed on the same line by one.
-            NodeId cur = element;
-            while (cur.valid() && sink_.ok()) {
-                auto const kids = visibleChildren(tree_, cur);
-                if (kids.empty()) return;
-                NodeId const name = kids.front();
-                // ⚠ THE TAIL IS THE DIALECT'S ALT WRAPPER, NOT THE ARM. The
-                // shared grammar names the wrapper `asmStatementTail` and the
-                // arms `asmLabelTail` / `asmOperandSeq`; comparing the wrapper's
-                // rule against an ARM's landmark never matches, and the first
-                // version of this walker did exactly that — `main:` was then
-                // read as a zero-operand instruction and refused as "unknown
-                // mnemonic 'main'", a true diagnostic aimed at the wrong thing.
-                // Descend by RULE so the wrapper's depth stays the dialect's
-                // business.
-                NodeId const rawTail = kids.size() > 1 ? kids[1] : NodeId{};
-                NodeId const tail =
-                    findDescendantOfRule(tree_, rawTail, cfg_.labelTailRule);
-                if (tail.valid()) {
-                    enterLabel(std::string{tree_.text(name)}, name);
-                    if (!sink_.ok()) return;
-                    // The tail may carry another element on the same line: a
-                    // STATEMENT continues this loop's label chain, a DIRECTIVE
-                    // is handed back to `emitElement` - which is also what
-                    // routes a nested dot-LABEL (`Lfoo: .L3: ret`) and what
-                    // replays a `main: .text` line's SECTION effect, instead of
-                    // dropping either.
-                    NodeId const nested = elementInLabelTail(tail);
-                    cur = NodeId{};
-                    if (nested.valid()) {
-                        if (tree_.rule(nested).v == cfg_.statementRule.v) {
-                            cur = nested;
-                        } else {
-                            emitElement(nested);
-                            return;
-                        }
-                    }
-                    continue;
-                }
-                engine_.lowerStatement(cur, name,
-                                       findDescendantOfRule(
-                                           tree_, rawTail,
-                                           cfg_.operandSeqRule));
-                return;
+            auto const kids = visibleChildren(tree_, cur);
+            if (kids.empty()) return;
+            NodeId const name = kids.front();
+            // ⚠ THE TAIL IS THE DIALECT'S ALT WRAPPER, NOT THE ARM. The shared
+            // grammar names the wrapper `asmStatementTail` and the arms
+            // `asmLabelTail` / `asmOperandSeq`; comparing the wrapper's rule
+            // against an ARM's landmark never matches, and the first version of
+            // this walker did exactly that — `main:` was then read as a
+            // zero-operand instruction and refused as "unknown mnemonic 'main'",
+            // a true diagnostic aimed at the wrong thing. Descend by RULE so
+            // the wrapper's depth stays the dialect's business.
+            NodeId const rawTail = kids.size() > 1 ? kids[1] : NodeId{};
+            NodeId const tail =
+                findDescendantOfRule(tree_, rawTail, cfg_.labelTailRule);
+            if (tail.valid()) {
+                enterLabel(std::string{tree_.text(name)}, name);
+                cur = elementInLabelTail(tail);
+                continue;
             }
+            // The block a line BRANCHING to the location counter begins, when
+            // pass 1 gave it a label of its own: entered here, where the text
+            // puts it (a fall-through into it is written down as for any
+            // label).
+            if (auto const it = locationLabelAt_.find(cur.v);
+                it != locationLabelAt_.end()
+                && labels_[it->second].at.v == cur.v) {
+                enterLabelIndex(it->second, cur);
+                if (!sink_.ok()) return;
+            }
+            loweringStatement_ = cur;
+            engine_.lowerStatement(cur, name,
+                                   findDescendantOfRule(tree_, rawTail,
+                                                        cfg_.operandSeqRule));
+            loweringStatement_ = NodeId{};
+            return;
         }
     }
 
@@ -1815,21 +2278,29 @@ private:
             sink_.fail(at, std::format("label '{}' was not collected", name));
             return;
         }
-        auto& L = labels_[it->second];
+        enterLabelIndex(it->second, at);
+    }
+
+    void enterLabelIndex(std::size_t labelIdx, NodeId at) {
+        auto& L = labels_[labelIdx];
         // A data label named its `AssembledData` item during the scan; there is
         // nothing for the block model to do with it.
         if (L.isData) return;
         if (L.isEntry) {
-            openFunction(it->second);
+            openFunction(labelIdx);
             return;
         }
-        enterBlock(it->second, at);
+        enterBlock(labelIdx, at);
     }
 
     void openFunction(std::size_t labelIdx) {
         closeFunction();
         if (!sink_.ok()) return;
         auto& entry = labels_[labelIdx];
+        if (entry.start == kNoLabel) {   // an entry is a CODE label: planned
+            sink_.fail(entry.at, planDisagreementMessage());
+            return;
+        }
         builder_.addFunction(entry.symbol);
         // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED: the parallel slot, opened
         // with the function so its index and the LIR function index are the
@@ -1837,26 +2308,34 @@ private:
         perFuncCfi_.emplace_back();
         funcInstCount_     = 0;
         openFunctionLabel_ = labelIdx;
-        // ★ EVERY BLOCK OF THIS FUNCTION IS CREATED UP FRONT, IN LABEL ORDER.
-        // A forward branch (`jmp .Lend` above `.Lend:`) needs the target's
-        // LirBlockId before the label is reached, and `createBlock` call order
-        // IS block order — there is no layout pass to reorder them afterwards.
+        // ★ EVERY BLOCK OF THIS FUNCTION IS CREATED UP FRONT, IN TEXT ORDER —
+        // its labels' AND the anonymous ones the block plan recorded between
+        // them (see `BlockStart`). A forward branch (`jmp .Lend` above
+        // `.Lend:`) needs the target's LirBlockId before the label is reached,
+        // and `createBlock` call order IS block order — there is no layout pass
+        // to reorder them afterwards.
+        // ⓘ A DATA LABEL IS NOT IN THE PLAN, so it cannot end the function's
+        // run of blocks. (It once did, when this loop walked every label: a
+        // `.s` interleaving `.data`/`.text` left every later block of the
+        // function with an INVALID LirBlockId, which `beginBlock` turns into a
+        // process abort rather than a diagnostic.)
         entry.block = builder_.createBlock();
-        for (std::size_t i = labelIdx + 1; i < labels_.size(); ++i) {
-            // ⚠ A DATA LABEL DOES NOT END THE FUNCTION'S BLOCK RUN. A `.s` may
-            // interleave `.data`/`.text`, and stopping at the first data label
-            // would leave every later block of this function with an INVALID
-            // LirBlockId — which `beginBlock` turns into a process abort rather
-            // than a diagnostic.
-            if (labels_[i].isData) continue;
-            if (labels_[i].functionLabel != labelIdx) break;
-            labels_[i].block = builder_.createBlock();
+        for (std::size_t s = entry.start + 1; s < starts_.size(); ++s) {
+            BlockStart& start = starts_[s];
+            if (start.label == kNoLabel) {
+                start.block = builder_.createBlock();
+                continue;
+            }
+            if (labels_[start.label].functionLabel != labelIdx) break;
+            labels_[start.label].block = builder_.createBlock();
         }
+        trailingFallthrough_.reset();
         builder_.beginBlock(entry.block);
-        entry.opened     = true;
-        openTerminated_  = false;
-        blockInstCount_  = 0;
-        openBlockLabel_  = labelIdx;
+        entry.opened          = true;
+        openTerminated_       = false;
+        openBlockUnreachable_ = false;
+        blockInstCount_       = 0;
+        openBlockLabel_       = labelIdx;
     }
 
     void enterBlock(std::size_t labelIdx, NodeId at) {
@@ -1877,6 +2356,7 @@ private:
         builder_.beginBlock(labels_[labelIdx].block);
         labels_[labelIdx].opened = true;
         openTerminated_          = false;
+        openBlockUnreachable_    = false;   // a label may be branched to
         blockInstCount_          = 0;
         openBlockLabel_          = labelIdx;
     }
@@ -1953,6 +2433,42 @@ private:
         return branchOpcode_;
     }
 
+    // Terminate the open block — code no control reaches, ending the function
+    // (see `closeFunction`) — with the target's ONE unreachable trap. A target
+    // declaring none, or two to pick between, is refused by name.
+    void closeUnreachableTail(LabelInfo const& entry) {
+        std::vector<std::uint16_t> traps;
+        for (std::uint16_t op = 0; op < target_.opcodeCount(); ++op) {
+            auto const* info = target_.opcodeInfo(op);
+            if (info != nullptr
+                && info->terminatorKind == TargetTerminatorKind::Unreachable) {
+                traps.push_back(op);
+            }
+        }
+        if (traps.size() != 1) {
+            sink_.fail(entry.at,
+                 std::format("assembly function '{}' ends in code no control "
+                             "reaches — lines after its last unconditional "
+                             "terminator, with no label between — and such a "
+                             "block is closed with the target's unreachable "
+                             "trap, which target '{}' {}{}",
+                             entry.name, target_.name(),
+                             traps.empty()
+                                 ? std::string{"does not declare (no opcode's "
+                                               "terminatorKind is "
+                                               "'unreachable')"}
+                                 : std::format("declares twice ('{}' and '{}'), "
+                                               "so this build will not pick one",
+                                               target_.opcodeInfo(traps[0])->mnemonic,
+                                               target_.opcodeInfo(traps[1])->mnemonic),
+                             sink_.pairSuffix()));
+            return;
+        }
+        (void)builder_.addUnreachable(traps.front());
+        openTerminated_ = true;
+        ++blockInstCount_;
+    }
+
     void closeFunction() {
         if (openFunctionLabel_ == kNoLabel) return;
         auto const& entry = labels_[openFunctionLabel_];
@@ -1973,7 +2489,29 @@ private:
                              sink_.pairSuffix()));
             frame_.active = false;
         }
-        if (!openTerminated_) {
+        // ★ A CONDITIONAL BRANCH WHOSE FALSE EDGE PASSES THE FUNCTION's LAST
+        // LINE (`fallthroughAfter`): its block is begun here, empty, and the
+        // refusal below names it — control continuing past the end is falling
+        // off it, whether a line or a conditional branch took it there.
+        bool const branchFallsOffTheEnd = trailingFallthrough_.has_value();
+        if (branchFallsOffTheEnd) {
+            builder_.beginBlock(*trailingFallthrough_);
+            trailingFallthrough_.reset();
+            openTerminated_       = false;
+            openBlockUnreachable_ = false;
+            blockInstCount_       = 0;
+        }
+        if (!openTerminated_ && openBlockUnreachable_) {
+            // ★★ CODE NOTHING REACHES, ENDING THE FUNCTION (`ret` then `nop`;
+            // P68 round 8, D-ASM-INSTRUCTION-AFTER-A-TERMINATOR-REFUSED). No
+            // control arrives at its end, so the fall-off question below has
+            // no meaning to decide; LIR still ends every block in a terminator,
+            // and the one that STATES "nothing reaches here" is the target's
+            // unreachable trap. ✔MEASURED 2026-09-23: gas 2.42 and clang 18.1.3
+            // assemble such a tail and run the program; DSS emits the trap's
+            // bytes after it (the tail stays dead either way).
+            closeUnreachableTail(entry);
+        } else if (!openTerminated_) {
             // ★ A FUNCTION THAT FALLS OFF ITS END IS REFUSED, NOT PADDED. LIR
             // requires every block to be terminated, and the two ways to
             // satisfy it silently — appending a `ret` or an `unreachable` —
@@ -1989,7 +2527,11 @@ private:
                              "`ret`); falling off the end would need this build "
                              "to invent one{}",
                              entry.name,
-                             blockInstCount_ == 0
+                             branchFallsOffTheEnd
+                                 ? std::string{"its last line is a conditional "
+                                               "branch whose false edge falls "
+                                               "off the end, and every path"}
+                             : blockInstCount_ == 0
                                  ? std::format("its final block (label '{}') is "
                                                "empty and every block",
                                                openBlockLabel_ == kNoLabel
@@ -2013,6 +2555,18 @@ private:
                              "lowering never reached — the emit walk and the "
                              "label scan disagree about this file's structure{}",
                              labels_[i].name, sink_.pairSuffix()));
+        }
+        // The same guard for the blocks that begin WITHOUT a label.
+        for (std::size_t s = entry.start + 1; s < starts_.size(); ++s) {
+            BlockStart const& start = starts_[s];
+            if (start.label != kNoLabel) {
+                if (labels_[start.label].functionLabel != openFunctionLabel_) {
+                    break;
+                }
+                continue;
+            }
+            if (start.opened) continue;
+            sink_.fail(start.statement, planDisagreementMessage());
         }
 
         ModuleSymbol sym;
@@ -2073,18 +2627,40 @@ private:
     // so applying a format's C mangling here would rename what the programmer
     // wrote. That is also why there is no format branch anywhere in this
     // function: there is nothing per-format left to decide.
-    [[nodiscard]] SymbolId internExtern(std::string const& name) {
+    //
+    // ★★ WHAT THE REFERENCE SAYS ABOUT CODE-vs-DATA IS RECORDED, NOT GUESSED
+    // (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL). A CALL states
+    // CODE. An address operand or data slot states nothing, which is exactly
+    // what gas records (✔MEASURED 2026-09-23: one R_X86_64_PC32 whether the
+    // name is a datum or a function). Such a row is minted `Pending`: the link
+    // takes the kind from the DEFINITION it finds, as ld does, and refuses the
+    // row BY NAME if none states it (`ExternKindOrigin`). A later call to a
+    // `Pending` name states CODE, and that settles it. An address taken after a
+    // call leaves the call's answer standing.
+    enum class ExternReference : std::uint8_t { Call, Address };
+    [[nodiscard]] SymbolId internExtern(std::string const& name,
+                                        ExternReference reference) {
         if (auto const it = externIndex_.find(name); it != externIndex_.end()) {
-            return externs_[it->second].symbol;
+            ExternImport& known = externs_[it->second];
+            if (reference == ExternReference::Call
+                && known.kindOrigin == ExternKindOrigin::Pending) {
+                known.isData     = false;
+                known.kindOrigin = ExternKindOrigin::Stated;
+            }
+            return known.symbol;
         }
         ExternImport row;
         row.symbol      = mintSymbol();
         row.mangledName = name;
-        // `libraryPath` / `version` stay EMPTY (unbound), `isEagerImport` false
-        // (nothing shipped this row, so the reference gate may drop it when
-        // nothing references it), and `isData` false — this row exists because
-        // a CALL named it, and a call target is code.
-        row.isData = false;
+        // `libraryPath` / `version` stay EMPTY (unbound), and `isEagerImport`
+        // stays false: nothing shipped this row, so the reference gate may drop
+        // it when nothing references it.
+        // `isData` is false: a CALL states code, and for an address it is not
+        // read until a definition decides it (`Pending`).
+        row.isData     = false;
+        row.kindOrigin = reference == ExternReference::Call
+                             ? ExternKindOrigin::Stated
+                             : ExternKindOrigin::Pending;
         externIndex_.emplace(name, externs_.size());
         externs_.push_back(std::move(row));
         return externs_.back().symbol;
@@ -2098,11 +2674,12 @@ private:
     // because carrying a symbol is exactly what
     // `derivableIndirectSuccessors()` reads as "this block's address was
     // taken". That is the obligation the comment below states, and it is why
-    // this function is private to the two callers that bind a relocation:
-    // `sourceOperandForSymbol` (an address-materializing instruction) and
-    // `bindPendingDataSymbols` (a symbol-valued data slot). A third caller with
-    // any other motive would WIDEN the successor set of every indirect branch
-    // in the function.
+    // this function is private to the callers that take a label's ADDRESS:
+    // `sourceOperandForSymbol` (an address-materializing instruction),
+    // `bindPendingDataSymbols` (a symbol-valued data slot), the symbolic
+    // displacement and `resolveLocalBlock` (an address resolved at assemble
+    // time — `adr x1, 1f`, P68 round 9). A caller with any other motive would
+    // WIDEN the successor set of every indirect branch in the function.
     [[nodiscard]] SymbolId symbolForAddressedLabel(std::size_t labelIdx) {
         auto& L = labels_[labelIdx];
         if (!L.symbol.valid()) L.symbol = mintSymbol();
@@ -2126,29 +2703,43 @@ private:
     // symbol the relocation will target.
     bool bindPendingDataSymbols() {
         for (auto& p : pendingDataRelocs_) {
-            auto const it = labelIndex_.find(p.name);
-            if (it == labelIndex_.end()) {
-                // ★ A NAME THIS FILE DEFINES NOWHERE IS REFUSED RATHER THAN
-                // IMPORTED. `internExtern` mints a row whose `isData` drives
-                // the linker's GOT-vs-PLT slot choice (`elf.cpp`), and a data
-                // directive states nothing about whether the thing it points
-                // at is code or data — so the import would be a guess with a
-                // wire-format consequence. Anchored:
-                // D-ASM-DATA-SLOT-CANNOT-NAME-AN-UNDEFINED-SYMBOL.
-                sink_.fail(p.at,
-                     std::format("'.{}' names '{}', which this file defines no "
-                                 "label for. A data slot holding an address "
-                                 "must name something this translation unit "
-                                 "defines: an undefined name would have to be "
-                                 "imported, and an import states whether it is "
-                                 "CODE or DATA (which selects the linker's "
-                                 "indirection slot), while a data directive "
-                                 "says neither{}",
-                                 p.spelling, p.name, sink_.pairSuffix()));
+            LabelHit const hit = lookupLabel(p.name, p.at);
+            if (hit.kind == LabelLookup::UnresolvedLocal) {
+                sink_.fail(p.at, unresolvedLocalMessage(p.name, "." + p.spelling));
                 return false;
             }
-            p.labelIndex = it->second;
+            if (hit.kind == LabelLookup::NotALabel) {
+                // ★ A NAME THIS FILE DEFINES NOWHERE IS AN IMPORT, the same
+                // decision the address-operand site makes: a data directive
+                // states no kind, so the row is minted `Pending` and the
+                // DEFINITION decides it at the link (`internExtern`,
+                // D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL). It
+                // used to be refused here because an import had to state a kind
+                // at birth; ✔MEASURED 2026-09-23, gas writes `.quad sib_fn` as
+                // R_X86_64_64 with no kind, and gcc runs it to 42 with the
+                // definition in a sibling object.
+                p.importSymbol = internExtern(p.name, ExternReference::Address);
+                continue;
+            }
+            p.labelIndex = hit.index;
             auto const& L = labels_[p.labelIndex];
+            // ⚠ A CONSTANT ADDED TO A CODE LABEL (`.quad main+4`, `.quad 1f+8`
+            // — P68 round 9) is a byte distance in the reference assembler's
+            // code layout, which this build does not reproduce; refused rather
+            // than written as another byte. The same refusal the instruction
+            // engine makes for an operand (`namesCodeHere`).
+            if (p.addend != 0 && isCodeLabel(L)) {
+                sink_.fail(p.at,
+                     std::format("'.{}' writes the address of '{}' plus {}, a "
+                                 "location in this file's CODE, and this build "
+                                 "does not lay code out as the reference "
+                                 "assembler does (a jump it synthesizes at a "
+                                 "block's end; x86's long branch and immediate "
+                                 "forms), so the byte it names would not be the "
+                                 "reference's — label the instruction you mean{}",
+                                 p.spelling, p.name, p.addend, sink_.pairSuffix()));
+                return false;
+            }
             // An entry or data label already carries its symbol; only an
             // interior BLOCK label is minted here, and minting it is precisely
             // the act that makes its block address-taken.
@@ -2186,10 +2777,17 @@ private:
     // INTERIOR label, the block-symbol binding the driver needs.
     void emitPendingDataRelocations() {
         for (auto const& p : pendingDataRelocs_) {
+            if (p.importSymbol.valid()) {
+                // A name this file does not define: the slot relocates
+                // against its import row.
+                dataItems_[p.itemIndex].relocations.push_back(
+                    Relocation{p.byteOffset, p.importSymbol, p.kind, p.addend});
+                continue;
+            }
             if (p.labelIndex == kNoLabel) continue;   // pass 1c already failed
             auto const& L = labels_[p.labelIndex];
             dataItems_[p.itemIndex].relocations.push_back(
-                Relocation{p.byteOffset, L.symbol, p.kind, /*addend=*/0});
+                Relocation{p.byteOffset, L.symbol, p.kind, p.addend});
             if (L.isEntry || L.isData) continue;
             // ★★★ M4 — THE ONE CHANNEL THAT DID NOT ALREADY EXIST. An interior
             // label named ONLY from data emits no instruction, so the encoder
@@ -2215,6 +2813,23 @@ private:
                                  "so this slot's relocation would name a symbol "
                                  "with no address{}",
                                  p.spelling, p.name, sink_.pairSuffix()));
+                return;
+            }
+            blockSymbolBindings_.push_back(AsmBlockSymbolBinding{
+                functionOrdinalOf(L.functionLabel), L.block.v, L.symbol});
+        }
+        // The interior labels a symbolic memory displacement named — bound the
+        // same way, for the same reason: the instruction that names them
+        // carries no BlockRef for the encoder to bind them from. The driver
+        // binds a symbol once, however many sites named it.
+        for (auto const& d : displacedLabels_) {
+            auto const& L = labels_[d.labelIndex];
+            if (!L.block.valid()) {
+                sink_.fail(d.at,
+                     std::format("internal: a memory operand is relative to "
+                                 "'{}', which reserved no basic block — the emit "
+                                 "walk never opened the function that contains "
+                                 "it{}", L.name, sink_.pairSuffix()));
                 return;
             }
             blockSymbolBindings_.push_back(AsmBlockSymbolBinding{
@@ -2275,38 +2890,14 @@ private:
         }
     }
 
-    // The DIRECTIVE that follows a label ON THE SAME LINE, or invalid.
-    //
     // ★★ `msg: .asciz "hi"` AND `main: .globl main` ARE ORDINARY gas, AND THE
-    // SCAN USED TO DROP BOTH. `walkElements` visits LINE-level elements, and a
-    // directive nested inside a label tail is not one — the old comment claimed
-    // it would be "picked up when the walk reaches it", which is false. A
-    // dropped `.globl` emits the entry symbol with LOCAL linkage; a dropped
-    // data directive emits an empty item. Neither says anything.
-    NodeId nextDirectiveAfterLabel(NodeId statement) {
-        auto const kids = visibleChildren(tree_, statement);
-        if (kids.size() < 2) return NodeId{};
-        NodeId const labelTail =
-            findDescendantOfRule(tree_, kids[1], cfg_.labelTailRule);
-        if (!labelTail.valid()) return NodeId{};
-        NodeId const element =
-            findDescendantOfRule(tree_, labelTail, cfg_.elementRule);
-        if (!element.valid()) return NodeId{};
-        return findDescendantOfRule(tree_, element, cfg_.directiveRule);
-    }
-
-    // The statement that follows a label ON THE SAME LINE, or invalid.
-    NodeId nextStatementAfterLabel(NodeId statement) {
-        auto const kids = visibleChildren(tree_, statement);
-        if (kids.size() < 2) return NodeId{};
-        NodeId const labelTail =
-            findDescendantOfRule(tree_, kids[1], cfg_.labelTailRule);
-        if (!labelTail.valid()) return NodeId{};
-        NodeId const element =
-            findDescendantOfRule(tree_, labelTail, cfg_.elementRule);
-        if (!element.valid()) return NodeId{};
-        return findDescendantOfRule(tree_, element, cfg_.statementRule);
-    }
+    // SCAN USED TO DROP BOTH: a directive nested inside a label tail is not a
+    // LINE-level element, so `walkElements` never reaches it. A dropped `.globl`
+    // emits the entry symbol with LOCAL linkage; a dropped data directive emits
+    // an empty item. Neither says anything — which is why both passes walk a
+    // line's label chain to its end (`scanElement`, `emitElement`) through
+    // `elementAfterNamedLabel` / `elementAfterNumericLabel` /
+    // `elementInLabelTail`.
 
     // The label a statement defines, or invalid when it defines none.
     NodeId labelOf(NodeId element) {
@@ -2372,6 +2963,39 @@ private:
 
     std::vector<LabelInfo>                      labels_;
     std::unordered_map<std::string, std::size_t> labelIndex_;
+    // The numeric local labels (`1:`): the ONE resolver's table of their
+    // definitions, the label index each DEFINITION NODE was given (so the emit
+    // pass enters the very label the scan recorded), and how many times each
+    // number has been defined so far (the `#k` of the unspellable name).
+    asm_local_labels::Table<std::size_t>            localLabels_;
+    std::unordered_map<std::uint32_t, std::size_t>  numericLabelAt_;
+    std::unordered_map<std::uint64_t, std::uint32_t> numericDefinitionCount_;
+    // The BLOCK PLAN (see `BlockStart`): every start in text order, the
+    // anonymous start an instruction line begins (by statement node), the
+    // start each conditional branch falls into (by statement node), and what
+    // pass 1 is carrying from the last instruction it read.
+    std::vector<BlockStart>                         starts_;
+    std::unordered_map<std::uint32_t, std::size_t>  anonStartAt_;
+    std::unordered_map<std::uint32_t, std::size_t>  fallStartOf_;
+    AsmBlockEffect                                  planEffect_ = AsmBlockEffect::None;
+    NodeId                                          planCondBr_{};
+    // P68 round 9, the location counter as a BRANCH TARGET: the code label
+    // whose block no line has entered yet (the one a `b .` on the next line
+    // names), the label each line branching to `.` names (by statement node),
+    // how many such labels were minted, and the line the emit walk is lowering
+    // (what `.` means there).
+    std::size_t                                     freshLabelStart_ = kNoLabel;
+    std::unordered_map<std::uint32_t, std::size_t>  locationLabelAt_;
+    std::uint32_t                                   locationLabelCount_ = 0;
+    NodeId                                          loweringStatement_{};
+    // The object format kind this unit is assembled for — a KEY into the
+    // dialect's `symbolParts` (P68 round 9).
+    std::optional<ObjectFormatKind>                 formatKind_;
+    // The emit walk's half: a false edge past the open function's last start
+    // (`fallthroughAfter`), and whether the open block is one no control
+    // reaches (`openBlockAfterTerminator`).
+    std::optional<LirBlockId>                       trailingFallthrough_;
+    bool                                            openBlockUnreachable_ = false;
     std::unordered_set<std::string>             functionEntryNames_;
     std::unordered_set<std::string>             globals_;
     std::vector<ModuleSymbol>                   symbols_;
@@ -2390,6 +3014,15 @@ private:
     // name. Both empty for a `.s` whose data holds no addresses.
     std::vector<PendingDataReloc>               pendingDataRelocs_;
     std::vector<AsmBlockSymbolBinding>          blockSymbolBindings_;
+    // D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER: interior labels a
+    // SYMBOLIC MEMORY DISPLACEMENT named (`leaq 1f(%rip), %rcx`), bound to their
+    // blocks with the data slots' bindings once the emit walk has created every
+    // block.
+    struct DisplacedLabel {
+        std::size_t labelIndex = 0;
+        NodeId      at{};
+    };
+    std::vector<DisplacedLabel>                 displacedLabels_;
     std::optional<DataSectionKind>              scanSection_;
     std::optional<DataSectionKind>              emitSection_;
     std::size_t                                 openDataItem_      = kNoLabel;
@@ -2427,8 +3060,10 @@ std::optional<AsmTextModule>
 lowerAsmTextToLir(Tree const& tree, GrammarSchema const& grammar,
                   TargetSchema const& target,
                   std::span<std::string const> entryNames,
-                  DiagnosticReporter& reporter) {
-    AsmTextLowering lowering{tree, grammar, target, entryNames, reporter};
+                  DiagnosticReporter& reporter,
+                  std::optional<ObjectFormatKind> formatKind) {
+    AsmTextLowering lowering{tree, grammar, target, entryNames, reporter,
+                             formatKind};
     return lowering.run();
 }
 

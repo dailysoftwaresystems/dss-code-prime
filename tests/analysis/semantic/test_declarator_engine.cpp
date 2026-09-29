@@ -614,7 +614,7 @@ TEST(DeclaratorInversion, ZeroArrayLengthFailsLoud) {
     EXPECT_FALSE(typeOf(m, "x").valid());
 }
 
-// c33 (D-CSUBSET-TENTATIVE-DEFINITION): two declarators of the same name in one
+// c33 (D-CSUBSET-TENTATIVE-DEFINITION-MERGE): two declarators of the same name in one
 // list, BOTH with no initializer, are two TENTATIVE DEFINITIONS of one file-scope
 // object (C 6.9.2 — real GCC/Clang accept `int x, x;`). The per-declarator bind
 // path MERGES them (one surviving symbol, the other absorbed) rather than emitting

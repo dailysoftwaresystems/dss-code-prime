@@ -315,7 +315,7 @@ TEST(AsmX86MemoryArithmetic, MixedRegisterWidthsStayRefused) {
 // was a no-op), so a navigator that missed its container cannot pass silently.
 // ⚠ CONFIG-LEVEL: this file MUST run through ctest — `dss_add_test` sets
 // `DSS_CONFIG_ROOT`, while a bare `.exe` walks the cwd and would read whichever
-// tree the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+// tree the shell stands in.
 
 namespace {
 

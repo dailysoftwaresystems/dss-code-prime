@@ -46,11 +46,13 @@
 
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind
 
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <string>
 
 namespace dss {
 
@@ -73,6 +75,48 @@ public:
         return k == TypeKind::F128 ? 113 : 64;   // F80 (and the defensive default) → 64
     }
     [[nodiscard]] int significandBits() const noexcept { return significandBits(kind_); }
+
+    // ★ THE FORMAT BIT-WIDTH OF EACH KIND — the ONE table the `.dsshir` and `.dssir`
+    // text forms spell `wfloat <bits> <hi> <lo>` through: both WRITERS spell a
+    // value's kind from it and both READERS resolve a width through it (P68 round
+    // 8, lane `ht`, part 1c-b). The width is the formats' own (80, 128) — a STABLE
+    // semantic discriminator, where a `TypeKind` ordinal is version-fragile.
+    // ⚠ It used to be written out FOUR times: `(kind == F128) ? 128 : 80` in both
+    // writers and `(bits == 128) ? F128 : F80` in both readers, so a kind with no
+    // width was spelled 80 and EVERY width but 128 — `wfloat 64`, `wfloat 0` — read
+    // back as an x87 80-bit value, silently. Now a kind with no row is refused at
+    // the writer and a width with no row at the reader, each by name.
+    struct FormatBitWidth {
+        TypeKind      kind;
+        std::uint32_t bits;
+    };
+    static constexpr std::array<FormatBitWidth, 2> kFormatBitWidths{{
+        {TypeKind::F80, 80},
+        {TypeKind::F128, 128},
+    }};
+    [[nodiscard]] static constexpr std::optional<std::uint32_t>
+    formatBitWidth(TypeKind k) noexcept {
+        for (FormatBitWidth const& row : kFormatBitWidths) {
+            if (row.kind == k) return row.bits;
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] static constexpr std::optional<TypeKind>
+    kindOfFormatBitWidth(std::uint64_t bits) noexcept {
+        for (FormatBitWidth const& row : kFormatBitWidths) {
+            if (row.bits == bits) return row.kind;
+        }
+        return std::nullopt;
+    }
+    // The widths a refusal lists — projected off the table, never retyped.
+    [[nodiscard]] static std::string formatBitWidthsAccepted() {
+        std::string out;
+        for (FormatBitWidth const& row : kFormatBitWidths) {
+            if (!out.empty()) out += ", ";
+            out += std::to_string(row.bits);
+        }
+        return out;
+    }
 
     // ── Constructors (all set kind_; the default-ctor F64 value is inert — every
     // real value flows through one of these or the pool's widen-from-double) ──

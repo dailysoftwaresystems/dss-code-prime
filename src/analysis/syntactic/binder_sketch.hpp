@@ -66,10 +66,25 @@ struct DSS_EXPORT AmbiguousTypeNameCandidate {
 //     hoisting would extend this).
 //   * `kindByChild` discriminators are not evaluated — they only flip
 //     Variable→Function today, and both are VALUES to the triage.
-//   * `fieldChildren.liftToEnclosingScope` (C enum-constant lift) is not
-//     mirrored: enumerators read as Unknown after their enum closes.
-//     Unknown is SAFE — the follower test picks the value reading for
-//     every form valid C could mean, and semantic diagnoses the rest.
+//
+// ★★ TWO VALUES THE SOURCE NEVER DECLARES WHERE THEY ARE USED ARE MIRRORED
+// (P68 round 9, lane `cs`), AND THE OLD CLAIM THAT "Unknown IS SAFE" FOR THEM
+// WAS FALSE. `sizeof ( X )` has no operand after its type position, so the
+// follower test has nothing to read and an Unknown lone identifier COMMITS AS A
+// TYPE — the semantic tier then refused it S_UnknownType. ✔MEASURED 2026-09-23,
+// each reference separately and RUN: `sizeof(__func__)`, `sizeof(__FUNCTION__)`
+// and `sizeof(E)` for an enumerator of an anonymous, a named and a block-scope
+// enum build and exit 42 on gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC
+// 19.51, and DSS refused all five. So:
+//   * the language's PREDEFINED identifiers (`semantics.predefinedFunctionNames`)
+//     are recorded as VALUES in the global scope at construction — they are
+//     ordinary identifiers, never type names, wherever they are visible at all;
+//   * a field row its composite LIFTS (`fieldChildren.liftToEnclosingScope`, the
+//     C enumeration constant) binds its name in the nearest enclosing NAMESPACE
+//     scope — past the composite's own body scope and any declarator-dominator —
+//     exactly where the analyzer republishes it.
+// A type the sketch cannot see (a typedef from another tree of the compilation
+// unit) still reaches the Unknown arm and still commits as a type.
 class DSS_EXPORT BinderSketch {
 public:
     enum class NameKind : std::uint8_t { Unknown, Type, Value };
@@ -92,6 +107,10 @@ public:
         // both A and B as types).
         bool          declaratorMode = false;
         std::uint32_t carrierChild   = 0;
+        // A field row whose composite republishes its names in the enclosing
+        // scope (`fieldChildren.liftToEnclosingScope` — C's enumeration
+        // constants). See `record`.
+        bool          liftToEnclosingScope = false;
     };
 
     explicit BinderSketch(GrammarSchema const& schema);
@@ -123,7 +142,11 @@ public:
     // `span` is the source span of the declaring name-token — carried so the
     // CU oracle can tell a name's OWN defining occurrence apart from a USE of
     // it (globalTypeBindings / D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME).
-    void record(std::string name, bool isType, SourceSpan span);
+    // `liftToEnclosingScope` (a lifted field row's name, e.g. an enumeration
+    // constant) binds past the composite's own body scope and any
+    // declarator-dominator, into the nearest enclosing namespace scope.
+    void record(std::string name, bool isType, SourceSpan span,
+                bool liftToEnclosingScope = false);
     [[nodiscard]] NameKind lookup(std::string_view name) const noexcept;
 
     // Seed a TYPE binding into the GLOBAL scope before parsing — the
@@ -165,6 +188,7 @@ public:
         std::size_t                candidateCount = 0;
         std::vector<std::uint32_t> liveScopes;
         std::vector<bool>          liveScopeDominator;   // parallel to liveScopes
+        std::vector<bool>          liveScopeComposite;   // parallel to liveScopes
         std::uint32_t              nextScopeId    = 1;
     };
     [[nodiscard]] Snapshot snapshot() const;
@@ -186,6 +210,10 @@ private:
     // row that is NOT a Type/composite body). A composite TYPE tag declared
     // in such a scope floats past it to the enclosing namespace (see openScope).
     std::unordered_set<std::uint32_t>             dominatorScopeRules_;
+    // Scope rules that open a COMPOSITE BODY scope (a scope rule whose binder
+    // row is a Type — c's structSpec / unionSpec / enumSpec). A LIFTED field
+    // name floats past it (see `record`).
+    std::unordered_set<std::uint32_t>             compositeScopeRules_;
 
     // Chronological, append-only between snapshot/restore pairs. Closed
     // scopes do NOT truncate (liveness is scope-id-based) — see class doc.
@@ -195,6 +223,9 @@ private:
     // Parallel to liveScopes_: true iff that scope is a declarator-dominator
     // (a TYPE tag recorded while it is live floats past it to the namespace).
     std::vector<bool>                             liveScopeIsDominator_;
+    // Parallel to liveScopes_: true iff that scope is a composite BODY (a lifted
+    // field name recorded while it is live floats past it to the namespace).
+    std::vector<bool>                             liveScopeIsComposite_;
     std::uint32_t                                 nextScopeId_ = 1;
 
     std::vector<AmbiguousTypeNameCandidate>       candidates_;

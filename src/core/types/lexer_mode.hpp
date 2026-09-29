@@ -176,6 +176,53 @@ unterminatedFlavorFromName(std::string_view s) noexcept {
     return kUnterminatedFlavorTable.fromName(s);
 }
 
+// ★★★ WHAT THE END OF INPUT DOES TO A FRAME OF THIS MODE STILL OPEN THERE —
+// `lexerModes.<name>.atEndOfInput`, beside `unterminatedAs` (which names the
+// FLAVOUR of what is open; this names the VERDICT). ONE enum rather than a
+// "closes" boolean plus a "warns" boolean, because two booleans admit "warns but
+// does not close", a state no reference has and no reader could predict.
+//
+//   • `Unterminated` — the default and today's behaviour: an open frame at the
+//     end of input is refused (`P_Unterminated*`, flavoured by `unterminatedAs`).
+//   • `Closes` — the end of input closes the frame, silently. A C `//` comment:
+//     ✔MEASURED 2026-09-23, gcc 13.3.0, clang 18.1.3, aarch64 gcc, mingw-w64 gcc
+//     13.2.0 and MSVC 19.51 all accept a C file whose last line is a `//`
+//     comment with no newline (clang warns only under `-pedantic`).
+//   • `ClosesWithWarning` — the end of input closes the frame, and says so. A gas
+//     `/*` comment: ✔MEASURED 2026-09-23, GNU as 2.42 accepts a `.s` ending
+//     inside one ("end of file in comment" / "end of file in multiline comment")
+//     and the program runs; clang 18.1.3 refuses it. The references split on
+//     ACCEPTANCE, so the union accepts — and the warning is gas's, because a
+//     missing `*/` silently swallowing the rest of a file must not be silent.
+//
+// ⚠ A `popAtNewline` MODE HAS NO DECLARABLE POLICY: its frame ends with its line,
+// and the end of input ends the last line, so its verdict is `Closes` BY
+// CONSTRUCTION. The loader derives it and REFUSES an explicit `atEndOfInput` on
+// such a mode — one way to say one thing.
+enum class EndOfInputPolicy : std::uint8_t {
+    Unterminated,
+    Closes,
+    ClosesWithWarning,
+};
+
+// `Unterminated` is row 0, matching the field's own default, so an out-of-range
+// value renders as the verdict it would behave as.
+inline constexpr EnumNameTable<EndOfInputPolicy, 3> kEndOfInputPolicyTable{{{
+    { EndOfInputPolicy::Unterminated,      "unterminated"      },
+    { EndOfInputPolicy::Closes,            "closes"            },
+    { EndOfInputPolicy::ClosesWithWarning, "closesWithWarning" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kEndOfInputPolicyTable);
+
+[[nodiscard]] constexpr std::string_view
+endOfInputPolicyName(EndOfInputPolicy p) noexcept {
+    return kEndOfInputPolicyTable.name(p);
+}
+[[nodiscard]] constexpr std::optional<EndOfInputPolicy>
+endOfInputPolicyFromName(std::string_view s) noexcept {
+    return kEndOfInputPolicyTable.fromName(s);
+}
+
 // Schema-declared specification for a body-mode's default token. The
 // bundle makes illegal states unrepresentable: a mode without a
 // defaultToken cannot accidentally carry flags meant for one.
@@ -237,13 +284,25 @@ struct DSS_EXPORT LexerMode {
     // endsAt" scanner) may NOT set this — the two close mechanisms are
     // mutually exclusive (loader rejects the combination). Default false.
     bool                              popAtNewline = false;
+    // What the end of input does to a frame of this mode still open there —
+    // see `EndOfInputPolicy`. `Closes` for every `popAtNewline` mode (derived
+    // by the loader, never declared).
+    EndOfInputPolicy                  atEndOfInput = EndOfInputPolicy::Unterminated;
 
     [[nodiscard]] static LexerMode make(std::string name,
                                         LexerModeId id,
                                         std::optional<DefaultTokenSpec> defaultToken,
                                         UnterminatedFlavor flavor = UnterminatedFlavor::String,
-                                        bool popAtNewline = false) {
-        return LexerMode{std::move(name), id, defaultToken, flavor, popAtNewline};
+                                        bool popAtNewline = false,
+                                        EndOfInputPolicy atEndOfInput = EndOfInputPolicy::Unterminated) {
+        // A line-scoped frame ends with its line and the end of input ends the
+        // last line, so its verdict is `Closes` whatever was passed; the loader
+        // REFUSES a declared `atEndOfInput` on such a mode, so no document can
+        // ask for another.
+        EndOfInputPolicy const policy =
+            popAtNewline ? EndOfInputPolicy::Closes : atEndOfInput;
+        return LexerMode{std::move(name), id, defaultToken, flavor, popAtNewline,
+                         policy};
     }
 };
 

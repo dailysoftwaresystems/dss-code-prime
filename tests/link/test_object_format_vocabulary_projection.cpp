@@ -145,11 +145,14 @@ struct ShippedFormatDoc {
 
 // ★ `quotedTokens` used to be a file-local copy here, byte-identical to the one
 // three `tests/core` files had already merged — and therefore invisible to the
-// mutant that closed
-// D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE. It has ONE
+// mutant that merged them, which is how a per-file copy survives the very
+// change that was supposed to retire it. It has ONE
 // owner now, `tests/test_support/vocabulary_message_probe.hpp`, which is
-// json-free and reachable from every suite; see
-// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED.
+// json-free and reachable from every suite. It lives there and not in
+// `tests/core/vocabulary_projection_probe.hpp` because that header also LOCATES
+// a shipped config document and so drags in `nlohmann/json.hpp`, and because
+// `dss_add_test` puts only `src` and `tests/test_support` on every test
+// target's include path — `tests/core` is on no other suite's.
 using ::dss::test_support::quotedTokens;
 
 [[nodiscard]] bool contains(std::span<std::string_view const> names,

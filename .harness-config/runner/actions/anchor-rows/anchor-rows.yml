@@ -1,0 +1,77 @@
+# PURPOSE: stage, check and apply one fold's deferred-anchor rows as a batch through the door, rehearsed in a throwaway repository first, all or nothing, every row read back.
+name: anchor-rows
+description: >-
+  The self-test drives the rows batch through git fixture repositories and the REAL door (a host
+  without DssHarness fails it rather than skipping it): each refusal an arm names fires where the arm
+  says -- at stage, at check or at apply -- with a control beside each family, and a valid batch lands
+  as declared, rehearsed first and read back. It proves the refusals its arms name, not every failure
+  path the program has; the arms are the list. Each verb runs as a MANUAL step. The program documents
+  itself in its own header; this file declares only how a runner starts it and what witnesses that it
+  ran. Gated by ctest as `anchor_rows_selftest_guard`.
+  ⚠ THE MANUAL STEPS ACT ON THE TREE ITSELF -- its registries, and a lane's rows directory under its
+  worktrees or scratch -- so they run through the `rows` runner, whose one leg is this machine's own
+  tree. Through the `anchor-rows` runner they would also run on a host's synced copy, which holds no
+  lane's rows directory (`.worktrees` and `.temp` are ignored, and only what git does not ignore
+  travels): there a step refuses for want of its rows.
+  Every input of a step is handed over as `<input>=<value>`, defaults included, and `anchor-rows.py
+  --step` turns them into the verb's own arguments; its STEP_INPUTS table is the one statement of each
+  step's inputs, and the self-test holds this file to it. A list input is comma-separated, or
+  `@<file>` naming a list file, one item a line. A path is relative to the tree unless absolute.
+  `check` writes nothing; `apply` writes the registries, all or nothing -- a failure restores both,
+  unless another writer changed them meanwhile, which it says and leaves for a human.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./anchor-rows.py --self-test
+    successPattern: 'anchor-rows self-test: \d+ arm\(s\), 0 failed'
+    requireInputsUnmoved: true
+
+  - name: stage
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      rows:
+        description: "the lane's rows directory, <rows dir>/<ANCHOR ID>/<cell>.txt; the lane's files are never edited"
+      staged:
+        description: "a NEW directory the named rows are copied into -- the fold's record of what it carried"
+      only:
+        description: "the anchor ids to carry, every one of which the rows directory must hold"
+      new:
+        description: "the carried ids the batch may CREATE; a row no registry holds and this does not name is refused as a typo"
+        default: ''
+      liveOnly:
+        description: "true skips the *.applied cell files a lane renamed after an earlier application"
+        default: 'false'
+    run: |
+      python3 ./anchor-rows.py --step stage "rows={rows}" "staged={staged}" "only={only}" "new={new}" "liveOnly={liveOnly}"
+    successPattern: '^anchor-rows step stage: done\b'
+    requireInputsUnmoved: true
+
+  - name: check
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      staged:
+        description: "the staged directory: each row judged against the registries, the batch rehearsed in a throwaway repository"
+    run: |
+      python3 ./anchor-rows.py --step check "staged={staged}"
+    successPattern: '^anchor-rows step check: done\b'
+    requireInputsUnmoved: true
+
+  # `apply` writes the two registries -- tracked files -- by design, so it cannot carry requireInputsUnmoved.
+  # The door resolves no cited id, and no guard reads the registries' own citations (`check-anchor-citations`
+  # reads `anchors.citationRoots`, which holds no `.plans`): `check` and `apply` resolve every id the batch
+  # newly cites themselves, against both registries and the batch.
+  - name: apply
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      staged:
+        description: "the staged directory, checked; it is rehearsed again before the registries are written"
+      acceptLost:
+        description: "LOST cells to write anyway, <ANCHOR ID>:<cell> items, each after its word diff was read"
+        default: ''
+    run: |
+      python3 ./anchor-rows.py --step apply "staged={staged}" "acceptLost={acceptLost}"
+    successPattern: '^anchor-rows step apply: done\b'

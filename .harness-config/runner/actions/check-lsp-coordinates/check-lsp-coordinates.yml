@@ -1,0 +1,14 @@
+# PURPOSE: refuse a raw coordinate conversion in src/lsp/ outside lsp_coordinates.cpp — the anti-regression device for LSP positions resolved in synthesized preprocessor coordinates.
+name: check-lsp-coordinates
+description: >-
+  The action verifies every LSP coordinate conversion goes through its one owner.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `lsp_coordinate_ownership_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-lsp-coordinates.py
+    successPattern: 'check-lsp-coordinates selftest: OK'
+    requireInputsUnmoved: true

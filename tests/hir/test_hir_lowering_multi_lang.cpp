@@ -37,18 +37,17 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// D-TEST-FIXED-SCRATCH-PATH-POPULATION — the two `addFile` tests below need real
-// files on disk. They used to derive the directory from a CONSTANT name under
-// `temp_directory_path()`, so two concurrent instances of this binary shared one
-// directory and each one's trailing `remove_all` deleted the OTHER's inputs
-// mid-test. `ScratchDir` claims a per-instance slot atomically (SINGULAR
+// The two `addFile` tests below need real files on disk. They used to derive
+// the directory from a CONSTANT name under `temp_directory_path()`, so two
+// concurrent instances of this binary shared one directory and each one's
+// trailing `remove_all` deleted the OTHER's inputs mid-test. `ScratchDir`
+// claims a per-instance slot atomically (SINGULAR
 // `create_directory`, with the pid only as a seed) and cleans up in its dtor.
 using dss::test_support::Location;
 using dss::test_support::ScratchDir;
 
 [[nodiscard]] std::shared_ptr<GrammarSchema const> shipped(std::string_view name) {
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
-    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // This was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
     // ✔MEASURED against an emptied shipped config, the abort took the whole
     // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
     // no summary -- every sibling test in this executable lost its verdict.

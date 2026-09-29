@@ -73,6 +73,8 @@ constexpr std::string_view kFormatMatchingX86_64 = R"({
     {"kind":"strtab",  "name":".strtab",   "type":3, "flags":0,  "addrAlign":1,  "entrySize":0},
     {"kind":"shstrtab","name":".shstrtab", "type":3, "flags":0,  "addrAlign":1,  "entrySize":0}
   ],
+  "relocationAddends": "explicit",
+  "inputSectionPlacement": "unit",
   "relocations": [
     { "name": "R_X86_64_PC32",   "kind": 1, "nativeId": 2  },
     { "name": "R_X86_64_64",     "kind": 2, "nativeId": 1  },
@@ -276,6 +278,8 @@ TEST(Linker, ImageWithNoDataBindingStillRejectsReferencedDataExtern) {
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations":[{"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4}]
     })");
     ASSERT_TRUE(fmt.has_value());

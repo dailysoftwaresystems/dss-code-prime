@@ -108,6 +108,15 @@ struct DSS_EXPORT Relocation {
                                   // assembler-fabricated. Default-constructed
                                   // (invalid sentinel) means "uninitialized".
     std::int64_t   addend = 0;    // ABI-specific (e.g. PC-relative bias)
+    // ★ HOW MANY BYTES OF THE INSTRUCTION FOLLOW THE PATCHED FIELD — 0 when the
+    // field ends it (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    // `movl $5, x(%rip)` has 4 immediate bytes after its displacement, and an
+    // address relative to the NEXT instruction is then 4 bytes further on.
+    // The walker has ALREADY folded that into `addend` (once — the ISA's
+    // rule); this records it for the one format that also spells it in the
+    // relocation TYPE (Mach-O's X86_64_RELOC_SIGNED_1/_2/_4). No other consumer
+    // reads it, and a format with no such type ignores it.
+    std::uint8_t   bytesAfterField = 0;
 };
 
 // One synthetic SYMBOL ↔ interior-block byte-offset binding
@@ -158,6 +167,33 @@ struct DSS_EXPORT SehScopeEntry {
     std::uint32_t jumpTargetByteOffset = 0;  // the __except handler block (within parent bytes)
     SymbolId      filterFuncletSymbol{};     // the synthesized filter-funclet function symbol
     SymbolId      personalitySymbol{};       // __C_specific_handler extern (its thunk RVA = the UNWIND handler field)
+};
+
+// ★★★ THE PRODUCER'S INPUT SECTION AN ATOM WAS CUT FROM, when that section is
+// the UNIT OF PLACEMENT. A relocatable-object reader cuts a section into
+// symbol-bounded atoms; the object's FORMAT decides whether those atoms may then
+// move independently (`inputSectionPlacement` in the object-format schema). ELF
+// and PE/COFF say never, and a Mach-O object says it only when its header
+// declares subsections-via-symbols. Where the answer is never, every atom of one
+// section carries the section's key and its own offset in it, and the link lays
+// the section out as ONE block: each atom at `offset` from the block's start.
+//
+// Code the producer assembled depends on that layout in ways the reader cannot
+// see. Examples: a reference gas reduced to "section symbol + offset", with an
+// instruction's immediate folded into the addend; a `sym+off` that runs into the
+// next object; objects walked as an array between two labels. ✔MEASURED
+// 2026-09-23 (P68 round 9): gcc -O2's `static int y, x` stores, linked by DSS
+// before this, ran to 33 where gcc's own link runs to 42. The merge had moved
+// the two objects apart, so the stores landed in padding.
+//
+// nullopt = the atom is independently placeable: DSS's own output, and a
+// subsections-declaring Mach-O object.
+struct DSS_EXPORT InputSectionSlice {
+    // Unique within ONE AssembledModule. The link's merge re-keys it per
+    // module, so two objects' sections never share a key.
+    std::uint32_t section = 0;
+    // This atom's first byte, measured from the input section's first byte.
+    std::uint64_t offset = 0;
 };
 
 // One assembled function — bytes + symbol-relative metadata. `symbol`
@@ -272,6 +308,13 @@ struct DSS_EXPORT AssembledFunction {
     // function — a per-function map copy done once at assemble time, never per
     // instruction).
     std::unordered_map<std::uint32_t, std::uint32_t> blockByteOffsets;
+
+    // The input section this body was cut from, when that section may not be
+    // split (see `InputSectionSlice`). Every writer concatenates
+    // `functions` in order, so a unit keeps its layout when its members are
+    // consecutive, in offset order and contiguous. The merge orders them, and
+    // `validateInputSectionUnits` refuses a unit that is not.
+    std::optional<InputSectionSlice> inputSection;
 };
 
 // ★ THE ONE LITTLE-ENDIAN SCALAR APPEND, shared by every producer of data
@@ -360,6 +403,14 @@ struct DSS_EXPORT AssembledData {
     // int g;` produces the same shape with section=Tbss. D-LK4-DATA-PRODUCER
     // (BSS arm) + D-CSUBSET-THREAD-LOCAL (Tbss arm).
     std::uint64_t             reservedSize = 0;
+
+    // The input section this item was cut from, when that section may not be
+    // split (see `InputSectionSlice`). `buildExecDataSection` lays every item
+    // of one unit out as a single block, wherever the unit's first member
+    // appears in `dataItems`. The block is aligned to its strictest member, and
+    // each item sits at its own offset. `alignment` still states what the
+    // producer declared; inside a unit, the offset places the item.
+    std::optional<InputSectionSlice> inputSection;
 
     // The number of bytes this item occupies in its section / VA span — the
     // file-backed `bytes.size()` for Rodata/Data/Tdata, the zero-fill
@@ -613,6 +664,21 @@ struct DSS_EXPORT AssembledModule {
         return (i < functions.size()) ? &functions[i] : nullptr;
     }
 };
+
+// ★★★ AN INPUT SECTION THAT MAY NOT BE SPLIT IS NOT SPLIT (see
+// `InputSectionSlice`). Checked once, on the module the format writers receive.
+//   * CODE: writers concatenate `functions` back-to-back, so a unit survives
+//     only when its members are CONSECUTIVE, in increasing offset and
+//     CONTIGUOUS: each one starts where the previous one's bytes end. The
+//     readers make atoms cover a code section's padding for exactly this
+//     reason, and the merge orders every unit's members.
+//   * DATA: `buildExecDataSection` places a unit's members by offset, so they
+//     must share ONE data-section kind and must not overlap.
+// Anything else would move bytes the producer's code reaches by distance, so it
+// is refused with `K_InputSectionSplit`, naming the unit and the members.
+[[nodiscard]] DSS_EXPORT bool
+validateInputSectionUnits(AssembledModule const& module,
+                          DiagnosticReporter&    reporter);
 
 // Universal entrypoint — no per-arch overload. Same target-blind
 // shape that ML5 cycle 2a established (`lowerToLir(Mir, TargetSchema,

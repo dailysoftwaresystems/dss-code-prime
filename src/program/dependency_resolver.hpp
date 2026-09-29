@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/project_config.hpp"
+#include "core/types/project_sources.hpp"  // ManifestSourceSettings
 #include "core/types/resolve_library_spec.hpp"
 #include "program/cli_args.hpp"     // CompileConfig
 #include "program/git_acquire.hpp"  // IGitRunner
@@ -98,8 +99,9 @@ inline constexpr std::string_view kDependencyOutputDirName = "deps";
 // wrong, and either way the operator needs told rather than crashed at.
 inline constexpr std::size_t kMaxDependencyDepth = 64;
 
-// What a resolved graph contributes to the consumer's build. Exactly two
-// fields, because those are exactly the two ways a dependency can compose.
+// What a resolved graph contributes to the consumer's build: the two ways a
+// dependency can compose — sources to merge, artifacts to link — plus what each
+// merged source brings with it.
 struct DSS_EXPORT DependencyResolution {
     // `SourceMerge` contributions, already expanded and de-duplicated against
     // each contributing manifest's OWN directory (B.3), in DFS order.
@@ -110,6 +112,14 @@ struct DSS_EXPORT DependencyResolution {
     // caller concatenates ITS OWN sources FIRST and appends this, or adding a
     // `module` dependency silently RENAMES the output binary.
     std::vector<std::string> mergedSources;
+
+    // The contributing `module` manifest's OWN `includes` (resolved against its
+    // directory) and `defines`, keyed by the `mergedSources` spelling they
+    // apply to. A source whose module declares neither has no entry.
+    // [[D-DEPS-MODULE-INCLUDES-AND-DEFINES-SILENTLY-DROPPED]]: they used to be
+    // dropped. They reach THAT module's sources only — the caller must never
+    // apply them to its own (`Program::setSourceSettings`).
+    std::map<std::string, ManifestSourceSettings> mergedSourceSettings;
 
     // `ArtifactLink` contributions, keyed by the CONSUMER's own
     // `<targetName>:<formatName>` spec string — the key
@@ -136,9 +146,10 @@ struct DSS_EXPORT DependencyResolveRequest {
 
     // U-9's base: a dependency artifact lands at
     // `<artifactOutputBase>/deps/<name>/<formatName>/<file>`, never inside the
-    // dependency's own tree, which may be read-only. The caller passes
-    // `--output` when given and `<cwd>/target` otherwise — the same rule
-    // `resolveArtifactOutputDir` applies to the consumer's own artifact.
+    // dependency's own tree, which may be read-only. The caller passes the
+    // CONSUMER's own output directory — `--output` when given, else the root
+    // manifest's `output`, else `target/` in the root manifest's directory — so
+    // the graph's artifacts land beside the consumer's own.
     std::filesystem::path artifactOutputBase;
 
     // M3: propagated verbatim onto every dependency's fresh `Program`.

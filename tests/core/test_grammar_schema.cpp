@@ -1,4 +1,5 @@
 #include "core/types/grammar_schema.hpp"
+#include "core/types/constant_form.hpp"
 // The registered artifact-profile TABLE under test below (name + composition
 // verb), plus the shared closed-vocabulary well-formedness guard it is checked
 // with — the SAME `isWellFormedKeyVocabulary` every config loader uses, not a
@@ -8,6 +9,10 @@
 // The repo's SHA-256 — the independent oracle the retained `contentDigest()`
 // is pinned against (the tests hex-render it themselves; see `hexOracle`).
 #include "core/crypto/sha256.hpp"
+// The literal-prefix resolver and the one-spelling format type it takes
+// (D-HIR-RESOLVE-ELEMENT-CORE-UNKNOWN-AS-KEY).
+#include "core/types/hir_lowering_config.hpp"
+#include "core/types/object_format_kind.hpp"
 #include "repo_root.hpp"
 // The ONE load-or-fail-this-test helper for a shipped grammar.
 #include "shipped_schema_or_throw.hpp"
@@ -27,6 +32,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 using namespace dss;
@@ -1575,31 +1581,141 @@ TEST(GrammarSchema, IdentifierClassExtraContinueLoads) {
 }
 
 // ★ A LANGUAGE THAT DECLARES NOTHING GETS THE UNIVERSAL RULE — and the accessor
-// answers rather than returning a null the hot path must branch on.
+// answers rather than returning a null the hot path must branch on. ⓘ The
+// witness used to be the shipped C document; C now declares `$`
+// ([[D-C-DOLLAR-IN-IDENTIFIERS-REFUSED]]), so a synthetic document with no block
+// carries this half and C's own class is pinned below.
 TEST(GrammarSchema, IdentifierClassAbsentMeansTheUniversalRule) {
-    auto result = GrammarSchema::loadShipped("c");
+    auto result = GrammarSchema::loadFromText(R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "NoIdClass", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": ["Identifier", "Semi"] } }
+    })JSON");
     ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
-    EXPECT_TRUE((*result)->identifierClass().extraContinue.empty());
-    EXPECT_FALSE((*result)->identifierClass().continuesIdentifier('.'))
-        << "a C document must never read `a.b` as one identifier";
-    EXPECT_TRUE((*result)->identifierClass().continuesIdentifier('z'));
+    auto const& cls = (*result)->identifierClass();
+    EXPECT_FALSE(cls.declared());
+    EXPECT_FALSE(cls.continuesIdentifier('.'));
+    EXPECT_FALSE(cls.startsIdentifier('$'));
+    EXPECT_TRUE(cls.continuesIdentifier('z'));
+    EXPECT_TRUE(cls.startsIdentifier('_'));
+    EXPECT_FALSE(cls.startsIdentifier('7')) << "a digit starts a NUMBER";
 }
 
-// ★★ `extraStart` IS REFUSED BY NAME, NOT MERELY UNKNOWN. It is the key a
-// reader reaches for, and an "unknown key" message alone reads as an oversight
-// that the next implementer should fix. A leading character that also
-// introduces a directive or an operator is owned by that TOKEN; two mechanisms
-// for one byte cannot agree about which construct it opens.
-TEST(GrammarSchema, IdentifierClassStartKeyIsRefusedWithItsReason) {
-    auto result = GrammarSchema::loadFromText(wrapIdentifierClass(
-        R"({ "extraContinue": ".", "extraStart": "." })"));
+// ★★ C's `$`: it STARTS and CONTINUES an identifier, and `.` still does neither.
+// ✔MEASURED 2026-09-22: gcc 13.3.0, clang 18.1.3, MinGW gcc and MSVC VS 18 all
+// accept `$` leading, inside and trailing a name (C23 6.4.2.1).
+TEST(GrammarSchema, ShippedCIdentifiersStartAndContinueWithDollar) {
+    auto result = GrammarSchema::loadShipped("c");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    auto const& cls = (*result)->identifierClass();
+    EXPECT_TRUE(cls.startsIdentifier('$'));
+    EXPECT_TRUE(cls.continuesIdentifier('$'));
+    EXPECT_FALSE(cls.continuesIdentifier('.'))
+        << "a C document must never read `a.b` as one identifier";
+    EXPECT_FALSE(cls.startsIdentifier('@'));
+}
+
+// ★★ `extraStart` IS ADMITTED WHERE NO TOKEN OWNS THE BYTE, AND REFUSED — NAMING
+// THE LEXEME — WHERE ONE DOES. This key was refused outright ("an extra
+// character may CONTINUE an identifier and may never START one"); the reason
+// survives as the check: a leading byte that begins a declared lexeme is owned
+// by that TOKEN, and two mechanisms for one byte cannot agree about which
+// construct it opens. The gas `.` is that case; C's `$` is not
+// ([[D-C-DOLLAR-IN-IDENTIFIERS-REFUSED]]).
+TEST(GrammarSchema, IdentifierClassStartKeyIsRefusedWhereALexemeOwnsTheByte) {
+    auto result = GrammarSchema::loadFromText(std::format(R"JSON({{
+      "dssSchemaVersion": 4,
+      "language": {{ "name": "IdClassDot", "version": "0.1.0" }},
+      "tokens": {{ ";": [{{ "kind": "Semi" }}], ".": [{{ "kind": "Dot" }}] }},
+      "identifierClass": {},
+      "shapes": {{ "root": {{ "sequence": ["Identifier", "Semi"] }} }}
+    }})JSON", R"({ "extraContinue": ".", "extraStart": "." })"));
     ASSERT_FALSE(result.has_value());
     auto const msg = errorDiags(result.error());
     EXPECT_NE(msg.find("extraStart"), std::string::npos) << msg;
-    EXPECT_NE(msg.find("may CONTINUE an identifier and may never START one"),
-              std::string::npos)
-        << "the refusal must say WHY, or it reads as an unimplemented key: "
-        << msg;
+    EXPECT_NE(msg.find("begins a lexeme this document declares"), std::string::npos)
+        << "the refusal must say WHY: " << msg;
+    EXPECT_NE(msg.find("('.')"), std::string::npos) << "and name the lexeme: " << msg;
+}
+
+TEST(GrammarSchema, IdentifierClassStartKeyLoadsWhereNoLexemeOwnsTheByte) {
+    auto result = GrammarSchema::loadFromText(wrapIdentifierClass(R"({ "extraStart": "$" })"));
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    auto const& cls = (*result)->identifierClass();
+    EXPECT_TRUE(cls.startsIdentifier('$'));
+    EXPECT_FALSE(cls.continuesIdentifier('$'))
+        << "a start byte does not by itself continue a name — a language wanting "
+           "both declares both, which is what C does";
+    EXPECT_TRUE(cls.startsIdentifier('a')) << "additive: the universal set still holds";
+}
+
+// ★ THE DIRECT WITNESS, ON THE SHIPPED DOCUMENT: C declares `extraStart: "$"`, so
+// a `$$` lexeme added to C's own `tokens` is the ownership conflict the rule
+// exists for, and the load is REFUSED naming the lexeme. This is the shape that
+// moved `ClosedKeyVocabulary.ADollarLedKeyInTheTokensMapIsALexemeNotProse` off C.
+TEST(GrammarSchema, ShippedCRefusesALexemeThatBeginsWithItsDollarStart) {
+    std::ifstream in{dss::test::configRoot() / "sources" / "c.lang.json", std::ios::binary};
+    ASSERT_TRUE(in) << "cannot open the shipped c.lang.json";
+    std::stringstream ss;
+    ss << in.rdbuf();
+    std::string text = ss.str();
+    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
+        << "the unmutated shipped C document must load";
+    // The GLOBAL `tokens` map is the one at document level (two-space indent);
+    // a mode's inline table would be a declared lexeme too, but this names the
+    // map the pin's twin injects into.
+    std::string const anchor = "\n  \"tokens\": {";
+    auto const at = text.find(anchor);
+    ASSERT_NE(at, std::string::npos);
+    text.insert(at + anchor.size(), R"( "$$": [{ "kind": "DollarDollarProbe" }],)");
+    auto const result = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(result.has_value())
+        << "`$` starts a C identifier, so a lexeme beginning with it must be refused";
+    auto const msg = errorDiags(result.error());
+    EXPECT_NE(msg.find("begins a lexeme this document declares"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("('$$')"), std::string::npos) << "and name the lexeme: " << msg;
+}
+
+// ★ THE GAS `.`, ON THE SHIPPED DOCUMENT: gas lets `.` CONTINUE a name
+// (`b.eq`, `v1.8b`) and its leading `.` is the `DirectiveDot` token — so asking
+// the shipped dialect for `extraStart: "."` must be refused, naming that lexeme.
+// This is the case the key was once refused outright for; it is now refused by
+// the ownership rule, and only this pin says the rule reaches a real document.
+TEST(GrammarSchema, ShippedGasRefusesADotStartItsDirectiveTokenOwns) {
+    std::ifstream in{dss::test::configRoot() / "sources" / "asm-arm64-gas.lang.json",
+                     std::ios::binary};
+    ASSERT_TRUE(in) << "cannot open the shipped asm-arm64-gas.lang.json";
+    std::stringstream ss;
+    ss << in.rdbuf();
+    std::string text = ss.str();
+    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
+        << "the unmutated shipped gas document must load";
+    std::string const anchor = "\"identifierClass\": {";
+    auto const at = text.find(anchor);
+    ASSERT_NE(at, std::string::npos);
+    text.insert(at + anchor.size(), R"( "extraStart": ".",)");
+    auto const result = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(result.has_value())
+        << "`.` opens gas's DirectiveDot token, so it cannot also start a name";
+    auto const msg = errorDiags(result.error());
+    EXPECT_NE(msg.find("/identifierClass/extraStart"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("begins a lexeme this document declares"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("('.')"), std::string::npos) << "and name the lexeme: " << msg;
+}
+
+// The other refusals of the start key, each with its reason.
+TEST(GrammarSchema, IdentifierClassStartKeyRefusesWhatCannotStartAName) {
+    struct Case { char const* cls; char const* why; };
+    for (Case const c : {Case{R"({ "extraStart": "_" })", "already starts an identifier"},
+                         Case{R"({ "extraStart": "5" })", "is a digit"},
+                         Case{R"({ "extraStart": " " })", "is whitespace or a control character"},
+                         Case{R"({ "extraStart": ";" })", "begins a lexeme this document declares"}}) {
+        auto result = GrammarSchema::loadFromText(wrapIdentifierClass(c.cls));
+        ASSERT_FALSE(result.has_value()) << c.cls;
+        EXPECT_NE(errorDiags(result.error()).find(c.why), std::string::npos)
+            << c.cls << ": " << errorDiags(result.error());
+    }
 }
 
 // ★ A CHARACTER THAT ALREADY CONTINUES AN IDENTIFIER IS REFUSED. Declaring it
@@ -2459,7 +2575,7 @@ TEST(GrammarSchema, AttributeEffectAlignLoads) {
 // the message can no longer drift from the vocabulary in either direction, and
 // the fix that makes this pass is deriving one from the other.
 TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
-    // TF-C78 (D-CSUBSET-NOINLINE) added `noInline`; TF-C81
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK) added `noInline`; TF-C81
     // (D-CSUBSET-ALWAYSINLINE) added `alwaysInline`; TF-C92
     // (D-CSUBSET-NO-SANITIZE-THREAD) added `noSanitizeThread`; P44 lane h
     // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN) added
@@ -5202,6 +5318,65 @@ TEST(GrammarSchema, SemanticsEntryFunctionsDuplicateSignatureReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE — the environment verbs load with EXACTLY the
+// parameter lists their materialization produces, read off the one verb → shapes
+// table (`entryVerbParams`), and a row whose list disagrees with its verb is
+// refused: an `argc-argv-envp` row with two parameters would materialize an envp the
+// entry never receives, a two-parameter verb on a three-parameter row would call the
+// entry with an uninitialized third argument.
+TEST(GrammarSchema, SemanticsEntryFunctionsEnvironmentVerbsMatchTheirParameterLists) {
+    auto const load = [](std::string const& rows) {
+        std::string const cfg = R"JSON({
+          "dssSchemaVersion": 4,
+          "language": { "name": "X", "version": "0.1.0" },
+          "tokens": { ";": [{ "kind": "Semi" }] },
+          "shapes": { "root": { "sequence": [ "Semi" ] } },
+          "semantics": {
+            "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                                "entryFunctions": )JSON" + rows + R"JSON( } ]
+          }
+        })JSON";
+        return GrammarSchema::loadFromText(cfg);
+    };
+    // Every verb with the list its row in the table names — loads.
+    auto ok = load(R"({
+        "main": [
+          { "returns": "i32", "params": ["i32", "ptr-ptr-char", "ptr-ptr-char"],
+            "verb": "argc-argv-envp" },
+          { "returns": "i32",
+            "params": ["i32", "ptr-ptr-char", "ptr-ptr-char", "ptr-ptr-char"],
+            "verb": "argc-argv-envp-apple" } ],
+        "wmain": [
+          { "returns": "i32", "params": ["i32", "ptr-ptr-u16", "ptr-ptr-u16"],
+            "verb": "argc-wargv-wenvp" } ] })");
+    ASSERT_TRUE(ok.has_value()) << "each environment verb with its own list must load";
+    auto const& rows = (*ok)->semantics().declarations.at(0).entryFunctions;
+    ASSERT_EQ(rows.size(), 3u);
+    for (auto const& row : rows) {
+        auto const want = entryVerbParams(row.verb);
+        EXPECT_EQ(row.params, (std::vector<EntryParamShape>(want.begin(), want.end())))
+            << row.name << " / " << entryMaterializationName(row.verb);
+    }
+    // Each verb against a list one parameter short, or with the other width — refused.
+    for (char const* bad : {
+             R"({ "main": [ { "returns": "i32", "params": ["i32", "ptr-ptr-char"],
+                              "verb": "argc-argv-envp" } ] })",
+             R"({ "main": [ { "returns": "i32",
+                              "params": ["i32", "ptr-ptr-char", "ptr-ptr-char"],
+                              "verb": "argc-argv" } ] })",
+             R"({ "main": [ { "returns": "i32",
+                              "params": ["i32", "ptr-ptr-char", "ptr-ptr-char"],
+                              "verb": "argc-argv-envp-apple" } ] })",
+             R"({ "wmain": [ { "returns": "i32",
+                               "params": ["i32", "ptr-ptr-u16", "ptr-ptr-char"],
+                               "verb": "argc-wargv-wenvp" } ] })"}) {
+        SCOPED_TRACE(bad);
+        auto r = load(bad);
+        ASSERT_FALSE(r.has_value()) << "a verb disagreeing with its list must be refused";
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    }
+}
+
 // ── `externLibraryByFormat` IS RETIRED — THE KEY ITSELF IS NOW THE ERROR ─────
 //
 // This replaces the six tests that pinned the per-language `externLibraryByFormat`
@@ -5768,7 +5943,10 @@ TEST(GrammarSchema, SemanticsBuiltinFunctionsVariadicNotBool) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
-// ── constMarker (on a declaration entry) ─────────────────────────────────
+// ── constMarker (the language's qualifier vocabulary, `semantics` level) ──
+// P68 round 9 (lane `cs`): the qualifier tokens are declared ONCE, in the
+// semantics block; a declaration row takes them by derivation and may no longer
+// spell them.
 
 TEST(GrammarSchema, SemanticsConstMarkerUnknownTokenReportsUnknownToken) {
     constexpr std::string_view kCfg = R"JSON({
@@ -5776,9 +5954,8 @@ TEST(GrammarSchema, SemanticsConstMarkerUnknownTokenReportsUnknownToken) {
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { ";": [{ "kind": "Semi" }] },
       "shapes": { "root": { "sequence": [ "Semi" ] } },
-      "semantics": { "declarations": [
-        { "rule": "root", "name": 0, "kind": "variable",
-          "constMarker": "GhostConst" }
+      "semantics": { "constMarker": "GhostConst", "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable" }
       ] }
     })JSON";
     auto r = GrammarSchema::loadFromText(kCfg);
@@ -5792,14 +5969,42 @@ TEST(GrammarSchema, SemanticsConstMarkerNotStringReportsInvalid) {
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { ";": [{ "kind": "Semi" }] },
       "shapes": { "root": { "sequence": [ "Semi" ] } },
-      "semantics": { "declarations": [
-        { "rule": "root", "name": 0, "kind": "variable",
-          "constMarker": 42 }
+      "semantics": { "restrictMarker": 42, "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable" }
       ] }
     })JSON";
     auto r = GrammarSchema::loadFromText(kCfg);
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A declaration row that still SPELLS a qualifier marker is refused by name, the
+// message saying where the vocabulary lives now — never loaded as a second owner.
+TEST(GrammarSchema, APerRowQualifierMarkerIsRefusedAsRetired) {
+    for (char const* key : {"constMarker", "restrictMarker", "volatileMarker"}) {
+        std::string const cfg = std::string{R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "keywords": [ { "word": "lock", "kind": "Lock" } ],
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "constMarker": "Lock", "declarations": [
+        { "rule": "root", "name": 0, "type": 0, "kind": "variable", ")JSON"}
+            + key + R"JSON(": "Lock" }
+      ] }
+    })JSON";
+        auto r = GrammarSchema::loadFromText(cfg);
+        ASSERT_FALSE(r.has_value()) << key;
+        bool named = false;
+        for (auto const& d : r.error()) {
+            if (d.code == DiagnosticCode::C_InvalidSemantics
+                && d.message.find(std::string{"'declarations[0]."} + key + "' is retired")
+                       != std::string::npos
+                && d.message.find(std::string{"'semantics."} + key + "'") != std::string::npos)
+                named = true;
+        }
+        EXPECT_TRUE(named) << key << ": the refusal names the retired key and its home";
+    }
 }
 
 // ── kindByChild ───────────────────────────────────────────────────────────
@@ -5949,9 +6154,9 @@ TEST(GrammarSchema, SemanticsSE4SE6FacetsHappyPathRoundTrips) {
       },
       "semantics": {
         "identifierToken": "Identifier",
+        "constMarker": "Lock",
         "declarations": [
           { "rule": "decl", "name": 0, "kind": "variable",
-            "constMarker": "Lock",
             "kindByChild": {
               "childPath": [1, 0],
               "whenRule": "fnTail",
@@ -5978,7 +6183,12 @@ TEST(GrammarSchema, SemanticsSE4SE6FacetsHappyPathRoundTrips) {
     auto const& sem = (*r)->semantics();
     ASSERT_EQ(sem.declarations.size(), 1u);
     EXPECT_EQ(sem.declarations[0].ruleName, "decl");
-    ASSERT_TRUE(sem.declarations[0].constMarker.has_value());
+    // P68 round 9 (lane `cs`): the language's `const` token is declared once, at
+    // the semantics level; a row takes it only when it declares a TYPED entity
+    // (declarator mode or a `type` child), and `decl` has neither.
+    ASSERT_TRUE(sem.constMarker.has_value());
+    EXPECT_FALSE(sem.declarations[0].constMarker.has_value())
+        << "an untyped row derives no qualifier marker";
     ASSERT_TRUE(sem.declarations[0].kindByChild.has_value());
     auto const& disc = *sem.declarations[0].kindByChild;
     ASSERT_EQ(disc.childPath.size(), 2u);
@@ -6788,7 +6998,7 @@ TEST(GrammarSchema, ParserMaxExpressionDepthWrongTypeReportsCode) {
 }
 
 // C11/C23 6.4.5: the shipped c text with `stringLiteralPrefixes`, for
-// mutation-based validation of the `elementCoreByFormat` per-format core map.
+// mutation-based validation of the literal-prefix row grammar.
 namespace {
 // Located through the ONE test-side resolver (`repo_root.hpp`:
 // $DSS_CONFIG_ROOT → the CMake-baked repo root → the cwd ancestor walk). The
@@ -6813,92 +7023,152 @@ namespace {
 }
 } // namespace
 
-TEST(GrammarSchema, StringPrefixUnknownFormatKeyReportsCode) {
-    // An unknown object-format key in `elementCoreByFormat` must FAIL LOUD (a typo'd
-    // format would otherwise silently never override, baking the wrong wchar width).
+// ── P68 round 9: `elementCoreByFormat` IS DELETED, AND REFUSED BY NAME ──────────
+//
+// The per-format element-core map had ONE use, `wchar_t`, and that is a (processor
+// × platform) fact no format-keyed map can hold: `elf` is x86_64's `int` and
+// aarch64's `unsigned int` (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX). The wide rows now
+// name `abiTypedef: wchar_t`, read from the TARGET's `abiTypedefs` per pair, and the
+// map is gone. A document that still carries the key is REFUSED, in both prefix
+// tables, with a sentence naming its replacement — its author made no typo, they
+// wrote a mechanism that no longer exists. And a row's keys are a CLOSED set, so a
+// misspelled `abiTypedef` cannot load clean and leave the row on its base core.
+// These replace the four format-map refusal pins (unknown format key, the sentinel
+// key, an unknown per-format core, the char table's unknown key), whose map no
+// longer exists.
+// RED-ON-DISABLE: drop the retired-key sentence from the loader and the first pin
+// reds on its message; drop the closed-key check and BOTH mutated documents load.
+namespace {
+// The shipped c text with `insertion` spliced in right after the `"startToken"` of
+// the prefix row whose opener is `token`; empty (with an ADD_FAILURE) when the row
+// is gone.
+[[nodiscard]] std::string shippedCWithPrefixRowKey(std::string_view token,
+                                                   std::string_view insertion) {
     std::string text = shippedCTextForPrefixTest();
-    ASSERT_FALSE(text.empty());
-    // Baseline: the unmutated shipped config loads clean.
-    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c must load clean before mutation";
-    // Swap the WideStringStart row's valid `"pe"` key for a bogus format name.
-    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
+    std::string const needle = std::format("\"startToken\": \"{}\"", token);
     auto const pos = text.find(needle);
-    ASSERT_NE(pos, std::string::npos) << "elementCoreByFormat pe-key not found in shipped config";
-    text.replace(pos, needle.size(), "\"elementCoreByFormat\": { \"windoze\": \"U16\"");
-    auto result = GrammarSchema::loadFromText(text);
-    ASSERT_FALSE(result.has_value())
-        << "an unknown object-format key must fail the load, not silently ignore";
-    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
+    if (pos == std::string::npos) {
+        ADD_FAILURE() << "no literal-prefix row opens with " << token;
+        return {};
+    }
+    text.insert(pos + needle.size(), std::format(", {}", insertion));
+    return text;
+}
+} // namespace
+
+TEST(GrammarSchema, LiteralPrefixRetiredFormatMapIsRefusedByName) {
+    std::string const base = shippedCTextForPrefixTest();
+    ASSERT_FALSE(base.empty());
+    ASSERT_TRUE(GrammarSchema::loadFromText(base).has_value())
+        << "shipped c must load clean before mutation";
+    // A string row and a char row (the two tables share one validator), and a row
+    // that names no ABI typedef at all — the refusal is about the KEY, not the row.
+    for (std::string_view const token :
+         {"WideStringStart", "WideCharStart", "Utf16StringStart"}) {
+        SCOPED_TRACE(token);
+        std::string const text =
+            shippedCWithPrefixRowKey(token, "\"elementCoreByFormat\": { \"pe\": \"U16\" }");
+        ASSERT_FALSE(text.empty());
+        auto result = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(result.has_value())
+            << "a document carrying the retired key must not load";
+        EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
+        EXPECT_TRUE(std::ranges::any_of(result.error(), [](auto const& d) {
+            return d.message.find("'elementCoreByFormat' was removed") != std::string::npos
+                && d.message.find("'abiTypedef'") != std::string::npos;
+        })) << "the refusal names the retired key AND its replacement: "
+            << errorDiags(result.error());
+    }
 }
 
-// ★ THE SENTINEL VARIANT of the test above, and the WORST of the family. This
-// map is ALREADY keyed on `ObjectFormatKind`, so `"unknown"` does not merely sit
-// dead — it stores a LIVE `ObjectFormatKind::Unknown` row. `resolveElementCore`
-// takes an `optional<ObjectFormatKind>`, so any caller holding a
-// default-constructed kind (== Unknown, NOT nullopt) MATCHES that row and takes
-// a wchar_t element width nothing intended. A dead entry is a silent no-op; this
-// one is a silent WRONG ANSWER.
-//
-// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in the
-// `elementCoreByFormat` loop and the mutated config loads clean.
-TEST(GrammarSchema, StringPrefixSentinelFormatKeyReportsCode) {
-    std::string text = shippedCTextForPrefixTest();
+TEST(GrammarSchema, LiteralPrefixRowKeysAreAClosedSet) {
+    std::string const text =
+        shippedCWithPrefixRowKey("WideCharStart", "\"abiTypdef\": \"wchar_t\"");
     ASSERT_FALSE(text.empty());
-    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c must load clean before mutation";
-    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
-    auto const pos = text.find(needle);
-    ASSERT_NE(pos, std::string::npos)
-        << "elementCoreByFormat pe-key not found in shipped config";
-    text.replace(pos, needle.size(),
-                 "\"elementCoreByFormat\": { \"unknown\": \"U16\"");
     auto result = GrammarSchema::loadFromText(text);
     ASSERT_FALSE(result.has_value())
-        << "the 'unknown' sentinel must fail the load — it resolves through the "
-           "name table, so it would be STORED as a live per-format override";
-    EXPECT_TRUE(hasDiagCode(result.error(),
-                            DiagnosticCode::C_InvalidHirLowering));
+        << "a misspelled key must not load clean: the row would keep its base core "
+           "on every pair";
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
     EXPECT_TRUE(std::ranges::any_of(result.error(), [](auto const& d) {
-        return d.message.find("sentinel") != std::string::npos;
+        return d.message.find("abiTypdef") != std::string::npos;
     })) << errorDiags(result.error());
 }
 
 TEST(GrammarSchema, StringPrefixUnknownElementCoreReportsCode) {
-    // A per-format value that is not a known TypeKind must FAIL LOUD.
+    // A row's element core that is not a known TypeKind must FAIL LOUD. (It pinned
+    // the deleted per-format map's values until P68 round 9; the base core is the
+    // one element-core field a row still has.)
     std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
-    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
+    std::string const needle =
+        "{ \"startToken\": \"Utf16StringStart\", \"elementCore\": \"U16\"";
     auto const pos = text.find(needle);
-    ASSERT_NE(pos, std::string::npos);
-    text.replace(pos, needle.size(), "\"elementCoreByFormat\": { \"pe\": \"U17\"");
+    ASSERT_NE(pos, std::string::npos) << "the Utf16StringStart row was not found";
+    text.replace(pos, needle.size(),
+                 "{ \"startToken\": \"Utf16StringStart\", \"elementCore\": \"U17\"");
     auto result = GrammarSchema::loadFromText(text);
     ASSERT_FALSE(result.has_value())
-        << "an unknown per-format TypeKind must fail the load";
+        << "an unknown element-core TypeKind must fail the load";
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
 }
 
-// C11/C23 6.4.4.4: `charLiteralPrefixes` shares the SAME validator as
-// `stringLiteralPrefixes` (one loader lambda) — this mutates the WIDE-CHAR row's
-// format key to prove the char table is parsed + closed-key-validated too (a typo'd
-// char wchar format would otherwise silently bake the wrong char width).
-TEST(GrammarSchema, CharPrefixUnknownFormatKeyReportsCode) {
-    std::string text = shippedCTextForPrefixTest();
-    ASSERT_FALSE(text.empty());
-    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c must load clean before mutation";
-    // The WideCharStart row's `elementCoreByFormat` (the SECOND such snippet — the
-    // first belongs to WideStringStart).
-    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
-    auto const first = text.find(needle);
-    ASSERT_NE(first, std::string::npos);
-    auto const pos = text.find(needle, first + needle.size());
-    ASSERT_NE(pos, std::string::npos) << "the WideCharStart elementCoreByFormat row was not found";
-    text.replace(pos, needle.size(), "\"elementCoreByFormat\": { \"windoze\": \"U16\"");
-    auto result = GrammarSchema::loadFromText(text);
-    ASSERT_FALSE(result.has_value())
-        << "an unknown object-format key in charLiteralPrefixes must fail the load";
-    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
+// ── D-HIR-RESOLVE-ELEMENT-CORE-UNKNOWN-AS-KEY — "NO FORMAT" HAS ONE SPELLING ──
+//
+// That row closed by giving the literal-prefix resolver a `SelectableObjectFormatKind`
+// parameter, a type that cannot hold the `Unknown` sentinel. P68 round 9 DELETED the
+// resolver with the per-format map it read (see the retired-key pins above), so the
+// pin that asked what the RESOLVER accepts went with it; `analyze()`'s own
+// `activeFormat` takes the same type and keeps its call-shape pin
+// (`SemanticAnalyzerActiveFormat.TheSentinelCannotBeHandedToAnalyze`). What stays here
+// is the TYPE's own contract — the only door is `of()`, which refuses the sentinel —
+// and the bridge that converts a wider optional, refusing an engaged sentinel loudly.
+TEST(LiteralPrefixElementCore, OfAnswersNothingForTheSentinelAndCarriesEveryRealKind) {
+    EXPECT_FALSE((std::is_constructible_v<SelectableObjectFormatKind, ObjectFormatKind>))
+        << "the only door into the type is `of()`, which refuses the sentinel";
+    EXPECT_FALSE((std::is_convertible_v<ObjectFormatKind, SelectableObjectFormatKind>));
+    EXPECT_FALSE(SelectableObjectFormatKind::of(ObjectFormatKind::Unknown).has_value());
+    for (auto const& [kind, name] : kObjectFormatKindTable.rows) {
+        if (!isSelectableObjectFormatKind(kind)) continue;
+        auto const selectable = SelectableObjectFormatKind::of(kind);
+        ASSERT_TRUE(selectable.has_value()) << name;
+        EXPECT_EQ(selectable->kind(), kind) << name;
+    }
+    EXPECT_FALSE(selectableObjectFormat(std::nullopt).has_value())
+        << "the bridge keeps \"no format\" as nullopt";
+    auto const pe = selectableObjectFormat(ObjectFormatKind::Pe);
+    ASSERT_TRUE(pe.has_value());
+    EXPECT_EQ(pe->kind(), ObjectFormatKind::Pe);
+}
+
+// The engaged sentinel through the bridge is a caller's bug, refused loudly —
+// never folded into "no format", which is the second spelling the type removes.
+TEST(LiteralPrefixElementCoreDeathTest, TheBridgeRefusesAnEngagedSentinel) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        { (void)selectableObjectFormat(std::optional<ObjectFormatKind>{ObjectFormatKind::Unknown}); },
+        "engaged ObjectFormatKind::Unknown");
+}
+
+// The shipped wide rows name the platform typedef (P68 round 9): exactly the two `L`
+// openers — string and char — carry `abiTypedef: wchar_t`, and no other row carries
+// one. (It walked the deleted per-format map until then.) The per-PAIR answer is
+// pinned against the references in tests/analysis/preprocess/test_wchar_t_abi_typedef.
+TEST(LiteralPrefixElementCore, TheShippedWideRowsNameThePlatformTypedef) {
+    auto const schema = dss::test_support::shippedSchemaOrThrow("c");
+    std::vector<std::string> named;
+    for (auto const* list : {&schema->hirLowering().stringLiteralPrefixes,
+                             &schema->hirLowering().charLiteralPrefixes}) {
+        for (auto const& px : *list) {
+            if (px.abiTypedef.empty()) continue;
+            EXPECT_EQ(px.abiTypedef, "wchar_t") << px.startTokenName;
+            named.push_back(px.startTokenName);
+        }
+    }
+    std::ranges::sort(named);
+    EXPECT_EQ(named, (std::vector<std::string>{"WideCharStart", "WideStringStart"}))
+        << "exactly the `L` openers name wchar_t; a walk that found neither checked "
+           "nothing";
 }
 
 // The regression wall for the CLOSED `semantics` key vocabulary: every key
@@ -7910,4 +8180,160 @@ TEST(GrammarSchemaProbeIndex, AByteNoDeclaredKeyStartsWithHasAnEmptyRow) {
     // front of the table.
     EXPECT_TRUE(schema->lexemeLengthsForLeadByte(0x80).empty());
     EXPECT_TRUE(schema->lexemeLengthsForLeadByte(0xFF).empty());
+}
+
+// ── P68 round 10: the two array-parameter qualification keys fail loud ──────────
+//
+// `semantics.parameters.unqualifiedParameterTypes` (C 6.7.6.3p15: a function type
+// takes each parameter's UNQUALIFIED type) and
+// `declarators.arraySuffixOutermostOnlyTokens` (C 6.7.6.2p1: the decorations only a
+// parameter's OUTERMOST array derivation may carry). Each refusal is driven from the
+// SHIPPED `c` text with the key's shipped spelling replaced, so a pin whose needle
+// went stale fails instead of asserting nothing, and the unmutated text is the
+// baseline arm (a loader refusing everything would turn every negative arm green).
+// The SUBSET arm is the refusal that would otherwise read as configured: an
+// outermost-only token the bound locator does not skip (it is not an
+// `arraySuffixModifierTokens` entry) would be read AS the array's bound.
+// RED-ON-DISABLE: drop the subset check from the loader and that arm loads clean.
+namespace {
+// The shipped c text with its ONE occurrence of `needle` replaced; empty (with an
+// ADD_FAILURE) when the needle is gone or no longer unique.
+[[nodiscard]] std::string shippedCWithReplaced(std::string_view needle,
+                                               std::string_view replacement) {
+    std::string text = shippedCTextForPrefixTest();
+    auto const pos = text.find(needle);
+    if (pos == std::string::npos) {
+        ADD_FAILURE() << "the shipped c text no longer spells " << needle;
+        return {};
+    }
+    if (text.find(needle, pos + 1) != std::string::npos) {
+        ADD_FAILURE() << "the shipped c text spells " << needle << " more than once";
+        return {};
+    }
+    text.replace(pos, needle.size(), replacement);
+    return text;
+}
+
+constexpr std::string_view kUnqualifiedParameterTypesKey =
+    "\"unqualifiedParameterTypes\": true";
+constexpr std::string_view kOutermostOnlyTokensKey =
+    "\"arraySuffixOutermostOnlyTokens\": [ \"StaticKeyword\", \"ConstKeyword\", "
+    "\"VolatileKeyword\", \"RestrictKeyword\", \"AtomicKeyword\" ]";
+} // namespace
+
+TEST(GrammarSchema, TheArrayParameterQualificationKeysFailLoud) {
+    // Baseline: the shipped text loads, and both keys were READ.
+    auto const base = GrammarSchema::loadFromText(shippedCTextForPrefixTest());
+    ASSERT_TRUE(base.has_value()) << "shipped c must load clean before mutation";
+    auto const& sem = (*base)->semantics();
+    EXPECT_TRUE(sem.parameters.unqualifiedParameterTypes);
+    ASSERT_TRUE(sem.declarators.has_value());
+    EXPECT_EQ(sem.declarators->arraySuffixOutermostOnlyTokenNames.size(), 5u);
+
+    // A switch that is not a boolean.
+    {
+        auto const text = shippedCWithReplaced(kUnqualifiedParameterTypesKey,
+                                               "\"unqualifiedParameterTypes\": 1");
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(r.has_value())
+            << "a non-boolean `unqualifiedParameterTypes` must fail the load";
+        EXPECT_TRUE(hasDiagMessage(r.error(),
+                                   "'unqualifiedParameterTypes' must be a boolean"));
+    }
+    // The SUBSET arm: an outermost-only token the modifier list does not name.
+    {
+        auto const text = shippedCWithReplaced(
+            kOutermostOnlyTokensKey,
+            "\"arraySuffixOutermostOnlyTokens\": [ \"StaticKeyword\", \"IntKeyword\" ]");
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(r.has_value())
+            << "an outermost-only token that is not an array-suffix modifier must fail "
+               "the load: the bound locator would read it as the bound";
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+        EXPECT_TRUE(hasDiagMessage(r.error(), "names 'IntKeyword', which "
+                                              "'arraySuffixModifierTokens' does not"));
+    }
+    // A token kind the language does not declare.
+    {
+        auto const text = shippedCWithReplaced(
+            kOutermostOnlyTokensKey,
+            "\"arraySuffixOutermostOnlyTokens\": [ \"NoSuchDecorationKind\" ]");
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(r.has_value());
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken));
+        EXPECT_TRUE(hasDiagMessage(r.error(),
+                                   "references unknown token kind 'NoSuchDecorationKind'"));
+    }
+    // A value that is not an array.
+    {
+        auto const text = shippedCWithReplaced(
+            kOutermostOnlyTokensKey, "\"arraySuffixOutermostOnlyTokens\": \"StaticKeyword\"");
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(r.has_value());
+        EXPECT_TRUE(hasDiagMessage(r.error(), "must be an array of token-kind name strings"));
+    }
+}
+
+// P68 round 13 (lane `cs`, the static-initializer item): `semantics.staticInitializers` —
+// C 6.7.9p4's constraint (the block's PRESENCE) and the constant forms beyond C 6.6's own
+// list the language admits (6.6p10), `otherConstantForms`, the closed `ConstantForm`
+// vocabulary. The shipped c names all seven; every malformed shape fails the load, loud —
+// a dropped name would silently turn a form a reference builds into a refusal, a misspelt
+// one would read as "not admitted"; an EMPTY list is a valid rule that admits no other form.
+// RED-ON-DISABLE: accept an unknown name, a duplicate, or a non-array (each arm's load then
+// succeeds); drop the key from `kSemanticsKeys` (every shipped load refuses the block).
+namespace {
+constexpr std::string_view kStaticInitializerFormsKey =
+    "\"otherConstantForms\": [\"constObjectRead\", \"commaOperator\", \"addressAsInteger\", "
+    "\"addressTruthValue\", \"addressComparison\", \"addressDifference\", "
+    "\"addressIntegerAlgebra\"]";
+} // namespace
+
+TEST(GrammarSchema, StaticInitializerFormsLoadAndEveryMalformedShapeFailsLoud) {
+    auto const base = GrammarSchema::loadFromText(shippedCTextForPrefixTest());
+    ASSERT_TRUE(base.has_value()) << "shipped c must load clean before mutation";
+    auto const& rule = (*base)->semantics().staticInitializers;
+    ASSERT_TRUE(rule.has_value()) << "c declares the static-initializer constraint";
+    for (ConstantForm const f :
+         {ConstantForm::ConstObjectRead, ConstantForm::CommaOperator,
+          ConstantForm::AddressAsInteger, ConstantForm::AddressTruthValue,
+          ConstantForm::AddressComparison, ConstantForm::AddressDifference,
+          ConstantForm::AddressIntegerAlgebra})
+        EXPECT_TRUE(rule->otherConstantForms.admits(f)) << constantFormName(f);
+    EXPECT_EQ(otherConstantFormsOf(rule), std::optional<ConstantForms>{rule->otherConstantForms});
+
+    struct Bad { std::string_view replacement; std::string_view message; };
+    for (Bad const b : {
+             Bad{"\"otherConstantForms\": \"commaOperator\"",
+                 "must be an array of constant-form names"},
+             Bad{"\"otherConstantForms\": [\"noSuchForm\"]", "unknown constant form 'noSuchForm'"},
+             Bad{"\"otherConstantForms\": [42]", "unknown constant form '42'"},
+             Bad{"\"otherConstantForms\": [\"commaOperator\", \"commaOperator\"]",
+                 "constant form 'commaOperator' is listed twice"},
+             Bad{"\"otherForms\": []", "otherForms"},
+         }) {
+        auto const text = shippedCWithReplaced(kStaticInitializerFormsKey, b.replacement);
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(r.has_value()) << b.replacement;
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics)) << b.replacement;
+        EXPECT_TRUE(hasDiagMessage(r.error(), b.message)) << b.replacement;
+    }
+    {
+        auto const text = shippedCWithReplaced(kStaticInitializerFormsKey,
+                                               "\"otherConstantForms\": []");
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_TRUE(r.has_value()) << "an empty list is a rule that admits no other form";
+        auto const& empty = (*r)->semantics().staticInitializers;
+        ASSERT_TRUE(empty.has_value());
+        EXPECT_TRUE(empty->otherConstantForms.empty());
+    }
+    // An UNDECLARED block is no rule at all: the producer is told nothing (its static
+    // objects may be initialized at run time).
+    EXPECT_FALSE(otherConstantFormsOf(std::nullopt).has_value());
 }

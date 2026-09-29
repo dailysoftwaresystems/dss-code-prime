@@ -1,0 +1,40 @@
+{
+  "$comment": "P68 round 9 (lane `cs`), found while measuring D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS: the two POINTER-MIXED compound assignments. `x += p` (an integer x) and `p -= q` (two pointers to compatible types) are C constraint violations (C23 6.5.17.3p1) that gcc and mingw BUILD as the literal `E1 = E1 op E2`: `x + p` is the stride-scaled pointer, converted to x's type; `p - q` is the element difference, converted to p's pointer type. ✔MEASURED 2026-09-23, each reference separately, this file compiled and RUN: gcc 13.3.0 and mingw-w64 13.2.0 at -std=c2x build it with five -Wint-conversion warnings and exit 42; clang 18.1.3 and MSVC 19.51 (/std:c17, /std:clatest) refuse it, and gcc/mingw at -std=c17 -pedantic-errors refuse it (the required diagnostic made an error). DSS warns S_IntegerPointerConversion at the five positions below — at the pointer operand of each `+=`, at the whole `-=` (its integer is no operand the user wrote) — and computes gcc's values. Before this round DSS accepted all five SILENTLY and stored the wrong values (an unscaled integer add; the `p - n` stride with q as the index): ✔MEASURED, this file exits 0 under the lane's WSL tree at the P0 fold (ELF x86_64), and the `.temp/probe/r7d` probes exit 1 on pe64 where gcc exits 42. `--warnings-as-errors` turns each back into a refusal. exit 42 = every stored value is gcc's.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectWarnings": [
+    { "code": "S_IntegerPointerConversion", "line": 18, "col": 10 },
+    { "code": "S_IntegerPointerConversion", "line": 22, "col": 10 },
+    { "code": "S_IntegerPointerConversion", "line": 26, "col": 25 },
+    { "code": "S_IntegerPointerConversion", "line": 31, "col": 5 },
+    { "code": "S_IntegerPointerConversion", "line": 36, "col": 33 }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

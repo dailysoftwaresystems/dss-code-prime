@@ -1,0 +1,39 @@
+{
+  "$comment": "P68 round 9 (lane `cs`) — D-CSUBSET-INCOMPATIBLE-ELEMENT-ARRAY-TERNARY, closed by the same rule as D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS. `c ? \"ab\" : arr` (char[3] beside int[2]) decays both arms to pointers to incompatible types — none of C23 6.5.16p3's pairings. ✔MEASURED 2026-09-23, this file compiled and RUN on each reference separately: gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 at -std=c2x warn at every conditional and exit 42; MSVC 19.51 (/std:c17 and /std:clatest) warns C4133 and exits 30, because it types the conditional as the SECOND arm's `int *` rather than `void *`, so its `_Generic` takes `default` — the meaning fork the row records and decides for `void *` (two of the three pinned references, the one heterogeneous-pointer rule every vendor documents, and an answer that does not depend on the order of the arms). gcc and clang at -std=c17 -pedantic-errors refuse. DSS used to type the conditional as its FIRST arm's ARRAY (a type-confused aggregate copy, sizeof 3, `_Generic` default); it now warns S_IncompatiblePointerConversion at each of the four conditionals and gives them `void *`. exit 42 = 0 (the else arm read back as `const int *`) + 20 (the then arm as `const char *`) + 10 (sizeof measures a pointer) + 12 (`_Generic` selects `void *`).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectWarnings": [
+    { "code": "S_IncompatiblePointerConversion", "line": 20, "col": 20 },
+    { "code": "S_IncompatiblePointerConversion", "line": 23, "col": 21 },
+    { "code": "S_IncompatiblePointerConversion", "line": 25, "col": 21 },
+    { "code": "S_IncompatiblePointerConversion", "line": 26, "col": 23 }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

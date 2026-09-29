@@ -20,6 +20,6 @@ target_link_libraries(mir_lowering PRIVATE core hir hir_lowering mir)
 # added without a matching arm still fails the build rather than silently
 # reaching the runtime `unsupported(...)` fail-loud. As before it bites only
 # no-`default` switches, so this TU's many subset-with-`default` switches are
-# unaffected. Consolidated under
-# D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS, which
-# measured what five hand-listed copies of one gate had cost.
+# unaffected. Consolidated because five hand-listed copies of one gate had
+# already cost a missed file, and the enumerator that slipped through was
+# reported only on a macOS build — nothing had asked the local MSVC or GCC leg.

@@ -1,0 +1,22 @@
+{
+  "$comment": "P68 round 12 (lane `cs`, D-C-AN-ENUMERATED-TYPE-IS-NOT-COMPATIBLE-WITH-ITS-UNDERLYING-INTEGER-TYPE): the integer type an enumerated type is compatible with (C 6.7.2.2p4, C23 6.7.3.3p13) under the Microsoft x64 convention the pe64 formats declare (`enumCompatibleTypeRule: \"msvc\"`, MSVC's documented rule): `int` while `int` holds every value, a non-negative enumeration included — its arithmetic and bit-fields are `int`'s (`e - 1` for `e == 0` is -1, in a `long` and in a `long long`: on this LLP64 target the `long long` is what tells the conventions apart, since the `gnu` answer 4294967295 wraps to -1 in a 32-bit `long`), a redeclaration may spell `int`, a pointer to it converts to `int *`, and `_Generic` selects `int:` (C 6.5.1.1p3 with MSVC's own compatible type). Targets: only the pe64 format (ELF and Mach-O declare `gnu`: see enum_compatible_type_gnu_rule). MEASURED 2026-09-24, this file compiled and RUN on each reference separately: MSVC 19.51 (/std:clatest, /std:c17) runs every check but the three `_Generic` ones — it selects NO integer type for an enumeration, which C 6.7.2.2p4 rules out — and warns C4133 on the two pointer conversions (its type check calls the enumeration incompatible with `int` while its redeclarations, arithmetic and bit-fields treat it as `int`); with the `_Generic` checks removed it exits 42; `e - 1` stores -1 in both its `long` and its `long long` (mingw-w64 13.2.0: -1 and 4294967295). gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 follow the other convention and refuse `int f(void);` beside `enum Pos f(void)`. Before this round DSS selected `default`, warned on the pointer conversions and refused the three redeclarations. exit 42 = every check holds.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

@@ -29,8 +29,8 @@ dss_add_test(NAME analysis/semantic/test_semantic_analyzer_genericity
              SOURCES test_semantic_analyzer_genericity.cpp)
 
 # FC3 c1: width/signedness front-end semantics (typeSpecifiers multiset
-# table, dataModel threading, the integer-literal ladder, descriptor
-# signatureByDataModel, loader fail-louds, toy/tsql typing pins).
+# table, dataModel threading, the integer-literal ladder, a descriptor
+# signature's per-data-model arms, loader fail-louds, toy/tsql typing pins).
 dss_add_test(NAME analysis/semantic/test_fc3_width_semantics
              SOURCES test_fc3_width_semantics.cpp)
 
@@ -192,6 +192,30 @@ target_include_directories(dss_analysis_semantic_test_nodiscard_discard_context
 dss_add_test(NAME analysis/semantic/test_paren_declarator_function
              SOURCES test_paren_declarator_function.cpp)
 target_include_directories(dss_analysis_semantic_test_paren_declarator_function
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 8 lane `ht` part 2: what a C function type may spell and when its types
+# must be complete -- C 6.7.6.3p1 at the function suffix, C 6.9.1p3 / 6.7.6.3p4 in a
+# definition, C 6.5.2.2p1/p4 at a call (positionally, C 6.2.5p1), and the `(void)` /
+# named-void parameter rules, each against its MEASURED reference verdict. Every
+# refusal sits beside its nearest accepting twin, because the refusing half alone
+# passes under a check that refuses everything. The runnable half of the named-void
+# meaning is `examples/c/named_void_param_prototype/`.
+dss_add_test(NAME analysis/semantic/test_function_type_completeness
+             SOURCES test_function_type_completeness.cpp)
+target_include_directories(dss_analysis_semantic_test_function_type_completeness
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 8 lane `ht`: a `const` / `restrict` reached through a TYPEDEF claims
+# what its written-out spelling claims — the object's own const, a deeper level's,
+# an array typedef's elements, the C23 redeclaration axis, a qualified void
+# parameter and a typedef's redefinition — each beside its accepting twin. The
+# section it places a global in is pinned at MIR
+# (`MirLoweringC.AGlobalDeclaredThroughAConstTypedefIsReadOnlyData`), the constant
+# fold it enables by `examples/c/const_typedef_folds_array_dimension/`.
+dss_add_test(NAME analysis/semantic/test_const_through_typedef
+             SOURCES test_const_through_typedef.cpp)
+target_include_directories(dss_analysis_semantic_test_const_through_typedef
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
 # P44 lane a: [[D-CSUBSET-SUPPRESSED-SHIPPED-ROW-SIGNATURE-UNCHECKED]],
@@ -441,3 +465,120 @@ dss_add_test(NAME analysis/semantic/test_advertised_capability_is_honoured
              SOURCES test_advertised_capability_is_honoured.cpp)
 target_include_directories(dss_analysis_semantic_test_advertised_capability_is_honoured
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# ★★★ D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE — the COMPLEXITY pin.
+# `subtreeType` typed a whole expression subtree and discarded every descendant type
+# it computed, while `pass2Post` asked that whole-subtree question at EVERY operator
+# node of a post-order walk — so a left-deep `v + v + … + v` chain (a tree of DEPTH N)
+# cost Θ(N²) and the `semantic` phase was 98% of the compile: 24.2 s at n=8 000
+# against gcc 13.2.0 at 0.74 s on the identical file. The pin asserts the ALGORITHM'S
+# OWN counters (`SemanticModel::exprType{Queries,NodeVisits}`) and never a wall clock,
+# so it is deterministic, host-independent and identical in Debug and Release. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_semantic_expression_type_reuse_complexity
+             SOURCES test_semantic_expression_type_reuse_complexity.cpp)
+target_include_directories(dss_analysis_semantic_test_semantic_expression_type_reuse_complexity
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 9 (lane `cs`): the const-write check's designation walk reaches the
+# object however the designation is spelled — `__func__`'s const ELEMENTS
+# ([[D-C-A-WRITE-TO-AN-ELEMENT-OF-FUNC-IS-ACCEPTED-INTO-READ-ONLY-DATA]]) and a
+# pointer COMPUTED on the way (`*(p + 1)`, `*(c ? p : q)`, `*(z, p)`, `*(&a[0] + 1)`).
+# Shares `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_const_designation_walk
+             SOURCES test_const_designation_walk.cpp)
+target_include_directories(dss_analysis_semantic_test_const_designation_walk
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 9 (lane `cs`): `sizeof ( NAME )` takes the expression reading when NAME
+# is a value the parser's binder sketch never saw declared — the language's
+# predefined identifiers and the enumeration constants its enums lift — while a
+# type, and an unknown name, still take the type-name reading. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root. (Named short on
+# purpose: its object path, which spells the name twice, must stay inside the
+# worktree path budget — `worktrees.pathBudgetReserve`.)
+dss_add_test(NAME analysis/semantic/test_sizeof_undeclared_value_name
+             SOURCES test_sizeof_undeclared_value_name.cpp)
+target_include_directories(dss_analysis_semantic_test_sizeof_undeclared_value_name
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 9 (lane `cs`): a predefined function-name identifier used outside every
+# function body names the empty string (gcc's and clang's meaning) and warns
+# S_PredefinedIdentifierOutsideFunction at each use. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_predefined_identifier_at_file_scope
+             SOURCES test_predefined_identifier_at_file_scope.cpp)
+target_include_directories(dss_analysis_semantic_test_predefined_identifier_at_file_scope
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 9 (lane `cs`), the round's P0 merge blocker: an ARRAY parameter's adjusted
+# pointer carries only the qualifiers written inside its bracket (C 6.7.6.3p7) — the
+# element keeps its own — so `O *const objv[]` is a modifiable `O *const *` and sqlite's
+# `Tcl_Obj *CONST objv[]` … `objv++` compiles. Shares `semantic_test_fixture.hpp`, so it
+# needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_array_parameter_qualification
+             SOURCES test_array_parameter_qualification.cpp)
+target_include_directories(dss_analysis_semantic_test_array_parameter_qualification
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 9 (lane `cs`): a pointer converted to or paired with a pointer to an
+# INCOMPATIBLE type, or with an integer that is not a null pointer constant, is
+# admitted WITH A WARNING at every site of the pointer-compatibility constraint
+# ([[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]]),
+# and a `?:` of incompatible pointer arms is a `void *`. Perturbs the SHIPPED c
+# JSON (the two config keys, and the retired one), so it links nlohmann_json.
+dss_add_test(NAME analysis/semantic/test_incompatible_pointer_conversion
+             SOURCES test_incompatible_pointer_conversion.cpp)
+target_include_directories(dss_analysis_semantic_test_incompatible_pointer_conversion
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(dss_analysis_semantic_test_incompatible_pointer_conversion
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# P68 round 13 (lane `cs`, the static-initializer item): C 6.7.9p4 — an initializer of an
+# object of static or thread storage duration is refused where it PROVABLY is not a constant,
+# with the forms beyond C 6.6's own list the language names admitted
+# (`semantics.staticInitializers`). Perturbs the SHIPPED c JSON (the form list, the block), so
+# it links nlohmann_json.
+dss_add_test(NAME analysis/semantic/test_static_initializers
+             SOURCES test_static_initializers.cpp)
+target_include_directories(dss_analysis_semantic_test_static_initializers
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(dss_analysis_semantic_test_static_initializers
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# P68 round 13 (lane `cs`, found by the static-initializer item): the semantic walks that
+# stopped SILENTLY at a fixed depth (64 wrappers, 16 casts, 100000 items, 64 ancestors) and
+# answered as if they had finished — each now bounded by the tree alone.
+dss_add_test(NAME analysis/semantic/test_uncapped_semantic_walks
+             SOURCES test_uncapped_semantic_walks.cpp)
+target_include_directories(dss_analysis_semantic_test_uncapped_semantic_walks
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 9 (lane `cs`): the POINTER half of the arithmetic operators' operand
+# constraints (C23 6.5.4.3, 6.5.6-6.5.13, 6.5.17.3p1) — every pairing C does not
+# admit is refused ONCE, a refused operation has no type for its context to judge
+# again, and the two compound shapes gcc builds (`x += p`, `p -= q` over compatible
+# pointees) are admitted with S_IntegerPointerConversion. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_pointer_operand_constraints
+             SOURCES test_pointer_operand_constraints.cpp)
+target_include_directories(dss_analysis_semantic_test_pointer_operand_constraints
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 9 (lane `cs`): `_Generic` association matching on the QUALIFIER axis
+# (this round's row on associations differing only in a pointee qualifier)
+# — the controlling type decayed, a top-level-qualified association never matching,
+# and `const` / `restrict` / parameter qualifiers compared through the type name's
+# and the expression's qualifier spines. 60 measured cases. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_generic_qualifier_axis
+             SOURCES test_generic_qualifier_axis.cpp)
+target_include_directories(dss_analysis_semantic_test_generic_qualifier_axis
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 9 (lane `cs`): the CURRENT OBJECT of a brace list (C 6.7.9p17-p20) as the
+# pure placement cursor both tiers ask (`initializer_cursor.hpp`) — brace elision, the
+# continuation after a deep designator, a union taking one member, an unnamed
+# bit-field skipped — pinned over a synthetic type table, no front end in the way.
+dss_add_test(NAME analysis/semantic/test_initializer_cursor
+             SOURCES test_initializer_cursor.cpp)

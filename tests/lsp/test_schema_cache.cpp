@@ -2,6 +2,8 @@
 // caching identity (same pointer on hit), and lookup of an unknown
 // language → NotFound / NoExtensionMatch.
 
+#include "core/substrate/stack_sized_thread.hpp"
+#include "core/types/config_document_memo.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "lsp/schema_cache.hpp"
 #include "scratch_dir.hpp"
@@ -12,7 +14,6 @@
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 using dss::lsp::SchemaCache;
@@ -215,7 +216,7 @@ TEST(SchemaCache, ShippedModeWithNoDirectoryReportsShippedDirNotFound) {
 // `src/dss-config/sources/` with zero `*.lang.json` files.
 TEST(SchemaCache, ShippedModeWithEmptyDirectoryReportsShippedDirEmpty) {
     namespace fs = std::filesystem;
-    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — the root came from a CONSTANT name
+    // A FIXED SCRATCH PATH IS A SHARED ONE — the root came from a CONSTANT name
     // under `temp_directory_path()`, and the old "clean any prior run"
     // `remove_all` existed precisely BECAUSE that path could be stale. Under two
     // concurrent instances that line was the weapon: one instance wiped the tree
@@ -241,19 +242,37 @@ TEST(SchemaCache, ShippedModeWithEmptyDirectoryReportsShippedDirEmpty) {
 }
 
 TEST(SchemaCache, ConcurrentResolveYieldsSingleSharedPointer) {
-    // The cache's whole reason to hold a mutex is to ensure that N
-    // threads asking for the same language all converge on ONE
-    // shared_ptr — no torn loads, no duplicate parses.
+    // The cache's whole reason to hold a mutex is to ensure that N threads asking
+    // for the same language all converge on ONE shared_ptr — no torn loads. (It
+    // does NOT promise one parse: `resolveByName` loads outside the lock and a
+    // racing loser's schema is discarded at the double-check.)
+    //
+    // ★ COLD, AND ON A STATED STACK (P68 round 12,
+    // D-SUBSTRATE-WORKER-THREADS-TAKE-THE-HOST-DEFAULT-STACK). This test used to
+    // race against a WARM grammar-schema memo — every earlier test in this file
+    // loads `toy` on the main thread — so its threads built nothing and the race
+    // it names was never run. The memo is now cleared first and the threads are
+    // required to have BUILT (the miss count below), so the cold build IS what is
+    // raced — and that build is main-thread work: `buildSchemaFromJsonText` is a
+    // 415,360-byte frame under clang -O0 (P34). ✔MEASURED 2026-09-25: cold, on 16
+    // plain `std::thread`s (macOS's 512 KiB secondary-thread default), both arms of
+    // this binary die `Bus error` on macos-arm64-debug every run (runs
+    // 20260925-123720-3024574e and 20260925-124318-c8f3f62f) — the shuffled arm's
+    // rare gate failure was the same crash, reached when the shuffle ran this test
+    // before any `toy` load. So the threads state their stack: the constant the
+    // production executor's workers state, because they stand in for those workers.
     SchemaCache c;
     constexpr int kThreads = 16;
     std::vector<std::shared_ptr<dss::GrammarSchema const>> results(kThreads);
     std::atomic<int> ready{0};
     std::atomic<bool> go{false};
+    dss::detail::ConfigDocumentMemo<dss::GrammarSchema>::clear();
+    dss::detail::ConfigDocumentMemoStore::resetStats();
 
-    std::vector<std::thread> ts;
+    std::vector<dss::substrate::StackSizedThread> ts;
     ts.reserve(kThreads);
     for (int i = 0; i < kThreads; ++i) {
-        ts.emplace_back([&, i] {
+        ts.emplace_back(dss::substrate::kMainThreadClassStackBytes, [&, i] {
             ready.fetch_add(1, std::memory_order_release);
             while (!go.load(std::memory_order_acquire)) { /* spin */ }
             auto r = c.resolveByName("toy");
@@ -265,6 +284,9 @@ TEST(SchemaCache, ConcurrentResolveYieldsSingleSharedPointer) {
     go.store(true, std::memory_order_release);
     for (auto& t : ts) t.join();
 
+    EXPECT_GE(dss::detail::ConfigDocumentMemo<dss::GrammarSchema>::stats().misses, 1u)
+        << "no thread BUILT a schema — the memo was warm, and the race this test "
+           "names did not run";
     // All threads must observe the same shared_ptr value (identity).
     for (int i = 1; i < kThreads; ++i) {
         EXPECT_EQ(results[0].get(), results[i].get())

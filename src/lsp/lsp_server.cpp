@@ -3,6 +3,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "analysis/semantic/target_format_analysis.hpp"   // analyzeForTargetFormat
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_cursor.hpp"
@@ -543,23 +544,39 @@ bool LspServer::refreshWorkspacePreference_() {
     // and, at that point, an unfounded one.
     if (!initializeReceived_) return false;
 
+    // D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: the BUILD's configurations,
+    // re-read on the same occasions and by the same readers the build uses.
+    // When they moved, every open document is re-analyzed: a new target, include
+    // directory or define changes what every file means. `sameConfigurations`
+    // compares what a configuration is made of, so an unrelated save costs
+    // nothing.
+    auto freshBuild = resolveWorkspaceBuild(workspaceRoots_);
+    bool const buildMoved = !sameConfigurations(freshBuild, workspaceBuild_);
+    workspaceBuild_ = std::move(freshBuild);
+
     auto fresh = resolveWorkspaceLanguagePreference(workspaceRoots_);
-    if (fresh == workspacePreference_) return false;
-    workspacePreference_ = std::move(fresh);
+    bool const preferenceMoved = !(fresh == workspacePreference_);
+    if (preferenceMoved) workspacePreference_ = std::move(fresh);
+    if (!preferenceMoved && !buildMoved) return false;
 
     // ★ REPUBLISH, DON'T JUST REMEMBER. Every open document is re-resolved
     // under the new preference; the ones whose schema (or whose reason for
     // having none) actually moved are re-parsed, and the parse worker's
     // `publishDiagnostics_` puts the new answer on the wire. `setSchema`
     // returns false for a document that did not move, so an unrelated manifest
-    // edit costs no republishes at all.
+    // edit costs no republishes at all. A moved BUILD re-parses every open
+    // document, once — after its schema is settled, so no parse runs under a
+    // grammar about to be replaced.
     for (auto const& uri : documents_.openUris()) {
-        auto r = resolveSchemaForUri_(uri);
-        if (documents_.setSchema(uri, std::move(r.schema), std::move(r.reason))) {
-            enqueueParse_(uri);
+        bool schemaMoved = false;
+        if (preferenceMoved) {
+            auto r = resolveSchemaForUri_(uri);
+            schemaMoved = documents_.setSchema(uri, std::move(r.schema),
+                                               std::move(r.reason));
         }
+        if (schemaMoved || buildMoved) enqueueParse_(uri);
     }
-    return true;
+    return preferenceMoved;
 }
 
 void LspServer::handleWorkspaceManifestsMayHaveChanged_(
@@ -645,149 +662,253 @@ void LspServer::handleDidSave_(Notification const& /*n*/) {
     (void)refreshWorkspacePreference_();
 }
 
+LspServer::ParsePlan LspServer::planParse_(std::string const&      uri,
+                                           DocumentSnapshot const& snap) {
+    ParsePlan plan;
+    // No schema ⇒ nothing to analyze; the document's schema reason publishes.
+    if (!snap.schema) return plan;
+
+    // The language-only run: what every document got before the workspace's
+    // builds were read, and what a document still gets when no build applies.
+    auto const languageOnly = [&] {
+        ParseRun run;
+        run.grammar = snap.schema;
+        plan.runs.push_back(std::move(run));
+    };
+
+    if (!workspaceBuild_.has_value()) {
+        auto const& err = workspaceBuild_.error();
+        // "There is no build" — no workspace folder, no manifest — is not a
+        // refusal: there is nothing to agree with, and the document is analyzed
+        // under its language alone, exactly as before.
+        if (err.kind != WorkspaceProjectErrorKind::NoWorkspaceRoot
+            && err.kind != WorkspaceProjectErrorKind::ProjectFileNotFound) {
+            // A manifest the BUILD refuses is published on the document under
+            // the build's own code, so the editor says why it cannot answer with
+            // the build's configuration instead of silently answering without it.
+            DocumentAnalysis refusal;
+            dss::ParseDiagnostic d;
+            d.code     = err.code;
+            d.severity = dss::DiagnosticSeverity::Error;
+            d.actual   = "the workspace's build configuration could not be read ["
+                         + std::string{workspaceProjectErrorName(err.kind)}
+                         + "]: " + err.detail
+                         + " — this document is analyzed under its language "
+                           "alone until the manifest loads";
+            refusal.diagnostics.push_back(std::move(d));
+            plan.refusals.push_back(std::move(refusal));
+        }
+        languageOnly();
+        return plan;
+    }
+
+    auto const selection = selectDocumentConfigurations(
+        *workspaceBuild_, pathFromFileUri(uri), snap.schema->configName());
+    if (selection.configurations.empty()) {
+        languageOnly();
+        return plan;
+    }
+    for (auto const& c : selection.configurations) {
+        // The BUILD compiles under the manifest's `language`; the document's own
+        // grammar is reused when that is the one it names.
+        std::shared_ptr<dss::GrammarSchema const> grammar;
+        if (c.language == snap.schema->configName()) {
+            grammar = snap.schema;
+        } else {
+            auto resolved = schemaCache_.resolveByName(c.language);
+            if (!resolved.has_value()) {
+                DocumentAnalysis refusal;
+                refusal.label = c.label;
+                dss::ParseDiagnostic d;
+                d.code     = dss::DiagnosticCode::D_SchemaLoadFailed;
+                d.severity = dss::DiagnosticSeverity::Error;
+                d.actual   = "language schema '" + c.language + "' named by `"
+                             + c.manifest.filename().string()
+                             + "` could not be loaded — " + resolved.error().detail;
+                refusal.diagnostics.push_back(std::move(d));
+                plan.refusals.push_back(std::move(refusal));
+                continue;
+            }
+            grammar = *resolved;
+        }
+        ParseRun run;
+        run.label             = c.label;
+        run.grammar           = std::move(grammar);
+        run.target            = c.target;
+        run.format            = c.format;
+        run.callingConvention = c.callingConvention;
+        run.includeDirs       = c.includeDirs;
+        run.defines           = c.defines;
+        plan.runs.push_back(std::move(run));
+    }
+    return plan;
+}
+
+DocumentAnalysis LspServer::analyzeRun_(ParseRun const&    run,
+                                        std::string const& text,
+                                        std::string const& bufferName) {
+    // Build a single-file CompilationUnit and run full semantic analysis. The CU
+    // must outlive the SemanticModel (its side-tables hold raw Tree*), so it is
+    // handed over as a shared_ptr, which the model keeps inside itself.
+    dss::UnitBuilder builder{run.grammar, dss::DiagnosticBudget::libraryDefault()};
+    // ★★★ D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS
+    //
+    // THE LANGUAGE'S SYSTEM INCLUDE PATH — the `/usr/include` analogue the
+    // angle form `#include <h>` resolves against. Without this call
+    // `systemDirs` was EMPTY, so no shipped descriptor resolved and the
+    // editor compiled every buffer against a corpus the compiler never uses.
+    // ✔MEASURED through a real `dsscp --lsp` child, same file both ways:
+    // `#include <stdbool.h>` -> CLI rc=0, editor `P_PreprocessorErrorDirective`.
+    // That is a FALSE ALARM on the line the user is looking at.
+    //
+    // ★ IT IS NOT GATED ON THE WORKSPACE TARGET: `semantics.shippedLibDirs` is a
+    // property of the LANGUAGE, and every run carries its language. The pair's
+    // settings are the next call's.
+    //
+    // ⚠ AND IT MUST LAND WITH THE `driverDiagnostics()` PUBLISH BELOW, in
+    // BOTH directions. ✔MEASURED (the red-on-disable arm that removes THIS
+    // line): publishing driver diagnostics with an EMPTY system path puts
+    // ELEVEN spurious `C_UnbackedPredefinedMacro` diagnostics on every open
+    // document — including a buffer with no `#include` at all —
+    // because `UnitBuilder::finish()` validates each predefined macro's
+    // `impliedSurface` claim against the corpus reached through
+    // `systemDirs_`, and with no dirs every claim is unbacked. Half of this
+    // fix alone is worse than neither half.
+    // ⓘ The COUNT is a property of `c.lang.json`'s predefine set and will
+    // move when that document does; the pin asserts ZERO, never a number.
+    dss::applySystemDirs(builder, *run.grammar);
+    // ★★★ D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE — THE PAIR, THROUGH THE
+    // BUILD'S OWN TWO CALLS. The editor used to state no target and no format
+    // here, on purpose: with no workspace pair to read, guessing one would have
+    // made `#ifdef __aarch64__` resolve differently in the editor than in the
+    // build. The workspace's pairs are now read from its manifests
+    // (`resolveWorkspaceBuild`), so this run declares ITS pair with the call
+    // the driver's builder sites make — the format kind, its header-name case
+    // rule, the target's plain-`char` sign, the target's and the format's
+    // predefined macros — and analyzes with `analyzeForTargetFormat`, the
+    // driver's own derivation of the data model, aggregate layout, `va_list`,
+    // availability gate and `long double`. ✔MEASURED before: on a pe64
+    // workspace the editor refused `#include <Windows.h>` (build rc=0) and
+    // accepted `#include <pthread.h>` (build `F_ShippedHeaderUnavailableForTarget`).
+    if (run.target != nullptr && run.format != nullptr) {
+        dss::applyTargetFormatPair(builder, *run.target, *run.format);
+    }
+    // The manifest's `defines` and `includes` — the file-driven `--define` / `-I`
+    // the build applies to every translation unit it compiles.
+    builder.setUserDefines(run.defines);
+    for (auto const& dir : run.includeDirs) builder.addIncludeDir(dir);
+    builder.addInMemory(text, bufferName);
+    auto cu = std::make_shared<dss::CompilationUnit>(std::move(builder).finish());
+
+    DocumentAnalysis out;
+    out.label  = run.label;
+    out.target = run.target;
+    if (run.target != nullptr && run.format != nullptr) {
+        out.model = std::make_shared<dss::SemanticModel const>(
+            dss::analyzeForTargetFormat(cu, dss::DiagnosticBudget::libraryDefault(),
+                                        *run.target, *run.format,
+                                        run.callingConvention)
+                .model);
+    } else {
+        out.model = std::make_shared<dss::SemanticModel const>(
+            dss::analyze(cu, dss::DiagnosticBudget::libraryDefault()));
+    }
+
+    // Union the CU's DRIVER diagnostics with the per-tree parse diagnostics
+    // (lexer + parser, folded by UnitBuilder) and the semantic diagnostics.
+    //
+    // ★★★ THE DRIVER TIER USED TO BE DROPPED ENTIRELY, AND ITS ABSENCE WAS
+    // SILENT — D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS.
+    // `CompilationUnit::driverDiagnostics()` is where the import resolver
+    // puts `F_ShippedHeaderNotFound`, `D_UnresolvedImport` and
+    // `D_FileNotFound`; this function published only the parse and semantic
+    // streams. ✔MEASURED through a real `dsscp --lsp` child:
+    // `#include <definitely_not_a_header_xyz.h>` -> CLI rc=1 `error[F001A]`,
+    // editor an EMPTY diagnostics array, which every client renders as a
+    // CLEAN FILE. An editor that stays silent about a miss the compiler
+    // calls fatal is the same class of harm as a silent miscompile: the
+    // instrument the user is watching reported success.
+    //
+    // ⓘ DRIVER FIRST, then parse, then semantic — the order the tiers run
+    // in, so a header that could not be found is read before the cascade of
+    // undeclared identifiers it caused.
+    //
+    // ⚠ EVERY tree's diagnostics, not `trees()[0]`'s, is a DIFFERENT
+    // question and is deliberately NOT changed here: an auto-loaded include
+    // is a full member of `cu->trees()`, and publishing those is
+    // [[D-LSP-DIAGNOSTIC-RENDERED-AGAINST-THE-OPEN-DOCUMENT-IGNORING-ITS-BUFFER]]'s
+    // territory (which already made `publishDiagnostics_` group by ORIGIN
+    // uri, so the grouping is ready for it).
+    auto driverDiags = cu->driverDiagnostics().all();
+    out.diagnostics.assign(driverDiags.begin(), driverDiags.end());
+    if (!cu->trees().empty()) {
+        auto parseDiags = cu->trees()[0].diagnostics().all();
+        out.diagnostics.insert(out.diagnostics.end(), parseDiags.begin(),
+                               parseDiags.end());
+    }
+    auto semDiags = out.model->diagnostics().all();
+    out.diagnostics.insert(out.diagnostics.end(), semDiags.begin(), semDiags.end());
+    return out;
+}
+
 void LspServer::enqueueParse_(std::string uri) {
     auto snap = documents_.snapshot(uri);
     if (!snap.has_value()) return;
 
+    // Decided HERE, on the `run()` thread, because `workspaceBuild_` lives
+    // here; the worker receives the plan whole and never reads server state.
+    ParsePlan plan = planParse_(uri, *snap);
+    // ⛔ THE DOCUMENT'S BUFFER IS NAMED BY ITS PATH, as every file the build
+    // reads is (`SourceBuffer::fromFile`). It used to be named by its URI, and
+    // `includingDirectoryOf("file:///…/main.c")` is `file:///…` — no directory
+    // at all — so `#include "local.h"` beside the open document failed in the
+    // editor (`P_PreprocessorIncludeError`) while the build found it
+    // ✔MEASURED 2026-09-21. `DocumentCoordinates::uriOf` maps the document's
+    // own origin back to the uri the client sent. A document that is not a file
+    // keeps its uri, and has no directory to search.
+    auto const docPath = pathFromFileUri(uri);
+    std::string bufferName = docPath.has_value() ? docPath->string() : uri;
+
     executor_->submit([this,
-                       uri    = std::move(uri),
-                       snap   = std::move(*snap)]() mutable {
-        if (!snap.schema) {
-            // No schema — clear any prior PARSE diagnostics. The document's
-            // `schemaError` is NOT cleared here and is re-attached by
-            // `publishDiagnostics_`, so this publish carries the reason rather
-            // than an empty array (which reads as "clean" in every editor).
-            std::vector<dss::ParseDiagnostic> empty;
-            if (documents_.setDiagnostics(uri, snap.parseGeneration,
-                                           std::move(empty))) {
-                publishDiagnostics_(uri);
-            }
-            return;
+                       uri        = std::move(uri),
+                       snap       = std::move(*snap),
+                       plan       = std::move(plan),
+                       bufferName = std::move(bufferName)]() mutable {
+        // No schema ⇒ the plan holds no run, so this stores no analysis: the
+        // prior PARSE diagnostics are cleared and `publishDiagnostics_`
+        // re-attaches the document's `schemaError`, so the publish carries the
+        // reason rather than an empty array (which reads as "clean" in every
+        // editor).
+        std::vector<DocumentAnalysis> analyses = std::move(plan.refusals);
+        for (auto const& run : plan.runs) {
+            analyses.push_back(analyzeRun_(run, snap.text, bufferName));
         }
-        // Build a single-file CompilationUnit and run full semantic
-        // analysis. The CU must outlive the SemanticModel (its side-tables
-        // hold raw Tree*), so we wrap it in a shared_ptr and hand it to
-        // analyze(), which keeps its own shared_ptr inside the model.
-        // TF-C74: DELIBERATELY no `setTargetPredefinedMacros` — the LSP has no
-        // active target (it also sets no `setActiveFormat`), so the effective
-        // predefined-macro list is the LANGUAGE's alone, exactly as before this
-        // cycle. An editor session is not a compile: picking a target here would
-        // make `#ifdef __aarch64__` resolve differently in the editor than in
-        // the build, which is worse than resolving neither arm. Trigger to
-        // revisit: the day the LSP learns the workspace's active target.
-        // TF-C97: likewise no `setFormatPredefinedMacros`. The argument is the
-        // same one, and the format half is if anything stronger: with no active
-        // format there is no `dataModel`, so guessing `__LP64__` would make the
-        // editor take LP64 header arms in a workspace that might build LLP64.
-        // Same trigger — both channels light up together the day the LSP learns
-        // the workspace's `<target>:<format>` pair.
-        //
-        // ★ D-PP-HEADER-CASE-INSENSITIVE-PE (2026-08-04) — THIS ONE IS
-        // USER-VISIBLE TODAY, unlike the two above, so it is stated rather than
-        // inherited. With no active format the editor takes the conservative
-        // POSIX rule, which means that on a pe64 project the LSP SQUIGGLES
-        // `#include <Windows.h>` — the exact line this axis exists to make
-        // build — while the compiler accepts it. That is a false positive in
-        // the editor, not a wrong build, and it is the safe direction of the
-        // two (the alternative, guessing case-insensitive, would hide a real
-        // error on an elf workspace). It is written EXPLICITLY here rather than
-        // taken from a default so the gap cannot be mistaken for an oversight.
-        // Trigger to revisit: the same one as the two channels above — the day
-        // the LSP learns the workspace's `<target>:<format>` pair, all three
-        // light up together. Anchored as
-        // `D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE`.
-        dss::UnitBuilder builder{snap.schema, dss::DiagnosticBudget::libraryDefault()};
-        builder.setHeaderNameMatching(dss::kDefaultHeaderNameMatching);
-        // ★★★ D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS
-        //
-        // THE LANGUAGE'S SYSTEM INCLUDE PATH — the `/usr/include` analogue the
-        // angle form `#include <h>` resolves against. Without this call
-        // `systemDirs` was EMPTY, so no shipped descriptor resolved and the
-        // editor compiled every buffer against a corpus the compiler never uses.
-        // ✔MEASURED through a real `dsscp --lsp` child, same file both ways:
-        // `#include <stdbool.h>` -> CLI rc=0, editor `P_PreprocessorErrorDirective`.
-        // That is a FALSE ALARM on the line the user is looking at.
-        //
-        // ★ IT IS NOT GATED ON THE WORKSPACE TARGET, and that is the distinction
-        // from the three channels reasoned about below.
-        // `semantics.shippedLibDirs` is a property of the LANGUAGE, and the
-        // language is exactly what a snapshot already carries (`snap.schema`) —
-        // there is nothing here to guess and nothing to wait for. The three
-        // channels below (target predefines, format predefines, header-name
-        // matching) are properties of a `<target>:<format>` pair the editor does
-        // not have; this one never was. Do not fold it into
-        // [[D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE]]: different axis.
-        //
-        // ⚠ AND IT MUST LAND WITH THE `driverDiagnostics()` PUBLISH BELOW, in
-        // BOTH directions. ✔MEASURED (the red-on-disable arm that removes THIS
-        // line): publishing driver diagnostics with an EMPTY system path puts
-        // ELEVEN spurious `C_UnbackedPredefinedMacro` diagnostics on every open
-        // document — including a buffer with no `#include` at all —
-        // because `UnitBuilder::finish()` validates each predefined macro's
-        // `impliedSurface` claim against the corpus reached through
-        // `systemDirs_`, and with no dirs every claim is unbacked. Half of this
-        // fix alone is worse than neither half.
-        // ⓘ The COUNT is a property of `c.lang.json`'s predefine set and will
-        // move when that document does; the pin asserts ZERO, never a number.
-        dss::applySystemDirs(builder, *snap.schema);
-        builder.addInMemory(snap.text, uri);
-        auto cu = std::make_shared<dss::CompilationUnit>(
-            std::move(builder).finish());
-        auto model = std::make_shared<dss::SemanticModel const>(
-            dss::analyze(cu, dss::DiagnosticBudget::libraryDefault()));
-
-        // Union the CU's DRIVER diagnostics with the per-tree parse diagnostics
-        // (lexer + parser, folded by UnitBuilder) and the semantic diagnostics.
-        //
-        // ★★★ THE DRIVER TIER USED TO BE DROPPED ENTIRELY, AND ITS ABSENCE WAS
-        // SILENT — D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS.
-        // `CompilationUnit::driverDiagnostics()` is where the import resolver
-        // puts `F_ShippedHeaderNotFound`, `D_UnresolvedImport` and
-        // `D_FileNotFound`; this function published only the parse and semantic
-        // streams. ✔MEASURED through a real `dsscp --lsp` child:
-        // `#include <definitely_not_a_header_xyz.h>` -> CLI rc=1 `error[F001A]`,
-        // editor an EMPTY diagnostics array, which every client renders as a
-        // CLEAN FILE. An editor that stays silent about a miss the compiler
-        // calls fatal is the same class of harm as a silent miscompile: the
-        // instrument the user is watching reported success.
-        //
-        // ⓘ DRIVER FIRST, then parse, then semantic — the order the tiers run
-        // in, so a header that could not be found is read before the cascade of
-        // undeclared identifiers it caused.
-        //
-        // ⚠ EVERY tree's diagnostics, not `trees()[0]`'s, is a DIFFERENT
-        // question and is deliberately NOT changed here: an auto-loaded include
-        // is a full member of `cu->trees()`, and publishing those is
-        // [[D-LSP-DIAGNOSTIC-RENDERED-AGAINST-THE-OPEN-DOCUMENT-IGNORING-ITS-BUFFER]]'s
-        // territory (which already made `publishDiagnostics_` group by ORIGIN
-        // uri, so the grouping is ready for it).
-        std::vector<dss::ParseDiagnostic> diags;
-        auto driverDiags = cu->driverDiagnostics().all();
-        diags.assign(driverDiags.begin(), driverDiags.end());
-        if (!cu->trees().empty()) {
-            auto parseDiags = cu->trees()[0].diagnostics().all();
-            diags.insert(diags.end(), parseDiags.begin(), parseDiags.end());
-        }
-        auto semDiags = model->diagnostics().all();
-        diags.insert(diags.end(), semDiags.begin(), semDiags.end());
-
-        // Store the model under the same generation guard, then publish.
-        // setDiagnostics gates on generation too — a newer edit drops both.
-        const bool applied =
-            documents_.setDiagnostics(uri, snap.parseGeneration,
-                                      std::move(diags));
-        (void)documents_.setSemanticModel(uri, snap.parseGeneration,
-                                          std::move(model));
-        if (applied) {
+        // Stored under the same generation guard, then published: a newer edit
+        // drops the whole set, diagnostics and models together.
+        if (documents_.setAnalyses(uri, snap.parseGeneration, std::move(analyses))) {
             publishDiagnostics_(uri);
         }
     });
 }
 
+namespace {
+
+// Two renderings of one diagnostic: same place, same severity, same code, same
+// words. What makes the analyses of two configurations agree about it.
+[[nodiscard]] bool sameDiagnostic(Diagnostic const& a, Diagnostic const& b) {
+    return a.range.start.line == b.range.start.line
+        && a.range.start.character == b.range.start.character
+        && a.range.end.line == b.range.end.line
+        && a.range.end.character == b.range.end.character
+        && a.severity == b.severity && a.code == b.code && a.message == b.message;
+}
+
+} // namespace
+
 void LspServer::publishDiagnostics_(std::string const& uri) {
     auto snap = documents_.snapshot(uri);
     if (!snap.has_value()) return;
-    auto diags = documents_.diagnosticsFor(uri);
+    auto const analyses = documents_.analysesFor(uri);
 
     // == D-LSP-DIAGNOSTIC-RENDERED-AGAINST-THE-OPEN-DOCUMENT-IGNORING-ITS-BUFFER
     //
@@ -815,38 +936,91 @@ void LspServer::publishDiagnostics_(std::string const& uri) {
     // all, and they are present on EVERY preprocessed TU. The trigger had
     // therefore already fired everywhere, with no include path in sight.
     auto snapshotBuffer = dss::SourceBuffer::fromString(snap->text, uri);
-    auto model = documents_.semanticModelFor(uri);
-    std::optional<dss::lsp::DocumentCoordinates> coords;
-    if (model) coords.emplace(model->unit(), uri, snap->text);
 
+    // ★ D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE — ONE DOCUMENT, SEVERAL
+    // ANALYSES. Each diagnostic is rendered through the model that produced it
+    // (its buffer ids are that unit's), then merged: the same diagnostic from
+    // two configurations is ONE entry, and one that NOT every analyzed
+    // configuration reported is TAGGED `[target=<spec>, …]` with those that did
+    // — the build's own per-target spelling. With one analysis nothing is
+    // tagged, so a single-configuration document publishes exactly what it did
+    // before. A refusal (no model) is tagged with its configuration when it has
+    // one, and stands untagged when it is the workspace's.
+    struct Merged {
+        Diagnostic               d;
+        std::vector<std::size_t> from;   // indices into `analyses`
+    };
     // Grouped by origin uri. The document's OWN entry is created up front so a
     // clean document still publishes an EMPTY array -- without that a squiggle
     // outlives the edit that fixed it, forever.
-    std::map<std::string, std::vector<Diagnostic>> byUri;
-    byUri.emplace(uri, std::vector<Diagnostic>{});
-    for (auto const& pd : diags) {
-        if (!coords.has_value()) {
-            byUri[uri].push_back(translateDiagnostic(pd, *snapshotBuffer));
-            continue;
-        }
-        auto placed = coords->locateDiagnostic(pd.buffer, pd.span);
-        Diagnostic d = translateDiagnostic(pd, *snapshotBuffer);
-        d.range = placed.range;
-        if (!placed.syntheticOrigin.empty()) {
-            // A position in a compiler-generated buffer has no file to point
-            // at. It is published on the DOCUMENT at 0:0 with the origin NAMED
-            // -- the same shape the schema-less-document diagnostic below
-            // already uses for a condition that belongs to no span. Naming it
-            // is what keeps 0:0 from reading as "an error on line 1".
-            d.message = "in " + placed.syntheticOrigin + ": " + d.message;
-        }
-        byUri[placed.uri].push_back(std::move(d));
+    std::map<std::string, std::vector<Merged>> byUri;
+    byUri.emplace(uri, std::vector<Merged>{});
+    std::size_t analyzed = 0;
+    for (auto const& a : analyses) {
+        if (a.model) ++analyzed;
     }
+    for (std::size_t i = 0; i < analyses.size(); ++i) {
+        auto const& a = analyses[i];
+        std::optional<dss::lsp::DocumentCoordinates> coords;
+        if (a.model) coords.emplace(a.model->unit(), uri, snap->text);
+        for (auto const& pd : a.diagnostics) {
+            Diagnostic d = translateDiagnostic(pd, *snapshotBuffer);
+            std::string where = uri;
+            if (coords.has_value()) {
+                auto placed = coords->locateDiagnostic(pd.buffer, pd.span);
+                d.range = placed.range;
+                if (!placed.syntheticOrigin.empty()) {
+                    // A position in a compiler-generated buffer has no file to
+                    // point at. It is published on the DOCUMENT at 0:0 with the
+                    // origin NAMED -- the same shape the schema-less-document
+                    // diagnostic below already uses for a condition that belongs
+                    // to no span. Naming it is what keeps 0:0 from reading as "an
+                    // error on line 1".
+                    d.message = "in " + placed.syntheticOrigin + ": " + d.message;
+                }
+                where = placed.uri;
+            }
+            // Merge ACROSS analyses only: two identical reports from ONE
+            // analysis stay two, exactly as they were published before.
+            auto& list = byUri[where];
+            auto const same = std::find_if(
+                list.begin(), list.end(), [&](Merged const& m) {
+                    return sameDiagnostic(m.d, d)
+                        && std::find(m.from.begin(), m.from.end(), i)
+                               == m.from.end();
+                });
+            if (same == list.end()) {
+                list.push_back(Merged{std::move(d), {i}});
+            } else {
+                same->from.push_back(i);
+            }
+        }
+    }
+    auto const finish = [&](std::vector<Merged>& list) {
+        std::vector<Diagnostic> out;
+        out.reserve(list.size());
+        for (auto& m : list) {
+            std::size_t fromModels = 0;
+            std::string labels;
+            for (std::size_t const idx : m.from) {
+                if (analyses[idx].model) ++fromModels;
+                if (analyses[idx].label.empty()) continue;
+                if (!labels.empty()) labels += ", ";
+                labels += analyses[idx].label;
+            }
+            bool const partial = fromModels == 0 || (analyzed > 1 && fromModels < analyzed);
+            if (partial && !labels.empty()) {
+                m.d.message = "[target=" + labels + "] " + m.d.message;
+            }
+            out.push_back(std::move(m.d));
+        }
+        return out;
+    };
 
     PublishDiagnosticsParams params;
     params.uri         = uri;
     params.version     = snap->clientVersion;
-    params.diagnostics = std::move(byUri[uri]);
+    params.diagnostics = finish(byUri[uri]);
     byUri.erase(uri);
     // ★ THE SCHEMA-LESS DOCUMENT SPEAKS. Emitted on EVERY publish, not just the
     // first: the reason lives on the document, so an edit that re-publishes an
@@ -886,7 +1060,7 @@ void LspServer::publishDiagnostics_(std::string const& uri) {
     for (auto& [otherUri, otherDiags] : byUri) {
         PublishDiagnosticsParams p;
         p.uri         = otherUri;
-        p.diagnostics = std::move(otherDiags);
+        p.diagnostics = finish(otherDiags);
         for (auto& d : p.diagnostics) d.source = options_.diagnosticSource;
         (void)transport_->writeMessage(JsonRpc::serializeNotification(
             "textDocument/publishDiagnostics", serializePublishDiagnostics(p)));
@@ -906,7 +1080,7 @@ namespace {
 // EVERY handler resolves its position through `DocumentCoordinates` and renders
 // every span through it. `tree.source()` does not appear below, and that is not
 // a style preference — it is the anti-regression device, enforced mechanically
-// by `scripts/check-lsp-coordinates/`. See `lsp_coordinates.hpp` for why the
+// by `.harness-config/runner/actions/check-lsp-coordinates/`. See `lsp_coordinates.hpp` for why the
 // TYPE is the fix and patched arithmetic is not.
 struct ResolvedQuery {
     std::shared_ptr<dss::SemanticModel const>   model;
@@ -916,26 +1090,56 @@ struct ResolvedQuery {
     NodeId                                      node{};
 };
 
-[[nodiscard]] bool resolveQuery(DocumentStore const& docs,
-                                TextDocumentPosition const& tp,
-                                ResolvedQuery& out) {
-    out.model = docs.semanticModelFor(tp.uri);
+[[nodiscard]] bool resolveQuery(std::shared_ptr<dss::SemanticModel const> model,
+                                std::string const& uri,
+                                std::string const& text,
+                                Position           position,
+                                ResolvedQuery&     out) {
+    out.model = std::move(model);
     if (!out.model) return false;
-    auto snap = docs.snapshot(tp.uri);
-    if (!snap.has_value()) return false;
     auto trees = out.model->unit().trees();
     if (trees.empty() || !trees[0].root().valid()) return false;
-    out.coords.emplace(out.model->unit(), tp.uri, snap->text);
+    out.coords.emplace(out.model->unit(), uri, text);
     // ★ NOTHING here is a failure to report: a position with no synth image is
     // a position that is not in the program (an `#if 0` region, the `#include`
     // line the splice consumed, a cursor past the last byte). The handler
     // returns its protocol default, and MUST NOT reach for a nearby offset.
-    auto point = out.coords->toSynth(tp.position);
+    auto point = out.coords->toSynth(position);
     if (!point.has_value()) return false;
     out.tree   = point->tree;
     out.offset = point->offset;
     out.node   = nodeAtOffset(*out.tree, out.offset);
     return out.node.valid();
+}
+
+// ★ D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE — EVERY ANALYSIS ANSWERS.
+// A document analyzed under several configurations has one model per
+// configuration, and they are not interchangeable: an `#ifdef _WIN32` arm is
+// live in the pe64 model only, so a rename computed from one model misses the
+// uses in the other arm and a definition search misses the declarations there.
+// Answering from the first model would be clangd's `Candidates.front()` one tier
+// up. Every handler below resolves the position against EVERY model and merges
+// — union for the enumerating queries (definitions, references, rename edits,
+// completions, signatures), and for hover the distinct answers, each tagged with
+// the configurations that gave it when they differ.
+struct LabelledQuery {
+    std::string   label;
+    ResolvedQuery q;
+};
+
+[[nodiscard]] std::vector<LabelledQuery> resolveAll(DocumentStore const& docs,
+                                                    TextDocumentPosition const& tp) {
+    std::vector<LabelledQuery> out;
+    auto snap = docs.snapshot(tp.uri);
+    if (!snap.has_value()) return out;
+    for (auto const& a : docs.analysesFor(tp.uri)) {
+        LabelledQuery lq;
+        lq.label = a.label;
+        if (resolveQuery(a.model, tp.uri, snap->text, tp.position, lq.q)) {
+            out.push_back(std::move(lq));
+        }
+    }
+    return out;
 }
 
 // A Location {uri, range} for a node's span, resolved onto the ORIGIN file.
@@ -954,20 +1158,14 @@ struct ResolvedQuery {
     return json{{"uri", loc->uri}, {"range", rangeJson(loc->range)}};
 }
 
-} // namespace
-
-std::optional<std::string> LspServer::handleHover_(Request const& req) {
-    auto tp = parseTextDocumentPosition(req);
-    if (!tp) return std::string{"null"};
-    ResolvedQuery q;
-    if (!resolveQuery(documents_, *tp, q)) return std::string{"null"};
-
+// One model's hover, as the single-model server computed it.
+[[nodiscard]] std::optional<json> hoverFor(ResolvedQuery const& q) {
     const SymbolId sym = q.model->symbolAt(q.node);
     auto const* rec = q.model->recordFor(sym);
     if (rec == nullptr) {
         // No symbol bound here; fall back to the node's own type if any.
         const dss::TypeId ty = q.model->typeAt(q.node);
-        if (!ty.valid()) return std::string{"null"};
+        if (!ty.valid()) return std::nullopt;
         json result;
         result["contents"] = {
             {"kind", "markdown"},
@@ -977,7 +1175,7 @@ std::optional<std::string> LspServer::handleHover_(Request const& req) {
         if (auto loc = q.coords->locate(*q.tree, q.tree->span(q.node))) {
             result["range"] = rangeJson(loc->range);
         }
-        return result.dump();
+        return result;
     }
 
     auto const& interner = q.model->lattice().interner();
@@ -998,179 +1196,25 @@ std::optional<std::string> LspServer::handleHover_(Request const& req) {
     if (auto loc = q.coords->locate(*q.tree, q.tree->span(q.node))) {
         result["range"] = rangeJson(loc->range);
     }
-    return result.dump();
+    return result;
 }
 
-std::optional<std::string> LspServer::handleDefinition_(Request const& req) {
-    auto tp = parseTextDocumentPosition(req);
-    if (!tp) return std::string{"null"};
-    ResolvedQuery q;
-    if (!resolveQuery(documents_, *tp, q)) return std::string{"null"};
-
+// One model's definition location.
+[[nodiscard]] std::optional<json> definitionFor(ResolvedQuery const& q) {
     const SymbolId sym = q.model->symbolAt(q.node);
     auto const* rec = q.model->recordFor(sym);
-    if (rec == nullptr || !rec->declNode.valid()) return std::string{"null"};
+    if (rec == nullptr || !rec->declNode.valid()) return std::nullopt;
     // The decl node belongs to the symbol's tree; for a single-file CU
     // that is the same tree. Resolve via the model's CU trees by id.
     dss::Tree const* declTree = q.tree;
     for (auto const& t : q.model->unit().trees()) {
         if (t.id().v == rec->tree.v) { declTree = &t; break; }
     }
-    auto loc = locationJson(*q.coords, *declTree, rec->declNode);
-    if (!loc.has_value()) return std::string{"null"};
-    return loc->dump();
+    return locationJson(*q.coords, *declTree, rec->declNode);
 }
 
-std::optional<std::string> LspServer::handleReferences_(Request const& req) {
-    auto tp = parseTextDocumentPosition(req);
-    if (!tp) return std::string{"[]"};
-    ResolvedQuery q;
-    if (!resolveQuery(documents_, *tp, q)) return std::string{"[]"};
-
-    const SymbolId sym = q.model->symbolAt(q.node);
-    auto const* rec = q.model->recordFor(sym);
-    if (rec == nullptr) return std::string{"[]"};
-
-    // includeDeclaration defaults true per LSP; honor context if present.
-    bool includeDecl = true;
-    try {
-        auto params = json::parse(req.params);
-        if (auto ctx = params.find("context"); ctx != params.end()) {
-            if (auto inc = ctx->find("includeDeclaration");
-                inc != ctx->end() && inc->is_boolean()) {
-                includeDecl = inc->get<bool>();
-            }
-        }
-    } catch (...) { /* keep default */ }
-
-    // DEDUPED BY (uri, range): a header spliced twice yields two synth images
-    // of one token, and both map BACK to the same origin range. Collapsing them
-    // is why the multi-image case changes where results POINT and never what
-    // "references" MEANS.
-    json arr = json::array();
-    std::set<std::pair<std::string, std::string>> seen;
-    auto push = [&](NodeId n) {
-        auto loc = locationJson(*q.coords, *q.tree, n);
-        if (!loc.has_value()) return;   // synthetic origin: no location exists
-        auto key = std::make_pair((*loc)["uri"].get<std::string>(),
-                                  (*loc)["range"].dump());
-        if (!seen.insert(std::move(key)).second) return;
-        arr.push_back(std::move(*loc));
-    };
-    if (includeDecl && rec->declNode.valid()) push(rec->declNode);
-    for (NodeId use : q.model->usesOf(sym)) push(use);
-    return arr.dump();
-}
-
-std::optional<std::string> LspServer::handleRename_(Request const& req) {
-    auto tp = parseTextDocumentPosition(req);
-    if (!tp) return std::string{"null"};
-    ResolvedQuery q;
-    if (!resolveQuery(documents_, *tp, q)) return std::string{"null"};
-
-    std::string newName;
-    try {
-        auto params = json::parse(req.params);
-        if (auto n = params.find("newName"); n != params.end() && n->is_string()) {
-            newName = n->get<std::string>();
-        }
-    } catch (...) { return std::string{"null"}; }
-    if (newName.empty()) return std::string{"null"};
-
-    const SymbolId sym = q.model->symbolAt(q.node);
-    auto const* rec = q.model->recordFor(sym);
-    if (rec == nullptr) return std::string{"null"};
-
-    // * EDITS ARE GROUPED PER URI, which LSP has always modelled and this
-    // server never used: every edit was stamped with the REQUEST's uri, so
-    // renaming a symbol declared in a header wrote the header's edit into the
-    // OPEN DOCUMENT at a synth offset -- a corrupting edit, not merely a wrong
-    // report. An occurrence in a header now lands in the HEADER's entry.
-    //
-    // DEDUPED BY (uri, range) for the same reason `references` is: a header
-    // spliced twice gives two synth images of one token that map BACK to one
-    // origin range. Two identical edits at one range is what would change what
-    // a rename MEANS; collapsing them keeps it a rename that merely points
-    // somewhere new.
-    std::map<std::string, json> byUri;
-    std::set<std::pair<std::string, std::string>> seen;
-    auto pushEdit = [&](NodeId n) {
-        auto loc = q.coords->locate(*q.tree, q.tree->span(n));
-        // A SYNTHETIC origin (the built-in prologue) is not renameable: there
-        // is no file to edit. Dropping it is correct -- inventing a document
-        // edit would write compiler-generated text into the user's source.
-        if (!loc.has_value()) return;
-        auto rangeJs = rangeJson(loc->range);
-        if (!seen.insert({loc->uri, rangeJs.dump()}).second) return;
-        auto it = byUri.find(loc->uri);
-        if (it == byUri.end()) it = byUri.emplace(loc->uri, json::array()).first;
-        it->second.push_back(json{{"range", std::move(rangeJs)},
-                                  {"newText", newName}});
-    };
-    if (rec->declNode.valid()) pushEdit(rec->declNode);
-    for (NodeId use : q.model->usesOf(sym)) pushEdit(use);
-    if (byUri.empty()) return std::string{"null"};
-
-    json result;
-    result["changes"] = json::object();
-    for (auto& [uri, edits] : byUri) result["changes"][uri] = std::move(edits);
-    return result.dump();
-}
-
-std::optional<std::string> LspServer::handleCompletion_(Request const& req) {
-    auto tp = parseTextDocumentPosition(req);
-    if (!tp) return std::string{"null"};
-    auto model = documents_.semanticModelFor(tp->uri);
-    if (!model) return std::string{"null"};
-    auto trees = model->unit().trees();
-    if (trees.empty() || !trees[0].root().valid()) return std::string{"null"};
-    auto snap = documents_.snapshot(tp->uri);
-    if (!snap.has_value()) return std::string{"null"};
-    const dss::lsp::DocumentCoordinates coords{model->unit(), tp->uri,
-                                               snap->text};
-    auto point = coords.toSynth(tp->position);
-    if (!point.has_value()) return std::string{"null"};
-    dss::Tree const& tree = *point->tree;
-    const dss::ByteOffset offset = point->offset;
-
-    // Find the deepest scope containing the offset, then collect bindings
-    // up the parent chain (inner shadows outer — first-seen wins).
-    auto const& interner = model->lattice().interner();
-    auto const& scopes   = model->scopes();
-    ScopeId scope = scopeAtOffset(*model, tree, offset);
-
-    std::unordered_map<std::string, SymbolId> visible;
-    while (scope.valid() && scope.v < scopes.size()) {
-        for (auto const& [name, symId] : scopes[scope.v].bindings) {
-            visible.emplace(name, symId);  // inner (earlier) wins
-        }
-        scope = scopes[scope.v].parent;
-    }
-
-    json items = json::array();
-    for (auto const& [name, symId] : visible) {
-        auto const* rec = model->recordFor(symId);
-        if (rec == nullptr) continue;
-        json item;
-        item["label"] = name;
-        item["kind"]  = completionItemKind(rec->kind);
-        std::string detail{declKindLabel(rec->kind)};
-        if (rec->type.valid()) {
-            detail += ": ";
-            detail += typeString(interner, rec->type);
-        }
-        item["detail"] = detail;
-        items.push_back(std::move(item));
-    }
-    return items.dump();
-}
-
-std::optional<std::string> LspServer::handleSignatureHelp_(Request const& req) {
-    auto tp = parseTextDocumentPosition(req);
-    if (!tp) return std::string{"null"};
-    ResolvedQuery q;
-    if (!resolveQuery(documents_, *tp, q)) return std::string{"null"};
-
+// One model's signature for the call enclosing the position, or nullopt.
+[[nodiscard]] std::optional<json> signatureFor(ResolvedQuery const& q) {
     // Walk ancestors to find an enclosing call-rule node, then resolve its
     // callee to a FnSig. callRules come from the schema's SemanticConfig.
     auto const& cfg = q.model->unit().schema().semantics();
@@ -1224,7 +1268,7 @@ std::optional<std::string> LspServer::handleSignatureHelp_(Request const& req) {
                 auto const* rec = q.model->recordFor(calleeSym);
                 if (rec == nullptr || !rec->type.valid()
                     || interner.kind(rec->type) != dss::TypeKind::FnSig) {
-                    return std::string{"null"};
+                    return std::nullopt;
                 }
                 auto params = interner.fnParams(rec->type);
                 json paramArr = json::array();
@@ -1241,16 +1285,258 @@ std::optional<std::string> LspServer::handleSignatureHelp_(Request const& req) {
                 json sig;
                 sig["label"]      = label;
                 sig["parameters"] = std::move(paramArr);
-                json result;
-                result["signatures"]      = json::array({std::move(sig)});
-                result["activeSignature"] = 0;
-                result["activeParameter"] = 0;
-                return result.dump();
+                return sig;
             }
         }
         if (!cursor.gotoParent()) break;
     }
-    return std::string{"null"};
+    return std::nullopt;
+}
+
+} // namespace
+
+std::optional<std::string> LspServer::handleHover_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"null"};
+
+    // Every model's hover; identical answers collapse to one. Answers that
+    // DIFFER (a symbol typed per configuration, a symbol one configuration does
+    // not declare) are all shown, each under the configurations that gave it.
+    struct Answer {
+        json        result;
+        std::string labels;
+    };
+    std::vector<Answer> answers;
+    for (auto const& lq : resolveAll(documents_, *tp)) {
+        auto h = hoverFor(lq.q);
+        if (!h.has_value()) continue;
+        auto const same = std::find_if(answers.begin(), answers.end(),
+            [&](Answer const& a) {
+                return a.result["contents"] == (*h)["contents"];
+            });
+        if (same == answers.end()) {
+            answers.push_back(Answer{std::move(*h), lq.label});
+        } else if (!lq.label.empty()) {
+            same->labels += (same->labels.empty() ? "" : ", ") + lq.label;
+        }
+    }
+    if (answers.empty()) return std::string{"null"};
+    if (answers.size() == 1) return answers.front().result.dump();
+    std::string md;
+    for (auto const& a : answers) {
+        if (!md.empty()) md += "\n\n";
+        if (!a.labels.empty()) md += "`[target=" + a.labels + "]`\n";
+        md += a.result["contents"]["value"].get<std::string>();
+    }
+    json result = answers.front().result;
+    result["contents"]["value"] = md;
+    return result.dump();
+}
+
+std::optional<std::string> LspServer::handleDefinition_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"null"};
+
+    // The union of every model's definition, deduped by (uri, range): one
+    // result is a `Location`, exactly as before; several (a symbol declared in
+    // a different place under each configuration) are a `Location[]`, which the
+    // protocol allows for exactly this.
+    json locations = json::array();
+    std::set<std::pair<std::string, std::string>> seen;
+    for (auto const& lq : resolveAll(documents_, *tp)) {
+        auto loc = definitionFor(lq.q);
+        if (!loc.has_value()) continue;
+        auto key = std::make_pair((*loc)["uri"].get<std::string>(),
+                                  (*loc)["range"].dump());
+        if (!seen.insert(std::move(key)).second) continue;
+        locations.push_back(std::move(*loc));
+    }
+    if (locations.empty()) return std::string{"null"};
+    if (locations.size() == 1) return locations.front().dump();
+    return locations.dump();
+}
+
+std::optional<std::string> LspServer::handleReferences_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"[]"};
+
+    // includeDeclaration defaults true per LSP; honor context if present.
+    bool includeDecl = true;
+    try {
+        auto params = json::parse(req.params);
+        if (auto ctx = params.find("context"); ctx != params.end()) {
+            if (auto inc = ctx->find("includeDeclaration");
+                inc != ctx->end() && inc->is_boolean()) {
+                includeDecl = inc->get<bool>();
+            }
+        }
+    } catch (...) { /* keep default */ }
+
+    // DEDUPED BY (uri, range): a header spliced twice yields two synth images
+    // of one token, and both map BACK to the same origin range. Collapsing them
+    // is why the multi-image case changes where results POINT and never what
+    // "references" MEANS. The same collapse merges the models of several
+    // configurations: one use seen by two configurations is one reference.
+    json arr = json::array();
+    std::set<std::pair<std::string, std::string>> seen;
+    for (auto const& lq : resolveAll(documents_, *tp)) {
+        auto const& q = lq.q;
+        const SymbolId sym = q.model->symbolAt(q.node);
+        auto const* rec = q.model->recordFor(sym);
+        if (rec == nullptr) continue;
+        auto push = [&](NodeId n) {
+            auto loc = locationJson(*q.coords, *q.tree, n);
+            if (!loc.has_value()) return;   // synthetic origin: no location exists
+            auto key = std::make_pair((*loc)["uri"].get<std::string>(),
+                                      (*loc)["range"].dump());
+            if (!seen.insert(std::move(key)).second) return;
+            arr.push_back(std::move(*loc));
+        };
+        if (includeDecl && rec->declNode.valid()) push(rec->declNode);
+        for (NodeId use : q.model->usesOf(sym)) push(use);
+    }
+    return arr.dump();
+}
+
+std::optional<std::string> LspServer::handleRename_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"null"};
+
+    std::string newName;
+    try {
+        auto params = json::parse(req.params);
+        if (auto n = params.find("newName"); n != params.end() && n->is_string()) {
+            newName = n->get<std::string>();
+        }
+    } catch (...) { return std::string{"null"}; }
+    if (newName.empty()) return std::string{"null"};
+
+    // * EDITS ARE GROUPED PER URI, which LSP has always modelled and this
+    // server never used: every edit was stamped with the REQUEST's uri, so
+    // renaming a symbol declared in a header wrote the header's edit into the
+    // OPEN DOCUMENT at a synth offset -- a corrupting edit, not merely a wrong
+    // report. An occurrence in a header now lands in the HEADER's entry.
+    //
+    // DEDUPED BY (uri, range) for the same reason `references` is: a header
+    // spliced twice gives two synth images of one token that map BACK to one
+    // origin range. Two identical edits at one range is what would change what
+    // a rename MEANS; collapsing them keeps it a rename that merely points
+    // somewhere new.
+    //
+    // ★ And the UNION over every configuration's model: a use live only under
+    // `#ifdef _WIN32` is renamed from the pe64 model; a rename computed from one
+    // model would leave it behind, and the other configuration's build broken.
+    std::map<std::string, json> byUri;
+    std::set<std::pair<std::string, std::string>> seen;
+    for (auto const& lq : resolveAll(documents_, *tp)) {
+        auto const& q = lq.q;
+        const SymbolId sym = q.model->symbolAt(q.node);
+        auto const* rec = q.model->recordFor(sym);
+        if (rec == nullptr) continue;
+        auto pushEdit = [&](NodeId n) {
+            auto loc = q.coords->locate(*q.tree, q.tree->span(n));
+            // A SYNTHETIC origin (the built-in prologue) is not renameable: there
+            // is no file to edit. Dropping it is correct -- inventing a document
+            // edit would write compiler-generated text into the user's source.
+            if (!loc.has_value()) return;
+            auto rangeJs = rangeJson(loc->range);
+            if (!seen.insert({loc->uri, rangeJs.dump()}).second) return;
+            auto it = byUri.find(loc->uri);
+            if (it == byUri.end()) it = byUri.emplace(loc->uri, json::array()).first;
+            it->second.push_back(json{{"range", std::move(rangeJs)},
+                                      {"newText", newName}});
+        };
+        if (rec->declNode.valid()) pushEdit(rec->declNode);
+        for (NodeId use : q.model->usesOf(sym)) pushEdit(use);
+    }
+    if (byUri.empty()) return std::string{"null"};
+
+    json result;
+    result["changes"] = json::object();
+    for (auto& [uri, edits] : byUri) result["changes"][uri] = std::move(edits);
+    return result.dump();
+}
+
+std::optional<std::string> LspServer::handleCompletion_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"null"};
+    auto snap = documents_.snapshot(tp->uri);
+    if (!snap.has_value()) return std::string{"null"};
+
+    // Every model's visible names, merged by name (the first configuration's
+    // detail wins): a name visible under any configuration is one the user may
+    // write there.
+    bool any = false;
+    json items = json::array();
+    std::set<std::string> offered;
+    for (auto const& a : documents_.analysesFor(tp->uri)) {
+        auto const& model = a.model;
+        if (!model) continue;
+        auto trees = model->unit().trees();
+        if (trees.empty() || !trees[0].root().valid()) continue;
+        const dss::lsp::DocumentCoordinates coords{model->unit(), tp->uri,
+                                                   snap->text};
+        auto point = coords.toSynth(tp->position);
+        if (!point.has_value()) continue;
+        any = true;
+        dss::Tree const& tree = *point->tree;
+        const dss::ByteOffset offset = point->offset;
+
+        // Find the deepest scope containing the offset, then collect bindings
+        // up the parent chain (inner shadows outer — first-seen wins).
+        auto const& interner = model->lattice().interner();
+        auto const& scopes   = model->scopes();
+        ScopeId scope = scopeAtOffset(*model, tree, offset);
+
+        std::unordered_map<std::string, SymbolId> visible;
+        while (scope.valid() && scope.v < scopes.size()) {
+            for (auto const& [name, symId] : scopes[scope.v].bindings) {
+                visible.emplace(name, symId);  // inner (earlier) wins
+            }
+            scope = scopes[scope.v].parent;
+        }
+
+        for (auto const& [name, symId] : visible) {
+            if (offered.contains(name)) continue;
+            auto const* rec = model->recordFor(symId);
+            if (rec == nullptr) continue;
+            offered.insert(name);
+            json item;
+            item["label"] = name;
+            item["kind"]  = completionItemKind(rec->kind);
+            std::string detail{declKindLabel(rec->kind)};
+            if (rec->type.valid()) {
+                detail += ": ";
+                detail += typeString(interner, rec->type);
+            }
+            item["detail"] = detail;
+            items.push_back(std::move(item));
+        }
+    }
+    if (!any) return std::string{"null"};
+    return items.dump();
+}
+
+std::optional<std::string> LspServer::handleSignatureHelp_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"null"};
+
+    // Every model's signature for the enclosing call, deduped by label: a callee
+    // declared differently per configuration offers each shape it has.
+    json signatures = json::array();
+    std::set<std::string> seen;
+    for (auto const& lq : resolveAll(documents_, *tp)) {
+        auto sig = signatureFor(lq.q);
+        if (!sig.has_value()) continue;
+        if (!seen.insert((*sig)["label"].get<std::string>()).second) continue;
+        signatures.push_back(std::move(*sig));
+    }
+    if (signatures.empty()) return std::string{"null"};
+    json result;
+    result["signatures"]      = std::move(signatures);
+    result["activeSignature"] = 0;
+    result["activeParameter"] = 0;
+    return result.dump();
 }
 
 } // namespace dss::lsp

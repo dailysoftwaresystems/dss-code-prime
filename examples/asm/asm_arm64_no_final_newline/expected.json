@@ -1,0 +1,22 @@
+{
+  "$comment": "★★ AN arm64 `.s` WHOSE LAST LINE HAS NO NEWLINE ASSEMBLES AND RUNS (P68 round 8, D-ASM-LAST-LINE-WITHOUT-A-NEWLINE-REFUSED) — the AT&T sibling's claim on the second dialect, which is the evidence the fix is the shared declaration and not an x86 quirk. The final byte of `main.s` is the `t` of `ret`. ✔MEASURED 2026-09-23: `aarch64-linux-gnu-as` 2.42 assembles such a file with 'end of file not at end of a line; newline inserted' and it returns 42 under qemu-aarch64; clang 18.1.3 (`--target=aarch64-linux-gnu`) accepts it silently. DSS refused it with `P_MissingRequiredChild ... got '<eof>'` in debug and release until `asm-arm64-gas.lang.json` declared `endOfInputImplies: \"\\n\"`. ★ RED-ON-DISABLE: remove the key from THIS dialect and this example is refused again. ⚠ `.gitattributes` pins `examples/**` to LF, which never adds a final newline. The `ret` is load-bearing: a lost last line would let `main` fall off its end. The `release` arm pins only that naming the release pipeline does not break the assembly path (an assembly source forms no HIR/MIR).",
+  "language": "asm-arm64-gas",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

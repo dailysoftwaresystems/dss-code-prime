@@ -355,7 +355,7 @@ private:
                     // loud here via F_ShippedHeaderNotFound below — strictly safer).
                     HeaderSearchResult const resolved = resolveSystemDescriptor(
                         directive.filename, context.systemDirs,
-                        context.headerNameMatching);
+                        context.headerNameMatching, context.headerSearch);
                     if (resolved.status == HeaderSearchStatus::AmbiguousCase) {
                         ambiguous(resolved); continue;
                     }
@@ -378,7 +378,8 @@ private:
                     // `#include` line (this tier alone has systemDirs to catch it).
                     ffi::forEachDescriptorInClosure(
                         resolved.path, context.systemDirs,
-                        context.headerNameMatching, context.activeFormat,
+                        context.headerNameMatching, context.headerSearch,
+                        context.activeFormat,
                         systemVisited,
                         [&](std::filesystem::path const& descPath) {
                             context.shippedLibDescriptors.push_back(
@@ -446,7 +447,8 @@ private:
                 HeaderSearchResult const resolved =
                     resolveIncludePath(directive.filename, includingDir,
                                        context.includeDirs,
-                                       context.headerNameMatching);
+                                       context.headerNameMatching,
+                                       context.headerSearch);
                 if (resolved.status == HeaderSearchStatus::AmbiguousCase) {
                     ambiguous(resolved); continue;
                 }

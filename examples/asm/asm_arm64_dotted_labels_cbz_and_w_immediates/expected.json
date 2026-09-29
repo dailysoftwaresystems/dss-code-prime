@@ -1,0 +1,20 @@
+{
+  "$comment": "`.L` labels as branch targets, `cbz`/`cbnz`, and the W-form immediate add/sub, in a standalone aarch64 `.s` (D-ASM-DOTTED-LABEL-AS-A-BRANCH-TARGET-REFUSED, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). ✔MEASURED 2026-09-21: aarch64-linux-gnu-as 2.42 and clang 18.1.3 both assemble it, and the gas-built binary exits 42 under qemu-aarch64; the P68 round-7 base refused it (the first dotted branch target). Exit 11, 12 or 13 names the branch or the immediate that went wrong. ★ The `release` arm, scoped honestly: assembly text forms no MIR, so no pipeline can transform it — the arm pins that `--config=release` still produces a working binary from it.",
+  "language": "asm-arm64-gas",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

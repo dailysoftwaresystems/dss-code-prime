@@ -803,8 +803,7 @@ TEST(AsmCfiProducer, BothShippedDialectsBindTheSameSpellingsToTheSameRules) {
 // The engine-tier fixture, whose `setDirectives` writes exactly the rows a test
 // needs. ⚠ These are CONFIG-level, so this file MUST run through `ctest`:
 // `dss_add_test` sets `DSS_CONFIG_ROOT`, while a bare `.exe` walks the cwd and
-// would read whichever tree the shell stands in
-// (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+// would read whichever tree the shell stands in.
 [[nodiscard]] std::unique_ptr<LoweringRun>
 loadWithDirectives(std::vector<DirRow> rows) {
     auto doc = baseDialectDoc();

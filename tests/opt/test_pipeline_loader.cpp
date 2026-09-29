@@ -388,10 +388,11 @@ TEST(PipelineLoader, DocumentationKeysAcceptedAtEveryObjectOrdinaryKeysStillReje
                "discriminator was switched off";
         if (bad.has_value()) continue;
         EXPECT_TRUE(hasCode(bad.error(), DiagnosticCode::X_PipelineMalformed));
-        EXPECT_TRUE(msgHas(bad.error(),
-                           "D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD"))
-            << "the anchor id must survive the move to the shared check — it "
-               "is how this rule is found from a failing document";
+        EXPECT_TRUE(msgHas(bad.error(), "unknown key 'comment'"))
+            << "the refusal must name the key it refused at the " << a.label;
+        EXPECT_TRUE(msgHas(bad.error(), "allowed keys are"))
+            << "and the keys that ARE accepted there, so the fix needs no "
+               "schema open";
     }
 }
 

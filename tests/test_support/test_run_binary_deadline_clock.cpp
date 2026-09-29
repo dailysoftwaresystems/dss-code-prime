@@ -1,4 +1,4 @@
-// D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-SUSPEND — the permanent pin.
+// THE RUN HARNESS'S DEADLINE MUST NOT COUNT HOST SUSPEND — the permanent pin.
 //
 // THE DEFECT (measured 2026-08-13). `runBinary`'s POSIX arm took
 // `steady_clock::now()` and killed the child at `start + timeout`. "Has this
@@ -78,7 +78,7 @@ constexpr std::string_view kHangFlag = "--dss-hang-ms=";
 // ══ THE DURATIONS BELOW ARE THIS FILE'S SUBJECT, NOT ITS BUDGETS ══════════════
 //
 // ★★★ EVERY ONE OF THEM IS AN `ALLOWLIST`-BY-PROOF ENTRY IN
-// `scripts/check-wall-clock-in-tests/check-wall-clock-in-tests.py`, KEYED BY
+// `.harness-config/runner/actions/check-wall-clock-in-tests/check-wall-clock-in-tests.py`, KEYED BY
 // `path::symbol`, and the proof each entry carries is the sentence beside it
 // here. They are NOT routed through `test_wait_budget.hpp`, and routing them
 // there would destroy the tests: a test OF a deadline clock has to name
@@ -106,8 +106,8 @@ constexpr std::string_view kHangFlag = "--dss-hang-ms=";
 // upper bound against a number*. The file contradicted itself in one diff. Kept
 // and corrected rather than quietly reworded, because the lesson is the shape:
 // a UNIVERSAL claim over the contents of a file is falsified by anything the
-// same commit adds to that file, and nothing mechanical checks it
-// ([[D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED]]).
+// same commit adds to that file, and nothing mechanical checks it — a comment
+// can be true when it is typed and false by the time the commit lands.
 
 // STIMULUS. The child sleeps this long; the parent's budget is a small fraction
 // of it, so the kill is unambiguous even on a loaded box. A slow host makes the
@@ -230,8 +230,7 @@ TEST(RunBinaryDeadlineClock, TheDeadlineIsSpentOnTheClockThatStopsWithTheMachine
     EXPECT_LT(absDiff(awake, uptimeRaw), kReadJitter)
         << "the deadline clock is not CLOCK_UPTIME_RAW. On Darwin that means it "
            "counts host suspend, and every spawned child is billed for time the "
-           "machine spent asleep (D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-"
-           "SUSPEND)";
+           "machine spent asleep";
     // WHAT steady_clock ACTUALLY IS HERE, asked of the kernel rather than
     // assumed — an earlier reading of this defect named CLOCK_MONOTONIC when
     // libc++ on this host in fact resolves to CLOCK_MONOTONIC_RAW (the two are

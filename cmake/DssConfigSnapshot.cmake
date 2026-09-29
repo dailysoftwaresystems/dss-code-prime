@@ -1,12 +1,12 @@
 # ── THE RUN'S SHIPPED-CONFIG SNAPSHOT — ONE DECISION FOR THE WHOLE SUITE ─────
-#   D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED
+#   The shipped-config exposure stayed unfixed outside the one suite that flaked.
 #
 # ★★★ WHAT THIS EXISTS TO STOP. Every ctest entry that resolves shipped config
 # used to read the LIVE WORKING TREE: `dss_add_test` pointed `$DSS_CONFIG_ROOT`
 # at `${CMAKE_SOURCE_DIR}`, the corpus entries had no override at all and reached
 # the same tree through the cwd walk, and every `loadShipped()` in every process
 # then re-opened `<repo>/src/dss-config/...` from disk. ✔MEASURED (P31/P32, the
-# closed twin `D-TEST-SHIPPED-CONFIG-READ-FROM-A-TREE-ANOTHER-PROCESS-IS-WRITING`):
+# closed twin, shipped config read from a tree another process is writing):
 # none of the three `loadShipped` entry points caches, so a call-site count IS a
 # read count — `TargetSchema::loadShipped` 788 sites under `tests/`,
 # `ObjectFormatSchema::loadShipped` 294, `GrammarSchema::loadShipped` 152 — and a

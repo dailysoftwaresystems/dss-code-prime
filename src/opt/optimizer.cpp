@@ -118,8 +118,9 @@ struct PassRunResult {
     d.severity = DiagnosticSeverity::Error;
     d.actual   = std::format(
         "opt::runPass: PassId ordinal {} has no dispatch arm — "
-        "substrate-shape violation (D-OPT1-PASS-ID-STABILITY).",
+        "substrate-shape violation: add the arm for the new pass.",
         static_cast<int>(id));
+    // Anchored: D-OPT1-PASS-ID-STABILITY.
     reporter.report(std::move(d));
     return {false, false};
 }
@@ -465,8 +466,8 @@ struct ScheduleInterpreter {
                 d.severity = DiagnosticSeverity::Error;
                 d.actual   = "opt::optimize: pass returned ok=false WITHOUT "
                              "emitting a diagnostic — substrate contract "
-                             "violation (D-OPT1-RETURN-FALSE-DIAGNOSTIC-"
-                             "CONTRACT).";
+                             "violation: a failing pass must say why.";
+                // Anchored: D-OPT1-RETURN-FALSE-DIAGNOSTIC-CONTRACT.
                 reporter.report(std::move(d));
             }
             stopped = true;
@@ -498,9 +499,9 @@ struct ScheduleInterpreter {
                     "opt::optimize: PassId ordinal {} bypassed the "
                     "runPass enum-drift guard AND reached the "
                     "passMutationCount increment with mutated=true "
-                    "— substrate-shape violation "
-                    "(D-OPT1-PASS-ID-STABILITY).",
+                    "— substrate-shape violation.",
                     static_cast<int>(p));
+                // Anchored: D-OPT1-PASS-ID-STABILITY.
                 reporter.report(std::move(d));
                 stopped = true;
                 return;

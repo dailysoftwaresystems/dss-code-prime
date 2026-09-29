@@ -4,15 +4,29 @@
 #include "core/types/config_document_parse.hpp"   // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey — the shared `$` carve-out
 #include "core/types/parse_diagnostic.hpp"
+// `linker::detail::commitReplacing` — the ONE rename-over commit in this tree
+// (`lsp`, `program` and `link` are all aggregated into one `dsscp-lib`, so no
+// new link edge). See `save` below.
+#include "link/writer.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <string_view>
 #include <system_error>
 #include <utility>
+
+// `getpid`, for the per-process half of the scratch file's name — a HOST split,
+// the same one `runtime_object_cache.cpp` and `link/writer.cpp` make.
+#ifdef _WIN32
+#    include <process.h>
+#else
+#    include <unistd.h>
+#endif
 
 namespace dss {
 
@@ -20,6 +34,14 @@ namespace {
 
 namespace fs = std::filesystem;
 using json   = nlohmann::json;
+
+[[nodiscard]] std::uint64_t processId() {
+#ifdef _WIN32
+    return static_cast<std::uint64_t>(_getpid());
+#else
+    return static_cast<std::uint64_t>(getpid());
+#endif
+}
 
 constexpr std::string_view kDependenciesKey = "dependencies";
 
@@ -241,25 +263,69 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
     // does for anything a human may read.
     std::string const text = doc.dump(2) + "\n";
 
-    fs::path const tmp = lockPath.parent_path()
-                       / (lockPath.filename().string() + ".tmp");
-    {
-        std::ofstream out{tmp, std::ios::binary | std::ios::trunc};
-        if (!out) {
-            emitLockfileWriteFailed(rep, "the scratch file '"
-                                             + core::genericSpelling(tmp)
-                                             + "' could not be opened for "
-                                               "writing");
+    // ── A UNIQUE, EXCLUSIVELY CREATED SCRATCH FILE PER SAVE ───────────────────
+    // [[D-DEPS-LOCKFILE-STAGES-THROUGH-ONE-FIXED-TEMP-NAME]]
+    //
+    // It used to be ONE fixed name, `<lock>.tmp`, opened truncating — and two
+    // builds saving at once shared it. ✔MEASURED 2026-09-18 (lane `rw`), the
+    // pre-fix sequence replicated with two concurrent writers for 30 s: 32508
+    // times a writer's staged file was not its own document when it committed,
+    // 19013 times it was TORN (the shorter document written over the longer
+    // one's tail), and 3500 times the torn file was committed — and by U-4 an
+    // unparseable lockfile ABANDONS the next build. The commit primitive cannot
+    // help: it publishes whatever the scratch file holds.
+    //
+    // ⇒ each save CLAIMS `<lock>.tmp-<pid>-<n>`, n = 0, 1, … — claimed with
+    // `linker::detail::createExclusiveBinary`, which succeeds only when THIS
+    // call created the file, so a name another save holds (or a killed build
+    // left) is stepped over and never opened, let alone truncated. The pid keeps
+    // processes apart; the exclusive create keeps threads of one process apart.
+    // ⓘ The fixed name bought "a crashed build leaves exactly ONE stale file";
+    // a unique name leaves one per crashed save instead, harmless and never
+    // adopted — a far smaller cost than a torn lockfile.
+    fs::path       tmp;
+    std::FILE*     claimed = nullptr;
+    std::uint64_t const pid = processId();
+    for (std::uint32_t n = 0;; ++n) {
+        if (n >= linker::detail::kMaxClaimAttempts) {
+            emitLockfileWriteFailed(
+                rep, "could not claim a scratch file beside '"
+                         + core::genericSpelling(lockPath) + "' after "
+                         + std::to_string(linker::detail::kMaxClaimAttempts)
+                         + " attempts — stale '" + lockPath.filename().string()
+                         + ".tmp-*' files are accumulating (a build was killed "
+                           "mid-save); delete them");
             return false;
         }
-        out.write(text.data(), static_cast<std::streamsize>(text.size()));
-        out.flush();
-        // `bad()` covers the write itself; the explicit close below is what
-        // surfaces a flush that failed on a full disk, which a destructor would
-        // swallow — the exact silent-truncation shape `K_ImageWriteCloseFailed`
-        // exists for one tier down.
-        out.close();
-        if (!out) {
+        fs::path candidate =
+            lockPath.parent_path()
+            / (lockPath.filename().string() + ".tmp-" + std::to_string(pid)
+               + "-" + std::to_string(n));
+        claimed = linker::detail::createExclusiveBinary(candidate);
+        if (claimed != nullptr) {
+            tmp = std::move(candidate);
+            break;
+        }
+        // Occupied — another save's, or a killed build's — is STEPPED OVER.
+        // Asked at the ENTRY (`symlink_status`), which is the question the
+        // exclusive create asked; anything else is a real failure, reported now.
+        std::error_code eec;
+        auto const      entry = fs::symlink_status(candidate, eec);
+        if (!eec && fs::exists(entry)) continue;
+        emitLockfileWriteFailed(rep, "the scratch file '"
+                                         + core::genericSpelling(candidate)
+                                         + "' could not be created for writing");
+        return false;
+    }
+    {
+        std::size_t const written =
+            text.empty() ? std::size_t{0}
+                         : std::fwrite(text.data(), 1, text.size(), claimed);
+        // The close is checked, not left to a destructor: a flush that failed
+        // on a full disk would otherwise be swallowed — the silent-truncation
+        // shape `K_ImageWriteCloseFailed` exists for one tier down.
+        bool const closed = std::fclose(claimed) == 0;
+        if (written != text.size() || !closed) {
             emitLockfileWriteFailed(rep, "writing the scratch file '"
                                              + core::genericSpelling(tmp)
                                              + "' failed");
@@ -269,13 +335,21 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
         }
     }
 
-    std::error_code ec;
-    fs::rename(tmp, lockPath, ec);
-    if (ec) {
+    // ★ THE SAME DEFECT CLASS AS THE ROUND-7 GATE'S, ON A STABLE USER-VISIBLE
+    // FILE — [[D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE]].
+    // This used to be `fs::rename`, i.e. `MoveFileExW(REPLACE_EXISTING)` on
+    // Windows, which ANY open handle on the previous lockfile refuses — and a
+    // refusal here is an ERROR that fails the build. ✔MEASURED on the linker's
+    // identical commit: its holder shares delete and lasts 3–22 ms (🧠 a
+    // real-time scan, which meets this file the same way). The linker's commit
+    // steps past such a holder atomically and waits out the rest, so the
+    // lockfile takes the same one.
+    auto const commit = linker::detail::commitReplacing(tmp, lockPath);
+    if (!commit.committed) {
         emitLockfileWriteFailed(rep, "'" + core::genericSpelling(tmp)
                                          + "' could not be renamed over '"
                                          + core::genericSpelling(lockPath)
-                                         + "': " + ec.message());
+                                         + "': " + commit.refusal);
         std::error_code rmec;
         fs::remove(tmp, rmec);
         return false;

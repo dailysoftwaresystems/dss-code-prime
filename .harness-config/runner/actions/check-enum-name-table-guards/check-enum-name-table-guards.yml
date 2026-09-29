@@ -1,0 +1,14 @@
+# PURPOSE: refuse an `EnumNameTable` vocabulary declared in `src/` without a `DSS_CHECK_ENUM_NAME_TABLE` well-formedness assert.
+name: check-enum-name-table-guards
+description: >-
+  The action verifies every EnumNameTable carries its well-formedness assert, then proves it can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `enum_name_table_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-enum-name-table-guards.py
+    successPattern: 'check-enum-name-table-guards: self-test OK'
+    requireInputsUnmoved: true

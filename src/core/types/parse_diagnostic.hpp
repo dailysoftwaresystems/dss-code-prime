@@ -347,6 +347,23 @@ enum class DiagnosticCode : std::uint16_t {
     // `P_PreprocessorDefinedFromExpansion` next door, for the same two reasons.
     P_PreprocessorIfLiteralImplicitlyUnsigned = 0x0024,
 
+    // P68 round 8 (D-ASM-UNTERMINATED-BLOCK-COMMENT-AT-END-OF-FILE-REFUSED): a
+    // body the END OF INPUT closed, because its lexer mode declares
+    // `atEndOfInput: closesWithWarning`. A WARNING, reported at the body's
+    // OPENER and spanning to the end of the input; the flavour word in its text
+    // ("comment", "string", …) comes from the mode's `unterminatedAs`, never
+    // from a mode name. The shipped declarer is the gas dialects' `/*` comment:
+    // ✔MEASURED 2026-09-23, GNU as 2.42 assembles a `.s` ending inside an
+    // unterminated `/*` ("end of file in comment") and the program runs, while
+    // clang 18.1.3 refuses it — the references split on acceptance, so the union
+    // accepts, and gas's warning is kept because a missing `*/` silently
+    // swallowing the rest of a file must not be silent.
+    //
+    // ★ SUPPRESSABLE: the input is accepted and assembled exactly as the
+    // accepting reference assembles it, so suppressing the notice ships no wrong
+    // bytes and hides no build failure.
+    P_ClosedByEndOfInput          = 0x0025,
+
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past
     // ParserConfig::maxExpressionDepth) is reported HERE at the offending
@@ -694,10 +711,16 @@ enum class DiagnosticCode : std::uint16_t {
     // 0xC034 precedent.
     S_IndirectCallNotSupported    = 0xE015,  // RETIRED — see comment
     // FC4 c1 stage 2a: C 6.7.6.3p10 — a `(void)` parameter list declares
-    // zero parameters; a NAMED void parameter (`int f(void x)`) or void
-    // mixed with other parameters (`int f(void, int)`) is ill-formed.
-    // Emitted by the engine's param-harvest normalization when the
-    // language declares `parameters.soleVoidMeansEmpty`.
+    // zero parameters; an unnamed void mixed with other parameters or a
+    // `...` (`int f(void, int)`, `int f(void, ...)`) is ill-formed. Since P68
+    // round 8 (lane `ht`, part 2, measured on gcc, clang, mingw and MSVC): a
+    // NAMED void parameter (`int f(void x)`) is refused only in a function
+    // DEFINITION (C 6.7.6.3p4) — in any other declaration it is gcc's
+    // parameter of an incomplete type, kept — and so is a qualified sole void;
+    // `_Atomic` sole void and a `const`/`restrict` named void are refused
+    // everywhere. Emitted by the engine's param-harvest normalization and the
+    // C 6.9.1 definition block when the language declares
+    // `parameters.soleVoidMeansEmpty`.
     S_InvalidVoidParam            = 0xE016,
     // FC4 c1 stage 2a: a declaration position that REQUIRES named
     // declarators (`DeclarationRule.requireNamedDeclarators` — C's
@@ -787,9 +810,10 @@ enum class DiagnosticCode : std::uint16_t {
     // ++/-- sites classify the operand: a manifest rvalue (e.g. a literal `5++`,
     // `++5`) has no object to read-modify-write, so it fails loud here rather
     // than synthesize a write-back to a non-object. (A `const`-qualified lvalue
-    // `const int x; x++;` is a SEPARATE, pre-existing gap — `classifyLvalue` does
-    // not yet model `const` — anchored as D-CSUBSET-INCDEC-CONST-LVALUE, shared
-    // with the same gap on plain assignment.) Positioned at the ++/-- expression.
+    // `const int x; x++;` IS addressable and passes this shape test; it is refused
+    // one tier earlier, by the semantic tier's const-write check — the one an
+    // assignment's left operand asks — as S_ConstViolation, since P68 round 8.)
+    // Positioned at the ++/-- expression.
     S_IncDecNeedsModifiableLvalue = 0xE024,
     // RETIRED by c27 (D-CSUBSET-VOLATILE-POINTEE, 2026-06-27): formerly the
     // pointer-to-volatile-POINTEE reject (`volatile int *p`) under c21's model B,
@@ -951,7 +975,11 @@ enum class DiagnosticCode : std::uint16_t {
     // representable in the underlying type. The `.actual` names the enumerator.
     // Unsuppressable — a suppressed diagnostic would let the out-of-range value be
     // truncated/wrapped into the underlying type silently (a wrong constant value).
-    // Only fires for the EXPLICIT-underlying case; a default-int enum is unchanged.
+    // P68 round 12 (lane `cs`, the enumeration P1): also an enumeration WITHOUT a
+    // fixed type whose values no type the language can choose holds all at once
+    // (C23 6.7.3.3p4 — `enum { A = -1, B = 0xFFFFFFFFFFFFFFFFULL }`), and an
+    // implicit `previous + 1` past every 64-bit value; the value is read with its
+    // own signedness, so 0xFFFFFFFFFFFFFFFFULL in `unsigned long long` is in range.
     S_EnumeratorValueOutOfRange   = 0xE035,
     // C23 §6.7.2.5 (D-CSUBSET-TYPEOF): the operand of a `typeof`/`typeof_unqual`
     // is a BIT-FIELD member access (`typeof(s.flag)` where `flag` is a bit-field).
@@ -1052,11 +1080,13 @@ enum class DiagnosticCode : std::uint16_t {
     // write), which today surfaces as an engine-level "no storage slot" failure
     // at MIR. This is the REAL diagnostic for that misuse. Plain reads,
     // `&__func__` (legal C99 — the fold's rodata global provides the address),
-    // and indexing are unaffected. Simple assignment / `+=` are caught EARLIER
-    // by SE4's const check (the synthetic symbol is `isConst`) →
-    // S_ConstViolation; this code covers the inc/dec class the const check does
-    // not model. A plain Error; the classifiers bail to an Error path either
-    // way (NOT in the unsuppressable table — no silent-accept route).
+    // and indexing are unaffected. Assignment, `+=` and — since P68 round 8 —
+    // `++` / `--` are all caught EARLIER by the semantic tier's const-write check
+    // (the synthetic symbol is `isConst`) → S_ConstViolation, so this code is the
+    // lowering tier's BACKSTOP for the inc/dec class: it fires when that check
+    // did not stop the build (a suppressed S_ConstViolation). A plain Error; the
+    // classifiers bail to an Error path either way (NOT in the unsuppressable
+    // table — no silent-accept route).
     S_PredefinedIdentifierNotAddressable = 0xE040,
     // C23 §6.7.9 (D-CSUBSET-AUTO-TYPE-INFERENCE): an initializer-inferred
     // declaration (`auto x = expr;`) declares MORE THAN ONE declarator
@@ -1494,23 +1524,25 @@ enum class DiagnosticCode : std::uint16_t {
     // would refuse C that a reference compiles — the TF-C77 lesson, again.
     S_AttributeIgnoredForDeclarationKind = 0xE05F,
 
-    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (TF-C135): a DIRECT call argument
-    // whose pointee is an integer of the SAME REPRESENTATION as the parameter's
-    // but a DIFFERENT IDENTITY — `long long*` into `long*` on LP64, `int*` into
-    // `long*` on LLP64. C 6.5.2.2p7 makes it a constraint violation requiring a
-    // diagnostic; gcc (`-Wincompatible-pointer-types`), clang (same) and MSVC
-    // (C4133) all WARN, and DSS matches them rather than refusing code the
-    // platform toolchains compile. ✔MEASURED 2026-08-07: Apple clang 21.0.0
-    // compiles sqlite's `Tcl_GetWideIntFromObj(interp, objv[4], &iVal)` with
-    // exactly this warning and rc=0, on all four macOS SDKs present.
+    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (TF-C135): a pointer converted to a
+    // pointer whose pointee is an integer of the SAME REPRESENTATION but a
+    // DIFFERENT IDENTITY — `long long*` into `long*` on LP64, `int*` into `long*`
+    // on LLP64. C makes it a constraint violation requiring a diagnostic; gcc
+    // (`-Wincompatible-pointer-types`), clang (same) and MSVC (C4133) all WARN, and
+    // DSS matches them rather than refusing code the platform toolchains compile.
+    // ✔MEASURED 2026-08-07: Apple clang 21.0.0 compiles sqlite's
+    // `Tcl_GetWideIntFromObj(interp, objv[4], &iVal)` with exactly this warning
+    // and rc=0, on all four macOS SDKs present.
     //
     // WARNING, NOT ERROR, and the reasoning is recorded so it can be argued with:
     // the representations are identical, so no load, store or call ABI changes —
     // the realized Ptr→Ptr bitcast is a no-op — which means silence would be the
-    // dangerous choice and an error the merely-unportable one. `S_TypeMismatch`
-    // remains the ERROR for every mismatch this predicate does NOT admit
-    // (different width, different signedness, non-integer pointees, and the
-    // init/assign/return and indirect-call boundaries, which never relax).
+    // dangerous choice and an error the merely-unportable one.
+    // ★ P68 round 9 (lane `cs`): this code was a DIRECT call argument's only. It is
+    // now the narrower report of one class the language converts with a diagnostic
+    // at EVERY site (initialization, assignment, argument, return, `==`, `?:`) —
+    // the classifier `diagnosedConversion` names it; every other incompatible
+    // pointer pair reports S_IncompatiblePointerConversion (0xE083).
     //
     // SUPPRESSIBLE, deliberately — `--warnings-as-errors` restores the strict
     // pre-TF-C135 posture. Do NOT add it to `unsuppressable_codes.cpp`: a program
@@ -1528,20 +1560,25 @@ enum class DiagnosticCode : std::uint16_t {
     //   `SourceSpan` for a function, so it could only name the entry by symbol
     //   name — the weakest possible report of what is a plain declaration
     //   mistake with an obvious location.
-    //   ★ WHAT IT REFUSES, MEASURED 2026-08-10 on HEAD `3e86a187` (`build-dbg`):
-    //   `int main(int argc, char **argv, char **envp)` compiled **rc=0 with ZERO
-    //   diagnostics** on BOTH `pe64-x86_64-windows-exec` and
-    //   `elf64-x86_64-linux-exec`, and both images FAULT — observed `argc=3
-    //   argv=0x…7D10 envp=0x0000000000000004`, dereferencing envp gives
-    //   `0xC0000005` on pe and SIGSEGV (rc=139) on elf. gcc compiles the identical
-    //   source and it works. (The ORIGIN of the `0x4` is UNDETERMINED. An earlier
-    //   probe explained it as "the integer argc left in a leftover register"; that
-    //   is REFUTED — the measured run had argc=3 with envp still 0x4. Do NOT put a
-    //   mechanism claim into this diagnostic's text.)
-    //   ★ IT IS FORMAT-INDEPENDENT, DELIBERATELY. A 3-parameter `main` is refused
-    //   on a relocatable `.o` too, because no format realizes it and no
-    //   translation unit can make it legal later — the check needs no target and
-    //   so runs wherever the declaration is seen. What IS format-dependent is
+    //   ★ THE MEASURED FAULT THAT CREATED IT (2026-08-10, HEAD `3e86a187`,
+    //   `build-dbg`): `int main(int argc, char **argv, char **envp)` compiled
+    //   **rc=0 with ZERO diagnostics** on BOTH `pe64-x86_64-windows-exec` and
+    //   `elf64-x86_64-linux-exec`, and both images FAULTED — observed `argc=3
+    //   argv=0x…7D10 envp=0x0000000000000004`, dereferencing envp gave
+    //   `0xC0000005` on pe and SIGSEGV (rc=139) on elf, while gcc compiled the
+    //   identical source and it worked. (The ORIGIN of the `0x4` is
+    //   UNDETERMINED; the "argc left in a leftover register" explanation is
+    //   REFUTED — that run had argc=3 with envp still 0x4. Do NOT put a mechanism
+    //   claim into this diagnostic's text.) That form is SUPPORTED now: the
+    //   language declares its row and every exec format realizes its verb
+    //   (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE), so what this code refuses is every
+    //   signature the language does NOT declare for an entry name —
+    //   `int main(int, char**, int)`, `void main()`.
+    //   ★ IT IS FORMAT-INDEPENDENT, DELIBERATELY. An undeclared signature is
+    //   refused on a relocatable `.o` too, because no format realizes a shape the
+    //   language does not declare and no translation unit can make it legal
+    //   later — the check needs no target and so runs wherever the declaration
+    //   is seen. What IS format-dependent is
     //   CANDIDACY ("does this format realize the verb this row needs"), and that
     //   deliberately lives at entry resolution instead: on ELF, `wmain` is not a
     //   candidate but it is NOT an error either — a program defining `main` and
@@ -2072,9 +2109,9 @@ enum class DiagnosticCode : std::uint16_t {
     // correctness one — but gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
     // (`-std=c23`), probed SEPARATELY, both say "lvalue required as left operand
     // of assignment" / "expression is not assignable" at the user's own token.
-    // ⓘ The `const`-QUALIFIED lvalue case (`const int x; x = 5;`) is a DIFFERENT
-    // gap with its own row — [[D-CSUBSET-INCDEC-CONST-LVALUE]] — because a const
-    // lvalue IS addressable and passes the shape guard this code reports on.
+    // ⓘ The `const`-QUALIFIED lvalue case (`const int x; x = 5;`) is not this
+    // code's: a const lvalue IS addressable and passes the shape guard this code
+    // reports on, and the semantic tier refuses it first (S_ConstViolation).
     S_AssignNeedsModifiableLvalue = 0xE072,
 
     // P48 (D-CSUBSET-TERNARY-ARRAY-ARM-INCOMPATIBLE): the second and third
@@ -2383,6 +2420,187 @@ enum class DiagnosticCode : std::uint16_t {
     // backfill and silently give each declarator its OWN type — precisely the
     // per-declarator meaning no reference implements. Renders error[S07C].
     S_AutoDeclaratorsInferDifferentTypes = 0xE07C,
+    // P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the asm label of a GNU
+    // LOCAL REGISTER VARIABLE (a block-scope object whose declaration carries a
+    // `{asmLabelNamesRegister:true}` specifier — c's `register`) names no
+    // register of the active target. 📄 GCC: *"The register name must be a
+    // valid register name for the target platform."* ✔MEASURED 2026-09-19,
+    // gcc 13.3.0 (*invalid register name for 'v'*) and clang 18.1.3 (*unknown
+    // register name 'x99' in asm*) both refuse it — at the DECLARATION, even
+    // when the variable never reaches an asm statement (gcc -O2 alone compiles
+    // that case, having deleted the dead variable first). The name is resolved
+    // against the TARGET's register table (`TargetSchema::registerByName`, the
+    // question the clobber check asks), so the refusal names the target. A
+    // plain Error: the label is dropped with it, so a suppressed diagnostic
+    // leaves an ordinary automatic, never a binding to a guessed register.
+    S_AsmRegisterNameUnknown = 0xE07D,
+    // P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED, C 6.5.3.2p1): the
+    // ADDRESS of an object whose declaration carries a
+    // `{addressNotTakeable:true}` specifier (c's `register`) was requested —
+    // by unary `&`, or by binding the object to a MEMORY-form inline-asm
+    // operand, which asks for the same thing through a constraint letter.
+    // ✔MEASURED 2026-09-19: gcc 13.3.0 and clang 18.1.3 refuse both (*address
+    // of register variable requested*); DSS compiled both before this code
+    // existed. A plain Error: DSS keeps such an object in an ordinary memory
+    // home and binds it to its register only AT an asm operand, so a suppressed
+    // refusal takes the home's address — accepting C both references refuse,
+    // but reading and writing the object's own storage, never a wrong one.
+    S_AddressOfRegisterObject = 0xE07E,
+    // P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): an inline-asm
+    // statement asks one register for two things through GNU local register
+    // variables, and no single meaning exists — (a) the bound register is also
+    // named in the statement's CLOBBER list (✔MEASURED, gcc and clang both
+    // refuse: *'asm' specifier for variable 'v' conflicts with 'asm' clobber
+    // list*); (b) two INPUT operands are bound to ONE register through two
+    // DIFFERENT variables (✔MEASURED, both references ACCEPT and DISAGREE:
+    // gcc keeps the value assigned LAST, clang the operand listed last); (c) a
+    // constraint letter whose register set does not contain the bound register
+    // (both ACCEPT and DISAGREE: gcc drops the binding and uses a register of
+    // the letter's class, clang keeps the bound register). (b) and (c) are
+    // refused rather than given one reference's meaning — the disjunction
+    // decides acceptance, never meaning. UNSUPPRESSABLE: every arm is a
+    // statement whose operands would otherwise be bound to a register the
+    // source never agreed on.
+    S_InlineAsmBoundRegisterConflict = 0xE07F,
+    // S_IncompleteReturnType (P68 round 8, lane `ht`, part 2): a function's RETURN
+    //   type is incomplete where C requires it complete — the return type of a
+    //   function DEFINITION (C 6.9.1p3: "void or a complete object type other than
+    //   array type"), or of the function a CALL names (C 6.5.2.2p1). One code for
+    //   one fact — the callee's result has no size — with the position in the text.
+    //   ✔MEASURED: gcc 13.3, clang 18.1.3 and mingw-w64 13.2 refuse both; MSVC
+    //   19.51 refuses the definition and ACCEPTS the call — and the program it
+    //   builds CRASHES (0xC0000005) whether the type is completed later in the TU or
+    //   only in another TU. UNSUPPRESSABLE (`kWhyIncompleteType`): silenced, the
+    //   result of an incomplete composite has no size to allocate.
+    S_IncompleteReturnType           = 0xE080,
+    // S_IncompleteArgumentType (P68 round 8, lane `ht`, part 2): a call ARGUMENT
+    //   has an incomplete type (C 6.5.2.2p4: an argument is an expression of a
+    //   complete object type). ✔MEASURED: gcc, clang and mingw refuse; MSVC ACCEPTS
+    //   and its program runs with a WRONG result (the callee summed 556434983 for
+    //   36 with the type completed later in the TU, 247956583 with it complete only
+    //   in another TU). UNSUPPRESSABLE (`kWhyIncompleteType`), for that reason.
+    S_IncompleteArgumentType         = 0xE081,
+    // S_TagDeclaredInParameterList (P68 round 8, lane `cr`, part 6 item 7 —
+    //   D-C-TAG-DEFINED-IN-A-PARAMETER-LIST-REFUSED): a struct/union/enum tag is
+    //   DEFINED inside a parameter list. Legal C, and every reference builds it; but
+    //   C 6.2.1p4 ends the tag's scope with the function's declarator (a prototype)
+    //   or its body (a definition), so no caller can spell the type. ✔MEASURED: gcc
+    //   13.3.0 ("declared inside parameter list will not be visible outside of this
+    //   definition or declaration") and clang 18.1.3 (-Wvisibility) warn, MSVC 19.51
+    //   is silent. A WARNING, suppressible: the program means what it says.
+    S_TagDeclaredInParameterList     = 0xE082,
+    // S_IncompatiblePointerConversion (P68 round 9, lane `cs` —
+    //   D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS): a
+    //   pointer converted to — or paired, at `==`/`!=`/relational or `?:`, with — a
+    //   pointer to an INCOMPATIBLE type without a cast: object pointers of different
+    //   types, an object pointer beside a function pointer, a function pointer of
+    //   another signature (an array or a function designator contributing its decayed
+    //   pointer). C23 6.5.17.2p1 / 6.5.10p2 / 6.5.16p3 make it a constraint
+    //   violation, which needs a diagnostic and nothing more. ✔MEASURED 2026-09-23,
+    //   every program RUN: gcc 13.3.0, mingw-w64 13.2.0 and MSVC 19.51 build every
+    //   shape with a warning, clang 18.1.3 the object-pointer ones. A WARNING,
+    //   suppressible, reported at every site by the one classifier
+    //   (`diagnosedConversion`, type_rules.hpp); `--warnings-as-errors` restores the
+    //   refusal (GCC 14's default). Two distinct INTEGER pointees of one
+    //   representation keep their narrower S_IncompatiblePointerIntegerPointee.
+    S_IncompatiblePointerConversion  = 0xE083,
+    // S_IntegerPointerConversion (P68 round 9, lane `cs`, the same row): a pointer
+    //   from an integer that is not a null pointer constant, or an integer from a
+    //   pointer, without a cast — and a pointer compared with such an integer. C
+    //   6.3.2.3p5-p6 give both conversions an implementation-defined result, the one
+    //   the explicit cast gives; ✔MEASURED 2026-09-23 gcc 13.3.0, mingw-w64 13.2.0 and
+    //   MSVC 19.51 build them with a warning (clang 18.1.3 refuses by default). A
+    //   WARNING, suppressible; `--warnings-as-errors` restores the refusal.
+    S_IntegerPointerConversion       = 0xE084,
+    // S_PredefinedIdentifierOutsideFunction (P68 round 9, lane `cs`): a predefined
+    //   function-name identifier (`__func__`, a configured alias) used OUTSIDE a
+    //   function body. C 6.4.2.2 declares it only inside a function definition, so
+    //   ISO C has nothing to name there; gcc 13.3.0 and clang 18.1.3 both accept it
+    //   with a warning and agree it is the EMPTY string ("", sizeof 1) — ✔MEASURED
+    //   2026-09-23, every program run; MSVC 19.51 refuses (C2065). DSS takes gcc's
+    //   and clang's meaning with their warning: suppressible, and
+    //   `--warnings-as-errors` makes it MSVC's refusal.
+    S_PredefinedIdentifierOutsideFunction = 0xE085,
+    // S_AbiTypedefUndeclared (P68 round 9, lane `lm` —
+    //   D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): a construct takes its TYPE from a
+    //   platform ABI typedef the TARGET declares per object format (`abiTypedefs`
+    //   in `<arch>.target.json`) — a literal-prefix row's `abiTypedef`, `L"…"` and
+    //   `L'…'` → `wchar_t` — and the active target declares no such typedef, so on
+    //   this (target, format) pair the construct has no type. The analogue of
+    //   S_LongDoubleFormatUndeclared for `20.0L` on a format with no `long double`:
+    //   never a guessed width. Named for the MECHANISM, not for `wchar_t` (the
+    //   coordinator's ruling): every construct that reads a type through
+    //   `abiTypedef` refuses through this one code. Unreachable with the shipped
+    //   targets (both declare `wchar_t` on every format, pinned); it is the
+    //   fail-loud arm for a custom target. Always an Error, so never silenced
+    //   (`effectiveSeverity` refuses to silence an Error).
+    S_AbiTypedefUndeclared           = 0xE086,
+    // S_ExcessInitializerElements (P68 round 9, lane `cs`): a brace initializer
+    //   with more POSITIONAL elements than its aggregate has slots — `int a[2] =
+    //   {1, 2, 3}`, `struct P p = {40, 2, 7}`, and a character array initialized by
+    //   a string followed by more elements (`char s[] = {"a", "b"}`). C 6.7.9p2 makes
+    //   it a constraint violation. ✔MEASURED 2026-09-23, every program RUN: gcc
+    //   13.3.0, mingw-w64 13.2.0 and clang 18.1.3 at -std=c2x build the aggregate
+    //   shapes with a warning (clang alone the string one; gcc makes that one an
+    //   error), and each excess element is DROPPED UNEVALUATED — a call in it never
+    //   runs (`.temp/probe/r8f`); MSVC 19.51 refuses (C2078). A WARNING, suppressible;
+    //   `--warnings-as-errors` restores the refusal (-pedantic-errors' posture). A
+    //   DESIGNATED index past the end stays refused, as gcc refuses it.
+    S_ExcessInitializerElements           = 0xE087,
+    // P68 round 12 (lane `cs`, the enumeration P1): an enumeration WITHOUT a fixed
+    // underlying type is declared, the language declares which type each platform
+    // convention makes it compatible with (`semantics.enumerationCompatibleTypes`),
+    // and the active object format names NO convention (`enumCompatibleTypeRule`:
+    // wasm / spirv skeletons). C 6.7.2.2p4 requires SOME compatible integer type, and
+    // which one is the platform ABI's (`int` on Microsoft x64, `unsigned int` for a
+    // non-negative enumeration on SysV / AAPCS / Darwin), so none can be picked here.
+    // The `.actual` names the enumeration's tag (empty for an anonymous one).
+    // UNSUPPRESSABLE: a suppressed emission would leave the enumeration on a guessed
+    // type that reaches codegen — the `long double` axis's sibling, one step further.
+    S_EnumCompatibleTypeRuleUndeclared    = 0xE088,
+    // P68 round 12 (lane `cs`): a NEGATIVE enumerator value for an enumeration whose
+    // FIXED underlying type is UNSIGNED, and which the SIGNED type of the same width
+    // holds (`enum E : unsigned char { X = -1 }`), is CONVERTED modulo 2^N as a
+    // conversion to the underlying type is (X == 255). C23 6.7.3.3p3 makes the value a
+    // constraint violation; clang 18.1.3 builds exactly this extent and gcc 13.3.0
+    // refuses it, so the union ACCEPTS it and this warning is the diagnostic the
+    // constraint asks for. A WARNING, suppressible; `--warnings-as-errors` restores
+    // the refusal. Every other out-of-range value stays S_EnumeratorValueOutOfRange.
+    S_EnumeratorValueConvertedToUnderlyingType = 0xE089,
+    // P68 round 13 (lane `cs`, the static-initializer item): the initializer of an object of
+    // STATIC or THREAD storage duration contains a construct that PROVABLY is not a constant,
+    // in a position that is evaluated — C 6.7.9p4, a constraint (C23 6.7.11p5): the value of
+    // an object that is not a const, non-volatile one with a visible initializer (a DECLARED
+    // object is volatile when its type, looked through its array spine, is; a compound
+    // literal's read, when any lvalue on its path is), a call to a function the translation
+    // unit defines, an assignment, an increment or decrement, the address (or an array's
+    // decay) of an object of automatic storage duration, a SYMBOL's address converted to an
+    // integer narrower than a pointer, or the comma operator where the language does not
+    // admit it. Declared by `semantics.staticInitializers`. ★ It never means "DSS cannot fold
+    // this": a form the static-data producer does not fold is left to that producer's own
+    // refusal, because a reference may build it. ✔MEASURED 2026-09-24 (lane `cs`'s
+    // `.temp/probe/nci`, `sti` … `sti11`: gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0, each
+    // separately, every build RUN): every reference refuses each such construct; DSS built
+    // `int x = y;` for a non-const `y` and `int a[2] = { 1, y };` silently, refused `static
+    // int x = g();` under an object-format code and ABORTED on a local's address in a
+    // block-scope `static`. `.actual` names the construct and why; the span is its position.
+    // SUPPRESSIBLE, like any constraint whose violation cannot become a wrong image: silenced,
+    // the static-data producer either refuses the initializer itself (H_StaticInitializerNotFolded
+    // — a call, an assignment, an automatic object's address, a narrowed symbol address, a
+    // declared object that is not const and non-volatile, whose value its resolver never
+    // folds) or folds the value the object holds at load time, never another one: an element
+    // or member of a compound literal (HIR does not carry a literal's const-ness, so this code
+    // is the only refusal of a non-const or volatile one), and a const object read before its
+    // initializer is visible (P68 round 13, fold F7 — the reason once read "the producer
+    // refuses such an initializer itself", which the compound literal's element made false).
+    S_StaticInitializerNotConstant        = 0xE08A,
+    // P68 round 13 (lane `cs`): a static initializer uses the COMMA operator, which C 6.6p3
+    // excludes from a constant expression; clang 18.1.3 (even -pedantic-errors) and MSVC
+    // 19.51 build `static int x = (1, 42);` and gcc 13.3.0 refuses it, so the union ACCEPTS
+    // it (`staticInitializers.otherConstantForms: commaOperator`) and this warning is the
+    // diagnostic the constraint asks for. A WARNING, suppressible; `--warnings-as-errors`
+    // restores the refusal. `.actual` is the comma expression.
+    S_StaticInitializerUsesTheCommaOperator = 0xE08B,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -2454,14 +2672,14 @@ enum class DiagnosticCode : std::uint16_t {
     // tooling already filtering on this code; new emissions use the
     // remediation-distinct codes below).
     D_TargetFormatMismatch        = 0xD00C,
-    // D_TargetMachineCodeMismatch: D-LK6-8.2 closure — the machine
+    // D_TargetMachineCodeMismatch: D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET closure — the machine
     // code declared on the FORMAT schema doesn't match the TARGET
     // schema's expected machine code for that format kind. Example:
     // `arm64:elf64-x86_64-linux-exec` declares `elf.machine=62`
     // (EM_X86_64) but the "arm64" target expects `elf.machine=183`
     // (EM_AARCH64). Pre-fold this dispatched silently into the wrong
     // PLT-stub emitter → SIGILL.
-    // D_TargetAbiModelMismatch: D-LK6-8.2 post-fold #1 closure — the
+    // D_TargetAbiModelMismatch: D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET post-fold #1 closure — the
     // target's `abiModel` (register-machine / operand-stack /
     // result-id) doesn't match the format's `kind` (Elf/Pe/MachO vs
     // Wasm vs Spirv). Example: register-machine x86_64 target paired
@@ -2539,7 +2757,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   lower (`lowerCuMirToAssembly`) returned a null module WITHOUT any tier
     //   having reported a diagnostic. Every real tier failure reports its own
     //   K_/L_/A_/S_/H_ code; a null-with-silent-reporter is a substrate-contract
-    //   violation (the D-PERF-4 buildCuMir-null contract). Mirrors the
+    //   violation (the D-PERF-4-CU-PARALLELISM buildCuMir-null contract). Mirrors the
     //   optimizer's X_OptReturnFalseWithoutDiagnostic guard so a future silent
     //   tier-reject surfaces loudly here instead of exiting 1 with no output
     //   (the D-CSUBSET-TESTTU-SILENT-EXIT1 class of silent-exit-1 bug).
@@ -3466,7 +3684,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   block-scope declaration of an identifier WITH LINKAGE: the identifier
     //   names an object whose storage lives in another translation unit, so an
     //   initializer would either redefine it locally (contradicting `extern`)
-    //   or be silently dropped at lowering (the D-FF2-3 fold replaced that
+    //   or be silently dropped at lowering (the D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE fold replaced that
     //   drop). ✔MEASURED — all three references refuse it: gcc 13.3.0 "'x' has
     //   both 'extern' and initializer", clang 18.1.3 "declaration of block
     //   scope identifier with linkage cannot have an initializer", MSVC
@@ -3502,7 +3720,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   a future grammar permitting recovery shapes that reach
     //   lowering would trip it. D-FF2 H2 audit fold (post-fold
     //   #8/#9).
-    //   (2) D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3a,
+    //   (2) the extern import-library form's closure (step 13.3a,
     //   2026-06-02): the optional trailing `"libname"` string-literal
     //   inside `externFuncTail` had a malformed C-escape sequence
     //   (e.g. `\xZZ`) — `decodeStringLiteralBody` returned nullopt
@@ -3554,17 +3772,18 @@ enum class DiagnosticCode : std::uint16_t {
     //   the goto — entering a guarded PC range sideways would give it a filter
     //   it must never have (MSVC rejects the construct too).
     H_SehJumpIntoRegion           = 0xF00F,
-    // H_SehEarlyExit (D-CSUBSET-SEH-EARLY-EXIT, trigger-gated): a return /
-    //   goto-out / break-out / continue-out from INSIDE a __try guarded body.
-    //   Option (C) of the c115 design-audit: the guarded body has exactly ONE
-    //   exit (the fall-through) so c116's scope-table region membership stays
-    //   CFG-derivable; sqlite's ~13 SEH sites have ZERO early exits
-    //   (amalgamation-swept). MSVC-legal — the anchor carries the
-    //   mark-every-exit design for when a real consumer fires the trigger.
+    // H_SehEarlyExit (D-CSUBSET-SEH-EARLY-EXIT, open): a return / goto-out /
+    //   break-out / continue-out from INSIDE a __try guarded body. Option (C)
+    //   of the c115 design-audit: the guarded body has exactly ONE exit (the
+    //   fall-through) so c116's scope-table region membership stays
+    //   CFG-derivable. MSVC and clang run every such exit (measured
+    //   2026-09-24), so the row is owed work; it carries the mark-every-exit
+    //   design.
     H_SehEarlyExit                = 0xF010,
-    // H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, trigger-gated): `&&label`
-    //   naming a label inside any part of a __try statement — a computed goto
-    //   could then enter the guarded range undetectably at compile time.
+    // H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, open since its 2026-09-24
+    //   re-verdict: clang runs the region-internal form): `&&label` naming a
+    //   label inside any part of a __try statement — a computed goto could then
+    //   enter the guarded range undetectably at compile time.
     H_SehLabelAddress             = 0xF011,
     // H_WideCharSurrogateUnsupported (C11/C23 6.4.5): a wide/UTF string literal
     //   whose CST→HIR lowering could not represent its (escape-decoded) body in the
@@ -3721,6 +3940,18 @@ enum class DiagnosticCode : std::uint16_t {
     //   one code. Two scopes, two rules, two codes, two remediations ("drop the
     //   `extern`" here; "remove the initializer" there).
     H_ExternRedundantOnDefinition = 0xF01B,
+    // P68 round 13 (lane `cs`, the static-initializer item): the initializer of an object of
+    // static storage duration, in a language whose static objects cannot be initialized at
+    // run time (`semantics.staticInitializers` declared — C 6.7.9p4), is not a constant the
+    // static-data producer folds: either it is not a constant expression — one the semantic
+    // tier's S_StaticInitializerNotConstant could not prove, like the truth value of a weak
+    // declaration's address or `(unsigned long long)&a * 2`, which every reference refuses —
+    // or it is a constant form this compiler does not fold yet (each such form a reference
+    // builds has its own registry row). Before this code the initializer became a RUNTIME
+    // initializer that the static-data producer refused under an object-format code
+    // (K_NoMatchingObjectFormat "has a runtime initializer"), or reached the module
+    // initializer's lowering. `.actual` states the two readings; the span is the initializer.
+    H_StaticInitializerNotFolded  = 0xF01C,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -3932,7 +4163,8 @@ enum class DiagnosticCode : std::uint16_t {
     //   (or `argFprs.size()` for an FPR-class arg). Stack-passed args
     //   need both a callee-side load from `[SP + caller-arg-offset]`
     //   and a caller-side store/push BEFORE the call. v1 register-only.
-    //   Anchor: D-ML7-2.2.
+    //   Anchor: D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7
+    //   (the registry row; its pre-migration plan-step spelling was ML7-2.2).
     // L_CcRegLookupFailed: the cc declares a register name in
     //   `argGprs`/`argFprs`/`returnGprs`/`returnFprs` that does not
     //   resolve via `schema.registerByName(...)` — schema misconfiguration
@@ -3947,7 +4179,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   cycle (e.g. swap two args between argGprs[0] and argGprs[1]).
     //   The v1 emit-in-order materialization would silently miscompile
     //   such a cycle — second mov reads a clobbered source. v1 detects
-    //   loud; D-ML7-2.3 anchors the proper parallel-copy resolution.
+    //   loud; D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS anchors the proper parallel-copy resolution.
     // L_IndirectCallUnsupported: the LIR `call` instruction's callee
     //   operand is neither a `SymbolRef` (direct call) nor a `Reg`
     //   (indirect call through a register — FC4 c2 landed that
@@ -4100,6 +4332,41 @@ enum class DiagnosticCode : std::uint16_t {
     // green build.
     L_ArgClassHasNoRegisterPool    = 0xB013,
     L_ArgClassPoolUndeclared       = 0xB014,
+    // L_SymbolIdSpaceExhausted (P68 round 8, lane `ht`, part 1c): MIR→LIR mints
+    // block, jump-table and sign-mask symbols PAST the module's highest function /
+    // global / extern SymbolId, and a module holding the top of the 32-bit space
+    // leaves no id above it. The minter used to WRAP to 0 — the invalid-symbol
+    // sentinel — and on up through ids the module already owns, and it would have
+    // handed out the writer-reserved `_tls_index` id on the way; each is a symbol
+    // aliased to another, a wrong-address miscompile behind a green build. Refused
+    // instead, by name. UNSUPPRESSABLE for that reason.
+    L_SymbolIdSpaceExhausted       = 0xB015,
+
+    // ── THE INLINE-ASM BUNDLE (P68 round 8 part 4) ──────────────────────
+    //
+    // One inline-asm statement is ONE LIR instruction while registers are
+    // allocated — the `asm_region` bundle (`lir/lir_asm_region.hpp`) — and its
+    // template becomes real instructions only after that. (0xB015 is lane
+    // `ht`'s `L_SymbolIdSpaceExhausted`.)
+    //
+    // L_AsmRegionMalformed: the bundle's bookkeeping disagrees with itself —
+    //   a region handle on an opcode that is not the bundle, or a bundle with
+    //   none; a slot count that differs from the operand count; a role-bearing
+    //   operand that is not a register; a malformed body. The expansion also
+    //   reports it for a bundle it cannot realize (an operand still virtual
+    //   after allocation, a body register that names no slot) and for a bundle
+    //   that SURVIVES the expansion. Any of these, shipped, is a statement
+    //   whose operands are read or written in the wrong register.
+    //
+    // L_AsmRegionOperandUnallocatable: an operand of one statement was spilled
+    //   and no register is left to hold it for the WHOLE statement — the
+    //   statement needs more registers of one class at once than the function
+    //   has. GCC reports the same situation as "'asm' operand has impossible
+    //   constraints". Reloading it anywhere INSIDE the template instead is
+    //   exactly the defect the bundle exists to remove.
+    // Both UNSUPPRESSABLE: suppressed, each is a wrong-register codegen.
+    L_AsmRegionMalformed           = 0xB016,
+    L_AsmRegionOperandUnallocatable = 0xB017,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //
@@ -4503,8 +4770,9 @@ enum class DiagnosticCode : std::uint16_t {
     K_CrossCuImageEmitDeferred     = 0x8012,
     // K_AbsolutePointerRelocMissing: the cross-CU merge (LK11b) needs an
     //   ABSOLUTE 64-bit pointer relocation kind to mint a GOT-like thunk
-    //   slot (so an INDIRECT cross-CU call — `call qword ptr [slot]` — reads
-    //   a slot containing the sibling definition's address). The merge finds
+    //   slot (so an INDIRECT cross-CU call — `call qword ptr [slot]` — or a
+    //   DATA read through a got-indirect slot reads a slot containing the
+    //   sibling definition's address). The merge finds
     //   that kind AGNOSTICALLY by formula (`widthBytes == 8 && !pcRelative`)
     //   on the active `TargetSchema` — never by a hardcoded "abs64" name /
     //   kind constant. This fires when NO relocation row on the target schema
@@ -4513,11 +4781,14 @@ enum class DiagnosticCode : std::uint16_t {
     //   Fail loud rather than emit an image whose cross-CU calls dereference
     //   a null slot. (A target that genuinely has no abs64 reloc must add the
     //   row to its `*.target.json` before it can host cross-CU indirect calls.)
-    //   c154: SCOPED to formats whose declared `externCallDispatch` is
-    //   `indirect-slot` — the only dispatch whose call sites dereference a
-    //   slot. A `direct-plt`/undeclared format binds the reference directly
-    //   to the sibling definition (no slot, no abs64 needed), so this never
-    //   fires there (pinned by Abs64GateFiresOnlyOnTheIndirectSlotArm).
+    //   SCOPED to a reference its code reads THROUGH A SLOT — the referencing
+    //   import row's `ExternImport::readThroughSlot`, MIR→LIR's own answer
+    //   (P68 round 9, D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT; c154
+    //   scoped it to an `indirect-slot` dispatch, which answers for FUNCTION
+    //   calls only, and a DATA import read through a got-indirect slot was
+    //   bound to the object itself). A reference its code reaches directly
+    //   binds to the sibling definition (no slot, no abs64 needed), so this
+    //   never fires for one (pinned by Abs64GateFiresOnlyOnTheIndirectSlotArm).
     K_AbsolutePointerRelocMissing  = 0x8013,
     // K_ImageExecBitFailed: setting the POSIX execute bit on a just-written
     //   EXECUTABLE-flavor output (writer.cpp `--output` path) failed —
@@ -4993,7 +5264,67 @@ enum class DiagnosticCode : std::uint16_t {
     //   shares with the code above, AND that suppressing a compiler-defect
     //   report is never a legitimate user action.
     K_StaticDataEncoderInvariantBreach = 0x8026,
-    // K-NEXT-SLOT: 0x8027 — grep this marker before adding a K_* code.
+    // K_FormatLacksRunpath (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH) — WARNING.
+    //   The build asked the image to record where its libraries are (CLI
+    //   `--rpath` / project `runpaths`) but the chosen object format declares
+    //   no `runpath` carrier — a PE image, a relocatable object, an archive —
+    //   so nothing is recorded and the artifact is written without it.
+    //   ACCEPTED, not refused, because that is what the references do:
+    //   mingw GNU ld (silently) and MSVC link (LNK4044) both accept an rpath
+    //   request for a PE image and emit a byte-identical image that runs,
+    //   the Windows loader searching the application directory instead. The
+    //   text says where the format's loader looks (the declared
+    //   `runpathUnsupportedReason`, or — for an object or archive — that
+    //   nothing loads it). Fires once per artifact (`reportUnrecordedRunpaths`).
+    //   SUPPRESSIBLE: suppressing it hides a request that had no effect and
+    //   ships the same bytes the references ship — neither prong of the
+    //   unsuppressable table applies.
+    K_FormatLacksRunpath           = 0x8027,
+    // K_InvalidRunpathRequest (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH) — ERROR.
+    //   A runpath entry no carrier can hold: an EMPTY entry (no reference
+    //   makes one work — GNU ld records `RUNPATH []` and the program still
+    //   exits 127 from the library's own directory; clang's driver drops the
+    //   argument and ld.lld takes the next one as the path), or one holding a
+    //   NUL byte (every carrier stores a NUL-terminated string). Fires from
+    //   `enforceImageRequest`, so the linker gate and every walker reached
+    //   directly refuse alike. UNSUPPRESSABLE on prong (2): the link still
+    //   fails without it, and it is the only statement of why.
+    K_InvalidRunpathRequest        = 0x8028,
+    // K_InputSectionSplit (P68 round 9) — ERROR. The link would split an input
+    //   section that the object's format makes the unit of placement
+    //   (`inputSectionPlacement`; see `InputSectionSlice` in `asm/asm.hpp`).
+    //   Cases: a code unit whose members are not consecutive, in offset order
+    //   and contiguous in the module the writers concatenate; a data unit whose
+    //   members span two data-section kinds or overlap; a unit that a writer's
+    //   excluded items would cut in two. Every one of those moves bytes that
+    //   the producer's code reaches by DISTANCE, with no relocation to repair
+    //   the reference, so the image would run a different program. Refused
+    //   rather than emitted. Always an Error, so it needs no row in the
+    //   unsuppressable table (that table's own rule for a new Error code).
+    K_InputSectionSplit            = 0x8029,
+    // K_ImportReferenceUnbindable (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL,
+    //   P68 round 9) — ERROR, once per import row, by name. An assembly reference
+    //   that states no code-vs-data kind (a `.s` address operand or data slot
+    //   naming a symbol the file does not define: `ExternKindOrigin::Pending`)
+    //   reached the link bound in a way no writer can honour:
+    //   (a) no definition stated the kind — no linked unit defines the name and
+    //       the library that binds it reports none (a stripped `.so` NOTYPE, a PE
+    //       forwarder); unbound, the same row is `K_SymbolUndefined`, as before;
+    //   (b) the definition is a library DATUM, named DIRECTLY (`leaq x(%rip)`,
+    //       `movq x(%rip)`, `.quad x`). That needs a copy relocation (gcc makes
+    //       one, -no-pie and -pie alike), which DSS does not make, and DSS binds
+    //       library data through a GOT slot, so the reference would silently
+    //       yield the SLOT's address.
+    //   Since P68 round 11 also (c), for a row whose kind WAS stated: the CODE
+    //   of a unit that does not read the import through a slot (every unit an
+    //   object reader produces — a pulled archive member, gcc's or DSS's own)
+    //   names a library DATUM through a non-GOT relocation (`R_X86_64_PC32
+    //   stdout`, gcc's default x86_64 PIE code). Same copy relocation, same
+    //   silent slot read before the arm existed (✔MEASURED 2026-09-24: exit 2
+    //   where gcc's link of the same archive exits 42).
+    //   Always an Error, so it needs no row in the unsuppressable table.
+    K_ImportReferenceUnbindable    = 0x802A,
+    // K-NEXT-SLOT: 0x802B — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
@@ -5072,7 +5403,7 @@ enum class DiagnosticCode : std::uint16_t {
     // F_HeaderInternalInvariant: an internal-invariant violation
     //   reached the header walker — a compiler bug, not a user-fixable
     //   issue. Remediation: file a bug.
-    // (D-FF2-3 CLOSED 2026-06-01 via `H_ExternHasInitializer`
+    // (D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE CLOSED 2026-06-01 via `H_ExternHasInitializer`
     // (0xF00A) at the lowering tier — the FFI walker reuses the
     // c frontend, so the reject reaches it through the
     // shared lowering pipeline; no separate F_* code needed.
@@ -5131,7 +5462,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   conservative `unapplyCMangling` which silently passes such
     //   input through. Used by FF5 ingest where the format-kind
     //   is authoritative and a missing prefix is a structural
-    //   anomaly. (D-FF4-3 post-fold-#3.)
+    //   anomaly. (D-FF4-3-STRICT-MANGLE-PREFIX-CHECK post-fold-#3.)
     F_MangleMissingExpectedPrefix  = 0x5014,
     // F_FfiIngestDuplicateSymbol: FF5 ingest() saw the same canonical
     //   symbol exposed by more than one IngestionSource. First-source-
@@ -5492,6 +5823,35 @@ enum class DiagnosticCode : std::uint16_t {
     // honoured. A message reading only "importName ignored" sends the reader
     // hunting through a manifest for which entry it meant.
     F_DeclaredImportNameNotRecordable = 0x5028,
+    // ── D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION ──
+    //
+    // F_ShippedSymbolDeclaresNoBodyForFormat: a shipped-descriptor row the
+    // `#include` path injects is declared AVAILABLE on the active object format
+    // yet names NO BODY for it there — no `library` image, no `realization`
+    // source, no `synthesize` recipe (`ShippedRealizationStatus::
+    // NoLibraryForFormat`). There is nothing an import could bind to. The fact
+    // is about three things the reader can act on, and the `.actual` names all
+    // three — the DESCRIPTOR (path and header), the SYMBOL, the FORMAT — plus the
+    // three ways to give the row a body there.
+    //
+    // RAISED WHERE IT IS DECIDED: `ffi::refuseShippedSymbolWithoutABody` (built
+    // on the `realizeRow` kernel the corpus oracle uses), asked by the semantic
+    // tier's shipped-surface injection per row it injects, and positioned on the
+    // `#include`. ✔MEASURED before this code existed (a config tree whose
+    // `dirent.json` lost its `pe` realization): the build stopped three tiers
+    // lower on `H_UnsupportedLoweringForKind` "HIR ExternFunction (id N) —
+    // `importLibrary` is missing from the HirAttribute<FfiMetadata> side-table",
+    // an internal attribute and a node id naming none of the three.
+    //
+    // ⚠ NOT the retired 0x5019 above, whose number stays reserved for its own
+    // meaning (a LANGUAGE-level default image). And the HAND-WRITTEN declaration's
+    // road is unchanged: a bare `extern` of such a name is answered by the oracle
+    // as `NoLibraryForFormat` and still routes UNBOUND to the link tier.
+    //
+    // Member of `kUnsuppressableCodes`, prong (2): the semantic tier's error gate
+    // stops the build whether or not this line is shown, so a suppressed report
+    // would leave a non-zero exit with nothing naming the row.
+    F_ShippedSymbolDeclaresNoBodyForFormat = 0x5029,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
@@ -5535,7 +5895,7 @@ inline constexpr std::string_view kUnallocatedDiagnosticCodeName = "Unknown";
 // ⚠ Deliberately ASCII and deliberately not alphanumeric: every consumer that
 // scrapes codes out of compiler output keys on `[A-Z][0-9A-F]{4}`, so this
 // value makes an unallocated family INVISIBLE to those scrapers rather than
-// silently mis-attributed to the parser. (`scripts/corpus-census` was
+// silently mis-attributed to the parser. (`.harness-config/runner/actions/corpus-census` was
 // mis-attributing the entire X_* optimizer family to the parser for exactly
 // that reason.)
 inline constexpr char kUnallocatedFamilyLetter = '?';
@@ -5556,7 +5916,13 @@ inline constexpr char kUnallocatedFamilyLetter = '?';
 // into PREPROCESSING tokens; PHASE 7 converts each preprocessing token into a
 // token. A judgement phase 7 makes cannot apply to a preprocessing token that is
 // never converted — the text of a skipped conditional group is divided into
-// preprocessing tokens and, per C 6.10.1p6, *not otherwise processed*.
+// preprocessing tokens and, per C 6.10.1p6, *not otherwise processed*; and so is
+// much LIVE text: the words of an `#error` or `#warning`, a replacement list no
+// one expands, a stringized argument. The gate in `preprocess()` delivers a code
+// of this class only for a token that was CONVERTED — one that reached the
+// parser, or sat in an evaluated `#if`/`#elif` operand
+// ([[D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED]], which records
+// the four-reference measurement that moved it off byte liveness).
 //
 // ★★ WHY IT IS A PROPERTY OF THE CODE AND NOT A LIST AT THE GATE. The
 // preprocessor already suppressed exactly ONE code (`P_IllegalChar`) inside a

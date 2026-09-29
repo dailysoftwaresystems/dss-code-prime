@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -361,6 +362,41 @@ enum class LirOperandKind : std::uint8_t {
     // LirSpillSlot.v) + `spillSlotClass` (the value's LirRegClass, so callconv
     // picks the class-correct load).
     SpillSlotRef = 10,
+    // ★★★ A MEMORY DISPLACEMENT THAT IS A SYMBOL'S ADDRESS PLUS A CONSTANT —
+    // the `msg+4` of `msg+4(%rip)` (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    // It stands where a `MemOffset` stands, and is one: a variant guard's
+    // `memoffset` position accepts either, so every memory form a target already
+    // declares takes a symbolic displacement with no variant of its own. The
+    // encoder writes a RELOCATION into the displacement field instead of a
+    // number. `litIndex` names the module literal pool's `LirSymbolAddress`
+    // entry, because the symbol and the addend together do not fit 8 bytes.
+    // ⚠ NO VALUE AXIS READS IT: its value is a link-time address, so a variant
+    // bounding its displacement (`immMin`/`immMax`) never matches it — the
+    // strict reading, since no bound can be proven of a value nobody knows yet.
+    MemSymbolOffset = 11,
+    // ★★ A SYMBOL'S ADDRESS PLUS A CONSTANT IN A **SYMBOL** POSITION — the
+    // `msg+8` of `adrp x0, msg+8` / `adr x0, msg-4` (P68 round 9, the aarch64
+    // twins). `SymbolRef` carries a symbol id and nothing else, so an addend
+    // rides the literal pool's `LirSymbolAddress` entry, exactly as
+    // `MemSymbolOffset` carries one in a displacement position; a guard's
+    // `symbol` position accepts either. A symbol with no constant stays a
+    // `SymbolRef`.
+    SymbolAddress = 12,
+    // ★★ THE ADDRESS OF THE INSTRUCTION THAT CARRIES IT — the location counter
+    // `.` of `adr x7, .` / `adr x7, .+8` (P68 round 9, the aarch64 twins). It is
+    // a LOCATION OF THIS FUNCTION, as a `BlockRef` is, and a guard's `blockref`
+    // position takes either: the field is resolved at assemble time, the
+    // constant after the dot rides the instruction's `block.addend` wire exactly
+    // as a block's does, and no relocation exists. ✔MEASURED 2026-09-23, gas
+    // 2.42 and clang 18 (ELF and Darwin): `adr x7, .` = 0x10000007, `adr x7,
+    // .+8` = 0x10000047, `adr x7, .-4` = 0x10FFFFE7. ★ IT IS NOT A BLOCK, and
+    // that is the point: a `.` is no label in the reference assemblers, so
+    // beginning a block at its line would put a fall-through jump in front of
+    // it (D-ASM-FALLTHROUGH-INTO-A-LABEL-EMITS-A-JUMP) and move every `.±N`
+    // that spans it. No payload: the field's distance is the addend alone.
+    // Never a branch target — a branch names a successor BLOCK, and `b .`
+    // reaches one (`LirOperandKind::BlockRef`).
+    LocationCounter = 13,
 };
 
 // One slot in the operand pool. The tag picks the active field.
@@ -372,7 +408,18 @@ struct LirOperand {
     // clamps the matching class cursor so a SUBSEQUENT arg/vararg of that class also
     // goes to memory (matching the callee's va_start clamp). Unused (0) for any other
     // operand kind. Repurposes one padding byte — no struct-size change.
-    std::uint8_t   byValueAggExhaust = 0;        // 1
+    union {
+        std::uint8_t byValueAggExhaust = 0;      // 1
+        // P68 round 9: for a `SymbolRef`, `SymbolAddress` or `MemSymbolOffset`,
+        // WHICH PART of the symbol's address the operand denotes
+        // (`SymbolAddressPart` as its underlying byte — `adrp`'s page, a load's
+        // page offset). Read through `symbolAddressPart()`. 0 is `Whole`, what
+        // every producer that states no part leaves, so a plain symbol operand
+        // is unchanged. The same padding byte `byValueAggExhaust` repurposes —
+        // the two kinds never meet on one operand, and `LirOperand` stays 8
+        // bytes.
+        std::uint8_t symbolPartByte;
+    };
     // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): for a SpillSlotRef operand, the
     // value's LirRegClass (as a uint8 — GPR/FPR/...) so callconv resolves the
     // class-correct load op. Repurposes one of the two padding bytes — no
@@ -408,7 +455,7 @@ struct LirOperand {
         std::uint32_t symbolV;    // 4 — kind == SymbolRef → SymbolId.v
         std::uint32_t scale;      // 4 — kind == MemBase (1/2/4/8)
         std::int32_t  offset;     // 4 — kind == MemOffset
-        std::uint32_t litIndex;   // 4 — kind == LiteralIndex (into LirLiteralPool)
+        std::uint32_t litIndex;   // 4 — kind == LiteralIndex / MemSymbolOffset / SymbolAddress (into LirLiteralPool)
         std::uint32_t byValueAggBytes; // 4 — kind == ByValueStackAgg (aggregate byte size)
         std::uint32_t spillSlotV; // 4 — kind == SpillSlotRef (LirSpillSlot.v)
     };
@@ -452,11 +499,41 @@ struct LirOperand {
         o.blockSlot = v;
         return o;
     }
-    [[nodiscard]] static constexpr LirOperand makeSymbolRef(std::uint32_t v) noexcept {
+    // The address of the instruction that carries it (`.`). See
+    // `LirOperandKind::LocationCounter`.
+    [[nodiscard]] static constexpr LirOperand makeLocationCounter() noexcept {
         LirOperand o{};
-        o.kind     = LirOperandKind::SymbolRef;
-        o.symbolV  = v;
+        o.kind = LirOperandKind::LocationCounter;
         return o;
+    }
+    [[nodiscard]] static constexpr LirOperand
+    makeSymbolRef(std::uint32_t v,
+                  SymbolAddressPart part = SymbolAddressPart::Whole) noexcept {
+        LirOperand o{};
+        o.kind           = LirOperandKind::SymbolRef;
+        o.symbolV        = v;
+        o.symbolPartByte = static_cast<std::uint8_t>(part);
+        return o;
+    }
+    // A symbol plus a constant in a symbol position: `idx` names the module
+    // literal pool's `LirSymbolAddress` entry. See `LirOperandKind::SymbolAddress`.
+    [[nodiscard]] static constexpr LirOperand
+    makeSymbolAddress(std::uint32_t idx,
+                      SymbolAddressPart part = SymbolAddressPart::Whole) noexcept {
+        LirOperand o{};
+        o.kind           = LirOperandKind::SymbolAddress;
+        o.litIndex       = idx;
+        o.symbolPartByte = static_cast<std::uint8_t>(part);
+        return o;
+    }
+    // Which part of a symbol's address a symbolic operand denotes; `Whole` for
+    // every operand kind that names no symbol.
+    [[nodiscard]] constexpr SymbolAddressPart symbolAddressPart() const noexcept {
+        if (kind != LirOperandKind::SymbolRef && kind != LirOperandKind::SymbolAddress
+            && kind != LirOperandKind::MemSymbolOffset) {
+            return SymbolAddressPart::Whole;
+        }
+        return static_cast<SymbolAddressPart>(symbolPartByte);
     }
     [[nodiscard]] static constexpr LirOperand makeMemBase(std::uint32_t scale) noexcept {
         LirOperand o{};
@@ -474,6 +551,17 @@ struct LirOperand {
         LirOperand o{};
         o.kind     = LirOperandKind::LiteralIndex;
         o.litIndex = idx;
+        return o;
+    }
+    // A symbolic memory displacement: `idx` names the module literal pool's
+    // `LirSymbolAddress` entry. See `LirOperandKind::MemSymbolOffset`.
+    [[nodiscard]] static constexpr LirOperand
+    makeMemSymbolOffset(std::uint32_t idx,
+                        SymbolAddressPart part = SymbolAddressPart::Whole) noexcept {
+        LirOperand o{};
+        o.kind           = LirOperandKind::MemSymbolOffset;
+        o.litIndex       = idx;
+        o.symbolPartByte = static_cast<std::uint8_t>(part);
         return o;
     }
     // FC12a-struct: the by-value-aggregate stack-arg size marker. ALWAYS emitted
@@ -676,6 +764,59 @@ lirRegConstraintIndexForHandle(std::uint32_t handle) noexcept {
     return handle - 1;
 }
 
+// ── per-instruction ASM-REGION pool (P68 round 8 part 4) ─────────────────
+//
+// ★★★ ONE INLINE-ASM STATEMENT IS ONE INSTRUCTION WHILE REGISTERS ARE
+// ALLOCATED. A template used to be lowered into the enclosing function as one
+// LIR instruction per template line, each its own allocation point — so the
+// allocator's spill and reload code landed BETWEEN the template's own
+// instructions (✔MEASURED 2026-09-21: x86_64 release, six inputs, 29 lines and
+// 15 memory accesses between two `nop` delimiters of a 7-line template). An
+// `ldaxr`/`stlxr` pair with a store between them never succeeds, so such a
+// template under register pressure LOOPS FOREVER. The statement is now an
+// `asm_region` bundle: its operands are the template's operand registers, its
+// BODY — the template lowered by the shared engine into a scratch one-function
+// module — lives HERE, and `expandAsmRegions` (`lir_asm_region.hpp`) replaces
+// the bundle with the body once allocation is final.
+//
+// Same by-index, identity-preserving, 1-based-handle discipline as
+// `LirRegConstraintPool`: carried across every rebuild by
+// `lir_pass_util::copyModuleSideStructures` + `carryInstSideData`, and a
+// dropped handle is a pool entry no instruction references, which
+// `checkSideStructureIntegrity` reports. The entry is held by `shared_ptr`
+// because a region is IMMUTABLE once packaged and every rebuild copies the
+// pool: sharing is the copy.
+struct LirAsmRegion;   // lir/lir_asm_region.hpp
+
+class DSS_EXPORT LirAsmRegionPool {
+public:
+    // Append a region; returns its INDEX (0-origin). Aborts on null.
+    [[nodiscard]] std::uint32_t add(std::shared_ptr<LirAsmRegion const> region);
+    // Aborts on an out-of-range index — a handle that outlived its pool.
+    [[nodiscard]] LirAsmRegion const& at(std::uint32_t index) const;
+    [[nodiscard]] std::shared_ptr<LirAsmRegion const> const&
+    shared(std::uint32_t index) const;
+    [[nodiscard]] std::size_t size()  const noexcept { return pool_.size(); }
+    [[nodiscard]] bool        empty() const noexcept { return pool_.empty(); }
+
+private:
+    std::vector<std::shared_ptr<LirAsmRegion const>> pool_;
+};
+
+// "This instruction is not an asm region" — 0, so every instruction ever
+// built means "none" by construction (the `kLirNoRegConstraints` argument).
+inline constexpr std::uint32_t kLirNoAsmRegion = 0;
+
+[[nodiscard]] constexpr std::uint32_t
+lirAsmRegionHandleForIndex(std::uint32_t poolIndex) noexcept {
+    return poolIndex + 1;
+}
+// Precondition: `handle != kLirNoAsmRegion`.
+[[nodiscard]] constexpr std::uint32_t
+lirAsmRegionIndexForHandle(std::uint32_t handle) noexcept {
+    return handle - 1;
+}
+
 namespace detail {
 
 // ── instruction POD ──────────────────────────────────────────────
@@ -719,6 +860,11 @@ struct LirInst {
     // leaves a pool entry that NO instruction references, and that is
     // detectable from the rebuilt module alone.
     std::uint32_t regConstraints = kLirNoRegConstraints;
+    // 4 — 1-based handle into the module's `LirAsmRegionPool`;
+    // `kLirNoAsmRegion` (0) = this instruction is not an asm-region bundle.
+    // Carried EXACTLY like `regConstraints` (`carryInstSideData`), and for the
+    // same reason it cannot ride `addInst`.
+    std::uint32_t asmRegion = kLirNoAsmRegion;
 };
 static_assert(sizeof(LirInst) <= 32, "detail::LirInst grew unexpectedly");
 static_assert(std::is_trivially_copyable_v<LirInst>);

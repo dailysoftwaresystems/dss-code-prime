@@ -3,16 +3,18 @@
 #include "core/substrate/path_identity.hpp"
 
 #include "core/export.hpp"
-#include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
+#include "core/types/data_model.hpp"   // DataModel, LongDoubleFormat (the pair's `when` facts)
 #include "core/types/declared_qualification.hpp" // DeclaredQualification (a row's const/restrict claim)
 #include "core/types/include_path_resolve.hpp" // HeaderNameMatching + HeaderSearchResult (the `includes` closure walk's case policy)
 #include "core/types/named_type_binding.hpp" // NamedTypeBinding (c82 va_list alias thread-through)
 #include "core/types/object_format_kind.hpp" // ObjectFormatKind (availability predicate)
 #include "core/types/preprocess_config.hpp"  // PredefinedMacroDef / ShippedSurfaceClaim (the `impliedSurface` satisfaction half)
 #include "core/types/strong_ids.hpp"   // TypeId
+#include "core/types/type_lattice/core_type.hpp" // TypeKind (a constant's declared core, ShippedPpConstant)
 
 #include <cstddef>     // std::size_t (ShippedDescriptorCacheStats)
 #include <cstdint>
+#include <expected>    // std::expected (readShippedTypedefIdentities)
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -23,6 +25,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>     // std::pair (ShippedPairFacts::abiTypedefs)
 #include <vector>
 
 // ── LANGUAGE-NEUTRAL shipped-library FFI descriptor reader ───────────────────
@@ -99,8 +102,10 @@
 namespace dss {
 
 class DiagnosticReporter;
+class GrammarSchema;   // ShippedPairFacts::language — the consuming language's vocabulary
 class TypeInterner;
 class TypeRegistry;
+struct ParseDiagnostic;   // `refuseShippedSymbolWithoutABody`'s answer; see the note below
 // ⚠ DECLARED, NOT INCLUDED — see `diagnosticCodeForShippedSourceLookup` below.
 // `parse_diagnostic.hpp` is large and this header is widely included; a scoped enum
 // with a declared underlying type is exactly the forward-declarable case, so the
@@ -430,16 +435,72 @@ struct DSS_EXPORT ShippedConstant {
 // One `constants` row PROJECTED into the PREPROCESSOR's vocabulary — the
 // interner-free view `readShippedLibConstants` returns. `TypeId` cannot cross
 // this boundary (it is per-CompilationUnit and the preprocessor has no
-// interner), so the two facts a phase-4 spelling actually needs travel as DATA:
-// the value's bit pattern and the declared type's signedness + width. Rendering
-// them back into a source-language literal is the LANGUAGE tier's job (the
-// preprocessor splice, driven by `semantics.integerLiteralTyping`), never this
-// one — `src/ffi` stays free of any language's literal spelling.
+// interner), so the facts a spelling needs travel as DATA: the value's bit
+// pattern, the declared type's signedness + width (phase 4), and its IDENTITY —
+// core and vocabulary tag (phase 7). Rendering them back into a source-language
+// literal is the LANGUAGE tier's job (the preprocessor splice, driven by
+// `semantics.integerLiteralTyping`), never this one — `src/ffi` stays free of
+// any language's literal spelling.
+//
+// ★ THE IDENTITY IS NEW, AND IT IS THE P68 ROUND-9 FIX
+// (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS). The splice spelled a
+// constant by its signedness alone, so its C TYPE was whatever the least-decorated
+// literal of that signedness typed to: `<stdint.h>`'s `INT64_MAX` came out `long`
+// on Mach-O where `int64_t` is `long long`, and a `LONG_MAX` on pe would have
+// been an `int`. The splice now requires the literal's PHASE-7 type to be
+// exactly (`core`, `vocabularyName`).
 struct DSS_EXPORT ShippedPpConstant {
     std::string  name;
     std::int64_t value      = 0;      // bit pattern, exactly as ShippedConstant::value
     bool         isUnsigned = false;  // the declared integer scalar's signedness
     unsigned     width      = 0;      // the declared integer scalar's width, in bits
+    TypeKind     core       = TypeKind::Void;  // the declared type's core (I8..U128)
+    std::string  vocabularyName;      // its vocabulary tag; empty = the anonymous type
+};
+
+// ══ THE ACTIVE PAIR'S FACTS A DERIVED ROW IS REALIZED FROM ═══════════════════
+// (P68 round 9, D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS)
+//
+// A `constants` row may NAME a type and a limit instead of stating a value —
+// `{ "name": "LONG_MAX", "of": "long", "limit": "max" }` — because C 5.2.5.3.2
+// gives each `<limits.h>` macro its type's promoted type AND value, and those are
+// per PAIR: `long` is 32 bits on pe and 64 on ELF/Mach-O, plain `char` is unsigned
+// on aarch64 Linux only. A fixed row would be right on some pairs and silently
+// wrong on the rest. The reader realizes such a row from these facts, supplied by
+// the caller that has them (the preprocessor splice and the semantic tier build
+// them from the same `applyTargetFormatPair` inputs):
+//
+//   * `language` — the CONSUMING language. Its vocabulary resolves `of`
+//     (`resolveLanguageTypeName`, the loader's own resolver) and its integer
+//     promotions (`arithmeticConversions`) give a max/min row its type. nullptr ⇒
+//     no derived row is realized (a descriptor read for validation only).
+//   * `dataModel` — the pair's; nullopt means NO PAIR, and a fact that depends on
+//     it (`long`'s width) is then NOT realized — never borrowed from a default.
+//     A fact the data model cannot change (`int`) is realized without one.
+//   * `charIsUnsigned` — the pair's plain-`char` signedness
+//     (`TargetSchema::charIsUnsigned`); nullopt ⇒ `char`'s range is unknown and a
+//     row of `char` is not realized.
+//   * `abiTypedefs` — the TARGET's platform ABI typedefs resolved for this format
+//     (`TargetSchema::abiTypedefCore`, the table `__SIZEOF_WCHAR_T__` reads):
+//     (name, integer core). A `typedefs` entry (or variant) that names one —
+//     `{ "name": "wchar_t", "abiTypedef": "wchar_t" }` — takes its type from here
+//     (P68 round 9, D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): `wchar_t` is a
+//     processor × platform fact, and `<stddef.h>` restating it per format said
+//     `int` for aarch64 Linux, whose `wchar_t` is `unsigned int`. Empty ⇒ such an
+//     entry is not injected (the undefined name then fails loud at its use).
+struct DSS_EXPORT ShippedPairFacts {
+    GrammarSchema const*     language = nullptr;
+    std::optional<DataModel> dataModel;
+    std::optional<bool>      charIsUnsigned;
+    std::vector<std::pair<std::string, TypeKind>> abiTypedefs;
+    // P68 round 12 (S2a-1 of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES): the
+    // pair's LONG-DOUBLE FORMAT (the format document's `longDoubleFormat`), the
+    // fact a `when: { "longDoubleFormat": … }` arm is selected by — the
+    // representation of C's `long double` belongs to the format document, not
+    // to arch, format kind or data model. nullopt / `None` ⇒ no such arm can
+    // match (a key naming an absent fact never matches), never a borrowed
+    // default.
+    std::optional<LongDoubleFormat> longDoubleFormat;
 };
 
 // One decoded named FLOAT CONSTANT — the float-valued sibling of `ShippedConstant`
@@ -956,6 +1017,21 @@ validateShippedIncludeClosure(std::filesystem::path const&      descriptorDir,
 // instead of naming a macro and leaving the author to grep three families.
 //
 // Returns false (diagnostics already reported) on any unsatisfied requirement.
+//
+// [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]: a COMPILE
+// calls the form taking its `HeaderSearchCache`, so the claimed headers and their
+// closures are looked up in the listings the rest of the compile already read.
+// The form without one is for a check with no compile around it (the
+// `--dump-predefined-macros` report, unit tests): it lists for itself, once per
+// directory for that one call.
+[[nodiscard]] DSS_EXPORT bool
+validateShippedSurfaceRequirements(
+    std::span<PredefinedMacroDef const>    macros,
+    std::string_view                       declaringDocument,
+    std::span<std::filesystem::path const> systemDirs,
+    std::optional<ObjectFormatKind>        activeFormat,
+    DiagnosticReporter&                    reporter,
+    HeaderSearchCache&                     cache);
 [[nodiscard]] DSS_EXPORT bool
 validateShippedSurfaceRequirements(
     std::span<PredefinedMacroDef const>    macros,
@@ -981,15 +1057,16 @@ validateShippedSurfaceRequirements(
 // On success the returned descriptor is fully populated and every symbol's
 // `signature` is a valid TypeId in `interner`.
 // FC3 c1 `dataModel`: the ACTIVE format's width triple (threaded from
-// `analyze()`, which is per-(CU × target)). A symbol MAY carry a
-// `signatureByDataModel` object ({"LLP64": "fn(...) -> i32", …} — the
-// Model-3 `library`-map shape) whose entry for the active model REPLACES
-// the base `signature` (the base text is the LP64-correct form). Every
-// declared override must parse — a malformed override fails the read
-// even when its model is not the active one (it would otherwise lurk
-// until that model's first compile). Unknown model keys fail loud.
-// Defaulted for direct-API/unit callers (LP64 = the base-signature
-// identity); the semantic analyzer always passes its threaded model.
+// `analyze()`, which is per-(CU × target)). A symbol's `signature` MAY be a
+// per-pair OBJECT — `{ "variants": [ { "when": {…}, "value": "fn(…)" }, …,
+// { "default": true, "value": "fn(…)" } ] }`, the `version` / `linkName`
+// shape — selected by the ONE `when` selector (core/types/variant_when.hpp)
+// over arch, format, data model and long-double format (P68 round 12, S2a-1;
+// it replaced the data-model-only `signatureByDataModel` map). Every arm must
+// parse — a malformed arm fails the read even when no current pair selects it
+// — and a pair no arm selects is REFUSED by name unless a `default` arm serves
+// it: there is no silent fallback. Defaulted for direct-API/unit callers
+// (LP64); the semantic analyzer always passes its threaded model.
 // Plan-25 `activeTarget` / `activeFormat`: the ACTIVE compile target's
 // (arch name, object-format) — the per-target STRUCT-VARIANT selector. A
 // `structs` entry that declares `variants` is decoded by selecting the
@@ -1004,8 +1081,8 @@ validateShippedSurfaceRequirements(
 // field fails loud (P56 — see the arm in the .cpp for why the stricter
 // "publish nothing" rule was refuted). EAGER: every variant's field list is
 // decoded regardless of which is active (a malformed INACTIVE variant fails
-// the whole read on EVERY target — anti-lurking, mirrors
-// `signatureByDataModel`). Both default to nullopt for direct-API/LSP/unit
+// the whole read on EVERY target — anti-lurking, mirrors the `signature`
+// variants). Both default to nullopt for direct-API/LSP/unit
 // callers ⇒ no variant selection (a flat-`fields` struct decodes exactly as
 // before; a struct that carries ONLY `variants` contributes no layout when
 // no selector is available).
@@ -1064,6 +1141,16 @@ struct DSS_EXPORT ShippedDescriptorCacheStats {
 // string: the stated UNBOUND arm, byte-identical to an omitted key. Every
 // producer of an `ExternImport` (the driver's `analyze()` call and its
 // archive-member / assembly binders) passes one.
+//
+// ── `pairFacts` (P68 round 9, D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS)
+//
+// What a LATTICE-DERIVED `constants` row (`{name, of, limit}`) is realized from —
+// see `ShippedPairFacts`. `nullptr` (the default) realizes none: the row is still
+// VALIDATED (its keys, its `limit` verb), and injects nothing, exactly like a
+// `variants` row no target selects. The semantic tier passes the facts it built
+// for the pair; a validation-only reader passes none. Its `dataModel`, when
+// engaged, is the SAME model as `dataModel` above — the caller builds both from
+// one pair.
 [[nodiscard]] DSS_EXPORT std::optional<ShippedLibDescriptor>
 readShippedLibDescriptor(std::filesystem::path const&    path,
                          TypeInterner&                   interner,
@@ -1073,7 +1160,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                          std::optional<std::string_view> activeTarget = std::nullopt,
                          std::optional<ObjectFormatKind> activeFormat = std::nullopt,
                          std::span<NamedTypeBinding const> namedTypes = {},
-                         RuntimeLibraryRoleResolver const* roleResolver = nullptr);
+                         RuntimeLibraryRoleResolver const* roleResolver = nullptr,
+                         ShippedPairFacts const*         pairFacts    = nullptr);
 
 // Read ONLY the `macros` surface from the neutral descriptor at `path`, WITHOUT a
 // TypeInterner. Macros are pure preprocessor token text (no types), so the
@@ -1137,11 +1225,135 @@ readShippedLibMacros(std::filesystem::path const&    path,
 // diagnostics, exactly as it already does for `readShippedLibMacros`, so a
 // malformed `constants` surface is reported ONCE — by the import-resolver /
 // semantic tier that owns the positioned message.
+//
+// `pairFacts` (P68 round 9): the pair a LATTICE-DERIVED row is realized for —
+// the same facts the semantic read receives, so the two seams realize the same
+// value and type. Its `dataModel` also selects a `when:{dataModel}` typedef
+// variant a derived row's `of` names (the descriptor's typedefs are decoded
+// here for that alone, into a scratch reporter, so a typedef that needs the
+// semantic tier's cross-descriptor bindings costs nothing but its own rows).
+// nullptr ⇒ no derived row is realized, and no data model is assumed.
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<ShippedPpConstant>>
 readShippedLibConstants(std::filesystem::path const&    path,
                         DiagnosticReporter&             reporter,
                         std::optional<std::string_view> activeTarget = std::nullopt,
-                        std::optional<ObjectFormatKind> activeFormat = std::nullopt);
+                        std::optional<ObjectFormatKind> activeFormat = std::nullopt,
+                        ShippedPairFacts const*         pairFacts    = nullptr);
+
+// ══ THE LATTICE, ASKED OF ONE TYPE ════════════════════════════════════════════
+// (P68 round 9) A C integer type's LIMIT on a pair — its maximum, minimum or
+// width — as a value AND the type that value has: the promoted type for `max` /
+// `min` (C 5.2.5.3.2, 7.22.2p1: `USHRT_MAX` is an `int`, `ULONG_MAX` an `unsigned
+// long`), the promotion floor for `width`. The ONE computation both readers of the
+// fact run: a descriptor's lattice-derived `constants` row (`LONG_MAX`, after it
+// has resolved its `of`) and a `type-limit` predefined macro (`__LONG_MAX__`,
+// `__INT_FAST16_MAX__`). A POINTER's width (its bits under the pair's data model)
+// is the one limit of a non-integer type it answers (`__POINTER_WIDTH__`).
+//
+// REALIZED or NOT, never guessed: `Unrealized` when the answer depends on a fact
+// the pair does not supply (plain `char` with no signedness, no language, a data
+// model that decides it with none given); `Refused` when the question has no
+// answer (not an integer type, a language with no integer promotion, a value the
+// 64-bit carrier or the promoted type cannot hold) — `refusal` names which.
+enum class DerivedIntegerLimitOutcome : std::uint8_t { Realized, Unrealized, Refused };
+enum class DerivedIntegerLimitRefusal : std::uint8_t {
+    None,
+    NotAnIntegerType,    // the type has no range
+    NoIntegerPromotion,  // the language declares no `arithmeticConversions`
+    PromotedNotInteger,  // the promoted type is not an integer scalar
+    CarrierOverflow,     // the value does not fit the 64-bit carrier
+    NotRepresentable,    // the value does not fit its own (promoted) type
+};
+struct DSS_EXPORT DerivedIntegerLimitResult {
+    DerivedIntegerLimitOutcome outcome = DerivedIntegerLimitOutcome::Unrealized;
+    DerivedIntegerLimitRefusal refusal = DerivedIntegerLimitRefusal::None;
+    std::int64_t value = 0;            // bit pattern, exactly as a flat row's `value`
+    TypeKind     core  = TypeKind::Void;   // the VALUE's type: core …
+    std::string  vocabularyName;           // … and vocabulary tag (empty = anonymous)
+    // … and that type's signedness and width in bits, from the one integer-kind
+    // truth table this file owns — so a reader spelling the value (the typed
+    // splice's `ShippedPpConstant`) never keeps a second copy of it.
+    bool         isUnsigned = false;
+    unsigned     width      = 0;
+};
+[[nodiscard]] DSS_EXPORT DerivedIntegerLimitResult
+deriveIntegerLimitOnPair(TypeKind core, std::string_view vocabularyName,
+                         IntegerTypeLimit limit, ShippedPairFacts const* pair);
+
+// One typedef of a shipped descriptor, PROJECTED for the preprocessor — its name
+// and its IDENTITY on the pair (core + vocabulary tag), the interner-free view
+// `readShippedTypedefIdentities` returns (P68 round 9). A `type-name` /
+// `type-limit` / `type-suffix` predefined macro naming a `shippedTypedef` reads
+// it: GCC documents `__INT_FAST16_TYPE__` as "the correct underlying type" of
+// `int_fast16_t`, and the pair's descriptor is where DSS states that type.
+struct DSS_EXPORT ShippedPpTypedef {
+    std::string name;
+    TypeKind    core = TypeKind::Void;
+    std::string vocabularyName;
+};
+
+// Read the TYPEDEFS of the descriptor at `path` for one pair, WITHOUT an interner:
+// the `readShippedLibConstants` sibling, through the SAME `decodeShippedTypedefs`
+// the semantic tier injects them by — so the macro that names a typedef and the
+// typedef the program declares cannot select different variants. The variants are
+// selected by (`activeTarget`, `activeFormat`, the pair's data model); a typedef
+// whose type needs a cross-descriptor binding only the semantic tier holds
+// (`va_list`) is decoded into a SCRATCH reporter and simply absent here, exactly
+// as it is for a derived constant's `of`.
+// ⓘ NO REPORTER PARAMETER, deliberately: the one caller is the predefined-macro
+// merge, which reports through its own `conflicts` and holds no budget — a
+// reporter argument would force a throwaway into a budget-threaded file. An
+// unreadable document is the error, as its first diagnostic's text.
+[[nodiscard]] DSS_EXPORT std::expected<std::vector<ShippedPpTypedef>, std::string>
+readShippedTypedefIdentities(std::filesystem::path const&    path,
+                             std::optional<std::string_view> activeTarget,
+                             std::optional<ObjectFormatKind> activeFormat,
+                             ShippedPairFacts const*         pairFacts);
+
+// ══ A TYPEDEF OF A SHIPPED HEADER, NAMED BY THAT HEADER ═══════════════════════
+// (P68 round 9, D-FFI-STDINT-LIMIT-MACROS) Two kinds of config row name a typedef
+// that ANOTHER shipped header declares, by that header —
+// `{ "shippedTypedef": "size_t", "header": "stddef.h" }`: a `type-name` /
+// `type-limit` / `type-suffix` predefined macro (`__SIZE_MAX__`), and a lattice-
+// derived descriptor constant (`<stdint.h>`'s `SIZE_MAX`, whose type C 7.22.3
+// takes from `<stddef.h>`). BOTH ask this one function, so one reference can never
+// resolve to two typedefs: the header's descriptor is found in the consuming
+// language's own system directories (`resolveSystemDirs` — where `#include <…>`
+// looks), and read for the pair by `readShippedTypedefIdentities`.
+// ★ THE HEADER IS MATCHED EXACTLY AS SPELLED. A config cross-reference names
+// another descriptor's `header`; it is not a program's `#include` and takes no
+// per-format case folding — so the answer cannot depend on which format asked.
+enum class ShippedHeaderTypedefsStatus : std::uint8_t {
+    Read,           // `typedefs` / `declared` hold the header's answer on the pair
+    NoLanguage,     // no consuming language, so no directory to search: not realized
+    NotShipped,     // no descriptor for the header in the language's system directories
+    NotThisFormat,  // the descriptor exists and excludes the active object format
+    Unreadable,     // the descriptor could not be read; `error` says why
+};
+struct DSS_EXPORT ShippedHeaderTypedefs {
+    ShippedHeaderTypedefsStatus   status = ShippedHeaderTypedefsStatus::NoLanguage;
+    std::vector<ShippedPpTypedef> typedefs;   // Read: the typedefs SELECTED on this pair
+    std::vector<std::string>      declared;   // Read: every typedef NAME it declares, on any pair
+    std::string                   error;      // Unreadable: the first diagnostic's text
+
+    [[nodiscard]] ShippedPpTypedef const* selected(std::string_view name) const noexcept {
+        for (ShippedPpTypedef const& t : typedefs) {
+            if (t.name == name) return &t;
+        }
+        return nullptr;
+    }
+    [[nodiscard]] bool declares(std::string_view name) const noexcept {
+        for (std::string const& n : declared) {
+            if (n == name) return true;
+        }
+        return false;
+    }
+};
+[[nodiscard]] DSS_EXPORT ShippedHeaderTypedefs
+readShippedHeaderTypedefs(std::string_view                header,
+                          std::optional<std::string_view> activeTarget,
+                          std::optional<ObjectFormatKind> activeFormat,
+                          ShippedPairFacts const&         pair);
 
 // Read ONLY the `availableObjectFormats` set from the descriptor at `path`,
 // WITHOUT a TypeInterner — the FRONT-END per-target availability gate (the
@@ -1261,10 +1473,15 @@ readShippedLibIncludes(std::filesystem::path const&    path,
 //     reports, which is the exact drift this parameter exists to end. A tier that
 //     genuinely must stay silent (the preprocessor macro-splice, whose loud twin
 //     is the import resolver) passes an empty lambda AND says why.
+//   * `cache` is the COMPILE's `HeaderSearchCache`
+//     ([[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]): every
+//     edge resolves against the listings the compile already read, so a closure
+//     walked by three tiers lists `systemDirs` once, not once per edge per tier.
 DSS_EXPORT void forEachDescriptorInClosure(
     std::filesystem::path const&                            startPath,
     std::span<std::filesystem::path const>                  systemDirs,
     HeaderNameMatching                                      matching,
+    HeaderSearchCache&                                      cache,
     std::optional<ObjectFormatKind>                         activeFormat,
     std::unordered_set<core::PathIdentity>&                 visited,
     std::function<void(std::filesystem::path const&)> const& visit,
@@ -1284,7 +1501,8 @@ DSS_EXPORT void forEachDescriptorInClosure(
 // hold a format must use the full form and say what it does with the answer —
 // which is the property that keeps two tiers from disagreeing, and it is why
 // this is an overload with a stated precondition rather than a default argument
-// on the real one.
+// on the real one. With no compile around it, it lists for itself: one
+// `HeaderSearchCache` for the one walk.
 DSS_EXPORT void forEachDescriptorInClosure(
     std::filesystem::path const&                            startPath,
     std::span<std::filesystem::path const>                  systemDirs,
@@ -1406,7 +1624,7 @@ collectShippedExternSymbolFormats();
 // A user declaration carries the SIGNATURE. The PLATFORM — this shipped-descriptor
 // corpus, per object format — carries the REALIZATION: `library`,
 // `availableObjectFormats`, the `synthesize` recipe, `linkName`, `version`,
-// `signatureByDataModel`. `#include <stdio.h>` and a hand-written
+// the per-pair `signature` arm. `#include <stdio.h>` and a hand-written
 // `extern int printf(const char *, ...);` are two ways to obtain a TYPE; NEITHER
 // is a way to obtain a different PLATFORM.
 //
@@ -1521,11 +1739,48 @@ struct DSS_EXPORT ShippedSymbolRealization {
     // `status == ProvidedByShippedSource`; EMPTY for every other status.
     std::string shippedSourcePath;
     // The row's DECLARED signature, interned in the CALLER's interner (the
-    // `signatureByDataModel` override for the active model already applied).
+    // active pair's `signature` arm already selected).
     // InvalidType unless `status == Realized`.
     TypeId      signature;
     bool        isFunction = true;   // ExternFunction vs ExternGlobal
 };
+
+// ★★★ D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION — THE
+// `#include` PATH'S REFUSAL, DECIDED BY THE REALIZATION ITSELF.
+//
+// A row the platform declares AVAILABLE on the active format while naming NO BODY
+// for it there — no `library` image, no `realization` source, no `synthesize`
+// recipe (`ShippedRealizationStatus::NoLibraryForFormat`) — has nothing an import
+// could bind to. That is a fact about three named things the reader can act on:
+// the DESCRIPTOR, the SYMBOL and the FORMAT.
+//
+// ✔MEASURED before this function (a scratch config tree whose `dirent.json` lost
+// its `pe` realization, `x86_64:pe64-x86_64-windows-exec`): `#include <dirent.h>`
+// stopped the build — correctly — with one `H_UnsupportedLoweringForKind` per row,
+// "HIR ExternFunction (id N) — `importLibrary` is missing from the
+// HirAttribute<FfiMetadata> side-table": an internal attribute name and a node
+// number from a tier below the one where the condition is known, naming none of
+// the three.
+//
+// The semantic tier's shipped-surface injection asks this per row it injects and
+// reports the answer on the `#include` (the diagnostic comes back UNPOSITIONED; the
+// caller places it). Built on the same `realizeRow` kernel the corpus oracle
+// uses, so the two cannot disagree about which rows have a body. `nullopt` for
+// every other realization — and ALSO for a row whose body is a runtime-library
+// ROLE the caller's read did not resolve (no resolver in hand: the descriptor does
+// declare a body there, the caller simply binds no imports).
+//
+// ⚠ THE VERDICT DID NOT MOVE; THE TIER AND THE WORDS DID. The row stopped the
+// build before this function existed and it stops the build now, for every
+// body-less row the included header declares, referenced or not. The
+// HAND-WRITTEN declaration's road is a different one and is unchanged: the oracle
+// answers a bare `extern` of such a name `NoLibraryForFormat` and routes it
+// UNBOUND to the link tier.
+[[nodiscard]] DSS_EXPORT std::optional<ParseDiagnostic>
+refuseShippedSymbolWithoutABody(ShippedLibDescriptor const&  desc,
+                                ShippedSymbol const&         sym,
+                                ObjectFormatKind             activeFormat,
+                                std::filesystem::path const& descriptorPath);
 
 // Resolve the platform realization of each requested NAME for the active target.
 //
@@ -1548,7 +1803,7 @@ struct DSS_EXPORT ShippedSymbolRealization {
 // so a TU that hand-declares nothing reads NOTHING and a TU that hand-declares
 // `popen`/`pclose` reads ONE descriptor. Descriptors are read through the SAME
 // `readShippedLibDescriptor` the `#include` path uses — there is no second
-// resolution grammar, so `variants` / `signatureByDataModel` / per-symbol
+// resolution grammar, so `variants` (a signature's among them) / per-symbol
 // `library` overrides cannot be resolved one way here and another way there.
 //
 // A descriptor that FAILS to read is SKIPPED (its names stay `Unknown` and route
@@ -1595,7 +1850,15 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
                             std::span<NamedTypeBinding const> namedTypes = {},
                             // Threaded verbatim into every descriptor read this
                             // oracle performs — see `readShippedLibDescriptor`.
-                            RuntimeLibraryRoleResolver const* roleResolver = nullptr);
+                            RuntimeLibraryRoleResolver const* roleResolver = nullptr,
+                            // P68 round 12 (S2a-2a): the PAIR's facts, threaded the same
+                            // way, so a row whose signature names an ABI typedef
+                            // (`wchar_t`) or keys an arm on the long-double format reads
+                            // here exactly as it does through `#include` — without them
+                            // such a row would be refused (or its arm unselected) on this
+                            // path alone. `nullptr` realizes neither (the direct-API
+                            // default, as `readShippedLibDescriptor`'s).
+                            ShippedPairFacts const*           pairFacts    = nullptr);
 
 // EVERY symbol row of the descriptor that declares `name`, realized for the active
 // target — i.e. the whole import surface that descriptor would contribute.
@@ -1637,7 +1900,9 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
                                    std::optional<std::string_view>   activeTarget,
                                    std::optional<ObjectFormatKind>   activeFormat,
                                    std::span<NamedTypeBinding const> namedTypes = {},
-                                   RuntimeLibraryRoleResolver const* roleResolver = nullptr);
+                                   RuntimeLibraryRoleResolver const* roleResolver = nullptr,
+                                   // The pair's facts, as `realizeShippedExternSymbols`.
+                                   ShippedPairFacts const*           pairFacts    = nullptr);
 
 } // namespace ffi
 } // namespace dss

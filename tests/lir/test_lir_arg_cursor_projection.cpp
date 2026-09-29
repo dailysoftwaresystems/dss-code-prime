@@ -95,6 +95,25 @@ constexpr char const* kTargets[] = {"x86_64", "arm64"};
     return s.empty() ? std::string{"<no diagnostics>"} : s;
 }
 
+// A class whose ROW exists and whose POOL the target left empty: a cc that
+// declares integer arg registers and no floating ones. Written as a fixture
+// document rather than read off a shipped one, because no shipped cc has an
+// empty arg pool any more (see (E) below).
+[[nodiscard]] auto loadNoFpArgsTarget() {
+    return TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"noFpArgs"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[
+              {"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0},
+              {"name":"sp","class":"gpr","widthBytes":8,"hwEncoding":1},
+              {"name":"f0","class":"fpr","widthBytes":8,"hwEncoding":0}],
+            "callingConventions":[
+              {"name":"noFpArgs","argGprs":["x0"],"stackPointer":"sp",
+               "stackAlignment":16}
+            ]})",
+        "<inline>");
+}
+
 // The DWARF numbers a class's registers carry on this target. The counter
 // identity is derived from these; a pin that re-derived it from `hwEncoding`
 // would be re-typing the very mistake (C) exists to forbid.
@@ -426,21 +445,8 @@ TEST(LirArgCursorProjection, TheThreeArgPoolRefusalsNeverShareACode) {
     ASSERT_EQ(noRow.all().size(), 1u) << summarize(noRow);
     EXPECT_EQ(noRow.all()[0].code, DiagnosticCode::L_ArgClassHasNoRegisterPool);
 
-    // A class whose ROW exists and whose POOL the target left empty. Written
-    // as a fixture document rather than read off a shipped one, because no
-    // shipped cc has an empty arg pool any more.
-    auto emptyFpr = TargetSchema::loadFromText(
-        R"({"dssTargetVersion":1,"target":{"name":"noFpArgs"},
-            "opcodes":[{"mnemonic":"invalid","result":"none"}],
-            "registers":[
-              {"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0},
-              {"name":"sp","class":"gpr","widthBytes":8,"hwEncoding":1},
-              {"name":"f0","class":"fpr","widthBytes":8,"hwEncoding":0}],
-            "callingConventions":[
-              {"name":"noFpArgs","argGprs":["x0"],"stackPointer":"sp",
-               "stackAlignment":16}
-            ]})",
-        "<inline>");
+    // A class whose ROW exists and whose POOL the target left empty.
+    auto emptyFpr = loadNoFpArgsTarget();
     ASSERT_TRUE(emptyFpr.has_value())
         << (emptyFpr.has_value()
                 ? std::string{}
@@ -480,6 +486,50 @@ TEST(LirArgCursorProjection, TheThreeArgPoolRefusalsNeverShareACode) {
 
     EXPECT_NE(DiagnosticCode::L_ArgClassHasNoRegisterPool,
               DiagnosticCode::L_ArgClassPoolUndeclared);
+}
+
+// ── (E′) BOTH POOL REFUSALS SURVIVE `--suppress` AND A DEMOTION ───────────
+//
+// Their own note says "Both UNSUPPRESSABLE: suppressed, each is a wrong-register
+// codegen with a green build" — and until P68 round 8 (lane `ht`, part 1c-b)
+// neither was a `kUnsuppressableCodes` row, so a user's `--suppress` dropped the
+// refusal and `errorCount()` read 0. Pinned by what the membership DOES, in the
+// two situations (E) builds: each refusal still arrives, as an Error, and counts.
+TEST(LirArgCursorProjection, BothArgPoolRefusalsSurviveSuppressionAndDemotion) {
+    DiagnosticReporter::Config cfg;
+    for (DiagnosticCode const c : {DiagnosticCode::L_ArgClassHasNoRegisterPool,
+                                   DiagnosticCode::L_ArgClassPoolUndeclared}) {
+        cfg.policy.suppress.insert(c);
+        cfg.policy.overrides[c] = DiagnosticSeverity::Warning;
+    }
+
+    auto s = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(s.has_value());
+    auto const* cc = (*s)->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    DiagnosticReporter noRow{cfg};
+    EXPECT_FALSE(argPassingRegister(**s, *cc, 0, LirRegClass::Flags,
+                                    "argCursorProjection", noRow).has_value());
+    ASSERT_EQ(noRow.all().size(), 1u)
+        << "`--suppress L_ArgClassHasNoRegisterPool` dropped the refusal";
+    EXPECT_EQ(noRow.all()[0].code, DiagnosticCode::L_ArgClassHasNoRegisterPool);
+    EXPECT_EQ(noRow.all()[0].severity, DiagnosticSeverity::Error)
+        << "a demotion made the no-pool refusal a warning";
+    EXPECT_EQ(noRow.errorCount(), 1u);
+
+    auto emptyFpr = loadNoFpArgsTarget();
+    ASSERT_TRUE(emptyFpr.has_value());
+    auto const* emptyCc = (*emptyFpr)->callingConvention(0);
+    ASSERT_NE(emptyCc, nullptr);
+    DiagnosticReporter undeclared{cfg};
+    EXPECT_FALSE(argPassingRegister(**emptyFpr, *emptyCc, 0, LirRegClass::FPR,
+                                    "argCursorProjection", undeclared).has_value());
+    ASSERT_EQ(undeclared.all().size(), 1u)
+        << "`--suppress L_ArgClassPoolUndeclared` dropped the refusal";
+    EXPECT_EQ(undeclared.all()[0].code, DiagnosticCode::L_ArgClassPoolUndeclared);
+    EXPECT_EQ(undeclared.all()[0].severity, DiagnosticSeverity::Error)
+        << "a demotion made the empty-pool refusal a warning";
+    EXPECT_EQ(undeclared.errorCount(), 1u);
 }
 
 // And the accepted path still answers: index k of a populated pool is the

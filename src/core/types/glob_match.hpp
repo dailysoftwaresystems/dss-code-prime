@@ -56,12 +56,15 @@ namespace dss {
 // ABSOLUTE pattern ignores `baseDir` entirely under BOTH settings — it already
 // states its own base, and re-rooting it would be a silent relocation.
 //
-// The parameter exists because a manifest read from ANOTHER directory (a
-// dependency's) declares its sources relative to ITSELF, never to whatever
-// directory the consumer's compiler happens to be running in. Threading the base
-// is the only way that manifest can mean what it says; without it the expansion
-// silently searches the consumer's tree and matches nothing (or, worse, matches
-// the consumer's OWN same-named files).
+// The parameter exists because a manifest declares its sources relative to
+// ITSELF — the root manifest and a dependency's alike — never to whatever
+// directory the compiler happens to be running in. Threading the base is the only
+// way that manifest can mean what it says; without it the expansion silently
+// searches the wrong tree and matches nothing (or, worse, matches someone else's
+// same-named files). The pattern's literal prefix is re-based through THE one
+// base rule (`resolveManifestPath`, `core/types/project_sources.hpp`), never
+// joined to `baseDir` by the caller first: a `[` in the manifest's own directory
+// name must stay a character, not become a metacharacter.
 //
 // Returns false and sets `ec` ONLY on a genuine filesystem I/O error (a directory
 // that cannot be read during the walk — FAIL LOUD). A pattern that simply matches

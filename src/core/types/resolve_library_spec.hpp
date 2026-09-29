@@ -5,7 +5,7 @@
 #include <filesystem>
 #include <string>
 
-// ── ResolveLibrarySpec (D-FFI-DECLARED-IMPORT-NAME) ─────────────────
+// ── ResolveLibrarySpec (a path + its declared import name) ──────────
 //
 // ONE `--resolve-library` entry: the binary to READ, plus the OPTIONAL
 // runtime identity to RECORD for the symbols read out of it. The two are

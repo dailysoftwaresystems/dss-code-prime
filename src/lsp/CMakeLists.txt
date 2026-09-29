@@ -33,6 +33,12 @@ target_compile_definitions(lsp PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 # went unnoticed: a comment that overstates isolation reads as a
 # stronger invariant than the code actually keeps, and the next author
 # to add a json include here would believe they were the first.
+# link + ffi_abi (D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE): the editor now
+# reads a workspace's BUILD configurations the way the build does —
+# `workspace_project.cpp` loads each `targets[]` entry's FORMAT document
+# (`ObjectFormatSchema`, owned by `link`) and resolves the pair's calling
+# convention (`ffi::resolveAbi`, owned by `ffi_abi`). Neither depends on `lsp`,
+# so neither edge can close a cycle.
 target_link_libraries(lsp
     PRIVATE
         core
@@ -40,6 +46,8 @@ target_link_libraries(lsp
         analysis_syntactic
         analysis_compilation_unit
         analysis_semantic
+        link
+        ffi_abi
         nlohmann_json::nlohmann_json
 )
 

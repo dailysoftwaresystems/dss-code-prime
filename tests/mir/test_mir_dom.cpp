@@ -273,6 +273,27 @@ void expectChildrenIdenticalFull(
     }
 }
 
+// The dominance FRONTIER, compared the same way (D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION).
+// Inner ORDER is load-bearing here too: Mem2Reg mints its phi markers in
+// iterated-frontier insertion order, which follows these lists.
+void expectFrontierIdenticalFull(
+    std::vector<std::vector<MirBlockId>> const& fresh,
+    std::vector<std::vector<MirBlockId>> const& scratch,
+    char const* what) {
+    ASSERT_EQ(fresh.size(), scratch.size()) << what;
+    for (std::size_t i = 0; i < fresh.size(); ++i) {
+        ASSERT_EQ(fresh[i].size(), scratch[i].size())
+            << what << ": frontier[" << i << "] size (a slot a PREVIOUS call "
+               "wrote and this call's reset missed shows up here)";
+        for (std::size_t j = 0; j < fresh[i].size(); ++j) {
+            EXPECT_EQ(fresh[i][j].v, scratch[i][j].v)
+                << what << ": frontier[" << i << "][" << j << "] v";
+            EXPECT_EQ(fresh[i][j].arenaTag, scratch[i][j].arenaTag)
+                << what << ": frontier[" << i << "][" << j << "] arenaTag";
+        }
+    }
+}
+
 // Run the full fresh-vs-scratch comparison for one function against a shared
 // scratch (called in sequence to exercise the reset between calls).
 void compareFreshVsScratch(Mir const& mir, MirFuncId f,
@@ -282,11 +303,15 @@ void compareFreshVsScratch(Mir const& mir, MirFuncId f,
     auto const rpo = mirReversePostOrder(mir, entry);
     auto const freshDom = computeMirDomTree(mir, entry, rpo, preds);
     auto const freshChildren = mirDomTreeChildren(mir, freshDom);
+    auto const freshFrontier = mirDominanceFrontier(mir, freshDom, preds);
     auto const& scratchDom =
         computeMirDomTree(mir, entry, rpo, preds, scratch);
     auto const& scratchChildren = mirDomTreeChildren(mir, scratchDom, scratch);
+    auto const& scratchFrontier =
+        mirDominanceFrontier(mir, scratchDom, preds, scratch);
     expectDomTreesIdenticalFull(freshDom, scratchDom, what);
     expectChildrenIdenticalFull(freshChildren, scratchChildren, what);
+    expectFrontierIdenticalFull(freshFrontier, scratchFrontier, what);
 }
 
 } // namespace
@@ -445,4 +470,108 @@ TEST(MirDomScratch, RandomizedCfgSweepMatchesFresh) {
                                   "randomized sweep");
         }
     }
+}
+
+// ─── D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION ──────────────────────
+//
+// The scratch-backed frontier is once-per-compute-call, like the children
+// fill: a second call must hand back the SAME lists, not append every
+// contribution again (Mem2Reg's IDF would then plan duplicate phis).
+TEST(MirDomScratch, FrontierIsIdempotentPerComputeCall) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto d = buildDiamond(interner);
+    auto const preds = mirBuildPredecessors(d.mir);
+    MirBlockId const entry = d.mir.funcEntry(d.mir.funcAt(0));
+    auto const rpo = mirReversePostOrder(d.mir, entry);
+
+    MirDomScratch scratch;
+    auto const& dom = computeMirDomTree(d.mir, entry, rpo, preds, scratch);
+    auto const& first  = mirDominanceFrontier(d.mir, dom, preds, scratch);
+    std::size_t const armFrontier = first[d.tArm.v].size();
+    auto const& second = mirDominanceFrontier(d.mir, dom, preds, scratch);
+    EXPECT_EQ(&first, &second);
+    ASSERT_EQ(second[d.tArm.v].size(), armFrontier)
+        << "a repeat call appended the join a second time";
+    ASSERT_EQ(armFrontier, 1u);
+    EXPECT_EQ(second[d.tArm.v][0].v, d.merge.v);
+}
+
+// The frontier overload is sound only for the tree its OWN scratch just
+// computed — the ascending touched-slot sweep IS the fresh sweep only there.
+TEST(MirDomScratchDeathTest, FrontierOverAForeignTreeAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    TypeInterner interner{CompilationUnitId{1}};
+    auto d = buildDiamond(interner);
+    auto const preds = mirBuildPredecessors(d.mir);
+    MirBlockId const entry = d.mir.funcEntry(d.mir.funcAt(0));
+    auto const rpo = mirReversePostOrder(d.mir, entry);
+    MirDomScratch scratch;
+    (void)computeMirDomTree(d.mir, entry, rpo, preds, scratch);
+    MirDomTree const fresh = computeMirDomTree(d.mir, entry, rpo, preds);
+    EXPECT_DEATH((void)mirDominanceFrontier(d.mir, fresh, preds, scratch),
+                 "NOT this scratch's own");
+}
+
+// The COUNTER'S OWN PREMISE, pinned where the helpers live: a fresh overload
+// sweeps the WHOLE module on every call, a scratch overload sweeps its write
+// set. `test_mem2reg_dominance_complexity.cpp` bounds a PASS with this count;
+// if a helper stopped reporting, that bound would pass over nothing — this
+// catches the helper instead.
+TEST(MirDomSlotsSwept, FreshSweepsTheModuleEveryCallScratchSweepsTheFunction) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    constexpr std::uint32_t kFns = 8;
+    MirBuilder mb;
+    for (std::uint32_t k = 0; k < kFns; ++k) {   // kFns four-block diamonds
+        mb.addFunction(fnSig, SymbolId{100u + k});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const t = mb.createBlock(StructCfMarker::Linear);
+        MirBlockId const e = mb.createBlock(StructCfMarker::Linear);
+        MirBlockId const j = mb.createBlock(StructCfMarker::Linear);
+        mb.beginBlock(entry);
+        mb.addCondBr(mb.addArg(0, boolT), t, e);
+        mb.beginBlock(t);
+        mb.addBr(j);
+        mb.beginBlock(e);
+        mb.addBr(j);
+        mb.beginBlock(j);
+        MirLiteralValue v; v.value = std::int64_t{0}; v.core = TypeKind::I32;
+        mb.addReturn(mb.addConst(v, i32));
+    }
+    Mir mir = std::move(mb).finish();
+    std::uint64_t const bc = mir.blockCount();
+    ASSERT_EQ(bc, std::uint64_t{4} * kFns + 1);   // + the reserved slot 0
+
+    (void)mirDomSlotsSweptTake();
+    auto const preds = mirBuildPredecessors(mir);
+    EXPECT_EQ(mirDomSlotsSweptTake(), bc) << "the predecessor map is one module sweep";
+
+    for (std::uint32_t k = 0; k < kFns; ++k) {
+        MirBlockId const entry = mir.funcEntry(mir.funcAt(k));
+        auto const rpo  = mirReversePostOrder(mir, entry);
+        auto const dom  = computeMirDomTree(mir, entry, rpo, preds);
+        (void)mirDominanceFrontier(mir, dom, preds);
+        (void)mirDomTreeChildren(mir, dom);
+    }
+    EXPECT_EQ(mirDomSlotsSweptTake(), std::uint64_t{3} * kFns * bc)
+        << "each FRESH tree, frontier and children call sweeps the whole module";
+
+    MirDomScratch scratch;
+    for (std::uint32_t k = 0; k < kFns; ++k) {
+        MirBlockId const entry = mir.funcEntry(mir.funcAt(k));
+        auto const rpo = mirReversePostOrder(mir, entry);
+        auto const& dom = computeMirDomTree(mir, entry, rpo, preds, scratch);
+        (void)mirDominanceFrontier(mir, dom, preds, scratch);
+        (void)mirDomTreeChildren(mir, dom, scratch);
+    }
+    std::uint64_t const viaScratch = mirDomSlotsSweptTake();
+    // One module-sized allocation, then per function its own write sets: the
+    // tree's (4 blocks + the entry recorded twice), the previous call's resets,
+    // and the frontier and children fills — a few dozen slots, never `bc`.
+    EXPECT_GE(viaScratch, bc) << "the scratch's one allocation must be counted";
+    EXPECT_LE(viaScratch, bc + std::uint64_t{kFns} * 5 * 5)
+        << "a scratch call swept more than its function";
 }

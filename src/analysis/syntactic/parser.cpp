@@ -10,6 +10,7 @@
 #include "core/types/token.hpp"
 #include "core/types/tree_builder.hpp"
 #include "core/types/tree_node.hpp"
+#include "core/types/trivia_token.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -33,47 +34,6 @@ namespace {
     std::fputs(what, stderr);
     std::fputc('\n', stderr);
     std::abort();
-}
-
-
-// Trivia: the builder owns cursor-skip for these tokens; the parser
-// pushes them through without consulting the cursor and the parser's
-// own walker stays put so the next iteration re-checks the slot
-// against the next meaningful token.
-// ★★★ THE LANGUAGE DECIDES, AND THE CORE KIND IS ONLY THE FALLBACK. This used
-// to be a bare `switch (tok.coreKind)` returning true for Whitespace/Newline/
-// comments unconditionally — a language SEMANTIC baked into shared substrate,
-// invisible for as long as every shipped language agreed with it.
-// ✔MEASURED 2026-08-12 by the first one that does not: an assembly dialect is
-// LINE-ORIENTED (the newline IS the statement terminator) and declares
-// `"\n": [{ "kind": "LineEnd" }]` with no `EmptySpace` flag. The parser skipped
-// it anyway, so `ret \n ret` parsed as ONE instruction taking the next line's
-// mnemonic as its operand — a WRONG PARSE, not a parse error, produced by a
-// config declaration the loader had accepted. The same defect the tokenizer's
-// hardcoded newline lexeme had, one tier up: the knob that lies.
-//
-// ★★ WHY THE THREE-WAY TEST AND NOT SIMPLY `schema.isEmptySpace(kind)`:
-// `emptySpaceTokens` is populated only from DECLARED meanings, so a built-in
-// kind a language never mentioned is absent from it for the same reason a
-// deliberately-significant one is. Reading absence as "significant" would make
-// every synthetic test schema that omits `"\n"` start seeing newline tokens.
-// So: a DECLARED kind gets the language's answer; an undeclared one keeps the
-// historical core-kind default, byte-for-byte.
-[[nodiscard]] bool isSkippableTrivia(Token const& tok,
-                                     GrammarSchema const& schema) noexcept {
-    if (tok.schemaKind.valid() && schema.declaresLexemeToken(tok.schemaKind)) {
-        return schema.isEmptySpace(tok.schemaKind);
-    }
-    switch (tok.coreKind) {
-    case CoreTokenKind::Whitespace:
-    case CoreTokenKind::Newline:
-    case CoreTokenKind::LineComment:
-    case CoreTokenKind::BlockComment:
-        return true;
-    default:
-        break;
-    }
-    return isEmptySpace(tok.flags);
 }
 
 // Mirror the builder's `pushToken` kind-resolution so dispatch
@@ -672,7 +632,7 @@ struct Parser::Impl {
             Token const& peek = tokens.peek();
             if (peek.coreKind == CoreTokenKind::Eof)   break;
             if (peek.coreKind == CoreTokenKind::Error) break;
-            if (isSkippableTrivia(peek, *schema)) {
+            if (isTriviaToken(peek, *schema)) {
                 builder->pushToken(tokens.advance());
                 ++consumed;
                 continue;
@@ -946,9 +906,13 @@ struct Parser::Impl {
         // MULTIPLE bindings — `typedef int A, *B;` binds both — hence the
         // vector; legacy rows yield 0 or 1.)
         std::vector<BinderName> binderNames;
+        // P68 round 9 (lane `cs`): a lifted field row (an enumeration constant)
+        // binds in the enclosing namespace scope — see `BinderSketch::record`.
+        bool liftToEnclosingScope = false;
         if (sketch.enabled()) {
             if (auto const* decl = sketch.binderFor(rule)) {
                 binderNames = extractBinderNames_(*decl);
+                liftToEnclosingScope = decl->liftToEnclosingScope;
             }
         }
         walker.leaveRule(SourceSpan::empty(0), rule);
@@ -958,7 +922,8 @@ struct Parser::Impl {
         if (sketch.enabled()) {
             if (sketch.isScopeRule(rule)) sketch.closeScope();
             for (auto& bn : binderNames) {
-                sketch.record(std::move(bn.name), bn.isType, bn.span);
+                sketch.record(std::move(bn.name), bn.isType, bn.span,
+                              liftToEnclosingScope);
             }
         }
     }
@@ -1372,7 +1337,7 @@ struct Parser::Impl {
             if (t.coreKind == CoreTokenKind::Eof) {
                 return effectiveKind(t, identifierKind, errorKind);
             }
-            if (isSkippableTrivia(t, *schema)) continue;
+            if (isTriviaToken(t, *schema)) continue;
             if (seen == n) return effectiveKind(t, identifierKind, errorKind);
             ++seen;
         }
@@ -2411,6 +2376,15 @@ struct Parser::Impl {
                             tokens.peek().span,
                             "'<eof>'",
                             walker.expectedSet());
+            // The Error leaf the two expression-level missing-child sites
+            // already drop, and for the same reason: the frame IS missing a
+            // required child, and the tree has to say so, not only the
+            // diagnostic. Without it a block whose `}` never came closed as a
+            // well-formed block — and the scope its `{` opened stayed behind
+            // to be reported as a builder invariant
+            // ([[D-PARSE-BUILDER-INVARIANT-PRINTED-AFTER-A-CORRECT-REFUSAL]]).
+            // Silent: the diagnostic above is the one the user reads.
+            builder->pushErrorNode(tokens.peek().span);
             closeFrameOnce();
             return StepOutcome::Continue;
         }
@@ -2500,7 +2474,7 @@ struct Parser::Impl {
         }
 
         case SlotKind::TokenLeaf: {
-            if (isSkippableTrivia(peek, *schema)) {
+            if (isTriviaToken(peek, *schema)) {
                 builder->pushToken(tokens.advance());
                 return StepOutcome::Continue;
             }
@@ -2554,7 +2528,7 @@ struct Parser::Impl {
         }
 
         case SlotKind::RuleLeaf: {
-            if (isSkippableTrivia(peek, *schema)) {
+            if (isTriviaToken(peek, *schema)) {
                 builder->pushToken(tokens.advance());
                 return StepOutcome::Continue;
             }
@@ -2621,7 +2595,7 @@ struct Parser::Impl {
         }
 
         case SlotKind::AltChoice: {
-            if (isSkippableTrivia(peek, *schema)) {
+            if (isTriviaToken(peek, *schema)) {
                 builder->pushToken(tokens.advance());
                 return StepOutcome::Continue;
             }
@@ -2948,7 +2922,7 @@ ParseResult Parser::parse() && {
 
     // Drain head-of-stream trivia so dispatch sees a meaningful
     // token on iteration 0.
-    while (!I.tokens.isAtEnd() && isSkippableTrivia(I.tokens.peek(), *I.schema)) {
+    while (!I.tokens.isAtEnd() && isTriviaToken(I.tokens.peek(), *I.schema)) {
         I.builder->pushToken(I.tokens.advance());
     }
 
@@ -3033,7 +3007,7 @@ namespace {
 // Mirrors the main dispatch loop's TokenLeaf-trivia passthrough so
 // whitespace lands inside the wrapper frame that's currently open.
 void pumpTrivia(Parser::Impl& I) {
-    while (!I.tokens.isAtEnd() && isSkippableTrivia(I.tokens.peek(), *I.schema)) {
+    while (!I.tokens.isAtEnd() && isTriviaToken(I.tokens.peek(), *I.schema)) {
         I.builder->pushToken(I.tokens.advance());
     }
 }
@@ -3186,7 +3160,7 @@ void exprPrimaryStep(Parser::Impl& I) {
     // is pushed into the just-opened wrapper, before the operator token; if
     // the climb ends, it's pushed into the current frame. Both reproduce the
     // token-ordered leaf stream byte-for-byte.
-    while (!I.tokens.isAtEnd() && isSkippableTrivia(I.tokens.peek(), *I.schema)) {
+    while (!I.tokens.isAtEnd() && isTriviaToken(I.tokens.peek(), *I.schema)) {
         heldTrivia.push_back(I.tokens.advance());
     }
 

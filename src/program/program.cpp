@@ -50,7 +50,7 @@
 #include "program/dependency_resolver.hpp"  // AP6: `dependsOn` resolution
 #include "program/git_acquire.hpp"          // SystemGitRunner — the default git seam
 #include "program/input_resolver.hpp"
-#include "program/project_sources.hpp"  // D-AP2-SOURCES-GLOB + AP6 M4: sources[] → files
+#include "core/types/project_sources.hpp"  // D-AP2-SOURCES-GLOB + AP6 M4: sources[] → files
 // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the shipped runtime's
 // content-addressed object cache — the key, the two roots, and the archive
 // sibling lookup the runtime units are compiled against.
@@ -138,6 +138,16 @@ namespace {
 // Config through the SHIPPED projection rather than re-typing the config.
 // (D-LK10-7's policy knob still arrives here unchanged, at `Program::run`.)
 
+// ★★★ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: TRUE ONLY INSIDE THE NESTED
+// BUILD THAT MATERIALISES A SHIPPED RUNTIME ARCHIVE. Declared up here because
+// its three readers sit across this whole file — the diagnostic drain just
+// below, `compileOneTarget`'s artifact report, and
+// `resolveShippedRuntimeArchives`, which owns it. The full argument for why it
+// exists (without it the nested build resolves its own runtime and recurses
+// forever) is on `ShippedRuntimeBuildGuard`, which is the ONLY thing that may
+// write it.
+extern thread_local bool gCompilingShippedRuntimeUnit;
+
 // Drain reporter diagnostics to stderr. The driver is the boundary
 // between in-memory diagnostic records and the operator's terminal;
 // LSP mode owns its own emit path (LSP $/diagnostic), so this stderr
@@ -186,6 +196,22 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
                               std::size_t const         firstIndex = 0) {
     auto const all = rep.all();
     for (auto const& d : all.subspan(std::min(firstIndex, all.size()))) {
+        // ★★ THE NESTED RUNTIME BUILD SHOWS THE USER ONLY WHAT FAILS IT.
+        // Its diagnostics are about DSS's OWN shipped runtime, not the user's
+        // program, and the build runs only on a runtime-object-cache MISS —
+        // so printing its warnings and notes made the same command's stderr
+        // depend on whether this machine's cache was warm (✔MEASURED: every
+        // pe64 `--config=release` build printed the runtime's
+        // `X_OptFixpointTruncated` and `R_SpilledDueToCrossCallExhaustion`
+        // on a miss and nothing on a hit). An Error still prints — with its
+        // own positioned rendering — and still fails the build, where
+        // `resolveShippedRuntimeArchives` names the unit, format and target.
+        // Below Error the runtime's quality is DSS's own gate's business
+        // (tests/program/test_shipped_runtime_compiles), not the user's.
+        if (gCompilingShippedRuntimeUnit
+            && d.severity != DiagnosticSeverity::Error) {
+            continue;
+        }
         if (d.buffer.valid()) {
             std::cerr << rep.format(d, bufs);
         } else {
@@ -219,7 +245,8 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 }
 
 // ── THE BUILD'S STATEMENT OF RECORD ABOUT WHAT IT PRODUCED ─────────────────
-// D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118).
+// TF-C118 — born from a harness fixture that RECONSTRUCTED the artifact name
+// from its own suffix table and so assumed the POSIX spelling.
 //
 // ★ WHY THIS EXISTS. Until now a SUCCESSFUL build said nothing at all about
 // the file it had written, so every consumer had to RECONSTRUCT the name —
@@ -283,15 +310,6 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 }
 
 // Called ONCE per artifact, and ONLY after the write path reported success.
-// ★★★ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: TRUE ONLY INSIDE THE NESTED
-// BUILD THAT MATERIALISES A SHIPPED RUNTIME ARCHIVE. Declared up here because
-// its two readers sit at opposite ends of this file — `compileOneTarget`'s
-// artifact report, immediately below, and `resolveShippedRuntimeArchives`, which
-// owns it. The full argument for why it exists (without it the nested build
-// resolves its own runtime and recurses forever) is on
-// `ShippedRuntimeBuildGuard`, which is the ONLY thing that may write it.
-extern thread_local bool gCompilingShippedRuntimeUnit;
-
 void reportArtifactWritten(std::string const& targetSpec,
                            fs::path const&    outPath) {
     // Lexical only. `absolute` needs the cwd; `lexically_normal` folds the
@@ -848,7 +866,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         return std::nullopt;
     }
 
-    // D-LK6-8.2 cross-validation: confirm the (target, format) pair's
+    // D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET cross-validation: confirm the (target, format) pair's
     // machine identity matches before linking. Without this guard, a
     // hand-edited format JSON with the wrong `machine` value would
     // silently dispatch the linker to the wrong PLT-stub emitter,
@@ -898,7 +916,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         return std::nullopt;
     }
 
-    // D-FF3-3 (commit 9440143): resolve the (target, format) calling
+    // D-FF3-3-RESOLVED-CC-INDEX-THREADED (commit 9440143): resolve the (target, format) calling
     // convention BEFORE dispatching to compileSingleUnit. Replaces
     // the previous silent dispatch to `callingConventions[0]` —
     // that hardcode produced SysV register assignments on PE+x86_64
@@ -1172,9 +1190,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         return std::nullopt;
     }
 
-    // D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118):
-    // THE ONE report site for the three link/write dispatches below (static
-    // archive / single CU / merged multi-CU). They are three routes to the
+    // The artifact report (TF-C118) — THE ONE report site for the three
+    // link/write dispatches below (static archive / single CU / merged
+    // multi-CU). They are three routes to the
     // SAME `outPath`, so the report is attached at their only common ancestor
     // rather than copied into each — and it is attached to their RESULT, so
     // the line cannot be printed for a write that failed. Every `return` of a
@@ -1292,7 +1310,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // unreadable path stays DYNAMIC -- the dynamic path's eager open-probe
     // (compile_pipeline step 2.5-pre) fails it loud, so a bad path is never
     // silently dropped.
-    // D-FFI-DECLARED-IMPORT-NAME: a STATED import name is meaningful only on
+    // Declared import names: a STATED import name is meaningful only on
     // the DYNAMIC side (it names a runtime dependency); a static archive is
     // merged into the image and records no import at all. The partition keeps
     // the whole spec on the dynamic side and takes only the PATH for archives.
@@ -1375,7 +1393,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // count BEFORE the per-CU build/lower. Every genuine tier failure reports its
     // own K_/L_/A_/S_/H_ diagnostic; if a per-CU build (`buildCuMir`) or the
     // back-half lower (`lowerCuMirToAssembly`) returns a NULL module without any
-    // new diagnostic, that is a substrate-contract violation (the D-PERF-4
+    // new diagnostic, that is a substrate-contract violation (the D-PERF-4-CU-PARALLELISM
     // buildCuMir-null contract) — emit `D_CompileUnitNullNoDiagnostic` so the
     // driver never exits 1 with ZERO output. A no-op on the happy path and on
     // every genuine (already-reported) failure. Mirrors the optimizer's
@@ -1383,11 +1401,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     auto const errorsBeforeCuBuild = reporter.errorCount();
     auto const emitNullNoDiagnostic = [&](char const* where) {
         if (reporter.errorCount() == errorsBeforeCuBuild) {
+            // Anchored: D-CSUBSET-TESTTU-SILENT-EXIT1 (the fail-loud net).
             emitDriver(reporter, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
                        std::string{"internal: "} + where
                            + " returned a null module without reporting any "
-                             "diagnostic — substrate-contract violation "
-                             "(D-CSUBSET-TESTTU-SILENT-EXIT1 fail-loud net).");
+                             "diagnostic — substrate-contract violation: a "
+                             "failing tier must say why.");
         }
     };
     // ── plan 29 P4: THE `encode` PIPELINE ENTRY ────────────────────────────
@@ -2318,11 +2337,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             }
             auto const family = dss::ffi::shimFamilyOf(bare);
             if (!family.has_value()) {
+                // Anchored: D-FFI-PE-CRT-UCRT-MIGRATION.
                 dss::report(reporter, DiagnosticCode::D_SynthRecipeFamilyUnknown,
                             DiagnosticSeverity::Error,
                             std::format(
                                 "synthesize recipe '{}' (symbol {{ {} }}) belongs to no "
-                                "known shim family (D-FFI-PE-CRT-UCRT-MIGRATION) — "
+                                "known shim family — "
                                 "internal invariant breach: the descriptor loader should "
                                 "have rejected an unknown recipe id at read time "
                                 "(isKnownSynthesizeRecipe)",
@@ -2342,7 +2362,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling —
         // see `synth_stdio_shim.hpp` for the full contract. A clean no-op when
         // `mergedStdioRecipes` is empty. The va_list block is read from the SAME
-        // resolved CC (`abi->cc`, D-FF3-3 above) the merged module's calling-convention
+        // resolved CC (`abi->cc`, D-FF3-3-RESOLVED-CC-INDEX-THREADED above) the merged module's calling-convention
         // index was derived from — no second lookup, no format-name branch. It is passed
         // WHOLE, not narrowed to `.strategy`: `variadicUsesOverflowBase` is what selects
         // the shim's va leaf, and dropping it here would silently emit the home-base leaf
@@ -2927,7 +2947,9 @@ class LanguageBlockExtensionReader {
 // The per-invocation memo for the shipped-source units' extension⇒language
 // resolution. TWO fields, and they answer different questions:
 //
-//   * `claimantsByExtension` — WHICH language documents declare each extension.
+//   * `claimantsByExtension` — WHICH language documents declare each extension,
+//     each claimant carried AS its document (the stem `loadShipped` takes and
+//     the file it was read from), so a refusal names the FILE an operator fixes.
 //     Read off the documents ONCE per invocation (the whole `sources/` corpus
 //     in one directory walk), because it is a property of the config tree, not
 //     of the file being resolved. Every additional realized unit is then a map
@@ -2942,7 +2964,7 @@ class LanguageBlockExtensionReader {
 // stable within one invocation would be an unstated assumption, and this is
 // cheaper than the assumption.
 struct ShippedSourceLanguageCache {
-    std::map<std::string, std::vector<std::string>>             claimantsByExtension;
+    std::map<std::string, std::vector<ShippedConfigDocument>>   claimantsByExtension;
     std::map<std::string, std::shared_ptr<GrammarSchema const>> grammarByName;
     fs::path                                                    indexedDir;
 };
@@ -3015,6 +3037,18 @@ struct ShippedSourceLanguage {
     [[nodiscard]] explicit operator bool() const { return grammar != nullptr; }
 };
 
+// Each claimant AND the document it was read from, for a refusal that has to be
+// actionable: the operator deletes or fixes a FILE, so the file is what is named.
+[[nodiscard]] std::string claimantDocuments(
+    std::vector<ShippedConfigDocument> const& claimants) {
+    std::string out;
+    for (auto const& claimant : claimants) {
+        if (!out.empty()) out += ", ";
+        out += "'" + claimant.stem + "' from " + core::genericSpelling(claimant.path);
+    }
+    return out;
+}
+
 [[nodiscard]] ShippedSourceLanguage resolveShippedSourceGrammar(
     fs::path const&             path,
     ShippedSourceLanguageCache& cache,
@@ -3032,38 +3066,41 @@ struct ShippedSourceLanguage {
 
     if (cache.indexedDir != *sourcesDir) {
         cache.claimantsByExtension.clear();
-        std::error_code ec;
-        for (fs::directory_iterator it{*sourcesDir, ec}, end; it != end;
-             it.increment(ec)) {
-            if (ec) break;
-            if (!it->is_regular_file(ec)) continue;
-            std::string const leaf = it->path().filename().generic_string();
-            auto const        dot  = leaf.find(".lang.json");
-            if (dot == std::string::npos) continue;
-            std::string const name = leaf.substr(0, dot);
-            for (auto const& declared : declaredFileExtensionsOf(it->path())) {
+        // THE ONE OWNER of which files ARE language documents: exactly
+        // `<stem>.lang.json`, so an editor's or a merge's stray beside them
+        // (`c.lang.json.orig`, `zz.lang.json.bak`) is no claimant; a listing that
+        // fails, or stops part-way, is refused rather than read as the corpus.
+        // [[D-CONFIG-STRAY-FILE-NAMED-AFTER-A-LANGUAGE-LOADS-AS-A-SECOND-DOCUMENT]]
+        auto const documents = shippedConfigDocuments(*sourcesDir, ".lang.json");
+        if (!documents.has_value()) {
+            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                       "shipped-source realization: " + documents.error()
+                           + ", so no front end can be chosen for '"
+                           + core::genericSpelling(path) + "'");
+            return {};
+        }
+        // The documents arrive in the owner's STEM order and are visited once
+        // each, so every claimant list is in stem order too: the claimant set is
+        // a property of the CORPUS, not of the host filesystem's iteration order
+        // (sorted on NTFS, hash-ordered on ext4).
+        for (auto const& document : *documents) {
+            for (auto const& declared : declaredFileExtensionsOf(document.path)) {
                 auto& claimants = cache.claimantsByExtension[declared];
                 // A document that declares one extension twice is ONE claimant.
-                if (std::find(claimants.begin(), claimants.end(), name)
-                    == claimants.end())
-                    claimants.push_back(name);
+                if (claimants.empty() || claimants.back().stem != document.stem)
+                    claimants.push_back(document);
             }
         }
-        // Sorted so the claimant set is a property of the CORPUS and not of the
-        // host filesystem's iteration order (sorted on NTFS, hash-ordered on
-        // ext4).
-        for (auto& entry : cache.claimantsByExtension)
-            std::sort(entry.second.begin(), entry.second.end());
         cache.indexedDir = *sourcesDir;
     }
 
-    static std::vector<std::string> const kNoClaimants;
+    static std::vector<ShippedConfigDocument> const kNoClaimants;
     auto const  found = cache.claimantsByExtension.find(ext);
     auto const& claimants =
         found == cache.claimantsByExtension.end() ? kNoClaimants : found->second;
 
     if (claimants.size() == 1) {
-        std::string const& name = claimants.front();
+        std::string const& name = claimants.front().stem;
         auto               got  = cache.grammarByName.find(name);
         if (got == cache.grammarByName.end()) {
             auto loaded = GrammarSchema::loadShipped(name);
@@ -3100,8 +3137,9 @@ struct ShippedSourceLanguage {
                          + "', so there is no front end to compile it"
                    : "shipped-source realization: " + std::to_string(claimants.size())
                          + " shipped languages claim the extension '" + ext
-                         + "' of '" + core::genericSpelling(path)
-                         + "', so the extension alone cannot name one — refusing "
+                         + "' of '" + core::genericSpelling(path) + "' ("
+                         + claimantDocuments(claimants)
+                         + "), so the extension alone cannot name one — refusing "
                            "rather than guessing which front end owns this file");
     return {};
 }
@@ -3370,10 +3408,10 @@ serveArtifactFromCache(ArtifactCacheTicket const& ticket,
             "dependency artifact cache: a VERIFIED entry for this build was "
             "found at '{}' but could not be placed at '{}': {}. The entry is "
             "this build's artifact, so this is a failure to produce it rather "
-            "than a reason to compile again. Anchored: "
-            "D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION.",
+            "than a reason to compile again: make the output path writable.",
             core::genericSpelling(**hit), core::genericSpelling(outPath),
             ec.message()));
+        // Anchored: D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION.
     }
     return true;
 }
@@ -3553,8 +3591,9 @@ buildDependencyArtifactKey(
     std::string_view                     artifactSuffix,
     CompileOptions const&                compileOpts,
     ImageRequest const&                  imageRequest) {
-    static constexpr std::string_view kAnchor =
-        "D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION";
+    // Anchored (every refusal below): D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION.
+    // The id lives here, beside the refusals, and never in them: each message states
+    // what was not cached and why, and a row id there turns false the day it closes.
 
     // ⛔ AN INJECTED OPTIMIZER PIPELINE IS A REFUSAL, NOT A TERM. It is a raw
     // pointer to an in-memory pass list with no content identity to digest, and
@@ -3566,9 +3605,7 @@ buildDependencyArtifactKey(
         return std::unexpected(std::format(
             "dependency artifact cache: this build injects an optimizer "
             "pipeline directly, which changes the emitted bytes and carries no "
-            "content identity that could enter a cache key. Not cached. "
-            "Anchored: {}.",
-            kAnchor));
+            "content identity that could enter a cache key. Not cached."));
     }
 
     std::string const closure = unionInputDigest(cus);
@@ -3578,8 +3615,8 @@ buildDependencyArtifactKey(
             "— it builds {} translation unit(s), and a closure is available "
             "only when there is at least one and every one of them reports "
             "`CompilationUnit::inputDigest()`. An all-object link has nothing "
-            "parsed to digest. Not cached. Anchored: {}.",
-            targetSpec, cus.size(), kAnchor));
+            "parsed to digest. Not cached.",
+            targetSpec, cus.size()));
     }
 
     // The CONFIG ROOT — the cache anchor, and the directory the archive-sibling
@@ -3592,8 +3629,7 @@ buildDependencyArtifactKey(
             "dependency artifact cache: the shipped object-format directory "
             "(src/dss-config/object-formats) could not be located, so neither "
             "the cache root nor the archive-writing sibling can be resolved. "
-            "Not cached. Anchored: {}.",
-            kAnchor));
+            "Not cached."));
     }
     fs::path const configRoot = objectFormatsDir->parent_path();
 
@@ -3612,17 +3648,16 @@ buildDependencyArtifactKey(
         return std::unexpected(std::format(
             "dependency artifact cache: the archive-writing sibling format '{}' "
             "could not be loaded, so its content digest cannot enter the cache "
-            "key. Not cached. Anchored: {}.",
-            *siblingName, kAnchor));
+            "key. Not cached.",
+            *siblingName));
     }
 
     auto const parsedSpec = TargetSpec::parse(targetSpec);
     if (!parsedSpec.has_value()) {
         return std::unexpected(std::format(
             "dependency artifact cache: the target spec '{}' does not parse, so "
-            "the key's target term cannot be composed. Not cached. Anchored: "
-            "{}.",
-            targetSpec, kAnchor));
+            "the key's target term cannot be composed. Not cached.",
+            targetSpec));
     }
 
     dss::runtime::DependencyArtifactRequest request;
@@ -3640,6 +3675,10 @@ buildDependencyArtifactKey(
     request.ltoModeName =
         compileOpts.ltoMode == CompileOptions::LtoMode::Thin ? "thin" : "full";
     request.stackReserveBytes = imageRequest.stackReserveBytes;
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the runpaths reach the emitted
+    // bytes (a `.dynstr` string and a `.dynamic` entry, or LC_RPATH commands),
+    // so two builds that differ only in them must never share an entry.
+    request.runpaths = imageRequest.runpaths;
 
     // The config documents this build ALREADY LOADED, asked of the loaders that
     // own them — never hand-listed. Identical set and identical construction to
@@ -4077,11 +4116,19 @@ buildDependencyArtifactKey(
             Program                        runtimeProgram;
             runtimeProgram.setOutputDir(unitDir);
             runtimeProgram.setCompileConfig(config);
-            // POLICY inherited (suppress / overrides / warnings-as-errors), CAP
-            // and DEDUP relaxed — the same split the per-target scratch
-            // reporter uses, and for the same reason: the run-wide limits are
-            // enforced once at the destination.
-            auto nestedCfg           = rep.config();
+            // ★★ THE POLICY IS DSS's OWN — DEFAULT-CONSTRUCTED, NEVER THE
+            // USER's (`--suppress` / overrides / `--warnings-as-errors`). The
+            // runtime is hermetic by design (above), and the cache key carries
+            // no policy term, so an archive whose build depended on the user's
+            // policy would be served to builds whose policy differs.
+            // ✔MEASURED when it was inherited: `--warnings-as-errors
+            // --config=release` for a pe64 target FAILED on a cold cache — the
+            // runtime's `X_OptFixpointTruncated` promoted to an error, "the
+            // shipped runtime unit 'runtime/platform/src/atomic.c' … FAILED TO
+            // COMPILE" — and PASSED on a warm one, the same command either way.
+            // CAP and DEDUP relaxed, as before: nothing here is rate-limited,
+            // and what the user sees of it is the drain's Error floor.
+            DiagnosticReporter::Config nestedCfg;
             nestedCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
             nestedCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
             nestedCfg.dedupWindow    = 0;
@@ -4192,9 +4239,15 @@ int runCusToTargets(
     // "which gathered files become compilation units" — which is where the
     // partition below already lives — and removes the parallel-list shape
     // entirely rather than threading one through.
+    // D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: a build key's `<target>:<format>`
+    // pair is handed over as its two SCHEMAS (both null for a key with no
+    // preprocess pass, which one CU serves for every target), and the closure
+    // declares their consequences with `applyTargetFormatPair` — the same call
+    // the LSP and the FFI header parser make. It used to receive the key plus
+    // two macro spans and set every other setting from the key's copies, one
+    // setter per fact; the key now stays here, where it only CACHES builds.
     std::function<std::vector<CompilationUnit>(
-        CuBuildKey const&, std::span<PredefinedMacroDef const>,
-        std::span<PredefinedMacroDef const>,
+        TargetSchema const*, ObjectFormatSchema const*,
         std::shared_ptr<GrammarSchema const> const&,
         std::span<std::string const>)> buildCus,
     std::shared_ptr<GrammarSchema const> const& explicitGrammar,
@@ -4640,8 +4693,12 @@ int runCusToTargets(
     for (std::size_t ti = 0; ti < targets.size(); ++ti) {
         std::string const& spec = targets[ti];
         CuBuildKey key;
-        std::span<PredefinedMacroDef const> targetPredefines;
-        std::span<PredefinedMacroDef const> formatPredefines;
+        // The pair this key's CU is BUILT for, handed to `buildCus` whole:
+        // `applyTargetFormatPair` declares its consequences on the builder.
+        // Null for a language with no preprocess pass — one CU then serves
+        // every target, so no single pair may be declared on it.
+        TargetSchema const*       pairTarget = nullptr;
+        ObjectFormatSchema const* pairFormat = nullptr;
         // ★★ KEYED UNCONDITIONALLY — see `CuBuildKey::languageName` for why
         // this must NOT join the `ppEnabled` block below, and for why the
         // CONFIG NAME is the identity rather than the declared one.
@@ -4655,11 +4712,14 @@ int runCusToTargets(
             auto const parsed = TargetSpec::parse(spec);
             key.targetName    = parsed->targetName;
             key.formatName    = parsed->formatName;
-            targetPredefines  = targetByName.at(key.targetName)->predefinedMacros();
-            // TF-C97: the FORMAT's own predefines. `formatByName` was populated
-            // by the pre-flight above and every surviving spec's format is in
-            // it — a failed load already returned at the drain.
-            formatPredefines  = formatByName.at(key.formatName)->predefinedMacros();
+            pairTarget        = targetByName.at(key.targetName).get();
+            // `formatByName` was populated by the pre-flight above and every
+            // surviving spec's format is in it — a failed load already returned
+            // at the drain.
+            pairFormat        = formatByName.at(key.formatName).get();
+            // The two KEY members below read the same accessors
+            // `applyTargetFormatPair` reads for the builder, so the key cannot
+            // name a build other than the one it caches.
             // D-PP-HEADER-CASE-INSENSITIVE-PE: read the rule off the FORMAT
             // FILE (never derived from `key.format`, the KIND — that would be
             // the identity branch the agnosticism bar forbids).
@@ -4686,8 +4746,8 @@ int runCusToTargets(
             // 190 ms pe64 compile of `int main(void){return 0;}`. They are now
             // resolved per TARGET, below, as cached static archives; see
             // `resolveShippedRuntimeArchives`.
-            cuByKey.emplace(key, buildCus(key, targetPredefines,
-                                          formatPredefines, resolvedGrammar,
+            cuByKey.emplace(key, buildCus(pairTarget,
+                                          pairFormat, resolvedGrammar,
                                           // D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE:
                                           // the SOURCES, never every gathered
                                           // file — the objects are already out.
@@ -5385,11 +5445,15 @@ int Program::run(int argc, char* argv[]) {
     // `compileProject` then applies a manifest `stackReserve` ONLY IF this
     // stamp left it unset — the CLI WINS (see there).
     setStackReserveBytes(args.stackReserveBytes);
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: `--rpath <dir>` entries, stamped at
+    // the same point for the same reason. `compileProject` PREPENDS a
+    // manifest's `runpaths` to these — a list accumulates (see there).
+    setRunpaths(args.runpaths);
     // c162 (D-FF1-READER-CONSUMER): thread `--resolve-library <path>` into the
     // kernel so compile_pipeline step 2.5 reads each named binary's export
     // surface to resolve + validate this run's externs. The parser already
     // produced `ResolveLibrarySpec`s (path + the OPTIONAL declared import
-    // name, D-FFI-DECLARED-IMPORT-NAME), so this is a straight stamp — no
+    // name), so this is a straight stamp — no
     // re-parse, and no layer in between can drop the declared name.
     setResolveLibraries(args.resolveLibraries);
     // `--time`: report the compilation's timings to stderr when this run
@@ -5485,25 +5549,22 @@ namespace {
 // different question (WHICH format to build a dependency with) and memoizes it
 // per resolve; this one runs at most once per build, immediately before the
 // driver returns 1.
-[[nodiscard]] std::optional<std::vector<std::string>>
+[[nodiscard]] std::expected<std::vector<std::string>, std::string>
 shippedFormatsServingProfile(std::string_view profile) {
     auto const dir = findShippedConfigDir("object-formats");
-    if (!dir) return std::nullopt;
-
-    std::error_code ec;
-    std::vector<std::string> names;
-    for (fs::directory_iterator it{*dir, ec}, end; !ec && it != end;
-         it.increment(ec)) {
-        std::string const file = it->path().filename().string();
-        constexpr std::string_view kSuffix = ".format.json";
-        if (file.size() <= kSuffix.size()) continue;
-        if (!std::string_view{file}.ends_with(kSuffix)) continue;
-        names.push_back(file.substr(0, file.size() - kSuffix.size()));
+    if (!dir) {
+        return std::unexpected(std::string{
+            "the shipped object-format directory ('src/dss-config/object-formats') "
+            "could not be located"});
     }
-    std::sort(names.begin(), names.end());
+    // THE ONE OWNER of which files ARE format documents; a listing that fails
+    // or stops part-way is the answer, never an inventory of whatever was read.
+    auto const documents = shippedConfigDocuments(*dir, ".format.json");
+    if (!documents.has_value()) return std::unexpected(documents.error());
 
     std::vector<std::string> serving;
-    for (auto const& n : names) {
+    for (auto const& document : *documents) {
+        std::string const& n = document.stem;
         auto loaded = ObjectFormatSchema::loadShipped(n);
         // A shipped document that will not LOAD serves nothing by definition,
         // and reporting its load failure here would put an unrelated format's
@@ -5557,6 +5618,18 @@ int Program::compileProject(
         return 1;
     }
     ProjectConfig const& pc = *pcOpt;
+
+    // ★★ EVERY RELATIVE PATH THIS MANIFEST HOLDS IS RELATIVE TO ITS OWN DIRECTORY
+    // ([[D-PROJECT-ROOT-MANIFEST-PATHS-RESOLVE-AGAINST-THE-INVOCATION-DIRECTORY]]):
+    // `sources`, `includes`, `resolveLibraries`, `output`, the hooks' working
+    // directory and a hook program named by a path — through the ONE base rule
+    // (`core/types/project_sources.hpp`), the same one a dependency manifest and
+    // the editor use. It used to be the PROCESS working directory, and ✔MEASURED
+    // from a directory holding look-alikes this build compiled the wrong
+    // `src/main.c`, took the wrong header and ran the wrong hook — rc 0 each time.
+    // The command line (`--output`, `-I`, `--resolve-library`, `--project`) is
+    // not the manifest and stays relative to where the command runs.
+    fs::path const manifestDir = manifestDirectoryOf(fs::path{projectFilePath});
 
     // ── `dependsOn` IS NOW RESOLVED, NOT REFUSED (AP6) ──────────────────────
     //
@@ -5630,9 +5703,8 @@ int Program::compileProject(
             // unknown — and an empty list would silently assert the stronger,
             // possibly false one. Report what actually went wrong instead.
             emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
-                       "the shipped object-format directory "
-                       "('src/dss-config/object-formats') could not be located, "
-                       "so the artifact profile '" + pc.artifactProfile
+                       serving.error() + ", so the artifact profile '"
+                       + pc.artifactProfile
                        + "' could not be checked against the formats that serve "
                          "it. Set DSS_CONFIG_ROOT to the directory that contains "
                          "'src/dss-config', or run from inside the compiler's "
@@ -5670,21 +5742,30 @@ int Program::compileProject(
     // twice would double-append; that is out of contract (single-use), not a
     // supported reuse mode.
     {
+        // The manifest's `includes`, each resolved against ITS directory — the
+        // one base rule — BEFORE anything reads them: the usability check below
+        // must look where the build will search, not where the process sits.
+        std::vector<std::string> manifestIncludes;
+        manifestIncludes.reserve(pc.includes.size());
+        for (auto const& inc : pc.includes) {
+            manifestIncludes.push_back(resolveManifestPathSpelling(manifestDir, inc));
+        }
+
         // D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED (the ACCEPTANCE half),
-        // the MANIFEST surface. Checked BEFORE the merge and over `pc.includes`
-        // ALONE, not over the merged list: the CLI's own `-I` entries were
-        // already checked at their acceptance point in `Program::run`, and
+        // the MANIFEST surface. Checked BEFORE the merge and over the manifest's
+        // entries ALONE, not over the merged list: the CLI's own `-I` entries
+        // were already checked at their acceptance point in `Program::run`, and
         // re-checking them here would report each of them TWICE for every
         // project build — the "one check per surface" rule the CLI site states.
         // `rep` is this call's reporter, so a manifest warning renders with the
         // project's diagnostics rather than through a second channel.
         (void)InputResolver::checkSearchDirectoriesUsable(
-            pc.includes, "the project manifest's `includes`", rep);
+            manifestIncludes, "the project manifest's `includes`", rep);
 
         std::vector<std::string> mergedIncludes = includeDirs();
-        mergedIncludes.reserve(mergedIncludes.size() + pc.includes.size());
+        mergedIncludes.reserve(mergedIncludes.size() + manifestIncludes.size());
         mergedIncludes.insert(mergedIncludes.end(),
-                              pc.includes.begin(), pc.includes.end());
+                              manifestIncludes.begin(), manifestIncludes.end());
         setIncludeDirs(std::move(mergedIncludes));
 
         std::vector<std::string> mergedDefines = userDefines();
@@ -5693,14 +5774,18 @@ int Program::compileProject(
                              pc.defines.begin(), pc.defines.end());
         setUserDefines(std::move(mergedDefines));
 
-        // D-FFI-DECLARED-IMPORT-NAME: the manifest parses into the SAME
+        // Declared import names: the manifest parses into the SAME
         // `ResolveLibrarySpec` the CLI does, so the merge is a plain append —
         // a manifest entry's declared import name survives the join with the
         // CLI-stamped entries instead of being flattened back to a bare path.
+        // The manifest's PATH is re-based onto its directory first; the CLI's
+        // entries are the command line's and keep their own base.
         std::vector<ResolveLibrarySpec> mergedLibs = resolveLibraries();
         mergedLibs.reserve(mergedLibs.size() + pc.resolveLibraries.size());
-        mergedLibs.insert(mergedLibs.end(),
-                          pc.resolveLibraries.begin(), pc.resolveLibraries.end());
+        for (ResolveLibrarySpec lib : pc.resolveLibraries) {
+            lib.path = resolveManifestPath(manifestDir, lib.path);
+            mergedLibs.push_back(std::move(lib));
+        }
         setResolveLibraries(std::move(mergedLibs));
     }
 
@@ -5732,18 +5817,16 @@ int Program::compileProject(
     // `artifactName` (2026-07-24) and is superseded by it: the directory half of
     // that sketch is this field, the name half is `artifactName`.
     //
-    // ★ A RELATIVE VALUE RESOLVES AGAINST THE PROCESS WORKING DIRECTORY, NOT
-    // AGAINST THE MANIFEST'S OWN DIRECTORY — the SAME base this manifest's
-    // `sources[]` and `preBuildScripts` already use (this function's
-    // `expandAndDedupProjectSources` and `runBuildScripts` calls each pass an
-    // EMPTY base, each with its own note saying that is a statement rather than
-    // an omission). ⚠ The manifest-relative reading is
-    // the intuitive one and it is WRONG here: a hook that writes `dist/` and an
-    // `"output": "dist"` must name the same directory, or the manifest does not
-    // compose with itself. The manifest's own directory is the base a DEPENDENCY
-    // manifest uses, which is a different question with a different answer.
-    // The value is stored VERBATIM, exactly as `cli_args.cpp` stores `--output`,
-    // so one relative-path rule serves both doors.
+    // ★ A RELATIVE VALUE RESOLVES AGAINST THE MANIFEST'S OWN DIRECTORY — the
+    // one base rule, the SAME base this manifest's `sources[]` and hooks use, so
+    // a hook that writes `dist/` and an `"output": "dist"` still name the same
+    // directory ([[D-PROJECT-ROOT-MANIFEST-PATHS-RESOLVE-AGAINST-THE-INVOCATION-DIRECTORY]]).
+    // This used to be the process working directory; ✔MEASURED, a build started
+    // anywhere else then wrote its artifact under wherever it was started. The
+    // CLI `--output` is the command line's and keeps the command line's base.
+    // ★ AND WITH NEITHER, THE DEFAULT IS `<manifest dir>/target`, not
+    // `<cwd>/target` — Cargo's and MSBuild's precedent, and hermetic: a project
+    // build's output no longer depends on where it was started.
     //
     // ★ PRECEDENCE — the CLI `--output` WINS, and the override is ANNOUNCED.
     // Same rule and same reason as `stackReserve` immediately below (a SCALAR
@@ -5766,7 +5849,7 @@ int Program::compileProject(
     // buffer, no band — and routing it through the reporter would let
     // `--warnings-as-errors` turn "I passed --output" into a compile error.
     if (pc.output.has_value()) {
-        fs::path const manifestBase{*pc.output};
+        fs::path const manifestBase{resolveManifestPathSpelling(manifestDir, *pc.output)};
         if (!outputDir().has_value()) {
             setOutputDir(manifestBase);
         } else if (!sameOutputBase(*outputDir(), manifestBase)) {
@@ -5784,6 +5867,9 @@ int Program::compileProject(
                 + artifactPathForReport(manifestBase)
                 + "'), which was not used.");
         }
+    }
+    if (!outputDir().has_value()) {
+        setOutputDir(resolveManifestPath(manifestDir, fs::path{"target"}));
     }
 
     // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the manifest's OPTIONAL
@@ -5803,6 +5889,21 @@ int Program::compileProject(
     // survives; the manifest never overwrites a supplied flag.
     if (!stackReserveBytes().has_value() && pc.stackReserveBytes.has_value()) {
         setStackReserveBytes(pc.stackReserveBytes);
+    }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the manifest's OPTIONAL `runpaths`.
+    //
+    // PRECEDENCE — a LIST, so it ACCUMULATES like the three flag arrays above,
+    // not the scalar rule just applied: the manifest's entries FIRST, then the
+    // CLI's `--rpath` entries `Program::run` stamped. Repeated `-rpath`
+    // accumulates in gcc and ld64 alike, so a command line ADDS a directory to
+    // the committed ones rather than silently replacing them; order is kept,
+    // and the writer drops an exact duplicate. The manifest's entries passed
+    // the PORTABLE rule at load (`parseProjectConfig`); the CLI's are gcc's
+    // literal strings, which is why only the CLI may name a loader-specific one.
+    if (!pc.runpaths.empty()) {
+        std::vector<std::string> merged = pc.runpaths;
+        merged.insert(merged.end(), runpaths().begin(), runpaths().end());
+        setRunpaths(std::move(merged));
     }
 
     // ── `dependsOn` RESOLUTION (AP6) ────────────────────────────────────────
@@ -5842,12 +5943,11 @@ int Program::compileProject(
     // takes the manifest path rather than deriving anything.
     depRequest.rootManifestPath = fs::path{projectFilePath};
     depRequest.targets          = pc.targets;
-    // U-9's base, stated rather than left implicit: `--output` when given, and
-    // `<cwd>/target` when not — the same rule `resolveArtifactOutputDir`
-    // applies to this build's own artifact, so a dependency's artifacts land
-    // beside the consumer's rather than in a second convention.
-    depRequest.artifactOutputBase =
-        outputDir().has_value() ? *outputDir() : (fs::current_path() / "target");
+    // U-9's base, stated rather than left implicit: THIS build's own output base
+    // — `--output`, else the manifest's `output`, else `<manifest dir>/target`,
+    // all three already stamped above — so a dependency's artifacts land beside
+    // the consumer's rather than in a second convention.
+    depRequest.artifactOutputBase = *outputDir();
     depRequest.compileConfig  = compileConfig();
     depRequest.jobs           = jobs();
     depRequest.executor       = executor();
@@ -5905,49 +6005,40 @@ int Program::compileProject(
     // `PreBuildScriptGeneratesSourceThatCompilesAndRuns` is the pin that
     // catches it, and it catches it by RUNNING the produced binary.
     //
-    // CWD — the child starts in the PROCESS working directory, which is the
-    // same base a relative `sources[]` entry and every relative glob already
-    // resolve against (see the expansion block below and
-    // `docs/project-config-spec.md`). A hook that writes `generated/main.c` and
-    // a manifest that reads `generated/*.c` must mean the same directory, or the
-    // feature does not compose with itself. The empty path IS that instruction:
-    // `substrate::spawnAndWaitInherit` documents `cwd` empty as "inherit the
-    // caller's current directory". It is passed as the sentinel rather than a
-    // materialized `fs::current_path()` on purpose — materializing introduces a
-    // failure mode (a deleted cwd) whose only honest handling is a diagnostic
-    // for a condition under which nothing else in this function works either,
-    // and it would let the two answers drift apart. (A DEPENDENCY manifest's
-    // hooks must run in THAT dependency's directory instead — which is why
-    // `runBuildScripts` takes `cwd` as a parameter at all; that caller does not
-    // exist yet, see the `dependsOn` reject above.)
-    if (!runBuildScripts(pc.preBuildScripts, fs::path{}, rep)) {
+    // CWD — the child starts in THE MANIFEST'S OWN DIRECTORY, the same base a
+    // relative `sources[]` entry and every relative glob resolve against (the
+    // expansion block below), so a hook that writes `generated/main.c` and a
+    // manifest that reads `generated/*.c` mean the same directory — for the root
+    // exactly as for a dependency, which is why `runBuildScripts` takes the
+    // directory as a parameter and a `run[0]` spelled as a path is re-based onto
+    // it there. A manifest named with no directory component hands over the
+    // EMPTY path, which `substrate::spawnAndWaitInherit` documents as "inherit
+    // the caller's current directory" — that manifest's directory — rather than a
+    // materialized `fs::current_path()`, which would add a failure mode (a
+    // deleted cwd) for a condition under which nothing else here works either.
+    if (!runBuildScripts(pc.preBuildScripts, manifestDir, rep)) {
         drainDiagnosticsToStderr(rep);
         return 1;
     }
 
     // D-AP2-SOURCES-GLOB + AP6 M4: `sources[]` entries → the concrete, deduped
     // file list, resolved by `expandAndDedupProjectSources`
-    // (`program/project_sources.hpp`, which carries the whole policy docblock:
+    // (`core/types/project_sources.hpp`, which carries the whole policy docblock:
     // expansion, the zero-match / I-O fail-loud rules, the `weakly_canonical`
     // dedup key, and why ORDER is load-bearing). It runs BEFORE the
     // multi-vs-single-CU routing count is taken, so a `"src/**/*.c"` entry routes
     // EXACTLY as if its matches had been listed literally.
     //
-    // ★ THE BASE IS EMPTY HERE, AND THAT IS A STATEMENT, NOT AN OMISSION. The
-    // ROOT manifest's entries resolve against the PROCESS working directory —
-    // the same base its `preBuildScripts` run in (see the hook call above) and
-    // the same base every relative CLI input uses — so a hook that writes
-    // `generated/main.c` and a manifest that reads `generated/*.c` mean the same
-    // directory. Passing the manifest's OWN directory here would be a silent
-    // behaviour change for every existing project whose cwd is not its manifest's
-    // directory. The non-empty base is for a DEPENDENCY manifest, which declares
-    // its sources relative to itself and has no other way to mean them.
+    // ★ THE BASE IS THE MANIFEST'S OWN DIRECTORY — for the root exactly as for a
+    // dependency, through the one base rule. It used to be EMPTY here (the
+    // process working directory), and ✔MEASURED from a directory holding
+    // look-alikes the root then compiled THEIR `src/main.c` with rc 0.
     //
     // The helper reports its own fail-loud diagnostic and leaves draining to us,
     // matching the gate sites above; the delegate below drains the rest
     // (runCusToTargets).
     auto expandedSourcesOpt =
-        expandAndDedupProjectSources(pc.sources, fs::path{}, rep);
+        expandAndDedupProjectSources(pc.sources, manifestDir, rep);
     if (!expandedSourcesOpt) {
         drainDiagnosticsToStderr(rep);
         return 1;
@@ -5971,6 +6062,11 @@ int Program::compileProject(
     // duplicate CU and a duplicate-symbol link error that names no manifest.
     // FIRST occurrence wins, keeping its own spelling, exactly as within a
     // single manifest.
+    // [[D-DEPS-MODULE-INCLUDES-AND-DEFINES-SILENTLY-DROPPED]]: each merged
+    // module source that is APPENDED compiles with its module's own `includes`
+    // and `defines`. A source this build's own manifest also names was kept as
+    // the ROOT's source above and gets none — whatever the two spellings are.
+    std::map<std::string, ManifestSourceSettings> moduleSettings;
     if (!resolved->mergedSources.empty()) {
         std::set<core::PathIdentity> seen;
         auto const key = [](std::string const& s) {
@@ -5980,9 +6076,15 @@ int Program::compileProject(
         expandedSources.reserve(expandedSources.size()
                                 + resolved->mergedSources.size());
         for (auto const& s : resolved->mergedSources) {
-            if (seen.insert(key(s)).second) expandedSources.push_back(s);
+            if (!seen.insert(key(s)).second) continue;
+            expandedSources.push_back(s);
+            if (auto const it = resolved->mergedSourceSettings.find(s);
+                it != resolved->mergedSourceSettings.end()) {
+                moduleSettings.emplace(s, it->second);
+            }
         }
     }
+    setSourceSettings(std::move(moduleSettings));
 
     // Route by the EXPANDED source COUNT via the shared `routesToMultiUnit`
     // threshold (identical to the CLI dispatcher): >1 source ⇒ N independent CUs
@@ -6038,7 +6140,7 @@ int Program::compileProject(
     // the failed hook at the bottom of a duplicated dump. The mark is taken
     // outside the `&&` because `runBuildScripts` is what appends to `rep`.
     std::size_t const preHookDiagnostics = rep.all().size();
-    if (rc == 0 && !runBuildScripts(pc.postBuildScripts, fs::path{}, rep)) {
+    if (rc == 0 && !runBuildScripts(pc.postBuildScripts, manifestDir, rep)) {
         drainDiagnosticsToStderr(rep, preHookDiagnostics);
         return 1;
     }
@@ -6128,6 +6230,37 @@ void applyIncludeDirs(UnitBuilder& builder,
     }
 }
 
+// [[D-DEPS-MODULE-INCLUDES-AND-DEFINES-SILENTLY-DROPPED]]: a `module`
+// dependency is a library whose consumption happens to be source-merge
+// (plan 06 B.13.3), so its sources must mean in its consumer what they mean
+// when the module builds standalone — with the module's OWN `includes` and
+// `defines`. ✔MEASURED before this, both were dropped: a module whose source
+// includes a header from its own include directory failed to compile inside
+// EVERY consumer, from every working directory. So a source with an entry in
+// `settings` gets the module's include directories searched BEFORE the build's
+// (the module's own header wins a same-named one), and its defines AFTER the
+// build's, so the module's own value wins a conflict with the preprocessor's
+// redefinition warning (`P_PreprocessorMacroRedefinition`, gcc's -D rule). A
+// source without an entry — every source the build's own manifest names —
+// compiles with the build's settings alone; the module's never reach it. The
+// build's own settings still reach the module's sources, as they always have:
+// that is [[D-DEPS-SOURCEMERGE-INHERITS-THE-CONSUMERS-COMPILATION-ENVIRONMENT]],
+// gated on AP7. Sets the unit's user defines in every case.
+void applyOwnSourceSettings(UnitBuilder&                                         builder,
+                            std::map<std::string, ManifestSourceSettings> const& settings,
+                            std::string const&                                   source,
+                            std::vector<std::string> const&                      buildDefines) {
+    auto const it = settings.find(source);
+    if (it == settings.end()) {
+        builder.setUserDefines(buildDefines);
+        return;
+    }
+    std::vector<std::string> defines = buildDefines;
+    defines.insert(defines.end(), it->second.defines.begin(), it->second.defines.end());
+    builder.setUserDefines(std::move(defines));
+    applyIncludeDirs(builder, it->second.includeDirs);
+}
+
 int Program::compileFiles(
     const std::vector<std::string>& sourceFiles,
     const std::string& languageName,
@@ -6205,14 +6338,15 @@ int Program::compileFiles(
     // parse and analysis are BOTH deep-safe and the cap is a real semantic
     // limit end-to-end.
     // c9 (Phase-2): the front-end build is a closure invoked once per distinct
-    // object-format-kind by `runCusToTargets`, so `__has_include` is per-target
-    // truthful. `setActiveFormat(kind)` is the only addition vs the pre-c9 build;
-    // `kind` is nullopt for a non-preprocess language / undeterminable spec
-    // (pure-existence, unchanged). The build still runs on the 64 MiB worker stack
-    // (D-PARSE-DEEP-FRONTEND-STACK).
-    auto buildCus = [&](CuBuildKey const&                   key,
-                        std::span<PredefinedMacroDef const> targetPredefines,
-                        std::span<PredefinedMacroDef const> formatPredefines,
+    // build key by `runCusToTargets`, so `__has_include` is per-target truthful:
+    // the key's pair reaches the builder through `applyTargetFormatPair`, and a
+    // non-preprocess language gets no pair (pure-existence, unchanged). The
+    // build still runs on the 64 MiB worker stack (D-PARSE-DEEP-FRONTEND-STACK).
+    auto buildCus = [&](// The build key's `<target>:<format>` pair, or both
+                        // null for a language with no preprocess pass (see the
+                        // `runCusToTargets` parameter).
+                        TargetSchema const*                 pairTarget,
+                        ObjectFormatSchema const*           pairFormat,
                         // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the grammar
                         // THIS key resolved to. Never the enclosing
                         // `grammar` — that is null on the ask-the-target path.
@@ -6240,20 +6374,26 @@ int Program::compileFiles(
                 // end no bound at all.
                 UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}};
                 applySystemDirs(builder, *keyGrammar);
-                if (key.format) builder.setActiveFormat(*key.format);
-                // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
-                // header-name case rule (NOT derived from the format kind).
-                builder.setHeaderNameMatching(key.headerNameMatching);
-                // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the target's
-                // plain-`char` sign, for the `#if` ICE fold.
-                builder.setCharIsUnsigned(key.charIsUnsigned);
-                // TF-C74: the active target's per-architecture identity macros.
-                builder.setTargetPredefinedMacros(
-                    {targetPredefines.begin(), targetPredefines.end()});
-                // TF-C97: the active format's data-model macros.
-                builder.setFormatPredefinedMacros(
-                    {formatPredefines.begin(), formatPredefines.end()});
-                builder.setUserDefines(userDefines());  // c105: --define
+                // D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: everything the
+                // pair decides about the build — the format kind, its header-
+                // name case rule, the target's plain-`char` sign, the target's
+                // and the format's predefined macros — in ONE call, the one the
+                // LSP and the FFI header parser make too.
+                if (pairTarget != nullptr && pairFormat != nullptr) {
+                    applyTargetFormatPair(builder, *pairTarget, *pairFormat);
+                }
+                // A module source's own settings, as in `compileUnits`. This
+                // builder makes ONE unit from every file it is given, so a
+                // per-source setting is only expressible for a one-file unit —
+                // and that is the only shape a settings-carrying build reaches
+                // here: a manifest build routes two or more sources to
+                // `compileUnits` (`routesToMultiUnit`).
+                if (sources.size() == 1) {
+                    applyOwnSourceSettings(builder, sourceSettings_, sources.front(),
+                                           userDefines());  // c105: --define
+                } else {
+                    builder.setUserDefines(userDefines());  // c105: --define
+                }
                 applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
                 for (auto const& path : sources) {
                     builder.addFile(fs::path{path});
@@ -6276,8 +6416,10 @@ int Program::compileFiles(
         resolveLibraries_, resolveLibraryAdditionsByTarget_, artifactPaths_,
         executor_, jobs_,
         // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the CLI/manifest stack-reserve
-        // request (nullopt = the format default stands).
-        ImageRequest{stackReserveBytes_},
+        // request (nullopt = the format default stands), and
+        // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the CLI/manifest runpaths.
+        ImageRequest{.stackReserveBytes = stackReserveBytes_,
+                     .runpaths          = runpaths_},
         // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
         // the cross-build artifact cache policy. nullopt on every CLI build and
         // on every ROOT project build; engaged only on a DEPENDENCY sub-build,
@@ -6555,7 +6697,7 @@ int Program::compileUnits(
     // miss — it DOES spawn a thread, but it spawns it and immediately JOINS
     // it, so it buys stack depth, never concurrency.
     //
-    // The batch below is the SAME SHAPE the back half has used since D-PERF-4
+    // The batch below is the SAME SHAPE the back half has used since D-PERF-4-CU-PARALLELISM
     // (see `compileOneTarget`), deliberately reused rather than reinvented:
     //   • write BY INDEX into a pre-sized slot vector — no shared container is
     //     mutated, so there is nothing to lock and nothing to order;
@@ -6584,9 +6726,10 @@ int Program::compileUnits(
     // per unit on the steady-state HIT, and its MISS arm runs a whole nested
     // `Program` build whose own per-CU pool would then be nested inside this
     // one. Refusing to parallelize it is not an oversight.
-    auto buildCus = [&](CuBuildKey const&                   key,
-                        std::span<PredefinedMacroDef const> targetPredefines,
-                        std::span<PredefinedMacroDef const> formatPredefines,
+    auto buildCus = [&](// The build key's pair, or both null (see the
+                        // `compileFiles` twin).
+                        TargetSchema const*                 pairTarget,
+                        ObjectFormatSchema const*           pairFormat,
                         // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: this key's
                         // resolved grammar (see the `compileFiles` twin).
                         std::shared_ptr<GrammarSchema const> const& keyGrammar,
@@ -6622,20 +6765,17 @@ int Program::compileUnits(
                     // exists to prevent.
                     UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}};
                     for (auto const& d : systemDirs) builder.addSystemDir(d);
-                    if (key.format) builder.setActiveFormat(*key.format);
-                    // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
-                    // header-name case rule (NOT derived from the format kind).
-                    builder.setHeaderNameMatching(key.headerNameMatching);
-                    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the target's
-                    // plain-`char` sign, for the `#if` ICE fold.
-                    builder.setCharIsUnsigned(key.charIsUnsigned);
-                    // TF-C74: the active target's per-architecture identity macros.
-                    builder.setTargetPredefinedMacros(
-                        {targetPredefines.begin(), targetPredefines.end()});
-                    // TF-C97: the active format's data-model macros.
-                    builder.setFormatPredefinedMacros(
-                        {formatPredefines.begin(), formatPredefines.end()});
-                    builder.setUserDefines(userDefines());  // c105: --define
+                    // D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: the pair's
+                    // consequences in ONE call (see the `compileFiles` twin).
+                    if (pairTarget != nullptr && pairFormat != nullptr) {
+                        applyTargetFormatPair(builder, *pairTarget, *pairFormat);
+                    }
+                    // [[D-DEPS-MODULE-INCLUDES-AND-DEFINES-SILENTLY-DROPPED]]:
+                    // a merged module source adds ITS module's own settings —
+                    // include directories searched first, defines after the
+                    // build's (see `applyOwnSourceSettings`).
+                    applyOwnSourceSettings(builder, sourceSettings_, sources[i],
+                                           userDefines());  // c105: --define
                     applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
                     builder.addFile(fs::path{sources[i]});
                     return std::move(builder).finish();
@@ -6717,8 +6857,10 @@ int Program::compileUnits(
         resolveLibraries_, resolveLibraryAdditionsByTarget_, artifactPaths_,
         executor_, jobs_,
         // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the CLI/manifest stack-reserve
-        // request (nullopt = the format default stands).
-        ImageRequest{stackReserveBytes_},
+        // request (nullopt = the format default stands), and
+        // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the CLI/manifest runpaths.
+        ImageRequest{.stackReserveBytes = stackReserveBytes_,
+                     .runpaths          = runpaths_},
         // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
         // the cross-build artifact cache policy — see the `compileFiles` twin.
         dependencyArtifactCache_);

@@ -35,15 +35,19 @@
 #include "program/cli_args.hpp"
 #include "program/program.hpp"
 #include "repo_root.hpp"   // the seam guard's subject is the source tree
+#include "scratch_dir.hpp" // one scratch directory per PROCESS, claimed atomically
 
 #include <gtest/gtest.h>
 
+#include <algorithm>   // std::min — the opt-in arm's list split
 #include <array>
+#include <cstdlib>     // std::getenv — the opt-in arm's inputs
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 using namespace dss;
@@ -61,14 +65,25 @@ constexpr std::string_view kTarget = "x86_64:elf64-x86_64-linux";
 // whether `long`→`int` is an explicit `cast` node or an identity retag.
 constexpr std::string_view kTargetLlp64 = "x86_64:pe64-x86_64-windows-exec";
 
-// A scratch directory unique to this binary, under the system temp root. It is
-// NOT the repository root: a bare output filename would land in whatever
-// directory the runner happened to start in, which on this project has twice
-// meant probe artifacts committed into a source tree.
+// A scratch directory unique to this PROCESS, under the system temp root,
+// claimed atomically by the shared `ScratchDir` helper. It is NOT the
+// repository root: a bare output filename would land in whatever directory the
+// runner happened to start in, which on this project has twice meant probe
+// artifacts committed into a source tree.
+//
+// It used to be the constant `temp_directory_path()/"dss_emit_hir_mode_test"`,
+// and this comment called that "unique to this binary". It was one directory
+// per MACHINE, shared by every build tree's copy of this binary, and `emitTo`
+// removes its destination before emitting. ✔MEASURED 2026-09-23 (P68 round 8):
+// two concurrent instances of the same binary failed 7 of 24 runs across 12
+// pairs (an artifact read back EMPTY, or gone, after the other instance's
+// `remove`), and every solo run passed. A lane's MSVC gate hit it as a red on
+// `EmitHirMode.TypedefUnionEnumAndArrayExtentsAllTravel` while another tree ran
+// the same test.
 [[nodiscard]] fs::path scratchDir() {
-    fs::path const d = fs::temp_directory_path() / "dss_emit_hir_mode_test";
-    fs::create_directories(d);
-    return d;
+    static dss::test_support::ScratchDir const scratch{
+        dss::test_support::Location::Temp, "emit-hir-mode"};
+    return scratch.path();
 }
 
 [[nodiscard]] fs::path writeSource(std::string_view stem, std::string_view text) {
@@ -168,22 +183,28 @@ TEST(EmitHirMode, RejectedSourceExitsNonZeroAndWritesNothing) {
 
 // ── Self-contained TYPES (the reader holds only the text) ───────────────────
 
-TEST(EmitHirMode, StructDefinitionTravelsWithEveryUseOfIt) {
+TEST(EmitHirMode, AStructIsDefinedOnceAndEveryUseNamesItsHandle) {
     auto const r = emitTo("structs",
                           "struct Point { int x; int y; };\n"
                           "int sum_fields(struct Point *p) { return p->x + p->y; }\n");
     ASSERT_EQ(r.rc, 0) << r.err;
 
     // The FIELD TYPES are in the text, not an id pointing at an interner this
-    // process happens to still hold. `struct "Point"` alone would be an opaque
-    // name — the `{i32, i32}` is the claim.
-    EXPECT_NE(r.artifact.find("struct \"Point\" {i32, i32}"), std::string::npos)
-        << r.artifact;
-    // And it travels THROUGH the pointer, at the use site, not only at the
-    // declaration: a reader that met `ptr<struct "Point">` with no body could
-    // not state a property about `p->x`.
-    EXPECT_NE(r.artifact.find("ptr<struct \"Point\" {i32, i32}>"), std::string::npos)
-        << r.artifact;
+    // process happens to still hold — and since v5 they are there ONCE, in the
+    // artifact's own `types` table. `struct "Point"` alone would be an opaque
+    // name; the `{i32, i32}` is the claim.
+    EXPECT_NE(r.artifact.find("types {\n  type 1 = struct \"Point\" {i32, i32}\n}\n"),
+              std::string::npos) << r.artifact;
+    // Every USE names the handle — the declaration, the parameter, and through
+    // the pointer — so a reader holding only the bytes resolves `p->x` against
+    // the one definition. ✔v4 re-spelled the whole struct at each of these, which
+    // is what made the artifact (mentions × reachable graph) on real C.
+    EXPECT_NE(r.artifact.find("type_decl %1 : type 1\n"), std::string::npos) << r.artifact;
+    EXPECT_NE(r.artifact.find("param %3 : ptr<type 1>\n"), std::string::npos) << r.artifact;
+    EXPECT_EQ(r.artifact.find("ptr<struct"), std::string::npos)
+        << "a composite was spelled inline at a use site:\n" << r.artifact;
+    EXPECT_EQ(r.artifact.find("struct \"Point\""), r.artifact.rfind("struct \"Point\""))
+        << "the definition appears more than once:\n" << r.artifact;
 
     auto const back = reparse(r.artifact);
     EXPECT_TRUE(back.ok) << back.diagnostics << "\n---\n" << r.artifact;
@@ -224,33 +245,36 @@ TEST(EmitHirMode, TypedefUnionEnumAndArrayExtentsAllTravel) {
 }
 
 TEST(EmitHirMode, CyclicCompositesEmitThroughTheWholeFrontEndAndReadBack) {
-    // ★★★ v3 CLOSED THE FORMAT'S ONE SELF-CONTAINMENT HOLE. Until v3 a TU
-    // containing `struct Node { struct Node *next; }` — the ordinary linked list,
-    // and with it every tree, intrusive container and parent pointer in real C —
-    // exited non-zero with no file. The type graph is CYCLIC and the grammar had
-    // no back-reference form, so the writer emitted the poison `?` and an Error.
+    // ★★★ v3 CLOSED THE FORMAT'S ONE SELF-CONTAINMENT HOLE, AND v5 MADE IT
+    // ORDINARY. Until v3 a TU containing `struct Node { struct Node *next; }` —
+    // the ordinary linked list, and with it every tree, intrusive container and
+    // parent pointer in real C — exited non-zero with no file. v3 spelled the
+    // cycle with a `rec <H>` back-reference; v5 defines every composite ONCE in
+    // the `types` table, so the pointer that closes the cycle is a reference like
+    // any other and needs no marker at all.
     //
-    // `rec <H>` is that form, and this arm is the END-TO-END half: not the codec
-    // in isolation but the shipped CLI over real C source, through tokenize,
-    // preprocess, parse, semantic analysis and HIR lowering. All three shapes the
-    // consumer actually has are here — self-reference, a MUTUALLY recursive pair,
-    // and a self-reference reached through a TYPEDEF (where the name at the use
-    // site is not the name on the definition).
+    // This arm is the END-TO-END half: not the codec in isolation but the shipped
+    // CLI over real C source, through tokenize, preprocess, parse, semantic
+    // analysis and HIR lowering. All three shapes the consumer actually has are
+    // here — self-reference, a MUTUALLY recursive pair, and a self-reference
+    // reached through a TYPEDEF (where the name at the use site is not the name on
+    // the definition). Each expectation is the artifact's whole `types` section.
     struct Arm { char const* name; char const* src; char const* expect; };
     std::array<Arm, 3> const arms{{
         {"self", "struct Node { int v; struct Node *next; };\n"
                  "int head_value(struct Node *n) { return n->v; }\n",
-                 "struct \"Node\" rec 1 {i32, ptr<rec 1>}"},
+                 "types {\n  type 1 = struct \"Node\" {i32, ptr<type 1>}\n}\n"},
         {"mutual", "struct B;\n"
                    "struct A { int x; struct B *b; };\n"
                    "struct B { int y; struct A *a; };\n"
                    "int ax(struct A *p) { return p->x; }\n"
                    "int by(struct B *p) { return p->y; }\n",
-                   "struct \"A\" rec 1 {i32, ptr<struct \"B\" rec 2 {i32, ptr<rec 1>}>}"},
+                   "types {\n  type 1 = struct \"A\" {i32, ptr<type 2>}\n"
+                   "  type 2 = struct \"B\" {i32, ptr<type 1>}\n}\n"},
         {"typedef", "typedef struct TNode TNode;\n"
                     "struct TNode { int v; TNode *left; TNode *right; };\n"
                     "int tv(TNode *t) { return t->v; }\n",
-                    "struct \"TNode\" rec 1 {i32, ptr<rec 1>, ptr<rec 1>}"},
+                    "types {\n  type 1 = struct \"TNode\" {i32, ptr<type 1>, ptr<type 1>}\n}\n"},
     }};
     for (Arm const& arm : arms) {
         auto const r = emitTo(arm.name, arm.src);
@@ -268,18 +292,230 @@ TEST(EmitHirMode, CyclicCompositesEmitThroughTheWholeFrontEndAndReadBack) {
                              << "\n---\n" << r.artifact;
     }
 
-    // CONTROL: an ACYCLIC composite carries NO handle, so the marker is a
-    // property of the type graph and not of "being a struct" — without this,
-    // "the handle appeared" is equally consistent with the writer stamping one
-    // on everything.
+    // CONTROL: an ACYCLIC composite is spelled exactly like a cyclic one — one
+    // table entry — so cyclicity costs nothing and marks nothing. Without this,
+    // "the cyclic arms emit" is equally consistent with the writer special-casing
+    // them.
     auto const control = emitTo("cyclic_control",
                                 "struct Leaf { int v; int *p; };\n"
                                 "int leaf_value(struct Leaf *n) { return n->v; }\n");
     EXPECT_EQ(control.rc, 0) << control.err;
-    EXPECT_NE(control.artifact.find("struct \"Leaf\" {i32, ptr<i32>}"), std::string::npos)
-        << control.artifact;
+    EXPECT_NE(control.artifact.find("types {\n  type 1 = struct \"Leaf\" {i32, ptr<i32>}\n}\n"),
+              std::string::npos) << control.artifact;
     EXPECT_EQ(control.artifact.find(" rec "), std::string::npos) << control.artifact;
     EXPECT_TRUE(reparse(control.artifact).ok);
+}
+
+// ── Real C's shape: a composite GRAPH mentioned many times ──────────────────
+//
+// ★★★ THE CONSUMER-VISIBLE HALF OF THE v5 BOUND, THROUGH THE WHOLE FRONT END. A
+// chain of `kGraph` structs (each pointing at the next) is mentioned by
+// `kMentions` functions. v4 re-spelled the entire chain at every mention —
+// ✔MEASURED on sqlite's amalgamation (P68 r7, lane `cr`): 1.18 MB of it ran 275.9 G
+// instructions and died `std::bad_alloc` — where v5 writes each struct's fields
+// exactly once. The codec-level COUNT pin lives in `tests/hir/test_hir_text.cpp`
+// (`HirTextTypeSpellingCost.*`); this arm asserts the same fact on the artifact a
+// consumer reads: one definition per struct, and no field list anywhere else.
+TEST(EmitHirMode, ACompositeGraphMentionedManyTimesIsDefinedOnceInTheTable) {
+    constexpr int kGraph    = 12;
+    constexpr int kMentions = 40;
+    std::string src;
+    for (int k = 0; k < kGraph; ++k) {
+        src += "struct S" + std::to_string(k) + " { int v; ";
+        src += (k + 1 < kGraph) ? "struct S" + std::to_string(k + 1) + " *next; };\n"
+                                : std::string{"int *last; };\n"};
+    }
+    for (int m = 0; m < kMentions; ++m) {
+        src += "int f" + std::to_string(m) + "(struct S0 *p) { return p->v; }\n";
+    }
+    auto const r = emitTo("composite_graph", src);
+    ASSERT_EQ(r.rc, 0) << r.err;
+    std::size_t entries = 0;
+    for (std::size_t at = r.artifact.find("\n  type "); at != std::string::npos;
+         at = r.artifact.find("\n  type ", at + 1)) {
+        ++entries;
+    }
+    EXPECT_EQ(entries, static_cast<std::size_t>(kGraph)) << r.artifact;
+    for (int k = 0; k < kGraph; ++k) {
+        std::string const name = "struct \"S" + std::to_string(k) + "\" {";
+        EXPECT_EQ(r.artifact.find(name), r.artifact.rfind(name))
+            << "S" << k << " is defined more than once";
+        EXPECT_NE(r.artifact.find(name), std::string::npos) << "S" << k << " has no definition";
+    }
+    // No composite is spelled inline anywhere outside the table.
+    std::size_t const body = r.artifact.find("\nmodule ");
+    ASSERT_NE(body, std::string::npos);
+    EXPECT_EQ(r.artifact.find("struct \"", body), std::string::npos)
+        << "a composite was spelled inline in the module body";
+    EXPECT_EQ(hirArtifactRoundTripFailure(r.artifact), "");
+}
+
+// ── Job 2 of P68 round 8: `if (x) return; g();` ─────────────────────────────
+//
+// ★★★ THE MINIMAL CONSTRUCT sqlite's `test/speedtest1.c` MET, THROUGH THE CLI. v4
+// wrote the value-less return as a bare `return`, the next statement's `@loc`
+// block followed it, and the reader took that statement for the return's VALUE:
+// `--emit-hir` refused its own artifact with rc 2 (`unexpected node kind
+// 'ExprStmt' in expression position`). gcc 13.3, clang 18.1.3 and MSVC 14.51 all
+// accept the source — it is ISO C, not an extension (✔MEASURED, P68 round 8).
+TEST(EmitHirMode, AValueLessReturnFollowedByAStatementEmitsAndReadsBack) {
+    auto const r = emitTo("return_then_statement",
+                          "void g(void);\n"
+                          "void guarded(int x) { if (x) return; g(); }\n");
+    ASSERT_EQ(r.rc, 0) << "rc 2 is the refusal sqlite's speedtest1.c met\n" << r.err;
+    EXPECT_NE(r.artifact.find("return void\n"), std::string::npos) << r.artifact;
+    EXPECT_EQ(hirArtifactRoundTripFailure(r.artifact), "");
+
+    // READ BACK: `g();` is the block's second statement, not the return's value.
+    DiagnosticReporter rep;
+    auto const parsed = parseHir(r.artifact, CompilationUnitId{1}, rep);
+    ASSERT_TRUE(parsed->ok) << r.artifact;
+    Hir const& h = parsed->hir;
+    auto const decls = h.moduleDecls(h.root());
+    ASSERT_FALSE(decls.empty());
+    HirNodeId const fn = decls[decls.size() - 1];
+    ASSERT_EQ(h.kind(fn), HirKind::Function);
+    auto const members = h.children(h.functionBody(fn));
+    ASSERT_EQ(members.size(), 2u) << r.artifact;
+    EXPECT_EQ(h.kind(members[0]), HirKind::IfStmt);
+    EXPECT_EQ(h.kind(members[1]), HirKind::ExprStmt);
+    EXPECT_FALSE(h.returnValue(h.ifThen(members[0])).has_value())
+        << "the then-arm return came back WITH a value — the v4 misread";
+}
+
+// ── A suppress list cannot silence a structural verifier refusal ────────────
+//
+// ★★ ✔MEASURED P68 (lane `ht`, `dsscp --compile --suppress=<code>`, WSL Release)
+// BEFORE these codes joined `kUnsuppressableCodes`: for the six structural
+// verifier refusals a C source reaches, suppressing the refusal let the invalid
+// tree go on — two green PE executables (`H_SehJumpIntoRegion`,
+// `H_SehLabelAddress`, rc 0), two compiler process ABORTS in MIR
+// (`H_VlaJumpIntoScope`, `H_VlaComputedGotoInScope`, rc 134) and two refusals
+// replaced by an unrelated LIR error (`H_SehBuiltinContext`, `H_SehEarlyExit`);
+// `--emit-hir` then blamed its own read-back ("a defect in the compiler, not in
+// the source", rc 2). Each arm runs the real front end with the operator's
+// suppress list naming its code: the compile must still fail, the refusal must
+// still be SHOWN, nothing may be written, and `--emit-hir` must refuse the SOURCE
+// (rc 1), not its own artifact. The three codes no C source reaches are pinned in
+// `tests/hir/test_hir_text.cpp` (`HirTextVerdict.*`).
+TEST(EmitHirMode, ASuppressListCannotSilenceAStructuralVerifierRefusalACSourceReaches) {
+    constexpr std::string_view kPe = "x86_64:pe64-x86_64-windows-exec";
+    struct Arm {
+        char const*      stem;
+        DiagnosticCode   code;
+        std::string_view target;
+        char const*      source;
+    };
+    std::array<Arm, 6> const arms{{
+        {"suppress_seh_builtin", DiagnosticCode::H_SehBuiltinContext, kPe,
+         "int f(void) { return (int)_exception_code(); }\n"
+         "int main(void) { return f(); }\n"},
+        {"suppress_seh_return", DiagnosticCode::H_SehEarlyExit, kPe,
+         "int f(int *p) { __try { return *p; } __except (1) { return 42; } }\n"
+         "int main(void) { int x = 7; return f(&x); }\n"},
+        {"suppress_seh_goto_into", DiagnosticCode::H_SehJumpIntoRegion, kPe,
+         "int f(int *p) { int rc = 0; if (*p) goto L;\n"
+         "  __try { L: rc = *p; } __except (1) { rc = 42; } return rc; }\n"
+         "int main(void) { int x = 7; return f(&x); }\n"},
+        {"suppress_seh_label_addr", DiagnosticCode::H_SehLabelAddress, kPe,
+         "int f(int *p) { int rc = 0; void *q = &&L; (void)q;\n"
+         "  __try { L: rc = *p; } __except (1) { rc = 42; } return rc; }\n"
+         "int main(void) { int x = 7; return f(&x); }\n"},
+        {"suppress_vla_goto_into", DiagnosticCode::H_VlaJumpIntoScope, kTarget,
+         "int main(void) { volatile int vn = 4; int n = vn;\n"
+         "  goto L; int a[n]; L: a[0] = 1; return a[0]; }\n"},
+        {"suppress_vla_computed_goto", DiagnosticCode::H_VlaComputedGotoInScope, kTarget,
+         "int main(void) { volatile int vn = 4; int n = vn; void *p = &&L;\n"
+         "  { int a[n]; a[0] = 1; goto *p; } L: return 0; }\n"},
+    }};
+    for (Arm const& arm : arms) {
+        SCOPED_TRACE(std::string{diagnosticCodeName(arm.code)});
+        fs::path const src = writeSource(arm.stem, arm.source);
+        DiagnosticReporter::Config cfg;
+        cfg.policy.suppress.insert(arm.code);
+
+        // (1) THE COMPILE, through the rep-injection overload so the diagnostics
+        // the run printed can be read back.
+        fs::path const outDir = scratchDir() / (std::string{arm.stem} + "_out");
+        std::error_code ec;
+        fs::remove_all(outDir, ec);
+        DiagnosticReporter rep{cfg};
+        Program compiler;
+        compiler.setOutputDir(outDir);
+        int const rc = compiler.compileFiles({src.string()}, "c",
+                                             std::vector<std::string>{std::string{arm.target}},
+                                             rep);
+        EXPECT_NE(rc, 0) << "the compile went on past a suppressed structural refusal";
+        std::size_t shown = 0;
+        for (auto const& d : rep.all()) if (d.code == arm.code) ++shown;
+        EXPECT_EQ(shown, 1u) << "the suppress list SILENCED the structural refusal";
+        EXPECT_TRUE(!fs::exists(outDir) || fs::is_empty(outDir))
+            << "an artifact was written for a refused program";
+
+        // (2) `--emit-hir`, with the same list: the SOURCE is refused (rc 1), and
+        // nothing is written — not the rc 2 that blames the compiler's read-back.
+        fs::path const dst = scratchDir() / (std::string{arm.stem} + ".dsshir");
+        fs::remove(dst, ec);
+        std::ostringstream out;
+        std::ostringstream err;
+        Program emitter;
+        int const erc = emitter.emitHirText({src.string()}, "c", std::string{arm.target},
+                                            dst.string(), out, err, cfg);
+        EXPECT_EQ(erc, 1) << err.str();
+        EXPECT_FALSE(fs::exists(dst)) << "an artifact was written for a refused program";
+    }
+}
+
+// ── OPT-IN: sqlite's own `test/speedtest1.c`, wherever the sqlite tree is reachable ──
+//
+// ctest cannot see an sqlite checkout, so this arm is DISABLED by default and armed
+// by hand (the `ArWriter.DISABLED_WriteCoffLibForNativeWitness` precedent):
+//   DSS_SQLITE_SPEEDTEST1_C   = <sqlite>/test/speedtest1.c
+//   DSS_SQLITE_INCLUDE_DIRS   = ';'-separated include dirs, the one holding the
+//                               GENERATED sqlite3.h among them
+//   DSS_SQLITE_DEFINES        = optional ','-separated NAME[=VALUE] list (the CLI
+//                               recipe's defines, to reproduce a recipe exactly)
+//   dss_program_test_emit_hir_mode --gtest_also_run_disabled_tests \
+//       --gtest_filter='*SqliteSpeedtest1*'
+// Armed without its inputs it FAILS rather than skips, so an armed run cannot pass
+// vacuously.
+TEST(EmitHirMode, DISABLED_SqliteSpeedtest1EmitsAndReadsBack) {
+    char const* const source   = std::getenv("DSS_SQLITE_SPEEDTEST1_C");
+    char const* const includes = std::getenv("DSS_SQLITE_INCLUDE_DIRS");
+    ASSERT_NE(source, nullptr) << "set DSS_SQLITE_SPEEDTEST1_C to sqlite's test/speedtest1.c";
+    ASSERT_NE(includes, nullptr)
+        << "set DSS_SQLITE_INCLUDE_DIRS to the ';'-separated include dirs (sqlite3.h's among them)";
+    ASSERT_TRUE(fs::exists(source)) << source;
+    auto const split = [](std::string_view list, char sep) {
+        std::vector<std::string> out;
+        std::size_t from = 0;
+        while (from <= list.size()) {
+            std::size_t const to = std::min(list.find(sep, from), list.size());
+            if (to > from) out.emplace_back(list.substr(from, to - from));
+            from = to + 1;
+        }
+        return out;
+    };
+    std::vector<std::string> const includeDirs = split(includes, ';');
+    ASSERT_FALSE(includeDirs.empty());
+    std::vector<std::string> defines;
+    if (char const* const d = std::getenv("DSS_SQLITE_DEFINES")) defines = split(d, ',');
+
+    fs::path const dst = scratchDir() / "speedtest1.dsshir";
+    std::error_code ec;
+    fs::remove(dst, ec);
+    std::ostringstream out;
+    std::ostringstream err;
+    Program p;
+    p.setIncludeDirs(includeDirs);
+    p.setUserDefines(defines);
+    int const rc = p.emitHirText({std::string{source}}, "c", std::string{kTarget},
+                                 dst.string(), out, err);
+    ASSERT_EQ(rc, 0) << "rc 2 was the v4 refusal this arm pins against\n" << err.str();
+    std::string const artifact = readFile(dst);
+    EXPECT_EQ(hirArtifactRoundTripFailure(artifact), "");
+    EXPECT_NE(artifact.find("return void\n"), std::string::npos)
+        << "speedtest1.c's `if( … ) return;` sites must spell their absence";
 }
 
 // ── Self-contained NAMES ────────────────────────────────────────────────────
@@ -322,7 +558,7 @@ TEST(EmitHirMode, VersionAndRealProducerRevisionHeadTheArtifact) {
     ASSERT_EQ(r.rc, 0) << r.err;
     // The version is the FIRST line, so a reader can decide whether to continue
     // before it has parsed anything it might misread.
-    EXPECT_TRUE(r.artifact.starts_with("dsshir 4\n")) << r.artifact.substr(0, 64);
+    EXPECT_TRUE(r.artifact.starts_with("dsshir 6\n")) << r.artifact.substr(0, 64);
     EXPECT_NE(r.artifact.find("\nproducer \""), std::string::npos) << r.artifact;
     // ⚠ NOT MERELY "a producer line exists". The emitter accepts an EMPTY
     // producer (hand-built test modules use it), so a routing defect that never
@@ -356,8 +592,8 @@ TEST(EmitHirMode, AMalformedOrAbsentVersionIsRefusedLoudlyOnRead) {
         {"the superseded v1", "dsshir 1\nsymbols {\n}\nmodule \"toy\" {\n}\n"},
         {"no version at all", "module \"toy\" {\n}\n"},
         {"a non-numeric version", "dsshir vNext\nmodule \"toy\" {\n}\n"},
-        {"no producer line", "dsshir 4\nmodule \"toy\" {\n}\n"},
-        {"an unquoted producer", "dsshir 4\nproducer 7\nmodule \"toy\" {\n}\n"},
+        {"no producer line", "dsshir 6\nmodule \"toy\" {\n}\n"},
+        {"an unquoted producer", "dsshir 6\nproducer 7\nmodule \"toy\" {\n}\n"},
     };
     for (auto const& arm : arms) {
         DiagnosticReporter r;
@@ -370,7 +606,7 @@ TEST(EmitHirMode, AMalformedOrAbsentVersionIsRefusedLoudlyOnRead) {
     // it, six failures are equally consistent with "this parser refuses
     // everything".
     DiagnosticReporter ok;
-    auto good = parseHir(std::string{"dsshir 4\nproducer \"ctl\"\nmodule \"toy\" {\n}\n"},
+    auto good = parseHir(std::string{"dsshir 6\nproducer \"ctl\"\nmodule \"toy\" {\n}\n"},
                          CompilationUnitId{1}, ok);
     EXPECT_TRUE(good->ok);
     EXPECT_EQ(good->producer, "ctl");
@@ -500,7 +736,7 @@ TEST(EmitHirMode, DashWritesTheArtifactToTheGivenStreamAndNoFile) {
     int const rc = p.emitHirText({src.string()}, "c", std::string{kTarget}, "-",
                                  out, err);
     EXPECT_EQ(rc, 0) << err.str();
-    EXPECT_TRUE(out.str().starts_with("dsshir 4\n")) << out.str().substr(0, 64);
+    EXPECT_TRUE(out.str().starts_with("dsshir 6\n")) << out.str().substr(0, 64);
     EXPECT_TRUE(err.str().empty()) << err.str();
     // A file literally named `-` is the failure this arm exists to catch.
     EXPECT_FALSE(fs::exists(fs::path{"-"}));
@@ -515,7 +751,7 @@ TEST(DumpHirKinds, InventoryNamesEveryCoreKindAndIsAttributed) {
     // It reports the format version too, because a consumer generating a
     // build-time coverage table needs to know which artifact grammar these kinds
     // belong to.
-    EXPECT_NE(text.find("dsshir-format-version 4\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("dsshir-format-version 6\n"), std::string::npos) << text;
 
     // ★ THE COUNT LINE MUST AGREE WITH THE ROWS. A truncated enumeration is the
     // dangerous failure here: a consumer treats this list as EXHAUSTIVE and
@@ -607,7 +843,7 @@ TEST(HirArtifactRoundTrip, AnArtifactCarryingATokenTheGrammarHasNoRuleForIsRefus
     // had no token for at all, and four shipped artifacts were refused by name.
     // Reproduced synthetically, because that particular hole is now closed.
     std::string const bad =
-        "dsshir 4\n"
+        "dsshir 6\n"
         "producer \"planted\"\n"
         "module \"C\" {\n"
         "  \x01\x02 not a production this grammar has\n"

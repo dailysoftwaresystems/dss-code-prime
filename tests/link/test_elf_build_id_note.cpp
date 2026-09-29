@@ -156,8 +156,9 @@ struct Shdr {
 // TheSameId` asserts EQUALITY, and two dangling reads that both land on offset 0 are
 // equal. It was green on every host while proving nothing. A test that cannot fail is
 // worse than one that does.
-// ⇒ Both prior occurrences (`D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE`, and the
-// `named(arrayOf(...), ...)` copy in `tests/ffi/test_pe_abort_behavior_binding.cpp`)
+// ⇒ Both prior occurrences — a schema fixture that bound a reference to a
+// destroyed temporary, and the `named(arrayOf(...), ...)` copy in
+// `tests/ffi/test_pe_abort_behavior_binding.cpp` —
 // were fixed by ADOPTING THE NAMED-LOCAL CONVENTION. A convention has no teeth at the
 // moment of the decision, which is exactly why the class came back. This deletion
 // makes the mistake a COMPILE ERROR instead: bind the sections to a named local first.

@@ -1,0 +1,16 @@
+{
+  "$comment": "★★★ THE PAGE AND THE PAGE OFFSET OF A SYMBOL, AS CLANG WRITES THEM FOR DARWIN (P68 round 9, the aarch64 twins of D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER, and the Mach-O half of D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD). The same program as `asm_arm64_page_and_page_offset_elf`, spelled `sym@PAGE` / `sym@PAGEOFF` (clang for Darwin refuses `:lo12:`, a bare `adrp` operand and an `adr` to another section, which Mach-O has no relocation for), with a constant on either side of the operator (`tail+8@PAGE`, `tail@PAGEOFF+8`). ✔MEASURED 2026-09-23: clang 18.1.3 --target=arm64-apple-macos11 assembles a copy spelled for Darwin (`_main`, no `.type`) word for word as DSS writes this one, with ARM64_RELOC_PAGE21 / ARM64_RELOC_PAGEOFF12 on every pair (ARM64_RELOC_ADDEND 8 for the two `+8`s) and ARM64_RELOC_UNSIGNED `self` for `.quad .`. At the round-9 base `adrp` was an unknown mnemonic, `@` an illegal character and `.` did not parse. ONE relocation type serves the ADD and every load and store size here, so the link must take the scale from the instruction (ld64's rule): a load read with the ADD's arithmetic lands 2^size times too far, and the `pad` in front keeps every object off page offset 0, where it would happen to be right. The darwin leg RUNS it; elsewhere it is compiled only. The `release` arm pins only that naming the release pipeline does not break the assembly path.",
+  "language": "asm-arm64-gas",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

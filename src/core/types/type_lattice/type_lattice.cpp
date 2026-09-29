@@ -29,9 +29,9 @@ namespace detail {
     std::fputs("dss::TypeInterner fatal: stale operand/scalar span read — the "
                "interner pool was mutated by a later intern since this view was "
                "created; retaining operands()/scalars()/fnParams() across an "
-               "intern is a heap-use-after-free "
-               "(D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD).\n",
+               "intern is a heap-use-after-free.\n",
                stderr);
+    // Anchored: D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD (unreachable: the abort below).
     std::abort();
 }
 }  // namespace detail
@@ -114,6 +114,7 @@ inline constexpr std::array<std::string_view, 20> kLeafTypeKindNames =
         spelling.empty()
             ? std::format("<unnamed kind #{}>", static_cast<std::uint32_t>(kind))
             : std::string{spelling};
+    // Anchored: D-LATTICE-PRIMITIVE-BUILDER-ACCEPTS-A-NON-PRIMITIVE-KIND.
     latticeFatal(
         std::format(
             "TypeInterner::primitive: TypeKind {} is not a LEAF kind, so it "
@@ -122,8 +123,7 @@ inline constexpr std::array<std::string_view, 20> kLeafTypeKindNames =
             "that fails at some later consumer instead of here. Build it with "
             "the kind's own builder (structType/unionType/enumType/array/"
             "vector/matrix/complex/bitInt/pointer/…), or gate the argument on "
-            "`isPrimitiveTypeKind`. Expected one of: {}. "
-            "(D-LATTICE-PRIMITIVE-BUILDER-ACCEPTS-A-NON-PRIMITIVE-KIND)",
+            "`isPrimitiveTypeKind`. Expected one of: {}.",
             shown, shown, detail::renderAllowedList(kLeafTypeKindNames))
             .c_str());
 }
@@ -447,6 +447,20 @@ bool TypeInterner::isVolatileQualified(TypeId id) const {
 
 bool TypeInterner::isAtomicQualified(TypeId id) const {
     return (qualifierBits(id) & static_cast<std::int64_t>(QualBit::Atomic)) != 0;
+}
+
+bool TypeInterner::isVolatileObjectType(TypeId id) const {
+    // The array-element spine only (`ops[0]`), as `typeContainsVla` walks it: a qualifier
+    // skin at ANY level answers — over an element type, or over an array type itself (a skin
+    // qualifies every element beneath it) — and a non-array level ends the walk.
+    while (id.valid()) {
+        if (isVolatileQualified(id)) return true;
+        if (kind(id) != TypeKind::Array) return false;
+        auto const ops = operands(id);
+        if (ops.empty()) return false;
+        id = ops[0];
+    }
+    return false;
 }
 
 TypeId TypeInterner::array(TypeId element, std::int64_t length) {
@@ -1076,12 +1090,55 @@ TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> va
     return id;
 }
 
-TypeId TypeInterner::enumType(std::string_view name, TypeKind underlying) {
+TypeId TypeInterner::enumType(std::string_view name, TypeKind underlying,
+                              TypeId declaredUnderlying, EnumUnderlyingOrigin origin) {
     // scalars=[(int)underlying]; no operands (enumerator symbols carry
     // the enum's TypeId individually as Variables; the enum type itself
     // is identified nominally by name + tagged with its underlying type).
     std::array<std::int64_t, 1> const sc{static_cast<std::int64_t>(underlying)};
-    return internContent(TypeKind::Enum, {}, {}, sc, names_.intern(name));
+    if (!declaredUnderlying.valid())
+        return internContent(TypeKind::Enum, {}, {}, sc, names_.intern(name));
+    // P68 round 12 (lane `cs`): a FIXED underlying type rides as the one operand,
+    // UNQUALIFIED — C23 6.7.2.2 makes the underlying type "the unqualified,
+    // non-atomic version" of what the clause names, so a `volatile` / `_Atomic`
+    // skin is peeled here, the one place the record is built — and it must be the
+    // kind the scalar states, or the record would state two types.
+    TypeId const declared = materialId_(declaredUnderlying);
+    if (kind(declared) != underlying)
+        latticeFatal("enumType: the declared underlying type's kind is not the enum's "
+                     "underlying kind");
+    std::array<TypeId, 1> const ops{declared};
+    // The enumeration P1: the CHOSEN compatible type of an enum without a fixed
+    // underlying type rides the same operand slot and a second scalar marks the
+    // origin, so the fixed record above is unchanged and the two can never intern
+    // to one TypeId.
+    if (origin == EnumUnderlyingOrigin::Chosen) {
+        std::array<std::int64_t, 2> const chosen{static_cast<std::int64_t>(underlying),
+                                                 std::int64_t{1}};
+        return internContent(TypeKind::Enum, {}, ops, chosen, names_.intern(name));
+    }
+    return internContent(TypeKind::Enum, {}, ops, sc, names_.intern(name));
+}
+
+TypeId TypeInterner::enumDeclaredUnderlying(TypeId id) const {
+    if (!id.valid() || kind(id) != TypeKind::Enum) return InvalidType;
+    auto const ops = operands(id);
+    if (ops.empty() || scalars(id).size() != 1) return InvalidType;
+    return ops[0];
+}
+
+TypeId TypeInterner::enumChosenUnderlying(TypeId id) const {
+    if (!id.valid() || kind(id) != TypeKind::Enum) return InvalidType;
+    auto const ops = operands(id);
+    auto const sc = scalars(id);
+    if (ops.empty() || sc.size() != 2 || sc[1] != 1) return InvalidType;
+    return ops[0];
+}
+
+TypeId TypeInterner::enumUnderlyingType(TypeId id) const {
+    if (!id.valid() || kind(id) != TypeKind::Enum) return InvalidType;
+    auto const ops = operands(id);
+    return ops.empty() ? InvalidType : ops[0];
 }
 
 TypeId TypeInterner::bitInt(std::int64_t widthBits, bool isSigned) {
@@ -1123,9 +1180,10 @@ TypeKind TypeInterner::bitIntContainerKind(TypeId id) const {
     // a scalar), so reaching here means a wide value slipped into the scalar path. FAIL
     // LOUD (a crash), never the old silent `Void` sentinel that would flow to codegen
     // as a garbage-width op. The C2 by-address diverts keep this unreachable for wide.
+    // Anchored: D-CSUBSET-BITINT-C2-WIDE.
     latticeFatal("bitIntContainerKind: _BitInt(N>64) has no native container — a wide "
                  "_BitInt is multi-limb (memory), reached by ADDRESS, never as a scalar "
-                 "value; this query is a scalar-path leak (D-CSUBSET-BITINT-C2-WIDE)");
+                 "value; this query is a scalar-path leak");
 }
 
 TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallConv cc) {
@@ -1140,7 +1198,7 @@ TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallCo
 TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallConv cc,
                            bool isVariadic) {
     // operands = [result, params...] so the result is recoverable at a
-    // fixed position. D-LANG-VARIADIC (step 13.4, 2026-06-02): scalars
+    // fixed position. D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): scalars
     // encoding depends on isVariadic:
     //   non-variadic → scalars=[(int)cc]               (1 slot, legacy)
     //   variadic     → scalars=[(int)cc, isVariadic=1] (2 slots)
@@ -1302,7 +1360,7 @@ GuardedSpan<TypeId> TypeInterner::fnParams(TypeId id) const {
 bool TypeInterner::fnIsVariadic(TypeId id) const {
     if (kind(id) != TypeKind::FnSig) latticeFatal("fnIsVariadic: TypeId is not a FnSig");
     auto const sc = scalars(id);
-    // D-LANG-VARIADIC (step 13.4): every FnSig MUST carry at least
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): every FnSig MUST carry at least
     // the cc scalar (post-13.4 audit-fold HIGH-1). Pre-13.4 FnSigs
     // encode scalars=[(int)cc] (1 slot); variadic FnSigs encode
     // scalars=[(int)cc, 1] (2 slots). A 0-slot FnSig has no cc —
@@ -1310,6 +1368,23 @@ bool TypeInterner::fnIsVariadic(TypeId id) const {
     // pin the invariant against a future builder bypass.
     if (sc.empty()) latticeFatal("fnIsVariadic: FnSig has no cc scalar");
     return sc.size() >= 2 && sc[1] != 0;
+}
+
+// See the header: the declared parameters up to the first one of UNQUALIFIED void.
+// `kind()` sees through a qualifier skin, so the raw `qualifierBits` is what tells
+// a `volatile void` (not the end) from a plain `void` (the end).
+GuardedSpan<TypeId> TypeInterner::fnArgumentParams(TypeId id) const {
+    auto const ps = fnParams(id);   // fatal on a non-FnSig, like its siblings
+    for (std::size_t i = 0; i < ps.size(); ++i) {
+        TypeId const p = ps[i];
+        if (p.valid() && kind(p) == TypeKind::Void && qualifierBits(p) == 0)
+            return ps.first(i);
+    }
+    return ps;
+}
+
+bool TypeInterner::fnArgumentsVariadic(TypeId id) const {
+    return fnIsVariadic(id) && fnArgumentParams(id).size() == fnParams(id).size();
 }
 
 // ── THE OBJECT-REPRESENTATION PROJECTION (D-CSUBSET-NULLPTR-T-DECLARABLE) ──

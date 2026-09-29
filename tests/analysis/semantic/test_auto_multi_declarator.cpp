@@ -174,6 +174,8 @@ TEST(AutoMultiDeclarator, BothDeclaratorsDecayAndAgreeOnThePointerType) {
         "}\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* p = symbolNamed(model, "p");
     auto const* q = symbolNamed(model, "q");
     ASSERT_NE(p, nullptr);

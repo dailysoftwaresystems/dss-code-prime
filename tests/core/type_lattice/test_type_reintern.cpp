@@ -536,6 +536,96 @@ TEST(TypeReintern, VocabularyNameSurvivesReintern) {
     EXPECT_EQ(hi.name(hi.operands(hpLong)[0]), "long");
 }
 
+// P68 round 12 (lane `cs`): an enum with a FIXED underlying type (C23 6.7.2.2,
+// `enum E : long`) keeps that type AS DECLARED as its one operand, because its
+// rank is decided by the NAME (C 6.3.1.1p1) and `long` and an anonymous I64 are two
+// types. The merge re-interns that operand, so the host's enum still answers
+// `long`, and it is the host's OWN `enum E : long` — one type, not a second
+// operand-less twin beside it. An enum with no fixed type stays operand-less.
+// RED-ON-DISABLE: rebuild the Enum arm from the kind alone and the host enum has
+// no declared underlying type.
+TEST(TypeReintern, AnEnumsFixedUnderlyingTypeSurvivesReintern) {
+    TypeInterner src{CompilationUnitId{1}};
+    TypeId const longT = src.primitive(TypeKind::I64, "long");
+    TypeId const fixed = src.enumType("E", TypeKind::I64, longT);
+    TypeId const plain = src.enumType("P", TypeKind::I32);
+    ASSERT_EQ(src.enumDeclaredUnderlying(fixed).v, longT.v);
+
+    TypeLattice host{CompilationUnitId{2}};
+    auto& hi = host.interner();
+    std::unordered_map<std::uint32_t, TypeId> remap;
+    TypeId const hFixed = reinternType(src, fixed, host, remap);
+    TypeId const hPlain = reinternType(src, plain, host, remap);
+
+    ASSERT_EQ(hi.kind(hFixed), TypeKind::Enum);
+    TypeId const hUnderlying = hi.enumDeclaredUnderlying(hFixed);
+    ASSERT_TRUE(hUnderlying.valid())
+        << "the merge dropped the enum's declared underlying type";
+    EXPECT_EQ(hi.name(hUnderlying), "long");
+    EXPECT_EQ(hi.kind(hUnderlying), TypeKind::I64);
+    EXPECT_FALSE(hi.enumDeclaredUnderlying(hPlain).valid());
+    TypeId const hLong = hi.primitive(TypeKind::I64, "long");
+    EXPECT_EQ(hi.enumType("E", TypeKind::I64, hLong).v, hFixed.v)
+        << "the re-interned enum must BE the host's own `enum E : long`";
+}
+
+// P68 round 12 (lane `cs`, the enumeration P1): an enum whose compatible type its language
+// CHOSE keeps the ORIGIN through the merge — dropping it would re-intern the chosen type as
+// a FIXED one, a different enumeration (C23 6.2.7p1). RED-ON-DISABLE: rebuild the Enum arm
+// without the origin and the host enum reads fixed.
+TEST(TypeReintern, AnEnumsChosenCompatibleTypeSurvivesReinternAsChosen) {
+    TypeInterner src{CompilationUnitId{1}};
+    TypeId const uintT  = src.primitive(TypeKind::U32, "unsigned int");
+    TypeId const chosen = src.enumType("Hue", TypeKind::U32, uintT,
+                                       TypeInterner::EnumUnderlyingOrigin::Chosen);
+    ASSERT_EQ(src.enumChosenUnderlying(chosen).v, uintT.v);
+
+    TypeLattice host{CompilationUnitId{2}};
+    auto& hi = host.interner();
+    std::unordered_map<std::uint32_t, TypeId> remap;
+    TypeId const hChosen = reinternType(src, chosen, host, remap);
+    ASSERT_EQ(hi.kind(hChosen), TypeKind::Enum);
+    ASSERT_TRUE(hi.enumChosenUnderlying(hChosen).valid())
+        << "the merge dropped the enum's chosen compatible type, or re-made it fixed";
+    EXPECT_FALSE(hi.enumDeclaredUnderlying(hChosen).valid());
+    EXPECT_EQ(hi.name(hi.enumChosenUnderlying(hChosen)), "unsigned int");
+    TypeId const hUint = hi.primitive(TypeKind::U32, "unsigned int");
+    EXPECT_EQ(hi.enumType("Hue", TypeKind::U32, hUint,
+                          TypeInterner::EnumUnderlyingOrigin::Chosen).v, hChosen.v)
+        << "the re-interned enum must BE the host's own chosen `enum Hue`";
+    EXPECT_NE(hi.enumType("Hue", TypeKind::U32, hUint).v, hChosen.v)
+        << "…and not the host's fixed `enum Hue : unsigned int`";
+}
+
+// P68 round 12 (lane `cs`): C23 6.7.2.2 makes an enum's underlying type "the unqualified,
+// non-atomic version" of what its clause names, so `enum E : long`, `enum E : long volatile`
+// and `enum E : _Atomic long` declare ONE type — and two units that spell the clause
+// differently declare compatible types (C 6.2.7) the merge must unify. The record keeps the
+// unqualified `long`. RED-ON-DISABLE: let the record keep the clause's qualified type and the
+// three spellings become three enums, in each unit and in the merged host.
+TEST(TypeReintern, AnEnumDeclaredThroughAQualifiedClauseIsTheUnqualifiedEnum) {
+    TypeInterner cu1{CompilationUnitId{1}};
+    TypeInterner cu2{CompilationUnitId{2}};
+    TypeId const long1 = cu1.primitive(TypeKind::I64, "long");
+    TypeId const long2 = cu2.primitive(TypeKind::I64, "long");
+    TypeId const plain = cu1.enumType("E", TypeKind::I64, long1);
+    TypeId const viaVolatile = cu2.enumType("E", TypeKind::I64, cu2.volatileQualified(long2));
+    TypeId const viaAtomic   = cu2.enumType("E", TypeKind::I64, cu2.atomicQualified(long2));
+    EXPECT_EQ(viaVolatile.v, viaAtomic.v)
+        << "`: long volatile` and `: _Atomic long` must name the same enum in one unit";
+    EXPECT_EQ(cu2.enumDeclaredUnderlying(viaVolatile).v, long2.v)
+        << "the record keeps the UNQUALIFIED `long`";
+
+    TypeLattice host{CompilationUnitId{3}};
+    std::unordered_map<std::uint32_t, TypeId> remap1;
+    std::unordered_map<std::uint32_t, TypeId> remap2;
+    TypeId const h1 = reinternType(cu1, plain, host, remap1);
+    TypeId const h2 = reinternType(cu2, viaVolatile, host, remap2);
+    EXPECT_EQ(h1.v, h2.v)
+        << "one unit's `enum E : long` and another's `enum E : long volatile` are ONE enum "
+           "in the merged module";
+}
+
 // The 2-CU shape the whole-program / static-link merge actually runs: TWO source
 // interners folded into ONE host lattice. The same vocabulary entry from both CUs
 // must CANONICALIZE to one host TypeId, while entries that merely share a

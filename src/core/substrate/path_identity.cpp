@@ -113,8 +113,8 @@ namespace fs = std::filesystem;
 // later, so the two together destroyed a UNC path twice over
 // ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]). Printed with `.string()`,
 // so no print-side transform can be blamed:
-//     input            '\\wsl.localhost\Ubuntu\home\rafael\p\uncprobe.h'
-//     lexically_normal '\wsl.localhost\Ubuntu\home\rafael\p\uncprobe.h'
+//     input            '\\wsl.localhost\Ubuntu\home\<user>\p\uncprobe.h'
+//     lexically_normal '\wsl.localhost\Ubuntu\home\<user>\p\uncprobe.h'
 // One separator gone: the authority is now an ordinary directory on the local
 // drive root, and the key names a file that does not exist. A run of TWO OR MORE
 // leading separators is the one place a "redundant" separator is not redundant,

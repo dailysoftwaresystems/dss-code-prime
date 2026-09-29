@@ -1,0 +1,18 @@
+{
+  "$comment": "★★ THE REFUSAL HALF OF D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL (P68 round 9). `movq stdout(%rip), %rcx` names libc's DATUM `stdout` directly. The kind comes from the definition, and the platform's descriptor says `stdout` is an object, so the reference needs a COPY relocation. ✔MEASURED 2026-09-23: gcc -no-pie and -pie both link this file with one and run it to 42. DSS makes no copy relocation (it binds library data through a loader-filled slot), so a direct reference would silently read the SLOT instead of the datum. It is therefore refused BY NAME at the link: `K_ImportReferenceUnbindable`, never bound.",
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "K_ImportReferenceUnbindable",
+      "line": 0,
+      "col": 0,
+      "positioned": false
+    }
+  ]
+}

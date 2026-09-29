@@ -62,8 +62,9 @@ struct RewrittenBundle {
 // `ccIndex` default `= 0` is a TEST-HARNESS convenience only — the
 // underlying `allocateRegisters` parameter is REQUIRED (no default)
 // per `src/lir/lir_regalloc.hpp`'s "no default" discipline,
-// which exists to prevent a future caller from inheriting the
-// pre-D-FF3-3 hardcode silently. Tests pinning ccIndex=1 behavior
+// which exists to prevent a future caller from inheriting, silently,
+// the hardcoded cc index 0 that D-FF3-3-RESOLVED-CC-INDEX-THREADED
+// replaced. Tests pinning ccIndex=1 behavior
 // must pass `1` explicitly; the default exists so the dozens of
 // pre-existing non-cc tests don't have to be rewritten.
 [[nodiscard]] RewrittenBundle
@@ -1045,7 +1046,7 @@ TEST(LirCallconv, X8664HighStackParamHasNoScaledImm12FrameOps) {
     EXPECT_FALSE(bundle.lowered.target->opcodeByMnemonic("store_u").has_value());
 }
 
-// D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow) byte-pin.
+// D-AS3-BLOCK-REL-IMM19-26 (ARM64 conditional control-flow) byte-pin.
 //
 // HAND-BUILT LIR exercising the three control-flow opcodes (cmp / jcc / jmp)
 // directly through assemble(), laid out as a while-loop control-flow skeleton:
@@ -1302,7 +1303,7 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
     ASSERT_NE(cc, nullptr);
     for (std::size_t i = 0; i < result.perFunc.size(); ++i) {
         auto const& layout = result.perFunc[i];
-        // D-ML7-2.2 (2026-06-02): spillAreaOffset is now
+        // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 (2026-06-02): spillAreaOffset is now
         // outgoingArgAreaSize + savedRegAreaSize (outgoing area is
         // the new SP+0 zone; saved regs sit above it).
         EXPECT_EQ(layout.spillAreaOffset(),
@@ -1312,7 +1313,6 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
                   static_cast<std::uint32_t>(layout.savedRegs.size()) * layout.slotSize);
         EXPECT_EQ(layout.spillAreaSize,
                   bundle.alloc.perFunc[i].numSpillSlots * layout.slotSize);
-        // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
         // localAreaSize == numLocalAllocas * slotSize. Each body-
         // local declaration (`int a1; int r; ...`) emits one
         // `alloca` LIR op which the materialize pass rewrites to a
@@ -1322,8 +1322,8 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
         EXPECT_EQ(layout.localAreaOffset(),
                   layout.outgoingArgAreaSize + layout.savedRegAreaSize
                       + layout.spillAreaSize);
-        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02) + D-ML7-2.2
-        // (2026-06-02) + D-CSUBSET-LOCAL-INT-CODEGEN (2026-06-02):
+        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02) + D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7
+        // (2026-06-02) + the local-alloca area (2026-06-02):
         // expected formula incorporates outgoingArgAreaSize directly
         // (already includes the callee's shadow-space when hasCalls)
         // AND the new localAreaSize above the spill area.
@@ -1418,7 +1418,7 @@ TEST(LirCallconv, FrameSizeAlignedToCcStackAlignment) {
 //     no Reg operands. Matches the schema's encoding variant guard
 //     `["symbol"]` so the assembler can encode the byte sequence.
 //   * Stack-passed args (k >= argGprs.size()) fail loud with
-//     `L_StackPassedArgUnsupported` (D-ML7-2.2).
+//     `L_StackPassedArgUnsupported` (D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7).
 
 namespace {
 
@@ -1433,8 +1433,7 @@ struct InstStats {
     // [SymbolRef] (the post-ML7-cycle-2 shape) or carries extra Reg
     // operands (the pre-cycle-2 shape — would fail at the assembler).
     std::uint32_t callsWithOnlySymbol = 0;
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
-    // post-materialize, EVERY `alloca` LIR op must be rewritten to
+    // Post-materialize, EVERY `alloca` LIR op must be rewritten to
     // a `lea result, [sp + offset]`. Survival of an `alloca` would
     // trip A_NoEncodingDeclared at the assembler. The 7-agent F3
     // audit added these counters + the per-lea-offset capture so
@@ -1563,10 +1562,10 @@ TEST(LirCallconvAbi, SingleArgFunctionEmitsMovFromArgGpr0) {
 }
 
 TEST(LirCallconvAbi, MsX64CcDoesNotDeclareVariadicVectorCountReg) {
-    // D-LANG-VARIADIC (step 13.4) post-fold MEDIUM-2: Win64 ms_x64
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4) post-fold MEDIUM-2: Win64 ms_x64
     // has NO equivalent to SysV's AL-count register — the loader
-    // ABI uses vararg double-spill (anchored
-    // D-ML7-VARIADIC-WIN64-DOUBLE-SPILL). A regression that copy-
+    // ABI uses vararg double-spill instead, which DSS does not yet
+    // implement. A regression that copy-
     // pasted SysV's `variadicVectorCountReg: rax` into the ms_x64
     // entry would silently emit a wrong-cc count-mov at every printf
     // call from a Windows-targeted binary. Pin: the ms_x64 cc field
@@ -1579,12 +1578,12 @@ TEST(LirCallconvAbi, MsX64CcDoesNotDeclareVariadicVectorCountReg) {
     EXPECT_FALSE(msX64->variadicVectorCountReg.has_value())
         << "Win64 ms_x64 has NO caller-side variadic vector-count "
            "register — the count-mov path is SysV-specific. A future "
-           "Win64 vararg-double-spill implementation goes through "
-           "D-ML7-VARIADIC-WIN64-DOUBLE-SPILL, NOT this field.";
+           "Win64 vararg-double-spill implementation goes through the "
+           "double-spill path, NOT this field.";
 }
 
 TEST(LirCallconvAbi, SysVCcDeclaresVariadicVectorCountReg) {
-    // D-LANG-VARIADIC (step 13.4) substrate pin: the SysV AMD64 cc
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4) substrate pin: the SysV AMD64 cc
     // on x86_64 MUST declare `variadicVectorCountReg` (rax / AL per
     // §3.5.7). Without this field, ML7 materialize skips the
     // pre-call `mov <countReg>, <fpCount>` and printf reads garbage
@@ -1600,7 +1599,7 @@ TEST(LirCallconvAbi, SysVCcDeclaresVariadicVectorCountReg) {
     ASSERT_TRUE(cc->variadicVectorCountReg.has_value())
         << "SysV AMD64 cc (cc index 0 on x86_64) MUST declare the "
            "variadic vector-count register per SysV §3.5.7 / "
-           "D-LANG-VARIADIC step 13.4.";
+           "D-LANG-VARIADIC-CALL-SUBSTRATE step 13.4.";
     // The register name must resolve in the target's register table
     // — a typo'd or non-existent name would silently cause the
     // ordinal to refer to the wrong physical reg. The loader sets
@@ -1917,7 +1916,7 @@ TEST(LirCallconvAbi, SysVVariadicCountsSpilledFpVarargTowardAl) {
 }
 
 TEST(CallPayload, EncodeDecodeRoundtripsVariadicAndFixedCount) {
-    // D-LANG-VARIADIC (step 13.4) substrate pin: the shared MIR/LIR
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4) substrate pin: the shared MIR/LIR
     // Call payload encoding (bit 31 = isVariadic; bits 0..29 =
     // fixedOperandCount) round-trips for both the non-variadic and
     // variadic cases. The ML7 materialize call arm reads these bits
@@ -1984,7 +1983,7 @@ TEST(LirCallconvAbi, CalleeArgReceivesFromArgGprAcrossSysVAndMsX64) {
     // a function with one arg materializes its arg-mov against the
     // cc's argGprs[0] (rdi on SysV). MS-x64 would yield rcx; the
     // ms_x64 path needs a separate driver-flag plumbing anchored at
-    // D-ML7-2.6 (cc selection by attribute). For now this pins the
+    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (cc selection by attribute). For now this pins the
     // SysV default.
     auto bundle = lowerThroughRewrite("int f(int x) { return x; }");
     ASSERT_TRUE(bundle.lowered.lir.ok);
@@ -2016,7 +2015,7 @@ TEST(LirCallconvAbi, CalleeArgReceivesFromArgGprAcrossSysVAndMsX64) {
 }
 
 TEST(LirCallconvAbi, CcIndex1DrivesDifferentArgGprThanCc0) {
-    // PINS: D-FF3-3 behavioral arm — companion to
+    // PINS: D-FF3-3-RESOLVED-CC-INDEX-THREADED behavioral arm — companion to
     // `LirRegAlloc.CcIndex1RecordsThroughToFuncAllocation`
     // (metadata pin, test_lir_regalloc.cpp) and
     // `CalleeArgReceivesFromArgGprAcrossSysVAndMsX64` (ccIndex=0
@@ -2160,7 +2159,7 @@ TEST(LirCallconvAbi, CallSiteMaterializesArgIntoArgGprAndResultFromReturnGpr) {
         }
     }
     // ★ THE `OR` CLAUSE THIS TEST'S OWN DOCBLOCK ALWAYS STATED, NOW
-    // IMPLEMENTED (plan 22 OPT8 / D-ML7-2.5). The property under test is that
+    // IMPLEMENTED (plan 22 OPT8 / D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG). The property under test is that
     // the ABI register HOLDS the value at the call — not that an instruction
     // moved it there. With regalloc pre-coloring the allocator homes the
     // parameter IN `argGprs[0]`, so `maybeMov` emits NOTHING, which is the
@@ -2256,7 +2255,7 @@ TEST(LirCallconvAbi, VoidReturnCallExercisesNoPostCallReturnMov) {
 // allocator usually lands the pieces cleanly → the break path is uncovered), so
 // this pin builds the swap DIRECTLY and verifies the emitted move sequence is
 // value-correct by simulating it. RED-ON-DISABLE: revert the cycle-break to the
-// naive two-move emit (or the D-ML7-2.3 reject) and either `result.ok()` is false
+// naive two-move emit (or the D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS reject) and either `result.ok()` is false
 // or the simulation shows rdx ending with piece 0's value instead of piece 1's.
 TEST(LirCallconvAbi, MultiPieceReturnBreaksRegisterSwapCycle) {
     auto target = TargetSchema::loadShipped("x86_64");
@@ -2479,7 +2478,7 @@ TEST(LirCallconvAbi, MultiArgFunctionMaterializesEveryArgGpr) {
         }
     }
     // ★ THE THIRD WAY THE PARAMETER CAN BE "ALREADY THERE" (plan 22 OPT8 /
-    // D-ML7-2.5): regalloc pre-coloring homes it IN the arg register, so
+    // D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG): regalloc pre-coloring homes it IN the arg register, so
     // `maybeMov` emits no instruction at all and the ordinal surfaces in
     // NEITHER a mov result nor a mov operand. The docblock above already
     // admitted "no explicit copy was needed because the param is already
@@ -2505,7 +2504,7 @@ TEST(LirCallconvAbi, MultiArgFunctionMaterializesEveryArgGpr) {
 // ── Fail-loud surfaces ────────────────────────────────────────────────
 
 TEST(LirCallconvAbi, SysVSevenArgFunctionStackPassesOverflowArg) {
-    // D-ML7-2.2 (closed 2026-06-02): SysV AMD64 has 6 GPR arg
+    // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 (closed 2026-06-02): SysV AMD64 has 6 GPR arg
     // registers (rdi/rsi/rdx/rcx/r8/r9). A 7-arg int function
     // overflows arg 6 onto the stack; the materialization must
     // succeed cleanly + emit a `frame_load` (the schema's `load`
@@ -2530,14 +2529,15 @@ TEST(LirCallconvAbi, SysVSevenArgFunctionStackPassesOverflowArg) {
                                                *bundle.lowered.target,
                                                bundle.alloc, ccRep);
     ASSERT_TRUE(result.ok())
-        << "D-ML7-2.2 closure: 7-arg SysV fn + call must lower cleanly";
+        << "D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 closure: 7-arg SysV fn + call must lower cleanly";
     EXPECT_EQ(ccRep.errorCount(), 0u);
     // L_StackPassedArgUnsupported must NOT fire — the substrate
     // now handles the overflow via stack-spill rather than rejecting.
     EXPECT_EQ(::dss::test_support::countCode(
                   ccRep, DiagnosticCode::L_StackPassedArgUnsupported),
               0u)
-        << "stack-passed guard must NOT fire on D-ML7-2.2-closed substrate";
+        << "stack-passed guard must NOT fire on the substrate plan-12 step "
+           "ML7 cycle 2.2 closed";
 
     // f7's frame must reserve outgoing-args area sized for the
     // function's CALLS (none — f7 is leaf), but its non-leaf flag
@@ -2604,7 +2604,8 @@ TEST(LirCallconvAbi, SysVSevenArgFunctionStackPassesOverflowArg) {
 }
 
 TEST(LirCallconvAbi, Win64FiveArgFunctionStackPassesViaSlotAligned) {
-    // D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): Win64 ms_x64
+    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7
+    // (closed alongside plan-12 step ML7 cycle 2.2, 2026-06-02): Win64 ms_x64
     // has 4 GPR arg registers (rcx/rdx/r8/r9). A 5-arg int function
     // overflows arg 4 onto the stack. Under slot-aligned semantics,
     // arg-4 lands at [rsp + shadowSpaceBytes + 0 * slotSize] =
@@ -2621,14 +2622,14 @@ TEST(LirCallconvAbi, Win64FiveArgFunctionStackPassesViaSlotAligned) {
                                                *bundle.lowered.target,
                                                bundle.alloc, ccRep);
     ASSERT_TRUE(result.ok())
-        << "D-ML7-2.6 closure: 5-arg Win64 fn + call must lower cleanly";
+        << "D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 closure: 5-arg Win64 fn + call must lower cleanly";
     EXPECT_EQ(ccRep.errorCount(), 0u);
 
     auto const* cc = bundle.lowered.target->callingConvention(1);
     ASSERT_NE(cc, nullptr);
     EXPECT_STREQ(cc->name.c_str(), "ms_x64");
     EXPECT_TRUE(cc->slotAligned)
-        << "ms_x64 MUST declare slotAligned=true (D-ML7-2.6 closure)";
+        << "ms_x64 MUST declare slotAligned=true (D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 closure)";
     EXPECT_EQ(cc->shadowSpaceBytes, 32u);
     EXPECT_EQ(cc->callPushBytes, 8u);
 
@@ -2971,7 +2972,7 @@ TEST(LirCallconvAbi, OrderableChainArgPassingSucceeds) {
 }
 
 TEST(LirCallconvAbi, MoveCycleInArgPassingResolvedViaScratch) {
-    // D-ML7-2.3 (closed): construct a LIR call whose arg-passing is a 2-cycle
+    // D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS (closed): construct a LIR call whose arg-passing is a 2-cycle
     // (a swap): arg 0 currently lives in `rsi` (= argGprs[1]) and arg 1 lives in
     // `rdi` (= argGprs[0]). The naive in-order emit would produce
     //   mov rdi, rsi   (clobbers rdi which is arg 1's source)
@@ -3044,7 +3045,7 @@ TEST(LirCallconvAbi, MoveCycleInArgPassingResolvedViaScratch) {
 }
 
 TEST(LirCallconvAbi, ThreeFprCycleResolvedViaFprScratch) {
-    // D-ML7-2.3: a 3-element FP arg cycle (cycle length > 2) must be broken with
+    // D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS: a 3-element FP arg cycle (cycle length > 2) must be broken with
     // an FPR-class scratch (movaps), not a GPR. Args in xmm1, xmm2, xmm0 route to
     // argFprs[0..2] = xmm0, xmm1, xmm2 -> the rotation
     //   xmm0 <- xmm1, xmm1 <- xmm2, xmm2 <- xmm0
@@ -3142,7 +3143,7 @@ TEST(LirCallconvAbi, ThreeFprCycleResolvedViaFprScratch) {
 }
 
 TEST(LirCallconvAbi, CycleBreakScratchAvoidsCommittedArgDestination) {
-    // D-ML7-2.3 SCRATCH-COLLAPSE fix. A wide arg-passing move set whose SOURCES
+    // D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS SCRATCH-COLLAPSE fix. A wide arg-passing move set whose SOURCES
     // overlap the low arg registers: the first six args arrive in HIGH caller-
     // saved FPRs (xmm8..xmm13) and route to argFprs[0..5] (xmm0..xmm5) as an
     // orderable chain; the last two args form a 2-swap in argFprs[6],[7]
@@ -3281,7 +3282,7 @@ TEST(LirCallconvAbi, CycleBreakScratchAvoidsCommittedArgDestination) {
 
 // ★★★ THE FAIL-LOUD BOUNDARY OF THE PARALLEL-COPY RESOLVER, SHOWN FIRING.
 //
-// `D-ML7-2.3` closed by REPLACING a refusal with a resolution, and the tests
+// `D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS` closed by REPLACING a refusal with a resolution, and the tests
 // above prove the resolution. That leaves a question none of them can answer:
 // is `L_MoveCycleUnsupported` still REACHABLE, or has closing the row quietly
 // turned this project's loudest post-regalloc diagnostic into dead code? A
@@ -3399,7 +3400,7 @@ TEST(LirCallconvAbi, MoveCycleUnsupportedStillFiresWhenNoScratchOfItsClassIsFree
 }
 
 TEST(LirCallconvAbi, IndependentGprAndFprCyclesBothResolved) {
-    // D-ML7-2.3: one call carrying TWO disjoint cycles of DIFFERENT classes — a
+    // D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS: one call carrying TWO disjoint cycles of DIFFERENT classes — a
     // GPR swap (rdi<->rsi) AND an FPR swap (xmm0<->xmm1) — plus they compose in
     // the same parallel-move set. Each cycle must break with a scratch of ITS OWN
     // class (a GPR scratch for the int swap, an FPR scratch for the double swap).
@@ -3646,7 +3647,7 @@ TEST(LirCallconv, NonLeafFunctionReservesShadowSpaceAndAlignmentBias) {
         << "g is leaf; FrameLayout.hasCalls must reflect that";
 
     // f (non-leaf): totalFrameSize >= shadowSpaceBytes AND
-    // satisfies the callPushBytes congruence. D-ML7-2.2 (2026-06-02):
+    // satisfies the callPushBytes congruence. D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 (2026-06-02):
     // outgoingArgAreaSize already incorporates the shadow-space
     // requirement (when hasCalls; for SysV it adds 0), so the
     // expected formula folds shadow into raw via outgoingArgAreaSize
@@ -3749,7 +3750,7 @@ TEST(LirCallconv, NonLeafFunctionOnWin64CcReservesFullShadowSpaceFrame) {
     EXPECT_TRUE(fLayout->hasCalls);
 }
 
-// D-CSUBSET-LOCAL-INT-CODEGEN substrate-tier tests (7-agent fold F3,
+// Local-alloca frame-layout substrate-tier tests (7-agent fold F3,
 // 2026-06-02): the FrameLayoutInvariantsHoldPerFunction test pins
 // the layout-arithmetic invariant (localAreaSize == numLocalAllocas
 // * slotSize). It does NOT pin the materialize-loop's behavior:
@@ -5216,17 +5217,18 @@ TEST(LirCallconv, Aarch64HighStackDoubleParamUsesScaledFpFrameLoad) {
 
 // ── THE OUTGOING-ARGUMENT STORE TWIN OF THE ARM ABOVE ──────────────────────
 //
-// ★★ THIS PIN EXISTS AGAIN, AND ITS ABSENCE WAS THE WHOLE OF
-// D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO.
+// ★★ THIS PIN EXISTS AGAIN, AND ITS ABSENCE WAS THE WHOLE DEFECT: the front end
+// lowered a many-arg call to NOTHING, so the pins over it measured zero.
 // Lane `fo` wrote it in P47, measured ZERO scaled stores, and REMOVED it rather
-// than ship a green test about nothing — the correct call, and the row was
-// filed from it. What the row could not see is WHY: `lowerCToLir` passed a NULL
-// `ffiMap`, so the `double g(...);` PROTOTYPE this source needs was refused at
-// HIR->MIR, the call to it was dropped as an unbound Ref, and the module `fo`
-// measured had no call in it at all. `mirReporter` carried both errors and
-// `HirToMirResult.ok` was FALSE the entire time; the fixture returned them
-// unread. The map is threaded now and the fixture states its verdict, so the
-// same source lowers the same forty stores the CLI always emitted.
+// than ship a green test about nothing — the correct call, and the finding was
+// filed from it. What that finding could not see is WHY: `lowerCToLir` passed
+// a NULL `ffiMap`, so the `double g(...);` PROTOTYPE this source needs was
+// refused at HIR->MIR, the call to it was dropped as an unbound Ref, and the
+// module `fo` measured had no call in it at all. `mirReporter` carried both
+// errors and `HirToMirResult.ok` was FALSE the entire time; the fixture
+// returned them unread. The map is threaded now and the fixture states its
+// verdict, so the same source lowers the same forty stores the CLI always
+// emitted.
 //
 // ⚠ THE ARGUMENT COUNT WAS NEVER THE TRIGGER. `Aarch64HighStackDoubleParamUses
 // ScaledFpFrameLoad` above passes the identical eighty doubles as PARAMETERS
@@ -5330,8 +5332,9 @@ TEST(LirCallconv, Aarch64HighOutgoingStackDoubleArgUsesScaledFpFrameStore) {
         << "an 80-double outgoing argument list must emit at least one fstr_u: "
            "the trailing arguments sit past the unscaled reach whatever the "
            "frame size. 0 means the chokepoint swaps only the integer file's "
-           "op — the defect D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-"
-           "MEMORY-FORM closed, in the direction its own lane could not pin.";
+           "op — the defect "
+           "D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM "
+           "closed, in the direction its own lane could not pin.";
 
     // The arm that separates "the swap fired" from "the swap fired CORRECTLY":
     // the INTEGER twin must not have been used for an FP store, which would put

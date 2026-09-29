@@ -1,0 +1,14 @@
+# PURPOSE: refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal.
+name: check-diagnostic-codes
+description: >-
+  The action holds the DiagnosticCode ordinals to their rules, then proves it can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `diagnostic_codes_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-diagnostic-codes.py
+    successPattern: 'check-diagnostic-codes: self-test OK'
+    requireInputsUnmoved: true

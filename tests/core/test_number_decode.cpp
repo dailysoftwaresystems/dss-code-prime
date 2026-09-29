@@ -734,7 +734,7 @@ TEST(NumberDecodeWide, ZeroAndTheLoudRefusalContract) {
     // everything else. That guard strips string and CHARACTER literals before
     // matching, and a C++14 digit separator beside a real char literal gives the
     // shared stripper two ways to pair the quotes. Reported, not worked around
-    // elsewhere: the guard lives in `scripts/`, outside this lane's file set, and
+    // elsewhere: the guard lives in `.harness-config/runner/actions/`, outside this lane's file set, and
     // it fails toward NOISY here rather than toward clean.
     std::string const tooManyDigits = "1." + std::string(20001, '3') + "L";
     EXPECT_FALSE(decodeFloatWide(tooManyDigits, &s, TypeKind::F80, ok).has_value());

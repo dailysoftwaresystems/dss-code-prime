@@ -823,8 +823,8 @@ TEST(AsmShippedDialects, Arm64GasRefusesAnUnmodelledCsetCondition) {
 //       MUTANT — which is what says the run read the mutated schema at all and
 //       that only the W arm went missing.
 // ⓘ It reads the shipped `.target.json`, so it must run under `ctest`
-// (`dss_add_test` sets `DSS_CONFIG_ROOT`; a bare .exe walks the cwd —
-// D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+// (`dss_add_test` sets `DSS_CONFIG_ROOT`; a bare .exe walks the cwd and would
+// read whichever tree the shell stands in).
 TEST(AsmShippedDialects, Arm64GasCsetWFormNeedsTheTargetsWidth32Variant) {
     std::size_t before = 0;
     std::size_t after  = 0;

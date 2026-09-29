@@ -21,8 +21,9 @@
 // legalizer.
 //
 // ⚠ CONFIG-LEVEL: `dss_add_test` sets `DSS_CONFIG_ROOT`, so this file must run
-// through ctest and never as a bare `.exe`
-// (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+// through ctest and never as a bare `.exe` -- a bare run falls back to a cwd
+// walk and can read a DIFFERENT config tree, which turns a red-on-disable
+// arm green for the wrong reason.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/strong_ids.hpp"
@@ -86,7 +87,7 @@ constexpr std::string_view kTiedMnemonic = "xor";
 //
 // ⚠ `mutateShippedTargetSchemaDoc` THROWS if the lambda leaves the document
 // byte-identical, so a navigator that missed the row cannot yield a "mutant"
-// that is the shipped schema (D-TEST-SCHEMA-MUTATION-HELPER-FAILS-OPEN).
+// that is the shipped schema — the mutation helper must not fail OPEN.
 [[nodiscard]] std::shared_ptr<TargetSchema> schemaTiedToOperand(unsigned index) {
     auto r = mutateShippedTargetSchemaDoc("x86_64", [&](nlohmann::json& doc) {
         for (auto& op : doc.at("opcodes")) {

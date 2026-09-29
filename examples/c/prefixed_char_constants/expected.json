@@ -1,0 +1,42 @@
+{
+  "$comment": "Prefixed character constants — L'…', u'…', U'…', u8'…' — are integer constant expressions in every position C requires one (C 6.4.4.4 + 6.6) and in #if (C 6.10.1p4), where a character constant reads as signed iff its ELEMENT TYPE is: wchar_t for L'…' (signed on x86_64 Linux and macOS, unsigned on aarch64 Linux and Windows), char16_t/char32_t/unsigned char for u/U/u8 (always unsigned), plain char for the narrow form (unsigned on aarch64 Linux alone) (P68 round 9, D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION and D-PP-IF-NARROW-CHARACTER-CONSTANT-IGNORES-PLAIN-CHAR-SIGNEDNESS). Six groups set six bits (main.c lists them); the exit is 42 only when all hold. ✔MEASURED 2026-09-23 on this file: gcc 13.3.0 and clang 18.1.3 on x86_64 Linux and on aarch64 Linux (cross, qemu), -O0 and -O2, `-std=c2x -pedantic -Wall`, mingw-w64 gcc 13.2.0 at -O0 and -O2, and MSVC 14.51 (/std:clatest, and /O2 — its u8 checks stand behind !defined(_MSC_VER): MSVC has no u8 character constant in C, error C3691) all exit 42, and so does Apple clang 21.0.0 on arm64 and on x86_64 at -O0 and -O2 (the coordinator's Mac runs). ✔MEASURED at HEAD 4d9a24c4: DSS REFUSED the file on every pair — `unexpected token in #if expression: L'` — and, one by one, refused the prefixed forms in a static assertion, an array bound and an enumerator while taking the narrow `#if` arm as signed on aarch64 Linux (exit 7 where the references exit 42). The `release` arm runs the shipped optimizer pipeline over the same checks.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

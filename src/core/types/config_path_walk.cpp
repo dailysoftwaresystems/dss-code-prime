@@ -4,7 +4,9 @@
 #include "core/substrate/phase_timers.hpp"        // the `locate-config` pipeline phase
 #include "core/types/predefined_macro_json.hpp"   // kBuildVersionText — the binary's own version
 
+#include <algorithm>
 #include <cstdlib>
+#include <format>
 #include <fstream>
 #include <iterator>
 #include <optional>
@@ -40,8 +42,8 @@
 //
 // Undefined => the build is BROKEN, loudly, here and now — exactly as
 // `DSS_PROJECT_VERSION` does one header over. A default would ship a compiler
-// that silently has no installed-layout arm, which is the defect
-// [[D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE]] closed.
+// that silently has no installed-layout arm — the defect that left a PACKAGED
+// compiler with no way to find its own config tree.
 #ifndef DSS_INSTALL_CONFIG_RELDIR
 #    error "DSS_INSTALL_CONFIG_RELDIR is not defined — cmake/DssInstall.cmake must compute it and src/core/CMakeLists.txt must forward it (see the top-level CMakeLists.txt)."
 #endif
@@ -211,9 +213,9 @@ struct Resolution {
     // cwd walk it existed to prevent, and a `/mnt/c` working directory turned
     // every shipped-descriptor canonicalisation into a 9P round trip —
     // 213.50 s at 13% CPU against 15.16 s at 90%, same binary, only the cwd
-    // moving. That row fixed its own pin and recorded the remaining half as
-    // *"a production question, raised rather than taken"*:
-    // [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+    // moving. The benchmark fixed its own pin and left the remaining half —
+    // SAYING SO when a set override is ignored — as *"a production question,
+    // raised rather than taken"*. This field is that half, taken.
     std::optional<std::string> ignoredOverride;
     std::optional<std::string> refusal;  // engaged => stop, and say this
     std::vector<std::string> tried;      // every candidate, in order, for the diagnostic
@@ -661,6 +663,46 @@ std::optional<std::string> configRootProvenanceNote() {
     // than this sentence could say.
     if (!resolved.has_value()) return std::nullopt;
     return configRootProvenanceNoteFor(*resolved, fs::path{buildSourceDir()});
+}
+
+// THE DOCUMENTS OF ONE KIND -- see the header for the measured disagreement this ends.
+std::expected<std::vector<ShippedConfigDocument>, std::string>
+shippedConfigDocuments(std::filesystem::path const& directory, std::string_view suffix) {
+    std::vector<ShippedConfigDocument> out;
+    std::error_code                    ec;
+    fs::directory_iterator             it{directory, ec};
+    if (ec) {
+        return std::unexpected(std::format(
+            "the config directory '{}' could not be listed ({}), so which "
+            "'*{}' documents it holds cannot be told",
+            directory.generic_string(), ec.message(), suffix));
+    }
+    for (fs::directory_iterator const end; it != end; it.increment(ec)) {
+        if (ec) break;
+        // A dedicated error code: `ec` carries the ITERATION's status, and a probe
+        // failure written into it would masquerade as a listing failure.
+        std::error_code typeEc;
+        if (!it->is_regular_file(typeEc) || typeEc) continue;
+        std::string const leaf = it->path().filename().generic_string();
+        // EXACT: the name ENDS with the suffix and something precedes it. A name that
+        // merely CONTAINS it (`c.lang.json.orig`) is not a document of the kind, and
+        // neither is the bare suffix.
+        if (leaf.size() <= suffix.size() || !std::string_view{leaf}.ends_with(suffix)) continue;
+        out.push_back(ShippedConfigDocument{leaf.substr(0, leaf.size() - suffix.size()),
+                                            it->path()});
+    }
+    if (ec) {
+        return std::unexpected(std::format(
+            "the listing of config directory '{}' was interrupted after {} "
+            "'*{}' document(s) ({}); a partial listing cannot prove which "
+            "documents exist, so it is refused",
+            directory.generic_string(), out.size(), suffix, ec.message()));
+    }
+    std::sort(out.begin(), out.end(),
+              [](ShippedConfigDocument const& a, ShippedConfigDocument const& b) {
+                  return a.stem < b.stem;
+              });
+    return out;
 }
 
 } // namespace dss

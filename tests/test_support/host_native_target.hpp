@@ -6,7 +6,7 @@
 // The HOST's own native target/format spellings — the single place a test that
 // BUILDS an artifact and then SPAWNS it decides what to build for.
 //
-// D-TEST-HOST-SPAWNS-FOREIGN-BINARY. A test that spawns its own output must
+// A HOST MUST NOT SPAWN A FOREIGN BINARY. A test that spawns its own output must
 // build for the machine it is running on; anything else emits a foreign binary
 // and `posix_spawn` fails with rc=8 (ENOEXEC). That defect has now been found
 // TWICE, in the same shape, because each site carried its OWN `#if` ladder:

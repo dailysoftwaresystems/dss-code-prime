@@ -23,7 +23,8 @@ function(dss_add_test)
     # PUBLIC define, the same includes), so the one precompiled header is
     # valid for every one of them.
     #
-    # GUARDED, not unconditional (D-BUILD-PCH-REUSE-FROM-UNGUARDED-IN-DEBUG).
+    # GUARDED, not unconditional — an unguarded REUSE_FROM floods a Debug
+    # configure with warnings.
     # The Debug canary sets CMAKE_DISABLE_PRECOMPILE_HEADERS (../CMakeLists.txt
     # ~:162) so the linux-clang-asan leg builds PCH-free — but REUSE_FROM is NOT
     # a no-op under it the way a producer call is. CMake still records the
@@ -73,8 +74,8 @@ function(dss_add_test)
     # that never READ the variable. The fix was the shared resolver; this line
     # is one of the candidates it consults, not the mechanism.
     #
-    # ★★★ AND IT NO LONGER NAMES THE LIVE SOURCE TREE.
-    # D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED:
+    # ★★★ AND IT NO LONGER NAMES THE LIVE SOURCE TREE. The exposure was never
+    # confined to the one suite that flaked:
     # pointing it at ${CMAKE_SOURCE_DIR} made every one of these ~219 entries —
     # and the ~1200 `loadShipped()` call sites they reach, none of which caches —
     # a live reader of a tree several workstreams write to, so a neighbour
@@ -135,12 +136,12 @@ add_subdirectory(program)
 add_subdirectory(lsp)
 add_subdirectory(examples)
 add_subdirectory(harness)
-# The DIFFERENTIAL accept/reject oracle (D-CONF-REFERENCE-DIFFERENTIAL-ORACLE):
+# The DIFFERENTIAL accept/reject oracle:
 # diffs DSS's accept/reject verdicts against every reference C compiler on the
 # host, in BOTH directions — they-accept-we-reject AND we-accept-nobody-accepts.
 add_subdirectory(conformance)
 
-# ── TF-C91 (D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE) — the ORDER arm ──
+# ── TF-C91 (a schema temporary left a DANGLING REFERENCE) — the ORDER arm ──
 #
 # WHY THIS EXISTS. The dangling-reference defect this cycle fixed was a
 # heap-use-after-free that read GREEN in every full-suite run and only bit when
@@ -191,8 +192,9 @@ add_subdirectory(conformance)
 # `powershell -File` precisely because their command is a SCRIPT. This command is
 # a binary; there is nothing to interpret.
 #
-# CONCURRENCY — AND WHY THERE IS DELIBERATELY NO `RUN_SERIAL` HERE
-# (D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES). This arm is a SECOND ctest entry
+# CONCURRENCY — AND WHY THERE IS DELIBERATELY NO `RUN_SERIAL` HERE, given that
+# a FIXED temp path is one two overlapping runs both collide on.
+# This arm is a SECOND ctest entry
 # on the SAME binary, so an ordinary `ctest -j` overlaps it with the plain entry
 # and TWO live processes of that binary run at once. That is by design and must
 # stay that way: `RUN_SERIAL`/`RESOURCE_LOCK` would bury the very contention that
@@ -206,8 +208,7 @@ add_subdirectory(conformance)
 # tests/test_support/scratch_dir.hpp). MEASURED before that root existed: the two
 # entries clobbered each other's fixture files and `ctest -j 8` over just this
 # pair went red 1 run in 3. Any suite added to this arm inherits the obligation.
-# ── THE COST IS PER-LEG, SO THE REPEAT COUNT HAS TO BE TOO
-# ── (D-TEST-SHUFFLE-ARM-REPEAT-BUDGET-IS-PER-LEG) ──
+# ── THE COST IS PER-LEG, SO THE SHUFFLE ARM'S REPEAT BUDGET HAS TO BE TOO ──
 #
 # Every N below was chosen against a cost that differs by ~28x between the legs
 # that run it, so no single global constant can be right on all of them. MEASURED,
@@ -260,7 +261,7 @@ add_subdirectory(conformance)
 # the configure with rc=1 rather than quietly registering repeat=2.
 #
 # ★ THE OBSERVATION IS READ FROM ITS ONE OWNER, `cmake/DssBuildClass.cmake`, not
-# tested here (D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY). This
+# tested here. This
 # block used to carry its own sanitizer test over CMAKE_CXX_FLAGS and its build-type
 # variant while the ctest budgets carried a second one over more flags, and the two
 # agreed only because of how CI passes its flags. That module also stops the
@@ -322,7 +323,7 @@ endfunction()
 
 dss_add_shuffle_arm(NAME analysis/preprocess/test_preprocessor REPEAT 20)
 
-# D-TEST-FIXED-SCRATCH-PATH-POPULATION — the suites below all derived a scratch
+# A FIXED SCRATCH PATH IS A SHARED ONE — the suites below all derived a scratch
 # path from a CONSTANT and clobbered each other under concurrency; they now derive
 # it from ScratchDir's per-run root. These arms are what keep that true. A comment
 # saying "do not simplify this back" is not a guard; a second concurrent ctest entry
@@ -398,7 +399,7 @@ dss_add_shuffle_arm(NAME analysis/semantic/test_fc3_width_semantics REPEAT 20)
 # NOT sufficient — for an in-tree build (build/dbg/) the repo root is an
 # ancestor, candidate (3) resolves, and the arm proves nothing again.
 #
-# ⚠ D-CYCLE-A-WORKTREE-INSIDE-THE-REPO-ROOT-CANNOT-BE-CONFIGURED.
+# ⚠ A WORKTREE INSIDE THE REPO ROOT CANNOT BE CONFIGURED BY A GUESS.
 # THIS USED TO **GUESS** THE LOCATION FROM THE BUILD LAYOUT — "in-tree ⇒
 # CMAKE_SOURCE_DIR/.." — and then verify the guess. The guess is wrong for a
 # lane worktree: since the 2026-08-26 ruling those live at

@@ -40,6 +40,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -65,7 +66,7 @@ constexpr ShippedPair kArm{"asm-arm64-gas", "arm64", "%function"};
 
 // The shipped dialect document's TEXT. ⚠ CONFIG-LEVEL: `dss_add_test` sets
 // `DSS_CONFIG_ROOT`, so this file must run through ctest and never as a bare
-// `.exe` (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+// `.exe`, which walks the cwd and would read whichever tree the shell stands in.
 [[nodiscard]] std::string dialectText(std::string_view name) {
     auto pathR = findShippedConfig(
         ShippedConfigLocator{name, "sources", ".lang.json", "language",
@@ -270,14 +271,25 @@ runTemplateWith(std::shared_ptr<GrammarSchema> dialect, ShippedPair const& p,
                                        *run->target, bindings, builder,
                                        run->reporter, labelBindings);
 
+    // ★ A REFUSED TEMPLATE's BODY IS DISCARDED, EXACTLY AS THE REAL CALLER
+    // DISCARDS IT (`mir_to_lir` returns on a false lowering and never finishes
+    // the builder). A refusal can come AFTER a line sealed the open block — a
+    // template may carry a line after a branch (P68 round 8) — and after the
+    // template's own label blocks were created and never begun; closing or
+    // finishing such a body is `LirBuilder`'s process abort, which ends every
+    // later test in this binary instead of failing the one that refused.
+    // ✔MEASURED 2026-09-23: the red-on-disable rod that refuses such a line
+    // aborted here ("LirBuilder: block already terminated") before this return
+    // existed. No refusal test reads the body.
+    if (!run->ok) return run;
+
     // Close the block the way the embedding language will. ⚠ A TEMPLATE THAT
     // BRANCHES HAS ALREADY SEALED IT — `LirBuilder` seals a block on one
     // terminator and aborts on a second — so the harness adds its own only when
-    // the caller said the template does not terminate, or when the lowering
-    // REFUSED before it could (a refused `jmp %l[x]` emits nothing at all).
+    // the caller said the template does not terminate.
     auto const retOp = run->target->opcodeByMnemonic("ret");
     if (!retOp.has_value()) throw std::runtime_error{"target has no `ret`"};
-    if (!templateTerminates || !run->ok) builder.addReturn(*retOp, {});
+    if (!templateTerminates) builder.addReturn(*retOp, {});
     for (LirBlockId const block : run->labelBlocks) {
         builder.beginBlock(block);
         builder.addReturn(*retOp, {});
@@ -520,19 +532,77 @@ TEST(AsmTemplateToLir, AnUnknownMnemonicNamesTheArm64PairToo) {
     expectRefusalNamesThePair(*run, "frobnicate");
 }
 
-// ── what a TEMPLATE structurally cannot carry ─────────────────────────────
+// ── what a TEMPLATE structurally cannot carry, and what it now can ─────────
 //
-// ★ THESE ARE CAPABILITY STATEMENTS, NOT STUBS, AND THEY ARE PINNED BECAUSE
-// THE SILENT ARM IS A MISCOMPILE. `LirOperand::makeBlockRef` names a
-// FUNCTION-LOCAL SLOT: a template branching to its own label would bind to
-// whichever block sits at that index in the CALLER's function.
+// ★ THE REFUSALS BELOW ARE CAPABILITY STATEMENTS, NOT STUBS, AND THEY ARE
+// PINNED BECAUSE THE SILENT ARM IS A MISCOMPILE. A template label USED to be
+// one of them — `LirOperand::makeBlockRef` names a FUNCTION-LOCAL SLOT, and
+// before the inline-asm bundle a template's label would have been a block of
+// the CALLER's function, bound to whichever block sat at that index there.
+// Since P68 round 8 a template is lowered into the statement's OWN body and a
+// label it defines is a block of THAT body
+// (D-ASM-LABELS-INSIDE-A-TEMPLATE-AND-NUMERIC-LOCAL-LABELS-REFUSED); a branch to
+// a label the template does NOT define is still refused, by name
+// (`tests/asm/test_asm_numeric_labels_and_forms.cpp`).
 
-TEST(AsmTemplateToLir, ATemplateLabelIsRefusedRatherThanBound) {
+TEST(AsmTemplateToLir, ATemplateLabelIsABlockOfTheStatementsOwnBody) {
     auto const run = runTemplate(kX86, "Lloop:\n\tnop\n", {});
     ASSERT_TRUE(run->parsed) << "template did not parse";
-    EXPECT_FALSE(run->ok) << "a template label must be refused";
-    auto const msg = messages(*run);
-    EXPECT_NE(msg.find("Lloop"), std::string::npos) << msg;
+    EXPECT_TRUE(run->ok) << "a label the template defines is a block of its own "
+                            "body: " << messages(*run);
+    // CONTROL: a branch to a label NO ONE here defines is still refused, naming
+    // the label, rather than bound to some block of the caller.
+    auto const out = runTemplate(kX86, "\tjmp Lelsewhere\n", {});
+    ASSERT_TRUE(out->parsed) << "template did not parse";
+    EXPECT_FALSE(out->ok) << "a jump out of the statement must be refused";
+    EXPECT_NE(messages(*out).find("Lelsewhere"), std::string::npos)
+        << messages(*out);
+}
+
+// ★ A LINE AFTER AN UNCONDITIONAL BRANCH, WITH NO LABEL BETWEEN THEM, BEGINS A
+// BLOCK OF THE STATEMENT's OWN BODY (P68 round 8,
+// D-ASM-INSTRUCTION-AFTER-A-TERMINATOR-REFUSED, which this build refused as code
+// "it cannot place in a basic block"). ✔MEASURED 2026-09-23: gcc 13.3.0 and
+// clang 18.1.3 run such templates on x86_64 and aarch64
+// (`examples/c/asm_template_code_after_a_terminator`). Nothing branches to the
+// dead line's block; it falls into the label that follows it.
+TEST(AsmTemplateToLir, ALineAfterABranchBeginsABlockOfItsOwn) {
+    struct Case {
+        ShippedPair const* p;
+        std::string_view   text;
+    };
+    Case const cases[] = {
+        {&kX86, "jmp 1f\n\taddl $100, %%eax\n1:\n\taddl $2, %%eax\n"},
+        {&kArm, "b 1f\n\tadd w0, w0, #100\n1:\n\tadd w0, w0, #2\n"},
+    };
+    for (Case const& c : cases) {
+        SCOPED_TRACE(c.p->dialect);
+        auto const run = runTemplate(*c.p, c.text, {});
+        ASSERT_TRUE(run->parsed) << "template did not parse";
+        ASSERT_TRUE(run->ok) << messages(*run);
+        Lir const& lir = run->lir;
+        LirFuncId const fn = lir.funcAt(0);
+        // The entry (the jump), `1:`'s block, and the dead line's own block.
+        ASSERT_EQ(lir.funcBlockCount(fn), 3u);
+        LirBlockId const entry = lir.funcBlockAt(fn, 0);
+        ASSERT_EQ(lir.blockSuccessors(entry).size(), 1u);
+        LirBlockId const label = lir.blockSuccessors(entry)[0];
+        std::optional<LirBlockId> dead;
+        for (std::uint32_t i = 1; i < lir.funcBlockCount(fn); ++i) {
+            LirBlockId const b = lir.funcBlockAt(fn, i);
+            if (b.v != label.v) dead = b;
+        }
+        ASSERT_TRUE(dead.has_value());
+        ASSERT_EQ(lir.blockSuccessors(*dead).size(), 1u);
+        EXPECT_EQ(lir.blockSuccessors(*dead)[0].v, label.v)
+            << "the dead line falls into the label that follows it";
+        for (std::uint32_t i = 0; i < lir.funcBlockCount(fn); ++i) {
+            for (LirBlockId const s :
+                 lir.blockSuccessors(lir.funcBlockAt(fn, i))) {
+                EXPECT_NE(s.v, dead->v) << "nothing branches to the dead line";
+            }
+        }
+    }
 }
 
 TEST(AsmTemplateToLir, ATemplateDirectiveIsRefusedRatherThanApplied) {

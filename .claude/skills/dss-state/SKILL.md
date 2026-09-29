@@ -112,10 +112,10 @@ exits 0 since 2026-06-12 — the `ptr_swap_through` miscompile is FIXED, see bel
   `cmake --build build-dbg --target dss-code-prime` (Ninja, single-config — no `--config`).
 - **The `ptr_swap_through` miscompile is FIXED (2026-06-12)**: the probe's exit-34 was NOT a
   pointer bug — the swap compiled perfectly; `return x - y + 4;` parsed RIGHT-associative
-  (`x - (y + 4)`) because same-precedence infix chains nested rightward in the Pratt walker
-  (`D-PARSE-INFIX-ASSOCIATIVITY-STRUCTURAL` ✅, registry). The probe now passes, MISCOMPILES
-  is empty, and `--strict` exits 0. Lesson for probe triage: a miscompile probe's NAME frames
-  a hypothesis (pointers) — the disassembly, not the name, localizes the defect.
+  (`x - (y + 4)`) because same-precedence infix chains nested rightward in the Pratt walker.
+  The probe now passes, MISCOMPILES is empty, and `--strict` exits 0. Lesson for probe triage:
+  a miscompile probe's NAME frames a hypothesis (pointers) — the disassembly, not the name,
+  localizes the defect.
 - **PowerShell quirk while probing by hand**: piping the CLI through `Select-Object -First N`
   can kill it before it exits — `$LASTEXITCODE` comes back empty. The driver is unaffected
   (Node captures properly); just don't trust `rc=` after a truncated pipe.

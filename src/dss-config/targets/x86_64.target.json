@@ -15,6 +15,11 @@
   "defaultAssemblyLanguage": "asm-x86_64-att",
   "$atomicsComment": "D-CSUBSET-PACKED-ATOMIC-MEMBER — the arm64 twin carries the fault half of this argument; read that file's copy. ★★ THIS PROCESSOR'S ANSWER IS `losesAtomicity`, AND IT IS A DIFFERENT FACT FROM arm64's, WHICH IS THE WHOLE REASON THIS KEY IS A THREE-WAY ENUM AND NOT A BOOLEAN. ✔MEASURED 2026-09-02, one `_Atomic int` at byte offset 1 of a packed struct: gcc 13.3.0 INLINES `xchgl 1+g(%rip)` for the store and a PLAIN `movl 1+g(%rip)` for the load, and DSS's own x86_64 output (pe64 on Windows, elf64 in WSL) runs `rc 42` on both — so the native form does NOT fault here. ⚠ THAT rc 42 IS A TRUE ANSWER TO THE NARROWER QUESTION ONLY: it proves no FAULT, never ATOMICITY ([[feedback-an-instrument-that-answers-an-adjacent-question]]). The two halves of gcc's sequence are not equally safe — `xchg` with a memory operand carries x86's implicit LOCK and stays atomic misaligned, while the paired plain `movl` is NOT architecturally atomic when the four bytes straddle a cache line. clang 18.1.3 measured on the same source emits `callq __atomic_store@PLT` / `callq __atomic_load@PLT` for the packed member and inlines only for an aligned control, i.e. clang's rule is IDENTICAL on x86-64 and aarch64. MSVC casts no vote: `cl.exe` 14.51.36231 refuses `_Atomic` as a type qualifier under both /std:c11 and /std:c17, including the ALIGNED control, so it is a missing feature and not an opinion. ⇒ ORCHESTRATOR RULING (P53, judgement not measurement, recorded so it can be overruled without archaeology): route the under-aligned access through the runtime here TOO, because a silent loss of atomicity is the same defect shape as arm64's SIGBUS with a quieter failure mode, and one working reference makes the safe route required. ⚠ THE RULING IS HONOURED WHEREVER A RUNTIME IMAGE EXISTS AND CANNOT BE ON pe64: ✔MEASURED — `libatomic.so.1` exports the generic entries on x86_64 Linux (`T __atomic_load@@LIBATOMIC_1.0`) and libSystem carries them on darwin, so elf64 and macho64 declare the `atomicsRuntime` role; UCRT exports NO `__atomic_*` symbol and there is no PE atomics image to name, so pe64 declares none and the `losesAtomicity` arm deliberately KEEPS the native form there — refusing would put DSS below the union on the one platform whose only C reference (mingw-w64 gcc) inlines and works. That per-format difference is expressible only because the FORMAT declares the image and the TARGET declares the hardware fact; a single boolean here could not have said it.",
   "atomics": { "underAlignedNativeForm": "losesAtomicity" },
+  "$abiTypedefsComment": "P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): the integer type a PLATFORM ABI fixes for a C library typedef no language rule derives, per object format, in `charIsUnsigned`'s shape and for its reason: the fact is per (processor x platform), `elf` serves processors that answer differently, and the format documents carry no processor. `default` is this processor's answer; `byObjectFormat` overrides it where the platform decides. Values are integer cores. The C language's `__SIZEOF_WCHAR_T__` and `__SIZEOF_WINT_T__` (`type-size` rows naming `{\"abiTypedef\": ...}`) read their SIZE from here, per build pair. ✔MEASURED 2026-09-21 (`-dM -E`, gcc 13.3.0 / clang 18.1.3 / mingw gcc 13.2.0 / Apple clang): `__WCHAR_TYPE__` is `int` on x86_64 Linux and on Apple (both processors), `unsigned int` on aarch64 Linux (`__WCHAR_UNSIGNED__` defined), `unsigned short` on Windows; `__WINT_TYPE__` is `unsigned int` on Linux (both processors), `int` on Apple, `unsigned short` on Windows. `wint_t` is here, beside `wchar_t`, whether or not `<wchar.h>` ships: the macro states an ABI fact the target owns (the P68 ruling). `wchar_t` here agrees with its other carriers on every x86_64 format (✔MEASURED 2026-09-22: a `_Generic` probe selects `int` on ELF and `unsigned short` on PE, for the typedef and for `L'a'`, in DSS and in the references).",
+  "abiTypedefs": {
+    "wchar_t": { "default": "I32", "byObjectFormat": { "pe": "U16" } },
+    "wint_t":  { "default": "U32", "byObjectFormat": { "macho": "I32", "pe": "U16" } }
+  },
   "$predefinedMacrosComment": "TF-C74: the per-ARCHITECTURE identity macros this CPU predefines, merged with the language's `preprocess.predefinedMacros` at preprocess time. Declared on the TARGET (like aggregateLayout/tls below) because they are per-CPU facts; putting them on the language would force c.lang.json to enumerate CPU architectures. COLLISION POLICY: a name declared by BOTH this file and the language config is FATAL (C_ConflictingPredefinedMacro) — neither side silently wins. GATING (MEASURED 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>`): all four spellings are defined identically by x86_64-linux-gnu, x86_64-apple-darwin AND x86_64-pc-windows-msvc, so all four are UNGATED — unlike the arm64 twin, where `__arm64__`/`__arm64` are Apple-only and must carry availableObjectFormats. DELIBERATELY NOT SHIPPED: `_M_X64` (an MSVC TOOLCHAIN-profile macro, not a CPU fact — it belongs with the pe-gated `_MSC_VER` family on the language side); SHIPPED, BUT NOT HERE -- LANDED ON THE OBJECT FORMAT (TF-C97, D-PP-FORMAT-DATA-MODEL-PREDEFINES): `__LP64__`/`_LP64` are a DATA MODEL, not an architecture -- x86_64:pe64 is LLP64 while the SAME CPU is LP64 under elf64/macho64 -- so a row here would be wrong on one of this target's own formats. This note used to read 'DELIBERATELY NOT SHIPPED' and was a HANDOFF that went four cycles uncompleted; it is now DONE: every LP64 `*.format.json` declares both spellings through the format schema's own `predefinedMacros` key (the same key name, the same shared entry grammar, the same C_ConflictingPredefinedMacro collision policy as this file's), and every LLP64/ILP32 one declares NEITHER -- the negative being the whole reason the channel sits at the format layer. Do not add them here. ★ `__BYTE_ORDER__` USED TO BE LISTED HERE AS 'DELIBERATELY NOT SHIPPED (its value must be a macro REFERENCE, e.g. `__ORDER_LITTLE_ENDIAN__`, which needs a different mechanism than a literal Constant body)'. THAT CLAIM WAS FALSE AND IS NOW REFUTED BY MEASUREMENT (TF-C115, D-PP-ENDIANNESS-PREDEFINES): the `constant` kind ALREADY carries a macro-reference body, because a materialized predefine is spliced over its invocation and RESCANNED like any other replacement (`preprocessor.cpp` — `spliceOver(...); continue;   // rescan from the materialized value`). MEASURED 2026-08-04 against a patched config copy reached through DSS_CONFIG_ROOT: with `__BYTE_ORDER__` = `__ORDER_LITTLE_ENDIAN__`, all of `defined(__BYTE_ORDER__)`, `__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__`, `__BYTE_ORDER__ == 1234` and `!(__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)` hold; the same probe against the UNPATCHED config fired 6 of its 8 `#error` legs (A/B/C/E/F/G; 6 x P001E), INCLUDING the one asserting `__BYTE_ORDER__ != __ORDER_BIG_ENDIAN__` — i.e. the unshipped state was not merely silent, it selected the BIG-ENDIAN arm of any such ladder (`0 == 0`, C 6.10.1p4). No engine change was needed; the note had never been tested. The two endianness rows are now SHIPPED below. Still DELIBERATELY NOT SHIPPED: toolchain identity (`__GNUC__`/`__clang__`) which is a COMPILER profile, not a CPU.",
   "$endiannessPredefinesComment": "TF-C115 (D-PP-ENDIANNESS-PREDEFINES). ★ THIS IS A DOCUMENTATION KEY ONLY — there is deliberately NO `endianness` root key (see below); it annotates the two endianness rows in `predefinedMacros`. THE LAYER, ARGUED FROM THE SAME RULE `__LP64__` LOST ON: a fact belongs on the layer where it does not vary. Endianness DOES vary by CPU (MEASURED: clang defines `__BIG_ENDIAN__` and `__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__` for aarch64_be-linux-gnu, `__LITTLE_ENDIAN__` for aarch64-linux-gnu) and does NOT vary across the object formats a single DSS target serves — x86_64 is little-endian under elf64, macho64 AND pe64, and arm64 is little-endian under elf64 and macho64 — which is precisely the test `__LP64__` FAILED (x86_64 is LP64 on elf/macho and LLP64 on pe, so its row had to move to the format). So these belong HERE, per-CPU, exactly like `__x86_64__`. NO SEPARATE `endianness` KEY IS DECLARED alongside them: the `charIsUnsigned` precedent (arm64.target.json) shows that a second notation of one fact is a DRIFT SOURCE requiring its own coherence test, and unlike `charIsUnsigned` — which HIR→MIR genuinely reads for the char→int promotion — nothing in the engine consumes an endianness value today (`bitFieldStrategy` already carries the LSB-first bit-field rule these targets need). A key with no consumer is dead config that can silently disagree with the macro; the day a consumer exists, it gets declared and THEN gets its coherence example. GATING (MEASURED 2026-08-04, `clang-19 -dM -E -x c /dev/null -target <triple>`, Ubuntu clang 19.1.1): `__LITTLE_ENDIAN__` is defined as 1 on ALL FIVE little-endian triples DSS targets — arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu, x86_64-unknown-linux-gnu AND x86_64-pc-windows-msvc — so it is UNGATED, like the four x86_64 identity spellings above and unlike arm64's Apple-only `__arm64__`. Same for `__BYTE_ORDER__`. ★ `__BIG_ENDIAN__` IS DELIBERATELY ABSENT, AND THE ABSENCE IS THE DECLARATION: MEASURED, clang defines it ONLY on a big-endian triple (aarch64_be-linux-gnu), so shipping it anywhere here would be a lie about the machine, and Apple's `libkern/OSByteOrder.h` selects its swap-macro family on `defined(__BIG_ENDIAN__)` FIRST — a stray row would silently pick byte-swapping macros on a little-endian host. The negative is asserted by examples/c/endianness_predefines, which is red if `__BIG_ENDIAN__` ever appears on any leg. ★ NOT A GCC PROFILE: MEASURED, gcc 13.3.0 (native x86_64 and the aarch64-linux-gnu cross) defines `__BYTE_ORDER__` and the `__ORDER_*` triple but NOT `__LITTLE_ENDIAN__` — that spelling is a clang/Apple-toolchain one. Shipping it is consistent with the identity this compiler already claims unconditionally (`__clang__` in c.lang.json), and it is what unblocks the Apple SDK: `libkern/OSByteOrder.h:314` is a bare `#error Unknown endianess.` when neither spelling is defined. THE `__ORDER_*` CONSTANTS THIS ROW'S VALUE NAMES ARE NOT HERE — they are invariant across every triple and live on the LANGUAGE (c.lang.json); see that row's comment for the argument.",
   "predefinedMacros": [
@@ -25,10 +30,12 @@
     { "name": "__LITTLE_ENDIAN__", "kind": "constant", "value": "1", "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
     { "name": "__BYTE_ORDER__",    "kind": "constant", "value": "__ORDER_LITTLE_ENDIAN__", "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } }
   ],
-  "$aggregateLayoutComment": "FC6 (D-FF3-1): per-ABI struct/union/array layout params the generic type_layout engine reads. `natural` = scalar alignment equals its byte size (capped at maxAlignment) — the rule all four current C ABIs (SysV/Win64/AAPCS64/Apple) share; the format's dataModel supplies the OS-dependent pointer width. maxAlignment 16 = the x86_64 max fundamental alignment (__int128/long double/max_align_t). D-CSUBSET-BITFIELD-ABI-EXACT: `bitFieldStrategy` here is the BACK-COMPAT FALLBACK only — C bit-field packing is OS/format-determined (this CPU serves BOTH ELF-SysV gnu_packed AND PE-MS msvc_straddle), so the ACTIVE strategy is resolved from the object FORMAT (effectiveBitFieldStrategy). The fallback is used only by direct-API / test callers with no format in scope. D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN (P63): `maxRequestedAlignment` is the largest alignment a PROGRAM may REQUEST via `_Alignas(N)` / `__attribute__((aligned(N)))`. IT IS NOT `maxAlignment` AND MUST NEVER BE FOLDED INTO IT -- `maxAlignment` is the ISA's largest FUNDAMENTAL alignment (16), the cap on a scalar's NATURAL alignment; reusing it for a request would refuse `_Alignas(32)`, an ordinary AVX spill. 268435456 = 2^28, MEASURED as the union ceiling: gcc 13.3.0 and clang 18.1.3 BUILD AND RUN both spellings at 512, 1024, 4096, 8192, 65536, 2^20 and 2^28, and gcc refuses 2^29 BY NAME (\"requested alignment '536870912' exceeds maximum 268435456\"); aarch64-linux-gnu-gcc 13.3.0 and mingw-w64 gcc 13.2.0 give the SAME number, so it is a TARGET fact and not a format one. clang at 2^29 builds and then answers with an `_Alignof` that disagrees with the request, so it casts no vote under \"the union is over what WORKS\". Before this key the ceiling was a hardcoded 256 in the semantic ladder and `aligned(4096)` -- a page, the first alignment a program asking for one would write -- was refused by name.",
+  "$aggregateLayoutComment": "FC6 (D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS): per-ABI struct/union/array layout params the generic type_layout engine reads. `natural` = scalar alignment equals its byte size (capped at maxAlignment) — the rule all four current C ABIs (SysV/Win64/AAPCS64/Apple) share; the format's dataModel supplies the OS-dependent pointer width. maxAlignment 16 = the x86_64 max fundamental alignment (__int128/long double/max_align_t). D-CSUBSET-BITFIELD-ABI-EXACT: `bitFieldStrategy` here is the BACK-COMPAT FALLBACK only — C bit-field packing is OS/format-determined (this CPU serves BOTH ELF-SysV gnu_packed AND PE-MS msvc_straddle), so the ACTIVE strategy is resolved from the object FORMAT (effectiveBitFieldStrategy). The fallback is used only by direct-API / test callers with no format in scope. D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN (P63): `maxRequestedAlignment` is the largest alignment a PROGRAM may REQUEST via `_Alignas(N)` / `__attribute__((aligned(N)))`. IT IS NOT `maxAlignment` AND MUST NEVER BE FOLDED INTO IT -- `maxAlignment` is the ISA's largest FUNDAMENTAL alignment (16), the cap on a scalar's NATURAL alignment; reusing it for a request would refuse `_Alignas(32)`, an ordinary AVX spill. 268435456 = 2^28, MEASURED as the union ceiling: gcc 13.3.0 and clang 18.1.3 BUILD AND RUN both spellings at 512, 1024, 4096, 8192, 65536, 2^20 and 2^28, and gcc refuses 2^29 BY NAME (\"requested alignment '536870912' exceeds maximum 268435456\"); aarch64-linux-gnu-gcc 13.3.0 and mingw-w64 gcc 13.2.0 give the SAME number, so it is a TARGET fact and not a format one. clang at 2^29 builds and then answers with an `_Alignof` that disagrees with the request, so it casts no vote under \"the union is over what WORKS\". Before this key the ceiling was a hardcoded 256 in the semantic ladder and `aligned(4096)` -- a page, the first alignment a program asking for one would write -- was refused by name.",
   "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16, "maxRequestedAlignment": 268435456, "bitFieldStrategy": "gnu_packed" },
   "$tlsComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): the CPU's static-TLS layout convention — psABI-per-CPU data (x86_64 is Variant II under EVERY OS, so it lives on the TARGET, not the format). variant2 = the thread pointer points ONE PAST the TLS block's end (fs:[0] holds tp itself); a symbol's link-time thread-pointer offset is NEGATIVE: tpoff = templateOffset − alignUp(blockSize, p_align). tcbHeaderBytes = 0 (a Variant-I-only input — arm64 declares 16 with its own block at TLS C2). Consumed ONLY by the walker's tpoff helper when the format's tlsAccess.model is local-exec — a config-keyed formula selector, never a machine-identity branch.",
   "tls": { "variant": "variant2", "tcbHeaderBytes": 0 },
+  "$isaFeaturesComment": "P68 round 8 (D-ASM-TEMPLATE-FORMS-A-REFERENCE-EXPANDS-REFUSED): the ISA features this target's code may assume, each ON or OFF — the one TARGET fact an inline-asm template form reads. gcc's x86 `%~` expands to `i` under `-mavx2` and to `f` without it (✔MEASURED 2026-09-23, gcc 13.3.0). This target emits baseline x86-64 and assumes no AVX2 — also the x86_64 default of gcc and clang (`-march=x86-64`, 📄DOCUMENTED). A feature absent here is UNKNOWN, and a form asking about one is refused by name, never read as off.",
+  "isaFeatures": { "avx2": false },
   "opcodes": [
     {
       "$comment": "Slot 0 = the Invalid sentinel. Every target must declare it as the first opcode so the substrate's `opcode == 0` check (in LirBuilder::addInst) catches default-constructed insts loudly.",
@@ -184,7 +191,7 @@
             "wires":      [{ "index": 0, "slotKind": "imm32" }]
           },
           {
-            "$comment": "mov r/m8, imm8 — 0xC6 /0 ib (2026-08-23, the `movb $5, %al` spelling). The `imm32` operand KIND is the JSON-side label for `OperandKindFilter::ImmInt`; the SLOT is what decides how many bytes are emitted, and `imm8` emits one — the same pairing the shift rows use for their `ib` count. `forceRexPrefix` for the byte-register rationale on the row above. ⚠⚠ THIS SENTENCE SHIPPED FALSE AND IS CORRECTED IN PLACE RATHER THAN DELETED, BECAUSE THE SHAPE IS THE REUSABLE PART — AND IT IS THE SHARPEST INSTANCE IN THE TREE: it said THERE IS DELIBERATELY NO 16-BIT SIBLING and that the spelling STAYS FAIL-LOUD, and the 16-bit sibling it denies sits FOURTEEN LINES BELOW IT IN THIS SAME FILE, added by the same commit. The reason it gave was real up to that moment: `movw $5, %ax` is `0x66 0xC7 /0 iw` — a TWO-byte immediate — and the x86-variable walker declared no 2-byte immediate slot, so declaring the row with an `imm32` slot would have emitted FOUR bytes where the instruction takes two, i.e. a corrupt instruction stream with no diagnostic. That is why the spelling was fail-loud rather than approximated, and it is still why an `imm32` slot must never be substituted here. The slot now exists as `EncodingSlotKind::Imm16Bytes` (the older `Imm16` belongs to the fixed32 shape and `checkSlotShape` still refuses THAT one here at load), the width-16 row below wires it, and [[D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT]] is CLOSED. ⇒ a cross-lane citation of an OPEN row is a claim with an expiry date, and the fold is when it expires ([[D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED]]).",
+            "$comment": "mov r/m8, imm8 — 0xC6 /0 ib (2026-08-23, the `movb $5, %al` spelling). The `imm32` operand KIND is the JSON-side label for `OperandKindFilter::ImmInt`; the SLOT is what decides how many bytes are emitted, and `imm8` emits one — the same pairing the shift rows use for their `ib` count. `forceRexPrefix` for the byte-register rationale on the row above. ⚠⚠ THIS SENTENCE SHIPPED FALSE AND IS CORRECTED IN PLACE RATHER THAN DELETED, BECAUSE THE SHAPE IS THE REUSABLE PART — AND IT IS THE SHARPEST INSTANCE IN THE TREE: it said THERE IS DELIBERATELY NO 16-BIT SIBLING and that the spelling STAYS FAIL-LOUD, and the 16-bit sibling it denies sits FOURTEEN LINES BELOW IT IN THIS SAME FILE, added by the same commit. The reason it gave was real up to that moment: `movw $5, %ax` is `0x66 0xC7 /0 iw` — a TWO-byte immediate — and the x86-variable walker declared no 2-byte immediate slot, so declaring the row with an `imm32` slot would have emitted FOUR bytes where the instruction takes two, i.e. a corrupt instruction stream with no diagnostic. That is why the spelling was fail-loud rather than approximated, and it is still why an `imm32` slot must never be substituted here. The slot now exists as `EncodingSlotKind::Imm16Bytes` (the older `Imm16` belongs to the fixed32 shape and `checkSlotShape` still refuses THAT one here at load), the width-16 row below wires it, and [[D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT]] is CLOSED. ⇒ a cross-lane citation of an OPEN row is a claim with an expiry date, and the fold is when it expires.",
             "guard":      { "operandKinds": ["imm32"], "width": 8 },
             "template":   { "opcode": [198], "modrmRegExt": 0, "forceRexPrefix": true },
             "resultSlot": "modrm.rm",
@@ -2171,7 +2178,7 @@
             ]
           },
           {
-            "$comment": "★★★ cmp [base + disp32], imm32 — REX.W 0x81 /7 (2026-08-23). ⚠⚠ THIS PARAGRAPH USED TO CALL THIS THE **ONLY** MEMORY FORM `cmp` CAN SAFELY DECLARE, AND IT CLOSED BY SAYING BOTH REGISTER-OPERAND SPELLINGS STAY REFUSED WITH `A0008 … no candidate target opcode encodes that shape`. BOTH HALVES WERE TRUE WHEN THEY WERE TYPED AND FALSE WHEN THE COMMIT LANDED, so they are CORRECTED in place rather than deleted — the reasoning beneath them is exactly why the fix had to exist (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED). ✔RE-MEASURED at the CLI 2026-08-24, x86_64:pe64-x86_64-windows-exec AND x86_64:elf64-x86_64-linux-exec, debug AND release: ONE program spelling BOTH directions — an `__asm__ goto` comparing an `\"m\"` operand against an `\"r\"` one as `cmpq %reg, mem` and then as `cmpq mem, %reg` — compiles rc=0 and RUNS returning 42, so each direction branches on the flags of the comparison it actually writes and neither encodes the other. [[D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE]] IS CLOSED; the register pair it named is DECLARED further down this same opcode, separated by `memoryDestination`, and the eight narrow spellings landed with it.\n★★★ WHAT SURVIVES THE CORRECTION IS THE MECHANISM, AND IT IS THE WHOLE REASON THAT AXIS HAD TO BE INVENTED. `AsmInstructionLowering::buildLirInst` builds the memory-DESTINATION list for `cmpq %r14, mem` and the memory-SOURCE list for `cmpq mem, %r14` as the SAME four kinds `[reg, reg, membase, memoffset]`, and the two mean `mem - r14` (0x39 /r) and `r14 - mem` (0x3B /r) — opposite operand orders, different flags for every signed comparison. Every other arithmetic mnemonic escapes that collision because it PRODUCES a value: its memory-destination direction lives on a `result: none` sibling (`add_mem`, `sub_mem`, …) elected from the consumer set while its memory-source direction is a variant on the producer, and the engine withholds the register-destination shape entirely while a memory operand is present AND the row lists a producer. `cmp` is ALREADY `result: none`, so it has no producer to trigger that withholding and no second candidate set to separate the directions — which is precisely why the direction could not be carried by the CANDIDATE SET here and had to be carried on the INSTRUCTION instead. ⚠ THE OPERATIONAL RULE THE CORRECTED SENTENCE WAS PROTECTING IS UNCHANGED AND STILL BINDING, which is why it is restated rather than dropped: a `[\"reg\", \"reg\", \"membase\", \"memoffset\"]` sibling added to this opcode WITHOUT `memoryDestination` on BOTH members of the pair is a silent miscompile, not a feature.\n★ THIS IMMEDIATE ROW IS SAFE FOR A REASON THAT IS CHECKABLE RATHER THAN ASSERTED: the memory-source list ALWAYS begins with the destination REGISTER, so it can never be `[imm32, …]`. The two shapes are distinguishable by their first operand kind, which is exactly what the register pair lacks. ✔MEASURED, gcc 13.3.0 emits this form (`cmpq $5, -16(%rbp)`) and GNU as 2.42 assembles it.",
+            "$comment": "★★★ cmp [base + disp32], imm32 — REX.W 0x81 /7 (2026-08-23). ⚠⚠ THIS PARAGRAPH USED TO CALL THIS THE **ONLY** MEMORY FORM `cmp` CAN SAFELY DECLARE, AND IT CLOSED BY SAYING BOTH REGISTER-OPERAND SPELLINGS STAY REFUSED WITH `A0008 … no candidate target opcode encodes that shape`. BOTH HALVES WERE TRUE WHEN THEY WERE TYPED AND FALSE WHEN THE COMMIT LANDED, so they are CORRECTED in place rather than deleted — the reasoning beneath them is exactly why the fix had to exist. ✔RE-MEASURED at the CLI 2026-08-24, x86_64:pe64-x86_64-windows-exec AND x86_64:elf64-x86_64-linux-exec, debug AND release: ONE program spelling BOTH directions — an `__asm__ goto` comparing an `\"m\"` operand against an `\"r\"` one as `cmpq %reg, mem` and then as `cmpq mem, %reg` — compiles rc=0 and RUNS returning 42, so each direction branches on the flags of the comparison it actually writes and neither encodes the other. [[D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE]] IS CLOSED; the register pair it named is DECLARED further down this same opcode, separated by `memoryDestination`, and the eight narrow spellings landed with it.\n★★★ WHAT SURVIVES THE CORRECTION IS THE MECHANISM, AND IT IS THE WHOLE REASON THAT AXIS HAD TO BE INVENTED. `AsmInstructionLowering::buildLirInst` builds the memory-DESTINATION list for `cmpq %r14, mem` and the memory-SOURCE list for `cmpq mem, %r14` as the SAME four kinds `[reg, reg, membase, memoffset]`, and the two mean `mem - r14` (0x39 /r) and `r14 - mem` (0x3B /r) — opposite operand orders, different flags for every signed comparison. Every other arithmetic mnemonic escapes that collision because it PRODUCES a value: its memory-destination direction lives on a `result: none` sibling (`add_mem`, `sub_mem`, …) elected from the consumer set while its memory-source direction is a variant on the producer, and the engine withholds the register-destination shape entirely while a memory operand is present AND the row lists a producer. `cmp` is ALREADY `result: none`, so it has no producer to trigger that withholding and no second candidate set to separate the directions — which is precisely why the direction could not be carried by the CANDIDATE SET here and had to be carried on the INSTRUCTION instead. ⚠ THE OPERATIONAL RULE THE CORRECTED SENTENCE WAS PROTECTING IS UNCHANGED AND STILL BINDING, which is why it is restated rather than dropped: a `[\"reg\", \"reg\", \"membase\", \"memoffset\"]` sibling added to this opcode WITHOUT `memoryDestination` on BOTH members of the pair is a silent miscompile, not a feature.\n★ THIS IMMEDIATE ROW IS SAFE FOR A REASON THAT IS CHECKABLE RATHER THAN ASSERTED: the memory-source list ALWAYS begins with the destination REGISTER, so it can never be `[imm32, …]`. The two shapes are distinguishable by their first operand kind, which is exactly what the register pair lacks. ✔MEASURED, gcc 13.3.0 emits this form (`cmpq $5, -16(%rbp)`) and GNU as 2.42 assembles it.",
             "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "rexW": true, "opcode": [129], "modrmRegExt": 7 },
             "wires":    [
@@ -2602,6 +2609,7 @@
             "$comment": "3-op no-index form, width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): `movzx reg, byte [base + disp32]` (REX.W 0F B6 /r). A char/byte memory access MUST be byte-EXACT — a 64-bit read of a 1-byte string/array element reads 7 bytes past it (a fault at a section/page edge). ZERO-extend (movzx) is deliberate: the load is a SIGNEDNESS-AGNOSTIC byte fetch — sign semantics live in the explicit cast that follows (SExt for signed `char`, ZExt for unsigned `byte`), each of which re-reads the low byte, so the load's upper bits never reach a consumer un-recast (C integer-promotion always widens a char operand before arithmetic). REX.W sets the r64 dest (its low 8 hold the byte); the memory source has no high-byte-alias hazard (that is a register-source-only concern). Selected when the Load's result type is Char (width 8 on the LIR inst, via memAccessWidthFlags).",
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "resultSlot": "modrm.reg",
+            "destWidth":  64,
             "template":   { "rexW": true, "opcode": [15, 182] },
             "wires":      [
               { "index": 0, "slotKind": "modrm.rm.mem"  },
@@ -2624,6 +2632,7 @@
             "$comment": "3-op no-index form, width 16 (D-LIR-INT-MEMORY-WIDTH-EXACT): `movzx r32, word [base + disp32]` (0F B7 /r, no REX.W). A 2-byte short load must be half-word-exact — a wider read of a packed short reads past it. ZERO-extend (movzx) is the signedness-agnostic half-word fetch (the width-8 char movzx peer at 0F B6); the short→int promote cast that follows re-reads the low 16 bits (SExt/ZExt-16 = D-CSUBSET-SUBNATIVE-ALU-FORMS, not yet encoded ⇒ short VALUE use fails loud, never silently miscompiles). Selected when the Load's result type is I16/U16 — width 16 via memAccessWidthFlags.",
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
             "resultSlot": "modrm.reg",
+            "destWidth":  32,
             "template":   { "opcode": [15, 183] },
             "wires":      [
               { "index": 0, "slotKind": "modrm.rm.mem"  },
@@ -2632,7 +2641,7 @@
             ]
           },
           {
-            "$comment": "4-op indexed form (D-AS4-5), width 64: `mov reg, [base + index*scale + disp32]` (REX.W 0x8B). The walker emits SIB unconditionally when SibIndex wires.",
+            "$comment": "4-op indexed form (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL), width 64: `mov reg, [base + index*scale + disp32]` (REX.W 0x8B). The walker emits SIB unconditionally when SibIndex wires.",
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "resultSlot": "modrm.reg",
             "template":   { "rexW": true, "opcode": [139] },
@@ -2647,6 +2656,7 @@
             "$comment": "4-op indexed form, width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): `movzx reg, byte [base + index*scale + disp32]` (REX.W 0F B6 /r + SIB). The byte-exact + signedness-agnostic rationale is the 3-op width-8 form's; this arm serves a runtime-index char-array access (`arr[i]`, scale 1 since sizeof(char)==1).",
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
             "resultSlot": "modrm.reg",
+            "destWidth":  64,
             "template":   { "rexW": true, "opcode": [15, 182] },
             "wires":      [
               { "index": 0, "slotKind": "modrm.rm.mem"  },
@@ -2691,6 +2701,30 @@
               { "index": 0, "slotKind": "modrm.rm.mem"  },
               { "index": 1, "slotKind": "membase.scale" },
               { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "mov r8, [base + index*scale + disp32] — 0x8A /r with a SIB (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). The indexed twin of the byte form above, which an unsuffixed `mov (%rdi,%rsi), %cl` needs as much as `movb` does. ✔MEASURED 2026-09-21: GNU as 2.42 and clang 18.1.3 both assemble the indexed byte move to 8a /r with a SIB byte.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "resultSlot": "modrm.reg",
+            "template":   { "opcode": [138], "forceRexPrefix": true },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "mov r16, [base + index*scale + disp32] — 0x66 0x8B /r with a SIB (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS).",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "resultSlot": "modrm.reg",
+            "template":   { "mandatoryPrefix": [102], "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
             ]
           }
         ]
@@ -2754,7 +2788,7 @@
             ]
           },
           {
-            "$comment": "5-op indexed form (D-AS4-5), width 64: `mov [base + index*scale + disp32], reg` (REX.W 0x89 + SIB).",
+            "$comment": "5-op indexed form (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL), width 64: `mov [base + index*scale + disp32], reg` (REX.W 0x89 + SIB).",
             "guard":    { "operandKinds": ["reg", "reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "rexW": true, "opcode": [137] },
             "wires":    [
@@ -2878,6 +2912,29 @@
               { "index": 0, "slotKind": "modrm.rm.mem"  },
               { "index": 1, "slotKind": "membase.scale" },
               { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "The 16-bit form — `leaw 2(%rdi), %ax` = 66 8D /r (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). ✔MEASURED 2026-09-21: GNU as 2.42 and clang 18.1.3 assemble `leaw 2(%rdi), %ax` and the unsuffixed `lea 2(%rdi), %ax` to 66 8d 47 02.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "resultSlot": "modrm.reg",
+            "template":   { "mandatoryPrefix": [102], "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "The indexed 16-bit form — `leaw 2(%rdi,%rsi,4), %ax`.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "resultSlot": "modrm.reg",
+            "template":   { "mandatoryPrefix": [102], "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
             ]
           },
           {
@@ -3637,7 +3694,7 @@
       }
     },
     {
-      "$comment": "Integer two's-complement negate — REX.W 0xF7 /3 (NEG r/m64). D-CSUBSET-LOCAL-INT-CODEGEN closure (step 13.3b, 2026-06-02): encoding row added so c's unary minus (`-x`) lowers through the assembler. requires2Address mirrors the sub/mul shape — the operand IS the destination, the 2-addr legalize pass guarantees this invariant before encoding (insert a mov when result != operand[0] at MIR→LIR time). modrmRegExt=3 fills ModR/M.reg with the /3 opcode-extension digit.",
+      "$comment": "Integer two's-complement negate — REX.W 0xF7 /3 (NEG r/m64). The local-int codegen closure (plan step 13.3b, 2026-06-02): encoding row added so c's unary minus (`-x`) lowers through the assembler. requires2Address mirrors the sub/mul shape — the operand IS the destination, the 2-addr legalize pass guarantees this invariant before encoding (insert a mov when result != operand[0] at MIR→LIR time). modrmRegExt=3 fills ModR/M.reg with the /3 opcode-extension digit.",
       "mnemonic": "neg", "result": "value",
       "requires2Address": true,
       "minOperands": 1, "maxOperands": 1,
@@ -4270,7 +4327,7 @@
       }
     },
     {
-      "$comment": "Signed-integer-to-float (SIToFP) — the REVERSE of fp_to_si above. CVTSI2SD xmm, r/m = F2 [REX.W] 0F 2A /r (Intel SDM: scalar signed-int -> double). Operand roles MIRROR cvttsd2si SWAPPED: ModR/M.reg = the xmm DESTINATION (resultSlot — the result is FPR-class via the F64 MIR result type, regClassFor), ModR/M.rm = the GPR SOURCE (wire 0). The width axis here keys on the SOURCE INTEGER width (the MIR->LIR SIToFP arm threads a widthOverride from the source operand's int type): a 32-bit source -> the no-REX.W form CVTSI2SD xmm, r32 (width=32), a 64-bit source -> REX.W CVTSI2SD xmm, r64 (width=64). REX.W selects the 64-bit source-integer interpretation (NOT the dest float width — the dest is fixed F64/sd here). DESIGN NOTE (audit + qemu-arm64 scrutiny): the variant guard offers ONE width axis, but cvtsi2sd/ss needs TWO independent selectors — REX.W (source-int width) AND F2-vs-F3 prefix (dest-float width). The source-int axis MUST vary (i32 vs i64 both occur; REX.W wrong = reads the wrong register width), so it OWNS the width axis; the dest-float prefix is fixed at F2/sd (F64 destination), the dominant + sqlite-blocking case (i64 -> volatile double). int -> F32 (`float f = anInt`, ss/F3) has NO encoding this cycle and FAILS LOUD at the mir_to_lir SIToFP arm (a deferred narrow gap, D-CSUBSET-INT-TO-F32-CODEGEN); sqlite uses `double` only.",
+      "$comment": "Signed-integer-to-float (SIToFP) — the REVERSE of fp_to_si above. CVTSI2SD xmm, r/m = F2 [REX.W] 0F 2A /r (Intel SDM: scalar signed-int -> double). Operand roles MIRROR cvttsd2si SWAPPED: ModR/M.reg = the xmm DESTINATION (resultSlot — the result is FPR-class via the F64 MIR result type, regClassFor), ModR/M.rm = the GPR SOURCE (wire 0). The width axis here keys on the SOURCE INTEGER width (the MIR->LIR SIToFP arm threads a widthOverride from the source operand's int type): a 32-bit source -> the no-REX.W form CVTSI2SD xmm, r32 (width=32), a 64-bit source -> REX.W CVTSI2SD xmm, r64 (width=64). REX.W selects the 64-bit source-integer interpretation (NOT the dest float width — the dest is fixed F64/sd here). DESIGN NOTE (audit + qemu-arm64 scrutiny): the variant guard offers ONE width axis, but cvtsi2sd/ss needs TWO independent selectors — REX.W (source-int width) AND F2-vs-F3 prefix (dest-float width). The source-int axis MUST vary (i32 vs i64 both occur; REX.W wrong = reads the wrong register width), so it OWNS the width axis; the dest-float prefix is fixed at F2/sd (F64 destination) on THIS opcode, the dominant + sqlite-blocking case (i64 -> volatile double). The F32 destination (`float f = anInt`, the F3 prefix) is its own opcode, `si_to_fp32` below: the destination width rides the OPCODE, because the guard's one width axis is the source's (P68 round 12, D-CSUBSET-INT-TO-F32-CODEGEN). ⓘ this comment used to add that sqlite uses `double` only; it does not — the generated amalgamation declares `float` in rtree (RtreeValue) and geopoly (GeoCoord) (✔MEASURED 2026-09-24, sqlite f544d3599a10) — but it converts no integer to it: ✔MEASURED 2026-09-24 with clang 18.1.3 over the round-close recompile's 189 TUs and their defines, in the linux and the mingw configuration, no integral-to-floating cast to `float` in any of sqlite's own files.",
       "mnemonic": "si_to_fp", "result": "value",
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0,
@@ -4323,6 +4380,70 @@
             "steps": [
               { "op": "zext",             "result": "lo",     "resultClass": "gpr", "width": 32, "operands": [{ "source": 0 }] },
               { "op": "si_to_fp",         "result": "result", "resultClass": "fpr", "width": 64, "operands": [{ "temp": "lo" }] }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "P68 round 12 (D-CSUBSET-INT-TO-F32-CODEGEN): the F32-DESTINATION half of `si_to_fp` — CVTSI2SS xmm, r/m = F3 [REX.W] 0F 2A /r (Intel SDM: scalar signed integer -> single). The same operand roles and the same SOURCE-INTEGER width axis as `si_to_fp` (REX.W = a 64-bit source); what differs is the mandatory prefix, F3 where CVTSI2SD has F2 — the DESTINATION float width, which the variant guard cannot carry (its one width axis is the source's, and a LIR instruction carries one width) and which is therefore this OPCODE's, declared as `destWidth` 32 on each arm: the convention the reverse direction already uses on arm64 (`fp_to_si32`). ✔MEASURED 2026-09-24, GNU as 2.42 and clang 18.1.3 agreeing byte for byte: `cvtsi2ss %eax,%xmm0` = f3 0f 2a c0, `cvtsi2ss %ecx,%xmm3` = f3 0f 2a d9, `cvtsi2ss %r9d,%xmm12` = f3 45 0f 2a e1; `cvtsi2ssq %rax,%xmm0` = f3 48 0f 2a c0, `cvtsi2ssq %rcx,%xmm3` = f3 48 0f 2a d9, `cvtsi2ssq %r9,%xmm12` = f3 4d 0f 2a e1. A signed source of either width becomes a single in ONE correctly rounded step (C 6.3.1.4p2), the instruction gcc and clang emit for `(float)anInt` and `(float)aLongLong`.",
+      "mnemonic": "si_to_fp32", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "CVTSI2SS xmm, r64 — F3 REX.W 0F 2A /r (64-bit signed source).",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 42] },
+            "resultRegClass": "fpr", "resultSlot": "modrm.reg",
+            "destWidth": 32,
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "CVTSI2SS xmm, r32 — F3 0F 2A /r (32-bit signed source, no REX.W).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 42] },
+            "resultRegClass": "fpr", "resultSlot": "modrm.reg",
+            "destWidth": 32,
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "P68 round 12 (D-CSUBSET-INT-TO-F32-CODEGEN): unsigned integer -> F32. ★ NO `encoding`, for `ui_to_fp`'s reason: SSE has no unsigned convert. ★★ AND NOT `ui_to_fp`'s ALGEBRA. That row splits a u64 into two halves that each convert EXACTLY to binary64 and recombines them with ONE rounding; to binary32 a 32-bit half does not convert exactly, and converting through binary64 first rounds TWICE — ✔MEASURED, 2^63 + 2^39 + 1 becomes 0x5F000000 through double and 0x5F000001 correctly (the conversion-matrix audit's `uitofp_u64_f32`). The realization is the one gcc 13.3.0 and clang 18.1.3 emit at -O2 (both BRANCH on the sign bit, ✔MEASURED), made branchless: a value below 2^63 converts SIGNED as it is; a value at or above 2^63 is halved with its lost low bit OR-ed back in as a STICKY bit — so the one rounding sees the same round and sticky information the full value carries — converted, and doubled, which is exact. The select and the scale both come from the arithmetic-shift sign mask: no compare, no branch, no constant pool.",
+      "mnemonic": "ui_to_fp32", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "lowering": {
+        "sequences": [
+          {
+            "$comment": "U64 source. mask = x >> 63 arithmetic (all ones iff x >= 2^63). sticky = (x >> 1) | (x & 1). y = x ^ ((x ^ sticky) & mask): x below 2^63, sticky at or above it — both below 2^63, so the SIGNED CVTSI2SS reads either right. f = cvtsi2ss(y). scaleBits = 0x3F800000 (1.0f) + (mask & 0x00800000), one exponent step exactly when the mask is set: 1.0f or 2.0f, carried to the xmm as a GPR bit pattern (the cross-class move writes 64 bits; MULSS reads the low dword). result = f × scale — exact, a power of two, and within range (at most 2^64).",
+            "guard": { "width": 64 },
+            "steps": [
+              { "op": "shr_a",           "result": "mask",      "resultClass": "gpr", "width": 64, "operands": [{ "source": 0 }, { "imm": 63 }] },
+              { "op": "shr_l",           "result": "half",      "resultClass": "gpr", "width": 64, "operands": [{ "source": 0 }, { "imm": 1 }] },
+              { "op": "and",             "result": "lowBit",    "resultClass": "gpr", "width": 64, "operands": [{ "source": 0 }, { "imm": 1 }] },
+              { "op": "or",              "result": "sticky",    "resultClass": "gpr", "width": 64, "operands": [{ "temp": "half" }, { "temp": "lowBit" }] },
+              { "op": "xor",             "result": "diff",      "resultClass": "gpr", "width": 64, "operands": [{ "source": 0 }, { "temp": "sticky" }] },
+              { "op": "and",             "result": "pick",      "resultClass": "gpr", "width": 64, "operands": [{ "temp": "diff" }, { "temp": "mask" }] },
+              { "op": "xor",             "result": "y",         "resultClass": "gpr", "width": 64, "operands": [{ "source": 0 }, { "temp": "pick" }] },
+              { "op": "si_to_fp32",      "result": "f",         "resultClass": "fpr", "width": 64, "operands": [{ "temp": "y" }] },
+              { "op": "and",             "result": "bump",      "resultClass": "gpr", "width": 64, "operands": [{ "temp": "mask" }, { "imm": 8388608 }] },
+              { "op": "add",             "result": "scaleBits", "resultClass": "gpr", "width": 64, "operands": [{ "temp": "bump" }, { "imm": 1065353216 }] },
+              { "op": "movq_gpr_to_xmm", "result": "scale",     "resultClass": "fpr", "width": 64, "operands": [{ "temp": "scaleBits" }] },
+              { "op": "fmul",            "result": "result",    "resultClass": "fpr", "width": 32, "operands": [{ "temp": "f" }, { "temp": "scale" }] }
+            ]
+          },
+          {
+            "$comment": "U32 source → float. Zero-extend to the full 64-bit register FIRST (`zext` width 32 = `mov r32, r32`), THEN the width-64 CVTSI2SS, which reads all 64 bits and so sees the value unsigned — `ui_to_fp`'s U32 arm with the F3 prefix, and what clang emits.",
+            "guard": { "width": 32 },
+            "steps": [
+              { "op": "zext",             "result": "wide",   "resultClass": "gpr", "width": 32, "operands": [{ "source": 0 }] },
+              { "op": "si_to_fp32",       "result": "result", "resultClass": "fpr", "width": 64, "operands": [{ "temp": "wide" }] }
             ]
           }
         ]
@@ -4406,7 +4527,213 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
-      "$comment": "FC2 Part B: FPR-class register-register copy — MOVAPS xmm1, xmm2 = 0F 28 /r (NO mandatory prefix; the F2-prefixed reg-reg MOVSD form merges into the destination's upper lane, creating a false dependency on dst's prior value — MOVAPS copies the full register, the classic codegen choice). ModR/M.reg = destination (resultSlot), ModR/M.rm = source; xmm8-15 set REX.R/REX.B automatically. Bound to the `fpr` class's `move` slot in registerClassOps[] — consumed by the 2-addr legalize implicit copy, MIR→LIR mov-to-fresh/phi-edge copies, and callconv arg/return moves whenever the register class is FPR.",
+      "$comment": "Virtual-ISA pseudo-op (P68 round 8 part 4): ONE inline-asm STATEMENT while registers are allocated — the asm-region BUNDLE (`lir/lir_asm_region.hpp`). Operands = the statement's operand registers, one per slot, each with a ROLE in the module's asm-region side record (read at the early slot / written at the late slot / both / written at the early slot); the template's own instructions, labels as blocks, live in that record. `expandAsmRegions` replaces it with its body once allocation is final, so it is never encoded — which is the point: the allocator's spill and reload code can no longer land BETWEEN a template's lines (an LL/SC pair with a store between them never succeeds). side-effecting so no pass drops, merges or reorders it. maxOperands 255 is the operand-pool bound, not a GNU limit (GCC allows 30 operands; a pair-carried one takes two slots).",
+      "mnemonic": "asm_region", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 255,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op (P68 round 8 part 4): ONE inline-asm `asm goto` STATEMENT while registers are allocated — the TERMINATOR form of `asm_region` (terminatorKind asm-goto). Operands = the statement's slots, with roles in the module's asm-region side record; successors = its goto labels in order, then its fall-through. `expandAsmRegions` replaces it with the template's own blocks, whose branches to a label go to that successor, so it is never encoded.",
+      "mnemonic": "asm_region_goto", "result": "none",
+      "terminatorKind": "asm-goto",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 255,
+      "minSuccessors": 1, "maxSuccessors": 255
+    },
+    {
+      "$comment": "★★ `test` — AND WITHOUT A RESULT, FLAGS ONLY (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). The sibling of `cmp` in every shape: register-register (85 /r; 84 /r for bytes), register-immediate (F7 /0; F6 /0), immediate-memory, and register-memory. ✔MEASURED 2026-09-21, GNU as 2.42 and clang 18.1.3 agreeing on every byte: `testq %rax, %rcx` = 48 85 c1, `testl %eax, %ecx` = 85 c1, `testw %ax, %cx` = 66 85 c1, `testb %al, %cl` = 84 c1, `testq $1, %rcx` = 48 f7 c1 01 00 00 00, `testw $300, %cx` = 66 f7 c1 2c 01, `testb $1, %cl` = f6 c1 01, `testl $1, (%rdi)` = f7 07 01 00 00 00. ★ ONE register-memory variant per width, with NO `memoryDestination` guard, and that is a measurement rather than a shortcut: `testl %eax, (%rdi)` and `testl (%rdi), %eax` are the SAME bytes (85 07) on both references — TEST is commutative, so unlike `cmp` (39 /r vs 3B /r) there is no direction for a guard to separate. ⓘ The references pick the short `a9 id` form for `test $imm, %eax`; this table encodes the general F7 /0 form there, the same instruction.",
+      "mnemonic":      "test",
+      "result":        "none",
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 8 },
+            "template": { "opcode": [132], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm16.bytes" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 8 },
+            "template": { "opcode": [246], "modrmRegExt": 0, "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm16.bytes" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [246], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm8" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [132], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "★★ `movapd` — the packed-DOUBLE register move, 66 0F 28 /r (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). The same data movement as `movaps` (0F 28 /r) under the operand-size prefix; ✔MEASURED 2026-09-21, GNU as 2.42 and clang 18.1.3 both assemble `movapd %xmm1, %xmm0` to 66 0f 28 c1 and `movaps` to 0f 28 c1 — so the two are two encodings a programmer chooses between, and each spelling gets its own. Widths as `movaps` declares them, for the same reason.",
+      "mnemonic": "movapd", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [15, 40] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [15, 40] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 128 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [15, 40] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC2 Part B: FPR-class register-register copy — MOVAPS xmm1, xmm2 = 0F 28 /r (NO mandatory prefix; the F2-prefixed reg-reg MOVSD form merges into the destination's upper lane, creating a false dependency on dst's prior value — MOVAPS copies the full register, the classic codegen choice). ModR/M.reg = destination (resultSlot), ModR/M.rm = source; xmm8-15 set REX.R/REX.B automatically. Bound to the `fpr` class's `move` slot in registerClassOps[] — consumed by the 2-addr legalize implicit copy, MIR→LIR mov-to-fresh/phi-edge copies, and callconv arg/return moves whenever the register class is FPR. ★★ KEYED AT 32, 64 AND 128 BITS — THE SAME BYTES THREE TIMES, AND THE KEYS ARE THE FACT, NOT THE BYTES (D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS). MOVAPS copies the whole register, so it moves an F32, an F64 and a 128-bit value alike; the ONE width-agnostic variant it used to carry made the asm engine's width-honesty gate (`variantHonorsDeclaredWidth`: an agnostic variant is honest only at the width-default, 64) refuse every 128-bit use — ✔MEASURED at `7df54cc1`, `__asm__ volatile(\"movaps %%xmm1, %%xmm2\" ::: \"xmm2\")` refused A_AsmTextUnsupported ('movaps' operates on 128 bits … declares no width-keyed encoding variant), the registers written in the text deriving 128 — and a 16-byte value carried into an `\"x\"` operand (gcc and clang carry an `__int128` there) had no instruction that could name it. The loader refuses a keyed variant beside an agnostic one of the same `operandKinds` (D-CSUBSET-32BIT-ALU-FORMS), so every width an FPR value occupies is keyed: 32 (F32 plumbing), 64 (F64 and the width-default), 128 (a full-register spill or carried value). Sub-32 plumbing promotes to 32 (`lirWidthFlagsForBits`), so no narrower key is needed.",
       "mnemonic": "movaps", "result": "value",
       "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
@@ -4416,7 +4743,19 @@
         "registerClass": "fpr",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "opcode": [15, 40] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "opcode": [15, 40] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 128 },
             "template":   { "opcode": [15, 40] },
             "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
@@ -4561,39 +4900,42 @@
   ],
   "$registersComment": "Physical register file. Ordinal = position in this array (consumed by `LirReg::id` post-regalloc). Only the registers ML6 regalloc + ML7 callconv reference are declared here — sub-byte aliases (al/ah/bl/...) are omitted until a real consumer needs them. Width is in bytes (8/4/2/1). hwEncoding = ModR/M ordinal the assembler/encoder will read.",
   "registers": [
-    { "name": "rax", "class": "gpr", "widthBytes": 8, "hwEncoding": 0, "dwarfNumber": 0 },
-    { "name": "rcx", "class": "gpr", "widthBytes": 8, "hwEncoding": 1, "dwarfNumber": 2 },
-    { "name": "rdx", "class": "gpr", "widthBytes": 8, "hwEncoding": 2, "dwarfNumber": 1 },
-    { "name": "rbx", "class": "gpr", "widthBytes": 8, "hwEncoding": 3, "dwarfNumber": 3 },
+    { "$comment": "★★ `continuesIn` — THE REGISTER A VALUE TOO WIDE FOR THIS ONE CONTINUES IN, when a GNU local register variable binds it here (P68 round 8, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). ✔MEASURED 2026-09-19 with gcc 13.3.0 at -O0 and -O2: `register __int128 v asm(R)` on an `\"r\"` input binds R and then gcc's own hard-register order — rax:rdx, rdx:rcx, rcx:rbx, rbx:rsi, rsi:rdi, rdi:rbp (-O2; -O0 refuses \"bp cannot be used in 'asm' here\"), and r8:r9 through r14:r15 — which is NOT the encoding order (rdx follows rax, yet its hwEncoding is 2 and rcx's is 1). clang 18.1.3 cannot allocate any of them (\"couldn't allocate input reg for constraint '{rax}'\"). rbp, rsp and r15 continue in nothing: both references refuse them.",
+      "name": "rax", "class": "gpr", "widthBytes": 8, "hwEncoding": 0, "dwarfNumber": 0, "continuesIn": "rdx" },
+    { "name": "rcx", "class": "gpr", "widthBytes": 8, "hwEncoding": 1, "dwarfNumber": 2, "continuesIn": "rbx" },
+    { "name": "rdx", "class": "gpr", "widthBytes": 8, "hwEncoding": 2, "dwarfNumber": 1, "continuesIn": "rcx" },
+    { "name": "rbx", "class": "gpr", "widthBytes": 8, "hwEncoding": 3, "dwarfNumber": 3, "continuesIn": "rsi" },
     { "name": "rsp", "class": "gpr", "widthBytes": 8, "hwEncoding": 4, "dwarfNumber": 7 },
-    { "name": "rbp", "class": "gpr", "widthBytes": 8, "hwEncoding": 5, "dwarfNumber": 6 },
-    { "name": "rsi", "class": "gpr", "widthBytes": 8, "hwEncoding": 6, "dwarfNumber": 4 },
-    { "name": "rdi", "class": "gpr", "widthBytes": 8, "hwEncoding": 7, "dwarfNumber": 5 },
-    { "name": "r8",  "class": "gpr", "widthBytes": 8, "hwEncoding": 8, "dwarfNumber": 8 },
-    { "name": "r9",  "class": "gpr", "widthBytes": 8, "hwEncoding": 9, "dwarfNumber": 9 },
-    { "name": "r10", "class": "gpr", "widthBytes": 8, "hwEncoding": 10, "dwarfNumber": 10 },
-    { "name": "r11", "class": "gpr", "widthBytes": 8, "hwEncoding": 11, "dwarfNumber": 11 },
-    { "name": "r12", "class": "gpr", "widthBytes": 8, "hwEncoding": 12, "dwarfNumber": 12 },
-    { "name": "r13", "class": "gpr", "widthBytes": 8, "hwEncoding": 13, "dwarfNumber": 13 },
-    { "name": "r14", "class": "gpr", "widthBytes": 8, "hwEncoding": 14, "dwarfNumber": 14 },
+    { "$comment": "★★ `encodingRole` BECAUSE `rip` SHARES ENCODING 5 (P68 round 9, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): ModR/M rm=101 reads as RBP at mod 01/10 and as RIP at mod 00, so the two rows are one number with two readings. RBP is the DEFAULT reading — every field that names no `regRole` means RBP, exactly as before — and `rip` is legal only where `pcRelativeMemoryBase` lists the field.",
+      "name": "rbp", "class": "gpr", "widthBytes": 8, "hwEncoding": 5, "dwarfNumber": 6, "encodingRole": "generalRegister", "encodingRoleIsDefault": true },
+    { "name": "rsi", "class": "gpr", "widthBytes": 8, "hwEncoding": 6, "dwarfNumber": 4, "continuesIn": "rdi" },
+    { "name": "rdi", "class": "gpr", "widthBytes": 8, "hwEncoding": 7, "dwarfNumber": 5, "continuesIn": "rbp" },
+    { "name": "r8",  "class": "gpr", "widthBytes": 8, "hwEncoding": 8, "dwarfNumber": 8, "continuesIn": "r9" },
+    { "name": "r9",  "class": "gpr", "widthBytes": 8, "hwEncoding": 9, "dwarfNumber": 9, "continuesIn": "r10" },
+    { "name": "r10", "class": "gpr", "widthBytes": 8, "hwEncoding": 10, "dwarfNumber": 10, "continuesIn": "r11" },
+    { "name": "r11", "class": "gpr", "widthBytes": 8, "hwEncoding": 11, "dwarfNumber": 11, "continuesIn": "r12" },
+    { "name": "r12", "class": "gpr", "widthBytes": 8, "hwEncoding": 12, "dwarfNumber": 12, "continuesIn": "r13" },
+    { "name": "r13", "class": "gpr", "widthBytes": 8, "hwEncoding": 13, "dwarfNumber": 13, "continuesIn": "r14" },
+    { "name": "r14", "class": "gpr", "widthBytes": 8, "hwEncoding": 14, "dwarfNumber": 14, "continuesIn": "r15" },
     { "name": "r15", "class": "gpr", "widthBytes": 8, "hwEncoding": 15, "dwarfNumber": 15 },
 
-    { "name": "xmm0",  "class": "fpr", "widthBytes": 16, "hwEncoding": 0, "dwarfNumber": 17 },
-    { "name": "xmm1",  "class": "fpr", "widthBytes": 16, "hwEncoding": 1, "dwarfNumber": 18 },
-    { "name": "xmm2",  "class": "fpr", "widthBytes": 16, "hwEncoding": 2, "dwarfNumber": 19 },
-    { "name": "xmm3",  "class": "fpr", "widthBytes": 16, "hwEncoding": 3, "dwarfNumber": 20 },
-    { "name": "xmm4",  "class": "fpr", "widthBytes": 16, "hwEncoding": 4, "dwarfNumber": 21 },
-    { "name": "xmm5",  "class": "fpr", "widthBytes": 16, "hwEncoding": 5, "dwarfNumber": 22 },
-    { "name": "xmm6",  "class": "fpr", "widthBytes": 16, "hwEncoding": 6, "dwarfNumber": 23 },
-    { "name": "xmm7",  "class": "fpr", "widthBytes": 16, "hwEncoding": 7, "dwarfNumber": 24 },
-    { "name": "xmm8",  "class": "fpr", "widthBytes": 16, "hwEncoding": 8, "dwarfNumber": 25 },
-    { "name": "xmm9",  "class": "fpr", "widthBytes": 16, "hwEncoding": 9, "dwarfNumber": 26 },
-    { "name": "xmm10", "class": "fpr", "widthBytes": 16, "hwEncoding": 10, "dwarfNumber": 27 },
-    { "name": "xmm11", "class": "fpr", "widthBytes": 16, "hwEncoding": 11, "dwarfNumber": 28 },
-    { "name": "xmm12", "class": "fpr", "widthBytes": 16, "hwEncoding": 12, "dwarfNumber": 29 },
-    { "name": "xmm13", "class": "fpr", "widthBytes": 16, "hwEncoding": 13, "dwarfNumber": 30 },
-    { "name": "xmm14", "class": "fpr", "widthBytes": 16, "hwEncoding": 14, "dwarfNumber": 31 },
-    { "name": "xmm15", "class": "fpr", "widthBytes": 16, "hwEncoding": 15, "dwarfNumber": 32 },
+    { "name": "xmm0",  "class": "fpr", "widthBytes": 16, "hwEncoding": 0, "dwarfNumber": 17, "nameStatesNoWidth": true,
+      "$comment": "★★ `nameStatesNoWidth` ON ALL SIXTEEN xmm ROWS (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS): x86 names the WHOLE xmm register for a scalar-double (`addsd`, 64), a scalar-single (`addss`, 32) and a packed (`movaps`, 128) operation alike — no narrower xmm spelling exists, so the mnemonic states the width. ✔MEASURED 2026-09-21: GNU as 2.42 and clang 18.1.3 assemble `addsd %xmm1, %xmm0` (f2 0f 58 c1), `movq %xmm0, %rax` (66 48 0f 7e c0) and `movd %xmm0, %eax` (66 0f 7e c0); DSS refused each, reading the 128 of every xmm name as a width statement." },
+    { "name": "xmm1",  "class": "fpr", "widthBytes": 16, "hwEncoding": 1, "dwarfNumber": 18, "nameStatesNoWidth": true },
+    { "name": "xmm2",  "class": "fpr", "widthBytes": 16, "hwEncoding": 2, "dwarfNumber": 19, "nameStatesNoWidth": true },
+    { "name": "xmm3",  "class": "fpr", "widthBytes": 16, "hwEncoding": 3, "dwarfNumber": 20, "nameStatesNoWidth": true },
+    { "name": "xmm4",  "class": "fpr", "widthBytes": 16, "hwEncoding": 4, "dwarfNumber": 21, "nameStatesNoWidth": true },
+    { "name": "xmm5",  "class": "fpr", "widthBytes": 16, "hwEncoding": 5, "dwarfNumber": 22, "nameStatesNoWidth": true },
+    { "name": "xmm6",  "class": "fpr", "widthBytes": 16, "hwEncoding": 6, "dwarfNumber": 23, "nameStatesNoWidth": true },
+    { "name": "xmm7",  "class": "fpr", "widthBytes": 16, "hwEncoding": 7, "dwarfNumber": 24, "nameStatesNoWidth": true },
+    { "name": "xmm8",  "class": "fpr", "widthBytes": 16, "hwEncoding": 8, "dwarfNumber": 25, "nameStatesNoWidth": true },
+    { "name": "xmm9",  "class": "fpr", "widthBytes": 16, "hwEncoding": 9, "dwarfNumber": 26, "nameStatesNoWidth": true },
+    { "name": "xmm10", "class": "fpr", "widthBytes": 16, "hwEncoding": 10, "dwarfNumber": 27, "nameStatesNoWidth": true },
+    { "name": "xmm11", "class": "fpr", "widthBytes": 16, "hwEncoding": 11, "dwarfNumber": 28, "nameStatesNoWidth": true },
+    { "name": "xmm12", "class": "fpr", "widthBytes": 16, "hwEncoding": 12, "dwarfNumber": 29, "nameStatesNoWidth": true },
+    { "name": "xmm13", "class": "fpr", "widthBytes": 16, "hwEncoding": 13, "dwarfNumber": 30, "nameStatesNoWidth": true },
+    { "name": "xmm14", "class": "fpr", "widthBytes": 16, "hwEncoding": 14, "dwarfNumber": 31, "nameStatesNoWidth": true },
+    { "name": "xmm15", "class": "fpr", "widthBytes": 16, "hwEncoding": 15, "dwarfNumber": 32, "nameStatesNoWidth": true },
 
     { "name": "rflags", "class": "flags", "widthBytes": 8, "hwEncoding": 0, "dwarfNumber": 49 },
 
@@ -4649,9 +4991,17 @@
     { "name": "r12b", "class": "gpr", "widthBytes": 1, "subOf": "r12",  "hwEncoding": 12 },
     { "name": "r13b", "class": "gpr", "widthBytes": 1, "subOf": "r13",  "hwEncoding": 13 },
     { "name": "r14b", "class": "gpr", "widthBytes": 1, "subOf": "r14",  "hwEncoding": 14 },
-    { "name": "r15b", "class": "gpr", "widthBytes": 1, "subOf": "r15",  "hwEncoding": 15 }
+    { "name": "r15b", "class": "gpr", "widthBytes": 1, "subOf": "r15",  "hwEncoding": 15 },
+    { "$comment": "★★★ THE INSTRUCTION POINTER, AS THE BASE OF A MEMORY OPERAND AND NOTHING ELSE (P68 round 9, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER). `leaq msg(%rip), %rax` is how gcc -S writes every global access, and before this row it failed at `unknown register 'rip'`. ✔MEASURED 2026-09-23 (gas 2.42, clang 18.1.3, mingw gas 2.41.90, llvm-mc 18.1.3): `leaq 8(%rip),%rcx` = 48 8d 0d 08 00 00 00 on every format; `movq %rip, %rax` is refused by gas. ⚠ APPENDED, so no existing ordinal moves. ⚠ NOT ALLOCATABLE: no calling convention names it, and allocation draws only from `kAllocatablePoolLists` (`validate()` refuses a convention that does). ⚠ ITS ROLE is what makes every other field refuse it — see rbp's row — and `pcRelativeMemoryBase` below is the one place that lists the fields where it is legal. No DWARF number: a CFI rule never names it, and column 16 is the synthetic return-address column (`dwarfReturnAddressColumn`), not this row.",
+      "name": "rip", "class": "gpr", "widthBytes": 8, "hwEncoding": 5, "encodingRole": "instructionPointer" }
   ],
-  "$asmConstraintsComment": "★★★ WHICH GNU INLINE-ASM CONSTRAINT LETTER MEANS WHICH REGISTER IS TARGET VOCABULARY, AND THEREFORE LIVES HERE. `\"=a\"(o)` means RAX; nothing in the C standard says so, and a C++ table keyed on architecture would be an agnosticism break that no grep catches until arm64 inline asm arrives — at which point the table is load-bearing.\n★★ THE LINE AGAINST [[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]], WHICH REVERTED AN `asmSyntax` BLOCK ON THIS FILE. That block died because `registerPrefix`/`immediatePrefix`/comment chars/operand order are (target, DIALECT) facts — ✔MEASURED, AT&T `movq %rsi, (%rdi)` vs Intel `mov QWORD PTR [rdi], rsi`, ONE CPU. Constraint letters take the same test and PASS it: `=a` means RAX under AT&T and under Intel, in ELF and in PE. The letter names a REGISTER; a register is a property of the processor. ⇒ no sigils, no operand order, no mnemonic spellings may ever enter this array. The MODIFIERS `= + & %` are GNU-asm grammar owned by the source language and the loader REJECTS a letter containing one.\n★ THREE AXES, ALL BOUND TO VOCABULARY THAT ALREADY EXISTED — no fourth axis, no `AsmConstraint*` verb set: `registerClass` → TargetRegClass, `register` → this file's own `registers[].name` (the `implicitRegisters` name-resolution precedent, resolved to an ordinal AT LOAD), `operandKind` → OperandKindFilter, the same closed set the encoding variant guards use.\n✔MEASURED, gcc 13.3.0 x86_64, `-O2 -S`, WITH THREE COMPETING LIVE `\"r\"` OPERANDS so a lucky allocation cannot be mistaken for a pin: r→%rax, a→%rax, b→%rbx, c→%rcx, d→%rdx, S→%rsi, D→%rdi, x→%xmm0; `\"m\"(*p)`→`(%rdi)`; `\"i\"(7)`→`$7`. ⚠ CASE IS LOAD-BEARING: `d` is %rdx and `D` is %rdi — two different registers, one letter apart.\n★★ `q` IS DECLARED AND `Q` IS NOT, AND THE DIFFERENCE WAS MEASURED AFTER AN EARLIER DRAFT OF THIS VERY COMMENT ASSERTED IT WRONGLY. That draft grouped `q` with `Q` as 'the byte-addressable subclass' and refused both — asserted from the letter's NAME, never probed. ✔THE PROBE, which counts how many SIMULTANEOUS live operands each letter admits (the register-set size, read off the point where gcc says 'impossible constraints'): **r=15, q=15, Q=4, x=16, a=1**. So on THIS target `q` admits exactly the registers `r` does — REX makes every GPR byte-addressable, so the i386 subclass {a,b,c,d} that the letter's name remembers does not exist here — and `q`→`gpr` is EXACT, not an approximation. `Q`=4 is a genuine subset and stays out. ⚠ The lesson generalizes past this row: a constraint letter's MEANING is per-target, so its register set must be measured per-target and never inferred from what the letter means somewhere else. `a`=1 is the control that shows the probe can see a single-register pin.\n⚠ DELIBERATELY NOT DECLARED: `Q`. ✔MEASURED 4 registers ({rax,rbx,rcx,rdx}); `TargetRegClass` cannot express a SUBSET of a class, and declaring it as plain `gpr` would be a knob that LIES — it would load clean, read as support, and hand the allocator 11 registers gcc forbids. A letter this file cannot describe EXACTLY is a letter it refuses by name.\n★ THE DEFERRAL, stated here because it has no registry row yet (the lane that owns .plans must add it, and this sentence is the handover): expressing a register SUBCLASS needs a FOURTH binding axis — an explicit list of register names — which is deliberately NOT built. Trigger: the first client corpus whose inline asm actually uses a subclass letter. ✔MEASURED that none does today — sqlite's src/hwtime.h, the only inline asm in the corpus, uses exactly `\"=a\"`, `\"=d\"` and `\"=r\"`. Building the axis before that trigger fires would be a speculative build with no consumer, so the honest state is: refuse the letter loudly, and let the refusal be the thing that fires when a client needs it.\n✔MEASURED `x`→%xmm0, and its register set is **16** by the same simultaneous-operand probe, which is exactly the 16 `fpr` rows this file declares (xmm0-xmm15) ⇒ `x`→`fpr` is EXACT here. ★ THE SAME LETTER IS *NOT* EXACT ON AARCH64 — there `x` measures 16 out of a 32-register V file, i.e. the V0-V15 SUBCLASS — so arm64.target.json refuses it while this file declares it. One letter, two processors, opposite decisions, both measured: that is the facet earning its existence.",
+  "$pcRelativeMemoryBaseComment": "★★★ THE PROGRAM COUNTER AS A MEMORY BASE (P68 round 9, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER). `register` is the row above; `memoryBaseSlots` the fields that accept it — the ModR/M memory field, whose mod=00 rm=101 form is `[rip + disp32]`, relative to the NEXT instruction; `symbolicDisplacementRelocation` the format-neutral relocation a symbolic displacement (`msg+4(%rip)`) takes. ✔MEASURED 2026-09-23 how each format stores that relocation — ELF R_X86_64_PC32 with the addend in r_addend, PE IMAGE_REL_AMD64_REL32 with it in place, Mach-O X86_64_RELOC_SIGNED(_1/_2/_4) by the bytes that follow the field — which is why the kind named here is the target's and each object format maps it. The walker reduces the addend by the bytes after the field (`movl $5, x(%rip)`: 4 immediate bytes), once, because 'relative to the next instruction' is this ISA's rule.",
+  "pcRelativeMemoryBase": {
+    "register": "rip",
+    "memoryBaseSlots": ["modrm.rm.mem"],
+    "symbolicDisplacementRelocation": "riprel32"
+  },
+  "$asmConstraintsComment": "★★★ WHICH GNU INLINE-ASM CONSTRAINT LETTER MEANS WHICH REGISTER IS TARGET VOCABULARY, AND THEREFORE LIVES HERE. `\"=a\"(o)` means RAX; nothing in the C standard says so, and a C++ table keyed on architecture would be an agnosticism break that no grep catches until arm64 inline asm arrives — at which point the table is load-bearing.\n★★ THE LINE AGAINST [[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]], WHICH REVERTED AN `asmSyntax` BLOCK ON THIS FILE. That block died because `registerPrefix`/`immediatePrefix`/comment chars/operand order are (target, DIALECT) facts — ✔MEASURED, AT&T `movq %rsi, (%rdi)` vs Intel `mov QWORD PTR [rdi], rsi`, ONE CPU. Constraint letters take the same test and PASS it: `=a` means RAX under AT&T and under Intel, in ELF and in PE. The letter names a REGISTER; a register is a property of the processor. ⇒ no sigils, no operand order, no mnemonic spellings may ever enter this array. The MODIFIERS `= + & %` are GNU-asm grammar owned by the source language and the loader REJECTS a letter containing one.\n★ THREE AXES, ALL BOUND TO VOCABULARY THAT ALREADY EXISTED — no fourth axis, no `AsmConstraint*` verb set: `registerClass` → TargetRegClass, `register` → this file's own `registers[].name` (the `implicitRegisters` name-resolution precedent, resolved to an ordinal AT LOAD), `operandKind` → OperandKindFilter, the same closed set the encoding variant guards use.\n✔MEASURED, gcc 13.3.0 x86_64, `-O2 -S`, WITH THREE COMPETING LIVE `\"r\"` OPERANDS so a lucky allocation cannot be mistaken for a pin: r→%rax, a→%rax, b→%rbx, c→%rcx, d→%rdx, S→%rsi, D→%rdi, x→%xmm0; `\"m\"(*p)`→`(%rdi)`; `\"i\"(7)`→`$7`. ⚠ CASE IS LOAD-BEARING: `d` is %rdx and `D` is %rdi — two different registers, one letter apart.\n★★ `q` IS DECLARED AND `Q` IS NOT, AND THE DIFFERENCE WAS MEASURED AFTER AN EARLIER DRAFT OF THIS VERY COMMENT ASSERTED IT WRONGLY. That draft grouped `q` with `Q` as 'the byte-addressable subclass' and refused both — asserted from the letter's NAME, never probed. ✔THE PROBE, which counts how many SIMULTANEOUS live operands each letter admits (the register-set size, read off the point where gcc says 'impossible constraints'): **r=15, q=15, Q=4, x=16, a=1**. So on THIS target `q` admits exactly the registers `r` does — REX makes every GPR byte-addressable, so the i386 subclass {a,b,c,d} that the letter's name remembers does not exist here — and `q`→`gpr` is EXACT, not an approximation. `Q`=4 is a genuine subset and stays out. ⚠ The lesson generalizes past this row: a constraint letter's MEANING is per-target, so its register set must be measured per-target and never inferred from what the letter means somewhere else. `a`=1 is the control that shows the probe can see a single-register pin.\n⚠ DELIBERATELY NOT DECLARED: `Q`. ✔MEASURED 4 registers ({rax,rbx,rcx,rdx}); `TargetRegClass` cannot express a SUBSET of a class, and declaring it as plain `gpr` would be a knob that LIES — it would load clean, read as support, and hand the allocator 11 registers gcc forbids. A letter this file cannot describe EXACTLY is a letter it refuses by name.\n★ THE DEFERRAL, stated here because it has no registry row yet (the lane that owns .plans must add it, and this sentence is the handover): expressing a register SUBCLASS needs a FOURTH binding axis — an explicit list of register names — which is deliberately NOT built. Trigger: the first client corpus whose inline asm actually uses a subclass letter. ✔MEASURED 2026-09-24 that none does (sqlite f544d3599a10): the corpus's inline asm is four `__asm__ __volatile__` statements, all in src/hwtime.h, and their constraints are exactly `\"=a\"`, `\"=d\"` and `\"=r\"`. Building the axis before that trigger fires would be a speculative build with no consumer, so the honest state is: refuse the letter loudly, and let the refusal be the thing that fires when a client needs it.\n✔MEASURED `x`→%xmm0, and its register set is **16** by the same simultaneous-operand probe, which is exactly the 16 `fpr` rows this file declares (xmm0-xmm15) ⇒ `x`→`fpr` is EXACT here. ★ THE SAME LETTER IS *NOT* EXACT ON AARCH64 — there `x` measures 16 out of a 32-register V file, i.e. the V0-V15 SUBCLASS — so arm64.target.json refuses it while this file declares it. One letter, two processors, opposite decisions, both measured: that is the facet earning its existence.",
   "asmConstraints": [
     { "$comment": "The general-register class. ✔%rax with three competing \"r\" operands live — an allocation, not a pin, which is exactly what a CLASS binding means.",
       "letter": "r", "binds": "registerClass", "registerClass": "gpr"  },
@@ -4676,6 +5026,23 @@
   "asmBareOperandWidths": [
     { "class": "gpr", "derivation": "operandType" },
     { "class": "fpr", "derivation": "operandType" }
+  ],
+  "$asmValueCarriageComment": "★★★ WHICH VALUES A REGISTER CLASS CARRIES FROM MEMORY INTO AN INLINE-ASM OPERAND — BY KIND, SIZE AND DIRECTION (D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS, D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED). A struct/union, a `_Complex`, a 128-bit integer or an x87 `long double` lives in MEMORY in this pipeline, so a register-constrained operand of one is LOADED into its register(s) before the template and STORED back after — never handed its address. Each entry lists the exact SIZES a reference carries; a size wider than one register is a register PAIR whose second register AT&T gives the template no name for (a `+` operand's high half survives an `addq $1, %0`); the x87 value is 64 + 16 bits. ✔MEASURED 2026-09-18, gcc 13.3.0 and clang 18.1.3 SEPARATELY, -O0 and -O2, every probe RUN and checked on the VALUE: on `\"r\"` both carry a 1/2/4/8-byte struct and an 8-byte `_Complex float` in ONE register and a 16-byte `__int128`/`unsigned __int128` in TWO, gcc also a 16-byte struct or union, a `_Complex double` and an x87 `long double` in TWO; on `\"x\"` both carry a `__int128` and a 4/8-byte struct in ONE XMM register, gcc a 2-byte struct (through a general register — `movzwl` + `movd`, hence `stagesThrough`) and a 16-byte struct or union, clang an 8-byte `_Complex float`. A `_Complex double` rides ONE XMM register as an OUTPUT (clang, all 16 bytes, both -O0 and -O2; a first probe's run crash, rc 139, was clang's own aligned `movaps` spill of the result to a misaligned stack slot, read in its assembly) — as an input or `+` neither reference carries it (gcc \"inconsistent operand constraints\", clang \"indirect register inputs\"). NOT carried, by any reference: a 1-byte struct on `\"x\"` (gcc \"inconsistent operand constraints\", clang \"couldn't allocate\"), a struct of 3/6/12/24/32 bytes on either class (\"impossible constraint in 'asm'\"), an x87 `long double` on `\"x\"`, and any `_BitInt` (the front end's refusal). ⚠ ADJUDICATED, NOT MEASURED-AWAY: a 32-byte `_Complex long double` OUTPUT on `\"r\"` is ACCEPTED by clang 18.1.3 and exits 42 on a probe that reads only its first 8 bytes — clang binds ONE 64-bit register and fills the other 24 bytes from an uninitialized stack temporary (read in its -O0 and -O2 assembly: `movq %rax, -40(%rsp)` then two `fldt` of the 32-byte temp). That is a TRUNCATION, not a carriage — the acceptance is achieved by dropping three quarters of the object, the silent-wrong-program class the 2026-08-28 ruling refuses to buy with acceptance — and gcc refuses it (\"unsupported operand size for extended register\"), so it is not listed and DSS refuses it by name. A PINNED single-register letter (`\"a\"`, `\"d\"`, …) with a two-register value is refused by BOTH (gcc \"inconsistent operand constraints\", clang \"couldn't allocate\"), so no pinned entry appears here.",
+  "asmValueCarriage": [
+    { "class": "gpr",
+      "carries": [
+        { "kinds": ["Struct", "Union"], "bytes": [1, 2, 4, 8, 16] },
+        { "kinds": ["Complex"], "bytes": [8, 16] },
+        { "kinds": ["I128", "U128"], "bytes": [16] },
+        { "kinds": ["F80"], "bytes": [10] }
+      ] },
+    { "class": "fpr", "stagesThrough": "gpr",
+      "carries": [
+        { "kinds": ["Struct", "Union"], "bytes": [2, 4, 8, 16] },
+        { "kinds": ["Complex"], "bytes": [8] },
+        { "kinds": ["Complex"], "bytes": [16], "directions": ["out"] },
+        { "kinds": ["I128", "U128"], "bytes": [16] }
+      ] }
   ],
   "$registerClassOpsComment": "FC2 Part B: per-register-class move/load/store mnemonics. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (a GPR mov against an XMM hwEncoding assembles to valid-looking-but-WRONG bytes — the class-blind silent miscompile this table kills). fpr's `store` landed with its FIRST consumer (trigger discipline honored): the ms_x64 prologue saved-reg spill — Win64 callee-saved xmm6-15 + regalloc's callee-saved-first policy put the first FPR vreg in a callee-saved xmm, and classOpHandle failed loud L_RequiredLirOpcodeMissing until movsd_store was declared. ★★ THE TWO PARAGRAPHS ABOVE AND BELOW WERE TWO SEPARATE `$registerClassOpsComment` KEYS IN THIS DOCUMENT UNTIL 2026-08-30 (cycle P46), AND JSON LET THAT PASS: every mainstream parser -- nlohmann, which is what DSS uses -- keeps the LAST occurrence and drops the first WITHOUT A DIAGNOSTIC. So the paragraph above this sentence was dead text the loader never saw, while being the one a reader meets first. Merged rather than deleted, because neither subsumes the other: the first says WHY this table exists and what a missing row costs, the second says what a ROW MEANS now that its subject is an ordered pair. D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. D-TARGET-NO-CROSS-CLASS-MOVE-VERB: a row's subject is an ORDERED PAIR of register classes — `class` is the SOURCE and the optional `to` is the DESTINATION, `to` omitted meaning the DIAGONAL (a copy within one file), which is what every row written before this key existed meant. ★ ONE TABLE, not two: `move` answers the single question *how does this machine copy a bit pattern from class A to class B?* for every (A,B) including A == B. A separate cross-class list would have given that one question two homes and a reader would have found whichever their grep reached first. ⚠ `load`/`store` are DIAGONAL-ONLY and the loader refuses them off it: they relate a class to MEMORY, and memory is not a register class. ⚠ AND THE MOVE'S OWN ENCODING IS CHECKED AGAINST THE PAIR IT IS FILED UNDER — filing the integer `mov` as the gpr->fpr move would load clean and re-create D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND (a register NUMBER written into the wrong file, silently), so `validate()` refuses a move whose declared banks disagree with its row.",
 "registerClassOps": [
@@ -4715,7 +5082,7 @@
       "entryStackPointerBias": 0,
       "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address. ML7 `computeFrameLayout` consumes this as the bias for non-leaf functions so their prologue `sub rsp, N` produces RSP ≡ 0 mod 16 at the next call site. SysV's entry bias is 0 (kernel JMP) but this in-program call-push is 8 — the two distinct facts coincide on Win64 (both 8) and diverge here. Without this wired, the user-fn → extern-call shadow-space + alignment violation reappears one stack frame below the trampoline (the same 0xC0000005 class as D-LK10-ENTRY-TRAMP-PROLOGUE, now recurring at the user-fn boundary).",
       "callPushBytes": 8,
-      "$variadicVectorCountRegComment": "D-LANG-VARIADIC (step 13.4, 2026-06-02): SysV AMD64 §3.5.7 — the caller MUST set AL to the number of vector (XMM) registers used to pass variadic arguments before any call to a function with `...`. printf reads %al to know whether to consult the XMM save area in its va_list walk; passing AL uninitialized yields garbage formatting and (on hardened glibcs) an abort. C-subset has no float type today, so every variadic call from c stamps the count as 0; the count-of-FPRs logic in ML7 materialize is data-driven via this field — future float support (in c or any other source language) lights up the same code path with zero substrate change. The field names `rax` (the register table's canonical full-width name) rather than `al` (the ABI document's low-byte alias) because the register table does NOT yet model the x86 subregister aliases (al / ax / eax for the low-byte / low-word / low-dword of rax); anchored D-TARGET-SUBREGISTER-ALIASES. Writing rax = count is ABI-equivalent: a `mov rax, <count<=8>` sets AL to the same byte and the upper bits are irrelevant to printf's ABI contract.",
+      "$variadicVectorCountRegComment": "D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): SysV AMD64 §3.5.7 — the caller MUST set AL to the number of vector (XMM) registers used to pass variadic arguments before any call to a function with `...`. printf reads %al to know whether to consult the XMM save area in its va_list walk; passing AL uninitialized yields garbage formatting and (on hardened glibcs) an abort. C-subset has no float type today, so every variadic call from c stamps the count as 0; the count-of-FPRs logic in ML7 materialize is data-driven via this field — future float support (in c or any other source language) lights up the same code path with zero substrate change. The field names `rax` (the register table's canonical full-width name) rather than `al` (the ABI document's low-byte alias) because the register table does NOT yet model the x86 subregister aliases (al / ax / eax for the low-byte / low-word / low-dword of rax); anchored D-TARGET-SUBREGISTER-ALIASES. Writing rax = count is ABI-equivalent: a `mov rax, <count<=8>` sets AL to the same byte and the upper bits are irrelevant to printf's ABI contract.",
       "variadicVectorCountReg": "rax",
       "$vaListLayoutComment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): System V AMD64 §3.5.7 variadic-CALLEE layout. `__va_list_tag` = {u32 gp_offset@0; u32 fp_offset@4; void* overflow_arg_area@8; void* reg_save_area@16;} = 24B. A variadic callee's prologue spills the 6 integer arg regs (rdi..r9, 8B each = 48B) then the al-gated 8 SSE arg regs (xmm0..xmm7, 16B each = 128B) into a 176B register-save-area. va_start sets gp_offset = fixedGPR*8, fp_offset = 48 + fixedSSE*16, reg_save_area = &save, overflow_arg_area = &(incoming stack args). va_arg(T) of an INTEGER reads reg_save_area+gp_offset (bump +8) while gp_offset < gpOffsetLimit(48), else overflow; an SSE arg reads reg_save_area+fp_offset (bump +16) while fp_offset < fpOffsetLimit(176), else overflow. Every fact is config — the HIR→MIR diamond + LIR prologue spill read these, never branching on cc.name/arch/format. ★ STALENESS FIXED 2026-07-25: this note used to end \"Win64/AAPCS64 omit this block (different variadic ABI) and fail loud at the va_start site\" — no longer true, and it had become actively misleading. Every shipped CC now declares its own `vaListLayout`, each naming a DIFFERENT `strategy`: `ms_x64` two rows below (homogeneous_pointer, FC12b), arm64 `aapcs64` (aapcs64_dual_cursor, FC12c) and `apple_arm64` (homogeneous_pointer). So the block is not a SysV-only opt-in whose absence means fail-loud; it is the per-CC declaration of WHICH variadic model applies, and `strategy` is the closed-vocabulary verb the engine dispatches on. Absent `vaListLayout` now describes only a hypothetical future CC that declares none — nothing shipped.",
       "vaListLayout": {
@@ -4760,7 +5127,7 @@
       "callPushBytes": 8,
       "$stackProbePageBytesComment": "D-WIN64-LARGE-FRAME-STACK-PROBE: the Windows x86-64 stack guard-page size (4096). A function whose total frame EXCEEDS 4096 bytes must touch every page on the way down (committing each PAGE_GUARD page) instead of a bare `sub rsp, F` that jumps over the guard page → STATUS_GUARD_PAGE_VIOLATION → access violation on the first deep write. The ML7 prologue reads this generically and, when totalFrameSize > 4096, emits the `stack_probe` virtual op (page step = this value) which the x86_64 encoder lowers to an inline page-walking loop — INSTEAD of the plain `sub rsp, F`. NO __chkstk dependency (dss PE exes are freestanding; __chkstk lives in msvcrt/ucrt). sysv_amd64 omits this field (0 = no probing: Linux auto-grows the stack via demand paging). Agnostic: the prologue branches on the VALUE, never on cc.name/arch/format.",
       "stackProbePageBytes": 4096,
-      "$slotAlignedComment": "D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): Win64 ms_x64 uses SLOT-ALIGNED arg passing — each arg consumes one shared slot index regardless of register class. Slot N reserves BOTH argGprs[N] AND argFprs[N]. `f(int, double, int, double, int)` consumes slots 0..4 → (rcx OR xmm0, rdx OR xmm1, r8 OR xmm2, r9 OR xmm3, [rsp+0x20]). Pure-GPR calls (WriteFile, GetStdHandle, etc.) happen to give the same overflow count as independent counters; mixed-class calls require the slot-aligned counting to land arg-5 on the stack correctly. ML7 `computeMaxOutgoingStackArgs` + `materializeOneFunc` consult this flag.",
+      "$slotAlignedComment": "D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (closed co-with plan-12 step ML7-2.2, 2026-06-02): Win64 ms_x64 uses SLOT-ALIGNED arg passing — each arg consumes one shared slot index regardless of register class. Slot N reserves BOTH argGprs[N] AND argFprs[N]. `f(int, double, int, double, int)` consumes slots 0..4 → (rcx OR xmm0, rdx OR xmm1, r8 OR xmm2, r9 OR xmm3, [rsp+0x20]). Pure-GPR calls (WriteFile, GetStdHandle, etc.) happen to give the same overflow count as independent counters; mixed-class calls require the slot-aligned counting to land arg-5 on the stack correctly. ML7 `computeMaxOutgoingStackArgs` + `materializeOneFunc` consult this flag.",
       "slotAligned": true,
       "$vaListLayoutComment": "FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): Microsoft x64 variadic-CALLEE layout. `va_list` is a plain `char*` (sizeof 8) — the HomogeneousPointer strategy, NOT SysV's __va_list_tag/register-save-area. Win64 spills the first 4 named integer args into the caller-provided 32-byte HOME SPACE (rcx/rdx/r8/r9 slots) which sits CONTIGUOUS with the 5th+ stack args, so `va_arg` is a LINEAR pointer bump by namedArgSlotBytes (8) across home→overflow — no diamond, no per-class cursor. The callee prologue spills the named integer arg regs into their home slots; `va_start` sets ap = &home[namedArgCount]. FP varargs are passed in BOTH the XMM and matching integer register, and the callee reads va_arg(double) from the home (GPR) slot — so the CALLER duplicates each FP vararg into the matching integer reg (lir_callconv, strategy-gated). Struct-by-value varargs are DEFERRED this cycle (D-FC12B-WIN64-STRUCT-VARARG, fail-loud). Every fact is config — the lowering + spill read these, never branching on cc.name/arch/format.",
       "vaListLayout": {
@@ -4799,7 +5166,17 @@
       "name": "pcrel32", "kind": 5, "formula": "linear", "pcRelative": true, "addendBias": 0, "widthBytes": 4 },
     { "$comment": "D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: a 32-bit IMAGE-RELATIVE reference — the target's address MINUS the image base, i.e. an RVA. Every field of a Win64 `RUNTIME_FUNCTION` (BeginAddress, EndAddress, UnwindInfoAddress) is one, and so is the UNWIND_INFO exception-handler field, so a PE relocatable object cannot carry `.pdata`/`.xdata` without it. ⚠ IT IS NOT `abs32` WITH A DIFFERENT NAME: abs32 writes the FULL VA, and the Windows unwinder reads these fields as offsets from the loaded image base, so an abs32 there is a number ~2^32 too large that RtlLookupFunctionEntry follows into unmapped memory. The two rows are identical in formula, width, bias and non-pc-relativity — `imageRelative` is the ONLY property that separates them, which is why it is a schema field and not a name match. ✔MEASURED 2026-08-27 against gcc 13.2.0's own x64 COFF `.obj`: `.pdata` carries THREE IMAGE_REL_AMD64_ADDR32NB (type 3) per RUNTIME_FUNCTION — two against the `.text` section symbol, one against `.xdata` — with the addends stamped in the section bytes because COFF has no addend column. Declared on the TARGET (the psABI states the field's shape) and mapped to a wire id by each PE object format that has a writer for it.",
       "name": "imagerel32", "kind": 6, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 4, "imageRelative": true },
-    { "$comment": "D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the GOT-slot-relative reference a real distro glibc `libc.a` member carries -- R_X86_64_GOTPCREL = 9, the 32-bit displacement of a `<insn> sym@GOTPCREL(%rip)`. It names the SLOT THAT HOLDS the symbol's address, never the symbol, so `value = GOTSLOT(S) + A - P`. THE FORMULA IS ITS OWN DISCRIMINATOR AND THAT IS MEASURED, NOT PREFERRED: declaring it `linear` + `pcRelative` + `addendBias: 0` + `widthBytes: 4` -- which is what its wire arithmetic looks like -- makes the READ fail, because `pcrel32` already occupies the (32-bit, pc-relative, zero-bias) description and D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS then cannot say which row a DWARF FDE `initial_location` means. Verified 2026-09-07 through the CLI against glibc `exit.o`. The addend bias is ZERO: a real site carries r_addend -5 (a 4-byte displacement followed by a 1-byte immediate), and only a zero bias hands that number to the merge unchanged -- a row copied from `rel32` (bias -4) would be one byte off at every site. DSS synthesizes no GOT in its static ET_EXEC path, so `applyExecRelocations` REFUSES this kind explicitly rather than fabricating a direct pc-relative reference; declaring the row is what lets a foreign member be READ, and giving the resolution a slot is the other half of the row.",
-      "name": "gotpcrel32", "kind": 7, "formula": "x86_64_gotpcrel" }
+    { "$comment": "D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the GOT-slot-relative reference a real distro glibc `libc.a` member carries -- R_X86_64_GOTPCREL = 9, the 32-bit displacement of a `<insn> sym@GOTPCREL(%rip)`. It names the SLOT THAT HOLDS the symbol's address, never the symbol, so `value = GOTSLOT(S) + A - P`. THE FORMULA IS ITS OWN DISCRIMINATOR AND THAT IS MEASURED, NOT PREFERRED: declaring it `linear` + `pcRelative` + `addendBias: 0` + `widthBytes: 4` -- which is what its wire arithmetic looks like -- makes the READ fail, because `pcrel32` already occupies the (32-bit, pc-relative, zero-bias) description and D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS then cannot say which row a DWARF FDE `initial_location` means. Verified 2026-09-07 through the CLI against glibc `exit.o`. The addend bias is ZERO: a real site carries r_addend -5 (a 4-byte displacement followed by a 1-byte immediate), and only a zero bias hands that number to the merge unchanged -- a row copied from `rel32` (bias -4) would be one byte off at every site. P68 round 11: an IMAGE link lowers it (`lowerGotSlotReferences`, link/got_slots.hpp) to its declared `gotSlotTwin`, `pcrel32` — the Linear, pc-relative, 4-byte, bias-0 row, which the loader proves has exactly those properties (`gotSlotTwinMismatch`) — against a slot it mints as a relocation-bearing data item holding S, which every image writer fills per image kind; `applyExecRelocations` REFUSES the un-lowered kind rather than fabricate a direct reference. No relaxation: the `X` forms below are a permission to rewrite the instruction, an optimisation, never a meaning. (This comment used to say the static ET_EXEC walker mints a `.got` for it — ✔MEASURED 2026-09-24 that no program the driver builds reached that walker, every ELF image importing libc `exit`; D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS was reopened for it and this lowering closes it.)",
+      "name": "gotpcrel32", "kind": 7, "formula": "x86_64_gotpcrel", "gotSlotTwin": "pcrel32" },
+    { "$comment": "P68 round 11 (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS): R_X86_64_GOTPCRELX = 41, the RELAXABLE form of `gotpcrel32` gas writes for a non-REX `<insn> sym@GOTPCREL(%rip)` unless told `-mrelax-relocations=no`. The X is a PERMISSION the assembler grants the linker (it checked the instruction shape), never a requirement: declining to relax leaves an indirect load through a slot holding the same address, which is always correct — so the arithmetic, the slot and the lowering are `gotpcrel32`'s exactly. Its OWN kind because two format rows may share a wire type but not a kind (✔MEASURED by the GOTPCREL row: mapping a second wire onto kind 7 made the kind→row direction the emitter uses stop being a function, and reddened 11 targets).",
+      "name": "gotpcrelx32", "kind": 9, "formula": "x86_64_gotpcrel", "gotSlotTwin": "pcrel32" },
+    { "$comment": "P68 round 11: R_X86_64_REX_GOTPCRELX = 42, the relaxable form for a REX-prefixed instruction — what gcc 13 -O2 DEFAULT (PIE) codegen writes for an extern FUNCTION's address (`movq sym@GOTPCREL(%rip), %rax`; ✔MEASURED 2026-09-24 on `return dss_app_twice;` — DSS refused such a member at READ), and a distro glibc `libc.a` carries 74 in 15 members. Lowered unrelaxed, as `gotpcrelx32`.",
+      "name": "rex_gotpcrelx32", "kind": 10, "formula": "x86_64_gotpcrel", "gotSlotTwin": "pcrel32" },
+    { "$comment": "P68 round 9 (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): a 32-bit displacement of a MEMORY operand relative to the NEXT instruction — `movq msg(%rip), %rax`, a DATA reference, never a call. The arithmetic is `rel32`'s (S + A - P, bias -4 for the end of the field; the x86 walker lowers A by the bytes that follow the field, so the sum is relative to the instruction's end). It is its own kind because the formats spell it differently from a call: Mach-O writes X86_64_RELOC_SIGNED(_1/_2/_4) where a call is X86_64_RELOC_BRANCH, and ELF writes R_X86_64_PC32 where a call to an undefined function is R_X86_64_PLT32 (✔MEASURED 2026-09-23, gas 2.42 and clang 18.1.3: `leaq ext_fn(%rip)` is PC32).",
+      "name": "riprel32", "kind": 8, "formula": "linear", "pcRelative": true, "addendBias": -4, "widthBytes": 4 },
+    { "$comment": "P68 round 11 (the Mach-O GOT_LOAD / GOT item): the GOT-slot-relative reference Mach-O spells X86_64_RELOC_GOT — `GOTSLOT(S) + A - P` with bias -4, because Mach-O measures a pc-relative field from its END and keeps the remainder IN PLACE: ✔MEASURED 2026-09-24, clang 18 `--target=x86_64-apple-macos11`, the field holds 0 for `addq sym@GOTPCREL(%rip), %rax`, -1 for `cmpq $0, sym@GOTPCREL(%rip)` (an imm8 follows), -4 for `movl $imm32, sym@GOTPCREL(%rip)`, +8 for `movq sym@GOTPCREL+8(%rip)`, and +4 for the `__eh_frame` personality pointer (a DATA field, where G + 4 - (P + 4) = G - P). The same bias ELF's `gotpcrel32` does not carry, because R_X86_64_GOTPCREL's -4 rides the RELA record's addend: the two rows are the GOT twins of `riprel32` and `pcrel32`. Its `gotSlotTwin` is DECLARED `riprel32` — `rel32` has the same arithmetic (Linear, pc-relative, 4 bytes, bias -4) and differs only in how a format spells it (a branch where this is a memory operand), so a search would have to pick. An image link lowers it (`lowerGotSlotReferences`) and applies no relaxation.",
+      "name": "gotriprel32", "kind": 11, "formula": "x86_64_gotpcrel", "addendBias": -4, "gotSlotTwin": "riprel32" },
+    { "$comment": "P68 round 11: Mach-O's X86_64_RELOC_GOT_LOAD — the same reference as `gotriprel32` on a `movq sym@GOTPCREL(%rip), %reg` the linker MAY relax (clang 18 writes it for exactly that instruction and X86_64_RELOC_GOT for every other GOT operand, ✔MEASURED 2026-09-24). Its own kind because the format spells it apart; the same arithmetic and the same declared twin, and no relaxation — a load through a slot holding the same address is always correct.",
+      "name": "gotriprel32_load", "kind": 12, "formula": "x86_64_gotpcrel", "addendBias": -4, "gotSlotTwin": "riprel32" }
   ]
 }

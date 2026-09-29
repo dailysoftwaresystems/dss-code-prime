@@ -1,5 +1,12 @@
 # Testing discipline + coding conventions
 
+## Contents
+- 7. Testing — strict asserts required: 7.1 rules · 7.2 test infrastructure · 7.3 death tests on
+  Windows / MinGW · 7.4 don't
+- 9. Coding conventions — mandatory: 9.1 the fatal pattern · 9.2 strong-typed IDs · 9.3 `DSS_EXPORT`
+  discipline · 9.4 `[[nodiscard]]` · 9.5 templates and headers · 9.6 comments · 9.7 move semantics ·
+  9.8 no abbreviations / no narration
+
 ## 7. Testing — STRICT ASSERTS REQUIRED
 
 **This is the most important rule in this skill.** This project's tests catch regressions that

@@ -84,9 +84,9 @@ constexpr char const* kLabel = "returnPoolProjection";
 // is "appears in quotes" — and asking for the quoted form is what makes the
 // check immune to the spelling turning up inside some longer word.
 //
-// ✔ IT NOW ASKS THE ONE TOKENIZER (2026-08-23, cycle P28,
-// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED). This
-// used to be a private `msg.find("'" + name + "'")`, and the comment here gave
+// ✔ IT NOW ASKS THE ONE TOKENIZER (2026-08-23, cycle P28). The message-reading
+// half used to be UNREACHABLE from here and JSON-COUPLED: this was a private
+// `msg.find("'" + name + "'")`, and the comment here gave
 // the honest reason: `tests/core/vocabulary_projection_probe.hpp` was NOT on
 // this target's include path, and it dragged `nlohmann/json.hpp` behind it for a
 // TU that touches no JSON. Both obstacles are gone — the message-reading half

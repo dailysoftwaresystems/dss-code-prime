@@ -1,8 +1,10 @@
 #include "link/format/elf_object_reader.hpp"
 #include "link/format/dwarf_cfi_decode.hpp"
 #include "link/format/foreign_section_alignment.hpp"
+#include "link/format/section_relative_target.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
+#include "link/format/relocation_addend.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
@@ -103,11 +105,12 @@ constexpr std::uint8_t kSttFile    = 4;
 // ★ A REFERENCE TO IT IS ALREADY REFUSED, BY NAME, ONE STEP EARLIER — which is
 // why this arm drops the row instead of adding a second refusal. A real
 // reference travels on R_X86_64_GOTPC32 / GOTPC64 / GOTOFF64 (✔MEASURED:
-// `gcc -c "leaq _GLOBAL_OFFSET_TABLE_(%rip),%rax"` emits wire type 26), and the
-// elf64-x86_64 documents declare wire ids {1, 2, 9, 10} only, so the
+// `gcc -c "leaq _GLOBAL_OFFSET_TABLE_(%rip),%rax"` emits wire type 26), and no
+// elf64-x86_64 document declares a GOTPC or GOTOFF wire type, so the
 // undeclared-wire-type arm in the relocation pass rejects such an object before
 // any symbol is classified. A second refusal here would be a second place for
-// that wording to drift.
+// that wording to drift. (The GOTPCREL family the documents DO declare names a
+// symbol's own slot, never the GOT base.)
 //
 // ⓘ AND THE SHAPE NO ASSEMBLER EMITS IS COVERED TOO, IN THE SAME DIRECTION: a
 // reference through a DECLARED wire type (a bare `.quad _GLOBAL_OFFSET_TABLE_`,
@@ -116,11 +119,10 @@ constexpr std::uint8_t kSttFile    = 4;
 // this skip existed that case was WORSE, not better — the phantom import bound
 // it silently to an import slot.
 //
-// ★ THE SPELLING IS READER-OWNED, on the same stated convention `elf.cpp` uses
-// for `kGotSectionName`: it is not a place a PRODUCER can put anything, because
-// the assembler that produced the object already wrote this exact spelling into
-// its `.symtab`. It is gABI-generic — every ELF architecture uses it — so it
-// carries no arch branch.
+// ★ THE SPELLING IS READER-OWNED: it is not a place a PRODUCER can put
+// anything, because the assembler that produced the object already wrote this
+// exact spelling into its `.symtab`. It is gABI-generic — every ELF
+// architecture uses it — so it carries no arch branch.
 constexpr std::string_view kGotBaseSymbolName = "_GLOBAL_OFFSET_TABLE_";
 
 // st_info / st_other decode (gABI 4.31).
@@ -474,7 +476,6 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         return fail(DiagnosticCode::F_CorruptedBinary,
                     "elf::readRelocatableObject: " + decode.error());
     }
-    auto const& nativeToKind         = decode->nativeToKind;
     auto const& callSignalNativeIds  = decode->callSignalNativeIds;
 
     // -- (6) Reconstruct functions / data items / externs / symbols --
@@ -1168,6 +1169,23 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         return nullptr;
     };
 
+    // Whether this object's input sections are UNITS of placement: the format's
+    // declared rule (`inputSectionPlacement`), applied to an object that has no
+    // way to declare its sections divisible. It decides two things below: a
+    // section-relative reference may bind through any atom of its section, and
+    // every atom carries the section it was cut from (`InputSectionSlice`).
+    auto const placement = objectFormatSchema.inputSectionPlacement();
+    if (!placement.has_value()) {
+        return fail(DiagnosticCode::F_CorruptedBinary,
+            "elf::readRelocatableObject: ELF format '"
+            + std::string{objectFormatSchema.name()}
+            + "' declares no 'inputSectionPlacement', so whether this object's "
+              "sections may be split into independently placed atoms is "
+              "unstated.");
+    }
+    bool const sectionsAreUnits = link::format::inputSectionsAreUnits(
+        *placement, /*objectDeclaresSubsections=*/false);
+
     for (std::uint16_t si = 0; si < eShnum; ++si) {
         Shdr const& rela = secs[si];
         if (rela.type != kShtRela) continue;
@@ -1220,16 +1238,33 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + "' names symbol #" + std::to_string(symIdx)
                     + " past the symbol table (" + std::to_string(numSyms) + ").");
             }
-            auto const kindIt = nativeToKind.find(rType);
-            if (kindIt == nativeToKind.end()) {
+            // The ONE decode (`RelocationDecodeTable::decode`); an ELF type
+            // names one kind, so the site is read only by a format that
+            // declares a wire type decoded by instruction.
+            std::span<std::uint8_t const> site{};
+            if (!rangeExceedsBuffer(rOffset, 4, patched.size)
+                && !rangeExceedsBuffer(patched.offset, patched.size, bytes.size())
+                && patched.type != kShtNobits) {
+                site = std::span<std::uint8_t const>{
+                    bytes.data() + static_cast<std::size_t>(patched.offset + rOffset), 4};
+            }
+            auto const decoded = decode->decode(rType, site);
+            if (!decoded.has_value()) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "elf::readRelocatableObject: relocation type "
                     + std::to_string(rType) + " in '" + rela.name
-                    + "' is not declared by ELF format '"
-                    + std::string{objectFormatSchema.name()}
-                    + "' -- cannot map it back to a universal RelocationKind.");
+                    + (decoded.error() == RelocationDecodeTable::Miss::Undeclared
+                           ? "' is not declared by ELF format '"
+                                 + std::string{objectFormatSchema.name()}
+                                 + "' -- cannot map it back to a universal "
+                                   "RelocationKind."
+                           : "' is decoded by the instruction it patches, and "
+                             "no row of ELF format '"
+                                 + std::string{objectFormatSchema.name()}
+                                 + "' decodes the word at offset "
+                                 + std::to_string(rOffset) + "."));
             }
-            RelocationKind const kind = kindIt->second;
+            RelocationKind const kind = *decoded;
             // Un-bake the psABI bias the writer added (r_addend = addend +
             // addendBias) so the reconstructed addend is DSS-native.
             auto const* tri = targetSchema.relocationInfo(kind);
@@ -1240,8 +1275,25 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + std::string{targetSchema.name()}
                     + "' -- cannot un-bake the addend bias.");
             }
-            std::int64_t const nativeAddend =
-                rAddend - static_cast<std::int64_t>(tri->addendBias);
+            // Through the ONE owner of where a format keeps an addend: an ELF
+            // RELA record's column (`relocationAddends: explicit`).
+            auto const storage = objectFormatSchema.relocationAddendStorage();
+            if (!storage.has_value()) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: ELF format '"
+                    + std::string{objectFormatSchema.name()}
+                    + "' declares no 'relocationAddends', so where a "
+                      "relocation's addend lives is unstated.");
+            }
+            auto const recovered = link::format::recoverRelocationAddend(
+                *storage, *tri, rAddend, std::span<std::uint8_t const>{});
+            if (!recovered.has_value()) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: relocation at offset "
+                    + std::to_string(rOffset) + " in '" + rela.name + "': "
+                    + recovered.error());
+            }
+            std::int64_t const nativeAddend = *recovered;
 
             Interval const* iv = findInterval(*ivs, rOffset);
             if (iv == nullptr) {
@@ -1311,36 +1363,37 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                                   + static_cast<std::int64_t>(tri->addendBias)
                                   - relInAtom;
                     }
-                    Interval const* hit = nullptr;
-                    bool hitFunc = false;
-                    if (searchOff >= 0) {
-                        std::uint64_t const off = static_cast<std::uint64_t>(searchOff);
-                        if (auto funcsIt = funcIntervalsBySec.find(tsym.shndx);
-                            funcsIt != funcIntervalsBySec.end()) {
-                            if (Interval const* h = findInterval(funcsIt->second, off)) {
-                                hit = h; hitFunc = true;
+                    // WHICH atom, and why any atom of the section is exact
+                    // once the section is a unit, is the shared rule's
+                    // (`section_relative_target.hpp`) — COFF binds through
+                    // the same one.
+                    auto spansOf = [](auto const& bySec, std::uint16_t key) {
+                        std::vector<link::format::SectionAtomSpan> spans;
+                        if (auto it = bySec.find(key); it != bySec.end()) {
+                            for (auto const& v : it->second) {
+                                spans.push_back(link::format::SectionAtomSpan{
+                                    v.start, v.len, v.outIdx});
                             }
                         }
-                        if (hit == nullptr) {
-                            if (auto datasIt = dataIntervalsBySec.find(tsym.shndx);
-                                datasIt != dataIntervalsBySec.end()) {
-                                hit = findInterval(datasIt->second, off);
-                            }
-                        }
-                    }
-                    if (hit == nullptr) {
+                        return spans;
+                    };
+                    auto const bound = link::format::bindSectionRelativeReference(
+                        spansOf(funcIntervalsBySec, tsym.shndx),
+                        spansOf(dataIntervalsBySec, tsym.shndx), bindBase,
+                        searchOff, sectionsAreUnits);
+                    if (!bound.has_value()) {
                         return fail(DiagnosticCode::F_CorruptedBinary,
                             "elf::readRelocatableObject: section-relative relocation "
                             "in '" + rela.name + "' targets section symbol '"
                             + tsym.name + "' + offset " + std::to_string(searchOff)
                             + " (section #" + std::to_string(tsym.shndx) + " '"
-                            + secs[tsym.shndx].name + "'), which lands in no "
-                            "reconstructed atom -- cannot bind the reference (a "
-                            "reference into unmodeled/metadata section content).");
+                            + secs[tsym.shndx].name + "'), which "
+                            + bound.error() + ".");
                     }
-                    relTarget = hitFunc ? mod.functions[hit->outIdx].symbol
-                                        : mod.dataItems[hit->outIdx].symbol;
-                    relAddend = bindBase - static_cast<std::int64_t>(hit->start);
+                    relTarget = bound->isFunction
+                                    ? mod.functions[bound->outIdx].symbol
+                                    : mod.dataItems[bound->outIdx].symbol;
+                    relAddend = bound->residual;
                 }
             }
             Relocation rel;
@@ -1581,6 +1634,30 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
+    // -- (6.8) INPUT-SECTION UNITS: every atom names the section it was cut from
+    //
+    // `inputSectionPlacement`: an ELF input section is never split. Each atom
+    // carries its section and its offset in it (`InputSectionSlice`), so the link
+    // keeps the section's layout whatever moves around it: the merge orders a
+    // code unit's members, `buildExecDataSection` lays a data unit out as one
+    // block, and a member that dedup discards keeps its bytes. Stamped from the
+    // intervals, which still index the atoms here. (6.9) below reorders
+    // `functions` and stamps the padding atoms it creates itself.
+    if (sectionsAreUnits) {
+        for (auto const& [secIdx, ivs] : funcIntervalsBySec) {
+            for (auto const& iv : ivs) {
+                mod.functions[iv.outIdx].inputSection =
+                    InputSectionSlice{secIdx, iv.start};
+            }
+        }
+        for (auto const& [secIdx, ivs] : dataIntervalsBySec) {
+            for (auto const& iv : ivs) {
+                mod.dataItems[iv.outIdx].inputSection =
+                    InputSectionSlice{secIdx, iv.start};
+            }
+        }
+    }
+
     // -- (6.9) INTER-ATOM PADDING: PRESERVE THE DISTANCES A BAKED, RELOC-LESS
     //          DISPLACEMENT WAS ASSEMBLED AGAINST -----------------------------
     //
@@ -1692,7 +1769,15 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // not, the honest answer is a refusal, because reordering them
             // breaks callers (✔MEASURED above) and packing them silently moves
             // a baked call.
-            for (std::size_t k = 1; k < ordered.size(); ++k) {
+            // ★ UNLESS THE SECTION IS A UNIT (6.8). Then every atom, and the
+            // padding atom minted below, carries its OFFSET, and the link's
+            // merge places a unit's members in offset order whatever order this
+            // reader emitted them in (`validateInputSectionUnits` refuses a
+            // unit that still is not contiguous). The refusal is for a section
+            // with no such record. ✔MEASURED 2026-09-23: gcc -O2 sqlite3.c puts
+            // 1558 functions in one `.text`, and the symbol table lists its
+            // `static` ones first, so this refused the whole object.
+            for (std::size_t k = 1; k < ordered.size() && !sectionsAreUnits; ++k) {
                 if (ordered[k].outIdx > ordered[k - 1].outIdx) continue;
                 return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
                     "elf::readRelocatableObject: section #"
@@ -1728,6 +1813,11 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 pad.bytes.assign(bytes.begin() + off,
                                  bytes.begin() + off
                                      + static_cast<std::size_t>(gapLen));
+                // The padding is part of the unit it pads (6.8): without it the
+                // members after it would not be contiguous.
+                if (sectionsAreUnits) {
+                    pad.inputSection = InputSectionSlice{secIdx, gapStart};
+                }
                 padAtoms.emplace_back(ordered[k - 1].outIdx, std::move(pad));
             }
             // ⓘ `ivs` KEEPS THE ORIGINAL EXTENTS: they routed relocations to

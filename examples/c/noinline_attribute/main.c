@@ -1,4 +1,4 @@
-// TF-C78 (D-CSUBSET-NOINLINE) corpus witness: GNU `__attribute__((noinline))`
+// TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK) corpus witness: GNU `__attribute__((noinline))`
 // is HONORED end to end, and the honoring COMPOSES with the SHIPPED release
 // optimizer rather than merely surviving a baseline build.
 //

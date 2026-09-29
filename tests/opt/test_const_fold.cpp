@@ -243,7 +243,7 @@ TEST(ConstFold, DoesNotFoldBitIntArithmetic) {
     EXPECT_FALSE(ret.isConst);
 }
 
-// TF-C94 (D-CSUBSET-INT128-CONSTFOLD): the ConstFold pass MUST NOT fold an
+// TF-C94 (D-CSUBSET-INT128-CONSTFOLD-WIDE): the ConstFold pass MUST NOT fold an
 // I128/U128-typed instruction either — the exact twin of the `_BitInt` refusal
 // above, and for the identical reason: this pass's int64 helpers have no
 // mod-2^128 wrap, and `wrapToIntTarget(v, {128, …})` returns its input UNCHANGED,

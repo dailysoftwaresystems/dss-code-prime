@@ -418,14 +418,21 @@ TEST(TypeRules, IsAssignableIntToEnumWhenGated) {
     EXPECT_FALSE(isAssignable(in, color, i32))
         << "RED-ON-DISABLE: ungated, int does not flow into enum";
 }
-// SCOPE GUARD: the arm admits enum↔INT only — NEVER enum↔DIFFERENT-enum, even
-// gated (a cross-enum assignment is a C constraint violation that stays loud).
-TEST(TypeRules, IsAssignableDifferentEnumsRemainMismatch) {
+// P68 round 12 (lane `cs`, the enumeration P1): enum ← a DIFFERENT enum is admitted
+// when gated. This test used to pin the opposite, calling the pair "a C constraint
+// violation" — it is not: C 6.5.16.1p1 admits arithmetic ← arithmetic and an
+// enumerated type is an integer type (6.2.5p17); gcc 13.3.0, clang 18.1.3, mingw-w64
+// 13.2.0 and MSVC 19.51 all build `e = f;` (lane `cs`'s `.temp/probe/eec`,
+// [[D-C-AN-ASSIGNMENT-BETWEEN-TWO-ENUMERATED-TYPES-IS-REFUSED]]). Ungated, the pair
+// stays distinct — the red-on-disable control.
+TEST(TypeRules, IsAssignableBetweenTwoEnumerationsWhenGated) {
     auto in = makeInterner();
     auto a  = in.enumType("A", TypeKind::I32);
     auto b  = in.enumType("B", TypeKind::I32);
-    EXPECT_FALSE(isAssignable(in, a, b, {}, false, false, /*enum=*/true))
-        << "different enums stay a mismatch even gated (no over-admission)";
+    EXPECT_TRUE(isAssignable(in, a, b, {}, false, false, /*enum=*/true))
+        << "enum ← another enum converts as integer ← integer does";
+    EXPECT_FALSE(isAssignable(in, a, b))
+        << "RED-ON-DISABLE: ungated, two enumerations stay distinct";
     EXPECT_TRUE(isAssignable(in, a, a, {}, false, false, /*enum=*/true))
         << "same enum is the identity path";
 }
@@ -471,15 +478,15 @@ TEST(TypeRules, EnumPromotesToUnderlyingInArith) {
         << "enum + same-enum → the underlying int";
 }
 
-// D-UAC-SHIFT-RESULT-RULE-CONFIG: `shiftResultType` is the SINGLE chokepoint
-// both the CST→HIR shift lowering and the semantic-tier expression typer route
-// through, so the config verb `shiftResult` cannot be read inconsistently. The
-// verb picks the result type: `promotedLeft` (C 6.5.7) → the promoted LEFT
-// operand (`i32 << i64` is I32, the count's type never contributes);
-// `commonType` → the usual-arithmetic common type (`i32 << i64` is I64). RED-ON-
-// DISABLE: the I32↔I64 flip when ONLY the verb changes — a dead read would peg
-// both arms at promotedLeft's I32 (or a divergent edit to one tier would let
-// the two disagree; routing both through this one function forecloses that).
+// `shiftResultType` is the SINGLE chokepoint both the CST→HIR shift lowering
+// and the semantic-tier expression typer route through, so the config verb
+// `shiftResult` cannot be read inconsistently. The verb picks the result type:
+// `promotedLeft` (C 6.5.7) → the promoted LEFT operand (`i32 << i64` is I32,
+// the count's type never contributes); `commonType` → the usual-arithmetic
+// common type (`i32 << i64` is I64). RED-ON-DISABLE: the I32↔I64 flip when ONLY
+// the verb changes — a dead read would peg both arms at promotedLeft's I32 (or
+// a divergent edit to one tier would let the two disagree; routing both through
+// this one function forecloses that).
 TEST(TypeRules, ShiftResultRuleSelectsByVerb) {
     auto in  = makeInterner();
     auto i32 = in.primitive(TypeKind::I32);
@@ -1068,4 +1075,67 @@ TEST(TypeRules, DefinitelyNotIndexIntegerCoversTheCComplementOnly) {
     // A POINTER is not judged here: two containers is `Ambiguous`, a different
     // finding with a different message.
     EXPECT_FALSE(isDefinitelyNotIndexInteger(in, in.pointer(in.primitive(TypeKind::I32))));
+}
+
+// ── P68 round 10 (lane `cs`): C 6.3.1.8's FIFTH CONVERSION ────────────────────
+// Two operands of the SAME width whose SIGNED one has the higher conversion rank:
+// the signed type cannot represent every value of the unsigned one, so both
+// convert to the UNSIGNED COUNTERPART of the signed type (C 6.3.1.8; C 6.3.1.1
+// ranks by name). The width decides every other mixed-signedness pair; at equal
+// width the declared vocabulary ranks do. ✔MEASURED 2026-09-24 (the lane's
+// `.temp/probe/uac`, each reference separately, every build RUN): gcc 13.3.0 and
+// clang 18.1.3 (LP64) type `long long + unsigned long` as `unsigned long long`, and
+// mingw-w64 13.2.0 and MSVC 19.51 (LLP64) type `long + unsigned int` as `unsigned
+// long`; DSS named the UNSIGNED operand's own type. RED-ON-DISABLE: the equal-width
+// arm answering the unsigned operand's name (the pre-fix `uRank >= sRank`).
+TEST(TypeRules, UsualArithmeticCommonTypeTakesTheUnsignedCounterpartAtEqualWidth) {
+    auto in = makeInterner();
+    ResolvedArithmeticRules rules;
+    rules.minRank = TypeKind::I32;
+    in.declareVocabularyRank("long", 3);
+    in.declareVocabularyRank("unsigned long", 3);
+    in.declareVocabularyRank("long long", 4);
+    in.declareVocabularyRank("unsigned long long", 4);
+    rules.unsignedCounterpart = {{"long", "unsigned long"},
+                                 {"long long", "unsigned long long"}};
+    auto UAC = [&](TypeId a, TypeId b) { return usualArithmeticCommonType(in, a, b, rules); };
+    auto both = [&](TypeId a, TypeId b, TypeId want, char const* what) {
+        EXPECT_EQ(UAC(a, b).v, want.v) << what;
+        EXPECT_EQ(UAC(b, a).v, want.v) << what << " (the other operand order)";
+    };
+    // LP64: `long` and `long long` are both I64, their unsigned twins both U64.
+    TypeId const l64   = in.primitive(TypeKind::I64, "long");
+    TypeId const ll64  = in.primitive(TypeKind::I64, "long long");
+    TypeId const ul64  = in.primitive(TypeKind::U64, "unsigned long");
+    TypeId const ull64 = in.primitive(TypeKind::U64, "unsigned long long");
+    both(ll64, ul64, ull64, "LP64 `long long + unsigned long` is `unsigned long long` (the fifth conversion)");
+    both(l64, ull64, ull64, "LP64 `long + unsigned long long`: the unsigned rank is higher (the third)");
+    both(l64, ul64, ul64, "LP64 `long + unsigned long`: equal rank, the unsigned type (the third)");
+    // LLP64: `long` is I32, `unsigned long` U32; `int` / `unsigned int` stay anonymous.
+    TypeId const l32  = in.primitive(TypeKind::I32, "long");
+    TypeId const ul32 = in.primitive(TypeKind::U32, "unsigned long");
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const u32  = in.primitive(TypeKind::U32);
+    both(l32, u32, ul32, "LLP64 `long + unsigned int` is `unsigned long` (the fifth conversion)");
+    both(i32, ul32, ul32, "LLP64 `int + unsigned long`: the unsigned rank is higher (the third)");
+    both(i32, u32, u32, "`int + unsigned int`: both anonymous, the unsigned type (the third)");
+    both(ll64, ul32, ll64, "LLP64 `long long + unsigned long`: a WIDER signed type represents every "
+                           "value (the fourth)");
+    // A hand-built rule set WITHOUT the map (no loaded language reaches this: the
+    // loader refuses a named signed entry with no counterpart) still gets the
+    // unsigned type of the right width — anonymous, never the operand's name.
+    ResolvedArithmeticRules bare;
+    bare.minRank = TypeKind::I32;
+    EXPECT_EQ(usualArithmeticCommonType(in, ll64, ul64, bare).v, in.primitive(TypeKind::U64).v);
+    // An operand PROMOTED to another kind is the anonymous promoted type, whatever
+    // its own name ranked: a language that NAMED a 16-bit `short` (rank 1) still has
+    // `short + unsigned int` meet as `int + unsigned int` — the third conversion,
+    // `unsigned int` — never the fifth (no shipped name promotes; this pins the rule
+    // for a language that names one).
+    // (Its counterpart is IN the map, so a wrongly taken fifth conversion would name
+    // a type — it cannot hide behind the anonymous fallback above.)
+    in.declareVocabularyRank("short", 1);
+    rules.unsignedCounterpart.emplace("short", "unsigned short");
+    TypeId const namedShort = in.primitive(TypeKind::I16, "short");
+    both(namedShort, u32, u32, "a promoted operand carries the promoted type's rank, not its own");
 }

@@ -141,6 +141,8 @@ ordinalOf(TargetSchema const& t, std::string_view name) {
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,
          "flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},

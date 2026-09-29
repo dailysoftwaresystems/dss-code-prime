@@ -1,0 +1,12 @@
+[
+  {
+    "source": "examples/examples_runner.cpp",
+    "site": "examples/CMakeLists.txt",
+    "reason": "NOT a gtest suite. It is the ONE example-corpus runner binary, built by add_executable(dss_examples_runner examples_runner.cpp) in examples/CMakeLists.txt and driven per-example by the ctest entries that same file generates from the expected.json glob. Registering it via dss_add_test would make it a test in its own right, which it is not."
+  },
+  {
+    "source": "test_support/pch_stub.cpp",
+    "site": "CMakeLists.txt",
+    "reason": "NOT a test. A translation unit that exists only so add_library(dss_test_pch STATIC ...) in the tests-root CMakeLists.txt has something to compile, which is what lets target_precompile_headers PRODUCE the one shared test PCH every dss_add_test target consumes via REUSE_FROM. It contains no assertions and defines no symbol worth running."
+  }
+]

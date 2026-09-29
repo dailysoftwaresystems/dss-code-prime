@@ -52,10 +52,10 @@
  *     both), and the in-process runner and the CLI harness then disagree on the
  *     COLUMN too (31:11 vs 31:1 on the same diagnostic), so no honest line:col
  *     exists to assert.
- *   D-TEST-POSITIONED-FALSE-REQUIRES-SPANLESS-RENDERING — `positioned:false` is
- *     not an escape: the integrated CLI arm greps for the SYMBOLIC rendering
- *     `error[S_UnknownType]`, which the CLI emits only for SPAN-LESS diagnostics —
- *     a spanned one renders `error[S0006]`.
+ *   THE `positioned:false` KEY IS NOT THE ESCAPE IT LOOKS LIKE — it is a
+ *     REQUIREMENT, not merely a relaxation: the integrated CLI arm greps for the
+ *     SYMBOLIC rendering `error[S_UnknownType]`, which the CLI emits only for
+ *     SPAN-LESS diagnostics — a spanned one renders `error[S0006]`.
  * The corpus pe arm lands when either is fixed. Baking the shifted numbers into a
  * golden manifest would have encoded the first defect as EXPECTED behaviour.
  * The two BSD-ONLY members (fixpt_t / segsz_t, absent from glibc/musl/bionic)

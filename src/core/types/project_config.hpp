@@ -98,7 +98,7 @@ namespace dss {
 //   * `resolveLibraries`— OPTIONAL library paths whose export surfaces resolve
 //                         this build's externs; the counterpart of the CLI
 //                         `--resolve-library <path>`. Empty when absent.
-//                         D-FFI-DECLARED-IMPORT-NAME: each entry is EITHER a
+//                         Declared import names: each entry is EITHER a
 //                         plain non-empty STRING (the path; nothing stated —
 //                         the byte-for-byte pre-existing form every shipped
 //                         manifest uses) OR an extended OBJECT
@@ -116,9 +116,20 @@ namespace dss {
 //                         key inside the object and a missing/empty member
 //                         fail loud `C_MalformedJson` — never a silent drop of
 //                         the very identity the entry exists to carry.
+//   * `runpaths`        — OPTIONAL directories each emitted image records for
+//                         its loader to search (DT_RUNPATH / LC_RPATH); the
+//                         PORTABLE counterpart of the CLI `--rpath`. Each entry
+//                         is absolute or rooted at `${ORIGIN}` (the image's own
+//                         directory, spelled per format by its document), with
+//                         no other `$` and no `:`; anything else fails loud
+//                         `C_MalformedJson`, naming the CLI flag as the place
+//                         for a loader-specific spelling. A format that records
+//                         no runpath (PE) accepts it with a warning.
+//                         D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.
 //   The three flag arrays MERGE (append) onto the Program's current state in
 //   `Program::compileProject` — they ADD to any CLI-provided flags, never
-//   replace them. A present-but-empty `[]` is allowed (⇒ empty list).
+//   replace them, and so does `runpaths` (manifest entries first, then the
+//   CLI's). A present-but-empty `[]` is allowed (⇒ empty list).
 
 // ── OPTIONAL build-lifecycle script entry (`preBuildScripts` /
 //    `postBuildScripts`) ─────────────────────────────────────────────────────
@@ -278,6 +289,16 @@ struct DSS_EXPORT ProjectConfig {
     // convention, and it is the only rule that lets a user probe a different
     // reserve without editing (and risking committing) the manifest.
     std::optional<std::uint64_t> stackReserveBytes;
+    // OPTIONAL runpaths (manifest key `runpaths`;
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH): directories every image this
+    // project builds records for its loader to search for the libraries it
+    // needs, in order. Empty iff the field is absent (or `[]`) ⇒ nothing is
+    // recorded. Every entry passed the PORTABLE rule at load — absolute, or
+    // rooted at `${ORIGIN}`, no other `$`, no `:` — so one manifest means the
+    // same thing on every target; a loader-specific spelling belongs on the
+    // CLI `--rpath`. A LIST, so it MERGES with the CLI's (manifest first), in
+    // `Program::compileProject`; a dependency's own list stays its own.
+    std::vector<std::string>     runpaths;
     // OPTIONAL build-lifecycle hooks + project prerequisites. ALL THREE are
     // absent ⇒ EMPTY, never an error — a manifest that declares no scripts and
     // no dependencies is the overwhelmingly common case and must stay silent.

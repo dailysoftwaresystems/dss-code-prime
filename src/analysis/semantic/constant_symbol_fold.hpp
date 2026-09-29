@@ -36,6 +36,16 @@ namespace dss {
 // Signedness mirrors the HIR walker's `isSignedCore` for every integer core
 // (unsigned == `unsignedIntRank > 0`); `enumValue` carries the bit-pattern (the
 // int64 value for an integer core, the IEEE-754 f64 bits for a float core).
+//   ★ P68 round 12 (lane `cs`, the enumeration P1): an enumerator's `rec.type` is no
+//     longer always the ENUM. C types an enumeration constant `int` once its list is
+//     complete and every value fits (C17 6.4.4.3p2, C23 6.7.3.3p15), and WHILE the list
+//     is processed it may be a wider integer type — its constant expression's (`A =
+//     0x100000000` is `long` on LP64) or the next rung `previous + 1` needed (p12). Such
+//     an enumerator's core is that integer type's kind, exactly as an injected
+//     constant's is: defaulting it to I32 folded `B = A + 1` inside the list in the
+//     32-bit domain and wrapped it (✔MEASURED on the P1's trial build, `.temp/probe/
+//     ectE`: `enum E { A = 0x100000000, B = A + 1 };` gave B == 1; gcc 13.3.0 and clang
+//     18.1.3 give 0x100000001).
 [[nodiscard]] inline std::optional<HirLiteralValue>
 constantLiteralForSymbol(SymbolRecord const& rec, TypeInterner const& interner) {
     if (!(rec.isEnumerator || rec.isInjectedConstant)) return std::nullopt;
@@ -45,7 +55,9 @@ constantLiteralForSymbol(SymbolRecord const& rec, TypeInterner const& interner) 
         if (tk == TypeKind::Enum) {
             auto const sc = interner.scalars(rec.type);
             if (!sc.empty()) core = static_cast<TypeKind>(sc[0]);
-        } else if (rec.isInjectedConstant) {
+        } else if (rec.isInjectedConstant
+                   || detail::type_rules::signedIntRank(tk) != 0
+                   || detail::type_rules::unsignedIntRank(tk) != 0) {
             core = tk;
         }
     }

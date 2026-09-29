@@ -685,8 +685,8 @@ TEST(TargetSchema, ImplicitRegistersUnknownSubKeyRejected) {
             ]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
-        << "typo'd sub-key 'inpts' must fail-loud (D-CONFIG-LOADER-"
-           "UNKNOWN-KEYS-FAIL-LOUD discipline)";
+        << "typo'd sub-key 'inpts' must fail-loud ("
+           "D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD discipline)";
     EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
 }
 
@@ -1096,7 +1096,7 @@ TEST(TargetSchema, CallPushBytesShippedX8664SysVDeclaresEight) {
 }
 
 TEST(TargetSchema, SlotAlignedShippedMsX64IsTrueOthersFalse) {
-    // D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): the shipped
+    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (closed together with plan step ML7-2.2, 2026-06-02): the shipped
     // schemas must declare `slotAligned: true` on ms_x64 (the only
     // SLOT-ALIGNED cc DSS supports today) and leave it false elsewhere.
     // A schema regression that silently flipped this would: (a) flip
@@ -1129,7 +1129,7 @@ TEST(TargetSchema, SlotAlignedShippedMsX64IsTrueOthersFalse) {
 }
 
 TEST(TargetSchema, SlotAlignedRejectsNonBoolean) {
-    // D-ML7-2.6 validator: the slotAligned field must be a JSON
+    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 validator: the slotAligned field must be a JSON
     // boolean. A non-boolean value (string "true", number 1, null,
     // etc.) is rejected loud with C_MalformedJson — matches the
     // sibling fields' (`isCall`, `pcRelative`, `rexW`) discipline.
@@ -1689,7 +1689,8 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // grew one, all trip it now and none of them tripped the total.
     auto r = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ((*r)->registerCount(), 81u);
+    // 81 + `rip` (P68 round 9, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    EXPECT_EQ((*r)->registerCount(), 82u);
 
     // ★★ THE COMPOSITION IS KEYED ON (class, sub-ness, WIDTH), NOT JUST
     // (class, sub-ness) — extended when the 8-bit views landed
@@ -1711,13 +1712,28 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // ZERO, so it now means "no sub-register of a width this file does not
     // enumerate", which is a claim the old form could not make about a 2-byte
     // row. A total re-cut to 81 alone would have said strictly less.
+    // ★★★ THE INSTRUCTION POINTER IS ITS OWN BUCKET, NOT A 17th GPR (P68
+    // round 9). `rip` is a full-width `gpr` row, but it is the memory base
+    // `pcRelativeMemoryBase` names and its `encodingRole` fits no field that
+    // names no role. Counting it among `fullGpr` would re-cut that total to
+    // 17 and stop saying "rax..r15". It is counted apart, and the bucket
+    // requires BOTH facts to agree, so a general register that took the role,
+    // or a base the key names without the role, trips it.
+    auto const* pcBase = (*r)->pcRelativeMemoryBase();
+    ASSERT_NE(pcBase, nullptr) << "x86_64 declares its PC-relative memory base";
     std::size_t fullGpr = 0, subGpr32 = 0, subGpr16 = 0, subGpr8 = 0;
-    std::size_t subGprOther = 0;
+    std::size_t subGprOther = 0, instructionPointer = 0;
     std::size_t fpr = 0, flags = 0, other = 0;
+    std::uint16_t ordinal = 0;
     for (auto const& info : (*r)->registers()) {
         bool const sub = !info.subOf.empty();
+        bool const isPcBase = ordinal++ == pcBase->registerOrdinal;
         switch (info.regClass) {
             case TargetRegClass::GPR:
+                if (!sub && isPcBase && info.encodingRole == "instructionPointer") {
+                    ++instructionPointer;
+                    break;
+                }
                 if (!sub) { ++fullGpr; break; }
                 if (info.widthBytes == 4)      ++subGpr32;
                 else if (info.widthBytes == 2) ++subGpr16;
@@ -1742,6 +1758,9 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     EXPECT_EQ(subGprOther, 0u) << "every declared sub-register is 4, 2 or 1 "
                                   "bytes wide — a row at any other width is "
                                   "one this composition does not describe";
+    EXPECT_EQ(instructionPointer, 1u)
+        << "rip: the one register `pcRelativeMemoryBase` names, carrying the "
+           "`instructionPointer` role";
     EXPECT_EQ(fpr,      16u) << "xmm0..xmm15";
     EXPECT_EQ(flags,     1u) << "rflags";
     EXPECT_EQ(other,     0u);
@@ -1989,14 +2008,14 @@ TEST(TargetSchema, TFC74Arm64PredefinedMacrosExactSet) {
                   {"__ARM_ARCH_ISA_A64", K::Constant, "1", {}},
                   {"__arm64__",          K::Constant, "1", {"macho"}},
                   {"__arm64",            K::Constant, "1", {"macho"}},
-                  // TF-C75: NOT an identity spelling — the PREPROCESSOR face of
-                  // this file's `charIsUnsigned` key, gated to exactly the leg
-                  // where that key's `default` (true) is the effective answer.
-                  // The macho/pe `byObjectFormat` overrides make bare `char`
-                  // SIGNED there, so the macro must NOT appear on those legs.
-                  // MEASURED 2026-07-28, `/usr/bin/clang -dM -E`: defined for
-                  // aarch64-linux-gnu only.
-                  {"__CHAR_UNSIGNED__",  K::Constant, "1", {"elf"}},
+                  // P68 round 9: `__CHAR_UNSIGNED__` is NOT a row of this file
+                  // any more. It was TF-C75's hand-gated `{"elf"}` constant — the
+                  // preprocessor face of this file's `charIsUnsigned` in a
+                  // second notation. It is now the LANGUAGE's `type-unsigned`
+                  // row naming `char`, realized per pair FROM that key (so it is
+                  // still defined on arm64 × elf alone — pinned per pair in
+                  // test_type_unsigned_predefines); its absence here is what
+                  // keeps a second owner from coming back.
                   // TF-C115 (D-PP-ENDIANNESS-PREDEFINES): the per-CPU byte-order
                   // ANSWER. UNGATED — MEASURED 2026-08-04 (`clang-19 -dM -E -x c
                   // /dev/null -target <triple>`), __LITTLE_ENDIAN__ is 1 on
@@ -2016,10 +2035,10 @@ TEST(TargetSchema, TFC74Arm64PredefinedMacrosExactSet) {
                   {"__BYTE_ORDER__",     K::Constant, "__ORDER_LITTLE_ENDIAN__", {}},
               }))
         << "arm64 must predefine the two UNIVERSAL AArch64 spellings ungated, "
-           "the two APPLE-ONLY spellings gated to macho, __CHAR_UNSIGNED__ "
-           "gated to elf — the one row whose gate is an ABI property rather "
-           "than a vendor spelling — and the two UNGATED endianness rows, with "
-           "NO __BIG_ENDIAN__ anywhere";
+           "the two APPLE-ONLY spellings gated to macho and the two UNGATED "
+           "endianness rows, with NO __BIG_ENDIAN__ anywhere — and no "
+           "__CHAR_UNSIGNED__ row: that macro is the language's type-unsigned "
+           "row, derived from charIsUnsigned (P68 round 9)";
 }
 
 // The x86_64 twin: MEASURED identical on x86_64-linux-gnu, x86_64-apple-darwin
@@ -2627,6 +2646,84 @@ TEST(TargetSchema, TFC75DollarPrefixedInnerKeysAccepted) {
         << "`$`-prefixed keys are the codebase-wide documentation convention";
     EXPECT_FALSE((*r)->charIsUnsigned(ObjectFormatKind::MachO));
     EXPECT_TRUE((*r)->charIsUnsigned(ObjectFormatKind::Elf));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING) — `abiTypedefs`, the
+// platform ABI typedefs (`wchar_t`, `wint_t`) in `charIsUnsigned`'s shape.
+// The SHIPPED values are pinned against the references by
+// `tests/analysis/preprocess/test_sizeof_macro_family.cpp`; these pin the
+// loader: the resolution rule and every refusal.
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+using ::dss::TypeKind;
+
+[[nodiscard]] std::string targetWithAbiTypedefs(std::string_view body) {
+    return std::string{
+               R"({"dssTargetVersion":1,"target":{"name":"X"},)"
+               R"("opcodes":[{"mnemonic":"invalid","result":"none"}],)"
+               R"("abiTypedefs":)"}
+           + std::string{body} + "}";
+}
+}  // namespace
+
+// The format's override where declared, the processor's default elsewhere, and
+// NOTHING for a typedef the target does not declare — never a default core.
+TEST(TargetSchema, AbiTypedefsResolvePerFormatThenTheDefault) {
+    auto r = TargetSchema::loadFromText(
+        targetWithAbiTypedefs(
+            R"({"$comment":"prose","wchar_t":{"default":"I32",
+                "byObjectFormat":{"$peComment":"UTF-16","pe":"U16"}},
+                "wint_t":{"default":"U32","byObjectFormat":{"macho":"I32"}}})"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value()) << r.error().front().message;
+    auto const& t = **r;
+    EXPECT_EQ(t.abiTypedefCore("wchar_t", ObjectFormatKind::Pe), TypeKind::U16);
+    EXPECT_EQ(t.abiTypedefCore("wchar_t", ObjectFormatKind::Elf), TypeKind::I32);
+    EXPECT_EQ(t.abiTypedefCore("wchar_t", ObjectFormatKind::MachO), TypeKind::I32);
+    EXPECT_EQ(t.abiTypedefCore("wint_t", ObjectFormatKind::MachO), TypeKind::I32);
+    EXPECT_EQ(t.abiTypedefCore("wint_t", ObjectFormatKind::Elf), TypeKind::U32);
+    EXPECT_FALSE(t.abiTypedefCore("char16_t", ObjectFormatKind::Elf).has_value())
+        << "an undeclared typedef has no core";
+    EXPECT_EQ(t.abiTypedefNames(),
+              (std::vector<std::string_view>{"wchar_t", "wint_t"}))
+        << "declaration order, `$` keys skipped";
+    // Absent as a whole: no typedef at all.
+    auto none = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_TRUE(none.has_value());
+    EXPECT_TRUE((*none)->abiTypedefNames().empty());
+}
+
+// Every malformed shape fails the LOAD and names where — each one would
+// otherwise leave a typedef on an answer no file states.
+TEST(TargetSchema, AbiTypedefsRefuseEveryMalformedShape) {
+    struct Case {
+        char const* body;
+        char const* needle;   // in the message or the path
+    };
+    constexpr Case kCases[] = {
+        {R"(["wchar_t"])", "abiTypedefs"},                               // not an object
+        {R"({"wchar_t":"I32"})", "wchar_t"},                              // entry not an object
+        {R"({"wchar_t":{"byObjectFormat":{"pe":"U16"}}})", "default"},    // no default
+        {R"({"wchar_t":{"default":"F32"}})", "integer core"},             // a float core
+        {R"({"wchar_t":{"default":"Struct"}})", "integer core"},          // an aggregate
+        {R"({"wchar_t":{"default":"Int32"}})", "integer core"},           // no such core
+        {R"({"wchar_t":{"default":7}})", "integer core"},                 // not a string
+        {R"({"wchar_t":{"default":"I32","byObjectFormat":{"machO":"I32"}}})", "machO"},
+        {R"({"wchar_t":{"default":"I32","byObjectFormat":{"unknown":"I32"}}})", "unknown"},
+        {R"({"wchar_t":{"default":"I32","byObjectFormat":{"pe":"F64"}}})", "integer core"},
+        {R"({"wchar_t":{"default":"I32","byObjectFormat":["pe"]}})", "byObjectFormat"},
+        {R"({"wchar_t":{"defualt":"I32","default":"I32"}})", "defualt"},  // typo'd key
+    };
+    for (auto const& c : kCases) {
+        auto r = TargetSchema::loadFromText(targetWithAbiTypedefs(c.body), "<inline>");
+        ASSERT_FALSE(r.has_value()) << "must be REFUSED: " << c.body;
+        EXPECT_TRUE(anyMentions(r.error(), c.needle))
+            << "the refusal of " << c.body << " must name '" << c.needle << "'";
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -4715,4 +4812,81 @@ TEST(TargetSchema, ShippedTargetsDeclareTheirMeasuredUnderAlignedAtomicForm) {
     EXPECT_NE((*a)->underAlignedAtomicForm(), (*x)->underAlignedAtomicForm())
         << "arm64 FAULTS and x86_64 silently de-atomizes; a single answer for "
            "both is the conflation this vocabulary exists to prevent";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// P68 round 8 — `isaFeatures`: the ISA features a target's code may assume, the
+// one TARGET fact an inline-asm template form reads (gcc's x86 `%~` expands to
+// `i` under `-mavx2` and `f` without — ✔MEASURED 2026-09-23, gcc 13.3.0).
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+[[nodiscard]] std::string targetWithIsaFeatures(std::string_view block) {
+    return std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "opcodes":[{"mnemonic":"invalid","result":"none"}],
+        "isaFeatures":)"} + std::string{block} + "}";
+}
+}  // namespace
+
+TEST(TargetSchema, IsaFeaturesAreDeclaredOnOrOffAndAnUndeclaredOneIsUnknown) {
+    auto r = TargetSchema::loadFromText(targetWithIsaFeatures(
+        R"({"$comment":"prose","avx2":false,"sse4":true})"));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->isaFeature("avx2"), std::optional<bool>{false});
+    EXPECT_EQ((*r)->isaFeature("sse4"), std::optional<bool>{true});
+    EXPECT_EQ((*r)->isaFeature("avx512"), std::nullopt)
+        << "an undeclared feature is UNKNOWN — never read as off";
+    EXPECT_EQ((*r)->isaFeature("$comment"), std::nullopt)
+        << "a `$` key is documentation, not a feature";
+}
+
+TEST(TargetSchema, AnIsaFeatureThatIsNotABooleanIsRefused) {
+    for (char const* block : {R"({"avx2":"yes"})", R"({"avx2":1})", R"(["avx2"])"}) {
+        auto r = TargetSchema::loadFromText(targetWithIsaFeatures(block));
+        EXPECT_FALSE(r.has_value()) << block;
+        if (!r.has_value()) {
+            EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson)) << block;
+        }
+    }
+}
+
+TEST(TargetSchema, TheShippedX86TargetAssumesNoAvx2) {
+    // RED-ON-DISABLE: drop `isaFeatures` from x86_64.target.json and x86's `%~`
+    // is refused by name ("declares no such feature") instead of expanding.
+    auto x = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x.has_value());
+    EXPECT_EQ((*x)->isaFeature("avx2"), std::optional<bool>{false});
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// P68 round 8 — `resultEarlyClobber`: an opcode whose result may share a
+// register with none of its operands (arm64 STLXR's status register — the
+// overlap is CONSTRAINED UNPREDICTABLE in the Arm ARM; ✔MEASURED 2026-09-23:
+// gas 2.42 warns and assembles it, clang 18.1.3 refuses it).
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+[[nodiscard]] std::string targetWithOpcode(std::string_view row) {
+    return std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "opcodes":[{"mnemonic":"invalid","result":"none"},)"} + std::string{row} + "]}";
+}
+}  // namespace
+
+TEST(TargetSchema, ResultEarlyClobberIsABooleanOnAnOpcodeWithAResult) {
+    auto ok = TargetSchema::loadFromText(targetWithOpcode(
+        R"({"mnemonic":"x","result":"value","resultEarlyClobber":true})"));
+    ASSERT_TRUE(ok.has_value());
+    auto const op = (*ok)->opcodeByMnemonic("x");
+    ASSERT_TRUE(op.has_value());
+    EXPECT_TRUE((*ok)->opcodeInfo(*op)->resultEarlyClobber);
+
+    auto notBool = TargetSchema::loadFromText(targetWithOpcode(
+        R"({"mnemonic":"x","result":"value","resultEarlyClobber":1})"));
+    EXPECT_FALSE(notBool.has_value()) << "`1` is not a boolean";
+
+    auto noResult = TargetSchema::loadFromText(targetWithOpcode(
+        R"({"mnemonic":"x","result":"none","resultEarlyClobber":true})"));
+    ASSERT_FALSE(noResult.has_value())
+        << "an early-clobber claim on an opcode with no result reads nothing";
+    EXPECT_TRUE(anyHasCode(noResult.error(), DiagnosticCode::C_ConflictingField));
 }

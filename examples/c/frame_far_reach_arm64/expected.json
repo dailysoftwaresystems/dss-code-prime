@@ -1,0 +1,13 @@
+{
+  "$comment": "D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm): the RUN witness for a frame access BEYOND every form AArch64 declares — the unscaled LDUR/STUR imm9 (+-256) and the scaled LDR/STR imm12 (4095 x the access). Four functions put one there through four zones: stacked integer params above a 40000-byte local (a far load into an integer register, addressed through its own destination), stacked double params above the same frame in a LEAF (a far load into the SIMD&FP file, addressed through the convention's frameAddressScratch x30, which the leaf therefore saves), the same in a function that calls (x30 already saved), and a 2305-term right-nested expression whose ~2280 spill slots run past 32760 (far spill STORES — the shape a deep `_BitInt(256)` chain was first refused on). Before this every one of the four was REFUSED on arm64 at debug AND release (A_ImmediateOperandOutOfRange on load/store/fldur, A_FunctionEncodeAborted x4), while aarch64-linux-gnu-gcc 13.3.0 compiles the file and it runs exit 42 at -O0 and -O2 under qemu-aarch64 (clang 18.1.3 stops at its own bracket-nesting limit, and crashes when it is raised). The exit code is arithmetic over values that must survive the round trip through far slots, so a wrong address changes it — a compile-only pin would not. RED-ON-DISABLE: make the frame chokepoint's far tier keep the short op (the pre-fix behavior) -> the four arm64 functions are refused again; drop `frameAddressScratch` from both arm64 conventions -> the build is refused BY NAME at the first far SIMD&FP access (L_CcRegLookupFailed: '... declares no `frameAddressScratch` register') instead of being mis-addressed; the integer-register reads address through their own destination and need no scratch (both halves are pinned per function by lir/test_lir_frame_far_form). ARM64 ONLY, on purpose: both conventions carry the far form (aapcs64 here under qemu-aarch64, apple_arm64 natively on the macOS leg), while x86_64 carries a disp32 and never takes it — and the file costs ~20 s per compile per target (measured 23 s through the CLI), so an x86 arm would double this entry's time to prove nothing about the subject (gcc 13.3.0 already runs the file exit 42 on x86_64 at -O0 and -O2).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

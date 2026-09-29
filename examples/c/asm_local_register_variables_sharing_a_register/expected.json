@@ -1,0 +1,35 @@
+{
+  "$comment": "Two GNU local register variables on ONE register: `a` assigned 42, then `b` assigned 4, then an asm statement reading only `a` through `%1` — THE MEANING DSS KEEPS (D-C-LOCAL-REGISTER-VARIABLES-SHARING-A-REGISTER-MEANING-SPLIT). The references split on what this computes (✔MEASURED 2026-09-21, each SEPARATELY at -O0 and -O2, x86_64 natively and aarch64 under qemu): clang 18.1.3 exits 42 — the operand's value is copied into its register AT THE STATEMENT; gcc 13.3.0 exits 4 — the variable IS the register, so `b`'s assignment overwrote it. ★ RULED (P68 round 8, delegated to the orchestrator by the operator): DSS keeps clang's meaning, because gcc's own manual says the only supported use of a local register variable is supplying extended-asm operands and that the register's contents are not guaranteed outside that statement — gcc's 4 relies on the register holding a value BETWEEN statements, which its documentation leaves unsupported. ✔MEASURED at the P68 round-8 part-4 base: DSS exits 42 on PE, ELF x86_64 and ELF aarch64, debug and release (the binding copies the value in); this example pins that it cannot drift to 4. Exit 42 = the ruled meaning, 4 = gcc's. ★ The `release` arm: both seeds are `volatile` and the function is reached through a volatile pointer, so neither assignment can be folded away.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

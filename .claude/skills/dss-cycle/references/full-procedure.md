@@ -1,6 +1,21 @@
 # The pause gate, the ten steps, hard stops, and stop-handling — full text
 
+## Contents
+- B. The pause-and-ask gate — the most important behavioral rule
+- C. The cycle — Step 0 Orient · 1 Pick · 2 Clear blockers · 3 Plan · 3.5 Design-audit the plan · 4
+  Implement · 5 Review & fold · 7 Pin deferrals · 8.5 Self-audit · 9 Commit & push · 10 Report & end
+  (Steps 6 and 8 are in `gate-and-cross-plan.md`)
+- D. Hard stops & gated anchors
+- E. Stop-command handling
+
+This file numbers the steps the older way; the crosswalk to `SKILL.md`'s 0–12 is at the top of
+`workflow-steps.md`.
+
+AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — where this file sends a FORK to the user as a §B decision, a meaning fork or a documented-behaviour change included, or a new engine mechanism at the plan's design audit, `SKILL.md`'s step 4, the agent now decides it by measurement and the references' own documentation, writes the rationale into the row and reports it veto-able. The gates' three ESCAPE HATCHES stay the operator's — a deferral, §A.7 clause c; carrying a net-open rise, the balance gate's escalation; growing a ratchet baseline, `UNCOVERED_BASELINE` and its kind — because standing orders govern all three: close, do not file; no follow-ups; a ratchet only comes down. Each is a PAUSE with one crisp question, never an agent decision (see SKILL.md, the decision gate)
+
 ## B. The pause-and-ask gate — the most important behavioral rule
+
+AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — forks, meaning forks included, are decided by the agent and reported veto-able; the gates' escape hatches — a deferral, carrying a net-open rise, growing a ratchet baseline — stay the operator's, and the loop pauses only for the cases of the decision gate, each with one crisp question (see SKILL.md)
 
 The loop is autonomous for **execution** but escalates **decisions** to the user. When any
 of the following appears, **PAUSE the loop and ask the user — do not assume a default, do
@@ -45,12 +60,14 @@ The loop resumes only after the user answers. While paused, do not start a diffe
   drifted is worse than a missing one, because it is trusted.
 - Check `git status` + current branch + the last commit subject. A `… WIP` cycle in flight
   means **this cycle finishes it** (it is the priority).
-- Read §0.1 of plan 00 and skim the two WORKING registries for open anchors --
-  `_deferred-anchor-registry-{production,harness}.md`. ⚠ **Not `-done.md`**: it is the archive
+- Read §0.1 of plan 00 and skim the WORKING registry for open anchors --
+  `_deferred-anchor-registry-production.md`, which since 2026-09-16 is the only one. ⚠ **Not
+  `-done.md`**: it is the archive
   (every closed row, moved out on close since 2026-09-01) and reading it to ORIENT is how a
   closed row got recommended three times in this project's history. One screen:
-  `bash scripts/anchors/read-anchors.sh --production`.
-- Establish the baseline: `cmake --build build` then `ctest --test-dir build --output-on-failure`.
+  `dssharness read-anchors --pending`.
+- Establish the baseline: `dssharness test --legs windows-x86_64-debug --json --time` — it builds first,
+  and `--filter <regex>` iterates but never concludes.
   Baseline must be green before new work (unless the WIP is the thing being repaired). A red
   baseline with no WIP-repair context is itself a **§B gate** — present it; do not silently
   "fix it" (scope creep) and do not proceed on red.
@@ -95,7 +112,7 @@ cheaper than after the diff lands. (This is the gate run on the linkage P1+P2 pl
   bar to the plan — fresh context, no stake in having authored it, so it cannot rubber-stamp its
   own reasoning. For a **substrate / architectural-fork / new-mechanism** cycle this is *also* a
   §B pause: route the plan + the review's findings to the user (the human-side `dss-audit` pass)
-  before resuming. **Scale the rigor:** a trivial mechanical cycle needs only a quick self-check
+  before resuming. AMENDED 2026-09-21 by the decision gate — the plan and the review's findings are reported to the user veto-able, and the cycle does not pause for them (see SKILL.md) **Scale the rigor:** a trivial mechanical cycle needs only a quick self-check
   against the list below; a new engine mechanism needs the full independent review.
 - **What it checks — the bar (§A) + guardrails (§D), applied to a plan:**
   - *Agnosticism (the #1 break point):* every new vocabulary config-driven with a generic engine
@@ -154,7 +171,7 @@ cheaper than after the diff lands. (This is the gate run on the linkage P1+P2 pl
 
 ### Step 7 — Pin deferrals (bookkeeping sweep)
 Sweep every deferral discovered this cycle and pin it per §F. This is the record-keeping pass:
-high-priority and blocker-now deferrals of the *current* task were already actioned (Step 2 or
+high-priority and blocking deferrals of the *current* task were already actioned (Step 2 or
 before push) — they are never left open-ended.
 
 ### Step 8.5 — Self-audit before lock (the pre-commit audit gate)
@@ -178,9 +195,10 @@ independent audit.) Running it here catches such a thing **before** anything is 
   themselves a §B signal.
 - **Pre-commit, by design.** Auditing *before* the commit keeps a rule-breaking change off the
   branch entirely — no fix-forward churn, no pushed §F violation — and preserves "one cycle = one
-  clean push". **CI legs** are the one thing this gate cannot check (nothing is pushed yet); they
-  verify post-push (next cycle's Step 0 baseline, the separate human-run `dss-audit`, or
-  `gh run watch`). This in-loop self-audit does **not** replace that external `dss-audit` — that
+  clean push". **CI legs** are the one thing this gate cannot check: CI runs only when the operator
+  adds the `Run Pipes` label, a cycle never triggers it (no label, no re-run, no push to re-trigger), and
+  the next cycle's Step 0 READS it with `dssharness check-ci-legs` — beside the separate human-run
+  `dss-audit`. This in-loop self-audit does **not** replace that external `dss-audit` — that
   stays the independent post-push backstop.
 
 ### Step 9 — Commit & push
@@ -190,10 +208,16 @@ independent audit.) Running it here catches such a thing **before** anything is 
   who will not notice.
 - Commit using the repo cycle convention: subject `Cycle <id>: <concise summary>` (use
   `Cycle <id> WIP: …` only if the cycle legitimately pauses mid-task at a §B gate). Body
-  lists anchors closed/opened + test delta. End with the repo's standard Co-Authored-By
-  trailer (currently `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`).
-- **Push immediately** to the current feature branch (push-after-every-commit: it starts CI
-  while context is hot, so GCC issues surface on the next cycle, not days later).
+  lists anchors closed/opened + test delta. End with the repo's standard `Co-authored-by:`
+  trailer. ⛔ **The model name is deliberately not written here** — this line said
+  `Claude Opus 4.8` long after the tree had moved on, which is exactly the rot a hardcoded
+  model name guarantees. Take the trailer from the session's own attribution instructions, or
+  read the newest one off the tree:
+  `git log --format='%b' -20 | grep -im1 '^[Cc]o-authored-by:'`.
+- **Push immediately** to the current feature branch (push-after-every-commit, so the work is
+  on the remote before context is lost). ⚠ **It does not start the test matrix**: ✔MEASURED
+  2026-09-16 at `305604f1`, `.github/workflows/pipeline-pr.yml` gates every build and test job
+  on the operator's `Run Pipes` label, and only `landing-log-check` is ungated.
 - Stay on the current feature branch; do not cut a new branch per cycle unless the user asks.
 
 ### Step 10 — Report & end
@@ -215,18 +239,17 @@ fresh context.
 
 ## D. Hard stops & gated anchors (always route through §B)
 
-- **OPT7 / inlining — roadmap `G-406` (plan 07); cross-CU sub-anchor `D-OPT7-1` (plan 22).**
+- **OPT7 / inlining — roadmap `G-406` (plan 07), with its cross-CU sub-anchor in plan 22.**
   First inter-procedural pass; touches linkage / DCE / cross-CU legality. Plan 07 marks it a
   **"HARD STOP boundary … supervised cycle when opened"** — so always halt and present a §B
   decision brief; never open autonomously.
-- **Trigger-gated anchors** (e.g. `D-OPT-MEMORYSSA-CLOBBER-WALK`,
-  `D-OPT4-1-NON-LINEAR-MARKER-MERGE`). A trigger-gated anchor is **NOT a TODO** — it means
+- **Trigger-gated anchors.** A trigger-gated anchor is **NOT a TODO** — it means
   "do not build until the trigger fires" (real-input failure, 3rd consumer, targeted
   backend). If its trigger has not fired, **skip it and report "trigger not fired"** — do
   not close it because it is next in a backlog. Backlog ordering is sequencing guidance, not
   a closure license.
-- **Correctness-critical anchors** (silent-miscompile class, e.g.
-  `D-OPT6-LICM-TRAP-SAFE-HOIST`). The closing cycle MUST ship a **negative miscompile-pin**:
+- **Correctness-critical anchors** (the silent-miscompile class — a trap-safe hoist, say).
+  The closing cycle MUST ship a **negative miscompile-pin**:
   a program that breaks (e.g. traps via div-by-zero) iff the transform mis-fires under a
   constructed input. If the pin cannot be constructed this cycle, **STOP** and bring a §B
   brief — do not ship on review alone.

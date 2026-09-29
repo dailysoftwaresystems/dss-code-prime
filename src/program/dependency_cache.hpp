@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -33,15 +34,23 @@
 
 namespace dss {
 
-// The lockfile's fixed filename, and the checkout-staging directory, both
-// spelled ONCE.
+// The lockfile's fixed filename and the cache's two bookkeeping directories,
+// all spelled ONCE.
 inline constexpr std::string_view kDependencyCacheDirName = ".dss-deps";
 inline constexpr std::string_view kDependencyLockfileName = "dss-lock.json";
-// Contains a `+`, which is OUTSIDE the derived-name character set below, so no
-// URL can ever derive a name that collides with it. That is the whole reason
-// for the odd spelling — a plain "staging" would be a legal derived name and a
-// repo called `staging` would land on top of the compiler's scratch area.
-inline constexpr std::string_view kDependencyStagingDirName = "+staging";
+// Both contain a `+`, which is OUTSIDE the derived-name character set below, so
+// no URL can ever derive a name that collides with them. That is the whole
+// reason for the odd spelling — a plain "partial" would be a legal derived name
+// and a repo called `partial` would land on top of the cache's own records.
+//
+// `+partial/<name>` — the COMPLETENESS MARKER (Go's `.partial`, see
+// `DependencyCache::acquire`): present while `.dss-deps/<name>/` is being
+// written or rewritten, so a checkout an interrupted build left is never
+// trusted. `+locks/<name>` — the per-dependency cross-process LOCK FILE; it is
+// never deleted (deleting a lock file others may be waiting on would split one
+// lock into two).
+inline constexpr std::string_view kDependencyPartialDirName = "+partial";
+inline constexpr std::string_view kDependencyLockDirName    = "+locks";
 
 // ── U-5: THE `.dss-deps/<name>` DERIVATION ───────────────────────────────────
 //
@@ -190,6 +199,11 @@ public:
     // `registerGitDependency`. The `(url, ref)` is read back from the
     // registration rather than passed again, so the pair that was checked for
     // collisions and the pair that is acquired cannot disagree.
+    //
+    // Holds `<name>`'s cross-process acquisition lock (`.dss-deps/+locks/<name>`)
+    // from before the checkout is examined until it returns: a second build
+    // acquiring the same dependency WAITS, then reads what the first one left
+    // ([[D-DEPS-CONCURRENT-ACQUISITIONS-OF-ONE-DEPENDENCY-SHARE-A-PATH-AND-CAN-HANG]]).
     [[nodiscard]] ResolvedGitDependency acquire(std::string const&  name,
                                                 DiagnosticReporter& rep);
 
@@ -203,29 +217,48 @@ public:
         return lock_;
     }
 
+    // Called when ANOTHER build holds `<name>`'s acquisition lock, just before
+    // this one blocks waiting for it. Production sets nothing: the wait is the
+    // behaviour. It is the seam a test uses to act at exactly that moment — by
+    // handshake, never by a timer.
+    void setLockContentionObserver(
+        std::function<void(std::string const& name)> observer) {
+        lockContentionObserver_ = std::move(observer);
+    }
+
 private:
     DependencyCache(std::filesystem::path depsDir, IGitRunner& git,
                     bool forceRefresh, DependencyLockfile lock)
         : depsDir_(std::move(depsDir)), git_(&git), force_(forceRefresh),
           lock_(std::move(lock)) {}
 
-    // Clone into a staging directory and rename into place only once the
-    // checkout is at the requested ref.
+    // Clone `url` DIRECTLY into `.dss-deps/<name>/` and apply `ref` there, with
+    // the completeness marker present for the whole time the tree is being
+    // written. Called only under `<name>`'s acquisition lock.
     //
-    // ★ WHY STAGE AT ALL. A clone that dies halfway — a dropped connection, a
-    // Ctrl-C — leaves a directory at `.dss-deps/<name>` that is not a
-    // repository. Nothing then removes it, and every later build sees "a
-    // directory is there". The `rev-parse` probe keeps that from being read as
-    // a usable checkout (so it cannot route to the 0xD01F "proceed on stale
-    // sources" arm), but without staging the cache would still be WEDGED: git
-    // refuses to clone into a non-empty directory, so the project would be
-    // unbuildable until the operator deleted a directory by hand. Staging makes
-    // the whole acquisition atomic — the final path either does not exist or
-    // holds a complete checkout at the right revision — for the same reason and
-    // by the same mechanism the lockfile is written temp-then-renamed.
+    // ★ WHY IN PLACE, AND NOT STAGE-THEN-RENAME AS IT USED TO.
+    // [[D-DEPS-CACHE-LANDS-A-CHECKOUT-BY-RENAMING-A-DIRECTORY-A-SCANNER-CAN-HOLD]]
+    // A clone into `+staging/<name>` renamed into place was atomic in principle
+    // and refusable in practice: on Windows a directory cannot be renamed while
+    // ANY file beneath it is open, and a real-time scan of the freshly written
+    // files is exactly such a holder (✔MEASURED: 5 from every rename primitive,
+    // POSIX semantics included; 2 of 380 landings of a 150-file checkout and 4
+    // of 120 of a 1000-file one refused under load). Go abandoned the same
+    // design for the same reason in 1.16 and extracts in place under a lock with
+    // a `.partial` marker; cargo clones in place under a lock with `.cargo-ok`.
+    // The marker keeps what staging bought — an interrupted clone is NEVER read
+    // as a usable checkout — and the lock keeps a concurrent build out of the
+    // tree while it is written. A leftover from an interrupted acquisition is
+    // recognised by its marker and removed before the clone; a directory there
+    // WITHOUT the marker was not left by this cache and is refused, never
+    // deleted.
     [[nodiscard]] GitCommandResult
-    cloneStaged_(std::string const& name, std::string const& url,
-                 std::optional<std::string> const& ref);
+    cloneInPlace_(std::string const& name, std::string const& url,
+                  std::optional<std::string> const& ref);
+
+    [[nodiscard]] std::filesystem::path partialMarker_(std::string const& name) const {
+        return depsDir_ / std::string{kDependencyPartialDirName} / name;
+    }
 
     // What was registered under a derived name, so a collision can compare the
     // FULL `(url, ref)` pair — 0xD020's discriminator is the pair, not the url
@@ -242,6 +275,7 @@ private:
     bool                         gitAvailable_ = false;
     DependencyLockfile           lock_;
     std::map<std::string, Claim> claims_;
+    std::function<void(std::string const&)> lockContentionObserver_;
 };
 
 } // namespace dss

@@ -86,10 +86,21 @@ inline constexpr std::string_view kBuildVersionText = DSS_PROJECT_VERSION;
 // spelling the same macro would make the effective value depend on which seed
 // site iterated last — a silent last-writer-wins across the four preprocessor
 // seed sites. Fail loud instead.
+//
+//   `typeVocabularyInScope` — whether this family can resolve a TYPE NAME,
+//                   i.e. may declare `type-size` rows (P68 round 8,
+//                   D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING). Only the
+//                   LANGUAGE loader passes true: a type name belongs to a
+//                   language's vocabulary, and a target or format document has
+//                   none. The parser records the row's `type` as written; the
+//                   language loader resolves it once its type tables are read.
+//                   Defaulted to false, so the target and format loaders refuse
+//                   the kind without restating that rule.
 void parsePredefinedMacroArray(nlohmann::json const&           pms,
                                std::string_view                arrayPath,
                                DiagnosticCode                  entryCode,
                                substrate::DiagnosticCollector& coll,
-                               std::vector<PredefinedMacroDef>& out);
+                               std::vector<PredefinedMacroDef>& out,
+                               bool typeVocabularyInScope = false);
 
 } // namespace dss::detail

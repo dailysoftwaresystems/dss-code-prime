@@ -1,0 +1,36 @@
+# PURPOSE: judge every prototype DSS ships against the TYPE the leg's own platform header gives it — twice, by DSS's own `_Generic` and by the leg's reference compiler — and keep a per-symbol report, so a shipped prototype's identity is MEASURED, never assumed.
+name: prototype-census
+description: >-
+  Over every `symbols` row of the tree's shipped descriptors that the leg's pair sees, two verdicts per symbol: (a)
+  DSS judges its own prototype against the type the reference compiler spells for the platform header, with its
+  own `_Generic`, in a program the leg's dsscp builds for the leg's own pair and runs there; (b) the reference
+  compiler judges the descriptor's text, rendered to C with typedef names kept, against its real header. Each judge
+  is blind where the other sees (the program's header says where), so the report keeps both, and a symbol they
+  disagree on is a finding of its own. Built 2026-09-25 (P68 round 12, lane `lm`) to prove S2a's descriptor type
+  identity and to measure S2c's prototype-shape class. It needs the leg's BUILT dsscp (`{product}`) — run it after
+  `dssharness build` on the leg. The program documents itself in its own header; this file declares only how a runner
+  starts it and what witnesses that it ran. Bring the kept report back with
+  `dssharness sync --legs <leg> --pull <its path>`.
+inputs:
+  cc:
+    description: "the reference C compiler, a bare program name on the host's PATH — clang, whose refusal spells the header's type in the (aka …) form verdict (a) reads"
+    default: 'clang'
+  flags:
+    description: 'comma-separated reference flags (each percent-decoded; a comma inside one flag is %2C)'
+    default: '-std=gnu2x,-D_GNU_SOURCE'
+  only:
+    description: 'one header to census, e.g. string.h (empty = every header the pair sees)'
+    default: ''
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./prototype-census.py --selftest --tree="{treeDir}" --os="{os}" --processor="{processor}" --dsscp="{product}" --cc="{cc}" --flags="{flags}"
+    successPattern: 'prototype-census: SELFTEST OK '
+  - name: census
+    workingDirectoryRoot: action
+    run: |
+      python3 ./prototype-census.py --tree="{treeDir}" --os="{os}" --processor="{processor}" --dsscp="{product}" --cc="{cc}" --flags="{flags}" --only="{only}" --out="{stepBuild}/prototype-census.tsv"
+    outputs: [prototype-census.tsv]
+    persist: true
+    successPattern: 'prototype-census: OK '

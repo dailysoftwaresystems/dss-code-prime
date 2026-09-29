@@ -236,17 +236,14 @@ struct ExecDataSectionLayout {
     // the real per-thread span).
     bool const zeroFill = isZeroFill(kind);
 
-    for (std::size_t i = 0; i < dataItems.size(); ++i) {
+    auto const isExcluded = [&](std::size_t i) {
+        return std::binary_search(excludedItemIndices.begin(),
+                                  excludedItemIndices.end(), i);
+    };
+    // The per-item refusals, asked of every item this section lays out: a
+    // unit member (below) meets exactly the rules a free item meets.
+    auto const itemIsLayable = [&](std::size_t i) -> bool {
         auto const& d = dataItems[i];
-        if (d.section != kind) continue;     // belongs to another section
-        // Laid out by the caller in a section of its own (see the parameter's
-        // note) -- contributes nothing at all here. ASCENDING by contract, so
-        // the membership test is a binary search rather than a linear scan
-        // inside a per-item loop (this runs over every data item of a module).
-        if (std::binary_search(excludedItemIndices.begin(),
-                               excludedItemIndices.end(), i)) {
-            continue;
-        }
         // A data item carrying its OWN relocations (data->data references —
         // a vtable / fn-ptr table / cross-CU thunk slot). Where the caller
         // patches/emits them (`allowItemRelocations=true`) they flow through;
@@ -256,12 +253,12 @@ struct ExecDataSectionLayout {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format("{}: {} data item #{} (SymbolId={{ {} }}) carries "
                              "{} relocation(s); data->data relocations are not "
-                             "yet supported by this writer (deferred D-LK1-ELF-"
-                             "RODATA-DATAITEM-RELOC — it patches FUNCTION "
+                             "yet supported by this writer (deferred "
+                             "D-LK1-ELF-RODATA-DATAITEM-RELOC — it patches FUNCTION "
                              "relocations only).",
                              writerName, dataSectionKindName(kind), i,
                              d.symbol.v, d.relocations.size()));
-            return std::nullopt;
+            return false;
         }
         // Defense in depth (validateAssembledData ran first): a zero-fill
         // (Bss/Tbss) item must carry NO file bytes — its span comes from
@@ -274,8 +271,114 @@ struct ExecDataSectionLayout {
                              "size without storing bytes.",
                              writerName, dataSectionKindName(kind), i,
                              d.symbol.v, d.bytes.size()));
-            return std::nullopt;
+            return false;
         }
+        return true;
+    };
+
+    // ★★★ AN INPUT SECTION THAT IS A UNIT IS LAID OUT AS ONE BLOCK
+    // (`InputSectionSlice`, the format's `inputSectionPlacement`). All of a
+    // unit's members are placed together, at the point where its FIRST member
+    // appears in `dataItems`, so the order a reader emitted them in cannot
+    // separate them (the ELF and COFF readers append anonymous gap atoms after
+    // the named ones). The block starts at an address aligned to its strictest
+    // member, and each member sits at its own offset from that start. That
+    // reproduces the producer's section exactly, including a member's alignment
+    // relative to the section. Bytes no member covers (bss padding) stay zero.
+    // A unit that this call would cut is refused (`K_InputSectionSplit`): some
+    // of its members in another kind, or excluded by the caller.
+    std::unordered_map<std::uint32_t, std::vector<std::size_t>> unitMembers;
+    for (std::size_t i = 0; i < dataItems.size(); ++i) {
+        auto const& d = dataItems[i];
+        if (!d.inputSection.has_value() || d.section != kind) continue;
+        if (isExcluded(i)) continue;
+        unitMembers[d.inputSection->section].push_back(i);
+    }
+    for (std::size_t i = 0; i < dataItems.size(); ++i) {
+        auto const& d = dataItems[i];
+        if (!d.inputSection.has_value()) continue;
+        if (!unitMembers.contains(d.inputSection->section)) continue;
+        bool const elsewhere = d.section != kind || isExcluded(i);
+        if (!elsewhere) continue;
+        emit(reporter, DiagnosticCode::K_InputSectionSplit,
+             std::format("{}: data item #{} (SymbolId={{ {} }}) belongs to the "
+                         "same input section (unit #{}) as items this {} "
+                         "section lays out, but it is {} -- placing the unit's "
+                         "members in two places would split one input section "
+                         "and move bytes the producer's code reaches by "
+                         "distance.",
+                         writerName, i, d.symbol.v, d.inputSection->section,
+                         dataSectionKindName(kind),
+                         d.section != kind
+                             ? std::format("in section kind '{}'",
+                                           dataSectionKindName(d.section))
+                             : std::string{"laid out separately by this writer"}));
+        return std::nullopt;
+    }
+    for (auto& [unit, members] : unitMembers) {
+        std::sort(members.begin(), members.end(),
+                  [&](std::size_t a, std::size_t b) {
+                      return dataItems[a].inputSection->offset
+                           < dataItems[b].inputSection->offset;
+                  });
+    }
+    std::unordered_set<std::uint32_t> placedUnits;
+    auto const placeUnit = [&](std::vector<std::size_t> const& members) -> bool {
+        std::uint64_t unitAlign = 1;
+        for (std::size_t m : members) {
+            if (!itemIsLayable(m)) return false;
+            unitAlign = std::max<std::uint64_t>(unitAlign,
+                                                dataItems[m].alignment.bytes());
+        }
+        std::uint64_t const firstOffset = dataItems[members.front()].inputSection->offset;
+        // base ≡ 0 (mod unitAlign), and the first member lands at or after the
+        // current end: the smallest such base.
+        std::uint64_t const floor =
+            layout.spanSize > firstOffset ? layout.spanSize - firstOffset : 0u;
+        std::uint64_t const base = ((floor + unitAlign - 1) / unitAlign) * unitAlign;
+        for (std::size_t m : members) {
+            auto const& d = dataItems[m];
+            std::uint64_t const at = base + d.inputSection->offset;
+            if (at < layout.spanSize) {
+                emit(reporter, DiagnosticCode::K_InputSectionSplit,
+                     std::format("{}: data item #{} (SymbolId={{ {} }}) of unit #{} "
+                                 "starts at section offset {}, inside the "
+                                 "member before it -- two items cannot own the "
+                                 "same bytes of one input section.",
+                                 writerName, m, d.symbol.v,
+                                 d.inputSection->section, d.inputSection->offset));
+                return false;
+            }
+            if (!zeroFill) {
+                while (layout.bytes.size() < at) layout.bytes.push_back(0);
+                layout.bytes.insert(layout.bytes.end(), d.bytes.begin(),
+                                    d.bytes.end());
+            }
+            layout.itemOffsets.push_back(at);
+            layout.itemIndices.push_back(m);
+            layout.spanSize = at + d.sizeInSection();
+        }
+        layout.maxAlign = std::max<std::uint64_t>(layout.maxAlign, unitAlign);
+        return true;
+    };
+
+    for (std::size_t i = 0; i < dataItems.size(); ++i) {
+        auto const& d = dataItems[i];
+        if (d.section != kind) continue;     // belongs to another section
+        // Laid out by the caller in a section of its own (see the parameter's
+        // note) -- contributes nothing at all here. ASCENDING by contract, so
+        // the membership test is a binary search rather than a linear scan
+        // inside a per-item loop (this runs over every data item of a module).
+        if (isExcluded(i)) continue;
+        if (d.inputSection.has_value()) {
+            // Placed with its whole unit, once, where the unit first appears.
+            if (!placedUnits.insert(d.inputSection->section).second) continue;
+            if (!placeUnit(unitMembers.at(d.inputSection->section))) {
+                return std::nullopt;
+            }
+            continue;
+        }
+        if (!itemIsLayable(i)) return std::nullopt;
 
         std::uint64_t const itemSize = d.sizeInSection();
         // Lay each item at its alignment within the section span; record the

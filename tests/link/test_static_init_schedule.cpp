@@ -436,3 +436,65 @@ TEST(StaticInitSchedule, TheTrampolineParksTheArgumentRegistersAcrossTheCalls) {
            "so a save or a restore is missing and `main(argc, argv)` would "
            "receive whatever the last initializer left behind";
 }
+
+// D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE — HOW MANY argument registers the park carries is
+// the FORMAT's answer, not a literal. The trampoline cannot see the resolved entry's
+// signature (an `AssembledModule` carries the entry's symbol only), so it parks what
+// the format implies is live when the initializers run:
+//   * a LOADER-delivered format (Mach-O: dyld calls LC_MAIN with argc, argv, envp,
+//     apple) — as many as the widest verb it realizes, FOUR on the shipped Mach-O
+//     documents;
+//   * `stack-vector` (elf) — the TWO the trampoline loads itself (the environment
+//     verb's init computes envp from them);
+//   * `crt-argv-accessors` (pe) — NONE: the entry was retargeted to an init that
+//     takes no arguments and asks the CRT after the initializers ran.
+//
+// ★ THE DEFECT THIS REPLACED, found on the way to the environment verbs: the park
+// was `min(2, argGprs)` on every format, so on Mach-O a 3- or 4-parameter `main`
+// beside a constructor received whatever the initializers left in envp's and apple's
+// registers. examples/c/entry_main_envp_apple is its end-to-end witness on the Mac;
+// this pin makes it observable on every host.
+//
+// Measured the way the pin above is — trampoline GROWTH from adding one before-entry
+// and one after-entry initializer, on the shipped x86_64 target — so the two calls and
+// the one status save are common to all three formats and the DIFFERENCES are the
+// parks alone. The comparisons between formats are encoder-independent; the one
+// absolute bound is calibrated against the mutant, as above.
+TEST(StaticInitSchedule, TheParkCarriesWhatTheFormatHandsTheEntry) {
+    auto const target = x64Target();
+    ASSERT_TRUE(target != nullptr);
+    auto const growthFor = [&](char const* formatName) -> long long {
+        auto fmt = ObjectFormatSchema::loadShipped(formatName);
+        EXPECT_TRUE(fmt.has_value()) << formatName;
+        if (!fmt.has_value()) return -1;
+        AssembledModule bare = makeThreeFnModule();
+        bare.staticInitSchedule.clear();
+        DiagnosticReporter r0;
+        EXPECT_TRUE(injectEntryTrampoline(bare, *target, **fmt, r0)) << formatName;
+        AssembledModule sched = makeThreeFnModule();
+        DiagnosticReporter r1;
+        EXPECT_TRUE(injectEntryTrampoline(sched, *target, **fmt, r1)) << formatName;
+        if (bare.functions.empty() || sched.functions.empty()) return -1;
+        return static_cast<long long>(sched.functions.front().bytes.size())
+             - static_cast<long long>(bare.functions.front().bytes.size());
+    };
+    long long const macho = growthFor("macho64-x86_64-darwin-exec");
+    long long const elf   = growthFor("elf64-x86_64-linux-exec");
+    long long const pe    = growthFor("pe64-x86_64-windows-exec");
+
+    // 37 = two `call rel32` at 5 bytes each, plus NINE `mov r64,r64` at 3 bytes each:
+    // four argument saves, four restores, one status save. ✔MEASURED 2026-09-24 on
+    // the shipped x86_64 target: Mach-O 37, elf 25, pe 13 — and under the
+    // two-register literal this replaced, 25 on all three, which reds every line
+    // below.
+    EXPECT_GE(macho, 37)
+        << "the Mach-O trampoline grew by " << macho << " bytes — fewer than two "
+           "calls plus four argument parks cost, so envp or apple would reach `main` "
+           "as whatever the initializers left in their registers";
+    EXPECT_GT(macho, elf)
+        << "a loader-delivered format parks every register its entry forms read "
+           "(four), the entry stack only the two the trampoline loads";
+    EXPECT_GT(elf, pe)
+        << "the CRT arm's init takes no arguments, so nothing is live to park — "
+           "a park there is dead traffic";
+}

@@ -1,0 +1,21 @@
+{
+  "$comment": "A DSS-built static library and the program that links it BOTH call the printf family, and the program also uses <threads.h> (P68 round 11, D-LK-SYNTHESIZED-LIBRARY-BODY-DEFINED-STRONG-IN-EVERY-UNIT). On pe the UCRT exports none of printf, fprintf, sprintf, snprintf, sscanf and vfprintf, so DSS synthesizes each body into the unit that references it — the library's member (lib.c) and the program's CU each carry a copy. Those copies were STRONG: ✔MEASURED with main's dsscp at R11-F5, this shape (a pe static library calling printf, linked into a program calling printf) was refused with K_SymbolRedefinedAcrossUnits for all six — the class predates the round-11 getopt realization that made sqlite hit it. Every synthesized body is now Weak + Hidden, so the linker keeps one copy per image and no image exports one. The <threads.h> half exercises the other synthesized family (pe and Mach-O arm64: mtx_*, call_once and its synthesized once-adapter) through the same linkage; only exec formats declare its synthesis vehicle, so it lives in the program. FOUR pairs, as the threads corpus: x86_64 Mach-O declares no threads vehicle (a deliberate omission of its format), so <threads.h> is refused there. On ELF and Mach-O the printf family is the platform libc's own and these arms guard the same program shape without a synthesized stdio body. The member receives its stream from main instead of naming `stdout`: a member that names a library datum directly is D-LK-MEMBER-DIRECT-LIBRARY-DATUM-BOUND-TO-THE-SLOT, a separate subject. pe's stdout is a text-mode stream, hence its CRLF pin. References: gcc 13.3.0 and clang 18.1.3 (x86_64) and aarch64-linux-gnu-gcc 13.3.0 (qemu), -O0/-O2 `-pedantic -Wall`, lib.c in a real `ar` archive, and MSVC 14.51 (/std:clatest, default and /O2, lib.c through lib.exe): exit 42, no warning, this stdout (mingw-w64 13.2.0 ships no <threads.h>; Apple's SDK neither — the Mach-O arm is DSS's own threads). RED-ON-DISABLE: `synthesizeStdioShim`'s bodies back to Global -> the pe arm refuses the link (K_SymbolRedefinedAcrossUnits ×6).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "lib: 14\nlib: fprintf\nlib: vfprintf\nmain: 28\n",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"],
+      "expectedStdout": "lib: 14\r\nlib: fprintf\r\nlib: vfprintf\r\nmain: 28\r\n",
+      "dependsOn": [ { "sources": ["lib.c"], "spec": "x86_64:pe64-x86_64-windows-staticlib", "artifact": "lib.lib", "mustDifferFromBaseline": true } ] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"],
+      "dependsOn": [ { "sources": ["lib.c"], "spec": "x86_64:elf64-x86_64-linux-staticlib", "artifact": "lib.a", "mustDifferFromBaseline": true } ] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64",
+      "dependsOn": [ { "sources": ["lib.c"], "spec": "arm64:elf64-aarch64-linux-staticlib", "artifact": "lib.a", "mustDifferFromBaseline": true } ] },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "",
+      "dependsOn": [ { "sources": ["lib.c"], "spec": "arm64:macho64-arm64-darwin-staticlib", "artifact": "lib.a", "mustDifferFromBaseline": true } ] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

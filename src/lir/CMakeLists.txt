@@ -1,6 +1,7 @@
 add_library(lir OBJECT
     lir.cpp
     lir_2addr_legalize.cpp
+    lir_asm_region.cpp
     lir_callconv.cpp
     lir_literal_pool.cpp
     lir_liveness.cpp
@@ -43,9 +44,10 @@ target_link_libraries(lir PRIVATE core)
 # C4062 are suppressed by the presence of a `default:` arm.
 #
 # ⚠ This was the FOURTH per-file copy of one gate. The fifth copy's list is
-# what missed `src/asm/asm_text_to_lir.cpp` — see
-# D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS. Do not add a
-# sixth; extend the chokepoint instead.
+# what missed `src/asm/asm_text_to_lir.cpp`, and the unhandled enumerator that
+# slipped through surfaced only on a macOS build — no local MSVC or GCC leg was
+# passing the flag that would have caught it. Do not add a sixth; extend the
+# chokepoint instead.
 
 # ML5 cycle 3: MIR→LIR isel pass lives in `lowering/`; separate OBJECT lib
 # so the LIR substrate itself stays MIR-free (the LIR module is target-

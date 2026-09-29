@@ -641,7 +641,7 @@ TEST(DescriptorRoleFollowsTheTableDeath, AResolverForAnotherKindRefusesTheAnalys
     EXPECT_DEATH(
         {
             (void)analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
-                          std::nullopt, std::nullopt, ObjectFormatKind::Elf,
+                          std::nullopt, std::nullopt, SelectableObjectFormatKind::of(ObjectFormatKind::Elf),
                           std::optional<std::string_view>{"x86_64"},
                           LongDoubleFormat::None, nullptr, 0, &peRoles);
         },
@@ -660,7 +660,7 @@ TEST(DescriptorRoleFollowsTheTable, NoResolverBesideAnActiveFormatIsNotAMismatch
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     auto const model =
         analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
-                std::nullopt, std::nullopt, ObjectFormatKind::Elf,
+                std::nullopt, std::nullopt, SelectableObjectFormatKind::of(ObjectFormatKind::Elf),
                 std::optional<std::string_view>{"x86_64"});
     EXPECT_EQ(model.diagnostics().errorCount(), 0u) << joinDiags(model.diagnostics());
 }

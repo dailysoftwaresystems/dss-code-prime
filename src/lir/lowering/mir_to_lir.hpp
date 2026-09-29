@@ -214,6 +214,13 @@ struct DSS_EXPORT MirToLirResult {
     // calls), but the assembler needs them to populate
     // `AssembledModule.externImports`, so we propagate verbatim.
     std::vector<ExternImport> externImports;
+    // P68 round 9 (D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT): the
+    // imports whose every CODE reference this lowering read through a pointer
+    // slot (`SymbolId.v`). `lowerToLir` stamps it onto each row of
+    // `externImports` as `ExternImport::readThroughSlot` before returning, so
+    // the rows leave carrying the one owner's answer; kept here as the record
+    // the stamp was made from.
+    std::vector<std::uint32_t> readThroughSlotSymbols;
     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: per-function max local alignment for
     // functions with an over-aligned local (SPARSE — see FuncLocalAlignment).
     // Consumed by `compile_pipeline.cpp` → `materializeCallingConvention` →
@@ -479,6 +486,15 @@ lowerToLir(Mir const&          mir,
            // A definition the routing selects but this vector does not name is
            // a FAIL-LOUD, never a silent fallback to the direct branch: the
            // direct branch is the defect.
-           std::vector<DefinedSymbolName> definedSymbolNames = {});
+           std::vector<DefinedSymbolName> definedSymbolNames = {},
+           // P68 round 9 (the aarch64 twins): the ACTIVE object format's KIND,
+           // and ONLY as a key into the assembly dialect's per-format-kind
+           // spelling acceptance — an inline-asm template's address-part
+           // operator (`:lo12:` / `@PAGEOFF`) is read only on the kinds its
+           // dialect row lists. Nothing here branches on it; it is handed to
+           // `lowerAsmTemplateToLirRun` verbatim. nullopt ⇒ no format stated,
+           // and every such operator is refused by name. Trailing (like every
+           // format fact above) so positional callers are unaffected.
+           std::optional<ObjectFormatKind> assemblyFormatKind = std::nullopt);
 
 } // namespace dss

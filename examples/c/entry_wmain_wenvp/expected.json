@@ -1,0 +1,13 @@
+{
+  "$comment": "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the RUN witness for MSVC's 3-parameter `wmain(int, wchar_t**, wchar_t**)`, whose third vector is the WIDE environment (MSVC's startup passes `_get_initial_wide_environment()`, DOCUMENTED in the toolset's crt/src/vcruntime/exe_common.inl). The entry matches the language row fn(i32, ptr-ptr-u16, ptr-ptr-u16) -> i32 (verb `argc-wargv-wenvp`), which pe64-x86_64-windows-exec realizes through the UCRT's wide environment pair declared in its `processArgs`. The program checks the vector's structure and a CROSS-WIDTH agreement -- every all-ASCII wide entry must equal the NARROW getenv of its name, and the UCRT keeps the two environments as separate tables -- see main.c for the exit-code ladder (90..96). pe64-ONLY: on the ELF and Mach-O formats `wmain` is not a program entry at all, because their `entryVerbs` carry no wide verb (entry_wmain_only_refused_elf and entry_wmain_only_refused_macho pin that). RED-ON-DISABLE: take \"argc-wargv-wenvp\" out of the pe format's `entryVerbs` together with the wide pair only it reads (the loader refuses either half alone) -> K_ProgramEntryUndefined; hand the init the narrow accessor for the wide verb -> exit 93 or 94.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

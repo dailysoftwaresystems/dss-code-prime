@@ -56,6 +56,12 @@ enum class SchemaResolveErrorKind : std::uint8_t {
     // so the operator knows whether to set --schema-dir or to populate
     // the located directory.
     ShippedDirEmpty,
+    // Shipped-mode only: the shipped-config directory was located but could
+    // not be LISTED, or its listing stopped part-way, so which languages it
+    // holds is unknown. Distinct from `ShippedDirEmpty` because "contains no
+    // `*.lang.json` files" would be a false diagnosis of a directory nobody
+    // could read; the detail carries the listing's own error.
+    ShippedDirUnreadable,
 };
 
 struct DSS_EXPORT SchemaResolveError {
@@ -77,6 +83,12 @@ using SchemaResult = std::expected<std::shared_ptr<dss::GrammarSchema const>,
 struct DSS_EXPORT ShippedDiscoveryResult {
     std::vector<std::string>             names;
     std::optional<std::filesystem::path> directory;
+    // Non-empty when `directory` was located but could not be listed (or the
+    // listing stopped part-way): `names` is then EMPTY and must not be read as
+    // the corpus. The documents of the kind are named by ONE owner,
+    // `shippedConfigDocuments` (config_path_walk), which refuses a partial
+    // listing rather than truncating it.
+    std::string                          listingError;
 };
 
 class DSS_EXPORT SchemaCache {
@@ -187,6 +199,10 @@ private:
     // `nullopt` when the cwd-walk failed (→ ShippedDirNotFound on
     // extension lookup) or when in --schema-dir mode (unused).
     std::optional<std::filesystem::path>                                shippedDir_;
+    // The discovery's listing error, when `shippedDir_` was located and could
+    // not be listed (→ ShippedDirUnreadable on extension lookup). Empty
+    // otherwise.
+    std::string                                                         shippedListingError_;
 };
 
 } // namespace dss::lsp

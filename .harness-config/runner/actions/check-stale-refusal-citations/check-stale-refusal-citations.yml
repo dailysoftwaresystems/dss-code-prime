@@ -1,0 +1,14 @@
+# PURPOSE: refuse a new present-tense refusal sentence that cites an anchor row already marked CLOSED.
+name: check-stale-refusal-citations
+description: >-
+  The action refuses a present-tense refusal citing a closed row, then proves it can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `stale_refusal_citations_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-stale-refusal-citations.py
+    successPattern: 'stale-refusal-citations selftest: OK'
+    requireInputsUnmoved: true

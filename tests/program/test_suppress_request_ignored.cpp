@@ -29,6 +29,9 @@
 //   * A REFERENCE-COMPILER PROBE recording the gcc / clang / MSVC behaviour
 //     the warn-and-continue decision rests on, so the conformance claim is
 //     MEASURED IN-TREE rather than asserted in a comment.
+//   * An ERROR named by `--suppress` is reported anyway, with the notice said
+//     once — end-to-end through a real compile, at the semantic and the parser
+//     tier ([[D-DIAG-SUPPRESSING-AN-ERROR-REPORTS-A-FALSE-INTERNAL-FAILURE]]).
 //
 // Every pin drives the SHIPPED projection — `parseCliArgs` (argv) →
 // `buildReporterConfig` → `buildReporter` — never a hand-typed `Config`. A
@@ -47,6 +50,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <fstream>
 #include <initializer_list>
 #include <iostream>
@@ -396,6 +400,80 @@ TEST(SuppressRequestIgnored, EveryRefusedCodeGetsItsOwnNoticeInDeterministicOrde
         << "third notice was: " << rep.all()[2].actual;
 }
 
+// ── An ERROR is never suppressed: it is reported, and the refusal is said ─
+//
+// [[D-DIAG-SUPPRESSING-AN-ERROR-REPORTS-A-FALSE-INTERNAL-FAILURE]], END TO END
+// through the shipped argv → Config → reporter projection and a real compile.
+// ✔MEASURED before the rule: `--suppress=S_ArgCountMismatch` over a call with
+// the wrong argument count ended in rc 1 with ONLY `D_CompileUnitNullNoDiagnostic`
+// ("internal: per-CU build (buildCuMir) returned a null module … substrate-
+// contract violation") — the semantic tier had stopped on the error its gate
+// still counted, and the driver blamed its own contract; and a suppressed
+// parser error left nothing but `info[D_LaterPhasesNotRun]`.
+namespace {
+struct SuppressedErrorRun {
+    int                          rc = -1;
+    std::vector<DiagnosticCode>  codes;
+    std::string                  firstNotice;
+};
+
+[[nodiscard]] SuppressedErrorRun compileSuppressing(std::string const& source,
+                                                    std::string const& code) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp,
+                                          "suppress-an-error"};
+    fs::path const src = scratch.path() / "main.c";
+    {
+        std::ofstream out(src, std::ios::binary);
+        out << source;
+    }
+    auto rep = reporterFor({"dsscp", "--compile", src.string(), "--language", "c",
+                            "--target=x86_64:elf64-x86_64-linux-exec",
+                            "--suppress=" + code});
+    Program p;
+    p.setOutputDir(scratch.path() / "out");
+    SuppressedErrorRun run;
+    run.rc = p.compileFiles({src.string()}, "c", {"x86_64:elf64-x86_64-linux-exec"}, rep);
+    run.codes = codesOf(rep);
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::D_SuppressRequestIgnored) {
+            run.firstNotice = d.actual;
+            break;
+        }
+    }
+    return run;
+}
+
+[[nodiscard]] std::size_t countOf(std::vector<DiagnosticCode> const& codes,
+                                  DiagnosticCode code) {
+    return static_cast<std::size_t>(std::ranges::count(codes, code));
+}
+} // namespace
+
+TEST(SuppressRequestIgnored, ASuppressedSemanticErrorIsReportedNotMisnamed) {
+    auto const run = compileSuppressing(
+        "int f(int);\nint main(void){ return f(); }\n", "S_ArgCountMismatch");
+    EXPECT_NE(run.rc, 0) << "the error still stops the build";
+    EXPECT_EQ(countOf(run.codes, DiagnosticCode::S_ArgCountMismatch), 1u)
+        << "the error is reported whatever --suppress says";
+    EXPECT_EQ(countOf(run.codes, DiagnosticCode::D_SuppressRequestIgnored), 1u)
+        << "and the refused request is said once";
+    EXPECT_TRUE(run.firstNotice.starts_with(
+        "--suppress=S_ArgCountMismatch had no effect on an ERROR"))
+        << run.firstNotice;
+    EXPECT_EQ(countOf(run.codes, DiagnosticCode::D_CompileUnitNullNoDiagnostic), 0u)
+        << "the driver's internal contract check must not be blamed for a user error";
+}
+
+// (iv) the PARSER tier: a suppressed parse error used to leave only the info line.
+TEST(SuppressRequestIgnored, ASuppressedParseErrorIsReportedNotOnlyTheInfoLine) {
+    auto const run = compileSuppressing("int main(void){ return 1 +; }\n",
+                                        "P_BacktrackFailed");
+    EXPECT_NE(run.rc, 0);
+    EXPECT_EQ(countOf(run.codes, DiagnosticCode::P_BacktrackFailed), 1u)
+        << "the parse error is reported, not just D_LaterPhasesNotRun";
+    EXPECT_EQ(countOf(run.codes, DiagnosticCode::D_SuppressRequestIgnored), 1u);
+}
+
 // ── The other end of the same defect: a mode with no reporter at all ─────
 
 TEST(SuppressRequestIgnored, PolicyFlagsAreRefusedInModesThatBuildNoReporter) {
@@ -556,36 +634,45 @@ struct FlagProbe {
     return out;
 }
 
+// ★★ THE VISUAL STUDIO ENVIRONMENT COMES FROM `native_c_probe.hpp`, ENTERED ONCE PER
+// PROCESS, AND THIS FUNCTION NO LONGER ENTERS IT ITSELF. It used to write a batch per
+// arm that CALLed vcvars64.bat and then ran `cl` — two full developer-prompt entries
+// per run of this file, the one test left doing that after the link witnesses moved
+// to the shared helper (✔MEASURED by lane mig, 2026-09-19: an entry costs 1.2–2.4 s
+// alone and 3.9–16.2 s beside a concurrent build). The `cl` line is the one the batch
+// ran, byte for byte, captured into the same log the same way; only the entry moved.
+//
+// ⚠ AND ONLY AN ABSENT TOOLCHAIN IS "NOT PRESENT". This used to read every non-`ok()`
+// location as absent, so a vswhere that FAILED to run reached the skip verdict as
+// "no MSVC here". A located toolchain whose environment cannot be entered is now a
+// present tool with no exit code (rc -1) and the reason as its output, which the
+// control assertion below reports by name.
 [[nodiscard]] FlagProbe probeMsvcFlag(fs::path const& work, std::string const& tag,
                                       std::string const& extraFlags) {
     FlagProbe out;
     auto const msvc = native_probe::locateMsvcToolchain(work);
-    if (!msvc.ok()) {
+    if (msvc.toolAbsent()) {
         out.tool = msvc.detail;
+        return out;
+    }
+    out.toolPresent = true;
+    out.tool        = "MSVC cl.exe";
+    auto const env = native_probe::msvcEnvironment(msvc, work);
+    if (!env.ok()) {
+        out.output = env.describe();
         return out;
     }
     fs::path const src = work / (tag + "_probe.c");
     fs::path const obj = work / (tag + "_probe.obj");
-    fs::path const bat = work / (tag + "_probe.bat");
     {
         std::ofstream f{src};
         f << "int main(void) { return 0; }\n";
     }
-    {
-        // `\r\n` and the `call` line mirror `native_c_probe`'s own generated
-        // batch: cmd.exe is the interpreter, and vcvars64 is what puts `cl`
-        // on PATH at all.
-        std::ofstream f{bat, std::ios::binary};
-        f << "@echo off\r\n"
-          << "call \"" << msvc.vcvars.string() << "\" >nul 2>&1\r\n"
-          << "cl /nologo /W3 /c " << extraFlags << " /Fo:\"" << obj.string()
-          << "\" \"" << src.string() << "\"\r\n";
-    }
-    out.toolPresent = true;
-    out.tool        = "MSVC cl.exe";
     fs::path const log = work / (tag + "_log.txt");
-    out.rc     = std::system(
-        native_probe::captureCmd("\"\"" + bat.string() + "\"\"", log).c_str());
+    out.rc     = native_probe::systemUnder(
+        env, native_probe::captureCmd("cl /nologo /W3 /c " + extraFlags + " /Fo:\""
+                                          + obj.string() + "\" \"" + src.string() + "\"",
+                                      log));
     out.output = native_probe::tailOf(log, 20);
     return out;
 }
@@ -674,5 +761,13 @@ TEST(SuppressRequestIgnored, ReferenceCompilersDoNotRejectAnUnhonourableSilencin
                "to emit command-line warning D9014 and CONTINUE. Compiler "
                "output:\n"
             << msvc.output;
+        // COUNTED, NEVER TIMED: both MSVC arms ran, and this process entered the
+        // Visual Studio environment exactly once between them — the shared
+        // helper's entry, not one per arm (it was two before; 0 would mean an
+        // arm reached `cl` without going through the helper at all).
+        EXPECT_EQ(native_probe::msvcEnvironmentEntries(), 1u)
+            << "this process entered vcvars64.bat "
+            << native_probe::msvcEnvironmentEntries()
+            << " time(s) for two `cl` probes; ONE per process is the design";
     }
 }

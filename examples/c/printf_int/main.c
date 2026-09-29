@@ -1,4 +1,4 @@
-// D-LANG-VARIADIC (step 13.4, 2026-06-02): variadic int arg.
+// D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): variadic int arg.
 // `printf("answer=%d\n", 42)` passes 2 args against the 1-fixed-
 // param variadic FnSig: `fmt` ("answer=%d\n") is the fixed param
 // (Ptr<Char>); 42 is the vararg int. The vararg int passes in rsi

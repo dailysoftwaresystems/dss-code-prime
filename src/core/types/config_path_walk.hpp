@@ -5,6 +5,7 @@
 #include "core/types/parse_diagnostic.hpp"
 
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -33,8 +34,8 @@
 // ancestry, find shipped config at all. A set-but-miss falls through.
 //
 // ★ ARM 2 EXISTS BECAUSE A PACKAGED COMPILER HAD NO WAY TO FIND ITS OWN
-// CONFIG ([[D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE]]). With only an
-// override and a cwd walk, an installed `dsscp` at `/usr/bin` invoked from a
+// CONFIG. With only an override and a cwd walk, an installed `dsscp` at
+// `/usr/bin` invoked from a
 // user's project walked THAT project's ancestors and found nothing — so
 // copying the config tree into a package would still not have worked, and
 // `#include <stdio.h>` was unresolvable. The layout it probes is COMPUTED BY
@@ -165,6 +166,41 @@ findShippedConfigDir(
     std::string_view                            subdir,
     std::optional<std::filesystem::path> const& startPath = std::nullopt);
 
+// ── THE DOCUMENTS OF ONE KIND ────────────────────────────────────────────────
+// [[D-CONFIG-STRAY-FILE-NAMED-AFTER-A-LANGUAGE-LOADS-AS-A-SECOND-DOCUMENT]]
+//
+// ★★★ THE DEFECT, ✔MEASURED 2026-09-23 (P68 round 9), and it was a DISAGREEMENT
+// BETWEEN ENUMERATIONS OF ONE DIRECTORY rather than a missing check. The driver's
+// shipped-source realization listed `sources/` by SUBSTRING (`find(".lang.json")`)
+// while the LSP's discovery listed the same directory by EXACT suffix. So a
+// `zz.lang.json.bak` -- an editor, merge or `cp` safety artifact -- was a SECOND
+// LANGUAGE to the driver: a pe64 build refused with "2 shipped languages claim the
+// extension '.c'" (once per runtime source) naming NEITHER document, and a same-stem
+// stray (`c.lang.json.orig`) was silently READ, its extension list binding to `c`.
+// Five hand-rolled enumerations of a config kind existed in src/ (two `.lang.json`,
+// three `.format.json`), each with its own idea of an iteration error.
+//
+// ⇒ ONE OWNER for "which files ARE the documents of this kind". The accepted form is
+// DEFINED -- a regular file named exactly `<stem><suffix>` with a non-empty stem -- and
+// its complement is refused, never a list of artifact suffixes (`.orig`, `.rej`,
+// `.bak`, `.tmp-*` ...) that the next tool would have to extend.
+//
+// The result is SORTED BY STEM, so every answer built from it (a claimant set, a
+// candidate list, the wording of an ambiguity report) is a property of the corpus and
+// not of the host filesystem's iteration order (sorted on NTFS, hash-ordered on ext4).
+//
+// ⚠ A PARTIAL ENUMERATION IS REFUSED, NEVER TRUNCATED. A listing error -- at the start
+// or mid-directory -- is the error, naming the directory: a claimant set built from half
+// a directory can answer "one claimant" where the whole has two, which is the silent
+// wrong answer this owner exists to end.
+struct DSS_EXPORT ShippedConfigDocument {
+    std::string           stem;   // "c" for `c.lang.json`: the name `loadShipped` takes
+    std::filesystem::path path;   // the document itself
+};
+
+[[nodiscard]] DSS_EXPORT std::expected<std::vector<ShippedConfigDocument>, std::string>
+shippedConfigDocuments(std::filesystem::path const& directory, std::string_view suffix);
+
 // THE RESOLVED SYSTEM-INCLUDE DIRS for `grammar`: its declared
 // `semantics.shippedLibDirs` strings mapped through `findShippedConfigDir` to
 // ABSOLUTE directories, in the language's own order. This is the `/usr/include`
@@ -260,10 +296,10 @@ struct DSS_EXPORT ResolvedConfigRoot {
     // that it was SILENT, which is the same invisible-outcome class as the
     // foreign tree above and has already cost a measured 5x false regression
     // (the speedtest1 benchmark's pin was one directory too deep, missed, and
-    // fell through to the very cwd walk it existed to prevent). That row fixed
-    // its own pin and recorded the rest as "a production question, raised
-    // rather than taken":
-    // [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+    // fell through to the very cwd walk it existed to prevent). The benchmark
+    // fixed its own pin and left the rest — SAYING SO when a set override is
+    // ignored — as "a production question, raised rather than taken". This
+    // field is that half, taken.
     std::optional<std::string> ignoredOverride;
 };
 

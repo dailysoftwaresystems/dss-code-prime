@@ -4,8 +4,9 @@
 #include "core/substrate/path_identity.hpp"        // genericSpelling / normalizeKeepingRoot — the lossless spellings
 #include "core/types/config_document_parse.hpp"   // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"   // the ONE closed-key check + the `$`-prose carve-out
-#include "core/types/config_path_walk.hpp"       // findShippedConfigDir — shared src/dss-config/<dir> resolver
-#include "core/types/data_model.hpp"             // dataModelFromName (signatureByDataModel keys)
+#include "core/types/config_path_walk.hpp"       // findShippedConfigDir — shared src/dss-config/<dir> resolver; resolveSystemDirs (a header named by a config row)
+#include "core/types/data_model.hpp"             // dataModelFromName, longDoubleFormatName (the pair's `when` facts)
+#include "core/types/variant_when_json.hpp"      // the ONE `when` selector: decodeWhen + whenMatches (S2a-1)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/enum_name_table.hpp"        // EnumNameTable/allNames (the descriptor-local closed sets)
 #include "core/types/include_path_resolve.hpp"   // resolveSystemDescriptor (the `includes` closure walk)
@@ -15,19 +16,25 @@
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind (constant integer-scalar gate)
 #include "core/types/type_lattice/type_interner.hpp" // TypeInterner::kind (constant type gate)
 #include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (the private lattice readShippedLibConstants owns)
+#include "core/types/type_lattice/type_layout.hpp"   // scalarByteSize — a pointer's width, the `type-limit` width of `pointerTo`
 #include "core/types/number_decode.hpp"          // decodeFloat (the ONE float-literal decoder)
+#include "analysis/semantic/type_rules.hpp"     // resolveArithmeticRules + promoteIntegerKind — the ONE integer-promotion rule a derived constant is typed by. HEADER-ONLY use (both inline): no link dependency on analysis_semantic, and type_rules.hpp includes only core headers, so no include cycle
+#include "core/types/grammar_schema.hpp"        // GrammarSchema::semantics() — a derived row's language
+#include "core/types/type_name_resolve.hpp"     // resolveLanguageTypeName — the ONE type-name resolver (a derived row's `of`)
 #include "ffi/shipped_type_consistency.hpp"      // the ONE cross-descriptor agreement rule ((C))
 #include "hir/hir_text.hpp"                      // parseTypeFromText (the ONE type decoder)
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>         // a one-directory search span (a typedef reference's owner)
 #include <cmath>
 #include <cstddef>       // std::size_t (was <cstdlib> for std::getenv, gone with the local walk)
 #include <cstdint>
 #include <deque>         // std::deque (Option C: address-stable typedef-name backing)
 #include <fstream>
 #include <iterator>   // istreambuf_iterator — the lenient scan's whole-file read
+#include <limits>      // std::numeric_limits (a derived row's signed 64-bit minimum)
 #include <functional>    // std::function (forEachDescriptorInClosure callbacks)
 #include <initializer_list>
 #include <mutex>         // std::mutex/lock_guard (the corpus-index memo)
@@ -84,9 +91,9 @@ void emitMalformed(DiagnosticReporter& reporter, std::string what) {
 // of a BUILD and says nothing about the PROCESS the cache actually lives in: the
 // cache is `thread_local`, so its lifetime is the THREAD's, and nothing scopes it
 // to a compile. Serving the pre-change document silently is the wrong-answer class
-// `readFileChecked`'s own torn-read refusal exists to prevent one layer down
-// (D-TEST-SHIPPED-CONFIG-READ-FROM-A-TREE-ANOTHER-PROCESS-IS-WRITING names the
-// same tree-changes-under-the-reader situation).
+// `readFileChecked`'s own torn-read refusal exists to prevent one layer down —
+// the same tree-changes-under-the-reader situation, seen from the cache
+// instead of from the read.
 //
 // ⓘ REACHABILITY, MEASURED RATHER THAN ASSUMED — AND THE MEASUREMENT REFUTED THE
 // OBVIOUS ANSWER. The candidate production reach is `dsscp --lsp`: a long-running
@@ -252,6 +259,17 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
 // `objPath` doubles as the object LABEL — it is already the most specific
 // name this loader has for the object ("(root)", "symbols[3]", "macros[7]"),
 // so the message names it once instead of twice.
+//
+// The ONE emission of the shared check's sentence, in this reader's diagnostic
+// and shape — used by this adapter and by the `when` adapter below, whose keys
+// the core `when` decoder checks (P68 round 12, S2a-1), so the two cannot say
+// the refusal two ways.
+void emitUnknownKeySentence(DiagnosticReporter& reporter, std::string sentence) {
+    emitMalformed(reporter,
+        std::string{"shipped-lib descriptor: "} + std::move(sentence)
+            + " (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD)");
+}
+
 [[nodiscard]] bool rejectUnknownKeys(DiagnosticReporter& reporter,
                                      json const& obj, std::string const& objPath,
                                      std::initializer_list<std::string_view> allowed) {
@@ -259,9 +277,7 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
     detail::rejectUnknownKeys(obj, allowed, "'" + objPath + "'",
         [&](std::string_view, std::string message) {
             ok = false;
-            emitMalformed(reporter,
-                std::string{"shipped-lib descriptor: "} + std::move(message)
-                    + " (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD)");
+            emitUnknownKeySentence(reporter, std::move(message));
         });
     return ok;
 }
@@ -474,212 +490,113 @@ decodeConstantValue(json const& v, TypeKind kind) {
 // clean selection outcomes.
 enum class WhenMatch { Match, NoMatch, Error };
 
-// WHICH AXES OF THE `when` SELECTOR PARTICIPATE IN THE MATCH. One evaluator,
-// three modes — never a second evaluator (a `when` decoded by two readers is a
-// `when` two readers can disagree about).
-//
-//  • `FormatOnly`     — `{format}` is the WHOLE legal key vocabulary; an `arch`
-//                       or `dataModel` key FAILS LOUD. The preprocessor-facing
-//                       surfaces (`macros`, and the `includes` edge gate) live
-//                       here: neither arch nor the data model is threaded into
-//                       preprocess (c9 build-key avoidance), so a key naming
-//                       them could only ever be a config author's mistake.
-//  • `FullTarget`     — `{arch,format,dataModel}` are all legal and all
-//                       participate. The TYPED surfaces (structs / constants /
-//                       typedefs / per-target `value` variants), which select a
-//                       LAYOUT or a TYPE and therefore need every axis.
-//  • `FormatReachability` — `{arch,format,dataModel}` are all legal and
-//                       VALIDATED, but only `format` participates. This answers
-//                       a strictly weaker question than `FullTarget`: "could
-//                       this arm be selected on object format F, for SOME
-//                       target?" — which is the right question for a NAME
-//                       PRESENCE scan (`shippedSurfaceNamesForFormat`), because
-//                       a variant set changes a name's TYPE or LAYOUT per arch,
-//                       never whether the name exists at all. Answering it with
-//                       `FullTarget` and no active arch would say NoMatch for
-//                       every arch-keyed arm and under-report the surface;
-//                       answering it by ignoring `variants` entirely would
-//                       over-report it. Both are silent wrong answers to a
-//                       question two fail-loud invariants are built on.
-enum class WhenAxes { FormatOnly, FullTarget, FormatReachability };
-
-// Decode + test a variant's `when` object (the per-target SELECTOR shared by the
-// `structs` / `constants` / `typedefs` / `macros` variant surfaces). The contract
-// is MATCH-ALL-SPECIFIED: every key the `when` SPECIFIES must equal the active
-// value (generic string equality — never an `if (arch == "x86_64")` here); an
-// unspecified key is a wildcard. A key tested against an UNKNOWN active value
-// (activeTarget / activeFormat nullopt — direct-API/LSP/test callers) can never
-// match. `axes` selects which keys are LEGAL and which PARTICIPATE — see the
-// `WhenAxes` table above. EVERY mode VALIDATES every key it admits (a typo'd
-// value fails loud in all three, including on an axis that does not
-// participate). `activeFormatName` is the precomputed
-// `objectFormatKindName(*activeFormat)` (empty when activeFormat is nullopt);
-// `activeDataModelName` is the precomputed `dataModelName(dataModel)` — the
-// descriptor reader always has a data model (a non-optional parameter), so unlike
-// arch/format this axis can never be "unknown". `whenCtx` is the caller's
-// diagnostic context for the `when` object (e.g. "structs[0] variants[1].when").
-// Reports via `emitMalformed` on a malformed `when`; the format and data-model
-// VALUES are validated against their closed vocabularies so a typo'd "elff" /
-// "LP62" fails loud rather than silently never matching.
-//
-// D-LANG-TYPE-IDENTITY-VOCABULARY: `dataModel` is the axis that lets a descriptor
-// spell a type C defines as a per-data-model ALIAS of a standard NAMED type —
-// `size_t` IS `unsigned long` on LP64 and `unsigned long long` on LLP64, `int64_t`
-// IS `long` / `long long`. A FIXED vocabulary tag would be wrong on one of the two
-// models, and an untagged core is a THIRD type matching neither. It rides the SAME
-// selector arch/format already use rather than a typedef-only `typeByDataModel`
-// key, so structs/constants/versions gain the axis for free.
+// THE `when` SELECTOR IS NOT DECIDED HERE (P68 round 12, S2a-1 of
+// D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES). Its three participation modes
+// (`WhenAxes`), its closed key and value vocabularies, the empty-`when` refusal
+// and the match-all-specified contract live in `core/types/variant_when.hpp` —
+// ONE owner for this reader and for the C language document's builtin
+// `signature` variants, which are decoded at LOAD and matched at INJECTION.
+// This adapter only routes the decoder's findings into THIS reader's
+// diagnostic (F_ShippedLibDescriptorMalformed), in the sentences this reader
+// always printed, and turns the verdict into the tri-state the variant loops
+// below consume. `facts` is the pair — build it with `whenFactsFor`.
 [[nodiscard]] WhenMatch
 matchVariantWhen(json const& when, WhenAxes axes, std::string const& whenCtx,
-                 std::optional<std::string_view> activeTarget,
-                 std::optional<ObjectFormatKind> activeFormat,
-                 std::string const& activeFormatName,
-                 std::string_view activeDataModelName,
-                 DiagnosticReporter& reporter) {
-    // Closed key vocabulary: {arch,format,dataModel} for the typed surfaces,
-    // {format} only for macros. An unknown/forbidden key (e.g. `arch` in a macro
-    // `when`, or a typo'd "ach") fails loud — a silently-ignored key would match
-    // more broadly than intended.
-    //
-    // ★ LEGALITY AND PARTICIPATION ARE SEPARATE. `FormatReachability` admits the
-    // arch axes (they are legal in a typed surface's `when`) and still VALIDATES
-    // their values, but does not let them decide the match — which is what makes
-    // it a strictly WEAKER test than `FullTarget` rather than a different one.
-    bool const archKeysLegal        = (axes != WhenAxes::FormatOnly);
-    bool const archKeysParticipate  = (axes == WhenAxes::FullTarget);
-    if (archKeysLegal) {
-        if (!rejectUnknownKeys(reporter, when, whenCtx,
-                               {"arch", "format", "dataModel"}))
-            return WhenMatch::Error;
-    } else {
-        if (!rejectUnknownKeys(reporter, when, whenCtx, {"format"}))
-            return WhenMatch::Error;
-    }
-    // ── D-FFI-DESCRIPTOR-MACRO-VARIANT-COVERAGE-AND-ARITY-UNCHECKED limb (c) ──
-    // AN EMPTY `when` IS REFUSED. It used to be an UNCONDITIONAL CATCH-ALL by
-    // accident rather than by design: with no key present no branch below runs,
-    // `matches` keeps its initial `true`, and the variant matched EVERY target —
-    // including `activeFormat == nullopt`, which this function's own contract
-    // says can never select anything. So a `{}` selector both contradicted the
-    // documented rule and gave a per-target surface a silent target-invariant
-    // arm. ✔MEASURED: zero `"when": {}` in the shipped corpus (a sweep of every
-    // `when` object under `src/dss-config`), so this refuses a shape nothing
-    // relies on and stops the next one from being written.
-    //
-    // A caller wanting a target-invariant entry already has the FLAT form, which
-    // is what makes this refusal a narrowing with no expressiveness lost. The
-    // `includes` surface already required a non-empty `when` for the same
-    // reason; this moves the rule into the ONE `when` evaluator so every surface
-    // gets it and the two cannot drift.
-    if (when.empty()) {
-        emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                    + ": 'when' must name at least one selector "
-                                      "(an empty 'when' would match EVERY target, "
-                                      "including one with no active format — use the "
-                                      "flat, non-variant form for a target-invariant "
-                                      "entry)");
-        return WhenMatch::Error;
-    }
-    bool matches = true;
-    if (archKeysLegal && when.contains("dataModel")) {
-        if (!when.at("dataModel").is_string()) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'dataModel' must be a string");
-            return WhenMatch::Error;
-        }
-        std::string const wantModel = when.at("dataModel").get<std::string>();
-        // CLOSED vocabulary (the same spellings `coreByDataModel` /
-        // `signatureByDataModel` use) — a typo would otherwise silently never
-        // match, making the entry vanish on every target.
-        if (!dataModelFromName(wantModel).has_value()) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'dataModel' has unknown data-model name '"
-                                        + wantModel + "' (expected "
-                                        + allowedList(allNames(kDataModelTable))
-                                        + ")");
-            return WhenMatch::Error;
-        }
-        if (archKeysParticipate && activeDataModelName != wantModel) matches = false;
-    }
-    if (archKeysLegal && when.contains("arch")) {
-        if (!when.at("arch").is_string()) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'arch' must be a string");
-            return WhenMatch::Error;
-        }
-        std::string const wantArch = when.at("arch").get<std::string>();
-        // The arch name is OPEN (it lives only in the target schemas this reader
-        // does not load) — an unknown arch simply never matches.
-        if (archKeysParticipate
-            && (!activeTarget.has_value() || *activeTarget != wantArch))
-            matches = false;
-    }
-    if (when.contains("format")) {
-        if (!when.at("format").is_string()) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'format' must be a string");
-            return WhenMatch::Error;
-        }
-        std::string const wantFormat = when.at("format").get<std::string>();
-        // The format VALUE is matched against the CLOSED object-format vocabulary
-        // (a typo'd "elff" would otherwise silently never match → the entry
-        // vanishes on every target).
-        auto const wantKind = objectFormatKindFromName(wantFormat);
-        if (!wantKind.has_value()) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'format' has unknown object-format name '"
-                                        + wantFormat + "' (expected "
-                                        + allowedList(kSelectableObjectFormatKindNames)
-                                        + ")");
-            return WhenMatch::Error;
-        }
-        // ...and the `unknown` SENTINEL has the identical consequence by the
-        // rationale one line up: it spells correctly, so the lookup accepts it,
-        // and then it matches no real active format — the entry vanishes on
-        // every target, exactly as the typo would. Same defect, same verdict.
-        if (!isSelectableObjectFormatKind(*wantKind)) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'format' names the invalid sentinel — "
-                                        + std::string{kObjectFormatKindSentinelRejection});
-            return WhenMatch::Error;
-        }
-        if (!activeFormat.has_value() || activeFormatName != wantFormat) matches = false;
-    }
-    return matches ? WhenMatch::Match : WhenMatch::NoMatch;
+                 WhenFacts const& facts, DiagnosticReporter& reporter) {
+    auto const spec = decodeWhen(
+        when, axes, whenCtx,
+        [&](std::string body) {
+            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx + ": " + std::move(body));
+        },
+        [&](std::string sentence) { emitUnknownKeySentence(reporter, std::move(sentence)); });
+    if (!spec.has_value()) return WhenMatch::Error;
+    return whenMatches(*spec, axes, facts) ? WhenMatch::Match : WhenMatch::NoMatch;
+}
+
+// The pair's selector facts as the typed surfaces see them: the reader's own
+// arch / format / data model, plus the long-double format the CALLER's pair facts
+// carry (ShippedPairFacts::longDoubleFormat — nullopt without a pair, so a
+// `longDoubleFormat` key then matches nothing, exactly like an unknown arch).
+[[nodiscard]] WhenFacts
+whenFactsFor(std::optional<std::string_view> activeTarget,
+             std::optional<ObjectFormatKind> activeFormat,
+             std::string_view activeDataModelName,
+             ShippedPairFacts const* pairFacts) {
+    WhenFacts f;
+    f.arch          = activeTarget;
+    f.format        = activeFormat;
+    f.dataModelName = activeDataModelName;
+    if (pairFacts != nullptr && pairFacts->longDoubleFormat.has_value()
+        && *pairFacts->longDoubleFormat != LongDoubleFormat::None)
+        f.longDoubleFormatName = longDoubleFormatName(*pairFacts->longDoubleFormat);
+    return f;
+}
+
+// WHAT A PAIR MATCHING NO ARM MEANS, per field. For `version` and `linkName`
+// "no arm" is a VALUE — unversioned, the plain identifier — so zero matches keep
+// the empty default. For a `signature` there is no such value: a symbol whose
+// type no arm gives on this pair has NO prototype here, and binding some other
+// arm's would be the silent fallback the variants form exists to remove (S2a-1
+// of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES) — so zero matches REFUSE, naming
+// the pair, unless the row says outright which arm serves every other pair:
+// `{ "default": true, "value": … }`, at most one, never with a `when`.
+//
+// ★ AND ONLY WHERE THE SYMBOL IS AVAILABLE (P68 round 12, S2a-2a). On a pair its
+// DECLARED availability (`availableObjectFormats`, its own else its document's)
+// excludes, a symbol is not injected anyway, so a signature with no arm for that
+// pair is `OmitUnlessDefault`: the default serves if there is one, else the symbol
+// is simply absent there — the rule a typedef or struct variant already follows.
+// Availability is never inferred from which arms exist: `strtold`'s arms key on a
+// long-double format the wasm32/spirv documents do not declare, and its row states
+// elf/macho/pe. Every arm is decoded either way.
+enum class ZeroMatch { KeepEmpty, RefuseUnlessDefault, OmitUnlessDefault };
+
+// The pair, spelled for a refusal: every fact the selector can test.
+[[nodiscard]] std::string pairLabel(WhenFacts const& f) {
+    auto const opt = [](std::optional<std::string_view> v) {
+        return v.has_value() ? "'" + std::string{*v} + "'" : std::string{"<none>"};
+    };
+    return "arch=" + opt(f.arch) + ", format="
+           + (f.format.has_value() ? "'" + std::string{objectFormatKindName(*f.format)} + "'"
+                                   : std::string{"<none>"})
+           + ", dataModel='" + std::string{f.dataModelName} + "', longDoubleFormat="
+           + opt(f.longDoubleFormatName);
 }
 
 // Decode ONE optional per-symbol PER-TARGET STRING field into `out`. The shape
 // is the c156 `version` shape, generalized so its TF-C121 sibling `linkName`
-// cannot drift from it:
+// and the S2a-1 `signature` cannot drift from it:
 //
 //   "<key>": "flat"                                        (target-invariant)
-//   "<key>": { "variants": [ { "when": {arch?,format?,dataModel?},
-//                              "value": "…" }, … ] }        (per-target)
+//   "<key>": { "variants": [ { "when": {arch?,format?,dataModel?,longDoubleFormat?},
+//                              "value": "…" }, …,
+//                            { "default": true, "value": "…" } ] }   (per-pair)
 //
-// ABSENT ⇒ `out` untouched (the caller pre-sets the empty default). 0 matching
-// variants ⇒ `out` stays empty — LEGAL, and load-bearing for BOTH consumers: it
-// is aarch64's single-versioned realpath, and it is arm64-Darwin's `fstat`,
-// whose only ABI is the modern one so the plain name is already right.
-// >1 match ⇒ ambiguous ⇒ fail loud (each target must select at most one).
+// ABSENT ⇒ `out` untouched (the caller pre-sets the empty default). >1 match ⇒
+// ambiguous ⇒ fail loud (each pair must select at most one). 0 matches ⇒ the
+// field's `ZeroMatch` policy: `KeepEmpty` (LEGAL, and load-bearing for
+// `version` — aarch64's single-versioned realpath — and for `linkName` —
+// arm64-Darwin's `fstat`, whose only ABI is the modern one) or
+// `RefuseUnlessDefault` (a `signature`: the `default` arm's value, else a
+// refusal naming the pair). A `default` arm is legal only under
+// `RefuseUnlessDefault`: an unversioned `version` needs no arm to say so.
 //
 // EAGER: every variant's SHAPE is validated regardless of which one is active,
-// so a malformed INACTIVE variant fails the read on EVERY target rather than
-// lurking until that target is first compiled (mirrors `signatureByDataModel`
-// and the struct variants). Returns false when the entry is malformed — the
-// caller `continue`s past this symbol and the read fails via its errorCount
-// delta.
+// so a malformed INACTIVE variant fails the read on EVERY pair rather than
+// lurking until that pair is first compiled; `allArms`, when given, receives
+// every arm's value so the caller can decode each one too (a signature's TYPE).
+// Returns false when the entry is malformed — the caller `continue`s past this
+// symbol and the read fails via its errorCount delta.
 //
-// ★ ONE DECODER FOR BOTH FIELDS IS THE POINT. `version` and `linkName` are the
-// two per-symbol strings whose correct value depends on the active target; they
-// were written as one block and a copy would let the second silently lose a
-// validation the first gained (a `when` key vocabulary, the ambiguity check).
+// ★ ONE DECODER FOR EVERY PER-PAIR SYMBOL STRING IS THE POINT. They were written
+// as one block and a copy would let the next field silently lose a validation
+// the first gained (a `when` key vocabulary, the ambiguity check).
 [[nodiscard]] bool
 decodePerTargetSymbolString(json const& sym, std::string const& key,
                             std::string const& at, std::size_t symIdx,
-                            std::optional<std::string_view> activeTarget,
-                            std::optional<ObjectFormatKind> activeFormat,
-                            std::string_view activeDataModelName,
-                            DiagnosticReporter& reporter, std::string& out) {
+                            WhenFacts const& facts, ZeroMatch zeroMatch,
+                            DiagnosticReporter& reporter, std::string& out,
+                            std::vector<std::string>* allArms = nullptr) {
     if (!sym.contains(key)) return true;
     json const& node = sym.at(key);
     if (node.is_string()) {
@@ -690,6 +607,7 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
                   "this symbol's " + key + " unset)");
             return false;
         }
+        if (allArms != nullptr) allArms->push_back(out);
         return true;
     }
     if (!node.is_object()) {
@@ -708,10 +626,9 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
               "string)");
         return false;
     }
-    std::string const activeFormatName =
-        activeFormat.has_value() ? std::string{objectFormatKindName(*activeFormat)}
-                                 : std::string{};
+    bool const defaultLegal = (zeroMatch != ZeroMatch::KeepEmpty);
     int         matchCount = 0;
+    std::optional<std::string> defaultValue;
     std::size_t vi         = 0;
     for (auto const& vdef : node.at("variants")) {
         std::string const vctx = objCtx + ".variants[" + std::to_string(vi) + "]";
@@ -721,13 +638,33 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
                 + "' must be an object with 'when' + 'value'");
             return false;
         }
-        if (!rejectUnknownKeys(reporter, vdef, vctx, {"when", "value"}))
-            return false;   // already reported
+        bool const isDefault = defaultLegal && vdef.contains("default");
+        bool const keysOk = isDefault ? rejectUnknownKeys(reporter, vdef, vctx, {"default", "value"})
+                                      : rejectUnknownKeys(reporter, vdef, vctx, {"when", "value"});
+        if (!keysOk) return false;   // already reported
         if (!vdef.contains("value") || !vdef.at("value").is_string()
             || vdef.at("value").get<std::string>().empty()) {
             emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + vctx
                 + "' must carry a non-empty string 'value'");
             return false;
+        }
+        std::string const value = vdef.at("value").get<std::string>();
+        if (allArms != nullptr) allArms->push_back(value);
+        if (isDefault) {
+            if (!vdef.at("default").is_boolean() || !vdef.at("default").get<bool>()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + vctx
+                    + "' 'default' must be the literal true (a default arm has no "
+                      "'when'; omit the key for a guarded arm)");
+                return false;
+            }
+            if (defaultValue.has_value()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + key
+                    + "' has more than one 'default' arm — at most one arm may "
+                      "serve every pair no other arm selects");
+                return false;
+            }
+            defaultValue = value;
+            continue;
         }
         if (!vdef.contains("when") || !vdef.at("when").is_object()) {
             emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + vctx
@@ -736,12 +673,11 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
         }
         WhenMatch const wm =
             matchVariantWhen(vdef.at("when"), WhenAxes::FullTarget, vctx + ".when",
-                             activeTarget, activeFormat, activeFormatName,
-                             activeDataModelName, reporter);
+                             facts, reporter);
         if (wm == WhenMatch::Error) return false;
         if (wm == WhenMatch::Match) {
             ++matchCount;
-            out = vdef.at("value").get<std::string>();
+            out = value;
         }
     }
     if (matchCount > 1) {
@@ -751,7 +687,25 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
               "ambiguous (each target must match at most one)");
         return false;
     }
-    // matchCount == 0 ⇒ `out` stays empty on this target. LEGAL, not an error.
+    if (matchCount == 0 && zeroMatch != ZeroMatch::KeepEmpty) {
+        if (defaultValue.has_value()) {
+            out = *defaultValue;
+            return true;
+        }
+        if (zeroMatch == ZeroMatch::OmitUnlessDefault) {
+            out.clear();                            // not injected on this pair
+            return true;
+        }
+        std::string const symName =
+            sym.contains("name") && sym.at("name").is_string() ? sym.at("name").get<std::string>()
+                                                               : std::string{"<unnamed>"};
+        emitMalformed(reporter, "shipped-lib descriptor " + at + ": symbol '" + symName + "': '" + key
+            + "' has no variant matching the active pair (" + pairLabel(facts)
+            + ") and no 'default' arm — refusing to bind another pair's value "
+              "(the variants form has no silent fallback)");
+        return false;
+    }
+    // matchCount == 0 under KeepEmpty ⇒ `out` stays empty on this target. LEGAL, not an error.
     return true;
 }
 
@@ -973,7 +927,8 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
         // aliases have no pe arm because Windows has no such thing, the
         // `_stati64`/`_fstat`/`_wstat` family is MSVC-only, `strtoll` is a pe-only
         // link-name realization because `libc.so.6` exports `strtoll` directly,
-        // and `environ` is elf-only because neither other reference declares it.
+        // and `environ`/`_environ` are pe-only because only the Windows CRTs reach the
+        // environment through a macro onto an accessor.
         // A descriptor is available on a format when ANY of its surface is; a
         // MACRO's reach is its own and narrower.
         //
@@ -1079,8 +1034,7 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
             // preprocessor). A nullopt activeFormat can never match (no selection).
             WhenMatch const wm = matchVariantWhen(
                 vdef.at("when"), WhenAxes::FormatOnly, vat + ".when",
-                /*activeTarget=*/std::nullopt, activeFormat, activeFormatName,
-                /*activeDataModelName=*/std::string_view{}, reporter);
+                WhenFacts{.format = activeFormat}, reporter);
             if (wm == WhenMatch::Error) { okVariants = false; break; }
             if (wm == WhenMatch::Match) {
                 ++matchCount;
@@ -1740,9 +1694,6 @@ void decodeShippedIncludes(json const& doc, std::string const& pathStr,
                                       "strings, e.g. [\"stdio.h\"]");
         return;
     }
-    std::string const activeFormatName =
-        activeFormat.has_value() ? std::string{objectFormatKindName(*activeFormat)}
-                                 : std::string{};
     std::size_t iidx = 0;
     for (auto const& v : doc.at("includes")) {
         std::string const at =
@@ -1812,9 +1763,7 @@ void decodeShippedIncludes(json const& doc, std::string const& pathStr,
         // have). Only the DECISION is per-format.
         WhenMatch const wm =
             matchVariantWhen(v.at("when"), WhenAxes::FormatOnly, at + ".when",
-                             /*activeTarget=*/std::nullopt, activeFormat,
-                             activeFormatName,
-                             /*activeDataModelName=*/std::string_view{}, reporter);
+                             WhenFacts{.format = activeFormat}, reporter);
         if (wm == WhenMatch::Error) continue;   // already reported
         // NoMatch (including EVERY conditional edge when no format is active —
         // LSP / direct-API / test callers) ⇒ the edge is NOT TAKEN. It is not an
@@ -1960,6 +1909,1005 @@ decodeConstantValueAndType(json const& obj, std::string const& at,
     return true;
 }
 
+// ── THE ONE `typedefs` DECODE, read by BOTH seams ────────────────────────────
+// (P68 round 9, D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS.) Lifted
+// verbatim out of `readShippedLibDescriptor` (it was the inline "(3.pre)" block)
+// when a lattice-derived constant gained the right to NAME a typedef of its own
+// descriptor — `{ "name": "INT64_MAX", "of": "int64_t", "limit": "max" }` — so
+// the interner-free preprocessor read needs the same per-pair typedef selection
+// the semantic read makes. One decode, the `decodeShippedConstants` precedent:
+// the two seams cannot select a different variant of the same typedef.
+//
+// Behaviour is the block's, unchanged: array order is dependency order, each
+// resolved typedef is PUBLISHED into `mergedNamedTypes` (backed by the
+// address-stable `typedefNameStore`) before the next is decoded, and a
+// malformed entry is reported and skipped. `false` = the `typedefs` node is not
+// an array (the caller aborts the read, as the inline block did).
+//
+// P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): an entry — or a variant —
+// may name its type as a platform ABI typedef instead of spelling it:
+// `{ "name": "wchar_t", "abiTypedef": "wchar_t" }` takes the TARGET's
+// `abiTypedefs` core for this format (`ShippedPairFacts::abiTypedefs`, the table
+// `__SIZEOF_WCHAR_T__` reads), so `<stddef.h>` can no longer restate per FORMAT a
+// fact that is per processor × platform. With no such fact on the pair the entry
+// is simply not injected (a use then fails loud as an undefined type); `type` and
+// `abiTypedef` together are two owners of one type and are refused. The key is the
+// shared type-reference notation (`kTypeRefAbiTypedefKey`, preprocess_config.hpp).
+constexpr std::string_view kAbiTypedefKey = kTypeRefAbiTypedefKey;
+
+// ── A TYPEDEF THAT NAMES ITS OWNER ────────────────────────────────────────────
+// (P68 round 12, S2a-2a of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES)
+//
+// An entry — or a variant arm — may take its type from ANOTHER shipped header's
+// typedef: `{ "name": "size_t", "shippedTypedef": { "header": "stddef.h" } }`.
+// C's own model: many headers declare `size_t`, ONE type defines it. Before this,
+// `size_t`'s per-pair arms were copied into six descriptors, `wchar_t`'s into four,
+// held together only by the consistency sweep.
+//
+// ★ THE REFERENCE TAKES THE OWNER'S WHOLE ANSWER ON THE PAIR — its type, and "not
+// declared here" too, exactly as an `abiTypedef` the pair lacks is not injected: a
+// use of the name there then fails loud as an unknown type (at decode, for a
+// descriptor signature that names it). Nothing is guessed, because no type is
+// invented. A referrer that declares LESS than its owner (stdio.h's pe-only
+// `wchar_t`) gates a reference ARM.
+//
+// REFUSED AT LOAD, each with its own sentence: an owner the referrer's own shipped
+// root does not hold; an owner that declares the name on NO pair; an owner entry
+// that is itself a reference (one document defines each type — name that one); a
+// cycle of references; and a reference beside `type` or `abiTypedef` (two owners).
+//
+// WHERE THE OWNER IS FOUND: in the REFERRER's own shipped root — its path minus its
+// own `header`, rewritten as `#include <h>` rewrites a name (extension dropped,
+// `.json`, subdirectories kept) — matched as spelled, the precedent a config
+// cross-reference follows (`readShippedHeaderTypedefs`). So a reference resolves in
+// the corpus its referrer belongs to, the shipped tree or a test's scratch tree
+// alike, and needs no consuming language to find it.
+constexpr std::string_view kShippedTypedefRefKey = "shippedTypedef";
+
+// The shipped root `doc` (read from `pathStr`) lives in, or nullopt when its location
+// does not end in its own header's descriptor name — the provenance every shipped
+// descriptor holds (AllShippedDescriptorsDecode pins it).
+[[nodiscard]] std::optional<std::filesystem::path>
+shippedRootOf(std::string const& pathStr, json const& doc) {
+    if (!doc.contains("header") || !doc.at("header").is_string()) return std::nullopt;
+    std::string rel = doc.at("header").get<std::string>();
+    std::size_t const slash = rel.find_last_of('/');
+    std::size_t const dot   = rel.find_last_of('.');
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) rel.erase(dot);
+    rel += ".json";
+    std::string const tail = "/" + rel;
+    if (pathStr.size() <= tail.size()
+        || pathStr.compare(pathStr.size() - tail.size(), tail.size(), tail) != 0)
+        return std::nullopt;
+    return std::filesystem::path{pathStr.substr(0, pathStr.size() - tail.size())};
+}
+
+// True when a typedef entry states its type by reference — flat, or in any arm.
+[[nodiscard]] bool typedefEntryIsReference(json const& entry) {
+    if (entry.contains(kShippedTypedefRefKey)) return true;
+    if (!entry.contains("variants") || !entry.at("variants").is_array()) return false;
+    return std::any_of(entry.at("variants").begin(), entry.at("variants").end(),
+                       [](json const& v) { return v.is_object() && v.contains(kShippedTypedefRefKey); });
+}
+
+// The OWNER a reference names, located and checked (not yet decoded): its path and
+// its entry for `name`. nullopt after reporting a refusal.
+struct TypedefReferenceOwner {
+    std::filesystem::path path;
+    std::string           pathStr;
+    json const*           doc   = nullptr;
+    json const*           entry = nullptr;
+};
+
+[[nodiscard]] std::optional<TypedefReferenceOwner>
+locateTypedefReferenceOwner(json const& ref, std::string const& ctx, std::string const& tname,
+                            std::string const& referrerPathStr, json const& referrerDoc,
+                            DiagnosticReporter& reporter) {
+    if (!ref.is_object()) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                    + "': 'shippedTypedef' must be an object "
+                                      "{ \"header\": \"<the header that defines it>\" }");
+        return std::nullopt;
+    }
+    if (!rejectUnknownKeys(reporter, ref, ctx + ".shippedTypedef", {"header"})) return std::nullopt;
+    if (!ref.contains("header") || !ref.at("header").is_string()
+        || ref.at("header").get<std::string>().empty()) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                    + "': 'shippedTypedef' needs a non-empty string 'header' "
+                                      "naming the header that defines it");
+        return std::nullopt;
+    }
+    std::string const ownerHeader = ref.at("header").get<std::string>();
+    auto const root = shippedRootOf(referrerPathStr, referrerDoc);
+    if (!root.has_value()) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                    + "' names '" + ownerHeader + "', but this descriptor's location "
+                                      "does not end in its own header's name, so the shipped root "
+                                      "that header is found in cannot be named");
+        return std::nullopt;
+    }
+    HeaderSearchCache cache;
+    std::array<std::filesystem::path, 1> const dirs{*root};
+    HeaderSearchResult const found =
+        resolveSystemDescriptor(ownerHeader, dirs, kDefaultHeaderNameMatching, cache);
+    if (found.status != HeaderSearchStatus::Found) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                    + "' names '" + ownerHeader + "' as its owner, and no shipped "
+                                      "descriptor for that header is beside this one — a reference "
+                                      "must name a header of the same corpus");
+        return std::nullopt;
+    }
+    TypedefReferenceOwner owner;
+    owner.path    = found.path;
+    owner.pathStr = core::genericSpelling(found.path);
+    owner.doc     = cachedDescriptorJson(found.path, reporter);
+    if (owner.doc == nullptr) return std::nullopt;   // the read reported why
+    if (owner.doc->contains("typedefs") && owner.doc->at("typedefs").is_array()) {
+        for (json const& e : owner.doc->at("typedefs")) {
+            if (e.is_object() && e.contains("name") && e.at("name").is_string()
+                && e.at("name").get<std::string>() == tname) {
+                owner.entry = &e;
+                break;
+            }
+        }
+    }
+    if (owner.entry == nullptr) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname + "' names '"
+                                    + ownerHeader + "' as its owner, which declares no typedef '" + tname
+                                    + "' on any pair");
+        return std::nullopt;
+    }
+    if (typedefEntryIsReference(*owner.entry)) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname + "' names '"
+                                    + ownerHeader + "' as its owner, whose '" + tname
+                                    + "' is itself a reference — one document defines each type; name "
+                                      "the header that defines it");
+        return std::nullopt;
+    }
+    return owner;
+}
+
+[[nodiscard]] bool
+decodeShippedTypedefs(json const& doc, std::string const& pathStr,
+                      TypeInterner& interner, TypeRegistry& typeReg,
+                      DiagnosticReporter& reporter,
+                      std::vector<ShippedTypedef>& out,
+                      std::optional<std::string_view> activeTarget,
+                      std::optional<ObjectFormatKind> activeFormat,
+                      std::string_view activeDataModelName,
+                      std::deque<std::string>& typedefNameStore,
+                      std::vector<NamedTypeBinding>& mergedNamedTypes,
+                      ShippedPairFacts const* pairFacts,
+                      std::vector<std::string>* referenceChain = nullptr) {
+    // The CALLER's bindings (a `va_list`), before this descriptor adds its own: what an
+    // owner a reference names is decoded with — never the referrer's typedefs.
+    std::size_t const callerBindings = mergedNamedTypes.size();
+    std::vector<std::string> chainStore;
+    std::vector<std::string>& chain = referenceChain != nullptr ? *referenceChain : chainStore;
+    if (doc.contains("typedefs")) {
+        if (!doc.at("typedefs").is_array()) {
+            emitMalformed(reporter,
+                std::string{"shipped-lib descriptor '"} + pathStr
+                    + "': 'typedefs' must be an array");
+            return false;
+        }
+        json const& typedefs = doc.at("typedefs");
+        out.reserve(typedefs.size());
+        std::size_t tidx = 0;
+        for (auto const& t : typedefs) {
+            std::string const at = std::string{"'"} + pathStr
+                + "' typedefs[" + std::to_string(tidx) + "]";
+            ++tidx;
+            if (!t.is_object()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+                continue;
+            }
+            (void)rejectUnknownKeys(reporter, t,
+                                    "typedefs[" + std::to_string(tidx - 1) + "]",
+                                    {"name", "type", "variants", kAbiTypedefKey,
+                                     kShippedTypedefRefKey});
+            if (!t.contains("name") || !t.at("name").is_string()
+                || t.at("name").get<std::string>().empty()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": missing or empty 'name'");
+                continue;
+            }
+            std::string tname = t.at("name").get<std::string>();
+
+            // Decode the `type` field of a typedef entry/variant (any decodable
+            // type — scalar, pointer, struct ref, fn ptr, OR an EARLIER descriptor
+            // typedef spelled by name via `mergedNamedTypes`) through the ONE codec;
+            // fail loud on a missing/undecodable type. Returns the TypeId, or
+            // InvalidType (the caller skips on invalid). `ctx` is the diag context.
+            auto decodeTypedefType = [&](json const& obj, std::string const& ctx) -> TypeId {
+                if (!obj.contains("type") || !obj.at("type").is_string()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + ctx
+                                                + ": missing or non-string 'type'");
+                    return InvalidType;
+                }
+                std::string const typeText = obj.at("type").get<std::string>();
+                TypeId const ty = parseTypeFromText(typeText, interner, typeReg, reporter,
+                                                    mergedNamedTypes);
+                if (!ty.valid() || ty == InvalidType) {
+                    dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                                DiagnosticSeverity::Error,
+                                "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                    + "' has a 'type' that failed to decode ('" + typeText
+                                    + "')");
+                    return InvalidType;
+                }
+                return ty;
+            };
+            // P68 round 9: the entry's (or variant's) type from EITHER source —
+            // a spelled `type`, or the pair's platform ABI typedef — and, since
+            // P68 round 12 (S2a-2a), a third: the typedef its OWNER header defines.
+            enum class TypedefTypeOutcome { Decoded, Unrealized, Error };
+            auto referencedType = [&](json const& obj, std::string const& ctx,
+                                      TypeId& outTy) -> TypedefTypeOutcome {
+                if (obj.contains("type") || obj.contains(kAbiTypedefKey)) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '"
+                                                + tname + "' states its type twice — a "
+                                                  "'shippedTypedef' reference and a 'type' or "
+                                                  "'abiTypedef'; the header it names is the one "
+                                                  "owner, remove the other");
+                    return TypedefTypeOutcome::Error;
+                }
+                auto const owner = locateTypedefReferenceOwner(obj.at(kShippedTypedefRefKey), ctx,
+                                                               tname, pathStr, doc, reporter);
+                if (!owner.has_value()) return TypedefTypeOutcome::Error;
+                if (owner->pathStr == pathStr
+                    || std::find(chain.begin(), chain.end(), owner->pathStr) != chain.end()) {
+                    std::string cycle;
+                    for (std::string const& c : chain) cycle += "'" + c + "' -> ";
+                    emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                                + "' closes a cycle of typedef references ("
+                                                + cycle + "'" + pathStr + "' -> '" + owner->pathStr
+                                                + "') — a reference must reach the header that "
+                                                  "defines the type");
+                    return TypedefTypeOutcome::Error;
+                }
+                // The owner's answer ON THIS PAIR, from its own ONE typedef decode —
+                // the same interner, target, format, model and pair facts, so its
+                // TypeId is the owner's identity itself.
+                std::deque<std::string>       ownerNames;
+                std::vector<NamedTypeBinding> ownerBindings(
+                    mergedNamedTypes.begin(),
+                    mergedNamedTypes.begin() + static_cast<std::ptrdiff_t>(callerBindings));
+                std::vector<ShippedTypedef> ownerOut;
+                chain.push_back(pathStr);
+                bool const ownerRead = decodeShippedTypedefs(
+                    *owner->doc, owner->pathStr, interner, typeReg, reporter, ownerOut,
+                    activeTarget, activeFormat, activeDataModelName, ownerNames, ownerBindings,
+                    pairFacts, &chain);
+                chain.pop_back();
+                if (!ownerRead) return TypedefTypeOutcome::Error;
+                for (ShippedTypedef const& o : ownerOut) {
+                    if (o.name != tname) continue;
+                    outTy = o.type;
+                    return TypedefTypeOutcome::Decoded;
+                }
+                return TypedefTypeOutcome::Unrealized;   // the owner does not declare it here
+            };
+            auto typedefType = [&](json const& obj, std::string const& ctx,
+                                   TypeId& outTy) -> TypedefTypeOutcome {
+                if (obj.contains(kShippedTypedefRefKey)) return referencedType(obj, ctx, outTy);
+                if (!obj.contains(kAbiTypedefKey)) {
+                    TypeId const ty = decodeTypedefType(obj, ctx);
+                    if (ty == InvalidType) return TypedefTypeOutcome::Error;
+                    outTy = ty;
+                    return TypedefTypeOutcome::Decoded;
+                }
+                if (obj.contains("type")) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '"
+                                                + tname + "' states its type twice — "
+                                                  "'type' and 'abiTypedef'; the target's ABI "
+                                                  "typedef is the one owner, remove 'type'");
+                    return TypedefTypeOutcome::Error;
+                }
+                json const& av = obj.at(kAbiTypedefKey);
+                if (!av.is_string() || av.get<std::string>().empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '"
+                                                + tname + "': 'abiTypedef' must be the "
+                                                  "non-empty name of a platform ABI typedef "
+                                                  "a target declares ('abiTypedefs')");
+                    return TypedefTypeOutcome::Error;
+                }
+                std::string const wanted = av.get<std::string>();
+                if (pairFacts != nullptr) {
+                    for (auto const& [name, core] : pairFacts->abiTypedefs) {
+                        if (name != wanted) continue;
+                        outTy = interner.primitive(core);
+                        return TypedefTypeOutcome::Decoded;
+                    }
+                }
+                return TypedefTypeOutcome::Unrealized;   // not a fact of this pair
+            };
+
+            // Exactly ONE of a flat `type` (single, back-compat) — or its
+            // `abiTypedef` sibling (P68 round 9), or a `shippedTypedef` reference
+            // (P68 round 12) — or per-target `variants` (plan 25 extension): the
+            // name is INVARIANT; only the type/width varies per target (e.g. a
+            // `wchar_t` that is 32-bit on elf but 16-bit on pe). Both, or neither,
+            // is malformed — fail loud.
+            bool const tHasFlat = t.contains("type") || t.contains(kAbiTypedefKey)
+                               || t.contains(kShippedTypedefRefKey);
+            bool const tHasVariants = t.contains("variants");
+            if (tHasFlat == tHasVariants) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": a typedef must declare EXACTLY one of a flat "
+                                              "'type', 'abiTypedef' or 'shippedTypedef' (single) "
+                                              "or 'variants' (per-target types)");
+                continue;
+            }
+
+            TypeId selType;
+            bool   selected = false;
+
+            if (tHasFlat) {
+                TypeId tty;
+                TypedefTypeOutcome const o = typedefType(t, at, tty);
+                if (o != TypedefTypeOutcome::Decoded) continue;   // error, or not this pair's
+                selType  = tty;
+                selected = true;
+            } else {
+                // PER-TARGET VARIANTS. Decode EVERY variant's `type` EAGERLY, then
+                // select the variant whose `when` matches the active target.
+                if (!t.at("variants").is_array() || t.at("variants").empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": 'variants' must be a non-empty array");
+                    continue;
+                }
+                std::string const activeFormatName =
+                    activeFormat.has_value()
+                        ? std::string{objectFormatKindName(*activeFormat)}
+                        : std::string{};
+                bool okVariants = true;
+                std::size_t matchCount = 0;
+                bool selectedUnrealized = false;   // P68 round 9: an abiTypedef arm the pair lacks
+                std::size_t vidx = 0;
+                for (auto const& vdef : t.at("variants")) {
+                    std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
+                    ++vidx;
+                    if (!vdef.is_object()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                    + ": must be an object");
+                        okVariants = false; break;
+                    }
+                    (void)rejectUnknownKeys(reporter, vdef, vat,
+                                            {"when", "type", kAbiTypedefKey,
+                                             kShippedTypedefRefKey});
+                    if (!vdef.contains("when") || !vdef.at("when").is_object()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                    + ": missing or non-object 'when' "
+                                                      "(e.g. {\"arch\":\"x86_64\",\"format\":\"elf\"})");
+                        okVariants = false; break;
+                    }
+                    TypeId vType;
+                    TypedefTypeOutcome const vo = typedefType(vdef, vat, vType);   // EAGER
+                    if (vo == TypedefTypeOutcome::Error) { okVariants = false; break; }
+                    WhenMatch const wm = matchVariantWhen(
+                        vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
+                        whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts),
+                        reporter);
+                    if (wm == WhenMatch::Error) { okVariants = false; break; }
+                    if (wm == WhenMatch::Match) {
+                        ++matchCount;
+                        if (matchCount == 1) {
+                            selType            = vType;
+                            selectedUnrealized = (vo == TypedefTypeOutcome::Unrealized);
+                        }
+                    }
+                }
+                if (!okVariants) continue;
+                if (matchCount > 1) {
+                    dss::report(reporter, DiagnosticCode::F_ShippedTypedefVariantAmbiguous,
+                                DiagnosticSeverity::Error,
+                                "shipped-lib descriptor " + at + ": typedef '" + tname
+                                    + "' has " + std::to_string(matchCount)
+                                    + " 'variants' matching the active target (arch='"
+                                    + (activeTarget.has_value() ? std::string{*activeTarget}
+                                                                : std::string{"<none>"})
+                                    + "', format='"
+                                    + (activeFormat.has_value() ? activeFormatName
+                                                                : std::string{"<none>"})
+                                    + "') — exactly one variant may match (refusing an "
+                                      "ambiguous per-target typedef type)");
+                    continue;
+                }
+                // 0 ⇒ not injected; a matched `abiTypedef` arm the pair declares no
+                // such typedef for ⇒ not injected either (P68 round 9).
+                selected = (matchCount == 1) && !selectedUnrealized;
+            }
+
+            if (!selected) continue;   // no variant matched → inject nothing
+            // Option C: PUBLISH this typedef as a NAME binding for the REST of this
+            // descriptor's parses (symbols / constants / structs + later typedefs).
+            // The name lives in the address-stable `typedefNameStore` so the view
+            // stays valid as `mergedNamedTypes` grows; the binding is appended
+            // BEFORE `tname` is moved into `out`.
+            typedefNameStore.push_back(tname);
+            mergedNamedTypes.push_back(
+                NamedTypeBinding{std::string_view{typedefNameStore.back()}, selType});
+            out.push_back(ShippedTypedef{std::move(tname), selType});
+        }
+    }
+    return true;
+}
+
+// ══ LATTICE-DERIVED CONSTANTS ════════════════════════════════════════════════
+// (P68 round 9, D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS)
+//
+// A `constants` row may state a TYPE and a LIMIT instead of a number:
+//
+//     { "name": "LONG_MAX",   "of": "long",    "limit": "max"   }
+//     { "name": "CHAR_MIN",   "of": "char",    "limit": "min"   }
+//     { "name": "LONG_WIDTH", "of": "long",    "limit": "width" }
+//     { "name": "INT64_MAX",  "of": "int64_t", "limit": "max"   }
+//
+// C 5.2.5.3.2 gives every `_MIN`/`_MAX` macro the promoted type AND the value of
+// its type, and both are per PAIR — `long` is 32 bits on pe and 64 on ELF and
+// Mach-O, plain `char` is unsigned on aarch64 Linux alone. So the VALUE and the
+// TYPE come from the pair's lattice, never from the row:
+//   * `of` names the type the way this descriptor's own text would see it — a
+//     typedef the descriptor declares (`int64_t`), else a name in the consuming
+//     language's vocabulary (`long`), resolved by the language's ONE resolver
+//     (`resolveLanguageTypeName`) and selected for the pair's data model;
+//   * OR `of` is ONE type REFERENCE, in the notation the `type-limit` predefined
+//     macros use for the same types (P68 round 9, D-FFI-STDINT-LIMIT-MACROS):
+//     `{ "shippedTypedef": "size_t", "header": "stddef.h" }` — a typedef ANOTHER
+//     shipped header declares, read for the pair by `readShippedHeaderTypedefs`,
+//     the one reader `__SIZE_MAX__` also asks — or `{ "abiTypedef": "wint_t" }`,
+//     the target's platform ABI typedef (`ShippedPairFacts::abiTypedefs`). C 7.22.3
+//     gives `<stdint.h>` the limits of `ptrdiff_t`, `size_t`, `wchar_t`, `wint_t`
+//     and `sig_atomic_t`, which `<stddef.h>`, `<signal.h>` and the platform ABI
+//     declare, and `<stdint.h>` includes none of them. Where that header is not
+//     shipped for the format (`<signal.h>` on pe) or the typedef is not selected
+//     on the pair, the row is NOT realized — so the macro is undefined exactly
+//     where its type is (C 7.22.3p2: "only the macros corresponding to those
+//     typedef names it actually provides"). A header no directory holds, or one
+//     that declares no such typedef on any pair, is REFUSED: a typo cannot pass
+//     for an absence;
+//   * `max`/`min` is that type's range on the pair (plain `char` by the pair's
+//     signedness), typed as the language's INTEGER PROMOTION of the type
+//     (`promoteIntegerKind`, the owner of the rule) — `USHRT_MAX` is an `int`,
+//     `ULONG_MAX` an `unsigned long`;
+//   * `width` is the type's C 6.2.6.2 width (value bits plus sign bit; `bool` is
+//     1), typed as the language's promotion floor (`int`) — the type gcc, clang
+//     and mingw all give every `*_WIDTH` macro (✔MEASURED, see limits.json).
+//
+// ★ REALIZED OR NOT, NEVER GUESSED. A row whose type depends on a fact the pair
+// does not supply — `long` with no data model, `char` with no signedness, any row
+// with no language — is NOT realized: it injects nothing and the name stays
+// undefined, the same outcome as a `variants` row no target selects. A fact the
+// missing input cannot change (`int`'s width) is realized without it: with no
+// data model the row is evaluated under EVERY model and must come out the same.
+// ★ REFUSED, LOUDLY, in the `model-limit` style: an unknown `limit`, a `value`/
+// `type`/`variants` beside `of` (the second copy of what the lattice states), a
+// `limit` with no `of`, an `of` that names nothing, a malformed `of` reference
+// (an unknown key, a `shippedTypedef` with no `header`, a `header` beside
+// anything else, two sources at once, a reference to this descriptor's OWN header
+// — its typedefs have the bare-name notation), and a row whose value cannot be
+// formed (a non-integer type, a range the 64-bit carrier cannot hold).
+
+// The closed `limit` vocabulary is `IntegerTypeLimit` / `kIntegerTypeLimitTable`
+// (core/types/preprocess_config.hpp) — ONE table, shared with the `type-limit`
+// predefined macros, which state the same fact about the same type (P68 round 9;
+// until then this file owned a private copy of the three spellings).
+
+// The constant-entry key spellings a derived row adds. One owner each.
+constexpr std::string_view kDerivedOfKey    = "of";
+constexpr std::string_view kDerivedLimitKey = "limit";
+// The keys of an `of` REFERENCE (P68 round 9, D-FFI-STDINT-LIMIT-MACROS) — the
+// shared type-reference notation (`kTypeRef…Key`, preprocess_config.hpp) the
+// predefined-macro `type` arm reads too, so one notation names a shipped or an ABI
+// typedef wherever config names one. `abiTypedef` is `kAbiTypedefKey` above.
+constexpr std::string_view kDerivedOfShippedTypedefKey = kTypeRefShippedTypedefKey;
+constexpr std::string_view kDerivedOfHeaderKey         = kTypeRefHeaderKey;
+
+// What a derived row's `of` names.
+struct DerivedOf {
+    enum class Kind : std::uint8_t {
+        Name,             // a type name as this descriptor's text sees it
+        ShippedTypedef,   // a typedef ANOTHER shipped header declares
+        AbiTypedef,       // the target's platform ABI typedef for the format
+    };
+    Kind        kind = Kind::Name;
+    std::string name;     // the type name, the typedef's, or the ABI typedef's
+    std::string header;   // ShippedTypedef: the header that declares it
+
+    // How a sentence names it — `'long'`, `typedef 'size_t' of <stddef.h>`.
+    [[nodiscard]] std::string describe() const {
+        switch (kind) {
+            case Kind::Name:           return "'" + name + "'";
+            case Kind::ShippedTypedef: return "typedef '" + name + "' of <" + header + ">";
+            case Kind::AbiTypedef:     return "ABI typedef '" + name + "'";
+        }
+        return "'" + name + "'";   // unreachable: every enumerator has an arm above
+    }
+};
+
+// The shapes an `of` may take, as a refusal lists them — rendered FROM the key
+// constants, so the sentence cannot name a spelling the parse does not read.
+[[nodiscard]] std::string derivedOfShapes() {
+    return "a type name (\"long\", or a typedef this descriptor declares), { \""
+         + std::string{kDerivedOfShippedTypedefKey} + "\": <name>, \""
+         + std::string{kDerivedOfHeaderKey} + "\": <the shipped header declaring it> }, or { \""
+         + std::string{kAbiTypedefKey} + "\": <a platform ABI typedef the target declares> }";
+}
+
+// Parse a row's `of`. The SHAPE is judged here, on every read, pair or no pair;
+// what it NAMES is judged when the row is realized. `ownHeader` is this
+// descriptor's `header` (empty if it states none).
+[[nodiscard]] std::optional<DerivedOf>
+parseDerivedOf(json const& node, std::string_view ownHeader, std::string const& at,
+               std::string const& cname, DiagnosticReporter& reporter) {
+    std::string const who = "shipped-lib descriptor " + at + ": constant '" + cname + "'";
+    std::string const of{kDerivedOfKey};
+    std::string const shippedKey{kDerivedOfShippedTypedefKey};
+    std::string const headerKey{kDerivedOfHeaderKey};
+    std::string const abiKey{kAbiTypedefKey};
+    if (node.is_string()) {
+        std::string name = node.get<std::string>();
+        if (name.empty()) {
+            emitMalformed(reporter, who + ": '" + of + "' must be a non-empty type name");
+            return std::nullopt;
+        }
+        return DerivedOf{DerivedOf::Kind::Name, std::move(name), {}};
+    }
+    if (!node.is_object()) {
+        emitMalformed(reporter, who + ": '" + of + "' must be one of " + derivedOfShapes());
+        return std::nullopt;
+    }
+    if (!rejectUnknownKeys(reporter, node, at + " '" + cname + "'." + of,
+                           {kDerivedOfShippedTypedefKey, kDerivedOfHeaderKey,
+                            kAbiTypedefKey})) {
+        return std::nullopt;
+    }
+    auto const text = [&](std::string_view key) -> std::optional<std::string> {
+        if (!node.contains(key)) return std::nullopt;
+        json const& v = node.at(key);
+        if (!v.is_string() || v.get<std::string>().empty()) return std::string{};
+        return v.get<std::string>();
+    };
+    std::optional<std::string> const shipped = text(kDerivedOfShippedTypedefKey);
+    std::optional<std::string> const header  = text(kDerivedOfHeaderKey);
+    std::optional<std::string> const abi     = text(kAbiTypedefKey);
+    if (shipped.has_value() == abi.has_value()) {
+        emitMalformed(reporter, who + ": an '" + of + "' reference names its type by EXACTLY "
+                                      "one of '" + shippedKey + "' or '" + abiKey + "' — "
+                                    + derivedOfShapes());
+        return std::nullopt;
+    }
+    for (auto const& [key, value] : {std::pair{kDerivedOfShippedTypedefKey, shipped},
+                                     std::pair{kDerivedOfHeaderKey, header},
+                                     std::pair{kAbiTypedefKey, abi}}) {
+        if (value.has_value() && value->empty()) {
+            emitMalformed(reporter, who + ": '" + of + "'." + std::string{key}
+                                        + " must be a non-empty string");
+            return std::nullopt;
+        }
+    }
+    if (abi.has_value()) {
+        if (header.has_value()) {
+            emitMalformed(reporter, who + ": '" + of + "'." + headerKey + " is the companion "
+                                          "of '" + shippedKey + "' alone — an ABI typedef is "
+                                          "the target's, and no header declares it");
+            return std::nullopt;
+        }
+        return DerivedOf{DerivedOf::Kind::AbiTypedef, *abi, {}};
+    }
+    if (!header.has_value()) {
+        emitMalformed(reporter, who + ": '" + of + "'." + shippedKey + " requires '" + headerKey
+                                    + "' — the shipped header that declares '" + *shipped + "'");
+        return std::nullopt;
+    }
+    if (!ownHeader.empty() && *header == ownHeader) {
+        emitMalformed(reporter, who + ": '" + of + "' names a typedef of this very descriptor (<"
+                                    + *header + ">) by header — name it bare, \"" + of + "\": \""
+                                    + *shipped + "\", the one notation for a descriptor's "
+                                      "own typedefs");
+        return std::nullopt;
+    }
+    return DerivedOf{DerivedOf::Kind::ShippedTypedef, *shipped, *header};
+}
+
+// The typedefs of the OTHER headers a descriptor's rows name, read once per
+// decode: a header three rows name is searched and read once.
+class ForeignHeaderTypedefs {
+public:
+    ForeignHeaderTypedefs(std::optional<std::string_view> activeTarget,
+                          std::optional<ObjectFormatKind> activeFormat,
+                          ShippedPairFacts const*         pair)
+        : activeTarget_(activeTarget), activeFormat_(activeFormat), pair_(pair) {}
+
+    // nullptr ⇒ no pair: nothing can be searched, so nothing is realized.
+    [[nodiscard]] ShippedHeaderTypedefs const* of(std::string const& header) {
+        if (pair_ == nullptr) return nullptr;
+        auto it = read_.find(header);
+        if (it == read_.end()) {
+            it = read_.emplace(header, readShippedHeaderTypedefs(header, activeTarget_,
+                                                                 activeFormat_, *pair_))
+                     .first;
+        }
+        return &it->second;
+    }
+
+private:
+    std::optional<std::string_view>                        activeTarget_;
+    std::optional<ObjectFormatKind>                        activeFormat_;
+    ShippedPairFacts const*                                pair_;
+    std::unordered_map<std::string, ShippedHeaderTypedefs> read_;
+};
+
+// The data models a pair-dependent fact is evaluated under: the pair's own, or —
+// with no pair — every model in the closed table, whose answers must then AGREE.
+[[nodiscard]] std::vector<DataModel> modelsFor(std::optional<DataModel> dm) {
+    if (dm.has_value()) return {*dm};
+    std::vector<DataModel> all;
+    for (auto const& [m, name] : kDataModelTable.rows) {
+        (void)name;
+        all.push_back(m);
+    }
+    return all;
+}
+
+// An integer type's identity as a derived row reads and types it.
+struct PairIntegerType {
+    TypeKind    core = TypeKind::Void;
+    std::string vocabularyName;
+    friend bool operator==(PairIntegerType const&, PairIntegerType const&) = default;
+};
+
+// A C integer type's range and width, as bit patterns in the constant's int64
+// carrier (an unsigned maximum above INT64_MAX is carried reinterpreted, exactly
+// as a flat row's `value`). nullopt `min`/`max` ⇒ the carrier cannot hold it.
+struct PairIntegerRange {
+    std::optional<std::int64_t> min;
+    std::optional<std::int64_t> max;
+    unsigned                    width = 0;
+};
+
+// The range of an integer core on the pair. nullopt ⇒ `core` is not an integer
+// type. `Char` takes the pair's signedness; with none it is unrealized, which
+// the caller distinguishes by asking `core == Char` first.
+[[nodiscard]] std::optional<PairIntegerRange>
+integerRangeOnPair(TypeKind core, bool charIsUnsigned) {
+    auto const signedRange = [](unsigned w) {
+        PairIntegerRange r;
+        r.width = w;
+        if (w <= 64) {
+            r.max = static_cast<std::int64_t>(
+                (w == 64) ? std::uint64_t{0x7FFFFFFFFFFFFFFFu}
+                          : ((std::uint64_t{1} << (w - 1)) - 1u));
+            r.min = (w == 64) ? std::numeric_limits<std::int64_t>::min()
+                              : -static_cast<std::int64_t>(std::uint64_t{1} << (w - 1));
+        }
+        return r;
+    };
+    auto const unsignedRange = [](unsigned w) {
+        PairIntegerRange r;
+        r.width = w;
+        if (w <= 64) {
+            r.min = 0;
+            r.max = static_cast<std::int64_t>(
+                (w == 64) ? ~std::uint64_t{0} : ((std::uint64_t{1} << w) - 1u));
+        }
+        return r;
+    };
+    switch (core) {
+        case TypeKind::Char:
+            return charIsUnsigned ? unsignedRange(8) : signedRange(8);
+        case TypeKind::Bool: {
+            // C23 6.2.6.2/5.2.5.3.2: `bool` has width 1 (footnote 15: "exact")
+            // and the values 0 and 1.
+            PairIntegerRange r;
+            r.width = 1;
+            r.min   = 0;
+            r.max   = 1;
+            return r;
+        }
+        default:
+            break;
+    }
+    if (auto const w = integerScalarWidthBits(core)) {
+        return isUnsignedIntegerKind(core) ? unsignedRange(*w) : signedRange(*w);
+    }
+    return std::nullopt;
+}
+
+}  // namespace — closed for the one EXPORTED step of the lattice, then reopened
+
+// Declared in `ffi/shipped_lib_descriptor.hpp` (P68 round 9). Steps (2)–(4) of a
+// derived row — the range, the value's type, the value — lifted out of
+// `realizeDerivedConstant` VERBATIM when the `type-limit` predefined macros needed
+// the same answer for the same type: one computation, two readers, so
+// `LONG_MAX` and `__LONG_MAX__` cannot disagree on a pair.
+DerivedIntegerLimitResult
+deriveIntegerLimitOnPair(TypeKind core, std::string_view vocabularyName,
+                         IntegerTypeLimit limit, ShippedPairFacts const* pair) {
+    DerivedIntegerLimitResult out;
+    auto const refuse = [&](DerivedIntegerLimitRefusal why) {
+        out.outcome = DerivedIntegerLimitOutcome::Refused;
+        out.refusal = why;
+        return out;
+    };
+    PairIntegerType const ofType{core, std::string{vocabularyName}};
+    std::optional<DataModel> const dm =
+        pair != nullptr ? pair->dataModel : std::optional<DataModel>{};
+    std::vector<DataModel> const models = modelsFor(dm);
+
+    // (2) ITS RANGE ON THE PAIR. A POINTER has none, but it has a WIDTH — its
+    // bits under the data model — and that one limit is answered (below).
+    bool const pointerWidth =
+        (ofType.core == TypeKind::Ptr && limit == IntegerTypeLimit::Width);
+    if (ofType.core == TypeKind::Char
+        && (pair == nullptr || !pair->charIsUnsigned.has_value())) {
+        return out;   // Unrealized: plain char's signedness is the pair's
+    }
+    bool const charUnsigned =
+        pair != nullptr && pair->charIsUnsigned.value_or(false);
+    std::optional<PairIntegerRange> range;
+    if (pointerWidth) {
+        std::optional<unsigned> bits;
+        for (DataModel const m : models) {
+            auto const bytes = scalarByteSize(TypeKind::Ptr, m);
+            if (!bytes.has_value()) return refuse(DerivedIntegerLimitRefusal::NotAnIntegerType);
+            unsigned const b = static_cast<unsigned>(*bytes * 8u);
+            if (bits.has_value() && *bits != b) return out;   // Unrealized: the model's to say
+            bits = b;
+        }
+        range = PairIntegerRange{};
+        range->width = *bits;
+    } else {
+        range = integerRangeOnPair(ofType.core, charUnsigned);
+    }
+    if (!range.has_value()) return refuse(DerivedIntegerLimitRefusal::NotAnIntegerType);
+
+    // (3) THE ROW'S TYPE — the promotion rule and the promotion floor are the
+    // LANGUAGE's, evaluated for the pair (every model with none, which must agree).
+    if (pair == nullptr || pair->language == nullptr) {
+        return out;   // Unrealized: no language
+    }
+    std::optional<ArithmeticConversions> const& acOpt =
+        pair->language->semantics().arithmeticConversions;
+    if (!acOpt.has_value() || !isIntegerScalarKind(acOpt->minRankType.core)) {
+        return refuse(DerivedIntegerLimitRefusal::NoIntegerPromotion);
+    }
+    ArithmeticConversions const& ac = *acOpt;
+    std::optional<PairIntegerType> rowType;
+    for (DataModel const m : models) {
+        PairIntegerType t;
+        if (limit == IntegerTypeLimit::Width) {
+            t.core           = ac.minRankType.resolveCore(m);
+            t.vocabularyName = ac.minRankType.vocabularyName;
+        } else {
+            // ONE resolver for every tier: the rules come from the whole semantics config (the
+            // counterpart map and the `_BitInt` flag ride with it), never from its arithmetic
+            // block alone.
+            std::optional<::dss::ResolvedArithmeticRules> const rules =
+                ::dss::resolveArithmeticRules(pair->language->semantics(), m);
+            if (!rules.has_value()) return refuse(DerivedIntegerLimitRefusal::NoIntegerPromotion);
+            TypeKind const p =
+                ::dss::detail::type_rules::promoteIntegerKind(ofType.core, *rules);
+            // `integerPromotedType`'s rule: a type the promotion leaves alone keeps
+            // its identity; one it changes becomes the anonymous promoted kind.
+            t = (p == ofType.core) ? ofType : PairIntegerType{p, {}};
+        }
+        if (rowType.has_value() && !(*rowType == t)) return out;   // Unrealized
+        rowType = t;
+    }
+    out.core           = rowType->core;
+    out.vocabularyName = rowType->vocabularyName;
+    if (!isIntegerScalarKind(rowType->core)) {
+        return refuse(DerivedIntegerLimitRefusal::PromotedNotInteger);
+    }
+    out.isUnsigned = isUnsignedIntegerKind(rowType->core);
+    out.width      = integerScalarWidthBits(rowType->core).value_or(0u);
+
+    // (4) THE VALUE, in the row's type.
+    std::optional<std::int64_t> bits;
+    switch (limit) {
+        case IntegerTypeLimit::Max:   bits = range->max; break;
+        case IntegerTypeLimit::Min:   bits = range->min; break;
+        case IntegerTypeLimit::Width: bits = static_cast<std::int64_t>(range->width); break;
+    }
+    if (!bits.has_value()) return refuse(DerivedIntegerLimitRefusal::CarrierOverflow);
+    // It must be representable in the row's type — the check a flat row's
+    // `value` gets against its `type` (`decodeConstantValue`), asked of the
+    // derived number, so a promotion that could not hold its own maximum (a
+    // language whose floor is narrower than the type) refuses instead of wrapping.
+    {
+        json const asJson = isUnsignedIntegerKind(rowType->core)
+                                ? json(static_cast<std::uint64_t>(*bits))
+                                : json(*bits);
+        if (!decodeConstantValue(asJson, rowType->core).has_value()) {
+            return refuse(DerivedIntegerLimitRefusal::NotRepresentable);
+        }
+    }
+    out.outcome = DerivedIntegerLimitOutcome::Realized;
+    out.value   = *bits;
+    return out;
+}
+
+namespace {
+
+enum class DerivedOutcome { Realized, Unrealized, Refused };
+
+// Realize ONE derived row on the pair — its value and its type — or say why not.
+// `declaredTypedefs` is every typedef NAME the descriptor declares (on any
+// target); `namedTypes` the typedefs SELECTED for this pair plus the caller's
+// bindings; `foreign` the typedefs of the other headers the rows name. Refusals
+// are reported here; `Unrealized` is silent by design (the row simply does not
+// exist on this pair — see the banner).
+[[nodiscard]] DerivedOutcome
+realizeDerivedConstant(std::string const& at, std::string const& cname,
+                       DerivedOf const& of, IntegerTypeLimit limit,
+                       std::span<NamedTypeBinding const> namedTypes,
+                       std::unordered_set<std::string> const& declaredTypedefs,
+                       ForeignHeaderTypedefs& foreign,
+                       ShippedPairFacts const* pair, TypeInterner& interner,
+                       DiagnosticReporter& reporter,
+                       std::int64_t& outValue, TypeId& outType) {
+    std::string const row = "shipped-lib descriptor " + at + ": constant '" + cname
+        + "' (derived: of " + of.describe() + ", limit '"
+        + std::string{kIntegerTypeLimitTable.name(limit)} + "')";
+    std::optional<DataModel> const dm =
+        pair != nullptr ? pair->dataModel : std::optional<DataModel>{};
+    std::vector<DataModel> const models = modelsFor(dm);
+
+    // (1) WHICH TYPE `of` NAMES, and its identity on the pair: core + vocabulary tag.
+    PairIntegerType ofType;
+    switch (of.kind) {
+        case DerivedOf::Kind::Name: {
+            // This descriptor's own typedef first (C scoping: a header's typedef is
+            // in scope for its own macros), else the language's vocabulary.
+            bool haveOf = false;
+            for (auto const& b : namedTypes) {
+                if (b.name != of.name) continue;
+                ofType.core           = interner.kind(b.type);
+                ofType.vocabularyName = std::string{interner.vocabularyName(b.type)};
+                haveOf = true;
+                break;
+            }
+            if (!haveOf && declaredTypedefs.contains(of.name)) {
+                // The descriptor declares it, but no variant is selected for this
+                // pair (or its type needs a binding this reader lacks): not on this
+                // pair.
+                return DerivedOutcome::Unrealized;
+            }
+            if (!haveOf) {
+                if (pair == nullptr || pair->language == nullptr) {
+                    return DerivedOutcome::Unrealized;   // no vocabulary to resolve it in
+                }
+                auto const ref = resolveLanguageTypeName(*pair->language, of.name);
+                if (!ref.has_value()) {
+                    emitMalformed(reporter, row + " names a type that is neither a typedef "
+                                                  "this descriptor declares nor one the "
+                                                  "consuming language resolves: "
+                                                + ref.error());
+                    return DerivedOutcome::Refused;
+                }
+                std::optional<TypeKind> chosen;
+                for (DataModel const m : models) {
+                    TypeKind const k = ref->resolveCore(m);
+                    if (chosen.has_value() && *chosen != k) {
+                        return DerivedOutcome::Unrealized;   // the width is the pair's to say
+                    }
+                    chosen = k;
+                }
+                ofType.core           = *chosen;
+                ofType.vocabularyName = ref->vocabularyName;
+            }
+            break;
+        }
+        case DerivedOf::Kind::AbiTypedef: {
+            // The target's platform ABI typedef for this format — the table
+            // `__SIZEOF_WINT_T__` and `__WINT_MAX__` read. None on the pair ⇒ not
+            // on this pair, exactly as a `typedefs` entry naming one is not injected.
+            if (pair == nullptr) return DerivedOutcome::Unrealized;
+            bool found = false;
+            for (auto const& [name, core] : pair->abiTypedefs) {
+                if (name != of.name) continue;
+                ofType.core = core;   // the ABI table states a core; no vocabulary tag
+                found       = true;
+                break;
+            }
+            if (!found) return DerivedOutcome::Unrealized;
+            break;
+        }
+        case DerivedOf::Kind::ShippedTypedef: {
+            ShippedHeaderTypedefs const* const h = foreign.of(of.header);
+            if (h == nullptr) return DerivedOutcome::Unrealized;   // no pair to search for
+            switch (h->status) {
+                case ShippedHeaderTypedefsStatus::NoLanguage:
+                case ShippedHeaderTypedefsStatus::NotThisFormat:
+                    return DerivedOutcome::Unrealized;   // not a header of this pair
+                case ShippedHeaderTypedefsStatus::NotShipped:
+                    emitMalformed(reporter, row + ": no shipped descriptor for <" + of.header
+                                                + "> is found in the consuming language's "
+                                                  "system directories — name a header DSS "
+                                                  "ships");
+                    return DerivedOutcome::Refused;
+                case ShippedHeaderTypedefsStatus::Unreadable:
+                    emitMalformed(reporter, row + ": the descriptor of <" + of.header
+                                                + "> cannot be read: " + h->error);
+                    return DerivedOutcome::Refused;
+                case ShippedHeaderTypedefsStatus::Read:
+                    break;
+            }
+            if (ShippedPpTypedef const* const t = h->selected(of.name)) {
+                ofType.core           = t->core;
+                ofType.vocabularyName = t->vocabularyName;
+                break;
+            }
+            if (h->declares(of.name)) {
+                return DerivedOutcome::Unrealized;   // declared; no variant on this pair
+            }
+            emitMalformed(reporter, row + ": <" + of.header + "> declares no typedef '"
+                                        + of.name + "' on any pair");
+            return DerivedOutcome::Refused;
+        }
+    }
+
+    // (2)–(4) THE RANGE, THE ROW'S TYPE, THE VALUE — the one lattice computation
+    // (`deriveIntegerLimitOnPair`), shared with the `type-limit` predefined
+    // macros. Its refusals are reported HERE, in this row's words.
+    // ⓘ A `pointerTo`-shaped `of` cannot reach it: `of` resolves to a typedef or
+    // a vocabulary name, so a pointer's width is the predefine path's alone.
+    DerivedIntegerLimitResult const lim =
+        deriveIntegerLimitOnPair(ofType.core, ofType.vocabularyName, limit, pair);
+    switch (lim.outcome) {
+        case DerivedIntegerLimitOutcome::Unrealized:
+            return DerivedOutcome::Unrealized;
+        case DerivedIntegerLimitOutcome::Realized:
+            outValue = lim.value;
+            outType  = interner.primitive(lim.core, lim.vocabularyName);
+            return DerivedOutcome::Realized;
+        case DerivedIntegerLimitOutcome::Refused:
+            break;
+    }
+    std::string why;
+    switch (lim.refusal) {
+        case DerivedIntegerLimitRefusal::None:
+        case DerivedIntegerLimitRefusal::NotAnIntegerType:
+            why = of.describe() + " is not an integer type ("
+                + std::string{typeKindNameOrEmpty(ofType.core)} + ")";
+            break;
+        case DerivedIntegerLimitRefusal::NoIntegerPromotion:
+            why = "the consuming language declares no integer promotion ('semantics."
+                  "arithmeticConversions.integerPromotion'), which is what types a "
+                  "derived limit";
+            break;
+        case DerivedIntegerLimitRefusal::PromotedNotInteger:
+            why = "its type would be " + std::string{typeKindNameOrEmpty(lim.core)}
+                + ", not an integer scalar";
+            break;
+        case DerivedIntegerLimitRefusal::CarrierOverflow:
+            why = "the value does not fit the descriptor's 64-bit constant carrier";
+            break;
+        case DerivedIntegerLimitRefusal::NotRepresentable:
+            why = "its value does not fit its promoted type "
+                + std::string{typeKindNameOrEmpty(lim.core)};
+            break;
+    }
+    emitMalformed(reporter, row + " cannot be formed: " + why);
+    return DerivedOutcome::Refused;
+}
+
+// Every typedef NAME a descriptor declares, on any target — what lets a derived
+// row tell "names a typedef not selected on this pair" (unrealized) from "names
+// nothing" (refused). Shape errors are the typedef decode's to report.
+[[nodiscard]] std::unordered_set<std::string> declaredTypedefNames(json const& doc) {
+    std::unordered_set<std::string> out;
+    if (!doc.contains("typedefs") || !doc.at("typedefs").is_array()) return out;
+    for (auto const& t : doc.at("typedefs")) {
+        if (t.is_object() && t.contains("name") && t.at("name").is_string()) {
+            out.insert(t.at("name").get<std::string>());
+        }
+    }
+    return out;
+}
+
 // ── THE ONE `constants` DECODE, read by BOTH seams ──────────────────────────
 // Lifted verbatim out of `readShippedLibDescriptor` (it was inline there) when
 // D-FFI-DESCRIPTOR-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR gave the surface a
@@ -1996,7 +2944,8 @@ decodeShippedConstants(json const& doc, std::string const& pathStr,
                        std::optional<std::string_view> activeTarget,
                        std::optional<ObjectFormatKind> activeFormat,
                        std::string_view activeDataModelName,
-                       std::span<NamedTypeBinding const> namedTypes) {
+                       std::span<NamedTypeBinding const> namedTypes,
+                       ShippedPairFacts const* pairFacts) {
 // (5) Optional `constants` array — the neutral form of a header's object-
 // like `#define` macros that ARE compile-time constants (e.g. `CHAR_BIT`).
 // Each: required non-empty `name`; required hir-text `type` that MUST decode
@@ -2004,6 +2953,8 @@ decodeShippedConstants(json const& doc, std::string const& pathStr,
 // type's width + signedness. Collect-all (continue on error; the read still
 // fails via the errorCount delta). A non-integer-scalar type or an out-of-
 // range value FAILS LOUD — never a silent wrong constant.
+// P68 round 9: OR `of` + `limit` — a LATTICE-DERIVED row, realized for the pair
+// by `realizeDerivedConstant` (see the banner above it).
 if (doc.contains("constants")) {
     if (!doc.at("constants").is_array()) {
         emitMalformed(reporter,
@@ -2013,6 +2964,15 @@ if (doc.contains("constants")) {
     }
     json const& constants = doc.at("constants");
     out.reserve(constants.size());
+    std::unordered_set<std::string> const declaredTypedefs = declaredTypedefNames(doc);
+    // The header this descriptor IS — an `of` reference may not name it (its own
+    // typedefs have the bare-name notation) — and the other headers' typedefs,
+    // read on first use (P68 round 9, D-FFI-STDINT-LIMIT-MACROS).
+    std::string const ownHeader =
+        (doc.contains("header") && doc.at("header").is_string())
+            ? doc.at("header").get<std::string>()
+            : std::string{};
+    ForeignHeaderTypedefs foreign{activeTarget, activeFormat, pairFacts};
     std::size_t cidx = 0;
     for (auto const& c : constants) {
         std::string const at = std::string{"'"} + pathStr
@@ -2025,7 +2985,8 @@ if (doc.contains("constants")) {
         (void)rejectUnknownKeys(reporter, c,
                                 "constants[" + std::to_string(cidx - 1) + "]",
                                 {"name", "value", "type", "variants",
-                                 "preprocessorVisible"});
+                                 "preprocessorVisible", kDerivedOfKey,
+                                 kDerivedLimitKey});
         if (!c.contains("name") || !c.at("name").is_string()
             || c.at("name").get<std::string>().empty()) {
             emitMalformed(reporter, "shipped-lib descriptor " + at
@@ -2050,6 +3011,68 @@ if (doc.contains("constants")) {
                 continue;
             }
             cPpVisible = c.at("preprocessorVisible").get<bool>();
+        }
+
+        // P68 round 9: a LATTICE-DERIVED row — `of` + `limit`, and nothing that
+        // states what the lattice states. Its shape is refused on EVERY read
+        // (with or without a pair), so a typo cannot lurk until some target
+        // realizes it; its value and type are the pair's (`realizeDerivedConstant`).
+        bool const cHasOf    = c.contains(kDerivedOfKey);
+        bool const cHasLimit = c.contains(kDerivedLimitKey);
+        if (cHasOf || cHasLimit) {
+            std::string const accepted =
+                detail::renderAllowedList(allNames(kIntegerTypeLimitTable), " / ");
+            if (!cHasOf) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": constant '"
+                                            + cname + "' has a 'limit' but no 'of' — a "
+                                              "derived row names the type whose limit it "
+                                              "is");
+                continue;
+            }
+            std::optional<DerivedOf> const of =
+                parseDerivedOf(c.at(kDerivedOfKey), ownHeader, at, cname, reporter);
+            if (!of.has_value()) continue;   // refused: reported
+            if (!cHasLimit) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": constant '"
+                                            + cname + "' has an 'of' but no 'limit' — "
+                                                      "name which limit it states (one of "
+                                            + accepted + ")");
+                continue;
+            }
+            std::optional<IntegerTypeLimit> const limit =
+                c.at(kDerivedLimitKey).is_string()
+                    ? kIntegerTypeLimitTable.fromName(c.at(kDerivedLimitKey).get<std::string>())
+                    : std::nullopt;
+            if (!limit.has_value()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": constant '"
+                                            + cname + "' has an unknown 'limit' "
+                                            + c.at(kDerivedLimitKey).dump()
+                                            + " — accepted: " + accepted);
+                continue;
+            }
+            bool stated = false;
+            for (std::string_view const k : {std::string_view{"value"},
+                                             std::string_view{"type"},
+                                             std::string_view{"variants"}}) {
+                if (!c.contains(k)) continue;
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": constant '"
+                                            + cname + "' derives its value and type from "
+                                              "'of' on the pair's lattice, so a '"
+                                            + std::string{k}
+                                            + "' beside it would be the second copy "
+                                              "that drifts from it. Remove '"
+                                            + std::string{k} + "'");
+                stated = true;
+            }
+            if (stated) continue;
+            std::int64_t dValue = 0;
+            TypeId       dType;
+            DerivedOutcome const outcome = realizeDerivedConstant(
+                at, cname, *of, *limit, namedTypes, declaredTypedefs, foreign, pairFacts,
+                interner, reporter, dValue, dType);
+            if (outcome != DerivedOutcome::Realized) continue;   // refused: reported
+            out.push_back(ShippedConstant{std::move(cname), dValue, dType, cPpVisible});
+            continue;
         }
 
         // Exactly ONE of a flat `{value,type}` (single value, back-compat) or
@@ -2148,8 +3171,8 @@ if (doc.contains("constants")) {
                 }
                 WhenMatch const wm = matchVariantWhen(
                     vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
-                    activeTarget, activeFormat, activeFormatName,
-                    activeDataModelName, reporter);
+                    whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts),
+                    reporter);
                 if (wm == WhenMatch::Error) { okVariants = false; break; }
                 if (wm == WhenMatch::Match) {
                     ++matchCount;
@@ -2289,7 +3312,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                          std::optional<std::string_view> activeTarget,
                          std::optional<ObjectFormatKind> activeFormat,
                          std::span<NamedTypeBinding const> namedTypes,
-                         RuntimeLibraryRoleResolver const* roleResolver) {
+                         RuntimeLibraryRoleResolver const* roleResolver,
+                         ShippedPairFacts const*         pairFacts) {
     std::size_t const errBefore = reporter.errorCount();
 
     // (0)+(1) Read + parse the file — via the thread-local parse cache (the same
@@ -2445,153 +3469,11 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // `name` view STABLE backing, so growing `mergedNamedTypes` never dangles.
     std::deque<std::string>       typedefNameStore;
     std::vector<NamedTypeBinding> mergedNamedTypes(namedTypes.begin(), namedTypes.end());
-    if (doc.contains("typedefs")) {
-        if (!doc.at("typedefs").is_array()) {
-            emitMalformed(reporter,
-                std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
-                    + "': 'typedefs' must be an array");
-            return std::nullopt;
-        }
-        json const& typedefs = doc.at("typedefs");
-        out.typedefs.reserve(typedefs.size());
-        std::size_t tidx = 0;
-        for (auto const& t : typedefs) {
-            std::string const at = std::string{"'"} + core::genericSpelling(path)
-                + "' typedefs[" + std::to_string(tidx) + "]";
-            ++tidx;
-            if (!t.is_object()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
-                continue;
-            }
-            (void)rejectUnknownKeys(reporter, t,
-                                    "typedefs[" + std::to_string(tidx - 1) + "]",
-                                    {"name", "type", "variants"});
-            if (!t.contains("name") || !t.at("name").is_string()
-                || t.at("name").get<std::string>().empty()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at
-                                            + ": missing or empty 'name'");
-                continue;
-            }
-            std::string tname = t.at("name").get<std::string>();
-
-            // Decode the `type` field of a typedef entry/variant (any decodable
-            // type — scalar, pointer, struct ref, fn ptr, OR an EARLIER descriptor
-            // typedef spelled by name via `mergedNamedTypes`) through the ONE codec;
-            // fail loud on a missing/undecodable type. Returns the TypeId, or
-            // InvalidType (the caller skips on invalid). `ctx` is the diag context.
-            auto decodeTypedefType = [&](json const& obj, std::string const& ctx) -> TypeId {
-                if (!obj.contains("type") || !obj.at("type").is_string()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + ctx
-                                                + ": missing or non-string 'type'");
-                    return InvalidType;
-                }
-                std::string const typeText = obj.at("type").get<std::string>();
-                TypeId const ty = parseTypeFromText(typeText, interner, typeReg, reporter,
-                                                    mergedNamedTypes);
-                if (!ty.valid() || ty == InvalidType) {
-                    dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
-                                DiagnosticSeverity::Error,
-                                "shipped-lib descriptor " + ctx + ": typedef '" + tname
-                                    + "' has a 'type' that failed to decode ('" + typeText
-                                    + "')");
-                    return InvalidType;
-                }
-                return ty;
-            };
-
-            // Exactly ONE of a flat `type` (single, back-compat) or per-target
-            // `variants` (plan 25 extension): the name is INVARIANT; only the
-            // type/width varies per target (e.g. a `wchar_t` that is 32-bit on elf
-            // but 16-bit on pe). Both, or neither, is malformed — fail loud.
-            bool const tHasFlat     = t.contains("type");
-            bool const tHasVariants = t.contains("variants");
-            if (tHasFlat == tHasVariants) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at
-                                            + ": a typedef must declare EXACTLY one of a flat "
-                                              "'type' (single) or 'variants' (per-target types)");
-                continue;
-            }
-
-            TypeId selType;
-            bool   selected = false;
-
-            if (tHasFlat) {
-                TypeId const tty = decodeTypedefType(t, at);
-                if (tty == InvalidType) continue;
-                selType  = tty;
-                selected = true;
-            } else {
-                // PER-TARGET VARIANTS. Decode EVERY variant's `type` EAGERLY, then
-                // select the variant whose `when` matches the active target.
-                if (!t.at("variants").is_array() || t.at("variants").empty()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                + ": 'variants' must be a non-empty array");
-                    continue;
-                }
-                std::string const activeFormatName =
-                    activeFormat.has_value()
-                        ? std::string{objectFormatKindName(*activeFormat)}
-                        : std::string{};
-                bool okVariants = true;
-                std::size_t matchCount = 0;
-                std::size_t vidx = 0;
-                for (auto const& vdef : t.at("variants")) {
-                    std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
-                    ++vidx;
-                    if (!vdef.is_object()) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + vat
-                                                    + ": must be an object");
-                        okVariants = false; break;
-                    }
-                    (void)rejectUnknownKeys(reporter, vdef, vat, {"when", "type"});
-                    if (!vdef.contains("when") || !vdef.at("when").is_object()) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + vat
-                                                    + ": missing or non-object 'when' "
-                                                      "(e.g. {\"arch\":\"x86_64\",\"format\":\"elf\"})");
-                        okVariants = false; break;
-                    }
-                    TypeId const vType = decodeTypedefType(vdef, vat);   // EAGER
-                    if (vType == InvalidType) { okVariants = false; break; }
-                    WhenMatch const wm = matchVariantWhen(
-                        vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
-                        activeTarget, activeFormat, activeFormatName,
-                        activeDataModelName, reporter);
-                    if (wm == WhenMatch::Error) { okVariants = false; break; }
-                    if (wm == WhenMatch::Match) {
-                        ++matchCount;
-                        if (matchCount == 1) selType = vType;
-                    }
-                }
-                if (!okVariants) continue;
-                if (matchCount > 1) {
-                    dss::report(reporter, DiagnosticCode::F_ShippedTypedefVariantAmbiguous,
-                                DiagnosticSeverity::Error,
-                                "shipped-lib descriptor " + at + ": typedef '" + tname
-                                    + "' has " + std::to_string(matchCount)
-                                    + " 'variants' matching the active target (arch='"
-                                    + (activeTarget.has_value() ? std::string{*activeTarget}
-                                                                : std::string{"<none>"})
-                                    + "', format='"
-                                    + (activeFormat.has_value() ? activeFormatName
-                                                                : std::string{"<none>"})
-                                    + "') — exactly one variant may match (refusing an "
-                                      "ambiguous per-target typedef type)");
-                    continue;
-                }
-                selected = (matchCount == 1);   // 0 ⇒ not injected
-            }
-
-            if (!selected) continue;   // no variant matched → inject nothing
-            // Option C: PUBLISH this typedef as a NAME binding for the REST of this
-            // descriptor's parses (symbols / constants / structs + later typedefs).
-            // The name lives in the address-stable `typedefNameStore` so the view
-            // stays valid as `mergedNamedTypes` grows; the binding is appended
-            // BEFORE `tname` is moved into `out.typedefs`.
-            typedefNameStore.push_back(tname);
-            mergedNamedTypes.push_back(
-                NamedTypeBinding{std::string_view{typedefNameStore.back()}, selType});
-            out.typedefs.push_back(ShippedTypedef{std::move(tname), selType});
-        }
+    if (!decodeShippedTypedefs(doc, core::genericSpelling(path), interner, typeReg,
+                               reporter, out.typedefs, activeTarget, activeFormat,
+                               activeDataModelName, typedefNameStore,
+                               mergedNamedTypes, pairFacts)) {
+        return std::nullopt;
     }
 
     // (3.union) UNIONS — the named-member sibling of `structs`, resolved right
@@ -2709,7 +3591,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // and the measurement that refuted the stricter rule it replaced).
     // EAGER: EVERY variant's field list is decoded regardless
     // of which is active, so a malformed INACTIVE variant fails the read on EVERY
-    // target (anti-lurking, mirrors `signatureByDataModel`).
+    // target (anti-lurking, mirrors the `signature` variants).
     //
     // (3.struct.pre) THE BY-NAME DEPENDENCY GATE. The loop below PUBLISHES each
     // injected struct's tag name into `mergedNamedTypes` (the typedef/union
@@ -2957,8 +3839,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         // SHARED selector — typed surfaces allow {arch,format}.)
                         WhenMatch const wm = matchVariantWhen(
                             vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
-                            activeTarget, activeFormat, activeFormatName,
-                            activeDataModelName, reporter);
+                            whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts),
+                            reporter);
                         if (wm == WhenMatch::Error) { okVariants = false; break; }
                         if (wm == WhenMatch::Match) {
                             ++matchCount;
@@ -3095,6 +3977,10 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // overall read still fails (errorCount delta below) so a malformed
     // descriptor never yields a usable result.
     out.symbols.reserve(symbols.size());
+    // The pair every per-pair symbol field (`signature`, `version`, `linkName`)
+    // is selected for — built once; the long-double format rides in from the
+    // caller's pair facts.
+    WhenFacts const symFacts = whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts);
     std::size_t idx = 0;
     for (auto const& sym : symbols) {
         std::string const at =
@@ -3117,13 +4003,16 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             continue;
         }
 
-        // signature (required string → decoded type).
-        if (!sym.contains("signature") || !sym.at("signature").is_string()) {
+        // signature (required): a type-text STRING, or a per-pair OBJECT whose
+        // `variants` select the text for this pair — decoded below, through the
+        // ONE per-pair decoder `version` and `linkName` use (S2a-1).
+        if (!sym.contains("signature")
+            || !(sym.at("signature").is_string() || sym.at("signature").is_object())) {
             emitMalformed(reporter, "shipped-lib descriptor " + at
-                                        + ": missing or non-string 'signature'");
+                                        + ": missing 'signature', or one that is neither a type-text "
+                                          "string nor a per-pair object with 'variants'");
             continue;
         }
-        std::string const sigText = sym.at("signature").get<std::string>();
 
         // kind (optional, closed enum, default Function).
         ShippedSymbolKind kind = ShippedSymbolKind::Function;
@@ -3240,11 +4129,10 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // on that target (LEGAL — the aarch64 realpath case). EAGER: every
         // variant's shape is validated regardless of which is active (a
         // malformed INACTIVE variant fails the read on EVERY target —
-        // anti-lurking, mirrors `signatureByDataModel` / the struct variants).
+        // anti-lurking, mirrors the `signature` variants / the struct variants).
         std::string version;
-        if (!decodePerTargetSymbolString(sym, "version", at, idx - 1,
-                                         activeTarget, activeFormat,
-                                         activeDataModelName, reporter, version))
+        if (!decodePerTargetSymbolString(sym, "version", at, idx - 1, symFacts,
+                                         ZeroMatch::KeepEmpty, reporter, version))
             continue;
 
         // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the optional
@@ -3263,9 +4151,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // `applyCMangling` — the SAME single call the un-overridden path takes.
         // Config never spells a per-FORMAT fact per-symbol.
         std::string linkName;
-        if (!decodePerTargetSymbolString(sym, "linkName", at, idx - 1,
-                                         activeTarget, activeFormat,
-                                         activeDataModelName, reporter, linkName))
+        if (!decodePerTargetSymbolString(sym, "linkName", at, idx - 1, symFacts,
+                                         ZeroMatch::KeepEmpty, reporter, linkName))
             continue;
 
         // Optional per-SYMBOL `availableObjectFormats` — which object-formats this
@@ -3310,81 +4197,68 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                                      reporter, symRealization))
             continue;
 
-        // FC3 c1: optional per-data-model signature override
-        // (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH closure for the
-        // LP64-merged libc symbols — fseek/ftell/atol/strtol/strtoul/
-        // labs carry the C `long`, whose width is the FORMAT's data
-        // model, not one signature). Shape mirrors the Model-3
-        // per-format `library` map: the BASE `signature` is the
-        // LP64-correct text; `signatureByDataModel` keys data-model
-        // names ("LLP64"/"ILP32") to replacement type texts. The
-        // ACTIVE model's entry (when present) becomes the effective
-        // signature; EVERY declared override must parse (a malformed
-        // override under a model not currently selected would
-        // otherwise lurk until that model is first compiled). Unknown
-        // model keys fail loud (closed vocabulary).
-        std::string effectiveSigText = sigText;
-        bool overridesOk = true;
-        if (sym.contains("signatureByDataModel")) {
-            if (!sym.at("signatureByDataModel").is_object()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at
-                                            + ": 'signatureByDataModel' must be an "
-                                              "object mapping data-model names to "
-                                              "signature strings");
-                continue;
-            }
-            for (auto const& kv : sym.at("signatureByDataModel").items()) {
-                auto const dm = dataModelFromName(kv.key());
-                if (!dm) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                        + ": 'signatureByDataModel' has unknown data-model key '"
-                        + kv.key() + "' (expected one of "
-                        + allowedList(allNames(kDataModelTable)) + ")");
-                    overridesOk = false;
-                    continue;
-                }
-                if (!kv.value().is_string()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                        + ": 'signatureByDataModel." + kv.key()
-                        + "' must be a signature string");
-                    overridesOk = false;
-                    continue;
-                }
-                std::string const ovText = kv.value().get<std::string>();
-                TypeId const ovSig =
-                    parseTypeFromText(ovText, interner, typeReg, reporter, mergedNamedTypes);
-                if (!ovSig.valid() || ovSig == InvalidType) {
-                    dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
-                                DiagnosticSeverity::Error,
-                                "shipped-lib descriptor " + at + ": symbol '" + name
-                                    + "' has a 'signatureByDataModel." + kv.key()
-                                    + "' that failed to decode as a type ('" + ovText
-                                    + "') — refusing a descriptor whose override "
-                                      "would fail when that data model is selected");
-                    overridesOk = false;
-                    continue;
-                }
-                if (*dm == dataModel) effectiveSigText = ovText;
+        // ★ THE SIGNATURE FOR THIS PAIR (P68 round 12, S2a-1 of
+        // D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES). A prototype that differs by
+        // pair — C's `long` is 64-bit on LP64 and 32-bit on LLP64; `long double`
+        // is x87-80, ieee128 or f64 by the format document — carries `variants`
+        // selected by the ONE `when` selector (core/types/variant_when.hpp), with
+        // NO silent fallback: a pair no arm selects is refused by name unless a
+        // `default` arm says outright that it serves every other pair. It
+        // REPLACES the old `signatureByDataModel` map, which keyed on the data
+        // model alone and could not say "long double" at all.
+        std::string sigText;
+        std::vector<std::string> sigArms;
+        // Available here (its DECLARED set, else the document's; no active format
+        // decides nothing, so it counts as available): no arm is a refusal.
+        // Unavailable here: no arm means the symbol is absent here (see ZeroMatch).
+        bool const availableHere =
+            !activeFormat.has_value()
+            || objectFormatInAvailabilitySet(symAvail.empty() ? out.availableObjectFormats : symAvail,
+                                             *activeFormat);
+        if (!decodePerTargetSymbolString(sym, "signature", at, idx - 1, symFacts,
+                                         availableHere ? ZeroMatch::RefuseUnlessDefault
+                                                       : ZeroMatch::OmitUnlessDefault,
+                                         reporter, sigText, &sigArms))
+            continue;
+        // EAGER: every arm must decode as a TYPE, the active one or not — an arm
+        // no current pair selects would otherwise lurk until that pair is first
+        // compiled.
+        bool armsOk = true;
+        for (std::string const& arm : sigArms) {
+            if (arm == sigText) continue;               // decoded below, with its claim
+            TypeId const armSig = parseTypeFromText(arm, interner, typeReg, reporter, mergedNamedTypes);
+            if (!armSig.valid() || armSig == InvalidType) {
+                dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                            DiagnosticSeverity::Error,
+                            "shipped-lib descriptor " + at + ": symbol '" + name
+                                + "' has a 'signature' variant that failed to decode as a type ('"
+                                + arm + "') — refusing a descriptor whose arm would fail when that "
+                                  "pair is selected");
+                armsOk = false;
             }
         }
-        if (!overridesOk) continue;
+        if (!armsOk) continue;
+        // No arm and no default on a pair the symbol is NOT available on: it is not
+        // injected here (every arm was still decoded above).
+        if (sigText.empty()) continue;
 
         // Reject unknown per-symbol keys (closed key set).
         (void)rejectUnknownKeys(reporter, sym, "symbols[" + std::to_string(idx - 1) + "]",
-                                {"name", "signature", "signatureByDataModel",
+                                {"name", "signature",
                                  "kind", "linkage", "availableObjectFormats",
                                  "noreturn", "returnsTwice", "synthesize", "version",
                                  "linkName", "library", "realization"});
 
-        // Decode the signature via the ONE type-text decoder. A decode failure
-        // is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
+        // Decode the pair's signature via the ONE type-text decoder. A decode
+        // failure is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
         // symbol is NEVER appended with InvalidType (it is dropped from `out`,
-        // and the whole read fails via the errorCount delta below). The BASE
-        // text is decoded even when an override is active (both must be
-        // valid); the EFFECTIVE signature is the active model's.
+        // and the whole read fails via the errorCount delta below). Every other
+        // arm was decoded above.
         // P44: the qualification claim comes out of the SAME decode, not a
         // second reader — `const<…>` is part of the signature grammar, so the one
-        // type-text decoder is the one place it is understood.
+        // type-text decoder is the one place it is understood. The claim is the
+        // SELECTED arm's: each arm is its own statement, and the one this pair
+        // selects is what this build is compiled against.
         DeclaredQualification baseQual;
         TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter, mergedNamedTypes, &baseQual);
         if (!baseSig.valid() || baseSig == InvalidType) {
@@ -3396,20 +4270,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                               "an extern with an unresolved signature");
             continue;
         }
-        TypeId sig = baseSig;
+        TypeId const sig = baseSig;
         DeclaredQualification qual = std::move(baseQual);
-        if (effectiveSigText != sigText) {
-            // The per-data-model override carries its OWN claim: the two texts
-            // are two independent statements and the ACTIVE one is what this
-            // build is compiled against. Taking the base's claim here would
-            // describe a signature that is not the one being used.
-            DeclaredQualification ovQual;
-            sig = parseTypeFromText(effectiveSigText, interner, typeReg, reporter, mergedNamedTypes, &ovQual);
-            // Already validated above; a second-parse failure here would be
-            // interner drift — covered by the errorCount delta either way.
-            if (!sig.valid() || sig == InvalidType) continue;
-            qual = std::move(ovQual);
-        }
         // An EMPTY claim is stored as NO claim: the two spellings of "this row
         // says nothing about qualifiers" must not be distinguishable downstream,
         // or a consumer will eventually treat one of them as a statement.
@@ -3531,7 +4393,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     if (!decodeShippedConstants(doc, core::genericSpelling(path), interner, typeReg,
                                 reporter, out.constants, activeTarget,
                                 activeFormat, activeDataModelName,
-                                mergedNamedTypes)) {
+                                mergedNamedTypes, pairFacts)) {
         return std::nullopt;
     }
 
@@ -3664,11 +4526,15 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     bool const declaredConstants      = declaresArray("constants");
     bool const declaredTypedefs       = declaresArray("typedefs");
     bool const declaredMacroVariants  = declaresArray("macros");
+    // P68 round 12 (S2a-2a): `symbols` joins them — a per-pair signature with no arm
+    // on a pair its symbol is not available on leaves that symbol out there, so a
+    // header of such symbols can inject none on a pair and still declare them.
+    bool const declaredSymbols        = declaresArray("symbols");
     if (out.symbols.empty() && out.constants.empty() && out.floatConstants.empty()
         && out.typedefs.empty() && out.structs.empty() && out.unions.empty()
         && out.macros.empty()
         && !declaredStructs && !declaredUnions && !declaredConstants
-        && !declaredTypedefs && !declaredMacroVariants) {
+        && !declaredTypedefs && !declaredMacroVariants && !declaredSymbols) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
                 + "': declares nothing — needs at least one of 'symbols', "
@@ -3714,7 +4580,8 @@ std::optional<std::vector<ShippedPpConstant>>
 readShippedLibConstants(std::filesystem::path const&    path,
                         DiagnosticReporter&             reporter,
                         std::optional<std::string_view> activeTarget,
-                        std::optional<ObjectFormatKind> activeFormat) {
+                        std::optional<ObjectFormatKind> activeFormat,
+                        ShippedPairFacts const*         pairFacts) {
     // Interner-FREE preprocessor read of the `constants` surface, through the
     // SAME `decodeShippedConstants` chokepoint the semantic read uses — the
     // `readShippedLibMacros` / `readShippedLibAvailability` /
@@ -3747,10 +4614,40 @@ readShippedLibConstants(std::filesystem::path const&    path,
     if (!docPtr) return std::nullopt;
 
     TypeLattice lattice{CompilationUnitId{1}};
+    // P68 round 9: the data model a variant is selected by is the PAIR's, or none.
+    // This read used to select under LP64 unconditionally — harmless while a
+    // preprocessor-visible constant could key its variants on `format` alone (it
+    // still must), and wrong the moment a derived row's `of` names a typedef
+    // keyed `{dataModel, format}` (`int64_t`): with no pair that selection must
+    // miss, not borrow LP64's answer. An empty name matches no `dataModel` key.
+    std::optional<DataModel> const pairModel =
+        pairFacts != nullptr ? pairFacts->dataModel : std::optional<DataModel>{};
+    std::string const activeModelName =
+        pairModel.has_value() ? std::string{dataModelName(*pairModel)} : std::string{};
+    // The descriptor's TYPEDEFS, for a derived row's `of` alone, through the ONE
+    // typedef decode. Into a SCRATCH reporter: a typedef whose type needs a
+    // cross-descriptor binding only the semantic tier holds (`va_list`) fails
+    // here and must not take the constants down with it — the lesson the
+    // `readShippedLibDescriptor` delegation taught this function once already
+    // (see above). A derived row naming such a typedef is then simply not
+    // realized here; the semantic read, which has the bindings, reports any
+    // real defect in it.
+    std::deque<std::string>       typedefNameStore;
+    std::vector<NamedTypeBinding> typedefBindings;
+    {
+        DiagnosticReporter typedefScratch;
+        std::vector<ShippedTypedef> typedefsUnused;
+        (void)decodeShippedTypedefs(*docPtr, core::genericSpelling(path),
+                                    lattice.interner(), lattice.registry(),
+                                    typedefScratch, typedefsUnused, activeTarget,
+                                    activeFormat, activeModelName, typedefNameStore,
+                                    typedefBindings, pairFacts);
+    }
     std::vector<ShippedConstant> decoded;
     if (!decodeShippedConstants(*docPtr, core::genericSpelling(path), lattice.interner(),
                                 lattice.registry(), reporter, decoded, activeTarget,
-                                activeFormat, dataModelName(DataModel::Lp64), {})) {
+                                activeFormat, activeModelName, typedefBindings,
+                                pairFacts)) {
         return std::nullopt;
     }
     if (reporter.errorCount() != errBefore) return std::nullopt;
@@ -3768,9 +4665,99 @@ readShippedLibConstants(std::filesystem::path const&    path,
         // which is the P0016-safe direction (never a silent wrong VALUE).
         auto const w = integerScalarWidthBits(k);
         if (!w.has_value()) continue;
-        out.push_back(ShippedPpConstant{c.name, c.value, isUnsignedIntegerKind(k), *w});
+        // P68 round 9: the IDENTITY rides too — the splice spells the literal
+        // whose phase-7 type is exactly this (core, vocabulary tag).
+        out.push_back(ShippedPpConstant{
+            c.name, c.value, isUnsignedIntegerKind(k), *w, k,
+            std::string{lattice.interner().vocabularyName(c.type)}});
     }
     return out;   // empty ⇒ no constants, or none preprocessor-visible
+}
+
+std::expected<std::vector<ShippedPpTypedef>, std::string>
+readShippedTypedefIdentities(std::filesystem::path const&    path,
+                             std::optional<std::string_view> activeTarget,
+                             std::optional<ObjectFormatKind> activeFormat,
+                             ShippedPairFacts const*         pairFacts) {
+    // P68 round 9. The `readShippedLibConstants` pattern exactly: the cached parse,
+    // a FUNCTION-LOCAL lattice whose TypeIds never escape (only each typedef's
+    // identity — core + vocabulary tag — crosses), and the ONE `typedefs` decode,
+    // variant-selected for the pair's data model, into a SCRATCH reporter so a
+    // typedef needing a binding only the semantic tier holds cannot take the
+    // others down (the lesson that function's own history records).
+    DiagnosticReporter readScratch;
+    json const* const docPtr = cachedDescriptorJson(path, readScratch);
+    if (!docPtr) {
+        for (auto const& d : readScratch.all()) {
+            if (!d.actual.empty()) return std::unexpected(d.actual);
+        }
+        return std::unexpected(std::string{"shipped-lib descriptor '"}
+                               + core::genericSpelling(path) + "' could not be read");
+    }
+
+    TypeLattice lattice{CompilationUnitId{1}};   // valid tag; see readShippedLibConstants
+    std::optional<DataModel> const pairModel =
+        pairFacts != nullptr ? pairFacts->dataModel : std::optional<DataModel>{};
+    std::string const activeModelName =
+        pairModel.has_value() ? std::string{dataModelName(*pairModel)} : std::string{};
+    std::deque<std::string>       typedefNameStore;
+    std::vector<NamedTypeBinding> typedefBindings;
+    std::vector<ShippedTypedef>   decoded;
+    {
+        DiagnosticReporter typedefScratch;
+        (void)decodeShippedTypedefs(*docPtr, core::genericSpelling(path),
+                                    lattice.interner(), lattice.registry(),
+                                    typedefScratch, decoded, activeTarget,
+                                    activeFormat, activeModelName, typedefNameStore,
+                                    typedefBindings, pairFacts);
+    }
+    std::vector<ShippedPpTypedef> out;
+    out.reserve(decoded.size());
+    for (ShippedTypedef const& t : decoded) {
+        out.push_back(ShippedPpTypedef{
+            t.name, lattice.interner().kind(t.type),
+            std::string{lattice.interner().vocabularyName(t.type)}});
+    }
+    return out;
+}
+
+ShippedHeaderTypedefs
+readShippedHeaderTypedefs(std::string_view                header,
+                          std::optional<std::string_view> activeTarget,
+                          std::optional<ObjectFormatKind> activeFormat,
+                          ShippedPairFacts const&         pair) {
+    // P68 round 9 (D-FFI-STDINT-LIMIT-MACROS). The search an `#include <…>` makes —
+    // the consuming language's system directories — with the name matched exactly
+    // (see the declaration), then the availability gate, then the ONE typedef read.
+    ShippedHeaderTypedefs out;
+    if (pair.language == nullptr) return out;   // NoLanguage
+    std::vector<std::filesystem::path> const dirs = resolveSystemDirs(*pair.language);
+    HeaderSearchCache cache;
+    HeaderSearchResult const desc =
+        resolveSystemDescriptor(header, dirs, kDefaultHeaderNameMatching, cache);
+    if (desc.status != HeaderSearchStatus::Found) {
+        out.status = ShippedHeaderTypedefsStatus::NotShipped;
+        return out;
+    }
+    if (activeFormat.has_value() && !shippedHeaderAvailableForFormat(desc.path, *activeFormat)) {
+        out.status = ShippedHeaderTypedefsStatus::NotThisFormat;
+        return out;
+    }
+    auto ids = readShippedTypedefIdentities(desc.path, activeTarget, activeFormat, &pair);
+    if (!ids.has_value()) {
+        out.status = ShippedHeaderTypedefsStatus::Unreadable;
+        out.error  = std::move(ids).error();
+        return out;
+    }
+    // Every NAME it declares, on any pair — what tells "declared, not selected on
+    // this pair" (not realized) from "declared nowhere" (a config defect). The same
+    // cached parse the identities came from, so it cannot fail where they did not.
+    DiagnosticReporter namesScratch;
+    out.declared = readShippedLibTypedefNames(desc.path, namesScratch)
+                       .value_or(std::vector<std::string>{});
+    out.typedefs = std::move(*ids);
+    out.status   = ShippedHeaderTypedefsStatus::Read;
+    return out;
 }
 
 std::optional<std::vector<std::string>>
@@ -3850,6 +4837,7 @@ void forEachDescriptorInClosure(
     std::filesystem::path const&                             startPath,
     std::span<std::filesystem::path const>                   systemDirs,
     HeaderNameMatching                                       matching,
+    HeaderSearchCache&                                       cache,
     std::optional<ObjectFormatKind>                          activeFormat,
     std::unordered_set<core::PathIdentity>&                  visited,
     std::function<void(std::filesystem::path const&)> const& visit,
@@ -3897,7 +4885,7 @@ void forEachDescriptorInClosure(
             // spelling gets — a `includes:["Windows.h"]` edge must reach
             // `windows.json` on a pe build from ANY host, and must NOT on an elf one.
             HeaderSearchResult child =
-                resolveSystemDescriptor(edge.headerName, systemDirs, matching);
+                resolveSystemDescriptor(edge.headerName, systemDirs, matching, cache);
             if (child.status != HeaderSearchStatus::Found) {
                 onUnresolvedInclude(edge.headerName, child);
                 continue;
@@ -3988,7 +4976,10 @@ void forEachDescriptorInClosure(
     // SAFE BY CONSTRUCTION, not by hope: the only site that invokes it is guarded
     // on `activeFormat.has_value()`, and this overload passes nullopt. See the
     // header for why this is an overload rather than a default argument.
-    forEachDescriptorInClosure(startPath, systemDirs, matching,
+    // No compile around this walk, so it lists for itself — once per directory
+    // for the one walk (see the header).
+    HeaderSearchCache walkOwn;
+    forEachDescriptorInClosure(startPath, systemDirs, matching, walkOwn,
                                /*activeFormat=*/std::nullopt, visited, visit,
                                onUnresolvedInclude,
                                [](std::string const&,
@@ -4057,10 +5048,27 @@ namespace {
 [[nodiscard]] bool
 typedEntryReachableOnFormat(json const& entry, std::string const& at,
                             ObjectFormatKind fmt,
-                            std::string const& fmtName,
-                            DiagnosticReporter& reporter) {
+                            DiagnosticReporter& reporter,
+                            json const* referrerDoc = nullptr,
+                            std::string const* referrerPathStr = nullptr) {
+    // P68 round 12 (S2a-2a): a `shippedTypedef` reference exists wherever its OWNER's
+    // entry does — the reference takes the owner's whole answer, coverage included —
+    // so the harvest follows it, as the full read does. An owner the reference cannot
+    // name is refused here as there (the caller's reporter carries it).
+    auto const ownerReachable = [&](json const& node, std::string const& ctx) -> bool {
+        if (referrerDoc == nullptr || referrerPathStr == nullptr) return true;
+        std::string const tname =
+            entry.contains("name") && entry.at("name").is_string() ? entry.at("name").get<std::string>()
+                                                                   : std::string{};
+        auto const owner = locateTypedefReferenceOwner(node.at(kShippedTypedefRefKey), ctx, tname,
+                                                       *referrerPathStr, *referrerDoc, reporter);
+        if (!owner.has_value()) return false;
+        return typedEntryReachableOnFormat(*owner->entry, ctx + " -> '" + owner->pathStr + "'", fmt,
+                                           reporter);
+    };
     auto const it = entry.find("variants");
-    if (it == entry.end()) return true;             // flat ⇒ always present
+    if (it == entry.end())                          // flat ⇒ always present — a reference, where its owner is
+        return entry.contains(kShippedTypedefRefKey) ? ownerReachable(entry, at) : true;
     if (!it->is_array() || it->empty()) return false;
     std::size_t vidx = 0;
     for (auto const& vdef : *it) {
@@ -4072,9 +5080,10 @@ typedEntryReachableOnFormat(json const& entry, std::string const& at,
         }
         WhenMatch const wm = matchVariantWhen(
             vdef.at("when"), WhenAxes::FormatReachability, vat + ".when",
-            /*activeTarget=*/std::nullopt, fmt, fmtName,
-            /*activeDataModelName=*/std::string_view{}, reporter);
-        if (wm == WhenMatch::Match) return true;
+            WhenFacts{.format = fmt}, reporter);
+        if (wm == WhenMatch::Match
+            && (!vdef.contains(kShippedTypedefRefKey) || ownerReachable(vdef, vat)))
+            return true;
     }
     return false;
 }
@@ -4085,7 +5094,7 @@ typedEntryReachableOnFormat(json const& entry, std::string const& at,
 // reachability probe entirely rather than probe a key that cannot be there).
 void harvestNamedSurface(json const& doc, std::string const& pathStr,
                          char const* key, bool surfaceAdmitsVariants,
-                         ObjectFormatKind fmt, std::string const& fmtName,
+                         ObjectFormatKind fmt,
                          DiagnosticReporter& reporter,
                          std::vector<std::string>& out) {
     auto const it = doc.find(key);
@@ -4100,7 +5109,7 @@ void harvestNamedSurface(json const& doc, std::string const& pathStr,
         std::string name = e.at("name").get<std::string>();
         if (name.empty()) continue;
         if (surfaceAdmitsVariants
-            && !typedEntryReachableOnFormat(e, at, fmt, fmtName, reporter)) {
+            && !typedEntryReachableOnFormat(e, at, fmt, reporter, &doc, &pathStr)) {
             continue;
         }
         out.push_back(std::move(name));
@@ -4118,7 +5127,6 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
     if (!docPtr) return std::nullopt;
     json const&       doc      = *docPtr;
     std::string const pathStr  = core::genericSpelling(path);
-    std::string const fmtName{objectFormatKindName(fmt)};
 
     std::vector<std::string> out;
 
@@ -4156,16 +5164,11 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
     // the SAME facts the full read's key vocabularies declare — a surface that
     // grows `variants` later must flip its flag here, and the surface-name test
     // is what makes that visible.
-    harvestNamedSurface(doc, pathStr, "constants",      true,  fmt, fmtName,
-                        reporter, out);
-    harvestNamedSurface(doc, pathStr, "floatConstants", false, fmt, fmtName,
-                        reporter, out);
-    harvestNamedSurface(doc, pathStr, "typedefs",       true,  fmt, fmtName,
-                        reporter, out);
-    harvestNamedSurface(doc, pathStr, "structs",        true,  fmt, fmtName,
-                        reporter, out);
-    harvestNamedSurface(doc, pathStr, "unions",         false, fmt, fmtName,
-                        reporter, out);
+    harvestNamedSurface(doc, pathStr, "constants",      true,  fmt, reporter, out);
+    harvestNamedSurface(doc, pathStr, "floatConstants", false, fmt, reporter, out);
+    harvestNamedSurface(doc, pathStr, "typedefs",       true,  fmt, reporter, out);
+    harvestNamedSurface(doc, pathStr, "structs",        true,  fmt, reporter, out);
+    harvestNamedSurface(doc, pathStr, "unions",         false, fmt, reporter, out);
 
     // macros — decoded through the REAL macro decoder with the real format, so a
     // variants-only macro that selects no arm on `fmt` contributes no name here
@@ -4407,6 +5410,46 @@ realizeRow(ShippedLibDescriptor const& desc, ShippedSymbol const& sym,
 
 } // namespace
 
+// ── D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION ──────
+// See the header. Built on `realizeRow` — the kernel the corpus oracle and the
+// descriptor-surface realization already share — so "does this row have a body
+// on this format" has ONE answer however it is asked.
+std::optional<ParseDiagnostic>
+refuseShippedSymbolWithoutABody(ShippedLibDescriptor const&  desc,
+                                ShippedSymbol const&         sym,
+                                ObjectFormatKind             activeFormat,
+                                std::filesystem::path const& descriptorPath) {
+    std::string const formatKey{objectFormatKindName(activeFormat)};
+    bool const docAvailableHere =
+        objectFormatInAvailabilitySet(desc.availableObjectFormats, activeFormat);
+    ShippedSymbolRealization const real =
+        realizeRow(desc, sym, activeFormat, formatKey, docAvailableHere);
+    if (real.status != ShippedRealizationStatus::NoLibraryForFormat) {
+        return std::nullopt;
+    }
+    // A `library` entry naming a ROLE is a body declared THROUGH the format's
+    // runtime-library table: a caller that resolves no roles (no resolver — the
+    // direct-API and layout tests) sees no image for it, and that is its own
+    // choice to bind nothing, not a descriptor without a body. The declared roles
+    // are recorded whether or not a resolver answered them, which is what makes
+    // the two cases tellable apart here.
+    if (sym.libraryRoles.contains(formatKey) || desc.libraryRoles.contains(formatKey)) {
+        return std::nullopt;
+    }
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::F_ShippedSymbolDeclaresNoBodyForFormat;
+    d.severity = DiagnosticSeverity::Error;
+    d.actual   = "shipped descriptor `" + core::genericSpelling(descriptorPath)
+               + "` (`<" + desc.header + ">`) declares `" + sym.name
+               + "` available on object format `" + formatKey
+               + "` but names no body for it there: no `library` image, no "
+                 "`realization` source and no `synthesize` recipe for `"
+               + formatKey + "`. Give the row one of the three for `" + formatKey
+               + "`, or leave `" + formatKey + "` out of its "
+                 "`availableObjectFormats`";
+    return d;
+}
+
 std::optional<std::unordered_map<std::string, std::vector<std::string>>>
 collectShippedExternSymbolFormats() {
     // ── D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS ────────────────────
@@ -4484,14 +5527,15 @@ refusalBelongsToThisBuild(std::filesystem::path const&      path,
                           std::optional<std::string_view>   activeTarget,
                           std::optional<ObjectFormatKind>   activeFormat,
                           std::span<NamedTypeBinding const> namedTypes,
-                          RuntimeLibraryRoleResolver const* roleResolver) {
+                          RuntimeLibraryRoleResolver const* roleResolver,
+                          ShippedPairFacts const*           pairFacts) {
     // No resolver ⇒ nothing but the descriptor itself could have refused.
     if (roleResolver == nullptr) return false;
     DiagnosticReporter withoutResolver;
     auto const again = readShippedLibDescriptor(path, interner, typeReg,
                                                 withoutResolver, dataModel,
                                                 activeTarget, activeFormat,
-                                                namedTypes, nullptr);
+                                                namedTypes, nullptr, pairFacts);
     return again.has_value();
 }
 
@@ -4506,7 +5550,8 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
                             std::optional<std::string_view>   activeTarget,
                             std::optional<ObjectFormatKind>   activeFormat,
                             std::span<NamedTypeBinding const> namedTypes,
-                            RuntimeLibraryRoleResolver const* roleResolver) {
+                            RuntimeLibraryRoleResolver const* roleResolver,
+                            ShippedPairFacts const*           pairFacts) {
     CorpusIndex const* const idx = corpusIndex();
     if (idx == nullptr) return std::nullopt;   // discovery failed — route unbound
     std::unordered_map<std::string, ShippedSymbolRealization> out;
@@ -4567,7 +5612,7 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
     std::sort(wantedDescriptors.begin(), wantedDescriptors.end());
 
     // (2) Read each candidate descriptor ONCE, through the SAME reader the
-    // `#include` path uses — so `variants`, `signatureByDataModel` and per-symbol
+    // `#include` path uses — so `variants` (a signature's among them) and per-symbol
     // `library` overrides cannot resolve one way here and another way there.
     //
     // THROWAWAY reporter, and a failed read is SKIPPED: this oracle is consulted
@@ -4584,11 +5629,12 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
         DiagnosticReporter throwaway;
         auto desc = readShippedLibDescriptor(idx->root / rel, interner, typeReg,
                                              throwaway, dataModel, activeTarget,
-                                             activeFormat, namedTypes, roleResolver);
+                                             activeFormat, namedTypes, roleResolver,
+                                             pairFacts);
         if (!desc) {
             if (refusalBelongsToThisBuild(idx->root / rel, interner, typeReg,
                                           dataModel, activeTarget, activeFormat,
-                                          namedTypes, roleResolver)) {
+                                          namedTypes, roleResolver, pairFacts)) {
                 for (auto const& d : throwaway.all()) reporter.report(d);
             }
             continue;
@@ -4794,7 +5840,8 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
                                    std::optional<std::string_view>   activeTarget,
                                    std::optional<ObjectFormatKind>   activeFormat,
                                    std::span<NamedTypeBinding const> namedTypes,
-                                   RuntimeLibraryRoleResolver const* roleResolver) {
+                                   RuntimeLibraryRoleResolver const* roleResolver,
+                                   ShippedPairFacts const*           pairFacts) {
     CorpusIndex const* const idx = corpusIndex();
     if (idx == nullptr) return std::nullopt;
     std::unordered_map<std::string, ShippedSymbolRealization> out;
@@ -4817,7 +5864,7 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
         auto desc = readShippedLibDescriptor(idx->root / row.relPath, interner,
                                             typeReg, throwaway, dataModel,
                                             activeTarget, activeFormat, namedTypes,
-                                            roleResolver);
+                                            roleResolver, pairFacts);
         if (!desc) continue;
         bool const docHere = objectFormatInAvailabilitySet(
             desc->availableObjectFormats, *activeFormat);
@@ -5218,7 +6265,8 @@ struct ClosureSurfaceOnFormat {
 [[nodiscard]] ClosureSurfaceOnFormat
 closureSurfaceOnFormat(std::filesystem::path const&           startPath,
                        std::span<std::filesystem::path const> systemDirs,
-                       ObjectFormatKind                       fmt) {
+                       ObjectFormatKind                       fmt,
+                       HeaderSearchCache&                     cache) {
     ClosureSurfaceOnFormat outS;
     std::unordered_set<core::PathIdentity> visited;
     // Case-SENSITIVE resolution, and the choice is load-bearing rather than
@@ -5230,7 +6278,7 @@ closureSurfaceOnFormat(std::filesystem::path const&           startPath,
     // claim or an edge that resolves here resolves on every format — and one that
     // does not is refused with a spelling the author can fix in one place.
     forEachDescriptorInClosure(
-        startPath, systemDirs, kDefaultHeaderNameMatching, fmt, visited,
+        startPath, systemDirs, kDefaultHeaderNameMatching, cache, fmt, visited,
         [&](std::filesystem::path const& p) {
             DiagnosticReporter throwaway;
             auto names = shippedSurfaceNamesForFormat(p, fmt, throwaway);
@@ -5364,6 +6412,10 @@ bool validateShippedIncludeClosure(
     // filesystem's, and a sweep that reports its failures in a host-dependent
     // order is a sweep whose output cannot be diffed).
     std::sort(descriptors.begin(), descriptors.end());
+    // One view of the corpus for the whole sweep: every closure it walks lists
+    // the search directories once, not once per edge per descriptor per format
+    // ([[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]).
+    HeaderSearchCache sweepOwn;
 
     std::span<std::filesystem::path const> const searchDirs{&descriptorDir, 1};
 
@@ -5385,7 +6437,7 @@ bool validateShippedIncludeClosure(
         for (ObjectFormatKind const fmt : declaredFormatsOf(*avail, servedFormats)) {
             std::string const fmtName{objectFormatKindName(fmt)};
             ClosureSurfaceOnFormat const cs =
-                closureSurfaceOnFormat(p, searchDirs, fmt);
+                closureSurfaceOnFormat(p, searchDirs, fmt, sweepOwn);
 
             // (i) — the two ways an active edge fails to land.
             for (std::string const& h : cs.unresolvedEdges) {
@@ -5438,6 +6490,19 @@ bool validateShippedSurfaceRequirements(
     std::span<std::filesystem::path const> systemDirs,
     std::optional<ObjectFormatKind>        activeFormat,
     DiagnosticReporter&                    reporter) {
+    // No compile around this check: it lists for itself (see the header).
+    HeaderSearchCache checkOwn;
+    return validateShippedSurfaceRequirements(macros, declaringDocument, systemDirs,
+                                              activeFormat, reporter, checkOwn);
+}
+
+bool validateShippedSurfaceRequirements(
+    std::span<PredefinedMacroDef const>    macros,
+    std::string_view                       declaringDocument,
+    std::span<std::filesystem::path const> systemDirs,
+    std::optional<ObjectFormatKind>        activeFormat,
+    DiagnosticReporter&                    reporter,
+    HeaderSearchCache&                     cache) {
     // ═══ D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE — SATISFACTION ═══
     //
     // The SHAPE of the predicate is core's (`ShippedSurfaceClaim`); this
@@ -5519,7 +6584,7 @@ bool validateShippedSurfaceRequirements(
                 // active one, and a per-format case policy cannot answer a
                 // cross-format question.
                 HeaderSearchResult const hit = resolveSystemDescriptor(
-                    claim.header, systemDirs, kDefaultHeaderNameMatching);
+                    claim.header, systemDirs, kDefaultHeaderNameMatching, cache);
                 if (hit.status != HeaderSearchStatus::Found) {
                     emitUnbackedPredefine(reporter,
                         std::string{"predefined macro '"} + pm.name + "' ("
@@ -5543,7 +6608,7 @@ bool validateShippedSurfaceRequirements(
                     continue;
                 }
                 ClosureSurfaceOnFormat const cs =
-                    closureSurfaceOnFormat(hit.path, systemDirs, fmt);
+                    closureSurfaceOnFormat(hit.path, systemDirs, fmt, cache);
                 if (!cs.undecodable.empty()) {
                     emitUnbackedPredefine(reporter,
                         std::string{"predefined macro '"} + pm.name + "' ("

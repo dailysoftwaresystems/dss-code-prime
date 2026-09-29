@@ -41,6 +41,8 @@
 
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: AAPCS64 linux-arm64 `long double` = IEEE binary128, 16/16. See elf64-aarch64-linux-exec.",
   "longDoubleFormat": "ieee128",
+  "$enumCompatibleTypeRuleComment": "P68 round 12 (lane `cs`): the integer type an enumeration without a fixed underlying type is compatible with (C 6.7.2.2p4) is the platform ABI's choice — this ABI's (gcc's and clang's documented rule): `unsigned int` when no value is negative, else `int`, wider when the values need it; the language's `enumerationCompatibleTypes.gnu` ladders say which C types that is.",
+  "enumCompatibleTypeRule": "gnu",
 
   "$supportedDataSectionsComment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE + D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a relocatable object carries data — a global lands in `.rodata`/`.data`/`.bss`/`.data.rel.ro` with `sh_addr=0` + a section-relative `.symtab` entry the FINAL linker binds. Same machine-NEUTRAL elf.cpp ET_REL writer as elf64-x86_64-linux (it reads section names/flags + reloc nativeIds from THIS schema, never hardcoding a machine); arch differs only via config — the abs64 data reloc is R_AARCH64_ABS64 (257) here vs R_X86_64_64 (1) on x86_64. A reloc-bearing CONST global (`relro`) emits `.rela.data.rel.ro`; a reloc-bearing MUTABLE pointer emits `.rela.data`. TLS (`tdata`/`tbss`) is deferred to a follow-up.",
   "supportedDataSections": ["rodata", "data", "bss", "relro"],
@@ -61,7 +63,7 @@
   "$weakDefinitionComment": "D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED + D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS: HOW this format spells a WEAK DEFINITION -- a symbol several translation units may define, of which the linker keeps one. ELF puts the weakness in the SYMBOL's own BINDING field: STB_WEAK (2) in the high nibble of Elf64_Sym.st_info, gABI 4.18. No section flag and no separate per-symbol flag bit is involved, which is exactly what distinguishes `symbol-binding` from COFF's `comdat` (a per-SECTION duplicate-resolution policy) and from Mach-O's `symbol-flag` (N_WEAK_DEF set ALONGSIDE an ordinary binding). Written by `stbForBinding` in src/link/format/elf.cpp. THIS IS A DIALECT ROW, NOT A CAPABILITY FLAG: it says how this format spells something it CAN express, never that it cannot -- see D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE for why an implementation gap recorded as a format incapability is a false fact in the place most likely to be trusted later. `elf::encode` READS this key -- ONCE, covering every ELF flavor, because the alias pass reaches stbForBinding on ET_REL, ET_EXEC and ET_DYN alike -- and refuses loud on a dialect it has no encoder for, so the declaration cannot drift away from what is actually emitted. The loader additionally refuses this key at LOAD when the declared dialect is not one the resolved backend's walker writes (ObjectFormatBackend::weakDefinitionDialects), so a mis-declaration fails at its source rather than at the first weak definition.",
   "weakDefinition": { "dialect": "symbol-binding" },
 
-  "$externAddrBindingComment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): taking the ADDRESS of an undefined/preemptible extern (function OR data) as a LIVE code-form VALUE -- an argument, an automatic's initializer, a returned function pointer (NOT a call, NOT a static-data-item initializer) -- must materialize THROUGH a GOT slot the FINAL (foreign) linker synthesizes: arm64 `adrp x,:got:sym` (R_AARCH64_ADR_GOT_PAGE) + `ldr x,[x,:got_lo12:sym]` (R_AARCH64_LD64_GOT_LO12_NC). This relocatable `.o` is linked by a foreign DEFAULT-PIE toolchain (aarch64-linux-gnu-gcc with no -no-pie); an ABSOLUTE `adrp`+`add` (ADR_PREL_PG_HI21 + ADD_ABS_LO12_NC) against a symbol that may bind externally is REJECTED ('relocation R_AARCH64_ADR_PREL_PG_HI21 against symbol ... which may bind externally can not be used when making a shared object'). sqlite3.c -> arm64 .o has 3 such residuals (dlsym / sqlite3_search_count / stdout). The GOT indirection is exactly what gcc/clang emit for `&extern` in a default-PIE `.o`. DSS-NEUTRAL to x86_64 (its `&extern` value is a PC-relative rel32, already PIE-safe) and to the DSS-linked arm64 EXEC (it uses `dataImportBinding: copy-relocation` for data + a direct address for functions) and to the arm64 PIE/dyn formats (the c117 DSS-local __got slot) -- so ONLY the relocatable + static-archive formats declare it. Consumed by MIR->LIR `lowerGlobalAddr`'s value-form arm (keyed on the capability-derived symbol set, never a format/arch identity branch).",
+  "$externAddrBindingComment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): taking the ADDRESS of an undefined/preemptible extern (function OR data) as a LIVE code-form VALUE -- an argument, an automatic's initializer, a returned function pointer (NOT a call, NOT a static-data-item initializer) -- must materialize THROUGH a GOT slot the FINAL linker synthesizes (a foreign toolchain, or since P68 round 11 DSS's own image link, which lowers the pair — `lowerGotSlotReferences`): arm64 `adrp x,:got:sym` (R_AARCH64_ADR_GOT_PAGE) + `ldr x,[x,:got_lo12:sym]` (R_AARCH64_LD64_GOT_LO12_NC). This relocatable `.o` is linked by a foreign DEFAULT-PIE toolchain (aarch64-linux-gnu-gcc with no -no-pie); an ABSOLUTE `adrp`+`add` (ADR_PREL_PG_HI21 + ADD_ABS_LO12_NC) against a symbol that may bind externally is REJECTED ('relocation R_AARCH64_ADR_PREL_PG_HI21 against symbol ... which may bind externally can not be used when making a shared object'). sqlite3.c -> arm64 .o has 3 such residuals (dlsym / sqlite3_search_count / stdout). The GOT indirection is exactly what gcc/clang emit for `&extern` in a default-PIE `.o`. DSS-NEUTRAL to x86_64 (its `&extern` value is a PC-relative rel32, already PIE-safe) and to the DSS-linked arm64 EXEC (it uses `dataImportBinding: copy-relocation` for data + a direct address for functions) and to the arm64 PIE/dyn formats (the c117 DSS-local __got slot) -- so ONLY the relocatable + static-archive formats declare it. Consumed by MIR->LIR `lowerGlobalAddr`'s value-form arm (keyed on the capability-derived symbol set, never a format/arch identity branch).",
   "externAddrBinding": "got",
 
   "elf": {
@@ -193,6 +195,10 @@
     }
   ],
 
+  "$relocationAddendsComment": "P68 round 9: WHERE a relocatable object of this format keeps a relocation's addend — `explicit`: the ELF RELA record's `r_addend` column, which carries the psABI's full implicit addend (DSS's addend plus the target kind's `addendBias`). Read and written only through `link/format/relocation_addend.hpp`.",
+  "relocationAddends": "explicit",
+  "$inputSectionPlacementComment": "P68 round 9: an input section of a relocatable object in this format is the UNIT OF PLACEMENT, as it is for every ELF and PE/COFF linker. The reader slices it into symbol-bounded atoms, and the link keeps every atom at its offset from the others, keeping or dropping the section whole. Code in the object can depend on that layout with nothing a reader can see: a reference gas reduced to `section symbol + offset` with an immediate folded into the addend, a `sym+off` that runs into the next object, objects walked as an array between two labels. ✔MEASURED 2026-09-23: gcc -O2 `static int y, x` stores, linked by DSS while atoms moved independently, ran to 33 where gcc's link runs to 42.",
+  "inputSectionPlacement": "unit",
   "relocations": [
     {
       "$comment": "26-bit PC-relative branch with link / branch (BL / B target). ELF type R_AARCH64_CALL26 = 283. `kind` = 1 matches arm64.target.json's `call26` row. ★ `isCall` (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL, 2026-08-20): this wire relocation can ONLY target executable code, so an object reader that meets an undefined extern through it has PROVEN the extern is a function rather than a data object -- the only classification signal a symbol-name-only reference offers. It is declared HERE, on the format row, and not derived from the target's formula, because a formula describes ARITHMETIC and not ROLE: `S + A - P` is the identical arithmetic for a call and for a PC-relative data reference, so the x86_64 target's `linear` is honest and simply carries no role, while aarch64's `aarch64_call26` looked like a role only because that CPU's branch has its own instruction encoding. ✔MEASURED 2026-08-20: every macho64-x86_64 archive member calling any library function was unreadable for exactly this reason while the arm64 sibling read the same source cleanly. The target document cannot carry it -- it is PER-CPU and shared with ELF, where the same `rel32` genuinely serves data references too.",
@@ -220,13 +226,13 @@
       "nativeId": 257
     },
     {
-      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-entry page (ADRP of `:got:sym`). ELF type R_AARCH64_ADR_GOT_PAGE = 311. `kind` = 7 matches arm64.target.json's `adr_got_page` row (the ADRP word of the `lea_extern_got` macro). Emitted only into this relocatable object; the foreign linker synthesizes the GOT slot + patches the ADRP page-delta. DSS never applies it (the exec_reloc_apply kernel arm fail-loud-refuses).",
+      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-entry page (ADRP of `:got:sym`). ELF type R_AARCH64_ADR_GOT_PAGE = 311. `kind` = 7 matches arm64.target.json's `adr_got_page` row (the ADRP word of the `lea_extern_got` macro). DSS emits it only into this relocatable object and its static-archive sibling; the FINAL linker owns the GOT slot — a foreign one, or since P68 round 11 DSS's own image link, which lowers it (`lowerGotSlotReferences`, link/got_slots.hpp) to ADR_PREL_PG_HI21 against a slot it mints holding S + A. The exec_reloc_apply kernel arm fail-loud-refuses an un-lowered one; the image documents declare only the twin.",
       "name": "R_AARCH64_ADR_GOT_PAGE",
       "kind": 7,
       "nativeId": 311
     },
     {
-      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-entry low-12 scaled offset (LDR of `[x,:got_lo12:sym]`). ELF type R_AARCH64_LD64_GOT_LO12_NC = 312. `kind` = 8 matches arm64.target.json's `ld64_got_lo12` row (the LDR word of the `lea_extern_got` macro). Paired with R_AARCH64_ADR_GOT_PAGE against the same symbol; the foreign linker patches the scaled GOT-slot offset.",
+      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-entry low-12 scaled offset (LDR of `[x,:got_lo12:sym]`). ELF type R_AARCH64_LD64_GOT_LO12_NC = 312. `kind` = 8 matches arm64.target.json's `ld64_got_lo12` row (the LDR word of the `lea_extern_got` macro). Paired with R_AARCH64_ADR_GOT_PAGE against the same symbol; the final linker patches the scaled GOT-slot offset (DSS's own image link lowers it to LDST64_ABS_LO12_NC against the slot it mints).",
       "name": "R_AARCH64_LD64_GOT_LO12_NC",
       "kind": 8,
       "nativeId": 312
@@ -236,6 +242,38 @@
       "name": "R_AARCH64_PREL32",
       "kind": 9,
       "nativeId": 261
+    },
+    {
+      "$comment": "P68 round 9 (the aarch64 twin of D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the one-word `adr`, S + A - P in signed 21 bits. ELF type R_AARCH64_ADR_PREL_LO21 = 274; kind 11 = arm64's `adr_prel_lo21`. ✔MEASURED 2026-09-23: gas 2.42 and clang 18 write `adr x0, msg` with this type.",
+      "name": "R_AARCH64_ADR_PREL_LO21",
+      "kind": 11,
+      "nativeId": 274
+    },
+    {
+      "$comment": "P68 round 9 (D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD): the page offset of a load or store, one type per access size — AAELF64's R_AARCH64_LDST8/16/32/64/128_ABS_LO12_NC = 278/284/285/286/299, kinds 12..16 = arm64's `ldst*_abs_lo12_nc` (the scale is the target row's `scaleLog2`). ✔MEASURED 2026-09-23: aarch64 gcc 13 -O2 writes all five for one global per size; at the round-9 base this reader refused the object ('relocation type 299 ... is not declared').",
+      "name": "R_AARCH64_LDST8_ABS_LO12_NC",
+      "kind": 12,
+      "nativeId": 278
+    },
+    {
+      "name": "R_AARCH64_LDST16_ABS_LO12_NC",
+      "kind": 13,
+      "nativeId": 284
+    },
+    {
+      "name": "R_AARCH64_LDST32_ABS_LO12_NC",
+      "kind": 14,
+      "nativeId": 285
+    },
+    {
+      "name": "R_AARCH64_LDST64_ABS_LO12_NC",
+      "kind": 15,
+      "nativeId": 286
+    },
+    {
+      "name": "R_AARCH64_LDST128_ABS_LO12_NC",
+      "kind": 16,
+      "nativeId": 299
     }
   ]
 }

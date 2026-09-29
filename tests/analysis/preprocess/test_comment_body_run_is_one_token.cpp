@@ -50,10 +50,9 @@ using namespace dss;
 namespace fs = std::filesystem;
 
 // Shared schema fixture — a REFERENCE to a function-local static, for the
-// reason `test_preprocessor.cpp` spells out under
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: `GrammarSchema`'s accessors hand
-// back references INTO the schema, so a by-value return would make
-// `helper()->accessor()` a heap-use-after-free.
+// reason `test_preprocessor.cpp` spells out at its own `cSubset()`:
+// `GrammarSchema`'s accessors hand back references INTO the schema, so a
+// by-value return would make `helper()->accessor()` a heap-use-after-free.
 [[nodiscard]] std::shared_ptr<GrammarSchema const> const& cSchema() {
     static std::shared_ptr<GrammarSchema const> const schema = [] {
         auto loaded = GrammarSchema::loadShipped("c");

@@ -1,0 +1,42 @@
+{
+  "$comment": "A null pointer, or an integer address, that reaches a pointer object with STATIC storage through a CHAIN of pointer casts is an address constant (C 6.6p9; 6.3.2.3p4: a null pointer converted to another pointer type is a null pointer), so it is static data (P68 round 9, D-C-STATIC-INITIALIZER-POINTER-CAST-CHAIN-REFUSED). `char *p = NULL;` with the platforms' own `NULL`, `((void *)0)`, is such a chain — the explicit `(void *)` plus the implicit conversion — and so are a NULL-terminated pointer array, a getopt option table and sqlite's `SQLITE_INT_TO_PTR` element address off a `NULL` base. Every object is read back through a volatile lvalue, so the check reads the bytes the image holds at every optimization level; seven groups set seven bits (main.c lists them) and the exit is 42 only when all hold. ✔MEASURED 2026-09-23 on this file: gcc 13.3.0 and clang 18.1.3 on x86_64 Linux and on aarch64 Linux (cross, qemu), -O0 and -O2, `-std=c17 -pedantic-errors -Wall`, mingw-w64 gcc 13.2.0 at -O0 and -O2 with the same flags, and MSVC 14.51 (/std:clatest, and /O2) all exit 42. ✔MEASURED at HEAD 4d9a24c4: DSS REFUSED the file on all five pairs (the mixed pointer array `g06`: an aggregate the static classifier could not fold fell to a runtime initializer, which an array cannot take); measured one by one on x86_64 ELF, every chained scalar and struct member became a runtime initializer, which the static-data producer refuses, while the one-cast `(void *)0` and `(char *)0x10` folded. ★ RED-ON-DISABLE, ✔MEASURED 2026-09-23 (each mutant built, this program compiled and run by it on pe64, ELF x86_64 and ELF aarch64 under qemu, debug and release): the null-pointer classifier back to one cast REFUSES the file on all three (the `b3` table: its NULL-based element addresses fall to a runtime initializer an array cannot take) — the scalar and member null chains alone stay green there, because the integer-address arm folds them to the same zero leaf, which is why group 64 exists; the integer-address classifier back to one cast REFUSES the file on all three (`g08` and `g12` become runtime initializers); both back to one cast (HEAD's code) REFUSES the file on all three. The `release` arm runs the shipped optimizer pipeline over the same checks.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

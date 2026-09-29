@@ -50,6 +50,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "test_support/repo_root.hpp"
 #include "test_support/scoped_env.hpp"
+#include "test_support/scratch_dir.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -206,13 +207,17 @@ struct Signatory {
 //      measured a harness whose "good" column silently ran the mutant.
 class OwnerDocMutant {
 public:
-    explicit OwnerDocMutant(std::function<void(json&)> const& mutate) {
+    // The root is claimed per PROCESS by `ScratchDir`. It used to be
+    // `temp/dss-sigil-owner-mutant-<n>` from a per-process counter, preceded by
+    // a `remove_all`: every concurrent process (another build tree's copy of this
+    // binary) drew the SAME first name and wiped the other's mutant tree (the
+    // P68 round 8 cross-tree temp race, measured on test_emit_hir_mode).
+    explicit OwnerDocMutant(std::function<void(json&)> const& mutate)
+        : scratch_(std::make_unique<dss::test_support::ScratchDir>(
+              dss::test_support::Location::Temp, "sigil-owner-mutant")) {
         namespace fs = std::filesystem;
-        static int counter = 0;
         std::error_code ec;
-        root_ = fs::temp_directory_path()
-              / ("dss-sigil-owner-mutant-" + std::to_string(++counter));
-        fs::remove_all(root_, ec);
+        root_ = scratch_->path();
         fs::create_directories(root_ / "src", ec);
         fs::copy(dss::test::configRoot(), root_ / "src" / "dss-config",
                  fs::copy_options::recursive, ec);
@@ -254,10 +259,8 @@ public:
     }
 
     ~OwnerDocMutant() {
-        namespace fs = std::filesystem;
-        std::error_code ec;
         env_.reset();                       // restore BEFORE the tree vanishes
-        fs::remove_all(root_, ec);
+        // `scratch_` (declared first, so destroyed last) removes the tree.
     }
 
     OwnerDocMutant(OwnerDocMutant const&)            = delete;
@@ -266,6 +269,7 @@ public:
     [[nodiscard]] bool changed() const { return changed_; }
 
 private:
+    std::unique_ptr<dss::test_support::ScratchDir> scratch_;
     std::filesystem::path root_;
     std::filesystem::path target_;
     bool                  changed_ = false;
@@ -533,8 +537,8 @@ TEST(InlineAsmTemplateSigilAgreement, MutatingTheLanguageDeclarationMovesEveryDi
                     << b.stem << ": the SHIPPED byte(s) still have a meaning in "
                        "the template mode after the language moved them — a "
                        "second owner is answering for them, which is exactly the "
-                       "defect D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-"
-                       "A-CONFIG-OWNER names";
+                       "defect "
+                       "D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER names";
             }
         }
     }

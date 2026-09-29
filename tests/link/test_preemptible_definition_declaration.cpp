@@ -42,6 +42,8 @@ constexpr std::string_view kBase = R"({
   "externCallDispatch": "direct-plt",
   "format": { "name": "elf64-x86_64-linux-dyn", "version": "1.0", "kind": "elf" },
   "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+  "relocationAddends": "explicit",
+  "inputSectionPlacement": "unit",
   "relocations": [ { "name": "R_X86_64_PC32", "kind": 1, "nativeId": 2 } ]
 })";
 

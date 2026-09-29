@@ -5,18 +5,21 @@
 #include "core/types/enum_name_table.hpp"  // allNames — the `core` tag's ONE owner is kTypeKindNameTable
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/core_type.hpp"
+#include "lir/lir_asm_region.hpp"
 #include "lir/lir_literal_pool.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
 #include "lir/lir_reg.hpp"
 #include "lir/lir_verifier.hpp"
 
+#include <array>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
 #include <format>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -65,14 +68,27 @@ namespace {
     return name.empty() ? std::string_view{"?"} : name;
 }
 
+// The name `ctx` supplies for symbol `v` — its dense table first, then its
+// sparse one (what `parseLir` hands back); empty when neither names it.
+[[nodiscard]] std::string_view
+symbolNameOf(std::uint32_t v, LirTextContext const& ctx) {
+    if (v < ctx.symbolNames.size()) return ctx.symbolNames[v];
+    if (ctx.symbolNameMap != nullptr) {
+        if (auto const it = ctx.symbolNameMap->find(v); it != ctx.symbolNameMap->end()) {
+            return it->second;
+        }
+    }
+    return {};
+}
+
 // Render a symbol id as `%<v>` always, optionally followed by ` "name"`
 // when ctx supplies a non-empty entry. The "name" form is consumed by
 // cycle-2's parser as a debug annotation; the `%<v>` numeric handle is
 // the authoritative identity. Slot 0 is the invalid-symbol sentinel.
 [[nodiscard]] std::string
 renderSymbol(std::uint32_t v, LirTextContext const& ctx) {
-    if (v < ctx.symbolNames.size() && !ctx.symbolNames[v].empty()) {
-        return std::format("%{} \"{}\"", v, ctx.symbolNames[v]);
+    if (std::string_view const name = symbolNameOf(v, ctx); !name.empty()) {
+        return std::format("%{} \"{}\"", v, name);
     }
     return std::format("%{}", v);
 }
@@ -160,6 +176,11 @@ renderLiteralValue(LirLiteralValue const& v) {
                 return std::format("f64 {}", payload);
             } else if constexpr (std::is_same_v<T, std::string>) {
                 return "str " + renderEscapedString(payload);
+            } else if constexpr (std::is_same_v<T, LirSymbolAddress>) {
+                // `symaddr @<symbol> <addend>` — the symbol in the operand
+                // sigil every other symbol reference uses.
+                return std::format("symaddr @{} {}", payload.symbol.v,
+                                   payload.addend);
             } else {
                 return renderAggregateLiteral(payload);
             }
@@ -178,6 +199,12 @@ renderLiteralValue(LirLiteralValue const& v) {
 //   * `MemBase`       — `*<scale>`
 //   * `MemOffset`     — `+<offset>` or `-<offset>` for signed
 //   * `LiteralIndex`  — `lit#<index>`
+//   * `MemSymbolOffset` — `memsym#<index>` (a pool `symaddr` entry)
+//   * `SymbolAddress` — `symaddr#<index>` (the same pool entry, in a symbol
+//                       position). A symbolic operand naming a PART of the
+//                       address carries it as a suffix: `@5:page`,
+//                       `memsym#2:pageOffset` (`SymbolAddressPart`).
+//   * `LocationCounter` — `^.` (the address of the instruction itself)
 //   * `None`          — `_`
 // The (reserved) enum slot 3 (formerly `ImmFloat`) is unreachable; the
 // switch is `[[nodiscard]]`-exhaustive over the live variants.
@@ -188,6 +215,14 @@ renderLiteralValue(LirLiteralValue const& v) {
 // the inst-operand block ref would carry the module-wide id while the
 // successor list carries the within-function slot, breaking round-
 // trip (parser keys its `blockMap_` by within-function slot).
+// A symbolic operand's PART of the address (P68 round 9), as the `:<part>`
+// suffix the parser reads back; nothing for the whole address.
+[[nodiscard]] std::string renderPartSuffix(LirOperand const& op) {
+    auto const part = op.symbolAddressPart();
+    if (part == SymbolAddressPart::Whole) return {};
+    return std::format(":{}", symbolAddressPartName(part));
+}
+
 [[nodiscard]] std::string
 renderOperand(LirOperand const& op, TargetSchema const& schema,
               std::uint32_t fnEntryV, DiagnosticReporter& reporter) {
@@ -201,7 +236,7 @@ renderOperand(LirOperand const& op, TargetSchema const& schema,
         case LirOperandKind::BlockRef:
             return std::format("^b{}", op.blockSlot - fnEntryV);
         case LirOperandKind::SymbolRef:
-            return std::format("@{}", op.symbolV);
+            return std::format("@{}", op.symbolV) + renderPartSuffix(op);
         case LirOperandKind::MemBase:
             return std::format("*{}", op.scale);
         case LirOperandKind::MemOffset:
@@ -225,6 +260,12 @@ renderOperand(LirOperand const& op, TargetSchema const& schema,
             // this arm is a diagnostic aid, not a round-tripped codec (the
             // class is not re-parsed, mirroring the ByValueStackAgg exhaust byte).
             return std::format("spill#{}", op.spillSlotV);
+        case LirOperandKind::MemSymbolOffset:
+            return std::format("memsym#{}", op.litIndex) + renderPartSuffix(op);
+        case LirOperandKind::SymbolAddress:
+            return std::format("symaddr#{}", op.litIndex) + renderPartSuffix(op);
+        case LirOperandKind::LocationCounter:
+            return "^.";
     }
     // Fall-through is a substrate-corruption signal — the discriminator
     // landed on the reserved slot 3 (formerly ImmFloat) or on an out-of-
@@ -278,6 +319,14 @@ collectReachableSymbols(Lir const& lir) {
             }
         }
     }
+    // A symbolic displacement names its symbol through a pool entry, not an
+    // operand, and the `symbols` section must still declare it.
+    auto const& pool = lir.literalPool();
+    for (std::uint32_t i = 0; i < pool.size(); ++i) {
+        if (auto const* a = std::get_if<LirSymbolAddress>(&pool.at(i).value)) {
+            seen.insert(a->symbol.v);
+        }
+    }
     seen.erase(0);  // slot 0 is the invalid-symbol sentinel
     return seen;
 }
@@ -296,8 +345,8 @@ void emitSymbols(std::string& out, Lir const& lir,
         // parser path purely for a debug annotation. The empty form is
         // both lossless (round-trips to the same set) and parseable
         // with the existing punctuation token set.
-        if (v < ctx.symbolNames.size() && !ctx.symbolNames[v].empty()) {
-            out.append(std::format("  %{} \"{}\"\n", v, ctx.symbolNames[v]));
+        if (std::string_view const name = symbolNameOf(v, ctx); !name.empty()) {
+            out.append(std::format("  %{} \"{}\"\n", v, name));
         } else {
             out.append(std::format("  %{}\n", v));
         }
@@ -406,6 +455,23 @@ void emitRegConstraintPool(std::string& out, LirRegConstraintPool const& pool,
     out.append("}\n");
 }
 
+// P68 round 8 part 4 — the inline-asm bundle's ROLE, as the `.dsslir` text
+// spells it: one word each (the lexer reads `-` as its own token). ONE table,
+// read by the emitter and the reader, so the two cannot drift.
+struct AsmRoleSpelling { LirAsmOperandRole role; std::string_view text; };
+constexpr std::array<AsmRoleSpelling, 4> kAsmRoleSpellings{{
+    {LirAsmOperandRole::Use,      "use"},
+    {LirAsmOperandRole::Def,      "def"},
+    {LirAsmOperandRole::UseDef,   "usedef"},
+    {LirAsmOperandRole::EarlyDef, "earlydef"},
+}};
+[[nodiscard]] constexpr std::string_view asmRoleText(LirAsmOperandRole r) noexcept {
+    for (auto const& e : kAsmRoleSpellings) {
+        if (e.role == r) return e.text;
+    }
+    return "?";
+}
+
 void emitInst(std::string& out, Lir const& lir, LirInstId inst,
               TargetSchema const& schema, std::uint32_t fnEntryV,
               DiagnosticReporter& reporter) {
@@ -455,6 +521,14 @@ void emitInst(std::string& out, Lir const& lir, LirInstId inst,
     if (rc != kLirNoRegConstraints) {
         out.append(std::format(" rc={}", rc));
     }
+    // P68 round 8 part 4: ` ar=<handle>` — the inline-asm bundle's body, by the
+    // same "absent state, loud if lost" argument as `rc=`: the `asm_regions`
+    // section still declares the entry, and `verifyLirText` reports a region
+    // no instruction references.
+    std::uint32_t const ar = lir.instAsmRegionHandle(inst);
+    if (ar != kLirNoAsmRegion) {
+        out.append(std::format(" ar={}", ar));
+    }
     out.push_back('\n');
 }
 
@@ -482,6 +556,55 @@ void emitBlock(std::string& out, Lir const& lir, LirFuncId fn, LirBlockId b,
     out.append("  }\n");
 }
 
+// P68 round 8 part 4 — the inline-asm bundle bodies:
+//   asm_regions {
+//     ar#0 = slots [use %v.3:gpr, earlydef %v.5:gpr] exit ^b1 goto [^b2]
+//            falls [^b0] { block ^b0 [entry] -> [^b1] { ... } ... }
+//   }
+// `slots` pairs each ROLE with the register the body names for that slot;
+// `exit`, `goto` and `falls` name body blocks by their slot in the body (the
+// same `^b` numbering its blocks print with). The section is written only when
+// the pool is non-empty, so every module without a statement reads back
+// byte-identical to what it did before this section existed.
+void emitAsmRegionPool(std::string& out, LirAsmRegionPool const& pool,
+                       TargetSchema const& schema, DiagnosticReporter& reporter) {
+    if (pool.empty()) return;
+    out.append("asm_regions {\n");
+    for (std::uint32_t i = 0; i < pool.size(); ++i) {
+        LirAsmRegion const& r = pool.at(i);
+        Lir const& body = r.body;
+        LirFuncId const fn = body.funcAt(0);
+        std::uint32_t const entryV = body.funcEntry(fn).v;
+        out.append(std::format("  ar#{} = slots [", i));
+        for (std::size_t k = 0; k < r.roles.size(); ++k) {
+            if (k > 0) out.append(", ");
+            out.append(asmRoleText(r.roles[k]));
+            out.push_back(' ');
+            out.append(renderReg(r.bodyRegs[k], schema, reporter));
+        }
+        out.append(std::format("] exit ^b{} goto [", r.exit.v - entryV));
+        for (std::size_t j = 0; j < r.gotoTargets.size(); ++j) {
+            if (j > 0) out.append(", ");
+            out.append(std::format("^b{}", r.gotoTargets[j].v - entryV));
+        }
+        out.append("] falls [");
+        bool first = true;
+        for (std::size_t b = 0; b < r.syntheticFallthrough.size(); ++b) {
+            if (r.syntheticFallthrough[b] == 0) continue;
+            if (!first) out.append(", ");
+            first = false;
+            out.append(std::format("^b{}", b));
+        }
+        out.append("] {\n");
+        std::uint32_t const nb = body.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            emitBlock(out, body, fn, body.funcBlockAt(fn, bi), schema, reporter);
+        }
+        out.append("  }\n");
+    }
+    out.append("}\n");
+}
+
 void emitFunction(std::string& out, Lir const& lir, LirFuncId fn,
                   TargetSchema const& schema, LirTextContext const& ctx,
                   DiagnosticReporter& reporter) {
@@ -506,6 +629,7 @@ std::string emitLir(Lir const& lir, TargetSchema const& schema,
     emitSymbols(out, lir, ctx);
     emitLiteralPool(out, lir.literalPool());
     emitRegConstraintPool(out, lir.regConstraintPool(), schema, reporter);
+    emitAsmRegionPool(out, lir.asmRegionPool(), schema, reporter);
     out.append("module {\n");
     std::size_t const fnCount = lir.moduleFuncCount();
     for (std::uint32_t i = 0; i < fnCount; ++i) {
@@ -683,6 +807,12 @@ public:
         if (peekIdent("symbols"))      parseSymbols();
         if (peekIdent("literal_pool")) parseLiteralPool();
         if (peekIdent("reg_constraints")) parseRegConstraintPool();
+        if (peekIdent("asm_regions")) {
+            parseAsmRegionPool();
+            // A region body abandoned unsealed poisoned ITS builder, not the
+            // module's; stop here, before the module parse drives either.
+            if (unterminatedBlock_) return finalize(errBefore);
+        }
         if (!expectIdent("module")) return makeEmptyResult();
         if (!expect(TokKind::LBrace)) return makeEmptyResult();
         while (true) {
@@ -722,7 +852,17 @@ private:
     TargetSchema const&                         schema_;
     DiagnosticReporter&                         reporter_;
     LirBuilder                                  builder_;
-    std::vector<std::string>                    symbolNames_;
+    // P68 round 8 part 4: the builder the FUNCTION-level parse (blocks,
+    // instructions, vregs) writes into — the module's, or, while an
+    // `asm_regions` entry is read, that region's own one-function body.
+    // Module-level sections (pools, `finish`) always use `builder_`.
+    LirBuilder*                                 cur_ = &builder_;
+    // Per parsed region, its slot count — `ar=` checks an instruction's
+    // operand count against it BEFORE the builder's abort would.
+    std::vector<std::size_t>                    regionSlotCounts_;
+    // SymbolId.v → declared name, one entry per declaration — SPARSE (see
+    // `LirParseResult::symbolNames`), never sized by a slot's number.
+    std::unordered_map<std::uint32_t, std::string> symbolNames_;
     // Block-slot mapping is per-function (slots are function-local).
     std::unordered_map<std::uint32_t, LirBlockId> blockMap_;
     // Vreg-id mapping. Builder mints vregs from 1; text uses the same
@@ -753,6 +893,9 @@ private:
     // shortened form round-trip byte-for-byte instead.
     std::vector<std::uint32_t>                  currentBlockSuccSlots_;
     bool                                        errors_ = false;
+    // Every refusal `emit` makes, counted HERE, whatever the reporter then does
+    // with it (a capped or deduplicating reporter may drop the line itself).
+    std::size_t                                 refusals_ = 0;
     // Set ONLY through `markUnterminatedBlock` — "a block was abandoned in a
     // state `LirBuilder` cannot close, on purpose, with a diagnostic already
     // reported". Two shapes reach it: an OPEN block left without a terminator
@@ -774,6 +917,7 @@ private:
         d.actual   = std::move(what);
         reporter_.report(std::move(d));
         errors_ = true;
+        ++refusals_;
     }
 
     // Refuse to leave the open block sealed: report, mark the block
@@ -817,7 +961,7 @@ private:
     // prevent. It is private to that pairing, not a general "give up".
     void markUnterminatedBlock() {
         unterminatedBlock_ = true;
-        builder_.poison();
+        cur_->poison();
     }
 
     [[nodiscard]] std::unique_ptr<LirParseResult> makeEmptyResult() {
@@ -866,6 +1010,14 @@ private:
         T v{};
         auto [ptr, ec] = std::from_chars(text.data(),
                                          text.data() + text.size(), v);
+        // The out-of-range case names its field width, as the MIR twin does: a
+        // number the text spells is read as that number or refused as too wide.
+        if (ec == std::errc::result_out_of_range) {
+            emit(DiagnosticCode::I_TextMalformed,
+                 std::format("{} value '{}' does not fit its {}-bit field", what, text,
+                             sizeof(T) * 8));
+            return T{};
+        }
         if (ec != std::errc{} || ptr != text.data() + text.size()) {
             emit(DiagnosticCode::I_TextMalformed,
                  std::format("malformed {} value '{}'", what, text));
@@ -966,13 +1118,21 @@ private:
                 continue;
             }
             // Optional `"name"` — bare `%N` is the synthetic form.
+            // ★ ONE ENTRY PER DECLARED NAME, never a table sized by the slot's
+            // number: this was `resize(v + 1)`, and a legitimate text carries
+            // slot 0xFFFFFF01 — the reserved PE `_tls_index` singleton
+            // (✔MEASURED P68, lane `ht`, part 1c: 20 of 804 example modules), a
+            // 128 GB table; a hostile one, `%4294967295`, wrapped `v + 1` to 0
+            // and wrote out of bounds. A second name for one slot is refused.
             Tok next = lex_.peek();
             if (next.kind == TokKind::String) {
                 lex_.take();
-                if (symbolNames_.size() <= v) symbolNames_.resize(v + 1);
-                symbolNames_[v] = next.text;
+                if (!symbolNames_.emplace(v, next.text).second) {
+                    emit(DiagnosticCode::I_TextMalformed,
+                         std::format("symbol slot %{} is named twice in symbols {{ }}", v));
+                }
             }
-            // No name → leave symbolNames_ unset for slot v.
+            // No name → no entry for slot v (the synthetic form).
         }
         (void)expect(TokKind::RBrace);
     }
@@ -1097,6 +1257,171 @@ private:
             }
         }
         (void)expect(TokKind::RBrace);
+    }
+
+    // ── P68 round 8 part 4: `asm_regions { ar#i = ... }` ─────────────────
+    //
+    // Each entry's BODY is a one-function module of its own, read by the SAME
+    // block/instruction parser as a module function — with `cur_` pointed at
+    // the region's builder — so a template's blocks read exactly as a
+    // function's do. The region is validated with `lirAsmRegionShapeDefect`
+    // (the builder's abort is a producer contract; a reader reports) before it
+    // is pooled.
+    void parseAsmRegionPool() {
+        (void)expectIdent("asm_regions");
+        if (!expect(TokKind::LBrace)) return;
+        while (true) {
+            Tok pk = lex_.peek();
+            if (pk.kind == TokKind::RBrace || pk.kind == TokKind::End) break;
+            if (!(pk.kind == TokKind::Ident && pk.text == "ar")) {
+                emit(DiagnosticCode::I_TextMalformed,
+                     std::format("expected 'ar' in asm_regions, got '{}'",
+                                 pk.text));
+                while (true) {
+                    Tok q = lex_.peek();
+                    if (q.kind == TokKind::End || q.kind == TokKind::RBrace) break;
+                    if (q.kind == TokKind::Ident && q.text == "ar") break;
+                    lex_.take();
+                }
+                continue;
+            }
+            (void)expectIdent("ar");
+            (void)expect(TokKind::Hash);
+            Tok idxTok = lex_.take();
+            std::uint32_t const declaredIdx = (idxTok.kind == TokKind::Integer)
+                ? parseNumber<std::uint32_t>(idxTok.text, "ar index") : 0;
+            (void)expect(TokKind::Eq);
+            parseOneAsmRegion(declaredIdx);
+            if (unterminatedBlock_) return;
+        }
+        (void)expect(TokKind::RBrace);
+    }
+
+    // `[ ^bN, ^bM ]` — body block slots.
+    [[nodiscard]] std::vector<std::uint32_t> parseBlockSlotList() {
+        std::vector<std::uint32_t> slots;
+        if (!expect(TokKind::LBracket)) return slots;
+        while (true) {
+            Tok pk = lex_.peek();
+            if (pk.kind == TokKind::RBracket || pk.kind == TokKind::End) break;
+            slots.push_back(parseCaretBlockSlot());
+            if (lex_.peek().kind == TokKind::Comma) lex_.take();
+        }
+        (void)expect(TokKind::RBracket);
+        return slots;
+    }
+
+    void parseOneAsmRegion(std::uint32_t declaredIdx) {
+        std::size_t const refusalsBefore = refusals_;
+        LirBuilder body{schema_};
+        LirBuilder* const saved = cur_;
+        cur_ = &body;
+        struct RestoreCur {
+            LirBuilder*& cur;
+            LirBuilder*  saved;
+            ~RestoreCur() { cur = saved; }
+        } const restore{cur_, saved};
+        (void)body.addFunction(SymbolId{});
+        blockMap_.clear();
+        vregMap_.clear();
+
+        auto region = std::make_shared<LirAsmRegion>();
+        if (!expectIdent("slots") || !expect(TokKind::LBracket)) return;
+        while (true) {
+            Tok pk = lex_.peek();
+            if (pk.kind == TokKind::RBracket || pk.kind == TokKind::End) break;
+            Tok roleTok = lex_.take();
+            std::optional<LirAsmOperandRole> role;
+            for (auto const& e : kAsmRoleSpellings) {
+                if (roleTok.kind == TokKind::Ident && e.text == roleTok.text) {
+                    role = e.role;
+                }
+            }
+            if (!role.has_value()) {
+                emit(DiagnosticCode::I_TextUnknownName,
+                     std::format("unknown asm-region slot role '{}' (the roles "
+                                 "are use, def, usedef, earlydef)",
+                                 roleTok.text));
+                return;
+            }
+            region->roles.push_back(*role);
+            region->bodyRegs.push_back(parseRegOperand());
+            if (lex_.peek().kind == TokKind::Comma) lex_.take();
+        }
+        (void)expect(TokKind::RBracket);
+        if (!expectIdent("exit")) return;
+        std::uint32_t const exitSlot = parseCaretBlockSlot();
+        if (!expectIdent("goto")) return;
+        std::vector<std::uint32_t> const gotoSlots = parseBlockSlotList();
+        if (!expectIdent("falls")) return;
+        std::vector<std::uint32_t> const fallSlots = parseBlockSlotList();
+
+        if (!expect(TokKind::LBrace)) return;
+        std::size_t const bodyStart = lex_.peekPos();
+        scanBlockHeaders();
+        lex_.setPos(bodyStart);
+        while (true) {
+            Tok pk = lex_.peek();
+            if (pk.kind == TokKind::RBrace || pk.kind == TokKind::End) break;
+            if (!(pk.kind == TokKind::Ident && pk.text == "block")) {
+                emit(DiagnosticCode::I_TextMalformed,
+                     std::format("expected 'block' inside an asm region's "
+                                 "body, got '{}'", pk.text));
+                lex_.take();
+                continue;
+            }
+            parseBlock();
+            if (unterminatedBlock_) return;   // the body builder is poisoned
+        }
+        (void)expect(TokKind::RBrace);
+        if (refusals_ != refusalsBefore) return;
+
+        auto const blockAt = [&](std::uint32_t slot) -> std::optional<LirBlockId> {
+            auto const it = blockMap_.find(slot);
+            if (it != blockMap_.end()) return it->second;
+            emit(DiagnosticCode::I_TextUnknownName,
+                 std::format("asm region ar#{} names body block ^b{}, which its "
+                             "body does not declare", declaredIdx, slot));
+            return std::nullopt;
+        };
+        auto const exitBlock = blockAt(exitSlot);
+        if (!exitBlock.has_value()) return;
+        region->exit = *exitBlock;
+        for (std::uint32_t const sl : gotoSlots) {
+            auto const b = blockAt(sl);
+            if (!b.has_value()) return;
+            region->gotoTargets.push_back(*b);
+        }
+        Lir bodyLir = std::move(body).finish();
+        std::uint32_t const nb = bodyLir.moduleFuncCount() == 1
+                               ? bodyLir.funcBlockCount(bodyLir.funcAt(0)) : 0u;
+        region->syntheticFallthrough.assign(nb, 0);
+        for (std::uint32_t const sl : fallSlots) {
+            if (sl >= nb) {
+                emit(DiagnosticCode::I_TextUnknownName,
+                     std::format("asm region ar#{} marks body block ^b{} as "
+                                 "falling through, and its body has {} block(s)",
+                                 declaredIdx, sl, nb));
+                return;
+            }
+            region->syntheticFallthrough[sl] = 1;
+        }
+        region->body = std::move(bodyLir);
+        if (auto const defect = lirAsmRegionShapeDefect(*region)) {
+            emit(DiagnosticCode::I_TextMalformed,
+                 std::format("asm region ar#{} is malformed: {}", declaredIdx,
+                             *defect));
+            return;
+        }
+        std::size_t const slots = region->roles.size();
+        std::uint32_t const actualIdx = builder_.asmRegionPoolAdd(std::move(region));
+        regionSlotCounts_.push_back(slots);
+        if (actualIdx != declaredIdx) {
+            emit(DiagnosticCode::I_TextMalformed,
+                 std::format("asm-region pool index drift: text declared ar#{} "
+                             "but builder minted ar#{} (pool ordering must "
+                             "match emit order)", declaredIdx, actualIdx));
+        }
     }
 
     // `<clause> [ name, name, ... ]` — an empty list is `[]`. The clause
@@ -1305,6 +1630,18 @@ private:
                      std::format("expected string after 'str', got '{}'", v.text));
             }
             lv.value = std::move(v.text);
+        } else if (tag.text == "symaddr") {
+            // `symaddr @<symbol> <addend>` — the emitter's arm, read back.
+            LirSymbolAddress a;
+            if (!expect(TokKind::At)) return lv;
+            Tok s = lex_.take();
+            a.symbol = SymbolId{parseNumber<std::uint32_t>(s.text, "symaddr symbol")};
+            bool const neg = (lex_.peek().kind == TokKind::Minus);
+            if (neg) lex_.take();
+            Tok v = lex_.take();
+            a.addend = parseNumber<std::int64_t>(v.text, "symaddr addend");
+            if (neg) a.addend = -a.addend;
+            lv.value = a;
         } else if (tag.text == "agg") {
             if (!expect(TokKind::LBracket)) return lv;
             LirAggregateValue agg;
@@ -1383,7 +1720,13 @@ private:
                              what, t.text));
             return std::nullopt;
         }
-        return parseNumber<std::uint32_t>(t.text, what);
+        // A number `parseNumber` refused (too wide for 32 bits) is not 0: answer
+        // "no integer" so the caller does not ALSO report the 0 it would have
+        // returned as the invalid-symbol sentinel (P68 round 8, lane `ht`, 1c).
+        std::size_t const before = refusals_;
+        std::uint32_t const v = parseNumber<std::uint32_t>(t.text, what);
+        if (refusals_ != before) return std::nullopt;
+        return v;
     }
 
     // ── functions ──────────────────────────────────────────────────
@@ -1402,18 +1745,19 @@ private:
         // future emit-vs-parse drift doesn't silently flip identities.
         if (lex_.peek().kind == TokKind::String) {
             Tok name = lex_.take();
-            if (symbolNames_.size() <= sym) symbolNames_.resize(sym + 1);
-            if (symbolNames_[sym].empty()) {
-                symbolNames_[sym] = std::move(name.text);
-            } else if (symbolNames_[sym] != name.text) {
+            // The same sparse table — this site too was `resize(sym + 1)`.
+            auto const [it, inserted] = symbolNames_.try_emplace(sym, name.text);
+            if (!inserted && it->second.empty()) {
+                it->second = std::move(name.text);
+            } else if (!inserted && it->second != name.text) {
                 emit(DiagnosticCode::I_TextMalformed,
                      std::format("function %{} inline name \"{}\" contradicts "
                                  "the symbols-block entry \"{}\"",
-                                 sym, name.text, symbolNames_[sym]));
+                                 sym, name.text, it->second));
             }
         }
         if (!expect(TokKind::LBrace)) return;
-        builder_.addFunction(SymbolId{sym});
+        cur_->addFunction(SymbolId{sym});
         // Per-function state reset.
         blockMap_.clear();
         vregMap_.clear();
@@ -1457,7 +1801,7 @@ private:
                 lex_.take();
                 std::uint32_t const slot = parseCaretBlockSlot();
                 if (blockMap_.find(slot) == blockMap_.end()) {
-                    blockMap_[slot] = builder_.createBlock();
+                    blockMap_[slot] = cur_->createBlock();
                 }
                 continue;
             }
@@ -1467,6 +1811,12 @@ private:
 
     [[nodiscard]] std::uint32_t parseCaretBlockSlot() {
         if (!expect(TokKind::Caret)) return 0;
+        return parseBlockSlotName();
+    }
+
+    // The `b<int>` after a `^`, already consumed (`parseOperand` reads the
+    // caret itself to tell a block from the location counter `^.`).
+    [[nodiscard]] std::uint32_t parseBlockSlotName() {
         Tok t = lex_.take();
         // `^b<digits>` arrives as identifier whose first char is `b`.
         if (t.kind != TokKind::Ident || t.text.empty() || t.text[0] != 'b') {
@@ -1474,16 +1824,18 @@ private:
                  std::format("expected '^b<int>', got '^{}'", t.text));
             return 0;
         }
-        std::uint32_t v = 0;
         for (std::size_t i = 1; i < t.text.size(); ++i) {
             if (!std::isdigit(static_cast<unsigned char>(t.text[i]))) {
                 emit(DiagnosticCode::I_TextMalformed,
                      std::format("malformed block-slot '^{}'", t.text));
                 return 0;
             }
-            v = v * 10 + static_cast<std::uint32_t>(t.text[i] - '0');
         }
-        return v;
+        // ★ READ AS WRITTEN OR REFUSED (P68 round 8, lane `ht`, part 1c). This was a
+        // hand-rolled 32-bit `v * 10 + d`, so `^b4294967297` WRAPPED to `^b1` — a
+        // branch to a different block — and a bare `^b` read as `^b0`. The checked
+        // reader refuses both by name.
+        return parseNumber<std::uint32_t>(std::string_view{t.text}.substr(1), "block slot");
     }
 
     void parseBlock() {
@@ -1558,7 +1910,7 @@ private:
         // fires. The pin uses the second shape; the first was written,
         // measured GREEN against the mutant, and discarded.
         if (!expect(TokKind::LBrace)) { markUnterminatedBlock(); return; }
-        builder_.beginBlock(it->second);
+        cur_->beginBlock(it->second);
         while (true) {
             Tok pk = lex_.peek();
             if (pk.kind == TokKind::RBrace || pk.kind == TokKind::End) break;
@@ -1604,7 +1956,7 @@ private:
         // continuing to the next. One diagnostic per unsealed block is
         // bounded, unlike the per-token cascade
         // `skipToNextInstOrBlockEnd` exists to prevent.
-        if (!unterminatedBlock_ && !builder_.openBlockIsTerminated()) {
+        if (!unterminatedBlock_ && !cur_->openBlockIsTerminated()) {
             refuseTerminator(std::format(
                 "block ^b{} closes without a terminator instruction; every LIR "
                 "block must end in one, and a `.dsslir` reader may not kill the "
@@ -1637,7 +1989,7 @@ private:
         // mints of the same class. Filler vregs are unused — their
         // class is therefore inert (no defs / no uses observe it).
         while (true) {
-            LirReg const minted = builder_.newVReg(cls);
+            LirReg const minted = cur_->newVReg(cls);
             vregMap_[static_cast<std::uint32_t>(minted.id)] = minted;
             if (minted.id == id) return minted;
             if (minted.id > id) {
@@ -1711,6 +2063,19 @@ private:
     }
 
     // Parse one operand based on its leading sigil.
+    // The optional `:<part>` suffix of a symbolic operand (P68 round 9) —
+    // `renderPartSuffix`'s inverse. Absent ⇒ the whole address; a name the
+    // vocabulary does not know is malformed text, never silently the whole.
+    [[nodiscard]] SymbolAddressPart parsePartSuffix() {
+        if (lex_.peek().kind != TokKind::Colon) return SymbolAddressPart::Whole;
+        lex_.take();
+        Tok const n = lex_.take();
+        if (auto const part = symbolAddressPartFromName(n.text)) return *part;
+        emit(DiagnosticCode::I_TextMalformed,
+             std::format("'{}' is not a part of a symbol's address", n.text));
+        return SymbolAddressPart::Whole;
+    }
+
     [[nodiscard]] LirOperand parseOperand() {
         Tok pk = lex_.peek();
         switch (pk.kind) {
@@ -1727,7 +2092,14 @@ private:
                 return LirOperand::makeImmInt32(v);
             }
             case TokKind::Caret: {
-                std::uint32_t const slot = parseCaretBlockSlot();
+                lex_.take();
+                // `^.` — the location counter (P68 round 9): the address of
+                // the instruction that carries it, which is no block.
+                if (lex_.peek().kind == TokKind::Dot) {
+                    lex_.take();
+                    return LirOperand::makeLocationCounter();
+                }
+                std::uint32_t const slot = parseBlockSlotName();
                 auto it = blockMap_.find(slot);
                 if (it == blockMap_.end()) {
                     // Forward-or-cross-function ref to a block
@@ -1751,7 +2123,7 @@ private:
                 lex_.take();
                 Tok n = lex_.take();
                 std::uint32_t const v = parseNumber<std::uint32_t>(n.text, "SymbolRef id");
-                return LirOperand::makeSymbolRef(v);
+                return LirOperand::makeSymbolRef(v, parsePartSuffix());
             }
             case TokKind::Star: {
                 lex_.take();
@@ -1784,6 +2156,22 @@ private:
                     return LirOperand::makeByValueStackAgg(
                         parseNumber<std::uint32_t>(n.text, "ByValueStackAgg bytes"));
                 }
+                if (pk.text == "memsym") {
+                    lex_.take();
+                    (void)expect(TokKind::Hash);
+                    Tok n = lex_.take();
+                    auto const idx =
+                        parseNumber<std::uint32_t>(n.text, "MemSymbolOffset");
+                    return LirOperand::makeMemSymbolOffset(idx, parsePartSuffix());
+                }
+                if (pk.text == "symaddr") {
+                    lex_.take();
+                    (void)expect(TokKind::Hash);
+                    Tok n = lex_.take();
+                    auto const idx =
+                        parseNumber<std::uint32_t>(n.text, "SymbolAddress");
+                    return LirOperand::makeSymbolAddress(idx, parsePartSuffix());
+                }
                 return LirOperand::makeReg(parseRegOperand());
             }
             case TokKind::Percent:
@@ -1809,10 +2197,15 @@ private:
     // instruction's handle and that instruction would vanish. The
     // `= <integer>` shape is unambiguous: a result-form instruction always
     // has a MNEMONIC after its `=`, never a number.
-    [[nodiscard]] bool takeRcTailKeyword() {
-        if (!peekIdent("rc")) return false;
+    [[nodiscard]] bool takeRcTailKeyword() { return takeTailKeyword("rc"); }
+
+    // `<keyword> = <integer>`, confirmed by its whole shape before anything is
+    // consumed (the `rc` argument above applies to every tail keyword: `ar` is
+    // P68 round 8 part 4's inline-asm region handle).
+    [[nodiscard]] bool takeTailKeyword(std::string_view keyword) {
+        if (!peekIdent(keyword)) return false;
         std::size_t const save = lex_.peekPos();
-        lex_.take();                                  // `rc`
+        lex_.take();                                  // the keyword
         if (lex_.peek().kind == TokKind::Eq) {
             lex_.take();                              // `=`
             if (lex_.peek().kind == TokKind::Integer) return true;
@@ -1922,15 +2315,50 @@ private:
                      "never emitted — an explicit rc=0 means the producer "
                      "wrote a handle it did not have");
             } else if (lirRegConstraintIndexForHandle(rcHandle)
-                       >= builder_.regConstraintPoolSize()) {
+                       >= cur_->regConstraintPoolSize()) {
                 emit(DiagnosticCode::I_TextUnknownName,
                      std::format("rc={} names register-constraint pool entry "
                                  "rc#{}, but the reg_constraints section "
                                  "declared {} entries",
                                  rcHandle,
                                  lirRegConstraintIndexForHandle(rcHandle),
-                                 builder_.regConstraintPoolSize()));
+                                 cur_->regConstraintPoolSize()));
                 rcHandle = kLirNoRegConstraints;
+            }
+        }
+        // P68 round 8 part 4: optional ` ar=<handle>` — the inline-asm
+        // bundle's region. Range-checked and slot-counted HERE: the builder's
+        // `setInstAsmRegion` aborts on either violation, and a text reader
+        // reports a bad file instead.
+        std::uint32_t arHandle = kLirNoAsmRegion;
+        if (takeTailKeyword("ar")) {
+            Tok n = lex_.take();
+            arHandle = parseNumber<std::uint32_t>(n.text, "ar handle");
+            std::uint32_t const idx = arHandle == kLirNoAsmRegion
+                                    ? 0u : lirAsmRegionIndexForHandle(arHandle);
+            if (arHandle == kLirNoAsmRegion) {
+                emit(DiagnosticCode::I_TextMalformed,
+                     "ar=0 is the 'not a bundle' sentinel and is never "
+                     "emitted — an explicit ar=0 means the producer wrote a "
+                     "handle it did not have");
+            } else if (idx >= cur_->asmRegionPoolSize()) {
+                emit(DiagnosticCode::I_TextUnknownName,
+                     std::format("ar={} names asm-region pool entry ar#{}, but "
+                                 "the asm_regions section declared {} entries "
+                                 "(a region body carries no regions of its own)",
+                                 arHandle, idx, cur_->asmRegionPoolSize()));
+                arHandle = kLirNoAsmRegion;
+            } else if (idx >= regionSlotCounts_.size()
+                       || regionSlotCounts_[idx] != operands.size()) {
+                emit(DiagnosticCode::I_TextMalformed,
+                     std::format("ar={} names a region with {} slot(s), but the "
+                                 "instruction carries {} operand(s) — a role is "
+                                 "read by position",
+                                 arHandle,
+                                 idx < regionSlotCounts_.size()
+                                     ? regionSlotCounts_[idx] : 0u,
+                                 operands.size()));
+                arHandle = kLirNoAsmRegion;
             }
         }
         // Dispatch by terminator-ness.
@@ -1983,10 +2411,10 @@ private:
             };
             switch (info->terminatorKind) {
                 case TargetTerminatorKind::Return:
-                    builder_.addReturn(op, nonBlock, payload, flags);
+                    cur_->addReturn(op, nonBlock, payload, flags);
                     break;
                 case TargetTerminatorKind::Unreachable:
-                    builder_.addUnreachable(op, payload, flags);
+                    cur_->addUnreachable(op, payload, flags);
                     break;
                 case TargetTerminatorKind::Br: {
                     auto ts = resolveTargets();
@@ -2024,7 +2452,7 @@ private:
                             mnem.text, operands.size()));
                         return;
                     }
-                    builder_.addBr(op, (*ts)[0], payload, flags);
+                    cur_->addBr(op, (*ts)[0], payload, flags);
                     break;
                 }
                 case TargetTerminatorKind::CondBr: {
@@ -2048,7 +2476,7 @@ private:
                     // target. `lir_pass_util::emitTerminator` — the sibling
                     // dispatch every LIR pass rebuilds through — has always
                     // passed its (remapped) full list; this arm was the outlier.
-                    builder_.addCondBr(op, operands, (*ts)[0], (*ts)[1],
+                    cur_->addCondBr(op, operands, (*ts)[0], (*ts)[1],
                                        payload, flags);
                     break;
                 }
@@ -2107,7 +2535,29 @@ private:
                         }
                         return;
                     }
-                    builder_.addIndirectBr(op, operands, *ts, payload, flags);
+                    cur_->addIndirectBr(op, operands, *ts, payload, flags);
+                    break;
+                }
+                case TargetTerminatorKind::AsmGoto: {
+                    // P68 round 8 part 4: an inline-asm `asm goto` bundle. Its
+                    // successors (the labels, then the fall-through) ride the
+                    // block header's `-> [...]` list, exactly as IndirectBr's
+                    // do, and its operands are its slots. >=1 successor — the
+                    // fall-through always exists — refused, never built, when
+                    // absent.
+                    auto ts = resolveTargets();
+                    if (!ts.has_value() || ts->empty()) {
+                        if (ts.has_value()) {
+                            refuseTerminator(
+                                 std::format("asm-goto opcode '{}' requires "
+                                             ">=1 successor (its fall-through); "
+                                             "block declared 0", mnem.text));
+                        } else {
+                            markUnterminatedBlock();
+                        }
+                        return;
+                    }
+                    cur_->addAsmGoto(op, operands, *ts, payload, flags);
                     break;
                 }
                 case TargetTerminatorKind::None:
@@ -2124,7 +2574,7 @@ private:
                     return;
             }
         } else {
-            builder_.addInst(op, result, operands, payload, flags);
+            cur_->addInst(op, result, operands, payload, flags);
         }
         // Attach the constraint handle to whatever was just appended.
         // ★ Reached only by the paths that actually emitted an
@@ -2133,9 +2583,13 @@ private:
         // silently emits nothing cannot quietly bind this handle to the
         // PREVIOUS instruction.
         if (rcHandle != kLirNoRegConstraints) {
-            builder_.setInstRegConstraints(
-                builder_.lastInst(),
+            cur_->setInstRegConstraints(
+                cur_->lastInst(),
                 lirRegConstraintIndexForHandle(rcHandle));
+        }
+        if (arHandle != kLirNoAsmRegion) {
+            cur_->setInstAsmRegion(cur_->lastInst(),
+                                   lirAsmRegionIndexForHandle(arHandle));
         }
     }
 
@@ -2176,6 +2630,7 @@ private:
                 // cannot have its next instruction eaten by the RECOVERY
                 // path either.
                 if (takeRcTailKeyword()) (void)lex_.take();
+                if (takeTailKeyword("ar")) (void)lex_.take();
                 break;
             }
             lex_.take();
@@ -2190,9 +2645,12 @@ private:
         auto result = std::make_unique<LirParseResult>(
             std::move(module), std::move(symbolNames_));
         // Verify-on-load: LIR-only rules (the only ones meaningful
-        // without an MIR cross-reference).
-        (void)verifyLirText(result->lir, schema_, reporter_);
-        result->ok = (reporter_.errorCount() == errBefore);
+        // without an MIR cross-reference). `ok` takes the verifier's OWN
+        // verdict, not only the delta — the P68 (lane `ht`) rule for every
+        // text tier's verify-on-load: a refusal the reporter drops as a recent
+        // duplicate must still fail the read.
+        bool const verified = verifyLirText(result->lir, schema_, reporter_);
+        result->ok = verified && reporter_.errorCount() == errBefore;
         return result;
     }
 };

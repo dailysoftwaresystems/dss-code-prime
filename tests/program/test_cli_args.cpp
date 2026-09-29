@@ -1477,8 +1477,8 @@ TEST(CliArgs, ResolveLibraryFlagCollectsRepeatable) {
     // Both spellings (`--resolve-library <path>` / `--resolve-library=<path>`),
     // repeatable, carried verbatim to CliArgs::resolveLibraries. NO `=` inside
     // the value ⇒ the PLAIN form: nothing is stated, so `declaredImportName`
-    // stays EMPTY and the pre-D-FFI-DECLARED-IMPORT-NAME precedence (embedded
-    // soname, else basename) applies unchanged.
+    // stays EMPTY and the precedence that predates declared import names
+    // (embedded soname, else basename) applies unchanged.
     Argv a{"dsscp", "--compile", "main.c",
            "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux-exec",
@@ -1507,7 +1507,7 @@ TEST(CliArgs, ResolveLibraryFlagEmptyValueRejected) {
     EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
 }
 
-// ── D-FFI-DECLARED-IMPORT-NAME: `--resolve-library <path>[=<import-name>]` ───
+// ── The declared import name: `--resolve-library <path>[=<import-name>]` ───
 
 TEST(CliArgs, ResolveLibraryDeclaredImportNameParsedOnBothFlagSpellings) {
     // The `=<import-name>` suffix STATES the runtime identity to record. It

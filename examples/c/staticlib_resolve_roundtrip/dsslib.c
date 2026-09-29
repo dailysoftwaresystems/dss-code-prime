@@ -1,10 +1,10 @@
-/* D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): the LIBRARY half of the
- * multi-artifact corpus round-trip. The runner builds THIS into a static
+/* Multi-artifact corpus example (c171): the LIBRARY half of the
+ * two-artifact corpus round-trip. The runner builds THIS into a static
  * archive (a `.lib` on pe64 / a `.a` on elf64 via the c171-D `-staticlib`
  * format), then builds `main.c` resolving `dss_lib_answer` against it via
  * `--resolve-library` -> a self-contained exec -> exit 42.
  *
- * D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM -- WHY THIS BODY IS NOT
+ * THE `dependsOn` RELEASE ARM -- WHY THIS BODY IS NOT
  * `return 42;`, AND WHY SIMPLIFYING IT BACK WOULD SILENTLY DISARM A TEST.
  * `expected.json` now declares a `release` arm with
  * `mustDifferFromBaseline: true`, which reds unless the optimized executable
@@ -50,7 +50,7 @@
  * the function, so no file-local relocation survives and the arm would link
  * green against a reader that still had the bug. The `release` arm above is
  * still doing its own job -- it is the optimizer witness the
- * D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM note describes -- but it is
+ * `release`-arm note at the top of this file describes -- but it is
  * not this one, and a release-only test of this defect is vacuous. */
 static int dss_lib_step(int acc, int addend) {
     return acc + addend;

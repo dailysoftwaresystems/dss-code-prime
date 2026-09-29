@@ -1,5 +1,5 @@
-// THE GUARD ON THE RUN'S SHIPPED-CONFIG SNAPSHOT.
-//   D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED
+// THE GUARD ON THE RUN'S SHIPPED-CONFIG SNAPSHOT — the exposure that reddened
+// one suite was never confined to that suite.
 //
 // `cmake/DssConfigSnapshot.cmake` gives every config-reading ctest entry a
 // `$DSS_CONFIG_ROOT` pointed at a copy of the shipped config tree taken ONCE per
@@ -270,7 +270,7 @@ TEST(ConfigSnapshot, TheSnapshotIsCurrentWithTheLiveTree) {
 
 // The other half of the split this change made: `$DSS_CONFIG_ROOT` names the
 // CONFIG tree and nothing else. `repoRoot()` — which reaches tests/corpus,
-// tests/hir/lowering_goldens, examples/, scripts/ and src/ — must keep naming the
+// tests/hir/lowering_goldens, examples/, .harness-config/runner/actions/ and src/ — must keep naming the
 // checkout these binaries were built from, or pointing the suite at a
 // config-only snapshot would take every golden file in the repository with it.
 TEST(ConfigSnapshot, RepoRootStillNamesTheCheckoutTheseTestsWereBuiltFrom) {

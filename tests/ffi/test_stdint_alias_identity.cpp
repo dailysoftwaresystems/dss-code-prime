@@ -557,7 +557,11 @@ TEST(StdintAliasIdentity, DeletingTheMachoArmLeavesUint64Uninjected) {
             }
         }
     }
-    ASSERT_EQ(removed, 10u) << "the mutant must remove exactly the ten macho arms — "
+    // FOURTEEN since P68 round 9: the ten 64-bit / pointer / greatest-width aliases
+    // this file pins, plus the four fast16/32 typedefs that gained per-format
+    // variants when glibc's `long` was measured for them
+    // (D-FFI-STDINT-FAST16-32-TYPEDEFS-WRONG-ON-ELF) — each with one macho arm.
+    ASSERT_EQ(removed, 14u) << "the mutant must remove exactly the fourteen macho arms — "
                                "a different count means the file moved under it";
     writeJson(stdintJson, doc);
 
@@ -596,7 +600,11 @@ TEST(StdintAliasIdentity, DeletingTheFormatKeysRestoresTheAmbiguityTheRowRemoved
             if (arm.at("when").erase("format") != 0) ++stripped;
         }
     }
-    ASSERT_EQ(stripped, 30u) << "ten typedefs x three arms carry the key this row added";
+    // 42 since P68 round 9: the ten aliases this row keyed AND the four fast16/32
+    // typedefs (D-FFI-STDINT-FAST16-32-TYPEDEFS-WRONG-ON-ELF), three arms each, all
+    // keyed on `{dataModel, format}` — so stripping `format` makes every one of them
+    // ambiguous on Darwin, the fast ones included.
+    ASSERT_EQ(stripped, 42u) << "fourteen typedefs x three arms carry the key this row added";
     writeJson(stdintJson, doc);
 
     TypeInterner       interner{CompilationUnitId{1}};

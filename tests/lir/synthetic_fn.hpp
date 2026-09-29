@@ -4,7 +4,7 @@
 // need to exercise specific MIR opcodes the c frontend doesn't
 // emit naturally (e.g. bitwise/float arithmetic, reverse Bitcast,
 // liveness-shape probes). Promoted to a shared header in ML6 cycle 1
-// (cycle-3e deferral D-3e.7) so multiple test binaries — `test_mir_to_lir`
+// (cycle-3e deferral D-PLAN12-BUILDSYNTHETICFN-TEST-HELPER-PROMOTION-LIFT-FROM-TESTS-LIR) so multiple test binaries — `test_mir_to_lir`
 // and `test_lir_liveness` — share the same harness.
 //
 // Lives in `tests/lir/` so it's available only to the LIR test binaries
@@ -29,9 +29,9 @@ struct SyntheticFn {
 
 // ── THE PROBE'S KIND -> TypeId RESOLUTION, ONE OWNER ──────────────────────
 //
-// D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR. These lowering probes
-// name a type by its KIND because what they assert is register CLASS and
-// WIDTH, not structure -- and every kind they name is a LEAF kind that
+// THE `tests/lir` AND `tests/link` SUITES MINTED AN OPERAND-LESS `Ptr`. These
+// lowering probes name a type by its KIND because what they assert is register
+// CLASS and WIDTH, not structure -- and every kind they name is a LEAF kind that
 // `primitive(k)` builds directly, EXCEPT `Ptr`.
 //
 // `Ptr` is structural: it carries a pointee operand. `primitive(TypeKind::Ptr)`

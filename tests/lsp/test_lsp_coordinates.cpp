@@ -21,12 +21,14 @@
 #include "lsp/lsp_coordinates.hpp"
 #include "lsp/workspace_project.hpp"   // fileUriFromPath
 #include "test_support/repo_root.hpp"
+#include "test_support/scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -88,18 +90,29 @@ namespace {
          p = text.find(from, p + to.size())) {
         text.replace(p, from.size(), to);
     }
-    // ...except the FUNCTION-LIKE rows. The loader refuses a warn verb on one
-    // (c105 already lowers it to an ordinary prologue `#define`, so a warn
-    // claim would be unenforceable), and this A/B is not the place to argue
-    // with that rule -- it is the place to vary the OBJECT-like prologue. Their
-    // two lines are common to BOTH arms, so they are not a variable.
-    const std::string fnFrom =
-        "\"params\": [\"x\"], \"availableObjectFormats\": [\"pe\"], " + to;
-    const std::string fnTo =
-        "\"params\": [\"x\"], \"availableObjectFormats\": [\"pe\"], " + from;
-    for (std::string::size_type p = text.find(fnFrom); p != std::string::npos;
-         p = text.find(fnFrom, p + fnTo.size())) {
-        text.replace(p, fnFrom.size(), fnTo);
+    // ...except the FUNCTION-LIKE rows ('params' present) — EVERY one, found by
+    // the key rather than by one row's spelling. The loader refuses a warn verb
+    // on one (c105 already lowers it to an ordinary prologue `#define`, so a warn
+    // claim would be unenforceable), and this A/B is not the place to argue with
+    // that rule -- it is the place to vary the OBJECT-like prologue. Their lines
+    // are common to BOTH arms, so they are not a variable. (Until P68 round 9 the
+    // only function-like rows were the pe `params: ["x"]` pair and this restore
+    // matched that spelling; the `__INTN_C(c)` rows broke it.) Each predefine row
+    // of c.lang.json is ONE line, so a line holding `"params"` is one such row.
+    {
+        std::string restored;
+        std::istringstream lines{text};
+        for (std::string line; std::getline(lines, line);) {
+            if (line.find("\"params\"") != std::string::npos) {
+                for (std::string::size_type p = line.find(to); p != std::string::npos;
+                     p = line.find(to, p + from.size())) {
+                    line.replace(p, to.size(), from);
+                }
+            }
+            restored += line;
+            restored += '\n';
+        }
+        text = std::move(restored);
     }
     auto loaded = dss::GrammarSchema::loadFromText(text, "<c-empty-prologue>");
     if (!loaded.has_value()) {
@@ -133,33 +146,28 @@ struct Built {
 }
 
 // A temp directory that cleans itself up, so a fixture with real `#include`
-// files never accumulates in the tree.
+// files never accumulates in the tree. Claimed per PROCESS by `ScratchDir`: the
+// old name was keyed on this object's ADDRESS, which two processes (two build
+// trees' copies of this binary) can share, and `create_directories` accepts a
+// directory that already exists, so both would have written into one (the P68
+// round 8 cross-tree temp race, measured on test_emit_hir_mode).
 class TempDir {
 public:
-    TempDir() {
-        dir_ = fs::temp_directory_path()
-             / ("dss-lspcoord-" + std::to_string(
-                    reinterpret_cast<std::uintptr_t>(this)));
-        fs::create_directories(dir_);
-    }
-    ~TempDir() {
-        std::error_code ec;
-        fs::remove_all(dir_, ec);
-    }
+    TempDir() : scratch_(dss::test_support::Location::Temp, "lsp-coordinates") {}
     TempDir(TempDir const&) = delete;
     TempDir& operator=(TempDir const&) = delete;
 
     [[nodiscard]] fs::path write(std::string const& name,
                                  std::string_view text) const {
-        const fs::path p = dir_ / name;
+        const fs::path p = scratch_.path() / name;
         std::ofstream out(p, std::ios::binary);
         out << text;
         return p;
     }
-    [[nodiscard]] fs::path const& path() const noexcept { return dir_; }
+    [[nodiscard]] fs::path const& path() const noexcept { return scratch_.path(); }
 
 private:
-    fs::path dir_;
+    dss::test_support::ScratchDir scratch_;
 };
 
 } // namespace

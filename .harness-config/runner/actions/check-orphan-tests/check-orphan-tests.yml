@@ -1,0 +1,14 @@
+# PURPOSE: refuse a test source that no CMake target compiles and no ctest entry runs.
+name: check-orphan-tests
+description: >-
+  The action refuses a test source no target compiles, then proves every refusal can fire.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `orphan_tests_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-orphan-tests.py
+    successPattern: 'orphan-tests: self-test OK'
+    requireInputsUnmoved: true

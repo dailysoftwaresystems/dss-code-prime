@@ -1,0 +1,115 @@
+{
+  "$comment": "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH -- AN IMAGE THAT SAYS WHERE ITS LIBRARIES ARE, AND RUNS BECAUSE OF IT. Every target builds `dsslib.c` into a dynamic library beside the executable (`dependsOn`) and links `main.c` against it with `runpaths: [\"${ORIGIN}\"]` -- the runner's spelling of the CLI `--rpath '${ORIGIN}'` (CLI-subprocess runner) and `Program::setRunpaths` (in-process runner). `${ORIGIN}` is DSS's PORTABLE token for the directory of the image that carries the path; each format's DOCUMENT declares its own spelling (`runpath.origin`), so the ELF arms record DT_RUNPATH `$ORIGIN` and the Mach-O arms record LC_RPATH `@loader_path` from this one manifest. The ELF arms declare NO `loaderSearchPathVariable`, and that absence is the witness: the four older dynamic-library examples still set LD_LIBRARY_PATH for their spawns (the HARNESS answer for running an image that records nothing), while these run because the IMAGE says where its library is. The control is `examples/c/dynlib_runpath_absent_exits_127`: the same program built WITHOUT the request, which the loader refuses at exit 127.",
+  "$commentReferences": "The behaviour transcribes the references, measured separately in lane `vn`'s part 3 (probes and logs under its `.temp/ref/`): gcc 13.3 + GNU ld 2.42 and clang 18 + ld.lld 18 record `-Wl,-rpath,'$ORIGIN'` as ONE DT_RUNPATH entry holding `$ORIGIN` verbatim, and the same executable with the library beside it exits 42 while the one built without the request exits 127 -- natively on x86_64 and under qemu-aarch64 alike. ld64.lld records one LC_RPATH per -rpath. mingw GNU ld and MSVC link both ACCEPT an rpath request for a PE image and emit a byte-identical image that runs with the DLL beside it.",
+  "$commentPe": "THE PE ARM DECLARES THE SAME REQUEST AND RUNS ANYWAY -- which is the decision the PE measurement made, witnessed end to end. The pe64 format declares no runpath carrier (its document declares `runpathUnsupportedReason: application-directory-search` instead), so the request is ACCEPTED, nothing is recorded, and the build reports it once as the K_FormatLacksRunpath WARNING; the exe then finds `dsslib.dll` because the Windows loader searches the application's own directory. The warning itself is pinned by unit test (tests/link/test_image_runpath.cpp), not here: `expectWarnings` is a manifest-level key and would demand the same warning of the ELF and Mach-O arms, which rightly emit none.",
+  "$commentMachO": "THE MACH-O ARMS ARE BUILD-ONLY (`runOn: []`) until a Mac is reachable from the gate: the in-process runner compiles them on every host, so the LC_RPATH writer runs here on every leg. What they record is pinned STRUCTURALLY by tests/link/test_image_runpath.cpp, which decodes the `rpath_command` bytes (`@loader_path`, lc_str offset 12, cmdsize a multiple of 8) and the `@rpath/` LC_LOAD_DYLIB they resolve.",
+  "$commentRedOnDisable": "RED-ON-DISABLE: remove the DT_RUNPATH entry from `elf.cpp`'s dynamic-image writer and every ELF arm here exits 127 on linux -- the control's result -- because the loader no longer knows where `dsslib.so` is. Measured by lane `vn` through both runners; see its findings, part 3.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:elf64-x86_64-linux-dyn",
+          "artifact": "dsslib.so",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-pie",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:elf64-x86_64-linux-dyn",
+          "artifact": "dsslib.so",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "arm64:elf64-aarch64-linux-dyn",
+          "artifact": "dsslib.so",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-pie",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "arm64:elf64-aarch64-linux-dyn",
+          "artifact": "dsslib.so",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:pe64-x86_64-windows-dll",
+          "artifact": "dsslib.dll",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [],
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "arm64:macho64-arm64-darwin-dylib",
+          "artifact": "dsslib.dylib",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": [],
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:macho64-x86_64-darwin-dylib",
+          "artifact": "dsslib.dylib",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    }
+  ]
+}

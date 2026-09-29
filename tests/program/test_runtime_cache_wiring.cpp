@@ -85,8 +85,10 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -1053,4 +1055,264 @@ TEST(RuntimeCacheWiring, AHitAndAMissEmitTheSameImage) {
            "passes on the developer's second run and fails on CI's first — in "
            "either direction, and with every symptom pointing at the code under "
            "test rather than at the cache.";
+}
+
+// ═══ AND THE SAME FOR EVERYTHING ELSE THAT REACHES THE USER ═════════════════
+//
+// D-PROGRAM-RUNTIME-BUILD-OUTPUT-DEPENDS-ON-CACHE-WARMTH. The image was already
+// pinned identical on a hit and a miss; the user's STREAM and the build's
+// VERDICT were not, and both varied. ✔MEASURED (WSL, every pe64
+// `--config=release` output, a fresh cache root per cell): the miss printed the
+// runtime's own `warning[X_OptFixpointTruncated]` and
+// `info[R_SpilledDueToCrossCallExhaustion]`, tagged with the archive sibling's
+// target and naming no source, and the hit printed neither; and
+// `--warnings-as-errors` FAILED on a cold cache — the runtime's warning
+// promoted by the USER's policy, "the shipped runtime unit
+// 'runtime/platform/src/atomic.c' … FAILED TO COMPILE" — and PASSED on a warm
+// one. Two mechanisms, one pin each, plus the one that must NOT be lost:
+//   * the nested runtime build uses DSS's own default policy, never the user's;
+//   * below Error, its diagnostics never reach the user's stream;
+//   * an Error in it still does — with its reason — and still fails the build.
+//
+// ★ THE WARNING IS PLANTED, NOT HOPED FOR. Whether today's runtime sources
+// happen to draw a warning is an accident of the optimizer's heuristics; these
+// cases append a construct the front end ALWAYS warns about (`H_UnreachableCode`
+// — a statement after `return`) to the STAGED runtime unit, and prove the
+// construct warns before relying on it. That is what keeps them from passing
+// over a runtime that simply compiled quietly.
+
+namespace {
+
+// Everything this process writes to `std::cerr` while it lives. The driver's
+// drain and its report lines both go there, so this IS the user's stream.
+class CerrCapture {
+public:
+    CerrCapture() : old_{std::cerr.rdbuf(buf_.rdbuf())} {}
+    CerrCapture(CerrCapture const&)            = delete;
+    CerrCapture& operator=(CerrCapture const&) = delete;
+    ~CerrCapture() { std::cerr.rdbuf(old_); }
+    [[nodiscard]] std::string text() const { return buf_.str(); }
+
+private:
+    std::ostringstream buf_;
+    std::streambuf*    old_;
+};
+
+constexpr std::string_view kArtifactLine = "dsscp: artifact ";
+
+// The stream minus the per-cell `dsscp: artifact <spec> <path>` line (each
+// cell writes to its own directory, so the path is the one legitimate
+// difference). The COUNT of such lines is checked separately.
+[[nodiscard]] std::string withoutArtifactLines(std::string const& text) {
+    std::istringstream in{text};
+    std::string        line, out;
+    while (std::getline(in, line)) {
+        if (line.starts_with(kArtifactLine)) continue;
+        out += line;
+        out += '\n';
+    }
+    return out;
+}
+
+[[nodiscard]] std::size_t artifactLineCount(std::string const& text) {
+    std::istringstream in{text};
+    std::string        line;
+    std::size_t        n = 0;
+    while (std::getline(in, line)) {
+        if (line.starts_with(kArtifactLine)) ++n;
+    }
+    return n;
+}
+
+constexpr std::string_view kUnreachableConstruct =
+    "int dss_runtime_cache_probe_unreachable(void) { return 0; return 1; }\n";
+
+// PROOF the planted construct warns: the same construct in the USER's own
+// file, compiled for the same spec under a default policy, draws
+// `H_UnreachableCode` as a Warning. Run BEFORE planting, so the runtime this
+// compile materialises is the unplanted one and the planted cells below still
+// start cold.
+void expectTheConstructWarns(Harness const& h, Subject const& subject) {
+    fs::path const probe = h.scratch.path() / "probe-warns.c";
+    ASSERT_TRUE(writeWhole(probe, std::string{kUnreachableConstruct}
+                                      + "int main(void) { return 0; }\n"));
+    Program program;
+    program.setCompileConfig(CompileConfig::Release);
+    program.setOutputDir(h.scratch.path() / "probe-warns-out");
+    DiagnosticReporter rep;
+    CerrCapture const quiet;
+    (void)program.compileFiles(std::vector<std::string>{probe.generic_string()},
+                               "c", std::vector<std::string>{subject.spec()}, rep);
+    bool warned = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::H_UnreachableCode
+            && d.severity == DiagnosticSeverity::Warning) {
+            warned = true;
+        }
+    }
+    ASSERT_TRUE(warned)
+        << "premise: the construct planted into the runtime unit below must draw "
+           "an H_UnreachableCode WARNING, or these cases would pass over a "
+           "runtime that simply compiled quietly";
+}
+
+// Append the construct to the STAGED unit — never the real one.
+[[nodiscard]] bool plantRuntimeWarning(Harness const& h, Subject const& subject) {
+    fs::path const unit = h.configDir / subject.units.front();
+    std::string const before = readWhole(unit);
+    if (before.empty()) return false;
+    return writeWhole(unit, before + "\n" + std::string{kUnreachableConstruct});
+}
+
+// One production compile with the given policy, stream captured.
+struct CapturedCompile {
+    int           rc = 0;
+    std::uint64_t optimizeRuns = 0;
+    std::string   stream;
+    std::vector<ParseDiagnostic> diagnostics;
+};
+
+[[nodiscard]] CapturedCompile compileCaptured(Harness const&     h,
+                                              std::string const& spec,
+                                              fs::path const&    source,
+                                              bool               warningsAsErrors,
+                                              unsigned           cell) {
+    PhaseTimers::reset();
+    Program program;
+    program.setCompileConfig(CompileConfig::Release);
+    program.setOutputDir(h.scratch.path() / ("captured-out-" + std::to_string(cell)));
+    DiagnosticReporter::Config cfg;
+    cfg.policy.warningsAsErrors = warningsAsErrors;
+    DiagnosticReporter rep{cfg};
+    CapturedCompile out;
+    {
+        CerrCapture const cap;
+        out.rc = program.compileFiles(std::vector<std::string>{source.generic_string()},
+                                      "c", std::vector<std::string>{spec}, rep);
+        out.stream = cap.text();
+    }
+    out.optimizeRuns = PhaseTimers::read(CompilePhase::Optimize).runs;
+    out.diagnostics.assign(rep.all().begin(), rep.all().end());
+    return out;
+}
+
+}  // namespace
+
+// BELOW ERROR, THE RUNTIME'S DIAGNOSTICS ARE NOT THE USER'S — so a miss prints
+// exactly what a hit prints.
+TEST(RuntimeCacheWiring, AMissAndAHitPrintTheSameDiagnostics) {
+    auto const subject = discoverSubject();
+    ASSERT_TRUE(subject.has_value());
+    Harness h;
+    ASSERT_TRUE(layDown(h));
+    ScopedEnv const cfgEnv{"DSS_CONFIG_ROOT", h.treeRoot.string()};
+    ScopedEnv const cacheEnv{"DSS_RUNTIME_CACHE_DIR", h.cacheDir.string()};
+    ASSERT_TRUE(stagedTreeIsTheOneBeingRead(h));
+    expectTheConstructWarns(h, *subject);
+    if (HasFatalFailure()) return;
+    ASSERT_TRUE(plantRuntimeWarning(h, *subject));
+
+    CapturedCompile const miss = compileCaptured(h, subject->spec(), h.source, false, 0);
+    ASSERT_EQ(miss.rc, 0) << miss.stream;
+    CapturedCompile const hit = compileCaptured(h, subject->spec(), h.source, false, 1);
+    ASSERT_EQ(hit.rc, 0) << hit.stream;
+    ASSERT_LT(hit.optimizeRuns, miss.optimizeRuns)
+        << "the second identical build did not HIT (" << hit.optimizeRuns << " vs "
+        << miss.optimizeRuns << " optimize runs), so this case would compare two "
+           "misses";
+
+    EXPECT_EQ(artifactLineCount(miss.stream), 1u) << miss.stream;
+    EXPECT_EQ(artifactLineCount(hit.stream), 1u) << hit.stream;
+    EXPECT_EQ(withoutArtifactLines(miss.stream), withoutArtifactLines(hit.stream))
+        << "THE SAME COMMAND PRINTED DIFFERENTLY ON A CACHE MISS AND A HIT.\n"
+           "--- miss ---\n" << miss.stream << "--- hit ---\n" << hit.stream
+        << "The miss compiled DSS's own runtime; nothing it says below Error is "
+           "about the user's program.";
+    EXPECT_EQ(miss.stream.find("H_UnreachableCode"), std::string::npos)
+        << "the runtime unit's planted warning reached the user's stream";
+}
+
+// THE VERDICT TOO: `--warnings-as-errors` is the user's policy for the user's
+// program. It must neither fail a build over DSS's own runtime nor pass or fail
+// by cache warmth.
+TEST(RuntimeCacheWiring, WarningsAsErrorsGivesTheSameVerdictOnAMissAndAHit) {
+    auto const subject = discoverSubject();
+    ASSERT_TRUE(subject.has_value());
+    Harness h;
+    ASSERT_TRUE(layDown(h));
+    ScopedEnv const cfgEnv{"DSS_CONFIG_ROOT", h.treeRoot.string()};
+    ScopedEnv const cacheEnv{"DSS_RUNTIME_CACHE_DIR", h.cacheDir.string()};
+    ASSERT_TRUE(stagedTreeIsTheOneBeingRead(h));
+
+    // CONTROL — the policy still governs the USER's code: the same construct in
+    // the user's own file is an ERROR under `--warnings-as-errors` and fails
+    // the build. Green whether the runtime inherits the policy or not.
+    fs::path const userWarns = h.scratch.path() / "user-warns.c";
+    ASSERT_TRUE(writeWhole(userWarns, std::string{kUnreachableConstruct}
+                                          + "int main(void) { return 0; }\n"));
+    CapturedCompile const control = compileCaptured(h, subject->spec(), userWarns, true, 0);
+    EXPECT_NE(control.rc, 0) << "--warnings-as-errors stopped applying to the user's code";
+    bool userError = false;
+    for (auto const& d : control.diagnostics) {
+        if (d.code == DiagnosticCode::H_UnreachableCode
+            && d.severity == DiagnosticSeverity::Error) {
+            userError = true;
+        }
+    }
+    EXPECT_TRUE(userError) << control.stream;
+
+    ASSERT_TRUE(plantRuntimeWarning(h, *subject));
+    CapturedCompile const miss = compileCaptured(h, subject->spec(), h.source, true, 1);
+    EXPECT_EQ(miss.rc, 0)
+        << "--warnings-as-errors FAILED a clean user program on a runtime-cache "
+           "MISS — the runtime's own warning was promoted by the user's policy:\n"
+        << miss.stream;
+    ASSERT_FALSE(cacheArtifacts(h.cacheDir).empty());
+    CapturedCompile const hit = compileCaptured(h, subject->spec(), h.source, true, 2);
+    EXPECT_EQ(hit.rc, 0) << hit.stream;
+    EXPECT_LT(hit.optimizeRuns, miss.optimizeRuns)
+        << "the second build did not HIT, so the verdicts compared are two misses'";
+    EXPECT_EQ(miss.rc, hit.rc) << "the same command's verdict depended on the cache";
+}
+
+// THE ONE THING THE ERROR FLOOR MUST NOT TAKE: a runtime unit that does not
+// compile still fails the build LOUDLY, and the user's stream carries the
+// nested build's OWN error — the reason — beside the driver's attribution.
+TEST(RuntimeCacheWiring, ARuntimeUnitErrorStillReachesTheUsersStream) {
+    auto const subject = discoverSubject();
+    ASSERT_TRUE(subject.has_value());
+    Harness h;
+    ASSERT_TRUE(layDown(h));
+    ScopedEnv const cfgEnv{"DSS_CONFIG_ROOT", h.treeRoot.string()};
+    ScopedEnv const cacheEnv{"DSS_RUNTIME_CACHE_DIR", h.cacheDir.string()};
+    ASSERT_TRUE(stagedTreeIsTheOneBeingRead(h));
+
+    fs::path const unit = h.configDir / subject->units.front();
+    std::string const before = readWhole(unit);
+    ASSERT_FALSE(before.empty());
+    ASSERT_TRUE(writeWhole(unit, before + "this is not a translation unit ###\n"));
+
+    CapturedCompile const broken = compileCaptured(h, subject->spec(), h.source, false, 0);
+    EXPECT_NE(broken.rc, 0) << "a shipped runtime unit that does not compile was skipped";
+    std::istringstream in{broken.stream};
+    std::string        line;
+    std::size_t        reasons = 0;
+    bool               attributed = false;
+    while (std::getline(in, line)) {
+        if (!line.starts_with("error[")) continue;
+        if (line.find("D_SchemaLoadFailed") != std::string::npos) {
+            if (line.find("FAILED TO COMPILE") != std::string::npos) attributed = true;
+            continue;
+        }
+        ++reasons;   // an error the NESTED build reported about the unit itself
+    }
+    EXPECT_TRUE(attributed) << broken.stream;
+    EXPECT_GE(reasons, 1u)
+        << "the build failed and the user's stream names no reason — the nested "
+           "runtime build's own error was swallowed with its warnings:\n"
+        << broken.stream;
+    EXPECT_NE(broken.stream.find(fs::path{subject->units.front()}.filename().generic_string()),
+              std::string::npos)
+        << "the broken unit is not named anywhere in the user's stream:\n"
+        << broken.stream;
 }

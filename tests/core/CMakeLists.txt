@@ -7,7 +7,16 @@ dss_add_test(NAME core/test_source_buffer       SOURCES test_source_buffer.cpp)
 dss_add_test(NAME core/test_token               SOURCES test_token.cpp)
 dss_add_test(NAME core/test_rule_id             SOURCES test_rule_id.cpp)
 dss_add_test(NAME core/test_parse_diagnostic    SOURCES test_parse_diagnostic.cpp)
+# The ONE expansion of an inline-asm template's TEXT forms, pinned against the
+# measured gcc/clang outputs (D-ASM-TEMPLATE-FORMS-A-REFERENCE-EXPANDS-REFUSED).
+dss_add_test(NAME core/test_asm_template_text_forms
+             SOURCES test_asm_template_text_forms.cpp)
 dss_add_test(NAME core/test_config_path_walk    SOURCES test_config_path_walk.cpp)
+# The ONE owner of which files ARE the documents of a config kind: exact
+# `<stem><suffix>` regular files, sorted, a partial listing refused
+# (D-CONFIG-STRAY-FILE-NAMED-AFTER-A-LANGUAGE-LOADS-AS-A-SECOND-DOCUMENT).
+dss_add_test(NAME core/test_shipped_config_documents
+             SOURCES test_shipped_config_documents.cpp)
 # The ONE path-identity chokepoint (D-PATH-IDENTITY-8DOT3-SPELLINGS-SPLIT-KEYS).
 # Its 8.3 arms CONSTRUCT the hazard and SKIP LOUDLY where the volume cannot
 # stage it -- a test that merely hopes to meet a short name is a false green.
@@ -36,7 +45,7 @@ dss_add_test(NAME core/test_target_schema       SOURCES test_target_schema.cpp)
 target_link_libraries(dss_core_test_target_schema PRIVATE nlohmann_json::nlohmann_json)
 # Two `.target.json` loader gates that close the same shape — a config that
 # loads clean and then does nothing:
-#   * D-UNWIND-NO-EH-FRAME-…: the psABI DWARF numbering must arrive in BOTH
+#   * D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO: the psABI DWARF numbering must arrive in BOTH
 #     halves, and every register a calling convention names as frame-relevant
 #     must be numbered (derived from what the target already declares).
 #   * D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-KEY: `vaListLayout`'s key set
@@ -193,6 +202,14 @@ dss_add_test(NAME core/test_bitfield_abi_conformance   SOURCES test_bitfield_abi
 # gcc/clang `__attribute__((packed))`) and asserts dss's computeLayout(packed) is
 # byte-identical (sizeof + per-field offsetof). Skips when no toolchain.
 dss_add_test(NAME core/test_packed_abi_conformance     SOURCES test_packed_abi_conformance.cpp)
+# The MSVC developer-environment ENTRY every native witness shares (native_c_probe.hpp),
+# entered from parents a real process has: nested up to cmd.exe's 8,191-character line
+# limit and one level past it, each beside the control arm that proves such a parent still
+# breaks an entry that keeps it (dying at the limit, losing its PATH past it — refused by
+# name), one whose own never-entered PATH is past the limit (refused, not silently dropped),
+# and one that entered another installation. Skips only where no MSVC toolchain is installed.
+dss_add_test(NAME core/test_msvc_environment_entry
+             SOURCES test_msvc_environment_entry.cpp)
 # D-CSUBSET-PER-MEMBER-PACKED: the PER-FIELD packed channel — GNU `packed` on ONE
 # member-declarator, which packs that member and leaves the aggregate's own size and
 # alignment alone. Every golden is transcribed from a four-arm measurement (gcc 13.3.0

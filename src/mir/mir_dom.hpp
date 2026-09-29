@@ -162,6 +162,16 @@ struct MirDomScratch {
     std::vector<std::uint32_t> touched;
     std::vector<std::uint32_t> touchedSorted;
     bool childrenFilled = false;   // children fill is once-per-compute-call
+    // Dominance-frontier result (module-sized; empty outside the fill's write
+    // set) for the scratch-backed `mirDominanceFrontier` overload. Its write
+    // set is NOT a subset of `touched`: a frontier walk starts at EVERY
+    // predecessor of a join, and a predecessor unreachable from this function's
+    // entry is outside `order` yet still receives the join (exactly as the
+    // fresh path writes it). So the fill records its own write set, and the
+    // next compute call resets those slots — never re-derived from `touched`.
+    std::vector<std::vector<MirBlockId>> frontier;
+    std::vector<std::uint32_t> frontierTouched;
+    bool frontierFilled = false;   // frontier fill is once-per-compute-call
 };
 
 // Scratch-backed dominator computation — byte-identical results to the
@@ -274,6 +284,50 @@ mirDominanceFrontier(Mir const& mir,
                      MirDomTree const& dom,
                      std::vector<std::vector<MirBlockId>> const& preds);
 
+// Scratch-backed dominance frontier — byte-identical to the fresh overload
+// above, O(function) per call instead of O(module).
+// D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION: Mem2Reg asked for a
+// ONE-function frontier by sweeping and allocating the WHOLE module, once per
+// function, which made the pass quadratic in module size.
+//
+// WHY IT IS IDENTICAL. The fresh sweep visits slots `1..blockCount` ascending
+// and contributes only for a block whose idom is VALID — and a one-function
+// tree gives a valid idom to `order ∪ {entry}` and to nothing else. That set,
+// ascending, is exactly the scratch's `touchedSorted`, so iterating it visits
+// the same blocks in the same order, runs the same walk with the same step
+// cap (`idom.size()` is module-sized in both), and appends to every list in
+// the same order. Lists never written stay empty, as fresh ones are.
+//
+// `dom` MUST be the tree the SAME scratch's compute call just produced
+// (fail-loud identity check, as for the children overload), and `preds` the
+// pass's hoisted whole-module map (fail-loud size check). The returned
+// reference is invalidated by the next compute call with that scratch.
+[[nodiscard]] DSS_EXPORT std::vector<std::vector<MirBlockId>> const&
+mirDominanceFrontier(Mir const& mir,
+                     MirDomTree const& dom,
+                     std::vector<std::vector<MirBlockId>> const& preds,
+                     MirDomScratch& scratch);
+
+// ── THE WORK THESE HELPERS DO, AS A COUNT ─────────────────────────────────────
+//
+// D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION. Every predecessor-map,
+// dominator-tree, dominance-frontier and dominator-children helper in this
+// header adds the number of block SLOTS it swept (allocated, reset, or
+// iterated) to a per-thread counter; this returns it and zeroes it. The fresh
+// overloads each sweep the whole module (`blockCount`), the scratch overloads
+// sweep their write sets — so a caller that asks for one-function answers
+// through the fresh overloads, once per function, shows up here as
+// functions × module blocks, and one that uses the scratch shows up as linear.
+//
+// It exists so a complexity regression can be pinned by COUNTING, never by a
+// stopwatch: the count is deterministic, host- and load-independent, and the
+// same in Debug and Release. Per-THREAD because the driver's per-CU pool runs
+// several modules at once; a pass, and a test, reads the thread it ran on.
+// ⓘ Scope, stated: the forward-dominator family only. The post-dominator
+// helpers are not counted; the natural-loop sweep has its OWN counter,
+// `mirNaturalLoopSourcesSweptTake`, so neither family's pins move the other's.
+[[nodiscard]] DSS_EXPORT std::uint64_t mirDomSlotsSweptTake() noexcept;
+
 // Dominator-tree children: invert `idom` so consumers can walk the
 // tree top-down. Returns `children[b.v]` = list of blocks whose
 // immediate dominator is `b` (excluding the entry's self-loop).
@@ -297,75 +351,57 @@ mirDomTreeChildren(Mir const& mir, MirDomTree const& dom);
 mirDomTreeChildren(Mir const& mir, MirDomTree const& dom,
                    MirDomScratch& scratch);
 
-// Natural-loop forest computation. See `MirNaturalLoop` for shape. The
-// back-edge scan sweeps EVERY block of the module — `dom` is a ONE-FUNCTION
-// tree, so this is O(module) work per function for a per-function answer.
-[[nodiscard]] DSS_EXPORT std::vector<MirNaturalLoop>
-mirNaturalLoops(Mir const& mir,
-                MirDomTree const& dom,
-                std::vector<std::vector<MirBlockId>> const& preds);
-
-// Candidate-scoped natural-loop forest (D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN)
-// — the SAME computation as the whole-module overload above with the back-edge
-// SOURCE sweep restricted to `candidateSources`. Loop BODIES are unaffected:
-// they are a backward closure over `preds` from the back-edge sources, so a
-// scoped scan still discovers every body block.
+// ── THE NATURAL-LOOP FOREST OF ONE FUNCTION ──────────────────────────────────
+//
+// THE RULE, stated once: the natural loops of function `f` are the loops whose
+// back-edge SOURCE is one of `f`'s own blocks. `mirBackEdgeCandidates` below
+// builds that source set and is the ONLY production builder of it; every
+// consumer reaches the forest through it and this sweep — the struct-CF marker
+// derivation (so every producer that re-stamps markers AND the verifier that
+// re-derives them), LICM, and the thin-LTO module summary.
+//
+// WHY `f`'s OWN RANGE, AND NOT ONLY ITS DOMINATOR ORDER: a block `u` outside
+// `order` has an INVALID idom, so `mirDominatesBlock(s, u, dom)` can answer
+// `Dominates` only when `s.v == u.v` — the only back edge such a block can
+// source is a self-loop. An UNREACHABLE self-looping block of `f`'s OWN is
+// still a loop of `f` (canon, D-MIR-STRUCTCF-UNREACHABLE-BLOCK-CLAIMED): its
+// function claims it, and no other function does.
+//
+// ⓘ HISTORY (D-MIR-STRUCTCF-DERIVATION-REACHES-PAST-THE-FUNCTION, now closed).
+// Until 2026-09-18 every function's source set also carried every SELF-LOOPING
+// block of the MODULE, so that the scoped sweep reproduced a whole-module one —
+// and a foreign self-loop became a one-block pseudo-loop in EVERY function's
+// forest. ✔MEASURED on the sqlite amalgamation, release: 256,878 pseudo-loops
+// per LICM call on the full 9.57 MB (98.8% of each forest; ×88 for ×7.9
+// functions — quadratic) and 11.0% of the compile's retired instructions, while
+// scoping the rule changed no artifact byte over the corpus. The whole-module
+// overload and the module self-loop index are deleted, so the reach has no
+// second door back in.
 //
 // `candidateSources` MUST be ascending, unique, and every element in
-// [1, blockCount) — a violation is a caller bug and fails loud. Ascending is
-// not cosmetic: it is what makes `MirNaturalLoop::backEdgeSources` come out in
-// the same order the whole-module sweep produces.
-//
-// COMPLETENESS (what a caller must supply to get the whole-module answer for a
-// tree computed over ONE function's `order`): a block `u` outside `order` has
-// an INVALID idom, so `mirDominatesBlock(s, u, dom)` can only answer
-// `Dominates` when `s.v == u.v`. Therefore the only back-edge sources outside
-// `order` are SELF-LOOPING blocks, and
-//     candidateSources ⊇ order ∪ {self-looping blocks of the module}
-// yields byte-identical output to the whole-module sweep. Callers that hold a
-// function's block range typically pass that range ∪ order ∪ the module's
-// self-loop index (which is a module property, so it is computed ONCE per
-// module rather than once per function).
+// [1, blockCount) — a violation is a caller bug and fails loud (ascending is
+// what fixes `MirNaturalLoop::backEdgeSources` order). Loop BODIES are the
+// backward closure over `preds` from the back-edge sources, so the sweep still
+// discovers every body block.
 [[nodiscard]] DSS_EXPORT std::vector<MirNaturalLoop>
 mirNaturalLoops(Mir const& mir,
                 MirDomTree const& dom,
                 std::vector<std::vector<MirBlockId>> const& preds,
                 std::span<std::uint32_t const> candidateSources);
 
-// ── THE TWO HELPERS THAT SATISFY THE COMPLETENESS CLAUSE ABOVE ──────────────
+// The back-edge SOURCE set of `f` — THE rule above — in the shape the sweep
+// demands (ascending, unique, in [1, blockCount)): `f`'s own contiguous block
+// range, plus anything in `rpo` outside that range (a malformed cross-function
+// edge — the verifier owns the diagnostic, but an analysis must not silently
+// answer differently while one exists). Nothing else: no block of another
+// function enters `f`'s sweep.
 //
-// They live HERE, beside the clause they exist to discharge, and not in any one
-// caller. ✔MEASURED 2026-08-25 (cycle P36): they were private to
-// `mir_struct_markers.cpp`, so the SECOND caller that needed them —
-// `opt::passes::runLicm`, which calls the whole-module overload once per
-// function — could not reach them and kept paying the O(functions × module
-// blocks) sweep the scoped overload was built to remove
-// ([[D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN]]: 2,239 ms of each 2,552 ms LICM
-// call on the merged sqlite module). A contract whose only satisfier is private
-// to one TU is a contract the next caller re-derives or, as here, silently does
-// not adopt.
-
-// The module's SELF-LOOPING blocks, ascending — a MODULE property, so a caller
-// that sweeps every function computes it ONCE and reuses it for all of them.
-//
-// Why the completeness clause needs it: `mirDominatesBlock(s, u, dom)`
-// short-circuits to `Dominates` whenever `s.v == u.v`, BEFORE it consults the
-// tree. So a self-looping block outside this function's dominator order still
-// registers as a back-edge source, and the whole-module sweep therefore
-// manufactures a single-block pseudo-loop for every self-looping block in the
-// module, in EVERY function's answer. Feeding this index to the scoped sweep
-// reproduces that bit-for-bit ([[D-MIR-STRUCTCF-DERIVATION-REACHES-PAST-THE-FUNCTION]]
-// is the row that holds the behaviour as canon).
-DSS_EXPORT void mirModuleSelfLoopBlocks(Mir const& mir,
-                                        std::vector<std::uint32_t>& out);
-
-// The back-edge SOURCE candidate set for `f`, in the shape the scoped
-// `mirNaturalLoops` demands (ascending, unique, in [1, blockCount)): `f`'s own
-// contiguous block range, plus anything in `rpo` outside that range (a
-// malformed cross-function edge — the verifier owns the diagnostic, but an
-// analysis must not silently answer differently while one exists), plus
-// `moduleSelfLoops`. That set is a superset of `rpo ∪ {module self-loops}`, so
-// the scoped sweep's output is byte-identical to the whole-module sweep's.
+// ⓘ It lives HERE, beside the sweep it feeds, and in no one caller.
+// ✔MEASURED 2026-08-25 (cycle P36): while it was private to
+// `mir_struct_markers.cpp`, the SECOND caller that needed it — `runLicm` —
+// could not reach it and kept an O(functions × module blocks) sweep
+// ([[D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN]]). A contract whose only
+// satisfier is private to one TU is a contract the next caller re-derives.
 //
 // `out` is cleared and refilled; pass the SAME vector across a function loop so
 // the storage is reused rather than reallocated per function. `f` must have at
@@ -374,8 +410,17 @@ DSS_EXPORT void mirModuleSelfLoopBlocks(Mir const& mir,
 // otherwise silently NARROW the sweep instead of failing.
 DSS_EXPORT void mirBackEdgeCandidates(Mir const& mir, MirFuncId f,
                                       std::vector<MirBlockId> const& rpo,
-                                      std::span<std::uint32_t const> moduleSelfLoops,
                                       std::vector<std::uint32_t>& out);
+
+// The natural-loop sweep's work, as a COUNT: every back-edge candidate source
+// `mirNaturalLoops` visits is added to a per-thread counter; this returns it and
+// zeroes it. A consumer that asks for each function's forest over that
+// function's own blocks shows up as Σ function blocks — linear in the module;
+// one that lets blocks of OTHER functions into each function's sweep shows up
+// as functions × those blocks. Deterministic, host- and load-independent, so a
+// pin COUNTS and never times. Per-THREAD for the same reason as
+// `mirDomSlotsSweptTake`: the driver's per-CU pool runs several modules at once.
+[[nodiscard]] DSS_EXPORT std::uint64_t mirNaturalLoopSourcesSweptTake() noexcept;
 
 // Iterated dominance frontier (IDF) of a set of "def blocks". For
 // Cytron-Ferrante SSA construction (Mem2Reg): a Phi for variable V

@@ -2,6 +2,7 @@
 
 #include "core/crypto/sha256.hpp"
 #include "core/substrate/path_identity.hpp"  // genericSpelling
+#include "core/types/config_path_walk.hpp"   // shippedConfigDocuments -- the ONE owner of a kind's documents
 #include "program/cross_validate_target_format.hpp"
 // D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK:
 // `detail::createExclusiveBinary` is the EXCLUSIVE-CREATE primitive the
@@ -106,8 +107,10 @@ constexpr std::string_view kKeyDocumentHeader = "dss-runtime-object-cache-key/2"
 // dependency-artifact key without parsing the rest. `/1` because this is the
 // first shape of it; the same bump rule applies — add or reorder a term and
 // every previously-written entry must become UNREACHABLE, not merely stale.
+// `/2` (P68 round 8, D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH): the `runpath-count=`
+// and `runpath=` terms joined, after `stack-reserve=`.
 constexpr std::string_view kDependencyKeyDocumentHeader =
-    "dss-dependency-artifact-cache-key/1";
+    "dss-dependency-artifact-cache-key/2";
 
 // The anchor for the dependency artifact cache's own refusals. A message
 // naming the shipped-runtime ruling to somebody whose dependency failed to
@@ -792,8 +795,23 @@ writeThroughTemp(RuntimeObjectKey const&       key,
     if (fs::exists(destination, ec) && !ec) return {};  // the temp is discarded
     ec.clear();
 
-    fs::rename(temporary, destination, ec);
-    if (ec) {
+    // ── THE COMMIT IS THE LINKER'S, FOR THE SAME REASON THE CLAIM IS ─────────
+    // [[D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE]]
+    //
+    // 🧠 THIS STORE CANNOT MEET THE ROUND-7 GATE'S FAILURE, and the reason is
+    // the check just above: it never replaces an entry. A holder can only hold a
+    // file that EXISTS, the destination was just shown absent, and a replace
+    // refused because a concurrent winner landed there (and is being scanned)
+    // is SUCCESS by the re-probe below — same key, same bytes. What it CAN meet
+    // is a holder of its own freshly closed temp that withholds FILE_SHARE_DELETE
+    // (✔MEASURED: opening a held staged file for the rename answers 32), and the
+    // cost there is a lost cache entry and a note, never a failed build.
+    // It goes through `linker::detail::commitReplacing` anyway: one owner of the
+    // Windows replace — the argument this file makes for reusing
+    // `createExclusiveBinary` instead of re-deriving it — so this store waits
+    // out a transient holder and names a lasting one exactly as the linker does.
+    auto const commit = linker::detail::commitReplacing(temporary, destination);
+    if (!commit.committed) {
         // A concurrent winner landed between the check and the rename. Same
         // key, same bytes — success, and the guard discards our temp.
         std::error_code probeEc;
@@ -802,7 +820,7 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             key,
             std::format("could not rename '{}' into place as '{}': {}.{}",
                         core::genericSpelling(temporary),
-                        core::genericSpelling(destination), ec.message(),
+                        core::genericSpelling(destination), commit.refusal,
                         composedPathNote(directory, destination))));
     }
     guard.release();  // the temp no longer exists under that name
@@ -940,49 +958,29 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
             buildFormat.name(), requester.anchor));
     }
 
-    // ── STEP 1: enumerate, then SORT BY FILENAME ────────────────────────────
+    // ── STEP 1: the documents, by the ONE owner of which files ARE format ──
+    // documents (`shippedConfigDocuments`: exactly `<stem>.format.json`, regular
+    // files, SORTED BY STEM), which refuses a listing that fails or stops
+    // part-way rather than truncating it -- a partial scan cannot prove the
+    // archive-writing sibling is unique. This was one of six hand-rolled
+    // enumerations of a config kind
+    // ([[D-CONFIG-STRAY-FILE-NAMED-AFTER-A-LANGUAGE-LOADS-AS-A-SECOND-DOCUMENT]]).
     //
     // ★ The sort is for DETERMINISM OF THE MESSAGE, not of the answer — the
-    // answer cannot depend on order, because the scan below never stops early.
-    // But an ambiguity diagnostic that lists its candidates in
-    // `directory_iterator` order would read differently on NTFS (sorted) and
-    // ext4 (hash-ordered), and a diagnostic whose text depends on the host is
-    // a diagnostic nobody can pin in a test.
+    // answer cannot depend on order, because the scan below never stops early,
+    // and the matches are sorted again before any ambiguity report names them.
     std::vector<fs::path> documents;
     {
-        fs::directory_iterator it(objectFormatsDir, ec);
-        if (ec) {
+        auto const listed = shippedConfigDocuments(objectFormatsDir, ".format.json");
+        if (!listed.has_value()) {
             return std::unexpected(std::format(
-                "{}: could not open the object-format "
-                "directory '{}': {}. Anchored: {}.",
-                requester.label, core::genericSpelling(objectFormatsDir),
-                ec.message(), requester.anchor));
+                "{}: {}; a partial or failed scan cannot prove the "
+                "archive-writing sibling is unique, so this is a refusal. "
+                "Anchored: {}.",
+                requester.label, listed.error(), requester.anchor));
         }
-        for (fs::directory_iterator const end{}; it != end; it.increment(ec)) {
-            if (ec) {
-                return std::unexpected(std::format(
-                    "{}: the scan of object-format directory "
-                    "'{}' was interrupted after PARTIAL enumeration: {}. A "
-                    "partial scan cannot prove the archive-writing sibling is "
-                    "unique, so this is a refusal. Anchored: {}.",
-                    requester.label, core::genericSpelling(objectFormatsDir),
-                    ec.message(), requester.anchor));
-            }
-            // A dedicated error_code: `ec` carries the ITERATION's status and
-            // clobbering it here would let a probe failure masquerade as a
-            // scan failure on the next loop test.
-            std::error_code typeEc;
-            if (!it->is_regular_file(typeEc) || typeEc) continue;
-            if (!it->path().filename().string().ends_with(".format.json")) {
-                continue;
-            }
-            documents.push_back(it->path());
-        }
+        for (auto const& document : *listed) documents.push_back(document.path);
     }
-    std::sort(documents.begin(), documents.end(),
-              [](fs::path const& a, fs::path const& b) {
-                  return a.filename().string() < b.filename().string();
-              });
 
     // ── STEP 2: the TOTAL scan ──────────────────────────────────────────────
     //
@@ -1417,6 +1415,16 @@ computeDependencyArtifactKey(DependencyArtifactRequest const& request) {
         field("stack-reserve=", std::to_string(*request.stackReserveBytes));
     } else {
         line("stack-reserve=<format-default>");
+    }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the runpaths, in request ORDER (the
+    // loader searches in it, so order is meaning). The COUNT leads and every
+    // entry is LENGTH-PREFIXED: an entry may legally hold a newline, and
+    // without the length ["a\nrunpath=b", "c"] and ["a", "b\nrunpath=c"] —
+    // two different images — would render the same lines and share a key,
+    // which is the failure-toward-HIT this document exists to prevent.
+    field("runpath-count=", std::to_string(request.runpaths.size()));
+    for (std::string const& entry : request.runpaths) {
+        field("runpath=", std::format("{}:{}", entry.size(), entry));
     }
     field("inputs-sha256=", request.inputClosureDigest);
 

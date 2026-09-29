@@ -1,6 +1,6 @@
 #pragma once
 
-// TF-C78 (D-CSUBSET-NOINLINE): declaration inliner-opt-out side-table value.
+// TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): declaration inliner-opt-out side-table value.
 // Attached per-node via `HirAttribute<NoInlineAttr>` to a NATIVE FUNCTION
 // declaration HIR node whose bound symbol carried a source-level `noinline`
 // attribute — GNU `__attribute__((noinline))` / `[[gnu::noinline]]` (there is no

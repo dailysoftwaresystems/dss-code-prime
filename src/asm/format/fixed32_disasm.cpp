@@ -73,6 +73,14 @@ windowFor(EncodingSlotKind s) noexcept {
         // the multi-word slots below it is NOT part of the
         // D-AS5-MULTIWORD-DISASM gap.
         case EncodingSlotKind::Imm16Inverted:  return SlotBitWindow{ 5, 16 };
+        // ElementIndex (P68 round 8): the AdvSIMD `imm5` at bits 16..20; the
+        // wire loop below recovers the INDEX from the size bit it carries.
+        case EncodingSlotKind::ElementIndex:   return SlotBitWindow{ 16, 5 };
+        // AdrImm21 / BlockAddend (P68 round 9): block-relative, resolved at
+        // assemble time — nothing a round-trip decoder reads back as a
+        // register or an immediate.
+        case EncodingSlotKind::AdrImm21:
+        case EncodingSlotKind::BlockAddend:    return std::nullopt;
         // Every remaining slot decodes to nullopt. This is an
         // intentionally PARTIAL mirror of `fixed32::windowFor`: the
         // round-trip decoder only needs the register/immediate windows
@@ -113,6 +121,10 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
+        // [[D-CSUBSET-LONG-BRANCH]]: the TBZ/TBNZ imm14 is block-relative like
+        // Imm19 and is not decoded by this mirror yet — the same
+        // disasm-completeness gap (D-AS5-MULTIWORD-DISASM).
+        case EncodingSlotKind::Imm14:
         // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: the MOVZ/MOVK 3-word
         // form is not decoded by this round-trip mirror yet (the same
         // disasm-completeness gap as Imm19/MemOffsetZero — anchored
@@ -281,6 +293,25 @@ disassemble(TargetSchema const&            schema,
                 // exact inverse of the encoder's `-raw - 1`.
                 result.wires.push_back(DisassembledSlot{
                     wire.slotKind, -extract(wire.slotKind) - 1
+                });
+            } else if (wire.slotKind == EncodingSlotKind::ElementIndex) {
+                // P68 round 8: the encoder wrote the whole AdvSIMD `imm5` —
+                // the element's size as the lowest set bit, the index above
+                // it — so the decoder recovers the INDEX, which is what the
+                // LIR operand holds. An all-zero field names no size at all.
+                std::int64_t const imm5 = extract(wire.slotKind);
+                if (imm5 <= 0) {
+                    report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                           DiagnosticSeverity::Error,
+                           std::format("round-trip: opcode '{}' element field "
+                                       "(imm5) is zero — it carries no "
+                                       "element size", info->mnemonic));
+                    return std::nullopt;
+                }
+                unsigned sizeBit = 0;
+                while (((imm5 >> sizeBit) & 1) == 0) ++sizeBit;
+                result.wires.push_back(DisassembledSlot{
+                    wire.slotKind, imm5 >> (sizeBit + 1u)
                 });
             } else {
                 result.wires.push_back(DisassembledSlot{

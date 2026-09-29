@@ -38,6 +38,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_name_resolve.hpp"   // resolveLanguageTypeName: each rung is the spelled type
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
@@ -170,7 +171,8 @@ void expectGenericClean(SemanticModel const& m) {
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
-    return analyze(cu, DiagnosticBudget::libraryDefault(), dm, std::nullopt, std::nullopt, fmt, arch);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dm, std::nullopt, std::nullopt,
+                   SelectableObjectFormatKind::of(fmt), arch);
 }
 
 // The (dataModel, objectFormat, arch) triples the shipped descriptors are
@@ -213,9 +215,12 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
 })JSON";
 
 // Analyze `mainSrc` against `kFfiWideDescriptorJson` (written into `sysDir`) under
-// the axis `ax`. `flagOn` selects the SHIPPED schema (relaxation enabled) vs a
-// perturbed copy with `pointerConversions.directCallIntPointeeCompat=false` —
-// the config red-on-disable axis (the `analyzeWithOverride` perturbation idiom).
+// the axis `ax`. `flagOn` selects the SHIPPED schema (the diagnosed conversion
+// enabled) vs a perturbed copy with
+// `pointerConversions.incompatiblePointerConvertsDiagnosed=false` — the config
+// red-on-disable axis (the `analyzeWithOverride` perturbation idiom). P68 round 9
+// retired `directCallIntPointeeCompat` into that key: the same-representation
+// integer pointee is one instance of the class it admits.
 // The ScratchDir must outlive the returned model (the semantic phase reads the
 // descriptor file), so the caller owns it.
 [[nodiscard]] SemanticModel analyzeFfiWide(ScratchDir const& sysDir,
@@ -230,11 +235,12 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
         builder.addInMemory(mainSrc, "main.c");
         auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
         assertNoBuilderErrors(*cu);
-        return analyze(cu, DiagnosticBudget::libraryDefault(), ax.dm, std::nullopt, std::nullopt, ax.fmt, ax.arch);
+        return analyze(cu, DiagnosticBudget::libraryDefault(), ax.dm, std::nullopt, std::nullopt,
+                       SelectableObjectFormatKind::of(ax.fmt), ax.arch);
     };
     if (flagOn) return build(loadShippedSchema("c"));
     nlohmann::json doc = loadShippedCJson();
-    doc["semantics"]["pointerConversions"]["directCallIntPointeeCompat"] = false;
+    doc["semantics"]["pointerConversions"]["incompatiblePointerConvertsDiagnosed"] = false;
     auto schema = GrammarSchema::loadFromText(doc.dump(), "<ffi-wide-flag-off>");
     // ★ FAIL-CLOSED, TF-C135: this was `EXPECT_TRUE`, which is NON-FATAL — so when
     // the key was renamed and the perturbed schema stopped loading, the helper walked
@@ -245,8 +251,8 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
     if (!schema.has_value()) {
         throw std::runtime_error(
             "perturbed c schema failed to load — the "
-            "`directCallIntPointeeCompat` key was renamed or removed, so this "
-            "red-on-disable axis is testing nothing");
+            "`incompatiblePointerConvertsDiagnosed` key was renamed or removed, so "
+            "this red-on-disable axis is testing nothing");
     }
     return build(*schema);
 }
@@ -530,21 +536,29 @@ TEST(TypeIdentityVocabulary, IncompatiblePointerTypesNowDiagnose) {
     // C requires a constraint diagnostic here. Under the collapse `int` and
     // `long` were ONE TypeId on LLP64, so this compiled SILENTLY — the collapse
     // did not merely fail loud, it ACCEPTED invalid code.
+    // ★ P68 round 9 (lane `cs`): the diagnostic is now the WARNING every pinned
+    // reference gives (the program builds and keeps its pointer), not a refusal —
+    // [[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]].
+    // What this test exists for is unchanged and still asserted: the two types are
+    // DIFFERENT, so the conversion is DIAGNOSED, never silent.
     auto llp = analyzeC(
         "int f(void){ int x = 0; int *p = &x; long *q = p; return *q != 0; }\n",
         DataModel::Llp64);
-    EXPECT_TRUE(llp.hasErrors())
-        << "`long *q = p;` from an `int *` is a C constraint violation";
-    EXPECT_EQ(countCode(llp.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_FALSE(llp.hasErrors())
+        << "`long *q = p;` from an `int *` is admitted with the diagnostic C requires";
+    EXPECT_EQ(countCode(llp.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u)
+        << "`long *q = p;` from an `int *` is a C constraint violation: DIAGNOSED";
 
-    // The same tightening on LP64's OTHER same-representation pair.
+    // The same diagnostic on LP64's OTHER same-representation pair.
     auto lp = analyzeC(
         "int f(void){ long x = 0; long *p = &x; long long *q = p;\n"
         "  return *q != 0; }\n",
         DataModel::Lp64);
-    EXPECT_TRUE(lp.hasErrors())
+    EXPECT_FALSE(lp.hasErrors());
+    EXPECT_EQ(countCode(lp.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u)
         << "`long long *q = (long*)…` is a C constraint violation on LP64 too";
-    EXPECT_EQ(countCode(lp.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
 
     // ... and the matching-type control stays CLEAN (proves the tightening is
     // not a blanket pointer reject).
@@ -558,13 +572,16 @@ TEST(TypeIdentityVocabulary, CharFamilyStaysThreeDistinctTypes) {
     // Pre-existing behavior that must be PRESERVED: char / signed char /
     // unsigned char are three distinct CORES (Char/I8/U8), so their pointers
     // were already incompatible. Unrelated to the vocabulary split — pinned so a
-    // future identity change cannot quietly merge them.
+    // future identity change cannot quietly merge them. (P68 round 9: the
+    // incompatibility is DIAGNOSED with the warning every reference gives rather
+    // than refused; a merged identity would make it silent, which is what this
+    // pin catches.)
     auto m = analyzeC(
         "int f(void){ char c = 0; char *p = &c; signed char *q = p;\n"
         "  return *q != 0; }\n",
         DataModel::Lp64);
-    EXPECT_TRUE(m.hasErrors());
-    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion), 1u);
 }
 
 // ── Conversion RANK is keyed on the NAME, not the width ────────────────────
@@ -775,15 +792,18 @@ TEST(TypeIdentityVocabulary, ShippedFixedWidthAliasesAreTheNamedStandardTypes) {
 }
 
 // The pointer direction — strict TypeId identity, so a wrongly-anonymous alias
-// shows up as a bare S_TypeMismatch on code C says is correct.
+// shows up as a DIAGNOSED pointer conversion on code C says is correct. (P68
+// round 9, lane `cs`: an incompatible pointer conversion is admitted with the
+// warning every pinned reference gives, so the witness is the diagnosed-conversion
+// code, never `hasErrors()` alone — that would pass over a silent accept too.)
 TEST(TypeIdentityVocabulary, ShippedAliasPointersMatchTheirNamedStandardType) {
     for (ModelAxis const ax : {kLp64, kLlp64}) {
         SCOPED_TRACE(ax.label);
         std::string const ok =
             // The pointer flows through an INTERMEDIATE variable of the alias's
-            // own pointer type: a direct `T *p = &x;` initializer is not
-            // pointee-checked today (a pre-existing gap, unrelated to identity),
-            // so it would make this pin vacuous in BOTH directions.
+            // own pointer type. A direct `T *p = &x;` initializer runs the same
+            // pointer-conversion classifier, so either spelling witnesses the
+            // identity; the intermediate keeps the pin's source unchanged.
             std::string{"#include <stdint.h>\n#include <stddef.h>\n"}
             + "int f(void){ uint64_t x = 0; uint64_t *px = &x;\n"
             + "  " + ax.sizeName + " *p = px;\n"
@@ -796,18 +816,36 @@ TEST(TypeIdentityVocabulary, ShippedAliasPointersMatchTheirNamedStandardType) {
         EXPECT_FALSE(m.hasErrors())
             << "the shipped alias IS that named type on this data model";
         EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u)
+            << "the alias and its named type are ONE type: nothing to diagnose";
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_IncompatiblePointerConversion), 0u)
+            << "the alias and its named type are ONE type: nothing to diagnose";
 
         // ... and the OTHER model's name is a genuinely different type, so it
         // must still DIAGNOSE (proving the pin above is not a blanket accept).
-        std::string const wrongName =
-            ax.dm == DataModel::Lp64 ? "unsigned long long" : "unsigned long";
+        // On LP64 the wrong name (`unsigned long long`) shares `uint64_t`'s
+        // representation, so it is the narrower same-representation code; on
+        // LLP64 the wrong name (`unsigned long`) is 32-bit, the general one.
+        bool const lp = ax.dm == DataModel::Lp64;
+        std::string const wrongName = lp ? "unsigned long long" : "unsigned long";
         std::string const bad =
             std::string{"#include <stdint.h>\n"}
             + "int f(void){ uint64_t x = 0; uint64_t *px = &x;\n"
             + "  " + wrongName + " *p = px;\n"
             + "  return *p != 0; }\n";
         auto n = analyzeWithShippedHeaders(bad, ax.dm, ax.fmt, ax.arch);
-        EXPECT_EQ(countCode(n.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        EXPECT_FALSE(n.hasErrors())
+            << "an incompatible pointer conversion builds with its diagnostic";
+        EXPECT_EQ(countCode(n.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+        EXPECT_EQ(countCode(n.diagnostics(),
+                            DiagnosticCode::S_IncompatiblePointerIntegerPointee),
+                  lp ? 1u : 0u)
+            << "the other model's vocabulary entry is a DIFFERENT type here";
+        EXPECT_EQ(countCode(n.diagnostics(),
+                            DiagnosticCode::S_IncompatiblePointerConversion),
+                  lp ? 0u : 1u)
             << "the other model's vocabulary entry is a DIFFERENT type here";
     }
 }
@@ -823,6 +861,8 @@ TEST(TypeIdentityVocabulary, InterlockedCompareExchangeTakesALongPointer) {
     EXPECT_FALSE(m.hasErrors())
         << "`&v` on a `long` IS the intrinsic's `LONG volatile*` parameter";
     EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(m.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // "No error" alone would pass PRE-CHANGE too — back then `long*` and `int*`
     // were literally the same TypeId, so ANY 32-bit integer pointer was accepted.
@@ -909,19 +949,31 @@ TEST(TypeIdentityVocabulary, WindowsDwordPointerIsUnsignedLongPointer) {
         "int f(void){ DWORD d = 0; DWORD *pd = &d; unsigned int *q = pd;\n"
         "  return (int)(*q != 0); }\n",
         kLlp64.dm, kLlp64.fmt, kLlp64.arch);
-    EXPECT_EQ(countCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+    // P68 round 9: DIAGNOSED with the warning the references give, not refused.
+    EXPECT_EQ(countCode(bad.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u)
         << "`unsigned int *` is NOT `DWORD *` — both are u32, and that is "
            "exactly the collapse this change undoes";
+    EXPECT_EQ(countCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // ── D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT ────────────────────────────────
 //
 // A shipped-FFI-descriptor `ptr<i64>` parameter accepts a real C integer pointer
-// of the SAME representation (size ∧ signedness ∧ integer-base-kind) AT THE
-// CALL-ARG BOUNDARY ONLY. Every pin is red-on-disable and scoped: the relaxation
-// admits ONLY a same-representation integer pointer, ONLY at a direct
-// shipped-descriptor call arg, ONLY with the config flag on, and NEVER merges the
+// of the SAME representation (size ∧ signedness ∧ integer-base-kind) with the
+// narrower S_IncompatiblePointerIntegerPointee warning, and NEVER merges the
 // distinct type identities.
+// ★ P68 round 9 (lane `cs`,
+// [[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]]): this
+// admission used to be SCOPED — a direct call's argument only, a same-representation
+// integer pointee only — and every other incompatible pointer pair was refused. It
+// was one instance of a class every pinned reference builds with a warning at EVERY
+// site, and the class is now admitted as such: a different width or signedness
+// reports the general S_IncompatiblePointerConversion, the same pair at init /
+// assignment / return / an indirect call reports the same narrower code, and the
+// switch is `incompatiblePointerConvertsDiagnosed`. The pins below keep what the row
+// was for — the identity witness, the per-target answer, the diagnostic never going
+// silent, the config key being the switch — and state the moved expectations.
 
 // ★★ TF-C135 — THE CASE THE OLD `isShippedDescriptorFn` GATE COULD NOT REACH, AND
 // THE REASON THE GATE WAS WRONG. The callee here is an ORDINARY C PROTOTYPE, not a
@@ -954,15 +1006,19 @@ TEST(TypeIdentityVocabulary, DirectCallIntPointeeAdmitsAtAPlainCPrototypeAndWarn
 
     // PER-TARGET, BY CONSTRUCTION AND WITH NO FORMAT BRANCH: on LLP64 `long` is I32
     // while `long long` is I64, so `sameRepresentation` fails on the width axis and
-    // the SAME source stays a hard error. This is the negative control for the pin
-    // above — without it, "admitted on LP64" could equally describe a relaxation that
-    // admits everywhere.
+    // the SAME source is the GENERAL incompatible-pointer class (P68 round 9: admitted
+    // with S_IncompatiblePointerConversion, as MSVC's C4133 and gcc 13 admit it). The
+    // negative control for the pin above is therefore the CODE: without it, "the
+    // narrower code on LP64" could equally describe a predicate that answers it
+    // everywhere.
     auto llp = analyzeWithShippedHeaders(src, kLlp64.dm, kLlp64.fmt, kLlp64.arch);
-    EXPECT_TRUE(llp.hasErrors())
-        << "`long long*` into `long*` is a REAL width mismatch on LLP64";
-    EXPECT_EQ(countCode(llp.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_FALSE(llp.hasErrors());
+    EXPECT_EQ(countCode(llp.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
     EXPECT_EQ(countCode(llp.diagnostics(),
-                  DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u);
+                  DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u)
+        << "`long long*` into `long*` is a REAL width mismatch on LLP64";
+    EXPECT_EQ(countCode(llp.diagnostics(),
+                  DiagnosticCode::S_IncompatiblePointerConversion), 1u);
 }
 
 // POSITIVE: `ptr<i64>` accepts `long long*`, a `typedef long long` (the
@@ -999,18 +1055,25 @@ TEST(TypeIdentityVocabulary,
     EXPECT_EQ(vocabOf(m, "a"), "long long");
 }
 
-// PER-TARGET (Condition 6): on LLP64/pe (where `long` is I32) the SAME `long*`
-// REFUSES the `ptr<i64>` parameter — emergent from the data model's `kind`, with
-// no format branch. `long long*` (I64 on both models) is still admitted.
-TEST(TypeIdentityVocabulary, DirectCallIntPointeePerTargetRefusesLongUnderLlp64) {
+// PER-TARGET (Condition 6): on LLP64/pe (where `long` is I32) the SAME `long*` is
+// NOT the `ptr<i64>` parameter's representation — emergent from the data model's
+// `kind`, with no format branch — so it takes the GENERAL incompatible-pointer code
+// (P68 round 9: admitted with S_IncompatiblePointerConversion, no longer S0003).
+// `long long*` (I64 on both models) keeps the narrower same-representation code.
+TEST(TypeIdentityVocabulary, DirectCallIntPointeePerTargetUnderLlp64LongIsAnotherWidth) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-llp64"};
     auto bad = analyzeFfiWide(sysDir,
         "#include <ffiwide.h>\n"
         "int f(void){ long c = 0; ffi_take_wide(&c); return 0; }\n",
         kLlp64);
-    EXPECT_EQ(countCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "`long` is 32-bit under LLP64, so `long*` is NOT `ptr<i64>` — still S0003, "
-           "with no format branch (sameRepresentation's kind axis decides)";
+    EXPECT_EQ(countCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(bad.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u)
+        << "`long` is 32-bit under LLP64, so `long*` is NOT `ptr<i64>`'s "
+           "representation — with no format branch (sameRepresentation's kind axis "
+           "decides)";
+    EXPECT_EQ(countCode(bad.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u);
 
     auto ok = analyzeFfiWide(sysDir,
         "#include <ffiwide.h>\n"
@@ -1018,15 +1081,17 @@ TEST(TypeIdentityVocabulary, DirectCallIntPointeePerTargetRefusesLongUnderLlp64)
         kLlp64);
     EXPECT_FALSE(ok.hasErrors())
         << "`long long` is 64-bit on every model — its pointer is the parameter";
-    EXPECT_EQ(countCode(ok.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(ok.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u);
 }
 
-// PREDICATE NEGATIVES at the shipped boundary (flag on, calleeIsShippedFfi true):
-// the relaxation admits ONLY same-(size ∧ signedness ∧ integer-base-kind) — every
-// other integer/non-integer pointer STILL S0003 (proving the predicate
-// discriminates exactly where it is active).
+// PREDICATE NEGATIVES at the shipped boundary: the NARROWER code answers ONLY a
+// same-(size ∧ signedness ∧ integer-base-kind) pointee — every other integer /
+// non-integer pointer takes the general S_IncompatiblePointerConversion (P68 round
+// 9: admitted with a warning, no longer S0003), proving the predicate still
+// discriminates exactly where it is asked.
 TEST(TypeIdentityVocabulary,
-     DirectCallIntPointeePredicateNegativesStillRejectAtShippedBoundary) {
+     DirectCallIntPointeePredicateNegativesTakeTheGeneralCode) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-neg"};
     std::string const src =
         "#include <ffiwide.h>\n"
@@ -1039,15 +1104,25 @@ TEST(TypeIdentityVocabulary,
         "  _BitInt(64) w = 0;        ffi_take_wide(&w);\n"    // extensionKind (BitInt)
         "  return p; }\n";
     auto m = analyzeFfiWide(sysDir, src, kLp64);
-    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 5u)
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u)
         << "each arg differs on exactly one axis (size / signedness / base-kind / "
            "kind / extensionKind) — none is a same-representation integer pointer";
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerConversion), 5u);
 }
 
-// CONDITION 3 (red-on-disable): the relaxation is SCOPED to the call-arg boundary.
-// With the flag ON, the SAME sameRepresentation-distinct integer-pointer mismatch
-// at INIT / ASSIGNMENT / RETURN still S0003 — it never leaks past the call arg.
-TEST(TypeIdentityVocabulary, DirectCallIntPointeeScopedToCallArgNotInitAssignReturn) {
+// ★ P68 round 9: THE CONVERSION IS ONE RULE AT EVERY SITE. This pin used to assert
+// the opposite — that the SAME same-representation pair stayed a hard S0003 at
+// INIT / ASSIGNMENT / RETURN because the relaxation was scoped to the call argument
+// (TF-C41's "Condition 3"). Every pinned reference builds all four sites with the
+// same warning, and C converts an initializer, an argument and a return "as if by
+// assignment", so a scope that differed by site was the defect
+// [[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]]
+// closed. What survives is the property that matters: each site DIAGNOSES it, with
+// the same narrower code, once.
+TEST(TypeIdentityVocabulary, IntPointeeSameRepresentationReportsAlikeAtInitAssignReturn) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-scope"};
     std::string const src =
         "#include <ffiwide.h>\n"
@@ -1055,20 +1130,17 @@ TEST(TypeIdentityVocabulary, DirectCallIntPointeeScopedToCallArgNotInitAssignRet
         "void g_assign(void){ long long *p; p = ffi_wide_ptr(); }\n"              // ASSIGN
         "long long* g_return(void){ return ffi_wide_ptr(); }\n";                  // RETURN
     auto m = analyzeFfiWide(sysDir, src, kLp64);
-    // `ptr<i64>` (the ffi_wide_ptr result) into a `long long*` slot is a
-    // sameRep-distinct mismatch — admitted at a call ARG, but INIT / ASSIGN /
-    // RETURN keep the strict default-false isAssignable (no leak past the arg).
-    // INIT + ASSIGN report S_TypeMismatch; RETURN has its own S_ReturnTypeMismatch.
-    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 2u)
-        << "INIT + ASSIGN keep the strict assignment reject";
-    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 1u)
-        << "RETURN keeps the strict return-type reject — the relaxation never leaks "
-           "past the call-arg boundary";
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u);
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 3u)
+        << "INIT + ASSIGN + RETURN each report the same narrower code once";
 }
 
-// CONFIG RED-ON-DISABLE: the whole relaxation is gated on
-// `pointerConversions.ffiDescriptorIntPointeeCompat`. Flip it FALSE (schema
-// perturbation) and the very admission above reverts to S0003.
+// CONFIG RED-ON-DISABLE: the admission is gated on
+// `pointerConversions.incompatiblePointerConvertsDiagnosed` (P68 round 9; it was
+// `directCallIntPointeeCompat`). Flip it FALSE (schema perturbation) and the very
+// admission above reverts to S0003.
 TEST(TypeIdentityVocabulary, DirectCallIntPointeeConfigFlagRedOnDisable) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-flagoff"};
     std::string const src =
@@ -1082,24 +1154,26 @@ TEST(TypeIdentityVocabulary, DirectCallIntPointeeConfigFlagRedOnDisable) {
         << "flag OFF reverts to the strict pointer-pointee reject";
 }
 
-// FN-POINTER / INDIRECT: the relaxation fires ONLY at the DIRECT bare-name call.
-// The SAME shipped fn reached through a NON-direct callee (a designator deref —
-// the vehicle here because a typed C fn-pointer cannot spell the descriptor's
-// anonymous `i64` parameter) routes the expression-callee path, which passes
-// calleeIsShippedFfi=false → STILL S0003 even for the `long long*` a direct call
-// admits.
-TEST(TypeIdentityVocabulary, DirectCallIntPointeeIndirectCallStaysStrict) {
+// FN-POINTER / INDIRECT: ★ P68 round 9 — the same shipped fn reached through a
+// NON-direct callee (a designator deref — the vehicle here because a typed C
+// fn-pointer cannot spell the descriptor's anonymous `i64` parameter) reports
+// EXACTLY what the direct call reports. This pin used to assert the indirect path
+// stayed S0003; a conversion that depends on how the callee is SPELLED is the
+// provenance-gated rule TF-C135 already called a mistake, one layer further out.
+TEST(TypeIdentityVocabulary, IntPointeeSameRepresentationReportsAlikeThroughAnIndirectCall) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-indirect"};
     auto direct = analyzeFfiWide(sysDir,
         "#include <ffiwide.h>\n"
         "int f(void){ long long a = 0; ffi_take_wide(&a); return 0; }\n", kLp64);
     EXPECT_FALSE(direct.hasErrors()) << "the direct bare-name call admits";
+    EXPECT_EQ(countCode(direct.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u);
     auto indirect = analyzeFfiWide(sysDir,
         "#include <ffiwide.h>\n"
         "int f(void){ long long a = 0; (*ffi_take_wide)(&a); return 0; }\n", kLp64);
-    EXPECT_EQ(countCode(indirect.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "a shipped fn reached through a non-direct callee stays strict — the "
-           "relaxation is scoped to the direct-symbol call site";
+    EXPECT_FALSE(indirect.hasErrors()) << "the indirect call admits it alike";
+    EXPECT_EQ(countCode(indirect.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u);
 }
 
 // ── The f64 float axis: a QUALIFIED named operand still yields the entry ──
@@ -1248,6 +1322,109 @@ TEST(TypeIdentityVocabularyLoader, SynthesizedTypeAcceptsAnyDeclaredEntry) {
            "through the same table every other type-name knob uses";
 }
 
+// ── P68 round 12 (lane `cs`, the enumeration P1): the `enumerationConstant` role and
+//    the `enumerationCompatibleTypes` ladders load, and every malformed shape fails ──
+
+namespace {
+// Perturb the shipped semantics block (the whole object, so a test can remove the
+// constant role the ladders depend on) and report whether the schema still loads.
+[[nodiscard]] bool semanticsLoad(std::function<void(nlohmann::json&)> mutate) {
+    nlohmann::json doc = loadShippedCJson();
+    mutate(doc["semantics"]);
+    return GrammarSchema::loadFromText(doc.dump(), "<semantics-perturbed>").has_value();
+}
+} // namespace
+
+TEST(TypeIdentityVocabularyLoader, ShippedEnumerationTypingLoadsAndIsDeclared) {
+    auto const schema = loadShippedSchema("c");
+    ASSERT_NE(schema, nullptr);
+    SemanticConfig const& cfg = schema->semantics();
+    EXPECT_TRUE(cfg.enumerationConstantType.declared())
+        << "C declares the type of an enumeration constant (`int`, C17 6.4.4.3p2)";
+    ASSERT_TRUE(cfg.enumerationCompatibleTypes.declared());
+    auto const* gnu  = cfg.enumerationCompatibleTypes.ladders(EnumCompatibleTypeRule::Gnu);
+    auto const* msvc = cfg.enumerationCompatibleTypes.ladders(EnumCompatibleTypeRule::Msvc);
+    ASSERT_NE(gnu, nullptr);
+    ASSERT_NE(msvc, nullptr);
+    EXPECT_EQ(cfg.enumerationCompatibleTypes.ladders(EnumCompatibleTypeRule::None), nullptr);
+    // Each rung is EXACTLY the type the language gives its spelling — its core per data
+    // model AND its vocabulary identity (C names only the types that share a kind:
+    // `unsigned long` and `unsigned long long` are two U64 types; `int` and `unsigned
+    // int` are their kinds' canonical, unnamed ones).
+    auto const expectLadder = [&](std::vector<DataModelTypeRef> const& ladder,
+                                  std::vector<char const*> const& spelled, char const* what) {
+        ASSERT_EQ(ladder.size(), spelled.size()) << what;
+        for (std::size_t i = 0; i < spelled.size(); ++i) {
+            auto const want = resolveLanguageTypeName(*schema, spelled[i]);
+            ASSERT_TRUE(want.has_value()) << spelled[i];
+            EXPECT_EQ(ladder[i].core, want->core) << what << " rung " << i << ": " << spelled[i];
+            EXPECT_EQ(ladder[i].coreByDataModel, want->coreByDataModel)
+                << what << " rung " << i << ": " << spelled[i];
+            EXPECT_EQ(ladder[i].vocabularyName, want->vocabularyName)
+                << what << " rung " << i << ": " << spelled[i];
+        }
+    };
+    expectLadder(gnu->unsignedLadder, {"unsigned int", "unsigned long", "unsigned long long"},
+                 "gnu unsigned (gcc / clang: `unsigned int` first when no value is negative)");
+    expectLadder(gnu->signedLadder, {"int", "long", "long long"}, "gnu signed");
+    expectLadder(msvc->unsignedLadder, {"int", "unsigned int", "unsigned long long"},
+                 "msvc unsigned (the Microsoft x64 ABI's `int` while `int` holds every value)");
+    expectLadder(msvc->signedLadder, {"int", "long long"}, "msvc signed");
+    EXPECT_EQ(gnu->unsignedLadder[1].vocabularyName, "unsigned long")
+        << "a rung that shares its kind keeps its NAME";
+}
+
+TEST(TypeIdentityVocabularyLoader, EnumerationCompatibleTypesMalformedShapesRejected) {
+    EXPECT_FALSE(semanticsLoad([](nlohmann::json& s) {
+        s["enumerationCompatibleTypes"] = nlohmann::json::array();
+    })) << "the block is an object keyed by format convention";
+    EXPECT_FALSE(semanticsLoad([](nlohmann::json& s) {
+        s["enumerationCompatibleTypes"]["mvsc"] = s["enumerationCompatibleTypes"]["msvc"];
+    })) << "a key that is no convention spelling would silently serve no format";
+    EXPECT_FALSE(semanticsLoad([](nlohmann::json& s) {
+        s["enumerationCompatibleTypes"].erase("msvc");
+    })) << "every convention must be covered: a pe64 format would find no ladders";
+    EXPECT_FALSE(semanticsLoad([](nlohmann::json& s) {
+        s["enumerationCompatibleTypes"]["gnu"] = nlohmann::json::array();
+    })) << "each convention's entry is an object of two ladders";
+    EXPECT_FALSE(semanticsLoad([](nlohmann::json& s) {
+        s["enumerationCompatibleTypes"]["gnu"]["unsgined"] =
+            s["enumerationCompatibleTypes"]["gnu"]["unsigned"];
+    })) << "a typo'd ladder key would silently declare nothing";
+    EXPECT_FALSE(semanticsLoad([](nlohmann::json& s) {
+        s["enumerationCompatibleTypes"]["gnu"].erase("signed");
+    })) << "both ladders are required: a missing one leaves a sign with no answer";
+    EXPECT_FALSE(semanticsLoad([](nlohmann::json& s) {
+        s["enumerationCompatibleTypes"]["msvc"]["unsigned"] = nlohmann::json::array();
+    })) << "an empty ladder chooses nothing";
+    EXPECT_FALSE(semanticsLoad([](nlohmann::json& s) {
+        s["enumerationCompatibleTypes"]["gnu"]["signed"][1] = "double";
+    })) << "a rung must be an integer type under every data model";
+    EXPECT_FALSE(semanticsLoad([](nlohmann::json& s) {
+        s["enumerationCompatibleTypes"]["gnu"]["signed"][0] = "unsigned int";
+    })) << "an unsigned rung on the SIGNED ladder could never hold a negative value";
+    EXPECT_FALSE(semanticsLoad([](nlohmann::json& s) {
+        s["enumerationCompatibleTypes"]["gnu"]["unsigned"][2] = "unsigned looong";
+    })) << "an unresolvable rung never silently no-ops";
+    EXPECT_FALSE(semanticsLoad([](nlohmann::json& s) {
+        s["synthesizedTypes"].erase("enumerationConstant");
+    })) << "the ladders choose a compatible type BESIDE the constants' type, so the "
+           "constant role must be declared too";
+    // The one sign rule the loader does NOT impose: a SIGNED rung on the unsigned
+    // ladder holds the non-negative values it is chosen for (the Microsoft ABI's `int`).
+    EXPECT_TRUE(semanticsLoad([](nlohmann::json& s) {
+        s["enumerationCompatibleTypes"]["gnu"]["unsigned"][0] = "int";
+    }));
+}
+
+TEST(TypeIdentityVocabularyLoader, EnumerationTypingIsOptional) {
+    EXPECT_TRUE(semanticsLoad([](nlohmann::json& s) {
+        s.erase("enumerationCompatibleTypes");
+        s["synthesizedTypes"].erase("enumerationConstant");
+    })) << "a language that declares neither keeps each constant typed as its "
+           "enumeration (the pre-P1 typing) — the mechanism is not C-specific";
+}
+
 // A NEW name on a row whose representation matches an existing entry must still
 // load — nothing about the mechanism is C-specific or spelling-aware.
 TEST(TypeIdentityVocabularyLoader, ArbitraryOpaqueNameAccepted) {
@@ -1258,14 +1435,21 @@ TEST(TypeIdentityVocabularyLoader, ArbitraryOpaqueNameAccepted) {
     })) << "`name` is OPAQUE tag data — the engine must never spell-check it";
 }
 
-// ── Loader validation: `builtinFunctions.signatureByDataModel` ─────────────
+// ── Loader validation: a builtin's PER-PAIR `signature` ─────────────────────
 //
-// The NEW language-config surface this cycle added. It is read ONLY inside the
-// `signature` branch, so on the `params`/`result` form it was silently ignored —
-// and `builtinFunctions` entries had NO closed-key rejection at all, so a typo'd
-// key loaded clean and did nothing. Both are the "knob that lies" class the
-// neighbouring rejections ('rank' requires a 'name'; 'signature' and
-// 'params'/'result' are mutually exclusive) already close.
+// A builtin whose prototype differs by build pair (`_InterlockedCompareExchange`
+// takes a `LONG *`, and `long` is 64-bit on LP64 and 32-bit on LLP64) declares
+// its `signature` as the object the shipped descriptors use —
+// `{ "variants": [ { "when": {…}, "value": "fn(…)" }, …,
+// { "default": true, "value": "fn(…)" } ] }` — decoded at LOAD by the ONE
+// `when` decoder (core/types/variant_when.hpp) and SELECTED at injection with
+// the pair the CU is compiled for. P68 round 12 (S2a-1 of
+// D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES) replaced the data-model-only
+// `signatureByDataModel` map with it, and the closed key list now refuses the
+// old key. The rules are the descriptor reader's: every arm decodes whether or
+// not it is selected, a pair no arm selects is refused unless a `default` arm
+// serves it, two arms selecting one pair are refused, and a `default` is
+// written at most once.
 
 namespace {
 // Perturb the shipped `builtinFunctions` array and report whether the schema
@@ -1276,15 +1460,53 @@ namespace {
     return GrammarSchema::loadFromText(doc.dump(), "<builtins-perturbed>").has_value();
 }
 
-// The index of the first shipped builtin declaring `key`.
-[[nodiscard]] std::size_t builtinIndexWith(nlohmann::json const& arr,
-                                           char const* key) {
-    for (std::size_t i = 0; i < arr.size(); ++i) {
-        if (arr[i].contains(key)) return i;
+// The first shipped builtin whose `signature` is PER PAIR (an object).
+[[nodiscard]] nlohmann::json& perPairBuiltin(nlohmann::json& arr) {
+    for (auto& e : arr) {
+        if (e.contains("signature") && e.at("signature").is_object()) return e;
     }
-    ADD_FAILURE() << "no shipped builtinFunctions entry declares '" << key << "'";
-    return 0;
+    throw std::runtime_error("no shipped builtinFunctions entry declares a per-pair 'signature'");
 }
+
+// Analyze `src` against the shipped C language with its builtins perturbed by
+// `mutate`, on the pair (dm, ldf). The perturbation must LOAD — every defect
+// these pins exercise is one the loader cannot see, because it needs a pair.
+[[nodiscard]] SemanticModel analyzeWithBuiltins(std::function<void(nlohmann::json&)> const& mutate,
+                                                std::string const& src, DataModel dm,
+                                                LongDoubleFormat ldf = LongDoubleFormat::X87_80) {
+    nlohmann::json doc = loadShippedCJson();
+    mutate(doc["semantics"]["builtinFunctions"]);
+    auto schema = GrammarSchema::loadFromText(doc.dump(), "<builtins-probe>");
+    if (!schema.has_value())
+        throw std::runtime_error("the perturbed builtins must LOAD for an injection-time pin");
+    UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
+    builder.addInMemory(src, "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dm, std::nullopt, std::nullopt,
+                   std::nullopt, std::nullopt, ldf);
+}
+
+// True iff some diagnostic of `m` carries `needle`.
+[[nodiscard]] bool mentions(SemanticModel const& m, std::string_view needle) {
+    for (auto const& d : m.diagnostics().all()) {
+        if (d.actual.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// Every diagnostic of `m`, one per line — the "what DID it say, then?" payload.
+[[nodiscard]] std::string diagnosticsOf(SemanticModel const& m) {
+    std::string out;
+    for (auto const& d : m.diagnostics().all()) {
+        out += "\n  [";
+        out += diagnosticCodeName(d.code);
+        out += "] ";
+        out += d.actual;
+    }
+    return out.empty() ? std::string{"\n  <no diagnostics>"} : out;
+}
+
+constexpr char const* kCasProbe = "int f(void){ return 0; }\n";
 } // namespace
 
 TEST(TypeIdentityVocabularyLoader, ShippedBuiltinFunctionsLoadUnperturbed) {
@@ -1294,61 +1516,119 @@ TEST(TypeIdentityVocabularyLoader, ShippedBuiltinFunctionsLoadUnperturbed) {
     // (otherwise every pin below would be testing an unused code path).
     nlohmann::json const doc = loadShippedCJson();
     auto const& arr = doc["semantics"]["builtinFunctions"];
-    std::size_t withOverride = 0;
+    std::size_t perPair = 0;
     for (auto const& e : arr) {
-        if (e.contains("signatureByDataModel")) ++withOverride;
+        if (e.contains("signature") && e.at("signature").is_object()) ++perPair;
+        EXPECT_FALSE(e.contains("signatureByDataModel"))
+            << "the retired key survives on '" << e.value("name", std::string{}) << "'";
     }
-    EXPECT_GE(withOverride, 1u)
-        << "at least one shipped builtin must carry a per-data-model signature "
-           "override (`_InterlockedCompareExchange`'s `LONG*`)";
+    EXPECT_GE(perPair, 1u)
+        << "at least one shipped builtin must carry a per-pair signature "
+           "(`_InterlockedCompareExchange`'s `LONG*`)";
 }
 
-TEST(TypeIdentityVocabularyLoader, BuiltinSignatureByDataModelUnknownKeyRejected) {
+// The retired key is REFUSED, not ignored — on both builtin forms. Ignored, it
+// would load clean and leave the base signature in force on every pair.
+TEST(TypeIdentityVocabularyLoader, BuiltinRetiredSignatureByDataModelKeyRejected) {
     EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
-        arr[builtinIndexWith(arr, "signatureByDataModel")]
-           ["signatureByDataModel"]["LP62"] = "fn(i32) -> i32";
-    })) << "a typo'd data-model key can NEVER match — it would silently leave "
-           "the base signature in force on every target";
-}
-
-TEST(TypeIdentityVocabularyLoader, BuiltinSignatureByDataModelNonStringRejected) {
-    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
-        arr[builtinIndexWith(arr, "signatureByDataModel")]
-           ["signatureByDataModel"]["LP64"] = 42;
-    })) << "each override must be a non-empty signature STRING";
-    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
-        arr[builtinIndexWith(arr, "signatureByDataModel")]
-           ["signatureByDataModel"]["LP64"] = "";
-    })) << "an EMPTY override is indistinguishable from 'no override'";
-    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
-        arr[builtinIndexWith(arr, "signatureByDataModel")]
-           ["signatureByDataModel"] = "fn(i32) -> i32";
-    })) << "the value must be an OBJECT keyed by data-model name";
-}
-
-// ★ The silent-ignore hole: the `params`/`result` form never READS the key, so
-// declaring it there loaded clean and did exactly nothing.
-TEST(TypeIdentityVocabularyLoader, BuiltinSignatureByDataModelWithParamsRejected) {
+        perPairBuiltin(arr)["signatureByDataModel"] = {{"LLP64", "fn(u64) -> u64"}};
+    })) << "the retired key on a per-pair row";
     EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
         for (auto& e : arr) {
-            if (e.contains("signature")) continue;   // the other form
+            if (e.contains("signature")) continue;   // the params/result form
             e["signatureByDataModel"] = {{"LLP64", "fn(u64) -> u64"}};
             return;
         }
         ADD_FAILURE() << "no shipped builtin uses the params/result form";
-    })) << "'signatureByDataModel' overrides 'signature'; on the params/result "
-           "form there is nothing to override, so it must FAIL LOUD rather than "
-           "load clean and silently do nothing";
+    })) << "the retired key on a params/result row";
 }
 
-// The closed-key discriminator itself — the general fix, not just this one key.
+TEST(TypeIdentityVocabularyLoader, BuiltinSignatureArmUnknownWhenVocabularyRejected) {
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"][0]["when"] = {{"dataModel", "LP62"}};
+    })) << "a typo'd data model can NEVER match — it would silently strand the arm";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"][0]["when"] = {{"longDoubleFormat", "x87-81"}};
+    })) << "a typo'd long-double format can NEVER match";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"][0]["when"] = {{"ach", "x86_64"}};
+    })) << "an unknown `when` key would widen the arm to every arch";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"][0]["when"] = nlohmann::json::object();
+    })) << "an empty `when` would match every pair";
+}
+
+TEST(TypeIdentityVocabularyLoader, BuiltinSignatureArmMalformedShapesRejected) {
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"] = 42;
+    })) << "neither a type-text string nor a per-pair object";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"] = nlohmann::json::object();
+    })) << "a per-pair object with no `variants`";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"] = nlohmann::json::array();
+    })) << "an EMPTY `variants`";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["fallback"] = "fn(i32) -> i32";
+    })) << "an unknown key beside `variants` — `fallback` is the silent rule the form forbids";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"][0]["value"] = 42;
+    })) << "each arm's value must be a non-empty signature STRING";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"][0]["value"] = "";
+    })) << "an EMPTY value is indistinguishable from 'no arm'";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"][0].erase("when");
+    })) << "an arm with neither `when` nor `default`";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        auto& v = perPairBuiltin(arr)["signature"]["variants"];
+        v.push_back({{"default", true}, {"value", "fn(ptr<i32>, i32, i32) -> i32"}});
+        v.push_back({{"default", true}, {"value", "fn(ptr<i32>, i32, i32) -> i32"}});
+    })) << "at most ONE default arm";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"].push_back(
+            {{"default", false}, {"value", "fn(ptr<i32>, i32, i32) -> i32"}});
+    })) << "`default` is the literal true or absent";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"].push_back(
+            {{"default", true}, {"when", {{"dataModel", "ILP32"}}},
+             {"value", "fn(ptr<i32>, i32, i32) -> i32"}});
+    })) << "a default arm carries no `when` — a guarded arm is not a default";
+    // The control: ONE well-formed default arm loads.
+    EXPECT_TRUE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"].push_back(
+            {{"default", true}, {"value", "fn(ptr<i32>, i32, i32) -> i32"}});
+    })) << "one default arm is the form's own spelling of 'every other pair'";
+}
+
+// The per-pair object is still a `signature`: the rule that forbids declaring
+// both `signature` and `params`/`result` holds for it, and a type-generic
+// `genericPointee` — which needs ONE exemplar signature — refuses several.
+TEST(TypeIdentityVocabularyLoader, BuiltinPerPairSignatureExclusivityRules) {
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        for (auto& e : arr) {
+            if (e.contains("signature")) continue;   // the params/result form
+            e["signature"] = {{"variants", nlohmann::json::array({
+                {{"when", {{"dataModel", "LP64"}}}, {"value", "fn(i32) -> i32"}}})}};
+            return;
+        }
+        ADD_FAILURE() << "no shipped builtin uses the params/result form";
+    })) << "a per-pair `signature` beside `params`/`result` is two declarations";
+    EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
+        perPairBuiltin(arr)["genericPointee"] = {
+            {"bindFromParam", 0}, {"applyToParams", nlohmann::json::array({1, 2})},
+            {"applyToResult", true}};
+    })) << "`genericPointee` binds from ONE exemplar; a per-pair signature has several";
+}
+
+// The closed-key discriminator itself — the general fix, not just one key.
 TEST(TypeIdentityVocabularyLoader, BuiltinFunctionUnknownKeyRejected) {
     EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
         arr[0]["signatureByDataModl"] = {{"LLP64", "fn(u64) -> u64"}};
     })) << "a mis-spelled key must be rejected, not silently ignored";
     EXPECT_FALSE(builtinFunctionsLoad([](nlohmann::json& arr) {
         arr[0]["varadic"] = true;
-    })) << "the typo discriminator covers every key, not just the new one";
+    })) << "the typo discriminator covers every key";
     // `$`-prefixed documentation keys stay legal (the codebase-wide convention).
     EXPECT_TRUE(builtinFunctionsLoad([](nlohmann::json& arr) {
         arr[0]["$note"] = "documentation";
@@ -1356,42 +1636,125 @@ TEST(TypeIdentityVocabularyLoader, BuiltinFunctionUnknownKeyRejected) {
 }
 
 // The EAGER anti-lurking decode at the injection site (semantic_analyzer.cpp):
-// EVERY declared override is decoded regardless of which model is active, so a
-// malformed INACTIVE override fails on EVERY target rather than lurking until
-// that model is first compiled. Observed end-to-end: the perturbed schema is
-// analyzed under the OTHER data model and must still error.
-TEST(TypeIdentityVocabulary, MalformedInactiveSignatureOverrideFailsOnEveryTarget) {
-    auto const analyzeWithOverride = [](std::string const& text, DataModel dm) {
-        nlohmann::json doc = loadShippedCJson();
-        auto& arr = doc["semantics"]["builtinFunctions"];
-        bool patched = false;
-        for (auto& e : arr) {
-            if (!e.contains("signatureByDataModel")) continue;
-            e["signatureByDataModel"]["LLP64"] = text;
-            patched = true;
-            break;
-        }
-        EXPECT_TRUE(patched);
-        auto schema = GrammarSchema::loadFromText(doc.dump(), "<override-probe>");
-        EXPECT_TRUE(schema.has_value());
-        UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
-        builder.addInMemory("int f(void){ return 0; }\n", "<mem>");
-        auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-        return analyze(cu, DiagnosticBudget::libraryDefault(), dm);
+// EVERY declared text — each `when` arm AND the `default` — is decoded whatever
+// the pair, so a malformed INACTIVE one fails on EVERY pair rather than lurking
+// until its pair is first compiled. Observed end-to-end: the perturbed schema
+// is analyzed on the OTHER data model and must still error.
+TEST(TypeIdentityVocabulary, MalformedInactiveSignatureArmFailsOnEveryPair) {
+    auto const withLlp64Arm = [](std::string text) {
+        return [text](nlohmann::json& arr) {
+            for (auto& arm : perPairBuiltin(arr)["signature"]["variants"]) {
+                if (arm.contains("when") && arm["when"].value("dataModel", "") == "LLP64")
+                    arm["value"] = text;
+            }
+        };
     };
-    // The LLP64 override is malformed. Under LLP64 it is the ACTIVE one...
-    EXPECT_TRUE(analyzeWithOverride("fn(ptr<", DataModel::Llp64).hasErrors());
-    // ... and under LP64 it is INACTIVE, yet must STILL fail: an override that
-    // only breaks on the target nobody built yet is the lurking-config defect.
-    EXPECT_TRUE(analyzeWithOverride("fn(ptr<", DataModel::Lp64).hasErrors())
-        << "an INACTIVE malformed override must fail on EVERY target";
-    // A well-formed override under BOTH models is the clean control.
-    EXPECT_FALSE(analyzeWithOverride("fn(ptr<i32>, i32, i32) -> i32",
+    // The LLP64 arm is malformed. Under LLP64 it is the ACTIVE one...
+    EXPECT_TRUE(analyzeWithBuiltins(withLlp64Arm("fn(ptr<"), kCasProbe, DataModel::Llp64).hasErrors());
+    // ... and under LP64 it is INACTIVE, yet must STILL fail: an arm that only
+    // breaks on the pair nobody built yet is the lurking-config defect.
+    EXPECT_TRUE(analyzeWithBuiltins(withLlp64Arm("fn(ptr<"), kCasProbe, DataModel::Lp64).hasErrors())
+        << "an INACTIVE malformed arm must fail on EVERY pair";
+    // A well-formed arm under BOTH models is the clean control.
+    EXPECT_FALSE(analyzeWithBuiltins(withLlp64Arm("fn(ptr<i32>, i32, i32) -> i32"), kCasProbe,
                                      DataModel::Lp64).hasErrors());
-    // ... and a well-formed override that is not a FUNCTION type fails too
-    // (the decode must land an FnSig, never any type that happens to parse).
-    EXPECT_TRUE(analyzeWithOverride("i32", DataModel::Lp64).hasErrors())
-        << "an override must decode to a FUNCTION type";
+    // ... and a well-formed arm that is not a FUNCTION type fails too (the decode
+    // must land an FnSig, never any type that happens to parse).
+    EXPECT_TRUE(analyzeWithBuiltins(withLlp64Arm("i32"), kCasProbe, DataModel::Lp64).hasErrors())
+        << "an arm must decode to a FUNCTION type";
+    // ★ The DEFAULT arm is decoded eagerly too. Here an arm SELECTS the pair, so
+    // the default is never chosen — and it must still fail, or a malformed
+    // default would lurk until a pair with no arm of its own compiled.
+    auto const withBadDefault = [](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"].push_back(
+            {{"default", true}, {"value", "fn(ptr<"}});
+    };
+    EXPECT_TRUE(analyzeWithBuiltins(withBadDefault, kCasProbe, DataModel::Lp64).hasErrors())
+        << "an unselected malformed DEFAULT must fail on every pair";
+}
+
+// NO SILENT FALLBACK at injection. A pair no arm selects, with no `default`, is
+// refused and NAMED — the retired map handed such a pair its base (LP64) text.
+// A `default` arm is what makes the same pair legal; two arms selecting one
+// pair are refused rather than resolved by order.
+//
+// ⚠ The unselected pair is made with the LONG-DOUBLE axis, not a third data
+// model: ILP32 is refused by the analyzer on its own
+// (`Fc3WidthSemantics.Ilp32SelectionFailsLoud`), so a pair that errors there
+// could not tell a builtin refusal from the data-model one.
+TEST(TypeIdentityVocabulary, PerPairBuiltinSignatureSelectionIsExact) {
+    auto const noChange = [](nlohmann::json&) {};
+    // The shipped row declares LP64 and LLP64 arms and no default: both select.
+    EXPECT_FALSE(analyzeWithBuiltins(noChange, kCasProbe, DataModel::Lp64).hasErrors());
+    EXPECT_FALSE(analyzeWithBuiltins(noChange, kCasProbe, DataModel::Llp64).hasErrors());
+    // One arm, for x87-80 alone, and no default.
+    auto const x87Only = [](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"] = nlohmann::json::array({
+            {{"when", {{"longDoubleFormat", "x87-80"}}},
+             {"value", "fn(ptr<i32>, i32, i32) -> i32"}}});
+    };
+    EXPECT_FALSE(analyzeWithBuiltins(x87Only, kCasProbe, DataModel::Lp64, LongDoubleFormat::X87_80)
+                     .hasErrors()) << "control: the arm selects x87-80";
+    {
+        auto const m =
+            analyzeWithBuiltins(x87Only, kCasProbe, DataModel::Lp64, LongDoubleFormat::F64);
+        EXPECT_TRUE(m.hasErrors()) << "f64 selects no arm and the row has no default";
+        EXPECT_TRUE(mentions(m, "no 'signature' variant matches this pair"));
+        EXPECT_TRUE(mentions(m, "long-double format 'f64'")) << "the refusal names the pair";
+    }
+    auto const x87AndDefault = [&](nlohmann::json& arr) {
+        x87Only(arr);
+        perPairBuiltin(arr)["signature"]["variants"].push_back(
+            {{"default", true}, {"value", "fn(ptr<i32>, i32, i32) -> i32"}});
+    };
+    EXPECT_FALSE(analyzeWithBuiltins(x87AndDefault, kCasProbe, DataModel::Lp64,
+                                     LongDoubleFormat::F64).hasErrors())
+        << "the default serves the pair no arm selects";
+    auto const withSecondLp64Arm = [](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"].push_back(
+            {{"when", {{"dataModel", "LP64"}}}, {"value", "fn(ptr<i32>, i32, i32) -> i32"}});
+    };
+    {
+        auto const m = analyzeWithBuiltins(withSecondLp64Arm, kCasProbe, DataModel::Lp64);
+        EXPECT_TRUE(m.hasErrors()) << "two arms select LP64";
+        EXPECT_TRUE(mentions(m, "2 'signature' variants match this pair"));
+    }
+    EXPECT_FALSE(analyzeWithBuiltins(withSecondLp64Arm, kCasProbe, DataModel::Llp64).hasErrors())
+        << "control: LLP64 still selects exactly one";
+}
+
+// The long-double format selects too — the axis S2a-1 added, observed through
+// the TYPE the builtin's call gets: the x87-80 arm returns `long long` and the
+// default `int`, so a `_Generic` over the call says which arm the pair chose.
+// (`_Generic`, not `sizeof`: with no target layout in hand — this analysis has
+// none — `sizeof` of a call is not folded to a constant, ✔MEASURED at S2a-1:
+// S_StaticAssertFailed "not an integer constant expression".)
+TEST(TypeIdentityVocabulary, PerPairBuiltinSignatureSelectsByLongDoubleFormat) {
+    auto const byLongDouble = [](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"] = nlohmann::json::array({
+            {{"when", {{"longDoubleFormat", "x87-80"}}},
+             {"value", "fn(ptr<i32>, i32, i32) -> i64 \"long long\""}},
+            {{"default", true}, {"value", "fn(ptr<i32>, i32, i32) -> i32"}}});
+    };
+    std::string const wide =
+        "int x;\n_Static_assert(_Generic(_InterlockedCompareExchange(&x, 0, 0), long long: 1, "
+        "default: 0), \"x87 arm\");\n";
+    std::string const narrow =
+        "int x;\n_Static_assert(_Generic(_InterlockedCompareExchange(&x, 0, 0), int: 1, "
+        "default: 0), \"default\");\n";
+    {
+        auto const m = analyzeWithBuiltins(byLongDouble, wide, DataModel::Lp64, LongDoubleFormat::X87_80);
+        EXPECT_FALSE(m.hasErrors()) << "x87-80 selects its arm" << diagnosticsOf(m);
+    }
+    {
+        auto const m = analyzeWithBuiltins(byLongDouble, narrow, DataModel::Lp64, LongDoubleFormat::F64);
+        EXPECT_FALSE(m.hasErrors()) << "f64 selects no arm: the default serves it" << diagnosticsOf(m);
+    }
+    // The negative arms: each pair REFUSES the other's size.
+    EXPECT_TRUE(analyzeWithBuiltins(byLongDouble, narrow, DataModel::Lp64, LongDoubleFormat::X87_80)
+                    .hasErrors());
+    EXPECT_TRUE(analyzeWithBuiltins(byLongDouble, wide, DataModel::Lp64, LongDoubleFormat::Ieee128)
+                    .hasErrors());
 }
 
 // ── Literal SUFFIXES carry vocabulary identity, not just a width ────────────
@@ -1453,4 +1816,149 @@ TEST(TypeIdentityVocabulary, FloatLiteralSuffixSelectsLongDouble) {
             << "`1.0L` IS `long double`, `1.0` IS the anonymous `double`, "
                "`1.0f` IS `float` — on EVERY long-double axis";
     }
+}
+
+// ── P68 round 10 (lane `cs`, D-LANG-UAC-UNSIGNED-COUNTERPART-OF-SIGNED): C 6.3.1.8's
+// FIFTH CONVERSION ─────────────────────────────────────────────────────────────────
+// When the signed operand ranks higher (C 6.3.1.1, by NAME) but has the SAME width as
+// the unsigned one, it cannot represent every unsigned value, and both convert to the
+// UNSIGNED COUNTERPART of the signed type: LP64 `long long + unsigned long` is `unsigned
+// long long`, LLP64 `long + unsigned int` is `unsigned long`. The same VALUE and width
+// as the unsigned operand's own type — only `_Generic` / `typeof` can tell, which is
+// why this was a NAME-only divergence. ✔MEASURED 2026-09-24 (the lane's
+// `.temp/probe/uac`, each case one translation unit, every build RUN): gcc 13.3.0 and
+// clang 18.1.3 at `-std=c17 -pedantic-errors` and `-std=c2x` (LP64), mingw-w64 13.2.0
+// and MSVC 19.51 at both of their modes (LLP64) select exactly the arms below; DSS
+// selected the unsigned operand's own type. The widths that DIFFER are the controls:
+// a wider signed type represents every value (the fourth conversion).
+TEST(TypeIdentityVocabulary, ASameWidthMixedSignednessPairTakesTheSignedTypesUnsignedCounterpart) {
+    std::string const src =
+        "int f(long long a, unsigned long b, long c, unsigned int d, int k){\n"
+        "  return _Generic(a + b, unsigned long long: 11, unsigned long: 12, long long: 13, default: 14)\n"
+        "       + _Generic(b + a, unsigned long long: 21, unsigned long: 22, long long: 23, default: 24)\n"
+        "       + _Generic(c + d, unsigned long: 31, unsigned int: 32, long: 33, default: 34)\n"
+        "       + _Generic(d + c, unsigned long: 41, unsigned int: 42, long: 43, default: 44)\n"
+        "       + _Generic(k ? a : b, unsigned long long: 51, unsigned long: 52, long long: 53, default: 54);\n"
+        "}\n";
+    {
+        SCOPED_TRACE("LP64: long long / unsigned long are both 64-bit, long / unsigned int are not");
+        auto m = analyzeC(src, DataModel::Lp64);
+        expectGenericClean(m);
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"11", "21", "33", "43", "51"}));
+    }
+    {
+        SCOPED_TRACE("LLP64: long / unsigned int are both 32-bit, long long / unsigned long are not");
+        auto m = analyzeC(src, DataModel::Llp64);
+        expectGenericClean(m);
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"13", "23", "31", "41", "53"}));
+    }
+}
+
+// P68 round 12 (lane `cs`): an enumeration with a FIXED underlying type (C23 6.7.2.2) has
+// that type's RANK (C 6.3.1.1p1), and rank is by NAME — so `enum E : long` meets an
+// `unsigned int` as `long` does: the fifth conversion on LLP64 (`unsigned long`), the
+// fourth on LP64 (`long`). The enum record keeps its underlying type AS DECLARED; it
+// kept only the kind, and an anonymous I32 / I64 took the unsigned operand's type
+// (LLP64 `unsigned int`) or no named type at all (LP64). The enumeration CONSTANT has the
+// enumerated type too, and an enum WITHOUT a fixed type is the `int` control.
+// ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/uacx`): gcc 13.3.0, clang 18.1.3 and
+// mingw-w64 13.2.0 at -std=c2x build and run every shape to C's answer; MSVC 19.51 has no
+// fixed underlying types and abstains.
+TEST(TypeIdentityVocabulary, AnEnumWithAFixedUnderlyingTypeHasThatTypesRank) {
+    std::string const src =
+        "enum E : long { A = 1 };\n"
+        "enum F : long long { B = 1 };\n"
+        "enum G { C = 1 };\n"
+        "int f(enum E e, enum F g, enum G h, unsigned int u, unsigned long ul) {\n"
+        "  return _Generic(e + u, unsigned long: 11, long: 12, unsigned int: 13, default: 14)\n"
+        "       + _Generic(A + u, unsigned long: 21, long: 22, unsigned int: 23, default: 24)\n"
+        "       + _Generic(g + ul, unsigned long long: 31, long long: 32, unsigned long: 33, default: 34)\n"
+        "       + _Generic(h + u, unsigned int: 41, int: 42, default: 43);\n"
+        "}\n";
+    {
+        SCOPED_TRACE("LLP64: `long` / `unsigned int` share a width — the fifth conversion");
+        auto m = analyzeC(src, DataModel::Llp64);
+        expectGenericClean(m);
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"11", "21", "32", "41"}));
+    }
+    {
+        SCOPED_TRACE("LP64: `long` is wider than `unsigned int`; `long long` / `unsigned long` share one");
+        auto m = analyzeC(src, DataModel::Lp64);
+        expectGenericClean(m);
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"12", "22", "31", "41"}));
+    }
+}
+
+// P68 round 12 (lane `cs`): C23's enum-type-specifier is a specifier-qualifier-LIST, and
+// the underlying type is "the unqualified, non-atomic version" of what it names (C23
+// 6.7.2.2) — so `enum E : const long`, `: volatile long` and `: _Atomic long` are `long`
+// enums, ranked as `long`. ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/enq`): gcc 13.3.0
+// and mingw-w64 13.2.0 at -std=c2x build and run all three to that answer, clang 18.1.3 the
+// first two (it refuses `_Atomic long` as "non-integral"; gcc's acceptance is the
+// disjunction's), MSVC 19.51 abstains; DSS refused all three at PARSE — the clause took a
+// qualifier-free base only.
+TEST(TypeIdentityVocabulary, AQualifiedFixedUnderlyingTypeIsItsUnqualifiedType) {
+    std::string const src =
+        "enum E : const long { A = 1 };\n"
+        "enum F : volatile long { B = 1 };\n"
+        "enum G : _Atomic long { C = 1 };\n"
+        "int f(enum E e, enum F g, enum G h, unsigned int u) {\n"
+        "  return _Generic(e + u, unsigned long: 11, long: 12, default: 13)\n"
+        "       + _Generic(g + u, unsigned long: 21, long: 22, default: 23)\n"
+        "       + _Generic(h + u, unsigned long: 31, long: 32, default: 33);\n"
+        "}\n";
+    {
+        SCOPED_TRACE("LLP64: the fifth conversion, as for an unqualified `long`");
+        auto m = analyzeC(src, DataModel::Llp64);
+        expectGenericClean(m);
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"11", "21", "31"}));
+    }
+    {
+        SCOPED_TRACE("LP64: the fourth conversion, as for an unqualified `long`");
+        auto m = analyzeC(src, DataModel::Lp64);
+        expectGenericClean(m);
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"12", "22", "32"}));
+    }
+}
+
+// The loader's half: under `rank-prefer-unsigned` every NAMED signed entry must have
+// ONE unsigned counterpart — a named entry of the same `rank` whose core is the
+// unsigned twin — under every data model. Both perturbations below keep every row
+// loadable on its own (no name disappears — `synthesizedTypes` still resolves), so
+// the refusal is this check's and no other; the message is read, not just the fact.
+namespace {
+[[nodiscard]] std::string typeSpecifiersLoadErrors(std::function<void(nlohmann::json&)> mutate) {
+    nlohmann::json doc = loadShippedCJson();
+    mutate(doc["semantics"]["typeSpecifiers"]);
+    auto const loaded = GrammarSchema::loadFromText(doc.dump(), "<vocab-perturbed>");
+    if (loaded.has_value()) return {};
+    std::string all;
+    for (auto const& d : loaded.error()) all += d.message + "\n";
+    return all.empty() ? std::string{"<refused with no message>"} : all;
+}
+}  // namespace
+
+TEST(TypeIdentityVocabularyLoader, ASignedEntryWithoutAnUnsignedCounterpartIsRefused) {
+    // `unsigned long long` re-ranked 5: no rank-4 unsigned entry is left for `long long`
+    // (and `unsigned __int128`, U128 at rank 5, is no twin of an I64). THE CONTROL is
+    // ArbitraryOpaqueNameAccepted above: it names the 16-bit `short` with no named
+    // unsigned twin, and must still LOAD — `short` is promoted to `int` before any
+    // conversion decision, so only an entry that survives promotion needs a counterpart.
+    std::string const errors = typeSpecifiersLoadErrors([](nlohmann::json& rows) {
+        for (auto& r : rows)
+            if (r.value("name", std::string{}) == "unsigned long long") r["rank"] = 5;
+    });
+    EXPECT_NE(errors.find("'long long' has no unsigned counterpart"), std::string::npos)
+        << "refused for its OWN reason:\n" << errors;
+}
+
+TEST(TypeIdentityVocabularyLoader, ASignedEntryWithTwoUnsignedCounterpartsIsRefused) {
+    // One spelling of `unsigned long long` renamed: a SECOND rank-4 U64 entry, so
+    // `long long` has two candidate counterparts and "the" counterpart is no one type.
+    std::string const errors = typeSpecifiersLoadErrors([](nlohmann::json& rows) {
+        rows[rowIndexFor(rows, {"UnsignedKeyword", "LongKeyword", "LongKeyword", "IntKeyword"})]["name"] =
+            "unsigned long long int";
+    });
+    EXPECT_NE(errors.find("'long long' has more than one unsigned counterpart"), std::string::npos)
+        << "refused for its OWN reason:\n" << errors;
 }

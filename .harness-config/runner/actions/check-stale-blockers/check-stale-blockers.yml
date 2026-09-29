@@ -1,0 +1,13 @@
+# PURPOSE: list OPEN registry rows whose Closing-work cell waits on a blocker that has since CLOSED.
+name: check-stale-blockers
+description: >-
+  The action proves the matcher can fire and stay silent, and scans the live registries for leads.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-stale-blockers.py --selftest
+    successPattern: 'check-stale-blockers: self-test OK'
+    requireInputsUnmoved: true

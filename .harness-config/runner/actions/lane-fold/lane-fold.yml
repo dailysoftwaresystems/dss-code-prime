@@ -1,0 +1,14 @@
+# PURPOSE: seed a lane worktree from the main tree, fold only that lane's real changes back, and land it with its rows applied and its evidence preserved.
+name: lane-fold
+description: >-
+  The action proves the fold, the landing and the evidence preservation can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `lane_fold_selftest_guard`.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./lane-fold.py --self-test
+    successPattern: 'lane-fold self-test: \d+ pin\(s\), 0 failed'
+    requireInputsUnmoved: true

@@ -1,0 +1,52 @@
+{
+  "$comment": "★★★ DATA FROM A STATIC ARCHIVE, READ BY THE PROGRAM THAT LINKS IT (P68 round 9, D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT, routed from lane lm, whose getopt row it unblocks). Each target's `dependsOn` builds `dsslib.c` — an int, an array, and a pointer whose value the archive's own initializer computes — into a DSS static library, and `main.c` reads all three: its CODE through the slot every image format reads an extern datum through, its static initializer `via_init` through the object's own address. ✔MEASURED 2026-09-24 at the round's base (the pre-fix lane build): pe64 exec, ELF x86_64 exec (WSL) and ELF aarch64 exec (qemu) each exit 1 — the merge bound the slot-shaped reference to the OBJECT, so the code read the object's bytes as its address and the archive's pointer disagreed with main's (the same defect makes a plain `return x;` of an archive's `int x = 42;` die: access violation 0xC0000005 on pe64, SIGSEGV 139 on both ELF targets). The references on the same two files, library as an `ar` archive: gcc 13 -no-pie and -pie 42, clang 18 42, aarch64-linux-gnu-gcc 13.3 42 under qemu, mingw-w64 gcc 13.2 42 on Windows. What each value proves by the exit code: 1 — the archive's pointer (`dss_lib_ptr`, relocated inside the archive against its own element) differs from the address main's CODE computes for that element through the slot; 2 — main's static initializer (a DATA relocation, which must name the object and never the slot) differs from main's code's address; 42 = 30 + 5 + 3 + 4 only if every read reaches its object. The Mach-O x86_64 arm is compiled only; Mach-O arm64 runs on the darwin leg. The `release` arm builds the archive and main through the shipped release pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        { "sources": ["dsslib.c"], "spec": "x86_64:pe64-x86_64-windows-staticlib", "artifact": "dsslib.lib" }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "dependsOn": [
+        { "sources": ["dsslib.c"], "spec": "x86_64:elf64-x86_64-linux-staticlib", "artifact": "dsslib.a" }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "dependsOn": [
+        { "sources": ["dsslib.c"], "spec": "arm64:elf64-aarch64-linux-staticlib", "artifact": "dsslib.a" }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "dependsOn": [
+        { "sources": ["dsslib.c"], "spec": "arm64:macho64-arm64-darwin-staticlib", "artifact": "dsslib.a" }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        { "sources": ["dsslib.c"], "spec": "x86_64:macho64-x86_64-darwin-staticlib", "artifact": "dsslib.a" }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

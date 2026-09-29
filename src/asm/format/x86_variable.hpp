@@ -80,4 +80,13 @@ encode(Lir const&                  lir,
        std::vector<walker_util::BlockSymPatch>& blockSymPatches,
        DiagnosticReporter&         reporter);
 
+// [[D-CSUBSET-LONG-BRANCH]]: WHAT THIS OPCODE DECLARES AS ITS SELF-CONTAINED
+// UNCONDITIONAL BRANCH — the body a branch island is made of. The `fixed32`
+// twin of this query carries the argument for why it is public; the short of
+// it is that x86-64's `rel32` edge is a function body over 2 GiB, so the x86
+// island BODY is pinned by reading what the config declares rather than by
+// synthesizing the edge. That composition is stated, never implied.
+[[nodiscard]] DSS_EXPORT walker_util::BranchIslandBody
+islandBody(TargetOpcodeInfo const& info);
+
 } // namespace dss::x86_variable

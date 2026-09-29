@@ -1,0 +1,36 @@
+{
+  "$comment": "Neutral shipped <getopt.h> — POSIX `getopt` and the GNU long-option extension (`getopt_long`, `getopt_long_only`, `struct option`), with the four globals `optarg`/`optind`/`opterr`/`optopt`. P68 round 9, D-CONFIG-NO-SHIPPED-GETOPT-ON-ANY-FORMAT: every reference toolchain DSS targets ships this header and DSS shipped it on no format. ✔MEASURED 2026-09-23, one translation unit per name, each an ADDRESS-OF (functions, objects), a `struct option` object or an `#ifdef` — an implicit call can fake none of them: gcc 13.3.0 and clang 18.1.3 (glibc, x86_64 and aarch64) declare in <getopt.h> getopt, getopt_long, getopt_long_only, optarg, optind, opterr, optopt, `struct option` and the three `has_arg` names as MACROS (0/1/2), and no `optreset`; mingw-w64 gcc 13.2.0 declares the same set with the three `has_arg` names as ENUM constants (not `#ifdef`-visible) and `optreset` only under `_BSD_SOURCE`; Darwin (Apple clang 21.0.0) declares them with `optreset` a plain variable; MSVC 14.51 ships no <getopt.h>. `struct option` is {const char *name; int has_arg; int *flag; int val;} everywhere. ★ THE BODY: `elf` and `macho` import the platform C library's own getopt (role `cLibrary` — ✔MEASURED 2026-09-23, `nm -D --defined-only`: glibc's libc.so.6 exports getopt, getopt_long and getopt_long_only (T) and optarg (B), opterr, optind and optopt (D), all @GLIBC_2.2.5 on x86_64 and @GLIBC_2.17 on aarch64, with no `optreset`; Darwin's libSystem links and runs them — the coordinator's Apple clang 21.0.0 probe on both arches), so a DSS program parses exactly as a gcc/clang one on that platform — glibc's GNU permutation, Darwin's BSD rules. `pe` has NO platform image exporting any of these names (not ucrtbase, not kernel32; mingw-w64 links them from its own static runtime), so the `pe` realization is the shipped source `runtime/platform/src/getopt.c`, written to mingw-w64's measured behaviour (its header comment lists it; ✔MEASURED: linked into the same 13-scenario probe in place of mingw's, its transcript is IDENTICAL to mingw's, messages included; examples/c/getopt_platform runs it). A declaration bound to a DLL instead would break every pe binary's LOAD (DSS imports each declared shipped extern eagerly). ★ The has_arg names follow each platform: macros on elf/macho (`#define no_argument 0`), preprocessor-INVISIBLE constants on pe (mingw's enum) — so `#ifdef no_argument` answers as the platform's reference does. `optreset` is declared on macho alone (Darwin's variable); mingw's is `_BSD_SOURCE`-only and glibc has none. <unistd.h> re-declares the POSIX subset (getopt + the four globals) — see unistd.json.",
+  "header": "getopt.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf", "macho", "pe"],
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
+  "realization": { "pe": { "source": "runtime/platform/src/getopt.c" } },
+  "structs": [
+    { "name": "option", "fields": [
+      { "name": "name",    "type": "ptr<char>" },
+      { "name": "has_arg", "type": "i32" },
+      { "name": "flag",    "type": "ptr<i32>" },
+      { "name": "val",     "type": "i32" }
+    ] }
+  ],
+  "symbols": [
+    { "name": "getopt",           "signature": "fn(i32, ptr<ptr<char>>, ptr<char>) -> i32",                          "kind": "function", "linkage": "external" },
+    { "name": "getopt_long",      "signature": "fn(i32, ptr<ptr<char>>, ptr<char>, ptr<option>, ptr<i32>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "getopt_long_only", "signature": "fn(i32, ptr<ptr<char>>, ptr<char>, ptr<option>, ptr<i32>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "optarg",   "signature": "ptr<char>", "kind": "object", "linkage": "external" },
+    { "name": "optind",   "signature": "i32",       "kind": "object", "linkage": "external" },
+    { "name": "opterr",   "signature": "i32",       "kind": "object", "linkage": "external" },
+    { "name": "optopt",   "signature": "i32",       "kind": "object", "linkage": "external" },
+    { "name": "optreset", "signature": "i32",       "kind": "object", "linkage": "external", "availableObjectFormats": ["macho"] }
+  ],
+  "macros": [
+    { "name": "no_argument",       "variants": [ { "when": { "format": "elf" }, "replacement": "0" }, { "when": { "format": "macho" }, "replacement": "0" } ] },
+    { "name": "required_argument", "variants": [ { "when": { "format": "elf" }, "replacement": "1" }, { "when": { "format": "macho" }, "replacement": "1" } ] },
+    { "name": "optional_argument", "variants": [ { "when": { "format": "elf" }, "replacement": "2" }, { "when": { "format": "macho" }, "replacement": "2" } ] }
+  ],
+  "constants": [
+    { "name": "no_argument",       "preprocessorVisible": false, "variants": [ { "when": { "format": "pe" }, "value": 0, "type": "i32" } ] },
+    { "name": "required_argument", "preprocessorVisible": false, "variants": [ { "when": { "format": "pe" }, "value": 1, "type": "i32" } ] },
+    { "name": "optional_argument", "preprocessorVisible": false, "variants": [ { "when": { "format": "pe" }, "value": 2, "type": "i32" } ] }
+  ]
+}

@@ -1,11 +1,15 @@
 #include "core/substrate/process_spawn.hpp"
 
-#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot -- UNC-safe absolute
+#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot, genericSpellingU8
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <exception>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -89,6 +93,14 @@
             #define DSS_SPAWN_ADDCHDIR ::posix_spawn_file_actions_addchdir_np
         #endif
     #endif
+#endif
+
+#if !defined(_WIN32) && !defined(DSS_SPAWN_USE_POSIX_SPAWN)
+// The environment the `fork` arm's `execv` hands on, read entry by entry when
+// the environment arm has to FILTER it (`filteredEnvironment` below). macOS
+// reaches the same thing through `_NSGetEnviron()` instead — see the note at
+// its `posix_spawn` call for why.
+extern char** environ;
 #endif
 
 // process_spawn — see process_spawn.hpp for the contract, the rationale, and
@@ -534,6 +546,76 @@ std::optional<fs::path> resolveDetailed(std::string const& command,
     return std::nullopt;
 }
 
+// ── Where a missed program was looked for, in the operator's words ─────────
+//
+// ★ THE SENTENCE NAMES THE LOOKUP THAT HAPPENED, BRANCHING ON THE SAME
+// PREDICATE THE RESOLVER BRANCHES ON.
+// [[D-SPAWN-PATH-FORM-PROGRAM-REPORTED-AS-LOOKED-UP-IN-PATH]]. `resolveDetailed`
+// runs one of two lookups and the not-found text used to describe only one of
+// them: a path-form argv[0] — never searched for, probed at ONE file — was
+// reported as "It was looked up in PATH (the current directory is deliberately
+// never searched); pass a path containing a directory separator to run a local
+// tool." ✔MEASURED through `dsscp --project`, a pre-build hook naming a missing
+// `tools/gen.exe`: every clause false for that input — no PATH lookup happened,
+// a relative path-form is resolved AGAINST the current directory, and the
+// advice asks for the separator the name already has. Since a hook's path-form
+// program is re-based onto its manifest's directory, every missing one reaches
+// this text.
+//
+// The path-form arm names the file probed as the probe saw it: made absolute
+// against the CALLER's working directory by the same `makeAbsolute` a hit goes
+// through, spelled with `core::genericSpellingU8` (UTF-8 — argv's own encoding
+// — and a UNC authority kept). If that rendering throws (a working directory
+// holding text no encoding accepts), the path is named as given, which is
+// still the exact path the probe was handed. On Windows the extension rule is
+// stated too, because it decides which files were tried: a name with an
+// extension is tried as given and then with each PATHEXT extension appended,
+// and a name without one ONLY with them appended.
+//
+// `foundNonExecutable` = the caller already named a file that IS there (POSIX
+// permission bits), so the "no regular file exists there" clause would
+// contradict it and is left out.
+std::string whereItWasLookedFor(std::string const& command,
+                                bool               foundNonExecutable) {
+    if (!hasDirectoryComponent(command)) {
+        return "It was looked up in PATH (the current directory is "
+               "deliberately never searched); pass a path containing a "
+               "directory separator to run a local tool.";
+    }
+    // `spawnAndWaitInherit` decoded argv[0] before resolving it, so this
+    // decode succeeds there; the fallback only keeps the function total.
+    auto const  commandPath = pathFromUtf8(command);
+    std::string probed      = command;
+    if (commandPath.has_value()) {
+        try {
+            std::u8string const u8 =
+                core::genericSpellingU8(makeAbsolute(*commandPath));
+            probed.assign(reinterpret_cast<char const*>(u8.data()), u8.size());
+        } catch (std::exception const&) {
+            probed = command;
+        }
+    }
+    std::string text = "It contains a directory separator, so it names one "
+                       "file and was NOT searched for in PATH. The path probed "
+                       "was '" + probed + "'";
+#if defined(_WIN32)
+    // The same test `probeCandidate` applies, on the same decoded path.
+    bool const hasOwnExtension =
+        commandPath.has_value() && commandPath->has_extension();
+    std::string extensions;
+    for (auto const& ext : pathExtensions()) {
+        extensions += (extensions.empty() ? "" : " ") + ext;
+    }
+    text += hasOwnExtension
+                ? " (as given, then with each PATHEXT extension appended: "
+                      + extensions + ")"
+                : " (only with each PATHEXT extension appended, since it has "
+                  "no extension of its own: " + extensions + ")";
+#endif
+    text += foundNonExecutable ? "." : ", and no regular file exists there.";
+    return text;
+}
+
 #if defined(_WIN32)
 
 // ── Handing our OWN stdin/stderr on when the child's stdout is redirected ───
@@ -711,6 +793,118 @@ HandshakeVerdict interpretExecHandshake(std::size_t             bytesRead,
 
 namespace {
 
+// ── The environment arm: which variables a child is DENIED ─────────────────
+// The contract, and the measured corruption it exists for, are in the header
+// ("The environment arm"). These helpers decide it; `spawnAndWaitImpl` only
+// hands the result to the OS.
+
+// A withheld name that names no variable is the CALLER's bug, reported and
+// never ignored: an ignored typo would hand the child exactly what the caller
+// asked to keep from it. Empty => every name is well-formed. A name holding a
+// NUL is identified by index and not printed (it would end the message there).
+std::string malformedWithheldName(std::vector<std::string> const& names) {
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        std::string const& name  = names[index];
+        std::string const  which = "withheld environment variable name #"
+                                 + std::to_string(index);
+        if (name.empty()) {
+            return which + " is empty, and an empty name names no variable";
+        }
+        if (name.find('\0') != std::string::npos) {
+            return which
+                 + " contains an embedded NUL byte, which no variable name can "
+                   "carry";
+        }
+        if (name.find('=') != std::string::npos) {
+            return which + " ('" + name
+                 + "') contains '=', which ends a variable's name, so it names "
+                   "no variable";
+        }
+    }
+    return {};
+}
+
+#if defined(_WIN32)
+
+// The child's environment block when something is withheld: this process's
+// own block, entry by entry, minus every entry whose NAME equals a withheld one
+// ignoring case (`CompareStringOrdinal`, the OS's ordinal rule). The kept
+// entries keep the block's own order, which is the sorted order `CreateProcessW`
+// asks of a block it is handed. `false`, with `error`, when this process's own
+// block cannot be read: never an empty or partial block, which would silently
+// change what the child inherits.
+bool withheldEnvironmentBlock(std::vector<std::wstring> const& withheld,
+                              std::wstring& block, std::string& error) {
+    LPWCH const own = ::GetEnvironmentStringsW();
+    if (own == nullptr) {
+        error = windowsErrorText(::GetLastError());
+        return false;
+    }
+    block.clear();
+    for (wchar_t const* entry = own; *entry != L'\0';) {
+        std::size_t const length = std::wcslen(entry);
+        // The name ends at the first '=' AFTER the first character: a hidden
+        // per-drive entry (`=C:=C:\dir`) BEGINS with one, and it is kept —
+        // no withheld name can match it, because none may contain '='.
+        wchar_t const* const equals = std::wcschr(entry + 1, L'=');
+        std::size_t const    nameLength =
+            equals != nullptr ? static_cast<std::size_t>(equals - entry) : length;
+        bool const denied = std::any_of(
+            withheld.begin(), withheld.end(), [&](std::wstring const& name) {
+                return ::CompareStringOrdinal(entry, static_cast<int>(nameLength),
+                                              name.c_str(),
+                                              static_cast<int>(name.size()), TRUE)
+                    == CSTR_EQUAL;
+            });
+        if (!denied) {
+            block.append(entry, length);
+            block.push_back(L'\0');
+        }
+        entry += length + 1;
+    }
+    ::FreeEnvironmentStringsW(own);
+    // A block ends with one more NUL (an empty string), so a block that kept no
+    // entry at all is two.
+    if (block.empty()) {
+        block.push_back(L'\0');
+    }
+    block.push_back(L'\0');
+    return true;
+}
+
+#else
+
+// The child's environment when something is withheld: this process's own
+// entries minus every entry whose NAME is byte-identical to a withheld one
+// (POSIX names are case-sensitive). Built in the PARENT, before any process
+// exists, because the `fork` arm may not allocate between `fork` and `exec`.
+// `storage` owns the bytes `pointers` points into; `pointers` ends in nullptr.
+void filteredEnvironment(std::vector<std::string> const& withheld,
+                         std::vector<std::string>&       storage,
+                         std::vector<char*>&             pointers) {
+#if defined(DSS_SPAWN_USE_POSIX_SPAWN)
+    char** const own = *::_NSGetEnviron();
+#else
+    char** const own = environ;
+#endif
+    storage.clear();
+    for (char** entry = own; entry != nullptr && *entry != nullptr; ++entry) {
+        std::string_view const text{*entry};
+        std::string_view const name = text.substr(0, text.find('='));
+        if (std::find(withheld.begin(), withheld.end(), name) == withheld.end()) {
+            storage.emplace_back(text);
+        }
+    }
+    pointers.clear();
+    pointers.reserve(storage.size() + 1);
+    for (std::string& kept : storage) {
+        pointers.push_back(kept.data());
+    }
+    pointers.push_back(nullptr);
+}
+
+#endif
+
 // ── The ONE spawn, with the ONE thing the two entry points disagree about ──
 //
 // `stdoutFile` empty = the child writes to our stdout (the inheriting spawn);
@@ -727,10 +921,13 @@ namespace {
 // second place for each of them to come back, and only the copy with a pin on
 // it would stay fixed. The redirection is four decisions (open the file, name
 // its failure, install it in the child, close our handles) and they are the
-// only branches below that ask about `stdoutFile`.
+// only branches below that ask about `stdoutFile`. The environment arm is the
+// same kind of thing — one decision (which entries the child gets), made by the
+// helpers above and handed to whichever OS call creates the process.
 SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
                              fs::path const&                 cwd,
                              fs::path const&                 stdoutFile,
+                             std::vector<std::string> const& withheldVariables,
                              char const*                     entryPoint) {
     SpawnResult out;
 
@@ -770,6 +967,14 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
                              "receive something other than what was asked for";
             return out;
         }
+    }
+
+    // The environment arm's caller-bug check, with the other caller bugs:
+    // before anything is resolved and before any process can exist.
+    if (std::string const malformed = malformedWithheldName(withheldVariables);
+        !malformed.empty()) {
+        out.diagnostic = self + malformed + ", so nothing was started";
+        return out;
     }
 
 #if defined(_WIN32)
@@ -826,9 +1031,7 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
                          + "' exists and is a regular file but is not "
                            "executable by this user (check its permission "
                            "bits). ")
-            + "It was looked up in PATH"
-              " (the current directory is deliberately never searched); pass"
-              " a path containing a directory separator to run a local tool.";
+            + whereItWasLookedFor(argv[0], !notExecutable.empty());
         return out;
     }
 
@@ -850,6 +1053,38 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
 
     std::wstring const exePath = exe->wstring();
     std::wstring const cwdPath = cwd.empty() ? std::wstring{} : cwd.wstring();
+
+    // The environment arm: the child's own block when something is withheld,
+    // built BEFORE any handle is opened so a failure here has nothing to clean
+    // up. Nothing withheld = `lpEnvironment` stays null and the child inherits
+    // our block exactly as before.
+    bool const   withholding = !withheldVariables.empty();
+    std::wstring environmentBlock;
+    if (withholding) {
+        std::vector<std::wstring> withheldWide;
+        withheldWide.reserve(withheldVariables.size());
+        for (std::size_t index = 0; index < withheldVariables.size(); ++index) {
+            std::wstring wide;
+            std::string  nameError;
+            if (!decodeUtf8ToWide(withheldVariables[index], wide, nameError)) {
+                out.diagnostic = self + "withheld environment variable name #"
+                               + std::to_string(index) + " is not valid UTF-8 ("
+                               + nameError + "), so nothing was started";
+                return out;
+            }
+            withheldWide.push_back(std::move(wide));
+        }
+        std::string blockError;
+        if (!withheldEnvironmentBlock(withheldWide, environmentBlock,
+                                      blockError)) {
+            out.diagnostic = self + "could not read this process's environment ("
+                           + blockError + "), so '" + exe->string()
+                           + "' was not started — running it with every "
+                             "variable inherited would hand it the ones the "
+                             "caller withheld";
+            return out;
+        }
+    }
 
     // With NO redirection, NO STARTF_USESTDHANDLES: the child inherits the
     // parent's stdio exactly as-is. `bInheritHandles=TRUE` is required for that
@@ -940,8 +1175,8 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
         /*lpProcessAttributes*/ nullptr,
         /*lpThreadAttributes*/  nullptr,
         /*bInheritHandles*/     TRUE,
-        /*dwCreationFlags*/     0,
-        /*lpEnvironment*/       nullptr,
+        /*dwCreationFlags*/     withholding ? CREATE_UNICODE_ENVIRONMENT : 0u,
+        /*lpEnvironment*/       withholding ? environmentBlock.data() : nullptr,
         /*lpCurrentDirectory*/  cwd.empty() ? nullptr : cwdPath.c_str(),
         &si, &pi);
 
@@ -1050,6 +1285,19 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
         argvPtrs.push_back(element.data());
     }
     argvPtrs.push_back(nullptr);
+
+    // The environment arm: the child's entries when something is withheld,
+    // prepared here with everything else the child needs. `childEnvironment`
+    // stays null when nothing is withheld, and the child then gets our own
+    // environment exactly as before (`execv` / `*_NSGetEnviron()`).
+    std::vector<std::string> environmentStorage;
+    std::vector<char*>       environmentPtrs;
+    char** childEnvironment = nullptr;
+    if (!withheldVariables.empty()) {
+        filteredEnvironment(withheldVariables, environmentStorage,
+                            environmentPtrs);
+        childEnvironment = environmentPtrs.data();
+    }
 
     // ── The stdout redirect, opened by the PARENT ──────────────────────────
     //
@@ -1271,7 +1519,9 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     pid_t spawnedPid = -1;
     spawnStatus      = ::posix_spawn(&spawnedPid, exePath.c_str(), &fileActions,
                                      /*attrp=*/nullptr, argvPtrs.data(),
-                                     *::_NSGetEnviron());
+                                     childEnvironment != nullptr
+                                         ? childEnvironment
+                                         : *::_NSGetEnviron());
     ::posix_spawn_file_actions_destroy(&fileActions);
     // The child holds its own descriptor 1 from here on (or never will), so
     // ours is done either way — and the file must have exactly one writer while
@@ -1445,6 +1695,16 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
             // stdin/stdout/stderr are simply the parent's, which IS the
             // inheritance the header promises — and is why stderr and stdin
             // still inherit on the redirect path. On success this never returns.
+            //
+            // The environment arm, in the CHILD's copy of `environ`: `execv`
+            // hands the new image whatever `environ` names, so pointing it at
+            // the entries prepared before the fork is the whole arm. One
+            // pointer store (async-signal-safe), in this process only; the
+            // parent's `environ` is untouched, and so is the one `execv` call
+            // whose failure the handshake reports by name.
+            if (childEnvironment != nullptr) {
+                environ = childEnvironment;
+            }
             ::execv(exePath.c_str(), argvPtrs.data());
             failure.stage = 'X';
             failure.error = errno;
@@ -1564,14 +1824,16 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
 } // namespace
 
 SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
-                                fs::path const&                 cwd) {
-    return spawnAndWaitImpl(argv, cwd, /*stdoutFile=*/{},
+                                fs::path const&                 cwd,
+                                std::vector<std::string> const& withheldVariables) {
+    return spawnAndWaitImpl(argv, cwd, /*stdoutFile=*/{}, withheldVariables,
                             "spawnAndWaitInherit");
 }
 
 SpawnResult spawnAndWaitRedirectStdout(std::vector<std::string> const& argv,
                                        fs::path const&                 cwd,
-                                       fs::path const& stdoutFile) {
+                                       fs::path const& stdoutFile,
+                                       std::vector<std::string> const& withheldVariables) {
     // ★ THE EMPTY PATH IS REFUSED, NOT REINTERPRETED. Internally an empty
     // `stdoutFile` is the sentinel for "inherit", and letting it through here
     // would make the ONE function whose purpose is to capture output silently
@@ -1588,7 +1850,7 @@ SpawnResult spawnAndWaitRedirectStdout(std::vector<std::string> const& argv,
             "is what is wanted.";
         return out;
     }
-    return spawnAndWaitImpl(argv, cwd, stdoutFile,
+    return spawnAndWaitImpl(argv, cwd, stdoutFile, withheldVariables,
                             "spawnAndWaitRedirectStdout");
 }
 

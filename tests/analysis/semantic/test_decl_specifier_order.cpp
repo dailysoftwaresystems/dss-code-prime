@@ -46,8 +46,10 @@
 // when the real config LOSES the feature).
 // ===========================================================================
 
+#include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
+#include "hir/lowering/cst_to_hir.hpp"
 
 #include "semantic_test_fixture.hpp"
 
@@ -290,6 +292,13 @@ TEST(DeclSpecifierOrder, TwoStorageClassesStayRefusedInEveryOrder) {
 // linkage fold scans. With no `linkageSpecifierIgnoredKinds` entry the fold
 // reports `H_UnknownLinkageSpecifier` and EXITS 0 — a warning on a perfectly
 // ordinary declaration. This pin is the one that keeps that from shipping.
+//
+// ★ P68 round 10 (lane `cs`): IT IS ASKED OF THE LOWERING NOW, BECAUSE THAT IS THE
+// ONE TIER THAT EMITS THE CODE. The fold is `linkageFrom` in CST→HIR; this pin read
+// `model.diagnostics()` — the SEMANTIC reporter, which never carries an H_ code — so
+// it could not fail whatever the config said. RED-ON-DISABLE (lane `cs`'s round-10
+// transcript): the qualifier keywords removed from the declaration rows'
+// `linkageSpecifierIgnoredKinds` reds it through the lowering reporter below.
 TEST(DeclSpecifierOrder, LeadingQualifierIsNotAnUnknownLinkageSpecifier) {
     for (std::string_view const src : {
              "const static int g = 1;\n",
@@ -300,11 +309,14 @@ TEST(DeclSpecifierOrder, LeadingQualifierIsNotAnUnknownLinkageSpecifier) {
              "int probe(void){ const register int r = 1; return r; }\n",
          }) {
         auto model = analyzeShipped("c", {std::string{src}});
-        EXPECT_FALSE(hasCode(model.diagnostics(),
-                             DiagnosticCode::H_UnknownLinkageSpecifier))
+        EXPECT_FALSE(model.hasErrors()) << src;
+        DiagnosticReporter lowering{};
+        auto lowered = lowerToHir(model, lowering);
+        ASSERT_TRUE(lowered != nullptr) << src;
+        EXPECT_TRUE(lowered->ok) << src;
+        EXPECT_FALSE(hasCode(lowering, DiagnosticCode::H_UnknownLinkageSpecifier))
             << "a type qualifier in the specifier prefix must be IGNORED by the "
                "linkage tier (and read by the type tier): " << src;
-        EXPECT_FALSE(model.hasErrors()) << src;
     }
 }
 

@@ -1,0 +1,26 @@
+# PURPOSE: regenerate the PR landing-log hash anchors in the plans from git log.
+name: refresh_landing_log
+description: >-
+  The action runs the self-test, the unit tests CI runs, and the drift check CI runs.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `landing_log_git_environment_guard (CI also runs the unit tests and --check)`.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./refresh_landing_log.py --self-test
+    successPattern: 'refresh_landing_log self-test: OK'
+    requireInputsUnmoved: true
+  - name: unit-tests
+    workingDirectoryRoot: action
+    run: |
+      python3 ./test_refresh_landing_log.py
+    successPattern: 'Ran \d+ tests? in'
+    requireInputsUnmoved: true
+  - name: check
+    workingDirectoryRoot: action
+    run: |
+      python3 ./refresh_landing_log.py --check
+    successPattern: 'refresh_landing_log: --check OK'
+    requireInputsUnmoved: true

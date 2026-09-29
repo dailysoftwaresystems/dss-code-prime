@@ -5,7 +5,7 @@
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
 
-// Plan 14 §3.1 D-LK6-8.2 closure (2026-06-01).
+// Plan 14 §3.1 D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET closure (2026-06-01).
 //
 // Cross-validate that the (target, format) pair the user supplied
 // via `--target=<target>:<format>` declares matching machine

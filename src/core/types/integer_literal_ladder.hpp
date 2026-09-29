@@ -7,6 +7,7 @@
 #include "core/types/type_lattice/core_type.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -73,7 +74,74 @@ namespace detail::int_ladder {
     return magnitude <= maxv;
 }
 
+// The rule that covers the literal's matched suffix — the empty-`suffixes` rule
+// for an unsuffixed literal — or nullptr when none does, which the loader's
+// coverage cross-check makes substrate drift for a shipped document. ONE select
+// for every question asked of a literal (its type, its phase-4 operand), so no
+// two of them can pick different rules.
+[[nodiscard]] inline IntegerLiteralTypingRule const*
+ruleFor(std::string_view suffix,
+        std::span<IntegerLiteralTypingRule const> rules) noexcept {
+    for (auto const& r : rules) {
+        if (suffix.empty()) {
+            if (r.suffixes.empty()) return &r;
+            continue;
+        }
+        for (auto const& s : r.suffixes) {
+            if (s == suffix) return &r;
+        }
+    }
+    return nullptr;
+}
+
 } // namespace detail::int_ladder
+
+// ── THE VALUE A TYPED INTEGER LITERAL CARRIES ─────────────────────────────
+//   P68 round 13, D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED
+//
+// The decoded magnitude REDUCED to the literal's type — modulo 2^width, then read
+// at the type's signedness — as that value's 64-bit two's-complement pattern
+// (sign-extended from a signed type's width, zero-extended from an unsigned one).
+// For a ladder-typed literal this is the identity: the ladder chose the first
+// candidate whose range HOLDS the magnitude. For a FIXED-TYPE rule whose
+// `outOfRange` is `wrap` it is the reduction MSVC performs on its sized suffixes
+// (✔MEASURED 2026-09-25, MSVC 19.51.36260, run 20260925-092743-c2711a1a: `300i8`
+// is 44, `0xFFi8` is -1, `256ui8` is 0, `2147483648i32` is INT_MIN). Every tier
+// that needs a literal's VALUE — the CST→HIR literal, the CST-side constant
+// evaluator and phase 4 — asks here, so no two of them can reduce differently.
+//
+// Plain `char` is the one core whose signedness the core does not carry: the
+// TARGET decides it (`TargetSchema::charIsUnsigned(ObjectFormatKind)`), so the
+// caller hands over the pair's answer. nullopt ⇔ the type is `char`, the caller
+// has no pair, and the reduced byte is above 0x7F — the one case whose value the
+// answer changes; the caller refuses, loud, never a guessed sign. A 128-bit kind
+// holds every 64-bit magnitude, so its reduction is the identity. Any other core
+// is not a type an integer literal can have (nullopt).
+[[nodiscard]] inline std::optional<std::uint64_t>
+reducedIntegerLiteralBits(TypeKind kind, std::uint64_t magnitude,
+                          std::optional<bool> charIsUnsigned) noexcept {
+    int  width    = 0;
+    bool isSigned = true;
+    if (kind == TypeKind::Char) {
+        width = 8;
+        if (charIsUnsigned.has_value()) {
+            isSigned = !*charIsUnsigned;
+        } else if ((magnitude & 0xFFu) > 0x7Fu) {
+            return std::nullopt;
+        }
+    } else {
+        width = detail::int_ladder::integerWidth(kind);
+        if (width == 0) return std::nullopt;
+        isSigned = detail::int_ladder::isSignedIntKind(kind);
+    }
+    if (width >= 64) return magnitude;
+    std::uint64_t bits = magnitude & ((std::uint64_t{1} << width) - 1);
+    if (isSigned) {
+        std::uint64_t const sign = std::uint64_t{1} << (width - 1);
+        bits = (bits ^ sign) - sign;   // sign-extend from the type's width
+    }
+    return bits;
+}
 
 // Outcome of a ladder run. `kind` is meaningful only when
 // `status == Typed`.
@@ -111,18 +179,18 @@ typeIntegerLiteral(std::string_view rawText,
 
     // 2. Rule select: the rule whose `suffixes` contains the matched
     //    spelling; the empty-`suffixes` rule for an unsuffixed literal.
-    IntegerLiteralTypingRule const* rule = nullptr;
-    for (auto const& r : rules) {
-        if (suffix.empty()) {
-            if (r.suffixes.empty()) { rule = &r; break; }
-            continue;
-        }
-        for (auto const& s : r.suffixes) {
-            if (s == suffix) { rule = &r; break; }
-        }
-        if (rule != nullptr) break;
-    }
+    IntegerLiteralTypingRule const* const rule =
+        detail::int_ladder::ruleFor(suffix, rules);
     if (rule == nullptr) return {IntegerLadderStatus::NoRule, TypeKind::Void};
+
+    // 2b. A FIXED-TYPE rule (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): its one
+    //     type, whatever the magnitude — `300i8` is a `char` as surely as `5i8`.
+    //     What the magnitude then IS as that type is `reducedIntegerLiteralBits`'
+    //     answer, which every tier that needs the value asks.
+    if (rule->fixedType.has_value()) {
+        return {IntegerLadderStatus::Typed, rule->fixedType->resolveCore(dm),
+                rule->fixedType->vocabularyName};
+    }
 
     // 3. Radix class: prefixed (per the declared numberStyle prefixes)
     //    selects the `nondecimal` candidate list; else `decimal`.
@@ -198,26 +266,86 @@ bitPreciseLiteralSignedness(std::string_view rawText,
 // cannot reach the answer. `#if -1 < 0x80000000L` is therefore the SAME branch on
 // LP64 and LLP64 -- which is what both references do, and which removes the
 // per-target threading this rule would otherwise have needed.
-[[nodiscard]] inline std::optional<bool>
-preprocessorLiteralSignedness(std::string_view rawText,
-                              NumberStyle const* ns,
-                              std::span<IntegerLiteralTypingRule const> rules,
-                              std::uint64_t magnitude) {
+//
+// ── P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): THE WHOLE OPERAND ──
+// A FIXED-TYPE literal is the one kind whose phase-4 VALUE is not its magnitude:
+// it is first reduced to its type, and only then taken at intmax width with that
+// type's signedness. ✔MEASURED 2026-09-25, MSVC 19.51.36260 (run
+// 20260925-092749-73db8424), identically under `/std:c17` (the conforming
+// preprocessor), `/std:c17 /Zc:preprocessor-` (the traditional one), the default
+// mode and `/std:clatest`: `#if 300i8 == 44`, `#if 128i8 < 0`, `#if 0xFFi8 == -1`,
+// `#if 256ui8 == 0` and `#if 4294967296i32 == 0` all take the `#if` arm, and
+// `#if 5ui8 - 6 < 0` / `#if -1 < 0ui8` the `#else` arm (the `ui` forms are
+// unsigned). So the question is the operand, `bits` + `isSigned`, and the
+// signedness-only one below is derived from it. Still no `DataModel`: the loader
+// admits only a fixed type whose core is the same under every model.
+enum class PhaseFourLiteralStatus : std::uint8_t {
+    Operand,             // `bits` / `isSigned` are the literal's #if operand
+    NoRule,              // no rule covers the suffix, or a candidate's signedness
+                         // varies by data model -- substrate drift, refuse
+    CharSignednessUnknown,  // a `char`-typed literal with no target pair: its
+                            // phase-4 signedness is the target's to decide
+};
+struct PhaseFourLiteral {
+    PhaseFourLiteralStatus status   = PhaseFourLiteralStatus::NoRule;
+    std::uint64_t          bits     = 0;      // the value at intmax width
+    bool                   isSigned = true;
+    // The literal's type is SIGNED but its magnitude exceeds INTMAX_MAX, so phase 4
+    // reads it as uintmax_t — the case both references warn about (the unsuffixed
+    // decimal, and clang's `wb`). The ladder that decided the reading reports it,
+    // so the evaluator's warning cannot drift from the answer it used.
+    bool                   reinterpretedUnsigned = false;
+};
+
+[[nodiscard]] inline PhaseFourLiteral
+preprocessorLiteral(std::string_view rawText,
+                    NumberStyle const* ns,
+                    std::span<IntegerLiteralTypingRule const> rules,
+                    std::uint64_t magnitude,
+                    std::optional<bool> charIsUnsigned) {
     std::string_view const suffix = matchIntegerSuffix(rawText, ns);
 
     // Rule select + radix class: IDENTICAL to `typeIntegerLiteral`'s steps 2-3.
-    IntegerLiteralTypingRule const* rule = nullptr;
-    for (auto const& r : rules) {
-        if (suffix.empty()) {
-            if (r.suffixes.empty()) { rule = &r; break; }
-            continue;
+    IntegerLiteralTypingRule const* const rule =
+        detail::int_ladder::ruleFor(suffix, rules);
+    if (rule == nullptr) return {};
+
+    // A fixed-type literal: reduced to its type, then read at intmax width with
+    // the type's own signedness -- which, for plain `char`, only the target knows.
+    if (rule->fixedType.has_value()) {
+        TypeKind const k = rule->fixedType->core;   // model-invariant (loader)
+        bool isSigned = true;
+        if (k == TypeKind::Char) {
+            if (!charIsUnsigned.has_value()) {
+                return {PhaseFourLiteralStatus::CharSignednessUnknown};
+            }
+            isSigned = !*charIsUnsigned;
+        } else {
+            isSigned = detail::int_ladder::isSignedIntKind(k);
         }
-        for (auto const& s : r.suffixes) {
-            if (s == suffix) { rule = &r; break; }
-        }
-        if (rule != nullptr) break;
+        auto const bits = reducedIntegerLiteralBits(k, magnitude, charIsUnsigned);
+        if (!bits.has_value()) return {};   // a kind the loader never admits
+        return {PhaseFourLiteralStatus::Operand, *bits, isSigned};
     }
-    if (rule == nullptr) return std::nullopt;
+
+    // A BIT-PRECISE literal (`wb`, `uwb`): its type's signedness is its rule's own,
+    // because C23 counts the bit-precise types among the signed and unsigned integer
+    // types phase 4 widens to intmax_t / uintmax_t. ✔MEASURED 2026-09-25, clang
+    // 18.1.3 `-std=c23` and `-std=c2x -pedantic-errors` (runs
+    // 20260925-095900-8cb95906, 20260925-102338-6976cc3f): `#if 5wb - 6 < 0` takes
+    // the `#if` arm and `#if 5uwb - 6 < 0` the `#else`; a `wb` literal past INTMAX_MAX
+    // is read UNSIGNED with a warning, exactly like an unsuffixed decimal; gcc 13.3.0
+    // refuses both spellings. ⚠ This rule used to reach the candidate loop below with
+    // NO candidates and fall to its closing `unsigned`, so `wb` read unsigned and the
+    // first condition took the wrong arm in silence (D-PP-IF-BIT-PRECISE-LITERAL-READS-UNSIGNED).
+    if (rule->bitPrecise) {
+        bool const fitsSigned = magnitude <= static_cast<std::uint64_t>(
+                                                 std::numeric_limits<std::int64_t>::max());
+        bool const isSigned = rule->bitPreciseSigned && fitsSigned;
+        return {PhaseFourLiteralStatus::Operand, magnitude, isSigned,
+                rule->bitPreciseSigned && !fitsSigned};
+    }
+
     auto const& candidates = integerLiteralIsPrefixed(rawText, ns)
                                  ? rule->nondecimal
                                  : rule->decimal;
@@ -244,9 +372,11 @@ preprocessorLiteralSignedness(std::string_view rawText,
     // "signed candidate ⇒ fits iff magnitude <= INTMAX_MAX; unsigned ⇒ always".
     for (auto const& c : candidates) {
         auto const sgn = signednessOf(c);
-        if (!sgn.has_value()) return std::nullopt;
+        if (!sgn.has_value()) return {};
         TypeKind const at64 = *sgn ? TypeKind::I64 : TypeKind::U64;
-        if (detail::int_ladder::magnitudeFits(at64, magnitude)) return *sgn;
+        if (detail::int_ladder::magnitudeFits(at64, magnitude)) {
+            return {PhaseFourLiteralStatus::Operand, magnitude, *sgn};
+        }
     }
 
     // Every candidate is signed and the magnitude exceeds INTMAX_MAX -- C's
@@ -259,7 +389,28 @@ preprocessorLiteralSignedness(std::string_view rawText,
     // substitutes a TRUNCATED value while clang refuses and DSS refuses with it.
     // A magnitude too large for `uintmax_t` never reaches here: `decodeInteger`
     // has already nullopt'd and the caller has failed loud.
-    return false;
+    // REINTERPRETED only for the UNSUFFIXED rule — the case both references are
+    // measured warning about, and the one the evaluator's warning has always
+    // covered; an `l`/`ll` decimal past INTMAX_MAX reads unsigned here too and
+    // keeps the silence the evaluator has always given it.
+    return {PhaseFourLiteralStatus::Operand, magnitude, false, suffix.empty()};
+}
+
+// The SIGNEDNESS alone — true = signed, false = unsigned — of the phase-4 operand
+// above, for a caller that only verifies a spelling (the preprocessor's shipped-
+// constant splice). nullopt ⇔ no operand: no rule covers the suffix (substrate
+// drift, refuse) or it is a `char`-typed literal and `charIsUnsigned` is absent,
+// in which case a spelling search simply does not use it.
+[[nodiscard]] inline std::optional<bool>
+preprocessorLiteralSignedness(std::string_view rawText,
+                              NumberStyle const* ns,
+                              std::span<IntegerLiteralTypingRule const> rules,
+                              std::uint64_t magnitude,
+                              std::optional<bool> charIsUnsigned) {
+    PhaseFourLiteral const lit =
+        preprocessorLiteral(rawText, ns, rules, magnitude, charIsUnsigned);
+    if (lit.status != PhaseFourLiteralStatus::Operand) return std::nullopt;
+    return lit.isSigned;
 }
 
 // ── FC3.5 sweep-c2: the float-literal typing rule (C 6.4.4.2) ────────────

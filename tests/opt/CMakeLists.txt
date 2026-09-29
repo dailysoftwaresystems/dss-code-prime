@@ -6,6 +6,16 @@ dss_add_test(NAME opt/test_pipeline_loader SOURCES test_pipeline_loader.cpp)
 dss_add_test(NAME opt/test_dce             SOURCES test_dce.cpp)
 dss_add_test(NAME opt/test_dce_linkage     SOURCES test_dce_linkage.cpp)
 dss_add_test(NAME opt/test_mem2reg         SOURCES test_mem2reg.cpp)
+# D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION: Mem2Reg's dominance work must
+# be linear in the module. A COUNT of the swept block slots, never a stopwatch.
+dss_add_test(NAME opt/test_mem2reg_dominance_complexity
+             SOURCES test_mem2reg_dominance_complexity.cpp)
+# D-MIR-STRUCTCF-DERIVATION-REACHES-PAST-THE-FUNCTION: every consumer of the
+# natural-loop forest (marker applier = every producer, verifier, LICM, module
+# summary) sweeps only each function's own blocks. One file, one fixture, a
+# COUNT per consumer — never a stopwatch.
+dss_add_test(NAME opt/test_natural_loop_reach_per_function
+             SOURCES test_natural_loop_reach_per_function.cpp)
 dss_add_test(NAME opt/test_copy_prop       SOURCES test_copy_prop.cpp)
 dss_add_test(NAME opt/test_cse             SOURCES test_cse.cpp)
 dss_add_test(NAME opt/test_simplify_cfg    SOURCES test_simplify_cfg.cpp)

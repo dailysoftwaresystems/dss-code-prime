@@ -333,8 +333,7 @@ TEST(RegisterClassGate, Arm64FaddRefusesAGprSource) {
 //
 // ★★ A CONFIG-LEVEL MUTANT, WHICH IS WHY THIS FILE RUNS THROUGH ctest.
 // `dss_add_test` sets DSS_CONFIG_ROOT; a bare .exe would walk the cwd and read
-// whichever tree the shell happens to stand in
-// (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+// whichever tree the shell happens to stand in.
 //
 // Re-point `fp_to_si`'s XMM source field at the `gpr` bank — a LIE about the
 // machine, and exactly the state the schema was in before this anchor closed

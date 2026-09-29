@@ -153,9 +153,7 @@ struct ShippedSchemas {
     auto hir = lowerToHir(model, hirReporter);
 
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat     = schema->hirLowering().globalsConstEval.allowFloat;
-    mirCfg.nonObjectTypeSizes    = schema->semantics().nonObjectTypeSizes;
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
     mirCfg.aggregateLayout       = target->aggregateLayout();
     mirCfg.aggregateLayoutLoaded = target->aggregateLayoutLoaded();
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,

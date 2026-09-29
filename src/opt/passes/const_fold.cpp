@@ -198,7 +198,7 @@ private:
         // wrap-aware fold lives in the HIR/CST const-eval (C4b); the optimizer defers
         // BitInt entirely. (A wide `_BitInt` is memory-resident — no scalar Const —
         // but the explicit guard pins the intent + is a red-on-disable boundary.)
-        // D-CSUBSET-INT128-CONSTFOLD (TF-C94): I128/U128 join the refusal, for the
+        // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): I128/U128 join the refusal, for the
         // IDENTICAL reason — this pass's int64/uint64 helpers have no mod-2^128
         // wrap either, and `wrapToIntTarget(v, {128, …})` returns its input
         // unchanged, so a folded 128-bit instruction would carry a 64-bit value

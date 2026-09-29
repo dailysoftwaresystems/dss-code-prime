@@ -7,6 +7,13 @@
  * `((size_t)&((T*)0)->m)` text this feature was once sized around is not what a
  * real SDK header hands a compiler any more — so a translation unit that reaches
  * ANY real header trips this token without the program ever writing it.
+ * ⚠ CORRECTED 2026-09-24 (P68 round 12, lane `lm`): that argument is about the SDK's
+ * header, and DSS never hands a translation unit the SDK's <stddef.h> — it hands
+ * its OWN shipped one, which had no `offsetof` macro at all. So while this
+ * intrinsic worked, `#include <stddef.h>` + `offsetof(...)` was refused on every
+ * pair (✔MEASURED: S_UndeclaredIdentifier over a typedef name, a parse error over
+ * `struct S`). The shipped <stddef.h> now defines `offsetof(type, member)` as
+ * `__builtin_offsetof(type, member)`; SHAPE 9 is the macro's witness.
  * ✔MEASURED through the shipped CLI at HEAD `60198126`, immediately before this
  * cycle: `error[P0002] expected 'ParenClose' — got 'struct'`. DSS was reading it
  * as an ordinary CALL, which it cannot be: `struct S` is not an expression, and
@@ -42,6 +49,8 @@
  * reject the same two shapes.
  */
 
+#include <stddef.h>   /* SHAPE 9's `offsetof` — DSS's own shipped header */
+
 struct Inner { int x; int y; };
 struct Outer { int p; struct Inner q; int r[4]; };
 union  Both  { int i; double d; char c[16]; };
@@ -57,6 +66,9 @@ struct Basic { int a; int b; double c; };
 _Static_assert(__builtin_offsetof(struct Basic, c) == 8,
                "offsetof must fold in a constant expression");
 int dss_dim[__builtin_offsetof(struct Basic, b)];
+
+/* SHAPE 9's const-expr half: the MACRO in a `_Static_assert`, as a header uses it. */
+_Static_assert(offsetof(struct Packed, d) == 5, "<stddef.h>'s offsetof must fold in a constant expression");
 
 /* SHAPE 6's subject. Not `const`, and its `b` is not 0, so reading the wrong
  * field yields a DIFFERENT number rather than the same zero. */
@@ -109,6 +121,13 @@ int main(void) {
 
     /* SHAPE 8 — the array dimension really is 4 elements. */
     if ((int)(sizeof dss_dim / sizeof dss_dim[0]) != 4) return 14;
+
+    /* SHAPE 9 — THE MACRO this row is named for: <stddef.h>'s `offsetof` on a struct
+     * tag, a typedef'd container and an indexed designator, each equal to its
+     * intrinsic twin (see the ⚠ CORRECTED note at the top). */
+    if (offsetof(struct Basic, c) != __builtin_offsetof(struct Basic, c)) return 15;
+    if (offsetof(Wrapped, u) != __builtin_offsetof(Wrapped, u)) return 16;
+    if (offsetof(struct Outer, r[2]) != 20u) return 17;
 
     /* Every mismatch above already returned its own code; this arithmetic is a
      * second, weaker check kept so the exit code is a FUNCTION of the measured

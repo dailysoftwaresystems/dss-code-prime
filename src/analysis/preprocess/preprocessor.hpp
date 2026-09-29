@@ -68,6 +68,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
+#include "core/types/include_path_resolve.hpp"  // HeaderSearchCache (the compile's view of the include tree)
 #include "core/types/line_map.hpp"              // LineMap / LineMapSegment (the coordinate map, shared with the CU + src/lsp/)
 #include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
@@ -157,7 +158,7 @@ struct DSS_EXPORT PreprocessResult {
     // error must still parse so the parse-level diagnostics surface.
     bool fatal = false;
 
-    // D-PERF-1 effectiveness metric: total front-splice token-moves in the macro
+    // D-PERF-1-PREPROCESSOR effectiveness metric: total front-splice token-moves in the macro
     // pass; the O(n^2)->O(n) pin asserts this is <= k*N. Summed across every
     // `spliceOver` in `MacroExpander::expand`; the front-consumed-deque rewrite
     // keeps it LINEAR in the token count (zero for an identity pass or a TU with
@@ -357,12 +358,42 @@ struct DSS_EXPORT MergedPredefinedMacros {
 //      rather than a no-op. Single-family callers (the dump's origin
 //      attribution) pass `{}` because the authoritative check already ran over
 //      the full merge; re-running it per family could only under-report.
+//  (f) P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): every
+//      `type-size` entry is REALIZED for the (target, format) pair `typeFacts`
+//      describes — its `value` becomes the size of its type there
+//      (`predefinedTypeSize`) — or DROPPED when that pair does not realize the
+//      type, and always dropped when `typeFacts` is null (no pair: the LSP
+//      without a target, direct-API and test callers), as gcc leaves
+//      `__SIZEOF_INT128__` undefined where there is no `__int128`. Realized
+//      AFTER the collision scan (a same-named row in another family is still a
+//      conflict on every pair) and within the format filter, so the effective
+//      list stays in (c)'s order. The dump passes the same facts to its
+//      per-family calls, or its origin check would see the rows vanish.
+//  (g) P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): every
+//      `type-unsigned` entry is KEPT, with `value` `1`, exactly where its type
+//      is an unsigned integer type on the pair (`predefinedTypeIsUnsigned` —
+//      plain `char` by `typeFacts->charIsUnsigned`), and DROPPED where the type
+//      is signed, is not realized, or `typeFacts` is null — (f)'s rule, with
+//      the type's signedness in place of its size.
+//  (h) P68 round 9: every `type-name` / `type-limit` / `type-suffix` entry is
+//      REALIZED with the LANGUAGE in hand (`language`, the document the
+//      `languageMacros` came from): its type's identity on the pair
+//      (`predefinedTypeIdentity` — a `shippedTypedef` from the pair's own
+//      descriptor, decoded here once per call), then its spelling
+//      (`typeNameSpellings`), its lattice limit (`ffi::deriveIntegerLimitOnPair`)
+//      spelled by the typed splice, or its promoted type's literal suffix (`c ##
+//      sfx` when function-like). DROPPED — (f)'s rule — where the pair does not
+//      realize the type or `typeFacts` / `language` is null; a type the pair
+//      DOES realize but the language cannot spell, limit or suffix is a
+//      CONFIGURATION defect and lands in `conflicts` (loud, never a guess).
 [[nodiscard]] DSS_EXPORT MergedPredefinedMacros mergePredefinedMacros(
     std::span<PredefinedMacroDef const> languageMacros,
     std::span<PredefinedMacroDef const> targetMacros,
     std::span<PredefinedMacroDef const> formatMacros,
     std::optional<ObjectFormatKind>     activeFormat,
-    std::span<PredefinedMacroExclusionGroup const> exclusiveGroups = {});
+    std::span<PredefinedMacroExclusionGroup const> exclusiveGroups = {},
+    PredefinedTypeFacts const*          typeFacts = nullptr,
+    GrammarSchema const*                language  = nullptr);
 
 // ── c105 (D-PP-USER-DEFINE): the ONE owner of `--define NAME[=VALUE]` ─────
 //
@@ -430,8 +461,7 @@ struct DSS_EXPORT TranslationTimestamp {
 // stopwatch. ✔MEASURED on CI run 33156833090: the ratio pin that stood in for
 // this counter read x1.048 against a bound of 0.85 on `linux-gcc-release` and
 // PASSED on `linux-arm64-gcc-release` in the same run at the same commit, which
-// is a property of the runner rather than of the compiler
-// [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]].
+// is a property of the runner rather than of the compiler.
 //
 // ⚠ COUNTERS, NOT A CACHE POLICY SURFACE. There is nothing to configure here
 // and nothing a caller may switch off: the memo is a memo of a pure function,
@@ -563,7 +593,27 @@ public:
     // same integer under both readings and folds exactly as before, while a
     // high byte REFUSES with a positioned diagnostic. There is no silent choice
     // to make greppable, because there is no choice.
-    std::optional<bool>                  charIsUnsigned = std::nullopt);
+    std::optional<bool>                  charIsUnsigned = std::nullopt,
+    // [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]: the
+    // COMPILE's view of the include tree (`HeaderSearchCache`), so every search
+    // this pass makes — splice, pre-scan, `__has_include`, `#embed`, the
+    // descriptor closures — reads a directory's listing once per compile, and the
+    // import resolver after it reads the same one. `UnitBuilder` passes its own.
+    // ⚠ DEFAULTED, AND THE DEFAULT IS NOT A SILENT SECOND VIEW: with no compile
+    // around it (the LSP, the direct API, the ~dozen test callers) this run IS the
+    // compile, so it owns a cache for itself and still lists each directory once.
+    HeaderSearchCache*                   headerSearch = nullptr,
+    // P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): the ACTIVE
+    // (target × format) pair's facts for the language's `type-size` predefined
+    // macros (`__SIZEOF_LONG__` and its family) — the data model, the
+    // `long double` format and the target's ABI typedefs for this format — built
+    // by `applyTargetFormatPair`. Handed to `mergePredefinedMacros`, which
+    // realizes each such row to the size `sizeof` gives its type on the pair.
+    // ⚠ DEFAULTED, AND null DOES NOT GUESS A PAIR: a caller with no target (the
+    // LSP without one, the direct API, the test callers) gets NO `type-size`
+    // macro at all — the honest answer to "what size is `long` here?" when no
+    // "here" was named — never a size borrowed from some default target.
+    PredefinedTypeFacts const*           typeFacts = nullptr);
 
 // FC17.9(h) (`#embed`; the size-cap boundary of D-PP-EMBED-STREAMING): a PURE
 // budget check for the `#embed` splice. The splice materializes the resource as

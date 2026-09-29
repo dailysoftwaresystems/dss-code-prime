@@ -6,7 +6,8 @@
 //   1. `tokenizer.cpp` special-cased `'\n'` and emitted
 //      `schemaTokens().find("Newline")` UNCONDITIONALLY, never consulting the
 //      lexeme table (D-TOKENIZER-NEWLINE-LEXEME-HARDCODED);
-//   2. `parser.cpp`'s `isSkippableTrivia` returned true for
+//   2. `parser.cpp`'s `isSkippableTrivia` (now `isTriviaToken`, shared with the tree
+//      builder in core/types/trivia_token.hpp) returned true for
 //      `CoreTokenKind::Newline` UNCONDITIONALLY, so even a correctly-kinded
 //      token was skipped before any rule could name it
 //      (D-PARSER-TRIVIA-KEYED-ON-CORE-KIND-NOT-CONFIG).

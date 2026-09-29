@@ -112,9 +112,10 @@ public:
     // stale-but-unnoticed checkout is the silent-miscompile direction.
     [[nodiscard]] virtual bool isAvailable() = 0;
 
-    // Create a NEW checkout of `url` at `dest`. `dest` must not exist; the
-    // caller stages it (see `dependency_cache.hpp` on why a clone never writes
-    // straight to `.dss-deps/<name>`).
+    // Create a NEW checkout of `url` at `dest`. `dest` must not exist. The
+    // cache clones IN PLACE, straight to `.dss-deps/<name>`, under its
+    // per-dependency lock and completeness marker (see `dependency_cache.hpp`
+    // on why it no longer clones aside and renames a directory into place).
     [[nodiscard]] virtual GitCommandResult
     clone(std::string const& url, std::filesystem::path const& dest) = 0;
 
@@ -167,6 +168,57 @@ protected:
 //
 // `gitExe` is the RESOLVED path to git (from `resolveExecutableOnPath`), passed
 // in rather than looked up here so these stay pure.
+//
+// ── ★★★ EVERY COMMAND THAT OPERATES ON A CHECKOUT NAMES IT — git NEVER
+//    DISCOVERS A REPOSITORY FOR THE CACHE ─────────────────────────────────────
+// [[D-DEPS-GIT-RUNNER-DISCOVERS-AN-ENCLOSING-REPOSITORY-AND-FORCE-CHECKS-IT-OUT]]
+//
+// `fetch`, `checkout` and `rev-parse` carry `--git-dir=<checkout>/.git
+// --work-tree=<checkout>` before the subcommand. They used to carry neither and
+// relied on the spawn's working directory — i.e. on git's REPOSITORY DISCOVERY,
+// which walks UP the directory tree until it finds a repository. `.dss-deps/`
+// lives INSIDE the consuming project, and a consuming project is almost always a
+// git repository itself. ✔MEASURED 2026-09-18 (lane `rw`): with
+// `.dss-deps/<name>/.git` gutted (its `HEAD` gone), a build's `rev-parse HEAD`
+// answered with the ENCLOSING repository's commit ("usable checkout"), the
+// refresh arm then ran `git fetch --force --tags origin HEAD` against that
+// repository's remote and `git checkout --detach --force FETCH_HEAD` over its
+// working tree — the reflog reads `checkout: moving from 7df54cc1… to
+// FETCH_HEAD` — discarding its uncommitted work and detaching its HEAD. With the
+// repository NAMED, a missing or invalid checkout fails "not a git repository",
+// which is exactly the "no usable checkout" answer the cache needs. The two
+// options also OVERRIDE an inherited `GIT_DIR` / `GIT_WORK_TREE`.
+// `clone` needs neither: it CREATES its destination and discovers nothing.
+//
+// ── ★★★ AND NO `git` THE CACHE SPAWNS INHERITS GIT'S OWN REPOSITORY
+//    VARIABLES ──────────────────────────────────────────────────────────────
+// [[D-DEPS-GIT-RUNNER-INHERITS-GITS-REPOSITORY-VARIABLES-AND-WRITES-THE-USERS-INDEX]]
+//
+// Naming the repository is not enough on its own. A compiler that git itself
+// started (a `pre-commit` hook, a `rebase --exec`) receives git's OWN
+// repository in its environment, and in a linked worktree that includes an
+// ABSOLUTE `GIT_INDEX_FILE`, which no command-line option overrides.
+// ✔MEASURED 2026-09-18 (lane `rw`, Git for Windows 2.55.0, the fixed `dsscp`
+// run from a `pre-commit` hook in a linked worktree): both the refresh's
+// `checkout` and a first acquisition's `clone` wrote the DEPENDENCY's index
+// into the USER's worktree index. The staged work was gone, the user's commit
+// failed with `invalid object … for '.dss-project.json'`, and `git status` then
+// refused the repository (`unable to read …`). So every spawn below WITHHOLDS
+// `gitRepositoryLocalVariables()` through the substrate's environment arm. That
+// is exactly what git does when it spawns git inside another repository
+// (`sanitize_repo_env`: its `local_repo_env` minus the two config carriers),
+// and what cargo's `fetch_with_cli` does (`env_remove("GIT_DIR")`, …).
+//
+// The list, as git defines it (`environment.h`, "Repository-local GIT_*
+// environment variables; these will be cleared when git spawns a sub-process
+// that runs inside another repository") and as `git rev-parse
+// --local-env-vars` prints it, minus `GIT_CONFIG_PARAMETERS` and
+// `GIT_CONFIG_COUNT`, which git's own `sanitize_repo_env` keeps: they carry the
+// user's `git -c` settings (a proxy, an ssh command), which are not a
+// repository. A pin compares the list against the installed git, so a git that
+// adds a variable fails a test instead of reaching a user.
+[[nodiscard]] DSS_EXPORT std::vector<std::string> const&
+gitRepositoryLocalVariables();
 
 // `git clone -- <url> <dest>`.
 //
@@ -178,7 +230,8 @@ protected:
 gitCloneArgv(std::string const& gitExe, std::string const& url,
              std::filesystem::path const& dest);
 
-// `git fetch --force --tags origin <ref-or-HEAD>`.
+// `git --git-dir=<checkoutDir>/.git --work-tree=<checkoutDir>
+//  fetch --force --tags origin <ref-or-HEAD>`.
 //
 // `--force` because a re-fetch of a rewritten tag or a force-pushed branch must
 // update the local ref rather than refuse; this is a CACHE we own, not a user's
@@ -188,9 +241,11 @@ gitCloneArgv(std::string const& gitExe, std::string const& url,
 // branches. The literal `HEAD` for an absent ref asks the remote for its own
 // default branch, which is exactly what a `{git}`-with-no-`ref` entry means.
 [[nodiscard]] DSS_EXPORT std::vector<std::string>
-gitFetchArgv(std::string const& gitExe, std::string const& ref);
+gitFetchArgv(std::string const& gitExe, std::filesystem::path const& checkoutDir,
+             std::string const& ref);
 
-// `git checkout --detach --force <rev>`.
+// `git --git-dir=<checkoutDir>/.git --work-tree=<checkoutDir>
+//  checkout --detach --force <rev>`.
 //
 // ★ `--detach`, ALWAYS. Checking out a BRANCH name would create a local branch
 // and leave HEAD attached to it — and then the next `--force-git-cache` fetch
@@ -201,11 +256,13 @@ gitFetchArgv(std::string const& gitExe, std::string const& ref);
 // `--force` because the tree is ours: a half-applied earlier checkout must not
 // be able to wedge the cache.
 [[nodiscard]] DSS_EXPORT std::vector<std::string>
-gitCheckoutArgv(std::string const& gitExe, std::string const& rev);
+gitCheckoutArgv(std::string const& gitExe, std::filesystem::path const& checkoutDir,
+                std::string const& rev);
 
-// `git rev-parse <rev>`.
+// `git --git-dir=<checkoutDir>/.git --work-tree=<checkoutDir> rev-parse <rev>`.
 [[nodiscard]] DSS_EXPORT std::vector<std::string>
-gitRevParseArgv(std::string const& gitExe, std::string const& rev);
+gitRevParseArgv(std::string const& gitExe, std::filesystem::path const& checkoutDir,
+                std::string const& rev);
 
 // ── The production implementation ────────────────────────────────────────────
 //

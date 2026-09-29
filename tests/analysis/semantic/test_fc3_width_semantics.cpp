@@ -2,8 +2,8 @@
 // (plan 23): the C 6.7.2 type-specifier multiset table, the format-schema
 // dataModel (LP64/LLP64/ILP32) threading, the C 6.4.4.1 integer-literal
 // ladder, the bool keyword literals, the loader fail-louds for every new
-// config block, the shipped-lib descriptor signatureByDataModel
-// resolution, and the toy/tsql typing-unchanged pins.
+// config block, the shipped-lib descriptor's per-data-model `signature`
+// arms, and the toy/tsql typing-unchanged pins.
 //
 // Discipline: every engine behavior here is driven by the SHIPPED
 // c config (the vocabulary lives in JSON; the tests perturb the
@@ -19,6 +19,7 @@
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/integer_literal_ladder.hpp"   // reducedIntegerLiteralBits (the fixed-type reduction)
 #include "core/types/tree_cursor.hpp"
 #include "core/types/tree_visitor.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -26,6 +27,7 @@
 #include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "shipped_read_pairs.hpp"   // the real pairs a REAL descriptor is read on
 
 #include <nlohmann/json.hpp>
 
@@ -40,10 +42,12 @@
 #include <initializer_list>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 using namespace dss;
@@ -143,8 +147,21 @@ namespace {
     mutate(doc["semantics"]["arithmeticConversions"]);
     auto schema = GrammarSchema::loadFromText(doc.dump(), "<arith-perturbed>");
     if (!schema) {
-        ADD_FAILURE() << "perturbed schema failed to load";
-        std::abort();
+        // THROW, with the loader's own diagnostics — the `shipped_schema_or_throw.hpp`
+        // pattern. GoogleTest reports an escaping exception as a failure of the ONE
+        // running case, names it, and runs the others; this helper cannot `ASSERT_*`
+        // because it returns a model. Until P68 round 12 it called the process-kill
+        // here instead, which Windows ends in a `__fastfail` (0xC0000409): ✔MEASURED
+        // with the shipped C document made refusable, 38 of the 71 tests reported and
+        // the other 33 lost their verdicts, with no word of WHY the document was refused.
+        std::string message = "the perturbed C document did not load";
+        for (auto const& d : schema.error()) {
+            message += "\n    ";
+            message += d.path;
+            message += ": ";
+            message += d.message;
+        }
+        throw std::runtime_error(std::move(message));
     }
     UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
@@ -662,7 +679,241 @@ TEST(Fc3LoaderRejects, NonIntegerLadderCandidateRejects) {
     EXPECT_FALSE(schemaLoads(doc));
 }
 
-// ── D-UAC-SHIFT-RESULT-RULE-CONFIG: the shift-result rule is a config verb ──
+// ── P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): the FIXED-TYPE shape ──
+//
+// MSVC's sized suffixes — `i8` `i16` `i32` `i64` and `ui8` … `ui64`, the `i` and
+// the `u` each in either case — FIX the literal's type, and a magnitude that type
+// cannot hold is reduced modulo 2^width at the type's signedness. ✔MEASURED
+// 2026-09-25 through `dssharness run probe-reference-cc --legs
+// windows-x86_64-release` (MSVC 19.51.36260, run 20260925-092743-c2711a1a); gcc
+// 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 refuse all 24. Every value below
+// is MSVC's.
+namespace {
+
+// The loader's diagnostics for a perturbed C document, as `path: message` lines —
+// empty when it loads. A refusal is asserted by WHERE it points, so a test cannot
+// pass on an unrelated break in the perturbed document.
+[[nodiscard]] std::string loadDiagnostics(nlohmann::json const& doc) {
+    auto r = GrammarSchema::loadFromText(doc.dump(), "<sized-suffix-perturbed>");
+    if (r.has_value()) return {};
+    std::string out;
+    for (auto const& d : r.error()) {
+        out += d.path;
+        out += ": ";
+        out += d.message;
+        out += "\n";
+    }
+    return out;
+}
+
+// The shipped document's fixed-type rule whose first suffix is `first`.
+[[nodiscard]] nlohmann::json& sizedRule(nlohmann::json& doc, std::string_view first) {
+    for (auto& rule : doc["semantics"]["integerLiteralTyping"]) {
+        if (!rule["suffixes"].empty()
+            && rule["suffixes"][0].get<std::string>() == first) {
+            return rule;
+        }
+    }
+    throw std::runtime_error("the shipped C document has no rule led by '"
+                             + std::string{first} + "'");
+}
+
+} // namespace
+
+TEST(Fc3SizedSuffix, ReductionIsModuloTheWidthReadAtTheTypesSign) {
+    auto const bits = [](TypeKind k, std::uint64_t m,
+                         std::optional<bool> charIsUnsigned = false) {
+        return reducedIntegerLiteralBits(k, m, charIsUnsigned);
+    };
+    auto const neg = [](std::int64_t v) { return static_cast<std::uint64_t>(v); };
+    EXPECT_EQ(bits(TypeKind::I8, 300), std::optional<std::uint64_t>{44});
+    EXPECT_EQ(bits(TypeKind::I8, 0xFF), neg(-1));
+    EXPECT_EQ(bits(TypeKind::I8, 128), neg(-128));
+    EXPECT_EQ(bits(TypeKind::U8, 256), std::optional<std::uint64_t>{0});
+    EXPECT_EQ(bits(TypeKind::U8, 0x1FF), std::optional<std::uint64_t>{255});
+    EXPECT_EQ(bits(TypeKind::I16, 32768), neg(-32768));
+    EXPECT_EQ(bits(TypeKind::U16, 65536), std::optional<std::uint64_t>{0});
+    EXPECT_EQ(bits(TypeKind::I32, 2147483648ULL), neg(-2147483648LL));
+    EXPECT_EQ(bits(TypeKind::U32, 4294967296ULL), std::optional<std::uint64_t>{0});
+    EXPECT_EQ(bits(TypeKind::I64, ~std::uint64_t{0}), neg(-1));
+    EXPECT_EQ(bits(TypeKind::U64, ~std::uint64_t{0}), ~std::uint64_t{0});
+    // The IDENTITY on every magnitude a ladder candidate holds — which is why every
+    // tier may ask this of every typed literal without changing an ISO one.
+    EXPECT_EQ(bits(TypeKind::I32, 2147483647), std::optional<std::uint64_t>{2147483647});
+    EXPECT_EQ(bits(TypeKind::U32, 4294967295ULL), std::optional<std::uint64_t>{4294967295ULL});
+    EXPECT_EQ(bits(TypeKind::U128, ~std::uint64_t{0}), ~std::uint64_t{0});
+    // Plain `char` reads the TARGET's sign; with none, a byte above 0x7F REFUSES.
+    EXPECT_EQ(bits(TypeKind::Char, 0xFF, false), neg(-1));
+    EXPECT_EQ(bits(TypeKind::Char, 0xFF, true), std::optional<std::uint64_t>{255});
+    EXPECT_EQ(bits(TypeKind::Char, 300, std::nullopt), std::optional<std::uint64_t>{44})
+        << "44 is the same char under either sign, so no target is needed";
+    EXPECT_EQ(bits(TypeKind::Char, 0x80, std::nullopt), std::nullopt)
+        << "0x80 is -128 or +128 by the target's char signedness: refuse, never guess";
+    EXPECT_EQ(bits(TypeKind::F64, 5), std::nullopt);
+}
+
+TEST(Fc3SizedSuffix, EachOfTheTwentyFourSpellingsTypesAsItsFixedType) {
+    struct Row { char const* suffix; TypeKind kind; };
+    static constexpr Row kRows[] = {
+        {"i8", TypeKind::Char},   {"I8", TypeKind::Char},
+        {"ui8", TypeKind::U8},    {"Ui8", TypeKind::U8},   {"uI8", TypeKind::U8},   {"UI8", TypeKind::U8},
+        {"i16", TypeKind::I16},   {"I16", TypeKind::I16},
+        {"ui16", TypeKind::U16},  {"Ui16", TypeKind::U16}, {"uI16", TypeKind::U16}, {"UI16", TypeKind::U16},
+        {"i32", TypeKind::I32},   {"I32", TypeKind::I32},
+        {"ui32", TypeKind::U32},  {"Ui32", TypeKind::U32}, {"uI32", TypeKind::U32}, {"UI32", TypeKind::U32},
+        {"i64", TypeKind::I64},   {"I64", TypeKind::I64},
+        {"ui64", TypeKind::U64},  {"Ui64", TypeKind::U64}, {"uI64", TypeKind::U64}, {"UI64", TypeKind::U64},
+    };
+    for (auto const& row : kRows) {
+        expectLiteralTypes(std::string{"5"} + row.suffix, row.kind);
+        expectLiteralTypes(std::string{"5"} + row.suffix, row.kind, DataModel::Llp64);
+    }
+}
+
+TEST(Fc3SizedSuffix, TheMagnitudeNeverChangesTheType) {
+    // Where a ladder would climb, a fixed type stays put: MSVC types each of these
+    // as its suffix's type (`_Generic`) and reduces the value.
+    expectLiteralTypes("300i8", TypeKind::Char);
+    expectLiteralTypes("4294967296i32", TypeKind::I32);
+    expectLiteralTypes("18446744073709551615ui16", TypeKind::U16);
+    // The `ll` ladder would type this `unsigned long long`; `i64` never does.
+    expectLiteralTypes("0xFFFFFFFFFFFFFFFFi64", TypeKind::I64);
+}
+
+TEST(Fc3SizedSuffix, I64IsLongLongAndNotLongUnderEveryModel) {
+    // `long` and `long long` share the I64 core on LP64, so only the vocabulary tag
+    // tells them apart — which `_Generic` reads.
+    for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64}) {
+        auto m = analyzeC("int f(void) { return _Generic(5i64, long: 1, long long: 2, "
+                          "default: 3) + _Generic(5ui64, unsigned long: 10, "
+                          "unsigned long long: 20, default: 30); }\n", dm);
+        EXPECT_FALSE(m.hasErrors());
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"2", "20"}));
+    }
+}
+
+TEST(Fc3SizedSuffix, AMagnitudePastUint64IsTooLargeRatherThanReduced) {
+    // MSVC: 'constant too big' (C2177) for both — the reduction acts on a 64-bit
+    // magnitude, and one past 2^64 - 1 never becomes one.
+    auto m = analyzeC("long long a = 18446744073709551616i64;\n"
+                      "unsigned char b = 18446744073709551616ui8;\n");
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_IntegerLiteralTooLarge), 2u);
+}
+
+TEST(Fc3SizedSuffix, ConstantExpressionsReadTheReducedValue) {
+    // Each dimension is a value MSVC 19.51 computes (`_Static_assert`, enumerator,
+    // array bound and case label all measured). The `char`-typed `i8` is pinned by
+    // the two tests below and, with a target, in test_hir_lowering_c: arithmetic
+    // on a plain `char` needs the target's sign, which this analysis is not given.
+    auto m = analyzeC("char b[256ui8 + 1];\n"
+                      "char c[65536i16 + 3];\n"
+                      "char d[(0xFFFFFFFFFFFFFFFFi64 == -1) + 1];\n"
+                      "char e[(4294967296i32 == 0) + 4];\n"
+                      "char g[(2147483648i32 < 0) + 6];\n"
+                      "enum { E = 65537ui16 };\n"
+                      "char h[E + 6];\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "b"), 1);
+    EXPECT_EQ(arrayDimOf(m, "c"), 3);
+    EXPECT_EQ(arrayDimOf(m, "d"), 2);
+    EXPECT_EQ(arrayDimOf(m, "e"), 5);
+    EXPECT_EQ(arrayDimOf(m, "g"), 7);
+    EXPECT_EQ(arrayDimOf(m, "h"), 7);
+}
+
+TEST(Fc3SizedSuffix, AnI8LiteralFoldsWithNoTargetOnlyWhenItsByteNeedsNoSign) {
+    // `300i8` reduces to the byte 44 and `0x7Fi8` to 127 — the same `char` under
+    // either sign — so each folds even though this analysis has no target.
+    auto m = analyzeC("char a[300i8];\n"
+                      "char d[0x7Fi8 ? 1 : 2];\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "a"), 44);
+    EXPECT_EQ(arrayDimOf(m, "d"), 1);
+    // The SAME shape with the byte 0x80, which is -128 or +128 by the target's
+    // char signedness: refused, never a guessed sign. (Truthiness would agree under
+    // both signs; the literal's VALUE does not, and that is what the leaf decides.)
+    auto m2 = analyzeC("char c[0x80i8 ? 1 : 2];\n");
+    EXPECT_TRUE(m2.hasErrors());
+}
+
+TEST(Fc3LoaderRejects, FixedTypeRuleWithoutOutOfRangeRejects) {
+    auto doc = loadShippedCJson();
+    sizedRule(doc, "i8").erase("outOfRange");
+    EXPECT_NE(loadDiagnostics(doc).find("/outOfRange: a fixed-type rule must say"),
+              std::string::npos) << loadDiagnostics(doc);
+}
+
+TEST(Fc3LoaderRejects, FixedTypeRuleUnknownOutOfRangeVerbRejects) {
+    auto doc = loadShippedCJson();
+    sizedRule(doc, "i8")["outOfRange"] = "saturate";
+    EXPECT_NE(loadDiagnostics(doc).find("unknown 'outOfRange' verb 'saturate' — expected 'wrap'"),
+              std::string::npos) << loadDiagnostics(doc);
+}
+
+TEST(Fc3LoaderRejects, OutOfRangeWithoutAFixedTypeRejects) {
+    auto doc = loadShippedCJson();
+    sizedRule(doc, "i8").erase("type");
+    EXPECT_NE(loadDiagnostics(doc).find("/type: 'outOfRange' belongs to a fixed-type rule"),
+              std::string::npos) << loadDiagnostics(doc);
+}
+
+TEST(Fc3LoaderRejects, FixedTypeRuleMixingShapesRejects) {
+    std::pair<char const*, nlohmann::json> const kMixes[] = {
+        {"decimal", nlohmann::json::array({"int"})},
+        {"nondecimal", nlohmann::json::array({"int"})},
+        {"bitPrecise", true},
+        {"signed", true},
+    };
+    for (auto const& [key, value] : kMixes) {
+        auto doc = loadShippedCJson();
+        sizedRule(doc, "i16")[key] = value;
+        EXPECT_NE(loadDiagnostics(doc).find("a fixed-type rule ('type') types every literal"),
+                  std::string::npos) << key << "\n" << loadDiagnostics(doc);
+    }
+}
+
+TEST(Fc3LoaderRejects, FixedTypeThatVariesByDataModelRejects) {
+    // `long` is I64 on LP64 and I32 on LLP64: phase 4 reduces with no data model
+    // in scope, so a width the model decides is refused at load.
+    auto doc = loadShippedCJson();
+    sizedRule(doc, "i32")["type"] = "long";
+    EXPECT_NE(loadDiagnostics(doc).find("fixed type 'long' must resolve"),
+              std::string::npos) << loadDiagnostics(doc);
+}
+
+TEST(Fc3LoaderRejects, FixedTypeThatIsNotAnIntegerRejects) {
+    for (char const* name : {"double", "_Bool"}) {
+        auto doc = loadShippedCJson();
+        sizedRule(doc, "i32")["type"] = name;
+        EXPECT_NE(loadDiagnostics(doc).find(std::string{"fixed type '"} + name + "' must resolve"),
+                  std::string::npos) << name << "\n" << loadDiagnostics(doc);
+    }
+}
+
+TEST(Fc3LoaderRejects, FixedTypeRuleWithoutSuffixesRejects) {
+    auto doc = loadShippedCJson();
+    sizedRule(doc, "i64")["suffixes"] = nlohmann::json::array();
+    EXPECT_NE(loadDiagnostics(doc).find("a fixed-type rule must declare its 'suffixes'"),
+              std::string::npos) << loadDiagnostics(doc);
+}
+
+TEST(Fc3LoaderRejects, AnUncoveredSizedSuffixRejects) {
+    // The lexer still admits `5ui64` once its rule is gone: the coverage cross-check
+    // spans the fixed-type shape like the other two.
+    auto doc = loadShippedCJson();
+    auto& ladder = doc["semantics"]["integerLiteralTyping"];
+    for (std::size_t i = 0; i < ladder.size(); ++i) {
+        if (!ladder[i]["suffixes"].empty()
+            && ladder[i]["suffixes"][0].get<std::string>() == "ui64") {
+            ladder.erase(i);
+            break;
+        }
+    }
+    EXPECT_NE(loadDiagnostics(doc).find("declares 'ui64' but no 'integerLiteralTyping' rule covers it"),
+              std::string::npos) << loadDiagnostics(doc);
+}
+
+// ── The shift-result rule is a config verb ──────────────────────────────
 //
 // The closed verb `shiftResult` selects a shift's RESULT TYPE (C 6.5.7). The
 // SEMANTIC-tier site (`subtreeType`) is witnessed end-to-end by folding
@@ -884,7 +1135,7 @@ TEST(Fc3FormatDataModel, ShippedFormatsDeclareTheirOsModels) {
     }
 }
 
-// ── P5: descriptor signatureByDataModel ─────────────────────────────────
+// ── P5: a descriptor `signature`'s per-data-model arms ──────────────────
 
 namespace {
 
@@ -892,7 +1143,7 @@ namespace {
 // ("no descriptor came back, and something errored"). Negative-only is
 // VACUOUS: a VANISHED or half-written fixture satisfies both just as well as
 // the malformed content the test means to pin, so the test can report green
-// while never once reaching the `signatureByDataModel` rejection path.
+// while never once reaching the data-model rejection path.
 // MEASURED at the time these helpers were added: with the descriptor files
 // hammer-deleted for a whole run, both tests still reported OK. These two
 // helpers close that hole from both ends — the PREMISE (the fixture really is
@@ -969,9 +1220,14 @@ findDiagnostic(DiagnosticReporter const& rep, DiagnosticCode code,
 } // namespace
 
 TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
-    // The SAME shipped stdio.json yields the LP64 i64 offset under LP64
-    // and the LLP64 i32 offset under LLP64 — the reader resolves the
-    // per-symbol signatureByDataModel against the threaded model.
+    // The SAME shipped stdio.json yields the LP64 i64 offset on an LP64 pair
+    // and the LLP64 i32 offset on an LLP64 pair — the reader selects fseek's
+    // per-pair `signature` arm by the pair's data model.
+    //
+    // ★ READ ON EVERY REAL PAIR (P68 round 12, S2a-1). This read passed only a
+    // data model — no arch, no format — which is a read no compile makes: the
+    // day stdio.json's prototypes name a per-format typedef (`off_t`, `size_t`),
+    // it stops decoding here while every build still succeeds.
     namespace fs = std::filesystem;
     // …/src/dss-config/sources/… — throws (never returns `{}`) if unresolvable,
     // so the old `ASSERT_FALSE(base.empty())` here would now be vacuous.
@@ -980,7 +1236,7 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
         base.parent_path().parent_path() / "shippedLibs" / "stdio.json";
     ASSERT_TRUE(fs::exists(desc));
 
-    auto const offsetKindUnder = [&](DataModel dm) {
+    auto const offsetKindOn = [&](test_support::ShippedReadPair const& pair) {
         TypeInterner interner{CompilationUnitId{1}};
         TypeRegistry registry;
         DiagnosticReporter rep;
@@ -996,9 +1252,11 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
             interner.structType("__va_list_tag", vaTagFields), 1);
         std::array<NamedTypeBinding, 1> namedTypes{
             NamedTypeBinding{"va_list", vaListTy}};
-        auto d = ffi::readShippedLibDescriptor(desc, interner, registry, rep, dm,
-                                               std::nullopt, std::nullopt,
-                                               namedTypes);
+        ffi::ShippedPairFacts const facts = pair.pairFacts();
+        auto d = ffi::readShippedLibDescriptor(desc, interner, registry, rep,
+                                               pair.dataModel(), pair.activeTarget(),
+                                               pair.activeFormat(), namedTypes,
+                                               nullptr, &facts);
         EXPECT_TRUE(d.has_value());
         EXPECT_EQ(rep.errorCount(), 0u);
         if (!d) return TypeKind::Void;
@@ -1012,13 +1270,33 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
         ADD_FAILURE() << "fseek not found in stdio.json";
         return TypeKind::Void;
     };
-    EXPECT_EQ(offsetKindUnder(DataModel::Lp64), TypeKind::I64);
-    EXPECT_EQ(offsetKindUnder(DataModel::Llp64), TypeKind::I32);
+    std::size_t lp64  = 0;
+    std::size_t llp64 = 0;
+    for (auto const& pair : test_support::shippedReadPairs()) {
+        SCOPED_TRACE(pair.label());
+        if (pair.dataModel() == DataModel::Lp64) {
+            ++lp64;
+            EXPECT_EQ(offsetKindOn(pair), TypeKind::I64);
+        } else if (pair.dataModel() == DataModel::Llp64) {
+            ++llp64;
+            EXPECT_EQ(offsetKindOn(pair), TypeKind::I32);
+        } else {
+            ADD_FAILURE() << "a shipped pair of a third data model — say what its offset is";
+        }
+    }
+    // Both arms must actually have been read.
+    EXPECT_GE(lp64, 1u);
+    EXPECT_GE(llp64, 1u);
 }
 
-TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
-    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — the descriptor used to be a CONSTANT
-    // filename under `temp_directory_path()`, shared by every concurrent instance
+// A data model a `when` names must be one the vocabulary knows. The retired
+// `signatureByDataModel` map (P68 round 12 replaced it with `signature`
+// `variants`) pinned this for its own keys; the refusal now belongs to the ONE
+// `when` decoder (core/types/variant_when.hpp), so the pin follows it there — a
+// typo'd model would otherwise select nothing on every pair, in silence.
+TEST(Fc3Descriptor, UnknownDataModelInASignatureArmFailsLoud) {
+    // The descriptor used to be a CONSTANT filename under
+    // `temp_directory_path()`, shared by every concurrent instance
     // of this binary. That never went RED here (MEASURED: 600/600 green with the
     // file hammer-deleted throughout the run) because both assertions below are
     // NEGATIVE — a vanished or half-written file also yields "no descriptor" plus
@@ -1033,8 +1311,9 @@ TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
     // rejection assertions below are only meaningful against.
     static constexpr std::string_view kDescriptor =
         R"({"header":"x.h","symbols":[
-          {"name":"f","signature":"fn(i32) -> i32",
-           "signatureByDataModel":{"LLP65":"fn(i32) -> i32"}}]})";
+          {"name":"f","signature":{"variants":[
+            {"when":{"dataModel":"LLP65"},"value":"fn(i32) -> i32"},
+            {"default":true,"value":"fn(i32) -> i32"}]}}]})";
     {
         std::ofstream out{tmp, std::ios::binary};
         out << kDescriptor;
@@ -1049,16 +1328,16 @@ TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
                                            DataModel::Lp64);
     EXPECT_FALSE(d.has_value());
     EXPECT_GT(rep.errorCount(), 0u);
-    // …and it must be THE unknown-key rejection, named in the message. Code
+    // …and it must be THE unknown-model rejection, named in the message. Code
     // alone is not enough: F_ShippedLibDescriptorMalformed is also what a
-    // missing file, a non-object `signatureByDataModel` and a non-string
-    // override all raise, so `errorCount() > 0` (and even a code match) is
-    // satisfied by rejections that never look at the key vocabulary.
+    // missing file, a non-object `when` and a non-string `value` all raise, so
+    // `errorCount() > 0` (and even a code match) is satisfied by rejections
+    // that never look at the model vocabulary.
     EXPECT_NE(findDiagnostic(rep, DiagnosticCode::F_ShippedLibDescriptorMalformed,
-                             {"'signatureByDataModel' has unknown data-model key",
+                             {"'dataModel' has unknown data-model name",
                               "'LLP65'"}),
               nullptr)
-        << "the unknown-key rejection never ran; diagnostics were:"
+        << "the unknown-model rejection never ran; diagnostics were:"
         << renderDiagnostics(rep);
     // Specifically NOT the I/O rejection — that is the vacuous pass this test
     // used to accept.
@@ -1070,18 +1349,19 @@ TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
     // `scratch`'s dtor removes the file — no manual `fs::remove`.
 }
 
-TEST(Fc3Descriptor, MalformedOverrideFailsEvenWhenNotSelected) {
-    // A broken LLP64 override must fail the read under LP64 too — it
-    // would otherwise lurk until the first Windows compile.
-    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — same fixed-name/false-green hazard as
-    // the sibling above; see the note there.
+TEST(Fc3Descriptor, MalformedInactiveSignatureArmFailsEvenWhenNotSelected) {
+    // A broken LLP64 arm must fail the read under LP64 too — it would
+    // otherwise lurk until the first Windows compile.
+    // Same fixed-name/false-green hazard as the sibling above; see the note
+    // there.
     dss::test_support::ScratchDir scratch{
         dss::test_support::Location::Temp, "fc3-desc-badsig"};
     auto const tmp = scratch.path() / "desc.json";
     static constexpr std::string_view kDescriptor =
         R"({"header":"x.h","symbols":[
-          {"name":"f","signature":"fn(i32) -> i32",
-           "signatureByDataModel":{"LLP64":"fn(notatype) -> i32"}}]})";
+          {"name":"f","signature":{"variants":[
+            {"when":{"dataModel":"LP64"},"value":"fn(i32) -> i32"},
+            {"when":{"dataModel":"LLP64"},"value":"fn(notatype) -> i32"}]}}]})";
     {
         std::ofstream out{tmp, std::ios::binary};
         out << kDescriptor;
@@ -1094,23 +1374,22 @@ TEST(Fc3Descriptor, MalformedOverrideFailsEvenWhenNotSelected) {
                                            DataModel::Lp64);
     EXPECT_FALSE(d.has_value());
     EXPECT_GT(rep.errorCount(), 0u);
-    // …and the error must name the NON-SELECTED LLP64 override — that is the
-    // whole claim of this test. `errorCount() > 0` alone is equally satisfied
-    // by an unreadable file or by the BASE signature failing to decode, i.e.
-    // by rejections that prove nothing about the lurking-override rule.
+    // …and the error must name the NON-SELECTED LLP64 arm — that is the whole
+    // claim of this test. `errorCount() > 0` alone is equally satisfied by an
+    // unreadable file or by the SELECTED arm failing to decode, i.e. by
+    // rejections that prove nothing about the lurking-arm rule.
     EXPECT_NE(findDiagnostic(rep, DiagnosticCode::F_ShippedLibUnsupportedType,
-                             {"'signatureByDataModel.LLP64' that failed to "
-                              "decode as a type",
+                             {"has a 'signature' variant that failed to decode as a type",
                               "fn(notatype) -> i32"}),
               nullptr)
-        << "the non-selected override was never decoded; diagnostics were:"
+        << "the non-selected arm was never decoded; diagnostics were:"
         << renderDiagnostics(rep);
-    // The BASE (LP64-selected) signature is well-formed — if IT is what failed,
-    // the override rule was not what rejected this descriptor.
+    // The SELECTED (LP64) arm is well-formed — if IT is what failed, the eager
+    // rule was not what rejected this descriptor.
     EXPECT_EQ(findDiagnostic(rep, DiagnosticCode::F_ShippedLibUnsupportedType,
                              {"has a 'signature' that failed to decode"}),
               nullptr)
-        << "the base signature failed instead of the override; diagnostics were:"
+        << "the selected arm failed instead of the inactive one; diagnostics were:"
         << renderDiagnostics(rep);
     EXPECT_EQ(findDiagnostic(rep, DiagnosticCode::F_ShippedLibDescriptorMalformed,
                              {"failed to open"}),

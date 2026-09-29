@@ -37,7 +37,9 @@
 #include "core/export.hpp"
 #include "core/types/header_name_matching.hpp"
 
+#include <cstddef>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -111,6 +113,93 @@ takeFound(HeaderSearchResult const& r, OnAmbiguous&& onAmbiguous) {
     return std::nullopt;   // unreachable — every status handled above
 }
 
+// ── ONE LISTING PER DIRECTORY PER COMPILE ─────────────────────────────────
+//
+// [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]
+//
+// ★★★ WHY THE RESOLVER READS DIRECTORY LISTINGS, AND WHY IT READ ONE PER RESOLUTION.
+// DSS answers the CASE question of a header name itself (the docblock at the top of
+// this file): a case-sensitive format checks the on-disk spelling byte for byte, a
+// case-insensitive one folds every entry and refuses a collision, and a rooted UNC
+// path finds where its checkable part begins by asking which ancestor its parent
+// LISTS. All three read a directory listing, and every resolution used to read its
+// own, per search directory tried, per component, per ancestor, keeping nothing.
+// ✔MEASURED on the sqlite speedtest1 build (103 TUs, pe64, 2026-09-19): 11,204
+// listings of 13 directories — the shipped-descriptor directory 6,477 times — about
+// 109 per compile where 13 at most were needed; spelled through `\\localhost\C$`, the
+// same build took 57.97 s instead of 32.43 s, 24 s of it in the include splice.
+//
+// ★★ THE REFERENCES LIST NOTHING, AND THAT IS WHY THIS KEEPS THE LISTING ANYWAY. gcc
+// opens each candidate (`open_file`: open + fstat) and caches every lookup for the
+// compile (`libcpp/files.cc`, `file_hash`); clang stats each candidate through a
+// per-compile `FileManager` cache (`SeenFileEntries`). Neither REFUSES a case mismatch
+// — clang only warns (`pp_nonportable_path`, from the opened file's real path) — so
+// neither needs the listing DSS's stricter answer needs. What goes is the repetition:
+// like theirs, this cache lives for the compile and asks each question once.
+//
+// ★★ WHAT IT HOLDS: each directory's entry names, listed ONCE, and each candidate's
+// `exists` answer, probed ONCE — everything a compile's header searches ask the
+// filesystem. OWNED BY THE COMPILE (`UnitBuilder` holds one for its whole build and
+// hands it to the preprocessor, the import resolver and the shipped-descriptor walks)
+// and never global, never shared between compiles: a header written between two
+// compiles is seen by the second. The ANSWERS are unchanged — the same names meet the
+// same rules; only WHEN the directory is read moved.
+//
+// ⚠ A SNAPSHOT, BY DESIGN: a file created DURING a compile inside a directory that
+// compile has already listed is not seen by it — as with both references, whose
+// per-compile caches keep negative answers too. Nothing in a compile writes into its
+// own include path.
+class DSS_EXPORT HeaderSearchCache {
+public:
+    HeaderSearchCache();
+    ~HeaderSearchCache();
+    HeaderSearchCache(HeaderSearchCache const&)            = delete;
+    HeaderSearchCache& operator=(HeaderSearchCache const&) = delete;
+    HeaderSearchCache(HeaderSearchCache&&)                 = delete;
+    HeaderSearchCache& operator=(HeaderSearchCache&&)      = delete;
+
+    // How many directories THIS cache has listed, and how many candidates it has
+    // probed for existence — each at most once. For pins; nothing decides by them.
+    [[nodiscard]] std::size_t listings() const;
+    [[nodiscard]] std::size_t probes() const;
+
+    struct Impl;   // defined in include_path_resolve.cpp, used only there
+    [[nodiscard]] Impl& impl() noexcept { return *impl_; }
+
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
+// ★ TEST OBSERVABILITY, NOT A CACHE — and the one process-wide object this row adds.
+// While a tally is alive, every listing and every `exists` probe that ANY
+// `HeaderSearchCache` performs is counted in it, keyed by what was listed or probed.
+// That is what lets a pin see a search made OUTSIDE its compile's cache — a caller that
+// built a cache of its own — as a second listing of the same directory, which a count
+// kept inside one cache never could. With no tally alive (the driver never makes one)
+// it costs one relaxed atomic load per listing and per probe. One at a time: a second
+// live tally is refused with `std::logic_error`.
+class DSS_EXPORT HeaderSearchTally {
+public:
+    HeaderSearchTally();
+    ~HeaderSearchTally();
+    HeaderSearchTally(HeaderSearchTally const&)            = delete;
+    HeaderSearchTally& operator=(HeaderSearchTally const&) = delete;
+    HeaderSearchTally(HeaderSearchTally&&)                 = delete;
+    HeaderSearchTally& operator=(HeaderSearchTally&&)      = delete;
+
+    // Each directory listed / candidate probed while this tally was alive, with how
+    // many times, in the spelling the cache keys it by (preferred separators), sorted.
+    [[nodiscard]] std::vector<std::pair<std::filesystem::path, std::size_t>>
+    listingsPerDirectory() const;
+    [[nodiscard]] std::vector<std::pair<std::filesystem::path, std::size_t>>
+    probesPerCandidate() const;
+
+    struct Impl;   // defined in include_path_resolve.cpp, used only there
+
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
 // ── [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] ───────────────────────
 //
 // DOES `p` NAME A LOCATION FROM A ROOT, rather than relative to somewhere?
@@ -163,9 +252,13 @@ shippedConfigRelativePathEscapes(std::string_view spelling);
 // `relName` may carry subdirectories (`sys/types.json`); the policy is applied
 // to EVERY component. A directory that cannot be enumerated (unreadable, or
 // absent) yields NotFound -- the same verdict the pre-policy `exists()` gave.
+//
+// EVERY search in this header reads the filesystem through `cache` — the
+// COMPILE's (see `HeaderSearchCache`). It is REQUIRED, like `matching`: a
+// defaulted cache would be a silent choice of a second view of the tree.
 [[nodiscard]] DSS_EXPORT HeaderSearchResult
 resolveInDir(std::filesystem::path const& dir, std::string_view relName,
-             HeaderNameMatching matching);
+             HeaderNameMatching matching, HeaderSearchCache& cache);
 
 // Search `dirs` for `filename` (a relative header name). First matching dir
 // wins. An absolute name resolves against the filesystem directly (the dir
@@ -180,7 +273,7 @@ resolveInDir(std::filesystem::path const& dir, std::string_view relName,
 // could even represent the collision, which is the defect, not the remedy.
 [[nodiscard]] DSS_EXPORT HeaderSearchResult
 findInDirs(std::string_view filename, std::span<std::filesystem::path const> dirs,
-           HeaderNameMatching matching);
+           HeaderNameMatching matching, HeaderSearchCache& cache);
 
 // The DIRECTORY a quote-include resolves against, derived from the NAME of the
 // source buffer that CONTAINS the directive. THE ONE derivation: every tier
@@ -232,7 +325,8 @@ includingDirectoryOf(std::string_view sourceName);
 resolveIncludePath(std::string_view filename,
                    std::filesystem::path const&                includingDir,
                    std::span<std::filesystem::path const>      includeDirs,
-                   HeaderNameMatching                          matching);
+                   HeaderNameMatching                          matching,
+                   HeaderSearchCache&                          cache);
 
 // ANGLE-form (`#include <h>` / `__has_include(<h>)`) resolution -- the
 // FUNNEL the FC15c plan-lock mandates (one chokepoint, no drift). DSS ships a
@@ -254,7 +348,8 @@ resolveIncludePath(std::string_view filename,
 [[nodiscard]] DSS_EXPORT HeaderSearchResult
 resolveSystemDescriptor(std::string_view                       filename,
                         std::span<std::filesystem::path const> systemDirs,
-                        HeaderNameMatching                     matching);
+                        HeaderNameMatching                     matching,
+                        HeaderSearchCache&                     cache);
 
 // ANGLE-form resolution VERDICT (D-INCLUDE-ANGLE-SOURCE-FALLBACK): what an
 // `#include <h>` / `__has_include(<h>)` resolves to, in priority order.
@@ -310,6 +405,7 @@ struct AngleIncludeResolution {
 resolveAngleInclude(std::string_view                       filename,
                     std::span<std::filesystem::path const> systemDirs,
                     std::span<std::filesystem::path const> includeDirs,
-                    HeaderNameMatching                     matching);
+                    HeaderNameMatching                     matching,
+                    HeaderSearchCache&                     cache);
 
 } // namespace dss

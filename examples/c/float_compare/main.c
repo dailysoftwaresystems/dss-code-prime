@@ -21,8 +21,8 @@
 //   lt(1.5,2.5)=1  lt(2.5,1.5)=0  gt(2.5,1.5)=1  ge(2.5,2.5)=1
 //   le(1.5,2.5)=1  eq(2.5,2.5)=1  ne(1.5,2.5)=1  eq(1.5,2.5)=0
 // total = 6 → exit 42 (the +100 tail separates "wrong count" from
-// "happened to be 6"). HONEST REACH (audit-residue sweep c2,
-// D-AUDIT-WITNESS-STRENGTHENING): the sum catches SOME misroutes,
+// "happened to be 6"). HONEST REACH (audit-residue sweep c2, which
+// found this claim overstated): the sum catches SOME misroutes,
 // not all — a POLARITY INVERSION of a predicate observed with both
 // outcomes here (lt, eq) flips both of its calls and is SUM-NEUTRAL,
 // and an adjacent-predicate slip (e.g. lt→le) is invisible without

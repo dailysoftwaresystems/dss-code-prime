@@ -38,3 +38,10 @@ target_include_directories(dss_lsp_test_lsp_coordinates
 dss_add_test(NAME lsp/test_lsp_driver_agreement SOURCES test_lsp_driver_agreement.cpp)
 target_link_libraries(dss_lsp_test_lsp_driver_agreement
                       PRIVATE nlohmann_json::nlohmann_json)
+# D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: the same agreement, with a
+# WORKSPACE — the editor answering with the build's own manifests (every pair,
+# the build's membership, includes/defines) against `Program::compileProject`.
+dss_add_test(NAME lsp/test_lsp_workspace_build_agreement
+             SOURCES test_lsp_workspace_build_agreement.cpp)
+target_link_libraries(dss_lsp_test_lsp_workspace_build_agreement
+                      PRIVATE nlohmann_json::nlohmann_json)

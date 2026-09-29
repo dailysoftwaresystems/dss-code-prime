@@ -15,16 +15,42 @@
 // Per-URI document state. The store is keyed by URI; each entry
 // holds the current source text, the resolved schema, a monotonic
 // `parseGeneration` (the cancellation token for in-flight parses),
-// and the last published diagnostics.
+// and the last stored analyses (one per configuration the document
+// was analyzed under — see `DocumentAnalysis`).
 //
 // Thread-safety: all public methods take an internal mutex. Worker
 // threads read text+schema via `snapshot(uri)` (returns a value
-// copy) and write back diagnostics via `setDiagnostics(uri, gen,
-// diags)` which silently drops the result if a newer `update`
+// copy) and write back their analyses via `setAnalyses(uri, gen,
+// analyses)`, which silently drops the result if a newer `update`
 // has bumped the generation in the meantime. This is the
 // stale-parse suppression invariant.
 
+namespace dss {
+class TargetSchema;   // core/types/target_schema.hpp
+} // namespace dss
+
 namespace dss::lsp {
+
+// ONE configuration's analysis of a document — [[D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE]].
+// A document is analyzed under every configuration the workspace's builds
+// compile it under (one per manifest pair), or under its language alone when no
+// build applies; each analysis is stored whole, because diagnostics can only be
+// rendered through the model that produced them (their buffers are that CU's)
+// and a query is answered by merging every model's answer.
+struct DSS_EXPORT DocumentAnalysis {
+    // The configuration's tag — what a diagnostic that not every analysis
+    // reported is labelled with. EMPTY for the language-only analysis, and for a
+    // workspace-level refusal that applies to every configuration alike.
+    std::string                                label;
+    // Null when there was nothing to analyze under: a refusal (the workspace's
+    // manifests, or this configuration's grammar, could not be loaded).
+    // `diagnostics` then carries the refusal, published on the document.
+    std::shared_ptr<dss::SemanticModel const>  model;
+    // The pair's target — `model->target()` points into it, so it is held
+    // exactly as long as the model is. Null for the language-only analysis.
+    std::shared_ptr<dss::TargetSchema const>   target;
+    std::vector<dss::ParseDiagnostic>          diagnostics;
+};
 
 struct DSS_EXPORT DocumentSnapshot {
     std::string                                uri;
@@ -111,36 +137,22 @@ public:
     [[nodiscard]] std::optional<DocumentSnapshot>
         snapshot(std::string const& uri) const;
 
-    // Write back diagnostics for a parse that started at `expectedGen`.
-    // If the document's current generation differs (newer update
-    // arrived), the call is silently dropped — the stale parse's
-    // diagnostics never reach the client. Returns true if applied,
-    // false if dropped.
-    [[nodiscard]] bool setDiagnostics(std::string const& uri,
-                                       std::uint32_t expectedGen,
-                                       std::vector<dss::ParseDiagnostic> diags);
+    // Write back the analyses of a parse that started at `expectedGen` — the
+    // document's diagnostics AND its models, in ONE step, so a reader can never
+    // see one parse's diagnostics beside another parse's models. If the
+    // document's current generation differs (a newer update arrived), the call
+    // is silently dropped: the stale parse never reaches the client. Returns
+    // true if applied, false if dropped.
+    [[nodiscard]] bool setAnalyses(std::string const& uri,
+                                   std::uint32_t expectedGen,
+                                   std::vector<DocumentAnalysis> analyses);
 
-    // Read back the last-published diagnostics for a URI. Returns
-    // empty vector if URI is unknown OR no diagnostics published.
-    [[nodiscard]] std::vector<dss::ParseDiagnostic>
-        diagnosticsFor(std::string const& uri) const;
-
-    // Store the SemanticModel produced by a parse that started at
-    // `expectedGen`. Dropped (returns false) on a generation mismatch —
-    // mirrors setDiagnostics' stale-suppression. SemanticModel is
-    // move-only, so it is handed in as a shared_ptr<const> the store keeps
-    // and hands back lock-free to query handlers.
-    [[nodiscard]] bool setSemanticModel(
-        std::string const& uri,
-        std::uint32_t expectedGen,
-        std::shared_ptr<dss::SemanticModel const> model);
-
-    // Snapshot the current SemanticModel for a URI (under the mutex). The
-    // returned shared_ptr lets the handler read the model lock-free for as
-    // long as it holds the pointer, even if a newer parse swaps in a
-    // replacement. Null if none stored.
-    [[nodiscard]] std::shared_ptr<dss::SemanticModel const>
-        semanticModelFor(std::string const& uri) const;
+    // The last-stored analyses for a URI (copied under the mutex; each model is
+    // shared, so a handler reads it lock-free for as long as it holds it, even
+    // if a newer parse swaps in replacements). Empty if the URI is unknown or
+    // nothing has been stored.
+    [[nodiscard]] std::vector<DocumentAnalysis>
+        analysesFor(std::string const& uri) const;
 
 private:
     struct Entry;
@@ -161,9 +173,7 @@ private:
         std::string                                 text;
         std::shared_ptr<dss::GrammarSchema const>   schema;
         std::string                                 schemaError;
-        std::vector<dss::ParseDiagnostic>           diagnostics;
-        std::shared_ptr<dss::SemanticModel const>   semanticModel;
-        std::uint32_t                               semanticGeneration = 0;
+        std::vector<DocumentAnalysis>               analyses;
     };
 
     mutable std::mutex                                  mutex_;

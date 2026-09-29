@@ -1,12 +1,18 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_compatibility.hpp"   // sameOrEnumCompatible
 
 #include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 
 // Header-only type-relation rules over `TypeInterner const&`. SE1 ships
 // the minimum the toy/c/tsql tests need: assignability, the
@@ -176,6 +182,31 @@ namespace detail::type_rules {
     return false;
 }
 
+// ── THE ARRAY-TO-POINTER DECAY'S ELEMENT TEST, ONE ANSWER FOR BOTH TIERS ──────
+// (P68 round 10, lane `cs`)
+//
+// Does an array whose element is `element` decay into a pointer whose pointee is
+// `pointee` as C's own conversion? When the two are the same type up to their
+// `volatile` skins: the decay yields a pointer to the element (C 6.3.2.1p3), and a
+// pointer conversion may ADD the qualifier (C 6.5.16.1p1) — the relation
+// `isAssignable`'s Ptr←Ptr arm already applies to a pointer that has decayed. The
+// ADMIT side (`isAssignable`'s Ptr←Array arm) and the REALIZE side (the HIR
+// `coerce` decay arm) both ask HERE, so admit ⟺ realize holds by construction.
+// ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/bv` bv21 / bv24): an `int a[2]`
+// passed to a `volatile int *` parameter is silent on gcc 13.3.0, clang 18.1.3,
+// mingw-w64 13.2.0 and MSVC 19.51; DSS warned S_IncompatiblePointerIntegerPointee
+// ("a pointer of a different integer type") because the arm compared the element
+// by identity while the pointer arm stripped the skin.
+// P68 round 12 (lane `cs`, the enumeration P1): an enumerated element beside its
+// compatible integer pointee decays the same way (`sameOrEnumCompatible`,
+// core/types/type_lattice/type_compatibility.hpp).
+[[nodiscard]] inline bool decayedElementReachesPointee(TypeInterner const& interner,
+                                                       TypeId pointee, TypeId element) {
+    return pointee.valid() && element.valid()
+        && sameOrEnumCompatible(interner, interner.stripVolatile(pointee),
+                                interner.stripVolatile(element));
+}
+
 // rhs assignable into lhs?
 //   InvalidType on either side → true (cascade suppression).
 //   Identical → true.
@@ -284,20 +315,7 @@ namespace detail::type_rules {
     bool                                               floatSameKindNarrows = false,
     bool                                               charArrayFromStringLiteralInit = false,
     bool                                               bitIntConversions = false,
-    bool                                               scalarConvertsToBool = false,
-    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (default false): admit a `Ptr<A>` →
-    // `Ptr<B>` where BOTH pointees A,B are integer kinds AND
-    // `interner.sameRepresentation(A,B)` — the shipped-FFI-descriptor abstract
-    // width-based `ptr<i64>` accepting a real C `long long*`/`sqlite3_int64*`/
-    // `long*`(LP64) whose pointee is same-REPRESENTATION but distinct-IDENTITY (the
-    // `_Generic`-splitting NAME differs; the bits do not). Passed `true` ONLY by
-    // `checkCallAgainstSig` at a shipped-descriptor DIRECT call-arg (the boundary the
-    // config gate scopes it to — never native C-to-C, never init/assign/return, never
-    // the fn-pointer/indirect paths). Per-target by construction: on LLP64 `long` is
-    // I32 so `long*` vs `ptr<i64>` FAILS `sameRepresentation`'s kind axis → still
-    // rejected, NO format branch. Identity is UNTOUCHED — this is a COMPAT admission
-    // that the coerce() Ptr→Ptr bitcast realizes, never a TypeId merge.
-    bool                                               intPointeeSameRepresentationCompat = false) noexcept {
+    bool                                               scalarConvertsToBool = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     // c27 (D-CSUBSET-VOLATILE-POINTEE): volatile is IGNORED for assignment
     // compatibility — C 6.5.16.1 compares the UNQUALIFIED versions of compatible
@@ -635,14 +653,21 @@ namespace detail::type_rules {
     // int→enum (`enum Color c = 1;`, the `c += 1` read-modify-write-back).
     // Gated on `enumConvertsToArith` (default false → a non-C schema keeps
     // `Enum` strictly distinct from the integer ranks); mirrors the
-    // `charConvertsToArith` gate. SCOPE: admits enum↔INT only — an
-    // enum↔DIFFERENT-enum pair satisfies neither disjunct (signedIntRank/
-    // unsignedIntRank of an Enum kind is 0), so it stays a loud mismatch (a
-    // C constraint violation); same-enum is already caught by the sameType
-    // identity above. Closes D-CSUBSET-ENUM-INT-CONVERSION.
+    // `charConvertsToArith` gate. Closes D-CSUBSET-ENUM-INT-CONVERSION.
+    // ★ P68 round 12 (lane `cs`, the enumeration P1): and enum↔DIFFERENT-enum. This
+    // comment used to call that pair "a C constraint violation" — it is not: C
+    // 6.5.16.1p1 admits arithmetic ← arithmetic, and an enumerated type is an integer
+    // type (6.2.5p17). ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/eec`): `e = f;`,
+    // `enum E e = C;` of an `enum F` constant, an `enum F` argument to an `enum E`
+    // parameter and an `enum F` returned as `enum E` — gcc 13.3.0, clang 18.1.3,
+    // mingw-w64 13.2.0 and MSVC 19.51 all build and run them (clang and MSVC warn by
+    // default, gcc under -Wextra); DSS refused all five
+    // ([[D-C-AN-ASSIGNMENT-BETWEEN-TWO-ENUMERATED-TYPES-IS-REFUSED]]). Same-enum is
+    // already caught by the sameType identity above.
     if (enumConvertsToArith
         && ((lk == TypeKind::Enum
-             && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0))
+             && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0
+                 || rk == TypeKind::Enum))
             || (rk == TypeKind::Enum
                 && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)))) {
         return true;
@@ -712,7 +737,9 @@ namespace detail::type_rules {
         auto const lhsElem = interner.operands(lhs);
         auto const rhsElem = interner.operands(rhs);
         if (!lhsElem.empty() && !rhsElem.empty()) {
-            if (lhsElem[0] == rhsElem[0]) {
+            // P68 round 10: the element up to its `volatile` skin — the one test the
+            // HIR `coerce` decay arm realizes (`decayedElementReachesPointee`).
+            if (decayedElementReachesPointee(interner, lhsElem[0], rhsElem[0])) {
                 return true;
             }
             // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6): the decayed
@@ -824,8 +851,10 @@ namespace detail::type_rules {
             // changes layout/codegen, only the access flag, which is keyed off the
             // ACCESSED type, so a dropped-qualifier pointer simply yields a plain
             // access through the lhs's stripped pointee — never a miscompile.)
-            if (interner.stripVolatile(lhsElem[0])
-                == interner.stripVolatile(rhsElem[0])) {
+            // P68 round 12 (lane `cs`, the enumeration P1): or an enumerated
+            // pointee beside its compatible integer type (`sameOrEnumCompatible`).
+            if (sameOrEnumCompatible(interner, interner.stripVolatile(lhsElem[0]),
+                                     interner.stripVolatile(rhsElem[0]))) {
                 return true;
             }
             // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6 + 6.5.16.1): two
@@ -875,41 +904,11 @@ namespace detail::type_rules {
             }
             // BOTH void: caught by sameType() above (Ptr<Void> ==
             // Ptr<Void> via interning). NEITHER void: distinct typed
-            // pointers; fall through to the strict-reject default
-            // below (Ptr<int> → Ptr<float> is NOT implicit) — UNLESS the
-            // shipped-descriptor integer-pointee relaxation below admits it.
-        }
-        // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: at a shipped-FFI-descriptor
-        // call-arg boundary ONLY (the sole caller passing this flag true — never
-        // native C-to-C, never init/assign/return), a descriptor's abstract width-
-        // based integer-pointee param (`ptr<i64>`, …) accepts a real C integer
-        // pointer whose pointee is the SAME representation (`long long*` /
-        // `sqlite3_int64*` / `long*`-on-LP64) — the ABI-identical match gcc admits.
-        // Predicate = BOTH pointees are integer kinds (size ∧ signedness ∧ integer-
-        // base-kind, via signedIntRank/unsignedIntRank) AND `sameRepresentation`
-        // (compares kind ∧ extensionKind ∧ operands ∧ scalars, NOT the identity
-        // NAME) — attribute-driven, NO `if(type==long long)`. Per-target by
-        // construction: on LLP64/pe64 `long` is I32, so `long*` vs `ptr<i64>` FAILS
-        // sameRepresentation's kind axis → still rejected, with NO format branch
-        // (Condition 6). A `_BitInt(64)*` fails the extensionKind axis; an
-        // `unsigned long long*` / `double*` / `enum E*` fail the kind/base-kind axes.
-        // Identity is UNTOUCHED — a COMPAT admission the coerce() Ptr→Ptr bitcast
-        // realizes, never a TypeId merge (Condition 1); `_Generic(long:,long long:)`
-        // still distinguishes. Cf. TF-C15/C16/C32 pointer-compat-policy notes +
-        // D-LANG-TYPE-IDENTITY-VOCABULARY / LD-5 (identity nominal).
-        if (intPointeeSameRepresentationCompat
-            && !lhsElem.empty() && !rhsElem.empty()) {
-            auto const lpk = interner.kind(lhsElem[0]);
-            auto const rpk = interner.kind(rhsElem[0]);
-            bool const bothInt =
-                (detail::type_rules::signedIntRank(lpk)
-                 || detail::type_rules::unsignedIntRank(lpk))
-                && (detail::type_rules::signedIntRank(rpk)
-                    || detail::type_rules::unsignedIntRank(rpk));
-            if (bothInt
-                && interner.sameRepresentation(lhsElem[0], rhsElem[0])) {
-                return true;
-            }
+            // pointers; fall through to the strict-reject default below
+            // (Ptr<int> → Ptr<float> is NOT one of C's conversions). A language
+            // that converts such a pair WITH A DIAGNOSTIC says so in its
+            // `pointerConversions` block, and `diagnosedConversion` below — asked
+            // by every site after this function declines — names the class.
         }
     }
     // C23 §6.3.2.3.4 / §6.2.5 (D-CSUBSET-NULLPTR): the predefined constant
@@ -938,6 +937,354 @@ namespace detail::type_rules {
         return true;
     }
     return false;
+}
+
+// `isAssignable` under EVERY conversion gate a language's `SemanticConfig` declares —
+// the one spelling of "the ordinary rules", so the semantic tier's five
+// assignment-shaped sites and the HIR tier's brace-element report and `coerce`
+// realize cannot pass different gate sets (they used to spell the dozen arguments out
+// at each site). `boolWidensToArith` is true here because every caller is a
+// PRE-coerce judgement; the post-coerce HIR verifier keeps calling `isAssignable`
+// with its strict defaults.
+[[nodiscard]] inline bool isAssignableUnder(SemanticConfig const& cfg,
+                                            TypeInterner const&   interner,
+                                            TypeId                lhs,
+                                            TypeId                rhs,
+                                            bool charArrayFromStringLiteralInit) noexcept {
+    return isAssignable(interner, lhs, rhs, cfg.pointerConversions,
+                        /*boolWidensToArith=*/true,
+                        cfg.charConvertsToArith, cfg.enumConvertsToArith,
+                        cfg.intCrossSignednessConverts, cfg.intSameSignednessNarrows,
+                        cfg.intConvertsToFloat, cfg.floatConvertsToInt,
+                        cfg.floatSameKindNarrows, charArrayFromStringLiteralInit,
+                        cfg.bitIntConversions, cfg.scalarConvertsToBool);
+}
+
+// ★★★ P68 round 9 (lane `cs`) — THE CONVERSIONS A LANGUAGE ADMITS WITH A DIAGNOSTIC,
+// D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS.
+//
+// C23 6.5.17.2p1 (C17 6.5.16.1p1) lists the pointer pairings an assignment may
+// convert between — compatible pointed-to types, an object pointer beside `void *`, a
+// null pointer constant, `bool` from a pointer — and a pairing outside the list is a
+// CONSTRAINT VIOLATION: the implementation must DIAGNOSE it, and C says nothing more.
+// An initialization, an argument and a return convert "as if by assignment", so they
+// share the list. What every pinned reference does next is convert anyway, keeping
+// the pointer's value (C 6.3.2.3p5-p8 give that value for an explicit cast; the
+// implicit conversion is the same bits). ✔MEASURED 2026-09-23, each reference separately and every build RUN
+// (gcc 13.3.0 and clang 18.1.3 at `-std=c17 -pedantic-errors` off and `-std=c2x`,
+// mingw-w64 13.2.0, MSVC 19.51 at `/std:c17` and `/std:clatest`): pointers to
+// incompatible object types, an object pointer beside a function pointer, and a
+// function pointer of another signature are built with a warning by gcc, mingw and
+// MSVC (clang too for the object pairs; it refuses the function-signature and
+// integer/pointer mixes by default); an integer that is not a null pointer constant
+// into a pointer, and a pointer into an integer, are built with a warning by gcc,
+// mingw and MSVC. Each such program RUNS to the value its explicit-cast twin gives.
+// `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` therefore owes every one WITH a diagnostic,
+// and DSS refused every one (S_TypeMismatch / S_ReturnTypeMismatch) — below the union
+// on a class legacy C is full of. 📄 GCC 14 made these errors by default; the union is
+// over the PINNED references, and `--warnings-as-errors` reproduces GCC 14's default.
+//
+// ★ THIS IS THE ONE CLASSIFIER, asked by every site of the pointer-compatibility
+// constraint in both tiers: the semantic tier's initialization, assignment,
+// argument and return checks, its `==`/`!=`/relational and `?:` checks, and the HIR
+// tier's brace-element report and `coerce` realize. A site asks only AFTER the
+// language's ordinary rules (`isAssignableUnder`, the null pointer constant) have
+// declined the pair, and reports the class it names; `coerce` realizes exactly the
+// classes this names and nothing the ordinary rules admit, so admit ⟺ realize holds
+// by construction.
+//
+// ⚠ CONFIG-DRIVEN, NOT C-SHAPED: the pointer classes are admitted only when the
+// language says so (`pointerConversions.incompatiblePointerConvertsDiagnosed`), the
+// integer classes only under `integerPointerConvertsDiagnosed`; a language that sets
+// neither keeps every such pair refused, byte for byte.
+enum class DiagnosedConversion : std::uint8_t {
+    None,                              // not admitted: the caller refuses the pair
+    IncompatiblePointer,               // pointer ← pointer / array / function designator
+    SameRepresentationIntegerPointee,  // … whose two pointees are distinct integer types of ONE representation
+    IntegerToPointer,                  // pointer ← an integer that is not a null pointer constant
+    PointerToInteger,                  // integer ← pointer / array / function designator
+};
+
+// Where a diagnosed conversion was met — it words the report and nothing else.
+enum class DiagnosedConversionSite : std::uint8_t {
+    Initialization, Assignment, CompoundAssignment, Argument, Return, Comparison, Conditional
+};
+
+// The pointee a pointer-VALUED operand contributes once it decays (C 6.3.2.1p3-p4):
+// a pointer's own, an array's element, a function designator itself. Invalid for
+// anything else, and for a shapeless (element-less) array or pointer.
+[[nodiscard]] inline TypeId contributedPointee(TypeInterner const& interner,
+                                               TypeId t) noexcept {
+    if (!t.valid()) return InvalidType;
+    t = interner.stripVolatile(t);
+    switch (interner.kind(t)) {
+        case TypeKind::Ptr:
+        case TypeKind::Array: {
+            auto const ops = interner.operands(t);
+            return ops.empty() ? InvalidType : ops[0];
+        }
+        case TypeKind::FnSig: return t;
+        default:              return InvalidType;
+    }
+}
+
+// An INTEGER kind in C's sense (6.2.5p17): the two rank ladders, `char`, `_Bool`, an
+// enumeration and a bit-precise integer.
+[[nodiscard]] inline bool isIntegerKindForConversion(TypeKind k) noexcept {
+    using namespace detail::type_rules;
+    return signedIntRank(k) != 0 || unsignedIntRank(k) != 0 || k == TypeKind::Char
+        || k == TypeKind::Bool || k == TypeKind::Enum || k == TypeKind::BitInt;
+}
+
+// Are two pointees COMPATIBLE for a pairing (`==`, `?:`) — the same type modulo the
+// qualifiers C23 6.5.10p2 / 6.5.16p3 let the two sides differ by (DSS interns
+// `volatile` on the type; `const` lives on the qualifier spine), or two array types C
+// 6.7.6.2p6 calls compatible? The same relation `isAssignable`'s pointer arms apply.
+// P68 round 12: an enumerated type and its compatible integer type too.
+[[nodiscard]] inline bool pointeesCompatible(TypeInterner const& interner,
+                                             TypeId a, TypeId b) {
+    if (!a.valid() || !b.valid()) return true;   // cascade suppression
+    TypeId const sa = interner.stripVolatile(a);
+    TypeId const sb = interner.stripVolatile(b);
+    return sa == sb || vlaCompatibleArrayTypes(interner, sa, sb)
+        || sameOrEnumCompatible(interner, sa, sb);
+}
+
+// A POINTER PAIRING C admits without a diagnostic at `==`/`!=` and `?:`: compatible
+// pointees, or an object pointer beside a `void *` (C23 6.5.10p2, 6.5.16p3) — and a
+// function pointer beside a `void *` where the language admits that conversion
+// (`allowVoidPtrFnConvert`, the POSIX `dlsym` class; gcc diagnoses it only under
+// `-pedantic`). The relational operators admit no `void` pairing (C23 6.5.9p2), so
+// they pass `voidPairingAdmitted = false`.
+[[nodiscard]] inline bool pointerPairingAdmitted(
+    TypeInterner const& interner, TypeId lPointee, TypeId rPointee,
+    bool voidPairingAdmitted,
+    SemanticConfig::PointerConversionRules const& rules) {
+    if (pointeesCompatible(interner, lPointee, rPointee)) return true;
+    if (!voidPairingAdmitted) return false;
+    TypeKind const lk = interner.kind(interner.stripVolatile(lPointee));
+    TypeKind const rk = interner.kind(interner.stripVolatile(rPointee));
+    bool const lVoid = lk == TypeKind::Void;
+    bool const rVoid = rk == TypeKind::Void;
+    if (lVoid == rVoid) return false;
+    TypeKind const other = lVoid ? rk : lk;
+    return other == TypeKind::FnSig ? rules.allowVoidPtrFnConvert
+                                    : rules.implicitToVoidPtr;
+}
+
+// ── P68 round 9 (lane `cs`): THE POINTER HALF OF THE ARITHMETIC OPERATORS' OPERAND
+//    CONSTRAINTS — the one answer the operator check (pass2Post's SE4e) and the
+//    expression typer (`subtreeType`, which must not hand a refused operation a type
+//    its context would then judge a second time) both ask.
+//
+// C23 6.5.7p2: `+` takes two arithmetic operands or a pointer and an integer (either
+// order); `-` takes two arithmetic operands, two pointers, or a pointer then an
+// integer. 6.5.6p2, 6.5.8p2 and 6.5.11-13 give `*` `/` `%` `<<` `>>` `&` `|` `^` no
+// pointer at all. `base` is the operator's core name (a compound assignment's
+// `compoundBase`). A pairing with NO pointer operand, or a `void` / `nullptr_t`
+// operand (the void-value and nullptr arms own those), is not this rule's question.
+enum class PointerOperands : std::uint8_t { NotApplicable, Admitted, Refused };
+
+[[nodiscard]] inline bool isPointerArithmeticOperator(std::string_view base) noexcept {
+    return base == "Add" || base == "Sub" || base == "Mul" || base == "Div"
+        || base == "Rem" || base == "Shl" || base == "Shr" || base == "BitAnd"
+        || base == "BitOr" || base == "BitXor";
+}
+
+[[nodiscard]] inline PointerOperands
+pointerOperandPairing(TypeInterner const& interner, std::string_view base, TypeId lt,
+                      TypeId rt) noexcept {
+    if (!isPointerArithmeticOperator(base) || !lt.valid() || !rt.valid())
+        return PointerOperands::NotApplicable;
+    auto const ownedElsewhere = [&](TypeId t) {
+        TypeKind const k = interner.kind(interner.stripVolatile(t));
+        return k == TypeKind::Void || k == TypeKind::NullptrT;
+    };
+    if (ownedElsewhere(lt) || ownedElsewhere(rt)) return PointerOperands::NotApplicable;
+    bool const lP = contributedPointee(interner, lt).valid();
+    bool const rP = contributedPointee(interner, rt).valid();
+    if (!lP && !rP) return PointerOperands::NotApplicable;
+    bool const lI = isIntegerKindForConversion(interner.kind(interner.stripVolatile(lt)));
+    bool const rI = isIntegerKindForConversion(interner.kind(interner.stripVolatile(rt)));
+    bool ok = false;
+    if (base == "Add")      ok = (lP && rI) || (lI && rP);
+    else if (base == "Sub") ok = lP && (rI || rP);
+    return ok ? PointerOperands::Admitted : PointerOperands::Refused;
+}
+
+// The COMPOUND form `E1 op= E2` (C23 6.5.17.3p1): for `+=` / `-=` a pointer left
+// operand takes an INTEGER right operand only and an arithmetic left operand an
+// arithmetic right one; every other `op=` takes the operands `op` takes. Two shapes C
+// refuses are BUILT by gcc 13.3.0 and mingw-w64 13.2.0 at `-std=c2x`, each with its
+// `-Wint-conversion` warning, as the literal `E1 = E1 op E2`: ✔MEASURED 2026-09-23
+// (`.temp/probe/r7c`, `r7d`, each reference separately, every build RUN) —
+//   * `x += p` (an integer `x`): `x + p` is a POINTER (6.5.7p9), converted to `x`'s
+//     type — gcc stores `(int)(p + x)`, the STRIDE-SCALED address;
+//   * `p -= q` (two pointers to COMPATIBLE types): `p - q` is the element
+//     difference, an integer, converted to `p`'s type — gcc stores `(T *)(p - q)`.
+// clang and MSVC refuse both, and all four refuse `p -= q` over incompatible
+// pointees (gcc: `p - q` itself is invalid there). One working reference makes the
+// two shapes owed, each WITH the integer/pointer diagnostic its conversion draws.
+enum class CompoundPointerOperands : std::uint8_t {
+    NotApplicable,           // no pointer operand (or a void / nullptr_t one): not this rule
+    Admitted,                // `p += n`, `p -= n`: C's own
+    Refused,                 // every reference refuses
+    PointerIntoInteger,      // `x += p`: the pointer sum converts to the integer
+    DifferenceIntoPointer,   // `p -= q`: the element difference converts to the pointer
+};
+
+[[nodiscard]] inline CompoundPointerOperands
+compoundPointerOperandPairing(TypeInterner const& interner, std::string_view base,
+                              TypeId lt, TypeId rt) noexcept {
+    PointerOperands const binary = pointerOperandPairing(interner, base, lt, rt);
+    if (binary == PointerOperands::NotApplicable) return CompoundPointerOperands::NotApplicable;
+    if (binary == PointerOperands::Refused) return CompoundPointerOperands::Refused;
+    TypeId const lPointee = contributedPointee(interner, lt);
+    TypeId const rPointee = contributedPointee(interner, rt);
+    if (!lPointee.valid()) return CompoundPointerOperands::PointerIntoInteger;   // `x += p`
+    if (!rPointee.valid()) return CompoundPointerOperands::Admitted;             // `p ± n`
+    // `p -= q`: the only two-pointer pairing `pointerOperandPairing` admits.
+    return pointeesCompatible(interner, lPointee, rPointee)
+        ? CompoundPointerOperands::DifferenceIntoPointer
+        : CompoundPointerOperands::Refused;
+}
+
+// The unary half (C23 6.5.4.3): `+` and `-` take an arithmetic operand and `~` an
+// integer one — a pointer (an array or a function designator decaying to one) is
+// none of them.
+[[nodiscard]] inline bool
+pointerOperandRefusedByUnary(TypeInterner const& interner, std::string_view target,
+                             TypeId operand) noexcept {
+    return (target == "Neg" || target == "Pos" || target == "BitNot")
+        && contributedPointee(interner, operand).valid();
+}
+
+// Which class a pair the ordinary rules DECLINED belongs to. `target` is the type
+// converted TO (an lvalue's, a parameter's, a function result's), `source` the
+// operand's own, un-decayed. The pairing sites (`==`, `?:`) pass a pointer target
+// built from one operand and the other operand as the source.
+[[nodiscard]] inline DiagnosedConversion
+diagnosedConversion(TypeInterner const& interner, TypeId target, TypeId source,
+                    SemanticConfig::PointerConversionRules const& rules) noexcept {
+    if (!target.valid() || !source.valid()) return DiagnosedConversion::None;
+    target = interner.stripVolatile(target);
+    source = interner.stripVolatile(source);
+    TypeKind const tk = interner.kind(target);
+    TypeKind const sk = interner.kind(source);
+    TypeId const sourcePointee = contributedPointee(interner, source);
+    if (tk == TypeKind::Ptr && sourcePointee.valid()) {
+        if (!rules.incompatiblePointerConvertsDiagnosed) return DiagnosedConversion::None;
+        auto const tops = interner.operands(target);
+        if (!tops.empty()) {
+            using namespace detail::type_rules;
+            TypeKind const tpk = interner.kind(interner.stripVolatile(tops[0]));
+            TypeKind const spk = interner.kind(interner.stripVolatile(sourcePointee));
+            bool const bothIntegers =
+                (signedIntRank(tpk) != 0 || unsignedIntRank(tpk) != 0)
+                && (signedIntRank(spk) != 0 || unsignedIntRank(spk) != 0);
+            if (bothIntegers && interner.sameRepresentation(tops[0], sourcePointee))
+                return DiagnosedConversion::SameRepresentationIntegerPointee;
+        }
+        return DiagnosedConversion::IncompatiblePointer;
+    }
+    if (tk == TypeKind::Ptr && isIntegerKindForConversion(sk)) {
+        return rules.integerPointerConvertsDiagnosed ? DiagnosedConversion::IntegerToPointer
+                                                     : DiagnosedConversion::None;
+    }
+    // `_Bool` from a pointer is C's OWN conversion (6.3.1.2, the truth value), which
+    // `isAssignable` admits; it never reaches here as a diagnosed class.
+    if (isIntegerKindForConversion(tk) && tk != TypeKind::Bool && sourcePointee.valid()) {
+        return rules.integerPointerConvertsDiagnosed ? DiagnosedConversion::PointerToInteger
+                                                     : DiagnosedConversion::None;
+    }
+    return DiagnosedConversion::None;
+}
+
+// The code each class reports under — one per class, at every site, in both tiers.
+[[nodiscard]] inline DiagnosticCode
+diagnosedConversionCode(DiagnosedConversion c) noexcept {
+    switch (c) {
+        case DiagnosedConversion::SameRepresentationIntegerPointee:
+            return DiagnosticCode::S_IncompatiblePointerIntegerPointee;
+        case DiagnosedConversion::IntegerToPointer:
+        case DiagnosedConversion::PointerToInteger:
+            return DiagnosticCode::S_IntegerPointerConversion;
+        case DiagnosedConversion::IncompatiblePointer:
+        case DiagnosedConversion::None:
+            break;
+    }
+    return DiagnosticCode::S_IncompatiblePointerConversion;
+}
+
+// The sentence each class reports — one wording for both tiers, so a brace element
+// (reported by the HIR tier, the one that knows which slot it fills) reads exactly
+// like the initialization the semantic tier reports.
+[[nodiscard]] inline std::string
+diagnosedConversionSentence(DiagnosedConversion c, DiagnosedConversionSite site,
+                            std::string_view operandText) {
+    bool const pairing = site == DiagnosedConversionSite::Comparison
+                      || site == DiagnosedConversionSite::Conditional;
+    // Clauses are C23's (N3220) numbering: simple assignment is 6.5.17.2 there
+    // (C17 6.5.16.1), initialization 6.7.11, the call 6.5.3.3, the return 6.8.7.5,
+    // the relational / equality operators 6.5.9 / 6.5.10, the conditional 6.5.16.
+    std::string_view where = "this conversion";
+    std::string_view clause = "C23 6.5.17.2p1";
+    switch (site) {
+        case DiagnosedConversionSite::Initialization:
+            where = "this initialization"; clause = "C23 6.7.11p12 / 6.5.17.2p1"; break;
+        case DiagnosedConversionSite::Assignment:
+            where = "this assignment"; clause = "C23 6.5.17.2p1"; break;
+        case DiagnosedConversionSite::CompoundAssignment:
+            where = "this compound assignment"; clause = "C23 6.5.17.3p1"; break;
+        case DiagnosedConversionSite::Argument:
+            where = "this argument"; clause = "C23 6.5.3.3p2 / 6.5.17.2p1"; break;
+        case DiagnosedConversionSite::Return:
+            where = "this return"; clause = "C23 6.8.7.5p3 / 6.5.17.2p1"; break;
+        case DiagnosedConversionSite::Comparison:
+            where = "this comparison"; clause = "C23 6.5.10p2 / 6.5.9p2"; break;
+        case DiagnosedConversionSite::Conditional:
+            where = "this conditional"; clause = "C23 6.5.16p3"; break;
+    }
+    std::string_view what = "converts between incompatible types";
+    std::string_view outcome = "the value converts exactly as an explicit cast would convert it";
+    switch (c) {
+        case DiagnosedConversion::IncompatiblePointer:
+            what = pairing ? "pairs pointers to incompatible types"
+                           : "converts a pointer to a pointer of an incompatible type";
+            break;
+        case DiagnosedConversion::SameRepresentationIntegerPointee:
+            what = pairing ? "pairs pointers to two different integer types that share one "
+                             "representation"
+                           : "converts a pointer to a pointer of a different integer type that "
+                             "shares its representation";
+            break;
+        case DiagnosedConversion::IntegerToPointer:
+            what = pairing ? "pairs a pointer with an integer that is not a null pointer "
+                             "constant"
+                           : "converts an integer that is not a null pointer constant to a "
+                             "pointer";
+            break;
+        case DiagnosedConversion::PointerToInteger:
+            what = pairing ? "pairs a pointer with an integer"
+                           : "converts a pointer to an integer";
+            break;
+        case DiagnosedConversion::None:
+            break;
+    }
+    if (site == DiagnosedConversionSite::Comparison) {
+        outcome = "the two addresses are compared";
+    } else if (site == DiagnosedConversionSite::Conditional
+               && c != DiagnosedConversion::IntegerToPointer
+               && c != DiagnosedConversion::PointerToInteger) {
+        outcome = "the conditional has type `void *` (gcc's and clang's meaning)";
+    }
+    std::string out;
+    out.reserve(operandText.size() + 256);
+    out.append("`").append(operandText).append("`: ").append(where).append(" ")
+       .append(what).append(" without a cast — a constraint violation (")
+       .append(clause).append(") that C requires a diagnostic for; ")
+       .append(outcome);
+    return out;
 }
 
 // FC2 explicit-cast legality (`(T)expr`). DELIBERATELY wider than
@@ -1382,10 +1729,24 @@ struct ResolvedArithmeticRules {
     // default false ⇒ a language without the flag keeps `usualArithmeticCommonType`
     // returning InvalidType for any BitInt pair (no accidental promotion).
     bool                  bitIntConversions = false;
+    // C 6.3.1.8's fifth conversion (P68 round 10, lane `cs`): each NAMED signed
+    // vocabulary entry's UNSIGNED COUNTERPART under this data model — derived from the
+    // language's `typeSpecifiers` by `deriveUnsignedCounterparts` (semantic_config.hpp),
+    // the derivation the loader checks complete. Empty for a hand-built rule set, which
+    // then never reaches the fifth conversion's name (see the RankPreferUnsigned arm).
+    std::unordered_map<std::string, std::string> unsignedCounterpart;
 };
 
-[[nodiscard]] inline ResolvedArithmeticRules
-resolveArithmeticRules(ArithmeticConversions const& cfg, DataModel dm) {
+// THE ONE RESOLVER, for both tiers (the semantic typer and the CST→HIR lowering):
+// nullopt for a language that declares no `arithmeticConversions` block (it keeps the
+// legacy `TypeInterner::commonType`), else the block resolved for `dm` together with
+// the two facts the block does not carry — the top-level `bitIntConversions` flag and
+// the unsigned-counterpart map. P68 round 10 (lane `cs`): the two call sites each
+// injected the flag by hand after resolving; they now ask this once.
+[[nodiscard]] inline std::optional<ResolvedArithmeticRules>
+resolveArithmeticRules(SemanticConfig const& sem, DataModel dm) {
+    if (!sem.arithmeticConversions.has_value()) return std::nullopt;
+    ArithmeticConversions const& cfg = *sem.arithmeticConversions;
     ResolvedArithmeticRules out;
     out.minRank = cfg.minRankType.resolveCore(dm);
     out.alsoPromote.reserve(cfg.alsoPromote.size());
@@ -1393,6 +1754,8 @@ resolveArithmeticRules(ArithmeticConversions const& cfg, DataModel dm) {
     out.mixedSignedness    = cfg.mixedSignedness;
     out.promoteComparisons = cfg.promoteComparisons;
     out.shiftResult        = cfg.shiftResult;
+    out.bitIntConversions  = sem.bitIntConversions;
+    out.unsignedCounterpart = deriveUnsignedCounterparts(sem.typeSpecifiers, dm).counterpartOf;
     return out;
 }
 
@@ -1444,9 +1807,25 @@ promoteIntegerKind(TypeKind k, ResolvedArithmeticRules const& rules) noexcept {
 // Used by `usualArithmeticCommonType` / `integerPromotedType` below so the
 // closed arithmetic verb never has to special-case Enum. Part of
 // D-CSUBSET-ENUM-INT-CONVERSION.
+// P68 round 12 (lane `cs`): an enum with a FIXED underlying type (C23 6.7.2.2) answers
+// with that type AS DECLARED — `enum E : long` is `long`, the vocabulary entry, not an
+// anonymous I32 / I64 — because C 6.3.1.1p1 gives the enumerated type the rank of its
+// underlying type and the conversions decide by rank, i.e. by name. ✔MEASURED
+// 2026-09-24 (lane `cs`'s `.temp/probe/uacx`): `e + u` for `enum E : long e` and
+// `unsigned int u` is `unsigned long` on LLP64 and `long` on LP64 under gcc 13.3.0,
+// clang 18.1.3 and mingw-w64 13.2.0 (-std=c2x; MSVC 19.51 has no fixed underlying
+// types); DSS answered `unsigned int` and an unnamed 64-bit type. An enum WITHOUT a
+// fixed underlying type keeps the kind-only answer (its type is compatible with an
+// implementation-chosen integer type, which DSS makes `int`).
+// The enumeration P1 (P68 round 12, lane `cs`): an enum WITHOUT a fixed underlying
+// type answers the same way when its language chose its compatible type (C23
+// 6.7.3.3p13) — the name its rank is decided by, like a fixed one's. Only a
+// kind-only record (a language that declares no choice) answers with its kind.
 [[nodiscard]] inline TypeId
 enumUnderlyingOrSelf(TypeInterner& interner, TypeId t) {
     if (!t.valid() || interner.kind(t) != TypeKind::Enum) return t;
+    if (TypeId const underlying = interner.enumUnderlyingType(t); underlying.valid())
+        return underlying;
     auto const sc = interner.scalars(t);
     return sc.empty() ? t : interner.primitive(static_cast<TypeKind>(sc[0]));
 }
@@ -1484,6 +1863,59 @@ enumeratorValueFitsUnderlying(std::int64_t value, TypeKind underlying) noexcept 
     return static_cast<std::uint64_t>(value) <= hi;
 }
 
+// ── P68 round 12 (lane `cs`, the enumeration P1): an enumerator's VALUE WITH ITS
+// SIGNEDNESS ──
+//
+// The semantic tier carries an enumerator's value as an int64 BIT PATTERN
+// (`SymbolRecord::enumValue`), and the pattern alone cannot say whether
+// 0xFFFFFFFFFFFFFFFF is -1 or 2^64 - 1 — the type the value came from does (the
+// constant expression's type for an explicit `= expr`, the previous constant's
+// arithmetic for an implicit one). Reading every pattern as signed refused
+// `enum E : unsigned long long { X = 0xFFFFFFFFFFFFFFFFULL }`, which C23 6.7.3.3p3
+// admits (✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/ect7`: gcc 13.3.0, clang
+// 18.1.3 and mingw-w64 13.2.0 run it; DSS said S_EnumeratorValueOutOfRange) —
+// [[D-C-A-FIXED-ENUMERATIONS-VALUE-ABOVE-THE-INT64-RANGE-IS-REFUSED]].
+struct EnumeratorValue {
+    std::int64_t bits = 0;
+    bool         isUnsigned = false;   // `bits` is a uint64 pattern
+    [[nodiscard]] bool isNegative() const noexcept { return !isUnsigned && bits < 0; }
+};
+
+// Does `v` fit the integer kind `k`? False for a non-integer kind.
+[[nodiscard]] inline bool enumeratorValueFitsKind(EnumeratorValue v, TypeKind k) noexcept {
+    int const width = intKindBits(k);
+    if (width == 0) return false;
+    bool const kindSigned = detail::type_rules::signedIntRank(k) != 0;
+    if (v.isNegative()) {
+        if (!kindSigned) return false;
+        if (width >= 64) return true;
+        return v.bits >= -(std::int64_t{1} << (width - 1));
+    }
+    auto const magnitude = static_cast<std::uint64_t>(v.bits);   // non-negative here
+    if (kindSigned) {
+        if (width >= 128) return true;
+        return magnitude <= (std::uint64_t{1} << (width - 1)) - 1;
+    }
+    if (width >= 64) return true;
+    return magnitude <= (std::uint64_t{1} << width) - 1;
+}
+
+// `v + 1` as a MATHEMATICAL value (C23 6.7.3.3p10 defines an implicit enumerator by
+// that addition, and p12 chooses a type able to hold the result rather than
+// letting it wrap); nullopt when the result leaves the uint64 range.
+[[nodiscard]] inline std::optional<EnumeratorValue>
+enumeratorSuccessor(EnumeratorValue v) noexcept {
+    if (v.isUnsigned) {
+        auto const u = static_cast<std::uint64_t>(v.bits);
+        if (u == UINT64_MAX) return std::nullopt;
+        return EnumeratorValue{static_cast<std::int64_t>(u + 1), true};
+    }
+    if (v.bits == INT64_MAX) {   // 2^63: only an unsigned pattern holds it
+        return EnumeratorValue{static_cast<std::int64_t>(std::uint64_t{1} << 63), true};
+    }
+    return EnumeratorValue{v.bits + 1, false};
+}
+
 // The C 6.3.1.8 common type of two operands under the language's
 // declared rules — the config-driven sibling of
 // `TypeInterner::commonType` (which keeps serving block-less languages
@@ -1495,12 +1927,18 @@ enumeratorValueFitsUnderlying(std::int64_t value, TypeKind underlying) noexcept 
 //      float side).
 //   2. integer promotion per `promoteIntegerKind` (floor + alsoPromote).
 //   3. same kind → it; same signedness → wider rank; mixed signedness
-//      per the closed verb. `rank-prefer-unsigned` (C): unsigned rank ≥
-//      signed rank → the unsigned kind at its rank; else the signed kind
-//      (a strictly-wider power-of-two signed type represents the whole
-//      unsigned range, so C's third branch — "the unsigned counterpart
-//      of the signed type" — is unreachable over width-distinct core
-//      kinds; it exists only for same-width different-rank ABO types).
+//      per the closed verb. `rank-prefer-unsigned` (C 6.3.1.8's last three
+//      conversions, on CONVERSION rank — C 6.3.1.1, by name): a strictly
+//      wider unsigned operand, or one of the same width and not lower rank →
+//      the unsigned type; a strictly wider signed operand represents every
+//      unsigned value → the signed type; the same width with the SIGNED
+//      operand ranked higher (LP64 `long long` vs `unsigned long`, LLP64
+//      `long` vs `unsigned int`) → the UNSIGNED COUNTERPART of the signed
+//      type. P68 round 10 (lane `cs`): that last conversion was taken for
+//      unreachable here — only the width decided, and the unsigned operand's
+//      own name won — so the sum was `unsigned long` where C says `unsigned
+//      long long` (LP64) and `unsigned int` where C says `unsigned long`
+//      (LLP64): the same value, the wrong type, observable through `_Generic`.
 [[nodiscard]] inline TypeId
 usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
                           ResolvedArithmeticRules const& rules) {
@@ -1656,12 +2094,30 @@ usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
     // so this switch is exhaustive over the declared vocabulary).
     switch (rules.mixedSignedness) {
         case MixedSignednessRule::RankPreferUnsigned: {
-            int const  uRank = sa ? rb : ra;
+            int const  uRank = sa ? rb : ra;   // WIDTH ranks, after promotion
             int const  sRank = sa ? ra : rb;
-            if (uRank >= sRank) {
-                return pick(kindAtRank(uRank, /*isSigned=*/false));
-            }
-            return pick(kindAtRank(sRank, /*isSigned=*/true));
+            if (uRank > sRank) return pick(kindAtRank(uRank, /*isSigned=*/false));
+            if (uRank < sRank) return pick(kindAtRank(sRank, /*isSigned=*/true));
+            // EQUAL WIDTH: the widths cannot decide; the CONVERSION ranks the
+            // language declares on its named entries do. An operand whose kind
+            // CHANGED under promotion is the anonymous promoted type (rank 0).
+            TypeId const   sOp = sa ? a : b;
+            TypeId const   uOp = sa ? b : a;
+            bool const     sKept = (sa ? ka : kb) == (sa ? pa : pb);
+            bool const     uKept = (sa ? kb : ka) == (sa ? pb : pa);
+            int const      sConv = sKept ? interner.vocabularyRank(sOp) : 0;
+            int const      uConv = uKept ? interner.vocabularyRank(uOp) : 0;
+            TypeKind const uKind = kindAtRank(uRank, /*isSigned=*/false);
+            if (uConv >= sConv) return pick(uKind);   // the unsigned operand's rank is not lower
+            // The signed operand ranks higher but, at the same width, cannot
+            // represent every unsigned value: its UNSIGNED COUNTERPART.
+            auto const cp = rules.unsignedCounterpart.find(
+                std::string{interner.vocabularyName(sOp)});
+            // Unreachable for a loaded language (the loader refuses a named signed
+            // entry with no counterpart); a hand-built rule set without the map
+            // gets the unsigned type of the right width, anonymous.
+            if (cp == rules.unsignedCounterpart.end()) return interner.primitive(uKind);
+            return interner.primitive(uKind, cp->second);
         }
     }
     return InvalidType;
@@ -1683,10 +2139,10 @@ integerPromotedType(TypeInterner& interner, TypeId t,
     return interner.primitive(p);
 }
 
-// C 6.5.7 shift RESULT TYPE under the config verb `shiftResult`
-// (D-UAC-SHIFT-RESULT-RULE-CONFIG) — the SINGLE chokepoint both the CST→HIR
-// shift lowering and the semantic-tier expression typer call, so the two tiers
-// can never diverge on the verb (a regression to one is a regression to both,
+// C 6.5.7 shift RESULT TYPE under the config verb `shiftResult` — the SINGLE
+// chokepoint both the CST→HIR shift lowering and the semantic-tier expression
+// typer call, so the two tiers can never diverge on the verb (a regression to
+// one is a regression to both,
 // caught by the one test). `PromotedLeft` (C): the PROMOTED LEFT operand — the
 // count's type never contributes (`i32 << i64` is I32). `CommonType`: the
 // usual-arithmetic common type — a shift typed like an ordinary binary op

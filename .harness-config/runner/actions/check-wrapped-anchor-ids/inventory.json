@@ -1,0 +1,17 @@
+{
+  "_comment": [
+    "Per-file ceilings for WRAPPED anchor ids -- an id split across a line break.",
+    "A wrapped id does not fail, it DISAPPEARS: no grep returns it and no anchor",
+    "guard counts it. A ceiling may only come DOWN. Un-wrap a site (put the id on",
+    "one line of its own) and lower the number in the SAME commit; the guard prints",
+    "the new value. Raising an entry, or adding a file, is a FAILURE -- that is the",
+    "ratchet. This file is DEBT, not a pass: green means no NEW wrap landed.",
+    "An EMPTY ceilings map is the strongest state this guard has, not a disabled one.",
+    "It WAS empty once -- cycle P36, after 290 sites across 145 files were un-wrapped --",
+    "and this line used to say so. That sentence went FALSE the moment a later cycle",
+    "re-filed an entry, which is the exact species the sibling stale-refusal guard exists",
+    "to catch. So it no longer states a count: the guard prints the live total and the",
+    "file count on every run. Read that, never this."
+  ],
+  "ceilings": {}
+}

@@ -1,4 +1,4 @@
-// D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT.
+// THE PEEPHOLE/CALLCONV IDENTITY-COPY CLAIM HAD NO INSTRUMENT, AND THIS IS IT.
 //
 // `lir_peephole.hpp` justifies running the peephole BEFORE
 // `materializeCallingConvention` — rather than last, where it would also see

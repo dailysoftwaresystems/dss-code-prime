@@ -5,8 +5,8 @@
 //   * per-vreg live ranges respect block-end live-out (loops)
 //   * RPO ordering of blocks is total (covers orphans defensively)
 //   * straight-line / branching / loop / switch / call shapes
-//   * D-3e.1 lowerSwitch first-cmp + first-jcc block-placement pin
-//   * D-3e.9 ICmp dispatch across all 10 predicates
+//   * D-PLAN12-LOWERSWITCH-FIRST-CMP-IMPLICIT-BLOCK-PLACEMENT-ASSERTION-ASSERT lowerSwitch first-cmp + first-jcc block-placement pin
+//   * D-PLAN12-CONDCODEFORICMP-BLIND-DEREF-HARDENING-RETURN-STD-OPTIONAL-TARGETCONDCODE ICmp dispatch across all 10 predicates
 //   * D-LIR-PER-INST-REG-CONSTRAINTS: an early-clobber result's def lands on
 //     the instruction's EARLY slot, with a matched plain-result control
 
@@ -205,7 +205,7 @@ TEST(LirLiveness, LoopRangeReachesLatchEnd) {
 }
 
 TEST(LirLiveness, SwitchPinsFirstCmpAndFirstJccOnSwitchHeader) {
-    // Pins D-3e.1: the first compare AND the first jcc both emit on
+    // Pins D-PLAN12-LOWERSWITCH-FIRST-CMP-IMPLICIT-BLOCK-PLACEMENT-ASSERTION-ASSERT: the first compare AND the first jcc both emit on
     // the switch-bearing block (the block open when lowerSwitch was
     // called). Lowering succeeds (lir.ok) AND the entry block of the
     // function contains `cmp` followed by `jcc` followed by no
@@ -238,7 +238,7 @@ TEST(LirLiveness, SwitchPinsFirstCmpAndFirstJccOnSwitchHeader) {
         }
     }
     EXPECT_TRUE(foundPair)
-        << "switch entry block must contain cmp+jcc pair (D-3e.1 pin)";
+        << "switch entry block must contain cmp+jcc pair (D-PLAN12-LOWERSWITCH-FIRST-CMP-IMPLICIT-BLOCK-PLACEMENT-ASSERTION-ASSERT pin)";
     // Liveness analysis succeeds without crashing.
     LirLiveness const out = analyzeLiveness(lir);
     ASSERT_EQ(out.perFunc.size(), 1u);
@@ -349,7 +349,7 @@ TEST(LirLiveness, PositionToInstReflectsDoubleSlotting) {
 }
 
 TEST(LirLiveness, AllICmpVariantsLowerAndAnalyze) {
-    // Pins D-3e.9 from the call-site: every ICmp predicate dispatched
+    // Pins D-PLAN12-CONDCODEFORICMP-BLIND-DEREF-HARDENING-RETURN-STD-OPTIONAL-TARGETCONDCODE from the call-site: every ICmp predicate dispatched
     // through the lowerer's ICmp arm must succeed and produce non-
     // empty liveness. Any future MIR ICmp opcode added to the arm
     // but missing from condCodeForICmp would fail loud here.

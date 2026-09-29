@@ -588,29 +588,23 @@ TEST(MirLoweringExtern, LocalBindingOnAnExternImportFailsLoud) {
            "defect wearing a diagnostic.";
 }
 
-TEST(MirLoweringExtern, ExternGlobalCurrentlyFailsLoudPendingFeatureWork) {
-    // D-FF2-5 audit pin (2026-06-01): `extern int x;` (and the
-    // array form `extern int x[10];` post-fold #11) lowers to a
-    // HIR `ExternGlobal` node correctly — but the MIR builder at
-    // src/mir/lowering/hir_to_mir.cpp (HirKind::ExternGlobal arm of
-    // the decl switch) currently rejects the kind with `unsupported()`
-    // because the FFI side of ExternGlobal (data-symbol ingestion +
-    // linker symbol-table emission) is not yet implemented end-to-end.
+TEST(MirLoweringExtern, ExternGlobalWithNoFfiMetadataFailsLoud) {
+    // HISTORY, stated as history: this began as the D-FF2-5-FEATURE audit pin
+    // (2026-06-01), when the MIR builder refused EVERY `ExternGlobal` because
+    // the FFI side of extern data (data-symbol ingestion + linker symbol-table
+    // emission) did not exist yet. That was true until the feature shipped —
+    // the row closed 2026-08-14: `collectExterns` in
+    // src/mir/lowering/hir_to_mir.cpp now registers the symbol in
+    // `globalSymbols` and pushes an `ExternImport` row flagged `isData`.
     //
-    // PRE-FOLD #11: `extern int x[10];` silently lost its array
-    // type (externDecl had no arraySuffix configured); lowered as
-    // `int`. Post-fold #11 the array type survives semantic
-    // analysis but the MIR builder still rejects ExternGlobal
-    // wholesale.
-    //
-    // This test pins the CURRENT loud-rejection behavior. A future
-    // fold landing real ExternGlobal MIR support (extending
-    // `collectExterns` + `ExternImport` with TypeId, etc. — see
-    // anchor D-FF2-5-FEATURE) will replace this test with the
-    // positive pin. Until then, a regression that silently accepted
-    // ExternGlobal at the MIR-builder layer (distinct from D-FF2-3's
-    // parser-level extern-with-init surface) would slip past the
-    // audit; this test catches that exact silent-accept surface.
+    // WHAT THIS PINS NOW is that pre-pass's fail-loud METADATA contract. This
+    // module hands `lowerToMir` NO FFI map, so the extern carries no mangled
+    // name — nothing the linker could resolve or import — and the builder must
+    // refuse it with `H_UnsupportedLoweringForKind` at the declaration rather
+    // than accept an extern it can neither bind nor import. A regression that
+    // silently accepted such an ExternGlobal (distinct from the parser-level
+    // extern-with-init surface of D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE)
+    // is exactly what the assertions below catch.
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     HirBuilder b{"c"};
@@ -627,8 +621,9 @@ TEST(MirLoweringExtern, ExternGlobalCurrentlyFailsLoudPendingFeatureWork) {
                              MirLoweringConfig{},
                              /*ffiMap=*/nullptr);
     EXPECT_FALSE(result.ok)
-        << "ExternGlobal currently fails loud at MIR lowering — "
-           "silent-accept would slip a feature gap past the audit";
+        << "an ExternGlobal with no FFI metadata must fail loud at MIR "
+           "lowering — silently accepting it would ship an extern nothing "
+           "can bind";
     EXPECT_TRUE(result.externImports.empty());
     bool sawUnsupported = false;
     for (auto const& d : rep.all()) {
@@ -638,8 +633,8 @@ TEST(MirLoweringExtern, ExternGlobalCurrentlyFailsLoudPendingFeatureWork) {
         }
     }
     EXPECT_TRUE(sawUnsupported)
-        << "MIR builder must emit H_UnsupportedLoweringForKind for "
-           "ExternGlobal until full lowering support lands";
+        << "MIR builder must emit H_UnsupportedLoweringForKind for an "
+           "ExternGlobal that carries no mangled name";
 }
 
 TEST(MirLoweringExtern, LowerToLirPropagatesExternsToMirToLirResult) {

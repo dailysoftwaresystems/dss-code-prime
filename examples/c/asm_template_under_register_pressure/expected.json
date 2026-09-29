@@ -1,0 +1,52 @@
+{
+  "$comment": "★★★ ONE INLINE-ASM STATEMENT IS ONE INSTRUCTION WHILE REGISTERS ARE ALLOCATED, AND AN LL/SC PAIR UNDER PRESSURE TERMINATES (P68 round 8, D-LIR-ASM-TEMPLATE-SPILL-CODE-LANDS-BETWEEN-TEMPLATE-INSTRUCTIONS). Each shape runs with more values live around the statement than the target has registers, so the function spills: x86_64 — one statement naming 14 registers (13 inputs and an earlyclobber output), every input read again after it; aarch64 — the same with 29 registers, and an `ldaxr` / `add` / `stlxr` increment in ONE template, retried from C with 28 values live across it. Until the bundle each template line was its own allocation point and the allocator's spill and reload code landed BETWEEN them (✔MEASURED 2026-09-21: 29 instructions and 15 memory accesses inside a 7-line x86_64 template at release); a store between an `ldaxr` and its `stlxr` clears the exclusive monitor on every try. The retry is BOUNDED, so a pair that never succeeds exits 23 instead of hanging; 11/21 a sum read a wrong input, 22 the LL/SC result is wrong, 24 a value live across it changed. ✔MEASURED 2026-09-23: gcc 13.3.0 and clang 18.1.3 run it to 42 on x86_64 and on aarch64 (qemu), at -O0 and -O2. 29 registers in one aarch64 statement is within Mach-O's capacity too (x18 is platform-reserved there; 30 is refused by name, as by Apple's clang). ★ RED-ON-DISABLE: expand the bundle BEFORE allocation and the between-the-lines pin in `tests/lir/test_lir_asm_region.cpp` reddens; drop the target's `resultEarlyClobber` from `stlxr` and an overlap the programmer did not guard with `&` would encode — the status operands here carry `=&r`, as every correct LL/SC loop does.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

@@ -369,6 +369,85 @@ TEST(ObjectFormatFamilySymmetry, EveryDarwinFormatDeclaresItsLongDoubleAxis) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// THE CROSS-TIER AXIS PIN (P68 round 8 part 4,
+// D-CONFIG-LONG-DOUBLE-REFUSED-ON-PIE-SHARED-AND-DLL-FORMATS).
+//
+// Every test above compares ONE image kind across PROCESSORS. That comparison
+// found the Mach-O dylib's missing `long double` axis — and could never find
+// the next five, because they were missing across IMAGE KINDS: the ELF `-dyn`
+// and `-pie` documents of both processors and the PE `-dll` declared no axis
+// while their `-exec`, relocatable and static-library siblings did, so a
+// `long double` compiled as an executable and was refused in a shared library
+// or a PIE — from the same source. `long double` is the PLATFORM's ABI, not the
+// image kind's.
+//
+// ★ THE PLATFORM IS EACH DOCUMENT'S OWN DECLARATION — its object-format kind and
+// its `targetArch` — never its file name: two documents are the same platform
+// because they SAY so. Every document of one platform must declare the same
+// `longDoubleFormat` (including the same absence, which only the declared-only
+// wasm/spirv skeletons have, one document each).
+// ─────────────────────────────────────────────────────────────────────────
+// P68 round 12 (lane `cs`): the enumeration compatible-type rule is the PLATFORM's
+// ABI too — every image kind of one platform declares the same one (an enumeration
+// must not change its compatible type between the `.o`, the `.dll` and the `.exe`
+// built from one translation unit).
+TEST(ObjectFormatFamilySymmetry, EveryImageKindOfOnePlatformDeclaresOneEnumCompatibleTypeRule) {
+    auto const formats = loadShippedFormats();
+    ASSERT_GE(formats.size(), 24u) << "the enumeration collapsed";
+    std::map<std::string, std::vector<std::pair<std::string, EnumCompatibleTypeRule>>> byPlatform;
+    for (auto const& f : formats) {
+        auto r = ObjectFormatSchema::loadShipped(f.name);
+        ASSERT_TRUE(r.has_value()) << f.name;
+        std::string platform{objectFormatKindName((*r)->kind())};
+        platform += '/';
+        platform += (*r)->targetArch();
+        byPlatform[platform].emplace_back(f.name, (*r)->enumCompatibleTypeRule());
+    }
+    std::size_t multiTier = 0;
+    for (auto const& [platform, members] : byPlatform) {
+        if (members.size() >= 2) ++multiTier;
+        for (auto const& [name, rule] : members) {
+            EXPECT_EQ(rule, members.front().second)
+                << platform << ": " << name << " declares enumCompatibleTypeRule '"
+                << enumCompatibleTypeRuleName(rule) << "' but " << members.front().first
+                << " declares '" << enumCompatibleTypeRuleName(members.front().second)
+                << "' (an empty name is an undeclared rule)";
+        }
+    }
+    EXPECT_GE(multiTier, 5u);
+}
+
+TEST(ObjectFormatFamilySymmetry, EveryImageKindOfOnePlatformDeclaresOneLongDoubleFormat) {
+    auto const formats = loadShippedFormats();
+    ASSERT_GE(formats.size(), 24u) << "the enumeration collapsed";
+    std::map<std::string, std::vector<std::pair<std::string, LongDoubleFormat>>> byPlatform;
+    for (auto const& f : formats) {
+        auto r = ObjectFormatSchema::loadShipped(f.name);
+        ASSERT_TRUE(r.has_value()) << f.name;
+        std::string platform{objectFormatKindName((*r)->kind())};
+        platform += '/';
+        platform += (*r)->targetArch();
+        byPlatform[platform].emplace_back(f.name, (*r)->longDoubleFormat());
+    }
+    std::size_t multiTier = 0;
+    for (auto const& [platform, members] : byPlatform) {
+        if (members.size() >= 2) ++multiTier;
+        for (auto const& [name, ldf] : members) {
+            EXPECT_EQ(ldf, members.front().second)
+                << platform << ": " << name << " declares longDoubleFormat '"
+                << longDoubleFormatName(ldf) << "' but " << members.front().first
+                << " declares '" << longDoubleFormatName(members.front().second)
+                << "' — the image kinds of one platform share one `long double`"
+                   " (an empty name is an undeclared axis)";
+        }
+    }
+    // FLOOR: elf/x86_64, elf/arm64, macho/x86_64, macho/arm64 and pe/x86_64 each
+    // ship several image kinds (✔MEASURED at P68 round 8 part 4) — a grouping
+    // that collapsed to singletons would compare nothing.
+    EXPECT_GE(multiTier, 5u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // The FIFTH instance, and the one the class test was written in time to
 // catch rather than trail: `supportedDataSections` + its `sections[]` rows
 // on `macho64-x86_64-darwin` and `-staticlib`
@@ -428,8 +507,7 @@ TEST(ObjectFormatFamilySymmetry, EveryMachoFormatDeclaresItsDataSectionsWithThei
                    "item of that kind with K_NoMatchingObjectFormat before "
                    "any walker runs — on a `rodata` regression that is every "
                    "TU carrying a string literal "
-                   "(D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-"
-                   "ABSENT).";
+                   "(D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-ABSENT).";
         }
 
         // (b) THE WALKER'S ROWS. Mach-O segment/section names carry no arch

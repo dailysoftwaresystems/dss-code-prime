@@ -336,9 +336,9 @@ void CsePolicy::analyze(MirFuncId fn,
                             "canonicalizes to v=%u with a different opcode or "
                             "result type — a CSE redirect may only join "
                             "same-opcode/same-type values, and the alias "
-                            "probe substitution is unsound without that "
-                            "(D-OPT-CSE-LOAD-PTR-KEY-UNRESOLVED).\n",
+                            "probe substitution is unsound without that.\n",
                             rawPtr.v, loadPtr.v);
+                        // Anchored: D-OPT-CSE-LOAD-PTR-KEY-UNRESOLVED (unreachable: the abort below).
                         std::abort();
                     }
                     MirBlockId const canonicalBlock = src_.instBlock(canonical);

@@ -22,7 +22,7 @@ namespace {
 
 // Layer-local fatal helper. Same posture as treeFatal / attrFatal /
 // streamFatal: always-on, release-mode abort, prefix identifies the
-// originating layer for triage. SKILL.md mandates this pattern over
+// originating layer for triage. The dss-code-prime skill's fail-loud rule mandates this pattern over
 // `<cassert>` (the latter is debug-only and silenced in Release).
 [[noreturn]] void tokenizerFatal(char const* what) {
     std::fputs("dss::Tokenizer fatal: ", stderr);
@@ -56,33 +56,19 @@ namespace {
     return c == '\v' || c == '\f';
 }
 
-// UTF-8 leading bytes are 0xC2..0xF4. Bytes 0x80..0xBF are continuation
-// bytes — only valid as the tail of a multi-byte sequence; appearing
-// at token start signals malformed UTF-8 and lands in the illegal-char
-// path. Bytes 0xC0..0xC1 and 0xF5..0xFF are reserved and never appear
-// in well-formed UTF-8. The byte-level isIdContinue accepts the full
-// 0x80..0xFF range so multi-byte continuation runs (already started
-// by a valid lead byte) don't terminate the identifier.
-[[nodiscard]] constexpr bool isIdStart(char c) noexcept {
-    const auto u = static_cast<unsigned char>(c);
-    return (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') || u == '_'
-        || (u >= 0xC2 && u <= 0xF4);
-}
-
-// ★★★ THE CONTINUATION RULE MOVED TO `IdentifierClass` (grammar_schema.hpp) —
-// D-ASM-DIALECT-IDENTIFIER-CONTINUATION-NOT-CONFIGURABLE, 2026-08-13 — because
-// it grew a SECOND reader. A language may now widen the class
-// (`identifierClass.extraContinue`), and the LOADER has to know the universal
-// set to refuse an extra that already continues an identifier; a copy of the
-// rule here and a copy there is how the loader starts accepting a class the
-// tokenizer ignores. This alias keeps the local call sites reading the same as
-// `isIdStart` beside it.
-// ⚠ AND `isIdStart` DELIBERATELY HAS NO CONFIG SIBLING: an extra character may
-// CONTINUE a name and may never START one. See `IdentifierClass`'s docblock —
-// the leading-`.` case a gas dialect needs is owned by the
-// `directiveIntroducer` TOKEN plus `asmDirective`'s `{optional asmLabelTail}`
-// slot, and a second mechanism for the same byte is exactly how `.L3:` and
-// `.text` would start disagreeing about who owns them.
+// ★★★ BOTH IDENTIFIER RULES LIVE IN `IdentifierClass` (grammar_schema.hpp).
+// The CONTINUATION rule moved there first
+// (D-ASM-DIALECT-IDENTIFIER-CONTINUATION-NOT-CONFIGURABLE, 2026-08-13) because
+// it grew a second reader — the loader, which must know the universal set to
+// refuse an extra that already continues an identifier. The START rule followed
+// on 2026-09-22 ([[D-C-DOLLAR-IN-IDENTIFIERS-REFUSED]]) for the same reason, when
+// a language (C, whose `$` all four reference compilers accept) needed an
+// `extraStart`: the tokenizer asks `IdentifierClass::startsIdentifier` of a
+// token's first byte, and the loader admits an extra start byte only where no
+// declared lexeme begins with it — so a leading `.` in gas stays the
+// `directiveIntroducer` TOKEN's, exactly as before. Letters, `_` and the UTF-8
+// lead bytes 0xC2..0xF4 start a name universally; a continuation byte
+// 0x80..0xBF, or 0xC0/0xC1/0xF5..0xFF, lands in the illegal-character path.
 [[nodiscard]] constexpr bool isIdContinue(char c) noexcept {
     return IdentifierClass::universalContinue(c);
 }
@@ -269,7 +255,10 @@ struct LookupHit {
                                       std::string_view endsAt,
                                       std::string_view dynamicSuffix,
                                       bool longestMatch) noexcept {
-    const auto remaining = r.remaining();
+    // A BODY's closer, so the buffer's bytes only: an implied tail
+    // (`endOfInputImplies`) is never part of a body, not even the second byte
+    // of a closer that would straddle the end of the buffer.
+    const auto remaining = r.remainingInBuffer();
     const std::size_t totalLen = endsAt.size() + dynamicSuffix.size();
     if (remaining.size() < totalLen) return 0;
     if (remaining.substr(0, endsAt.size()) != endsAt) return 0;
@@ -802,7 +791,11 @@ Tokenizer::Tokenizer(std::shared_ptr<SourceBuffer>        src,
 }
 
 TokenizeResult Tokenizer::tokenize() && {
-    SourceReader r{*source_};
+    // The language's `endOfInputImplies` lexeme (empty ⇒ none): a text that is
+    // non-empty and does not end with it is READ as if it did — GNU as's
+    // "newline inserted", stated as data. Every coordinate the reader hands out
+    // stays inside the buffer; see SourceReader's banner.
+    SourceReader r{*source_, schema_->endOfInputImplies()};
     std::vector<Token> tokens;
 
     // Pre-resolve every schema-token kind the tokenizer might emit
@@ -880,6 +873,12 @@ TokenizeResult Tokenizer::tokenize() && {
         LexerModeId        mode;
         StringStyle const* style;        // null when mode has no opener-stringStyle
         std::string        dynamicSuffix;
+        // Where the OPENER that pushed this frame begins. An unterminated body
+        // is reported HERE — at the literal the author wrote, on its own line —
+        // rather than where the scan gave up (the end of that line, or of the
+        // source), which is a position nobody wrote anything at
+        // ([[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]]).
+        ByteOffset         openerStart = 0;
     };
     std::vector<Frame> frames;
 
@@ -941,14 +940,145 @@ TokenizeResult Tokenizer::tokenize() && {
     // OR-merges with the schema meaning's `flagsApplied` at pushToken
     // time so both sources of flag intent reach the AST.
     ByteOffset start = 0;
+    // True for every emission read from the IMPLIED tail (`endOfInputImplies`)
+    // and for no other: set at the top of each scan iteration from whether any
+    // byte of the buffer is left. Such a token has no bytes in the buffer — its
+    // span is zero-width at the end — so it says so (`NodeFlags::Implied`), and
+    // the builder spells it by the declared lexeme instead of guessing from its
+    // position.
+    bool impliedEmission = false;
     auto emit = [&](CoreTokenKind ck, SchemaTokenId sk,
                     NodeFlags flagsApplied = NodeFlags::None) {
         tokens.push_back(Token{
             .coreKind   = ck,
-            .flags      = flagsApplied,
+            .flags      = impliedEmission ? (flagsApplied | NodeFlags::Implied)
+                                          : flagsApplied,
             .schemaKind = sk,
             .span       = SourceSpan::of(start, static_cast<ByteOffset>(r.position())),
         });
+    };
+
+    // An UNTERMINATED body, reported at its OPENER. The ONE site both ends of a
+    // body's life use — the new-line a single-line style does not allow (below,
+    // in the body branch) and the end of the source (the sweep after the loop) —
+    // so the two cannot disagree about the code, the flavour or the position.
+    // The flavour is the mode's schema-declared `unterminatedFlavor`, never a
+    // guess from its name.
+    auto reportUnterminated = [&](Frame const& f, ByteOffset end, std::string actual) {
+        const auto& mode = schema_->lexerMode(f.mode);
+        ParseDiagnostic d;
+        switch (mode.unterminatedFlavor) {
+            case UnterminatedFlavor::Comment:
+                d.code = DiagnosticCode::P_UnterminatedComment;
+                break;
+            case UnterminatedFlavor::String:
+            case UnterminatedFlavor::Generic:
+                d.code = DiagnosticCode::P_UnterminatedString;
+                break;
+        }
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = source_->id();
+        d.span     = SourceSpan::of(f.openerStart, end);
+        d.actual   = std::move(actual);
+        reporter_->report(std::move(d));
+    };
+
+    // ── THE END OF INPUT, AND WHAT IT DOES TO EACH FRAME LEFT UNCLOSED THERE ──
+    //
+    // ⓘ HISTORY, in a sentence of its own: a C `//` comment and a gas `/*`
+    // comment at the end of the input were refused until P68 round 8 made the
+    // verdict the mode's declared policy
+    // (D-C-LINE-COMMENT-AT-END-OF-FILE-REFUSED,
+    // D-ASM-UNTERMINATED-BLOCK-COMMENT-AT-END-OF-FILE-REFUSED).
+    //
+    // The verdict is the mode's declared `atEndOfInput` policy and nothing else
+    // — no mode name, no flavour sniffing, no second rule for a line-scoped mode
+    // (a `popAtNewline` mode's policy is `closes` by construction, derived by
+    // `LexerMode::make`, so the special case this sweep used to carry for it is
+    // the same verdict read from the one place that states it):
+    //   • `unterminated` — refused at the opener (`reportUnterminated`);
+    //   • `closes`       — closed silently: a C `//` comment on the last line
+    //                      (gcc, clang, MSVC and mingw all accept one);
+    //   • `closesWithWarning` — closed, and said so at the OPENER, spanning to
+    //                      the end of the input: gas's "end of file in comment",
+    //                      because a missing `*/` silently swallowing the rest
+    //                      of a file must not be silent.
+    // The flavour word in the warning is the mode's `unterminatedAs`.
+    auto reportClosedByEndOfInput = [&](Frame const& f, ByteOffset end) {
+        const auto& mode = schema_->lexerMode(f.mode);
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::P_ClosedByEndOfInput;
+        d.severity = DiagnosticSeverity::Warning;
+        d.buffer   = source_->id();
+        d.span     = SourceSpan::of(f.openerStart, end);
+        d.actual   = std::format(
+            "the input ends inside this {} body, which never closes — the end of "
+            "input closes it (lexer mode '{}' declares `atEndOfInput: "
+            "closesWithWarning`); everything after the opener is part of it",
+            unterminatedFlavorName(mode.unterminatedFlavor), mode.name);
+        reporter_->report(std::move(d));
+    };
+    // ★★ THE END OF INPUT IS THE END OF THE **BUFFER**, and the sweep runs
+    // there — before an implied tail (`endOfInputImplies`) is lexed, not after.
+    // gas's order, ✔MEASURED 2026-09-23 on GNU as 2.42: `ret /* never closed`
+    // with no newline assembles the `ret` — the comment runs to the end of the
+    // file, closes there, and only THEN is the newline inserted that ends the
+    // `ret` line. Swept after the tail instead, the comment would have
+    // swallowed the implied line end and the `ret` line would have none.
+    auto sweepAtEndOfInput = [&] {
+        ByteOffset const end = static_cast<ByteOffset>(r.size());
+        while (frames.size() > 1) {
+            Frame const&      f    = frames.back();
+            const auto&       mode = schema_->lexerMode(f.mode);
+            switch (mode.atEndOfInput) {
+                case EndOfInputPolicy::Closes:
+                    break;
+                case EndOfInputPolicy::ClosesWithWarning:
+                    reportClosedByEndOfInput(f, end);
+                    break;
+                case EndOfInputPolicy::Unterminated:
+                    // Reported at the OPENER, spanning to the end of the source
+                    // — the literal (or comment) the author left open, not the
+                    // empty position the scan ran out at. The same site and
+                    // flavour rule as the unterminated-at-a-new-line report.
+                    reportUnterminated(f, end,
+                                       std::format("EOF inside lexer mode '{}'",
+                                                   mode.name));
+                    break;
+            }
+            frames.pop_back();
+        }
+    };
+
+    // ── A NEW-LINE THE STYLE DOES NOT ALLOW ENDS THE BODY, UNTERMINATED ──────
+    //
+    // [[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]]. `stringStyle.multiline`
+    // is documented (docs/language-config-spec.md) as "whether newlines are
+    // allowed in the body", default FALSE — and until this, nothing read it: every
+    // body ran to its closing delimiter across any number of lines. ✔MEASURED, a
+    // lone `'` in C prose (`#error V's missing`) opened a character constant that
+    // ran to the NEXT apostrophe lines later, swallowing every directive between
+    // them — a program gcc, clang and MSVC refuse on its `#error` compiled, ran
+    // and exited 0. C23 6.4.4.4, 6.4.5 and 6.4.7 all exclude new-line from a
+    // character constant, a string literal and a header name.
+    //
+    // So a body whose style is not `multiline` ENDS at the first new-line its
+    // escape rule did not consume: the body token is emitted, NO closer (there is
+    // none in the source), the frame pops, and the new-line is LEFT for the main
+    // scan — so a line-scoped mode under it still pops and a directive on the
+    // next line is still first-on-line. An ESCAPED new-line is the escape rule's
+    // (a continuation), which is why this test runs after it.
+    auto endsUnterminatedAtNewline = [&](StringStyle const* style) {
+        return style != nullptr && !style->multiline && r.peek() == '\n';
+    };
+    auto unterminatedAtLineMessage = [&](Frame const& f) {
+        return std::format(
+            "missing terminating {} before the end of the line — lexer mode '{}' "
+            "does not allow a new-line in its body (its stringStyle is not "
+            "`multiline`), so the literal ends here, unterminated, and nothing "
+            "on a later line is part of it",
+            f.style != nullptr ? f.style->endsAt : std::string{"delimiter"},
+            schema_->lexerMode(f.mode).name);
     };
 
     // Tokenizer-local cache of compiled tagPattern regexes, keyed by
@@ -999,7 +1129,9 @@ TokenizeResult Tokenizer::tokenize() && {
                         }
                     }
                     std::cmatch match;
-                    const auto remaining = r.remaining();
+                    // The tag is text the author WROTE, so the buffer's bytes
+                    // only — never an implied tail.
+                    const auto remaining = r.remainingInBuffer();
                     if (std::regex_search(remaining.data(),
                                           remaining.data() + remaining.size(),
                                           match, it->second,
@@ -1008,10 +1140,13 @@ TokenizeResult Tokenizer::tokenize() && {
                         r.advance(static_cast<std::size_t>(match[0].length()));
                     }
                 }
+                // `start` is still the OPENER's first byte: the opener token was
+                // emitted with it just before this side effect runs.
                 frames.push_back(Frame{
                     .mode          = m.modeArg,
                     .style         = style,
                     .dynamicSuffix = std::move(captured),
+                    .openerStart   = start,
                 });
                 break;
             }
@@ -1047,6 +1182,7 @@ TokenizeResult Tokenizer::tokenize() && {
                     .mode          = m.modeArg,
                     .style         = style,
                     .dynamicSuffix = {},
+                    .openerStart   = start,
                 };
                 break;
             }
@@ -1055,7 +1191,7 @@ TokenizeResult Tokenizer::tokenize() && {
 
     // UTF-8 BOM at the start of the source: skip silently. Some
     // editors / git templates prepend it; treating it as an identifier
-    // (`isIdStart` previously accepted any byte ≥ 0x80) would leak
+    // (the start rule once accepted any byte ≥ 0x80) would leak
     // three garbage bytes into the first identifier of the file.
     //
     // A stray BOM AFTER position 0 cannot be distinguished from a
@@ -1076,7 +1212,17 @@ TokenizeResult Tokenizer::tokenize() && {
         r.advance(3);
     }
 
+    bool sweptAtBufferEnd = false;
     while (!r.isAtEnd()) {
+        // The buffer is exhausted and only an IMPLIED tail remains: this is the
+        // end of the input for every body left unclosed — take each one's verdict
+        // now, so the tail is lexed in the frame beneath (see
+        // `sweepAtEndOfInput`). Once: the tail never reopens the question.
+        if (!sweptAtBufferEnd && r.atBufferEnd()) {
+            sweepAtEndOfInput();
+            sweptAtBufferEnd = true;
+        }
+        impliedEmission = r.atBufferEnd();
         start = static_cast<ByteOffset>(r.position());
 
         // Body-mode branch — when the current mode declares a
@@ -1112,13 +1258,17 @@ TokenizeResult Tokenizer::tokenize() && {
                     tokenizerFatal("StringStyle escapeKind=Char with escapeChar=0 — schema bug");
                 }
                 bool sawClose = false;
+                bool endedAtNewline = false;
                 std::size_t closeLen = 0;
-                while (!r.isAtEnd()) {
+                // `atBufferEnd`, not `isAtEnd`: a body never reads into an
+                // implied tail — that line end is the language's, not text
+                // inside this literal (SourceReader's banner).
+                while (!r.atBufferEnd()) {
                     // doubled-delimiter escape: `''` is a literal delimiter, part of the body
                     if (style->escapeKind == EscapeKind::DoubledDelimiter
-                        && r.remaining().size() >= 2 * style->endsAt.size()
-                        && r.remaining().substr(0, style->endsAt.size()) == style->endsAt
-                        && r.remaining().substr(style->endsAt.size(), style->endsAt.size()) == style->endsAt) {
+                        && r.remainingInBuffer().size() >= 2 * style->endsAt.size()
+                        && r.remainingInBuffer().substr(0, style->endsAt.size()) == style->endsAt
+                        && r.remainingInBuffer().substr(style->endsAt.size(), style->endsAt.size()) == style->endsAt) {
                         r.advance(2 * style->endsAt.size());
                         continue;
                     }
@@ -1135,7 +1285,9 @@ TokenizeResult Tokenizer::tokenize() && {
                         && static_cast<unsigned char>(r.peek())
                                == static_cast<unsigned char>(style->escapeChar)) {
                         r.advance(1);
-                        if (r.isAtEnd()) {
+                        // An escape lead as the LAST byte the author wrote
+                        // escapes nothing: an implied tail is never its operand.
+                        if (r.atBufferEnd()) {
                             ParseDiagnostic d;
                             d.code     = DiagnosticCode::P_InvalidEscape;
                             d.severity = DiagnosticSeverity::Error;
@@ -1148,11 +1300,31 @@ TokenizeResult Tokenizer::tokenize() && {
                         r.advance(codepointByteCount(r.peek()));
                         continue;
                     }
+                    // a new-line this style does not allow: the body ends here,
+                    // unterminated (see `endsUnterminatedAtNewline`)
+                    if (endsUnterminatedAtNewline(style)) {
+                        endedAtNewline = true;
+                        break;
+                    }
                     // ordinary body codepoint
                     r.advance(codepointByteCount(r.peek()));
                 }
                 // One token for the whole body (possibly empty, e.g. `""`).
                 emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
+                if (endedAtNewline) {
+                    // No closer: there is none in the source to give a span to.
+                    // The frame pops HERE and the new-line stays in the stream,
+                    // so the rest of the file lexes exactly as if this literal
+                    // had been closed at the end of its line.
+                    reportUnterminated(topFrame, static_cast<ByteOffset>(r.position()),
+                                       unterminatedAtLineMessage(topFrame));
+                    if (frames.size() <= 1) {
+                        tokenizerFatal("frame stack underflow at an unterminated "
+                                       "single-line body");
+                    }
+                    frames.pop_back();
+                    continue;
+                }
                 if (sawClose) {
                     // c22 (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): an `endsAtExclusive`
                     // style leaves the close delimiter in the stream to be re-lexed
@@ -1236,9 +1408,9 @@ TokenizeResult Tokenizer::tokenize() && {
                 // 1. Doubled-delimiter escape: `''` inside a SQL
                 //    string is a literal `'`, NOT the end of the body.
                 if (style->escapeKind == EscapeKind::DoubledDelimiter
-                    && r.remaining().size() >= 2 * style->endsAt.size()
-                    && r.remaining().substr(0, style->endsAt.size()) == style->endsAt
-                    && r.remaining().substr(style->endsAt.size(), style->endsAt.size()) == style->endsAt) {
+                    && r.remainingInBuffer().size() >= 2 * style->endsAt.size()
+                    && r.remainingInBuffer().substr(0, style->endsAt.size()) == style->endsAt
+                    && r.remainingInBuffer().substr(style->endsAt.size(), style->endsAt.size()) == style->endsAt) {
                     r.advance(2 * style->endsAt.size());
                     emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
                     continue;
@@ -1284,7 +1456,9 @@ TokenizeResult Tokenizer::tokenize() && {
                 if (style->escapeKind == EscapeKind::Char
                     && static_cast<unsigned char>(r.peek()) == static_cast<unsigned char>(style->escapeChar)) {
                     r.advance(1);
-                    if (r.isAtEnd()) {
+                    // As in the coalesced path: an implied tail is never the
+                    // escaped codepoint.
+                    if (r.atBufferEnd()) {
                         ParseDiagnostic d;
                         d.code     = DiagnosticCode::P_InvalidEscape;
                         d.severity = DiagnosticSeverity::Error;
@@ -1296,6 +1470,21 @@ TokenizeResult Tokenizer::tokenize() && {
                         r.advance(codepointByteCount(r.peek()));
                     }
                     emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
+                    continue;
+                }
+
+                // 3b. A new-line this style does not allow: the SAME rule as the
+                //     coalesced path above — report at the opener, pop, and leave
+                //     the new-line to the main scan. A style whose `endsAt` IS the
+                //     new-line (a line comment) already closed at step 2.
+                if (endsUnterminatedAtNewline(style)) {
+                    reportUnterminated(topFrame, static_cast<ByteOffset>(r.position()),
+                                       unterminatedAtLineMessage(topFrame));
+                    if (frames.size() <= 1) {
+                        tokenizerFatal("frame stack underflow at an unterminated "
+                                       "single-line body");
+                    }
+                    frames.pop_back();
                     continue;
                 }
             }
@@ -1372,7 +1561,7 @@ TokenizeResult Tokenizer::tokenize() && {
         // 4.87M identifiers each paid that second scan, and the FIRST probe's
         // extends-past-the-run arm — the only thing the split bought — fired
         // exactly 10 times in the whole corpus.
-        if (isIdStart(c)) {
+        if (identClass.startsIdentifier(c)) {
             std::size_t identLen = 1;
             while (identClass.continuesIdentifier(r.peek(identLen))) ++identLen;
 
@@ -1478,7 +1667,8 @@ TokenizeResult Tokenizer::tokenize() && {
         // Tokenization continues so a single bad byte doesn't truncate
         // the rest of the stream. Bare UTF-8 continuation bytes
         // (0x80-0xBF — only valid as the tail of a multi-byte sequence)
-        // also land here because `isIdStart` rejects them.
+        // also land here because `IdentifierClass::startsIdentifier`
+        // rejects them.
         r.advance(1);
         emit(CoreTokenKind::Error, errorKind);
 
@@ -1492,51 +1682,25 @@ TokenizeResult Tokenizer::tokenize() && {
         reporter_->report(std::move(d));
     }
 
-    // Unterminated body modes: source ended before the active body's
-    // endsAt was matched. Emit one diagnostic per unterminated frame,
-    // EXCLUDING the bottom frame at frames[0] — `main` for a whole file, the
-    // caller's `initialMode` for a fragment. ★ THAT EXCLUSION IS WHY an
-    // embedded template's mode is seeded at frame 0 rather than pushed: a
-    // pushed one would be swept here and every well-formed fragment would
-    // report "EOF inside lexer mode 'asm-template'". The diagnostic
-    // flavor comes from the schema-declared `unterminatedFlavor` on
-    // the mode — no more substring-sniffing the mode name. Generic
-    // falls back to P_UnterminatedString since that's the closest
-    // single-code match.
-    while (frames.size() > 1) {
-        const auto& mode = schema_->lexerMode(frames.back().mode);
-        // A line-scoped (`popAtNewline`) mode that reaches EOF without a
-        // trailing newline is NOT unterminated — EOF is a valid end of
-        // the last line (a file ending in `#include "x.h"` with no final
-        // newline is well-formed C). Close it silently, like the newline
-        // pop would have.
-        if (mode.popAtNewline) {
-            frames.pop_back();
-            continue;
-        }
-        ParseDiagnostic d;
-        switch (mode.unterminatedFlavor) {
-            case UnterminatedFlavor::Comment:
-                d.code = DiagnosticCode::P_UnterminatedComment;
-                break;
-            case UnterminatedFlavor::String:
-            case UnterminatedFlavor::Generic:
-                d.code = DiagnosticCode::P_UnterminatedString;
-                break;
-        }
-        d.severity = DiagnosticSeverity::Error;
-        d.buffer   = source_->id();
-        d.span     = SourceSpan::of(static_cast<ByteOffset>(r.size()),
-                                    static_cast<ByteOffset>(r.size()));
-        d.actual   = std::format("EOF inside lexer mode '{}'", mode.name);
-        reporter_->report(std::move(d));
-        frames.pop_back();
-    }
+    // Body modes left unclosed where the source ended: each gets its mode's
+    // declared `atEndOfInput` verdict (`sweepAtEndOfInput`), EXCLUDING the
+    // bottom frame at frames[0] — `main` for a whole file, the caller's
+    // `initialMode` for a fragment. ★ THAT EXCLUSION IS WHY an embedded
+    // template's mode is seeded at frame 0 rather than pushed: a pushed one
+    // would be swept here and every well-formed fragment would report "EOF
+    // inside lexer mode 'asm-template'". A line-scoped (`popAtNewline`) mode
+    // closes silently — a file ending in `#include "x.h"` with no final newline
+    // is well-formed C — and that is now its declared policy (`closes`, by
+    // construction) rather than a rule of its own here. ⓘ When the reader had
+    // an implied tail, this sweep already ran at the end of the BUFFER and
+    // finds only what the tail itself opened (nothing, for a line end).
+    sweepAtEndOfInput();
 
     // Trailing Eof: span is zero-width at end-of-buffer. TokenStream's contract
     // requires this final entry; peek() past it keeps returning the
     // same Eof so parsers don't need an isAtEnd() guard at every step.
     start = static_cast<ByteOffset>(r.size());
+    impliedEmission = false;   // Eof is the end itself, never the implied lexeme
     emit(CoreTokenKind::Eof, eofKind);
 
     return TokenizeResult{

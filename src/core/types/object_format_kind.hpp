@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>    // selectableObjectFormat's refusal (stderr)
+#include <cstdlib>   // selectableObjectFormat's refusal (abort)
 #include <optional>
 #include <string>
 #include <string_view>
@@ -128,6 +130,76 @@ objectFormatKindFromName(std::string_view s) noexcept {
 [[nodiscard]] constexpr bool
 isSelectableObjectFormatKind(ObjectFormatKind k) noexcept {
     return k != ObjectFormatKind::Unknown;
+}
+
+// ★★ "NO FORMAT" HAS ONE SPELLING — D-HIR-RESOLVE-ELEMENT-CORE-UNKNOWN-AS-KEY.
+//
+// A parameter typed `std::optional<ObjectFormatKind>` can say "I have no format"
+// TWO ways: `nullopt`, and an ENGAGED `Unknown` — an ordinary enumerator the
+// optional cannot tell from a real format. ✔MEASURED (P68 round 8): one
+// `dss::analyze` handed the engaged sentinel read it BOTH ways at once — the
+// literal-prefix resolver as "no format" (`L"a"` fell to the base `i32`), the
+// shipped-header availability gate as a real format on which nothing restricted
+// exists (`#include <windows.h>` refused as unavailable "for this target").
+// Checking for the sentinel inside every such function is the REJECTED posture;
+// this type is the UNREPRESENTABLE one.
+//
+// `SelectableObjectFormatKind` is a kind that CANNOT be `Unknown`. Its one
+// constructor is private and `of()` is the only door: it answers `nullopt` for
+// the sentinel, so the caller decides what that means where it holds the value.
+// There is NO conversion from `ObjectFormatKind`, implicit or explicit, so a
+// function taking `std::optional<SelectableObjectFormatKind>` has exactly one
+// spelling of "no format" (`nullopt`) — and handing it `ObjectFormatKind::Unknown`,
+// or a `std::optional<ObjectFormatKind>`, does not compile.
+class SelectableObjectFormatKind {
+public:
+    [[nodiscard]] static constexpr std::optional<SelectableObjectFormatKind>
+    of(ObjectFormatKind k) noexcept {
+        if (!isSelectableObjectFormatKind(k)) return std::nullopt;
+        return SelectableObjectFormatKind{k};
+    }
+    [[nodiscard]] constexpr ObjectFormatKind kind() const noexcept { return kind_; }
+    friend constexpr bool operator==(SelectableObjectFormatKind,
+                                     SelectableObjectFormatKind) noexcept = default;
+
+private:
+    constexpr explicit SelectableObjectFormatKind(ObjectFormatKind k) noexcept
+        : kind_{k} {}
+    ObjectFormatKind kind_;
+};
+
+// The ONE bridge from a value that still admits the sentinel — a value typed
+// `std::optional<ObjectFormatKind>`, like the preprocessor's or a shipped
+// descriptor reader's `activeFormat` — into the one-spelling contract: `nullopt`
+// stays `nullopt` and a real kind is carried.
+// An ENGAGED `Unknown` is a CALLER's bug, refused rather than folded into "no
+// format" (folding it is exactly the second spelling this type removes), the way
+// this codebase refuses a caller-contract violation: a message on stderr and an
+// abort on the caller's own thread (`dss::analyze`'s role-resolver mismatch,
+// `UnitBuilder::setActiveFormat`'s sentinel).
+[[nodiscard]] inline std::optional<SelectableObjectFormatKind>
+selectableObjectFormat(std::optional<ObjectFormatKind> k) noexcept {
+    if (!k.has_value()) return std::nullopt;
+    auto selectable = SelectableObjectFormatKind::of(*k);
+    if (!selectable.has_value()) {
+        std::fputs("dss fatal: an engaged ObjectFormatKind::Unknown reached a "
+                   "format-keyed lookup -- the invalid sentinel names no object "
+                   "format, and \"no format\" is spelled nullopt\n",
+                   stderr);
+        std::abort();
+    }
+    return selectable;
+}
+
+// The bridge the OTHER way, for a consumer still typed
+// `std::optional<ObjectFormatKind>` (the shipped-descriptor readers `dss::analyze`
+// hands its active format to). Total and silent, because nothing here can go
+// wrong: a selectable kind is carried as its kind, "no format" stays `nullopt`,
+// and the result can never hold the sentinel because the input cannot.
+[[nodiscard]] constexpr std::optional<ObjectFormatKind>
+objectFormatKindOf(std::optional<SelectableObjectFormatKind> k) noexcept {
+    if (!k.has_value()) return std::nullopt;
+    return k->kind();
 }
 
 // The reserved SPELLING of the invalid sentinel, as it appears in a config
@@ -376,7 +448,7 @@ inline constexpr std::string_view kCCallingConventionNone = "none";
 // The format's C calling-convention block (`"cCallingConvention"` in
 // `.format.json`). A BLOCK carrying one `convention` verb rather than a bare
 // scalar, for `cSymbolDecoration`'s stated reason: a future per-format ABI
-// parameter (a layout-quirk selector, say — D-FF3-1) gains a sibling key
+// parameter (a layout-quirk selector, say — D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS) gains a sibling key
 // INSIDE this block instead of a second root key. REQUIRED on every format —
 // see `ObjectFormatData::validate()` for why the rule is unconditional.
 struct DSS_EXPORT CCallingConvention {
@@ -828,8 +900,7 @@ librarySynthVehicleFromName(std::string_view s) noexcept {
 // ★ The pe table pointing `cLibrary` and `unwindPersonality` at the SAME image
 // is therefore FINE: the table PERMITS sameness without ASSERTING it. That is
 // the whole difference from a single string, and it is what stops the value
-// from having to be re-cut every time a new configuration arrives
-// (`D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT`).
+// from having to be re-cut every time a new configuration arrives.
 //
 // ROLE IS A CLOSED ENUM, deliberately: every per-format BEHAVIORAL rule in this
 // schema family already is one, and free-form strings stay reserved for names
@@ -1584,13 +1655,20 @@ struct DSS_EXPORT WeakDefinition {
 // linker-synthesized PLT/stub which performs the indirection itself;
 // the LIR opcode is the universal `call`.
 //
-// Three independent consumers select the call shape from this rule:
+// The consumers that select or check the call shape by this rule:
 //   * `mir_to_lir.cpp::lowerCall`     — user-level extern calls (FFI).
 //   * `entry_trampoline.cpp`          — the synthesized `_exit` /
 //                                       `ExitProcess` ByNameImport call.
-//   * `linker.cpp::mergeModules`      — the cross-CU merge's slot-vs-
-//                                       direct-bind decision (c154).
-// All call THIS function so the rule lives exactly once (no `if(arch)`,
+//   * `macho.cpp`                     — the Mach-O walker's refusal of an
+//                                       indirect-shaped dispatch its
+//                                       `__stubs` cannot serve.
+// ⚠ `linker.cpp::mergeModules` WAS LISTED HERE (c154) AND NO LONGER ASKS THIS
+// (P68 round 9, D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT): the
+// merge's slot-vs-direct-bind decision reads the referencing import row's
+// `ExternImport::readThroughSlot` — the answer MIR→LIR stamped when it chose
+// the shape — because a call's dispatch answers for FUNCTION calls only, and
+// a DATA import read through a got-indirect slot was bound to the object.
+// Each calls THIS function so the rule lives exactly once (no `if(arch)`,
 // no second copy that could drift to the opposite — and opposite is a
 // SIGSEGV: dereferencing a PLT stub's code as a pointer). Keyed on the
 // OBJECT FORMAT's dispatch model, never the CPU target.

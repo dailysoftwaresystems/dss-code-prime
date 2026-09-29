@@ -99,7 +99,11 @@ struct DecodedModuleBody {
 };
 
 // Encode one module. `symbolNames` is indexed by `SymbolId.v` (slot 0 unused) —
-// the same table `MirTextContext` takes and `parseMir` hands back.
+// the DENSE table `MirTextContext::symbolNames` takes, the compiler's own. The
+// decode side hands back the SPARSE form (`DecodedModuleBody::parsed->
+// symbolNames`, one entry per symbol the body declares): a body's symbol ids are
+// the raw ids of its CU, and a table sized by the largest would cost that number,
+// not the body (P68, lane `ht`, part 1c).
 //
 // `moduleDigest` and `targetIdentity` are OPAQUE strings the caller supplies,
 // on the same terms `ModuleSummary` takes them: this is a MIR-tier leaf and must

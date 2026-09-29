@@ -1,0 +1,25 @@
+{
+  "$comment": "★★ A FOREIGN MEMBER THAT NAMES A LIBRARY DATUM DIRECTLY IS REFUSED BY NAME (P68 round 11, lane `xa`). The committed archive is gcc's DEFAULT x86_64 build of a member that reads libc's `stdout` (source and flags in main.c): its code reaches `stdout` through two R_X86_64_PC32, assuming the final link makes a COPY relocation. ✔MEASURED 2026-09-24: gcc -no-pie and -pie link this main.c with the archive and run it to 42. DSS makes no copy relocation — it binds library data through a loader-filled slot — and before this refusal every image writer bound the member's references to that slot: the member read the slot instead of the datum, and the program exited 2 (debug and release, exec and PIE). The link now refuses the reference by name, `K_ImportReferenceUnbindable`, as it refuses the same shape in a `.s` (examples/asm/asm_x86_64_address_of_a_library_datum_refused). The GOT lowering that landed with this refusal is what made this reachable from far more members: a default-built member that also takes a function's address through REX_GOTPCRELX used to be refused at read. The twin that links is examples/c/foreign_got_member_reads_a_library_datum (the same source, -fPIC). NO `optimizedPipelines` ARM: a refusal builds no artifact for an optimized arm to differ from, and both runners refuse the pair.",
+  "language": "c",
+  "source": "main.c",
+  "expectDiagnostics": [
+    {
+      "code": "K_ImportReferenceUnbindable",
+      "line": 0,
+      "col": 0,
+      "positioned": false
+    }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "prebuiltLibraries": [
+        {
+          "$comment": "gcc 13.3.0 `-O2 -c` (default PIE codegen) of the member quoted in main.c + GNU ar `rcsD`: two R_X86_64_PC32 against `stdout`. The witness is the member's own definition.",
+          "path": "tests/link/data/libforeign_library_datum_direct_x86_64_elf.a",
+          "containerWitness": "member_stdout"
+        }
+      ]
+    }
+  ]
+}

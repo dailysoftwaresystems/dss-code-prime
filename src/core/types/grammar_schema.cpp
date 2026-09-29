@@ -806,6 +806,10 @@ std::span<SchemaTokenId const> GrammarSchema::syncTokens() const noexcept {
     return d_.syncTokens;
 }
 
+std::string_view GrammarSchema::endOfInputImplies() const noexcept {
+    return d_.endOfInputImplies;
+}
+
 std::span<TypeExtensionDescriptor const> GrammarSchema::typeExtensions() const noexcept {
     return d_.typeExtensions;
 }

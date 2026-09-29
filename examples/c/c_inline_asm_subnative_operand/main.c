@@ -61,8 +61,7 @@
  * tests the 1-byte slot; the 16-bit immediate's own byte-exact pins live in
  * `tests/asm/test_asm_x86_width_and_direction.cpp`.
  * ⇒ A CROSS-LANE CITATION OF AN OPEN ROW IS A CLAIM WITH AN EXPIRY DATE, AND
- * THE FOLD IS WHEN IT EXPIRES
- * (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+ * THE FOLD IS WHEN IT EXPIRES.
  *
  * ⚠ THE `volatile` SEEDS ARE LOAD-BEARING: without them the release pipeline
  * folds the values to constants before lowering and silently changes which

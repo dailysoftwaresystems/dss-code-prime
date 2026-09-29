@@ -741,8 +741,8 @@ int main() {
 ` },
   // Self-referential struct (a struct with a pointer to its own type) —
   // sqlite3.c: `struct sqlite3 { sqlite3 *pBlockingConnection; ... };` and
-  // every linked-list/tree node. Closed by c24 (nominal composite typing,
-  // D-CSUBSET-SELF-REFERENTIAL-STRUCT); this probe captures that win so the
+  // every linked-list/tree node. Closed by c24 (nominal composite typing);
+  // this probe captures that win so the
   // battery stops being blind to it.
   { id: 'agg_self_referential_struct', cat: 'aggregates', expect: 42, src:
 `struct Node { int v; struct Node* next; };

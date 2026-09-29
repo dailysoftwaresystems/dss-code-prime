@@ -12,10 +12,14 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <bit>
+#include <cstdint>
 #include <format>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 using namespace dss;
@@ -43,7 +47,7 @@ RoundTripResult roundTrip(Mir const& mir, TypeInterner const& interner,
     MirTextContext ctx{&interner, &names};
     std::string first = emitMir(mir, ctx, r1);
     auto parsed = parseMir(first, CompilationUnitId{1}, r2);
-    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    MirTextContext ctx2{&parsed->interner, nullptr, &parsed->symbolNames};
     std::string second = emitMir(parsed->mir, ctx2, r3);
     return {std::move(first), std::move(second), parsed->ok};
 }
@@ -56,7 +60,7 @@ TEST(MirText, EmptyModuleRoundTrips) {
     DiagnosticReporter r;
     MirTextContext ctx{&ti};
     std::string out = emitMir(m, ctx, r);
-    EXPECT_NE(out.find("dssir 1"), std::string::npos);
+    EXPECT_NE(out.find("dssir 3"), std::string::npos);
     EXPECT_NE(out.find("module {"), std::string::npos);
 }
 
@@ -156,6 +160,111 @@ TEST(MirText, GlobalWithLiteralInitRoundTrips) {
     EXPECT_NE(rt.firstEmit.find("lit int 42"), std::string::npos);
 }
 
+// ── P68 round 8 (lane `ht`, part 1d): VALUES THE WRITER WROTE AND THE READER COULD NOT READ BACK ──
+//
+// ✔MEASURED by round-tripping the MIR of every module the examples corpus lowers (emit, parse with verify-on-load,
+// re-emit, compare): outside the declared inline-asm limitation, every module that did not read back failed for one
+// of these four — each a value this writer spells and this reader refused. Each pin round-trips the value and reads
+// its meaning back off the rebuilt module, because a byte-identical re-emission alone cannot see a value both
+// directions lose the same way.
+
+// A variadic signature: the writer never spelled the flag (the HIR tier has since c14), so it came back
+// NON-variadic — a different TypeId — and verify-on-load refused every call passing a variadic tail. 57 corpus
+// modules (`printf` and its kin) failed on that alone.
+TEST(MirText, AVariadicSignatureRoundTripsAndItsCallVerifiesOnLoad) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const voidTy = ti.primitive(TypeKind::Void);
+    TypeId const pChar = ti.pointer(ti.primitive(TypeKind::Char));
+    std::array<TypeId, 1> const fixed{pChar};
+    TypeId const printfSig = ti.fnSig(fixed, i32, CallConv::CcSysV, /*isVariadic=*/true);
+    TypeId const bareSig = ti.fnSig(std::span<TypeId const>{}, voidTy, CallConv::CcSysV, /*isVariadic=*/true);
+    TypeId const callerSig = ti.fnSig(std::span<TypeId const>{}, voidTy, CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const fmt = b.addInst(MirOpcode::Alloca, {}, pChar, /*bytes=*/8);
+    MirInstId const n = b.addConst(intLit(7), i32);
+    std::array<MirInstId, 4> const printfOps{b.addGlobalAddr(SymbolId{2}, ti.pointer(printfSig)), fmt, n, n};
+    b.addInst(MirOpcode::Call, printfOps, i32);
+    std::array<MirInstId, 2> const bareOps{b.addGlobalAddr(SymbolId{3}, ti.pointer(bareSig)), n};
+    b.addInst(MirOpcode::Call, bareOps, voidTy);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+    std::vector<std::string> names{"", "main", "printf", "bare"};
+    auto rt = roundTrip(m, ti, names);
+    EXPECT_TRUE(rt.parseOk) << "a call passing a variadic tail must verify on load:\n" << rt.firstEmit;
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+    EXPECT_NE(rt.firstEmit.find("fn(ptr<char>, ...) -> i32"), std::string::npos) << rt.firstEmit;
+    EXPECT_NE(rt.firstEmit.find("fn(...) -> void"), std::string::npos) << rt.firstEmit;
+}
+
+// A `_Complex` constant: its core had no row in the literal-core table, so the writer refused it (`?`).
+// `complex_static_image` and `complex_long_double_static_image` failed on it.
+TEST(MirText, AComplexLiteralCoreRoundTrips) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const f64 = ti.primitive(TypeKind::F64);
+    MirLiteralValue re;
+    re.value = 1.5;
+    re.core  = TypeKind::F64;
+    MirLiteralValue im = re;
+    im.value = -2.25;
+    MirAggregateValue parts;
+    parts.fields = {re, im};
+    MirLiteralValue z;
+    z.value = parts;
+    z.core  = TypeKind::Complex;
+    MirBuilder b;
+    std::uint32_t const litIdx = b.literalPoolAdd(z);
+    b.addGlobal(ti.complex(f64), SymbolId{1}, litIdx, MirFuncId{}, SymbolBinding::Global,
+                SymbolVisibility::Default, /*isConst=*/false, MirThreadStorage::Shared);
+    Mir m = std::move(b).finish();
+    std::vector<std::string> names{"", "z"};
+    DiagnosticReporter r;
+    MirTextContext const ctx{&ti, &names};
+    std::string const text = emitMir(m, ctx, r);
+    EXPECT_EQ(r.errorCount(), 0u) << text;
+    EXPECT_NE(text.find(": complex"), std::string::npos) << text;
+    auto rt = roundTrip(m, ti, names);
+    ASSERT_TRUE(rt.parseOk) << rt.firstEmit;
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+}
+
+// `-inf` (what `std::format` writes for a negative infinity) lexed as a bare `-`, and a SUBNORMAL double was
+// refused because strtod reports ERANGE for an underflow it still returns exactly. `float_literal_overflow_infinity`
+// and `subnormal_double_literal_decode` failed on them. Read back, the values must be the SAME doubles.
+TEST(MirText, ANegativeInfinityAndASubnormalDoubleReadBackAsTheSameDoubles) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const f64 = ti.primitive(TypeKind::F64);
+    double const values[] = {-std::numeric_limits<double>::infinity(),
+                             std::numeric_limits<double>::infinity(),
+                             2.225073858507201e-308,           // the largest subnormal
+                             std::numeric_limits<double>::denorm_min()};
+    MirBuilder b;
+    std::uint32_t sym = 1;
+    for (double const v : values) {
+        MirLiteralValue lit;
+        lit.value = v;
+        lit.core  = TypeKind::F64;
+        b.addGlobal(f64, SymbolId{sym++}, b.literalPoolAdd(lit), MirFuncId{}, SymbolBinding::Global,
+                    SymbolVisibility::Default, /*isConst=*/false, MirThreadStorage::Shared);
+    }
+    Mir m = std::move(b).finish();
+    std::vector<std::string> names{"", "a", "b", "c", "d"};
+    auto rt = roundTrip(m, ti, names);
+    ASSERT_TRUE(rt.parseOk) << rt.firstEmit;
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+    DiagnosticReporter r;
+    auto const parsed = parseMir(rt.firstEmit, CompilationUnitId{2}, r);
+    ASSERT_TRUE(parsed->ok);
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        MirGlobalId const g = parsed->mir.globalAt(i);
+        double const back = std::get<double>(parsed->mir.literalValue(parsed->mir.globalInitLiteralIndex(g)).value);
+        EXPECT_EQ(std::bit_cast<std::uint64_t>(back), std::bit_cast<std::uint64_t>(values[i])) << "global " << i;
+    }
+}
+
 TEST(MirText, MissingVersionEmitsVersionMismatch) {
     DiagnosticReporter r;
     auto res = parseMir("dssir 999\nmodule { }\n", CompilationUnitId{1}, r);
@@ -180,7 +289,7 @@ TEST(MirText, MalformedHeaderEmitsMalformedDiagnostic) {
 
 TEST(MirText, EmptyModuleParseRoundTripsToEmpty) {
     DiagnosticReporter r;
-    auto res = parseMir("dssir 1\nmodule { }\n", CompilationUnitId{1}, r);
+    auto res = parseMir("dssir 3\nmodule { }\n", CompilationUnitId{1}, r);
     EXPECT_TRUE(res->ok);
     EXPECT_EQ(res->mir.moduleFuncCount(), 0u);
 }
@@ -296,6 +405,40 @@ TEST(MirText, PointerAndArrayTypesRoundTrip) {
     EXPECT_NE(rt.firstEmit.find("arr<i32, 4>"), std::string::npos);
 }
 
+// P68 round 8 (lane `ht`, part 2): the MIR twin of
+// `HirText.AVoidParameterIsSpelledAndReadDistinctFromNoParameter`. A callee whose
+// signature KEEPS a parameter of type void (the C front end's `void f(void v);`,
+// gcc's meaning) is spelled `fn(void) -> void`, distinct from the parameterless
+// `fn() -> void`, and a zero-argument call through it survives the reader's
+// verify-on-load — the MIR verifier's call gate binds arguments to the parameters
+// BEFORE the void (`TypeInterner::fnArgumentParams`). A reader that normalized
+// `fn(void)` away re-emits `fn()` and breaks the byte identity; a gate that
+// counted the void refuses the call on load.
+TEST(MirText, AVoidParameterIsSpelledAndReadDistinctFromNoParameter) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const voidTy = ti.primitive(TypeKind::Void);
+    std::array<TypeId, 1> const voidParam{voidTy};
+    TypeId const withVoid = ti.fnSig(voidParam, voidTy, CallConv::CcSysV);
+    TypeId const none     = ti.fnSig(std::span<TypeId const>{}, voidTy, CallConv::CcSysV);
+    ASSERT_NE(withVoid, none);
+    MirBuilder b;
+    (void)b.addFunction(none, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    std::array<MirInstId, 1> const callF{b.addGlobalAddr(SymbolId{2}, ti.pointer(withVoid))};
+    b.addInst(MirOpcode::Call, callF, voidTy);
+    std::array<MirInstId, 1> const callG{b.addGlobalAddr(SymbolId{3}, ti.pointer(none))};
+    b.addInst(MirOpcode::Call, callG, voidTy);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+    std::vector<std::string> names{"", "main", "f", "g"};
+    auto rt = roundTrip(m, ti, names);
+    EXPECT_TRUE(rt.parseOk) << rt.firstEmit;
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+    EXPECT_NE(rt.firstEmit.find("fn(void) -> void"), std::string::npos) << rt.firstEmit;
+    EXPECT_NE(rt.firstEmit.find("fn() -> void"), std::string::npos) << rt.firstEmit;
+}
+
 // Symbol-name table with unnamed symbol — fallback to bare `%N` quote
 // must still round-trip.
 // A malformed numeric literal in an `int` literal must emit
@@ -309,7 +452,7 @@ TEST(MirText, PointerAndArrayTypesRoundTrip) {
 // diagnostics from the rest of the input).
 TEST(MirText, MissingFunctionLBraceDoesNotCascade) {
     std::string text =
-        "dssir 1\n"
+        "dssir 3\n"
         "symbols { %1 \"f\" }\n"
         "module {\n"
         "  function %1 : fn() -> i32\n"   // <-- missing `{`
@@ -337,7 +480,7 @@ TEST(MirText, MalformedNumericLiteralEmitsDiagnostic) {
     // Integer-but-out-of-range case (e.g. 9999999999999999999 as int32),
     // parseNumber emits the malformed diagnostic. Use that case:
     std::string text =
-        "dssir 1\n"
+        "dssir 3\n"
         "symbols { %1 \"f\" }\n"
         "module {\n"
         "  function %1 : fn() -> i32 {\n"
@@ -378,7 +521,7 @@ TEST(MirText, UnnamedSymbolRoundTrips) {
     EXPECT_NE(rt.firstEmit.find("%42 \"\""), std::string::npos);
 }
 
-// ── TF-C78 (D-CSUBSET-NOINLINE): per-FUNCTION attributes survive the
+// ── TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): per-FUNCTION attributes survive the
 // text round-trip ────────────────────────────────────────────────────
 //
 // ★ THIS TEST EXISTS BECAUSE THE ROUND-TRIP USED TO SILENTLY LOSE DATA.
@@ -482,7 +625,7 @@ TEST(MirText, FunctionAttributesSurviveRoundTrip) {
         << "an all-default function must emit no `[...]` list:\n" << text;
 
     // And the emitted text is itself stable (emit → parse → emit).
-    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    MirTextContext ctx2{&parsed->interner, nullptr, &parsed->symbolNames};
     DiagnosticReporter r3;
     EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
 }
@@ -572,7 +715,7 @@ TEST(MirText, AlwaysInlineAttributeSurvivesRoundTrip) {
     EXPECT_NE(text.find("alwaysinline"), std::string::npos)
         << "the printer must emit the `.dssir` keyword:\n" << text;
 
-    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    MirTextContext ctx2{&parsed->interner, nullptr, &parsed->symbolNames};
     DiagnosticReporter r3;
     EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
 }
@@ -661,7 +804,7 @@ TEST(MirText, NoOptimizeAttributeSurvivesRoundTrip) {
     EXPECT_NE(text.find("nooptimize"), std::string::npos)
         << "the printer must emit the `.dssir` keyword:\n" << text;
 
-    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    MirTextContext ctx2{&parsed->interner, nullptr, &parsed->symbolNames};
     DiagnosticReporter r3;
     EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
 }
@@ -784,7 +927,7 @@ TEST(MirText, NoSanitizeThreadAttributeSurvivesRoundTrip) {
     EXPECT_NE(text.find("nosanitizethread"), std::string::npos)
         << "the printer must emit the `.dssir` keyword — this IS the sink:\n" << text;
 
-    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    MirTextContext ctx2{&parsed->interner, nullptr, &parsed->symbolNames};
     DiagnosticReporter r3;
     EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
 }
@@ -795,7 +938,7 @@ TEST(MirText, NoSanitizeThreadAttributeSurvivesRoundTrip) {
 // permissive direction is closed by construction.
 TEST(MirText, UnknownFunctionAttributeIsMalformed) {
     char const* text =
-        "dssir 1\n"
+        "dssir 3\n"
         "module {\n"
         "  function %1 : fn() -> void [frobnicate] {\n"
         "    block %b0 [entry] {\n"
@@ -1003,7 +1146,7 @@ TEST(MirText, StaticInitScheduleSurvivesRoundTripWithItsPriority) {
         << "the printer must emit the priority in the `.dssir` text:\n" << text;
     EXPECT_NE(text.find("initafter(103)"), std::string::npos) << text;
 
-    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    MirTextContext ctx2{&parsed->interner, nullptr, &parsed->symbolNames};
     DiagnosticReporter r3;
     EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
 }
@@ -1027,11 +1170,17 @@ TEST(MirText, StaticInitScheduleSurvivesRoundTripWithItsPriority) {
 TEST(MirTextParse, TruncatedOperandListIsRefusedRatherThanLoopingForever) {
     struct Case { char const* name; char const* text; };
     Case const cases[] = {
-        {"tuple",  "dssir 1\nmodule {\n  global %1 : tuple<i32"},
-        {"struct", "dssir 1\nmodule {\n  global %1 : struct \"S\" { i32"},
-        {"union",  "dssir 1\nmodule {\n  global %1 : union \"U\" { i32"},
-        {"fn",     "dssir 1\nmodule {\n  function %2 : fn(i32"},
-        {"agg",    "dssir 1\nmodule {\n  global %1 : i64 = lit agg { lit int 1 : i64"},
+        {"tuple",  "dssir 3\nmodule {\n  global %1 : tuple<i32"},
+        // v1's inline composite, refused at its head since v2 and still consumed.
+        {"struct", "dssir 3\nmodule {\n  global %1 : struct \"S\" { i32"},
+        {"union",  "dssir 3\nmodule {\n  global %1 : union \"U\" { i32"},
+        // v2's `types` table: a truncated entry, and a truncated section.
+        {"types-struct",  "dssir 3\ntypes {\n  type 1 = struct \"S\" { i32"},
+        {"types-union",   "dssir 3\ntypes {\n  type 1 = union \"U\" { i32, "},
+        {"types-section", "dssir 3\ntypes {\n  type 1 = struct \"S\" {i32}\n"},
+        {"types-head",    "dssir 3\ntypes {\n  type 1 = struct"},
+        {"fn",     "dssir 3\nmodule {\n  function %2 : fn(i32"},
+        {"agg",    "dssir 3\nmodule {\n  global %1 : i64 = lit agg { lit int 1 : i64"},
     };
     for (Case const& c : cases) {
         DiagnosticReporter r;

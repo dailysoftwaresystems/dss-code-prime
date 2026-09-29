@@ -1,8 +1,8 @@
-// D-LK6-14-PAYLOAD-PIN: direct unit tests for the chained-fixups
+// PIN-LK6-14-PAYLOAD-PIN: direct unit tests for the chained-fixups
 // payload builder hoisted from macho.cpp at the d312c1c audit fold.
 // Pins byte-structure invariants of the LC_DYLD_CHAINED_FIXUPS
-// __LINKEDIT payload independently of the encodeExec* integration —
-// D-LK6-14-INTEGRATION will call this same primitive, so any
+// __LINKEDIT payload independently of the encodeExec* integration,
+// which calls this same primitive (D-LK6-14-INTEGRATION-PAYLOAD), so any
 // regression here would propagate to every chained-fixups binary.
 //
 // Coverage:
@@ -48,9 +48,10 @@ using dss::macho::detail::kDyldChainedStartsInSegmentHdrSz;
 // externs and no writable globals, and the shape ld64 was measured on.
 constexpr std::uint32_t kFourSegmentImage   = 4u;
 constexpr std::uint32_t kDataConstSegIndex  = 2u;
-// D-TEST-LE-READ-HELPERS CLOSED (8aabc04 audit fold 2026-06-01):
-// promoted to the shared `link_test_support.hpp` (where readU64LE
-// already lives); 2nd consumer trigger met.
+// The little-endian read helpers were promoted out of this file
+// at the 8aabc04 audit fold (2026-06-01) into the shared
+// `link_test_support.hpp` (where readU64LE already lives), on the
+// 2nd consumer.
 using dss::link_format::test::readU16LE;
 using dss::link_format::test::readU32LE;
 

@@ -306,6 +306,10 @@ makeCrossCuPair(bool arm64, bool withEntry, bool indirectSite = false) {
         ExternImport ext;
         ext.symbol      = SymbolId{2};
         ext.mangledName = "crossfn";
+        // P68 round 9 (D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT): the
+        // row states what MIR→LIR stamps for this call site — the `FF 15`
+        // dereferences a slot, a direct call does not. The merge reads it.
+        ext.readThroughSlot = indirectSite;
         m.externImports.push_back(std::move(ext));
         m.symbols.push_back(ModuleSymbol{SymbolId{1}, "caller",
                                          SymbolBinding::Global,
@@ -676,10 +680,11 @@ TEST(CrossCuLinkFormats, IndirectSlotDynMintsRelRoThunkSlotWithRelativeRow) {
         << "the indirect cross-CU call must dereference the minted slot";
 }
 
-// The abs64-pointer-relocation gate is scoped to the INDIRECT-SLOT arm: a
-// target with no `widthBytes==8 && !pcRelative` row cannot host a thunk slot
-// (K_AbsolutePointerRelocMissing, loud) — but the SAME modules under the
-// direct-plt shipped format bind directly and never need the pointer row.
+// The abs64-pointer-relocation gate is scoped to a reference READ THROUGH A
+// SLOT (the row's `readThroughSlot`, P68 round 9 — it was the format's
+// indirect-slot dispatch): a target with no `widthBytes==8 && !pcRelative` row
+// cannot host the slot (K_AbsolutePointerRelocMissing, loud) — but a reference
+// its code reaches directly binds to the definition and never needs the row.
 TEST(CrossCuLinkFormats, Abs64GateFiresOnlyOnTheIndirectSlotArm) {
     // Minimal x86_64-flavored target that declares ONLY the pc-relative rel32 —
     // deliberately NO absolute-64 row.

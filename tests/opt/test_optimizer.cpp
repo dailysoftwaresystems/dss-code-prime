@@ -986,8 +986,8 @@ TEST(Optimizer, EffectivenessSDivSurvivesShippedReleasePipeline) {
            "inliner) OR silently duplicates it (e.g. faulty LICM "
            "hoist that clones across a header) defeats the codegen-"
            "tier byte-pin tests' purpose — they only run when "
-           "exactly one IDIV reaches the assembler. (D-CSUBSET-"
-           "DIVISION-OP-CODEGEN closure-gate item (b), 2026-06-04.)";
+           "exactly one IDIV reaches the assembler. ("
+           "D-CSUBSET-DIVISION-OP-CODEGEN closure-gate item (b), 2026-06-04.)";
 }
 
 // D-CSUBSET-DIVISION-OP-CODEGEN closure-gate item (b) — UDiv analog

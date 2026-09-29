@@ -7,6 +7,7 @@
 //   3. Cascade bound: one structural error produces at most one
 //      recovery diagnostic for the broken region.
 
+#include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/syntactic/parser.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -16,6 +17,8 @@
 #include "core/types/tree_node.hpp"
 #include "tokenizer/token_stream.hpp"
 #include "tokenizer/tokenizer.hpp"
+
+#include "shipped_schema_or_throw.hpp"
 
 #include <gtest/gtest.h>
 
@@ -491,3 +494,146 @@ TEST(ParserRecovery, MissingInitDiagnosticsAreNotSuppressedAcrossCleanParse) {
 // point bad token still panic-scans, NOT synthesize-and-skip) is held by the
 // toy `@ noise more` resync pins earlier in this file — they would RED if the
 // stop-point branch over-fired on garbage.
+
+// ── A CORRECT REFUSAL IS NOT FOLLOWED BY THE BUILDER'S OWN INVARIANT ───────
+//
+// [[D-PARSE-BUILDER-INVARIANT-PRINTED-AFTER-A-CORRECT-REFUSAL]]. ✔MEASURED
+// before the fix, through `dsscp --compile` over 15 refusal shapes: NINE of
+// them, after the parser had reported the real error, also printed
+// `P_BuilderInvariant: scope stack non-empty at finish` — the tree builder's
+// internal check, worded for the compiler's author, spent on user input. The
+// scope stack is driven by tokens and the frames by the parser, so the two
+// drifted apart whenever the parse never reached a closer: an unterminated
+// literal swallowed it, panic recovery consumed it without `pushToken`, or the
+// input ended first. A frame now closes the scopes it opened
+// (`TreeBuilder::closeFrame_`).
+//
+// Each shape runs through the front end the driver runs (preprocess + parse),
+// and each pin asserts the invariant is ABSENT and the user's own diagnostic
+// is still there — so a fix that silenced everything cannot pass.
+// RED-ON-DISABLE: without the frame's truncation every pin below reds by name.
+
+namespace {
+
+struct FrontEnd {
+    std::shared_ptr<CompilationUnit> cu;
+    std::vector<ParseDiagnostic>     diags;
+};
+
+[[nodiscard]] FrontEnd frontEnd(std::string source) {
+    UnitBuilder b{dss::test_support::shippedSchemaOrThrow("c"),
+                  DiagnosticBudget::libraryDefault()};
+    b.addInMemory(std::move(source), "main.c");
+    FrontEnd out{std::make_shared<CompilationUnit>(std::move(b).finish()), {}};
+    for (auto const& t : out.cu->trees()) {
+        for (auto const& d : t.diagnostics().all()) out.diags.push_back(d);
+    }
+    return out;
+}
+
+[[nodiscard]] std::string codesOf(std::span<ParseDiagnostic const> diags) {
+    std::string s;
+    for (auto const& d : diags) {
+        s += ' ';
+        s += diagnosticCodeName(d.code);
+    }
+    return s;
+}
+
+void expectRefusedWithoutTheInvariant(std::string source, DiagnosticCode userCode) {
+    auto const fe = frontEnd(std::move(source));
+    EXPECT_EQ(countCode(fe.diags, DiagnosticCode::P_BuilderInvariant), 0u)
+        << "the builder's internal invariant reached the user; codes:" << codesOf(fe.diags);
+    EXPECT_GE(countCode(fe.diags, userCode), 1u)
+        << "the user's own diagnostic " << diagnosticCodeName(userCode)
+        << " must still be reported; codes:" << codesOf(fe.diags);
+}
+
+} // namespace
+
+// (1)–(3) the closer SWALLOWED by an unterminated literal on its own line
+TEST(ParserRecoveryScopeBalance, ACharConstantSwallowingTheBlockCloser) {
+    expectRefusedWithoutTheInvariant(
+        "int f(void){ return 'a; }\nint g(void){ return 1; }\nint main(void){ return 0; }\n",
+        DiagnosticCode::P_UnexpectedToken);
+}
+TEST(ParserRecoveryScopeBalance, AStringLiteralSwallowingTheBlockCloser) {
+    expectRefusedWithoutTheInvariant(
+        "int f(void){ char const *s = \"abc; }\nint main(void){ return 0; }\n",
+        DiagnosticCode::P_UnexpectedToken);
+}
+TEST(ParserRecoveryScopeBalance, AMacroExpandingToAnUnterminatedCharInABlock) {
+    expectRefusedWithoutTheInvariant("#define X 'a\nint main(void){ return X; }\n",
+                                     DiagnosticCode::P_UnexpectedToken);
+}
+
+// (4)–(6) the closer genuinely MISSING at the end of input
+TEST(ParserRecoveryScopeBalance, OneMissingBlockCloserAtEndOfInput) {
+    expectRefusedWithoutTheInvariant("int main(void){ return 0;\n",
+                                     DiagnosticCode::P_MissingRequiredChild);
+}
+TEST(ParserRecoveryScopeBalance, TwoMissingBlockClosersAtEndOfInput) {
+    expectRefusedWithoutTheInvariant("int main(void){ if (1) { return 0;\n",
+                                     DiagnosticCode::P_MissingRequiredChild);
+}
+TEST(ParserRecoveryScopeBalance, AMissingParenAndBlockCloserAtEndOfInput) {
+    expectRefusedWithoutTheInvariant("int main(void){ return (1 + 2;\n",
+                                     DiagnosticCode::P_MissingRequiredChild);
+}
+
+// (7)–(9) a syntax error INSIDE a block whose `}` is present: panic recovery
+// consumes it without `pushToken`
+TEST(ParserRecoveryScopeBalance, AnIncompleteExpressionInABlock) {
+    expectRefusedWithoutTheInvariant(
+        "int main(void){ int x = 1 +; return x; }\nint g(void){ return 2; }\n",
+        DiagnosticCode::P_BacktrackFailed);
+}
+TEST(ParserRecoveryScopeBalance, AnUnfinishedCallInABlock) {
+    expectRefusedWithoutTheInvariant(
+        "int f(int a){ return a; }\nint main(void){ return f(; }\nint g(void){ return 2; }\n",
+        DiagnosticCode::P_MissingRequiredChild);
+}
+TEST(ParserRecoveryScopeBalance, AnEmptyIfConditionInABlock) {
+    expectRefusedWithoutTheInvariant(
+        "int main(void){ if ( ) { return 1; } return 0; }\nint g(void){ return 2; }\n",
+        DiagnosticCode::P_NoAlternativeMatched);
+}
+
+// ★ THE AT-END-OF-INPUT FRAME TELLS THE TRUTH. A block whose `}` never came was
+// closed by the parser's premature-end-of-input handling WITHOUT an Error leaf,
+// so the tree claimed a well-formed block while the diagnostic said its `}` was
+// missing — and the builder's new clean-frame check caught exactly that. The
+// branch now drops the Error leaf its two sibling missing-child sites already
+// drop. Pinned: the diagnostic's own text is the one it always was, and every
+// `block` node on the path carries HasError.
+// RED-ON-DISABLE: remove that one leaf and "closed cleanly" is back.
+TEST(ParserRecoveryScopeBalance, ABlockThatReachedEndOfInputCarriesTheErrorInItsTree) {
+    for (std::string const src : {std::string{"int main(void){ return 0;\n"},
+                                  std::string{"int main(void){ if (1) { return 0;\n"}}) {
+        SCOPED_TRACE(src);
+        auto const fe = frontEnd(src);
+        EXPECT_EQ(countCode(fe.diags, DiagnosticCode::P_BuilderInvariant), 0u)
+            << codesOf(fe.diags);
+        bool sawMissingChild = false;
+        for (auto const& d : fe.diags) {
+            if (d.code != DiagnosticCode::P_MissingRequiredChild) continue;
+            sawMissingChild = true;
+            EXPECT_EQ(d.actual, "'<eof>'") << "the diagnostic's text is unchanged";
+        }
+        EXPECT_TRUE(sawMissingChild) << codesOf(fe.diags);
+
+        ASSERT_EQ(fe.cu->trees().size(), 1u);
+        Tree const& t = fe.cu->trees()[0];
+        RuleId const blockRule = t.schema().rules().find("block");
+        ASSERT_TRUE(blockRule.valid());
+        std::size_t blocks = 0;
+        for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+            NodeId const id{i, t.id().v};
+            if (t.kind(id) != NodeKind::Internal || t.rule(id).v != blockRule.v) continue;
+            ++blocks;
+            EXPECT_TRUE(hasError(t.flags(id)))
+                << "a block that reached the end of input is not a well-formed block";
+        }
+        EXPECT_GE(blocks, 1u);
+    }
+}

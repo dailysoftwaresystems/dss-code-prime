@@ -20,7 +20,7 @@
  * reading + writing the real thread-local via the libc `(*__errno_location())`
  * accessor (a genuine libc.so.6 call), with value-divergent constants.
  *
- * RED-ON-DISABLE: revert the D-PP-PRESCAN-ANGLE-MACRO-SPLICE gate change and
+ * RED-ON-DISABLE: revert the D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS gate change and
  * the pre-scan skips the splice under `#if DSS_USE_ERRNO` -> `errno` is
  * undeclared -> S0001 -> no binary. (A `#else` is intentionally omitted: the
  * ONLY compiling program is the errno one, so a regression cannot silently

@@ -2,6 +2,8 @@
 // and exception isolation (a throwing job must not kill the worker).
 
 #include "core/substrate/thread_pool.hpp"
+#include "core/types/config_document_memo.hpp"
+#include "core/types/grammar_schema.hpp"
 #include "test_wait_budget.hpp"
 
 #include <gtest/gtest.h>
@@ -56,4 +58,30 @@ TEST(ThreadPool, ShutdownIsIdempotent) {
     ThreadPool pool{1};
     pool.shutdown();
     pool.shutdown(); // must not crash / double-join
+}
+
+// ── P68 round 12 (D-SUBSTRATE-WORKER-THREADS-TAKE-THE-HOST-DEFAULT-STACK) ──────
+// A pool job is MAIN-THREAD work: the driver builds a whole compilation unit —
+// parse, semantic analysis, MIR — on a worker, and the LSP server a parse. The
+// heaviest single frame that work is known to reach is a COLD config-schema build
+// (`buildSchemaFromJsonText`, 415,360 bytes under clang -O0, P34). So a cold build
+// must survive on a worker, and this job performs one: the memo is cleared first
+// and the build is required to have happened (the miss count). ★ The workers were
+// plain `std::thread`s, which take the host's default secondary-thread stack — 512
+// KiB on macOS — and a cold build on one dies `Bus error` on macos-arm64-debug
+// (✔MEASURED 2026-09-25). Mac Debug is the only leg that can tell; every other leg
+// runs this green either way, which is why the pool STATES its workers' stack.
+TEST(ThreadPool, AColdSchemaBuildRunsOnAWorker) {
+    dss::detail::ConfigDocumentMemo<dss::GrammarSchema>::clear();
+    dss::detail::ConfigDocumentMemoStore::resetStats();
+    std::promise<bool> built;
+    auto fut = built.get_future();
+    ThreadPool pool{1};
+    pool.submit([&] { built.set_value(dss::GrammarSchema::loadShipped("c").has_value()); });
+    ASSERT_EQ(fut.wait_for(dss::test_support::kWaitBudget), std::future_status::ready);
+    EXPECT_TRUE(fut.get()) << "the shipped C document did not load on a pool worker";
+    pool.shutdown();
+    EXPECT_GE(dss::detail::ConfigDocumentMemo<dss::GrammarSchema>::stats().misses, 1u)
+        << "the worker BUILT nothing — the memo was warm, so the frame this pins "
+           "was never on the worker's stack";
 }

@@ -3,20 +3,21 @@
 #include <cstdlib>
 #include <string>
 
-// Portable RAII environment-variable override — hoisted at
-// `D-TEST-SCOPED-ENV-DUPLICATED-THREE-WAYS` closure (2026-08-13), mirroring the
-// `scratch_dir.hpp` hoist that preceded it.
+// Portable RAII environment-variable override — hoisted 2026-08-13 out of the
+// hand-copied duplicates, mirroring the `scratch_dir.hpp` hoist that preceded
+// it.
 //
-// ★★ THE ROW'S COUNT WAS WRONG, AND IT ERRED LOW. It said THREE copies
+// ★★ THE COUNT THAT ORDERED THE HOIST WAS WRONG, AND IT ERRED LOW. It said
+// THREE copies
 // (`tests/core/test_config_path_walk.cpp`, `tests/test_support/test_repo_root.cpp`,
 // `tests/lsp/test_workspace_project.cpp`). ✔MEASURED with
 // `grep -rn 'class ScopedEnv' tests/`: there were FIVE. The two the row never
 // counted are `tests/program/test_asm_dialect_per_target.cpp` and
-// `tests/program/test_system_dirs_cwd_independent.cpp`. A duplication row that
+// `tests/program/test_system_dirs_cwd_independent.cpp`. A duplication count that
 // undercounts its own subject is the same instrument failure this tree has been
 // burned by before — enumerate with a matcher, never from memory.
-// ✅ ALL FIVE are now repointed here (`D-TEST-SCOPED-ENV-STRAGGLERS-IN-TESTS-PROGRAM`,
-// 2026-08-13) — the two above were the last, and the census in
+// ✅ ALL FIVE are now repointed here (the two stragglers under `tests/program/`
+// were the last, 2026-08-13) — and the census in
 // `test_scoped_env.cpp` now asserts this file is the ONLY definition under
 // `tests/`, with the walk carrying its own positive control so an all-clear
 // cannot come from a walk that read nothing.

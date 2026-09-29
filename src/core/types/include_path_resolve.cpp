@@ -5,6 +5,12 @@
 #include "core/types/ascii_case.hpp"   // asciiToLower — the ONE folding helper
 
 #include <algorithm>
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -12,14 +18,130 @@ namespace dss {
 
 namespace fs = std::filesystem;
 
-namespace {
-
 // The FILESYSTEM's own character type: `char` on POSIX, `wchar_t` on Windows.
 // Nothing below branches on which — every name comparison in this file happens
 // in this type, and the two helpers underneath are written so that the same
 // source line is correct for both (see `kDotChar`).
 using NativeChar   = fs::path::value_type;
 using NativeString = fs::path::string_type;
+
+// ── [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]] ────────
+//
+// The compile's view of the tree (see `HeaderSearchCache` in the header). One
+// mutex: a compile's searches run on one thread today, so it is uncontended, and
+// it is what keeps "listed ONCE" true if that ever stops being so.
+struct HeaderSearchCache::Impl {
+    struct Listing {
+        // Every entry name the listing yielded, in enumeration order — exactly the
+        // names the per-resolution loops used to compare, a listing that failed to
+        // open yielding none and one that failed part-way keeping what it had read.
+        std::vector<NativeString>                                      names;
+        // The same names, for the byte-exact question (CaseSensitive, root prefix)…
+        std::unordered_set<NativeString>                               exact;
+        // …and grouped by their ASCII fold, for the CaseInsensitive one.
+        std::unordered_map<NativeString, std::vector<std::size_t>>     folded;
+    };
+    std::mutex                                  mutex;
+    std::unordered_map<NativeString, Listing>   listings;   // by directory
+    std::unordered_map<NativeString, bool>      probes;     // by candidate
+};
+
+struct HeaderSearchTally::Impl {
+    std::mutex                          mutex;
+    std::map<NativeString, std::size_t> listings;
+    std::map<NativeString, std::size_t> probes;
+};
+
+namespace {
+
+// ── the tally's install point ───────────────────────────────────────────────
+// Recording holds `tallyGate()` so a record can never meet a tally being torn
+// down; the fast path — no tally — is the one relaxed load below.
+[[nodiscard]] std::mutex& tallyGate() {
+    static std::mutex m;
+    return m;
+}
+[[nodiscard]] std::atomic<HeaderSearchTally::Impl*>& liveTally() {
+    static std::atomic<HeaderSearchTally::Impl*> t{nullptr};
+    return t;
+}
+void tallyRecord(NativeString const& key, bool listing) {
+    if (liveTally().load(std::memory_order_relaxed) == nullptr) return;
+    std::lock_guard<std::mutex> gate{tallyGate()};
+    HeaderSearchTally::Impl* const t = liveTally().load(std::memory_order_relaxed);
+    if (t == nullptr) return;
+    std::lock_guard<std::mutex> lock{t->mutex};
+    ++(listing ? t->listings : t->probes)[key];
+}
+
+// The key a directory or candidate is cached under: the spelling as searched,
+// with the host's preferred separator. `//server/share/x` and `\\server\share\x`
+// name one directory on Windows and read identically; on POSIX `make_preferred`
+// is the identity, so nothing is merged there that is not already one string.
+// ⚠ NOTHING ELSE IS NORMALIZED, on purpose: folding case would merge directories
+// a case-sensitive filesystem keeps apart, and resolving `..` lexically is wrong
+// through a symlink. Two spellings of one directory then cost two listings,
+// which is the price of never answering for the wrong directory.
+[[nodiscard]] NativeString cacheKeyOf(fs::path const& p) {
+    fs::path k = p;
+    k.make_preferred();
+    return k.native();
+}
+
+// The listing of `dir` in `c`, read on FIRST use — the caller holds `c.mutex`.
+[[nodiscard]] HeaderSearchCache::Impl::Listing const&
+listingOf(HeaderSearchCache::Impl& c, fs::path const& dir) {
+    NativeString key = cacheKeyOf(dir);
+    if (auto const hit = c.listings.find(key); hit != c.listings.end()) return hit->second;
+    HeaderSearchCache::Impl::Listing l;
+    std::error_code ec;
+    for (fs::directory_iterator it{dir, ec}, end; !ec && it != end; it.increment(ec)) {
+        l.names.push_back(it->path().filename().native());
+    }
+    l.exact.reserve(l.names.size());
+    for (std::size_t i = 0; i < l.names.size(); ++i) {
+        l.exact.insert(l.names[i]);
+        l.folded[asciiToLower(l.names[i])].push_back(i);
+    }
+    tallyRecord(key, /*listing=*/true);
+    return c.listings.emplace(std::move(key), std::move(l)).first->second;
+}
+
+// Does `dir` LIST an entry whose name is `name`, byte for byte?
+[[nodiscard]] bool listsExactly(HeaderSearchCache& cache, fs::path const& dir,
+                                NativeString const& name) {
+    HeaderSearchCache::Impl& c = cache.impl();
+    std::lock_guard<std::mutex> lock{c.mutex};
+    return listingOf(c, dir).exact.contains(name);
+}
+
+// Every entry of `dir` whose ASCII fold is `folded`, in enumeration order.
+[[nodiscard]] std::vector<NativeString> foldMatches(HeaderSearchCache& cache, fs::path const& dir,
+                                                    NativeString const& folded) {
+    HeaderSearchCache::Impl& c = cache.impl();
+    std::lock_guard<std::mutex> lock{c.mutex};
+    auto const& l = listingOf(c, dir);
+    std::vector<NativeString> out;
+    if (auto const hit = l.folded.find(folded); hit != l.folded.end()) {
+        out.reserve(hit->second.size());
+        for (std::size_t const i : hit->second) out.push_back(l.names[i]);
+    }
+    return out;
+}
+
+// `fs::exists(candidate)`, asked ONCE per candidate per compile — an error reads
+// as "does not exist", exactly as the uncached probe did.
+[[nodiscard]] bool existsOnce(HeaderSearchCache& cache, fs::path const& candidate) {
+    HeaderSearchCache::Impl& c = cache.impl();
+    std::lock_guard<std::mutex> lock{c.mutex};
+    NativeString key = cacheKeyOf(candidate);
+    if (auto const hit = c.probes.find(key); hit != c.probes.end()) return hit->second;
+    std::error_code ec;
+    bool const exists = fs::exists(candidate, ec);
+    tallyRecord(key, /*listing=*/false);
+    c.probes.emplace(std::move(key), exists);
+    return exists;
+}
 
 // `.` is in C's basic character set, so `NativeChar{'.'}` is the SAME code
 // point whichever type `NativeChar` turns out to be. That is what lets the
@@ -62,27 +184,29 @@ constexpr NativeChar kDotChar = NativeChar{'.'};
 // The comparison never needed the narrow form: the conversion was pure loss.
 // `name` therefore arrives as an `fs::path`, built ONCE by the caller from the
 // requested (source-text) name, and only its `native()` is ever compared.
+//
+// ★★ BOTH ARMS READ `dir` THROUGH THE COMPILE'S CACHE (`listsExactly`,
+// `foldMatches`, `existsOnce` above): the listing and the `exists` probe happen
+// once per compile, and every later lookup compares against what they returned.
+// The comparisons themselves are unchanged, name for name.
 HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
-                                  HeaderNameMatching matching) {
-    std::error_code ec;
+                                  HeaderNameMatching matching,
+                                  HeaderSearchCache& cache) {
     if (matching == HeaderNameMatching::CaseSensitive) {
         // Cheap DEFINITIVE reject first. If no entry answers to these exact
         // bytes even under the host's own (possibly folding) rules, then no
         // byte-exact entry can exist either — `exists()` is only ever MORE
         // permissive than we are, never less, so a false here is trustworthy.
         fs::path const candidate = dir / name;
-        if (!fs::exists(candidate, ec)) return HeaderSearchResult::notFound();
+        if (!existsOnce(cache, candidate)) return HeaderSearchResult::notFound();
         // `exists()` said yes — but a case-INSENSITIVE host may have FOLDED to
         // get there. Verify the REAL on-disk spelling ourselves; this is the
         // arm that stops `#include <Stdio.h>` from silently compiling for an
         // elf target on a Windows/macOS host. A directory we cannot enumerate
         // fails CLOSED (NotFound): unable to verify is not permission to
         // assume, and the caller's miss diagnostic is loud.
-        for (fs::directory_iterator it{dir, ec}, end; !ec && it != end;
-             it.increment(ec)) {
-            if (it->path().filename().native() == name.native())
-                return HeaderSearchResult::found(candidate);
-        }
+        if (listsExactly(cache, dir, name.native()))
+            return HeaderSearchResult::found(candidate);
         return HeaderSearchResult::notFound();
     }
 
@@ -91,13 +215,10 @@ HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
     // accepting the byte-exact one would hand the answer back to the host,
     // because a case-insensitive host cannot even hold that pair. Every
     // fold-match is collected and >= 2 is a LOUD failure, never a pick.
-    NativeString const wanted = asciiToLower(name.native());
+    // A hit is spelled `dir / <entry>` — the path the listing's iterator yields.
     std::vector<fs::path> hits;
-    for (fs::directory_iterator it{dir, ec}, end; !ec && it != end;
-         it.increment(ec)) {
-        if (asciiToLower(it->path().filename().native()) == wanted)
-            hits.push_back(it->path());
-    }
+    for (NativeString const& entry : foldMatches(cache, dir, asciiToLower(name.native())))
+        hits.push_back(dir / fs::path{entry});
     if (hits.empty()) return HeaderSearchResult::notFound();
     if (hits.size() == 1) return HeaderSearchResult::found(std::move(hits.front()));
     // Deterministic order, so the collision diagnostic reads the same run to
@@ -115,7 +236,7 @@ HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
 // Walk `base` down every component of `rel` under `matching`. `rel` must be
 // relative; the caller splits an absolute name into (root_path, remainder).
 HeaderSearchResult descend(fs::path base, fs::path const& rel,
-                           HeaderNameMatching matching) {
+                           HeaderNameMatching matching, HeaderSearchCache& cache) {
     for (fs::path const& comp : rel) {
         // NATIVE, not `comp.string()`: the requested name is already a path,
         // and narrowing it back would reintroduce the throw/lossy conversion
@@ -132,7 +253,7 @@ HeaderSearchResult descend(fs::path base, fs::path const& rel,
         // `dir / rel` did — the case rule still applies to every component that
         // actually names a file.
         if (isDotDotComponent(name)) { base /= comp; continue; }
-        HeaderSearchResult step = matchComponent(base, comp, matching);
+        HeaderSearchResult step = matchComponent(base, comp, matching, cache);
         if (step.status != HeaderSearchStatus::Found) return step;
         base = std::move(step.path);
     }
@@ -228,18 +349,19 @@ HeaderSearchResult descend(fs::path base, fs::path const& rel,
 // true YES agree; the boundary lands one step apart and both splits resolve. A
 // UNC path is the one shape where the correct answer at the shallowest ancestor
 // is NO and a spurious YES changes the verdict.
-[[nodiscard]] bool isListedInItsParent(fs::path const& p) {
-    std::error_code ec;
+//
+// The parent's listing comes from the compile's cache, so a rooted path's
+// ancestors are listed once per compile, not once per resolution — for a UNC
+// include, one SMB round trip per ancestor instead of one per ancestor per
+// `#include`.
+[[nodiscard]] bool isListedInItsParent(fs::path const& p, HeaderSearchCache& cache) {
     NativeString const want = p.filename().native();
     if (want.empty()) return false;
-    for (fs::directory_iterator it{p.parent_path(), ec}, end; !ec && it != end;
-         it.increment(ec)) {
-        if (it->path().filename().native() == want) return true;
-    }
-    return false;
+    return listsExactly(cache, p.parent_path(), want);
 }
 
-[[nodiscard]] fs::path rootPrefixOf(fs::path const& full, fs::path& below) {
+[[nodiscard]] fs::path rootPrefixOf(fs::path const& full, fs::path& below,
+                                    HeaderSearchCache& cache) {
     std::vector<fs::path> chain;   // deepest first
     for (fs::path q = full; !q.empty() && q != q.parent_path();
          q = q.parent_path()) {
@@ -253,7 +375,7 @@ HeaderSearchResult descend(fs::path base, fs::path const& rel,
     // is at the END of the path, never in the leading run.
     std::size_t boundary = 0;
     for (std::size_t shallow = 0; shallow < chain.size(); ++shallow) {
-        if (isListedInItsParent(chain[chain.size() - 1 - shallow])) break;
+        if (isListedInItsParent(chain[chain.size() - 1 - shallow], cache)) break;
         boundary = shallow + 1;
     }
     fs::path base = (boundary == 0) ? full.root_path()
@@ -286,16 +408,60 @@ HeaderSearchResult descend(fs::path base, fs::path const& rel,
 // (`-I` dirs, systemDirs) are NOT case-checked: they come from the driver and
 // the build config, not from a header name in the program text.
 HeaderSearchResult resolveMaybeAbsolute(fs::path const& rel, fs::path const& dir,
-                                        HeaderNameMatching matching) {
+                                        HeaderNameMatching matching,
+                                        HeaderSearchCache& cache) {
     if (isRootedPath(rel)) {
         fs::path below;
-        fs::path const base = rootPrefixOf(rel, below);
-        return descend(base, below, matching);
+        fs::path const base = rootPrefixOf(rel, below, cache);
+        return descend(base, below, matching, cache);
     }
-    return descend(dir, rel, matching);
+    return descend(dir, rel, matching, cache);
+}
+
+// Sorted (key, count) pairs out of a tally map, keys back as paths.
+[[nodiscard]] std::vector<std::pair<fs::path, std::size_t>>
+countsOf(std::map<NativeString, std::size_t> const& m) {
+    std::vector<std::pair<fs::path, std::size_t>> out;
+    out.reserve(m.size());
+    for (auto const& [key, n] : m) out.emplace_back(fs::path{key}, n);
+    return out;
 }
 
 } // namespace
+
+// ── HeaderSearchCache / HeaderSearchTally ───────────────────────────────────
+HeaderSearchCache::HeaderSearchCache() : impl_(std::make_unique<Impl>()) {}
+HeaderSearchCache::~HeaderSearchCache() = default;
+
+std::size_t HeaderSearchCache::listings() const {
+    std::lock_guard<std::mutex> lock{impl_->mutex};
+    return impl_->listings.size();
+}
+std::size_t HeaderSearchCache::probes() const {
+    std::lock_guard<std::mutex> lock{impl_->mutex};
+    return impl_->probes.size();
+}
+
+HeaderSearchTally::HeaderSearchTally() : impl_(std::make_unique<Impl>()) {
+    std::lock_guard<std::mutex> gate{tallyGate()};
+    Impl* expected = nullptr;
+    if (!liveTally().compare_exchange_strong(expected, impl_.get()))
+        throw std::logic_error("HeaderSearchTally: another tally is already alive — "
+                               "the counts would be split between two observers");
+}
+HeaderSearchTally::~HeaderSearchTally() {
+    std::lock_guard<std::mutex> gate{tallyGate()};
+    liveTally().store(nullptr);
+}
+
+std::vector<std::pair<fs::path, std::size_t>> HeaderSearchTally::listingsPerDirectory() const {
+    std::lock_guard<std::mutex> lock{impl_->mutex};
+    return countsOf(impl_->listings);
+}
+std::vector<std::pair<fs::path, std::size_t>> HeaderSearchTally::probesPerCandidate() const {
+    std::lock_guard<std::mutex> lock{impl_->mutex};
+    return countsOf(impl_->probes);
+}
 
 // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] -- see the header for the
 // measurement and for why this is exported rather than repeated per tier.
@@ -321,19 +487,20 @@ bool shippedConfigRelativePathEscapes(std::string_view spelling) {
 }
 
 HeaderSearchResult resolveInDir(fs::path const& dir, std::string_view relName,
-                                HeaderNameMatching matching) {
-    return resolveMaybeAbsolute(fs::path{relName}, dir, matching);
+                                HeaderNameMatching matching, HeaderSearchCache& cache) {
+    return resolveMaybeAbsolute(fs::path{relName}, dir, matching, cache);
 }
 
 HeaderSearchResult findInDirs(std::string_view              filename,
                               std::span<fs::path const>     dirs,
-                              HeaderNameMatching            matching) {
+                              HeaderNameMatching            matching,
+                              HeaderSearchCache&            cache) {
     fs::path const rel{filename};
     // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: `isRootedPath`, never a
     // bare `is_absolute()` -- see that predicate for the measurement.
-    if (isRootedPath(rel)) return resolveMaybeAbsolute(rel, {}, matching);
+    if (isRootedPath(rel)) return resolveMaybeAbsolute(rel, {}, matching, cache);
     for (fs::path const& dir : dirs) {
-        HeaderSearchResult r = descend(dir, rel, matching);
+        HeaderSearchResult r = descend(dir, rel, matching, cache);
         // An ambiguity anywhere ends the search: falling through to a later
         // dir would silently prefer whichever host could represent the tree.
         if (r.status != HeaderSearchStatus::NotFound) return r;
@@ -364,22 +531,24 @@ fs::path includingDirectoryOf(std::string_view sourceName) {
 HeaderSearchResult resolveIncludePath(std::string_view              filename,
                                       fs::path const&               includingDir,
                                       std::span<fs::path const>     includeDirs,
-                                      HeaderNameMatching            matching) {
+                                      HeaderNameMatching            matching,
+                                      HeaderSearchCache&            cache) {
     fs::path const rel{filename};
     // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: a UNC include answers
     // FALSE to `is_absolute()` on this build and was therefore searched against
     // the include dirs as though it were a relative name.
-    if (isRootedPath(rel)) return resolveMaybeAbsolute(rel, {}, matching);
+    if (isRootedPath(rel)) return resolveMaybeAbsolute(rel, {}, matching, cache);
     if (!includingDir.empty()) {
-        HeaderSearchResult r = descend(includingDir, rel, matching);
+        HeaderSearchResult r = descend(includingDir, rel, matching, cache);
         if (r.status != HeaderSearchStatus::NotFound) return r;
     }
-    return findInDirs(filename, includeDirs, matching);
+    return findInDirs(filename, includeDirs, matching, cache);
 }
 
 HeaderSearchResult resolveSystemDescriptor(std::string_view          filename,
                                            std::span<fs::path const> systemDirs,
-                                           HeaderNameMatching        matching) {
+                                           HeaderNameMatching        matching,
+                                           HeaderSearchCache&        cache) {
     // `<stem>.json`, PRESERVING any subdirectory so a POSIX `sys/*` header maps
     // to a distinct descriptor and never collides with a top-level header of the
     // same stem: `<sys/types.h>` -> `sys/types.json`, `<sys/time.h>` ->
@@ -405,18 +574,20 @@ HeaderSearchResult resolveSystemDescriptor(std::string_view          filename,
     // another machine. The rewrite must stay pure byte slicing (the header says
     // so) -- it just must not slice the root off.
     std::string const descriptorName = core::genericSpelling(relStem) + ".json";
-    return findInDirs(descriptorName, systemDirs, matching);
+    return findInDirs(descriptorName, systemDirs, matching, cache);
 }
 
 AngleIncludeResolution resolveAngleInclude(std::string_view          filename,
                                            std::span<fs::path const> systemDirs,
                                            std::span<fs::path const> includeDirs,
-                                           HeaderNameMatching        matching) {
+                                           HeaderNameMatching        matching,
+                                           HeaderSearchCache&        cache) {
     // 1. Descriptor FIRST — the DSS neutral `<stem>.json` model. Existence of the
     //    descriptor FILE is the gate here; per-format availability is the caller's
     //    verdict (so an existing-but-unavailable descriptor still returns
     //    Descriptor and does NOT fall through to a source header).
-    HeaderSearchResult desc = resolveSystemDescriptor(filename, systemDirs, matching);
+    HeaderSearchResult desc =
+        resolveSystemDescriptor(filename, systemDirs, matching, cache);
     switch (desc.status) {
         case HeaderSearchStatus::Found:
             return {AngleIncludeKind::Descriptor, std::move(desc.path), {}};
@@ -433,7 +604,7 @@ AngleIncludeResolution resolveAngleInclude(std::string_view          filename,
     //    NOT search the including file's own directory (C 6.10.2p2), so this is
     //    `includeDirs` ONLY, never a self-dir prepend (that distinction is what the
     //    quote form's `resolveIncludePath` adds; angle omits it by construction).
-    HeaderSearchResult src = findInDirs(filename, includeDirs, matching);
+    HeaderSearchResult src = findInDirs(filename, includeDirs, matching, cache);
     switch (src.status) {
         case HeaderSearchStatus::Found:
             return {AngleIncludeKind::Source, std::move(src.path), {}};

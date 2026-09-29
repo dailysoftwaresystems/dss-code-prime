@@ -1,4 +1,4 @@
-// c33 D-CSUBSET-TENTATIVE-DEFINITION witness: a file-scope object declared WITHOUT
+// c33 D-CSUBSET-TENTATIVE-DEFINITION-MERGE witness: a file-scope object declared WITHOUT
 // an initializer is a TENTATIVE DEFINITION (C 6.9.2). Any number of tentatives plus
 // AT MOST ONE real (initialized) definition of the same name MERGE into ONE object;
 // two tentatives alone merge into a single zero-initialized object. Pre-fix this

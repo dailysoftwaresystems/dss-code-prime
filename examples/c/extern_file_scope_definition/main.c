@@ -1,4 +1,4 @@
-// the FILE-SCOPE half of [[D-FF2-3]] (P65) — THE USING
+// the FILE-SCOPE half of [[D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE]] (P65) — THE USING
 // translation unit. It declares each of def.c's objects the ordinary way and
 // reads them back, so the example gates on the LINK and on the VALUES, not on
 // rc 0 from the front end.

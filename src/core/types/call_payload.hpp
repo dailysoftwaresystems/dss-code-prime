@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-// D-LANG-VARIADIC (step 13.4, 2026-06-02): shared payload encoding for
+// D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): shared payload encoding for
 // MIR/LIR Call instructions. Both tiers stamp a single u32 payload
 // describing the call's variadic shape:
 //   * `isVariadic` — true iff the callee's FnSig was built variadic

@@ -7,8 +7,11 @@
 //     an S_ArgCountMismatch (compile failure IS the witness).
 //   * `int main(void)` exercises the same normalization on the entry
 //     function.
-// A NAMED void param (`int g(void x)`) is S_InvalidVoidParam — pinned
-// at the unit tier (NamedVoidParamFiresInvalidVoidParamPositioned).
+// A NAMED void param in a DEFINITION (`int g(void x) { … }`) is
+// S_InvalidVoidParam — pinned at the unit tier
+// (NamedVoidParamFiresInvalidVoidParamPositioned); in a declaration that is not
+// a definition it is gcc's meaning, kept — see
+// `examples/c/named_void_param_prototype/`.
 int f(void) {
     return 42;
 }

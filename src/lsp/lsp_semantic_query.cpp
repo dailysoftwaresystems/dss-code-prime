@@ -131,6 +131,17 @@ ScopeId scopeAtOffset(SemanticModel const& model, dss::Tree const& tree,
             bestDepth = depth;
         }
     }
+    if (best.valid()) return best;
+    // ★ THE FALLBACK THIS FUNCTION'S CONTRACT STATES (P68 round 12, lane `cs`). A node's span ends at its
+    // last token and starts at its first (`TreeBuilder::closeFrame_`), so the root's does not cover the
+    // blank lines and comments before the file's first declaration or after its last — and an offset
+    // there is inside NO anchored scope. It is at file scope: the tree's own root scope answers.
+    for (std::size_t i = 1; i < scopes.size(); ++i) {
+        auto const& rec = scopes[i];
+        if (rec.tree.v == tree.id().v && rec.anchor == tree.root()) {
+            return ScopeId{static_cast<std::uint32_t>(i)};
+        }
+    }
     return best;
 }
 

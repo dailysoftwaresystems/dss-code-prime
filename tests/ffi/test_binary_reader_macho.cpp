@@ -500,7 +500,7 @@ TEST(BinaryReaderMacho, PartialCorruptionWarningNegativeByDesignSkips) {
 }
 
 TEST(BinaryReaderMacho, PartialCorruptionElevatesToErrorUnderWarningsAsErrors) {
-    // D-FF1-PARTIAL-CORRUPTION-WAE-PIN (Mach-O arm): mirrors the ELF
+    // PIN-FF1-PARTIAL-CORRUPTION-WAE-PIN (Mach-O arm): mirrors the ELF
     // + PE WAE pins. --warnings-as-errors elevates the Mach-O
     // partial-corruption Warning to Error and bumps errorCount.
     std::vector<Nlist> syms{

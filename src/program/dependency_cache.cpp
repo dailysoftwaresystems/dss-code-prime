@@ -2,15 +2,171 @@
 
 #include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "core/types/parse_diagnostic.hpp"
+// `linker::detail::createExclusiveBinary` — the completeness marker is CLAIMED
+// the way every staged file in this tree is (`lsp`, `program` and `link` are
+// one `dsscp-lib`, so no new link edge).
+#include "link/writer.hpp"
 
+#include <cstdio>
+#include <expected>
+#include <functional>
 #include <system_error>
 #include <utility>
+
+// HOST facilities for the per-dependency acquisition LOCK, and nothing else:
+// `LockFileEx` on Windows, `flock` on POSIX. The split is confined to
+// `AcquisitionLock` below — a host-portability split, never a target, format
+// or language one.
+#ifdef _WIN32
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#else
+#    include <cerrno>
+#    include <cstring>
+#    include <fcntl.h>
+#    include <sys/file.h>
+#    include <unistd.h>
+#endif
 
 namespace dss {
 
 namespace {
 
 namespace fs = std::filesystem;
+
+// ── ONE ACQUISITION OF A DEPENDENCY AT A TIME, ACROSS PROCESSES ─────────────
+// [[D-DEPS-CONCURRENT-ACQUISITIONS-OF-ONE-DEPENDENCY-SHARE-A-PATH-AND-CAN-HANG]]
+//
+// ✔MEASURED 2026-09-18 (lane `rw`): two real builds of one project acquiring
+// one git dependency at once shared the FIXED staging path and `remove_all`-ed
+// it under each other — git's own clone then failed with `could not lock config
+// file …/+staging/…/.git/config: No such file or directory`, and on the MinGW
+// build one of the two HUNG: 688 s of CPU inside libstdc++'s
+// `std::filesystem::remove_all`, which spins forever when another remover
+// deletes the same tree (reproduced in isolation; MSVC's STL fails instead).
+// The references hold a cross-process lock for exactly this (Go's
+// `lockedfile.MutexAt(<module>.lock)`, cargo's package-cache lock), so no two
+// acquisitions of one name ever touch its tree at once — held here for the
+// whole `acquire`, released by the OS if the build dies (no stale lock is
+// possible).
+//
+// The handle / descriptor is NOT inheritable (null `SECURITY_ATTRIBUTES` /
+// `O_CLOEXEC`): the acquisition spawns `git`, and a child that inherited the
+// lock handle would keep the file object — and on POSIX the `flock` — alive
+// beyond this build (the `createExclusiveBinary` lesson, one tier over).
+class AcquisitionLock {
+public:
+    AcquisitionLock() = default;
+    AcquisitionLock(AcquisitionLock const&)            = delete;
+    AcquisitionLock& operator=(AcquisitionLock const&) = delete;
+    AcquisitionLock(AcquisitionLock&& other) noexcept { swap(other); }
+    AcquisitionLock& operator=(AcquisitionLock&& other) noexcept {
+        AcquisitionLock moved{std::move(other)};
+        swap(moved);
+        return *this;
+    }
+    ~AcquisitionLock() { release(); }
+
+    // Take the lock on `file` (created if absent). If another process holds
+    // it, `onContention` runs once and then this call BLOCKS until the holder
+    // lets go — no timeout: the holder is another build's acquisition, which
+    // ends when its clone does (the process-spawn facility's own no-deadline
+    // rule, for the same reason).
+    [[nodiscard]] static std::expected<AcquisitionLock, std::string>
+    acquire(fs::path const& file, std::function<void()> const& onContention) {
+        AcquisitionLock lock;
+#ifdef _WIN32
+        lock.handle_ = ::CreateFileW(
+            file.c_str(), GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,  // not inheritable
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (lock.handle_ == INVALID_HANDLE_VALUE) {
+            return std::unexpected("the lock file '" + core::genericSpelling(file)
+                                   + "' could not be opened (Windows error "
+                                   + std::to_string(::GetLastError()) + ")");
+        }
+        OVERLAPPED tryRange{};
+        if (!::LockFileEx(lock.handle_,
+                          LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0,
+                          MAXDWORD, MAXDWORD, &tryRange)) {
+            DWORD const busy = ::GetLastError();
+            if (busy != ERROR_LOCK_VIOLATION) {
+                return std::unexpected("the lock file '" + core::genericSpelling(file)
+                                       + "' could not be locked (Windows error "
+                                       + std::to_string(busy) + ")");
+            }
+            if (onContention) onContention();
+            OVERLAPPED waitRange{};
+            if (!::LockFileEx(lock.handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD,
+                              MAXDWORD, &waitRange)) {
+                return std::unexpected("waiting for the lock file '"
+                                       + core::genericSpelling(file)
+                                       + "' failed (Windows error "
+                                       + std::to_string(::GetLastError()) + ")");
+            }
+        }
+#else
+        lock.fd_ = ::open(file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+        if (lock.fd_ < 0) {
+            return std::unexpected("the lock file '" + core::genericSpelling(file)
+                                   + "' could not be opened: " + std::strerror(errno));
+        }
+        if (::flock(lock.fd_, LOCK_EX | LOCK_NB) != 0) {
+            if (errno != EWOULDBLOCK) {
+                return std::unexpected("the lock file '" + core::genericSpelling(file)
+                                       + "' could not be locked: "
+                                       + std::strerror(errno));
+            }
+            if (onContention) onContention();
+            while (::flock(lock.fd_, LOCK_EX) != 0) {
+                if (errno != EINTR) {
+                    return std::unexpected("waiting for the lock file '"
+                                           + core::genericSpelling(file)
+                                           + "' failed: " + std::strerror(errno));
+                }
+            }
+        }
+#endif
+        return lock;
+    }
+
+private:
+    void release() noexcept {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            OVERLAPPED range{};
+            ::UnlockFileEx(handle_, 0, MAXDWORD, MAXDWORD, &range);
+            ::CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        if (fd_ >= 0) {
+            ::flock(fd_, LOCK_UN);
+            ::close(fd_);
+            fd_ = -1;
+        }
+#endif
+    }
+    void swap(AcquisitionLock& other) noexcept {
+#ifdef _WIN32
+        std::swap(handle_, other.handle_);
+#else
+        std::swap(fd_, other.fd_);
+#endif
+    }
+
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+};
 
 // The three names a checkout directory may NOT take. `.` and `..` are the
 // dangerous pair — both are spelled entirely from the legal character set, both
@@ -212,65 +368,89 @@ DependencyCache::registerGitDependency(std::string const&                url,
 }
 
 GitCommandResult
-DependencyCache::cloneStaged_(std::string const& name, std::string const& url,
-                              std::optional<std::string> const& ref) {
+DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
+                               std::optional<std::string> const& ref) {
     GitCommandResult out;
+    fs::path const   checkoutDir = depsDir_ / name;
+    fs::path const   marker      = partialMarker_(name);
+    std::error_code  ec;
 
-    fs::path const stagingRoot =
-        depsDir_ / std::string{kDependencyStagingDirName};
-    fs::path const staging = stagingRoot / name;
-    fs::path const landed  = depsDir_ / name;
-
-    std::error_code ec;
-    // An earlier run's abandoned attempt. Removing it is safe in a way removing
-    // `.dss-deps/<name>` would NOT be: this path is reachable only from here,
-    // it never holds a completed checkout, and its name cannot be derived from
-    // any URL (see `kDependencyStagingDirName`).
-    fs::remove_all(staging, ec);
-    if (ec) {
-        out.detail = "the staging directory '" + core::genericSpelling(staging)
-                   + "' could not be cleared: " + ec.message();
-        return out;
+    // ── A LEFTOVER IS REMOVED ONLY IF THIS CACHE MARKED IT AS ITS OWN ────────
+    // We hold `<name>`'s lock, so no acquisition is writing here: a directory
+    // WITH the marker is an interrupted acquisition's residue and is ours to
+    // remove. One WITHOUT the marker was not left by this cache — a user's
+    // directory, an external partial delete — and deleting it would destroy
+    // something we did not create; it is refused, as it always was (the
+    // staging design's landing rename refused it too).
+    bool const markedOurs = fs::exists(marker, ec) && !ec;
+    ec.clear();
+    if (fs::exists(fs::symlink_status(checkoutDir, ec)) && !ec) {
+        if (!markedOurs) {
+            out.detail = "'" + core::genericSpelling(checkoutDir)
+                       + "' exists but is not a usable checkout, and no '"
+                       + core::genericSpelling(marker)
+                       + "' says an interrupted acquisition of this cache left "
+                         "it, so it is not removed. Delete it to let the cache "
+                         "acquire the dependency again";
+            return out;
+        }
+        fs::remove_all(checkoutDir, ec);
+        if (ec) {
+            out.detail = "the incomplete checkout an interrupted acquisition left "
+                         "at '"
+                       + core::genericSpelling(checkoutDir)
+                       + "' could not be removed: " + ec.message();
+            return out;
+        }
     }
-    fs::create_directories(stagingRoot, ec);
-    if (ec) {
-        out.detail = "the staging directory '" + core::genericSpelling(stagingRoot)
-                   + "' could not be created: " + ec.message();
-        return out;
+    ec.clear();
+
+    // ── MARK INCOMPLETE BEFORE ONE BYTE OF THE TREE IS WRITTEN ──────────────
+    if (!markedOurs) {
+        fs::create_directories(marker.parent_path(), ec);
+        std::FILE* const claimed =
+            ec ? nullptr : linker::detail::createExclusiveBinary(marker);
+        if (claimed == nullptr || std::fclose(claimed) != 0) {
+            out.detail = "the completeness marker '" + core::genericSpelling(marker)
+                       + "' could not be created"
+                       + (ec ? ": " + ec.message() : std::string{});
+            return out;
+        }
     }
 
-    auto abandon = [&staging](GitCommandResult result) {
+    // A failed clone or ref checkout leaves nothing a later build could trust:
+    // the tree goes, and so does the marker — unless the tree could NOT be
+    // removed, in which case the marker stays and says so to the next build.
+    auto abandon = [&checkoutDir, &marker](GitCommandResult result) {
         std::error_code rmec;
-        fs::remove_all(staging, rmec);
+        fs::remove_all(checkoutDir, rmec);
+        if (!rmec) fs::remove(marker, rmec);
         return result;
     };
 
-    out = git_->clone(url, staging);
+    out = git_->clone(url, checkoutDir);
     if (!out.ok) return abandon(std::move(out));
 
-    // The ref is applied INSIDE staging, before anything lands. A checkout that
-    // failed after the rename would leave `.dss-deps/<name>` populated at the
-    // WRONG revision, and the next build — seeing a usable checkout — could
-    // fall back onto it under 0xD01F and compile it.
+    // The ref is applied while the marker still stands: a checkout that fails
+    // leaves a tree at the WRONG revision, which must never read as usable —
+    // the next build would otherwise fall back onto it under 0xD01F.
     if (ref) {
-        out = git_->checkout(staging, *ref);
+        out = git_->checkout(checkoutDir, *ref);
         if (!out.ok) return abandon(std::move(out));
     }
 
-    fs::create_directories(depsDir_, ec);
+    // ── PUBLISH: the tree is complete ───────────────────────────────────────
+    // ✔MEASURED: nothing holds this empty file when it is removed (0 refusals in
+    // 3300 create-then-remove cycles under load), so one attempt; a failure is
+    // LOUD, and the marker left behind makes the next build re-acquire rather
+    // than trust.
+    fs::remove(marker, ec);
     if (ec) {
         out.ok     = false;
-        out.detail = "the cache directory '" + core::genericSpelling(depsDir_)
-                   + "' could not be created: " + ec.message();
-        return abandon(std::move(out));
-    }
-    fs::rename(staging, landed, ec);
-    if (ec) {
-        out.ok     = false;
-        out.detail = "the completed checkout could not be moved from '"
-                   + core::genericSpelling(staging) + "' to '"
-                   + core::genericSpelling(landed) + "': " + ec.message();
-        return abandon(std::move(out));
+        out.detail = "the checkout at '" + core::genericSpelling(checkoutDir)
+                   + "' is complete but could not be marked so — '"
+                   + core::genericSpelling(marker)
+                   + "' could not be removed: " + ec.message();
     }
     return out;
 }
@@ -298,19 +478,48 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
     std::string const&                url = claim->second.url;
     std::optional<std::string> const& ref = claim->second.ref;
     fs::path const checkoutDir            = depsDir_ / name;
+    fs::path const marker                 = partialMarker_(name);
+
+    // ── ONE ACQUISITION OF `<name>` AT A TIME — see `AcquisitionLock` ───────
+    // Taken before the checkout is even LOOKED at, and held to the end of this
+    // function: a build that finds another's acquisition in progress waits for
+    // it, then re-reads the state the other one left — never a half-written
+    // tree, and never a `remove_all` racing the other build's.
+    std::error_code ec;
+    fs::path const  lockDir = depsDir_ / std::string{kDependencyLockDirName};
+    fs::create_directories(lockDir, ec);
+    auto held = ec ? std::expected<AcquisitionLock, std::string>{std::unexpected(
+                         "the lock directory '" + core::genericSpelling(lockDir)
+                         + "' could not be created: " + ec.message())}
+                   : AcquisitionLock::acquire(lockDir / name, [this, &name] {
+                         if (lockContentionObserver_) lockContentionObserver_(name);
+                     });
+    if (!held) {
+        report(rep, DiagnosticCode::D_DependencyGitAcquireFailed,
+               DiagnosticSeverity::Error,
+               "git dependency " + describeEntry(url, ref)
+                   + " could not be acquired: " + held.error()
+                   + ". Without the lock another build could be writing the "
+                     "same checkout, so nothing was touched.");
+        return out;
+    }
+    ec.clear();
 
     // ── "IS THERE A USABLE CHECKOUT?" — B.4's ONE DISCRIMINATOR ──────────────
     // Deliberately NOT `is_directory`. A directory can exist without being a
-    // repository (an interrupted clone from a build that predates staging, a
-    // half-deleted tree, a user's own mkdir), and calling that "a checkout"
-    // routes a later failure to 0xD01F — "the build PROCEEDS on possibly-stale
-    // sources" — over a tree that has no sources in it at all. Asking git is
-    // the only honest probe, and U-3 already requires this exact call on the
-    // hit path, so it costs nothing there.
-    std::error_code ec;
-    bool            hasCheckout = false;
-    std::string     headCommit;
-    if (fs::is_directory(checkoutDir, ec) && !ec) {
+    // repository (an interrupted clone, a half-deleted tree, a user's own
+    // mkdir), and calling that "a checkout" routes a later failure to 0xD01F —
+    // "the build PROCEEDS on possibly-stale sources" — over a tree that has no
+    // sources in it at all. Asking git is the only honest probe, and U-3
+    // already requires this exact call on the hit path, so it costs nothing
+    // there. ★ AND THE COMPLETENESS MARKER VETOES IT: a tree whose writing was
+    // interrupted can answer `rev-parse` perfectly well (git writes HEAD before
+    // the working tree is complete) — the marker is the only thing that knows.
+    bool        hasCheckout = false;
+    std::string headCommit;
+    bool const  markedIncomplete = fs::exists(marker, ec) && !ec;
+    ec.clear();
+    if (!markedIncomplete && fs::is_directory(checkoutDir, ec) && !ec) {
         GitCommandResult const head = git_->revParse(checkoutDir, "HEAD");
         hasCheckout                 = head.ok;
         headCommit                  = head.output;
@@ -335,7 +544,7 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
     // ── THE NETWORK PATH ─────────────────────────────────────────────────────
     GitCommandResult acq =
         hasCheckout ? git_->fetch(checkoutDir, ref.value_or(std::string{}))
-                    : cloneStaged_(name, url, ref);
+                    : cloneInPlace_(name, url, ref);
 
     // ★ A FETCH MUST BE FOLLOWED BY A CHECKOUT, AND IT CHECKS OUT `FETCH_HEAD`
     // RATHER THAN THE REF NAME. Fetching alone updates refs and leaves HEAD
@@ -346,15 +555,54 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
     // already checked out moves nowhere. `FETCH_HEAD` is the tip that was just
     // fetched — and `gitFetchArgv` fetches the manifest's ref EXPLICITLY, so
     // FETCH_HEAD means exactly the revision the manifest asked for.
-    // The clone arm needs no counterpart here: `cloneStaged_` has already
-    // applied the ref inside staging, and a clone with no ref lands on the
+    // The clone arm needs no counterpart here: `cloneInPlace_` has already
+    // applied the ref under its marker, and a clone with no ref lands on the
     // remote's default branch, which is what "no ref declared" means.
+    //
+    // ★ THE CHECKOUT REWRITES A TRUSTED TREE, SO IT RUNS UNDER THE MARKER TOO
+    // (cargo's `reset`: remove `.cargo-ok`, reset, recreate it). A fetch
+    // touches no working-tree file, so a FAILED FETCH leaves a tree that is
+    // still exactly the old commit — the 0xD01F fallback below stays honest. A
+    // checkout that fails MIDWAY leaves a tree that is part old, part new, while
+    // HEAD may still name the old commit; falling back onto it would compile a
+    // mix and report a commit it is not. So the marker goes up first and comes
+    // down only when the checkout succeeded.
+    bool refreshLeftTreeIncomplete = false;
     if (acq.ok && hasCheckout) {
-        acq = git_->checkout(checkoutDir, "FETCH_HEAD");
+        fs::create_directories(marker.parent_path(), ec);
+        std::FILE* const claimed =
+            ec ? nullptr : linker::detail::createExclusiveBinary(marker);
+        if (claimed == nullptr || std::fclose(claimed) != 0) {
+            acq.ok     = false;
+            acq.detail = "the completeness marker '" + core::genericSpelling(marker)
+                       + "' could not be created, so the working tree was not "
+                         "rewritten";
+        } else {
+            acq = git_->checkout(checkoutDir, "FETCH_HEAD");
+            if (acq.ok) {
+                fs::remove(marker, ec);
+                if (ec) {
+                    acq.ok     = false;
+                    acq.detail = "the refreshed checkout is complete but could "
+                                 "not be marked so — '"
+                               + core::genericSpelling(marker)
+                               + "' could not be removed: " + ec.message();
+                    refreshLeftTreeIncomplete = true;
+                }
+            } else {
+                refreshLeftTreeIncomplete = true;
+            }
+        }
     }
 
     if (!acq.ok) {
-        if (hasCheckout) {
+        if (refreshLeftTreeIncomplete) {
+            // Not a network fallback: the tree this build would fall back ON has
+            // been rewritten (or partly rewritten), and its marker says so.
+            acq.detail += "; the checkout at '" + core::genericSpelling(checkoutDir)
+                        + "' was being rewritten and is now marked incomplete, so "
+                          "it is not used — the next build re-acquires it";
+        } else if (hasCheckout) {
             // Re-probe rather than reporting the commit seen before the
             // attempt: the fetch may have got as far as moving something, and a
             // build that says it compiled commit X when the tree is at Y is a

@@ -40,9 +40,9 @@ namespace {
 
 // Wrap a body line in a minimal well-formed module.
 [[nodiscard]] std::string moduleWith(std::string_view bodyLine) {
-    return std::string("dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+    return std::string("dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                        "  function %1 : fn() -> void {\n    block {\n      ")
-         + std::string(bodyLine) + "\n      return\n    }\n  }\n}\n";
+         + std::string(bodyLine) + "\n      return void\n    }\n  }\n}\n";
 }
 
 // Every diagnostic's `actual` text concatenated — what an author would read.
@@ -426,11 +426,11 @@ TEST(HirTextVocabulary, BuiltinCallLoweringSentinelZeroIsRefused) {
 // reason that has nothing to do with the keyword being readable.
 TEST(HirTextVocabulary, LabelAddressKeywordRoundTripsThroughTheReader) {
     std::string const text =
-        "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
-        "      label L1:\n        return\n"
+        "      label L1:\n        return void\n"
         "      expr labeladdr L1 : ptr<void>\n"
-        "      return\n    }\n  }\n}\n";
+        "      return void\n    }\n  }\n}\n";
     ParseOutcome const o = parseText(text);
     EXPECT_TRUE(o.ok) << "labeladdr did not parse:\n" << o.diagnostics;
     EXPECT_EQ(o.diagnostics.find("unknown node keyword"), std::string::npos)
@@ -467,10 +467,10 @@ TEST(HirTextVocabulary, ExpressionNodesInStatementPositionAreNotDegradedToError)
     };
     for (Case const& c : cases) {
         std::string const text =
-            "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+            "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
             "  function %1 : fn() -> void {\n    block {\n"
             "      label L1:\n        unreachable\n      "
-            + std::string(c.line) + "\n      return\n    }\n  }\n}\n";
+            + std::string(c.line) + "\n      return void\n    }\n  }\n}\n";
         DiagnosticReporter r1;
         auto res = parseHir(text, CompilationUnitId{1}, r1);
         ASSERT_TRUE(res->ok) << c.kw << ":\n" << allDiagText(r1);

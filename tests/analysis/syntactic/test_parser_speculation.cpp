@@ -646,8 +646,8 @@ TEST(ParserSpeculation, COperandAltBranchesAreInDeclaredOrder) {
 // deep each compiles rc=0 through the WHOLE pipeline and the program RUNS
 // returning 42. The wording is corrected in place rather than deleted because
 // the scoping decision it justified is still right and the next author would
-// otherwise re-derive the same stale reason
-// (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+// otherwise re-derive the same stale reason: a comment's claim can be true
+// when it is typed and false by the time the commit lands.
 //
 // NOTE 2 (the generous 8× ceiling): the parse WORK is O(N) — the companion
 // `FlatChainParseWorkIsLinear` pins the shared machinery flat — but this
@@ -982,15 +982,15 @@ flatChainParseMetrics(std::shared_ptr<GrammarSchema const> const& schema,
 // still-open <row>"*, and the status half of that sentence WAS FALSE by the
 // time anyone read it: the row IS CLOSED. It is corrected in place rather than
 // deleted, because the TECHNICAL half is exactly why this flat control exists
-// and the two halves are easy to conflate
-// (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+// and the two halves are easy to conflate — a comment's claim can be true when
+// it is typed and false by the time the commit lands.
 // WHAT SURVIVES, and it is the whole reason for the pair: the RECURSIVE
 // deep-nest sibling carries an N-deep memory-hierarchy constant factor that
 // this non-recursive chain does not, which is why the two tests carry
 // different bounds — the separate row is
 // D-PARSE-DEEP-NEST-RECURSION-MEMORY.
 // ⚠ FOR ITS STATUS ASK THE INSTRUMENT — `python
-// scripts/check-anchor-balance/check-anchor-balance.py` — never a comment: a
+// .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py` — never a comment: a
 // status word in prose is a measurement with no instrument attached, which is
 // how this sentence rotted in the first place.
 TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {

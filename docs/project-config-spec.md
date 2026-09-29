@@ -24,6 +24,7 @@
   "defines":          ["NDEBUG", "MAX=64"],             // optional — NAME[=VALUE] macros   (mirrors CLI --define)
   "resolveLibraries": ["dist/libfoo.so"],               // optional — extern-resolving libs (mirrors CLI --resolve-library); see §2.3 for the extended entry
   "stackReserve":     4194304,                          // optional — per-PROGRAM stack reserve in BYTES; see §2.4 (CLI --stack-reserve WINS)
+  "runpaths":         ["${ORIGIN}", "/opt/app/lib"],    // optional — where each image records its libraries are (DT_RUNPATH / LC_RPATH); see §2.9 (merges with CLI --rpath)
   "preBuildScripts":  [{ "run": ["bash", "gen.sh"] }],  // optional — argv hooks run BEFORE the build; see §2.5
   "postBuildScripts": [{ "run": ["./sign.sh"],          // optional — argv hooks run AFTER a SUCCESSFUL build; see §2.5
                          "runOn": ["linux", "darwin"] }],
@@ -48,13 +49,14 @@ delegates to the existing compile path — routing by source **count** (§5).
 | `language` | **yes** | non-empty string | The shipped language to compile (`src/dss-config/sources/<language>.lang.json`). |
 | `artifactProfile` | **yes** | non-empty string | The **single** output shape to produce (§3). Singular — the language declares a *set*, the project picks *one*. |
 | `targets` | **yes** | non-empty array of non-empty strings | Each entry is a `"<targetName>:<formatName>"` spec (e.g. `"x86_64:elf64-x86_64-linux-exec"`). One artifact is produced per target. |
-| `sources` | **yes** | non-empty array of non-empty strings | The source files — each entry is a literal path **or a glob pattern** (`D-AP2-SOURCES-GLOB`, see §2.1). In the **root** manifest, relative entries resolve against the process working directory; in a manifest reached through `dependsOn`, against **that manifest's own directory** (§2.6). An absolute entry resolves directly under either. |
-| `output` | no | non-empty string when present | The output-dir **base** — the `<base>` each target's artifact routes into as `<base>/<formatName>/<artifactName-or-stem><ext>`, i.e. the file-driven form of the CLI `--output <dir>` (§5). Absent ⇒ `--output` when given, else `<cwd>/target`. It is a **directory, never a file path**: `artifactName` owns the emitted binary's *name*, and one fact does not get a second owner. A **relative** value resolves against the **process working directory** — the same base this manifest's `sources[]` and `preBuildScripts` use, so a hook that writes `dist/` and an `"output": "dist"` name the same place. Unlike `artifactName` it is **not** shape-checked at load: separators, `..` segments and an absolute or root-prefixed spelling are all legitimate in a directory, exactly as they are for `--output`. **Precedence: the CLI `--output` wins** (the `stackReserve` rule, §2.4), and when the two name *different* directories the override is announced on the driver note channel (`dsscp: note: …`) rather than silently applied. A **dependency** manifest's `output` is never read (§2.6, the U-9 ruling — the output base is a property of *the build*). |
-| `artifactName` | no | non-empty string when present, **no path separators** | The base **name** for the emitted binary (no extension). Absent ⇒ the source stem (unchanged). A project build routes each target's artifact to `<output-dir>/<formatName>/<artifactName-or-stem><ext>`; the base dir is the `--output` flag (or the default `<cwd>/target`). It is a bare *name*, not a path — a value with `/` or `\` fails loud at load (`C_MalformedJson`), and the router additionally rejects any name that would resolve **outside** the output dir (a `..` component, or a drive/root prefix) with a fail-loud `D_ArtifactNameEscapesOutputDir` (§5), so a bare name can never escape `--output`. The name + per-platform-subdir half of `D-AP2-OUTPUT-ROUTING` (§5, §7). |
-| `includes` | no | array of non-empty strings | Quote-include search dirs (C 6.10.2). The file-driven form of the CLI `-I <dir>` (`Program::setIncludeDirs`). |
-| `defines` | no | array of non-empty strings | `NAME[=VALUE]` preprocessor macros. The file-driven form of the CLI `--define` (`Program::setUserDefines`). |
-| `resolveLibraries` | no | array of non-empty strings **or `{"path","importName"}` objects** | Library paths whose export surfaces resolve + validate this build's externs. The file-driven form of the CLI `--resolve-library <path>[=<import-name>]` (`Program::setResolveLibraries`). See §2.3. |
+| `sources` | **yes** | non-empty array of non-empty strings | The source files — each entry is a literal path **or a glob pattern** (`D-AP2-SOURCES-GLOB`, see §2.1). A relative entry resolves against **this manifest's own directory** — the root manifest exactly as one reached through `dependsOn` (§2.2). An absolute entry resolves directly. |
+| `output` | no | non-empty string when present | The output-dir **base** — the `<base>` each target's artifact routes into as `<base>/<formatName>/<artifactName-or-stem><ext>`, i.e. the file-driven form of the CLI `--output <dir>` (§5). Absent ⇒ `--output` when given, else `target/` **in this manifest's directory**. It is a **directory, never a file path**: `artifactName` owns the emitted binary's *name*, and one fact does not get a second owner. A **relative** value resolves against **this manifest's own directory** (§2.2) — the same base its `sources[]` and the working directory of its `preBuildScripts` use, so a hook that writes `dist/` and an `"output": "dist"` name the same place. Unlike `artifactName` it is **not** shape-checked at load: separators, `..` segments and an absolute or root-prefixed spelling are all legitimate in a directory, exactly as they are for `--output`. **Precedence: the CLI `--output` wins** (the `stackReserve` rule, §2.4), and when the two name *different* directories the override is announced on the driver note channel (`dsscp: note: …`) rather than silently applied. A **dependency** manifest's `output` is never read (§2.6, the U-9 ruling — the output base is a property of *the build*). |
+| `artifactName` | no | non-empty string when present, **no path separators** | The base **name** for the emitted binary (no extension). Absent ⇒ the source stem (unchanged). A project build routes each target's artifact to `<output-dir>/<formatName>/<artifactName-or-stem><ext>`; the base dir is the `--output` flag, else the manifest's `output`, else `target/` in the manifest's directory (§5). It is a bare *name*, not a path — a value with `/` or `\` fails loud at load (`C_MalformedJson`), and the router additionally rejects any name that would resolve **outside** the output dir (a `..` component, or a drive/root prefix) with a fail-loud `D_ArtifactNameEscapesOutputDir` (§5), so a bare name can never escape `--output`. The name + per-platform-subdir half of `D-AP2-OUTPUT-ROUTING` (§5, §7). |
+| `includes` | no | array of non-empty strings | Quote-include search dirs (C 6.10.2). The file-driven form of the CLI `-I <dir>` (`Program::setIncludeDirs`). A relative entry resolves against this manifest's own directory (§2.2); a `-I` on the command line keeps the command line's base. A `module` dependency's entries apply to **its own** merged sources (§2.6). |
+| `defines` | no | array of non-empty strings | `NAME[=VALUE]` preprocessor macros. The file-driven form of the CLI `--define` (`Program::setUserDefines`). A `module` dependency's entries apply to **its own** merged sources (§2.6). |
+| `resolveLibraries` | no | array of non-empty strings **or `{"path","importName"}` objects** | Library paths whose export surfaces resolve + validate this build's externs. The file-driven form of the CLI `--resolve-library <path>[=<import-name>]` (`Program::setResolveLibraries`). A relative `path` resolves against this manifest's own directory (§2.2). See §2.3. |
 | `stackReserve` | no | JSON **unsigned** integer > 0 | The per-**program** stack reserve, in **bytes**. The file-driven twin of the CLI `--stack-reserve <bytes>`. Unlike the three arrays this is a **scalar** and therefore cannot merge — the **CLI wins** (§2.4). Absent ⇒ the object format's declared default stands. |
+| `runpaths` | no | array of non-empty strings, each **portable** | Directories every image this project builds records for its **own loader** to search for the libraries it needs — DT_RUNPATH on ELF, one LC_RPATH per entry on Mach-O, nothing on PE (accepted with a warning). The file-driven, **portable** twin of the CLI `--rpath <dir>` (`Program::setRunpaths`): each entry is absolute or rooted at `${ORIGIN}`, which every format's document spells its own way. A **list**, so it **merges** with the CLI's entries, manifest first. See §2.9. |
 | `preBuildScripts` | no | array of `{"run","runOn"}` objects | Commands run **before** the build. `run` is an **argv vector**, spawned directly — never a shell. See §2.5. |
 | `postBuildScripts` | no | array of `{"run","runOn"}` objects | Commands run **after** a build that **succeeded**. Same entry shape as `preBuildScripts`. See §2.5. |
 | `dependsOn` | no | array of `{"path"}` **or** `{"git","ref"?}` objects | Prerequisite projects, **resolved recursively** and folded into this build by the composition verb the *dependency's* `artifactProfile` declares (§3). See §2.6. |
@@ -72,7 +74,50 @@ than being silently ignored, matching the grammar/target/format loaders. The one
 the loader's own key table (`projectConfigKnownKeys()` / `projectConfigKnownKeyList()`), so the list a
 reject shows you can never drift from the set the check actually enforces.
 
-### 2.3 `resolveLibraries` — declaring the recorded import identity (`D-FFI-DECLARED-IMPORT-NAME`)
+### 2.2 Relative paths — the manifest's own directory, always
+
+**Every relative path a manifest holds names a location relative to THAT MANIFEST'S OWN DIRECTORY** —
+the root manifest exactly as a manifest reached through `dependsOn`, and from whatever directory the
+build was started. That covers `sources` (literal and glob, §2.1), `includes`, `resolveLibraries`,
+`output`, a `dependsOn` entry's `path`, the working directory the build hooks run in, and a hook
+program named by a path (§2.5). An **absolute** entry — or a rooted one, a `//host/share` UNC path
+included — is used as written. The resolution is **lexical**: nothing is read from the filesystem, so a
+file a pre-build hook has not generated yet resolves exactly like one that already exists. With neither
+`--output` nor `output`, the artifacts go to `target/` in the manifest's directory (§5).
+
+**Command-line flags are not manifest paths.** `--project` itself, `--output`, `-I` and
+`--resolve-library` resolve against the directory the command runs in, as they do for every compiler:
+they are what the person typing the command wrote, relative to where they typed it. A manifest value and
+a flag that merge (§2) each keep their own base.
+
+**One rule, in one place.** The root build, every dependency build, the hook runner and the editor all
+resolve through `resolveManifestPath` (`src/core/types/project_sources.hpp`) and the one `sources[]`
+expansion beside it, so none of them can disagree about which file a manifest names.
+
+**A tool that WRITES a manifest** writes each relative path relative to the directory it writes the
+manifest into, or writes it absolute.
+
+> ★ **Why, and what changed (2026-09-21).** The root manifest used to resolve its relative `sources`,
+> `includes`, `resolveLibraries`, `output` and hook paths against the **process working directory**,
+> while a dependency resolved them against its own directory. The reason given for the dependency rule —
+> a manifest's meaning must not depend on where the build happened to be started — applies to the root
+> just as much, and the old rule failed it in the worst way. ✔MEASURED from a directory holding
+> look-alike files, a root build compiled **their** `src/main.c` (literal and glob alike), took
+> **their** header and ran **their** hook script, with exit status 0 every time. From an empty
+> directory it failed, naming only the relative spelling. The root manifest also mixed two bases within
+> itself: its `dependsOn` and its `.dss-deps/` were already manifest-relative, while its `sources` were
+> not. And the four reference build systems agree. CMake and MSBuild (✔MEASURED, started from a directory
+> holding decoys) and Cargo and Meson (📄 documented) all resolve a manifest's own paths against the
+> manifest's directory, and use the invocation directory only for their command lines.
+>
+> A build started in the manifest's own directory means exactly what it meant before. That covers every
+> corpus runner, CI job and generated manifest in this repository (✔MEASURED). A build started anywhere
+> else now reads the files the manifest's author wrote relative to, and writes its default `target/`
+> beside the manifest instead of under wherever it was started. There is **no transition diagnostic**. A
+> build can switch files silently only when a same-named file exists under **both** bases, and then the
+> new rule reads the one the author meant.
+
+### 2.3 `resolveLibraries` — declaring the recorded import identity
 
 Reading a library binary answers **two** questions, and an entry can now answer both:
 
@@ -126,22 +171,22 @@ is just a non-empty source string — no filesystem access at parse time); `Prog
 been listed literally. The matcher lives in `core/types/glob_match.hpp` (language / target / format
 agnostic — pure path-text matching + a filesystem walk).
 
-- **Literal vs glob.** An entry with **no** metacharacter (`*`, `?`, `[`) is a literal path, kept
-  **verbatim** — unchanged behavior (a missing literal still fails downstream at CU build; it is *not*
-  newly rejected here). An entry with **any** metacharacter is expanded against the filesystem.
+- **Literal vs glob.** An entry with **no** metacharacter (`*`, `?`, `[`) is a literal path, resolved
+  against the manifest's directory (§2.2) and otherwise kept as written (a missing literal still fails
+  downstream at CU build; it is *not* rejected here). An entry with **any** metacharacter is expanded
+  against the filesystem.
 - **Syntax** (standard glob):
   - `*` — any run of characters **within one path segment** (does **not** cross `/`);
   - `**` — a whole segment matching **zero or more** segments (recursive: `a/**/b` matches `a/b`,
     `a/x/b`, `a/x/y/b`; `**/*.c` matches `x.c` *and* `sub/x.c`);
   - `?` — exactly one character within a segment;
   - `[...]` — a character class (ranges `a-z`, negation `[!...]` / `[^...]`).
-- **Base directory.** In the **root** manifest, patterns resolve relative to the **process working
-  directory** (the same base a literal source uses); an **absolute** pattern resolves directly. Only
-  the subtree under the pattern's literal leading prefix is walked (`src/**/*.c` never scans a sibling
-  `build/`). A manifest reached through `dependsOn` uses **its own directory** as that base instead,
-  for both halves — literal *and* glob (§2.6). One function answers "which files does this manifest
-  name" for both cases (`src/program/project_sources.hpp`), so the two bases cannot drift into two
-  policies.
+- **Base directory.** A relative pattern resolves against the **manifest's own directory** (§2.2) —
+  the same base a literal source uses, in the root manifest and in a dependency alike; an **absolute**
+  pattern resolves directly. Only the subtree under the pattern's literal leading prefix is walked
+  (`src/**/*.c` never scans a sibling `build/`). One function answers "which files does this manifest
+  name" for every manifest (`src/core/types/project_sources.hpp`), so literals and globs, roots and
+  dependencies cannot drift into separate policies.
 - **Determinism.** Matches are **sorted lexicographically**, so the compilation-unit order is stable
   and reproducible across platforms.
 - **Overlap composes.** Entries that overlap — two globs matching a shared file, or a literal alongside
@@ -186,6 +231,41 @@ rather than with an invocation.
   overflow without editing — and risking committing — the manifest.
 - Absent ⇒ the object format's declared default stands (unchanged behavior).
 
+### 2.9 `runpaths` — where each image says its libraries are (`D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH`)
+
+Directories the emitted image records for its **own loader** to search when it resolves the libraries
+the image needs — so a program linked against a library it ships beside itself runs without
+`LD_LIBRARY_PATH`. The references were measured before this was written: gcc and clang record
+`-Wl,-rpath,<dir>` as one `DT_RUNPATH` entry (`$ORIGIN` kept verbatim for `ld.so` to expand), ld64 records
+one `LC_RPATH` per `-rpath`, and neither PE linker (mingw GNU ld, MSVC `link`) records anything — the
+Windows loader searches the application's own directory instead.
+
+- **`${ORIGIN}` is the portable token** for *the directory of the image that carries the path* — never the
+  executable's (measured: a library's own `$ORIGIN` names the library's directory). Each format's
+  **document** declares its spelling (`runpath.origin`: `$ORIGIN` on ELF, `@loader_path` on Mach-O), so one
+  manifest means the same thing on every target. It is recognized only as the **leading** component — the
+  whole entry, or followed by `/` — the one position every loader expands its spelling in.
+- **The portable rule, checked at load** (`C_MalformedJson`): an entry is **absolute** (`/opt/app/lib`) or
+  **rooted at `${ORIGIN}`**; it carries **no other `$`** (glibc expands `$LIB` / `$PLATFORM`, musl ignores a
+  whole runpath holding any `$` but ORIGIN), **no `:`** (ELF's loader splits the list on it, dyld keeps it as
+  one path), and is **not relative** (a relative runpath resolves against the working directory of whatever
+  process loads the image). Every refusal names the entry and says where a loader-specific spelling *is*
+  accepted: the CLI `--rpath`, which takes gcc's literal semantics for the one target an invocation builds.
+- **What the image records.** The entries in order, a leading `${ORIGIN}` written in the format's spelling,
+  an exact duplicate dropped (the first kept — GNU ld and Apple's linker drop duplicates, and a current dyld
+  refuses an image with a duplicate `LC_RPATH`). A format that records none — PE, a relocatable object, an
+  archive — **accepts** the request, records nothing and says so once per artifact in the
+  `K_FormatLacksRunpath` **warning** (suppressible), naming where that format's loader looks instead. An entry
+  no image can hold — empty, or holding a NUL byte, reachable through the API — fails the link with the
+  unsuppressable `K_InvalidRunpathRequest`.
+- **★ Precedence — a list, so it MERGES.** `Program::compileProject` prepends the manifest's entries to the
+  CLI `--rpath` entries `Program::run` stamped: manifest first, then the command line, as repeated `-rpath`
+  accumulates in gcc and ld64 alike.
+- **A dependency's own.** A manifest reached through `dependsOn` records **its own** `runpaths` in the
+  artifact it builds; the consumer's entries never reach it, because a runpath describes the layout around
+  the image that carries it (§2.6).
+- Absent ⇒ nothing is recorded (unchanged behavior).
+
 ### 2.5 `preBuildScripts` / `postBuildScripts` — build-lifecycle hooks
 
 Two optional arrays of the **same** entry shape, declared in the manifest so a build step travels
@@ -224,7 +304,12 @@ containing a space or a `;` becoming executable text). Consequences you can rely
 - **Shell builtins and shell-only spellings do not resolve.** `{"run": ["cd", "x"]}` or
   `{"run": ["echo", "hi", ">", "f"]}` is a mistake; spell it `["bash", "-c", "…"]` if you genuinely
   want a shell, and own that choice explicitly in the manifest.
-- A **bare name** in `run[0]` is resolved against `PATH`; a path is used as given.
+- A **bare name** in `run[0]` (`python`) is resolved against `PATH`. A `run[0]` with a directory
+  component (`tools/gen`, `./gen.sh`, and on Windows also `tools\gen.exe`) names a **file**, and like
+  every path a manifest holds it resolves against the manifest's own directory (§2.2); an absolute one
+  is used as given. The spawn layer would otherwise resolve it against the *compiler's* directory, not
+  the hook's, so the build re-bases it before spawning. ✔MEASURED before that, a dependency whose hook
+  ran `tools/probe.exe` spawned it from its **consumer's** working directory, where it did not exist.
 - **No word may contain a NUL** — an escaped `U+0000` inside a `run` string is a loud
   `C_MalformedJson` naming the entry and element index (and deliberately *not* echoing the byte,
   which is unprintable). It is the one character that cannot cross the exec boundary at all: an argv
@@ -275,15 +360,15 @@ exactly one is emitted per run — the one belonging to the entry that stopped i
   is** rather than being deleted: the compile genuinely succeeded and the bytes are genuinely
   correct, so unwinding it because a deploy script's credentials expired would destroy re-usable
   work.
-- **Working directory** = the base that manifest's own `sources[]` resolve against (§2.1), because a
-  hook that writes `generated/main.c` and a manifest that reads `generated/*.c` must mean the same
-  directory or the feature would not compose with itself. For the **root** manifest that is the
-  **process working directory** — the driver passes the *empty-path sentinel*, which
-  `spawnAndWaitInherit` documents as "inherit the caller's current directory", rather than a
-  materialized `current_path()`: materializing would add a failure mode and let the two answers drift.
-  For a manifest reached through `dependsOn` it is **that dependency's own directory** (§2.6), which
-  is why the runner takes cwd as a *parameter* rather than reading the process cwd — one runner, one
-  policy, no caller-kind branch.
+- **Working directory** = **the manifest's own directory** (§2.2), the base its `sources[]` resolve
+  against (§2.1), because a hook that writes `generated/main.c` and a manifest that reads
+  `generated/*.c` must mean the same directory or the feature would not compose with itself. That holds
+  for the root manifest and for a manifest reached through `dependsOn` alike (§2.6), which is why the
+  runner takes the directory as a *parameter* rather than reading the process cwd — one runner, one
+  policy, no caller-kind branch. A manifest named with no directory component (`--project
+  app.dss-project.json`) is in the process working directory, and the driver passes the *empty path*,
+  which `spawnAndWaitInherit` documents as "inherit the caller's current directory", rather than a
+  materialized `current_path()`, which would only add a failure mode.
 
 **No timeout, no output capture.** A pre-build script is arbitrary user work — a code generator, a
 submodule sync, a download — and there is no defensible number of seconds after which the compiler
@@ -321,7 +406,7 @@ An entry names **exactly one** source:
 
 | Member | Rule |
 |---|---|
-| `path` | A local checkout. Kept **verbatim** — no filesystem access, no normalization, no resolution at parse time (exactly as `sources[]` is). |
+| `path` | A local checkout, relative to **this** manifest's directory when relative (§2.2). Kept **verbatim** — no filesystem access, no normalization, no resolution at parse time (exactly as `sources[]` is). |
 | `git` | A remote URL. |
 | `ref` | Optional branch / tag / commit. **Only valid alongside `git`.** |
 
@@ -377,16 +462,36 @@ Two asymmetries in that table are deliberate and are not oversights:
   (`core/types/artifact_profile.hpp`). Every verb is a valid *instruction*, `NotConsumable` included;
   "no verb" is the absence, and the absence must not be reported as an instruction.
 
-**Relative paths get two different bases, and that is correct.** The **root** manifest resolves its
-relative `sources[]` and hook paths against the **process working directory** — unchanged, shipped
-behaviour (§2.1), and it stays unchanged. A manifest reached through `dependsOn` resolves against
-**its own directory**. Anything else would make a dependency's meaning depend on where the *depender*
-happened to be invoked from — the same manifest would name different files on two machines.
+**A `module` brings its own `includes` and `defines` to its own sources, and to nothing else.** A
+module is a library that its consumers take in as source (the table above: built standalone, it is a
+library and emits an artifact). Its sources must therefore mean inside a consumer what they mean when
+the module builds on its own. Each merged source is compiled with its module's `includes`, resolved
+against the module's directory (§2.2) and searched **before** the consumer's. Its module's `defines` are
+applied **after** the consumer's, so the module's own value wins a conflict, with the preprocessor's
+redefinition warning (the rule a repeated `-D` follows). A module's settings never reach the consumer's
+own sources, and never another module's. ✔MEASURED before this, both were silently dropped: a module
+whose source included a header from its own include directory could not be compiled inside any
+consumer, from any working directory. The other direction is a known, gated gap: the consumer's own
+`includes` and `defines` still reach a module's sources, because a merged module is still compiled
+inside the consumer's one compilation (`D-DEPS-SOURCEMERGE-INHERITS-THE-CONSUMERS-COMPILATION-ENVIRONMENT`, §7).
+
+**Relative paths have ONE base: the manifest's own directory, for a dependency exactly as for the
+root (§2.2).** A manifest reached through `dependsOn` resolves its relative `sources`, `includes`,
+`resolveLibraries`, `dependsOn` paths, hook working directory and path-form hook program against **its
+own directory**. Anything else would make a dependency's meaning depend on where its *consumer* was
+built from, and the same manifest would name different files on two machines. This paragraph used to
+describe **two** bases, the root's being the process working directory, and to call that correct. But
+the argument it gave for dependencies is the argument for the root as well, and §2.2 records what the
+root's old base did (it read look-alike files with exit status 0). ✔MEASURED before the change, the
+dependency half was only partly built. An `ArtifactLink` dependency's `includes`, `resolveLibraries`
+and path-form hook program were resolved against the **consumer's** working directory. From the
+consumer's own directory such a dependency could not be built at all. From a directory holding a
+same-named header, it took that header and exited 0.
 
 > ★ **The LITERAL half of that rule matters exactly as much as the glob half, and it is the half that
-> is easy to get wrong.** ✔MEASURED and recorded at `src/program/project_sources.hpp`: a `sources[]`
-> entry with no glob metacharacter used to be kept verbatim and opened later against the **process**
-> cwd. `"sources": ["src/lib.c"]` is the overwhelmingly common form, so re-basing only the glob
+> is easy to get wrong.** ✔MEASURED and recorded at `src/core/types/project_sources.hpp`: a dependency's
+> `sources[]` entry with no glob metacharacter used to be kept verbatim and opened later against the
+> **process** cwd. `"sources": ["src/lib.c"]` is the overwhelmingly common form, so re-basing only the glob
 > expansion would have left the half everybody writes pointing at the wrong tree — and it would fail
 > by **reading the consumer's own `src/lib.c`**, if it has one, rather than by failing loud. That is
 > a silent miscompile, not a missing input. Both halves re-base together, through one function, or
@@ -458,7 +563,7 @@ each get their own checkout. That is deliberate — a cross-project shared store
 project's build depend on what some other project fetched last, and de-duplicating it would need its
 own invalidation and concurrency design, which this is explicitly not. (`.dss-deps/` also appears in
 the dss-code-prime repository's own `.gitignore`, but only because that repository contains example
-manifests of its own under `examples/` and `real-examples/`.)
+manifests of its own under `examples/`, and its sqlite corpus harness generates more.)
 
 ★ **There is ONE `.dss-deps` per BUILD — at the ROOT consumer's manifest directory — not one per
 node.** Stated rather than left to be inferred, because the obvious reading of "beside the consuming
@@ -558,9 +663,10 @@ never source, and committing it would vendor someone else's history into your re
 **Hooks run for dependencies too, and the rule mirrors the root's.** `preBuildScripts` run for
 **every** resolved dependency; `postBuildScripts` run **only** for an `ArtifactLink` dependency whose
 own build returned 0 — the same "only when the compile succeeded" rule the root follows (§2.5). Each
-dependency's hooks run with **that dependency's own directory** as their working directory. This is
-written down rather than left implicit because *"the hooks silently didn't run"* is otherwise
-unobservable: there is no output to be missing and no diagnostic to be absent.
+dependency's hooks run with **that dependency's own directory** as their working directory, and a hook
+program it names by a path is found there too (§2.5). This is written down rather than left implicit
+because *"the hooks silently didn't run"* is otherwise unobservable: there is no output to be missing
+and no diagnostic to be absent.
 
 **Where a dependency's artifact lands.** An `ArtifactLink` dependency's product is emitted under the
 **consumer's** output base, at:
@@ -570,11 +676,12 @@ unobservable: there is no output to be missing and no diagnostic to be absent.
 ```
 
 The base is the `--output` directory when given, else the ROOT manifest's `output` when it declares
-one, else the default `<cwd>/target` — the **same** rule the consumer's own artifact follows (§5),
-and it stays one rule by construction rather than by agreement: the manifest value is stamped onto
-`Program::setOutputDir`, which is what this base is read from. ✔MEASURED one function owns it
-(`resolveArtifactOutputDir`, `src/program/program.cpp`), so the path a dependency is written to and
-the path the consumer links against cannot be derived twice and drift. The layout is collision-free
+one, else the default `target/` in the ROOT manifest's directory — the **same** rule the consumer's
+own artifact follows (§5), and it stays one rule by construction rather than by agreement: a project
+build stamps whichever of the three applies onto `Program::setOutputDir`, which is what this base is
+read from. ✔MEASURED one function owns the artifact path (`resolveArtifactOutputDir`,
+`src/program/program.cpp`), so the path a dependency is written to and the path the consumer links
+against cannot be derived twice and drift. The layout is collision-free
 by construction, and it **never writes into the dependency's own tree**, which may be read-only for
 exactly the reasons the single-`.dss-deps` rule above gives.
 
@@ -816,8 +923,10 @@ is not project-buildable.
 - **Output path.** A **project build** routes each target's artifact to
   `<base>/<formatName>/<artifactName-or-stem><ext>`:
   - `<base>` — the `--output` directory when given, else the manifest's `output` when it declares
-    one, else the default `<cwd>/target`. Both doors store the value **verbatim**, so a relative
-    spelling resolves against the process working directory either way. When BOTH are given and they
+    one, else the default `target/` **in the manifest's directory**. Each keeps its own base (§2.2):
+    a relative `--output` resolves against the directory the command runs in, a relative `output`
+    against the manifest's directory, so a project build's default output no longer depends on where
+    it was started — Cargo's and MSBuild's precedent. When BOTH are given and they
     name **different** directories, `--output` wins and the driver announces it — `dsscp: note: the
     command-line output directory '…' overrides the project manifest's `output` ('…'), which was not
     used.` — on the operational note channel rather than as a `D_*` diagnostic (it is a statement
@@ -841,8 +950,9 @@ is not project-buildable.
 
   > **The CLI `--compile` path is unchanged.** A non-project compile keeps the legacy layout:
   > single-target is **flat** at `<output>/<stem><ext>` (no `<formatName>/` subdir), and only a
-  > multi-target compile subdir's by `<formatName>`. The forced per-platform subdir + the
-  > `artifactName` override apply to **project builds only**.
+  > multi-target compile subdir's by `<formatName>`, with the default base `<cwd>/target` — there is
+  > no manifest to be relative to. The forced per-platform subdir, the `artifactName` override and the
+  > manifest-relative default apply to **project builds only**.
 
 ---
 
@@ -852,7 +962,7 @@ is not project-buildable.
 |---|---|
 | `D_FileNotFound` | the project file can't be opened, or a hard I/O error occurs mid-read; **or** a `sources[]` **glob** pattern matched no files (§2.1) — the message names the unmatched pattern; **or** a `dependsOn` `path` names a directory that **does not exist** (§2.6 — a directory that exists but holds no manifest is `D019` instead, and the split is deliberate). |
 | `D_DirectoryScanFailed` | a directory could not be read while expanding a `sources[]` glob pattern (§2.1). |
-| `C_MalformedJson` | invalid JSON; non-object root; an **unknown** top-level key (`$`-prefixed keys excepted, §2.7); a field of the wrong type; a non-string / empty array entry; an empty `output` string; an empty `artifactName`, or one containing a path separator (`/` or `\`); a `stackReserve` that is not a positive unsigned integer (§2.4); any malformed `preBuildScripts` / `postBuildScripts` entry — unknown member, missing/empty `run`, empty `runOn`, unrecognized `runOn` token (§2.5); any malformed `dependsOn` entry — unknown member, both/neither of `path`+`git`, or `ref` without `git` (§2.6). Also the one **non-manifest** file this list covers: a `.dss-deps/dss-lock.json` that is present but unparseable, which **abandons** the build rather than being treated as a cache miss (§2.6). |
+| `C_MalformedJson` | invalid JSON; non-object root; an **unknown** top-level key (`$`-prefixed keys excepted, §2.7); a field of the wrong type; a non-string / empty array entry; an empty `output` string; an empty `artifactName`, or one containing a path separator (`/` or `\`); a `stackReserve` that is not a positive unsigned integer (§2.4); a `runpaths` entry the portable rule refuses — relative, holding a `$` other than a leading `${ORIGIN}`, or holding a `:` (§2.9); any malformed `preBuildScripts` / `postBuildScripts` entry — unknown member, missing/empty `run`, empty `runOn`, unrecognized `runOn` token (§2.5); any malformed `dependsOn` entry — unknown member, both/neither of `path`+`git`, or `ref` without `git` (§2.6). Also the one **non-manifest** file this list covers: a `.dss-deps/dss-lock.json` that is present but unparseable, which **abandons** the build rather than being treated as a cache miss (§2.6). |
 | `C_MissingField` | a required field (`language` / `artifactProfile` / `targets` / `sources`) is absent, an empty string, or an empty array. |
 | `D_ArtifactProfileNotSupported` (`D0010`) | the language gate (§4). |
 | `D_ArtifactProfileFormatMismatch` (`D0011`) | the format gate (§4). |
@@ -932,11 +1042,12 @@ does not over-promise:
 | Anchor | Gap |
 |---|---|
 | `D-AP2-SOURCES-GLOB` | **Realized** (§2.1). `sources[]` entries with a glob metacharacter (`* ? [`) are expanded against the filesystem in `Program::compileProject` before routing; literals are kept verbatim, zero-match fails loud. |
-| `D-AP2-OUTPUT-ROUTING` | **Realized** (§5). All three halves are wired: the `artifactName` field (binary base name), the per-platform `<formatName>/` subdir for project builds, and the `output` field as the output-dir **base** — a directory, cwd-rooted when relative, stamped onto `Program::setOutputDir` so the artifact router and the dependency output base follow one value. The CLI `--output` takes precedence and a real override is announced on the driver note channel. |
+| `D-AP2-OUTPUT-ROUTING` | **Realized** (§5). All three halves are wired: the `artifactName` field (binary base name), the per-platform `<formatName>/` subdir for project builds, and the `output` field as the output-dir **base** — a directory, resolved against the manifest's directory when relative (§2.2), stamped onto `Program::setOutputDir` so the artifact router and the dependency output base follow one value. The CLI `--output` takes precedence and a real override is announced on the driver note channel. |
 | `D-AP2-TARGET-NAME-DEFAULT-FORMAT` | `targets[]` require the explicit `:<formatName>` half; bare names (`"linux-x86_64"`) with an inferred default format aren't resolved yet. |
 | `D-AP2-COMPILATION-CONTEXT` | the resolved profile is **not** threaded to codegen (entry-symbol / subsystem / extension); deferred until a profile drives a codegen difference its `(target:format)` doesn't already encode (e.g. `gui`). |
 | plan 06 §B (`dependsOn` resolution) | **Realized** (§2.6). The resolver, both composition arms, git acquisition, the `.dss-deps/` cache and its lockfile, `--force-git-cache`, and every `D_Dependency*` code (§6.1) are built; the `D_PlanNotLanded` refusal this row used to describe is gone. |
-| plan 06 §B (dependency hooks) | **Realized** (§2.6). `runBuildScripts` takes its working directory as a **parameter**, and the dependency caller now passes that dependency's own directory; the root caller still passes the inherit-cwd sentinel (§2.5). |
+| plan 06 §B (dependency hooks) | **Realized** (§2.6). `runBuildScripts` takes its working directory as a **parameter**; every caller passes the manifest's own directory, the root's included (§2.2, §2.5), and a path-form `run[0]` is re-based onto it. |
+| `D-DEPS-SOURCEMERGE-INHERITS-THE-CONSUMERS-COMPILATION-ENVIRONMENT` | A merged `module`'s sources are compiled inside the **consumer's** one compilation, so the consumer's `includes`, `defines` and dialect still reach them (§2.6; the module's own `includes`/`defines` do apply to them). Gated on AP7 — per-project compilation contexts merged at an IR boundary — whose precondition the operator has set: a second general-purpose source language. |
 | `D-DEPS-DEPENDENCY-CANNOT-DECLINE-A-TARGET` | A dependency has no way to **decline** a platform it genuinely cannot serve: builds are consumer-driven (§2.6), so such a dependency fails as a compile error inside itself rather than as a clean resolve-time reject. Designed and **deliberately unbuilt** — no shipped dependency needs it, and a mechanism with no consumer is the defect in the other direction. **Trigger:** the first real dependency that must decline a target. The fix when it fires is a declared **constraint** (not a target list) on axes the config already carries — format kind, container, artifact profile — checked through `crossValidateTargetFormat`; **absent constraint ⇒ build whatever is asked**, so the common case keeps zero bookkeeping and cannot drift. |
 
 ---

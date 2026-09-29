@@ -1,0 +1,14 @@
+# PURPOSE: refuse DSS_EXPORT on a member of an already-exported class, which is MSVC error C2487.
+name: check-export-macro-placement
+description: >-
+  The action refuses DSS_EXPORT on a member of an exported class, then proves it can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `export_macro_placement_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-export-macro-placement.py
+    successPattern: 'selftest: OK \(0 failure\(s\)\)'
+    requireInputsUnmoved: true

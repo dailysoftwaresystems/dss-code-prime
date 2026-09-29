@@ -1,0 +1,35 @@
+{
+  "$comment": "A `long double` READ keeps what the object held when it was read, and a `volatile long double` can be read and written (D-LIR-LONG-DOUBLE-LOAD-READ-THE-OBJECT-AFTER-IT-WAS-OVERWRITTEN, D-LIR-VOLATILE-LONG-DOUBLE-ACCESS-MOVED-ITS-ADDRESS-INTO-A-FLOAT-REGISTER). The discriminating arms are x86_64 and aarch64 Linux, where `long double` lives in a 16-byte memory home; each check reads an object, overwrites it, then uses the value it read, with distinct values so a read of the wrong object fails its own exit code (11–18, listed in `main.c`). ✔MEASURED 2026-09-19: gcc 13.3.0 and clang 18.1.3 run it to 42 at -O0 and -O2 on x86_64 and aarch64 Linux; the P68 round-7 base refused it on both Linux targets (the `volatile` accesses), and returned the OVERWRITTEN value for the same shapes without `volatile` in its release pipeline — `main.c` has the per-check detail. ⓘ Portable C: where `long double` IS `double` (Windows, Apple arm64) every check holds just the same. ★ The `release` arm: every starting value comes from a `volatile`, so the optimized pipeline cannot fold the reads away.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

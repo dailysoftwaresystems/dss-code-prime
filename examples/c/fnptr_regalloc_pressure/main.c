@@ -29,7 +29,7 @@
 //     trip the conservative in-order move-hazard detector
 //     (L_MoveCycleUnsupported needs a later move reading an earlier
 //     move's destination — parallel-copy resolution for multi-arg
-//     permutations is anchored at D-ML7-2.3 and is NOT this
+//     permutations is anchored at D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS and is NOT this
 //     example's subject).
 //
 // Fold-resistance: fp is RUNTIME-SELECTED between alpha and beta

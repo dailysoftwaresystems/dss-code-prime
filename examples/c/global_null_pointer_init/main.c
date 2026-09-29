@@ -14,7 +14,8 @@
  * Pre-fix: const-eval refuses cast-to-pointer, and c67's
  * tryClassifyNullPointerConst was wired ONLY into the AGGREGATE member loop
  * (`struct {void* p;} g = {0}` folded while bare `void* g = 0;` did not)
- * -> runtimeInit -> K_NoMatchingObjectFormat fail-loud.
+ * -> runtimeInit -> K_NoMatchingObjectFormat fail-loud. (P68 round 13 deleted
+ * that classifier: the constant evaluator's integer-to-pointer arm folds it now.)
  *
  * gcc -O0/-O2 exits 42.
  */

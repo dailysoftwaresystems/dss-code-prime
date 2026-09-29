@@ -1,0 +1,14 @@
+# PURPOSE: replace one deferred-anchor registry row with a lane's verbatim row text from a file.
+name: apply-registry-row
+description: >-
+  The action proves every refusal of a verbatim row file can fire.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `apply_registry_row_selftest_guard`.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./apply-registry-row.py --self-test
+    successPattern: 'apply-registry-row self-test: 0 failed'
+    requireInputsUnmoved: true

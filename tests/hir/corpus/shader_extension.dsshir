@@ -1,4 +1,4 @@
-dsshir 4
+dsshir 6
 producer ""
 ext_kinds {
   "ShaderOps::WorkgroupBarrier" lang "glsl"
@@ -15,7 +15,7 @@ module "glsl" {
     block {
       expr intrinsic "math.sqrt" : f32 (lit #0 : f32)
       ext_node [shader] "ShaderOps::WorkgroupBarrier"
-      return
+      return void
     }
   }
 }

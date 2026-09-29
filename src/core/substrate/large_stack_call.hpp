@@ -13,7 +13,7 @@
 // runOnLargeStack — the standard compiler technique for deep recursion:
 // run a recursive callable on a DEDICATED worker thread that owns a large
 // RESERVED stack, JOIN it (the CALLER blocks — each individual call is
-// synchronous), and propagate any exception the callable threw. ★ D-PERF-4:
+// synchronous), and propagate any exception the callable threw. ★ D-PERF-4-CU-PARALLELISM:
 // the per-CU compile thread pool now runs MANY of these calls CONCURRENTLY
 // (one per parallel compilation unit), so this primitive must touch no
 // shared mutable state — and it doesn't: each call owns its own worker

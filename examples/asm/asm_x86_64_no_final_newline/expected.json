@@ -1,0 +1,28 @@
+{
+  "$comment": "★★ A `.s` WHOSE LAST LINE HAS NO NEWLINE ASSEMBLES AND RUNS (P68 round 8, D-ASM-LAST-LINE-WITHOUT-A-NEWLINE-REFUSED). The final byte of `main.s` is the `t` of `ret` — no `\\n` follows it. ✔MEASURED 2026-09-23: GNU as 2.42 (WSL x86_64 and native mingw-w64) assembles such a file with 'end of file not at end of a line; newline inserted' and the program returns 42; clang 18.1.3 accepts it silently. DSS refused it on every target and configuration with `P_MissingRequiredChild ... got '<eof>'`, because the dialect's grammar requires a `LineEnd` on every line and the end of input supplied none. ★ THE FIX IS A DECLARATION, NOT A SPECIAL CASE: `asm-x86_64-att.lang.json` declares `endOfInputImplies: \"\\n\"`, and the tokenizer reads a text lacking it as if it ended with it. The grammar's line boundary stays mandatory and the user's buffer is never rewritten; the implied `LineEnd` is a zero-width token at the end, like `Eof`. ★ RED-ON-DISABLE: remove `endOfInputImplies` from the dialect and this example is refused again with the same `P_MissingRequiredChild`. ⚠ `.gitattributes` pins `examples/**` to LF, which normalizes line ENDINGS but never adds a final newline, so the missing newline survives every checkout. The `ret` is load-bearing: were the unterminated line lost, `main` would fall off its end. WHAT THE `release` ARM PROVES, NARROWLY: an assembly source forms no HIR/MIR, so no optimizer pass can touch it; the arm pins only that naming the release pipeline does not break the assembly path.",
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

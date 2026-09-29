@@ -87,6 +87,7 @@
 #include "program/program.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "shipped_read_pairs.hpp"   // the real pairs a REAL descriptor is read on
 
 #include <nlohmann/json.hpp>
 
@@ -276,8 +277,8 @@ constexpr std::int64_t kCallReportValue = 2;
 // both are worth keeping: the honest-baseline ASSERT at the top of
 // `DescriptorAuditRejectsEveryDishonestShape`, and the fact that the real tree
 // and the synthetic baseline failed IDENTICALLY, which pointed at the predicate
-// rather than the data. Same class as
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE (tests/CMakeLists.txt).
+// rather than the data. Same class as the schema fixture in
+// `tests/CMakeLists.txt` that bound a reference to a destroyed temporary.
 nlohmann::json const kNoRows = nlohmann::json::array();
 
 [[nodiscard]] std::vector<std::string> auditAbortBehaviorBinding(
@@ -564,9 +565,14 @@ TEST(PeAbortBehaviorBinding, DecodedSignatureIsTwoU32ParamsReturningU32) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
     DiagnosticReporter rep;
+    // On the pe pair, with its own facts (P68 round 12, S2a-2a): a compile reads
+    // stdlib.json with the pair's ABI typedefs and long-double format.
+    auto const* pair = dss::test_support::shippedReadPair("x86_64", ObjectFormatKind::Pe);
+    ASSERT_NE(pair, nullptr);
+    ShippedPairFacts const facts = pair->pairFacts();
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
-                                         DataModel::Llp64, "x86_64",
-                                         ObjectFormatKind::Pe);
+                                         pair->dataModel(), pair->activeTarget(),
+                                         pair->activeFormat(), {}, nullptr, &facts);
     ASSERT_TRUE(desc.has_value())
         << "the REAL stdlib.json must decode for a pe/LLP64 target";
     EXPECT_FALSE(rep.hasErrors());

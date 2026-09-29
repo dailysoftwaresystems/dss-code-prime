@@ -11,6 +11,7 @@
 #include "link/format/macho_chained_fixups.hpp"
 #include "link/format/macho_indirect_symbols.hpp"
 #include "link/format/macho_symtab_bands.hpp"
+#include "link/format/relocation_addend.hpp"
 #include "core/types/config_key_vocabulary.hpp"
 #include "core/types/enum_name_table.hpp"
 #include "link/format/macho_codesign.hpp"
@@ -1463,6 +1464,39 @@ encodeExecDynamic(AssembledModule const&    module,
                   ImageRequest const&       request);
 } // namespace
 
+// ── [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] ──
+//
+// `encodeExecDynamic` lays `__stubs` IMMEDIATELY after `__text`
+// (`stubsVa = sectionVa + textBody.size()`), one `machoStubSizeFor(cputype)`
+// stub per FUNCTION import in `externImports` order — a data import owns a
+// `__got` slot and no stub. So the answer here is EXACT, not merely a bound:
+// stub j lies `j * stubSize` bytes past the end of `__text`, whatever
+// `__text`'s size. `encodeExecDynamic` asserts every stub against it.
+//
+// Empty for the flavors `encode` routes elsewhere: MH_OBJECT, and an
+// MH_EXECUTE with no import (the static writer, which emits no `__stubs`).
+link::ImportCallStubLayout
+importCallStubLayout(AssembledModule const&    module,
+                     ObjectFormatSchema const& objectFormatSchema) {
+    link::ImportCallStubLayout out;
+    auto const& fmt = objectFormatSchema;
+    if (fmt.backend() != &link::format::machoBackend()) return out;
+    bool const dynamicWriter =
+        fmt.macho().filetype == MachOObjectType::Dylib
+        || (fmt.macho().filetype == MachOObjectType::Execute
+            && !module.externImports.empty());
+    if (!dynamicWriter) return out;
+    std::uint64_t const stubSize = machoStubSizeFor(fmt.macho().cputype);
+    if (stubSize == 0) return out;  // the writer refuses this cputype itself
+    std::uint64_t j = 0;
+    for (auto const& ext : module.externImports) {
+        if (ext.isData) continue;
+        out.maxPastTextEnd.emplace(ext.symbol, j * stubSize);
+        ++j;
+    }
+    return out;
+}
+
 std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
@@ -1547,6 +1581,16 @@ encode(AssembledModule const&    module,
     if (!link::format::requireWeakDefinitionDialect(
             module, fmt, WeakDefinitionDialect::SymbolFlag,
             "macho::encode", reporter)) {
+        return {};
+    }
+
+    // ── D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the request, checked HERE too ──
+    //
+    // A public entry point reachable without `linker::link`, so it runs the
+    // SAME `enforceImageRequest` the gate runs (the `pe::encode` precedent):
+    // an entry no carrier can hold is refused whichever door it came through.
+    // A pure predicate on success, so the linker path reports nothing twice.
+    if (!enforceImageRequest(request, fmt, "macho::encode", reporter)) {
         return {};
     }
 
@@ -1636,6 +1680,26 @@ encode(AssembledModule const&    module,
             }
             return encodeExecDynamic(module, targetSchema, fmt,
                                      *secText, reporter, request);
+        }
+        // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the static arm writes no
+        // LC_LOAD_DYLIB and no dyld information at all, so nothing would ever
+        // consult an LC_RPATH — a runpath this format declares is said out
+        // loud here rather than dropped (the same shape as the ELF writer's
+        // no-dynamic-section arm; a format declaring none was reported by the
+        // gate). Unreachable from the driver today: every shipped exec
+        // document imports its process exit, so it is always dynamic.
+        if (!request.runpaths.empty() && fmt.runpath().has_value()) {
+            report(reporter, DiagnosticCode::K_FormatLacksRunpath,
+                   DiagnosticSeverity::Warning,
+                   std::format(
+                       "macho::encode: {} runpath entr{} requested, but this "
+                       "'{}' executable imports nothing, so it is written "
+                       "WITHOUT any dyld information and nothing would read an "
+                       "LC_RPATH. Nothing is recorded. "
+                       "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.",
+                       request.runpaths.size(),
+                       request.runpaths.size() == 1 ? "y was" : "ies were",
+                       fmt.name()));
         }
         return encodeExec(module, targetSchema, fmt, *secText, reporter);
     }
@@ -2007,11 +2071,31 @@ encode(AssembledModule const&    module,
     // |(pcrel<<24); the walker ORs in (1<<27) for r_extern + the
     // 24-bit symbol index.
     //
-    // Same discipline as PE: Mach-O's `relocation_info` has no
-    // addend column (per `<mach-o/reloc.h>`); addends live in the
-    // section's patch bytes. ELF Rela is the outlier with its
-    // explicit `r_addend`. Fail loud on non-zero addend so an
-    // ELF-shaped input cannot silently drop the addend here.
+    // Mach-O's `relocation_info` has no addend column (per
+    // `<mach-o/reloc.h>`): the format declares `relocationAddends: inPlace`,
+    // and the addend is written into the patched field by the ONE owner of
+    // that rule (`link/format/relocation_addend.hpp`) — a plain byte field
+    // takes it (x86_64 SIGNED: ✔MEASURED 2026-09-23, clang 18.1.3 writes
+    // `fc ff ff ff` for `movl $5, counter(%rip)`), and an arm64 instruction
+    // field cannot, so a non-zero addend there is still refused, now by the
+    // helper and naming the relocation.
+    auto const addendStorage = fmt.relocationAddendStorage();
+    // Required only where a relocation will be written: an object with none
+    // has no addend to place, and a format with no relocations states no
+    // storage (the loader requires the key exactly when `relocations` is
+    // non-empty).
+    bool const writesARelocation =
+        std::ranges::any_of(module.functions,
+                            [](auto const& f) { return !f.relocations.empty(); })
+        || std::ranges::any_of(module.dataItems,
+                               [](auto const& d) { return !d.relocations.empty(); });
+    if (!addendStorage.has_value() && writesARelocation) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             std::format("Mach-O writer: object format '{}' declares no "
+                         "'relocationAddends', so where a relocation's addend "
+                         "belongs is unstated", fmt.name()));
+        return {};
+    }
 
     std::vector<std::uint8_t> textRelocs;
     std::uint32_t textRelocCount = 0;
@@ -2019,13 +2103,33 @@ encode(AssembledModule const&    module,
         auto const& fn = module.functions[fi];
         std::uint64_t const fnStart = funcTextStart[fi];
         for (auto const& rel : fn.relocations) {
-            if (rel.addend != 0) {
+            auto const* tri = targetSchema.relocationInfo(rel.kind);
+            if (tri == nullptr) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-                     std::string{"Mach-O writer: relocation in symbol #"}
-                         + std::to_string(fn.symbol.v)
-                         + " carries addend=" + std::to_string(rel.addend)
-                         + " but Mach-O stores addends in the section's "
-                           "patch bytes, not on relocation_info");
+                     std::format("Mach-O writer: relocation kind {} has no "
+                                 "TargetRelocationInfo on target schema '{}'",
+                                 rel.kind.v, targetSchema.name()));
+                return {};
+            }
+            std::size_t const fieldAt =
+                static_cast<std::size_t>(fnStart + rel.offset);
+            std::size_t const fieldWidth =
+                link::format::relocationFieldHoldsAnAddend(*tri)
+                    ? tri->widthBytes : 0u;
+            if (fieldAt + fieldWidth > textBody.size()) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("Mach-O writer: relocation at text offset {} "
+                                 "in symbol #{} overruns __text", fieldAt,
+                                 fn.symbol.v));
+                return {};
+            }
+            auto const placed = link::format::placeRelocationAddend(
+                *addendStorage, *tri, rel.addend,
+                std::span<std::uint8_t>{textBody.data() + fieldAt, fieldWidth});
+            if (!placed.has_value()) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("Mach-O writer: relocation in symbol #{}: {}",
+                                 fn.symbol.v, placed.error()));
                 return {};
             }
             // The `nullptr` / missing-symbol branches mirror ELF's
@@ -2062,8 +2166,12 @@ encode(AssembledModule const&    module,
             // nativeId; OR in r_extern (bit 27) + r_symbolnum
             // (low 24 bits). All Mach-O relocs in cycle scope are
             // extern (point at a symbol), so r_extern = 1.
+            // ★ THE TYPE BY THE BYTES AFTER THE FIELD (X86_64_RELOC_SIGNED vs
+            // SIGNED_1/_2/_4) is the format row's declaration, read for the
+            // count the walker recorded — never re-derived here.
             std::uint32_t const rInfo =
-                fmtReloc->nativeId | (1u << 27) | (symIdx & 0x00FFFFFFu);
+                fmtReloc->nativeIdFor(rel.bytesAfterField) | (1u << 27)
+                | (symIdx & 0x00FFFFFFu);
             appendU32LE(textRelocs, rAddress);
             appendU32LE(textRelocs, rInfo);
             ++textRelocCount;
@@ -2174,13 +2282,19 @@ encode(AssembledModule const&    module,
                     return false;
                 }
                 // In-place addend (see the block comment above): the slot
-                // bytes carry A; ld64 computes S + A. addend 0 rewrites the
-                // producer's zero slot — a no-op by construction.
-                std::uint64_t const a =
-                    static_cast<std::uint64_t>(rel.addend);
-                for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
-                    layout.bytes[static_cast<std::size_t>(patchOff) + b] =
-                        static_cast<std::uint8_t>((a >> (8u * b)) & 0xFFu);
+                // bytes carry A; ld64 computes S + A — placed by the ONE owner
+                // of where a format keeps an addend.
+                auto const placed = link::format::placeRelocationAddend(
+                    *addendStorage, *tri, rel.addend,
+                    std::span<std::uint8_t>{
+                        layout.bytes.data() + static_cast<std::size_t>(patchOff),
+                        tri->widthBytes});
+                if (!placed.has_value()) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("macho::encode (MH_OBJECT): {} data item "
+                                     "SymbolId={{ {} }}: {}", sectionLabel,
+                                     di.symbol.v, placed.error()));
+                    return false;
                 }
                 appendU32LE(relocsOut,
                             static_cast<std::uint32_t>(patchOff));
@@ -2255,7 +2369,7 @@ encode(AssembledModule const&    module,
     // reference reaching only the alias would then keep that empty atom while
     // the body was stripped: perfect bytes, wrong program, rc=0.
     // ✔MEASURED 2026-08-20 on real Apple Silicon
-    // (scripts/macho-alias-ld64-matrix): 8 cells — a bare second `.globl` label,
+    // (.harness-config/runner/actions/macho-alias-ld64-matrix): 8 cells — a bare second `.globl` label,
     // the same plus `.alt_entry`, and a clang-authored `.globl`+`.set` alias as
     // the attribution control, each linked with and without `-dead_strip`
     // against a caller referencing ONLY the alias, plus a canonical-only
@@ -2444,7 +2558,7 @@ encode(AssembledModule const&    module,
     // ── Layout: header + load commands + section data + relocs
     //    + symtab + strtab ─────────────────────────────────────
     //
-    // Section count is DERIVED (architect D-LK2-5 precedent — pre-fix LK2
+    // Section count is DERIVED (architect D-LK2-5-DERIVED-SECTION-COUNT precedent — pre-fix LK2
     // hardcoded `1` and had to be folded into a derived size; ELF was
     // rewritten the same way at LK1): `numSections` (computed with the
     // section ordinals above) flows through the `mach_header_64.sizeofcmds`
@@ -3011,24 +3125,14 @@ encodeExec(AssembledModule const&    module,
                  codeSignatureRequestKeys(im)));
         return {};
     }
-    // LC_BUILD_VERSION is emitted only on the dynamic exec path
-    // (encodeExecDynamic) — the sole path the runnable arm64-darwin
-    // corpus uses. A static exec carrying `image.buildVersion` is a
-    // legitimate future combination (e.g. an x86_64-darwin static exec
-    // wanting a platform LC), but it has no shipped consumer today; fail
-    // loud here rather than silently drop the platform command.
-    // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION (trigger: first static
-    // Mach-O exec format that declares image.buildVersion).
-    if (im.buildVersion.has_value()) {
-        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-             "macho::encodeExec: 'image.buildVersion' (LC_BUILD_VERSION) "
-             "is currently emitted only on the dynamic Mach-O exec path "
-             "(encodeExecDynamic). The static path does not yet emit it "
-             "— route through the dynamic exec path or omit "
-             "image.buildVersion. Anchored "
-             "D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION.");
-        return {};
-    }
+    // LC_BUILD_VERSION is emitted on BOTH exec arms, through the one
+    // `appendBuildVersionCommand` chokepoint, whenever the format declares
+    // `image.buildVersion` — D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION, closed
+    // when the x86_64 darwin exec format came to declare it: this arm used
+    // to REFUSE such a schema, which was correct only while no shipped
+    // static-reachable document carried the key. Placed after the
+    // LC_SEGMENT_64 commands exactly as the dynamic arm places it.
+    bool const emitBuildVersion = im.buildVersion.has_value();
     // The trailing LC_UUID term — D-LK-MACHO-EMITS-NO-LC-UUID. Keyed on the
     // format document exactly as LC_BUILD_VERSION and LC_CODE_SIGNATURE are,
     // because ✔MEASURED on Apple Silicon the reference exposes this command's
@@ -3040,9 +3144,11 @@ encodeExec(AssembledModule const&    module,
     // key, matching `clang -c`.
     bool const emitUuid = im.uuid.has_value();
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
-        2u + 1u + 1u + im.loadDylibs.size() + 1u + (emitUuid ? 1u : 0u));
+        2u + (emitBuildVersion ? 1u : 0u) + 1u + 1u + im.loadDylibs.size() + 1u
+        + (emitUuid ? 1u : 0u));
     std::size_t const sizeofcmds =
-        kSegCmdPageZeroSize + kSegCmdTextSize + dylinkerCmdSize
+        kSegCmdPageZeroSize + kSegCmdTextSize
+        + (emitBuildVersion ? kBuildVersionCommandSize : 0u) + dylinkerCmdSize
         + kLcMainSize + totalDylibCmdSize + kSymtabCommandSize
         + (emitUuid ? kUuidCommandSize : 0u);
 
@@ -3238,6 +3344,12 @@ encodeExec(AssembledModule const&    module,
     appendU32LE(bytes, 0);                 // reserved2
     appendU32LE(bytes, 0);                 // reserved3
 
+    // LC_BUILD_VERSION — after the LC_SEGMENT_64 commands, as on the
+    // dynamic arm, and counted in ncmds / sizeofcmds above.
+    if (emitBuildVersion) {
+        appendBuildVersionCommand(bytes, *im.buildVersion);
+    }
+
     // LC_LOAD_DYLINKER
     {
         std::size_t const cmdStart = bytes.size();
@@ -3356,6 +3468,7 @@ encodeExec(AssembledModule const&    module,
 //   [LC_LOAD_DYLINKER]                        optional: emitDylinker (~24)
 //   [LC_MAIN]                                       optional: !isDylib (24)
 //   [LC_LOAD_DYLIB[N]]                                        (~32 each)
+//   [LC_RPATH[M]]           optional: one per recorded runpath (~24 each)
 //   [LC_SYMTAB]                                                       (24)
 //   [LC_DYSYMTAB]                                                     (80)
 //   [LC_UUID]                                    optional: emitUuid    (24)
@@ -3387,9 +3500,9 @@ namespace {
 
 // D-LK6-14 chained-fixups payload builder hoisted to private
 // header `link/format/macho_chained_fixups.hpp` at the d312c1c
-// audit fold for direct unit testing. When D-LK6-14-INTEGRATION
-// lands, encodeExecDynamic will `#include` the header and call
-// `dss::macho::detail::buildChainedFixupsPayload()`.
+// audit fold for direct unit testing. D-LK6-14-INTEGRATION-PAYLOAD
+// has landed: this file `#include`s the header and encodeExecDynamic
+// calls `dss::macho::detail::buildChainedFixupsPayload()`.
 
 [[nodiscard]] std::vector<std::uint8_t>
 encodeExecDynamic(AssembledModule const&    module,
@@ -3408,6 +3521,15 @@ encodeExecDynamic(AssembledModule const&    module,
                           "text", reporter, textAlignLog2)) {
         return {};
     }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the LC_RPATH paths this image
+    // records — the format's spelling of a leading `${ORIGIN}`, duplicates
+    // dropped (dyld refuses a duplicate LC_RPATH under its current policy).
+    // Resolved up front so a declaration this walker cannot write refuses
+    // before any layout; each path becomes one `rpath_command` below.
+    auto const rpaths = runpathsToRecord(request, fmt,
+                                         RunpathCarrier::MachoLoadCommand,
+                                         "macho::encodeExecDynamic", reporter);
+    if (!rpaths.has_value()) return {};
     // c153 (D-LK3-3): the MH_DYLIB arm rides THIS dynamic substrate
     // with schema-keyed divergences (filetype is closed-enum schema
     // data — the elf.cpp `isDyn` precedent, never a format-name
@@ -3858,10 +3980,37 @@ encodeExecDynamic(AssembledModule const&    module,
     }
     std::size_t const numFuncExterns = funcExternIdxs.size();
     // FUNCTION externs → their __stubs stub VA (the COMPACTED stub index j).
+    //
+    // ★ [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]:
+    // the branch-veneer pass measured every import-bound call against
+    // `importCallStubLayout` BEFORE this layout existed. Assert each stub lies
+    // where that answer said — the two descriptions of `__stubs` must not
+    // drift apart silently.
+    auto const stubBound = importCallStubLayout(module, fmt);
+    std::uint64_t const textEndVa = sectionVa + textBody.size();
     for (std::size_t j = 0; j < numFuncExterns; ++j) {
         std::size_t const i = funcExternIdxs[j];
         std::uint64_t const stubVa =
             stubsVa + static_cast<std::uint64_t>(j) * stubSize;
+        auto const bound =
+            stubBound.maxPastTextEnd.find(module.externImports[i].symbol);
+        if (bound == stubBound.maxPastTextEnd.end() || stubVa < textEndVa
+            || stubVa - textEndVa > bound->second) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("macho::encodeExecDynamic: import '{}''s `__stubs` "
+                             "entry lands {} bytes past the end of `__text`, "
+                             "outside the bound {} that `importCallStubLayout` "
+                             "reported for it — the branch-veneer pass measured "
+                             "calls to it against that bound, so the two "
+                             "descriptions of this layout have diverged "
+                             "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH)",
+                             module.externImports[i].mangledName,
+                             stubVa >= textEndVa ? stubVa - textEndVa : 0,
+                             bound == stubBound.maxPastTextEnd.end()
+                                 ? std::string{"<none>"}
+                                 : std::to_string(bound->second)));
+            return {};
+        }
         if (!symbolVa.emplace(module.externImports[i].symbol,
                               stubVa).second) {
             emit(reporter, DiagnosticCode::K_SymbolUndefined,
@@ -5052,6 +5201,13 @@ encodeExecDynamic(AssembledModule const&    module,
     for (auto const& path : emittedDylibs) {
         totalDylibCmdSize += commandSizeWithPath(24, path);
     }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: one `rpath_command` per recorded
+    // path — cmd, cmdsize, lc_str offset 12, the NUL-terminated path, padded to
+    // 8 (measured against ld64.lld: `@loader_path` → cmdsize 32).
+    std::size_t totalRpathCmdSize = 0;
+    for (auto const& path : *rpaths) {
+        totalRpathCmdSize += commandSizeWithPath(12, path);
+    }
     // Stable map: library → dylib ordinal (1-based per dyld). Keyed off
     // `emittedDylibs` (schema ∪ referenced) so a referenced non-schema
     // library resolves to ITS ordinal (not libSystem's) — each import's
@@ -5799,6 +5955,8 @@ encodeExecDynamic(AssembledModule const&    module,
     //       + [LC_DYLD_EXPORTS_TRIE when emitExportsTrieCmd]
     //       + [LC_LOAD_DYLINKER] + [LC_MAIN] + [LC_ID_DYLIB]
     //       + N × LC_LOAD_DYLIB
+    //       + M × LC_RPATH (one per recorded runpath —
+    //         D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH)
     //       + LC_SYMTAB + LC_DYSYMTAB (UNCONDITIONAL — ld64 emits it on
     //       the chained path too, ✔MEASURED with the -no_fixup_chains
     //       control; see the indirect-symbol construction above and
@@ -5824,6 +5982,7 @@ encodeExecDynamic(AssembledModule const&    module,
         + (isDylib ? 1u : 0u)          // LC_ID_DYLIB
         + (isDylib ? 0u : 1u)          // LC_MAIN
         + emittedDylibs.size()         // N × LC_LOAD_DYLIB (schema ∪ referenced)
+        + rpaths->size()               // M × LC_RPATH (the recorded runpaths)
         + 1u                           // LC_SYMTAB
         + 1u                           // LC_DYSYMTAB (both binding paths)
         + (emitExportsTrieCmd ? 1u : 0u)
@@ -5840,7 +5999,8 @@ encodeExecDynamic(AssembledModule const&    module,
         segCmdPageZeroActual + kSegCmdTextSize + segCmdDataConstActual +
         kSegCmdDataSize + kSegCmdLinkeditSize + dyldBindCmdSize +
         dylinkerCmdSizeActual + lcMainSizeActual + idDylibCmdSize +
-        totalDylibCmdSize + kSymtabCommandSize + kDysymtabCommandSize +
+        totalDylibCmdSize + totalRpathCmdSize +
+        kSymtabCommandSize + kDysymtabCommandSize +
         (emitExportsTrieCmd ? kLinkeditDataCommandSize : 0u) +
         (emitCodeSig ? kCodeSigCommandSize : 0u) +
         (emitUuid ? kUuidCommandSize : 0u) +  // D-LK-MACHO-EMITS-NO-LC-UUID
@@ -7054,6 +7214,23 @@ encodeExecDynamic(AssembledModule const&    module,
         appendU32LE(bytes, 0);
         appendU32LE(bytes, 0);
         appendU32LE(bytes, 0);
+        for (char c : path)
+            appendU8(bytes, static_cast<std::uint8_t>(c));
+        appendU8(bytes, 0);
+        while (bytes.size() - cmdStart < cmdSize) appendU8(bytes, 0);
+    }
+
+    // LC_RPATH[] — D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH. One `rpath_command`
+    // per recorded path, in request order, right after the libraries they
+    // resolve (ld64's order): the DECLARED command number, cmdsize, the lc_str
+    // offset (12 — the path follows the three words), the NUL-terminated path,
+    // zero padding to the 8-byte multiple `commandSizeWithPath` sized above.
+    for (auto const& path : *rpaths) {
+        std::size_t const cmdStart = bytes.size();
+        std::size_t const cmdSize = commandSizeWithPath(12, path);
+        appendU32LE(bytes, fmt.runpath()->loadCommand);
+        appendU32LE(bytes, static_cast<std::uint32_t>(cmdSize));
+        appendU32LE(bytes, 12);
         for (char c : path)
             appendU8(bytes, static_cast<std::uint8_t>(c));
         appendU8(bytes, 0);

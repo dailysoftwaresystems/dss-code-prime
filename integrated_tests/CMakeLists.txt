@@ -12,8 +12,7 @@ cmake_minimum_required(VERSION 3.28)
 # because this harness compiles ONLY the host-runnable spec, a manifest's other
 # targets are compiled by the IN-PROCESS runner ALONE. That division of labour is
 # checked by the `integrated_tests/coverage-boundary` entry at the bottom of this
-# file — see
-# D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+# file.
 #
 # The runner ALSO drives the curated `examples/` corpus through
 # the CLI path (parallel to the in-process exercise via
@@ -41,7 +40,7 @@ set_target_properties(integrated_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/dss
 )
 
-# ── ctest entries — D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD ─
+# ── ctest entries: one per example, never one thread for the whole corpus ───
 #
 # ★★★ ONE ENTRY PER EXAMPLE, PLUS THREE THAT ARE NOT ABOUT ANY ONE EXAMPLE.
 # Operator instruction 2026-08-21: *"paralelize integrated_tests + report each
@@ -102,7 +101,6 @@ foreach(MANIFEST ${DSS_EXAMPLE_MANIFESTS})
     )
     set_tests_properties(${TEST_NAME} PROPERTIES
         FIXTURES_REQUIRED DssIntegratedCells)
-    # D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED.
     # This used to spell `DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}` by hand; it now
     # comes from the ONE chokepoint, which points it at the run's snapshot
     # instead of the live tree. ★ It matters MORE here than anywhere: the value
@@ -182,7 +180,7 @@ dss_use_config_snapshot(integrated_tests/adjudicate)
 # (each entry above carries this property; the single `integrated_tests` entry it
 # used to be set on no longer exists)
 
-# D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the same strict-arm-verdict wiring
+# The same strict-arm-verdict wiring
 # the in-process corpus entries get. The capability MUST land on both harnesses
 # together — one runner enforcing an arm's verdict while its sibling shrugs is a
 # silent harness bug, which is the class this whole change closes.
@@ -202,8 +200,6 @@ dss_use_config_snapshot(integrated_tests/adjudicate)
 # red-on-disable pin with it.
 
 # ── the coverage boundary between the TWO corpus harnesses ───────────────────
-#
-# D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
 #
 # ★★★ THE ONE ENTRY THAT RUNS BOTH HARNESSES AND COMPARES THEM. Every other
 # entry in this file measures ONE runner; this one selects a corpus example that
@@ -240,7 +236,6 @@ dss_use_config_snapshot(integrated_tests/coverage-boundary)
 dss_strict_arm_verdicts(integrated_tests/coverage-boundary)
 
 # ── `ctest/entry-budgets`: the pin on EVERY entry's TIMEOUT ──────────────────
-# D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY
 #
 # Every ctest entry in this build — both corpus harnesses' and all the others —
 # gets its TIMEOUT from ONE mechanism, `cmake/DssTestBudgets.cmake`, which the root

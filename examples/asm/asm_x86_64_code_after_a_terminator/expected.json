@@ -1,0 +1,28 @@
+{
+  "$comment": "★★ CODE AFTER A TERMINATOR, WITH NO LABEL BETWEEN THEM, ASSEMBLES WHERE THE TEXT PUTS IT (P68 round 8, D-ASM-INSTRUCTION-AFTER-A-TERMINATOR-REFUSED and D-ASM-CONDITIONAL-BRANCH-FALLTHROUGH-LAID-OUT-AT-THE-FUNCTION-END). A line after `jmp`, a line after a mid-function `ret`, and a `nop` + `addl` tail after the LAST `ret`, each dead and each changing the exit code if it ran; `jne 2f` falls into the next line. ✔MEASURED 2026-09-23: GNU as 2.42 and clang 18.1.3 run this file to 42. DSS refused the first dead line as code 'it cannot place in a basic block', and laid a conditional branch's fall-through code out after the function's last label. The `.s` walker now plans every block start in pass 1 (label, the line after a conditional branch, the line after any other terminator) and creates the blocks in TEXT order; the dead tail ending `main` closes with the target's unreachable trap. ★ RED-ON-DISABLE: create the anonymous blocks after the labels again (the mint-on-demand order) and the block-plan pin reds — every false edge lands away from its branch. The `release` arm pins only that naming the release pipeline does not break the assembly path (an assembly source forms no HIR/MIR).",
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

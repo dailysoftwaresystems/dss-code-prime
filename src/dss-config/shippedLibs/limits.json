@@ -1,16 +1,47 @@
 {
-  "$comment": "Neutral shipped <limits.h> (Item 1, 2026-06-22). C 5.2.4.2.1 integer width macros. A C `.h` would be language-specific TEXT and couple the shipped config to C; instead each object-like `#define` that IS a compile-time constant is expressed as a NEUTRAL typed named constant (name + value + hir-text type) and INJECTED by the semantic phase, exactly like the descriptor's extern symbols. The constant folds to a literal at HIR lowering AND in constant-expression position (`int a[CHAR_BIT]`). No `symbols`/`library` — <limits.h> has no linkable surface, only macros.",
+  "$comment": "Neutral shipped <limits.h> — C23 5.2.5.3.2 / 7.10. ★ P68 round 9 (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS): EVERY `_MIN`/`_MAX`/`_WIDTH` ROW NAMES A TYPE AND A LIMIT, NEVER A NUMBER. C gives each `_MIN`/`_MAX` macro its type's PROMOTED type AND value, and both are per (target, format) pair: `long` is 32 bits on pe and 64 on ELF and Mach-O, and plain `char` is unsigned on aarch64 Linux alone. So `{ \"of\": \"long\", \"limit\": \"max\" }` is realized per pair from the lattice by the ONE constants decode (`decodeShippedConstants` → `realizeDerivedConstant`): `of` goes through the consuming language's own type-name resolver (`resolveLanguageTypeName`, the one the grammar loader uses), `max`/`min` is the type's range on the pair (plain `char` by `TargetSchema::charIsUnsigned`), typed as the language's integer promotion of the type (`promoteIntegerKind`), and `width` is the C 6.2.6.2 width, typed as the promotion floor (`int`). A fixed row here would restate a fact the lattice owns and be silently wrong on one of the pairs. ✔MEASURED 2026-09-23 against gcc 13.3.0 `-std=c2x` + clang 18.1.3 `-std=c23` (x86_64-linux, and aarch64-linux via `aarch64-linux-gnu-gcc -static` / `clang --target=aarch64-linux-gnu` under qemu), mingw-w64 gcc 13.2.0 `-std=c2x` and MSVC 14.51 `/std:clatest`, each by `_Generic` type + printed value: every `_MIN`/`_MAX` has its type's promoted type (`USHRT_MAX`/`UCHAR_MAX`/`CHAR_*`/`SCHAR_*`/`SHRT_*` int, `UINT_MAX` unsigned int, `LONG_*` long, `ULONG_MAX` unsigned long, `LLONG_*` long long, `ULLONG_MAX` unsigned long long) and every `*_WIDTH`, `CHAR_BIT`, `BOOL_MAX` and `MB_LEN_MAX` is int — identical in all four; `LONG_*` is 64-bit on both Linux arches and 32-bit on pe (mingw AND MSVC); `CHAR_MIN`/`CHAR_MAX` are -128/127 on x86_64-linux and pe and 0/255 on aarch64-linux. gcc, clang and mingw define all 32 names below (the C23 `BOOL_MAX` included); MSVC defines the 19 C89/C99 ones only — the union is the 32. ⚠ `BOOL_WIDTH` IS A MEANING FORK, DECIDED BY THE STANDARD: gcc and mingw say 1, clang 18.1.3 says 8; C23 5.2.5.3.2 lists `BOOL_WIDTH 1` with footnote 15 'This value is exact', so the lattice's width of `bool` — 1 — is the answer (the ruling of 2026-09-23). Apple clang 21.0.0 (both arches, ✔MEASURED 2026-09-23) also says 1 — the newer clang agrees with the standard — but it does not define `BOOL_MAX` at all — and there the TEXT decides, not a vote: C23 5.2.5.3.2p2 gives every unsigned integer type with a `_WIDTH` macro a `_MAX` macro (bool is one, 6.2.5p8, and `BOOL_WIDTH` is defined), Annex B.9 lists `BOOL_MAX` in <limits.h> and Annex E.2 gives `#define BOOL_MAX 1` (N3220). So it is REQUIRED; gcc 13.3.0, mingw-w64 13.2.0 and clang 18.1.3 define it (value 1, type int), and Apple clang 21.0.0's omission is its own gap. `MB_LEN_MAX` is the C RUNTIME's contract, not the lattice's, so it is DECLARED per object format (each format has one C runtime), each measured against that runtime's own `<limits.h>`: glibc 16 (gcc and clang, both arches), the UCRT 5 (mingw's and MSVC's headers), Darwin 6 — ✔MEASURED 2026-09-23 with Apple clang 21.0.0 (clang-2100.1.1.101) native on arm64-apple-darwin25.6.0 and under `-arch x86_64`, and DOCUMENTED in Apple xnu tag xnu-12377.121.6 `bsd/arm/limits.h` and `bsd/i386/limits.h` (`#define MB_LEN_MAX 6 /* Allow 31 bit UTF2 */`). `BITINT_MAXWIDTH` is the C23 bit-precise bound and has ONE owner already, the `model-limit` predefined macro `__BITINT_MAXWIDTH__` (`kBitIntMaxWidth`); it is spelled as a macro naming that predefine — exactly what clang's own <limits.h> does (`#define BITINT_MAXWIDTH __BITINT_MAXWIDTH__`) — so the bound is never stated twice. Its VALUE is therefore DSS's OWN implementation limit (8388608), never a reference's copied: the references disagree even with themselves, because each caps `_BitInt` at what its own back end lowers — clang 18.1.3 says 8388608 on x86_64 Linux and 128 on aarch64 Linux, Apple clang 21.0.0 says 128 on arm64 and 8388608 under `-arch x86_64` (✔MEASURED 2026-09-23) — and C23 5.2.5.3.2 only bounds it below, by `ULLONG_WIDTH`. `__STDC_VERSION_LIMITS_H__` is C23 7.10p2 (202311L, a `long`); gcc 13.3's own <limits.h> defines it in C2x mode; clang 18.1.3, Apple clang 21.0.0 and MSVC do not. Every row is preprocessor-visible (a `#define`), so `#if LONG_MAX > 2147483647` and `defined(CHAR_MIN)` answer as the references do, and `#undef` removes one.",
   "header": "limits.h",
-  "standard": "c89",
+  "standard": "c23",
   "constants": [
-    { "name": "CHAR_BIT",  "value": 8,          "type": "i32" },
-    { "name": "SCHAR_MIN", "value": -128,       "type": "i32" },
-    { "name": "SCHAR_MAX", "value": 127,        "type": "i32" },
-    { "name": "UCHAR_MAX", "value": 255,        "type": "i32" },
-    { "name": "SHRT_MIN",  "value": -32768,     "type": "i32" },
-    { "name": "SHRT_MAX",  "value": 32767,      "type": "i32" },
-    { "name": "INT_MIN",   "value": -2147483648, "type": "i32" },
-    { "name": "INT_MAX",   "value": 2147483647, "type": "i32" },
-    { "name": "UINT_MAX",  "value": 4294967295, "type": "u32" }
+    { "name": "CHAR_BIT",     "of": "char",               "limit": "width" },
+    { "name": "SCHAR_MIN",    "of": "signed char",        "limit": "min" },
+    { "name": "SCHAR_MAX",    "of": "signed char",        "limit": "max" },
+    { "name": "UCHAR_MAX",    "of": "unsigned char",      "limit": "max" },
+    { "name": "CHAR_MIN",     "of": "char",               "limit": "min" },
+    { "name": "CHAR_MAX",     "of": "char",               "limit": "max" },
+    { "name": "SHRT_MIN",     "of": "short",              "limit": "min" },
+    { "name": "SHRT_MAX",     "of": "short",              "limit": "max" },
+    { "name": "USHRT_MAX",    "of": "unsigned short",     "limit": "max" },
+    { "name": "INT_MIN",      "of": "int",                "limit": "min" },
+    { "name": "INT_MAX",      "of": "int",                "limit": "max" },
+    { "name": "UINT_MAX",     "of": "unsigned int",       "limit": "max" },
+    { "name": "LONG_MIN",     "of": "long",               "limit": "min" },
+    { "name": "LONG_MAX",     "of": "long",               "limit": "max" },
+    { "name": "ULONG_MAX",    "of": "unsigned long",      "limit": "max" },
+    { "name": "LLONG_MIN",    "of": "long long",          "limit": "min" },
+    { "name": "LLONG_MAX",    "of": "long long",          "limit": "max" },
+    { "name": "ULLONG_MAX",   "of": "unsigned long long", "limit": "max" },
+    { "name": "BOOL_MAX",     "of": "bool",               "limit": "max" },
+    { "name": "BOOL_WIDTH",   "of": "bool",               "limit": "width" },
+    { "name": "CHAR_WIDTH",   "of": "char",               "limit": "width" },
+    { "name": "SCHAR_WIDTH",  "of": "signed char",        "limit": "width" },
+    { "name": "UCHAR_WIDTH",  "of": "unsigned char",      "limit": "width" },
+    { "name": "SHRT_WIDTH",   "of": "short",              "limit": "width" },
+    { "name": "USHRT_WIDTH",  "of": "unsigned short",     "limit": "width" },
+    { "name": "INT_WIDTH",    "of": "int",                "limit": "width" },
+    { "name": "UINT_WIDTH",   "of": "unsigned int",       "limit": "width" },
+    { "name": "LONG_WIDTH",   "of": "long",               "limit": "width" },
+    { "name": "ULONG_WIDTH",  "of": "unsigned long",      "limit": "width" },
+    { "name": "LLONG_WIDTH",  "of": "long long",          "limit": "width" },
+    { "name": "ULLONG_WIDTH", "of": "unsigned long long", "limit": "width" },
+    { "name": "MB_LEN_MAX", "variants": [
+      { "when": { "format": "elf" },   "value": 16, "type": "i32" },
+      { "when": { "format": "macho" }, "value": 6,  "type": "i32" },
+      { "when": { "format": "pe" },    "value": 5,  "type": "i32" }
+    ] }
+  ],
+  "macros": [
+    { "name": "BITINT_MAXWIDTH",           "replacement": "__BITINT_MAXWIDTH__" },
+    { "name": "__STDC_VERSION_LIMITS_H__", "replacement": "202311L" }
   ]
 }

@@ -111,8 +111,7 @@ namespace fs = std::filesystem;
 
 // Shared schema fixture. Returns a REFERENCE to a function-local static: a
 // `GrammarSchema`'s accessors hand back references INTO the schema, so a
-// by-value return makes `helper()->accessor()` a heap-use-after-free
-// (D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE).
+// by-value return makes `helper()->accessor()` a heap-use-after-free.
 [[nodiscard]] std::shared_ptr<GrammarSchema const> const& cSchema() {
     static std::shared_ptr<GrammarSchema const> const schema = [] {
         auto loaded = GrammarSchema::loadShipped("c");
@@ -129,8 +128,8 @@ namespace fs = std::filesystem;
 
 // The shipped `c` document's TEXT, for the config-mutant arm below. Reached
 // through the ONE test-side resolver (`repo_root.hpp`), never a private cwd
-// walk — [[D-TEST-HELPERS-IGNORE-DSS-CONFIG-ROOT-OUT-OF-TREE]] cost 28 ctest
-// entries to the seventeen files that each had their own.
+// walk — the seventeen files that each had their own walk ignored
+// `$DSS_CONFIG_ROOT` and cost 28 ctest entries out of tree.
 [[nodiscard]] std::string shippedCText() {
     auto const root = dss::test::findConfigRoot();
     if (!root) {

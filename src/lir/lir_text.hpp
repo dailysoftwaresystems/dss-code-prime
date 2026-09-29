@@ -4,10 +4,12 @@
 #include "core/types/target_schema.hpp"
 #include "lir/lir.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 // LIR text format `.dsslir` (ML8) — a round-trippable, human-readable
@@ -101,6 +103,16 @@ struct DSS_EXPORT LirTextContext {
     // of a larger table) — the emitter only needs read-only random
     // access.
     std::span<std::string const> symbolNames{};
+
+    // The SPARSE form of the same table: one entry per symbol, keyed by
+    // `SymbolId.v` — what `parseLir` hands back (`LirParseResult::symbolNames`).
+    // A `.dsslir` text's slots are raw ids, and a legitimate one reaches
+    // 0xFFFFFF01, the reserved PE `_tls_index` singleton (✔MEASURED P68, lane
+    // `ht`, part 1c: 20 of 804 example modules; 804 of 804 sparse; sqlite3.c's
+    // 6169 symbols spread to %49060). A dense table would cost the NUMBER, not
+    // the text. A caller sets at most one of the two; the dense one is consulted
+    // first.
+    std::unordered_map<std::uint32_t, std::string> const* symbolNameMap = nullptr;
 };
 
 // Serialize `lir` to canonical `.dsslir` text. The schema is required
@@ -125,9 +137,13 @@ emitLir(Lir const& lir, TargetSchema const& schema,
 // deletion costs nothing at call sites and rules out a class of
 // slicing / dangling-reference bugs.
 //
-// `symbolNames`: built from the `symbols { }` preamble. Entries past
-// the end of the vector (or empty entries) are synthetic references
-// with no declared name.
+// `symbolNames`: built from the `symbols { }` preamble — ONE ENTRY PER
+// DECLARED NAME, keyed by `SymbolId.v`, so memory is the text's and never a
+// slot's number. It used to be a vector sized by the largest slot written
+// (✔MEASURED P68, lane `ht`, part 1c, on the MIR twin: 40 bytes of
+// `%100000000 "x"` built a 3.2 GB table, `%4000000000` threw `bad_alloc`,
+// `%4294967295` wrapped and wrote out of bounds). A slot with no entry (or an
+// empty one) is a synthetic reference with no declared name.
 //
 // `ok` is true iff zero error-severity diagnostics were emitted by
 // the parser OR the verify-on-load pass. On `ok == false`, both `lir`
@@ -135,11 +151,12 @@ emitLir(Lir const& lir, TargetSchema const& schema,
 // so consumers don't risk reading names for symbols that don't
 // exist in the module.
 struct DSS_EXPORT LirParseResult {
-    Lir                      lir;
-    std::vector<std::string> symbolNames;
-    bool                     ok = false;
+    Lir                                            lir;
+    std::unordered_map<std::uint32_t, std::string> symbolNames;
+    bool                                           ok = false;
 
-    explicit LirParseResult(Lir l, std::vector<std::string> names) noexcept
+    explicit LirParseResult(Lir l,
+                            std::unordered_map<std::uint32_t, std::string> names) noexcept
         : lir(std::move(l)), symbolNames(std::move(names)) {}
 
     LirParseResult(LirParseResult const&)            = delete;

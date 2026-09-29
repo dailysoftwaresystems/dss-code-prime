@@ -1,0 +1,20 @@
+{
+  "$comment": "One ELEMENT of a vector register, to and from a general register, in a standalone aarch64 `.s` — `umov`, `ins` and their `mov` aliases at the byte, halfword, word and doubleword sizes, with two re-reads that require `ins` to keep the lanes it does not write (D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). The P68 round-7 base refused the first `v1.b[1]` at its parser. ✔MEASURED 2026-09-21: aarch64-linux-gnu-gcc (GNU as 2.42) and clang 18.1.3 (its integrated assembler) both assemble it, and both binaries exit 42 under qemu-aarch64. Exit 11-16 names the check that went wrong. ★ The `release` arm, scoped honestly: assembly text forms no MIR, so no pipeline can transform it — the arm pins that `--config=release` still produces a working binary from it.",
+  "language": "asm-arm64-gas",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

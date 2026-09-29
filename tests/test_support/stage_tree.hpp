@@ -63,8 +63,8 @@ namespace fs = std::filesystem;
 // before — the recursion is reachable only by the nested shape it was added
 // for, and is not a silent widening of 581 green tests.
 //
-// ★ WHY error_code ON EVERY CALL, INCLUDING THE WALK'S OWN INCREMENT
-// (D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT): one of the two callers is a
+// ★ WHY error_code ON EVERY CALL, INCLUDING THE WALK'S OWN INCREMENT — AN
+// UNCAUGHT THROW FROM THE CORPUS WALK: one of the two callers is a
 // plain `main()` with no enclosing `try`, where a throwing `copy_file` ends the
 // process with `libc++abi: terminating` as the WHOLE output — no example name,
 // no path, no Results line. `recursive_directory_iterator`'s range-for form

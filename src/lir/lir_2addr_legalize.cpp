@@ -289,8 +289,7 @@ legalizeTwoAddress(Lir const&          src,
     }
 
     result.lir = std::move(b).finish();
-    // ★ THE OTHER MISSING STAGE BOUNDARY
-    // (D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT).
+    // ★ THE OTHER MISSING STAGE BOUNDARY.
     // Env-gated and zero-cost when unset. This pass SYNTHESIZES class moves,
     // so it is a producer of the population `lir_peephole` R1 consumes and it
     // has to be separable from the allocator's residue upstream of it. The

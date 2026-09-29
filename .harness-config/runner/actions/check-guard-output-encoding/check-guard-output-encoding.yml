@@ -1,0 +1,14 @@
+# PURPOSE: refuse a Python script whose report cannot carry a non-cp1252 character through a pipe.
+name: check-guard-output-encoding
+description: >-
+  The action probes every Python primary program through a cp1252 pipe, then proves it can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `guard_output_encoding_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-guard-output-encoding.py
+    successPattern: 'guard-output-encoding: OK'
+    requireInputsUnmoved: true

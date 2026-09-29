@@ -40,6 +40,31 @@
 
 namespace dss {
 
+// ★★ WHERE AN IMPORT's CODE-vs-DATA CAME FROM
+// (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL, P68 round 9).
+// A C declaration states its kind, and so does a `.s` CALL: a call target is
+// code. A `.s` ADDRESS operand or data slot (`leaq x(%rip)`, `.quad x`) naming
+// a symbol the file does not define states NOTHING. gas records the name alone
+// (✔MEASURED 2026-09-23: the same R_X86_64_PC32 for a datum and a function),
+// and ld takes the kind from the DEFINITION it finds. So does DSS:
+//   * `Stated`: `isData` is the reference's own statement (every producer
+//     except the one below, and the default);
+//   * `Pending`: the reference stated nothing, and no binder has read a
+//     definition yet. `isData` MEANS NOTHING in this state and must not be
+//     read as a statement;
+//   * `FromLibrary`: a binder read the definition's own kind from the library
+//     that owns the name and wrote it into `isData`.
+// A sibling unit's definition decides by folding the row away (the link's
+// cross-unit resolution), whatever the state. A row that SURVIVES to the
+// writers still `Pending` is refused by name, and so is one whose library
+// definition is a DATUM, because a direct reference to library data needs a
+// copy relocation (which DSS does not make). Neither is ever defaulted.
+enum class ExternKindOrigin : std::uint8_t {
+    Stated,
+    Pending,
+    FromLibrary,
+};
+
 struct DSS_EXPORT ExternImport {
     SymbolId    symbol{};       // matches Relocation::target
     std::string mangledName;    // on-binary symbol name
@@ -66,6 +91,29 @@ struct DSS_EXPORT ExternImport {
     // NOT implemented (D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC) — and the
     // walker tier rejects it loud (slice C). Meaningless (false) for
     // function imports (S_ThreadLocalOnFunction rejects those upstream).
+    //
+    // ⚠⚠ THIS FIELD IS THE SOURCE'S CLAIM, AND IT IS NOT EVIDENCE ABOUT THE
+    // LIBRARY (D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA). `false` here
+    // means "no declaration in this program spelled `thread_local`" — it does
+    // NOT mean the symbol has static storage duration, because the definition
+    // lives in somebody else's binary and has its own answer. Reading this
+    // field as though it were the definition's property is precisely the
+    // defect that anchor was opened for: a plain `extern int e;` against a
+    // library that exports `e` as `STT_TLS` left this `false`, sailed past the
+    // `K_FormatLacksThreadLocalSupport` gate below (which keys on THIS field),
+    // bound got-indirect, and emitted `R_*_GLOB_DAT` against a thread-local —
+    // ✔MEASURED to make the program read the shared library's ELF header
+    // instead of its datum, on both ELF legs, with no diagnostic at all.
+    // ★ THE LIBRARY'S ANSWER IS NOT CARRIED ON THIS ROW ON PURPOSE, AND THE
+    // ABSENCE IS THE DESIGN RATHER THAN AN OMISSION. It is known ONLY where a
+    // library is read and matched — the FF1 reader's `ImportSurface::kind` —
+    // and the link tier never opens a library at all (it has a NAME, not a
+    // path), so a field here could only ever be a copy made at the binder,
+    // which is the tier that can simply refuse. The agreement rule therefore
+    // lives at the binder, once, in `ffi::reportLibraryThreadStorageDisagreement`
+    // (ffi/ingest.hpp), and is applied by all three binders: the C/HIR one in
+    // `ffi::ingest`, and the assembly + pulled-archive-member ones in
+    // `program/compile_pipeline.cpp`.
     bool        isThreadLocal = false;
     // D-LK-EXTERN-DATA-IMPORT: the imported DATA object's byte size +
     // alignment, DERIVED from the declared type's layout at HIR→MIR
@@ -285,6 +333,38 @@ struct DSS_EXPORT ExternImport {
     // walker never assigned is a resolution error at link, never a zero address
     // at run.
     SymbolId addressSlotSymbol{};
+
+    // Where `isData` came from (see `ExternKindOrigin`). `Stated` for every
+    // producer except a `.s` address operand or data slot naming a symbol the
+    // file does not define.
+    ExternKindOrigin kindOrigin = ExternKindOrigin::Stated;
+
+    // ★★★ THE CODE READS THIS IMPORT THROUGH A POINTER SLOT (P68 round 9, the
+    // archive-DATA crash routed from lane `lm`,
+    // D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT). The answer MIR→LIR
+    // gave when it chose the shape of every CODE reference to this import: a
+    // DATA import under the format's `dataImportBinding: got-indirect`, and an
+    // import the `indirect-slot` dispatch routes (its `indirectSlotBindings`).
+    // Each such reference is `lea <symbol>` + a load of the POINTER found there,
+    // so wherever the import is bound, something must HOLD its address at
+    // <symbol>: the image writer's GOT / IAT slot for a library import, the
+    // slot a relocatable object CARRIES where its format spells one
+    // (`materializeObjectImportSlots`, PE's `.refptr.<name>`), and a slot the
+    // merge mints (`mergeModules`) when a sibling module of the link DEFINES
+    // it — without one, the code loads the definition's first bytes as a
+    // pointer (✔MEASURED 2026-09-24 at the round's base, `int x = 42;` read
+    // from a DSS static archive: an access violation on pe64, SIGSEGV — exit
+    // 139 — on ELF x86_64 and ELF aarch64).
+    // ★ ONE OWNER: MIR→LIR sets it (`lowerToLir`); an object READER never does —
+    // a relocatable object's code states its own shape (a direct reference, a GOT
+    // relocation, or a slot of its own, like PE's object-carried one) — and the
+    // merge, the object-slot pass and the image link's import-reference judgment
+    // (`refuseUnbindableImportReferences`: a unit that does NOT read a library
+    // datum through a slot and names it in code needs a copy relocation, P68
+    // round 11) only read it. Deriving it there from
+    // "data + a got-indirect format" would send a DIRECT load (a pulled
+    // member's, a `.s`'s) to a slot and load the ADDRESS instead of the value.
+    bool readThroughSlot = false;
 };
 
 } // namespace dss

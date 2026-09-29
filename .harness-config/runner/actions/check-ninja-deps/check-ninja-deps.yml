@@ -1,0 +1,20 @@
+# PURPOSE: refuse a gate over a build directory whose objects recorded no header dependencies.
+name: check-ninja-deps
+description: >-
+  The action proves the dependency-record reader can fail, then reads THIS leg's build directory.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `ninja_deps_selftest_guard + build/ninja-deps-freshness`.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-ninja-deps.py --self-test
+    successPattern: 'ninja-deps self-test: OK'
+    requireInputsUnmoved: true
+  - name: freshness
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-ninja-deps.py {buildDir}
+    successPattern: 'ninja-deps: OK '
+    requireInputsUnmoved: true

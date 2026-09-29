@@ -94,7 +94,7 @@ using namespace dss;
         auto loaded = GrammarSchema::loadShipped("c");
         if (!loaded.has_value()) {
             // THROW, never abort: an abort kills the whole binary and every
-            // sibling test loses its verdict (scripts/check-no-abort-in-tests).
+            // sibling test loses its verdict (.harness-config/runner/actions/check-no-abort-in-tests).
             throw std::runtime_error{"loadShipped(c) failed"};
         }
         return *loaded;
@@ -352,17 +352,17 @@ TEST(SkippedGroupNotOtherwiseProcessed, UnterminatedCommentInASkippedGroupIsStil
     // one. ✔MEASURED: gcc 13.3.0 and clang 18.1.3 BOTH refuse `#if 0` / `/*` /
     // `#endif`, while both accept every other shape in this file's accept arms.
     //
-    // ⚠ THIS ARM PINS THE BEHAVIOUR, NOT THE CLASSIFICATION, and the first draft
-    // of this comment claimed otherwise — that a "suppress everything inside a
-    // dead branch" mutant would redden it. ✔MEASURED FALSE: that mutant (the
-    // whole class test replaced by `true`) left this case GREEN, and the reason
-    // is the SPAN. An unterminated frame is swept at end-of-buffer, and the dead
-    // range is half-open ending at exactly that offset, so the byte gate never
-    // contains it either way. `P_UnterminatedComment`'s `false` classification is
-    // therefore correct and FUTURE-PROOFING rather than load-bearing today —
-    // exactly like `P_UnterminatedString`'s `true` one, for the same reason. The
-    // classification is pinned directly by `TokenConversionDiagnosticClass`
-    // below, which a constant predicate DOES redden.
+    // ⓘ THE CLASSIFICATION IS NOW LOAD-BEARING HERE, AND FOR A MEASURED REASON.
+    // This comment used to say the opposite: a "suppress everything inside a dead
+    // branch" mutant left this case GREEN, because an unterminated frame was
+    // swept at END-OF-BUFFER and no dead range could contain that offset — so
+    // `P_UnterminatedComment`'s `false` (and `P_UnterminatedString`'s `true`)
+    // were future-proofing only. Since 2026-09-22 the sweep reports at the
+    // OPENER ([[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]]), the `/*` here sits
+    // inside the skipped group, and a gate that judged this code as a conversion
+    // diagnostic WOULD swallow it — which is exactly what the classification
+    // exists to prevent. The classification is also pinned directly by
+    // `TokenConversionDiagnosticClass` below.
     const PPRun r = ppRun("#if 0\n/*\n#endif\n" + std::string{kLiveTail});
     EXPECT_TRUE(hasCode(r, DiagnosticCode::P_UnterminatedComment))
         << "an unterminated comment is a PHASE 3 failure and stays loud inside "

@@ -1,0 +1,36 @@
+{
+  "$comment": "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH -- THE CONTROL: the same program as `examples/c/dynlib_runpath_origin`, with its dynamic library built into the SAME directory as the executable, but with NO `runpaths` request and NO `loaderSearchPathVariable`. The image records the library in DT_NEEDED by bare name and nothing says where it is, so the loader refuses to start the program and the process exits 127 (`error while loading shared libraries: dsslib.so: cannot open shared object file`) -- natively on x86_64 and under qemu-aarch64 alike, as gcc's and clang's own executables do without `-Wl,-rpath` (measured, lane `vn` part 3). The subject next door differs from this manifest by the one key, and it exits 42.",
+  "$commentWhyAnExampleNotATest": "The row names a control, and the brief allowed a unit test instead. A corpus arm pins it better: it runs through BOTH runners, on the same spawn path, loader and environment as the subject, so a change in how the harness spawns (an inherited LD_LIBRARY_PATH, a staging change that installs the library somewhere the loader searches by default) turns THIS arm green-at-42 and red -- exactly the failures that would make the subject's 42 prove nothing. A unit test would spawn through a path neither runner uses.",
+  "$commentLinuxOnly": "ELF arms only. The Mach-O arms of the subject are build-only, so a Mach-O control could assert nothing a structural decode does not (the unit tests pin an image built without the request carrying NO LC_RPATH). A pe64 arm would exit 42 here, not 127 -- the Windows loader searches the application directory unasked, which is why PE records no runpath at all -- and that is witnessed by the subject's pe64 arm instead of being folded into a manifest named for the 127.",
+  "$commentNoOptimizedArm": "NO `optimizedPipelines`, deliberately: the observable is the LOADER refusing the image before any of its code runs, so an optimized arm would re-assert 127 over bytes the loader never executes -- it could witness only that the optimizer does not crash, which the subject's `release` arm already does over the same sources. The library body is a plain `return 42;` for the same reason: nothing here is meant to be transformed.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 127,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:elf64-x86_64-linux-dyn",
+          "artifact": "dsslib.so"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "arm64:elf64-aarch64-linux-dyn",
+          "artifact": "dsslib.so"
+        }
+      ]
+    }
+  ]
+}

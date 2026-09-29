@@ -32,9 +32,21 @@ add_library(core OBJECT
     # REPEATED key can be noticed
     # (D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC).
     types/config_document_parse.cpp
+    # The ONE expansion of an inline-asm template's TEXT forms (`%=`, the
+    # punctuation forms, the dialect alternatives) — the dialect declares them.
+    types/asm_template_text_forms.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
     types/predefined_macro_json.cpp
+    # The ONE resolver of a language type NAME (`"unsigned long"` -> its
+    # typeSpecifiers row): the grammar loader at LOAD and the shipped-descriptor
+    # reader at USE (a lattice-derived constant's `of`), P68 round 9.
+    types/type_name_resolve.cpp
+    # The ONE `when` selector (decode + validate, and the match against a pair):
+    # the shipped-descriptor reader at READ and the language document's builtin
+    # `signature` variants at LOAD + INJECTION — P68 round 12, S2a-1 of
+    # D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES.
+    types/variant_when.cpp
     # The ONE `.dss-project.json` reader. It lived in `src/program/` until
     # 2026-08-13, when the LSP tier's `workspace_project.cpp` — which reads the
     # same manifest to learn a workspace's assembly dialect — had to reach UP
@@ -43,6 +55,7 @@ add_library(core OBJECT
     # D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS: moved down to the tier
     # both readers already depend on, so the dependency runs one way again.
     types/project_config.cpp
+    types/project_sources.cpp
     types/target_schema.cpp
     types/target_spec.cpp
     types/target_schema_json.cpp
@@ -52,6 +65,10 @@ add_library(core OBJECT
     types/tree.cpp
     types/tree_builder.cpp
     types/tree_cursor.cpp
+    # The ONE owner of what a struct/union DEFINITION carries for every text tier
+    # that spells composites in a `types` table (HIR `.dsshir` v5, MIR `.dssir` v2):
+    # the channels a writer reads, the combinations a reader refuses, the completion.
+    types/type_lattice/composite_definition.cpp
     types/type_lattice/type_lattice.cpp
     types/type_lattice/type_layout.cpp
     types/type_lattice/type_reintern.cpp
@@ -109,6 +126,7 @@ target_compile_definitions(core PRIVATE DSS_BUILD_SOURCE_DIR="${CMAKE_SOURCE_DIR
 #     types/grammar_schema_json.cpp     types/target_schema_json.cpp
 #     types/project_config.cpp          types/predefined_macro_json.hpp
 #     substrate/relocation_table_json.hpp
+#     types/variant_when_json.hpp       (P68 round 12: the `when` decoder, `_json` shape)
 # Keep this list honest: `grep -rn '#include <nlohmann' src/core/` is the whole
 # instrument.
 #
@@ -178,6 +196,6 @@ set_source_files_properties(types/grammar_schema_json.cpp PROPERTIES
 # The old note warned against spreading the flag to grammar_schema.cpp /
 # target_schema.cpp, whose switches use subset-with-`default` forms. Spreading
 # it is now exactly what happened, and it is inert for them: `-Werror=switch` /
-# C4062 do not fire on a switch that has a `default:` arm. ✔MEASURED — see
-# D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS for the
-# whole-tree probe that found zero `-Wswitch` sites after consolidation.
+# C4062 do not fire on a switch that has a `default:` arm. ✔MEASURED — the
+# whole-tree probe run when the five per-file copies of this gate were folded
+# into the root CMakeLists.txt found zero `-Wswitch` sites left.

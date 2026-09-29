@@ -59,6 +59,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace dss {
@@ -401,6 +402,37 @@ private:
     bool          lastWasDefinedKeyword_ = false;
 };
 
+// What a CHARACTER CONSTANT in a `#if` means on the ACTIVE (target × object
+// format) pair — the facts C 6.10.1p4 leaves to the implementation and this
+// evaluator, running before any type checking, cannot know by itself. ONE struct
+// carrying the pair's facts, built by the preprocessor from the same sources the
+// type system reads, so a constant's `#if` reading and its expression type agree.
+//
+// ★ THE RULE, ✔MEASURED 2026-09-23 on all four references and without a fork: in
+// `#if` a character constant is SIGNED (`intmax_t`) iff its ELEMENT TYPE is
+// signed, and UNSIGNED (`uintmax_t`) otherwise — gcc 13.3.0 and clang 18.1.3 on
+// x86_64 Linux: `L'…'` signed, the narrow form signed; on aarch64 Linux: `L'…'`
+// unsigned AND the narrow form unsigned (plain `char` is); mingw-w64 13.2.0 and
+// MSVC 14.51: `L'…'` unsigned (`unsigned short`), the narrow form signed;
+// `u'…'`/`U'…'`/`u8'…'` unsigned everywhere. (P68 round 9,
+// D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION and
+// D-PP-IF-NARROW-CHARACTER-CONSTANT-IGNORES-PLAIN-CHAR-SIGNEDNESS.)
+struct PpCharConstantFacts {
+    // Plain `char`'s signedness on the pair
+    // (`TargetSchema::charIsUnsigned(ObjectFormatKind)`): decides a narrow
+    // constant's VALUE (C 6.4.4.4p10 — `'\xff'` is -1 where `char` is signed) and
+    // its `#if` SIGNEDNESS. `nullopt` = no pair (the LSP, the direct-API tests):
+    // a body above 0x7F then REFUSES, loud, and the rest read as `int`, the type
+    // C 6.4.4.4p10 gives the constant.
+    std::optional<bool> charIsUnsigned;
+    // The element core of each WIDE/UTF character-constant opener on the pair —
+    // opener token kind → core (`L'` → the target's `wchar_t` for the format,
+    // `u'` → U16, `U'` → U32, `u8'` → U8). A declared opener ABSENT from it (its
+    // row names an ABI typedef the target does not declare, or a caller supplied
+    // no pair at all) REFUSES in `#if`, loud — never a guessed core.
+    std::vector<std::pair<SchemaTokenId, TypeKind>> wideCoreByOpener;
+};
+
 // Evaluate the `#if`/`#elif` operand tokens to a compile-time integer.
 // `operandTokens` are sliced against `synth` (the prefix buffer). `productText`
 // supplies any product-tail bytes materialized during expansion (FC15b) so a
@@ -439,18 +471,13 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      DiagnosticReporter&    rep,
                      PpHasEmbed const&      hasEmbed = {},
                      PpOperatorRevoked const& operatorRevoked = {},
-                     // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the ACTIVE
-                     // (target × object format)'s plain-`char` signedness,
-                     // `TargetSchema::charIsUnsigned(ObjectFormatKind)`. C
-                     // 6.4.4.4p10 makes `#if '\xff' < 0` answer differently on a
-                     // signed- and an unsigned-`char` target, and this evaluator
-                     // has no other way to know. DEFAULTED to `nullopt` because
-                     // a `#if` fold is reachable from callers with no target in
-                     // scope at all (the LSP, the direct-API tests) — but the
-                     // default is NOT "signed": with it absent, a character
-                     // constant above 0x7F REFUSES, loud, and every 0–127 body
-                     // (which is every real-world one) folds unchanged.
-                     std::optional<bool>    charIsUnsigned = std::nullopt);
+                     // The ACTIVE pair's character-constant facts (see
+                     // `PpCharConstantFacts`). DEFAULTED to "no pair" because a
+                     // `#if` fold is reachable from callers with no target in
+                     // scope at all (the LSP, the direct-API tests) — and "no
+                     // pair" is NOT a guessed one: a narrow body above 0x7F and
+                     // every wide/UTF constant then REFUSE, loud.
+                     PpCharConstantFacts const& charFacts = {});
 
 // The phase-4 VALUE of a controlling expression (C 6.10.2p13: every operand
 // acts as `intmax_t` / `uintmax_t`): the 64 raw two's-complement bits plus which
@@ -475,7 +502,7 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
                           DiagnosticReporter&    rep,
                           PpHasEmbed const&      hasEmbed = {},
                           PpOperatorRevoked const& operatorRevoked = {},
-                          std::optional<bool>    charIsUnsigned = std::nullopt);
+                          PpCharConstantFacts const& charFacts = {});
 
 // C23 6.10.4.2 (D-PP-EMBED-PARAMS): evaluate a `limit` parameter's clause (the
 // tokens INSIDE its parens) to the element count it names. ONE implementation
@@ -506,7 +533,7 @@ evaluateEmbedLimit(std::span<Token const>   clause,
                    DiagnosticReporter&      rep,
                    PpHasEmbed const&        hasEmbed,
                    PpOperatorRevoked const& operatorRevoked,
-                   std::optional<bool>      charIsUnsigned,
+                   PpCharConstantFacts const& charFacts,
                    PpTokenTextFn const&     textOf,
                    PpEmbedFail const&       fail);
 

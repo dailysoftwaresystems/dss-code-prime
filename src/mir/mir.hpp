@@ -286,7 +286,7 @@ public:
     [[nodiscard]] SymbolVisibility funcVisibility(MirFuncId id) const {
         return funcArena_.at(id).visibility;
     }
-    // TF-C78 (D-CSUBSET-NOINLINE): TRUE iff the source declared this function
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): TRUE iff the source declared this function
     // `__attribute__((noinline))`. The inliner's §2.9 legality gate REFUSES to
     // splice such a callee — the sibling of the `funcBinding == Weak` refusal,
     // and read at the same site. See `detail::MirFunc::noInline`.
@@ -502,7 +502,7 @@ public:
     // Open a function. Closes any open function first (which requires its current
     // block be terminated and the function have ≥1 block). `signature` is the
     // FnSig TypeId; `symbol` the declared SymbolId.
-    // TF-C78 (D-CSUBSET-NOINLINE): `noInline` stamps the per-function
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): `noInline` stamps the per-function
     // inliner opt-out. DEFAULTED to false so a SYNTHESIZED function (a shim,
     // a funclet, a startup thunk — none of which the source annotated) reads
     // naturally; every site that COPIES an existing MirFunc must pass the
@@ -621,9 +621,9 @@ public:
     // operands and `resultType` are checked against `opcodeInfo(opcode)`
     // (operand count bounds + result-type rule). Returns the instruction id,
     // which IS its SSA value id.
-    // `payload2` (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): a secondary per-opcode
-    // scalar, defaulted 0. Currently set ONLY for `Alloca` (the local's
-    // effective alignment in bytes); ignored for every other opcode.
+    // `payload2`: a secondary per-opcode scalar, defaulted 0 ("no information").
+    // Which opcodes carry it and what each means is stated ONCE, at
+    // `detail::MirInst::payload2` (mir_node.hpp).
     MirInstId addInst(MirOpcode opcode, std::span<MirInstId const> operands,
                       TypeId resultType = InvalidType, std::uint32_t payload = 0,
                       MirInstFlags flags = MirInstFlags::None,
@@ -651,6 +651,9 @@ public:
     // at D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST was an ACCESS_VIOLATION
     // at run time, not a diagnostic. The site census lives beside that refusal in
     // `addInst`; a NEW copy site must be added there.
+    //
+    // `target` must be a block of the OPEN function (`isBlockOfOpenFunction`) —
+    // a block address is lowered inside its own function. Aborts otherwise.
     MirInstId addBlockAddress(MirBlockId target, TypeId type,
                               MirInstFlags flags = MirInstFlags::None);
     // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: publish `blockAddr`'s
@@ -925,6 +928,17 @@ public:
     // reached (the MirBuilder's "every created block must be filled +
     // terminated by finish()" invariant otherwise aborts).
     [[nodiscard]] bool isBlockUnopened(MirBlockId block) const noexcept;
+    // True iff `block` is a block of the function currently open for building.
+    // THE ONE OWNER of the rule `beginBlock`, every terminator's successor list
+    // and `addBlockAddress` enforce by ABORTING — a filled block, a CFG edge and
+    // a block address each name a block of their OWN function. (For the block
+    // address that is where the lowering puts it: `mir_to_lir` maps blocks per
+    // function, so a foreign target has no lowering — ✔measured P68 on x86_64
+    // and arm64, `L_UnsupportedLoweringForOpcode` "has no LIR block mapping".)
+    // Those aborts stay aborts: from compiler code the misuse is a programming
+    // error. A reader of untrusted text asks this FIRST and refuses by name.
+    // Never aborts: an invalid, out-of-range or foreign-module id answers false.
+    [[nodiscard]] bool isBlockOfOpenFunction(MirBlockId block) const noexcept;
     // The currently-open block (or `InvalidMirBlock` when none is open OR the
     // last-opened block has already been sealed by a terminator). Phi-
     // insertion lowerings (Ternary, LogicalAnd/Or) need to know which block

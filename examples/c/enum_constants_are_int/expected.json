@@ -1,0 +1,37 @@
+{
+  "$comment": "P68 round 12 (lane `cs`, D-C-AN-ENUMERATION-CONSTANT-IS-TYPED-AS-ITS-ENUMERATION-NOT-INT): the type of an enumeration constant, C17 6.4.4.3p2 and C23 6.7.3.3p12-p15 — `int` when every value of an enumeration without a fixed underlying type fits `int`; during its own list `int` when its own value fits, else its constant expression's type, and a wider type of the previous constant's signedness for an implicit `previous + 1` that leaves the previous type; the enumerated type (holding every value, never wrapped to 32 bits) when some value does not fit; the enumerated type for a fixed underlying type, inside the list as well; and a constant wider than `int` folds at its own type inside the list (`AR0 + 1`, `AR0 > 0`), never at 32 bits. MEASURED 2026-09-24 (re-measured 20:11 with the `AR` checks), this file compiled and RUN on each reference separately: gcc 13.3.0 (x86_64, and aarch64-linux-gnu-gcc under qemu) and mingw-w64 13.2.0 at -std=c2x exit 42; Apple clang 21.0.0 (arm64-apple-darwin25.6.0, the Mac) exits 42 too; clang 18.1.3 -std=c2x (x86_64 and aarch64) exits 1 on exactly one check — it keeps the fitting constant `W0` of a widened enumeration `int`, where C23 6.7.3.3p15 makes it the enumerated type (decided by the standard's text, which gcc follows); the -std=c17 -pedantic-errors modes and MSVC 19.51 refuse the C23 syntax (a value beyond `int`, the `: long` clause). Before this round DSS typed every constant as its enumeration and wrapped a value beyond `int` to 32 bits, silently. exit 42 = every type and value is C23's on this target's data model.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

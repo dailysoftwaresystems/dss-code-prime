@@ -8,6 +8,7 @@
 #include "core/types/integer_literal_ladder.hpp"  // C4b: bitPreciseLiteralSignedness
 #include "core/types/semantic_config.hpp"
 #include "core/types/tree.hpp"
+#include "core/types/wide_string_encode.hpp"  // decodeWideCharCodepoint (the value tier's decode)
 // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]: for
 // `classifyCstCastTarget` ONLY — the boundary function that turns a resolved
 // TypeId into a `CstCastTarget`. `evaluateConstantCst` itself still touches no
@@ -134,7 +135,7 @@ combineBinaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& opti
         if (bf.ok) return ok(std::move(bf.value));
         return fail(bf.failure, expr);
     }
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94) — the CRIT-3 belt, CST side. The HIR
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94) — the CRIT-3 belt, CST side. The HIR
     // walker's twin keys on the RESULT TypeId; this engine is interner-free, so it
     // keys on the OPERANDS instead: if either is 128-bit-cored and the bignum
     // above declined, the int64 path below would fold it mod 2^64 — silently. The
@@ -218,7 +219,7 @@ combineUnaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& optio
         if (uf.ok) return ok(std::move(uf.value));
         return fail(uf.failure, expr);
     }
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): the unary twin of the binary belt above.
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): the unary twin of the binary belt above.
     if (detail::isInt128Kind(inner.value->core)) {
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
     }
@@ -465,13 +466,29 @@ evalNode(NodeId                              expr,
             // the true (width, signed); absent rules ⇒ the I32 default (inert for
             // every non-BitInt fold — the leaf's other consumers read `.value`).
             lv.core = TypeKind::I32;
+            std::uint64_t bits = *iv;
             if (!ctx.integerLiteralTyping.empty()) {
                 auto const r = typeIntegerLiteral(tree.text(expr), ctx.numberStyle,
                                                   ctx.integerLiteralTyping,
                                                   ctx.dataModel, *iv);
-                if (r.status == IntegerLadderStatus::Typed) lv.core = r.kind;
+                if (r.status == IntegerLadderStatus::Typed) {
+                    lv.core = r.kind;
+                    // D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED: the VALUE is the
+                    // magnitude reduced to the type — the identity for a ladder
+                    // type, MSVC's `wrap` for a fixed one, so
+                    // `_Static_assert(300i8 == 44, "")` holds (✔MEASURED, MSVC
+                    // 19.51). The SAME shared reduction the CST→HIR literal and
+                    // phase 4 perform; a `char`-typed literal above 0x7F with no
+                    // target answer is not a constant this fold can decide.
+                    auto const reduced = reducedIntegerLiteralBits(
+                        r.kind, *iv, options.charIsUnsigned);
+                    if (!reduced.has_value()) {
+                        return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                    }
+                    bits = *reduced;
+                }
             }
-            lv.value = static_cast<std::int64_t>(*iv);
+            lv.value = static_cast<std::int64_t>(bits);
             return ok(std::move(lv));
         }
         // FC17 (D-CSUBSET-CONSTEXPR): a FLOAT literal leaf — ONLY when the
@@ -871,7 +888,7 @@ evalNode(NodeId                              expr,
             }
             return fail(ConstEvalFailure::NotAConstantExpression, expr);  // (T*)<nonzero>
         }
-        // D-CSUBSET-INT128-CONSTFOLD (TF-C94): a cast to a 128-bit integer routes
+        // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): a cast to a 128-bit integer routes
         // through the bignum, exactly like the `_BitInt` arm above — checked
         // BEFORE the generic `isInteger` arm, which would otherwise narrow the
         // value through `narrowIntToBits` into an int64 and tag it I64/U64. That
@@ -1303,30 +1320,71 @@ evalNode(NodeId                              expr,
     // not integers never folds them here). Decodes via the SHARED
     // `decodeCharLiteralBody` — the EXACT decode the CST→HIR narrow value path
     // (`lowerCharLiteral`) runs, so const-expr and value positions can never
-    // disagree; empty / multi-char / malformed-escape bodies fail loud. A
-    // WIDE/UTF opener (`L'`/`u'`/`U'`/`u8'`) deliberately does NOT match: its
-    // element core is FORMAT-keyed and semantic-stamped (pe wchar_t = u16), and
-    // its `\x`-escape surface is a named deferral — folding it here would
-    // silently accept what the value tier fails loud on. It falls through to
-    // the generic fail below (loud, as today).
-    if (cfg.charStartToken.valid() && cfg.charBodyToken.valid()
+    // disagree; empty / multi-char / malformed-escape bodies fail loud.
+    //
+    // ★ A WIDE/UTF OPENER (`L'`/`u'`/`U'`/`u8'`) FOLDS TOO, through the pair's
+    // element core (P68 round 9,
+    // D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION). C 6.4.4.4 +
+    // 6.6 make every character constant an integer constant expression, and
+    // ✔MEASURED at 4d9a24c4 on pe64 DSS refused `_Static_assert(L'a' == 97, "")`,
+    // `u'a'`/`U'a'` there, a file-scope `int a[L'a' == 97 ? 1 : -1]` and `enum { E =
+    // L'a' }` while mingw-w64 13.2.0 compiled and ran them all. This arm used to
+    // refuse them on purpose because the element core is the pair's (`wchar_t` is
+    // `unsigned short` on Windows, `int` on x86_64 Linux) and the engine cannot see
+    // the pair — so the core now comes from `resolveWideCharCore`, which each tier
+    // answers from the fact it owns, and the value from the SHARED
+    // `decodeWideCharCodepoint` the value tier runs, so an escape too wide for the
+    // element is refused here exactly as it is there. No resolver, or no core for
+    // this node, ⇒ not foldable, and the consumer's loud refusal stands.
+    if (cfg.charBodyToken.valid()
         && ctx.integerLiteralTokens.contains(cfg.charBodyToken.v)) {
-        NodeId charBody{};
-        bool   sawOpener  = false;
-        bool   allTokens  = !kids.empty();
+        NodeId        charBody{};
+        SchemaTokenId opener{};
+        bool          allTokens = !kids.empty();
         for (NodeId c : kids) {
             if (tree.kind(c) != NodeKind::Token) { allTokens = false; break; }
             SchemaTokenId const k = tree.tokenKind(c);
-            if (!sawOpener) {
-                // The NARROW opener must come FIRST — a wide/UTF opener leaves
-                // `sawOpener` false and the node never matches.
-                if (k.v != cfg.charStartToken.v) break;
-                sawOpener = true;
+            if (!opener.valid()) {
+                opener = k;   // the OPENER comes first: narrow `'`, or a prefixed one
                 continue;
             }
             if (!charBody.valid() && k.v == cfg.charBodyToken.v) charBody = c;
         }
-        if (allTokens && sawOpener && charBody.valid()) {
+        bool const narrow = cfg.charStartToken.valid() && opener.valid()
+                            && opener.v == cfg.charStartToken.v;
+        if (allTokens && !narrow && opener.valid() && charBody.valid()
+            && env.resolveWideCharCore) {
+            if (auto const core = env.resolveWideCharCore(expr)) {
+                auto const unit = decodeWideCharCodepoint(tree.text(charBody), *core);
+                if (!unit.has_value()) {
+                    return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                }
+                // The constant's VALUE is its code unit read as the element type
+                // (C 6.4.4.4p11): a signed element (`wchar_t` = `int`) holds a unit
+                // with its top bit set as a NEGATIVE number — `L'\xffffffff'` is -1
+                // on x86_64 Linux and 4294967295 on aarch64 Linux, as gcc 13.3.0 and
+                // clang 18.1.3 answer (✔MEASURED). The literal-pool contract carries
+                // a signed core in the int64 arm and an unsigned one in the uint64.
+                // The element's width and sign from the ONE table the fold
+                // arithmetic reads (`intKindInfo`); no plain-`char` core reaches
+                // here, so no `char` answer is needed.
+                auto const info = detail::intKindInfo(*core, std::nullopt);
+                if (!info.has_value()) {
+                    return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                }
+                HirLiteralValue lv;
+                lv.core = *core;
+                std::uint64_t const raw = static_cast<std::uint64_t>(*unit);
+                if (info->isSigned && info->bits < 64) {
+                    std::uint64_t const sign = std::uint64_t{1} << (info->bits - 1);
+                    lv.value = static_cast<std::int64_t>((raw ^ sign) - sign);
+                } else {
+                    lv.value = raw;
+                }
+                return ok(std::move(lv));
+            }
+        }
+        if (allTokens && narrow && charBody.valid()) {
             auto const cp = decodeCharLiteralBody(tree.text(charBody));
             if (!cp.has_value()) {
                 return fail(ConstEvalFailure::NotAConstantExpression, expr);
@@ -1594,7 +1652,7 @@ classifyCstCastTarget(TypeInterner const& in, TypeId ty,
         case TypeKind::U32:  t.isInteger=true; t.intBits=32; t.intSigned=false; break;
         case TypeKind::I64:  t.isInteger=true; t.intBits=64; t.intSigned=true;  break;
         case TypeKind::U64:  t.isInteger=true; t.intBits=64; t.intSigned=false; break;
-        // ★ D-CSUBSET-INT128-CONSTFOLD (TF-C94): the two 128-bit STANDARD kinds.
+        // ★ D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): the two 128-bit STANDARD kinds.
         // WITHOUT these rows they fell to `default: nullopt` and the whole cast was
         // non-foldable — which MEASURED as *every* 128-bit integer constant
         // expression refusing, not just wide ones:

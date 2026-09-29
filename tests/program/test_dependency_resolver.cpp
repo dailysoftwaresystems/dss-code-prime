@@ -167,6 +167,8 @@ struct ManifestSpec {
     std::string              artifactName;
     std::string              preBuildScripts;   // RAW JSON array
     std::string              postBuildScripts;  // RAW JSON array
+    std::vector<std::string> includes;
+    std::vector<std::string> defines;
 };
 
 [[nodiscard]] std::string renderManifest(ManifestSpec const& m) {
@@ -177,6 +179,12 @@ struct ManifestSpec {
     out += "  \"sources\": " + jsonStringArray(m.sources);
     if (!m.artifactName.empty()) {
         out += ",\n  \"artifactName\": " + jsonQuote(m.artifactName);
+    }
+    if (!m.includes.empty()) {
+        out += ",\n  \"includes\": " + jsonStringArray(m.includes);
+    }
+    if (!m.defines.empty()) {
+        out += ",\n  \"defines\": " + jsonStringArray(m.defines);
     }
     if (!m.dependsOn.empty()) {
         out += ",\n  \"dependsOn\": " + jsonArray(m.dependsOn);
@@ -1302,6 +1310,227 @@ TEST(DependencyResolverHooks, SourceMergeDependencyRunsNoPostBuildHook) {
     EXPECT_FALSE(fs::exists(dep / "post-ran.txt"))
         << "a source-merge dependency produces no build product, so it has no "
            "post-build to run — the marker's absence is the only observable";
+}
+
+// ══ A MODULE'S OWN `includes` AND `defines` — TO ITS OWN SOURCES, AND ONLY THERE
+//
+// [[D-DEPS-MODULE-INCLUDES-AND-DEFINES-SILENTLY-DROPPED]]. A `module` is a
+// library its consumers take in as source (plan 06 B.13.3: built standalone, it
+// IS a library), so its sources must mean inside a consumer what they mean when
+// it builds on its own — with its own `includes` and `defines`. ✔MEASURED before
+// the fix, both were dropped: only the source PATHS crossed the edge, and a
+// module including a header from its own include directory could not compile
+// inside any consumer, from any working directory.
+//
+// TWO HALVES, both pinned: the settings REACH the module's sources, and they
+// reach NOTHING ELSE — not the consumer's own sources, not another module's.
+// Every verdict is a compile-time `#error` naming what went wrong, so a green
+// build IS the assertion and nothing is spawned.
+//
+// RED-ON-DISABLE: drop `Program::setSourceSettings` from `compileProject` and
+// the four "reach" pins fail with the module's `#error`; apply a module's
+// settings to every source and the two "never reach" pins fail with theirs.
+//
+// ⚠ NO `#error` TEXT HERE HOLDS AN APOSTROPHE, deliberately. ✔MEASURED
+// 2026-09-21: DSS lexes a lone `'` on a line of a SKIPPED group as a character
+// constant that runs on past the end of the line, so two such lines swallow
+// every directive between them. The first draft of these pins wrote possessives
+// into its messages, and the module's second `#if` check was silently never
+// evaluated — a green pin asserting nothing. gcc and MSVC end the constant at
+// the line and evaluate the check.
+
+namespace {
+
+constexpr std::string_view kModuleNeedsItsDefine =
+    "#ifndef MODDEF\n"
+    "#error MODDEF did not reach the module source\n"
+    "#endif\n"
+    "#if MODDEF != 4\n"
+    "#error MODDEF reached the module source with the wrong value\n"
+    "#endif\n"
+    "int module_answer(void){ return MODDEF; }\n";
+
+// Builds `dir/app.dss-project.json` (root: `main.c`, `extraRoot`) depending on
+// the module at `dir/mod`. Returns the compile's exit status.
+[[nodiscard]] int buildRootWithModule(fs::path const& dir,
+                                      ManifestSpec     moduleSpec,
+                                      ManifestSpec     rootSpec,
+                                      DiagnosticReporter& rep) {
+    fs::path const mod = dir / "mod";
+    moduleSpec.profile = "module";
+    moduleSpec.targets = {std::string{kElfX64Exec}};
+    writeText(fs::path{manifestPathIn(mod)}, renderManifest(moduleSpec));
+    rootSpec.targets = {std::string{kElfX64Exec}};
+    rootSpec.dependsOn.push_back(pathEntry(mod.generic_string()));
+    fs::path const proj = dir / "app.dss-project.json";
+    writeText(proj, renderManifest(rootSpec));
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    return prog.compileProject(proj.string(), rep);
+}
+
+[[nodiscard]] std::string allMessages(DiagnosticReporter const& rep) {
+    std::string out;
+    for (auto const& d : rep.all()) out += "\n  " + d.contextPrefix + d.actual;
+    return out;
+}
+
+} // namespace
+
+TEST(DependencyResolverModuleSettings, ModuleDefinesReachItsOwnSources) {
+    ScratchDir scratch{Location::Temp, "dep-resolver"};
+    fs::path const dir = scratch.path();
+    writeText(dir / "mod" / "m.c", kModuleNeedsItsDefine);
+    writeText(dir / "main.c", kMainUsingModule);
+    DiagnosticReporter rep;
+    EXPECT_EQ(buildRootWithModule(dir, {.sources = {"m.c"}, .defines = {"MODDEF=4"}},
+                                  {.sources = {(dir / "main.c").generic_string()}},
+                                  rep),
+              0)
+        << allMessages(rep);
+}
+
+// The module's value WINS a conflict inside its own source — it is applied after
+// the consumer's, and the redefinition is announced, as a repeated `-D` is — and
+// the consumer's own source keeps the consumer's value.
+TEST(DependencyResolverModuleSettings, ModuleDefineWinsInItsOwnSourceAndOnlyThere) {
+    ScratchDir scratch{Location::Temp, "dep-resolver"};
+    fs::path const dir = scratch.path();
+    writeText(dir / "mod" / "m.c", kModuleNeedsItsDefine);
+    writeText(dir / "main.c",
+              "#if MODDEF != 9\n"
+              "#error MODDEF changed value in the consumer source\n"
+              "#endif\n"
+              + std::string{kMainUsingModule});
+    DiagnosticReporter rep;
+    ASSERT_EQ(buildRootWithModule(dir, {.sources = {"m.c"}, .defines = {"MODDEF=4"}},
+                                  {.sources = {(dir / "main.c").generic_string()},
+                                   .defines = {"MODDEF=9"}},
+                                  rep),
+              0)
+        << allMessages(rep);
+    EXPECT_GE(countCode(rep, DiagnosticCode::P_PreprocessorMacroRedefinition), 1u)
+        << "a module redefining the consumer's macro must say so";
+}
+
+// The module's include directory is searched BEFORE the consumer's for the
+// module's own source, so a same-named header resolves to the module's; the
+// consumer's source keeps finding its own.
+TEST(DependencyResolverModuleSettings, ModuleIncludesComeFirstForItsOwnSources) {
+    ScratchDir scratch{Location::Temp, "dep-resolver"};
+    fs::path const dir = scratch.path();
+    writeText(dir / "mod" / "inc" / "cfg.h", "#define CFG_V 4\n");
+    writeText(dir / "rinc" / "cfg.h", "#define CFG_V 9\n");
+    writeText(dir / "mod" / "m.c",
+              "#include \"cfg.h\"\n"
+              "#if CFG_V != 4\n"
+              "#error the module source did not take the module header\n"
+              "#endif\n"
+              "int module_answer(void){ return CFG_V; }\n");
+    writeText(dir / "main.c",
+              "#include \"cfg.h\"\n"
+              "#if CFG_V != 9\n"
+              "#error the consumer source did not take the consumer header\n"
+              "#endif\n"
+              + std::string{kMainUsingModule});
+    DiagnosticReporter rep;
+    EXPECT_EQ(buildRootWithModule(dir, {.sources = {"m.c"}, .includes = {"inc"}},
+                                  {.sources  = {(dir / "main.c").generic_string()},
+                                   .includes = {(dir / "rinc").generic_string()}},
+                                  rep),
+              0)
+        << allMessages(rep);
+}
+
+TEST(DependencyResolverModuleSettings, ModuleSettingsNeverReachTheConsumersSources) {
+    ScratchDir scratch{Location::Temp, "dep-resolver"};
+    fs::path const dir = scratch.path();
+    writeText(dir / "mod" / "inc" / "modonly.h", "#define MODONLY 1\n");
+    writeText(dir / "mod" / "m.c",
+              "#include \"modonly.h\"\n" + std::string{kModuleNeedsItsDefine});
+    writeText(dir / "main.c",
+              "#ifdef MODDEF\n"
+              "#error a module define reached the consumer source\n"
+              "#endif\n"
+              "#if __has_include(\"modonly.h\")\n"
+              "#error a module include directory reached the consumer source\n"
+              "#endif\n"
+              + std::string{kMainUsingModule});
+    DiagnosticReporter rep;
+    EXPECT_EQ(buildRootWithModule(dir,
+                                  {.sources  = {"m.c"},
+                                   .includes = {"inc"},
+                                   .defines  = {"MODDEF=4"}},
+                                  {.sources = {(dir / "main.c").generic_string()}},
+                                  rep),
+              0)
+        << allMessages(rep);
+}
+
+TEST(DependencyResolverModuleSettings, ModuleSettingsNeverReachAnotherModulesSources) {
+    ScratchDir scratch{Location::Temp, "dep-resolver"};
+    fs::path const dir = scratch.path();
+    fs::path const other = dir / "other";
+    writeText(dir / "mod" / "inc" / "modonly.h", "#define MODONLY 1\n");
+    writeText(dir / "mod" / "m.c",
+              "#include \"modonly.h\"\n" + std::string{kModuleNeedsItsDefine});
+    writeText(other / "o.c",
+              "#ifdef MODDEF\n"
+              "#error one module define reached another module source\n"
+              "#endif\n"
+              "#if __has_include(\"modonly.h\")\n"
+              "#error one module include directory reached another module source\n"
+              "#endif\n"
+              "int other_answer(void){ return 2; }\n");
+    writeText(fs::path{manifestPathIn(other)},
+              renderManifest({.profile = "module",
+                              .targets = {std::string{kElfX64Exec}},
+                              .sources = {"o.c"}}));
+    writeText(dir / "main.c",
+              "extern int module_answer(void);\nextern int other_answer(void);\n"
+              "int main(void){ return module_answer() + other_answer(); }\n");
+    DiagnosticReporter rep;
+    EXPECT_EQ(buildRootWithModule(dir,
+                                  {.sources  = {"m.c"},
+                                   .includes = {"inc"},
+                                   .defines  = {"MODDEF=4"}},
+                                  {.sources   = {(dir / "main.c").generic_string()},
+                                   .dependsOn = {pathEntry(other.generic_string())}},
+                                  rep),
+              0)
+        << allMessages(rep);
+}
+
+// A module merged into an ARTIFACT-LINK dependency — not the root — brings its
+// settings into THAT dependency's build: the same rule on the second call site.
+TEST(DependencyResolverModuleSettings, ModuleMergedIntoADependencyKeepsItsSettings) {
+    ScratchDir scratch{Location::Temp, "dep-resolver"};
+    fs::path const dir = scratch.path();
+    fs::path const lib = dir / "lib";
+    fs::path const mod = dir / "mod";
+    writeText(mod / "m.c", kModuleNeedsItsDefine);
+    writeText(fs::path{manifestPathIn(mod)},
+              renderManifest({.profile = "module",
+                              .targets = {std::string{kElfX64Exec}},
+                              .sources = {"m.c"},
+                              .defines = {"MODDEF=4"}}));
+    writeText(lib / "l.c",
+              "extern int module_answer(void);\n"
+              "int dep_answer(void){ return module_answer() + 2; }\n");
+    writeText(fs::path{manifestPathIn(lib)},
+              renderManifest({.profile   = "staticlib",
+                              .targets   = {std::string{kElfX64Exec}},
+                              .sources   = {"l.c"},
+                              .dependsOn = {pathEntry(mod.generic_string())}}));
+    writeText(dir / "main.c", kMainSource);
+    fs::path const proj = dir / "app.dss-project.json";
+    writeText(proj, renderManifest({.targets   = {std::string{kElfX64Exec}},
+                                    .sources   = {(dir / "main.c").generic_string()},
+                                    .dependsOn = {pathEntry(lib.generic_string())}}));
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    DiagnosticReporter rep;
+    EXPECT_EQ(prog.compileProject(proj.string(), rep), 0) << allMessages(rep);
 }
 
 // ── U-8 (as corrected): a staticlib that depends on a SHARED library ────────

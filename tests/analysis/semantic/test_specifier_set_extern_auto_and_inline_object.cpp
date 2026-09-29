@@ -203,6 +203,8 @@ TEST(SpecifierSetExternAutoAndInlineObject, ExternAutoInfersTheInitializersType)
         "extern auto s = \"hi\";\n"
         "auto extern c = (char)3;\n"});
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* d = symbolNamed(model, "d");
     auto const* s = symbolNamed(model, "s");
     auto const* c = symbolNamed(model, "c");

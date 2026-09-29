@@ -1,6 +1,7 @@
 # ══ cmake/DssBuildClass.cmake — the ONE owner of "what kind of build is this" ══
 #
-# D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY
+# Born of an integrated runner that hung before creating its own directory,
+# with no entry timeout in place to catch it.
 #
 # Two consumers ask this question and must never get two answers:
 #   * tests/CMakeLists.txt — the shuffle arms trim their repeat count only on an

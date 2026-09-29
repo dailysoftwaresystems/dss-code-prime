@@ -489,8 +489,18 @@ lowerBranchShape(TargetSchema const& schema, MirOpcode pred) {
 TEST(FcmpLowering, SingleCcPredicateFusesIntoJcc) {
     // x86 Ogt: the CondBr must branch DIRECTLY on the float condition
     // (jcc payload = Fogt) over a re-emitted fcmp — the ICmp-fusion
-    // mirror. The materialized setcc copy from the value lowering
-    // stays as dead code (D-LIR-SETCC-DEAD-AFTER-FUSION).
+    // mirror.
+    //
+    // ⚠ THIS ARM USED TO EXPECT **2** COMPARES AND CALL THE SECOND ONE "the
+    // established ICmp-fusion shape". It was pinning a defect
+    // (D-LIR-SETCC-DEAD-AFTER-FUSION): `lowerFCmp` materialized a
+    // `fcmp → setcc → zext` trio whose ONLY would-be reader was the CondBr
+    // that then re-derived the flags for itself and never read it. The
+    // use-count gate (`compareIsFusedOnly`) now declines to mint it, so the
+    // fused shape carries exactly ONE compare. The COMPOSED and F128
+    // predicates, which take the non-fused arm and genuinely need the Bool,
+    // are unaffected — see the two tests below and
+    // `tests/lir/test_lir_fused_compare_dce.cpp`'s second-consumer control.
     auto schema = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(schema.has_value());
     auto const s = lowerBranchShape(**schema, MirOpcode::FCmpOgt);
@@ -498,9 +508,9 @@ TEST(FcmpLowering, SingleCcPredicateFusesIntoJcc) {
     ASSERT_EQ(s.jccPayloads.size(), 1u);
     EXPECT_EQ(s.jccPayloads[0],
               static_cast<std::uint32_t>(TargetCondCode::Fogt));
-    EXPECT_EQ(s.fcmpCount, 2u)
-        << "the fused arm re-emits the float compare (the dead "
-           "materialized pair is the established ICmp-fusion shape)";
+    EXPECT_EQ(s.fcmpCount, 1u)
+        << "the fused arm re-emits the float compare and is the ONLY reader "
+           "of the flags — nothing reads the Bool, so nothing materializes it";
 }
 
 TEST(FcmpLowering, ComposedPredicateBranchesOnMaterializedBool) {

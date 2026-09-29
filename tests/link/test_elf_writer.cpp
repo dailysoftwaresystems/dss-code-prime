@@ -57,10 +57,11 @@ using namespace dss;
 
 namespace {
 
-// D-TEST-LE-READ-HELPERS CLOSED at 8aabc04 audit fold; complete-
-// hoist at 5ac97ae audit fold per code-architect Q1 (the partial
-// hoist of just u16 was strictly worse than either consistent
-// choice — 4 consumers across ELF/PE/Mach-O writer tests).
+// The little-endian read helpers are shared, not file-local:
+// hoisted at the 8aabc04 audit fold and completed at the 5ac97ae
+// one per code-architect Q1 (the partial hoist of just u16 was
+// strictly worse than either consistent choice — 4 consumers
+// across ELF/PE/Mach-O writer tests).
 using dss::link_format::test::readU16LE;
 using dss::link_format::test::readU32LE;
 using dss::link_format::test::readU64LE;

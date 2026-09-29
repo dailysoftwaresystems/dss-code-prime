@@ -1,0 +1,35 @@
+{
+  "$comment": "Static aggregates whose LEAVES are 16 bytes wide: `long double` members, elements and a union member (x87 extended on x86_64 Linux, binary128 on aarch64 Linux, `double` on Windows and Apple arm64) and `__int128` members, each past a narrower member so a leaf at the wrong offset, short, or in the wrong format fails its own exit code (11-18, listed in `main.c`). Check 15 compares the image of `0.1L` with the run-time quotient `1.0L/10.0L`, so a leaf widened from a `double` instead of carried at full precision fails it (D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL, D-CSUBSET-INT128-AGGREGATE-MEMBER-STATIC-INITIALIZER-REFUSED). ✔MEASURED 2026-09-21: gcc 13.3.0 and clang 18.1.3, each separately, run it to 42 at -O0 and -O2 on x86_64 and aarch64 Linux. The P68 round-8 base refused it on all four targets: PE and Mach-O arm64 at the static-data producer ('aggregate initializer could not be encoded', the `__int128` members), and both Linux targets earlier, at a `const long double` read that part 3 of the same round fixed; its `long double` and `__int128` members, probed on their own, were refused at the producer on both Linux targets and (the `__int128` ones) on all four. ★ The `release` arm: every object is read through a `volatile` pointer, so the optimized pipeline reads the emitted IMAGE rather than folding the initializer into the comparison.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

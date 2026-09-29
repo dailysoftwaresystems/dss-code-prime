@@ -76,8 +76,8 @@ struct Lowered {
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    // The language's policy through the pipeline's ONE assembly (`languageMirLoweringConfig`).
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
     // VLA C1a (D-CSUBSET-VLA): thread the target's aggregate-layout params so a VLA
     // alloca's element STRIDE (sizeof(int)) resolves at MIR (cachedLayout gates on
     // aggregateLayoutLoaded — even a scalar element needs it). Harmless for the
@@ -96,7 +96,10 @@ struct Lowered {
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
-                                    /*linkageMap=*/nullptr, /*mutabilityMap=*/nullptr,
+                                    /*linkageMap=*/nullptr,
+                                    // The constrained static-initializer fold's const input
+                                    // (P68 round 13 fold F7: the constraint came without it).
+                                    &hir->mutabilityMap,
                                     /*volatileMap=*/nullptr,
                                     &hir->alignmentMap,    // VLA C1b over-align gate
                                     /*threadLocalMap=*/nullptr,
@@ -2233,10 +2236,18 @@ TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
 TEST(MirToLir, IfElseLowersToCondBrChain) {
     // `int sign(int x) { if (x > 0) return 1; return 0; }`
     // MIR: ICmpSgt + CondBr + return-blocks.
-    // LIR: cmp+setcc / cmp+jcc / mov+ret in each branch / mov+ret in the
-    // join. Cycle 3b's "lower each MIR op naively" approach (no
-    // ICmp+CondBr peephole) is asserted here so the optimizer can later
-    // delete the redundant cmp/setcc.
+    // LIR: a single fused `cmp x, 0; jcc-Sgt`, then mov+ret in each branch.
+    //
+    // ⚠ THIS ARM USED TO ASSERT A `setcc` IN THE ENTRY BLOCK, and its comment
+    // said so out loud: *"cycle 3b's 'lower each MIR op naively' approach (no
+    // ICmp+CondBr peephole) is asserted here so the optimizer can later delete
+    // the redundant cmp/setcc"*. It was pinning a placeholder against the day
+    // the deletion arrived. It has (D-LIR-SETCC-DEAD-AFTER-FUSION): the
+    // compare's Bool is read by NOTHING but the CondBr that re-derives the
+    // flags for itself, so the use-count gate declines to mint the
+    // `cmp → setcc → zext` trio at all. The absence is now the assertion, and
+    // it is asserted BESIDE the `cmp` and the `jcc` that must still be there —
+    // a branch that silently stopped fusing would also have no setcc.
     auto L = lowerCToLir(
         "int sign(int x) { if (x > 0) return 1; return 0; }");
     assertUpstreamClean(L);
@@ -2255,28 +2266,48 @@ TEST(MirToLir, IfElseLowersToCondBrChain) {
     EXPECT_EQ(lir.instOpcode(entryTerm), *sch.opcodeByMnemonic("jcc"))
         << "entry block must end in jcc for an if/else";
 
-    // Somewhere in the entry block there's a `cmp` (the CondBr-side compare)
-    // and a `setcc` (the ICmpSgt-side materialization).
-    bool foundCmp = false, foundSetcc = false;
+    // The entry block holds the FUSED compare — exactly one — and no
+    // materialization of a Bool that nothing reads.
+    std::uint32_t cmpCount = 0, setccCount = 0;
     auto const cmpOp   = *sch.opcodeByMnemonic("cmp");
     auto const setccOp = *sch.opcodeByMnemonic("setcc");
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
         auto const o = lir.instOpcode(lir.blockInstAt(entry, i));
-        if (o == cmpOp)   foundCmp   = true;
-        if (o == setccOp) foundSetcc = true;
+        if (o == cmpOp)   ++cmpCount;
+        if (o == setccOp) ++setccCount;
     }
-    EXPECT_TRUE(foundCmp)   << "ICmp/CondBr must emit at least one cmp";
-    EXPECT_TRUE(foundSetcc) << "ICmpSgt must materialize a bool via setcc";
+    EXPECT_EQ(cmpCount, 1u)
+        << "the fused branch re-emits the compare, and that is the only "
+           "compare this function needs";
+    EXPECT_EQ(setccCount, 0u)
+        << "nothing reads the ICmpSgt's Bool but the branch that fuses it, so "
+           "no setcc materializes it (D-LIR-SETCC-DEAD-AFTER-FUSION)";
+    EXPECT_EQ(lir.instPayload(entryTerm),
+              static_cast<std::uint32_t>(::dss::TargetCondCode::Sgt))
+        << "and the jcc carries the COMPARE's condition — without this, a "
+           "branch that stopped fusing would satisfy the setcc absence above";
 }
 
 TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
     // C-subset's `int` is signed, so the surface-visible comparison ops
     // (`==`/`!=`/`<`/`<=`/`>`/`>=`) lower to the signed conditions only.
-    // Each test source feeds the comparison through `if (...)` so the
-    // setcc is emitted (CondBr re-fetches via cmp+0; the setcc isn't the
-    // immediate predecessor of the jcc — but it MUST appear in the entry
-    // block carrying the right condition). Unsigned variants need a
-    // synthetic-MIR helper (deferred to cycle 3c).
+    // The SUBJECT is the `condCodeForICmp` mapping, read off the setcc's
+    // payload: a regression mapping (say) ICmpEq → Sle passes every other test
+    // in this file and fails here.
+    //
+    // ⚠ EACH SOURCE USED TO BE `if (a OP b) return 1; return 0;` AND THAT
+    // SHAPE NO LONGER EMITS A setcc AT ALL. Its Bool was read by nothing but
+    // the CondBr that fuses it, so the use-count gate
+    // (D-LIR-SETCC-DEAD-AFTER-FUSION) declines to materialize it — and a
+    // subject that has ceased to exist is not a weaker pin, it is a vacuous
+    // one, because the loop would simply never find a setcc to disagree with.
+    // The source is now `return a OP b;`, which RETURNS the Bool: a genuine
+    // consumer, the materialization every `condCodeForICmp` row is actually
+    // for, and the same six-way mapping. The FUSED half of the mapping is
+    // pinned separately on the jcc payload —
+    // `CondBrFusesIcmpConditionIntoJccPayload` below and
+    // `tests/lir/test_lir_fused_compare_dce.cpp`.
+    // Unsigned variants need a synthetic-MIR helper (deferred to cycle 3c).
     struct Case { char const* op; ::dss::TargetCondCode cond; };
     std::array<Case, 6> cases{{
         {"==", ::dss::TargetCondCode::Eq},
@@ -2291,8 +2322,8 @@ TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
         return *(*sch)->opcodeByMnemonic("setcc");
     }();
     for (auto const& [op, expectedCond] : cases) {
-        std::string src = std::string{"int f(int a, int b) { if (a "} +
-                          op + " b) return 1; return 0; }";
+        std::string src = std::string{"int f(int a, int b) { return a "} +
+                          op + " b; }";
         auto L = lowerCToLir(src);
         assertUpstreamClean(L);
         ASSERT_TRUE(L.lir.ok) << "ICmp `" << op << "` must lower cleanly";
@@ -2313,7 +2344,9 @@ TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
             break;
         }
         EXPECT_TRUE(foundCorrectSetcc)
-            << "ICmp `" << op << "` must emit a setcc in the entry block";
+            << "ICmp `" << op << "` must emit a setcc in the entry block — a "
+               "RETURNED Bool is a real consumer, so the use-count gate must "
+               "not reach it";
     }
 }
 
@@ -2341,8 +2374,8 @@ TEST(MirToLir, CondBrFusesIcmpConditionIntoJccPayload) {
     EXPECT_EQ(lir.instPayload(term),
               static_cast<std::uint32_t>(::dss::TargetCondCode::Sgt))
         << "CondBr-fused jcc payload must be Sgt (the ICmpSgt's "
-           "cond code), NOT the legacy default Ne — D-CSUBSET-"
-           "WHILE-LOOP-SUBSTRATE fusion pin";
+           "cond code), NOT the legacy default Ne — "
+           "D-CSUBSET-WHILE-LOOP-SUBSTRATE fusion pin";
 }
 
 TEST(MirToLir, TernaryProducesPhiResolutionMoves) {
@@ -2676,7 +2709,7 @@ TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
 // ─── cycle 3d: bitwise + float arithmetic + cross-class Bitcast ──────────
 //
 // `SyntheticFn` / `buildSyntheticFn` were promoted to `synthetic_fn.hpp`
-// (ML6 cycle 1, cycle-3e deferral D-3e.7) so the new
+// (ML6 cycle 1, cycle-3e deferral D-PLAN12-BUILDSYNTHETICFN-TEST-HELPER-PROMOTION-LIFT-FROM-TESTS-LIR) so the new
 // `test_lir_liveness` binary can share the same harness. The shared
 // namespace is `dss::test_support` (not `dss::testing` — gtest already
 // owns the `::testing` namespace and `using namespace dss;` would
@@ -2895,7 +2928,7 @@ TEST(MirToLir, BitcastCrossClassFprToGprUsesTheDeclaredPairMove) {
 }
 
 TEST(MirToLir, BitcastCrossClassGprToFprUsesTheDeclaredPairMove) {
-    // The reverse direction (cycle-3e deferral D-3e.8 folded ML6 cycle 1).
+    // The reverse direction (cycle-3e deferral D-PLAN12-REVERSE-BITCAST-I64-F64-TEST-CURRENTLY-ONLY-F64 folded ML6 cycle 1).
     // ★ IT IS A SEPARATE OPCODE ON BOTH TARGETS AND DELIBERATELY SO: the
     // encoding-variant guard keys only on (operandKinds, width) and both
     // directions are `reg` at the same width, so one opcode carrying both
@@ -2980,9 +3013,10 @@ TEST_P(MirToLirCastMapping, EmitsExpectedMnemonicAndRegClass) {
 
     // Synthetic MIR: single src-typed arg → cast → return dst-typed value.
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    // D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR: the IntToPtr /
-    // PtrToInt / Bitcast rows name `Ptr`, which is structural — the ONE resolver
-    // in `synthetic_fn.hpp` builds the opaque `void*` the row means.
+    // The IntToPtr / PtrToInt / Bitcast rows name `Ptr`, which is structural,
+    // and a probe that minted an operand-less one interned a pointer with NO
+    // pointee — the ONE resolver in `synthetic_fn.hpp` builds the opaque
+    // `void*` these rows mean.
     auto const srcT = ::dss::test_support::probeTypeOfKind(interner, param.srcKind);
     auto const dstT = ::dss::test_support::probeTypeOfKind(interner, param.dstKind);
     std::array<::dss::TypeId, 1> params{srcT};
@@ -3050,7 +3084,11 @@ INSTANTIATE_TEST_SUITE_P(
         CastCase{::dss::MirOpcode::FPTrunc,  "fpcvt",    ::dss::TypeKind::F64, ::dss::TypeKind::F32, LirRegClass::FPR},
         CastCase{::dss::MirOpcode::FPExt,    "fpcvt",    ::dss::TypeKind::F32, ::dss::TypeKind::F64, LirRegClass::FPR},
         CastCase{::dss::MirOpcode::FPToSI,   "fp_to_si", ::dss::TypeKind::F64, ::dss::TypeKind::I64, LirRegClass::GPR},
-        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR}
+        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR},
+        // P68 round 12 (D-CSUBSET-INT-TO-F32-CODEGEN): an F32 result names the
+        // F32-destination opcode — the destination width rides the opcode.
+        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp32", ::dss::TypeKind::I64, ::dss::TypeKind::F32, LirRegClass::FPR},
+        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp32", ::dss::TypeKind::I32, ::dss::TypeKind::F32, LirRegClass::FPR}
         // ⚠ FPToUI and UIToFP USED TO SIT HERE, asserting that each emits ONE
         // LIR instruction of the same-named opcode. On x86_64 that assertion
         // was TRUE AND THE BUG: the same-named opcode carried the SIGNED
@@ -3207,6 +3245,96 @@ TEST(MirToLir, UnsignedFloatConversionsEmitTheDeclaredSequence) {
         EXPECT_EQ(countOf(f2u.ops, *sch.opcodeByMnemonic("and")), 1u);
         ASSERT_GE(f2u.ops.size(), 2u);
         EXPECT_EQ(f2u.ops[f2u.ops.size() - 2], *sch.opcodeByMnemonic("or"));
+    }
+}
+
+// ─── D-CSUBSET-INT-TO-F32-CODEGEN (P68 round 12): THE F32 DESTINATION ────
+//
+// An integer→float conversion with an F32 result names the F32-DESTINATION
+// opcode (`si_to_fp32` / `ui_to_fp32`) — the destination width rides the
+// opcode because the variant guard's one width axis is the source integer's.
+// Stated here INDEPENDENTLY of the config, as the test above states the F64
+// half:
+//
+//   * no F32 conversion may reach the F64 opcode — a detour through binary64
+//     rounds TWICE for a 64-bit source (2^63 + 2^39 + 1 becomes 0x5F000000
+//     instead of 0x5F000001), the silent wrong answer this guards;
+//   * arm64 emits exactly one converter of the right signedness;
+//   * x86_64's unsigned form is a SEQUENCE (SSE has no unsigned convert): the
+//     encodingless `ui_to_fp32` is never emitted, the value is converted SIGNED
+//     once, and the result comes out of the final power-of-two scale.
+//
+// The VALUE-level proof is examples/c/int_to_float_every_width.
+TEST(MirToLir, IntToF32ConversionsNameTheF32DestinationOpcode) {
+    // ── arm64: one SCVTF / UCVTF Sd each.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("arm64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        auto const siToFp32 = *sch.opcodeByMnemonic("si_to_fp32");
+        auto const uiToFp32 = *sch.opcodeByMnemonic("ui_to_fp32");
+        auto const siToFp   = *sch.opcodeByMnemonic("si_to_fp");
+        auto const uiToFp   = *sch.opcodeByMnemonic("ui_to_fp");
+        for (auto const src : {::dss::TypeKind::I32, ::dss::TypeKind::I64}) {
+            auto const s2f = lowerOneCast(sch, ::dss::MirOpcode::SIToFP, src,
+                                          ::dss::TypeKind::F32);
+            EXPECT_EQ(countOf(s2f.ops, siToFp32), 1u)
+                << "arm64 SIToFP to F32 must emit exactly one SCVTF Sd (`si_to_fp32`)";
+            EXPECT_EQ(countOf(s2f.ops, siToFp), 0u)
+                << "an F32 result must never take the F64 converter";
+        }
+        for (auto const src : {::dss::TypeKind::U32, ::dss::TypeKind::U64}) {
+            auto const u2f = lowerOneCast(sch, ::dss::MirOpcode::UIToFP, src,
+                                          ::dss::TypeKind::F32);
+            EXPECT_EQ(countOf(u2f.ops, uiToFp32), 1u)
+                << "arm64 UIToFP to F32 must emit exactly one UCVTF Sd (`ui_to_fp32`)";
+            EXPECT_EQ(countOf(u2f.ops, siToFp32), 0u)
+                << "arm64 UIToFP must NOT reach for the SIGNED SCVTF";
+            EXPECT_EQ(countOf(u2f.ops, uiToFp), 0u)
+                << "an F32 result must never take the F64 converter";
+        }
+    }
+
+    // ── x86_64: CVTSI2SS for a signed source; the sticky-halving sequence for
+    //    an unsigned 64-bit one.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        auto const siToFp32 = *sch.opcodeByMnemonic("si_to_fp32");
+        auto const uiToFp32 = *sch.opcodeByMnemonic("ui_to_fp32");
+        auto const siToFp   = *sch.opcodeByMnemonic("si_to_fp");
+        EXPECT_TRUE(sch.opcodeInfo(uiToFp32)->encoding.variants.empty())
+            << "x86_64 `ui_to_fp32` must declare NO encoding — SSE has no "
+               "unsigned int->float instruction to encode";
+        for (auto const src : {::dss::TypeKind::I32, ::dss::TypeKind::I64}) {
+            auto const s2f = lowerOneCast(sch, ::dss::MirOpcode::SIToFP, src,
+                                          ::dss::TypeKind::F32);
+            EXPECT_EQ(countOf(s2f.ops, siToFp32), 1u)
+                << "x86_64 SIToFP to F32 must emit exactly one CVTSI2SS (`si_to_fp32`)";
+            EXPECT_EQ(countOf(s2f.ops, siToFp), 0u)
+                << "an F32 result must never take CVTSI2SD";
+        }
+        auto const u2f = lowerOneCast(sch, ::dss::MirOpcode::UIToFP,
+                                      ::dss::TypeKind::U64, ::dss::TypeKind::F32);
+        EXPECT_EQ(countOf(u2f.ops, uiToFp32), 0u)
+            << "x86_64 UIToFP must not emit the encodingless `ui_to_fp32`";
+        EXPECT_EQ(countOf(u2f.ops, siToFp32), 1u)
+            << "the u64->float expansion converts ONCE, signed, after the select";
+        EXPECT_EQ(countOf(u2f.ops, siToFp), 0u)
+            << "a detour through CVTSI2SD rounds twice";
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("shr_a")), 1u)
+            << "the select and the scale come from ONE arithmetic-shift sign mask";
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("or")), 1u)
+            << "the halved value keeps its lost low bit as a STICKY bit";
+        ASSERT_GE(u2f.ops.size(), 2u);
+        EXPECT_EQ(u2f.ops[u2f.ops.size() - 2], *sch.opcodeByMnemonic("fmul"))
+            << "the value is produced by the exact power-of-two scale (1.0f or 2.0f)";
+        auto const u32 = lowerOneCast(sch, ::dss::MirOpcode::UIToFP,
+                                      ::dss::TypeKind::U32, ::dss::TypeKind::F32);
+        EXPECT_EQ(countOf(u32.ops, *sch.opcodeByMnemonic("zext")), 1u)
+            << "a u32 is zero-extended before the 64-bit signed convert";
+        EXPECT_EQ(countOf(u32.ops, siToFp32), 1u);
     }
 }
 
@@ -4186,7 +4314,7 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
 
     auto const leaOp  = *sch.opcodeByMnemonic("lea");
     auto const callOp = *sch.opcodeByMnemonic("call");
-    // D-ML7-2.9 (dead-callee-LEA suppression): a DIRECT call's callee is modeled
+    // D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED (dead-callee-LEA suppression): a DIRECT call's callee is modeled
     // as a standalone GlobalAddr(f). `lowerCall` folds f's SymbolId straight into
     // the `call` (a SymbolRef operand) and NEVER reads the GlobalAddr's lea vreg,
     // so `globalAddrFoldsIntoDirectCall` now SUPPRESSES that lea (previously it was
@@ -4216,7 +4344,7 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
     // RED-ON-DISABLE: revert `globalAddrFoldsIntoDirectCall` → the dead callee lea
     // reappears → this EXPECT_FALSE fails.
     EXPECT_FALSE(foundGlobalAddrLea)
-        << "the dead GlobalAddr(f) callee LEA must be SUPPRESSED (D-ML7-2.9) — "
+        << "the dead GlobalAddr(f) callee LEA must be SUPPRESSED (D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED) — "
            "lowerCall folds the symbol straight into the direct call";
     EXPECT_TRUE(foundCall) << "Call must emit the `call` opcode";
     EXPECT_TRUE(callFoldsCalleeSymbol)
@@ -5102,8 +5230,8 @@ TEST(MirToLir, U32CompareLowersWithThirtyTwoBitCmpWidth) {
 }
 
 // ── audit-residue sweep c1: the FUSED ICmp+CondBr cmp width pin ─────────
-// D-AUDIT-FUSED-CMP-WIDTH-PIN: lowerCondBr's ICmp-fusion arm emits its
-// OWN `cmp lhs, rhs` (immediately before the jcc) — a SEPARATE emit
+// lowerCondBr's ICmp-fusion arm emits its OWN `cmp lhs, rhs`
+// (immediately before the jcc) — a SEPARATE emit
 // site from lowerICmp's value-path cmp (which the U32Compare… pin
 // above covers). The fused cmp's width must follow the ICmp OPERANDS'
 // type, the same FC3-c2 rule. Because the 32-bit producers zero the
@@ -5212,7 +5340,7 @@ TEST(MirToLir, FusedI32CompareCondBrCmpCarriesThirtyTwoBitWidth) {
         EXPECT_EQ(s.fusedCmpWidthBits, 32u)
             << "the FUSED cmp over I32 operands must read 32 bits — "
                "width-64 here reads zero-extended upper bits and calls "
-               "a negative int positive (D-AUDIT-FUSED-CMP-WIDTH-PIN)";
+               "a negative int positive";
     }
 }
 
@@ -5248,10 +5376,10 @@ namespace {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     EXPECT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    // D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR: three `CastCase` rows
-    // below name `Ptr` as a src or dst kind (IntToPtr / PtrToInt / Bitcast), and
-    // `primitive(TypeKind::Ptr)` would mint a pointer with NO pointee. The ONE
-    // resolver in `synthetic_fn.hpp` builds what the row means.
+    // Three `CastCase` rows below name `Ptr` as a src or dst kind (IntToPtr /
+    // PtrToInt / Bitcast), and `primitive(TypeKind::Ptr)` would mint a pointer
+    // with NO pointee. The ONE resolver in `synthetic_fn.hpp` builds what the
+    // row means.
     auto const srcTy = ::dss::test_support::probeTypeOfKind(interner, src);
     auto const dstTy = ::dss::test_support::probeTypeOfKind(interner, dst);
     std::array<::dss::TypeId, 1> params{srcTy};
@@ -6316,8 +6444,13 @@ buildF128BinaryArith(::dss::TypeInterner& interner, ::dss::MirOpcode op) {
     return std::move(mb).finish();
 }
 
-// Index of the FIRST inst in block `bb` whose opcode == `op` and whose sole
-// SymbolRef operand names symbol `symV`, or nullopt.
+// Index of the FIRST inst in block `bb` whose opcode == `op` and whose callee
+// (operand 0) is a SymbolRef naming symbol `symV`, or nullopt. ⓘ The argument
+// operands after it are not constrained here: a softcall's F128 arguments are
+// hand-placed and unlisted, while a USER call now lists its marshalled F128
+// arguments at their positions as their physical registers
+// (D-LIR-AAPCS64-CALL-MIXING-LONG-DOUBLE-AND-DOUBLE-ARGS-REFUSED) — the tests
+// that care assert the operand list themselves.
 [[nodiscard]] std::optional<std::uint32_t>
 findCallToSymbol(::dss::Lir const& lir, ::dss::LirBlockId bb,
                  std::uint16_t callOp, std::uint32_t symV) {
@@ -6325,7 +6458,7 @@ findCallToSymbol(::dss::Lir const& lir, ::dss::LirBlockId bb,
         auto const inst = lir.blockInstAt(bb, i);
         if (lir.instOpcode(inst) != callOp) continue;
         auto const ops = lir.instOperands(inst);
-        if (ops.size() == 1 && ops[0].kind == ::dss::LirOperandKind::SymbolRef
+        if (!ops.empty() && ops[0].kind == ::dss::LirOperandKind::SymbolRef
             && ops[0].symbolV == symV) {
             return i;
         }
@@ -6804,7 +6937,11 @@ TEST(MirToLir, F128CallArgsMarshalIntoV0V1BeforeCall) {
     //       *pr = add(*pa, *pb);   // add: long double(long double,long double)
     //   }
     // The two F128 args are marshalled into v0/v1 (a burst of Q-form `fldur`s)
-    // IMMEDIATELY before the call — NOT operand-listed — and the F128 result is
+    // IMMEDIATELY before the call — and, since
+    // D-LIR-AAPCS64-CALL-MIXING-LONG-DOUBLE-AND-DOUBLE-ARGS-REFUSED, operand-listed
+    // at their positions AS those physical registers, so `lir_callconv`'s one
+    // argument walk counts them (pinned in `test_lir_aapcs64_mixed_fp_call`) —
+    // and the F128 result is
     // captured from v0 by a Q-form `fstur` IMMEDIATELY after (the LD-2
     // marshal→call adjacency). ⓘ Those two accesses used to be the separate
     // `fldur_q`/`fstur_q` mnemonics; they are width-128 variants now.
@@ -6868,6 +7005,14 @@ TEST(MirToLir, F128CallArgsMarshalIntoV0V1BeforeCall) {
                 && lir.instResult(m1).regClass() == LirRegClass::FPR
                 && lir.instResult(m1).id == *v1Ord)
         << "second F128 arg → v1";
+    // …and the call LISTS them, at their positions, as those registers — the
+    // one argument walk counts what it can see.
+    auto const callOps2 = lir.instOperands(lir.blockInstAt(bb, *callIdx));
+    ASSERT_EQ(callOps2.size(), 3u) << "callee + the two F128 arguments";
+    EXPECT_TRUE(callOps2[1].kind == LirOperandKind::Reg && callOps2[1].reg.isPhysical
+                && callOps2[1].reg.id == *v0Ord);
+    EXPECT_TRUE(callOps2[2].kind == LirOperandKind::Reg && callOps2[2].reg.isPhysical
+                && callOps2[2].reg.id == *v1Ord);
     // The immediately-following inst is the result capture (Q-form store of v0).
     ASSERT_LT(*callIdx + 1, lir.blockInstCount(bb));
     auto const cap = lir.blockInstAt(bb, *callIdx + 1);
@@ -7354,15 +7499,16 @@ TEST(MirToLir, LongDoubleComplexArithmeticLowersOnX87Axis) {
     ASSERT_TRUE(hir->ok)
         << (hirReporter.all().empty() ? "" : hirReporter.all()[0].actual);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     mirCfg.aggregateLayout       = (*target)->aggregateLayout();
     mirCfg.aggregateLayoutLoaded = (*target)->aggregateLayoutLoaded();
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
-                                    &hir->sourceMap, mirCfg);
+                                    &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
+                                    /*linkageMap=*/nullptr,
+                                    &hir->mutabilityMap);   // the constrained fold's const input
     ASSERT_TRUE(mir.ok)
         << "MIR lowering emits the componentwise F80 ops: "
         << (mirReporter.all().empty() ? "" : mirReporter.all()[0].actual);
@@ -8128,9 +8274,9 @@ TEST(MirToLir, VlaOverAlignedElementLowers) {
             << "L_OverAlignedStackLocal survives only as the non-power-of-two invariant "
                "guard; an ordinary _Alignas(32) element must not reach it";
     }
-    // ⚠ A lowering that emitted NOTHING would satisfy both assertions vacuously — the
-    // exact class D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO
-    // was closed for this cycle. Assert a POSITIVE count rather than trusting `ok`.
+    // ⚠ A lowering that emitted NOTHING would satisfy both assertions vacuously —
+    // the exact class a front end that lowers a many-arg call to nothing puts
+    // every pin into. Assert a POSITIVE count rather than trusting `ok`.
     std::uint32_t insts = 0;
     for (std::size_t f = 0; f < L.lir.lir.moduleFuncCount(); ++f) {
         LirFuncId const fn = L.lir.lir.funcAt(static_cast<std::uint32_t>(f));
@@ -9072,8 +9218,10 @@ namespace {
 
 // `_Bool f(long double* pa, long double* pb) { return *pa OP *pb; }` for a
 // memory-resident wide float. Pointer params (so the two `arg` opcodes give
-// each operand's address an IDENTIFIABLE register) + F80/F128 Loads, which
-// address-propagate — so the compare's operand registers ARE the arg registers.
+// each operand's address an IDENTIFIABLE register) + F80/F128 Loads, which are
+// read IN PLACE (nothing writes memory between them and the compare — see
+// `computeInPlaceWideFloatLoads`) — so the compare's operand registers ARE the
+// arg registers.
 [[nodiscard]] ::dss::Mir
 buildWideFloatCompare(::dss::TypeInterner& interner, ::dss::TypeKind kind,
                       ::dss::MirOpcode pred) {
@@ -10445,7 +10593,10 @@ TEST(MirToLir, IntToF128FailsLoudWithoutItsConfigRow) {
         EXPECT_FALSE(result.ok)
             << c.name << ": an integer→F128 conversion on a target with no row "
                          "must fail loud, not silently take some other helper";
-        EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        // P68 round 12: the gate's message states its CONDITION, not a row id
+        // (`check-emitted-anchor-ids`), so the pin reads the condition.
+        EXPECT_TRUE(sawAnchor(rep, "a long double one only through a conversion "
+                                   "the target declares"))
             << c.name << ": the fall-through must hit the encoded-width gate";
     }
 }
@@ -10873,4 +11024,64 @@ TEST(MirToLirAtomicRmw, AtomicPointerFetchAddScalesByTheElementSize) {
             << a.elem << "*: and the SEMANTIC tier must accept it too — the "
                          "operand parameter is `ptrdiff_t`, not the pointee";
     }
+}
+
+// ★★ P68 round 9 (D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT): the
+// lowering that chooses a slot read STAMPS it on the import row, and the merge
+// only reads it. A DATA import under `got-indirect` is read through its slot
+// (`GotIndirectExternDataGlobalAddrEmitsLeaThenDeref` pins the lea + deref);
+// the same import under a format that declares no binding (a relocatable
+// object) is read directly; a function import under `direct-plt` is not a slot
+// read. Each row must leave saying so — a row that under-states sends the slot
+// read to the object itself (the round's base: SIGSEGV on ELF, an access
+// violation on pe64), one that over-states
+// sends a direct read to a slot. The stale statement each row carries IN is the
+// opposite of the right answer, so an OR-ed stamp cannot pass.
+TEST(MirToLir, TheRowLeavesStatingWhetherItsCodeReadsThroughASlot) {
+    auto const lowerWith = [](std::optional<DataImportBinding> binding,
+                              bool isData) -> std::optional<bool> {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const i32      = interner.primitive(TypeKind::I32);
+        TypeId const i32Ptr   = interner.pointer(i32);
+        TypeId const params[] = {i32};
+        TypeId const fnSig    = interner.fnSig(params, i32, CallConv::CcSysV);
+        MirBuilder mb;
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(entry);
+        (void)mb.addArg(0, i32);
+        SymbolId const sym{200};
+        MirInstId const ga         = mb.addGlobalAddr(sym, i32Ptr);
+        MirInstId const loadArgs[] = {ga};
+        MirInstId const val        = mb.addInst(MirOpcode::Load, loadArgs, i32);
+        mb.addReturn(val);
+        Mir mir = std::move(mb).finish();
+        auto target = TargetSchema::loadShipped("x86_64");
+        if (!target.has_value()) return std::nullopt;
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> externs;
+        dss::ExternImport ei;
+        ei.symbol          = sym;
+        ei.mangledName     = "x";
+        ei.isData          = isData;
+        ei.readThroughSlot = !(isData && binding.has_value());  // stale, opposite
+        externs.push_back(ei);
+        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                               ExternCallDispatch::DirectPlt, binding);
+        if (!lirR.ok) return std::nullopt;
+        for (auto const& row : lirR.externImports) {
+            if (row.symbol.v == sym.v) return row.readThroughSlot;
+        }
+        return std::nullopt;
+    };
+    auto const gotData = lowerWith(DataImportBinding::GotIndirect, /*isData=*/true);
+    ASSERT_TRUE(gotData.has_value());
+    EXPECT_TRUE(*gotData) << "a got-indirect DATA import is read through its slot";
+    auto const relocatableData = lowerWith(std::nullopt, /*isData=*/true);
+    ASSERT_TRUE(relocatableData.has_value());
+    EXPECT_FALSE(*relocatableData)
+        << "with no declared binding the code reads the datum directly";
+    auto const directFn = lowerWith(DataImportBinding::GotIndirect, /*isData=*/false);
+    ASSERT_TRUE(directFn.has_value());
+    EXPECT_FALSE(*directFn) << "a direct-plt function import is not a slot read";
 }

@@ -12,6 +12,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/wide_float_value.hpp"   // WideFloatValue (the F80/F128 complex image pin)
 #include "hir/hir.hpp"
 #include "hir/hir_node.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
@@ -27,6 +28,7 @@
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"       // ObjectFormatSchema (the shipped format's declared kind)
 #include "scratch_dir.hpp"                      // ScratchDir (setjmp descriptor sys-dir)
+#include "shipped_schema_or_throw.hpp"          // shippedSchemaOrThrow — a load failure THROWS
 
 #include <gtest/gtest.h>
 
@@ -48,7 +50,6 @@ using namespace dss;
 namespace {
 
 // ★★ THE SHIPPED TARGET DOCUMENT, OR A LOUD STOP — never a silent default.
-// D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD
 //
 // Every site in this file that wanted a machine model wrote
 // `if (auto t = TargetSchema::loadShipped(...); t.has_value())` and simply did
@@ -84,8 +85,7 @@ requireShippedTarget(std::string const& name) {
             "TargetSchema::loadShipped(\"" + name + "\") failed — the fixture "
             "cannot proceed without a machine model, and continuing walks into "
             "MIR building and aborts on a block it never terminated, naming a "
-            "block id instead of the config "
-            "(D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD)."
+            "block id instead of the config."
             " The loader said:" + why);
     }
     return *t;
@@ -129,10 +129,13 @@ struct Lowered {
                                    // (the default) ⇒ no format in play and the
                                    // TARGET's value stands, byte-identically
                                    // what every pre-existing fixture here got.
-                                   std::string formatName = {}) {
-    auto loaded = GrammarSchema::loadShipped("c");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
-    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
+                                   std::string formatName = {},
+                                   // P68 round 13 (lane `cs`): FALSE lowers as a language whose
+                                   // static objects may be initialized at RUN time — the one way a
+                                   // C fixture still reaches the module initializer's lowering.
+                                   bool staticInitializersMustFold = true) {
+    auto const schema = dss::test_support::shippedSchemaOrThrow("c");
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
     // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): thread the selected CC's va_list
@@ -151,11 +154,11 @@ struct Lowered {
     std::shared_ptr<TargetSchema const> targetSchema;
     // ★★ A FAILED TARGET LOAD IS A HARNESS FAILURE, NOT A CONFIGURATION THIS
     //    FIXTURE MAY PROCEED UNDER.
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD
     //
-    // Both neighbours here — `GrammarSchema::loadShipped("c")` above and
-    // `ObjectFormatSchema::loadShipped(formatName)` below — `ADD_FAILURE()` and
-    // `std::abort()` when their document will not load. This one, alone, took the
+    // Both neighbours here — the grammar load above and
+    // `ObjectFormatSchema::loadShipped(formatName)` below — THROW when their
+    // document will not load (they used to `ADD_FAILURE()` and `std::abort()`,
+    // killing every sibling case with them). This one, alone, took the
     // `has_value()` branch and SILENTLY CONTINUED with a null target and a
     // default-constructed `aggregateLayout`, so a fixture ran against a machine
     // model that does not exist.
@@ -210,13 +213,21 @@ struct Lowered {
     if (!formatName.empty()) {
         auto f = ObjectFormatSchema::loadShipped(formatName);
         if (!f) {
-            ADD_FAILURE() << "loadShipped(format) failed: " << formatName;
-            std::abort();
+            throw std::runtime_error("loadShipped(format) failed: " + formatName);
         }
         formatKind = (*f)->kind();
     }
+    // The analysis takes the one-spelling type
+    // ([[D-SEMANTIC-ANALYZE-ACTIVE-FORMAT-ADMITS-THE-UNKNOWN-SENTINEL]]); a shipped
+    // format that resolved no kind is a broken fixture, not "no format". A THROW,
+    // so GoogleTest fails this one test rather than the whole binary.
+    auto const selectableFormat = SelectableObjectFormatKind::of(formatKind);
+    if (!selectableFormat) {
+        throw std::runtime_error("format '" + formatName
+                                 + "' resolved no object-format kind");
+    }
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
-                         dataModel, std::nullopt, vaStrategy, formatKind,
+                         dataModel, std::nullopt, vaStrategy, selectableFormat,
                          std::nullopt, ldf, targetSchema.get());
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
@@ -227,12 +238,11 @@ struct Lowered {
     // Plan 12.5 §0.2 D3 closed: schema declares MIR-globals const-eval
     // policy; the test driver reads it off the loaded schema and passes
     // the resolved knob through. No per-language C++ — the policy lives
-    // in `c.lang.json`.
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: thread the language's declared
-    // OPERAND sizes for `void` / a function type exactly as compile_pipeline.cpp
-    // does, so `sizeof(void)`, `_Alignof(void)` and `void *` element stride lower
+    // in `c.lang.json`. The LANGUAGE's whole part of the policy comes from the ONE
+    // assembly `compile_pipeline.cpp` uses (`languageMirLoweringConfig`, P68 round 13
+    // fold F7): the const-eval knob, the static-initializer constant forms, the aliasing
+    // knobs, and D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED's `void` / function-type
+    // OPERAND sizes, so `sizeof(void)`, `_Alignof(void)` and `void *` element stride lower
     // here the way they lower in a real build.
     //   ★ READ FROM THE SHIPPED SCHEMA, NEVER HARD-CODED — and that is the whole
     // difference between a pin and a decoration. A fixture that wrote `{1, 1}`
@@ -241,15 +251,15 @@ struct Lowered {
     // cost this project 11 red tests to learn). Reading the real declaration means
     // DELETING the key turns these pins RED, which is the direction that proves
     // something.
-    mirCfg.nonObjectTypeSizes = (*loaded)->semantics().nonObjectTypeSizes;
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);
+    if (!staticInitializersMustFold) mirCfg.globalsConstantForms = std::nullopt;
     // FC7 (D-FC7-MEMBER-ACCESS): thread the target's aggregate-layout params
     // (struct/union field offsets + sizes) into the MIR config exactly as
     // compile_pipeline.cpp does, so member-access + aggregate-local lowering
     // resolves field byte offsets. dataModel stays the Lp64 default (an
     // int-based struct's field offsets are dataModel-independent here).
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: reuse the ONE
-    // load taken above (which already failed loud if the document will not load)
-    // instead of asking the same question a second time.
+    // Reuse the ONE load taken above (which already failed loud if the document
+    // will not load) instead of asking the same question a second time.
     {
         auto const& t = loadedTarget;
         mirCfg.aggregateLayout       = t->aggregateLayout();
@@ -894,14 +904,22 @@ TEST(MirLoweringC, ComplexRelationalIsRefusedNamingTheRealOperandRule) {
 // copy. The two are now independently mutable, which is what lets each one's
 // red-on-disable mean something: revert the copy arm and THIS reds; revert the
 // classifier and the static-image pins red.
+// ⚠ P68 round 13 (lane `cs`, the static-initializer item): `g = z0` reads a NON-const
+// object, which C 6.7.9p4 forbids and every reference refuses — and since this round the
+// analyzer says so (S_StaticInitializerNotConstant, exactly once), and the MIR tier, told
+// C's constraint, refuses to make it a runtime initializer at all. What this pins is how the
+// MIR tier lowers a runtime initializer of a by-value-class object FOR A LANGUAGE THAT
+// PERMITS ONE, so it lowers past the semantic error with the constraint OFF.
 TEST(MirLoweringC, ComplexGlobalRuntimeInitCopiesTheObjectNotAPointer) {
     auto L = lowerC(
         "double _Complex z0;\n"
         "double _Complex g = z0;\n"
-        "int main(void) { return 0; }\n");
-    ASSERT_FALSE(L.model.hasErrors())
-        << (L.model.diagnostics().all().empty()
-                ? "" : L.model.diagnostics().all()[0].actual);
+        "int main(void) { return 0; }\n",
+        "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {},
+        /*staticInitializersMustFold=*/false);
+    ASSERT_EQ(dss::test_support::countCode(L.model.diagnostics(),
+                                           DiagnosticCode::S_StaticInitializerNotConstant), 1u)
+        << "C refuses the program; the MIR mechanism below is pinned regardless";
     ASSERT_TRUE(L.hir->ok)
         << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
     ASSERT_TRUE(L.mir.ok)
@@ -932,6 +950,124 @@ TEST(MirLoweringC, ComplexGlobalRuntimeInitCopiesTheObjectNotAPointer) {
         << "a non-foldable complex initializer routes to __module_init__ today";
 }
 
+// ── D-CSUBSET-COMPLEX-LONG-DOUBLE-STATIC-INITIALIZER-REFUSED (P68 round 8) ──
+// A `_Complex long double` with STATIC storage folds to a constant two-component
+// image on both wide models, as `double _Complex` has since P42. The classifier
+// was gated to F32/F64 components, so every one of these reached `__module_init__`
+// — a runtime initializer the static-data producer refuses whole — ✔MEASURED at
+// the round-8 base on ELF x86_64 and ELF aarch64, while gcc 13.3.0 and clang 18.1.3
+// fold them. Each case asserts the global carries a CONSTANT literal (no init
+// function) whose two leaves are `WideFloatValue`s of the element kind, and the
+// exact VALUES, computed here with the same kernel operations in the emitter's
+// operand order:
+//   (a) `= 40.0L`                    real→complex: (40, +0)
+//   (b) `= -(_Complex long double)2.5L`      the sign flip on BOTH parts: (-2.5, -0)
+//   (c) `= (…)0.1L * (…)3.0L`         the four-FMul product at the element's own
+//                                    precision — 0.1L has no binary64 value, so a
+//                                    fold carried through `double` differs (asserted)
+//   (d) `= 9007199254740993LL`       2^53 + 1: an INTEGER converted exactly, not via
+//                                    a `double` that holds 53 bits (asserted)
+//   (e) `= (…)6.0L / (…)2.0L`         the shared-denominator quotient: (3, 0)
+// RED-ON-DISABLE: re-gate `complexComponentKind` to F32/F64 and every case reaches
+// the runtime initializer (no literal); convert an integer operand to `double` at
+// production and only (d) changes; fold at binary64 and (c) changes.
+TEST(MirLoweringC, AComplexLongDoubleStaticInitializerFoldsToItsImage) {
+    struct Model {
+        char const*      target;
+        char const*      cc;
+        LongDoubleFormat ldf;
+        TypeKind         kind;
+    };
+    std::array<Model, 2> const models{{
+        {"x86_64", "sysv_amd64", LongDoubleFormat::X87_80, TypeKind::F80},
+        {"arm64", "aapcs64", LongDoubleFormat::Ieee128, TypeKind::F128},
+    }};
+    for (Model const& md : models) {
+        SCOPED_TRACE(md.target);
+        TypeKind const k = md.kind;
+        // The (re, im) of the ONE complex-typed global's constant image.
+        auto const imageOf = [&](std::string const& src,
+                                 WideFloatValue& re, WideFloatValue& im) {
+            auto L = lowerC(src, md.target, md.cc, DataModel::Lp64, md.ldf);
+            ASSERT_TRUE(L.mir.ok)
+                << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+            Mir const& m = L.mir.mir;
+            auto const& in = L.model.lattice().interner();
+            std::optional<MirGlobalId> g;
+            for (std::size_t gi = 0; gi < m.moduleGlobalCount(); ++gi)
+                if (in.kind(m.globalType(m.globalAt(gi))) == TypeKind::Complex)
+                    g = m.globalAt(gi);
+            ASSERT_TRUE(g.has_value()) << "no complex global in: " << src;
+            EXPECT_FALSE(m.globalInitFunc(*g).valid())
+                << "a foldable complex long double initializer must not become a "
+                   "runtime initializer: " << src;
+            ASSERT_NE(m.globalInitLiteralIndex(*g), UINT32_MAX) << src;
+            auto const& lit = m.literalValue(m.globalInitLiteralIndex(*g));
+            auto const* agg = std::get_if<MirAggregateValue>(&lit.value);
+            ASSERT_NE(agg, nullptr) << src;
+            ASSERT_EQ(agg->fields.size(), 2u) << src;
+            for (auto const& f : agg->fields) {
+                EXPECT_EQ(f.core, k) << src;
+                ASSERT_NE(std::get_if<WideFloatValue>(&f.value), nullptr)
+                    << "a wide component must be a WideFloatValue leaf: " << src;
+            }
+            re = std::get<WideFloatValue>(agg->fields[0].value);
+            im = std::get<WideFloatValue>(agg->fields[1].value);
+            EXPECT_EQ(re.kind(), k);
+            EXPECT_EQ(im.kind(), k);
+        };
+        auto const same = [](WideFloatValue const& a, WideFloatValue const& b) {
+            auto const pa = a.pack();
+            auto const pb = b.pack();
+            return pa.lo == pb.lo && pa.hi == pb.hi;
+        };
+        auto const d = [k](double v) { return WideFloatValue::fromDouble(v, k); };
+        WideFloatValue re, im;
+
+        imageOf("_Complex long double g = 40.0L;\n", re, im);          // (a)
+        EXPECT_TRUE(same(re, d(40.0)));
+        EXPECT_TRUE(same(im, d(0.0)));
+
+        imageOf("_Complex long double g = -(_Complex long double)2.5L;\n", re, im);  // (b)
+        EXPECT_TRUE(same(re, d(-2.5)));
+        EXPECT_TRUE(same(im, d(-0.0))) << "the sign flip reaches the zero imaginary part";
+
+        {                                                                   // (c)
+            WideFloatValue tenth, unused;
+            imageOf("_Complex long double g = (_Complex long double)0.1L;\n",
+                    tenth, unused);
+            imageOf("_Complex long double g = (_Complex long double)0.1L"
+                    " * (_Complex long double)3.0L;\n", re, im);
+            // The emitter's order: ac = a*c, bd = b*d, re = ac - bd; ad = a*d,
+            // bc = b*c, im = ad + bc — with b = d = +0.
+            auto const ac = WideFloatValue::mul(tenth, d(3.0));
+            auto const bd = WideFloatValue::mul(d(0.0), d(0.0));
+            auto const ad = WideFloatValue::mul(tenth, d(0.0));
+            auto const bc = WideFloatValue::mul(d(0.0), d(3.0));
+            ASSERT_TRUE(ac && bd && ad && bc);
+            auto const wantRe = WideFloatValue::sub(*ac, *bd);
+            auto const wantIm = WideFloatValue::add(*ad, *bc);
+            ASSERT_TRUE(wantRe && wantIm);
+            EXPECT_TRUE(same(re, *wantRe));
+            EXPECT_TRUE(same(im, *wantIm));
+            EXPECT_FALSE(same(re, d(0.1 * 3.0)))
+                << "the fixture must discriminate: through binary64 the product "
+                   "is a different number";
+        }
+
+        imageOf("_Complex long double g = 9007199254740993LL;\n", re, im);  // (d)
+        EXPECT_TRUE(same(re, WideFloatValue::fromInt64(9007199254740993LL, k)));
+        EXPECT_FALSE(same(re, d(static_cast<double>(9007199254740993LL))))
+            << "2^53 + 1 has no binary64 value; converted through a double it is 2^53";
+        EXPECT_TRUE(same(im, d(0.0)));
+
+        imageOf("_Complex long double g = (_Complex long double)6.0L"
+                " / (_Complex long double)2.0L;\n", re, im);              // (e)
+        EXPECT_TRUE(same(re, d(3.0)));
+        EXPECT_TRUE(same(im, d(0.0)));
+    }
+}
+
 namespace {
 
 // FC17.9(d) atomic cycle-1 Phase D/E (D-CSUBSET-ATOMIC): lower a program that
@@ -960,24 +1096,21 @@ namespace {
         ]
     })JSON";
 
-    auto loaded = GrammarSchema::loadShipped("c");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
-    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
+    auto const schema = dss::test_support::shippedSchemaOrThrow("c");
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     // Active elf/x86_64 (harmless — atomic_int carries no per-format variant).
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
                          DataModel::Lp64, std::nullopt, std::nullopt,
-                         ObjectFormatKind::Elf, "x86_64");
+                         SelectableObjectFormatKind::of(ObjectFormatKind::Elf), "x86_64");
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
-    // will not load is a STOP, never a fixture that quietly measures a default
-    // machine model.
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
+    // A target that will not load is a STOP, never a fixture that quietly
+    // measures a default machine model.
     {
         auto const t = requireShippedTarget("x86_64");
         mirCfg.aggregateLayout       = t->aggregateLayout();
@@ -1051,24 +1184,21 @@ namespace {
             { "name": "ffi_take_wide", "signature": "fn(ptr<i64>) -> void", "kind": "function", "linkage": "external" }
         ]
     })JSON";
-    auto loaded = GrammarSchema::loadShipped("c");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
-    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
+    auto const schema = dss::test_support::shippedSchemaOrThrow("c");
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.setActiveFormat(ObjectFormatKind::Elf);
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
                          DataModel::Lp64, std::nullopt, std::nullopt,
-                         ObjectFormatKind::Elf, "x86_64");
+                         SelectableObjectFormatKind::of(ObjectFormatKind::Elf), "x86_64");
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
-    // will not load is a STOP, never a fixture that quietly measures a default
-    // machine model.
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
+    // A target that will not load is a STOP, never a fixture that quietly
+    // measures a default machine model.
     {
         auto const t = requireShippedTarget("x86_64");
         mirCfg.aggregateLayout       = t->aggregateLayout();
@@ -1371,16 +1501,23 @@ TEST(MirLoweringC, EnumParamArithmeticLowersClean) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
 }
 
-// Scope guard at the SEMANTIC tier: enum↔DIFFERENT-enum stays a loud mismatch
-// (the conversion arm admits enum↔int ONLY). RED-ON-DISABLE: if the arm
-// over-admitted enum↔enum, this cross-enum assignment would wrongly type-check.
-TEST(MirLoweringC, DifferentEnumAssignStaysMismatch) {
+// P68 round 12 (lane `cs`, the enumeration P1): a value of one enumeration assigns to
+// an object of ANOTHER and lowers through the width-exact Cast (C 6.5.16.1p1 — an
+// enumerated type is an integer type). This test used to pin the refusal as a "loud
+// mismatch"; every reference builds both shapes (lane `cs`'s `.temp/probe/eec`,
+// [[D-C-AN-ASSIGNMENT-BETWEEN-TWO-ENUMERATED-TYPES-IS-REFUSED]]). `Y` is an `int`
+// constant now (C17 6.4.4.3p2); `b` is a `enum B` object, the enum ← enum shape.
+TEST(MirLoweringC, AssignmentBetweenTwoEnumerationsLowersClean) {
     auto L = lowerC(
         "enum A { X };\n"
         "enum B { Y };\n"
-        "int main(void) { enum A a = Y; return (int)a; }\n");
-    EXPECT_TRUE(L.model.hasErrors())
-        << "assigning a B enumerator to an A-typed var must be a loud mismatch";
+        "int main(void) { enum A a = Y; enum B b = Y; a = b; return (int)a; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
 }
 
 // ML2 cycle 1: literal + return.
@@ -1863,14 +2000,23 @@ TEST(MirLoweringC, GlobalWithOverflowingInitFoldsWithModularWrap) {
     EXPECT_EQ(std::get<std::int64_t>(m.literalValue(m.globalInitLiteralIndex(g)).value), -1);
 }
 
-// CE2 wire-up: `int a = 1; int b = a;` folds end-to-end. `b`'s init is a
+// CE2 wire-up: `const int a = 1; int b = a;` folds end-to-end. `b`'s init is a
 // `Ref(a)`; the const-eval engine's resolver callback looks up `a`'s
 // init in the globals pre-pass table and folds it to `1`, so `b` lands
 // as a constant-init global too — no `__module_init__` synthesized.
+// P68 round 13 (lane `cs`, the static-initializer item): this used to pin `int a = 1;` —
+// a NON-const `a`, which every reference refuses (C 6.7.9p4; gcc "initializer element is
+// not constant", MSVC C2099) and the analyzer now refuses too
+// ([[D-C-A-STATIC-INITIALIZER-THAT-IS-NOT-A-CONSTANT-EXPRESSION-IS-ACCEPTED]]). The wire-up is
+// exercised by the form C 6.6p10 lets the language accept and c.lang.json names
+// (`constObjectRead`: gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 build it even at
+// -pedantic-errors), and the analysis must be clean.
 TEST(MirLoweringC, GlobalCrossReferenceFoldsViaConstEvalResolver) {
     auto L = lowerC(
-        "int a = 1;\n"
+        "const int a = 1;\n"
         "int b = a;\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
     ASSERT_TRUE(L.mir.ok)
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
@@ -1878,8 +2024,12 @@ TEST(MirLoweringC, GlobalCrossReferenceFoldsViaConstEvalResolver) {
     // Both globals have constant initializers. No init function synthesized.
     MirGlobalId const ga = m.globalAt(0);
     MirGlobalId const gb = m.globalAt(1);
-    EXPECT_NE(m.globalInitLiteralIndex(ga), UINT32_MAX);
-    EXPECT_NE(m.globalInitLiteralIndex(gb), UINT32_MAX);
+    // ASSERT, not EXPECT: the literal reads below index the pool by these, and a missing one
+    // aborted the whole binary (`MirLiteralPool fatal: index 4294967295`, exit 0xc0000409) —
+    // measured when fold F7's red-on-disable dropped the static-initializer forms, where it
+    // hid every later test of the binary behind the crash.
+    ASSERT_NE(m.globalInitLiteralIndex(ga), UINT32_MAX);
+    ASSERT_NE(m.globalInitLiteralIndex(gb), UINT32_MAX);
     EXPECT_FALSE(m.globalInitFunc(ga).valid());
     EXPECT_FALSE(m.globalInitFunc(gb).valid());
     EXPECT_EQ(m.moduleFuncCount(), 0u);
@@ -1954,18 +2104,20 @@ TEST(MirLoweringC, GlobalWithFloatArithmeticInitializerFoldsThroughCastToInt) {
     EXPECT_EQ(std::get<std::int64_t>(lit.value), 4);
 }
 
-// ── TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE) — tryClassifyIntToPtrConst ──
+// ── TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE) — the integer→pointer constant ──
 // An explicit integer-constant→pointer cast in a STATIC/global initializer
 // (`(void*)0x5`) folds to a PLAIN uint64 pointer leaf (core==Ptr) — an ABSOLUTE
-// address, no symbol, no relocation. const-eval refuses the cast-to-pointer, so
-// without the classifier the initializer falls to `runtimeInit`: a SCALAR becomes
-// an init-func store (UINT32_MAX literal + valid initFunc), and an AGGREGATE trips
-// the ConstructAggregate fail-loud (mir.ok == false). Each pin below is therefore
-// RED-ON-DISABLE on the exact wiring it names.
+// address, no symbol, no relocation. Since P68 round 13 (lane `cs`) it is the
+// constant evaluator's integer→pointer arm (a NULL-base `HirAddressValue`, which
+// `toMirLiteral` writes as its bytes) that folds it — the `tryClassifyIntToPtrConst`
+// shape classifier these pins were written against is deleted. Without the arm the
+// initializer falls to `runtimeInit`: a SCALAR becomes an init-func store (UINT32_MAX
+// literal + valid initFunc), and an AGGREGATE trips the ConstructAggregate fail-loud
+// (mir.ok == false).
 
 // pin (i): a TOP-LEVEL scalar int→ptr cast folds to a uint64 pointer leaf == 5,
-// core==Ptr, with NO init function. RED-ON-DISABLE: the classifyGlobals scalar-
-// cascade wiring — `p` would fall to runtimeInit (UINT32_MAX literal + initFunc).
+// core==Ptr, with NO init function. RED-ON-DISABLE: the evaluator's integer→pointer
+// arm — `p` would fall to runtimeInit (UINT32_MAX literal + initFunc).
 TEST(MirLoweringC, StaticIntToPtrScalarFoldsToAbsolutePointerLeaf) {
     auto L = lowerC("static void* p = (void*)0x5;\n");
     ASSERT_TRUE(L.mir.ok)
@@ -1986,9 +2138,9 @@ TEST(MirLoweringC, StaticIntToPtrScalarFoldsToAbsolutePointerLeaf) {
 
 // pin (ii): an ARRAY of int→ptr — `static void* a[] = {(void*)1,(void*)2};` —
 // lowers to an aggregate const-init whose two fields are plain uint64 pointer
-// leaves (1, 2), NEITHER a symbol-address (reloc) leaf. RED-ON-DISABLE: the
-// member-loop wiring — the array aggregate would bail to runtimeInit → the
-// ConstructAggregate fail-loud (mir.ok == false).
+// leaves (1, 2), NEITHER a symbol-address (reloc) leaf. RED-ON-DISABLE: the same
+// arm, reached through the evaluator's aggregate fold — the array aggregate would
+// bail to runtimeInit → the ConstructAggregate fail-loud (mir.ok == false).
 TEST(MirLoweringC, StaticIntToPtrArrayFoldsToTwoRawPointerLeaves) {
     auto L = lowerC("static void* a[] = { (void*)1, (void*)2 };\n");
     ASSERT_TRUE(L.mir.ok)
@@ -2013,10 +2165,9 @@ TEST(MirLoweringC, StaticIntToPtrArrayFoldsToTwoRawPointerLeaves) {
     EXPECT_FALSE(std::holds_alternative<MirSymbolAddrValue>(agg.fields[1].value));
 }
 
-// pin (iii): `static void* z = (void*)0;` still folds to a uint64 0 pointer leaf.
-// tryClassifyNullPointerConst claims it FIRST (it runs before the int→ptr arm at
-// both sites) and the int→ptr arm would produce the byte-identical leaf anyway, so
-// the standard null-pointer constant is preserved — order intact.
+// pin (iii): `static void* z = (void*)0;` still folds to a uint64 0 pointer leaf —
+// the null pointer constant is the integer→pointer arm's value 0 (the separate
+// null-pointer classifier it used to take is deleted with the others).
 TEST(MirLoweringC, StaticNullPointerCastStillFoldsToZeroLeaf) {
     auto L = lowerC("static void* z = (void*)0;\n");
     ASSERT_TRUE(L.mir.ok)
@@ -2034,9 +2185,9 @@ TEST(MirLoweringC, StaticNullPointerCastStillFoldsToZeroLeaf) {
 
 // pin (iv): the MIX — `static struct Two X = {"a",(void*)0x5};` — `.a` stays a
 // SYMBOL-ADDRESS (reloc) leaf (the string's link-time rodata address) AND `.b` is
-// a plain uint64 pointer leaf == 5. Guards against the int→ptr arm cannibalizing
-// the symbol-address arm (which runs FIRST in the member loop). RED-ON-DISABLE:
-// the member-loop wiring — `.b` would bail the aggregate to runtimeInit.
+// a plain uint64 pointer leaf == 5. Guards against the integer→pointer arm turning
+// a symbol address into an integer (one fold now answers both). RED-ON-DISABLE: the
+// integer→pointer arm — `.b` would bail the aggregate to runtimeInit.
 TEST(MirLoweringC, StaticStructSymbolPlusIntToPtrMixKeepsRelocAndRawLeaf) {
     auto L = lowerC(
         "struct Two { char* a; void* b; };\n"
@@ -2067,10 +2218,10 @@ TEST(MirLoweringC, StaticStructSymbolPlusIntToPtrMixKeepsRelocAndRawLeaf) {
 }
 
 // pin (v) NEGATIVE: a pure SYMBOL-ADDRESS global — `char* s = "x";` — still routes
-// to the symbol-address (reloc) leaf, NEVER mis-folded to an absolute integer.
-// tryClassifyAsSymbolAddr runs FIRST in the scalar cascade, and the int→ptr arm
-// would nullopt on a non-Cast operand anyway. RED if the int→ptr arm ever swallowed
-// a symbol address (an integer leaf would appear where a reloc belongs).
+// to the symbol-address (reloc) leaf, NEVER mis-folded to an absolute integer: a
+// string literal's address is its interned rodata object (the evaluator's
+// `resolveStringLiteralSymbol`), and only a NULL base is written as bytes. RED if an
+// address were ever written as its offset (an integer leaf where a reloc belongs).
 TEST(MirLoweringC, StaticStringPointerStaysSymbolAddressNotInteger) {
     auto L = lowerC("char* s = \"x\";\n");
     ASSERT_TRUE(L.mir.ok)
@@ -2778,7 +2929,7 @@ TEST(MirLoweringCLinkage, WeakAttributeThreadsToMirBinding) {
         << "__attribute__((weak)) must thread to exactly one MirFunc binding==Weak";
 }
 
-// ── TF-C78 (D-CSUBSET-NOINLINE): source → MirFunc.noInline, per FORM ──
+// ── TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): source → MirFunc.noInline, per FORM ──
 //
 // The full chain in one assertion: the `attributeSemantics.effects` `noInline`
 // verb → `SymbolRecord.isNoInline` (FnSig-gated) → `HirNoInlineMap` →
@@ -4152,8 +4303,9 @@ TEST(MirLoweringCThreadLocal, ThreadLocalLinkageAndStaticComposition) {
 // fail loud S_ThreadLocalAddressNotConstant AT THE LOWERING TIER (the
 // semantic model is clean; the reject lives where MirSymbolAddrValue would
 // otherwise be minted). Scalar, aggregate-member, and block-scope-static
-// forms — the three mint paths. RED-ON-DISABLE: drop the
-// tryClassifyAsSymbolAddr screen and all three lower green with an abs64
+// forms. RED-ON-DISABLE: drop the `rejectTlsAddressesInFoldedLiteral` screen —
+// since P68 round 13 the screen of the ONE fold every address leaf comes from —
+// and all three lower green with an abs64
 // whose resolved value would be the link-time tpoff bit-cast into a data
 // slot (the silent garbage pointer this diagnostic exists to prevent).
 TEST(MirLoweringCThreadLocal, TlsAddressInStaticInitializerFailsLoud) {
@@ -5482,8 +5634,7 @@ TEST(MirLoweringC, SyntheticGlobalSymbolsRespectSemanticFloor) {
     ASSERT_TRUE(hir->ok);
     std::uint32_t const floor =
         static_cast<std::uint32_t>(model.symbols().size());
-    MirLoweringConfig cfg;
-    cfg.globalsAllowFloat    = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    MirLoweringConfig cfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
     cfg.syntheticSymbolFloor = floor;   // what compile_pipeline passes
     DiagnosticReporter mirRep;
     auto mir = lowerToMir(hir->hir, hir->literalPool,
@@ -6333,7 +6484,7 @@ TEST(MirLoweringC, Ml4TextFormatRoundTripsRealMir) {
     EXPECT_TRUE(parsed->ok)
         << "parse failed: "
         << (r2.all().empty() ? "" : r2.all()[0].actual);
-    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    MirTextContext ctx2{&parsed->interner, nullptr, &parsed->symbolNames};
     std::string second = emitMir(parsed->mir, ctx2, r3);
     EXPECT_EQ(first, second)
         << "byte-equal round-trip failed\nfirst:\n" << first
@@ -6472,7 +6623,7 @@ TEST(MirLoweringC, FuncNameReadsShareOneRodataGlobal) {
 
 // FC17.5 F2, the code-audit MEDIUM-1 closure: the identity must hold ACROSS
 // producer positions — a `static const char *p = __func__;` INITIALIZER
-// (classified by tryClassifyAsSymbolAddr's Cast-of-string-Literal arm) and a
+// (folded by the constant evaluator through `resolveStringLiteralSymbol`) and a
 // BODY read of `__func__` (materializeStringLiteralGlobal) must reference the
 // SAME rodata global, or `p == __func__` is silently false (wrong value, no
 // diagnostic). Both producers now route through the ONE shared
@@ -6577,9 +6728,12 @@ TEST(MirLoweringC, MixedSignCompareLowersUnsignedWithExplicitCast) {
 // REALIZES as a Ptr→Ptr Cast — a bitcast that HIR→MIR maps to a no-op, changing NO
 // bits. And admit⟺realize by construction: the semantic tier ADMITS (model clean)
 // AND the HIR verifier stays clean — because the coerce arm RETYPED the arg node to
-// the param type. If the coerce mark→bitcast arm were neutered, `L.hir->ok` would
-// go FALSE (H_VerifierFailure: the arg `ptr<i64 "long long">` != the param
-// `ptr<i64>`) — so this pin is the automated form of that realize red-on-disable.
+// the param type. If that arm were neutered, `L.hir->ok` would go FALSE
+// (H_VerifierFailure: the arg `ptr<i64 "long long">` != the param `ptr<i64>`) — so
+// this pin is the automated form of that realize red-on-disable. (P68 round 9: the
+// arm is `coerce`'s diagnosed-conversion realize, driven by the types through the
+// one classifier; it used to be a node mark the semantic tier set for this one
+// call-argument shape.)
 //
 // The witness is at the HIR (where coerce runs): the full MIR lowering of a call to
 // an UNDEFINED shipped extern needs the FFI-synthesis the unit `lowerToMir` harness
@@ -6626,6 +6780,67 @@ TEST(MirLoweringC, DirectCallIntPointeeArgRealizesAsPtrBitcast) {
     EXPECT_TRUE(foundRealizeCast)
         << "the admitted arg must realize as a Ptr<I64>→Ptr<I64> Cast (a same-rep, "
            "distinct-identity bitcast) — never a width op";
+}
+
+// P68 round 9 (lane `cs`),
+// [[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]]: an
+// integer from a pointer and a pointer from an integer — conversions the language
+// admits WITH A DIAGNOSTIC — realize as the explicit cast's own MIR opcodes,
+// PtrToInt and IntToPtr, and the function verifies. Without the realize, `coerce`
+// passed the operand through with its own type and the store of a Ptr into the
+// `long` slot is what the MIR verifier refuses (I_StoreValueTypeMismatch).
+TEST(MirLoweringC, DiagnosedIntegerPointerConversionsRealizeAsTheCastsOwnOpcodes) {
+    auto L = lowerC(
+        "int f(void) { int x = 42; long v = &x; int *p = v; return *p; }");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "admitted with S_IntegerPointerConversion warnings, never refused";
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::PtrToInt), 1u) << "`long v = &x;`";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::IntToPtr), 1u) << "`int *p = v;`";
+}
+
+// P68 round 9 (lane `cs`): the two POINTER-MIXED compound assignments gcc builds
+// (with its int-conversion warning; C 6.5.17.3p1 refuses them) compute the BINARY
+// operator's value and only then convert it to the lvalue's type: `x += p` is the
+// stride-scaled pointer sum `p + x` (a Gep) turned into an integer, `p -= q` the
+// element difference (a Sub divided by the element size) turned into a pointer.
+// ✔MEASURED (`.temp/probe/r7d`, every build RUN): the compound arms computed
+// `x += p` as an UNSCALED integer add and `p -= q` as the `p - n` stride with `q`
+// the index — DSS exit 1 where gcc exits 42; examples/c/
+// pointer_mixed_compound_assignment_values pins the values on every target. Both
+// the statement arm (`lowerCompoundAssign`) and the value arm (the driver's
+// `finishAssign`) take the route.
+TEST(MirLoweringC, APointerMixedCompoundAssignmentComputesTheBinaryOperatorsValue) {
+    auto sum = lowerC("long long f(int *p) { long long x = 3; x += p; return x; }");
+    ASSERT_FALSE(sum.model.hasErrors()) << "admitted with S_IntegerPointerConversion";
+    ASSERT_TRUE(sum.hir->ok);
+    ASSERT_TRUE(sum.mir.ok);
+    EXPECT_EQ(countOp(sum.mir.mir, MirOpcode::Gep), 1u) << "`p + x`: the stride-scaled sum";
+    EXPECT_EQ(countOp(sum.mir.mir, MirOpcode::PtrToInt), 1u) << "… converted to `x`'s type";
+    EXPECT_EQ(countOp(sum.mir.mir, MirOpcode::Add), 0u) << "never an unscaled integer add";
+
+    auto diff = lowerC("int *f(int *p, int *q) { p -= q; return p; }");
+    ASSERT_FALSE(diff.model.hasErrors()) << "admitted with S_IntegerPointerConversion";
+    ASSERT_TRUE(diff.hir->ok);
+    ASSERT_TRUE(diff.mir.ok);
+    EXPECT_EQ(countOp(diff.mir.mir, MirOpcode::SDiv), 1u) << "`p - q`: the element difference";
+    EXPECT_EQ(countOp(diff.mir.mir, MirOpcode::IntToPtr), 1u) << "… converted to `p`'s type";
+    EXPECT_EQ(countOp(diff.mir.mir, MirOpcode::Gep), 0u)
+        << "never the `p - n` stride with `q` as the index";
+
+    // VALUE position: the same two routes inside an expression.
+    auto sumV = lowerC("long long f(int *p) { long long z = 1; return (z += p) + 0; }");
+    ASSERT_FALSE(sumV.model.hasErrors());
+    ASSERT_TRUE(sumV.mir.ok);
+    EXPECT_EQ(countOp(sumV.mir.mir, MirOpcode::Gep), 1u) << "`(z += p)`: the stride-scaled sum";
+    EXPECT_EQ(countOp(sumV.mir.mir, MirOpcode::PtrToInt), 1u);
+    auto diffV = lowerC("int *f(int *p, int *q) { return (p -= q); }");
+    ASSERT_FALSE(diffV.model.hasErrors());
+    ASSERT_TRUE(diffV.mir.ok);
+    EXPECT_EQ(countOp(diffV.mir.mir, MirOpcode::SDiv), 1u) << "`(p -= q)`: the element difference";
+    EXPECT_EQ(countOp(diffV.mir.mir, MirOpcode::IntToPtr), 1u);
+    EXPECT_EQ(countOp(diffV.mir.mir, MirOpcode::Gep), 0u);
 }
 
 // `char + 1` promotes char to int (the `alsoPromote` config row): the
@@ -8448,6 +8663,165 @@ TEST(MirLoweringC, CallerNonVariadicStraddlingAggregateUsesStackCarrier) {
            "RecvByValueStackParam — the all-or-nothing fix covers non-variadic too";
 }
 
+// ── D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED (P68 round 8) ──────
+//
+// A stacked fixed SCALAR that FOLLOWS a stacked aggregate (or an x87 `long
+// double`, which SysV always stacks) used to be REFUSED, and so was an aggregate
+// straddle after a stacked scalar: the scalar was received through an `Arg`,
+// placed by lir_callconv's incoming cursor, which walks the `arg` ops alone and
+// never sees an aggregate received by `RecvByValueStackParam`. ✔MEASURED
+// 2026-09-19: 17 of 18 interleaved shapes were refused on the callee side at the
+// round-7 base (x86_64 SysV and AAPCS64), while gcc 13.3.0 and clang 18.1.3 run
+// every one; with the fix, every DSS callee linked against a gcc or clang caller,
+// every DSS caller against a gcc or clang callee, and DSS alone, debug and
+// release, returned 42 (396 cells, `fo3/j2i_run.sh`).
+// ⇒ Past the first stacked aggregate, HIR→MIR reads each stacked scalar at the
+// byte offset its own cursor gave it (`RecvByValueStackParam` + a load), so the
+// PINS are those offsets: each one is where gcc and clang put the datum.
+// RED-ON-DISABLE: receive the scalar through an `Arg` again → the payload list
+// loses its trailing offset and gains an `Arg`; restore the refusal → `mir.ok`.
+namespace {
+// Every `RecvByValueStackParam` payload (the incoming byte offset) in function
+// `fi`, in instruction order.
+[[nodiscard]] std::vector<std::uint32_t> recvStackPayloads(Mir const& m,
+                                                           std::uint32_t fi) {
+    std::vector<std::uint32_t> out;
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) == MirOpcode::RecvByValueStackParam)
+                out.push_back(m.instPayload(ix));
+        }
+    }
+    return out;
+}
+// The one function whose body receives anything from the incoming stack.
+[[nodiscard]] std::uint32_t funcWithStackReceive(Mir const& m) {
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi)
+        if (countOpcodeAllBlocks(m, fi, MirOpcode::RecvByValueStackParam) > 0) return fi;
+    return 0;
+}
+[[nodiscard]] std::string firstMirError(DiagnosticReporter const& r) {
+    return r.all().empty() ? std::string{} : r.all()[0].actual;
+}
+} // namespace
+
+// x86_64 SysV: rdi..r9 taken, `s` (16 bytes, INTEGER) stacked at +0, `h` at +16.
+TEST(MirLoweringC, AStackedScalarAfterAStackedAggregateIsReadAtItsByteOffset) {
+    auto L = lowerC(
+        "struct S16 { long x; long y; };\n"
+        "long f(long a, long b, long c, long d, long e, long g, struct S16 s,"
+        " long h) {\n"
+        "  return h + s.x;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok) << firstMirError(L.mirReporter);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithStackReceive(m);
+    EXPECT_EQ(recvStackPayloads(m, fi), (std::vector<std::uint32_t>{0u, 16u}))
+        << "the aggregate at +0 and the scalar after it at +16 — where gcc and clang "
+           "put them; an `Arg` for `h` would be placed at +0, over the aggregate";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::Arg), 6u)
+        << "only the six register parameters arrive through `Arg`";
+}
+
+// x86_64 SysV, x87 `long double`: MEMORY class, so ALWAYS stacked (at +0), and the
+// ninth `double` after it at +16 (the 16-byte x87 slot).
+TEST(MirLoweringC, ADoubleAfterAStackedX87LongDoubleIsReadPastItsSlot) {
+    auto L = lowerC(
+        "double f(double d0, double d1, double d2, double d3, double d4,"
+        " double d5, double d6, double d7, long double x, double d8) {\n"
+        "  return d8;\n"
+        "}\n",
+        "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::X87_80);
+    ASSERT_TRUE(L.mir.ok) << firstMirError(L.mirReporter);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(recvStackPayloads(m, funcWithStackReceive(m)),
+              (std::vector<std::uint32_t>{0u, 16u}));
+}
+
+// AAPCS64: `s` needs two GPRs with only x7 left → stacked at +0 AND the GPR class
+// exhausted (NGRN ← 8), so `a7` is stacked too, at +16.
+TEST(MirLoweringC, Aapcs64AScalarAfterAStackedAggregateIsReadAtItsByteOffset) {
+    auto L = lowerC(
+        "struct S16 { long x; long y; };\n"
+        "long f(long a0, long a1, long a2, long a3, long a4, long a5, long a6,"
+        " struct S16 s, long a7) {\n"
+        "  return a7 + s.y;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok) << firstMirError(L.mirReporter);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithStackReceive(m);
+    EXPECT_EQ(recvStackPayloads(m, fi), (std::vector<std::uint32_t>{0u, 16u}));
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::Arg), 7u)
+        << "x0..x6 arrive through `Arg`; x7 is left unused by the exhausted class";
+}
+
+// AAPCS64 binary128: `h` (a two-double HFA) finds no V register left and is
+// stacked at +0; the `long double` after it is a scalar WIDER than the slot —
+// its own 16 bytes, 16-aligned, at +16 — and the `double` after that at +32.
+// ✔MEASURED (the interop matrix, shape `a64_hfa_ld_double`): a DSS callee
+// linked against aarch64-linux-gnu-gcc 13.3.0's and clang 18.1.3's callers reads
+// every parameter right, and a DSS caller writes them where those compilers'
+// callees read, at -O0 and -O2, debug and release. A one-slot binary128 would
+// put the `double` at +24, inside the `long double`'s high half.
+TEST(MirLoweringC, Aapcs64ABinary128AfterAStackedAggregateTakesItsOwnSixteenBytes) {
+    auto L = lowerC(
+        "struct D16 { double a; double b; };\n"
+        "double f(double d0, double d1, double d2, double d3, double d4,"
+        " double d5, double d6, double d7, struct D16 h, long double x,"
+        " double d8) {\n"
+        "  return d8 + h.a;\n"
+        "}\n",
+        "arm64", "aapcs64", DataModel::Lp64, LongDoubleFormat::Ieee128);
+    ASSERT_TRUE(L.mir.ok) << firstMirError(L.mirReporter);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(recvStackPayloads(m, funcWithStackReceive(m)),
+              (std::vector<std::uint32_t>{0u, 16u, 32u}));
+}
+
+// The other interleaving: an aggregate AFTER a stacked scalar. `g` is the
+// seventh GPR parameter, stacked at +0 through its `Arg`; `s` follows at +8.
+TEST(MirLoweringC, AnAggregateAfterAStackedScalarIsPlacedPastIt) {
+    auto L = lowerC(
+        "struct S16 { long x; long y; };\n"
+        "long f(long a, long b, long c, long d, long e, long h, long g,"
+        " struct S16 s) {\n"
+        "  return g + s.x;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok) << firstMirError(L.mirReporter);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithStackReceive(m);
+    EXPECT_EQ(recvStackPayloads(m, fi), (std::vector<std::uint32_t>{8u}));
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::Arg), 7u)
+        << "the stacked scalar BEFORE any aggregate stays an `Arg` — the prefix on "
+           "which lir_callconv's cursor and this tier's agree";
+}
+
+// va_start past both: the overflow base skips the 16-byte aggregate AND the
+// scalar after it (16 + 8 = 24).
+TEST(MirLoweringC, VaStartSkipsAStackedScalarThatFollowsAStackedAggregate) {
+    auto L = lowerC(
+        "struct S16 { long x; long y; };\n"
+        "long f(long a, long b, long c, long d, long e, long g, struct S16 s,"
+        " long h, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, h);\n"
+        "  long v = va_arg(ap, long);\n"
+        "  va_end(ap);\n"
+        "  return h + v + s.x;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok) << firstMirError(L.mirReporter);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value());
+    EXPECT_EQ(*payload, 24u);
+    EXPECT_EQ(recvStackPayloads(m, fi), (std::vector<std::uint32_t>{0u, 16u}));
+}
+
 namespace {
 // Find the FIRST Call inst in function `fi` and return its payload (0 if none).
 [[nodiscard]] std::uint32_t firstCallPayload(Mir const& m, std::uint32_t fi) {
@@ -9919,9 +10293,8 @@ TEST(MirLoweringC, IterativeDeepIndexAddressChainLowersFlatAndByteIdentical) {
     // Thread the x86_64 aggregate layout so array stride/size resolve (mirrors
     // lowerC). A char[1]…[1] is 1 byte; stride at every level is 1.
     MirLoweringConfig mirCfg;
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
-    // will not load is a STOP, never a fixture that quietly measures a default
-    // machine model.
+    // A target that will not load is a STOP, never a fixture that quietly
+    // measures a default machine model.
     {
         auto const t = requireShippedTarget("x86_64");
         mirCfg.aggregateLayout       = t->aggregateLayout();
@@ -11325,6 +11698,34 @@ TEST(MirLoweringCVolatile, VolatileStoreThroughPointerParamSurvivesDce) {
            "MirInstFlags::Volatile like dce.cpp)";
 }
 
+// P68 round 10 (lane `cs`) — C 6.7.6.3p7: `int p[volatile]` IS `int *volatile p`, so
+// `p` is a volatile OBJECT. With its address taken it lives in memory, and the
+// incoming argument's store into its slot and the read of `p` for `*p` carry the flag,
+// exactly as the explicit spelling's do; the plain `int p[]` is the control. Before the
+// fix the bracket's `volatile` was dropped and both accesses were plain.
+TEST(MirLoweringCVolatile, ABracketVolatileArrayParameterIsAVolatileObject) {
+    for (char const* src : {"int f(int p[volatile]) { (void)&p; return *p; }\n",
+                            "int f(int *volatile p) { (void)&p; return *p; }\n"}) {
+        auto L = lowerC(src);
+        ASSERT_FALSE(L.model.hasErrors())
+            << src << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok) << src;
+        ASSERT_TRUE(L.mir.ok)
+            << src << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+            << "the incoming argument's store into p's slot must be volatile: " << src;
+        EXPECT_GE(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+            << "the read of p must be volatile: " << src;
+    }
+    auto L = lowerC("int f(int p[]) { (void)&p; return *p; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Store, /*wantVolatile=*/true), 0u);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u);
+}
+
 // ── c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION — opaque / incomplete struct ──
 // These pin the FAIL-LOUD axis end-to-end: an opaque (forward-declared, never
 // defined) struct is INCOMPLETE; a `Ptr<incomplete>` is sizeable and usable, but
@@ -11754,34 +12155,75 @@ TEST(MirLoweringC, WideBitIntFloatConversionLowersWithTheMultiLimbPrimitives) {
     }
 }
 
-// D-CSUBSET-INT128-FLOAT-CONV: the refusal SURVIVES for every floating type that is not
-// `double`, and each survivor has its own reason — one message that covered all of them
-// would hide which. F32/F16 are reachable only as a rounding of the F64 result, so they
-// would round TWICE and can land outside the two values C 6.3.1.4p2 permits (and int->F32
-// has no encoded form at all one tier down, D-CSUBSET-INT-TO-F32-CODEGEN). F80/F128 carry
-// more precision than F64, so widening an F64 result into them would invent precision on
-// the way out and rounding into F64 would lose it on the way in (D-CSUBSET-LONG-DOUBLE).
-// ⚠ `long double` is NOT used here: it is F64 on this target, so a `long double` probe
-// would assert nothing. The `float` spelling is F32 on every shipped data model.
-// RED-ON-DISABLE: drop the `toK != TypeKind::F64` gate in combineCast's wide-source arm
-// and a `(float)wide` silently acquires a double-rounded value.
-TEST(MirLoweringC, WideBitIntToNonDoubleFloatStillFailsLoud) {
+// ── D-CSUBSET-INT-TO-F32-CODEGEN (P68 round 12): A WIDE INTEGER TO `float`, DIRECTLY ──
+// This pin used to assert the REFUSAL of `(float)wide`, for two reasons: reaching F32 as
+// a rounding of the F64 result rounds TWICE and can land outside the two values C
+// 6.3.1.4p2 permits, and the int->F32 conversion one tier down did not exist. The second
+// reason is gone, and the first never applied to the right shape: the round-to-odd
+// intermediate converts STRAIGHT to F32 with one rounding. So the pin asserts THAT shape —
+// the multi-limb primitives, a UIToFP whose RESULT is F32, and NO FPTrunc anywhere (an
+// FPTrunc is precisely the double-rounding detour). The values are pinned where a value
+// can be observed: examples/c/wide_int_to_float_bit_exact (gcc 13.3.0 / clang 18.1.3
+// agreed, the double-rounding values included).
+// RED-ON-DISABLE: route the F32 destination through the F64 result plus an FPTrunc and
+// the FPTrunc expectation goes red (and the example's double-rounding checks fail).
+TEST(MirLoweringC, WideIntToFloatConvertsDirectlyWithOneRounding) {
     for (char const* src : {
         "int main(void){ _BitInt(128) x = 3; float f = (float)x;\n"
         "  return (int)f; }\n",
         "int main(void){ unsigned __int128 x = 3; float f = (float)x;\n"
+        "  return (int)f; }\n",
+        "int main(void){ __int128 x = -3; float f = (float)x;\n"
         "  return (int)f; }\n"}) {
         auto L = lowerC(src);
         ASSERT_FALSE(L.model.hasErrors()) << src;
         ASSERT_TRUE(L.hir->ok) << src;
-        EXPECT_FALSE(L.mir.ok) << src
-            << "\na wide-integer -> `float` conversion must still fail LOUD";
-        std::size_t n = 0;
-        for (auto const& d : L.mirReporter.all())
-            if (d.code == DiagnosticCode::S_BitIntWideFloatConvUnsupported) ++n;
-        EXPECT_EQ(n, 1u) << src
-            << "\nexactly one S_BitIntWideFloatConvUnsupported (0xE050)";
+        ASSERT_TRUE(L.mir.ok) << src
+            << "\na wide-integer -> `float` conversion must LOWER\n"
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const ops = allOpcodes(L.mir.mir);
+        EXPECT_GT(countOpcode(ops, MirOpcode::Clz), 0u) << src;
+        EXPECT_GT(countOpcode(ops, MirOpcode::FMul), 0u) << src;
+        EXPECT_EQ(countOpcode(ops, MirOpcode::FPTrunc), 0u) << src
+            << "\nan FPTrunc means the `float` was reached THROUGH the `double` result — "
+               "two roundings, the defect this emitter's argument forbids";
+        bool f32Convert = false;
+        Mir const& m = L.mir.mir;
+        TypeInterner const& ti = L.model.lattice().interner();
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                    MirInstId const inst = m.blockInstAt(b, ii);
+                    if (m.instOpcode(inst) == MirOpcode::UIToFP
+                        && ti.kind(m.instType(inst)) == TypeKind::F32) {
+                        f32Convert = true;
+                    }
+                }
+            }
+        }
+        EXPECT_TRUE(f32Convert) << src
+            << "\nthe round-to-odd intermediate must convert straight to F32";
     }
+}
+
+// The refusal SURVIVES for a `long double` destination: it carries more precision than
+// the 64-bit round-to-odd intermediate keeps, so the emitter's one-rounding argument does
+// not cover it. Probed with the x87 80-bit axis (the x86-64 ELF shape) — on the default
+// fixture `long double` may not be spelled at all.
+// RED-ON-DISABLE: admit F80 in combineCast's wide-source gate and this goes red.
+TEST(MirLoweringC, WideIntToLongDoubleStillFailsLoud) {
+    auto L = lowerC("int main(void){ _BitInt(128) x = 3; long double f = (long double)x;\n"
+                    "  return (int)f; }\n",
+                    "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::X87_80);
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    EXPECT_FALSE(L.mir.ok) << "a wide-integer -> `long double` conversion must still fail LOUD";
+    std::size_t n = 0;
+    for (auto const& d : L.mirReporter.all())
+        if (d.code == DiagnosticCode::S_BitIntWideFloatConvUnsupported) ++n;
+    EXPECT_EQ(n, 1u) << "exactly one S_BitIntWideFloatConvUnsupported (0xE050)";
 }
 
 namespace {
@@ -12656,6 +13098,142 @@ TEST(MirLoweringC, VlaTypedefObjectAllocaLoadsFrozenSizeNotReLoweredN) {
     EXPECT_TRUE(sawCopyDownStore)
         << "`R a;` must COPY R's frozen size DOWN — a Load(R's slot) Stored into a's own "
            "8-byte slot — so `a[i]` / `sizeof a` Load a's own copied slot";
+}
+
+// P68 round 12 (lane `cs`) — a QUALIFIED use of a variable-length typedef reads the size
+// the typedef FROZE. C 6.7.3p10 puts `volatile V`'s qualifier on the element, so every
+// level of the object's type is a different TypeId from the ones the typedef froze under;
+// the size slots are keyed by the level's unqualified SHAPE, so the object copies the
+// typedef's frozen size down exactly as `V v;` does (a Load of the typedef's slot, never a
+// re-lowered `n`), its element stores are volatile, and a pointer to the qualified alias
+// copies the alias's whole-object size as its row stride. Before this, each of these three
+// refused "origin froze no whole-object size slot"; gcc 13.3.0, clang 18.1.3 and mingw-w64
+// 13.2.0 build and run them (✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/vt`).
+// RED-ON-DISABLE: key the slots by the held TypeId again and all three refuse.
+TEST(MirLoweringC, AQualifiedUseOfAVlaTypedefCopiesItsFrozenSize) {
+    for (char const* src : {
+             "int main(void) { int n = 3; typedef int V[n]; volatile V a; a[0] = 1; return 0; }\n",
+             "int main(void) { int n = 3; typedef int V[n]; volatile V arr[2]; arr[1][0] = 1; "
+             "return 0; }\n",
+             "int main(void) { int n = 2; typedef int V[n]; int b[3][2] = {{0}}; "
+             "volatile V *p = (volatile V *)b; p[2][1] = 1; return 0; }\n",
+         }) {
+        auto L = lowerC(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        ASSERT_TRUE(L.mir.ok)
+            << src << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleFuncCount(), 1u) << src;
+        // The copy-down: a Store whose VALUE is a Load, into an 8-byte slot.
+        bool sawCopyDown = false;
+        MirBlockId const entry = m.funcEntry(m.funcAt(0));
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+            MirInstId const id = m.blockInstAt(entry, i);
+            if (m.instOpcode(id) != MirOpcode::Store) continue;
+            auto const ops = m.instOperands(id);
+            if (ops.size() == 2u && m.instOpcode(ops[0]) == MirOpcode::Load
+                && m.instOpcode(ops[1]) == MirOpcode::Alloca && m.instPayload(ops[1]) == 8u)
+                sawCopyDown = true;
+        }
+        EXPECT_TRUE(sawCopyDown)
+            << "the typedef's frozen size must be COPIED DOWN (a Load of its slot stored "
+               "into the use's own 8-byte slot), never re-lowered: " << src;
+        EXPECT_GE(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+            << "the element store through the qualified use must be volatile: " << src;
+    }
+}
+
+// P68 round 12 (lane `cs`) — a variable-length TYPE NAME's size and alignment. `sizeof(V)` of
+// a variable-length typedef reads the size the typedef FROZE (C17 6.7.8p3: `n` changed
+// afterwards moves nothing), qualified or not; `sizeof(V[3])` multiplies it by the name's own
+// bound; `_Alignof` of a variable-length type is its element's alignment and does not evaluate
+// its operand (C 6.5.3.4p3). Each was refused ("sizeof of an incomplete or un-sizeable type" /
+// "_Alignof of an incomplete or un-alignable type"); gcc 13.3.0, clang 18.1.3 and mingw-w64
+// 13.2.0 build and run every one (✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/vt`). The
+// size forms must READ the frozen slot — a Load — and the alignment forms must not: they fold.
+TEST(MirLoweringC, AVlaTypeNamesSizeReadsTheFrozenSizeAndItsAlignmentFolds) {
+    struct Case {
+        char const* src;
+        bool        readsAFrozenSize;
+    };
+    for (Case const& c : {
+             Case{"int f(int n) { typedef int V[n]; n = 9; return (int)sizeof(V); }\n", true},
+             Case{"int f(int n) { typedef int V[n]; n = 9; return (int)sizeof(volatile V); }\n", true},
+             Case{"int f(int n) { typedef int V[n]; n = 9; return (int)sizeof(V[3]); }\n", true},
+             Case{"int f(int n) { typedef int V[n]; n = 9; return (int)sizeof(volatile V[3]); }\n", true},
+             Case{"int f(int n) { return (int)_Alignof(int[n]); }\n", false},
+             Case{"int f(int n) { typedef double W[n][3]; return (int)_Alignof(volatile W); }\n", false},
+         }) {
+        auto L = lowerC(c.src);
+        ASSERT_FALSE(L.model.hasErrors()) << c.src;
+        ASSERT_TRUE(L.hir->ok) << c.src;
+        ASSERT_TRUE(L.mir.ok)
+            << c.src << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleFuncCount(), 1u) << c.src;
+        MirFuncId const fn = m.funcAt(0);
+        // A Load whose address is an 8-byte slot: the frozen size, read.
+        unsigned frozenReads = 0;
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            MirBlockId const blk = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+                MirInstId const id = m.blockInstAt(blk, i);
+                if (m.instOpcode(id) != MirOpcode::Load) continue;
+                auto const ops = m.instOperands(id);
+                if (ops.size() == 1u && m.instOpcode(ops[0]) == MirOpcode::Alloca
+                    && m.instPayload(ops[0]) == 8u && m.instOperands(ops[0]).empty())
+                    ++frozenReads;
+            }
+        }
+        if (c.readsAFrozenSize)
+            EXPECT_GE(frozenReads, 1u) << "the size must be READ from the typedef's frozen slot: "
+                                       << c.src;
+        else
+            EXPECT_EQ(frozenReads, 0u) << "an alignment is static; nothing is read: " << c.src;
+    }
+}
+
+// P68 round 12 (lane `cs`) — `sizeof` THROUGH A POINTER to a variable-length array: `sizeof
+// *p` and `sizeof p[i]` are the pointee's size, which the pointer froze as its row stride at
+// its own declaration, so the size is READ from that slot — for a direct `int (*p)[n]`, a
+// typedef's `V *p` and a qualified `volatile V *p` alike. Each was refused at the static fold
+// ("sizeof of an incomplete or un-sizeable type"); gcc 13.3.0, clang 18.1.3 and mingw-w64
+// 13.2.0 answer the pointee's size (✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/vtp`).
+// Two indirections through a pointer (`sizeof **pp`) stay refused: no slot holds that size.
+TEST(MirLoweringC, SizeofThroughAPointerToAVlaReadsItsFrozenStride) {
+    for (char const* src : {
+             "int f(int n, int (*p)[n]) { n = 9; return (int)sizeof *p; }\n",
+             "int f(int n, int (*p)[n]) { n = 9; return (int)sizeof p[1]; }\n",
+             "int f(int n, void *q) { typedef int V[n]; V *p = q; n = 9; return (int)sizeof *p; }\n",
+             "int f(int n, void *q) { typedef int V[n]; volatile V *p = q; n = 9; return (int)sizeof(*p); }\n",
+         }) {
+        auto L = lowerC(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        ASSERT_TRUE(L.mir.ok)
+            << src << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleFuncCount(), 1u) << src;
+        MirFuncId const fn = m.funcAt(0);
+        unsigned frozenReads = 0;
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            MirBlockId const blk = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+                MirInstId const id = m.blockInstAt(blk, i);
+                if (m.instOpcode(id) != MirOpcode::Load) continue;
+                auto const ops = m.instOperands(id);
+                if (ops.size() == 1u && m.instOpcode(ops[0]) == MirOpcode::Alloca
+                    && m.instPayload(ops[0]) == 8u && m.instOperands(ops[0]).empty())
+                    ++frozenReads;
+            }
+        }
+        EXPECT_GE(frozenReads, 1u) << "the pointee's size must be READ from the pointer's frozen "
+                                      "stride slot: " << src;
+    }
+    auto deep = lowerC("int f(int n, int (**pp)[n]) { return (int)sizeof **pp; }\n");
+    EXPECT_TRUE(deep.model.hasErrors() || !deep.hir->ok || !deep.mir.ok)
+        << "`sizeof **pp` has no frozen slot to read; it must stay refused, never guessed";
 }
 
 // VLA (D-CSUBSET-VLA) — THE COMPOSED VLA-TYPEDEF SHAPES LOWER. These three tests were
@@ -14569,9 +15147,8 @@ constexpr char const* kSetjmpRoundTripSrc =
         ]
     })JSON";
 
-    auto loaded = GrammarSchema::loadShipped("c");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
-    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
+    auto const schema = dss::test_support::shippedSchemaOrThrow("c");
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -14580,15 +15157,13 @@ constexpr char const* kSetjmpRoundTripSrc =
     // selected (nullopt would inject no variant typedef → `jmp_buf` undefined).
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
                          DataModel::Lp64, std::nullopt, std::nullopt,
-                         ObjectFormatKind::Elf, "x86_64");
+                         SelectableObjectFormatKind::of(ObjectFormatKind::Elf), "x86_64");
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
-    // will not load is a STOP, never a fixture that quietly measures a default
-    // machine model.
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
+    // A target that will not load is a STOP, never a fixture that quietly
+    // measures a default machine model.
     {
         auto const t = requireShippedTarget("x86_64");
         mirCfg.aggregateLayout       = t->aggregateLayout();
@@ -15865,14 +16440,22 @@ TEST(MirLoweringC, PointerArithEnumIndexInSubtractionWidensBeforeTheNegate) {
     // widening after) would sign-flip a 32-bit value into the high half of the
     // register. Pins the ordering by pinning that the widen exists at all on the
     // subtraction arm, which reaches the same site through a different opcode.
+    // P68 round 12 (lane `cs`, the enumeration P1): the widen's SIGNEDNESS follows
+    // the enumeration's compatible type, and `enum Step { ST_TWO = 2 }` has no negative
+    // value, so under the SysV convention this analysis runs (`lowerC`'s default, the
+    // LP64 platforms' "gnu") it is `unsigned int` — gcc 13.3.0 and clang 18.1.3 zero-
+    // extend it (lane `cs`'s `.temp/probe/ect8`, `exP1c`). This used to expect an SExt
+    // ("a default (int) underlying is signed"), true only under the msvc convention.
     auto L = lowerC(
         "enum Step { ST_TWO = 2 };\n"
         "int *f(int *p, enum Step e) { return p - e; }\n");
     ASSERT_TRUE(L.mir.ok)
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
-    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 1u)
-        << "a default (int) underlying is signed → SExt to the 64-bit offset";
+    EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 1u)
+        << "a non-negative enumeration is `unsigned int` under gnu → ZExt to the 64-bit offset";
+    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 0u)
+        << "an SExt would read an index above INT_MAX as negative — a wrong address";
     ASSERT_EQ(collectOps(m, MirOpcode::Neg).size(), 1u)
         << "`p - e` must negate the widened index";
     auto const& interner = L.model.lattice().interner();
@@ -16303,9 +16886,8 @@ TEST(MirLoweringC, ByValueStructArgumentCallIsLoweredExactlyOnce) {
         EXPECT_EQ(countCalls(calls, "mk"), 1u)
             // ⚠ The anchor id sits on ONE source line. Split across two string
             // literals it still CONCATENATES at runtime, but every grep and the
-            // registry guard see two ids — one of them invented. That is
-            // D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP,
-            // and this line carried an instance of it until the guard said so.
+            // registry guard see two ids — one of them invented. This line
+            // carried an instance of exactly that until the guard said so.
             << "C 6.5.2.2p10: `op(mk())` evaluates `mk()` ONCE. Two emitted "
                "Calls means the by-value argument path lowered the argument "
                "expression twice — a duplicated side effect with no diagnostic: "
@@ -16760,4 +17342,371 @@ TEST(MirLoweringC, AtomicStoreExplicitSpecializesToTheArgumentsPointeeWidth) {
     }
     EXPECT_TRUE(checkedAtomicStore)
         << "the program must lower to an AtomicStore at all";
+}
+
+// ── P68 round 8 (lane `ht`): A GLOBAL DECLARED THROUGH A CONST TYPEDEF IS READ-ONLY
+// DATA, EXACTLY WHERE ITS DIRECT SPELLING IS. `const` is not interned, so a
+// `typedef const int CI;` hands `CI g = 5;` a TypeId that says nothing about it, and
+// until the typedef's claim was applied the symbol's `isConst` was false: the global
+// reached MIR mutable and landed in writable `.data` (✔MEASURED 2026-09-23 with
+// readelf on DSS's own x86_64 ELF object, beside `const int g = 5;` in `.rodata`,
+// which is where gcc 13.3.0 puts both). `isConst` → MutabilityAttr →
+// `MirGlobal.isConst` is the chain the assembler's section choice reads, so this
+// pins it at MIR, with the direct spelling as the twin and a plain `int` as the
+// control that keeps the two assertions from passing by marking everything const.
+// RED-ON-DISABLE: drop the typedef application in `resolveDeclTypesPost` (or the
+// typedef row's `constMarker`) → `viaTypedef` and `viaChain` read back mutable.
+TEST(MirLoweringC, AGlobalDeclaredThroughAConstTypedefIsReadOnlyData) {
+    auto L = lowerC(
+        "typedef const int CI;\n"
+        "typedef CI CI2;\n"
+        "CI viaTypedef = 5;\n"
+        "CI2 viaChain = 6;\n"
+        "const int direct = 7;\n"
+        "int plain = 8;\n"
+        "int f(void) { return viaTypedef + viaChain + direct + plain; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::vector<std::pair<std::string, bool>> isConstByName;
+    for (std::size_t gi = 0; gi < m.moduleGlobalCount(); ++gi) {
+        MirGlobalId const g = m.globalAt(static_cast<std::uint32_t>(gi));
+        auto const* rec = L.model.recordFor(SymbolId{m.globalSymbol(g).v});
+        if (rec != nullptr) isConstByName.emplace_back(rec->name, m.globalIsConst(g));
+    }
+    auto const readOnly = [&](std::string const& name) -> std::optional<bool> {
+        for (auto const& [n, c] : isConstByName)
+            if (n == name) return c;
+        return std::nullopt;
+    };
+    for (char const* name : {"viaTypedef", "viaChain", "direct", "plain"}) {
+        ASSERT_TRUE(readOnly(name).has_value()) << "no MIR global named " << name;
+    }
+    EXPECT_TRUE(*readOnly("direct")) << "the direct spelling (the twin)";
+    EXPECT_TRUE(*readOnly("viaTypedef"))
+        << "`CI viaTypedef = 5;` is the object `const int viaTypedef = 5;` is — "
+           "its global must be read-only data, not writable `.data`";
+    EXPECT_TRUE(*readOnly("viaChain"))
+        << "a typedef of a const typedef hands the const on (`typedef CI CI2;`)";
+    EXPECT_FALSE(*readOnly("plain"))
+        << "the CONTROL: a plain `int` global must stay mutable";
+}
+
+// ── P68 round 13 (lane `cs`, the static-initializer item) ─────────────────────────────────
+// The address constants C 6.6p7/p9 builds by INTERLEAVING a value and an lvalue — `&*&y`,
+// `&(&s)->m`, `&(a + 1)[1]`, `&a[1] + 1`, `1 + a`, `"x*" + 1`, `1 ? &y : &z` — and an address in a
+// pointer-sized integer slot: each classifies as STATIC DATA, one symbol-address leaf with the
+// address's own addend, never a runtime initializer (which the static-data producer refuses).
+// ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/sti2`): gcc 13.3.0, clang 18.1.3, mingw-w64
+// 13.2.0 and MSVC 19.51 build and run every one; DSS refused each as a runtime initializer.
+namespace {
+struct SymAddrLeaf { std::uint32_t symbol; std::int64_t addend; };
+[[nodiscard]] std::vector<SymAddrLeaf> symbolAddressGlobals(Mir const& m) {
+    std::vector<SymAddrLeaf> out;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        std::uint32_t const li = m.globalInitLiteralIndex(m.globalAt(i));
+        if (li == UINT32_MAX) continue;
+        auto const& lit = m.literalValue(li);
+        if (auto const* sa = std::get_if<MirSymbolAddrValue>(&lit.value))
+            out.push_back({sa->symbol, sa->addend});
+    }
+    return out;
+}
+[[nodiscard]] std::uint32_t symbolNamed(SemanticModel const& model, std::string_view name) {
+    for (std::size_t i = 0; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == name) return static_cast<std::uint32_t>(i);
+    return UINT32_MAX;
+}
+} // namespace
+
+TEST(MirLoweringC, AnInterleavedAddressConstantIsStaticDataWithItsOwnAddend) {
+    struct Row { char const* src; char const* target; std::int64_t addend; };
+    for (Row const r : {
+             Row{"int a[3];\nint *p = &a[1] + 1;\n", "a", 8},
+             Row{"int a[3];\nint *p = 1 + a;\n", "a", 4},
+             Row{"int a[3];\nint *p = &a[2] - 1;\n", "a", 4},
+             Row{"int a[3];\nint *p = (int *)&a + 1;\n", "a", 4},
+             Row{"int a[3];\nint *p = &(a + 1)[1];\n", "a", 8},
+             Row{"struct S { int k; int m; } s;\nint *p = &(&s)->m;\n", "s", 4},
+             Row{"int y;\nint *p = &*&y;\n", "y", 0},
+             Row{"int y, z;\nint *p = 1 ? &y : &z;\n", "y", 0},
+             Row{"int y, z;\nint *p = 0 ? &y : &z;\n", "z", 0},
+             Row{"int y;\nint *p = (0, &y);\n", "y", 0},
+             // An array lvalue that is not a name decays to its first element's address.
+             Row{"int m[2][3];\nint *p = m[1];\n", "m", 12},
+             Row{"struct T { int k; int arr[2]; } t;\nint *p = t.arr;\n", "t", 4},
+             Row{"int m[2][3];\nint *p = m[1] + 2;\n", "m", 20},
+             Row{"int m[2][3];\nint *p = *(m + 1);\n", "m", 12},
+             Row{"int m[2][3];\nint (*r)[3] = m + 1;\n", "m", 12},
+             // An address in a pointer-sized INTEGER slot: the same leaf, the same relocation.
+             Row{"int a[2];\nunsigned long long u = (unsigned long long)&a[1];\n", "a", 4},
+             Row{"int a[2];\nlong l = (long)&a;\n", "a", 0},
+         }) {
+        auto L = lowerC(r.src);
+        ASSERT_TRUE(L.mir.ok) << r.src << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const leaves = symbolAddressGlobals(L.mir.mir);
+        ASSERT_EQ(leaves.size(), 1u) << r.src << ": exactly the one address-initialized global";
+        EXPECT_EQ(leaves[0].symbol, symbolNamed(L.model, r.target)) << r.src;
+        EXPECT_EQ(leaves[0].addend, r.addend) << r.src;
+    }
+}
+
+// A string literal's address plus a constant: the leaf targets the literal's rodata global.
+TEST(MirLoweringC, AStringLiteralPlusAConstantIsItsRodataAddressPlusTheConstant) {
+    auto L = lowerC("char const *s = \"x*\" + 1;\n");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const leaves = symbolAddressGlobals(L.mir.mir);
+    ASSERT_EQ(leaves.size(), 1u);
+    EXPECT_EQ(leaves[0].addend, 1);
+    EXPECT_NE(leaves[0].symbol, symbolNamed(L.model, "s")) << "the target is the literal, not s";
+}
+
+// An address in a pointer-sized integer MEMBER, and a comma initializer, are static data too.
+TEST(MirLoweringC, AnIntegerMemberAddressAndACommaInitializerAreStaticData) {
+    {
+        auto L = lowerC("int a[2];\nstruct S { unsigned long long u; int k; } s = "
+                        "{ (unsigned long long)&a, 42 };\n");
+        ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        MirAggregateValue const* agg = nullptr;
+        for (std::uint32_t i = 0; i < L.mir.mir.moduleGlobalCount(); ++i) {
+            std::uint32_t const li = L.mir.mir.globalInitLiteralIndex(L.mir.mir.globalAt(i));
+            if (li == UINT32_MAX) continue;
+            if (auto const* a = std::get_if<MirAggregateValue>(&L.mir.mir.literalValue(li).value))
+                agg = a;
+        }
+        ASSERT_NE(agg, nullptr) << "s must be const-init static data, not a runtime initializer";
+        ASSERT_EQ(agg->fields.size(), 2u);
+        auto const* sa = std::get_if<MirSymbolAddrValue>(&agg->fields[0].value);
+        ASSERT_NE(sa, nullptr) << ".u carries the relocation leaf";
+        EXPECT_EQ(sa->symbol, symbolNamed(L.model, "a"));
+    }
+    {
+        auto L = lowerC("int x = (1, 42);\n");
+        ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        ASSERT_EQ(L.mir.mir.moduleGlobalCount(), 1u);
+        MirGlobalId const g = L.mir.mir.globalAt(0);
+        EXPECT_FALSE(L.mir.mir.globalInitFunc(g).valid()) << "not a runtime initializer";
+        std::uint32_t const li = L.mir.mir.globalInitLiteralIndex(g);
+        ASSERT_NE(li, UINT32_MAX);
+        auto const& lit = L.mir.mir.literalValue(li);
+        ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit.value));
+        EXPECT_EQ(std::get<std::int64_t>(lit.value), 42);
+    }
+}
+
+// ── P68 round 13 (lane `cs`, the static-initializer item): the ONE fold ───────────────────
+// The static-data producer asks the constant evaluator for EVERY initializer now — its five
+// shape classifiers are gone — so the address algebra's VALUES land as static data. Each row
+// is a form a reference builds (lane `cs`'s `.temp/probe/sti4` … `sti9`), measured refused by
+// DSS as a runtime initializer before this item.
+namespace {
+[[nodiscard]] MirLiteralValue const* initOfGlobalNamed(Lowered const& L, std::string_view name) {
+    std::uint32_t const sym = symbolNamed(L.model, name);
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        MirGlobalId const g = m.globalAt(i);
+        if (m.globalSymbol(g).v != sym) continue;
+        std::uint32_t const li = m.globalInitLiteralIndex(g);
+        return li == UINT32_MAX ? nullptr : &m.literalValue(li);
+    }
+    return nullptr;
+}
+[[nodiscard]] bool hasRuntimeInitializer(Lowered const& L, std::string_view name) {
+    std::uint32_t const sym = symbolNamed(L.model, name);
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        MirGlobalId const g = m.globalAt(i);
+        if (m.globalSymbol(g).v == sym) return m.globalInitFunc(g).valid();
+    }
+    return false;
+}
+[[nodiscard]] std::optional<std::int64_t> intOf(MirLiteralValue const& v) {
+    if (auto const* p = std::get_if<std::int64_t>(&v.value)) return *p;
+    if (auto const* p = std::get_if<std::uint64_t>(&v.value)) return static_cast<std::int64_t>(*p);
+    if (auto const* p = std::get_if<bool>(&v.value)) return *p ? 1 : 0;
+    return std::nullopt;
+}
+} // namespace
+
+// RED-ON-DISABLE: the evaluator's address-comparison / difference / truth-value /
+// integer-algebra arms, each (its row becomes a runtime initializer).
+TEST(MirLoweringC, TheAddressAlgebraFoldsToItsValue) {
+    struct Row { char const* src; char const* global; std::int64_t value; };
+    for (Row const r : {
+             Row{"int a[4];\n_Bool t = &a;\n", "t", 1},
+             Row{"int a[4];\nint t = !&a[0];\n", "t", 0},
+             Row{"int a[4];\nlong t = &a[3] - &a[1];\n", "t", 2},
+             Row{"int a[4];\nint t = &a[1] < &a[2];\n", "t", 1},
+             Row{"int a[4], b[2];\nint t = &a[0] == &b[0];\n", "t", 0},
+             Row{"int t = (int *)0 == 0;\n", "t", 1},
+             Row{"int a[4];\nunsigned long long t = (unsigned long long)&a * 0;\n", "t", 0},
+             Row{"int a[4];\nint t = 1 ? 42 : a[0];\n", "t", 42},
+             // A THREAD-LOCAL object's address is no address constant (6.6p9) — but a
+             // value computed FROM it that is not an address is, on every reference (gcc
+             // 13.3.0, clang 18.1.3, mingw-w64 13.2.0, both modes: lane `cs`'s
+             // `.temp/probe/sti12`), so these fold and only an ADDRESS result meets
+             // S_ThreadLocalAddressNotConstant (MirLoweringCThreadLocal pins that).
+             Row{"_Thread_local int t;\n_Bool v = &t;\n", "v", 1},
+             Row{"_Thread_local int t[2];\nlong v = &t[1] - &t[0];\n", "v", 1},
+         }) {
+        auto L = lowerC(r.src);
+        ASSERT_TRUE(L.mir.ok) << r.src << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_FALSE(hasRuntimeInitializer(L, r.global)) << r.src;
+        auto const* lit = initOfGlobalNamed(L, r.global);
+        ASSERT_NE(lit, nullptr) << r.src << ": a constant initializer";
+        auto const v = intOf(*lit);
+        ASSERT_TRUE(v.has_value()) << r.src << ": an integer leaf";
+        EXPECT_EQ(*v, r.value) << r.src;
+    }
+}
+
+// The producer's resolver folds a READ only of a const, non-volatile object — the forms every
+// reference refuses (`int y = 42; int x = y;`, a `const volatile` read) used to fold here
+// silently (✔MEASURED at the fold-8 build: DSS ran 42). The semantic tier refuses them first
+// (S_StaticInitializerNotConstant); this pins that the producer cannot fold them either, from
+// any input. RED-ON-DISABLE: `classifyGlobals`' `constReadableSymbols` filter (the first two
+// fold again).
+TEST(MirLoweringC, OnlyAConstNonVolatileObjectsValueFolds) {
+    {
+        auto L = lowerC("int a = 1;\nint b = a;\n");
+        EXPECT_EQ(initOfGlobalNamed(L, "b"), nullptr) << "a non-const object's value is not folded";
+    }
+    {
+        auto L = lowerC("static const volatile int v = 42;\nint x = v;\n");
+        EXPECT_EQ(initOfGlobalNamed(L, "x"), nullptr) << "a volatile object's value is not folded";
+    }
+    {
+        auto L = lowerC("static const int k = 42;\nint y = k;\n");
+        ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const* lit = initOfGlobalNamed(L, "y");
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(intOf(*lit), std::optional<std::int64_t>{42});
+    }
+}
+
+// P68 round 13, fold F7 — the resolver asks the ONE rule the semantic tier asks
+// (`TypeInterner::isVolatileObjectType`): an object is volatile when its type, looked through its
+// ARRAY spine, is. `cva[1]` of `static const volatile int cva[2]` FOLDED here and ran 42 (the
+// access-volatility attribute the resolver read answers the top level only, and the qualifier sits
+// on the element type) where every reference refuses it — the orchestrator's probe-reference-cc
+// runs 20260926-161013-cfcd4fdb, -161017-be070270 and -161024-bd368135 on gcc 13.2.0 mingw-w64,
+// gcc 13.3.0, clang 18.1.3 and MSVC 19.51. Each refused case below is refused by all four, and
+// each folded one is built by gcc and mingw-w64, which fold a const, non-volatile object's
+// volatile MEMBER (lane `cs`'s `.temp/probe/f7`). This tier decides it from any input: the
+// semantic tier's refusal of the first cases is not what keeps them from folding here.
+// RED-ON-DISABLE: read the top-level volatility again (the array, 2-D, array-of-structures and
+// typedef'd-element cases fold); refuse on a volatile member on the way down (the member cases
+// stop folding).
+TEST(MirLoweringC, AnObjectIsVolatileThroughItsArraySpineForTheResolverToo) {
+    for (char const* src : {
+             "static const volatile int cva[2] = { 1, 42 };\nint x = cva[1];\n",
+             "static const volatile int m[2][2] = { { 1, 2 }, { 3, 42 } };\nint x = m[1][1];\n",
+             "static const volatile struct { int v; } a[2] = { { 1 }, { 42 } };\nint x = a[1].v;\n",
+             "typedef volatile int VI;\nstatic const VI a[2] = { 1, 42 };\nint x = a[1];\n",
+             "static const volatile struct { int v; } s = { 42 };\nint x = s.v;\n",
+         }) {
+        auto L = lowerC(src);
+        EXPECT_EQ(initOfGlobalNamed(L, "x"), nullptr) << src << ": a volatile object's value folded";
+        EXPECT_FALSE(hasRuntimeInitializer(L, "x")) << src;
+        EXPECT_EQ(dss::test_support::countCode(L.mirReporter,
+                                               DiagnosticCode::H_StaticInitializerNotFolded), 1u)
+            << src;
+    }
+    for (char const* src : {
+             "static const struct { volatile int v; } cs = { 42 };\nint x = cs.v;\n",
+             "static const struct { volatile int v[2]; } s = { { 1, 42 } };\nint x = s.v[1];\n",
+             "struct S { volatile int v; };\nstatic const struct S a[2] = { { 1 }, { 42 } };\n"
+             "int x = a[1].v;\n",
+             "static const struct { struct { volatile int v; } in; } s = { { 42 } };\n"
+             "int x = s.in.v;\n",
+             "static const struct { volatile int v; int w; } s = { 1, 42 };\nint x = s.w;\n",
+         }) {
+        auto L = lowerC(src);
+        ASSERT_TRUE(L.mir.ok) << src << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const* lit = initOfGlobalNamed(L, "x");
+        ASSERT_NE(lit, nullptr) << src << ": a non-volatile object's volatile member folds";
+        EXPECT_EQ(intOf(*lit), std::optional<std::int64_t>{42}) << src;
+    }
+}
+
+// P68 round 13, fold F7 — an address whose BASE is null, converted to an integer narrower than a
+// pointer, is a plain integer constant, and the evaluator folds it to its value: all four
+// references build every row (lane `cs`'s `.temp/probe/f7`; clang -std=c17 -pedantic-errors
+// alone refuses the pointer arithmetic), where the semantic tier once refused each as "an address
+// no relocation can hold" (StaticInitializers.ANarrowedAddressIsProofOnlyForASymbolsAddress pins
+// that half). A SYMBOL's address in the same integer is not folded: every reference refuses it.
+// This pins the producer's half, which fold F7 did not change: `combineAddressCast`'s null-base
+// arm is the one that answers.
+TEST(MirLoweringC, ANullBasedAddressInANarrowerIntegerFoldsToItsValue) {
+    struct Row { char const* src; std::int64_t value; };
+    for (Row const r : {
+             Row{"struct T { int a; int m; };\nint x = (int)&((struct T *)0)->m;\n", 4},
+             Row{"struct T { int a; int m; };\nchar x = (char)&((struct T *)0)->m;\n", 4},
+             Row{"int x = (int)(void *)0;\n", 0},
+             Row{"short x = (short)(char *)5;\n", 5},
+             Row{"int x = (int)&((int *)0)[3];\n", 12},
+             Row{"int x = (int)((char *)0 + 12);\n", 12},
+         }) {
+        auto L = lowerC(r.src);
+        ASSERT_TRUE(L.mir.ok) << r.src << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_FALSE(hasRuntimeInitializer(L, "x")) << r.src;
+        auto const* lit = initOfGlobalNamed(L, "x");
+        ASSERT_NE(lit, nullptr) << r.src << ": a constant initializer";
+        EXPECT_EQ(intOf(*lit), std::optional<std::int64_t>{r.value}) << r.src;
+    }
+    auto L = lowerC("static int a[2];\nint x = (int)&a[1];\n");
+    EXPECT_EQ(initOfGlobalNamed(L, "x"), nullptr) << "a symbol's address in a narrower integer";
+}
+
+// A language whose static objects cannot be initialized at run time (C, whose
+// `semantics.staticInitializers` the fixture threads) gets NO runtime initializer: an
+// initializer the evaluator does not fold is refused HERE, once, positioned — the static-data
+// producer's object-format refusal ("has a runtime initializer") never meets it. With the
+// constraint off (a language that permits dynamic initialization) the same initializer takes
+// the module initializer, as it always did. RED-ON-DISABLE: `classifyGlobals`' constrained
+// arm (the first case becomes a runtime initializer, H_StaticInitializerNotFolded absent).
+TEST(MirLoweringC, AnUnfoldedStaticInitializerIsRefusedHereNotByTheImageProducer) {
+    std::string const src = "int a = 1;\nint b = a;\n";
+    {
+        auto L = lowerC(src);
+        EXPECT_FALSE(hasRuntimeInitializer(L, "b")) << "no runtime initializer under the constraint";
+        EXPECT_EQ(dss::test_support::countCode(L.mirReporter,
+                                               DiagnosticCode::H_StaticInitializerNotFolded), 1u);
+        EXPECT_FALSE(L.mir.ok);
+    }
+    {
+        auto L = lowerC(src, "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {},
+                        /*staticInitializersMustFold=*/false);
+        EXPECT_TRUE(hasRuntimeInitializer(L, "b")) << "the runtime-initializer path, unconstrained";
+        EXPECT_EQ(dss::test_support::countCode(L.mirReporter,
+                                               DiagnosticCode::H_StaticInitializerNotFolded), 0u);
+    }
+}
+
+// The module initializer is a FUNCTION of its own: it starts with no local bindings, so an
+// operand of another function (`&l` of `main`'s `l`) is refused LOUD — never lowered against
+// `main`'s own alloca, which aborted dsscp in the rebuilder (exit 0xC0000409, ✔MEASURED at the
+// fold-7 build, lane `cs`'s `.temp/probe/sti` and `sti8`). C never reaches it any more (the
+// semantic tier refuses `&l`, and the constrained MIR tier refuses any unfolded initializer),
+// so it is pinned on the unconstrained path. RED-ON-DISABLE: drop the bindings' reset at the
+// initializer's entry (the module lowers "ok" with the foreign operand).
+TEST(MirLoweringC, TheModuleInitializerNeverReachesAnotherFunctionsLocal) {
+    auto L = lowerC("int main(void) { int l = 42; static int *p = &l; return *p; }\n",
+                    "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {},
+                    /*staticInitializersMustFold=*/false);
+    EXPECT_FALSE(L.mir.ok) << "the foreign operand must be refused, not lowered";
+    bool named = false;
+    for (auto const& d : L.mirReporter.all())
+        if (d.code == DiagnosticCode::H_UnsupportedLoweringForKind
+            && d.actual.find("no storage slot") != std::string::npos)
+            named = true;
+    EXPECT_TRUE(named) << "the refusal names the unbound local";
 }

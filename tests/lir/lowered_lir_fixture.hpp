@@ -44,8 +44,7 @@ struct LoweredLir {
     MirToLirResult                   lir;
 };
 
-// ★★★ WHAT THE CALLER CLAIMS ABOUT THIS LOWERING —
-// D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO.
+// ★★★ WHAT THE CALLER CLAIMS ABOUT THIS LOWERING.
 //
 // This fixture used to return a `LoweredLir` and say nothing about it. Three
 // reporters and three `ok` flags travelled inside the struct and NO caller read
@@ -112,8 +111,7 @@ lirFuncInstCount(Lir const& lir, LirFuncId f) {
     return n;
 }
 
-// ★★★ THE REFUSAL — the closing half of
-// D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO.
+// ★★★ THE REFUSAL — the closing half of the vacuity fix described above.
 //
 // TWO independent checks, because the fixture can lose a body in two ways and
 // only ONE of them was the measured defect:
@@ -180,9 +178,7 @@ inline void enforceLoweringExpectation(LoweredLir const& out,
                "wrong reason. Either drive a source this tier lowers, rebuild "
                "the pin on hand-constructed MIR, or — if the refusal IS the "
                "subject — pass LoweringExpectation::Refuses and assert the "
-               "diagnostic CODE.\n"
-               "  Row: "
-               "D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO";
+               "diagnostic CODE.";
         return;
     }
 
@@ -199,9 +195,7 @@ inline void enforceLoweringExpectation(LoweredLir const& out,
                 << "lowerCToLir: HIR carries a function DEFINITION (symbol "
                 << symbol.v
                 << ") that HIR->MIR dropped, with mir.ok true and NO "
-                   "diagnostic. A lowering that produces nothing must say so. "
-                   "Row: "
-                   "D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO";
+                   "diagnostic. A lowering that produces nothing must say so.";
             continue;
         }
         auto const lirFunc = lirFuncForSymbol(out.lir.lir, symbol);
@@ -212,8 +206,7 @@ inline void enforceLoweringExpectation(LoweredLir const& out,
                 << symbol.v
                 << ") that MIR->LIR lowered to NO instructions, with lir.ok "
                    "true and NO diagnostic. Every pin over this function is "
-                   "asserting against an empty instruction list. Row: "
-                   "D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO";
+                   "asserting against an empty instruction list.";
         }
     }
 }
@@ -267,8 +260,13 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    // The LANGUAGE's policy, through the ONE assembly `compile_pipeline.cpp` uses
+    // (`languageMirLoweringConfig`) — the static-initializer constraint and its constant forms
+    // among it. ⚠ P68 round 13 (fold F7): this fixture assembled the config by hand and read
+    // `globalsConstantForms`' default, so its C lowered with C 6.7.9p4's constraint OFF and no
+    // const object's value folding — a lowering the product never does, and the FOURTH miss of
+    // the class the note below records three times (TF-C78 / TF-C81 / TF-C92).
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
     // Thread the SELECTED CC's by-value aggregate + va_list params into MIR
     // lowering, mirroring compile_pipeline.cpp — so a struct-by-value OR a
     // variadic-callee (va_start/va_arg) source lowers through THIS fixture too
@@ -302,7 +300,7 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     // VLA has no bound → fail loud). The intervening maps stay nullptr (defaults).
     //
     // ★★★ `inlineAsmPool` IS THREADED, AND WITHOUT IT NO LIR TEST CAN SEE AN
-    // `__asm__` AT ALL (D-TEST-LIR-FIXTURE-BLIND-TO-INLINE-ASM).
+    // `__asm__` AT ALL — this fixture was blind to inline asm until it was.
     // `lowerToMir`'s own docblock is explicit that `nullptr` is NOT "no asm" — a
     // descriptor-carrying statement reached with no pool is a loud
     // `H_UnsupportedLoweringForKind`, because the alternative (inventing an
@@ -314,8 +312,8 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     // the product and through `compile_pipeline.cpp` while every unit test read a
     // nullptr and saw the feature as absent). Treat updating this call as PART OF
     // adding a map, never as a follow-up.
-    // ★★★ THE FFI MAP, AND WHY IT IS BUILT HERE RATHER THAN PASSED `nullptr`
-    // (D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO).
+    // ★★★ THE FFI MAP, AND WHY IT IS BUILT HERE RATHER THAN PASSED `nullptr` —
+    // a null one is how pins driving this fixture came to measure zero.
     //
     // ⚠⚠ THIS ARGUMENT IS THE ONE MAP IN THIS CALL WHOSE ABSENCE IS NOT A
     // DEFAULT. Every other `nullptr` below means "the source declared no such
@@ -354,7 +352,10 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, &ffiMap,
-                                    /*linkageMap=*/nullptr, /*mutabilityMap=*/nullptr,
+                                    /*linkageMap=*/nullptr,
+                                    // The constrained fold's const input: which object's value
+                                    // a static initializer may read (fold F7, with the config).
+                                    &hir->mutabilityMap,
                                     /*volatileMap=*/nullptr, /*alignmentMap=*/nullptr,
                                     /*threadLocalMap=*/nullptr,
                                     &hir->vlaSizeExprBySymbol,

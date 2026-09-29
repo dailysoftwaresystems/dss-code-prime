@@ -4,7 +4,7 @@
 
 This skill is **client-parameterised**. The client is the real-world corpus under test.
 
-- **Today the only implemented client is `sqlite`** (`real-examples/c/sqlite/`).
+- **Today the only implemented client is `sqlite`** (`.harness-config/runner/actions/real-examples/c/sqlite/`).
 - **If the invocation does not name a client, STOP AND ASK.** Do not default to sqlite —
   the whole point of the parameter is that more clients are coming, and silently picking
   one produces a verdict labelled with the wrong subject.
@@ -15,9 +15,9 @@ A client must supply, at minimum:
 
 | the client provides | sqlite's answer |
 |---|---|
-| a driver pair (one per host family) | `build-and-test.sh` + `build-and-test.ps1` |
+| a driver that runs on every host | `build_and_test.py` |
 | a leg catalogue | `legs.json` |
-| a shared resolver both drivers hard-require | `harness_legs.py` |
+| a resolver the driver hard-requires | `harness_legs.py` |
 | a **CLI** artifact + a smoke gate | `sqlite3` + a 14-assertion smoke |
 | a **UNITS** corpus + a tier | `testfixture` + `veryquick` |
 | a **reference/oracle** build for attribution | gcc-built `reference-testfixture` / `reference-sqlite3` |
@@ -57,13 +57,16 @@ token means a leg vanished without a verdict, which is a harness defect.
 
 ## 3. Running it
 
-Per host, drive the client's own driver. **Do not delegate the runs to an agent** — a
-delegated build agent reliably yields mid-build and leaves an orphaned job. Drive them
-foreground-blocking or via a harness-tracked background command that re-invokes you on exit.
+Drive the client's action through DssHarness: ONE invocation runs the `sqlite` runner's
+`build-and-test` step on every host it declares (Windows, Linux/WSL, macOS, the arm64 VPS — each
+host's release leg, with that leg's own dsscp, which the runner builds first). The tier, the dsscp
+configuration and a single test file are the step's inputs, carried on its command line. **Do not
+delegate the run to an agent** — a delegated build agent reliably yields mid-build and leaves an
+orphaned job. Drive it foreground-blocking or via a harness-tracked background command that
+re-invokes you on exit.
 
 ```bash
-# Linux/WSL, macOS, VPS
-DSS_TIER=veryquick DSS_CONFIG=release bash ./build-and-test.sh
+dssharness run sqlite --input tier=veryquick --input dssConfig=release
 ```
 
 ## 4. Adjudicating the result

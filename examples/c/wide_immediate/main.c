@@ -15,7 +15,7 @@
 //
 //   exit = (196608 >> 12) - 6 = 48 - 6 = 42.
 //
-// audit-residue sweep c2 (D-AUDIT-WITNESS-STRENGTHENING): every value
+// audit-residue sweep c2, which added negCheck(): every value
 // above stops at movk_lsl16 — chunks 2/3 (movk_lsl32 / movk_lsl48)
 // had NO runtime traffic. negCheck() adds it via the width-64
 // NEGATIVE materialization: the sign-extended pattern = chunk0 +

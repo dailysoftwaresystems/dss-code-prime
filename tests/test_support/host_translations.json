@@ -1,0 +1,20 @@
+{
+  "$comment": "OS-PROVIDED TRANSLATION — the hosts whose OWN operating system executes another ISA's images, read by BOTH corpus runners' cross-arch gate (tests/test_support/host_translations.hpp, `crossArchDecision`) BEFORE a manifest is asked for an `emulator`. A manifest's `emulator` names a program the corpus asks a MACHINE to have (qemu-user); a translation here is a property of the HOST PLATFORM, the same for every manifest, so it is declared ONCE and never in each Mach-O manifest it serves (D-TEST-EXAMPLES-X8664-MACHO-ARMS-NEVER-RUN-ON-THE-DARWIN-LEG: before this table no x86_64 Mach-O arm ran anywhere, because the only darwin leg is arm64). KEYS, each row: `hostOs` and `hostArch` in the runners' host vocabulary (`currentHostOs` / `currentHostArch`), `guestArch` in the spec vocabulary (`specTargetArch`), `command` the launcher argv whose argv[0] is a bare program name found on PATH (the sqlite harness's key for the same thing, in its legs.json), and `requires` the prerequisites BEYOND argv[0], in legs.json's own shape — a present launcher whose prerequisite is absent is `SkippedLauncherPrerequisiteMissing`, an ENVIRONMENTAL skip the strict gate turns red, never a silent pass. A row names no manifest, no format and no example.",
+  "translations": [
+    {
+      "$comment": "Apple Silicon runs x86_64 images under Rosetta 2; `arch -x86_64` selects the x86_64 slice and runs it translated — the launcher the sqlite harness already declares for its macho64-x86_64 leg on a darwin/arm64 host. ONE FACT, THREE DECLARATIONS, because three consumers read three schemas: this row (the corpus runners' cross-arch gate), the sqlite harness's macho64-x86_64 launcher (its legs.json) and DssHarness's `emulators.rosetta` (.harness-config/config.json, the leg-readiness witness `legs` runs) — a change to the launcher or its prerequisite is a change to all three. ✔MEASURED 2026-09-24 on the macos-arm64 leg through probe-reference-cc (Apple clang 21.0.0, arm64-apple-darwin25.6.0): /Library/Apple/usr/libexec/oah is a directory there, and a `-arch x86_64` image runs to exit 42.",
+      "hostOs": "darwin",
+      "hostArch": "arm64",
+      "guestArch": "x86_64",
+      "command": ["arch", "-x86_64"],
+      "requires": [
+        {
+          "kind": "directory",
+          "path": "/Library/Apple/usr/libexec/oah",
+          "provides": "the Rosetta 2 translation runtime, without which `arch -x86_64` cannot execute an x86_64 image on Apple Silicon at all",
+          "install": "softwareupdate --install-rosetta --agree-to-license"
+        }
+      ]
+    }
+  ]
+}

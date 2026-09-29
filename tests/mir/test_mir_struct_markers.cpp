@@ -24,7 +24,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
+#include <set>
 #include <span>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -669,8 +672,9 @@ namespace {
 // one-block function is the case a partial-reset bug survives), and so that
 // every ipdom arm is exercised: a real join, the virtual exit, and INVALID
 // (reverse-unreachable, from the infinite loop). Two functions own SELF-LOOPING
-// blocks — the shape that makes a back-edge sweep reach across function
-// boundaries (see ForeignSelfLoopPseudoLoopClaimIsPreserved).
+// blocks — the shape that used to make every function's back-edge sweep reach
+// across function boundaries (SelfLoopIsClaimedOnlyByItsOwnFunction pins that
+// it no longer does).
 struct AdversarialModule {
     Mir                    m;
     std::vector<MirFuncId> funcs;
@@ -749,9 +753,10 @@ AdversarialModule buildAdversarialModule(TypeInterner& interner) {
     }
 
     // f4 — an UNREACHABLE self-looping block whose OTHER successor is a
-    // further unreachable block. This is the shape the whole-module back-edge
-    // sweep turns into a single-block pseudo-loop in EVERY function's
-    // derivation, claiming LoopExit on `gTail` across function boundaries.
+    // further unreachable block. Its OWN function derives a one-block loop
+    // there and claims LoopExit on `gTail` (canon — an unreachable block CAN
+    // come back non-Linear); until the reach was narrowed, EVERY function's
+    // derivation did, across function boundaries.
     MirFuncId const f4 = mb.addFunction(fnSig, SymbolId{5});
     MirBlockId gSelf{}, gTail{};
     {
@@ -769,10 +774,11 @@ AdversarialModule buildAdversarialModule(TypeInterner& interner) {
     // function's FINAL block in the arena. The production candidate builder
     // enumerates the function's contiguous range [first, first+nb); an
     // off-by-one at the range END silently drops exactly this latch, the
-    // whole-module sweep still finds its loop, and every scoped-vs-whole
-    // differential in this file goes red. Until this function existed the
-    // clause was UNEXERCISED: f1's latch is mid-function, and f2's last
-    // block is a self-loop the module index covers regardless of the range.
+    // independent forest below still finds its loop, and the scoped-vs-
+    // independent differential goes red. Until this function existed the
+    // clause was UNEXERCISED: f1's latch is mid-function, and f2's last block
+    // is a self-loop the (since deleted) module self-loop index used to cover
+    // regardless of the range.
     MirFuncId const f5 = mb.addFunction(fnSig, SymbolId{6});
     {
         MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
@@ -860,25 +866,81 @@ AdversarialModule buildAdversarialModule(TypeInterner& interner) {
     return ::testing::AssertionSuccess();
 }
 
-// The candidate set a caller must supply for the scoped sweep to answer what
-// the whole-module sweep answers. Recomputed HERE independently of the
-// production builder (mir_struct_markers.cpp) — a shared helper would make the
-// differential tautological.
+// THE RULE — a function's back-edge sources are its OWN blocks (plus any rpo
+// block outside them, a malformed cross-function edge) — re-derived HERE
+// independently of the production builder `mirBackEdgeCandidates`
+// (mir_dom.cpp): a pin that shares the helper it guards tests the helper, not
+// the property. Nothing of any other function enters.
 std::vector<std::uint32_t> candidateSetFor(Mir const& m, MirFuncId f,
                                            std::vector<MirBlockId> const& rpo) {
     std::vector<std::uint32_t> out;
-    std::uint32_t const bc = static_cast<std::uint32_t>(m.blockCount());
     std::uint32_t const nb = m.funcBlockCount(f);
     for (std::uint32_t bi = 0; bi < nb; ++bi) out.push_back(m.funcBlockAt(f, bi).v);
     for (MirBlockId const b : rpo) out.push_back(b.v);
-    for (std::uint32_t i = 1; i < bc; ++i) {          // the module self-loop index
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+// The module's self-looping blocks, found HERE from the Mir — the fixture
+// premise that makes a cross-function reach observable at all.
+std::vector<std::uint32_t> selfLoopingBlocksOf(Mir const& m) {
+    std::vector<std::uint32_t> out;
+    for (std::uint32_t i = 1; i < m.blockCount(); ++i) {
         MirBlockId const b{i, m.id().v};
         for (MirBlockId const s : m.blockSuccessors(b)) {
             if (s.valid() && s.v == i) { out.push_back(i); break; }
         }
     }
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+// The natural-loop forest of `f`, computed HERE by brute force over EVERY
+// block of the module — independently of the production sweep AND of the
+// production candidate builder — then filtered by `keepSource`. With the rule
+// (`candidateSetFor`) as the filter this is what the production path must
+// answer; with no filter it is what a whole-module sweep answers, which is how
+// the fixture proves it carries foreign pseudo-loops for the rule to exclude.
+// Body = header + backward closure over `preds` from the back-edge sources,
+// skipping `gaveUp` blocks; bodies and loops ascending by slot.
+template <typename KeepSource>
+std::vector<MirNaturalLoop> bruteForceForest(Mir const& m, MirDomTree const& dom,
+        std::vector<std::vector<MirBlockId>> const& preds, KeepSource&& keepSource) {
+    std::uint32_t const bc = static_cast<std::uint32_t>(m.blockCount());
+    std::map<std::uint32_t, std::vector<MirBlockId>> byHeader;
+    for (std::uint32_t i = 1; i < bc; ++i) {
+        if (!keepSource(i)) continue;
+        if (i < dom.gaveUp.size() && dom.gaveUp[i]) continue;
+        MirBlockId const u{i, m.id().v};
+        for (MirBlockId const s : m.blockSuccessors(u)) {
+            if (!s.valid() || s.v >= bc) continue;
+            if (mirDominatesBlock(s, u, dom) == MirDomResult::Dominates) {
+                byHeader[s.v].push_back(u);
+            }
+        }
+    }
+    std::vector<MirNaturalLoop> out;
+    for (auto const& [h, sources] : byHeader) {
+        MirNaturalLoop loop;
+        loop.header = MirBlockId{h, m.id().v};
+        loop.backEdgeSources = sources;
+        std::set<std::uint32_t> body{h};
+        std::vector<MirBlockId> work;
+        for (MirBlockId const b : sources) {
+            if (body.insert(b.v).second) work.push_back(b);
+        }
+        while (!work.empty()) {
+            MirBlockId const n = work.back();
+            work.pop_back();
+            if (n.v >= preds.size()) continue;
+            for (MirBlockId const p : preds[n.v]) {
+                if (p.v < dom.gaveUp.size() && dom.gaveUp[p.v]) continue;
+                if (body.insert(p.v).second) work.push_back(p);
+            }
+        }
+        for (std::uint32_t const s : body) loop.body.push_back(MirBlockId{s, m.id().v});
+        out.push_back(std::move(loop));
+    }
     return out;
 }
 
@@ -990,23 +1052,39 @@ TEST(MirPostDomScratchReuseDeathTest, StaleScratchAcrossModulesAborts) {
                  "stale scratch across a rebuild");
 }
 
-// D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN. The scoped back-edge sweep must answer
-// EXACTLY what the whole-module sweep answers — same loops, same bodies, same
-// back-edge-source ORDER — for every function of the adversarial module.
-TEST(MirNaturalLoopsScopedSweep, MatchesWholeModuleSweepForEveryFunction) {
+// D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN + D-MIR-STRUCTCF-DERIVATION-REACHES-PAST-THE-FUNCTION.
+// The PRODUCTION path — `mirBackEdgeCandidates` feeding the scoped sweep — must
+// answer EXACTLY the function's forest under the rule — same loops, same
+// bodies, same back-edge-source ORDER — for every function of the adversarial
+// module, against a brute force over EVERY module block written here. The
+// premise arm keeps it honest: without the rule's filter the brute force DOES
+// find foreign pseudo-loops in this fixture, so the equality is not vacuous.
+TEST(MirNaturalLoopsScopedSweep, MatchesTheIndependentForestForEveryFunction) {
     TypeInterner interner{CompilationUnitId{1}};
     AdversarialModule a = buildAdversarialModule(interner);
     auto const preds = mirBuildPredecessors(a.m);
+    std::size_t functionsWithForeignPseudoLoops = 0;
+    std::vector<std::uint32_t> produced;
     for (MirFuncId const f : a.funcs) {
         MirBlockId const entry = a.m.funcEntry(f);
         auto const rpo = mirReversePostOrder(a.m, entry);
         MirDomTree const dom = computeMirDomTree(a.m, entry, rpo, preds);
-        auto const cands = candidateSetFor(a.m, f, rpo);
-        auto const wholeModule = mirNaturalLoops(a.m, dom, preds);
+        mirBackEdgeCandidates(a.m, f, rpo, produced);
         auto const scoped = mirNaturalLoops(
-            a.m, dom, preds, std::span<std::uint32_t const>(cands.data(), cands.size()));
-        EXPECT_TRUE(loopForestEqual(wholeModule, scoped)) << "func #" << f.v;
+            a.m, dom, preds, std::span<std::uint32_t const>(produced.data(), produced.size()));
+        auto const rule = candidateSetFor(a.m, f, rpo);
+        auto const expected = bruteForceForest(a.m, dom, preds, [&](std::uint32_t s) {
+            return std::binary_search(rule.begin(), rule.end(), s);
+        });
+        EXPECT_TRUE(loopForestEqual(expected, scoped)) << "func #" << f.v;
+        auto const unfiltered =
+            bruteForceForest(a.m, dom, preds, [](std::uint32_t) { return true; });
+        if (unfiltered.size() > expected.size()) ++functionsWithForeignPseudoLoops;
     }
+    EXPECT_EQ(functionsWithForeignPseudoLoops, a.funcs.size())
+        << "premise: f2 and f4 each own a self-looping block, so a whole-module "
+           "sweep of EVERY function — the two owners included — finds at least "
+           "one OTHER function's self-loop for the rule to exclude";
 }
 
 // The scoped overload's ascending-unique-in-range contract is what fixes
@@ -1072,7 +1150,7 @@ TEST(StructCfDerivation, LatchLastBlocksBackEdgeIsInTheCandidateRange) {
            "an exit)";
     // Rule 3: `exit` is the target of the loop-EXITING edge (header→exit,
     // a body block to a non-body block) — the same rule that claims gTail in
-    // ForeignSelfLoopPseudoLoopClaimIsPreserved. Under the range-end mutant
+    // SelfLoopIsClaimedOnlyByItsOwnFunction. Under the range-end mutant
     // the natural loop vanishes, so BOTH this and the LoopHeader claim above
     // fall through to the if/linear vocabulary.
     EXPECT_EQ(derived[exit.v],   StructCfMarker::LoopExit);
@@ -1081,38 +1159,54 @@ TEST(StructCfDerivation, LatchLastBlocksBackEdgeIsInTheCandidateRange) {
 // `mirDominatesBlock(s, u, dom)` short-circuits to Dominates when s.v == u.v,
 // BEFORE consulting the tree — so a SELF-LOOPING block registers as a
 // back-edge source even in a function whose dominator tree knows nothing about
-// it. The whole-module sweep therefore manufactures a single-block pseudo-loop
-// for every self-looping block in the MODULE, in EVERY function's derivation,
-// and rule 3 claims LoopExit on its non-self successors.
+// it. Until 2026-09-18 every function's candidate set carried the module's
+// self-looping blocks, so every derivation manufactured a one-block pseudo-loop
+// for each of them and rule 3 claimed LoopExit in slots owned by OTHER
+// functions (D-MIR-STRUCTCF-DERIVATION-REACHES-PAST-THE-FUNCTION, now closed).
 //
-// This pins that behaviour EXACTLY, because the scoped sweep must reproduce
-// it: RED if the module self-loop index is dropped from the candidate set.
+// ★ THIS IS THE FLIPPED RED ARM THAT ROW RESERVED. It used to pin the reach
+// (`ForeignSelfLoopPseudoLoopClaimIsPreserved`); it now pins its absence: RED if
+// a block of any other function re-enters a function's back-edge sweep.
 //
-// It is also the pin for a documented-spec divergence: mir_struct_markers.hpp
-// says unreachable blocks stay Linear, and `gTail` here is unreachable and
-// derives LoopExit. The behaviour is canon until the derivation rules change
-// deliberately — this test is what makes that change a DECISION rather than an
-// accident (D-MIR-STRUCTCF-UNREACHABLE-BLOCK-CLAIMED).
-TEST(StructCfDerivation, ForeignSelfLoopPseudoLoopClaimIsPreserved) {
+// ★ AND IT KEEPS THE CANON IT SHARES A FIXTURE WITH
+// (D-MIR-STRUCTCF-UNREACHABLE-BLOCK-CLAIMED): `gTail` is UNREACHABLE, and its OWN
+// function still derives it LoopExit through its own unreachable self-loop —
+// so the applier still stamps it. Narrowing moved what OTHER functions claim,
+// never what a function claims in its own blocks.
+TEST(StructCfDerivation, SelfLoopIsClaimedOnlyByItsOwnFunction) {
     TypeInterner interner{CompilationUnitId{1}};
     AdversarialModule a = buildAdversarialModule(interner);
 
-    // Deriving the TRIVIAL one-block function claims a slot that belongs to a
-    // DIFFERENT function, five functions later.
+    // Deriving the TRIVIAL one-block function claims nothing outside it — in
+    // particular not the slot of a self-loop exit five functions later.
     auto const derivedForTrivial = deriveStructCfMarkers(a.m, a.trivialFunc);
     ASSERT_LT(a.gTail.v, derivedForTrivial.size());
-    EXPECT_EQ(derivedForTrivial[a.gTail.v], StructCfMarker::LoopExit)
-        << "the module-wide back-edge sweep reaches out of the function being "
-           "derived; the scoped sweep must reproduce it";
-    EXPECT_EQ(derivedForTrivial[a.gSelf.v], StructCfMarker::Linear)
-        << "the pseudo-loop's own block is IN its body, so it is not an exit";
+    EXPECT_EQ(derivedForTrivial[a.gTail.v], StructCfMarker::Linear)
+        << "deriving one function must not claim a slot another function owns";
+    EXPECT_EQ(derivedForTrivial[a.gSelf.v], StructCfMarker::Linear);
 
-    // And the owning function derives the same thing for those slots.
+    // EVERY function, EVERY slot outside its own contiguous range: Linear.
+    for (MirFuncId const f : a.funcs) {
+        auto const derived = deriveStructCfMarkers(a.m, f);
+        std::uint32_t const first  = a.m.funcBlockAt(f, 0).v;
+        std::uint32_t const lastEx = first + a.m.funcBlockCount(f);
+        for (std::uint32_t s = 0; s < derived.size(); ++s) {
+            if (s >= first && s < lastEx) continue;
+            EXPECT_EQ(derived[s], StructCfMarker::Linear)
+                << "func #" << f.v << " derived " << structCfMarkerName(derived[s])
+                << " into slot " << s << ", which another function owns";
+        }
+    }
+
+    // The OWNER still claims its own unreachable self-loop's exit (canon).
     auto const derivedForOwner = deriveStructCfMarkers(a.m, a.selfLoopFunc);
-    EXPECT_EQ(derivedForOwner[a.gTail.v], StructCfMarker::LoopExit);
-    EXPECT_EQ(derivedForOwner[a.gSelf.v], StructCfMarker::Linear);
+    EXPECT_EQ(derivedForOwner[a.gTail.v], StructCfMarker::LoopExit)
+        << "an unreachable block of the function itself stays claimed "
+           "(D-MIR-STRUCTCF-UNREACHABLE-BLOCK-CLAIMED)";
+    EXPECT_EQ(derivedForOwner[a.gSelf.v], StructCfMarker::Linear)
+        << "the loop's own block is IN its body, so it is not an exit";
 
-    // …so the module-wide applier STAMPS an unreachable block LoopExit.
+    // …so the module-wide applier still STAMPS that unreachable block LoopExit.
     rederiveStructCfMarkers(a.m);
     EXPECT_EQ(a.m.blockMarker(a.gTail), StructCfMarker::LoopExit);
     EXPECT_EQ(a.m.blockMarker(a.gSelf), StructCfMarker::Linear);
@@ -1120,9 +1214,9 @@ TEST(StructCfDerivation, ForeignSelfLoopPseudoLoopClaimIsPreserved) {
 
 // The module-wide applier and the one-function applier must agree block for
 // block. They share a derivation core but reach it differently — the module
-// path hoists the self-loop index and REUSES one post-dominator scratch across
-// every function, the per-function path builds both fresh. This is the
-// end-to-end differential over both.
+// path REUSES one post-dominator scratch and one candidate buffer across every
+// function, the per-function path builds both fresh. This is the end-to-end
+// differential over both.
 TEST(StructCfDerivation, ModuleWideAndPerFunctionAppliersAgree) {
     TypeInterner interner{CompilationUnitId{1}};
     AdversarialModule wide = buildAdversarialModule(interner);
@@ -1139,56 +1233,62 @@ TEST(StructCfDerivation, ModuleWideAndPerFunctionAppliersAgree) {
     }
 }
 
-// ══ P36: THE TWO SUBSTRATE-REUSE PINS THE SECOND CALLER MADE NECESSARY ══════
+// ══ P36: THE SUBSTRATE-REUSE PIN THE SECOND CALLER MADE NECESSARY ══════════
 //
-// `mirBackEdgeCandidates` and `mirModuleSelfLoopBlocks` used to be private to
-// mir_struct_markers.cpp. They are now exported from mir_dom.hpp because the
-// SECOND caller that needed them — `opt::passes::runLicm`, which asked for the
-// loop forest once per FUNCTION through the whole-module overload — could not
-// reach them and silently kept the O(functions × module blocks) sweep
-// (D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN). Exporting the builder finally
-// makes the differential the P9 self-audit wanted possible: until now every
-// scoped-vs-whole comparison in this file fed the TEST's independent
-// `candidateSetFor`, while BOTH production appliers shared the production
-// builder — so a range bug agreed with itself and only the LATCH-LAST VALUE pin
-// could see it.
+// `mirBackEdgeCandidates` used to be private to mir_struct_markers.cpp. It is
+// exported from mir_dom.hpp because the SECOND caller that needed it —
+// `opt::passes::runLicm`, which asked for the loop forest once per FUNCTION
+// through a whole-module sweep — could not reach it and silently kept the
+// O(functions × module blocks) sweep (D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN).
+// Exporting the builder is what makes a production-builder differential
+// possible at all: before it, every comparison in this file fed the TEST's own
+// candidate set while BOTH production appliers shared the production builder —
+// so a range bug agreed with itself and only the LATCH-LAST VALUE pin could see
+// it.
 
-// The production builder against this file's independent one, for EVERY
-// function. A range-end off-by-one (`s < lastEx - 1`), a missing `first`
-// offset, a dropped rpo-outlier or a dropped self-loop index each move exactly
-// one set and not the other.
+// The production builder against this file's independent statement of THE
+// RULE, for EVERY function. A range-end off-by-one (`s < lastEx - 1`), a
+// missing `first` offset, a dropped rpo-outlier, or ANY block of another
+// function let in each move exactly one set and not the other.
 TEST(MirBackEdgeCandidates, ProductionBuilderMatchesTheIndependentTestSet) {
     TypeInterner interner{CompilationUnitId{1}};
     AdversarialModule a = buildAdversarialModule(interner);
-    std::vector<std::uint32_t> selfLoops;
-    mirModuleSelfLoopBlocks(a.m, selfLoops);
-    // The index is a MODULE property, and this module was built to have one.
-    EXPECT_FALSE(selfLoops.empty())
-        << "the fixture's self-looping blocks are what make the completeness "
-           "clause observable at all";
+    // Premise, found independently: the module HAS self-looping blocks (f2's
+    // and f4's), so a builder that lets them into OTHER functions' sets — the
+    // reach D-MIR-STRUCTCF-DERIVATION-REACHES-PAST-THE-FUNCTION closed — is
+    // observable in this fixture.
+    std::vector<std::uint32_t> const selfLooping = selfLoopingBlocksOf(a.m);
+    ASSERT_EQ(selfLooping.size(), 2u);
     std::vector<std::uint32_t> produced;
     for (MirFuncId const f : a.funcs) {
         auto const rpo = mirReversePostOrder(a.m, a.m.funcEntry(f));
-        mirBackEdgeCandidates(a.m, f, rpo,
-                              std::span<std::uint32_t const>{selfLoops}, produced);
+        mirBackEdgeCandidates(a.m, f, rpo, produced);
         EXPECT_EQ(produced, candidateSetFor(a.m, f, rpo)) << "func #" << f.v;
-        // The whole point of the scoped sweep: the set is O(function), never
-        // O(module). Asserted as a COUNT, not a clock — a regression to the
-        // whole-module sweep makes this a module-sized set.
-        EXPECT_LT(produced.size(), a.m.blockCount())
-            << "func #" << f.v << " — a candidate set as large as the module "
-               "IS the quadratic sweep coming back";
+        // The set is the function's OWN blocks — O(function), never O(module),
+        // and exactly `funcBlockCount` here (the fixture has no cross-function
+        // edge). Asserted as a COUNT, not a clock.
+        EXPECT_EQ(produced.size(), a.m.funcBlockCount(f))
+            << "func #" << f.v << " — every candidate beyond the function's own "
+               "blocks belongs to ANOTHER function";
+        std::uint32_t const first  = a.m.funcBlockAt(f, 0).v;
+        std::uint32_t const lastEx = first + a.m.funcBlockCount(f);
+        for (std::uint32_t const s : selfLooping) {
+            if (s >= first && s < lastEx) continue;   // the function's own
+            EXPECT_FALSE(std::binary_search(produced.begin(), produced.end(), s))
+                << "func #" << f.v << "'s sweep includes self-looping block " << s
+                << " of ANOTHER function";
+        }
     }
 }
 
 // D-PERF-VERIFIER-REESTABLISHES-MODULE-SUBSTRATES-PER-FUNCTION. One
 // `MirStructCfScratch`, an adversarial SEQUENCE (forward, then reversed, then a
 // repeat), and a FULL module-sized marker-vector comparison against the
-// per-call overload after EVERY call. The bundle carries the self-loop index
-// AND the post-dominator scratch across functions, so a reset this file cannot
-// see would show up HERE as one function's derivation contaminating the next —
-// which is why the order deliberately runs a big function straight into a
-// one-block one.
+// per-call overload after EVERY call. The bundle carries the post-dominator
+// scratch AND the candidate buffer across functions, so a reset this file
+// cannot see would show up HERE as one function's derivation contaminating the
+// next — which is why the order deliberately runs a big function straight into
+// a one-block one.
 TEST(MirStructCfScratchReuse, MatchesPerCallOverAdversarialSequence) {
     TypeInterner interner{CompilationUnitId{1}};
     AdversarialModule a = buildAdversarialModule(interner);
@@ -1215,9 +1315,10 @@ TEST(MirStructCfScratchReuse, MatchesPerCallOverAdversarialSequence) {
     }
 }
 
-// The bundle's self-loop index belongs to the module it was swept over. Serving
-// it for a different module is a WRONG loop forest, not a slow one — so the
-// reuse guard fails loud, the MirDomScratch / MirPostDomScratch pattern.
+// The bundle's post-dominator buffers belong to the module it was bound to.
+// Serving them for a different module is a caller bug, so the reuse guard fails
+// loud at the level the caller holds, the MirDomScratch / MirPostDomScratch
+// pattern.
 TEST(MirStructCfScratchReuseDeathTest, StaleScratchAcrossModulesAborts) {
     TypeInterner interner{CompilationUnitId{1}};
     AdversarialModule a = buildAdversarialModule(interner);

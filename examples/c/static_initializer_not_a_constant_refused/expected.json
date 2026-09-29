@@ -1,0 +1,36 @@
+{
+  "$comment": "P68 round 13 (lane `cs`, D-C-A-STATIC-INITIALIZER-THAT-IS-NOT-A-CONSTANT-EXPRESSION-IS-ACCEPTED): C 6.7.9p4 — an initializer of an object of static or thread storage duration takes only constant expressions and string literals. Three that provably are not: a non-const object's value (file scope), the same as an aggregate element, and a local's address in a block-scope `static` — the input that ABORTED the compiler before this round (MirFunctionRebuilder fatal, exit 0xC0000409), while the first two were BUILT silently. Each is now S_StaticInitializerNotConstant at the construct, on every target. MEASURED 2026-09-24 through `dssharness run probe-reference-cc` (lane `cs`'s batch runs 20260925-023301-54d7ccff on linux-x86_64-debug — gcc 13.3.0, clang 18.1.3 — and 20260925-023324-83d948e4 on windows-x86_64-debug — mingw-w64 13.2.0; AppleClang 21.0.0 on macos-arm64-release, run 20260925-030327-b1170b39, agrees with clang 18.1.3 throughout), this file at -std=c17 -pedantic-errors and at -std=c2x: every run refuses all three (gcc: 6:9, 7:17 and 11:21, \"initializer element is not constant\").",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "S_StaticInitializerNotConstant",
+      "line": 6,
+      "col": 9
+    },
+    {
+      "code": "S_StaticInitializerNotConstant",
+      "line": 7,
+      "col": 17
+    },
+    {
+      "code": "S_StaticInitializerNotConstant",
+      "line": 11,
+      "col": 22
+    }
+  ]
+}

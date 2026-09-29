@@ -1,0 +1,15 @@
+{
+  "$comment": "D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS — the `_Complex` values an FP-class asm register carries that CLANG carries and gcc refuses: the clang-witnessed half of the corpus (the gcc-witnessed half is `asm_value_operand_carriage_arm64` / `_x86_64`). A `_Complex` lives in MEMORY in this compiler's middle end; bound to an FP register constraint it must reach the template as its VALUE — before the fix a `_Complex` operand was handed its ADDRESS. On x86_64 a `_Complex float` rides one XMM register in each direction (exit 11..13) and a `_Complex double` is WRITTEN into one XMM register, all 16 bytes (14); on aarch64 a `_Complex double` is WRITTEN into one Q register (14). clang 18.1.3 runs the file to 42 at -O0 and -O2, natively and under qemu-aarch64; gcc 13.3.0 refuses every shape (\"inconsistent operand constraints\" on x86_64 `\"x\"`; aarch64 `\"=w\"` exhausts its reloads). The x86_64 `_Complex double` shape is also the witness that `movaps` names a 128-bit XMM operand: its encoding was declared width-agnostic, and the asm engine refused every 128-bit use until the x86_64 target keyed it. RED-ON-DISABLE: drop the `_Complex` entries from `asmValueCarriage` and every shape is refused by name.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

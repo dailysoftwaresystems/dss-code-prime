@@ -1,5 +1,5 @@
 {
-  "$comment": "D-ML7-2.10 (fixed by FC7 C1b per-class Arg ordinals): mix(int a, double b, int c) places the double in xmm0 + the ints in rdi/rsi (per-class), not the buggy global-index placement (double->xmm1). 10+20+12=42 via non-inlined mk*. SysV (per-class counters) — x86_64-ELF.",
+  "$comment": "D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA (fixed by FC7 C1b per-class Arg ordinals): mix(int a, double b, int c) places the double in xmm0 + the ints in rdi/rsi (per-class), not the buggy global-index placement (double->xmm1). 10+20+12=42 via non-inlined mk*. SysV (per-class counters) — x86_64-ELF.",
   "language": "c",
   "source": "main.c",
   "exitCode": 42,

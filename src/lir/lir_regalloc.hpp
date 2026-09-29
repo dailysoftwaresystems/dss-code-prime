@@ -217,6 +217,35 @@ struct DSS_EXPORT LirFuncAllocation {
     std::uint32_t                 coalescedCopies     = 0;
     std::uint32_t                 coalescedSpillSlots = 0;
 
+    // ── THE COALESCER'S OWN WORK, SO ITS COMPLEXITY IS PINNABLE ─────────────
+    //
+    // ★★★ D-LIR-COALESCE-ANTI-AFFINITY-QUERY-IS-QUADRATIC. Forbidden-pair
+    // inspections the anti-affinity veto performed while building the
+    // partition. It is the same kind of OBSERVATION as the two counters above
+    // — nothing reads it to choose anything — and it exists for one reason: the
+    // veto was Θ(edges x forbidden) and nothing could see it.
+    //
+    // ⚠ **A COUNTER, DELIBERATELY, AND NOT A STOPWATCH.** A wall-clock
+    // performance assertion is sized on the machine that wrote it and reds on
+    // the slowest leg that runs it, naming the wrong event;
+    // `.harness-config/runner/actions/check-wall-clock-in-tests/` refuses new ones for exactly that
+    // reason. This number is the ALGORITHM'S OWN WORK: it is identical on every
+    // host, under every load, in Debug and Release, so a test may assert its
+    // GROWTH RATIO between two input sizes and that assertion reds on a genuine
+    // complexity regression and on nothing else.
+    //
+    // ⚠ `…Queries` is how many times the veto was ASKED; `…Probes` is how many
+    // forbidden pairs it INSPECTED to answer. The predecessor's flat scan made
+    // `probes == queries × |forbidden|`; the incidence index routinely answers a
+    // query by inspecting NOTHING, because a straddling pair is incident to BOTH
+    // classes and an empty list on either side settles it. So `probes == 0` is a
+    // legitimate reading, and a pin that saw only `probes` could not tell it
+    // apart from "the veto is no longer consulted at all" — which would be a
+    // correctness regression wearing a performance win's clothes. The claim is
+    // `queries > 0` AND `probes = O(|forbidden|)`, and it takes both numbers.
+    std::uint64_t                 coalesceAntiAffinityQueries = 0;
+    std::uint64_t                 coalesceAntiAffinityProbes  = 0;
+
     // ── THE SPILL-RELOAD SCRATCH RESERVATION, AS ASKED FOR AND AS ACHIEVED ──
     //
     // ★★★ D-AS-REGALLOC-SCRATCH-POOL-EXHAUSTED-BY-A-LARGE-FUNCTION-IN-RELEASE.
@@ -358,7 +387,7 @@ struct DSS_EXPORT LirAllocation {
 // this compile. The allocator records it on every produced
 // `LirFuncAllocation`; `materializeCallingConvention` reads it back
 // to look up the structured cc and emit the right prologue/epilogue.
-// Pre-D-FF3-3 every function was hardcoded to index 0 — silent
+// Pre-D-FF3-3-RESOLVED-CC-INDEX-THREADED every function was hardcoded to index 0 — silent
 // miscompile on non-default-cc targets (e.g. PE64 + x86_64 silently
 // dispatched to sysv_amd64 instead of ms_x64).
 [[nodiscard]] DSS_EXPORT LirAllocation
@@ -377,7 +406,7 @@ allocateRegisters(Lir const&          lir,
 //
 // Post-fold-#5 code-reviewer-#82 fold: the parameter is REQUIRED (no
 // default) so a future caller cannot accidentally inherit the
-// pre-D-FF3-3 `0` hardcode silently. Test callers pass `0` explicitly
+// pre-D-FF3-3-RESOLVED-CC-INDEX-THREADED `0` hardcode silently. Test callers pass `0` explicitly
 // when the test fixture's target ships a single cc (cc[0] is then
 // the only valid choice).
 [[nodiscard]] DSS_EXPORT LirFuncAllocation

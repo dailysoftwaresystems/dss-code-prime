@@ -40,6 +40,76 @@ constexpr std::uint8_t kX86RegFieldBits = 4;
 // minimal.)
 using walker_util::PendingRelocSlot;
 
+// ─────────────────────────────────────────────────────────────────────
+// [[D-CSUBSET-LONG-BRANCH]] — THE ISLAND BODY, QUOTED FROM THIS CONFIG
+// ─────────────────────────────────────────────────────────────────────
+//
+// ★★★ THIS WALKER NEEDS NO "ELECTION" IN THE SENSE THE ROW MEANT, AND SAYING
+// SO IS HALF THE FIX. The row's (c) reads as missing machinery: `x86_variable`
+// "has no election and no WORD vocabulary to elect from". It does not need
+// one, because the bytes an island is made of are ALREADY WRITTEN DOWN in the
+// two rows that branch — `jmp`'s `template.opcode: [0xE9]`, and `jcc`'s
+// wire-1 `prefixOpcodeBytes: [0xE9]`, each immediately followed by the
+// `block.rel32` field. "Those bytes, then a block-relative field" IS an island
+// body verbatim. What was missing is that nobody carried it to the resolver.
+//
+// ⚠ TWO PLACES A SELF-CONTAINED UNCONDITIONAL BRANCH CAN BE DECLARED, AND
+// BOTH ARE READ:
+//
+//   * a wire with `prefixOpcodeBytes` — those bytes are emitted immediately
+//     before this wire's displacement and after everything the variant's
+//     earlier wires emitted, so prefix + displacement is a whole instruction
+//     by construction, whatever precedes it. This is jcc's trailing `E9`.
+//   * the variant's OWN `opcodeBytes`, when the variant is nothing but those
+//     bytes plus this one block-relative wire: no ModR/M (`modrmRegExt`
+//     absent and no ModR/M-family wire), no result placement, no cond nibble,
+//     no prefixes, no immediate. This is the one-byte `jmp` row.
+//
+// ⚠ AND THE OPCODE MUST DECLARE ITSELF UNCONDITIONAL for the second form, for
+// the same reason the `fixed32` election asks: the second form quotes the
+// variant's LEADING bytes, and on a conditional opcode those bytes ARE the
+// condition. Control reaches an island only through a branch aimed at it, so a
+// conditional island could fall out of its bottom into the next island — valid
+// bytes, wrong destination, no diagnostic. `terminatorKind == Br` is the
+// config's own sentence for "transfers control unconditionally". The first
+// form needs no such test: a wire's prefix bytes are a SECOND instruction
+// inside a macro, and the macro's conditional half is the part before them.
+[[nodiscard]] inline walker_util::BranchIslandBody
+electIslandBody(TargetOpcodeInfo const& info) {
+    constexpr std::uint8_t kRel32Bytes = 4;
+    bool const opcodeIsUnconditionalBranch =
+        info.terminatorKind == TargetTerminatorKind::Br;
+    auto quote = [](std::span<std::uint8_t const> lead)
+        -> walker_util::BranchIslandBody {
+        walker_util::BranchIslandBody body;
+        if (lead.empty()
+         || lead.size() + kRel32Bytes > walker_util::kMaxBranchIslandBytes)
+            return {};
+        for (std::size_t i = 0; i < lead.size(); ++i)
+            body.bytes[i] = lead[i];
+        body.byteCount   = static_cast<std::uint8_t>(lead.size() + kRel32Bytes);
+        body.fieldOffset = static_cast<std::uint8_t>(lead.size());
+        body.kind        = walker_util::BlockRelPatchKind::X86Rel32;
+        return body;
+    };
+    for (auto const& variant : info.encoding.variants) {
+        for (auto const& wire : variant.wires) {
+            if (wire.slotKind != EncodingSlotKind::BlockRel32) continue;
+            if (!wire.prefixOpcodeBytes.empty())
+                return quote(wire.prefixOpcodeBytes);
+            if (!opcodeIsUnconditionalBranch)            continue;
+            if (variant.wires.size() != 1)               continue;
+            if (variant.resultSlot.has_value())          continue;
+            if (variant.tmpl.condCodeFromPayload)        continue;
+            if (variant.tmpl.modrmRegExt.has_value())    continue;
+            if (!variant.tmpl.mandatoryPrefix.empty())   continue;
+            if (variant.tmpl.payloadBytePrefix)          continue;
+            return quote(variant.tmpl.opcodeBytes);
+        }
+    }
+    return {};
+}
+
 // State accumulated while emitting one variant: the 3-bit codes
 // destined for ModR/M.reg / ModR/M.rm + their high bits for REX.R /
 // REX.B, plus the immediate(s) and pending symbol-relative slot
@@ -62,7 +132,7 @@ struct EncodingState {
     bool                  rexR       = false;   // high bit of ModRmReg slot's hwEncoding
     bool                  rexB       = false;   // high bit of ModRmRm slot's hwEncoding
     // `rexX` carries the SIB.index high bit. Set by the `SibIndex`
-    // slot's wiring (D-AS4-5 closure 2026-06-01) from the index reg
+    // slot's wiring (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL closure 2026-06-01) from the index reg
     // hwEncoding bit 3. Stays false on no-index forms (the SIB byte
     // emits index=4 = no-index marker).
     bool                  rexX       = false;
@@ -93,7 +163,7 @@ struct EncodingState {
     // ModR/M-mem + missing-Disp32Mem pairing fail loud rather than
     // silently emitting a zero offset.
     std::optional<std::int32_t> disp32Mem;
-    // SIB.index slot (D-AS4-5). Set when a `SibIndex` wire fires;
+    // SIB.index slot (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL). Set when a `SibIndex` wire fires;
     // `optional` is the written-bit — same pattern as `disp32Mem`
     // (code-simplifier REQUIRED post-fold #1: dropped the redundant
     // `wroteSibIndex` flag).
@@ -145,6 +215,17 @@ struct EncodingState {
     // literal + a reloc in one variant fails loud (validate() rejects
     // the schema; the emit-time check is the defense-in-depth half).
     std::optional<PendingRelocSlot> memRelocDisp32;
+    // ★★ THE PROGRAM COUNTER IS THIS MEMORY OPERAND'S BASE
+    // (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the base wire named the
+    // target's `pcRelativeMemoryBase` register, so ModR/M takes the mod=00
+    // rm=101 form and the displacement — a number or a relocation — is
+    // relative to the NEXT instruction. Distinct from `RipRelDisp32`'s mode,
+    // which is reached from a bare `SymbolRef` and emits its field last.
+    bool pcRelativeBase = false;
+    // A SYMBOLIC displacement (`MemSymbolOffset`): its symbol and the constant
+    // written after it. Resolved to `memRelocDisp32` once the base is known,
+    // because the relocation kind depends on the base.
+    std::optional<LirSymbolAddress> symbolicDisplacement;
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): pending
     // intra-function block-relative branch targets. Each entry
     // emits its `prefixBytes` then 4 zero placeholder bytes,
@@ -250,7 +331,7 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             st.rexB           = (hwEnc & 0x8u) != 0u;
             return true;
         case EncodingSlotKind::SibIndex:
-            // D-AS4-5 indexed addressing: the index register's low 3
+            // D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL indexed addressing: the index register's low 3
             // bits fill SIB.index; the high bit drives REX.X. With-
             // index forces a SIB byte unconditionally (independent of
             // the rsp/r12 force-presence rule for no-index).
@@ -341,10 +422,18 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         case EncodingSlotKind::Imm32MovzMovk:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
+        // [[D-CSUBSET-LONG-BRANCH]]: the TBZ/TBNZ imm14 is a fixed32 bit-window
+        // slot, like Imm19.
+        case EncodingSlotKind::Imm14:
         // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the inverted-imm16
         // (complement-immediate) slot is fixed32, like Imm16 whose window it
         // shares.
         case EncodingSlotKind::Imm16Inverted:
+        // P68 round 8: the AdvSIMD element `imm5` is a fixed32 bit-window.
+        case EncodingSlotKind::ElementIndex:
+        // P68 round 9: the one-word ADR's block field and its addend.
+        case EncodingSlotKind::AdrImm21:
+        case EncodingSlotKind::BlockAddend:
             // Other shapes — the fixed32 register/immediate slots plus
             // the symbol-bearing Disp32, none handled by the x86
             // register-wiring walker. slotShapeFor + validate's cross-
@@ -501,9 +590,9 @@ wireImm64(EncodingState& st, EncodingSlotKind slot, std::uint64_t v,
     return true;
 }
 
-// D-AS4-1 + D-AS4-5 memory-addressing: validate a MemBase operand's
+// D-AS4-1 + D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL memory-addressing: validate a MemBase operand's
 // scale and store the SIB.scale exponent for emission. Scale ∈
-// {1,2,4,8} (D-AS4-5 generalisation from cycle-1's scale==1-only).
+// {1,2,4,8} (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL generalisation from cycle-1's scale==1-only).
 // The slot writes no bytes directly; the exponent feeds the SIB
 // byte when a `SibIndex` is also wired (or the existing rsp/r12
 // force-presence rule fires on no-index).
@@ -846,6 +935,48 @@ bool encode(Lir const&                  lir,
                                           encodingSlotKindName(wire.slotKind),
                                           reporter);
             if (!hw.has_value()) return false;
+            // ★★★ THE PROGRAM COUNTER AS A MEMORY BASE
+            // (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER). The target
+            // lists the fields that take it (`pcRelativeMemoryBase`), and the
+            // ModR/M rule is this format's: mod=00 with rm = the register's
+            // encoding (101) is `[rip + disp32]`, a 32-bit displacement from
+            // the NEXT instruction — never the mod=10 base form `wireSlot`
+            // would pick, which with rm=101 addresses through RBP.
+            // ⚠ ANYWHERE ELSE THE REGISTER IS REFUSED, and here rather than
+            // only at the election: its number is RBP's, so a field that took
+            // it would silently encode RBP.
+            if (srcOp.reg.isPhysical != 0
+                && schema.pcRelativeMemoryBase() != nullptr
+                && schema.pcRelativeMemoryBase()->registerOrdinal
+                       == static_cast<std::uint16_t>(srcOp.reg.id)) {
+                if (!schema.isPcRelativeMemoryBase(
+                        static_cast<std::uint16_t>(srcOp.reg.id),
+                        wire.slotKind)) {
+                    report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': field '{}' names the "
+                                       "program counter, which this target "
+                                       "admits only as the base of a memory "
+                                       "operand ('pcRelativeMemoryBase') — its "
+                                       "encoding is another register's in "
+                                       "every other field",
+                                       info->mnemonic,
+                                       encodingSlotKindName(wire.slotKind)));
+                    return false;
+                }
+                if (rejectDoubleWrite(st.wroteModRmRm, info->mnemonic,
+                                      "ModR/M.rm (the program-counter base)",
+                                      reporter)) {
+                    return false;
+                }
+                st.hasModRm       = true;
+                st.modRmRm3       = static_cast<std::uint8_t>(*hw & 0x7u);
+                st.rexB           = (*hw & 0x8u) != 0u;
+                st.wroteModRmRm   = true;
+                st.modMode        = EncodingState::ModMode::RipRel;
+                st.pcRelativeBase = true;
+                continue;
+            }
             if (!wireSlot(st, wire.slotKind, *hw,
                           info->mnemonic, reporter)) {
                 return false;
@@ -909,10 +1040,10 @@ bool encode(Lir const&                  lir,
                 return false;
             }
         } else if (srcOp.kind == LirOperandKind::MemBase) {
-            // D-AS4-1 + D-AS4-5 memory-addressing: MemBase carries the
+            // D-AS4-1 + D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL memory-addressing: MemBase carries the
             // scale for `[base + index*scale + disp]` addressing.
             // Cycle-1 (closed at LK10 cycle 2) handled scale==1 only;
-            // D-AS4-5 generalises to scale ∈ {1,2,4,8}.
+            // D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL generalises to scale ∈ {1,2,4,8}.
             if (!wireMemBaseScale(st, wire.slotKind, srcOp.scale,
                                    info->mnemonic, reporter)) {
                 return false;
@@ -932,6 +1063,50 @@ bool encode(Lir const&                  lir,
                                       info->mnemonic, reporter)) {
                 return false;
             }
+        } else if (srcOp.kind == LirOperandKind::MemSymbolOffset) {
+            // ★ A SYMBOLIC DISPLACEMENT (`msg+4(%rip)`): the field holds a
+            // RELOCATION, whose kind depends on the base — resolved after the
+            // loop, when the base wire has been seen whatever the wire order.
+            if (wire.slotKind != EncodingSlotKind::Disp32Mem) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': a symbolic displacement is "
+                                   "wired into slot '{}', which is not a "
+                                   "memory displacement",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            if (st.disp32Mem.has_value() || st.symbolicDisplacement.has_value()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': second writer to the memory "
+                                   "displacement — a memory operand has one",
+                                   info->mnemonic));
+                return false;
+            }
+            if (srcOp.litIndex >= lir.literalPool().size()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': symbolic displacement names "
+                                   "literal pool entry {} of {} — the index "
+                                   "outlived the pool it names",
+                                   info->mnemonic, srcOp.litIndex,
+                                   lir.literalPool().size()));
+                return false;
+            }
+            auto const* addr = std::get_if<LirSymbolAddress>(
+                &lir.literalValue(srcOp.litIndex).value);
+            if (addr == nullptr) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': symbolic displacement names "
+                                   "literal pool entry {}, which is not a "
+                                   "symbol address", info->mnemonic,
+                                   srcOp.litIndex));
+                return false;
+            }
+            st.symbolicDisplacement = *addr;
         } else if (srcOp.kind == LirOperandKind::BlockRef) {
             // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
             // intra-function block-relative branch target. The slot
@@ -951,7 +1126,34 @@ bool encode(Lir const&                  lir,
             }
             st.blockRels.push_back(EncodingState::PendingBlockRel{
                 wire.prefixOpcodeBytes, srcOp.blockSlot});
-        } else if (srcOp.kind == LirOperandKind::SymbolRef) {
+        } else if (srcOp.kind == LirOperandKind::SymbolRef
+                   || srcOp.kind == LirOperandKind::SymbolAddress) {
+            // ★ A SYMBOL PLUS A CONSTANT IN A SYMBOL POSITION (`leaq msg+4,
+            // %rax` — P68 round 9) reaches the same field as a plain symbol;
+            // its constant is the relocation's addend (the pool entry holds
+            // the pair), exactly as the fixed32 walker carries `adrp x0,
+            // msg+8`'s. A plain `SymbolRef` carries 0.
+            SymbolId     relocTarget{srcOp.symbolV};
+            std::int64_t relocAddend = 0;
+            if (srcOp.kind == LirOperandKind::SymbolAddress) {
+                auto const* addr =
+                    srcOp.litIndex < lir.literalPool().size()
+                        ? std::get_if<LirSymbolAddress>(
+                              &lir.literalValue(srcOp.litIndex).value)
+                        : nullptr;
+                if (addr == nullptr) {
+                    report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': symbol operand names "
+                                       "literal pool entry {}, which is not a "
+                                       "symbol address in this module's pool of "
+                                       "{}", info->mnemonic, srcOp.litIndex,
+                                       lir.literalPool().size()));
+                    return false;
+                }
+                relocTarget = addr->symbol;
+                relocAddend = addr->addend;
+            }
             // Plan 13 AS4 — symbol-bearing wire emits a Relocation.
             // Three symbol-bearing slots today:
             //   * Disp32         — pure 4-byte rel32 placeholder (e.g.
@@ -1015,9 +1217,7 @@ bool encode(Lir const&                  lir,
                     return false;
                 }
                 st.memRelocDisp32 = PendingRelocSlot{
-                    *wire.relocationKind,
-                    SymbolId{srcOp.symbolV}
-                };
+                    *wire.relocationKind, relocTarget, 0, relocAddend};
                 continue;
             }
             if (st.disp32.has_value()) {
@@ -1030,9 +1230,7 @@ bool encode(Lir const&                  lir,
                 return false;
             }
             st.disp32 = PendingRelocSlot{
-                *wire.relocationKind,
-                SymbolId{srcOp.symbolV}
-            };
+                *wire.relocationKind, relocTarget, 0, relocAddend};
             // RipRelDisp32: force the ModR/M state to the RIP-
             // relative form. mod=00 rm=101 names "[rip + disp32]"
             // in 64-bit mode — this slot repurposes the encoding
@@ -1057,6 +1255,39 @@ bool encode(Lir const&                  lir,
                                static_cast<int>(srcOp.kind)));
             return false;
         }
+    }
+
+    // ★★ THE SYMBOLIC DISPLACEMENT'S RELOCATION, now that the base is known.
+    // Against the program counter it is the distance to the symbol — the kind
+    // the target names for it (`pcRelativeMemoryBase`). Against any other base
+    // it would be the symbol's ABSOLUTE address (gas: `movl sym(%rax), %eax` is
+    // R_X86_64_32S), a relocation no target row declares for this field — so it
+    // is refused rather than encoded as the PC-relative distance it is not.
+    if (st.symbolicDisplacement.has_value()) {
+        if (!st.pcRelativeBase) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': a symbolic displacement against a "
+                               "base that is not the program counter is an "
+                               "ABSOLUTE address, and target '{}' declares no "
+                               "relocation for one in a memory displacement",
+                               info->mnemonic, schema.name()));
+            return false;
+        }
+        st.memRelocDisp32 = PendingRelocSlot{
+            schema.pcRelativeMemoryBase()->symbolicDisplacementRelocation,
+            st.symbolicDisplacement->symbol};
+    }
+    // An index register beside the program counter: x86-64's RIP-relative form
+    // has no SIB, so there is no field for one (gas: "`8(%rip,%rax)' is not a
+    // valid base/index expression").
+    if (st.pcRelativeBase && st.sibIndex3.has_value()) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': a program-counter-relative memory "
+                           "operand takes no index register — its ModR/M form "
+                           "has no SIB byte", info->mnemonic));
+        return false;
     }
 
     // D-CSUBSET-COMPUTED-GOTO: a block-address `lea` carries a trailing
@@ -1249,7 +1480,7 @@ bool encode(Lir const&                  lir,
     //    MemDisp32).
     // Decide whether a SIB byte follows. Two triggers:
     //   (a) D-AS4-1 force-presence: memory mode + rm.lo3 == 4.
-    //   (b) D-AS4-5 indexed addressing: a SibIndex wire fired.
+    //   (b) D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL indexed addressing: a SibIndex wire fired.
     // When SIB follows, ModR/M.rm MUST be 4 (the "SIB follows"
     // marker); the actual base register's lo3 goes into SIB.base.
     // The pre-existing no-index force-presence path "worked by
@@ -1320,7 +1551,7 @@ bool encode(Lir const&                  lir,
         }
     }
 
-    // 4.5) D-AS4-5 coherence: a SibIndex wire is only meaningful with
+    // 4.5) D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL coherence: a SibIndex wire is only meaningful with
     //      a ModRmRmMem base (the indexed form is a memory-addressing
     //      mode; register-direct mode has no SIB). Fail loud if a
     //      schema declared SibIndex without ModRmRmMem — silent
@@ -1343,7 +1574,7 @@ bool encode(Lir const&                  lir,
     //        that otherwise means "SIB follows"). No index register;
     //        SIB encodes `[base + 0 + disp]` with index=4 (no-index
     //        marker) and scale=0.
-    //    (b) D-AS4-5 indexed addressing: a `SibIndex` wire fired
+    //    (b) D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL indexed addressing: a `SibIndex` wire fired
     //        (st.wroteSibIndex). SIB encodes `[base + index*scale + disp]`
     //        with index = st.sibIndex3 (from the SibIndex wire's
     //        register operand), scale exponent = st.sibScaleExp
@@ -1392,7 +1623,29 @@ bool encode(Lir const&                  lir,
     if (st.absSibDisp32.has_value()) {
         asm_byte_emit::appendImm32LE(out, *st.absSibDisp32);
     }
-    if (st.modMode == EncodingState::ModMode::MemDisp32) {
+    // ★ THE PROGRAM-COUNTER BASE'S DISPLACEMENT SITS WHERE EVERY MEMORY
+    // DISPLACEMENT SITS — after ModR/M, BEFORE any immediate (✔MEASURED, gas
+    // 2.42: `movl $5, x(%rip)` = c7 05 <disp32> <imm32>). A symbolic one is a
+    // relocation whose addend is completed below, once the bytes after it are
+    // known.
+    std::optional<std::size_t> pcRelativeRelocIndex;
+    if (st.pcRelativeBase) {
+        if (st.memRelocDisp32.has_value()) {
+            pcRelativeRelocIndex = relocs.size();
+            walker_util::appendPendingReloc(relocs, out, *st.memRelocDisp32);
+            asm_byte_emit::appendU32LE(out, 0u);
+        } else if (st.disp32Mem.has_value()) {
+            asm_byte_emit::appendImm32LE(out, *st.disp32Mem);
+        } else {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': a program-counter-relative memory "
+                               "operand reached the encoder with no "
+                               "displacement — its form always carries 32 bits "
+                               "of one", info->mnemonic));
+            return false;
+        }
+    } else if (st.modMode == EncodingState::ModMode::MemDisp32) {
         if (st.disp32Mem.has_value() && st.memRelocDisp32.has_value()) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
@@ -1498,6 +1751,14 @@ bool encode(Lir const&                  lir,
     //    `0F 8x rel32; E9 rel32`), then 4 zero placeholder bytes
     //    at the patch offset. asm.cpp resolves all patches once
     //    every block in the function has been encoded.
+    //    [[D-CSUBSET-LONG-BRANCH]]: every one of them carries the island body
+    //    this opcode declares. `rel32` is x86-64's WIDEST block-relative field,
+    //    so no escape into a wider one can ever be elected here — which is
+    //    exactly the arm that needs an island, and the body is elected once
+    //    per instruction rather than once per patch.
+    auto const island = st.blockRels.empty()
+        ? walker_util::BranchIslandBody{}
+        : electIslandBody(*info);
     for (auto const& br : st.blockRels) {
         for (auto b : br.prefixBytes) {
             out.push_back(b);
@@ -1505,11 +1766,46 @@ bool encode(Lir const&                  lir,
         blockPatches.push_back(walker_util::BlockRelPatch{
             static_cast<std::uint32_t>(out.size()),
             br.targetBlock,
+            walker_util::BlockRelPatchKind::X86Rel32,
+            /*relaxable=*/false,
+            /*widerFieldDeclared=*/false,
+            /*instV=*/0,  // stamped centrally by asm.cpp
+            island,
         });
         asm_byte_emit::appendU32LE(out, 0u);
     }
 
+    // ★★★ "RELATIVE TO THE NEXT INSTRUCTION" — THIS ISA's RULE, APPLIED ONCE
+    // (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER). The CPU adds the
+    // displacement to the address of the byte AFTER the instruction, while a
+    // relocation kind's bias counts only to the end of its own field; the bytes
+    // between (an immediate) are subtracted from the addend here, and recorded
+    // for the one format that also spells them in the relocation type.
+    // ✔MEASURED, gas 2.42: `movl $5, counter(%rip)` is R_X86_64_PC32
+    // `counter-8` (the -4 of the field plus 4 immediate bytes).
+    if (pcRelativeRelocIndex.has_value()) {
+        auto& rel = relocs[*pcRelativeRelocIndex];
+        std::size_t const fieldEnd = static_cast<std::size_t>(rel.offset) + 4u;
+        std::size_t const after = out.size() - fieldEnd;
+        if (after > 0xFFu) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': {} bytes follow a relocated "
+                               "displacement — more than any instruction of "
+                               "this format carries", info->mnemonic, after));
+            return false;
+        }
+        rel.addend = st.symbolicDisplacement->addend
+                   - static_cast<std::int64_t>(after);
+        rel.bytesAfterField = static_cast<std::uint8_t>(after);
+    }
+
     return true;
+}
+
+walker_util::BranchIslandBody
+islandBody(TargetOpcodeInfo const& info) {
+    return electIslandBody(info);
 }
 
 } // namespace dss::x86_variable

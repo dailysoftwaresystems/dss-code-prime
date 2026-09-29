@@ -68,6 +68,7 @@
 #include "link/object_format_schema.hpp"
 
 #include "repo_root.hpp"
+#include "shipped_read_pairs.hpp"   // the real pairs a REAL descriptor is read on
 
 #include <gtest/gtest.h>
 
@@ -169,6 +170,13 @@ using Flavours = std::map<std::string, std::vector<std::shared_ptr<ObjectFormatS
 // must not rot) and every literal lands in `library`. By construction a role
 // entry yields no `library` string without a resolver, so the two maps
 // partition the corpus exactly.
+//
+// ON A REAL PAIR (P68 round 12, S2a-1). The read passed no arch and no format —
+// a read no compile makes, and one that stops decoding the day a prototype
+// names a per-format typedef. It reads on ONE real pair: neither `library` map
+// is selected by the pair (their keys are format kinds, all decoded) and no
+// symbol is dropped by it, so every pair yields the same corpus — and every
+// descriptor decodes on every real pair (`AllShippedDescriptorsDecode`).
 struct RoleReference {
     std::string        descriptor;   // config-root-relative, forward slashes
     std::string        context;      // "(root)" or "symbols['name']"
@@ -224,15 +232,20 @@ struct ReadContext {
         ADD_FAILURE() << "shippedLibs directory not found at " << dir;
         return out;
     }
+    auto const& pairs = dss::test_support::shippedReadPairs();
+    if (pairs.empty()) {
+        ADD_FAILURE() << "no real shipped pair to read the corpus on";
+        return out;
+    }
+    auto const&                pair  = pairs.front();
+    ffi::ShippedPairFacts const facts = pair.pairFacts();
     ReadContext ctx;
     for (auto const& path : descriptorPaths(dir)) {
         DiagnosticReporter rep;
         auto desc = readShippedLibDescriptor(path, ctx.interner, ctx.typeReg, rep,
-                                             DataModel::Lp64,
-                                             /*activeTarget=*/std::nullopt,
-                                             /*activeFormat=*/std::nullopt,
-                                             ctx.named,
-                                             /*roleResolver=*/nullptr);
+                                             pair.dataModel(), pair.activeTarget(),
+                                             pair.activeFormat(), ctx.named,
+                                             /*roleResolver=*/nullptr, &facts);
         // A descriptor that does not READ is a different invariant (pinned by
         // test_shipped_lib_descriptor) — but it MUST NOT silently shrink this
         // sweep, so it is surfaced rather than skipped in silence.
@@ -513,11 +526,17 @@ TEST(DescriptorLibraryRoleAgreement, EveryRoleEntryDecodesToItsFamilysImageThrou
             ASSERT_NE(group, flavours.end()) << kind;
             for (auto const& flavour : group->second) {
                 FormatRuntimeLibraryRoleResolver const resolver{*flavour};
+                // On the flavour's OWN pair (P68 round 12, S2a-1): the resolver
+                // and the read are two statements about ONE format, as in a build.
+                auto const* pair = dss::test_support::shippedReadPair(
+                    flavour->targetArch(), flavour->kind());
+                ASSERT_NE(pair, nullptr) << flavour->name();
+                ffi::ShippedPairFacts const facts = pair->pairFacts();
                 DiagnosticReporter rep;
                 auto desc = readShippedLibDescriptor(
-                    path, ctx.interner, ctx.typeReg, rep, DataModel::Lp64,
-                    /*activeTarget=*/std::nullopt, /*activeFormat=*/std::nullopt,
-                    ctx.named, &resolver);
+                    path, ctx.interner, ctx.typeReg, rep, pair->dataModel(),
+                    pair->activeTarget(), pair->activeFormat(), ctx.named, &resolver,
+                    &facts);
                 ASSERT_TRUE(desc.has_value())
                     << rel << " failed to read with the resolver over '"
                     << flavour->name() << "'";

@@ -146,6 +146,15 @@ public:
     weakDefinitionDialects() const noexcept override {
         return kPeWeakDialects;
     }
+    [[nodiscard]] std::span<RunpathCarrier const>
+    runpathCarriers() const noexcept override {
+        // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH. None, and that is the
+        // MEASURED answer rather than a gap: neither mingw GNU ld nor MSVC
+        // link records an rpath in a PE image (both accept the request and
+        // emit byte-identical images that RUN with the DLL beside them),
+        // because the Windows loader searches the application's directory.
+        return {};
+    }
 
     [[nodiscard]] bool
     isImageFlavor(detail::ObjectFormatData const& d) const noexcept override {
@@ -747,11 +756,13 @@ public:
            ObjectFormatSchema const& objectFormatSchema,
            DiagnosticReporter&       reporter,
            ImageRequest const&       request) const override {
-        // The one walker that consumes `request` — it implements the
-        // `pe-optional-header` vehicle declared above, for the exec flavor
-        // only. `pe::encode` RE-CHECKS the schema's declared capability
-        // itself rather than trusting the linker gate, because it is also a
-        // public entry point and it serves the .dll flavor too.
+        // The one walker that consumes `request`'s STACK RESERVE — it
+        // implements the `pe-optional-header` vehicle declared above, for the
+        // exec flavor only. `pe::encode` RE-CHECKS the schema's declared
+        // capability itself rather than trusting the linker gate, because it
+        // is also a public entry point and it serves the .dll flavor too.
+        // Its runpaths are accepted and recorded nowhere: PE declares no
+        // runpath carrier (the gate warned). D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.
         return pe::encode(module, targetSchema, objectFormatSchema, reporter,
                           request);
     }

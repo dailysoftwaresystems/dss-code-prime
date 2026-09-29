@@ -17,6 +17,17 @@ dss_add_test(NAME hir/test_hir_verifier      SOURCES test_hir_verifier.cpp)
 dss_add_test(NAME hir/test_const_eval        SOURCES test_const_eval.cpp)
 dss_add_test(NAME hir/test_hir_text          SOURCES test_hir_text.cpp)
 dss_add_test(NAME hir/test_hir_lowering_c SOURCES test_hir_lowering_c.cpp)
+# P68 round 9 (lane `cs`): a brace-init ELEMENT's diagnosed conversion is reported
+# by the lowering (the one tier that knows the element's slot) and realized by
+# `coerce` — [[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]].
+dss_add_test(NAME hir/test_brace_element_diagnosed_conversion
+             SOURCES test_brace_element_diagnosed_conversion.cpp)
+# P68 round 9 (lane `cs`): three initializer-list rules — an unknown size is the
+# largest initialized index + 1 (C 6.7.9p22, designators included), a string
+# literal in braces initializes a character array (6.7.9p14), and excess positional
+# elements warn S_ExcessInitializerElements and are dropped unevaluated (6.7.9p2).
+dss_add_test(NAME hir/test_initializer_list_shapes
+             SOURCES test_initializer_list_shapes.cpp)
 # D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION. Separate from
 # test_hir_lowering_c.cpp because that file's fixture deliberately pins the
 # long-double axis at `None` ("moving it would silently re-point every one of
@@ -38,6 +49,14 @@ dss_add_test(NAME hir/test_hir_lowering_multi_lang SOURCES test_hir_lowering_mul
 # VOCABULARY and the two capability gaps.
 dss_add_test(NAME hir/test_hir_text_vocabulary_and_capability SOURCES test_hir_text_vocabulary_and_capability.cpp)
 
+# A NUMBER A `.dsshir` SPELLS IS READ AS THAT NUMBER, OR REFUSED NAMING ITS FIELD
+# (P68 round 8, lane `ht`, part 1c): one row per field the reader fills, the
+# symbol table's density, and every field a number could be read as another
+# meaning in. Separate from test_hir_text.cpp because those arms pin the FORMAT
+# round trip and these pin the reader's arithmetic, row by named row.
+dss_add_test(NAME hir/test_hir_text_reads_every_number_as_written
+             SOURCES test_hir_text_reads_every_number_as_written.cpp)
+
 # D-HIR-TEXT-INLINE-ASM-OPERAND-KIND-DROPPED-IN-TRANSIT — the CONSEQUENCE half.
 # Separate from test_hir_text.cpp because those arms pin the round trip and this
 # one pins what the NEXT tier reads back: a dropped operand-form binding is
@@ -46,10 +65,10 @@ dss_add_test(NAME hir/test_hir_text_vocabulary_and_capability SOURCES test_hir_t
 dss_add_test(NAME hir/test_hir_text_operand_form_reaches_mir
              SOURCES test_hir_text_operand_form_reaches_mir.cpp)
 
-# D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT — the two
-# suites that DIED (0xC0000409, `__fastfail`) on an emptied shipped config must
-# now REPORT it. The property is how a test binary TERMINATES, and a process
-# cannot observe its own abort, so both subjects are spawned as CHILDREN.
+# A TORN SHIPPED CONFIG MUST RED A SUITE, NOT KILL IT: the two suites that DIED
+# (0xC0000409, `__fastfail`) on an emptied shipped config must now REPORT it.
+# The property is how a test binary TERMINATES, and a process cannot observe
+# its own abort, so both subjects are spawned as CHILDREN.
 #
 # ★ The paths are BAKED, not searched: `$<TARGET_FILE:…>` resolves to the real
 #   executable at generate time (with `.exe` on Windows) so this entry cannot
@@ -78,7 +97,7 @@ add_dependencies(dss_hir_test_torn_shipped_config_reds_not_crashes
 dss_add_test(NAME hir/test_type_representation_projection
              SOURCES test_type_representation_projection.cpp)
 
-# ── D-COMPILER-INPUT-PROPORTIONAL-RECURSION residue, front-end half (P55 `hs`) ──
+# ── D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED, front-end half (P55 `hs`) ──
 # TWO files, and the split is the point.
 #
 # `test_frontend_deep_nesting_probe` is the stage-selectable MEASUREMENT

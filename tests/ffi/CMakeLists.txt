@@ -42,16 +42,26 @@ dss_add_test(NAME ffi/test_pe_abort_behavior_binding
              SOURCES test_pe_abort_behavior_binding.cpp)
 target_link_libraries(dss_ffi_test_pe_abort_behavior_binding
                       PRIVATE nlohmann_json::nlohmann_json)
-# POSIX `environ` — the extern DATA-OBJECT row's two load-bearing properties:
-# its availability set (eager-import law — widening it to a format whose CRT
-# has no such export breaks every including binary's LOAD, silently at build
-# time) and the absence of any macro that would shadow an LVALUE data object.
+# POSIX `environ` — exactly ONE realization per format (a DATA-OBJECT row on elf
+# and macho, a macro onto the UCRT accessor on pe), each row's availability set
+# (widening one to a format whose CRT has no such export breaks the LOAD of every
+# binary that references it, silently at build time) and the absence of any
+# macro that would shadow an LVALUE data object.
 # Reads the shipped descriptors' JSON directly, hence the same json link as its
 # three siblings above.
 dss_add_test(NAME ffi/test_environ_data_object_binding
              SOURCES test_environ_data_object_binding.cpp)
 target_link_libraries(dss_ffi_test_environ_data_object_binding
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# ── D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES (P68 round 12, lane `lm`, fold S1) ──
+# <stdlib.h>'s C23 7.24 surface, per executable PAIR: the descriptor read through
+# the real reader with each pair's own facts (every S1 value, accessor, version and
+# mapping), and one probe per pair compiled in process whose image must import the
+# pair's own entry points. Reads images through
+# tests/test_support/image_dependency_table.hpp; needs no json link.
+dss_add_test(NAME ffi/test_stdlib_h_iso_surface
+             SOURCES test_stdlib_h_iso_surface.cpp)
 
 # D-FF1-AR-BSD-VARIANT (P31): the BSD `ar` variant -- "__.SYMDEF" /
 # "__.SYMDEF SORTED" ranlib tables and "#1/N" inline member names. Split from
@@ -118,6 +128,11 @@ target_link_libraries(dss_ffi_test_shipped_realization_oracle
 # shipped reader, so it needs no json link.
 dss_add_test(NAME ffi/test_shipped_no_library_for_format
              SOURCES test_shipped_no_library_for_format.cpp)
+# D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION: its
+# end-to-end arm stages a copy of the config tree and removes one descriptor's
+# body in the COPY, editing that descriptor's JSON — hence the json link.
+target_link_libraries(dss_ffi_test_shipped_no_library_for_format
+                      PRIVATE nlohmann_json::nlohmann_json)
 
 # D-FFI-SHIPPED-DESCRIPTOR-PARSE-CACHE-SERVES-A-STALE-DOCUMENT (P42): the
 # thread-local descriptor PARSE CACHE must answer about the file on disk NOW — a
@@ -223,7 +238,7 @@ target_link_libraries(dss_ffi_test_shipped_mtx_type_declarations
 dss_add_test(NAME ffi/test_shipped_ioctl_size_ceiling
              SOURCES test_shipped_ioctl_size_ceiling.cpp)
 
-# ── D-COMPILER-INPUT-PROPORTIONAL-RECURSION residue, FFI half (P55 lane `hs`) ──
+# ── D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED, FFI half (P55 lane `hs`) ──
 # Its own binary because a red here is a STACK OVERFLOW: the process dies with no
 # `[  FAILED  ]` line and no case name, so a sibling in a shared binary would lose
 # its verdict to an unattributable death.
@@ -305,3 +320,13 @@ dss_add_test(NAME ffi/test_shipped_library_role
 # Pure byte decoding: nothing is built, nothing is run, so every host answers.
 dss_add_test(NAME ffi/test_binary_architecture_field
              SOURCES test_binary_architecture_field.cpp)
+
+# P68 round 9 (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS): the LATTICE-DERIVED
+# `constants` row (`{name, of, limit}`) through both seams of the one decode — the
+# value and the type follow the pair (data model, plain-char signedness, the
+# language's promotions), `of` names the descriptor's own typedef first, a row the
+# missing pair decides is not realized, every malformed shape is refused, and the
+# shipped `limits.json` realizes all its rows on every pair shape. Reads the
+# shipped config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME ffi/test_shipped_derived_constants
+             SOURCES test_shipped_derived_constants.cpp)

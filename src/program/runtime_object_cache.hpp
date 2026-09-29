@@ -660,8 +660,8 @@ struct DSS_EXPORT DependencyArtifactRequest {
     //   * compileOpts.resolveLibraries, .objectInputs → `linkInputs`
     //   * artifactName.value_or(sourceStem) → `artifactStem` above, which is a
     //     key term as well as the entry's name
-    //   * compileOpts.ltoMode, imageRequest.stackReserveBytes → the two fields
-    //     below
+    //   * compileOpts.ltoMode, imageRequest.stackReserveBytes,
+    //     imageRequest.runpaths → the three fields below
     //   * compileOpts.pipelineOverride → NOT a field: a non-null override is
     //     REFUSED by the driver before a request is built. It is a raw pointer
     //     to an in-memory pass list with no identity to digest, so the only
@@ -684,6 +684,13 @@ struct DSS_EXPORT DependencyArtifactRequest {
     // the format happens to default to" are two keys — the format's default is
     // a property of a document that can change under a fixed manifest.
     std::optional<std::uint64_t> stackReserveBytes;
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the runpaths AS REQUESTED, in order.
+    // They reach the bytes — a `.dynstr` string and a `.dynamic` entry, or one
+    // LC_RPATH per path — so two builds differing only here must never share an
+    // entry. Keyed as requested rather than as written: the translation (the
+    // format's spelling of `${ORIGIN}`, duplicates dropped) is a function of
+    // these entries and the format document, which is already a `doc=` term.
+    std::vector<std::string> runpaths;
 };
 
 // ⚠ Same empty/malformed-digest refusals as `computeRuntimeObjectKey` over

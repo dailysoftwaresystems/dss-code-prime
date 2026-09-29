@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -453,23 +454,34 @@ TEST(InlineAsmConstraintParse, ModifiersSplitOffTheLetterAndTheLetterIsLeftAlone
         char const*            raw;
         char const*            letter;
         bool                   out, rw, early, commutative;
+        // The operand number a MATCHING constraint names, or -1 for none.
+        std::int64_t           matched;
     };
     // ★ `"Ush"` is in the table on purpose: it is a REAL aarch64 machine
     // constraint and it proves the parser does not treat "longer than one
     // character" as a defect. Deciding whether a long spelling is one letter or
     // several is the TARGET's job (`asmConstraintLooksMultiLetter`), not this
     // function's.
+    // ★ A SPELLING OF DIGITS ALONE IS GNU's MATCHING CONSTRAINT, NOT A LETTER
+    // (P68 round 8, D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER):
+    // `letter` stays EMPTY and the operand NUMBER is carried. This row used to
+    // pin `"0"` as the LETTER `0` — the reading that sent every `"0"` to the
+    // target as an undeclared machine letter and refused the GCC manual's own
+    // local-register-variable example. A digit mixed with letters is still one
+    // spelling for the target to judge (`"r0"`).
     Row const rows[] = {
-        {"r",    "r",   false, false, false, false},
-        {"=r",   "r",   true,  false, false, false},
-        {"+r",   "r",   true,  true,  false, false},
-        {"=&r",  "r",   true,  false, true,  false},
-        {"+&r",  "r",   true,  true,  true,  false},
-        {"%r",   "r",   false, false, false, true },
-        {"=%r",  "r",   true,  false, false, true },
-        {"a",    "a",   false, false, false, false},
-        {"Ush",  "Ush", false, false, false, false},
-        {"0",    "0",   false, false, false, false},
+        {"r",    "r",   false, false, false, false, -1},
+        {"=r",   "r",   true,  false, false, false, -1},
+        {"+r",   "r",   true,  true,  false, false, -1},
+        {"=&r",  "r",   true,  false, true,  false, -1},
+        {"+&r",  "r",   true,  true,  true,  false, -1},
+        {"%r",   "r",   false, false, false, true , -1},
+        {"=%r",  "r",   true,  false, false, true , -1},
+        {"a",    "a",   false, false, false, false, -1},
+        {"Ush",  "Ush", false, false, false, false, -1},
+        {"0",    "",    false, false, false, false,  0},
+        {"12",   "",    false, false, false, false, 12},
+        {"r0",   "r0",  false, false, false, false, -1},
     };
     for (auto const& r : rows) {
         auto const p = parseAsmConstraint(r.raw);
@@ -481,6 +493,13 @@ TEST(InlineAsmConstraintParse, ModifiersSplitOffTheLetterAndTheLetterIsLeftAlone
         EXPECT_EQ(p.value.earlyClobber, r.early)        << r.raw;
         EXPECT_EQ(p.value.commutative, r.commutative)   << r.raw;
         EXPECT_EQ(p.value.raw, r.raw)                   << "raw is kept verbatim";
+        if (r.matched < 0) {
+            EXPECT_FALSE(p.value.matchedOperand.has_value()) << r.raw;
+        } else {
+            ASSERT_TRUE(p.value.matchedOperand.has_value()) << r.raw;
+            EXPECT_EQ(static_cast<std::int64_t>(*p.value.matchedOperand),
+                      r.matched)                        << r.raw;
+        }
     }
 }
 
@@ -858,6 +877,54 @@ TEST(InlineAsmRefusals, EmptySectionsStillMakeTheTemplateExtended) {
                               wrap("__asm__ (\"movl %%eax, %%ebx\" :::);"));
     ASSERT_TRUE(escaped.model.has_value());
     EXPECT_FALSE(escaped.model->hasErrors()) << errorInventory(*escaped.model);
+}
+
+// ── A template TEXT FORM is the dialect's question (P68 round 8 part 4) ──
+// ✔MEASURED 2026-09-21/23 (gcc 13.3.0 and clang 18.1.3, x86_64 and aarch64,
+// each form inside `.ascii "X<form>Y"`): `%=` is expanded by all four ports,
+// `%{` `%}` by gcc x86 and clang (both ports), the other punctuation codes by
+// gcc's x86 port alone, and `%&` `%@` `%#` by none. The x86 and aarch64 sets
+// DIFFER and this tier has no dialect in scope, so every `%` + ASCII
+// punctuation passes here and the MIR→LIR expansion — which reads the
+// dialect's `assembly.templateTextForms` — expands or refuses it. What stays
+// refused HERE is the placeholder before a byte that begins nothing at all: a
+// space, a TAB, a non-ASCII byte — refused by all four references ("invalid
+// %-code" / "invalid % escape in inline assembly string"), so the message says
+// they refuse it too and cites no open row.
+// RED-ON-DISABLE: drop the punctuation arm in `scanInlineAsmTemplate` and the
+// `%=` / `%{` / `%&` rows redden (they are refused again at this tier).
+TEST(InlineAsmRefusals, APunctuationFormIsTheDialectsAndANonFormIsRefusedAsTheReferencesDo) {
+    for (char const* form : {"%=", "%{", "%}", "%|", "%~", "%&"}) {
+        auto m = analyzeFor("x86_64",
+                            wrap(std::string{"__asm__ (\"nop # "} + form
+                                 + "\" : : \"r\"(lo));"));
+        ASSERT_TRUE(m.model.has_value());
+        EXPECT_FALSE(has(*m.model,
+                         DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
+            << "`" << form << "` is a template text form — the dialect-aware "
+               "lowering expands or refuses it, not this tier: "
+            << errorInventory(*m.model);
+    }
+    for (char const* form : {"% ", "%\\t"}) {
+        auto m = analyzeFor("x86_64",
+                            wrap(std::string{"__asm__ (\"nop # "} + form
+                                 + "x\" : : \"r\"(lo));"));
+        ASSERT_TRUE(m.model.has_value());
+        std::string text;
+        for (auto const& d : m.model->diagnostics().all()) {
+            if (d.code == DiagnosticCode::S_InlineAsmOperandModifierUnsupported)
+                text = d.actual;
+        }
+        ASSERT_FALSE(text.empty())
+            << "`" << form << "` begins no reference and no form, and every "
+               "reference refuses it: " << errorInventory(*m.model);
+        EXPECT_NE(text.find("gcc and clang refuse it too"), std::string::npos)
+            << text;
+        EXPECT_EQ(text.find("D-ASM-TEMPLATE-FORMS-A-REFERENCE-EXPANDS-REFUSED"),
+                  std::string::npos)
+            << "the forms row is closed; this refusal is the references' own: "
+            << text;
+    }
 }
 
 // S0069 — the template exists and cannot be turned into text at all.

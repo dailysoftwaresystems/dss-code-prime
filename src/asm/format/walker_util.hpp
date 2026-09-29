@@ -26,6 +26,7 @@
 // instead of forking a third copy.
 
 #include "asm/asm.hpp"
+#include "asm/format/byte_emit.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"
@@ -34,6 +35,8 @@
 #include "lir/lir_pass_util.hpp"
 #include "lir/lir_reg.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <optional>
@@ -207,6 +210,16 @@ filterToLirKind(OperandKindFilter f) noexcept {
 // Per-position kind-equality check: variant's `operandKinds` filter
 // list must match the LIR instruction's source-operand kinds (same
 // length AND per-position kind translation).
+//
+// ★★ A `memoffset` POSITION TAKES A SYMBOLIC DISPLACEMENT TOO
+// (`LirOperandKind::MemSymbolOffset`, `msg+4(%rip)` —
+// D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER). The filter names the
+// displacement POSITION of a memory operand, and a displacement is a number or
+// a link-time address; which one reaches the field is the encoder's business
+// (a literal, or a relocation). Accepting both here is what lets every memory
+// form a target declares take a symbolic displacement with no variant of its
+// own — and the value axes still refuse it wherever a variant bounds its
+// displacement, because a link-time value has no magnitude to check.
 [[nodiscard]] inline bool
 operandsMatchGuard(std::span<LirOperand const>          instOps,
                    std::span<OperandKindFilter const>   guard) noexcept {
@@ -214,9 +227,57 @@ operandsMatchGuard(std::span<LirOperand const>          instOps,
     for (std::size_t i = 0; i < guard.size(); ++i) {
         auto const wanted = filterToLirKind(guard[i]);
         if (!wanted.has_value()) return false;
-        if (instOps[i].kind != *wanted) return false;
+        if (instOps[i].kind == *wanted) continue;
+        if (guard[i] == OperandKindFilter::MemOffset
+            && instOps[i].kind == LirOperandKind::MemSymbolOffset) {
+            continue;
+        }
+        // A `symbol` position takes a symbol plus a constant too (`adrp x0,
+        // msg+8`, P68 round 9): the constant rides the pool, the position is
+        // the same.
+        if (guard[i] == OperandKindFilter::SymbolRef
+            && instOps[i].kind == LirOperandKind::SymbolAddress) {
+            continue;
+        }
+        // A `blockref` position names a LOCATION OF THIS FUNCTION resolved at
+        // assemble time, and the location counter is one (`adr x7, .+8`, P68
+        // round 9): the address of the instruction itself, which no block
+        // begins at. A branch never carries one — its target is a successor
+        // block — so only a field that ADDRESSES a location meets it.
+        if (guard[i] == OperandKindFilter::BlockRef
+            && instOps[i].kind == LirOperandKind::LocationCounter) {
+            continue;
+        }
+        return false;
     }
     return true;
+}
+
+// ★★ THE PART OF A SYMBOL'S ADDRESS, AS A MATCH AXIS (P68 round 9, the aarch64
+// twins) — `guard.symbolPart`. A variant that states none takes only the WHOLE
+// address in its symbolic positions (every variant that existed before the
+// axis); a variant that states one takes only that part, and only when a
+// symbolic operand is present. So `adrp x0, msg` (page) and `adr x0, msg`
+// (whole) never elect each other's encoding, and `ldr x1, [x0, :lo12:msg]`
+// reaches the page-offset form while a numeric offset never does.
+[[nodiscard]] inline bool
+symbolPartsMatchGuard(std::span<LirOperand const>        instOps,
+                      std::span<OperandKindFilter const> guard,
+                      std::optional<SymbolAddressPart>   wanted) noexcept {
+    bool sawSymbol = false;
+    for (std::size_t i = 0; i < guard.size() && i < instOps.size(); ++i) {
+        auto const k = instOps[i].kind;
+        if (k != LirOperandKind::SymbolRef && k != LirOperandKind::SymbolAddress
+            && k != LirOperandKind::MemSymbolOffset) {
+            continue;
+        }
+        sawSymbol = true;
+        if (instOps[i].symbolAddressPart()
+            != wanted.value_or(SymbolAddressPart::Whole)) {
+            return false;
+        }
+    }
+    return sawSymbol || !wanted.has_value();
 }
 
 // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the unsigned MAGNITUDE of an
@@ -238,18 +299,16 @@ operandsMatchGuard(std::span<LirOperand const>          instOps,
 [[nodiscard]] inline std::optional<std::uint32_t>
 variantImmMagnitude(std::span<LirOperand const>        instOps,
                     std::span<OperandKindFilter const> guard) noexcept {
+    // The sign split is `variantValueMagnitude`'s (target_schema.hpp), shared
+    // with the LIR frame chokepoint so the two tiers read one value line.
     for (std::size_t i = 0; i < guard.size() && i < instOps.size(); ++i) {
         if (guard[i] == OperandKindFilter::ImmInt
             && instOps[i].kind == LirOperandKind::ImmInt) {
-            std::int32_t const v = instOps[i].immInt32;
-            if (v < 0) return std::nullopt;
-            return static_cast<std::uint32_t>(v);
+            return variantValueMagnitude(/*negValue=*/false, instOps[i].immInt32);
         }
         if (guard[i] == OperandKindFilter::MemOffset
             && instOps[i].kind == LirOperandKind::MemOffset) {
-            std::int32_t const v = instOps[i].offset;
-            if (v < 0) return std::nullopt;
-            return static_cast<std::uint32_t>(v);
+            return variantValueMagnitude(/*negValue=*/false, instOps[i].offset);
         }
     }
     return std::nullopt;
@@ -280,15 +339,11 @@ variantNegMagnitude(std::span<LirOperand const>        instOps,
     for (std::size_t i = 0; i < guard.size() && i < instOps.size(); ++i) {
         if (guard[i] == OperandKindFilter::ImmInt
             && instOps[i].kind == LirOperandKind::ImmInt) {
-            std::int32_t const v = instOps[i].immInt32;
-            if (v >= 0) return std::nullopt;
-            return static_cast<std::uint32_t>(-static_cast<std::int64_t>(v));
+            return variantValueMagnitude(/*negValue=*/true, instOps[i].immInt32);
         }
         if (guard[i] == OperandKindFilter::MemOffset
             && instOps[i].kind == LirOperandKind::MemOffset) {
-            std::int32_t const v = instOps[i].offset;
-            if (v >= 0) return std::nullopt;
-            return static_cast<std::uint32_t>(-static_cast<std::int64_t>(v));
+            return variantValueMagnitude(/*negValue=*/true, instOps[i].offset);
         }
     }
     return std::nullopt;
@@ -332,6 +387,9 @@ variantMatchesInst(std::span<LirOperand const>  instOps,
     if (!operandsMatchGuard(instOps, v.operandKinds)) {
         return false;
     }
+    if (!symbolPartsMatchGuard(instOps, v.operandKinds, v.symbolPart)) {
+        return false;
+    }
     // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE: the
     // MEMORY-DIRECTION axis. Absent ⇒ the variant does not discriminate and
     // matches either direction (every pre-existing variant, `store`
@@ -356,28 +414,15 @@ variantMatchesInst(std::span<LirOperand const>  instOps,
     auto const magnitude = v.negValue
         ? variantNegMagnitude(instOps, v.operandKinds)
         : variantImmMagnitude(instOps, v.operandKinds);
-    // A negValue variant is ALWAYS sign-gated (it must reject a
-    // non-negative operand even with no immMin/immMax bound), so consult
-    // the magnitude whenever the sign axis is on OR an imm-range is declared.
-    if (v.negValue || v.immMin.has_value() || v.immMax.has_value()
-        || v.immMultipleOf.has_value()) {
-        if (!magnitude.has_value()) return false;  // wrong sign / no operand
-        if (v.immMin.has_value() && *magnitude < *v.immMin) return false;
-        if (v.immMax.has_value() && *magnitude > *v.immMax) return false;
-        // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]: the
-        // DIVISIBILITY half of the same question. `immMin`/`immMax` bound an
-        // INTERVAL; a scaled field encodes `magnitude / N` and so carries only
-        // the MULTIPLES inside one. Without this a bounded variant matches an
-        // offset its own encoder then refuses — and because election commits
-        // to an opcode, the dialect's other candidate (the unscaled form that
-        // could have carried it) is never tried. `validate()` refuses a
-        // modulus of 0 or 1, so the division is always meaningful.
-        if (v.immMultipleOf.has_value()
-            && (*magnitude % *v.immMultipleOf) != 0) {
-            return false;
-        }
-    }
-    return true;
+    // The four value axes are ONE predicate in `target_schema.hpp`
+    // (`variantValueAxesAdmit`), because the LIR frame chokepoint asks the same
+    // question about an access it has not emitted yet and must get this
+    // matcher's answer. [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]'s
+    // divisibility half lives there too: without it a bounded variant matches an
+    // offset its own encoder then refuses — and because election commits to an
+    // opcode, the dialect's other candidate (the unscaled form that could have
+    // carried it) is never tried.
+    return variantValueAxesAdmit(v, magnitude);
 }
 
 // ★★★ WHY NO VARIANT MATCHED, WHEN THE ANSWER IS "THE VALUE".
@@ -415,6 +460,7 @@ variantRejectedOnValueOnly(TargetOpcodeInfo const&      info,
         }
         if (v.guardWidthBits != 0 && v.guardWidthBits != instWidthBits) continue;
         if (!operandsMatchGuard(instOps, v.operandKinds)) continue;
+        if (!symbolPartsMatchGuard(instOps, v.operandKinds, v.symbolPart)) continue;
         if (v.memoryDestination.has_value()
             && *v.memoryDestination != memoryIsDestination) {
             continue;
@@ -518,6 +564,10 @@ struct PendingRelocSlot {
     RelocationKind kind;
     SymbolId       target;
     std::uint8_t   wordIndex = 0;
+    // The constant the program wrote after the symbol (`adrp x0, msg+8` — P68
+    // round 9), from the operand's `LirSymbolAddress` pool entry; 0 for a plain
+    // `SymbolRef`.
+    std::int64_t   addend = 0;
 };
 
 // Push a `Relocation` entry at the current end of `out`. The reloc's
@@ -527,8 +577,8 @@ struct PendingRelocSlot {
 // invokes this immediately before appending word `pending.wordIndex`,
 // so `out.size()` is exactly that word's start (D-AS4-3 — the per-word
 // byte offset is DERIVED from the emit cursor, never a separately
-// computed `base + wordIndex*4`). `addend` is 0 in cycle scope
-// (D-AS4-4 anchors wire-declared addend bias).
+// computed `base + wordIndex*4`). The addend is the program's own constant
+// (`PendingRelocSlot::addend`); a wire-declared bias is still D-AS4-4's.
 inline void
 appendPendingReloc(std::vector<Relocation>&   relocs,
                    std::vector<std::uint8_t> const& out,
@@ -537,7 +587,7 @@ appendPendingReloc(std::vector<Relocation>&   relocs,
         static_cast<std::uint32_t>(out.size()),
         pending.target,
         pending.kind,
-        /*addend=*/0,
+        pending.addend,
     });
 }
 
@@ -554,11 +604,77 @@ enum class BlockRelPatchKind : std::uint8_t {
     // as 4 LE bytes at `patch_offset`. Used by `E9 rel32` /
     // `0F 8x rel32` (jmp / jcc family).
     X86Rel32 = 0,
-    // ARM64 placeholders (D-AS3-BLOCK-REL-IMM19/26 — close when
-    // ARM64 control-flow lands). Mentioned to lock in the enum
-    // shape; resolver MUST fail-loud on these until implemented.
+    // ARM64 (D-AS3-BLOCK-REL-IMM19-26 — RESOLVED since 2026-06-08; the
+    // "fail-loud placeholder" this comment used to describe is long gone,
+    // and `blockRelFieldGeometry` below now carries each arm's numbers).
     Arm64Imm19 = 1,  // B.cc — bits 23..5 of the 32-bit word, shift=2
     Arm64Imm26 = 2,  // B    — bits 25..0 of the 32-bit word, shift=2
+    // AArch64 `TBZ`/`TBNZ` — bits 18..5 of the 32-bit word, shift=2, ±32 KiB.
+    // The ISA's NARROWEST PC-relative branch field (ARM ARM C6.2.x, the
+    // test-and-branch family), declared here because the reach of a field is
+    // a fact about the ISA and not about which opcode DSS happens to wire it
+    // to today. Nothing in either shipped target declares a test-and-branch
+    // opcode yet — see the note on `Arm64Imm14`'s row in
+    // `blockRelFieldGeometry` for why the vocabulary carries it regardless.
+    Arm64Imm14 = 3,
+    // AArch64 one-word `ADR` (P68 round 9, the aarch64 twins): the ADDRESS of a
+    // block of the same function — `adr x1, 1f`, `adr x7, .` — resolved at
+    // assemble time as gas and clang resolve it (✔MEASURED 2026-09-23: no
+    // relocation, `adr x7, .` = 0x10000007, `adr x7, .+8` = 0x10000047).
+    // Unscaled, ±1 MiB, and SPLIT: the low 2 bits in immlo [30:29], the rest in
+    // immhi [23:5]. Not a branch: no escape and no island ever serves it.
+    Arm64Adr21 = 4,
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// D-CSUBSET-LONG-BRANCH — THE BRANCH ISLAND, AND WHAT IT IS MADE OF
+// ─────────────────────────────────────────────────────────────────────
+//
+// ★★★ THE WIDEST FIELD DOES NOT NEED A WIDER FIELD — IT NEEDS A NEARER
+// TARGET. A branch whose field is already the ISA's widest block-relative one
+// has no wider field to escape into, which is where the escape election
+// correctly stops. It does NOT follow that the branch then needs an absolute
+// address: `assemble()` knows every byte offset in the function, so the same
+// field aimed at a NEARER point of the same function is still just a
+// subtraction. The nearer point is an ISLAND holding the same branch again:
+//
+//     B island                  island: B far
+//
+// the same field twice, chained as far as the distance demands. No wider
+// field, no absolute address, no relocation, no synthetic symbol, no symbol
+// allocator, and — the part that matters most on AArch64 — NO SCRATCH
+// REGISTER. Every veneer shape that materializes an absolute address
+// (`ADRP`+`ADD`+`BR`, a literal-pool `LDR`+`BR`) needs a GPR, and the
+// assembler runs AFTER register allocation with no liveness to consult, so
+// such a veneer is a silent wrong answer rather than a refusal. An island is
+// a branch, and a branch reads no register.
+//
+// ★★★ AND ITS BYTES ARE QUOTED, NOT SYNTHESIZED. Writing an unconditional
+// branch's opcode into the shared resolver would hardcode one ISA into it —
+// the exact break `BlockRelPatchKind` exists to prevent. The body below is
+// COPIED from a word (or byte sequence) the OPCODE ITSELF declares: AArch64
+// `jcc`'s own trailing `B <ifFalse>` word, x86 `jcc`'s own
+// `prefixOpcodeBytes: [0xE9]`, either target's one-word/one-byte `jmp`
+// template. A target that declares no self-contained unconditional branch on
+// the overflowing opcode simply gets no island, and keeps its loud refusal.
+inline constexpr std::size_t kMaxBranchIslandBytes = 8;
+
+struct BranchIslandBody {
+    // The quoted bytes, with the block-relative field left ZERO.
+    std::array<std::uint8_t, kMaxBranchIslandBytes> bytes{};
+    // How many of them are real. ZERO means "this opcode declares no island
+    // body", which is the conservative default: no island is minted and the
+    // out-of-range refusal stands exactly as it did before islands existed.
+    std::uint8_t      byteCount   = 0;
+    // Where the block-relative field starts INSIDE `bytes`.
+    std::uint8_t      fieldOffset = 0;
+    // Which field it is — so the island's own displacement is computed from
+    // the same geometry row as every other block-relative write.
+    BlockRelPatchKind kind        = BlockRelPatchKind::X86Rel32;
+
+    [[nodiscard]] constexpr bool declared() const noexcept {
+        return byteCount != 0;
+    }
 };
 
 // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
@@ -574,7 +690,260 @@ struct BlockRelPatch {
     std::uint32_t patchOffset;  // byte offset of the placeholder in out
     std::uint32_t targetBlock;  // LirBlockId.v of the branch target block
     BlockRelPatchKind kind = BlockRelPatchKind::X86Rel32;
+    // D-CSUBSET-LONG-BRANCH: does an ESCAPE exist for this patch when its
+    // displacement leaves the field's reach? Set by the WALKER, because only
+    // the walker can see the opcode's declared encoding variants and decide
+    // whether a strictly-wider block-relative slot is available to escape
+    // into. FALSE is the conservative default: a patch that declares no
+    // escape keeps the loud `A_ImmediateOperandOutOfRange` refusal it has
+    // always had. The resolver never invents an escape — it only honours one
+    // the config proved exists.
+    bool relaxable = false;
+    // D-CSUBSET-LONG-BRANCH: does this patch's OPCODE declare, on any of its
+    // encoding variants, a self-contained word carrying a block-relative field
+    // that out-reaches THIS patch's own? Distinct from `relaxable`, which is
+    // additionally gated on this being the narrowest wire of the instruction —
+    // the escape rescues one wire, but the question of whether a wider field
+    // was declared at all is asked of every patch, and only the walker can
+    // answer it because only the walker sees the variants.
+    //
+    // It exists for ONE purpose: the out-of-range refusal must prescribe a
+    // remedy that can actually work. TRUE means a wider field IS declared on
+    // this opcode and this wire simply is not the one the escape rescues — a
+    // pure CONFIG gap. FALSE means the opcode declares no such word, which is
+    // where the two halves of D-CSUBSET-LONG-BRANCH part: either the TARGET
+    // has a wider field nobody declared here (still config), or this already
+    // IS the target's widest block-relative field and no encoding row can ever
+    // rescue it, because its escape is a different ADDRESSING MODE (an
+    // indirect branch through a materialized absolute address) needing a
+    // per-block symbol the assembler cannot mint. The refusal says both, and
+    // says WHICH is ruled out, rather than guessing at the one it cannot see.
+    //
+    // FALSE is the conservative default, so a walker that declares no escape
+    // vocabulary at all (`x86_variable`, whose widest block-relative slot is
+    // also its only one) is correct by construction rather than by remembering.
+    bool widerFieldDeclared = false;
+    // D-CSUBSET-LONG-BRANCH: the LIR instruction this patch came from —
+    // the STABLE IDENTITY across the relaxation re-encodes. `asm.cpp` stamps
+    // it centrally over the patches a single `encodeInst` appended, so no
+    // walker has to remember to. The promoted-instruction set is keyed on
+    // this value, which is why it must survive a re-encode unchanged
+    // (byte offsets do not — that is the whole reason the set is keyed on
+    // the instruction rather than on the patch site).
+    std::uint32_t instV = 0;
+    // D-CSUBSET-LONG-BRANCH: the self-contained unconditional branch this
+    // patch's OPCODE declares, or an undeclared body when it declares none.
+    // Stamped by the WALKER for the same reason `relaxable` is: only the
+    // walker sees the opcode's encoding variants, and the island's bytes are
+    // QUOTED from them. The resolver materializes islands out of this and
+    // never invents one.
+    //
+    // ⓘ COST: `kMaxBranchIslandBytes + 3` bytes on every block-relative patch,
+    // and a patch exists once per BRANCH rather than once per instruction —
+    // the 262146-instruction fixture in `tests/asm/test_asm_long_branch.cpp`
+    // carries five of them.
+    BranchIslandBody island{};
+    // P68 round 9: a constant the program added to the location's address —
+    // `adr x2, 1f+4`, `adr x7, .+8` — so the field holds `target + addend -
+    // (patch + bias)`. 0 for every branch (a branch names a block, never an
+    // offset into one).
+    std::int32_t addend = 0;
+    // P68 round 9: the LOCATION COUNTER — the field addresses the instruction
+    // that carries it (`adr x7, .`), not a block, so the target byte is
+    // `instStart + addend`. `instStart` is that instruction's first byte in
+    // the function, set by the walker; `targetBlock` is then the block the
+    // instruction SITS IN, stamped by `asm.cpp` with `instV` — the run a
+    // non-zero addend must stay inside (see the resolver).
+    bool          selfRelative = false;
+    std::uint32_t instStart    = 0;
 };
+
+// ─────────────────────────────────────────────────────────────────────
+// D-CSUBSET-LONG-BRANCH — THE REACH OF A BLOCK-RELATIVE FIELD, AS DATA
+// ─────────────────────────────────────────────────────────────────────
+//
+// ★★★ THE REACH OF A FIELD IS A PROPERTY OF THE FIELD, NOT OF A CPU NAME.
+// Before this table the `asm.cpp` resolver carried the lsb / width / scale /
+// PC-bias of each patch kind as literals inside its own `switch` arms — two
+// arms that happened to agree on ARM64's `>>2, no bias` and one that spelled
+// x86's `+4, whole word`. Adding an escape path to that shape would have
+// meant a THIRD copy of the same four numbers. They live here once, keyed by
+// the kind the encoder already selects from `wire.slotKind` (config-driven),
+// and every consumer — range check, patch write, escape election — reads the
+// same row.
+//
+// `wholeField` distinguishes the two write disciplines the resolver needs:
+//   * true  — the displacement IS the four bytes at `patchOffset` (x86
+//             rel32): write all 32 bits, no read-modify-write.
+//   * false — the displacement is a bit-window inside a 32-bit LE word
+//             (AArch64 Imm19 / Imm26): READ the word, replace only
+//             [lsb, lsb+width), write it back. A whole-word store here
+//             would clobber the opcode and the cond nibble.
+struct BlockRelFieldGeometry {
+    std::uint8_t lsb;         // first bit of the field inside its 32-bit word
+    std::uint8_t width;       // field width in bits
+    std::uint8_t scaleLog2;   // displacement = delta >> scaleLog2
+    std::int8_t  pcBias;      // bytes added to patchOffset before subtracting
+    bool         wholeField;  // the field is the whole 4-byte little-endian word
+    // P68 round 9: a SPLIT field's low part (AArch64 `ADR`'s immlo) — its
+    // first bit and width; 0 wide for every field that is one window. The
+    // signed range is then `width + loWidth` bits.
+    std::uint8_t loLsb   = 0;
+    std::uint8_t loWidth = 0;
+};
+
+[[nodiscard]] constexpr BlockRelFieldGeometry
+blockRelFieldGeometry(BlockRelPatchKind kind) noexcept {
+    switch (kind) {
+        // x86 rel32-after-disp: `disp = target - (patch + 4)`, unscaled,
+        // written as the whole 4-byte LE field at `patchOffset`.
+        case BlockRelPatchKind::X86Rel32:
+            return BlockRelFieldGeometry{ 0, 32, 0, 4, true };
+        // AArch64 `B.cond`: bits 5..23 of the word, scaled by 4, PC-relative
+        // to the instruction ITSELF (no bias). ±1 MiB.
+        case BlockRelPatchKind::Arm64Imm19:
+            return BlockRelFieldGeometry{ 5, 19, 2, 0, false };
+        // AArch64 `B`: bits 0..25, scaled by 4, no bias. ±128 MiB.
+        case BlockRelPatchKind::Arm64Imm26:
+            return BlockRelFieldGeometry{ 0, 26, 2, 0, false };
+        // AArch64 `TBZ`/`TBNZ`: bits 5..18, scaled by 4, no bias. ±32 KiB.
+        //
+        // ⓘ WHY A ROW WITH NO SHIPPED OPCODE. This is the ISA's narrowest
+        // block-relative field, and its reach is what makes the BRANCH-ISLAND
+        // machinery reachable by a test at all: the widest fields' edges
+        // (±128 MiB, ±2 GiB) cost a 134 MB and a 2 GiB function body to reach,
+        // which is a property of those fields and not of a lane's budget. A
+        // ±32 KiB field reaches the SAME code path with an 8192-word body. The
+        // numbers are the ARM ARM's, not an invention — declaring a field DSS
+        // does not yet wire is the same posture `immediateFieldBits` already
+        // takes for `Imm32` ("the width is a true fact about the slot").
+        case BlockRelPatchKind::Arm64Imm14:
+            return BlockRelFieldGeometry{ 5, 14, 2, 0, false };
+        // AArch64 `ADR`: 21 bits unscaled, no bias — immhi (19 bits) at
+        // bits 5..23 and immlo (the low 2) at bits 29..30. ±1 MiB.
+        case BlockRelPatchKind::Arm64Adr21:
+            return BlockRelFieldGeometry{ 5, 19, 0, 0, false, 29, 2 };
+    }
+    // Enum-drift backstop: a new kind added without a row here returns a
+    // ZERO-WIDTH field, whose signed range is empty, so the resolver refuses
+    // every displacement loudly rather than silently writing nothing.
+    return BlockRelFieldGeometry{ 0, 0, 0, 0, false };
+}
+
+// The inclusive signed displacement range (in SCALED units — the value that
+// actually lands in the field) a geometry admits. A zero-width field yields
+// an empty range `[0, -1]`, which no displacement satisfies.
+[[nodiscard]] constexpr std::int64_t
+blockRelFieldMin(BlockRelFieldGeometry g) noexcept {
+    unsigned const bits = g.width + g.loWidth;
+    return g.width == 0 ? 0 : -(std::int64_t{1} << (bits - 1));
+}
+[[nodiscard]] constexpr std::int64_t
+blockRelFieldMax(BlockRelFieldGeometry g) noexcept {
+    unsigned const bits = g.width + g.loWidth;
+    return g.width == 0 ? -1 : (std::int64_t{1} << (bits - 1)) - 1;
+}
+
+// How far, in BYTES, a kind can branch in the positive direction. Used to
+// ORDER two block-relative slots when the walker elects an escape: an escape
+// is only an escape if it reaches STRICTLY further than the field it rescues.
+// Comparing byte reach rather than bit width is what makes the ordering
+// correct across kinds with different scales (a 19-bit field scaled by 4
+// reaches further than an unscaled 19-bit one would).
+[[nodiscard]] constexpr std::int64_t
+blockRelByteReach(BlockRelPatchKind kind) noexcept {
+    auto const g = blockRelFieldGeometry(kind);
+    return blockRelFieldMax(g) << g.scaleLog2;
+}
+
+// D-CSUBSET-LONG-BRANCH: how far along the way to its target the resolver aims
+// when it asks for an island — the CHAIN STRIDE, in bytes.
+//
+// ★★★ IT IS HALF THE REACH, AND THE HALF IS THE WHOLE TERMINATION ARGUMENT.
+// Placing an island at the full reach leaves it EXACTLY at the edge, and every
+// later pass of the relaxation loop can only GROW the function — one more
+// escape word, one more island cluster — which pushes that island out of reach
+// again and asks for another. At half the reach the placed island keeps a
+// whole half-reach of slack, so the growth relaxation can add (bounded by the
+// island bound stated in `asm.cpp`) cannot undo a placement. Each hop then
+// advances at least `stride` bytes towards the target, which is what bounds
+// the chain length at `ceil(distance / stride)`.
+//
+// The floor of 1 exists so a hypothetical field whose reach is smaller than an
+// instruction still makes progress rather than asking for an island at the
+// site it is already standing on; such a field cannot reach any island at all,
+// so it falls out to the loud refusal, which is the correct answer for it.
+[[nodiscard]] constexpr std::int64_t
+blockRelIslandStride(BlockRelPatchKind kind) noexcept {
+    std::int64_t const half = blockRelByteReach(kind) / 2;
+    return half > 0 ? half : 1;
+}
+
+// D-CSUBSET-LONG-BRANCH: how many kinds the enum declares. Used only to WALK
+// the ordinals, because the enum alone cannot be iterated and a kind added
+// without a `blockRelFieldGeometry` row would silently take the zero-width
+// backstop — an outcome that is safe (it refuses) but wants to be LOUD at
+// build time rather than discovered in a binary.
+// `AsmLongBranch.EveryBlockRelPatchKindHasAGeometryRow` is that ratchet.
+inline constexpr std::size_t kBlockRelPatchKindCount = 4;
+
+// ─────────────────────────────────────────────────────────────────────
+// D-CSUBSET-LONG-BRANCH — THE FIELD WRITE, ONCE, FOR EVERY WRITER
+// ─────────────────────────────────────────────────────────────────────
+//
+// ★★★ THE SECOND WRITER IS WHY THIS IS A FUNCTION. Until branch islands the
+// patch-resolve loop in `asm.cpp` was the only place a block-relative field
+// was ever written, so its two write disciplines (whole 4-byte field vs.
+// read-modify-write of a bit-window) could live inline. An island cluster's
+// JUMP-OVER carries a displacement that is known at EMIT time — the cluster's
+// own size — so it is written by the emitter, not by the resolver. Two writers
+// of one field shape is the N-transforms-on-one-value shape this project keeps
+// naming, so there is one function and both call it.
+//
+// `wholeField` picks the discipline:
+//   * true  — the displacement IS the four bytes at `patchOffset` (x86 rel32).
+//   * false — the displacement is [lsb, lsb+width) inside a 32-bit LE word;
+//             the opcode / cond nibble / register bits already in that word
+//             must survive, so it is a read-modify-write.
+inline void
+writeBlockRelField(std::vector<std::uint8_t>& out,
+                   std::uint32_t              patchOffset,
+                   BlockRelFieldGeometry      g,
+                   std::int64_t               disp) noexcept {
+    std::uint32_t const o = patchOffset;
+    std::uint32_t word =
+        static_cast<std::uint32_t>(out[o])
+      | (static_cast<std::uint32_t>(out[o + 1]) << 8)
+      | (static_cast<std::uint32_t>(out[o + 2]) << 16)
+      | (static_cast<std::uint32_t>(out[o + 3]) << 24);
+    // A SPLIT field (P68 round 9, AArch64 `ADR`): the low `loWidth` bits of
+    // the value go to `loLsb`, the rest to the main window.
+    std::uint32_t const loMask = (1u << g.loWidth) - 1u;
+    std::uint32_t const lo     = static_cast<std::uint32_t>(disp) & loMask;
+    std::int64_t  const rest   = disp >> g.loWidth;
+    std::uint32_t const mask =
+        (g.width >= 32u) ? 0xFFFFFFFFu : ((1u << g.width) - 1u);
+    std::uint32_t const value = static_cast<std::uint32_t>(rest) & mask;
+    word = g.wholeField
+         ? value
+         : ((word & ~(mask << g.lsb) & ~(loMask << g.loLsb))
+            | (value << g.lsb) | (lo << g.loLsb));
+    asm_byte_emit::writeU32LEAt(out, o, word);
+}
+
+
+// ★★★ THE QUESTION "IS THERE A WIDER FIELD TO ESCAPE INTO" CANNOT BE ASKED OF
+// THIS TABLE, AND THE ATTEMPT IS RECORDED HERE BECAUSE IT LOOKED RIGHT.
+// ✔MEASURED 2026-09-16 (cycle P68 round 3, lane `cfgbr`) by a pin written
+// BEFORE the code it checks: a `blockRelWiderKindExists(kind)` that scanned
+// every row for a greater `blockRelByteReach` answered TRUE for `Arm64Imm26`,
+// because `X86Rel32` (±2 GiB) out-reaches it (±128 MiB) — IN A DIFFERENT ISA.
+// The table is a vocabulary of every shape the assembler knows, not of one
+// target's, so a table-wide maximum is a cross-ISA leak: it would have told a
+// reader whose arm64 `B` overflowed to go declare a wider word that AArch64
+// does not have. The question is therefore asked where it can be answered —
+// of the OPCODE's own encoding variants, by `electEscapeWord` — and its answer
+// rides to the resolver on `BlockRelPatch::widerFieldDeclared`.
 
 // D-CSUBSET-COMPUTED-GOTO (`&&label` block-address materialization):
 // a pending SYNTHETIC-SYMBOL ↔ BLOCK binding accumulated by an encoder

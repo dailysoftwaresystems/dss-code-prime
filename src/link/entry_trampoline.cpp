@@ -11,7 +11,7 @@
 #include "lir/lir_node.hpp"
 #include "lir/lir_reg.hpp"
 
-#include <algorithm>   // std::min -- the argument-register park
+#include <algorithm>   // std::max -- the live argument-register count
 #include <cstdint>
 #include <format>
 #include <limits>
@@ -165,6 +165,52 @@ void emit(DiagnosticReporter& rep, DiagnosticCode code, std::string msg) {
     if (info == nullptr) return std::nullopt;
     return makePhysicalReg(*ord,
                            static_cast<LirRegClass>(info->regClass));
+}
+
+// The `stack-vector` emitter below loads exactly two values off the entry stack
+// — argc into argGprs[0], argv's address into argGprs[1] — and every verb it
+// serves starts from those two (the environment verb's synthesized init computes
+// envp FROM them). One constant, read by the emitter's register-count check and by
+// the park, so the two cannot disagree about how many registers the emitter fills.
+constexpr std::size_t kStackVectorLoadedArgs = 2;
+
+// ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: HOW MANY ARGUMENT REGISTERS ARE LIVE ────
+//
+// The number of argument registers holding the program's arguments when the
+// before-entry static initializers run — exactly what the park below must carry
+// across them. Derived from the FORMAT's own declarations, never a literal:
+//   * `stack-vector` — the two this trampoline loads itself. An environment verb
+//     does not raise it: the entry was retargeted to a synthesized init that
+//     takes (argc, argv) and computes envp.
+//   * `crt-argv-accessors` — NONE. The entry was retargeted to a synthesized init
+//     that takes no arguments and asks the CRT for them after the initializers.
+//   * no `processArgs` block — the LOADER delivered the arguments before any DSS
+//     code ran (dyld calls LC_MAIN with argc, argv, envp, apple), and the entry
+//     may read as many as the widest verb this format realizes. The resolved verb
+//     is not visible here — `AssembledModule` carries the entry's symbol, not its
+//     signature — so the park covers every form this format can hand an entry.
+//
+// ★ THIS REPLACED A LITERAL `min(2, argGprs)`, AND THE LITERAL WAS A DEFECT
+// found on the way to the environment verbs: on the pass-through arm a 3- or
+// 4-parameter `main` beside a constructor received whatever the initializers left
+// in envp's and apple's registers (the argument registers are caller-saved on
+// every convention here). Too few is that defect; the CRT arm's two were dead
+// traffic. Neither is a count the format did not imply.
+[[nodiscard]] std::size_t liveEntryArgumentCount(ObjectFormatSchema const& format) {
+    auto const& pa = format.processArgs();
+    if (pa.has_value()) {
+        switch (pa->mechanism) {
+        case ArgsMechanism::StackVector:      return kStackVectorLoadedArgs;
+        case ArgsMechanism::CrtArgvAccessors: return 0;
+        case ArgsMechanism::None:             return 0;   // refused above: no arm
+        }
+        return 0;
+    }
+    std::size_t n = 0;
+    for (auto const v : format.entryVerbs()) {
+        n = std::max(n, entryVerbParams(v).size());
+    }
+    return n;
 }
 
 } // namespace
@@ -412,13 +458,14 @@ bool injectEntryTrampoline(AssembledModule&          module,
                              argsMechanismName(pa.mechanism)));
             return false;
         }
-        if (cc->argGprs.size() < 2) {
+        if (cc->argGprs.size() < kStackVectorLoadedArgs) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format("entry-trampoline: cc '{}' declares {} "
                              "argGprs but the stack-vector processArgs "
-                             "mechanism needs TWO (argc + argv "
+                             "mechanism needs {} (argc + argv "
                              "destinations).",
-                             ccName, cc->argGprs.size()));
+                             ccName, cc->argGprs.size(),
+                             kStackVectorLoadedArgs));
             return false;
         }
         if (!cc->stackPointer.has_value()) {
@@ -602,16 +649,45 @@ bool injectEntryTrampoline(AssembledModule&          module,
     // `main(int argc, char **argv)` whatever that initializer left behind.
     //
     // ★ IT IS NOT CONFINED TO FORMATS THAT DECLARE `processArgs`. On the
-    // pass-through arm (Mach-O, where dyld already delivers argc/argv in the
-    // argument registers) the trampoline never touches them — so the clobber is
-    // identical, and the park is gated on there BEING calls, not on how the
-    // registers came to hold their values.
+    // pass-through arm (Mach-O, where dyld already delivers argc/argv/envp/apple
+    // in the argument registers) the trampoline never touches them — so the
+    // clobber is identical, and the park is gated on there BEING calls, not on how
+    // the registers came to hold their values.
+    //
+    // ★ HOW MANY is `liveEntryArgumentCount`'s answer — see it for why each arm
+    // parks what it parks. A convention with fewer argument registers than that
+    // count cannot be the one the entry is called with, so it is refused rather
+    // than parked partially.
     std::vector<std::pair<LirReg, LirReg>> parkedArgs;   // (saved, original)
     if (!beforeEntry.empty()) {
-        std::size_t const nArgs = std::min<std::size_t>(2, cc->argGprs.size());
+        std::size_t const nArgs = liveEntryArgumentCount(format);
+        if (nArgs > cc->argGprs.size()) {
+            // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("entry-trampoline: format '{}' hands its program "
+                             "entry {} argument(s) in registers, but calling "
+                             "convention '{}' declares only {} argument GPRs — "
+                             "the park across the before-entry static "
+                             "initializers would leave the rest to whatever the "
+                             "initializers wrote. Declare the convention's full "
+                             "argument-register list, or drop the entry verbs "
+                             "the convention cannot carry from the format.",
+                             std::string{format.name()}, nArgs, ccName,
+                             cc->argGprs.size()));
+            return false;
+        }
         for (std::size_t i = 0; i < nArgs; ++i) {
             auto const orig = physRegByName(target, cc->argGprs[i]);
-            if (!orig.has_value()) continue;
+            if (!orig.has_value()) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("entry-trampoline: cc '{}' references "
+                                 "register '{}' (argGprs[{}], a live program "
+                                 "argument across the before-entry static "
+                                 "initializers) that the target schema does "
+                                 "not declare.",
+                                 ccName, cc->argGprs[i], i));
+                return false;
+            }
             auto const save = takeCalleeSavedGpr();
             if (!save.has_value()) {
                 emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,

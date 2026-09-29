@@ -1,0 +1,26 @@
+{
+  "$comment": "P68 round 13 (lane `cs`, D-C-A-STATIC-INITIALIZER-THAT-IS-NOT-A-CONSTANT-EXPRESSION-IS-ACCEPTED): the truth value of a WEAK declaration's address in a static initializer — no constant, because the declaration may resolve to a null address at load. The semantic tier cannot prove it (the address is a static object's), so the static-data producer's constant evaluator declines it (a weak declaration's address has no truth value) and, C's static objects taking no runtime initializer, the MIR tier refuses it at the initializer: H_StaticInitializerNotFolded — never the object-format refusal it met before this round. MEASURED 2026-09-24 through `dssharness run probe-reference-cc` (lane `cs`'s batch runs 20260925-030219-9712c3e8 on linux-x86_64-debug and 20260925-030248-b3863313 on windows-x86_64-debug), this file at -std=c17 -pedantic-errors and at -std=c2x: gcc 13.3.0 and mingw-w64 13.2.0 refuse it at 8:9 (\"initializer element is not constant\"), clang 18.1.3 at 8:12; AppleClang 21.0.0 refuses it too (macos-arm64-release, run 20260925-030327-b1170b39).",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "H_StaticInitializerNotFolded",
+      "line": 8,
+      "col": 9
+    }
+  ]
+}

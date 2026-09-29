@@ -28,6 +28,8 @@
 #include <span>
 #include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 using dss::CompilationUnitId;
 // Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): checkInlineAsm's vocabulary.
@@ -904,7 +906,7 @@ TEST(HirVerifier, CallArgWideningIsAssignableClean) {
     EXPECT_EQ(reporter.errorCount(), 0u);
 }
 
-// ── D-LANG-VARIADIC (step 13.4) variadic-arity arm ────────────────────────
+// ── D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4) variadic-arity arm ────────────────────────
 //
 // The Call walker's arity check is a 3-way branch: variadic-too-few /
 // fixed-mismatch / clean. These three tests pin the matrix at the HIR
@@ -976,6 +978,185 @@ TEST(HirVerifier, NonVariadicFnSigStillRejectsExtraArgs) {
     DiagnosticReporter reporter;
     EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
     EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+// ── P68 round 8 (lane `ht`, part 2): A `void` PARAMETER ENDS THE ARGUMENT LIST ──
+//
+// A C declaration that is not a definition may name a parameter of type void
+// (`void f(void v);`, `void f(int a, void v);` — gcc and mingw accept them, clang
+// and MSVC refuse), and gcc's measured meaning is that a call's arguments END at
+// it: `f()` and `f(42)` RUN against a `void f(void)` / `void f(int)` defined in
+// another translation unit. The semantic call check, THIS rule and the MIR
+// verifier's call gate ask ONE lattice helper which parameters take an argument —
+// `TypeInterner::fnArgumentParams` / `fnArgumentsVariadic` — so reverting it turns
+// these, the MIR twins, the C front end's pins
+// (`test_function_type_completeness.cpp`) and the runnable example
+// (`examples/c/named_void_param_prototype/`) red together.
+
+namespace {
+
+// One call of `sig` with `args` i32 literals, verified into `reporter`.
+void verifyCallWithI32Args(TypeInterner& ti, TypeId sig, std::size_t args,
+                           DiagnosticReporter& reporter) {
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    HirBuilder b{"c"};
+    std::vector<HirNodeId> lits;
+    for (std::size_t k = 0; k < args; ++k) lits.push_back(b.makeLiteral(i32));
+    HirNodeId const call = b.makeCall(b.makeRef(sig, /*symbol=*/1), lits, voidT);
+    Hir h = std::move(b).finish(call);
+    (void)HirVerifier{h, nullptr, &ti}.verify(reporter);
+}
+
+} // namespace
+
+TEST(HirVerifier, ACallsArgumentsEndAtAVoidParameter) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const onlyVoid = ti.fnSig(std::array{voidT}, voidT, dss::CallConv::CcSysV);
+    TypeId const intThenVoid =
+        ti.fnSig(std::array{i32, voidT}, voidT, dss::CallConv::CcSysV);
+    TypeId const voidThenInt =
+        ti.fnSig(std::array{voidT, i32}, voidT, dss::CallConv::CcSysV);
+    TypeId const voidThenDots = ti.fnSig(std::array{voidT}, voidT, dss::CallConv::CcSysV,
+                                         /*isVariadic=*/true);
+    // The lattice's one answer, read directly: the list BEFORE the first void.
+    EXPECT_EQ(ti.fnArgumentParams(onlyVoid).size(), 0u);
+    EXPECT_EQ(ti.fnArgumentParams(intThenVoid).size(), 1u);
+    EXPECT_EQ(ti.fnArgumentParams(voidThenInt).size(), 0u);
+    EXPECT_FALSE(ti.fnArgumentsVariadic(voidThenDots))
+        << "a `...` after the void is unreachable (gcc: too many arguments)";
+    // …and the verifier agrees with it: each of these calls is clean.
+    for (auto const& [sig, args] : {std::pair{onlyVoid, std::size_t{0}},
+                                    std::pair{intThenVoid, std::size_t{1}},
+                                    std::pair{voidThenInt, std::size_t{0}},
+                                    std::pair{voidThenDots, std::size_t{0}}}) {
+        DiagnosticReporter r;
+        verifyCallWithI32Args(ti, sig, args, r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u)
+            << "a call passing " << args << " argument(s) to signature #" << sig.v
+            << " binds exactly the parameters before its void";
+    }
+}
+
+TEST(HirVerifier, AnArgumentAtOrPastTheVoidParameterStillFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const onlyVoid = ti.fnSig(std::array{voidT}, voidT, dss::CallConv::CcSysV);
+    TypeId const intThenVoid =
+        ti.fnSig(std::array{i32, voidT}, voidT, dss::CallConv::CcSysV);
+    TypeId const voidThenDots = ti.fnSig(std::array{voidT}, voidT, dss::CallConv::CcSysV,
+                                         /*isVariadic=*/true);
+    for (auto const& [sig, args] : {std::pair{onlyVoid, std::size_t{1}},     // at the void
+                                    std::pair{intThenVoid, std::size_t{2}},  // past it
+                                    std::pair{intThenVoid, std::size_t{0}},  // before it
+                                    std::pair{voidThenDots, std::size_t{1}}}) {
+        DiagnosticReporter r;
+        verifyCallWithI32Args(ti, sig, args, r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 1u)
+            << "a call passing " << args << " argument(s) to signature #" << sig.v;
+    }
+}
+
+// A QUALIFIED void is not the end (gcc: `f()` through `void f(volatile void v)` is
+// "too few arguments"), so the declared list is the argument list.
+TEST(HirVerifier, AQualifiedVoidParameterDoesNotEndTheList) {
+    TypeInterner ti = makeInterner();
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const volVoid = ti.volatileQualified(voidT);
+    TypeId const sig = ti.fnSig(std::array{volVoid}, voidT, dss::CallConv::CcSysV);
+    EXPECT_EQ(ti.fnArgumentParams(sig).size(), 1u);
+    DiagnosticReporter r;
+    verifyCallWithI32Args(ti, sig, 0, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+// ── D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT — the post-coerce pointer
+//    invariant, pinned ──────────────────────────────────────────────────────
+//
+// `checkCallArguments` calls `isAssignable` WITHOUT its 4th parameter, so the
+// pointer rules default to `PointerConversionRules{}` — every flag false,
+// strict reject. That omission IS the invariant, not a conservatism: the
+// verifier reads POST-coerce HIR, in which every implicit pointer conversion
+// the active language admits has already been materialized as an explicit
+// `HirKind::Cast` by `cst_to_hir.cpp::coerce()`. A bare `Ptr<I32>` arriving in
+// a `Ptr<Void>` parameter slot is therefore a PRODUCER BUG, and admitting it
+// would bless a shim wiring a `FILE*` into a `char*` slot. `mir_verifier.cpp`
+// (`sameSlotType`) states the same rule one tier down.
+//
+// Until these two arms the contract was asserted by CONSTRUCTION and by COMMENT
+// only — nothing went red if someone "helpfully" threaded the active language's
+// `pointerConversions` block into that call site, which for `c` sets
+// `implicitToVoidPtr = true` and would silently admit the uncast argument.
+//
+// The comment's own Closure clause named the trigger: the first non-`cst_to_hir`
+// HIR producer. It has fired. `parseHir` (`hir/hir_text.cpp`) rebuilds a whole
+// module from `.dsshir` text and runs `HirVerifier` on load, and a `HirBuilder`
+// caller — every fixture in this file, and tomorrow's FFI shim or trampoline
+// synthesizer — reaches the same check without passing through `coerce()` at all.
+//
+// The argument is a `Ref`, NOT a `Literal`, deliberately: this same walker
+// carries the D-LANG-NULL-POINTER-CONSTANT structural fallback, which admits an
+// INTEGER-typed `Literal` in a `Ptr<*>` slot. A `Ref` is structurally outside
+// that arm, so what these arms measure is the pointer rule alone.
+//
+// Both arms are required. The FIRES arm alone could be satisfied by
+// blanket-rejecting every `Ptr`→`Ptr` argument; the CLEAN arm pins that the
+// rule is about the MISSING Cast, which is the only thing that makes the
+// post-coerce invariant a contract rather than a ban on pointers.
+
+TEST(HirVerifier, BarePointerArgIntoVoidPointerParamFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32     = ti.primitive(TypeKind::I32);
+    TypeId const voidTy  = ti.primitive(TypeKind::Void);
+    TypeId const ptrI32  = ti.pointer(i32);
+    TypeId const ptrVoid = ti.pointer(voidTy);
+    TypeId const sig     = ti.fnSig(std::array{ptrVoid}, i32,
+                                    dss::CallConv::CcSysV);  // (ptr<void>)->i32
+
+    HirBuilder b{"toy"};
+    HirNodeId const callee = b.makeRef(sig, /*symbol=*/1);
+    // NO interposed Cast — exactly the shape a producer emits when it assumes
+    // "all pointers are interchangeable".
+    HirNodeId const arg  = b.makeRef(ptrI32, /*symbol=*/2);
+    HirNodeId const call = b.makeCall(callee, std::array{arg}, i32);
+    Hir h = std::move(b).finish(call);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)))
+        << "a bare Ptr<I32> in a Ptr<Void> param slot is a post-coerce "
+           "producer bug and must not verify clean";
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u)
+        << "threading the active language's PointerConversionRules into "
+           "checkCallArguments' isAssignable call would silence exactly this";
+}
+
+TEST(HirVerifier, PointerArgCastToVoidPointerParamIsClean) {
+    // The NEGATIVE of the arm above, and the whole reason the rule is a
+    // contract: once `coerce()` has materialized the conversion as an explicit
+    // Cast, the argument's type IS the parameter's type and the check passes.
+    TypeInterner ti = makeInterner();
+    TypeId const i32     = ti.primitive(TypeKind::I32);
+    TypeId const voidTy  = ti.primitive(TypeKind::Void);
+    TypeId const ptrI32  = ti.pointer(i32);
+    TypeId const ptrVoid = ti.pointer(voidTy);
+    TypeId const sig     = ti.fnSig(std::array{ptrVoid}, i32,
+                                    dss::CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId const callee = b.makeRef(sig, /*symbol=*/1);
+    HirNodeId const arg    = b.makeCast(b.makeRef(ptrI32, /*symbol=*/2),
+                                        ptrVoid, HirFlags::Synthetic);
+    HirNodeId const call   = b.makeCall(callee, std::array{arg}, i32);
+    Hir h = std::move(b).finish(call);
+
+    DiagnosticReporter reporter;
+    EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)))
+        << "the post-coerce shape — Cast(Ref : ptr<i32>) : ptr<void> — is what "
+           "cst_to_hir emits and must verify clean";
+    EXPECT_EQ(reporter.errorCount(), 0u);
 }
 
 // ── intrinsic rule (HR6, H_UnknownIntrinsic) ──

@@ -100,6 +100,11 @@ struct HirAddressValue {
     std::uint32_t base       = kNullBase;
     std::int64_t  byteOffset = 0;
     TypeId        pointeeType{};   // fold-transient; not serialized (invalid when parsed)
+    // P68 round 13 (lane `cs`): FOLD-TRANSIENT too — the base is a weak declaration with no
+    // definition, whose address the loader may resolve to null, so the engine gives the
+    // address no truth value and no inequality with another (`EvalEnvironment`'s
+    // `AddressableSymbol`). Not serialized; false on a parsed value.
+    bool          baseMayBeNull = false;
 };
 
 struct HirLiteralValue {

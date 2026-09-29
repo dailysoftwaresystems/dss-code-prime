@@ -9,7 +9,8 @@
  * `&arr[CONST-EXPR]` is an ADDRESS CONSTANT (C 6.6p9): gcc emits
  * `.quad arr+K*sizeof(elem)` (abs64 reloc with addend), never a runtime store.
  * Pre-fix: tryClassifyAsSymbolAddr's AddressOf arm accepted only AddressOf(Ref)
- * -> the init fell to runtimeInit -> K_NoMatchingObjectFormat fail-loud.
+ * -> the init fell to runtimeInit -> K_NoMatchingObjectFormat fail-loud. (P68
+ * round 13 deleted that classifier: the constant evaluator's element arm folds it.)
  *
  * Checks are BY VALUE (deliberately no `p == arr` pointer-identity check:
  * that trips the pre-existing, unrelated D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY

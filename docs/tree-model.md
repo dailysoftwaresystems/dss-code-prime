@@ -50,7 +50,7 @@ Universal per-node accessors — these work on any node, no discriminant check n
 |---|---|---|
 | `t.kind(id)` | `NodeKind` | `Internal` or `Token` |
 | `t.flags(id)` | `NodeFlags` | Bitwise OR of `EmptySpace`, `HasError`, `Missing`, `Synthetic`, … |
-| `t.span(id)` | `SourceSpan` | Byte range in `t.source()` |
+| `t.span(id)` | `SourceSpan` | Byte range in `t.source()`. An `Internal` node's range runs from its first significant token to its last: its `EmptySpace` children (trivia the parser pushed in before an optional tail was decided) are children, but never widen it |
 | `t.parent(id)` | `NodeId` | `InvalidNode` for the root |
 | `t.children(id)` | `std::span<NodeId const>` | CST order — includes EmptySpace |
 | `t.text(id)` | `std::string_view` | Slice of `t.source()` covering `t.span(id)` |

@@ -122,6 +122,12 @@ private:
     // open document whose schema (or whose reason for having none) changed.
     // Returns true iff the preference changed.
     //
+    // D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: the same re-read also yields
+    // the workspace's BUILD configurations (`workspaceBuild_`), and when those
+    // differ every open document is re-analyzed — a manifest edit that adds a
+    // target, an include directory or a define changes what every file means,
+    // not just the files whose grammar moved.
+    //
     // ★ THE REPUBLISH IS THE POINT, NOT AN EXTRA. Re-reading the manifests per
     // `didOpen` was REJECTED when this channel was built, because it would let a
     // mid-session edit silently change the meaning of ALREADY-OPEN documents
@@ -131,6 +137,37 @@ private:
     // look. A refresh that changed future resolutions only would reintroduce
     // exactly the defect the original design refused.
     bool refreshWorkspacePreference_();
+
+    // ── WHAT ONE PARSE JOB RUNS (D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE) ──
+    // The document analyzed once per configuration the workspace's builds
+    // compile it under — a manifest's `<target>:<format>` pair with that
+    // manifest's language, include directories and defines — or once under its
+    // language alone when no build applies. Decided on the `run()` thread
+    // (`workspaceBuild_` lives there) and handed to the worker whole.
+    struct ParseRun {
+        std::string                               label;   // "" ⇒ language-only
+        std::shared_ptr<dss::GrammarSchema const> grammar;
+        std::shared_ptr<dss::TargetSchema const>  target;  // null ⇒ no pair
+        std::shared_ptr<dss::ObjectFormatSchema const> format;
+        dss::TargetCallingConvention const*       callingConvention = nullptr;
+        std::vector<std::filesystem::path>        includeDirs;
+        std::vector<std::string>                  defines;
+    };
+    struct ParsePlan {
+        std::vector<ParseRun>         runs;
+        // Refusals published as they are: the workspace's manifests could not
+        // be read, or a configuration's grammar could not be loaded.
+        std::vector<DocumentAnalysis> refusals;
+    };
+    [[nodiscard]] ParsePlan planParse_(std::string const&      uri,
+                                       DocumentSnapshot const& snap);
+
+    // One run of a plan: the document built and analyzed under ONE
+    // configuration. `bufferName` is the document's path (its uri when it is not
+    // a file), so a quote include searches the document's own directory.
+    [[nodiscard]] static DocumentAnalysis analyzeRun_(ParseRun const&    run,
+                                                      std::string const& text,
+                                                      std::string const& bufferName);
 
     // Submit a parse job for `uri`. Captures the current generation
     // from the document store; the worker drops the result if a
@@ -166,6 +203,14 @@ private:
     bool                               initializeReceived_ = false;
     std::vector<std::filesystem::path> workspaceRoots_;
     WorkspacePreferenceResult          workspacePreference_ =
+        std::unexpected(WorkspaceProjectError{
+            WorkspaceProjectErrorKind::NoWorkspaceRoot,
+            "the client has not sent `initialize` yet, so no workspace folder "
+            "is known"});
+    // The workspace's build configurations (see `ParsePlan`), re-derived with
+    // the preference and under the same rules: written and read on the `run()`
+    // thread only, and "no workspace yet" until `initialize` says otherwise.
+    WorkspaceBuildResult               workspaceBuild_ =
         std::unexpected(WorkspaceProjectError{
             WorkspaceProjectErrorKind::NoWorkspaceRoot,
             "the client has not sent `initialize` yet, so no workspace folder "

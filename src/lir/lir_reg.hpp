@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/target_schema.hpp"   // TargetRegClass (synchrony assert)
 
+#include <bit>          // std::bit_width — the class field's width is DERIVED
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -46,6 +47,67 @@ enum class LirRegClass : std::uint8_t {
 // impossible. Published beside the enum it derives from.
 inline constexpr std::size_t kLirRegClassCount =
     static_cast<std::size_t>(LirRegClass::Flags) + 1u;
+
+// ── THE THREE FIELD WIDTHS ARE DERIVED FROM THE CLASS COUNT AND THE POD SIZE ─
+// D-LIR-VREG-ID-BITFIELD-TRUNCATES-SILENTLY-PAST-ITS-WIDTH.
+//
+// ⚠⚠ WHAT THIS REPLACED, AND WHAT IT COST. The three widths used to be written
+// as literals — `id : 24`, `classKind : 6`, `isPhysical : 1`. That is 31 of the
+// 32 bits in the allocation unit: **one bit was simply unspent**, and five
+// register classes were given a field that can name sixty-four. ✔MEASURED
+// 2026-09-17 on one AArch64 function of 129 056 repeated aggregate copies: the
+// allocator sees `130·n + 4` distinct vreg ids, so at n = 129 055 it sees
+// 16 777 154 — sixty-one short of 2²⁴ — and compiles in 30 s, while at
+// n = 129 056 it sees 16 777 284 and the 16 777 216th id **truncates to 0**,
+// which is the INVALID SENTINEL. The boundary is exactly one repeat wide.
+//
+// Downstream of that truncation, distinct virtual registers SHARE an id;
+// liveness keys ranges by id, so their ranges union into a hull spanning the
+// whole function (✔MEASURED: one 41.8-million-position hull in a 51.8-million
+// position function), nothing can be register-allocated, and at n = 160 000 the
+// compile had produced 898 406 spill slots and was still running after 900 s.
+// ⛔ AND THE HANG WAS THE LUCKY OUTCOME: two live values on one id get ONE
+// register, and `findAllocationConflict` — the auditor installed against exactly
+// that — re-derives from the same liveness table and therefore inherits the same
+// collision. A silent miscompile is the failure mode this width now forecloses.
+//
+// ★ WHY DERIVED RATHER THAN A BIGGER LITERAL. A literal `28` would be a number
+// someone chose, and the next person to add a register class would silently
+// shrink the largest compilable function. These derive: `kLirRegClassBits` is
+// the narrowest field that can name every `LirRegClass`, `isPhysical` is one
+// bit, and **the id takes the entire remainder**. Add a sixth class and nothing
+// moves (3 bits already name eight); add a ninth and the id narrows by one bit
+// and the pin below stops the build so the trade is made on purpose. There is no
+// tunable here and nothing to configure: the widths are a consequence of the
+// enum above and of `sizeof(LirReg) == 4`, both of which already have owners.
+inline constexpr unsigned kLirRegClassBits =
+    static_cast<unsigned>(std::bit_width(kLirRegClassCount - 1u));
+inline constexpr unsigned kLirRegIdBits =
+    32u - kLirRegClassBits - 1u;   // 1 = isPhysical
+// The largest id `LirReg` can NAME. `LirBuilder::newVReg` refuses to mint past
+// it rather than truncating — see the refusal there, which is the door this
+// constant exists to gate.
+inline constexpr std::uint32_t kLirRegMaxId =
+    static_cast<std::uint32_t>((std::uint64_t{1} << kLirRegIdBits) - 1u);
+
+static_assert(kLirRegClassCount >= 2u,
+              "a register-class field narrower than one bit is not a field");
+static_assert(kLirRegClassCount <= (std::size_t{1} << kLirRegClassBits),
+              "the class field must be able to name every LirRegClass");
+static_assert(kLirRegIdBits + kLirRegClassBits + 1u == 32u,
+              "the three fields must spend the 4-byte allocation unit EXACTLY — "
+              "an unspent bit is a smaller largest-compilable-function for no "
+              "reason, which is the defect this derivation closed");
+// ★ THE TRIPWIRE, and it is the same device the class count already uses. The
+// value is fully derived, so this asserts nothing about correctness — it exists
+// so that adding a ninth register class, which would narrow the id by a bit and
+// HALVE the largest function this compiler can lower, stops the build instead of
+// quietly moving a cliff nobody is looking at.
+static_assert(kLirRegIdBits == 28u,
+              "the vreg id field changed width — that moves the largest function "
+              "DSS can lower (28 bits = 268 435 455 vregs ≈ 1.3 GB of emitted "
+              "text in ONE function). Re-read the derivation above, confirm the "
+              "trade is intended, then update this pin");
 
 // ── THE SPELLINGS HAVE ONE OWNER, AND IT IS `kTargetRegClassTable` ────────
 // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET.
@@ -119,8 +181,13 @@ struct LirReg;
 // regalloc: `isPhysical == true`, `id` is the target-specific
 // physical-register ordinal (e.g. x86_64 rax=0, rcx=1, ...).
 struct LirReg {
-    std::uint32_t id          : 24;  // virtual number OR physical ordinal
-    std::uint32_t classKind   :  6;  // LirRegClass (5 values fit in 6 bits)
+    // ⚠ THE WIDTHS ARE DERIVED — see `kLirRegIdBits` above for why, and for the
+    // measurement that showed what a literal `24` here cost. Every field is
+    // declared `std::uint32_t` so both the GNU and the MSVC bit-field layout
+    // algorithms pack all three into ONE 4-byte allocation unit; that is the
+    // same constraint the constructor docblock below records.
+    std::uint32_t id          : kLirRegIdBits;     // virtual number OR physical ordinal
+    std::uint32_t classKind   : kLirRegClassBits;  // LirRegClass
     std::uint32_t isPhysical  :  1;
 
     // ── THE AGGREGATE PATH IS SEALED, AND THAT IS THE WHOLE POINT ─────────
@@ -274,6 +341,16 @@ static_assert([] {
      ".dsslir text format and .target.json disagree in silence");
 
 // Factory definitions (declared above the struct, which befriends them).
+//
+// ⚠⚠ `id` IS NARROWED TO `kLirRegIdBits` HERE, AND THIS FACTORY DOES NOT CHECK
+// IT. D-LIR-VREG-ID-BITFIELD-TRUNCATES-SILENTLY-PAST-ITS-WIDTH. The check lives
+// at the ONE place ids are MINTED — `LirBuilder::newVReg`, which refuses past
+// `kLirRegMaxId` — for the same reason the aggregate path above is sealed rather
+// than policed: a precondition enforced at the single producer cannot be
+// forgotten, while one duplicated at every call site can. The other two callers
+// in `src/` (`lir_liveness.cpp`, rebuilding a range's own vreg, and the
+// allocator's physical path) re-state an id that this type already named, so
+// neither can present a value the mint door has not already accepted.
 [[nodiscard]] constexpr LirReg makeVirtualReg(std::uint32_t id,
                                               LirRegClass cls) noexcept {
     return LirReg{id, cls, /*physical=*/false};

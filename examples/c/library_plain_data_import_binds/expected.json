@@ -1,0 +1,34 @@
+{
+  "$comment": "D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA — the ACCEPTING half of the storage-duration agreement rule, and the arm that keeps the refusal from being a blanket. `library_thread_local_refused` names the TLS export from this same image and must be REFUSED; this entry names the ORDINARY export from it and must BIND. ★★★ WHY THE PAIR AND NOT JUST THE REFUSAL: a rule keyed on `this library exports a thread-local` rather than on `THIS NAME is a thread-local` would refuse every import from any image carrying a .tdata section, which is most real libraries — and it would pass the refusal example perfectly. This is the entry that sees that. It reaches the same call site with the same library on `--resolve-library`: the reader classifies both rows, the binder consults the matched one, and the answer for this name is `ordinary`. ★★ IT NEEDS NO HARNESS CAPABILITY. The SUCCESS arm of both runners has staged `prebuiltLibraries` since the BSD-archive entry, so this example is files only. Its sibling refusal is not, and that asymmetry is the finding this lane reports rather than a property of this entry. ⚠ THE TWO RUNNERS DO NOT WITNESS THE SAME THING HERE, AND SAYING SO IS THE POINT. ✔MEASURED at this tree: the IN-PROCESS runner reports `compiled=x86_64:elf64-x86_64-linux-exec,arm64:elf64-aarch64-linux-exec` — both specs built, artifacts produced, nothing spawned — while the CLI entry passes in 0.26 s having compiled NOTHING, because the integrated runner builds only the HOST-RUNNABLE spec and this entry declares none on any host. That asymmetry is a property of the harness, not of this entry; two corpus manifests already carried it before this one. It is recorded HERE rather than left for a reader to discover, because an entry that asserts in one runner and shrugs in the other must not read as if both had checked. ⇒ THE ASSERTION THIS ENTRY MAKES IS THE IN-PROCESS ONE: a compile that must SUCCEED against a TLS-carrying library, on both ELF targets. ⚠ WHY BOTH ARMS ARE BUILD-ONLY (`runOn: []`), and it is a property of the FIXTURE, not of the runners: the prebuilt `libtls-*.so.1` files declare the SONAME `libtls.so`, so the exec's DT_NEEDED names `libtls.so` — a file that exists under no name any library search path could find. ✔MEASURED 2026-09-18 (WSL, shipped CLI, both configurations): exit 127 WITHOUT a search path and STILL 127 WITH `LD_LIBRARY_PATH` pointed at `tests/ffi/data`, on both ELF targets — so the runners' `loaderSearchPathVariable` (P68) cannot make these arms run, and an earlier note here that promised a library-path capability would was wrong. What this entry needs from its arms is a BUILD-time event anyway — the bind either happens or is refused — so compile-only is the full assertion, and the artifact's existence is checked by the runner. ⓘ Running it would need the fixture regenerated with a SONAME equal to its file name, or a `libtls.so` beside it; the exitCode is already right for that day — the library's `dss_lib_plain_counter` is 11, `fold(11) & 0x7F` is 42. ★ THE `release` ARM, AND WHY THIS MANIFEST CARRIES ONE NOW: it used to carry NONE and stated the rule 'a build-only example must NOT declare `optimizedPipelines`', because an optimized arm was compiled only where its BASELINE arm RAN — on a build-only target a declared arm was built on no host and asserted nothing anywhere (the ledger read `compile not attempted: baseline arm did not run`), and six manifests carried exactly that phantom. That rule is RETIRED (P68): an arm on a target no host runs is now COMPILED wherever its baseline is — on every host, by the in-process runner — and its image JUDGED against the baseline's. So the arm is declared, with `mustDifferFromBaseline`, because ✔MEASURED (shipped CLI, debug vs `--config=release`, byte-wise) both ELF images differ — 9720 vs 9688 bytes on each target, distinct md5s — and a release pipeline that stopped transforming this program, or stopped binding it against a TLS-carrying library, now reds here. ⓘ The `release` pipeline emits X_OptFixpointTruncated on this program; it is a warning about the pipeline's own iteration cap, not about this code. Leg-by-leg results are NOT recorded here — whoever runs the legs writes them.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [],
+      "prebuiltLibraries": [
+        {
+          "$comment": "The SAME TLS-carrying fixture the refusal example resolves against — that is the whole point of this arm. gcc 13.3.0 / GNU ld 2.42, `-shared -fPIC -Os`, stripped; provenance and rebuild commands in tests/ffi/data/libtls.source.c.",
+          "path": "tests/ffi/data/libtls-x86_64.so.1",
+          "containerWitness": ".tdata"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [],
+      "prebuiltLibraries": [
+        {
+          "path": "tests/ffi/data/libtls-aarch64.so.1",
+          "containerWitness": ".tdata"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

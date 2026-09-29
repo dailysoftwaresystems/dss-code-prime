@@ -46,7 +46,7 @@ target_link_libraries(dss_asm_test_asm_arm64_bitwise_w
 # bytes, the OLD word). Same in-memory `mutate_target_schema.hpp` posture.
 # ⚠ ITS MUTANTS ARE CONFIG-LEVEL, so it MUST run through ctest — `dss_add_test`
 # sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever
-# tree the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# tree the shell stands in.
 dss_add_test(NAME asm/test_asm_arm64_movz_w
              SOURCES test_asm_arm64_movz_w.cpp)
 target_link_libraries(dss_asm_test_asm_arm64_movz_w
@@ -67,7 +67,7 @@ target_link_libraries(dss_asm_test_asm_text_to_lir
 # WARNING: its byte pins are config-level (they read the shipped `.lang.json`
 # and `.target.json`), so it MUST run through ctest -- `dss_add_test` sets
 # DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever
-# tree the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# tree the shell stands in.
 dss_add_test(NAME asm/test_asm_template_to_lir
              SOURCES test_asm_template_to_lir.cpp)
 target_link_libraries(dss_asm_test_asm_template_to_lir
@@ -97,11 +97,53 @@ target_link_libraries(dss_asm_test_asm_shipped_dialects
 # ⚠ ITS PINS ARE CONFIG-LEVEL (they read the shipped `.lang.json` and
 # `.target.json`), so it MUST run through ctest — `dss_add_test` sets
 # DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever tree
-# the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# the shell stands in.
 dss_add_test(NAME asm/test_asm_cfi_producer
              SOURCES test_asm_cfi_producer.cpp)
 target_link_libraries(dss_asm_test_asm_cfi_producer
     PRIVATE nlohmann_json::nlohmann_json)
+
+# The ONE numeric-local-label resolver (`asm/asm_local_labels.hpp`) that a `.s`
+# and an inline-asm template both ask — pinned once, on its own
+# (D-ASM-LABELS-INSIDE-A-TEMPLATE-AND-NUMERIC-LOCAL-LABELS-REFUSED).
+dss_add_test(NAME asm/test_asm_local_labels
+             SOURCES test_asm_local_labels.cpp)
+
+# Numeric labels, template labels and the template text forms through the
+# SHIPPED dialects and targets — the refusals, the shipped declarations and the
+# loader's refusal of every half-declaration. ⚠ CONFIG-LEVEL (it reads and
+# mutates the shipped `.lang.json` / `.target.json`), so it MUST run through
+# ctest, which points DSS_CONFIG_ROOT at the run's config snapshot.
+dss_add_test(NAME asm/test_asm_numeric_labels_and_forms
+             SOURCES test_asm_numeric_labels_and_forms.cpp)
+target_link_libraries(dss_asm_test_asm_numeric_labels_and_forms
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_numeric_labels_and_forms
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# arm64's exclusive pair (`ldaxr` / `stlxr`) written in assembly text, and the
+# target's `resultEarlyClobber` that refuses the UNPREDICTABLE overlap at every
+# tier — the builder's early mark, the text lowering and the encoder backstop.
+# ⚠ CONFIG-LEVEL, as above.
+dss_add_test(NAME asm/test_asm_arm64_exclusive_pair
+             SOURCES test_asm_arm64_exclusive_pair.cpp)
+target_link_libraries(dss_asm_test_asm_arm64_exclusive_pair
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_arm64_exclusive_pair
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# The `.s` walker's BLOCK PLAN: every block of a function created in TEXT order,
+# the conditional branch's false edge laid out next, and a line after a
+# terminator given a block where the text put it
+# (D-ASM-CONDITIONAL-BRANCH-FALLTHROUGH-LAID-OUT-AT-THE-FUNCTION-END,
+# D-ASM-INSTRUCTION-AFTER-A-TERMINATOR-REFUSED). ⚠ CONFIG-LEVEL, as above; it
+# also reads the numeric-local-labels corpus sources.
+dss_add_test(NAME asm/test_asm_block_plan
+             SOURCES test_asm_block_plan.cpp)
+target_link_libraries(dss_asm_test_asm_block_plan
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_block_plan
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
 
 # Tests under tests/asm/ share `asm_test_support.hpp` via this
 # include path. test_asm_substrate additionally reuses the LIR
@@ -140,8 +182,7 @@ target_include_directories(dss_asm_test_asm_pipeline
 # memory-form expectation is GNU as 2.42's own measured output.
 # ⚠ ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL, so it MUST run through ctest —
 # `dss_add_test` sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would
-# read whichever tree the shell stands in
-# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# read whichever tree the shell stands in.
 dss_add_test(NAME asm/test_asm_x86_memory_arithmetic
              SOURCES test_asm_x86_memory_arithmetic.cpp)
 target_link_libraries(dss_asm_test_asm_x86_memory_arithmetic
@@ -156,8 +197,7 @@ target_include_directories(dss_asm_test_asm_x86_memory_arithmetic
 # output unless the comment beside it records the deliberate difference.
 # WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL, so it MUST run through
 # ctest -- dss_add_test sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd and
-# would read whichever tree the shell stands in
-# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# would read whichever tree the shell stands in.
 dss_add_test(NAME asm/test_asm_x86_width_and_direction
              SOURCES test_asm_x86_width_and_direction.cpp)
 target_link_libraries(dss_asm_test_asm_x86_width_and_direction
@@ -174,8 +214,7 @@ target_include_directories(dss_asm_test_asm_x86_width_and_direction
 # encoder).
 # WARNING ITS RED-ON-DISABLE MUTANT IS CONFIG-LEVEL, so it MUST run through
 # ctest -- dss_add_test sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd
-# and would read whichever tree the shell stands in
-# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# and would read whichever tree the shell stands in.
 dss_add_test(NAME asm/test_asm_register_class_gate
              SOURCES test_asm_register_class_gate.cpp)
 target_link_libraries(dss_asm_test_asm_register_class_gate
@@ -195,8 +234,7 @@ target_include_directories(dss_asm_test_asm_register_class_gate
 # failing in both directions).
 # WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL, so it MUST run through
 # ctest -- dss_add_test sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd
-# and would read whichever tree the shell stands in
-# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# and would read whichever tree the shell stands in.
 dss_add_test(NAME asm/test_asm_bare_operand_width
              SOURCES test_asm_bare_operand_width.cpp)
 target_link_libraries(dss_asm_test_asm_bare_operand_width
@@ -216,7 +254,7 @@ target_include_directories(dss_asm_test_asm_bare_operand_width
 # flag (core cannot include lir_node.hpp; this test includes both).
 # WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL (shipped dialect JSON
 # edited in memory), so it MUST run through ctest -- dss_add_test sets
-# DSS_CONFIG_ROOT (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# DSS_CONFIG_ROOT.
 dss_add_test(NAME asm/test_asm_class_scoped_modifiers
              SOURCES test_asm_class_scoped_modifiers.cpp)
 target_link_libraries(dss_asm_test_asm_class_scoped_modifiers
@@ -236,7 +274,7 @@ target_link_libraries(dss_asm_test_asm_class_scoped_modifiers
 # WARNING ITS RED-ON-DISABLE MUTANT IS CONFIG-LEVEL -- it removes a row from the
 # SHIPPED dialect document -- so it MUST run through ctest: dss_add_test sets
 # DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever tree
-# the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# the shell stands in.
 dss_add_test(NAME asm/test_asm_x86_sse_dialect_rows
              SOURCES test_asm_x86_sse_dialect_rows.cpp)
 target_link_libraries(dss_asm_test_asm_x86_sse_dialect_rows
@@ -265,7 +303,7 @@ target_include_directories(dss_asm_test_asm_x86_sse_dialect_rows
 # the SHIPPED dialect document, the other an encoding variant from the SHIPPED
 # target -- so it MUST run through ctest: dss_add_test sets DSS_CONFIG_ROOT,
 # while a bare .exe walks the cwd and would read whichever tree the shell
-# stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# stands in.
 dss_add_test(NAME asm/test_asm_arm64_fp_dialect_rows
              SOURCES test_asm_arm64_fp_dialect_rows.cpp)
 target_link_libraries(dss_asm_test_asm_arm64_fp_dialect_rows
@@ -283,10 +321,10 @@ target_include_directories(dss_asm_test_asm_arm64_fp_dialect_rows
 # target (a deleted opcode, deleted `destWidth` declarations, a deleted result
 # bank) and one over the SHIPPED dialect (the deleted arrangement table) -- so
 # it MUST run through ctest: dss_add_test sets DSS_CONFIG_ROOT, while a bare
-# .exe walks the cwd and would read whichever tree the shell stands in
-# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE). Measured again this
-# cycle from the other side: a CLI probe run from the repo root while the edits
-# sat in a lane worktree silently answered about the MAIN tree's config.
+# .exe walks the cwd and would read whichever tree the shell stands in. Measured
+# again this cycle from the other side: a CLI probe run from the repo root while
+# the edits sat in a lane worktree silently answered about the MAIN tree's
+# config.
 dss_add_test(NAME asm/test_asm_arm64_conversion_dialect_rows
              SOURCES test_asm_arm64_conversion_dialect_rows.cpp)
 target_link_libraries(dss_asm_test_asm_arm64_conversion_dialect_rows
@@ -315,7 +353,7 @@ target_include_directories(dss_asm_test_asm_arm64_conversion_dialect_rows
 # dialect (deleted rows) and two over the SHIPPED target (a deleted opcode, a
 # deleted wire) -- so it MUST run through ctest: dss_add_test sets
 # DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever
-# tree the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# tree the shell stands in.
 dss_add_test(NAME asm/test_asm_arm64_rounding_dialect_rows
              SOURCES test_asm_arm64_rounding_dialect_rows.cpp)
 target_link_libraries(dss_asm_test_asm_arm64_rounding_dialect_rows
@@ -334,8 +372,7 @@ target_include_directories(dss_asm_test_asm_arm64_rounding_dialect_rows
 # WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL -- both over the SHIPPED
 # target (deleted width arms, deleted alias lists) -- so it MUST run through
 # ctest: dss_add_test sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd and
-# would read whichever tree the shell stands in
-# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# would read whichever tree the shell stands in.
 dss_add_test(NAME asm/test_asm_arm64_memory_dialect_rows
              SOURCES test_asm_arm64_memory_dialect_rows.cpp)
 target_link_libraries(dss_asm_test_asm_arm64_memory_dialect_rows
@@ -358,7 +395,7 @@ target_include_directories(dss_asm_test_asm_arm64_memory_dialect_rows
 # WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL -- over the SHIPPED target
 # AND the SHIPPED dialect -- so it MUST run through ctest: dss_add_test sets
 # DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever tree
-# the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+# the shell stands in.
 dss_add_test(NAME asm/test_asm_arm64_shared_encoding_31
              SOURCES test_asm_arm64_shared_encoding_31.cpp)
 target_link_libraries(dss_asm_test_asm_arm64_shared_encoding_31
@@ -382,3 +419,75 @@ target_include_directories(dss_asm_test_asm_arm64_shared_encoding_31
 # an unnameable code is ungreppable, which is the defect itself.
 dss_add_test(NAME asm/test_static_data_diagnostic_codes
              SOURCES test_static_data_diagnostic_codes.cpp)
+
+# [[D-CSUBSET-LONG-BRANCH]] (cycle P68 round 2, lane `br`): the branch-relaxation
+# fixed point. A SYNTHESIZED oversized function body — ~1 MiB of padding, laid
+# out so one conditional is out of AArch64 `B.cond`'s ±1 MiB reach by exactly one
+# word and a second is exactly AT the limit until the first one escapes — proves
+# that the resolver iterates rather than patching once, and that both escape
+# shapes (condition preserved / condition inverted) are emitted correctly. The
+# six-word in-reach skeleton is the named CONTROL arm: its bytes are pinned as
+# literals, so a relaxation that fires on branches that fit reds there while the
+# oversized pin stays green.
+# ⓘ It is the slowest test in this directory by construction — reaching a ±1 MiB
+# branch edge means emitting ~1 MiB of code, three times.
+dss_add_test(NAME asm/test_asm_long_branch
+             SOURCES test_asm_long_branch.cpp)
+
+# P68 round 8 (D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS,
+# D-ASM-DOTTED-LABEL-AS-A-BRANCH-TARGET-REFUSED): every spelling GNU as and
+# clang accept that the shipped dialects refused at the part-3 base — literal
+# xmm names, the cross-bank movq/movd, movapd, the test family, setcc, the
+# unsuffixed AT&T spellings and gas's unstated-width default with its warning,
+# dotted labels as branch targets, the aarch64 W-form add/sub immediates,
+# cbz/cbnz, and an operand placeholder as a memory base or index — each through
+# the SHIPPED dialect and target to bytes, each widening beside its refusal
+# control. Reads the shipped documents, so it must run through ctest.
+dss_add_test(NAME asm/test_asm_reference_accepted_spellings
+             SOURCES test_asm_reference_accepted_spellings.cpp)
+target_link_libraries(dss_asm_test_asm_reference_accepted_spellings
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_reference_accepted_spellings
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# P68 round 9 (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the program
+# counter as a memory base and a symbol as a displacement — `leaq msg(%rip)`,
+# `movl $5, counter(%rip)`, `msg+4` / `msg-8` — to the reference's bytes and
+# relocations through the SHIPPED dialect and target, the refusals (`%rip` as an
+# operand, an index beside it, a constant after a symbol outside a
+# displacement), and the red-on-disable arms that remove each declared fact.
+# Reads the shipped documents and mutates the target, so it must run through
+# ctest.
+dss_add_test(NAME asm/test_asm_pc_relative_memory
+             SOURCES test_asm_pc_relative_memory.cpp)
+target_link_libraries(dss_asm_test_asm_pc_relative_memory
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_pc_relative_memory
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# P68 round 9 (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL): a `.s`
+# naming, by address, a symbol it does not define. The import is minted with
+# its code-vs-data kind PENDING for an address operand, a memory displacement
+# and a data slot; a call states code and settles an earlier address; a name
+# the file defines is never imported. Reads the shipped documents, so it must
+# run through ctest.
+dss_add_test(NAME asm/test_asm_undefined_symbol_reference
+             SOURCES test_asm_undefined_symbol_reference.cpp)
+target_link_libraries(dss_asm_test_asm_undefined_symbol_reference
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_undefined_symbol_reference
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# P68 round 9 (the aarch64 twins): the PAGE and PAGE OFFSET of a symbol —
+# `adrp`, `:lo12:` / `@PAGEOFF` on `add` and every unsigned-offset load/store,
+# each spelling read only on the object format its dialect row lists — a
+# constant after a name, the one-word `adr`, a block of the function addressed
+# in a field and the location counter; the words and relocations are the
+# references' (gas 2.42 = clang 18 for ELF; clang 18 for Darwin). Reads the
+# shipped documents, so it must run through ctest.
+dss_add_test(NAME asm/test_asm_arm64_address_forms
+             SOURCES test_asm_arm64_address_forms.cpp)
+target_link_libraries(dss_asm_test_asm_arm64_address_forms
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_arm64_address_forms
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)

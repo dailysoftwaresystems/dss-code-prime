@@ -7,6 +7,7 @@
 #include "core/substrate/relocation_table_json.hpp"
 #include "core/types/config_document_parse.hpp"   // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"   // TF-C74: the shared closed-key guard
+#include "core/types/integer_literal_ladder.hpp"  // int_ladder::integerWidth — `abiTypedefs` accepts integer cores only
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/predefined_macro_json.hpp"   // TF-C74: the shared predefine parser
 
@@ -267,9 +268,30 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     // generalized from a memory displacement to any value-bearing operand;
     // the old spelling now lands here as an unknown key rather than being
     // read as `false`.
-    static constexpr std::array<std::string_view, 7> kGuardKeys{
+    // P68 round 9 (the aarch64 twins): OPTIONAL `symbolPart` — which part of a
+    // symbol's address this variant's symbolic field encodes. Absent ⇒ the
+    // whole address (every pre-existing variant). `whole` itself is refused:
+    // stating the default states nothing, the rule `immMultipleOf: 1` follows.
+    if (g.contains("symbolPart")) {
+        auto const& sp = g.at("symbolPart");
+        auto const path = std::format(
+            "/opcodes/{}/encoding/variants/{}/guard/symbolPart", opIdx, vi);
+        auto const part = sp.is_string()
+            ? symbolAddressPartFromName(sp.get<std::string>())
+            : std::nullopt;
+        if (!part.has_value() || *part == SymbolAddressPart::Whole) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      std::format("'symbolPart' must be '{}' or '{}' (the whole "
+                                  "address is the default and is not stated)",
+                                  symbolAddressPartName(SymbolAddressPart::Page),
+                                  symbolAddressPartName(SymbolAddressPart::PageOffset)));
+        } else {
+            variant.symbolPart = *part;
+        }
+    }
+    static constexpr std::array<std::string_view, 8> kGuardKeys{
         "operandKinds", "width", "immMin", "immMax", "negValue",
-        "immMultipleOf", "memoryDestination"};
+        "immMultipleOf", "memoryDestination", "symbolPart"};
     DSS_CHECK_KEY_VOCABULARY(kGuardKeys);
     rejectUnknownKeys(g, kGuardKeys,
                       std::format("/opcodes/{}/encoding/variants/{}/guard",
@@ -790,7 +812,7 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
         // A dropped `relocationKind` is the sharpest hazard here: the wire
         // would encode literal bits where the linker was meant to patch a
         // symbol address.
-        static constexpr std::array<std::string_view, 9> kWireKeys{
+        static constexpr std::array<std::string_view, 10> kWireKeys{
             "index", "slotKind", "relocationKind", "wordIndex",
             "prefixOpcodeBytes",
             // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: this field's
@@ -800,6 +822,9 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
             // this field reads its register as a VECTOR OF LANES, and how wide
             // one lane is. See `TargetEncodingWire::lanes`.
             "lanes", "laneBits",
+            // P68 round 8: this field reads ONE ELEMENT of its register, this
+            // wide. See `TargetEncodingWire::elementBits`.
+            "elementBits",
             // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]:
             // which READING of a shared register encoding this field has.
             "regRole"};
@@ -810,6 +835,26 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
             o2, "regClass", std::format("{}/regClass", wirePath), coll);
         parseLaneShape(o2, "lanes", "laneBits", wirePath, wire.lanes,
                        wire.laneBits, coll);
+        if (o2.contains("elementBits")) {
+            auto const& eb = o2.at("elementBits");
+            auto const ebPath = std::format("{}/elementBits", wirePath);
+            std::int64_t const ebv =
+                eb.is_number_integer() ? eb.get<std::int64_t>() : -1;
+            if (ebv != 8 && ebv != 16 && ebv != 32 && ebv != 64) {
+                coll.emit(DiagnosticCode::C_MalformedJson, ebPath,
+                          "'elementBits' must be 8, 16, 32 or 64 — the width of "
+                          "the ONE element this field reads; omit the key on a "
+                          "field that reads its register whole");
+            } else if (wire.lanes) {
+                coll.emit(DiagnosticCode::C_MalformedJson, ebPath,
+                          "'elementBits' beside 'lanes' — a field reads its "
+                          "register as every lane OR as one element, and both "
+                          "at once would admit two operand shapes the machine "
+                          "encodes as different instructions");
+            } else {
+                wire.elementBits = static_cast<std::uint8_t>(ebv);
+            }
+        }
         wire.regRole = parseRegRoleField(
             o2, "regRole", std::format("{}/regRole", wirePath), coll);
         if (!o2.contains("index") || !o2.at("index").is_number_integer()) {
@@ -1367,11 +1412,18 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // guard would reject every shipped target on its first load.
     //
     // Every name here is a key the loader genuinely reads.
-    static constexpr std::array<std::string_view, 18> kTargetDocumentKeys{
+    // 20 -> 21 (P68 round 8): `abiTypedefs`, the platform ABI typedefs
+    // (`wchar_t`, `wint_t`) per object format — `charIsUnsigned`'s shape.
+    // 21 -> 22 (P68 round 8): `isaFeatures`, what an inline-asm template form
+    // that depends on the ISA (x86's `%~`) reads.
+    // 22 -> 23 (P68 round 9): `pcRelativeMemoryBase`, the program counter as a
+    // memory base (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    static constexpr std::array<std::string_view, 23> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
-        "charIsUnsigned", "predefinedMacros", "aggregateLayout", "tls",
+        "charIsUnsigned", "abiTypedefs", "predefinedMacros", "aggregateLayout",
+        "tls", "isaFeatures",
         // which SOURCE LANGUAGE document spells this processor's assembly
         // (a NAME — D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET)
         "defaultAssemblyLanguage",
@@ -1397,6 +1449,15 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // letter binds. Undeclared is a legitimate state and every
         // consumer refuses by name; see `AsmBareOperandWidth`.
         "asmBareOperandWidths",
+        // Which values each register class carries FROM MEMORY into an asm
+        // operand — by kind, size and direction — see
+        // `TargetSchemaData::AsmValueCarriageRow`. Undeclared ⇒ no class
+        // carries one, and such an operand is refused by name.
+        "asmValueCarriage",
+        // The program counter as a memory base: which register, which memory
+        // fields take it, and the relocation a symbolic displacement against it
+        // takes — see `TargetSchemaData::PcRelativeMemoryBase`.
+        "pcRelativeMemoryBase",
         // machine description
         "opcodes", "registers", "registerClassOps", "relocations",
         "condCodeEncoding",
@@ -1408,7 +1469,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // faulting native form emitted, which is why the key is registered so
         // the load refuses rather than the runtime.
         "atomics",
-        "callingConventions"};
+        "callingConventions",
+        // What a LINKER may build, and clobber, to carry a branch past its
+        // field's reach — the ABI's grant, per relocation kind
+        // (D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH).
+        "linkVeneers"};
     DSS_CHECK_KEY_VOCABULARY(kTargetDocumentKeys);
     // The ROOT runs the same check as every nested object — it had its own
     // hand-written loop, which is how the container/leaf asymmetry this
@@ -1463,9 +1528,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // Empty OR whitespace-only `name` would be silently accepted by
     // the closed-enum cross-validation at the driver tier
     // (`lookupTargetArch` does exact comparison → no match → skip),
-    // reopening the SIGILL surface D-LK6-8.2 was anchored to close.
+    // reopening the SIGILL surface D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET was anchored to close.
     // Also reject leading/trailing whitespace ("  arm64 " ≠ "arm64").
-    // (silent-failure CRITICAL-2 + HIGH-1 post-fold — D-LK6-8.2 audit
+    // (silent-failure CRITICAL-2 + HIGH-1 post-fold — D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET audit
     // rounds 1 and 2 — empty was caught in round 1, whitespace in
     // round 2.)
     auto const isNonAsciiWhitespace = [](char c) noexcept {
@@ -1491,7 +1556,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                   "'name' must be a non-empty string with no leading "
                   "or trailing whitespace — would silently bypass the "
                   "(target, format) machine cross-check (plan 14 §3.1 "
-                  "D-LK6-8.2).");
+                  "D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET).");
         return std::unexpected(std::move(coll).release());
     }
     if (target.contains("version") && target.at("version").is_string()) {
@@ -1615,9 +1680,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             // belongs HERE rather than in the substrate — `ObjectFormatSchema`
             // drives the same substrate loader with a DIFFERENT extension set,
             // so a set placed there would reject the other family's keys.
-            static constexpr std::array<std::string_view, 8> kRelocationKeys{
+            static constexpr std::array<std::string_view, 10> kRelocationKeys{
                 "name", "kind", "formula", "widthBytes", "pcRelative",
-                "addendBias", "tls", "imageRelative"};
+                "addendBias", "tls", "imageRelative", "scaleLog2",
+                "gotSlotTwin"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationKeys);
             rejectUnknownKeys(r, kRelocationKeys,
                               std::format("/relocations/{}", i),
@@ -1726,6 +1792,62 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 }
                 info.imageRelative = r.at("imageRelative").get<bool>();
             }
+            // P68 round 9: `scaleLog2` — the access size a SCALED page-offset
+            // field is measured in (`TargetRelocationInfo::scaleLog2`). The
+            // formula that reads it must have it, and no other formula may
+            // carry it: a scale nothing reads is a fact that silently does
+            // nothing, and a missing one would make every size a byte.
+            bool const readsScale =
+                info.formulaKind == RelocFormulaKind::Aarch64LdstAbsLo12;
+            if (r.contains("scaleLog2")) {
+                auto const path = std::format("/relocations/{}/scaleLog2", i);
+                if (!readsScale) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           std::format("'scaleLog2' is read only by the '{}' "
+                                       "formula; formula '{}' has no scaled "
+                                       "field",
+                                       relocFormulaName(
+                                           RelocFormulaKind::Aarch64LdstAbsLo12),
+                                       relocFormulaName(info.formulaKind)));
+                    return false;
+                }
+                if (!r.at("scaleLog2").is_number_integer()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           "'scaleLog2' must be an integer");
+                    return false;
+                }
+                std::int64_t const s = r.at("scaleLog2").get<std::int64_t>();
+                if (s < 0 || s > 4) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           std::format("'scaleLog2' ({}) must be in [0, 4]: "
+                                       "an access of 1 to 16 bytes", s));
+                    return false;
+                }
+                info.scaleLog2 = static_cast<std::uint8_t>(s);
+            } else if (readsScale) {
+                c.emit(DiagnosticCode::C_MalformedJson,
+                       std::format("/relocations/{}", i),
+                       std::format("formula '{}' reads a scaled field, so the "
+                                   "row must declare 'scaleLog2' (0..4)",
+                                   relocFormulaName(info.formulaKind)));
+                return false;
+            }
+            // P68 round 11: `gotSlotTwin` — the direct row a GOT-slot-relative
+            // row lowers into (`TargetRelocationInfo::gotSlotTwin`). Parsed
+            // here; WHETHER a row must or may carry one, and whether the named
+            // row has the arithmetic, is `TargetSchema::validate()`'s rule (g),
+            // so a schema built past this loader meets the same rule.
+            if (r.contains("gotSlotTwin")) {
+                auto const path = std::format("/relocations/{}/gotSlotTwin", i);
+                if (!r.at("gotSlotTwin").is_string()
+                    || r.at("gotSlotTwin").get<std::string>().empty()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           "'gotSlotTwin' must be the non-empty name of a "
+                           "relocation row of this target");
+                    return false;
+                }
+                info.gotSlotTwin = r.at("gotSlotTwin").get<std::string>();
+            }
             // Non-Linear coherence + default widthBytes=4 (ARM64
             // instruction word).
             if (info.formulaKind != RelocFormulaKind::Linear) {
@@ -1750,7 +1872,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                        relocFormulaName(info.formulaKind)));
                     return false;
                 }
-                if (info.addendBias != 0) {
+                // A plain-field formula (x86-64's GOT displacement) may carry
+                // a bias — see `TargetSchema::validate()` rule (e).
+                if (info.addendBias != 0
+                    && !relocFormulaFacts(info.formulaKind).patchesPlainField) {
                     c.emit(DiagnosticCode::C_MalformedJson,
                            std::format("/relocations/{}/addendBias", i),
                            std::format("non-Linear formula '{}' encodes "
@@ -1910,7 +2035,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
-    // ── aggregateLayout (FC6, D-FF3-1 layout half): the per-ABI struct/union/
+    // ── aggregateLayout (FC6, D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS layout half): the per-ABI struct/union/
     //    array layout params the generic `type_layout` engine reads. REQUIRED on
     //    a register-machine target — a silent default would bake a wrong alignment
     //    rule into every aggregate (mirrors the format's required `dataModel`). ──
@@ -2219,6 +2344,132 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
+    // ── abiTypedefs (P68 round 8, D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING) ──
+    //
+    //     "abiTypedefs": {
+    //       "wchar_t": { "default": "U32", "byObjectFormat": { "macho": "I32", "pe": "U16" } },
+    //       "wint_t":  { "default": "U32", "byObjectFormat": { "macho": "I32", "pe": "U16" } }
+    //     }
+    //
+    // The integer type a PLATFORM ABI fixes for a C library typedef — a
+    // (processor × platform) fact, so it lives here in `charIsUnsigned`'s shape
+    // and for its reasons: `default` is the processor's answer and REQUIRED (an
+    // entry without it would leave unlisted formats on an answer no file
+    // states); every `byObjectFormat` key is a real object-format kind (the
+    // sentinel refused), because a misspelled key would silently leave the
+    // default in place. Values are INTEGER core names — a C library typedef that
+    // a platform fixes this way is an integer type, so a float or aggregate core
+    // is a config error. OPTIONAL as a whole: a target that declares no such
+    // typedef simply has none, and a `type-size` macro naming one is not
+    // defined on it (the language's `__SIZEOF_WINT_T__`, for example).
+    if (doc.contains("abiTypedefs")) {
+        static constexpr auto kAbiTypedefCoreNames =
+            namesWhere<10>(kTypeKindNameTable, [](TypeKind k) {
+                return detail::int_ladder::integerWidth(k) != 0;
+            });
+        auto const& at = doc.at("abiTypedefs");
+        if (!at.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/abiTypedefs",
+                      "'abiTypedefs' must be an OBJECT mapping a typedef name to "
+                      R"({"default": <core>, "byObjectFormat": {"pe": <core>, …}})");
+        } else {
+            static constexpr std::array<std::string_view, 2> kAbiTypedefKeys{
+                "default", "byObjectFormat"};
+            DSS_CHECK_KEY_VOCABULARY(kAbiTypedefKeys);
+            for (auto it = at.begin(); it != at.end(); ++it) {
+                if (detail::isDocumentationKey(it.key())) continue;
+                std::string const tpath = std::format("/abiTypedefs/{}", it.key());
+                auto const& entry = it.value();
+                if (it.key().empty() || !entry.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, tpath,
+                              "each 'abiTypedefs' entry is a non-empty typedef "
+                              "name mapped to an OBJECT "
+                              R"({"default": <core>, "byObjectFormat": {…}})");
+                    continue;
+                }
+                rejectUnknownKeys(entry, kAbiTypedefKeys, tpath,
+                                  "an 'abiTypedefs' entry", coll);
+                auto const readCore = [&](json const& v, std::string const& path)
+                    -> std::optional<TypeKind> {
+                    std::optional<TypeKind> const k =
+                        v.is_string() ? typeKindFromName(v.get<std::string>())
+                                      : std::nullopt;
+                    if (!k.has_value() || detail::int_ladder::integerWidth(*k) == 0) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("an ABI typedef's type must be an "
+                                              "integer core name — one of {}",
+                                              detail::renderAllowedList(
+                                                  kAbiTypedefCoreNames, " / ")));
+                        return std::nullopt;
+                    }
+                    return k;
+                };
+                detail::TargetSchemaData::AbiTypedef t;
+                t.name  = it.key();
+                bool ok = true;
+                if (!entry.contains("default")) {
+                    coll.emit(DiagnosticCode::C_MissingField, tpath + "/default",
+                              "an 'abiTypedefs' entry must state its 'default' — "
+                              "the processor's answer for every object format "
+                              "that declares no override");
+                    ok = false;
+                } else if (auto const k = readCore(entry.at("default"),
+                                                   tpath + "/default")) {
+                    t.defaultCore = *k;
+                } else {
+                    ok = false;
+                }
+                if (entry.contains("byObjectFormat")) {
+                    auto const& byFmt = entry.at("byObjectFormat");
+                    if (!byFmt.is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  tpath + "/byObjectFormat",
+                                  "'byObjectFormat' must be an object mapping "
+                                  "object-format kind names to integer cores");
+                        ok = false;
+                    } else {
+                        for (auto f = byFmt.begin(); f != byFmt.end(); ++f) {
+                            if (detail::isDocumentationKey(f.key())) continue;
+                            std::string const fpath =
+                                std::format("{}/byObjectFormat/{}", tpath, f.key());
+                            auto const kind = objectFormatKindFromName(f.key());
+                            if (!kind.has_value()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, fpath,
+                                          std::format(
+                                              "'{}' is not a recognized object-format "
+                                              "kind (expected one of {}). An "
+                                              "unrecognized name would declare an "
+                                              "override that never fires.",
+                                              f.key(),
+                                              detail::renderAllowedList(
+                                                  kSelectableObjectFormatKindNames,
+                                                  " / ")));
+                                ok = false;
+                                continue;
+                            }
+                            if (!isSelectableObjectFormatKind(*kind)) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, fpath,
+                                          std::string{
+                                              kObjectFormatKindSentinelRejection});
+                                ok = false;
+                                continue;
+                            }
+                            auto const k = readCore(f.value(), fpath);
+                            if (!k.has_value()) {
+                                ok = false;
+                                continue;
+                            }
+                            auto const idx = static_cast<std::size_t>(*kind);
+                            t.byFormat[idx]         = *k;
+                            t.byFormatDeclared[idx] = true;
+                        }
+                    }
+                }
+                if (ok) data.abiTypedefs.push_back(std::move(t));
+            }
+        }
+    }
+
     // ── atomics (D-CSUBSET-PACKED-ATOMIC-MEMBER) ──────────────────────
     //
     // `{"underAlignedNativeForm": "traps" | "losesAtomicity" |
@@ -2344,6 +2595,38 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
+    // ── isaFeatures (P68 round 8, optional) ──
+    // `"isaFeatures": { "<feature>": true|false, … }` — the ISA features this
+    // target's code may assume. The NAMES are an open vocabulary (they are
+    // what a dialect's feature-selected template form asks about), so there is
+    // no closed key check; the VALUES are strict booleans, because a feature
+    // spelled `"yes"` or `1` read as anything would be a knob that lies about
+    // which instruction a template names. `$…` keys are documentation, as
+    // everywhere else in the document.
+    if (doc.contains("isaFeatures")) {
+        json const& fs = doc.at("isaFeatures");
+        if (!fs.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/isaFeatures",
+                      "'isaFeatures' must be an object mapping each ISA "
+                      "feature name to true or false");
+        } else {
+            for (auto const& [name, on] : fs.items()) {
+                if (name.starts_with('$')) continue;
+                if (name.empty() || !on.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/isaFeatures/{}", name),
+                              std::format("ISA feature '{}' must be a non-empty "
+                                          "name mapped to true or false — an "
+                                          "undeclared feature is UNKNOWN, and a "
+                                          "feature is never read as off by "
+                                          "default", name));
+                    continue;
+                }
+                data.isaFeatures.emplace_back(name, on.get<bool>());
+            }
+        }
+    }
+
     // ── tls identity (TLS C1, D-CSUBSET-THREAD-LOCAL — optional) ──
     // The target's static-TLS layout convention: `"tls": { "variant":
     // "variant1"|"variant2", "tcbHeaderBytes": N }`. OPTIONAL like
@@ -2453,9 +2736,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                       "opcode entry must be an object");
             continue;
         }
-        static constexpr std::array<std::string_view, 14> kOpcodeKeys{
+        // 14 -> 15 (P68 round 8): `resultEarlyClobber`.
+        static constexpr std::array<std::string_view, 15> kOpcodeKeys{
             "mnemonic", "result", "hasSideEffects", "requires2Address",
-            "twoAddressSourceOperand",
+            "twoAddressSourceOperand", "resultEarlyClobber",
             "isCall", "terminatorKind", "minOperands", "maxOperands",
             "minSuccessors", "maxSuccessors", "encoding", "lowering",
             "implicitRegisters"};
@@ -2562,6 +2846,30 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 } else {
                     info.requires2Address = static_cast<std::uint8_t>(idx);
                 }
+            }
+        }
+        // ── resultEarlyClobber (P68 round 8, optional) ──
+        // A boolean, and only meaningful on an opcode that HAS a result: an
+        // early-clobber claim on nothing would be a declaration no consumer
+        // could read, so it is refused rather than ignored. See
+        // `TargetOpcodeInfo::resultEarlyClobber` for the measured instruction
+        // that needs it and the two consumers that honour it.
+        if (o.contains("resultEarlyClobber")) {
+            auto const& ec = o.at("resultEarlyClobber");
+            if (!ec.is_boolean()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("/opcodes/{}/resultEarlyClobber", i),
+                          std::format("opcode '{}': 'resultEarlyClobber' must be "
+                                      "a boolean", info.mnemonic));
+            } else if (ec.get<bool>() && info.result == TargetResultRule::None) {
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          std::format("/opcodes/{}/resultEarlyClobber", i),
+                          std::format("opcode '{}' declares 'resultEarlyClobber' "
+                                      "but 'result: none' — there is no result "
+                                      "register to keep apart from the operands",
+                                      info.mnemonic));
+            } else {
+                info.resultEarlyClobber = ec.get<bool>();
             }
         }
         if (o.contains("isCall") && o.at("isCall").is_boolean()) {
@@ -2853,11 +3161,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               "register entry must be an object");
                     continue;
                 }
-                static constexpr std::array<std::string_view, 10> kRegisterKeys{
+                static constexpr std::array<std::string_view, 12> kRegisterKeys{
                     "name", "class", "subOf", "aliases", "widthBytes",
                     "hwEncoding", "dwarfNumber",
-                    "nameRequiresLaneArrangement",
-                    "encodingRole", "encodingRoleIsDefault"};
+                    "nameRequiresLaneArrangement", "nameStatesNoWidth",
+                    "encodingRole", "encodingRoleIsDefault", "continuesIn"};
                 DSS_CHECK_KEY_VOCABULARY(kRegisterKeys);
                 rejectUnknownKeys(r, kRegisterKeys,
                                   std::format("/registers/{}", i),
@@ -2939,6 +3247,24 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                             r.at("nameRequiresLaneArrangement").get<bool>();
                     }
                 }
+                // ★★ THIS ROW'S NAMES STATE NO OPERATION WIDTH (P68 round 8,
+                // D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS) — see the
+                // field. Refused rather than coerced when not a boolean, for the
+                // reason the key above is.
+                if (r.contains("nameStatesNoWidth")) {
+                    if (!r.at("nameStatesNoWidth").is_boolean()) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("/registers/{}/nameStatesNoWidth", i),
+                            "'nameStatesNoWidth' must be a boolean — it states "
+                            "that naming this register in an instruction says "
+                            "nothing about the width the instruction operates "
+                            "at (the mnemonic, or another operand, does)");
+                    } else {
+                        info.nameStatesNoWidth =
+                            r.at("nameStatesNoWidth").get<bool>();
+                    }
+                }
                 // ★★ WHICH READING OF A SHARED `hwEncoding` THIS REGISTER IS.
                 // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
                 // The role is an OPAQUE IDENTIFIER, never an enum the engine
@@ -2981,6 +3307,23 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     } else {
                         info.encodingRoleIsDefault =
                             r.at("encodingRoleIsDefault").get<bool>();
+                    }
+                }
+                // ★ THE REGISTER A WIDER VALUE CONTINUES IN (P68 round 8,
+                // D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). A NAME, so the
+                // row that follows can be declared after this one; `validate()`
+                // resolves it once the table is whole.
+                if (r.contains("continuesIn")) {
+                    if (!r.at("continuesIn").is_string()
+                        || r.at("continuesIn").get<std::string>().empty()) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("/registers/{}/continuesIn", i),
+                            "'continuesIn' must be a non-empty string naming the "
+                            "register a value too wide for this one continues in "
+                            "(omit the key when there is none)");
+                    } else {
+                        info.continuesIn = r.at("continuesIn").get<std::string>();
                     }
                 }
                 std::string const regPath = std::format("/registers/{}", i);
@@ -3502,6 +3845,371 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
+    // ── asmValueCarriage (which values a class carries from memory) ──
+    //
+    // See `TargetSchemaData::AsmValueCarriageRow` for the measurement. Shape:
+    // `[{ "class": "<reg class>",
+    //     "carries": [{ "kinds": ["<TypeKind>", …], "bytes": [n, …]
+    //                   [, "directions": ["in"|"out"|"inout", …]] }, …]
+    //     [, "stagesThrough": "<reg class>"] }]` — one row per class.
+    // OPTIONAL as a whole: a target declaring none carries no memory-resident
+    // value into an asm register, and the asm tier refuses such an operand by
+    // name.
+    if (doc.contains("asmValueCarriage")) {
+        if (!doc.at("asmValueCarriage").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/asmValueCarriage",
+                      "'asmValueCarriage' must be an array of "
+                      "{ class, carries[, stagesThrough] } rows");
+        } else {
+            // ★ THE KINDS AN ENTRY MAY NAME ARE THE ONES THE PIPELINE KEEPS IN
+            // MEMORY — the by-address kinds and the two wide float formats. A
+            // register-resident kind (`I64`, `F64`) is carried by an ordinary
+            // move and naming it here would claim a second path for it.
+            static constexpr std::array<TypeKind, 7> kCarriable{
+                TypeKind::I128, TypeKind::U128, TypeKind::Struct,
+                TypeKind::Union, TypeKind::Complex, TypeKind::F80,
+                TypeKind::F128};
+            auto const carriableList = [] {
+                std::string out;
+                for (TypeKind const k : kCarriable) {
+                    if (!out.empty()) out += ", ";
+                    out += typeKindNameOrEmpty(k);
+                }
+                return out;
+            };
+            // One resolver for `class` and `stagesThrough`, so both inherit the
+            // same refusals.
+            auto readClass = [&](json const& r, std::string const& path,
+                                 char const* field)
+                -> std::optional<TargetRegClass> {
+                if (!r.contains(field) || !r.at(field).is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/{}", path, field),
+                              std::format("missing or non-string '{}' — it "
+                                          "names a register class", field));
+                    return std::nullopt;
+                }
+                auto const name = r.at(field).get<std::string>();
+                auto const cls = targetRegClassFromName(name);
+                if (!cls.has_value() || !isOperableTargetRegClass(*cls)) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/{}", path, field),
+                              std::format("unknown or inoperable register "
+                                          "class '{}' — a carriage row names a "
+                                          "class that HAS registers", name));
+                    return std::nullopt;
+                }
+                return cls;
+            };
+            auto const& rows = doc.at("asmValueCarriage");
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                auto const& r = rows[i];
+                auto const path = std::format("/asmValueCarriage/{}", i);
+                if (!r.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "asmValueCarriage entry must be an object");
+                    continue;
+                }
+                static constexpr std::array<std::string_view, 3>
+                    kCarriageKeys{"class", "carries", "stagesThrough"};
+                DSS_CHECK_KEY_VOCABULARY(kCarriageKeys);
+                rejectUnknownKeys(r, kCarriageKeys, path,
+                                  "an asmValueCarriage row", coll);
+                auto const cls = readClass(r, path, "class");
+                if (!cls.has_value()) continue;
+                bool duplicateClass = false;
+                for (auto const& prev : data.asmValueCarriage) {
+                    if (prev.regClass == *cls) duplicateClass = true;
+                }
+                if (duplicateClass) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/class", path),
+                              std::format("register class '{}' already has an "
+                                          "asmValueCarriage row — one row per "
+                                          "class, or two lists would answer one "
+                                          "question",
+                                          targetRegClassName(*cls)));
+                    continue;
+                }
+                detail::TargetSchemaData::AsmValueCarriageRow row;
+                row.regClass = *cls;
+                bool ok = true;
+                if (r.contains("stagesThrough")) {
+                    auto const stage = readClass(r, path, "stagesThrough");
+                    if (!stage.has_value()) continue;
+                    if (*stage == *cls) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/stagesThrough", path),
+                                  std::format("class '{}' stages through "
+                                              "itself — `stagesThrough` names "
+                                              "ANOTHER class, the one whose "
+                                              "loads and stores the value "
+                                              "borrows", targetRegClassName(*cls)));
+                        continue;
+                    }
+                    row.stagesThrough = *stage;
+                }
+                if (!r.contains("carries") || !r.at("carries").is_array()
+                    || r.at("carries").empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/carries", path),
+                              "missing or empty 'carries' — a carriage row lists "
+                              "the { kinds, bytes[, directions] } it admits");
+                    continue;
+                }
+                auto const& entries = r.at("carries");
+                for (std::size_t e = 0; e < entries.size(); ++e) {
+                    auto const& en = entries[e];
+                    auto const ePath = std::format("{}/carries/{}", path, e);
+                    if (!en.is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, ePath,
+                                  "a carries entry must be an object "
+                                  "{ kinds, bytes[, directions] }");
+                        ok = false;
+                        continue;
+                    }
+                    static constexpr std::array<std::string_view, 3>
+                        kEntryKeys{"kinds", "bytes", "directions"};
+                    DSS_CHECK_KEY_VOCABULARY(kEntryKeys);
+                    rejectUnknownKeys(en, kEntryKeys, ePath,
+                                      "an asmValueCarriage carries entry", coll);
+                    detail::TargetSchemaData::AsmValueCarriageEntry entry;
+                    // ── kinds ──
+                    if (!en.contains("kinds") || !en.at("kinds").is_array()
+                        || en.at("kinds").empty()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  std::format("{}/kinds", ePath),
+                                  std::format("missing or empty 'kinds' (of: {})",
+                                              carriableList()));
+                        ok = false;
+                        continue;
+                    }
+                    for (auto const& kn : en.at("kinds")) {
+                        auto const kind = kn.is_string()
+                            ? typeKindFromName(kn.get<std::string>())
+                            : std::optional<TypeKind>{};
+                        bool allowed = false;
+                        if (kind.has_value()) {
+                            for (TypeKind const k : kCarriable) {
+                                allowed = allowed || k == *kind;
+                            }
+                        }
+                        if (!allowed) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/kinds", ePath),
+                                      std::format("'kinds' names {} — not a kind "
+                                                  "the pipeline keeps in memory "
+                                                  "(expected one of: {})",
+                                                  kn.dump(), carriableList()));
+                            ok = false;
+                            continue;
+                        }
+                        bool repeat = false;
+                        for (TypeKind const k : entry.kinds) {
+                            repeat = repeat || k == *kind;
+                        }
+                        if (repeat) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/kinds", ePath),
+                                      std::format("'kinds' names '{}' twice",
+                                                  typeKindNameOrEmpty(*kind)));
+                            ok = false;
+                            continue;
+                        }
+                        entry.kinds.push_back(*kind);
+                    }
+                    // ── bytes: the exact sizes admitted, never a range ──
+                    if (!en.contains("bytes") || !en.at("bytes").is_array()
+                        || en.at("bytes").empty()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  std::format("{}/bytes", ePath),
+                                  "missing or empty 'bytes' — an entry lists the "
+                                  "exact value SIZES it admits, each a measured "
+                                  "one; a size wider than one register of the "
+                                  "class is carried in a register PAIR");
+                        ok = false;
+                        continue;
+                    }
+                    for (auto const& bn : en.at("bytes")) {
+                        if (!bn.is_number_unsigned() || bn.get<std::uint64_t>() == 0
+                            || bn.get<std::uint64_t>() > 4096) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/bytes", ePath),
+                                      std::format("'bytes' lists {} — each size "
+                                                  "is a positive byte count",
+                                                  bn.dump()));
+                            ok = false;
+                            continue;
+                        }
+                        auto const n = static_cast<std::uint32_t>(
+                            bn.get<std::uint64_t>());
+                        bool repeat = false;
+                        for (std::uint32_t const b : entry.bytes) {
+                            repeat = repeat || b == n;
+                        }
+                        if (repeat) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/bytes", ePath),
+                                      std::format("'bytes' lists {} twice", n));
+                            ok = false;
+                            continue;
+                        }
+                        entry.bytes.push_back(n);
+                    }
+                    // ── directions: optional; absent = all three ──
+                    if (en.contains("directions")) {
+                        if (!en.at("directions").is_array()
+                            || en.at("directions").empty()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/directions", ePath),
+                                      "'directions' must be a non-empty array of "
+                                      "\"in\" / \"out\" / \"inout\" — omit it to "
+                                      "admit all three");
+                            ok = false;
+                            continue;
+                        }
+                        for (auto const& dn : en.at("directions")) {
+                            auto const d = dn.is_string()
+                                ? asmCarriageDirectionFromName(
+                                      dn.get<std::string>())
+                                : std::optional<AsmCarriageDirection>{};
+                            if (!d.has_value()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/directions", ePath),
+                                          std::format("'directions' names {} — "
+                                                      "expected \"in\", \"out\" "
+                                                      "or \"inout\"",
+                                                      dn.dump()));
+                                ok = false;
+                                continue;
+                            }
+                            auto const bit = static_cast<std::uint8_t>(*d);
+                            if ((entry.directions & bit) != 0) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/directions", ePath),
+                                          std::format("'directions' names '{}' "
+                                                      "twice",
+                                                      asmCarriageDirectionName(*d)));
+                                ok = false;
+                                continue;
+                            }
+                            entry.directions =
+                                static_cast<std::uint8_t>(entry.directions | bit);
+                        }
+                    } else {
+                        entry.directions = kAsmCarriageAllDirections;
+                    }
+                    row.carries.push_back(std::move(entry));
+                }
+                if (ok) data.asmValueCarriage.push_back(std::move(row));
+            }
+        }
+    }
+
+    // ── pcRelativeMemoryBase (the program counter as a memory base) ─────
+    //
+    // See `TargetSchemaData::PcRelativeMemoryBase`. Shape:
+    // `{ "register": "<register row>", "memoryBaseSlots": ["<slot kind>", …],
+    //    "symbolicDisplacementRelocation": "<relocation row>" }`. OPTIONAL: a
+    // processor with no PC-relative memory base declares none. Read after
+    // `registers` and `relocations`, whose NAMES it resolves; what the names
+    // must BE (a non-allocatable register with a role, a PC-relative relocation,
+    // slots whose walker encodes the form) is `validate()`'s to judge.
+    if (doc.contains("pcRelativeMemoryBase")) {
+        auto const& pc = doc.at("pcRelativeMemoryBase");
+        std::string const root{"/pcRelativeMemoryBase"};
+        if (!pc.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, root,
+                      "'pcRelativeMemoryBase' must be an object { register, "
+                      "memoryBaseSlots, symbolicDisplacementRelocation }");
+        } else {
+            static constexpr std::array<std::string_view, 3> kPcBaseKeys{
+                "register", "memoryBaseSlots", "symbolicDisplacementRelocation"};
+            DSS_CHECK_KEY_VOCABULARY(kPcBaseKeys);
+            rejectUnknownKeys(pc, kPcBaseKeys, root,
+                              "the 'pcRelativeMemoryBase' object", coll);
+            detail::TargetSchemaData::PcRelativeMemoryBase out;
+            bool ok = true;
+            if (!pc.contains("register") || !pc.at("register").is_string()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, root + "/register",
+                          "'register' is required and must name a 'registers' "
+                          "row");
+                ok = false;
+            } else {
+                auto const name = pc.at("register").get<std::string>();
+                auto const it = data.registerIndex.find(name);
+                if (it == data.registerIndex.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, root + "/register",
+                              std::format("'{}' names no row of this target's "
+                                          "'registers'", name));
+                    ok = false;
+                } else {
+                    out.registerOrdinal = it->second;
+                }
+            }
+            if (!pc.contains("memoryBaseSlots")
+                || !pc.at("memoryBaseSlots").is_array()
+                || pc.at("memoryBaseSlots").empty()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          root + "/memoryBaseSlots",
+                          "'memoryBaseSlots' is required and must be a non-empty "
+                          "array of encoding slot kinds — a program counter no "
+                          "field accepts is a base nothing can name");
+                ok = false;
+            } else {
+                auto const& slots = pc.at("memoryBaseSlots");
+                for (std::size_t i = 0; i < slots.size(); ++i) {
+                    auto const path = std::format("{}/memoryBaseSlots/{}", root, i);
+                    auto const sk = slots[i].is_string()
+                        ? encodingSlotKindFromName(slots[i].get<std::string>())
+                        : std::nullopt;
+                    if (!sk.has_value()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("expected one of: {}",
+                                              detail::renderAllowedList(
+                                                  allNames(kEncodingSlotKindTable),
+                                                  " / ")));
+                        ok = false;
+                        continue;
+                    }
+                    if (std::find(out.memoryBaseSlots.begin(),
+                                  out.memoryBaseSlots.end(), *sk)
+                        != out.memoryBaseSlots.end()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("slot kind '{}' is listed twice",
+                                              encodingSlotKindName(*sk)));
+                        ok = false;
+                        continue;
+                    }
+                    out.memoryBaseSlots.push_back(*sk);
+                }
+            }
+            if (!pc.contains("symbolicDisplacementRelocation")
+                || !pc.at("symbolicDisplacementRelocation").is_string()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          root + "/symbolicDisplacementRelocation",
+                          "'symbolicDisplacementRelocation' is required and must "
+                          "name a 'relocations' row");
+                ok = false;
+            } else {
+                auto const name =
+                    pc.at("symbolicDisplacementRelocation").get<std::string>();
+                auto const it = data.relocationNameIndex.find(name);
+                if (it == data.relocationNameIndex.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              root + "/symbolicDisplacementRelocation",
+                              std::format("'{}' names no row of this target's "
+                                          "'relocations'", name));
+                    ok = false;
+                } else {
+                    out.symbolicDisplacementRelocation =
+                        data.relocations[it->second].kind;
+                }
+            }
+            if (ok) data.pcRelativeMemoryBase = std::move(out);
+        }
+    }
+
     // ── registerClassOps (FC2 Part B — optional) ───────────────────
     // The register-data-movement mnemonic table, keyed by the ORDERED PAIR
     // (`class` → `to`; `to` omitted means the diagonal — see
@@ -3870,7 +4578,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // instances carry the most `$...Comment` prose keys - which is
                 // exactly why the carve-out lives in `rejectUnknownKeys` as a
                 // PREFIX test rather than a literal `"$comment"` entry.
-                static constexpr std::array<std::string_view, 27> kCallConvKeys{
+                static constexpr std::array<std::string_view, 28> kCallConvKeys{
                     "name",
                     "argGprs", "argFprs", "returnGprs", "returnFprs",
                     "callerSaved", "calleeSaved",
@@ -3892,6 +4600,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     // vocabulary row lands before the descriptors that declare
                     // it, never after.
                     "framePointerReservation",
+                    // D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm):
+                    // the register a frame access beyond every declared reach
+                    // materializes its address in.
+                    "frameAddressScratch",
                     "variadicVectorCountReg", "indirectResultRegister",
                     "vaListLayout"};
                 DSS_CHECK_KEY_VOCABULARY(kCallConvKeys);
@@ -4124,7 +4836,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         }
                     }
                 }
-                // D-ML7-2.6: slot-aligned arg passing (Win64 ms_x64).
+                // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7: slot-aligned arg passing (Win64 ms_x64).
                 // Defaults to false (independent counters — SysV/AAPCS64
                 // semantics). A cc declaring `slotAligned: true` means
                 // each arg consumes one shared slot index regardless of
@@ -4326,6 +5038,32 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         }
                     }
                 }
+                // D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm): the
+                // register a far frame access carries its address in. Decoded
+                // like the other role registers (name → ordinal, atomically);
+                // what makes a register FIT the role is judged by validate().
+                if (c.contains("frameAddressScratch")) {
+                    if (!c.at("frameAddressScratch").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/frameAddressScratch", ccPath),
+                                  "must be a register-name string");
+                    } else {
+                        auto const name =
+                            c.at("frameAddressScratch").get<std::string>();
+                        auto it = data.registerIndex.find(name);
+                        if (it != data.registerIndex.end()) {
+                            cc.frameAddressScratch =
+                                TargetCallingConvention::NamedRegisterRef{
+                                    name, it->second};
+                        } else {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/frameAddressScratch", ccPath),
+                                      std::format("frame-address scratch '{}' is "
+                                                  "not in the register table",
+                                                  name));
+                        }
+                    }
+                }
                 if (c.contains("stackPointer")) {
                     if (!c.at("stackPointer").is_string()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
@@ -4405,7 +5143,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         }
                     }
                 }
-                // D-LANG-VARIADIC (step 13.4, 2026-06-02): optional
+                // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): optional
                 // caller-side vector-count register for variadic calls.
                 // SysV AMD64 sets it to "al"; Win64 / AAPCS64 omit it.
                 if (c.contains("variadicVectorCountReg")) {
@@ -4679,8 +5417,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                               "strategy '{}' — the '{}' parse arm "
                                               "never reads it, so it would load "
                                               "clean and do NOTHING "
-                                              "(D-CONFIG-VALISTLAYOUT-INERT-CROSS-"
-                                              "STRATEGY-KEY). Allowed here are {} "
+                                              "(D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-KEY). Allowed here are {} "
                                               "(plus any '$'-prefixed documentation "
                                               "key)",
                                               key, accepted,
@@ -5218,6 +5955,373 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                   "register", opName, row.resultRegisterName));
         } else {
             row.resultRegisterOrdinal = static_cast<std::uint16_t>(rit->second);
+        }
+    }
+
+    // ── linkVeneers (D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH) ──
+    //
+    // What a linker may build, and clobber, to carry a branch past its field's
+    // reach. The FULL argument — why each fact is the ABI's, and why the body
+    // is a sequence of this target's own opcodes — sits at `LinkVeneerVocabulary`
+    // in `target_schema.hpp`.
+    //
+    // Read HERE, after the register, opcode and relocation tables, because
+    // every value in it is a NAME into one of those three: each resolves here
+    // or fails loud here, with its JSON path. A register a step names must be
+    // one `scratchRegisters` grants — that is resolved here too, so an
+    // ungranted register never reaches the linker. The SHAPE rules (the last
+    // instruction is the only terminator and it is an indirect branch; no step
+    // is a call; a step writes a register iff its opcode produces a value; a
+    // data word only after the branch, PC-relative, as wide as its relocation;
+    // `literal` only in a body that has one — [[D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB]])
+    // are `validate()`'s, so a schema built in memory is held to them too.
+    //
+    // OPTIONAL as a block; a PRESENT block is strict — every array is required
+    // and non-empty, because a vocabulary that grants nothing would read as a
+    // capability while providing none.
+    if (doc.contains("linkVeneers")) {
+        static constexpr std::array<std::string_view, 3> kLinkVeneerKeys{
+            "scratchRegisters", "routableRelocations", "bodies"};
+        DSS_CHECK_KEY_VOCABULARY(kLinkVeneerKeys);
+        static constexpr std::array<std::string_view, 2> kLinkVeneerBodyKeys{
+            "name", "sequence"};
+        DSS_CHECK_KEY_VOCABULARY(kLinkVeneerBodyKeys);
+        // An INSTRUCTION step spells `mnemonic` (+ optional `result`); a DATA
+        // step spells `data`. One closed set, and the two shapes are told
+        // apart below — a step naming both, or neither, is refused.
+        static constexpr std::array<std::string_view, 5> kLinkVeneerStepKeys{
+            "mnemonic", "result", "data", "operands", "relocations"};
+        DSS_CHECK_KEY_VOCABULARY(kLinkVeneerStepKeys);
+        static constexpr std::array<std::string_view, 2> kLinkVeneerMemoryKeys{
+            "base", "offset"};
+        DSS_CHECK_KEY_VOCABULARY(kLinkVeneerMemoryKeys);
+
+        json const& lv = doc.at("linkVeneers");
+        if (!lv.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/linkVeneers",
+                      std::format("'linkVeneers' must be an object with the keys {}",
+                                  detail::renderAllowedList(kLinkVeneerKeys, ", ")));
+        } else {
+            rejectUnknownKeys(lv, kLinkVeneerKeys, "/linkVeneers",
+                              "the 'linkVeneers' block", coll);
+            LinkVeneerVocabulary vocab;
+            bool ok = true;
+
+            // A required, non-empty array of non-empty, distinct strings.
+            auto const readNames = [&](json const& obj, std::string_view key,
+                                       std::string const& path,
+                                       bool allowEmpty,
+                                       std::vector<std::string>& out) -> bool {
+                if (!obj.contains(key) || !obj.at(key).is_array()) {
+                    coll.emit(DiagnosticCode::C_MissingField, path,
+                              std::format("'{}' is required and must be an array "
+                                          "of names", key));
+                    return false;
+                }
+                json const& arr = obj.at(key);
+                if (arr.empty() && !allowEmpty) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("'{}' must not be empty", key));
+                    return false;
+                }
+                bool good = true;
+                for (std::size_t i = 0; i < arr.size(); ++i) {
+                    if (!arr[i].is_string() || arr[i].get<std::string>().empty()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/{}", path, i),
+                                  std::format("every entry of '{}' must be a "
+                                              "non-empty string", key));
+                        good = false;
+                        continue;
+                    }
+                    auto name = arr[i].get<std::string>();
+                    if (std::find(out.begin(), out.end(), name) != out.end()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/{}", path, i),
+                                  std::format("'{}' lists '{}' twice", key, name));
+                        good = false;
+                        continue;
+                    }
+                    out.push_back(std::move(name));
+                }
+                return good;
+            };
+            auto const resolveRelocation =
+                [&](std::string const& name, std::string const& path)
+                -> std::optional<RelocationKind> {
+                auto const it = data.relocationNameIndex.find(name);
+                if (it == data.relocationNameIndex.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("'{}' names no row of this target's "
+                                          "'relocations'", name));
+                    return std::nullopt;
+                }
+                return data.relocations[it->second].kind;
+            };
+
+            // scratchRegisters — the ABI's grant, and the ONLY registers a step
+            // may name. A name that is also an operand keyword could never be
+            // told apart from it, so it is refused rather than shadowed.
+            std::vector<std::pair<std::string, std::uint16_t>> granted;
+            if (readNames(lv, "scratchRegisters", "/linkVeneers/scratchRegisters",
+                          false, vocab.scratchRegisterNames)) {
+                for (std::size_t i = 0; i < vocab.scratchRegisterNames.size(); ++i) {
+                    auto const& name = vocab.scratchRegisterNames[i];
+                    auto const path = std::format("/linkVeneers/scratchRegisters/{}", i);
+                    if (linkVeneerOperandKindFromKeyword(name).has_value()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("scratch register '{}' is spelled like "
+                                              "the operand keyword '{}'", name, name));
+                        ok = false;
+                        continue;
+                    }
+                    auto const it = data.registerIndex.find(name);
+                    if (it == data.registerIndex.end()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("scratch register '{}' is not a "
+                                              "declared register", name));
+                        ok = false;
+                        continue;
+                    }
+                    vocab.scratchRegisters.push_back(it->second);
+                    granted.emplace_back(name, it->second);
+                }
+            } else {
+                ok = false;
+            }
+            // A register a step names must be one the block granted.
+            auto const grantedRegister =
+                [&](std::string const& name) -> std::optional<std::uint16_t> {
+                for (auto const& [n, ord] : granted)
+                    if (n == name) return ord;
+                return std::nullopt;
+            };
+            auto const grantedList = [&] {
+                return detail::renderAllowedList(vocab.scratchRegisterNames, ", ");
+            };
+
+            // routableRelocations — the branches the ABI hands a linker.
+            if (readNames(lv, "routableRelocations",
+                          "/linkVeneers/routableRelocations", false,
+                          vocab.routableRelocationNames)) {
+                for (std::size_t i = 0; i < vocab.routableRelocationNames.size(); ++i) {
+                    auto const kind = resolveRelocation(
+                        vocab.routableRelocationNames[i],
+                        std::format("/linkVeneers/routableRelocations/{}", i));
+                    if (kind.has_value()) vocab.routableRelocations.push_back(*kind);
+                    else ok = false;
+                }
+            } else {
+                ok = false;
+            }
+
+            // bodies — cheapest first.
+            if (!lv.contains("bodies") || !lv.at("bodies").is_array()
+                || lv.at("bodies").empty()) {
+                coll.emit(DiagnosticCode::C_MissingField, "/linkVeneers/bodies",
+                          "'bodies' is required and must be a non-empty array of "
+                          "{ \"name\", \"sequence\" } objects");
+                ok = false;
+            } else {
+                json const& bodies = lv.at("bodies");
+                for (std::size_t b = 0; b < bodies.size(); ++b) {
+                    std::string const bp = std::format("/linkVeneers/bodies/{}", b);
+                    json const& bj = bodies[b];
+                    if (!bj.is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, bp,
+                                  "a veneer body must be an object");
+                        ok = false;
+                        continue;
+                    }
+                    rejectUnknownKeys(bj, kLinkVeneerBodyKeys, bp,
+                                      "a veneer body", coll);
+                    LinkVeneerBody body;
+                    if (!bj.contains("name") || !bj.at("name").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField, bp + "/name",
+                                  "a veneer body needs a 'name' string");
+                        ok = false;
+                    } else {
+                        body.name = bj.at("name").get<std::string>();
+                    }
+                    if (!bj.contains("sequence") || !bj.at("sequence").is_array()) {
+                        coll.emit(DiagnosticCode::C_MissingField, bp + "/sequence",
+                                  "a veneer body needs a 'sequence' array");
+                        ok = false;
+                        continue;
+                    }
+                    json const& seq = bj.at("sequence");
+                    for (std::size_t s = 0; s < seq.size(); ++s) {
+                        std::string const sp = std::format("{}/sequence/{}", bp, s);
+                        json const& sj = seq[s];
+                        if (!sj.is_object()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, sp,
+                                      "a veneer step must be an object");
+                            ok = false;
+                            continue;
+                        }
+                        rejectUnknownKeys(sj, kLinkVeneerStepKeys, sp,
+                                          "a veneer step", coll);
+                        LinkVeneerStep step;
+                        bool const isData = sj.contains("data");
+                        if (isData == sj.contains("mnemonic")) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, sp,
+                                      "a veneer step is an INSTRUCTION ('mnemonic') or "
+                                      "a DATA word ('data') — exactly one of the two");
+                            ok = false;
+                            continue;
+                        }
+                        if (isData) {
+                            auto const& dj = sj.at("data");
+                            std::uint64_t const bytes =
+                                dj.is_number_unsigned() ? dj.get<std::uint64_t>() : 0;
+                            if (bytes == 0 || bytes > 8) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, sp + "/data",
+                                          "a data step's 'data' is the word's size in "
+                                          "bytes, an integer from 1 to 8");
+                                ok = false;
+                            } else {
+                                step.dataBytes = static_cast<std::uint8_t>(bytes);
+                            }
+                            if (sj.contains("result")) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, sp + "/result",
+                                          "a data step is never executed, so it writes "
+                                          "no register");
+                                ok = false;
+                            }
+                        } else if (!sj.at("mnemonic").is_string()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, sp + "/mnemonic",
+                                      "a veneer step's 'mnemonic' must be a string");
+                            ok = false;
+                        } else {
+                            step.mnemonic = sj.at("mnemonic").get<std::string>();
+                            auto const it = data.mnemonicIndex.find(step.mnemonic);
+                            if (it == data.mnemonicIndex.end()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          sp + "/mnemonic",
+                                          std::format("'{}' names no opcode of this "
+                                                      "target", step.mnemonic));
+                                ok = false;
+                            } else {
+                                step.opcode = it->second;
+                            }
+                        }
+                        if (!isData && sj.contains("result")) {
+                            auto const& rj = sj.at("result");
+                            auto const reg = rj.is_string()
+                                ? grantedRegister(rj.get<std::string>())
+                                : std::nullopt;
+                            if (!reg.has_value()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          sp + "/result",
+                                          std::format("a veneer step may write only a "
+                                                      "granted scratch register ({}); "
+                                                      "{} is not one — writing any other "
+                                                      "register is a clobber the ABI "
+                                                      "does not grant",
+                                                      grantedList(), rj.dump()));
+                                ok = false;
+                            } else {
+                                step.resultName     = rj.get<std::string>();
+                                step.resultRegister = *reg;
+                            }
+                        }
+                        auto const operandShapes = [&] {
+                            return std::format(
+                                "a granted scratch register ({}), a memory operand "
+                                "{{\"base\": <register>, \"offset\": <int>}}, or one "
+                                "of {}",
+                                grantedList(),
+                                detail::renderAllowedList(
+                                    allNames(kLinkVeneerOperandKeywordTable), " / "));
+                        };
+                        if (!sj.contains("operands") || !sj.at("operands").is_array()) {
+                            coll.emit(DiagnosticCode::C_MissingField, sp + "/operands",
+                                      std::format("a veneer step needs an 'operands' "
+                                                  "array; each operand is {}",
+                                                  operandShapes()));
+                            ok = false;
+                        } else {
+                            json const& ops = sj.at("operands");
+                            for (std::size_t o = 0; o < ops.size(); ++o) {
+                                std::string const op = std::format("{}/operands/{}", sp, o);
+                                LinkVeneerOperand operand;
+                                if (ops[o].is_string()) {
+                                    auto const name = ops[o].get<std::string>();
+                                    if (auto const kw = linkVeneerOperandKindFromKeyword(name)) {
+                                        operand.kind = *kw;
+                                    } else if (auto const reg = grantedRegister(name)) {
+                                        operand.kind         = LinkVeneerOperandKind::Register;
+                                        operand.registerName = name;
+                                        operand.reg          = *reg;
+                                    } else {
+                                        coll.emit(DiagnosticCode::C_MalformedJson, op,
+                                                  std::format("'{}' is not a veneer "
+                                                              "operand: an operand is {}",
+                                                              name, operandShapes()));
+                                        ok = false;
+                                        continue;
+                                    }
+                                } else if (ops[o].is_object()) {
+                                    json const& mj = ops[o];
+                                    rejectUnknownKeys(mj, kLinkVeneerMemoryKeys, op,
+                                                      "a veneer memory operand", coll);
+                                    auto const base = mj.contains("base") && mj.at("base").is_string()
+                                        ? grantedRegister(mj.at("base").get<std::string>())
+                                        : std::nullopt;
+                                    bool const offsetOk =
+                                        mj.contains("offset") && mj.at("offset").is_number_integer()
+                                        && mj.at("offset").get<std::int64_t>()
+                                               >= std::numeric_limits<std::int32_t>::min()
+                                        && mj.at("offset").get<std::int64_t>()
+                                               <= std::numeric_limits<std::int32_t>::max();
+                                    if (!base.has_value()) {
+                                        coll.emit(DiagnosticCode::C_MalformedJson, op + "/base",
+                                                  std::format("a memory operand's 'base' "
+                                                              "must be a granted scratch "
+                                                              "register ({})", grantedList()));
+                                        ok = false;
+                                        continue;
+                                    }
+                                    if (!offsetOk) {
+                                        coll.emit(DiagnosticCode::C_MalformedJson, op + "/offset",
+                                                  "a memory operand's 'offset' must be a "
+                                                  "32-bit signed integer");
+                                        ok = false;
+                                        continue;
+                                    }
+                                    operand.kind         = LinkVeneerOperandKind::Memory;
+                                    operand.registerName = mj.at("base").get<std::string>();
+                                    operand.reg          = *base;
+                                    operand.offset       = static_cast<std::int32_t>(
+                                        mj.at("offset").get<std::int64_t>());
+                                } else {
+                                    coll.emit(DiagnosticCode::C_MalformedJson, op,
+                                              std::format("a veneer operand is {}",
+                                                          operandShapes()));
+                                    ok = false;
+                                    continue;
+                                }
+                                step.operands.push_back(std::move(operand));
+                            }
+                        }
+                        if (readNames(sj, "relocations", sp + "/relocations", true,
+                                      step.relocationNames)) {
+                            for (std::size_t r = 0; r < step.relocationNames.size(); ++r) {
+                                auto const kind = resolveRelocation(
+                                    step.relocationNames[r],
+                                    std::format("{}/relocations/{}", sp, r));
+                                if (kind.has_value()) step.relocations.push_back(*kind);
+                                else ok = false;
+                            }
+                        } else {
+                            ok = false;
+                        }
+                        body.sequence.push_back(std::move(step));
+                    }
+                    vocab.bodies.push_back(std::move(body));
+                }
+            }
+            if (ok) data.linkVeneers = std::move(vocab);
         }
     }
 

@@ -320,22 +320,23 @@ TEST(HeaderNameMatching, VocabularyRoundTripsAndRejectsUnknown) {
 // ── the two directions, on one on-disk file, on any host ─────────────────
 
 TEST(HeaderNameMatching, PolicyDecidesCaseNotTheHostFilesystem) {
+    HeaderSearchCache cache;   // one compile's view of the tree
     ScratchDir scratch{Location::Temp, "header_case"};
     fs::path const dir = scratch.path();
     writeFile(dir / "stdio.json");
 
     // Byte-exact request resolves under BOTH policies — the control that keeps
     // the two rejections below attributable to CASE and nothing else.
-    EXPECT_EQ(resolveInDir(dir, "stdio.json", HeaderNameMatching::CaseSensitive).status,
+    EXPECT_EQ(resolveInDir(dir, "stdio.json", HeaderNameMatching::CaseSensitive, cache).status,
               HeaderSearchStatus::Found);
-    EXPECT_EQ(resolveInDir(dir, "stdio.json", HeaderNameMatching::CaseInsensitive).status,
+    EXPECT_EQ(resolveInDir(dir, "stdio.json", HeaderNameMatching::CaseInsensitive, cache).status,
               HeaderSearchStatus::Found);
 
     // ★ THE SILENT-ACCEPT PIN (the one that matters most). A case-SENSITIVE
     // format must NOT resolve `Stdio.json` to `stdio.json`. On a case-
     // INSENSITIVE host `fs::exists(dir/"Stdio.json")` returns TRUE, so this
     // goes red the moment DSS delegates the decision back to the host.
-    EXPECT_EQ(resolveInDir(dir, "Stdio.json", HeaderNameMatching::CaseSensitive).status,
+    EXPECT_EQ(resolveInDir(dir, "Stdio.json", HeaderNameMatching::CaseSensitive, cache).status,
               HeaderSearchStatus::NotFound)
         << "a POSIX/elf target must reject a case-mismatched header name even "
            "when the BUILD HOST's filesystem would happily fold it";
@@ -344,7 +345,7 @@ TEST(HeaderNameMatching, PolicyDecidesCaseNotTheHostFilesystem) {
     // case-SENSITIVE host `fs::exists` returns FALSE, so this goes red if DSS
     // stops folding for itself.
     HeaderSearchResult const ci =
-        resolveInDir(dir, "Stdio.json", HeaderNameMatching::CaseInsensitive);
+        resolveInDir(dir, "Stdio.json", HeaderNameMatching::CaseInsensitive, cache);
     ASSERT_EQ(ci.status, HeaderSearchStatus::Found)
         << "a pe/macho target must resolve `<Stdio.h>` to the shipped "
            "`stdio.json` on ANY build host";
@@ -354,13 +355,14 @@ TEST(HeaderNameMatching, PolicyDecidesCaseNotTheHostFilesystem) {
 
     // Mixed case, and a name that differs from the on-disk one by more than
     // case (never a match under either policy).
-    EXPECT_EQ(resolveInDir(dir, "StDiO.json", HeaderNameMatching::CaseInsensitive).status,
+    EXPECT_EQ(resolveInDir(dir, "StDiO.json", HeaderNameMatching::CaseInsensitive, cache).status,
               HeaderSearchStatus::Found);
-    EXPECT_EQ(resolveInDir(dir, "stdioo.json", HeaderNameMatching::CaseInsensitive).status,
+    EXPECT_EQ(resolveInDir(dir, "stdioo.json", HeaderNameMatching::CaseInsensitive, cache).status,
               HeaderSearchStatus::NotFound);
 }
 
 TEST(HeaderNameMatching, PolicyAppliesToEveryPathComponent) {
+    HeaderSearchCache cache;   // one compile's view of the tree
     ScratchDir scratch{Location::Temp, "header_case_subdir"};
     fs::path const dir = scratch.path();
     writeFile(dir / "sys" / "types.json");
@@ -368,20 +370,20 @@ TEST(HeaderNameMatching, PolicyAppliesToEveryPathComponent) {
     // The DIRECTORY component must fold too — `<SYS/TYPES.h>` is a legal
     // Windows spelling of the POSIX subdir header, and a resolver that folded
     // only the leaf would still reject it.
-    EXPECT_EQ(resolveInDir(dir, "SYS/TYPES.json", HeaderNameMatching::CaseInsensitive)
+    EXPECT_EQ(resolveInDir(dir, "SYS/TYPES.json", HeaderNameMatching::CaseInsensitive, cache)
                   .status,
               HeaderSearchStatus::Found);
-    EXPECT_EQ(resolveInDir(dir, "Sys/types.json", HeaderNameMatching::CaseInsensitive)
+    EXPECT_EQ(resolveInDir(dir, "Sys/types.json", HeaderNameMatching::CaseInsensitive, cache)
                   .status,
               HeaderSearchStatus::Found);
-    EXPECT_EQ(resolveInDir(dir, "SYS/TYPES.json", HeaderNameMatching::CaseSensitive)
+    EXPECT_EQ(resolveInDir(dir, "SYS/TYPES.json", HeaderNameMatching::CaseSensitive, cache)
                   .status,
               HeaderSearchStatus::NotFound);
-    EXPECT_EQ(resolveInDir(dir, "SYS/types.json", HeaderNameMatching::CaseSensitive)
+    EXPECT_EQ(resolveInDir(dir, "SYS/types.json", HeaderNameMatching::CaseSensitive, cache)
                   .status,
               HeaderSearchStatus::NotFound)
         << "a mismatch in the DIRECTORY component alone must still reject";
-    EXPECT_EQ(resolveInDir(dir, "sys/types.json", HeaderNameMatching::CaseSensitive)
+    EXPECT_EQ(resolveInDir(dir, "sys/types.json", HeaderNameMatching::CaseSensitive, cache)
                   .status,
               HeaderSearchStatus::Found);
 }
@@ -390,23 +392,24 @@ TEST(HeaderNameMatching, PolicyAppliesToEveryPathComponent) {
 // answers the case question. This is the exact shape of the sqlite CLI blocker:
 // `sqlite3.c` writes `#include <Windows.h>` and DSS ships `windows.json`.
 TEST(HeaderNameMatching, SystemDescriptorStemRewriteHonoursPolicy) {
+    HeaderSearchCache cache;   // one compile's view of the tree
     ScratchDir scratch{Location::Temp, "header_case_desc"};
     fs::path const dir = scratch.path();
     writeFile(dir / "windows.json");
     std::vector<fs::path> const sysDirs{dir};
 
     EXPECT_EQ(resolveSystemDescriptor("Windows.h", sysDirs,
-                                      HeaderNameMatching::CaseInsensitive).status,
+                                      HeaderNameMatching::CaseInsensitive, cache).status,
               HeaderSearchStatus::Found)
         << "the pe/macho convention must reach windows.json from <Windows.h>";
     EXPECT_EQ(resolveSystemDescriptor("WiNdOwS.h", sysDirs,
-                                      HeaderNameMatching::CaseInsensitive).status,
+                                      HeaderNameMatching::CaseInsensitive, cache).status,
               HeaderSearchStatus::Found);
     EXPECT_EQ(resolveSystemDescriptor("Windows.h", sysDirs,
-                                      HeaderNameMatching::CaseSensitive).status,
+                                      HeaderNameMatching::CaseSensitive, cache).status,
               HeaderSearchStatus::NotFound);
     EXPECT_EQ(resolveSystemDescriptor("windows.h", sysDirs,
-                                      HeaderNameMatching::CaseSensitive).status,
+                                      HeaderNameMatching::CaseSensitive, cache).status,
               HeaderSearchStatus::Found);
 }
 
@@ -415,6 +418,7 @@ TEST(HeaderNameMatching, SystemDescriptorStemRewriteHonoursPolicy) {
 // source-header fallback. A policy applied to only one arm would make an angle
 // include of a real `-I` header disagree with an angle include of a descriptor.
 TEST(HeaderNameMatching, AngleFunnelHonoursPolicyInBothArms) {
+    HeaderSearchCache cache;   // one compile's view of the tree
     ScratchDir scratch{Location::Temp, "header_case_angle"};
     fs::path const sysDir = scratch.path() / "sys";
     fs::path const incDir = scratch.path() / "inc";
@@ -424,22 +428,23 @@ TEST(HeaderNameMatching, AngleFunnelHonoursPolicyInBothArms) {
     std::vector<fs::path> const incDirs{incDir};
 
     EXPECT_EQ(resolveAngleInclude("Windows.h", sysDirs, incDirs,
-                                  HeaderNameMatching::CaseInsensitive).kind,
+                                  HeaderNameMatching::CaseInsensitive, cache).kind,
               AngleIncludeKind::Descriptor);
     EXPECT_EQ(resolveAngleInclude("Windows.h", sysDirs, incDirs,
-                                  HeaderNameMatching::CaseSensitive).kind,
+                                  HeaderNameMatching::CaseSensitive, cache).kind,
               AngleIncludeKind::NotFound);
     EXPECT_EQ(resolveAngleInclude("SQLite3Ext.h", sysDirs, incDirs,
-                                  HeaderNameMatching::CaseInsensitive).kind,
+                                  HeaderNameMatching::CaseInsensitive, cache).kind,
               AngleIncludeKind::Source)
         << "the -I source fallback arm must fold too, or an angle include of a "
            "real header disagrees with an angle include of a descriptor";
     EXPECT_EQ(resolveAngleInclude("SQLite3Ext.h", sysDirs, incDirs,
-                                  HeaderNameMatching::CaseSensitive).kind,
+                                  HeaderNameMatching::CaseSensitive, cache).kind,
               AngleIncludeKind::NotFound);
 }
 
 TEST(HeaderNameMatching, QuoteAndDirListSearchesHonourPolicy) {
+    HeaderSearchCache cache;   // one compile's view of the tree
     ScratchDir scratch{Location::Temp, "header_case_quote"};
     fs::path const selfDir = scratch.path() / "self";
     fs::path const incDir  = scratch.path() / "inc";
@@ -449,23 +454,74 @@ TEST(HeaderNameMatching, QuoteAndDirListSearchesHonourPolicy) {
 
     // Self-dir arm (quote-only, C 6.10.2p3).
     EXPECT_EQ(resolveIncludePath("Local.h", selfDir, incDirs,
-                                 HeaderNameMatching::CaseInsensitive).status,
+                                 HeaderNameMatching::CaseInsensitive, cache).status,
               HeaderSearchStatus::Found);
     EXPECT_EQ(resolveIncludePath("Local.h", selfDir, incDirs,
-                                 HeaderNameMatching::CaseSensitive).status,
+                                 HeaderNameMatching::CaseSensitive, cache).status,
               HeaderSearchStatus::NotFound);
     // -I arm.
     EXPECT_EQ(resolveIncludePath("Shared.h", selfDir, incDirs,
-                                 HeaderNameMatching::CaseInsensitive).status,
+                                 HeaderNameMatching::CaseInsensitive, cache).status,
               HeaderSearchStatus::Found);
     EXPECT_EQ(resolveIncludePath("Shared.h", selfDir, incDirs,
-                                 HeaderNameMatching::CaseSensitive).status,
+                                 HeaderNameMatching::CaseSensitive, cache).status,
               HeaderSearchStatus::NotFound);
     // `findInDirs` (the shared dir-list search) directly.
-    EXPECT_EQ(findInDirs("Shared.h", incDirs, HeaderNameMatching::CaseInsensitive).status,
+    EXPECT_EQ(findInDirs("Shared.h", incDirs, HeaderNameMatching::CaseInsensitive, cache).status,
               HeaderSearchStatus::Found);
-    EXPECT_EQ(findInDirs("Shared.h", incDirs, HeaderNameMatching::CaseSensitive).status,
+    EXPECT_EQ(findInDirs("Shared.h", incDirs, HeaderNameMatching::CaseSensitive, cache).status,
               HeaderSearchStatus::NotFound);
+}
+
+// ── [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]] ────────
+//
+// A COMPILE reads each directory ONCE, and only for itself. Every search above used to
+// list its directory afresh (✔MEASURED on the sqlite build: 11,204 listings of 13
+// directories, the shipped-descriptor directory 6,477 times); a `HeaderSearchCache` is
+// the compile's one view of the tree. COUNTED, from a tally that sees listings made
+// through any cache: both policies, hits and misses, answer from ONE listing and one
+// probe per candidate. And the view is the compile's alone — a header written after one
+// compile looked is seen by the next, which lists again: a cache that outlived its
+// compile would answer a later build from a tree that is gone.
+TEST(HeaderSearchCache, EachCompileListsADirectoryOnceAndOnlyForItself) {
+    ScratchDir scratch{Location::Temp, "header_cache_compile"};
+    fs::path const dir = scratch.path();
+    writeFile(dir / "early.h", "int e;\n");
+    std::vector<fs::path> const dirs{dir};
+    HeaderSearchTally const tally;
+
+    HeaderSearchCache first;
+    for (auto m : {HeaderNameMatching::CaseSensitive, HeaderNameMatching::CaseInsensitive}) {
+        SCOPED_TRACE(headerNameMatchingName(m));
+        for (int i = 0; i < 3; ++i) {
+            EXPECT_EQ(findInDirs("early.h", dirs, m, first).status, HeaderSearchStatus::Found);
+            EXPECT_EQ(findInDirs("late.h", dirs, m, first).status, HeaderSearchStatus::NotFound);
+        }
+    }
+    EXPECT_EQ(first.listings(), 1u)
+        << "one directory, twelve searches under two policies: ONE listing per compile";
+    EXPECT_EQ(first.probes(), 2u) << "one `exists` probe per candidate per compile";
+
+    // A header written AFTER the first compile listed its directory.
+    writeFile(dir / "late.h", "int l;\n");
+    // The first compile keeps the view it took — a per-compile snapshot, as gcc's
+    // `file_hash` and clang's `SeenFileEntries` keep negative answers too...
+    EXPECT_EQ(findInDirs("late.h", dirs, HeaderNameMatching::CaseInsensitive, first).status,
+              HeaderSearchStatus::NotFound);
+    // ...and the NEXT compile reads the tree again, and sees it.
+    HeaderSearchCache second;
+    EXPECT_EQ(findInDirs("late.h", dirs, HeaderNameMatching::CaseInsensitive, second).status,
+              HeaderSearchStatus::Found)
+        << "a later compile answered from an earlier compile's listing — the cache "
+           "outlived the compile it belongs to";
+    EXPECT_EQ(findInDirs("late.h", dirs, HeaderNameMatching::CaseSensitive, second).status,
+              HeaderSearchStatus::Found);
+
+    auto const listed = tally.listingsPerDirectory();
+    ASSERT_EQ(listed.size(), 1u) << "exactly the one fixture directory was listed";
+    EXPECT_EQ(listed.front().second, 2u)
+        << "the directory must be listed once PER COMPILE: twice for two compiles, "
+           "never once per search and never once for both";
 }
 
 // ── the AMBIGUITY path: fail loud, never pick ────────────────────────────
@@ -480,6 +536,7 @@ TEST(HeaderNameMatching, QuoteAndDirListSearchesHonourPolicy) {
 // case-only pair in the repo would break checkout on exactly the hosts this
 // whole change exists to serve.
 TEST(HeaderNameMatching, FoldCollisionFailsLoudAndNamesEveryCandidate) {
+    HeaderSearchCache cache;   // one compile's view of the tree
     ScratchDir scratch{Location::Temp, "header_case_ambig"};
     fs::path const dir = scratch.path();
     tryMakeDirCaseSensitive(dir);
@@ -490,7 +547,7 @@ TEST(HeaderNameMatching, FoldCollisionFailsLoudAndNamesEveryCandidate) {
         // still resolves — and let the case-sensitive leg (WSL/Linux ext4)
         // cover the collision itself.
         writeFile(dir / "foo.json");
-        EXPECT_EQ(resolveInDir(dir, "Foo.json", HeaderNameMatching::CaseInsensitive)
+        EXPECT_EQ(resolveInDir(dir, "Foo.json", HeaderNameMatching::CaseInsensitive, cache)
                       .status,
                   HeaderSearchStatus::Found);
         GTEST_SKIP() << "this filesystem folds case, so a `foo.json`/`Foo.json` "
@@ -501,7 +558,7 @@ TEST(HeaderNameMatching, FoldCollisionFailsLoudAndNamesEveryCandidate) {
     writeFile(dir / "Foo.json");
 
     HeaderSearchResult const r =
-        resolveInDir(dir, "Foo.json", HeaderNameMatching::CaseInsensitive);
+        resolveInDir(dir, "Foo.json", HeaderNameMatching::CaseInsensitive, cache);
     ASSERT_EQ(r.status, HeaderSearchStatus::AmbiguousCase)
         << "an exact match must NOT win the tie — that answer differs between "
            "ext4 (both files) and NTFS (only one can exist), which is the bug";
@@ -515,20 +572,20 @@ TEST(HeaderNameMatching, FoldCollisionFailsLoudAndNamesEveryCandidate) {
 
     // A case-SENSITIVE policy has no ambiguity to report — it wants the bytes
     // it asked for, and exactly one file can carry them.
-    EXPECT_EQ(resolveInDir(dir, "Foo.json", HeaderNameMatching::CaseSensitive).status,
+    EXPECT_EQ(resolveInDir(dir, "Foo.json", HeaderNameMatching::CaseSensitive, cache).status,
               HeaderSearchStatus::Found);
-    EXPECT_EQ(resolveInDir(dir, "foo.json", HeaderNameMatching::CaseSensitive).status,
+    EXPECT_EQ(resolveInDir(dir, "foo.json", HeaderNameMatching::CaseSensitive, cache).status,
               HeaderSearchStatus::Found);
 
     // The collision must also stop the ANGLE funnel and the dir-list search,
     // not just the single-dir atom — those are what the compiler actually calls.
     std::vector<fs::path> const dirs{dir};
-    EXPECT_EQ(findInDirs("Foo.json", dirs, HeaderNameMatching::CaseInsensitive).status,
+    EXPECT_EQ(findInDirs("Foo.json", dirs, HeaderNameMatching::CaseInsensitive, cache).status,
               HeaderSearchStatus::AmbiguousCase);
     // The DESCRIPTOR half (systemDirs) — distinct from the source half,
     // because a different tier owns each report.
     EXPECT_EQ(resolveAngleInclude("Foo.h", dirs, {},
-                                  HeaderNameMatching::CaseInsensitive).kind,
+                                  HeaderNameMatching::CaseInsensitive, cache).kind,
               AngleIncludeKind::AmbiguousDescriptor);
     // The SOURCE half (-I dirs), reached only when no descriptor matches. It
     // must report a DIFFERENT kind, because the import resolver re-resolves the
@@ -537,15 +594,18 @@ TEST(HeaderNameMatching, FoldCollisionFailsLoudAndNamesEveryCandidate) {
     // `F_ShippedHeaderNotFound`, naming the wrong defect.
     writeFile(dir / "bar.h", "int b;");
     writeFile(dir / "Bar.h", "int B;");
+    // New files are a new compile: the listing above is this test's first
+    // compile's snapshot, which by design does not see files written after it.
+    HeaderSearchCache afterWrites;
     EXPECT_EQ(resolveAngleInclude("Bar.h", dirs, dirs,
-                                  HeaderNameMatching::CaseInsensitive).kind,
+                                  HeaderNameMatching::CaseInsensitive, afterWrites).kind,
               AngleIncludeKind::AmbiguousSource)
         << "no `bar.json` exists, so the descriptor half misses and the search "
            "reaches the -I source half, where the collision lives";
     // CONTROL: a name matching neither half is a plain miss, so the two
     // Ambiguous* verdicts above are attributable to the collisions.
     EXPECT_EQ(resolveAngleInclude("nothing_here.h", dirs, dirs,
-                                  HeaderNameMatching::CaseInsensitive).kind,
+                                  HeaderNameMatching::CaseInsensitive, afterWrites).kind,
               AngleIncludeKind::NotFound);
 }
 
@@ -722,6 +782,7 @@ TEST(HeaderNameMatching, CaseCollisionScanPrunesThroughADotSpelledRoot) {
 // the post-implementation read of `descend`, NOT by the corpus: the existing
 // tests happen not to use a `..` include, so this would have shipped green.
 TEST(HeaderNameMatching, DotAndDotDotComponentsNavigateRatherThanMatch) {
+    HeaderSearchCache cache;   // one compile's view of the tree
     ScratchDir scratch{Location::Temp, "header_case_dots"};
     fs::path const root = scratch.path();
     writeFile(root / "shared.h", "int s;\n");
@@ -730,16 +791,16 @@ TEST(HeaderNameMatching, DotAndDotDotComponentsNavigateRatherThanMatch) {
 
     for (auto m : {HeaderNameMatching::CaseSensitive,
                    HeaderNameMatching::CaseInsensitive}) {
-        EXPECT_EQ(resolveInDir(inc, "../shared.h", m).status,
+        EXPECT_EQ(resolveInDir(inc, "../shared.h", m, cache).status,
                   HeaderSearchStatus::Found)
             << "`..` must navigate up, not be matched as a filename";
-        EXPECT_EQ(resolveInDir(inc, "./here.h", m).status,
+        EXPECT_EQ(resolveInDir(inc, "./here.h", m, cache).status,
                   HeaderSearchStatus::Found)
             << "`.` must be a no-op component";
-        EXPECT_EQ(resolveInDir(root, "inc/../shared.h", m).status,
+        EXPECT_EQ(resolveInDir(root, "inc/../shared.h", m, cache).status,
                   HeaderSearchStatus::Found);
         // ...and the case rule still governs the components that DO name files.
-        EXPECT_EQ(resolveInDir(inc, "../Shared.h", m).status,
+        EXPECT_EQ(resolveInDir(inc, "../Shared.h", m, cache).status,
                   m == HeaderNameMatching::CaseInsensitive
                       ? HeaderSearchStatus::Found
                       : HeaderSearchStatus::NotFound)
@@ -772,6 +833,7 @@ TEST(HeaderNameMatching, DotAndDotDotComponentsNavigateRatherThanMatch) {
 // conversion is a no-op), and the WINDOWS leg is the one that proves it WORKS.
 
 TEST(HeaderNameMatching, NonAsciiHeaderNamesResolveAndStayDistinct) {
+    HeaderSearchCache cache;   // one compile's view of the tree
     ScratchDir scratch{Location::Temp, "header_case_utf8"};
     fs::path const dir = scratch.path();
 
@@ -792,7 +854,7 @@ TEST(HeaderNameMatching, NonAsciiHeaderNamesResolveAndStayDistinct) {
                    HeaderNameMatching::CaseInsensitive}) {
         SCOPED_TRACE(headerNameMatchingName(m));
 
-        HeaderSearchResult const r = resolveInDir(dir, u8Bytes(kZhong), m);
+        HeaderSearchResult const r = resolveInDir(dir, u8Bytes(kZhong), m, cache);
         ASSERT_EQ(r.status, HeaderSearchStatus::Found)
             << "a non-ASCII header name must resolve, not abort the process";
         // ★ THE DISTINCTNESS PIN, and the reason this fix is justified even if
@@ -804,20 +866,20 @@ TEST(HeaderNameMatching, NonAsciiHeaderNamesResolveAndStayDistinct) {
         EXPECT_EQ(r.path.filename().native(), zhong.native());
         EXPECT_NE(r.path.filename().native(), nihon.native());
 
-        HeaderSearchResult const other = resolveInDir(dir, u8Bytes(kNihon), m);
+        HeaderSearchResult const other = resolveInDir(dir, u8Bytes(kNihon), m, cache);
         ASSERT_EQ(other.status, HeaderSearchStatus::Found);
         EXPECT_EQ(other.path.filename().native(), nihon.native())
             << "two distinct non-ASCII names must not resolve to one file";
 
-        EXPECT_EQ(resolveInDir(dir, u8Bytes(kNaive), m).status,
+        EXPECT_EQ(resolveInDir(dir, u8Bytes(kNaive), m, cache).status,
                   HeaderSearchStatus::Found);
         // CONTROL: a non-ASCII name that is NOT there is a plain miss — never a
         // crash, and never a fold onto its neighbour.
-        EXPECT_EQ(resolveInDir(dir, "x" + u8Bytes(kNihon), m).status,
+        EXPECT_EQ(resolveInDir(dir, "x" + u8Bytes(kNihon), m, cache).status,
                   HeaderSearchStatus::NotFound);
         // ...and the ASCII control, so the verdicts above are attributable to
         // the non-ASCII names rather than to the directory.
-        EXPECT_EQ(resolveInDir(dir, "plain.json", m).status,
+        EXPECT_EQ(resolveInDir(dir, "plain.json", m, cache).status,
                   HeaderSearchStatus::Found);
     }
 
@@ -827,9 +889,9 @@ TEST(HeaderNameMatching, NonAsciiHeaderNamesResolveAndStayDistinct) {
     // whose other code units are not ASCII at all, and must leave them alone.
     std::string upperExt = u8Bytes(kZhong);
     upperExt.replace(upperExt.size() - 5, 5, ".JSON");
-    EXPECT_EQ(resolveInDir(dir, upperExt, HeaderNameMatching::CaseInsensitive).status,
+    EXPECT_EQ(resolveInDir(dir, upperExt, HeaderNameMatching::CaseInsensitive, cache).status,
               HeaderSearchStatus::Found);
-    EXPECT_EQ(resolveInDir(dir, upperExt, HeaderNameMatching::CaseSensitive).status,
+    EXPECT_EQ(resolveInDir(dir, upperExt, HeaderNameMatching::CaseSensitive, cache).status,
               HeaderSearchStatus::NotFound);
 }
 
@@ -842,6 +904,7 @@ TEST(HeaderNameMatching, NonAsciiHeaderNamesResolveAndStayDistinct) {
 // lookup that passed through that directory, including lookups of headers that
 // have nothing to do with it.
 TEST(HeaderNameMatching, AnUnnarrowableSiblingDoesNotBreakAnAsciiLookup) {
+    HeaderSearchCache cache;   // one compile's view of the tree
     ScratchDir scratch{Location::Temp, "header_case_sibling"};
     fs::path const dir = scratch.path();
     writeFile(dir / "plain.json");
@@ -858,27 +921,27 @@ TEST(HeaderNameMatching, AnUnnarrowableSiblingDoesNotBreakAnAsciiLookup) {
     for (auto m : {HeaderNameMatching::CaseSensitive,
                    HeaderNameMatching::CaseInsensitive}) {
         SCOPED_TRACE(headerNameMatchingName(m));
-        EXPECT_EQ(resolveInDir(dir, "plain.json", m).status,
+        EXPECT_EQ(resolveInDir(dir, "plain.json", m, cache).status,
                   HeaderSearchStatus::Found)
             << "an ASCII lookup must survive an exotic BYSTANDER in the same "
                "directory — the resolver has no business narrowing entries it "
                "is not being asked about";
-        EXPECT_EQ(findInDirs("plain.json", dirs, m).status,
+        EXPECT_EQ(findInDirs("plain.json", dirs, m, cache).status,
                   HeaderSearchStatus::Found);
         // A MISS still has to enumerate the whole directory, so it hits the
         // bystander on every entry rather than stopping early at a hit.
-        EXPECT_EQ(resolveInDir(dir, "absent.json", m).status,
+        EXPECT_EQ(resolveInDir(dir, "absent.json", m, cache).status,
                   HeaderSearchStatus::NotFound);
     }
-    EXPECT_EQ(resolveInDir(dir, "Plain.json", HeaderNameMatching::CaseInsensitive)
+    EXPECT_EQ(resolveInDir(dir, "Plain.json", HeaderNameMatching::CaseInsensitive, cache)
                   .status,
               HeaderSearchStatus::Found);
-    EXPECT_EQ(resolveInDir(dir, "Plain.json", HeaderNameMatching::CaseSensitive)
+    EXPECT_EQ(resolveInDir(dir, "Plain.json", HeaderNameMatching::CaseSensitive, cache)
                   .status,
               HeaderSearchStatus::NotFound);
     // And through the angle funnel, which is what the preprocessor calls.
     EXPECT_EQ(resolveAngleInclude("Plain.h", dirs, dirs,
-                                  HeaderNameMatching::CaseInsensitive).kind,
+                                  HeaderNameMatching::CaseInsensitive, cache).kind,
               AngleIncludeKind::Descriptor);
 }
 

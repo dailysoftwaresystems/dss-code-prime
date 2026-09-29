@@ -1,0 +1,16 @@
+{
+  "$comment": "P68 round 8 lane ht part 2: a NAMED void parameter in a declaration that is not a definition, with gcc's measured meaning. A call's arguments END at the first unqualified void; gcc 13.3.0 and mingw-w64 13.2.0 build and RUN this two-TU shape, while clang and MSVC refuse the prototypes. main.c declares `void f(void v)` and `void g(int a, void v)`, calls f() directly and through a `void (*)(void w)` pointer, and calls g(40). helper.c defines both the ordinary way, and the cross-TU merge binds the named-void externs to those definitions. Exit 42 iff every call reached helper.c with its argument. RED-ON-DISABLE: `TypeInterner::fnArgumentParams` returning the whole declared list -> S_ArgCountMismatch at f(), no image.",
+  "language": "c",
+  "sources": ["main.c", "helper.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

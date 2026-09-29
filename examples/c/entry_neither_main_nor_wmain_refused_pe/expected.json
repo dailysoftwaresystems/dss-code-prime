@@ -1,0 +1,11 @@
+{
+  "$comment": "D-DIAG-ENTRY-RESOLUTION-CODE-SPLIT-CORPUS-COVERAGE: the pe64 arm of K_ProgramEntryUndefined -- an exec build whose translation unit defines NEITHER `main` NOR `wmain`. The elf and Mach-O arms (entry_wmain_only_refused_elf / _macho) reach the code with a `wmain`-only program, because those formats do not realize the wide verb; pe64-x86_64-windows-exec DOES realize it, so on pe the code is reachable only by a program with no entry spelling at all. Asserted by CODE, not by 'some error'. No span, deliberately: 'this program defines no entry' is a whole-program fact. No `release` arm: a diagnostic manifest's optimized arm is parsed and discarded (see the row). RED-ON-DISABLE: rename `helper` to `main` -> the program has its entry and the example stops erroring.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "K_ProgramEntryUndefined", "line": 1, "col": 1, "positioned": false }
+  ]
+}

@@ -1,4 +1,4 @@
-/* c76 (D-ML7-2.3 move-cycle + its scratch-picker soundness completion,
+/* c76 (D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS move-cycle + its scratch-picker soundness completion,
  * a.k.a. the re-characterized D-AS-REGALLOC-FPR-SPILL-RELOAD-SCRATCH):
  * an arg-register PERMUTATION at a call must be resolved as a parallel copy
  * whose cycle is broken via a config-driven scratch that avoids EVERY

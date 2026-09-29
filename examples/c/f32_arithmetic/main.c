@@ -22,8 +22,8 @@
 //   narrow(41.75)     = 41.75f          (CVTSD2SS)
 //   (int)(41.75f + 0.25f) = (int)42.0f  = 42  (ADDSS + CVTTSS2SI)
 //
-// HONEST REACH of the exact chain (audit-residue sweep c2,
-// D-AUDIT-WITNESS-STRENGTHENING): BECAUSE every value is exact in
+// HONEST REACH of the exact chain (audit-residue sweep c2, which
+// added the round_away() arm): BECAUSE every value is exact in
 // both binary32 and binary64, computing the whole chain at the wrong
 // precision (an all-F64 misinterpretation — a broken width axis)
 // would still exit 42 — the chain witnesses the PLUMBING (loads,

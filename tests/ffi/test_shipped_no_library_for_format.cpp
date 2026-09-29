@@ -71,6 +71,14 @@
 // that CONTAINS `src/dss-config/`, not the config directory itself. Pointed at
 // the config dir the override MISSES SILENTLY and the cwd walk answers with the
 // REAL shipped tree — every arm then agrees with itself about the wrong corpus.
+//
+// ── SECTIONS 4 AND 5: THE SAME ROW REACHED THROUGH `#include` ────────────────
+//
+// Verdict (b) above is the HAND-WRITTEN declaration's road. A row a header
+// injects is a different road, and on it the build always stopped — in HIR, with
+// a node id. It now stops where the realization is decided, naming the
+// descriptor, the symbol and the format
+// ([[D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION]]).
 
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -80,15 +88,23 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_registry.hpp"
 #include "diagnostic_count.hpp"
+#include "core/types/unsuppressable_codes.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
+#include "program/program.hpp"   // section 5: the driver builds the staged tree
+#include "repo_root.hpp"
 #include "scoped_env.hpp"
 #include "scratch_dir.hpp"
+#include "shipped_read_pairs.hpp"   // the real pairs a REAL descriptor is read on
+
+#include <nlohmann/json.hpp>
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <system_error>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -389,4 +405,368 @@ TEST(ShippedNoLibraryForFormat, TheAccessorCollapsesBothSpellingsOfAbsence) {
     EXPECT_TRUE(shippedLibraryImageForFormat(emptyValue, "pe").empty());
     EXPECT_TRUE(shippedLibraryImageForFormat(absent, "pe").empty());
     EXPECT_TRUE(shippedLibraryImageForFormat({}, "pe").empty());
+}
+
+// ── 4. THE `#include` PATH REFUSES A BODY-LESS ROW WHERE THE FACT IS DECIDED ──
+//
+// [[D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION]]. The
+// arm above is the HAND-WRITTEN declaration's: the oracle states it and routes
+// the reference unbound. A row reached through `#include` took a different road:
+// the semantic tier injected it, HIR marked it library-bound with no image, and
+// the build stopped three tiers lower on `H_UnsupportedLoweringForKind` "HIR
+// ExternFunction (id N) — `importLibrary` is missing from the
+// HirAttribute<FfiMetadata> side-table" — ✔MEASURED, a node id and an internal
+// attribute, naming neither the descriptor, nor the symbol, nor the format.
+//
+// The injection now asks `refuseShippedSymbolWithoutABody` per row it injects —
+// the same `realizeRow` kernel the oracle uses — and reports the answer on the
+// `#include`. The VERDICT did not move (the build stopped before and stops now,
+// for every such row the header declares, called or not); the tier and the words
+// did. The hand-written road is unchanged, and section 5 pins that it still is.
+namespace {
+
+// A descriptor exactly as the injection holds one, with `sym` its only row.
+[[nodiscard]] ShippedLibDescriptor oneRowDescriptor(ShippedSymbol sym) {
+    ShippedLibDescriptor desc;
+    desc.header = "probe.h";
+    desc.symbols.push_back(std::move(sym));
+    return desc;
+}
+
+[[nodiscard]] ShippedSymbol probeRow(std::vector<std::string> avail) {
+    ShippedSymbol sym;
+    sym.name                   = kProbe;
+    sym.availableObjectFormats = std::move(avail);
+    return sym;
+}
+
+// The refusal for the only row of `desc`, on `fmt`.
+[[nodiscard]] std::optional<ParseDiagnostic>
+refusalOf(ShippedLibDescriptor const& desc, ObjectFormatKind fmt) {
+    return refuseShippedSymbolWithoutABody(desc, desc.symbols.front(), fmt,
+                                           fs::path{"shippedLibs"} / "probe.json");
+}
+
+} // namespace
+
+// The witness: the row says it exists on pe and names a body only for elf. The
+// refusal is an Error under the new code, and its RENDERED text — what the reader
+// sees — names the descriptor, the symbol and the format.
+TEST(ShippedNoLibraryForFormat, TheIncludePathRefusalNamesDescriptorSymbolAndFormat) {
+    ShippedLibDescriptor desc = oneRowDescriptor(probeRow({"pe"}));
+    desc.library = {{"elf", "libc.so.6"}};
+
+    auto const d = refusalOf(desc, ObjectFormatKind::Pe);
+    ASSERT_TRUE(d.has_value())
+        << "an AVAILABLE row with no image, no source and no recipe for the "
+           "active format has nothing to bind: the injection must say so";
+    EXPECT_EQ(d->code, DiagnosticCode::F_ShippedSymbolDeclaresNoBodyForFormat);
+    EXPECT_EQ(d->severity, DiagnosticSeverity::Error);
+
+    DiagnosticReporter rep;
+    rep.report(*d);
+    std::string const rendered = rep.formatAll(BufferRegistry{});
+    EXPECT_NE(rendered.find("shippedLibs/probe.json"), std::string::npos)
+        << "the DESCRIPTOR must be named; got:\n" << rendered;
+    EXPECT_NE(rendered.find(std::string{"`"} + kProbe + "`"), std::string::npos)
+        << "the SYMBOL must be named; got:\n" << rendered;
+    EXPECT_NE(rendered.find("object format `pe`"), std::string::npos)
+        << "the FORMAT must be named; got:\n" << rendered;
+    EXPECT_EQ(rendered.find("HirAttribute"), std::string::npos)
+        << "no internal attribute name belongs in a statement about config";
+}
+
+// Every row that DOES have a body on the active format — each of the three kinds
+// of body, and a role the caller did not resolve — and a row or a descriptor not
+// available here at all, is answered with nothing. Without these the case above
+// could pass on a function that refuses everything.
+TEST(ShippedNoLibraryForFormat, TheIncludePathRefusalIsSilentForEveryRowWithABody) {
+    {
+        ShippedLibDescriptor desc = oneRowDescriptor(probeRow({"pe"}));
+        desc.library = {{"elf", "libc.so.6"}, {"pe", "ucrtbase.dll"}};
+        EXPECT_FALSE(refusalOf(desc, ObjectFormatKind::Pe).has_value())
+            << "an IMAGE for the active format is a body";
+    }
+    {
+        ShippedSymbol sym = probeRow({"pe"});
+        sym.library = {{"pe", "ucrtbase.dll"}};   // the per-SYMBOL override
+        ShippedLibDescriptor desc = oneRowDescriptor(std::move(sym));
+        desc.library = {{"elf", "libc.so.6"}};
+        EXPECT_FALSE(refusalOf(desc, ObjectFormatKind::Pe).has_value())
+            << "the symbol's own image merges over the descriptor's, as the "
+               "injection merges it";
+    }
+    {
+        ShippedLibDescriptor desc = oneRowDescriptor(probeRow({"pe"}));
+        desc.realization = {{"pe", "runtime/platform/src/probe.c"}};
+        EXPECT_FALSE(refusalOf(desc, ObjectFormatKind::Pe).has_value())
+            << "a shipped SOURCE for the active format is a body";
+    }
+    {
+        ShippedSymbol sym = probeRow({"pe"});
+        sym.synthesize = kProbe;
+        EXPECT_FALSE(refusalOf(oneRowDescriptor(std::move(sym)),
+                               ObjectFormatKind::Pe).has_value())
+            << "a `synthesize` recipe is a compiler-emitted body and needs no image";
+    }
+    {
+        ShippedLibDescriptor desc = oneRowDescriptor(probeRow({"pe"}));
+        desc.libraryRoles = {{"pe", RuntimeLibraryRole::CLibrary}};
+        EXPECT_FALSE(refusalOf(desc, ObjectFormatKind::Pe).has_value())
+            << "a ROLE is a body declared through the format's runtime-library "
+               "table; a caller that resolved no roles binds nothing, and that is "
+               "not a descriptor without a body";
+    }
+    {
+        ShippedLibDescriptor desc = oneRowDescriptor(probeRow({"elf", "macho"}));
+        desc.library = {{"elf", "libc.so.6"}};
+        EXPECT_FALSE(refusalOf(desc, ObjectFormatKind::Pe).has_value())
+            << "a row NOT available here is the symbol gate's to answer";
+    }
+    {
+        ShippedLibDescriptor desc = oneRowDescriptor(probeRow({}));
+        desc.availableObjectFormats = {"elf"};
+        desc.library = {{"elf", "libc.so.6"}};
+        EXPECT_FALSE(refusalOf(desc, ObjectFormatKind::Pe).has_value())
+            << "a DESCRIPTOR not available here declares nothing here";
+    }
+}
+
+// The shipped corpus, read the way the editor and the header parser read it (no
+// role resolver), on every object format a shipped target builds for: no row the
+// `#include` path injects may be refused. A corpus edit that leaves an available
+// row without a body reds here, at the gate, before any user's `#include` does.
+//
+// ⚠ elf / pe / macho ONLY, on purpose: `wasm32-v1` and `spirv-1.6` are declared
+// formats no shipped target pairs with, and the 125 rows that declare no
+// `availableObjectFormats` (available everywhere) name images only for the three
+// (✔MEASURED, see the file header). On those two the refusal is the true answer.
+TEST(ShippedNoLibraryForFormat, NoShippedRowIsBodylessOnAFormatAShippedTargetBuilds) {
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const libs = *cfg / "shippedLibs";
+    ASSERT_TRUE(fs::is_directory(libs)) << libs.generic_string();
+
+    // ★ ON EVERY DISTINCT REAL PAIR, WITH THE PAIR'S OWN FACTS (P68 round 12,
+    // S2a-1). The legs were three hand-written (format, data model) rows read as
+    // "x86_64" — arm64 was never read — with no pair facts, and a descriptor
+    // that FAILED to read was skipped in silence (`continue`), so a corpus edit
+    // that broke a read on one format shrank this sweep instead of reddening it;
+    // the floors below could not see a handful of missing files. The pairs now
+    // come from the shipped documents (`shipped_read_pairs.hpp`) and a failed
+    // read is a failure, named.
+    auto const& pairs = dss::test_support::shippedReadPairs();
+    ASSERT_FALSE(pairs.empty());
+    std::size_t descriptorsRead = 0;
+    std::size_t rowsAsked       = 0;
+    std::vector<std::string> refused;
+    for (auto const& pair : pairs) {
+        SCOPED_TRACE(pair.label());
+        ShippedPairFacts const facts = pair.pairFacts();
+        for (auto const& entry : fs::recursive_directory_iterator{libs}) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".json")
+                continue;
+            TypeInterner       interner{CompilationUnitId{1}};
+            TypeRegistry       typeReg;
+            DiagnosticReporter rep;
+            // stdio.json's `vfprintf` spells the ABI alias `va_list`, and a read
+            // without a binding fails loud — which the silent `continue` this
+            // sweep used to take HID: ✔MEASURED at S2a-1, stdio.json was never
+            // read here on any leg, so none of its rows was ever asked. Any
+            // consistent stand-in serves, as in the consistency sweep: nothing
+            // here reads a TypeId.
+            std::array<NamedTypeBinding, 1> const named{NamedTypeBinding{
+                "va_list", interner.pointer(interner.primitive(TypeKind::Void))}};
+            auto const desc = readShippedLibDescriptor(
+                entry.path(), interner, typeReg, rep, pair.dataModel(),
+                pair.activeTarget(), pair.activeFormat(), named, nullptr, &facts);
+            EXPECT_TRUE(desc.has_value())
+                << entry.path().generic_string() << " failed to read on this pair: "
+                << (rep.all().empty() ? std::string{"<no diagnostic>"}
+                                      : rep.all().front().actual);
+            if (!desc.has_value()) continue;
+            ++descriptorsRead;
+            for (auto const& sym : desc->symbols) {
+                ++rowsAsked;
+                if (auto const d = refuseShippedSymbolWithoutABody(
+                        *desc, sym, pair.kind, entry.path()))
+                    refused.push_back(d->actual);
+            }
+        }
+    }
+    // Floors: a walk that read nothing would pass the assertion below vacuously.
+    EXPECT_GE(descriptorsRead, 100u) << "the descriptor walk collapsed";
+    EXPECT_GE(rowsAsked, 1000u) << "the row walk collapsed";
+    EXPECT_TRUE(refused.empty())
+        << refused.size() << " shipped row(s) would be refused on `#include`; "
+        << "first: " << (refused.empty() ? std::string{} : refused.front());
+}
+
+// Suppression cannot hide it: the semantic tier's error gate stops the build on
+// the model's own error count, so a suppressed line would leave a failed build
+// with nothing naming the row (prong 2).
+TEST(ShippedNoLibraryForFormat, TheIncludePathRefusalCannotBeSuppressed) {
+    constexpr auto code = DiagnosticCode::F_ShippedSymbolDeclaresNoBodyForFormat;
+    EXPECT_TRUE(isUnsuppressable(code));
+    EXPECT_EQ(membershipProngOf(code), MembershipProng::BuildFailsWithNothingSaid);
+
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(code);
+    DiagnosticReporter r{cfg};
+    ParseDiagnostic d;
+    d.code     = code;
+    d.severity = DiagnosticSeverity::Error;
+    d.actual   = "shipped descriptor `x.json` declares `f` on `pe` with no body";
+    r.report(std::move(d));
+    ASSERT_EQ(r.all().size(), 1u) << "--suppress silenced it";
+    EXPECT_NE(r.all()[0].actual.find("x.json"), std::string::npos)
+        << "the delivered diagnostic must still NAME the row";
+    EXPECT_EQ(r.errorCount(), 1u);
+}
+
+// ── 5. END TO END: THE DRIVER BUILDS A HEADER WHOSE ROW LOST ITS BODY ─────────
+//
+// The row's own closing test: a fixture that REMOVES a format's body — in a
+// staged COPY of the shipped config tree; the shipped descriptor is never edited
+// — built by the driver. `dirent.json`'s descriptor-level `realization` map (its
+// only entry is `pe`) is deleted from the copy, so on pe `opendir` / `readdir` /
+// `closedir` stay declared and available with no body.
+namespace {
+
+// A repo-shaped copy of the shipped config tree (DSS_CONFIG_ROOT names the
+// directory CONTAINING `src/dss-config`) with `dirent.json`'s `realization` map
+// removed. Returns the root, or an empty path after a failure it reported.
+[[nodiscard]] fs::path stageTreeWithoutDirentRealization(ScratchDir const& dir) {
+    auto const shipped = dss::test::findConfigRoot();
+    if (!shipped) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
+        return {};
+    }
+    fs::path const root = dir.path() / "tree";
+    fs::path const cfg  = root / "src" / "dss-config";
+    std::error_code ec;
+    fs::create_directories(cfg.parent_path(), ec);
+    fs::copy(*shipped, cfg, fs::copy_options::recursive, ec);
+    if (ec) {
+        ADD_FAILURE() << "staging the config tree failed: " << ec.message();
+        return {};
+    }
+    fs::path const dirent = cfg / "shippedLibs" / "dirent.json";
+    nlohmann::json doc;
+    {
+        std::ifstream in{dirent, std::ios::binary};
+        doc = nlohmann::json::parse(in, nullptr, false);
+    }
+    if (doc.is_discarded() || !doc.is_object() || !doc.contains("realization")) {
+        ADD_FAILURE() << "the staged dirent.json has no `realization` map to "
+                         "remove — this fixture no longer removes a body";
+        return {};
+    }
+    doc.erase("realization");
+    {
+        std::ofstream out{dirent, std::ios::binary | std::ios::trunc};
+        out << doc.dump(2);
+    }
+    return root;
+}
+
+struct DriverRun {
+    int                rc = -1;
+    DiagnosticReporter rep;
+};
+
+// Build `text` for `spec` through the driver, under `configRoot` when it is not
+// empty (the shipped tree otherwise).
+[[nodiscard]] DriverRun buildUnder(fs::path const& configRoot, ScratchDir const& dir,
+                                   std::string const& tag, std::string_view text,
+                                   std::string const& spec) {
+    std::optional<ScopedEnv> env;
+    if (!configRoot.empty()) env.emplace("DSS_CONFIG_ROOT", configRoot.string());
+    DriverRun run;
+    fs::path const src = dir.path() / (tag + ".c");
+    {
+        std::ofstream f{src, std::ios::binary};
+        f << text;
+    }
+    dss::Program p;
+    p.setOutputDir(dir.path() / ("out-" + tag));
+    run.rc = p.compileFiles(std::vector<std::string>{src.string()}, "c",
+                            std::vector<std::string>{spec}, run.rep);
+    return run;
+}
+
+constexpr char const* kDirentProgram =
+    "#include <dirent.h>\n"
+    "int main(void) {\n"
+    "    DIR *d = opendir(\".\");\n"
+    "    if (d == 0) return 1;\n"
+    "    (void)readdir(d);\n"
+    "    return closedir(d);\n"
+    "}\n";
+constexpr char const* kPeSpec  = "x86_64:pe64-x86_64-windows-exec";
+constexpr char const* kElfSpec = "x86_64:elf64-x86_64-linux-exec";
+
+} // namespace
+
+TEST(ShippedNoLibraryForFormat, ABuildOfAHeaderWhoseRowLostItsBodyNamesAllThree) {
+    ScratchDir dir{Location::Temp, "ffi-nobody-e2e"};
+    fs::path const root = stageTreeWithoutDirentRealization(dir);
+    ASSERT_FALSE(root.empty());
+
+    DriverRun const run = buildUnder(root, dir, "nobody-pe", kDirentProgram, kPeSpec);
+    EXPECT_NE(run.rc, 0) << "rows with no body on pe must stop the build";
+    EXPECT_EQ(countCode(run.rep, DiagnosticCode::F_ShippedSymbolDeclaresNoBodyForFormat), 3u)
+        << "one refusal per body-less row `<dirent.h>` declares on pe";
+    EXPECT_EQ(countCode(run.rep, DiagnosticCode::H_UnsupportedLoweringForKind), 0u)
+        << "the refusal is raised where the fact is decided; nothing reaches HIR";
+
+    std::string const rendered = run.rep.formatAll(BufferRegistry{});
+    for (char const* needle :
+         {"shippedLibs/dirent.json", "`opendir`", "object format `pe`"}) {
+        EXPECT_NE(rendered.find(needle), std::string::npos)
+            << needle << " is not named; got:\n" << rendered;
+    }
+    for (auto const& d : run.rep.all()) {
+        if (d.code != DiagnosticCode::F_ShippedSymbolDeclaresNoBodyForFormat) continue;
+        EXPECT_TRUE(d.buffer.valid()) << "the refusal must stand on the `#include`";
+        EXPECT_GT(d.span.length(), 0u);
+    }
+}
+
+// The controls: the SAME staged tree on elf (dirent's rows name an image there),
+// and the SHIPPED tree on pe (the realization source is there) — both build.
+// Without them the case above could be measuring a fixture that breaks every
+// build rather than a missing body.
+TEST(ShippedNoLibraryForFormat, TheSameProgramBuildsWhereTheRowsHaveABody) {
+    ScratchDir dir{Location::Temp, "ffi-nobody-controls"};
+    fs::path const root = stageTreeWithoutDirentRealization(dir);
+    ASSERT_FALSE(root.empty());
+
+    DriverRun const elf = buildUnder(root, dir, "nobody-elf", kDirentProgram, kElfSpec);
+    EXPECT_EQ(elf.rc, 0) << elf.rep.formatAll(BufferRegistry{});
+    EXPECT_EQ(countCode(elf.rep, DiagnosticCode::F_ShippedSymbolDeclaresNoBodyForFormat), 0u);
+
+    DriverRun const shipped = buildUnder({}, dir, "shipped-pe", kDirentProgram, kPeSpec);
+    EXPECT_EQ(shipped.rc, 0) << shipped.rep.formatAll(BufferRegistry{});
+    EXPECT_EQ(countCode(shipped.rep, DiagnosticCode::F_ShippedSymbolDeclaresNoBodyForFormat), 0u);
+}
+
+// The hand-written road is unchanged: a bare declaration of the same body-less
+// name is the oracle's `NoLibraryForFormat`, routed UNBOUND, and judged by the
+// LINK tier by name — not by the `#include` path's refusal.
+TEST(ShippedNoLibraryForFormat, AHandWrittenDeclarationStillRoutesToTheLinkTier) {
+    ScratchDir dir{Location::Temp, "ffi-nobody-handwritten"};
+    fs::path const root = stageTreeWithoutDirentRealization(dir);
+    ASSERT_FALSE(root.empty());
+
+    DriverRun const run = buildUnder(root, dir, "handwritten-pe",
+                                     "typedef struct DIR DIR;\n"
+                                     "extern DIR *opendir(const char *name);\n"
+                                     "int main(void) { return opendir(\".\") == 0; }\n",
+                                     kPeSpec);
+    EXPECT_NE(run.rc, 0);
+    EXPECT_GE(countCode(run.rep, DiagnosticCode::K_SymbolUndefined), 1u)
+        << run.rep.formatAll(BufferRegistry{});
+    EXPECT_EQ(countCode(run.rep, DiagnosticCode::F_ShippedSymbolDeclaresNoBodyForFormat), 0u)
+        << "no `#include` injected the row, so the injection's refusal cannot apply";
 }

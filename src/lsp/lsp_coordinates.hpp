@@ -37,7 +37,7 @@
 // TYPE is the fix: a handler cannot obtain an offset except from `toSynth`, and
 // cannot render a span except through `locate`, and `tree.source()` is
 // unreachable from the handlers — enforced mechanically by
-// `scripts/check-lsp-coordinates/`, not by a comment.
+// `.harness-config/runner/actions/check-lsp-coordinates/`, not by a comment.
 
 namespace dss::lsp {
 
@@ -129,9 +129,16 @@ private:
     // every buffer a position can name.
     [[nodiscard]] dss::SourceBuffer const* bufferFor(dss::BufferId id) const;
 
+    // The uri a location in `origin` is published under: the CLIENT's uri for
+    // the document's own origin buffer, the path's uri for any other file.
+    [[nodiscard]] std::string uriOf(dss::SourceBuffer const& origin) const;
+
     dss::CompilationUnit const&           unit_;
     std::string                           documentUri_;
     std::shared_ptr<dss::SourceBuffer>    document_;
+    // The id of the document's own origin buffer inside `unit_` (invalid for an
+    // empty unit) — see `uriOf`.
+    dss::BufferId                         documentOrigin_{};
 };
 
 // TRUE for a buffer that names no file a user can open — the preprocessor's

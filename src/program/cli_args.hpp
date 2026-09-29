@@ -182,7 +182,7 @@ struct DSS_EXPORT CliArgs {
     // export table is the only way to link against it (a genuine,
     // non-duplicative capability). Threaded to `CompileOptions.resolveLibraries`.
     //
-    // D-FFI-DECLARED-IMPORT-NAME: the full spelling is
+    // Declared import names: the full spelling is
     // `--resolve-library <path>[=<import-name>]`, mirroring `--define
     // NAME[=VALUE]` -- one value-bearing flag whose value carries an OPTIONAL
     // `=`-separated second component, so no new flag enters the surface. With
@@ -410,6 +410,23 @@ struct DSS_EXPORT CliArgs {
     // `stackReserve` key when both are present (see
     // `Program::compileProject`).
     std::optional<std::uint64_t>  stackReserveBytes;
+
+    // `--rpath <dir>` / `--rpath=<dir>`, repeatable
+    // (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH): directories the emitted image
+    // records for its loader to search for the libraries it needs, in the
+    // order given — gcc's `-Wl,-rpath,<dir>` / ld64's `-rpath <dir>`, with
+    // gcc's LITERAL semantics: the string is recorded verbatim (`$ORIGIN`,
+    // `$LIB`, `@loader_path`, a `:` list included), except that a LEADING
+    // `${ORIGIN}` is written in the chosen format's own spelling. Nothing is
+    // validated here beyond the generic non-empty value; the linker gate
+    // refuses only an entry no carrier can hold, and a format that records no
+    // runpath accepts the request with a warning. Threaded to
+    // `Program::setRunpaths`.
+    //
+    // PRECEDENCE: a LIST, so it ACCUMULATES with a project manifest's
+    // `runpaths` — the manifest's entries first, then these — the way repeated
+    // `-rpath` accumulates (see `Program::compileProject`).
+    std::vector<std::string>      runpaths;
 };
 
 // Parse-failure kinds. Mirror the `TargetSpecError` shape so the
@@ -432,7 +449,7 @@ enum class CliArgsError : std::uint8_t {
     InvalidDefine       = 12,   // c105: --define with an empty NAME, or a '('
                                 // in NAME (a function-like --define is not
                                 // supported — use a config predefine)
-    InvalidJobs         = 13,   // D-PERF-4: --jobs with a non-numeric value, a
+    InvalidJobs         = 13,   // D-PERF-4-CU-PARALLELISM: --jobs with a non-numeric value, a
                                 // zero, or trailing junk (`--jobs 0`, `--jobs x`)
     AmbiguousEmitHirTarget = 19, // --emit-hir with more than one --target.
                                 // HIR is target-dependent and `--emit-hir
@@ -454,7 +471,7 @@ enum class CliArgsError : std::uint8_t {
                                 // zero, or trailing junk. RANGE/alignment is
                                 // NOT decided here — that is the linker gate's
                                 // job, against the format's declared bounds.
-    InvalidResolveLibrary = 15, // D-FFI-DECLARED-IMPORT-NAME:
+    InvalidResolveLibrary = 15, // a declared import name:
                                 // `--resolve-library <path>=<import-name>` with
                                 // an EMPTY side — `=libfoo.so` (no path to read)
                                 // or `libfoo.so=` (no identity to record).

@@ -2,6 +2,7 @@
 
 #include "core/substrate/process_spawn.hpp"  // spawnAndWaitInherit — the ONE process-creation call
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/project_sources.hpp"    // resolveManifestPathSpelling — THE one base rule for a manifest's paths
 #include "program/platform_token.hpp"        // currentHostOs — the closed windows/linux/darwin vocabulary
 
 #include <string>
@@ -45,6 +46,17 @@ void emitScriptError(DiagnosticReporter& rep,
     report(rep, code, DiagnosticSeverity::Error, std::move(detail));
 }
 
+// The spawn layer's diagnostic as a finished sentence, so the prose that
+// follows it can start a new one. Some of those texts end in a period (the
+// not-found sentences, an OS message) and some do not (a signal, a directory
+// check); appending ". " unconditionally rendered every not-found hook as
+// "…run a local tool.. The process was never created" ✔MEASURED 2026-09-22
+// through `dsscp --project` ([[D-SPAWN-PATH-FORM-PROGRAM-REPORTED-AS-LOOKED-UP-IN-PATH]]).
+[[nodiscard]] std::string asSentence(std::string text) {
+    if (text.empty() || text.back() != '.') text += '.';
+    return text;
+}
+
 } // namespace
 
 bool runBuildScripts(std::vector<ScriptEntry> const& scripts,
@@ -84,13 +96,39 @@ bool runBuildScripts(std::vector<ScriptEntry> const& scripts,
 
         std::string const& argv0 = entry.run.front();
 
-        // THE process creation. `entry.run` goes through WHOLE — argv[0] is the
+        // ── A PROGRAM NAMED BY A PATH IS A MANIFEST PATH ────────────────────
+        //
+        // [[D-DEPS-HOOK-PROGRAM-PATH-RESOLVES-AGAINST-THE-CONSUMERS-CWD]]. A
+        // BARE `run[0]` (`python`) is a PATH lookup and stays one. A `run[0]`
+        // with a directory component (`tools/gen`, `./gen.sh`, and on Windows
+        // also `tools\gen.exe` / `C:gen`) names a file, and a file a manifest
+        // names is relative to THAT manifest's directory — which `cwd` is. The
+        // spawn layer resolves a path-form argv[0] against the CALLER's
+        // directory by its own documented contract, so the re-basing has to
+        // happen here, before the argv reaches it: ✔MEASURED before this, a
+        // dependency whose hook ran `tools/probe.exe` spawned it from the
+        // consumer's working directory — `D_ScriptSpawnFailed` from the
+        // consumer's own directory, found only from the dependency's.
+        // `has_parent_path()` is the standard library's reading of the same
+        // separators the spawn layer scans for ('/' on POSIX; '/', '\' and a
+        // drive prefix on Windows), so a bare name and a path are told apart
+        // exactly as the process will be looked up.
+        std::vector<std::string> argv = entry.run;
+        if (std::filesystem::path{argv0}.has_parent_path()) {
+            argv.front() = resolveManifestPathSpelling(cwd, argv0);
+        }
+        std::string const programLabel =
+            argv.front() == argv0
+                ? "'" + argv0 + "'"
+                : "'" + argv0 + "' (the manifest's '" + argv.front() + "')";
+
+        // THE process creation. The argv goes through WHOLE — argv[0] is the
         // program, argv[1..] are its arguments, byte-for-byte as the manifest
         // spelled them. No join, no split, no expansion, no shell. `cwd` is the
-        // child's working directory (see the header note on why it is a
-        // parameter). stdio is inherited; there is no timeout.
+        // child's working directory — the manifest's own directory (see the
+        // header). stdio is inherited; there is no timeout.
         substrate::SpawnResult const result =
-            substrate::spawnAndWaitInherit(entry.run, cwd);
+            substrate::spawnAndWaitInherit(argv, cwd);
 
         // ── THE FORK: was there ever a process? ─────────────────────────────
         //
@@ -104,9 +142,9 @@ bool runBuildScripts(std::vector<ScriptEntry> const& scripts,
         if (!result.spawned) {
             emitScriptError(
                 rep, DiagnosticCode::D_ScriptSpawnFailed,
-                "build script '" + argv0 + "' could not be spawned: "
-                + result.diagnostic
-                + ". The process was never created, so it has no exit status — "
+                "build script " + programLabel + " could not be spawned: "
+                + asSentence(result.diagnostic)
+                + " The process was never created, so it has no exit status — "
                   "check that '" + argv0 + "' exists, is executable, and (for a "
                   "bare name) is on PATH. argv[0] is spawned directly, never "
                   "through a shell, so shell builtins and shell-only spellings "
@@ -138,7 +176,7 @@ bool runBuildScripts(std::vector<ScriptEntry> const& scripts,
             bool const isOwnVerdict = result.diagnostic.empty();
             emitScriptError(
                 rep, DiagnosticCode::D_ScriptExitedNonZero,
-                "build script '" + argv0 + "' ran and exited with status "
+                "build script " + programLabel + " ran and exited with status "
                 + std::to_string(result.exitCode)
                 + (isOwnVerdict
                        ? ". The program was found and executed, so this is "
@@ -146,8 +184,8 @@ bool runBuildScripts(std::vector<ScriptEntry> const& scripts,
                          "problem — fix what it reported on this build's "
                          "inherited stdout/stderr and re-run."
                        : ", which is NOT a status the script chose: "
-                         + result.diagnostic
-                         + ". The program was found and executed, so this is "
+                         + asSentence(result.diagnostic)
+                         + " The program was found and executed, so this is "
                            "not a missing-interpreter problem either — the "
                            "run itself did not complete normally.")
                 + " Non-zero stops the build: a hook that failed must not be "

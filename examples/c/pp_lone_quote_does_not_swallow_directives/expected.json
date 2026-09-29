@@ -1,0 +1,13 @@
+{
+  "$comment": "[[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]] refusal witness — the directive swallow. V is 4, so `#if V != 5` is live and its `#error V's wrong` must stop the build, with its own text. ✔MEASURED 2026-09-22: gcc 13.3.0, clang 18.1.3 and MinGW gcc refuse it (rc 1) and MSVC VS 18 refuses it (rc 2, C1189), each on that #error. Before the fix DSS COMPILED AND RAN IT (exit 4): the lone ' of `V's missing` began a character constant that the lexer let run across lines to the ' of `V's wrong`, so `#endif`, `#if V != 5` and the #error itself were body bytes. With the literal ending at its line, the skipped group's quote is not judged (never converted) and the live #error's quote is not judged either (its words are never converted) — exactly ONE diagnostic, the #error's.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "P_PreprocessorErrorDirective", "line": 10, "col": 2 },
+    { "code": "D_LaterPhasesNotRun", "line": 0, "col": 0, "positioned": false,
+      "$comment": "A translation unit refused in the PREPROCESSOR also carries this Info (no later tier ran), and it has no position. This is the corpus's first preprocess-tier refusal, so it is the first manifest to declare it; the CLI runner's code-only arm was widened to match a declared code under any rendered band for exactly this reason (it assumed `error[`)." }
+  ]
+}
