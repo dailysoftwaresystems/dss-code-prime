@@ -85,9 +85,9 @@ which is why every former `scripts/` program sits directly under the actions roo
 <!-- BEGIN GENERATED ACTION INDEX -->
 | Action | Runs | Purpose |
 | --- | --- | --- |
-| **`anchor-rows`** | `anchor-rows.py` | stage, check and apply one fold's deferred-anchor rows as a batch through the door, rehearsed in a throwaway repository first, all or nothing, every row read back. |
+| **`anchor-rows`** | `anchor-rows.py` | stage, check and apply a batch of the orchestrator's own deferred-anchor rows through the door, rehearsed in a throwaway repository first, all or nothing, every row read back. |
 | **`anchors`** | `anchors.py` | read and lint deferred-anchor registry rows, and launch the one door that writes them, dssharness write-anchor and set-anchor. |
-| **`apply-registry-row`** | `apply-registry-row.py` | replace one deferred-anchor registry row with a lane's verbatim row text from a file. |
+| **`apply-registry-row`** | `apply-registry-row.py` | replace one deferred-anchor registry row with the orchestrator's verbatim row text from a file. |
 | **`burndown-queue`** | `burndown-queue.py` | re-derive the prioritized burndown queue from the registry, production errors first. |
 | **`check-anchor-balance`** | `check-anchor-balance.py` | refuse a cycle that ends with more OPEN deferral-registry rows than it began. |
 | **`check-anchor-registry`** | `check-anchor-registry.py` | refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells. |
@@ -116,8 +116,6 @@ which is why every former `scripts/` program sits directly under the actions roo
 | **`compile-bench`** | `compile-bench.py` | time dsscp against gcc/clang/MSVC/tcc on ONE host over a subject size ladder, naming every reference it could not find. |
 | **`corpus-census`** | `corpus-census.py`, `test-corpus-census.py` | census the real-example corpus into a run-identified report instead of one overwritten log. |
 | **`examples-census`** | `examples-census.py` | re-derive every corpus-manifest figure examples/README.md states, by parsing the manifests. |
-| **`lane-fold`** | `lane-fold.py` | seed a lane worktree from the main tree, fold only that lane's real changes back, and land it with its rows applied and its evidence preserved. |
-| **`lane-worktree`** | `lane-worktree.py` | create and remove lane worktrees inside the ignored .worktrees/, refusing any root that would exceed Windows MAX_PATH. |
 | **`macho-alias-ld64-matrix`** | `macho-alias-ld64-matrix.py` | measure what Apple's ld64 does with a second defined symbol at the address of a canonical one, with and without -dead_strip. |
 | **`manual-end-to-end`** | `manual-end-to-end.py` | run the manual end-to-end corpus, the entries whose cost makes them wrong to put in a gate, taken deliberately instead. |
 | **`owning-tree`** | `owning-tree.py` | name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment. |
@@ -176,7 +174,7 @@ python .harness-config/runner/actions/check-line-endings/check-line-endings.py -
 
 Exit **0** all clean · **1** a CR was found · **2** a path could not be measured
 (missing, unreadable, a directory) — never a silent skip. It works on tracked,
-untracked and outside-the-repo paths, so a lane's scratchpad is fair game.
+untracked and outside-the-repo paths, so a lane's work directory is fair game.
 
 ⚠⚠ **DO NOT write your own.** ✔MEASURED 2026-08-27 (P42) on Git Bash against a
 `printf 'a\r\nb\n'` control verified by `od -c` to hold exactly one CR, beside a

@@ -92,8 +92,9 @@ lane's exit silently converts *"my row"* into *"nobody's row"*, and the anchor c
 while every individual lane still looks compliant.
 
 ⇒ **When a lane finishes with assigned rows still OPEN — or having minted an anchor id in source
-without filing its row — the orchestrator SPAWNS A NEW `/dss-cycle` LANE to close the remnants**,
-naming them explicitly. "Next cycle will notice" is the follow-up culture this section ends.
+without filing its row — the orchestrator SPAWNS A NEW LANE to close the remnants**, naming them
+explicitly: a new agent of the same orchestrator, briefed as lane `<o>/<a>`, which runs `/dss-cycle` AS A
+LANE and never orchestrates (orchestration.md). "Next cycle will notice" is the follow-up culture this section ends.
 
 ⚠⚠ **AND THE BALANCE GATE IS BLIND TO HALF OF IT. `check-anchor-balance` COUNTS *ROWS*, so an
 anchor cited in source with NO ROW IS INVISIBLE TO IT.** ✔MEASURED P40: it reported **"opened 0"**

@@ -10,7 +10,7 @@
   action); the worktrees root
 - The anchor registries, after the migration
 - Exit codes
-- The rule that matters most — a DssHarness defect is reported (sent by the agent to the repo-harness session), never worked around
+- The rule that matters most — a DssHarness defect is reported (sent by the session to the repo-harness session), never worked around
 
 `DssHarness` is a cross-platform .NET tool, built in `dailysoftwaresystems/repo-harness` and published
 on nuget.org. It REPLACED `scripts/`: the anchor registries, the worktrees, the legs, the builds,
@@ -115,9 +115,10 @@ releases never happened — all four landed in 0.5.3 instead. A document still q
 | Verb | What it replaces here |
 |---|---|
 | `init`, `verify-git`, `legs`, `install-missing-tools`, `host-exec`, `help` | host discovery, the leg catalogue, host provisioning, remote invocation |
-| `create-worktree`, `delete-worktree`, `list-worktree` | the plain lane-worktree lifecycle. ⚠ The `lane-worktree` ACTION stays for what the verbs lack: a VERIFIED evidence copy (`--preserve-to`) and the seed manifest `lane-fold` adjudicates a fold with SUPERSEDED 2026-09-24 by `dssharness create-worktree` — the seed manifest is now reset and recorded by `lane-fold.py seed`, MANDATORY right after creation, and the action stays for the verified evidence copy `land` makes through it before `delete-worktree` removes the worktree and the host copies DssHarness recorded (see worktrees.md). `list-worktree` lists each worktree's host copies, and the copies worktrees that are gone left with the `delete-worktree <name>` that removes them, from DssHarness's own record -- `--json` prints it as one document, which `land` reads; `--hosts` asks each host too, and names a copy the record does not hold |
-| `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`, `check-anchor-balance` | the eight anchor launchers — **DELETED**. The `anchors` action stays as the row LIBRARY other actions load; `apply-registry-row` stays for a lane's one-line VERBATIM row file, a different input than `set-anchor`'s file-per-cell SUPERSEDED 2026-09-25 by the one row format — a lane writes anchor-rows' rows directory, which the anchor-rows action applies as a batch (see lane-discipline.md) |
-| `check-anchor-citations` | resolving cited ids, over the roots in `anchors.citationRoots` (`.harness-config` since 2026-09-18, `tests` since 2026-09-19) — never `.plans`, so an id cited inside a registry cell is resolved by no guard: `anchor-rows` resolves the ids a batch newly cites, and `lane-fold` / `apply-registry-row` resolve none. ✔MEASURED: `--current-tree` reads tracked and untracked-not-ignored files and never an ignored one. From round four — the release this tree lands with — a citation resolves only to the row whose id it EXACTLY is (case counts; `read-anchor` agrees), and an id that runs into a hyphen at a line's end is reported as CUT whatever rows exist, even cut at its first or second hyphen when the next line completes it (0.5.7 resolved by substring and saw no cut at all). ⚠ Still unseen: a wrap inside a string literal whose prefix happens to be a row, and an id cut at a hyphen that OPENS the next line (that one fails as unresolved, not as cut) — `check-wrapped-anchor-ids` owns the first. ⚠ The `check-anchor-registry` action stays for what no verb covers: the plans' table cell-width property and the retired-id matcher |
+| `create-worktree`, `delete-worktree`, `list-worktree` | plain worktrees — a probe or a byte-changing measurement, never a lane (worktrees.md). `list-worktree` lists every worktree (an agent's as `o/a`), its host copies, and the copies gone worktrees left with the `delete-worktree <name>` that removes them, from DssHarness's own record -- `--json` prints it as one document; `--hosts` asks each host too, and names a copy the record does not hold |
+| `create-orchestrator`, `create-agent`, `seed-agent`, `refresh-agent`, `fold-agent`, `delete-agent`, `list-orchestrator`, `delete-orchestrator` | the lane programs `lane-fold` and `lane-worktree` — **DELETED** 2026-09-29, once the verbs were measured (✔MEASURED 2026-09-29). In this checkout: an agent created and seeded, a write and a deletion folded, a rows directory refused over a stray cell file, and the agent deleted with its host copies on WSL, macOS and the arm64 VPS. In a throwaway repository: rows applied (a close moved to the done registry), a changed row applied anew and one the registries changed since refused (both by dry runs; the first by `--apply` on 2026-09-30), `refresh-agent` and `seed-agent` with their refusals, and evidence kept byte-identical by `delete-agent`. The fold checks every row cell itself — an undeclared new id (`--new`), a cut id or path, a citation no row holds, a lost cell not accepted (`--accept-lost`) — ✔MEASURED 2026-09-30 in a throwaway repository, after the release these verbs came in, which made none of those checks, was reported and fixed. Every lane is an agent; the lifecycle is orchestration.md |
+| `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`, `check-anchor-balance` | the eight anchor launchers — **DELETED**. The `anchors` action stays as the row LIBRARY other actions load; `apply-registry-row` stays for a one-line VERBATIM row file, a different input than `set-anchor`'s file-per-cell, and `anchor-rows` for a batch of cell files — the orchestrator's own rows; a LANE's rows go to its agent's rows directory, which `fold-agent` applies (orchestration.md) |
+| `check-anchor-citations` | resolving cited ids, over the roots in `anchors.citationRoots` (`.harness-config` since 2026-09-18, `tests` since 2026-09-19) — never `.plans`, so no GUARD resolves an id cited inside a registry cell; the DOOR does: every write — `write-anchor`, `set-anchor`, `fold-agent`, `delete-agent` — refuses an id a cell newly cites that no row holds and a value it would store cut (`write-anchor` and `set-anchor` exit 13 and 10; a fold 13) (✔MEASURED 2026-09-30 in a throwaway repository for `write-anchor`'s cut value, `set-anchor`'s citation and `fold-agent`'s both; DOCUMENTED, `help anchors` and `help orchestrators`, for the rest), and `anchor-rows` resolves a batch's new citations against the batch too. ✔MEASURED: `--current-tree` reads tracked and untracked-not-ignored files and never an ignored one. From round four — the release this tree lands with — a citation resolves only to the row whose id it EXACTLY is (case counts; `read-anchor` agrees), and an id that runs into a hyphen at a line's end is reported as CUT whatever rows exist, even cut at its first or second hyphen when the next line completes it (0.5.7 resolved by substring and saw no cut at all). ⚠ Still unseen: a wrap inside a string literal whose prefix happens to be a row — `check-wrapped-anchor-ids` owns it. An id cut at a hyphen that OPENS the next line, or inside a segment, is reported cut only where the two lines joined spell a row's id; otherwise it reads as the shorter id, unresolved unless that is a row (DOCUMENTED, `dssharness help anchors`). ⚠ The `check-anchor-registry` action stays for what no verb covers: the plans' table cell-width property and the retired-id matcher |
 | `check-root-litter` | the `check-root-litter` program — **DELETED** |
 | `fix-line-endings` | rewriting endings. ⚠ The `check-line-endings` action stays: HEAD and index blobs, a CR instrument that cannot see a CR, `--files`, and its watchdog |
 | `check-ci-legs` | the `check-ci-legs` program — **DELETED** |
@@ -131,9 +132,8 @@ releases never happened — all four landed in 0.5.3 instead. A document still q
 deletions land one commit per verb group — so a group that cannot be proven leaves everything after
 it untouched. Build, sync, test and worktree management go through DssHarness only (2026-09-24): the
 one exception is a DssHarness BUG — reproduce it and REPORT it; a route around it lives only as long as
-the bug, is named as such, and is retired the day the fix ships. Besides it there is one NAMED INTERIM:
-seeding, folding and landing a lane run through the lane-fold action's own program until the action
-declares them as manual steps (the next section).
+the bug, is named as such, and is retired the day the fix ships. Lanes are managed by the orchestrator and
+agent verbs alone (orchestration.md).
 
 ## ⛔★★★ BUILD, SYNC, TEST AND WORKTREES GO THROUGH DSSHARNESS — AND WHAT BECOMES AN ACTION
 
@@ -141,9 +141,8 @@ declares them as manual steps (the next section).
 
 ⛔★★★ **BUILD, SYNC, TEST AND WORKTREE MANAGEMENT GO THROUGH DSSHARNESS, NEVER A SCRIPT** (operator, 2026-09-24:
 *"IS FORBIDDEN using scripts (unless a bug is found in dssharness)"*). `dssharness build`/`test` (MSVC is its
-`windows-x86_64-release` leg), `sync`, the worktree verbs, and — a NAMED INTERIM
-until the action declares them as manual steps — the lane-fold action's own program, `lane-fold.py seed` /
-`land`, for seeding, folding and landing. A program that is
+`windows-x86_64-release` leg), `sync`, the worktree verbs, and the orchestrator and agent verbs for every
+lane. A program that is
 big or reusable, or hard to write in `.ps1`/`.sh`, becomes an ACTION. Work an action owns but a plain run must not
 do, such as a benchmark or the round-close recompile, is a MANUAL STEP of that action. What the installed tool
 already does is USED, never re-built around and never requested upstream. Read its help first. See
@@ -167,14 +166,12 @@ already does is USED, never re-built around and never requested upstream. Read i
   script drives the mutants. One did not rebuild after restoring a code mutant, and six of its nine reads came from a
   stale binary (P68, 2026-09-24); `test` always builds the tree as it stands first.
 - **SYNC**: `dssharness sync` (with `--pull` and `--artifact`). Never a hand copy of a host's tree.
-- **WORKTREE MANAGEMENT**: `dssharness create-worktree` / `delete-worktree` / `list-worktree`. Seeding, folding and
-  landing a lane run through the lane-fold action's own program — `lane-fold.py seed <lane>`, and
-  `lane-fold.py land <lane> production --apply`, which folds — as a NAMED INTERIM: `dssharness run lane-fold`
-  runs only the action's self-test, and the interim ends when the action declares `seed` and `land` as manual
-  steps (scheduled: the harness lane's next-PR item). It is the only route besides a reported DssHarness bug,
-  and never a script of one's own. `seed` is MANDATORY right after `create-worktree` (`worktrees.md`).
+- **WORKTREE AND LANE MANAGEMENT**: a lane is an AGENT — `dssharness create-orchestrator` / `create-agent` /
+  `seed-agent` / `refresh-agent` / `fold-agent` / `delete-agent` / `list-orchestrator` / `delete-orchestrator`, MANDATORY
+  (orchestration.md); anything that is not a lane, `create-worktree` / `delete-worktree` / `list-worktree`
+  (worktrees.md). Never a script of one's own.
 - **The one exception is a DssHarness BUG.** Reproduce it and REPORT it (the closing section). A route around it lives
-  only as long as the bug, is named as such, and is retired the day the fix ships. [→ besides it, the only route is the lane-fold interim in the bullet above, which ends when the action declares its verbs as manual steps](dss-harness.md)
+  only as long as the bug, is named as such, and is retired the day the fix ships.
 
 ⇒ **What becomes an action, four tests applied to every program a cycle, a lane or the orchestrator writes:**
 1. **BIG or REUSABLE → an ACTION.** A program that more than one lane, round or leg will run lives under
@@ -327,14 +324,14 @@ config **cannot** be overridden per machine, and a machine-specific path belongs
 ### The worktrees root is somewhere else entirely
 
 ⚠ **The worktrees root is NOT under `.harness-config/`.** This repository's `worktrees.root` is
-`.worktrees`, at the CHECKOUT root, ignored as a whole DIRECTORY by its own rule — deliberately, so
-that the spelling without a trailing slash cannot answer NOT-IGNORED and ship N lane checkouts to
-every gate host. `.harness-config/worktrees/` exists but is empty and untracked: it is the tool's
-DEFAULT root, which this configuration overrides.
-⚠ **`dssharness help worktrees` states the default, not your configuration** — it says a worktree
-sits below `.harness-config/worktrees/<name>`. ✔MEASURED here: `dssharness list-worktree` reports
-`.manifests`, which exists only under `.worktrees/`, so the behaviour honours `worktrees.root` and
-the help topic's path is the one to distrust.
+`.worktrees`, at the CHECKOUT root, beside `.orchestrators` — both ignored in the contents shape with a
+tracked `.gitkeep`, as `init` writes them, and both withheld by `sync` by name, so no lane checkout ships to a
+gate host (worktrees.md). `.harness-config/worktrees/` is the tool's DEFAULT root, which this configuration
+overrides.
+⚠ **A help topic may state the default, not your configuration** — ask `list-worktree` where a worktree
+actually is. ✔MEASURED 2026-09-29 in this checkout: `create-agent` made its worktrees under `.worktrees/<o>/`, as
+`create-worktree` made its under `.worktrees/` on the release before the orchestration verbs, so the behaviour honours
+`worktrees.root`.
 
 No secret is ever tracked, and no host address, user name or key path appears in any tracked file.
 
@@ -364,7 +361,9 @@ is not a way to silence the gate: a disclosed row stays in the pending registry 
 ## Exit codes
 
 `0` success · `10` usage · `11` not initialised · `12` invalid configuration · `13` refused ·
-`14` a tool is missing · `15` a host is unavailable · `20` the command failed · `70` internal ·
+`14` a tool is missing · `15` a host is unavailable · `20` the command failed · `21` incomplete — it ran
+with nothing failing, but a leg reached no verdict, or a deletion, a fold or a hand-over stopped part way:
+run the same command again once what it names is dealt with, and never read it as a pass · `70` internal ·
 `130` cancelled. Codes 1–9 are reserved per command.
 
 ⚠ **`host-exec` returns the wrapped command's exit code unchanged**, so a remote 20 and a local 20 are
@@ -373,7 +372,7 @@ the same number for two different reasons unless you know which leg was asked.
 ## The rule that matters most
 
 **A defect in DssHarness is a repo-harness issue, never a local workaround — AND IT IS REPORTED: the
-agent SENDS it to the repo-harness session and tells the operator it was sent (2026-09-21).** That
+session SENDS it to the repo-harness session and tells the operator it was sent (2026-09-21).** That
 session is found by listing the local sessions and picking the one working in the repo-harness checkout;
 the report is sent to it there. The whole point of the move is that one implementation serves every host; a patch
 here that routes around the tool re-creates the drift the migration exists to end. Reproduce it,
@@ -384,7 +383,7 @@ dss-cycle skill that any issue found in DssHarness must be reported to me (the o
 because the rule used to say only where the FIX goes and was silent on who must be TOLD — and under
 the cycle's silence-is-the-default output contract, a tool defect that is neither a failure nor a
 blocker for this cycle had **no route to the operator at all**. It usually is neither: the cycle
-routes around it by using the script that still exists, and the finding dies in a lane report. SUPERSEDED 2026-09-24 by *build, sync, test and worktree management go through DssHarness* — a DssHarness BUG is the one exception, and a route around it lives only as long as the bug, is named as such, and is retired the day the fix ships (see the section on BUILD, SYNC, TEST AND WORKTREES above) AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — the agent SENDS the report to the repo-harness session with SendMessage and tells the operator it was sent, never asking the operator to relay it; the 2026-09-16 clause *report it in the cycle that finds it* stands (see output-contract.md)
+routes around it by using the script that still exists, and the finding dies in a lane report. SUPERSEDED 2026-09-24 by *build, sync, test and worktree management go through DssHarness* — a DssHarness BUG is the one exception, and a route around it lives only as long as the bug, is named as such, and is retired the day the fix ships (see the section on BUILD, SYNC, TEST AND WORKTREES above) AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — the session SENDS the report to the repo-harness session with SendMessage and tells the operator it was sent, never asking the operator to relay it; the 2026-09-16 clause *report it in the cycle that finds it* stands (see output-contract.md)
 
 **A report owes four things, and nothing more:**
 1. what was run; 2. what happened; 3. what should have happened;

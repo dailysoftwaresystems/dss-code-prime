@@ -198,8 +198,9 @@ __pycache__/
 # REQUIREMENT, not a nicety — operator, same day: "worktrees MUST be ignored by
 # ALL host copies to run legs". The transport derives what it carries from git —
 # a hand-typed exclude list per carriage first, `dssharness sync` since — so this
-# rule — and only this rule — is what stops N full repo copies riding to macOS and
-# the arm64 VPS on every push. ✔MEASURED: the same accident under `.claude/worktrees/` put
+# rule was, at first, the only thing that stopped N full repo copies riding to macOS
+# and the arm64 VPS on every push (two more stand behind it now: the floor below, and
+# `sync` withholding the directory by name). ✔MEASURED: the same accident under `.claude/worktrees/` put
 # 9,638 files on the macOS host, and the examples runner globs `examples/<lang>/*`,
 # so a gate host holding one can run somebody's uncommitted corpus and report the
 # result as the cycle's. `.worktrees/` is therefore ALSO pinned in that script's
@@ -215,7 +216,7 @@ __pycache__/
 # ⚠ `git clean -fd` (what a tree restore runs) does NOT delete
 # ignored paths, so a live worktree survives a leg restore. `-fdx` WOULD destroy
 # it mid-build; the dss-cycle skill forbids `-fdx` for exactly this reason.
-# ⓘ THE RULE ITSELF, `/.worktrees/`, NOW LIVES IN THE repo-harness MANAGED BLOCK AT THE END
+# ⓘ THE RULE ITSELF, `/.worktrees/*`, NOW LIVES IN THE repo-harness MANAGED BLOCK AT THE END
 # OF THIS FILE (2026-09-18): `dssharness init` derives it from `worktrees.root` in
 # `.harness-config/config.json`, so the directory and the rule cannot name two places. One
 # statement of the rule, not two -- the reasons above still apply to that line.
@@ -298,13 +299,14 @@ id_ed25519
 # re-includes its DIRECTORY, without which the block's `!…/.gitkeep` is unreachable.
 # ✔MEASURED 2026-09-21 in a throwaway repository: without `!/.harness-config/sshItems/`,
 # `git add --all` never reaches `sshItems/.gitkeep` and `check-ignore` names line 1.
-# ⚠ THE WORKTREES ROOT is ignored WHOLE, never by the contents shape: the block names it
-# (`/.worktrees`, like `/.harness-config/runs`) -- by NAME since 0.5.8, so a root kept on
-# another disk through a link is ignored as surely as a directory. The contents shape
-# `/x/* + !/x/.gitkeep` answers NOT-IGNORED to `check-ignore x` without the slash,
-# which costs nothing on a slot holding an address and a key and, on a root holding
-# entire working trees, is the difference between a clean sync and shipping N
-# checkouts -- which this repository has already paid for once.
+# ⚠ THE WORKTREES ROOT AND `.orchestrators` ARE IGNORED BY THE CONTENTS SHAPE since
+# DssHarness's orchestrators (2026-09-29): `/x/* + !/x/.gitkeep`, each kept in git by its
+# placeholder, so `check-ignore x` answers NOT-IGNORED while everything made in it is
+# ignored. What that shape would risk on a root holding entire working trees -- a sync
+# shipping N checkouts -- the tool closes itself: sync withholds both directories by
+# NAME, and `init` names either one it finds as a link and writes nothing through it.
+# ✔MEASURED 2026-09-29: `dssharness sync --dry-run` from the main checkout, with an agent's
+# worktree open under `.worktrees/`, listed no path below either directory (one host, WSL).
 /.harness-config/*
 !/.harness-config/config.json
 !/.harness-config/sshItems/
@@ -318,7 +320,10 @@ id_ed25519
 # >>> repo-harness managed block >>>
 /.harness-config/lock.json
 /.harness-config/runs
-/.worktrees
+/.worktrees/*
+!/.worktrees/.gitkeep
+/.orchestrators/*
+!/.orchestrators/.gitkeep
 /.harness-config/sshItems/*
 !/.harness-config/sshItems/.gitkeep
 /.harness-config/wslDistros/*

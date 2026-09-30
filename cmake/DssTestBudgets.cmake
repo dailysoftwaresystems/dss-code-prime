@@ -47,8 +47,8 @@
 #   the arm64 VPS's Debug and Release trees. linux-clang-asan is `sanitized`; the
 #   four CI release legs and every local or VPS Release tree are `release`; every
 #   Debug tree is `debug`.
-#   ⚠ TWO BLIND SPOTS IN THAT POPULATION, both ✔MEASURED since (the rows re-derived below,
-#   from lane_worktree_guard on). A cost-data AVERAGE is not a ceiling: it is a running mean
+#   ⚠ TWO BLIND SPOTS IN THAT POPULATION, both ✔MEASURED since (the rows re-derived below the
+#   note on two retired lane rows). A cost-data AVERAGE is not a ceiling: it is a running mean
 #   over every run a tree ever made, so it lags a suite that grew and sits below every loaded
 #   run. And no source above was a run under this workstation's everyday load, several lanes
 #   building and testing at once, where an entry that starts processes runs several times
@@ -145,40 +145,14 @@ set(_DSS_TB_NAMED
     "program/test_dependency_resolver|119|12|24"
     "analysis/semantic/test_type_identity_vocabulary|112|8|19"
     "link/test_descriptor_library_role_agreement|105|14|20"
-    # ★★ lane_worktree_guard: THE ROW WAS MEASURED ON THE WRONG POPULATION, AND THE SUITE DID
-    # NOT GET SLOWER. It read `|37|104|33`, and the entry was green only on a quiet machine
-    # (✔MEASURED: 315.40 s Timeout in a -j8 repo-guard run, 314.64 s in the round-6 gate).
-    #   · The suite is UNCHANGED since the row was derived: `test-lane-worktree.sh` differs by
-    #     2 lines between e8dbc3c5 (2026-09-15) and 7df54cc1, its subject only by a printed hint.
-    #   · It GREW EIGHTFOLD before that: 113 lines, 2 assertions and no PowerShell on
-    #     2026-09-02; 932 lines, 133 assertions and 46 `pwsh` starts from 2026-09-15.
-    #   · The debug 33 came from ctest's cost data, a RUNNING AVERAGE over every run the tree
-    #     ever made -- the main tree's MinGW Debug average is 24.78 s over 68 runs, most of them
-    #     the 113-line predecessor. An average over two programs is a measurement of neither.
-    #   · The release 104 sat BELOW that class's own average: 117.68 s over 8 MSVC Release runs.
-    # ⇒ RE-DERIVED from healthy runs of the CURRENT suite, Windows being the slowest host in
-    #   both classes (each of its ~50 arm groups is a real `git worktree add` + guarded
-    #   `remove`; one `pwsh` start costs 0.99 s through the .NET-tool shim, ✔MEASURED):
-    #   debug  -- 114.99 s (lane il), 139.66 s (round-6, alone), 192.44 s (the main tree's
-    #             MinGW Debug gate, 2026-09-17), 243.87 s (lane mig, under a -j12 build): 244;
-    #   release -- the 117.68 s average bounds the slowest run from below, last run 110.87 s: 118.
-    #   sanitized 37 (CI linux-clang-asan) is unaffected: Linux starts processes cheaply.
-    "lane_worktree_guard|37|118|244"
-    # ★ AND A NEIGHBOUR OF THE SAME SHAPE, NAMED BY THIS MODULE'S OWN TIER RULE ("every
-    # non-corpus entry whose ceiling passed 60 s on some class"), never named because no
-    # Windows gate log was read for it. ✔MEASURED 2026-09-18, Windows MinGW Debug, a -j8
-    # repo-guard run, PASSING: lane_fold_selftest_guard 220.45 s (37 s standalone). Unmeasured
-    # classes take the unit ceilings, below which no named row is ever budgeted.
-    # ⓘ Its 2026-09-18 neighbour `leg_tree_guard` (179.38 s) retired with its subject on
-    # 2026-09-21 (lane mig, part 4: the bash tree helper became part of `owning-tree.py`,
-    # proved by `owning_tree_selftest_guard`), and its row left with it.
-    # ✔MEASURED 2026-09-29 (P68's PR exit, lane `lf`: the self-test went from 93 to 135 pins, its
-    # landing arms driving the real `dssharness delete-worktree` and `list-worktree`), repo-guard
-    # runs of both Windows legs at once, PASSING: 81.44 then 86.04 s MinGW Debug, 82.31 then
-    # 87.08 s MSVC Release (134, then 135 pins) -- 87.08 s the slowest release run measured
-    # (2026-09-28's took 44.59-54.62 s), above its unit ceiling: 88. Debug stays
-    # 221 (the loaded 2026-09-18 run is still the slowest); sanitized stays unmeasured.
-    "lane_fold_selftest_guard|53|88|221"
+    # ⓘ `lane_worktree_guard` AND `lane_fold_selftest_guard` HAD ROWS HERE, GONE WITH THEIR SUBJECTS
+    # (2026-09-29: DssHarness's orchestrator verbs replaced both lane programs). The lesson each
+    # taught stays in the header's population note: the first's debug 33 was ctest's cost-data
+    # AVERAGE, and it timed out at 315 s in a loaded repo-guard run -- a ROW MEASURED ON THE WRONG
+    # POPULATION; the second went without a row although this module's own tier rule names every
+    # non-corpus entry whose ceiling passed 60 s on some class, and a passing Windows MinGW Debug
+    # repo-guard run took 220.45 s, because no Windows gate log had been read for it. The entries
+    # below are that class.
     # ★★ THE SAME CLASS AGAIN, THREE MORE ENTRIES. link/test_coff_object_reader,
     # link/test_pe_object_data_import_slot and core/test_include_path_rooted_resolution each
     # hit (Timeout) at 315 s in one -j10 full run on 2026-09-18, beside another lane's build,

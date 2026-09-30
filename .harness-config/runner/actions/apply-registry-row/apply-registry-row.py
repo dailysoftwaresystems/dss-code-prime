@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-# PURPOSE: replace one deferred-anchor registry row with a lane's verbatim row text from a file.
-"""apply-registry-row.py -- put ONE lane's row into the registry, from the lane's own row file.
+# PURPOSE: replace one deferred-anchor registry row with the orchestrator's verbatim row text from a file.
+"""apply-registry-row.py -- put ONE row into the registry, from a one-line row file.
+
+The orchestrator's own: a lane's rows go in with its fold (DssHarness's `fold-agent`), which checks them itself.
 
 ★★★ THE ROW IS NEVER RETYPED, AND THAT IS THE WHOLE REASON THIS EXISTS. A retyped row
 can WRAP AN ANCHOR ID, and a wrapped id **does not fail**: it goes INVISIBLE to every
@@ -9,7 +11,7 @@ id at the same time. In a fail-loud project that is the one defect class that ca
 caught by watching for a failure. ✔MEASURED 2026-08-20: of the 78 distinct `D-*` ids
 cited on one cycle's added lines, **17 were wrapped**, and 16 were harmless only
 because the same id appeared unwrapped nearby.
-⇒ The lane writes its row to a FILE as one physical line; this reads its cells from it.
+⇒ The row is written to a FILE as one physical line; this reads its cells from it.
 
 ★★ AND A DUPLICATE IS REFUSED, NEVER RESOLVED. Parallel lanes give one anchor TWO
 renditions -- typically an OPENER from one lane and a CLOSER from another. Settling
@@ -39,7 +41,7 @@ write-anchor` (new, with `--insert`) or `set-anchor` (existing), through the one
 both of this tree's row callers share, `anchors.door_write` -- which also performs the
 move-on-close: a row whose status is closed is DELETED from the working registry and
 appended to the archive, and a reopened one moves back. This file keeps what is uniquely
-its own: the validation of a lane's one-line row file. Its cells are handed to the door
+its own: the validation of a one-line row file. Its cells are handed to the door
 UN-escaped (the door escapes every pipe again, so an escaped pipe round-trips to the same
 bytes), and an update names only the fields that CHANGE, so a stored cell the row file did
 not change keeps its bytes.

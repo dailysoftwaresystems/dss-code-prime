@@ -795,13 +795,15 @@
       ],
       "action": "anchor-rows/anchor-rows.yml"
     },
-    // ★ A FOLD'S ROWS ARE APPLIED TO THE TREE ITSELF, so this runner has ONE leg: the one whose tree is this
-    // machine's own checkout, run in place. A host's synced copy holds no lane's rows directory (`.worktrees`
-    // and `.temp` are ignored, and only what git does not ignore travels), so there a step refuses for want of
-    // its rows. A plain run runs the self-test; `--manual-step stage|check|apply --input <name>=<value> ...`
-    // runs a verb (anchor-rows.yml declares each step's inputs).
+    // ★ ROWS ARE CHECKED AND APPLIED ON THE TREE ITSELF, so this runner has ONE leg: the one whose tree is
+    // this machine's own checkout, run in place. A host's synced copy holds no lane's rows directory
+    // (`.orchestrators`, `.worktrees` and `.temp` are ignored, and only what git does not ignore travels), so
+    // there a step refuses for want of its rows. A plain run runs the self-test; `--manual-step
+    // stage|check|apply --input <name>=<value> ...` runs a verb (anchor-rows.yml declares each step's inputs).
+    // Only the orchestrator's own rows come here: a lane's go in with its fold (`fold-agent`), which checks
+    // them itself.
     "rows": {
-      "description": "Stage, check and apply one fold's deferred-anchor rows as a batch -- anchor-rows' manual steps, on this machine's own tree.",
+      "description": "Stage, check and apply a batch of the orchestrator's own deferred-anchor rows -- anchor-rows' manual steps, on this machine's own tree.",
       "legs": [
         "windows-x86_64-debug"
       ],
@@ -1076,22 +1078,6 @@
         "linux-x86_64-debug"
       ],
       "action": "examples-census/examples-census.yml"
-    },
-    "lane-fold": {
-      "description": "Seed a lane worktree from the main tree, fold only that lane's real changes back, and land it with its rows applied and its evidence preserved.",
-      "legs": [
-        "windows-x86_64-debug",
-        "linux-x86_64-debug"
-      ],
-      "action": "lane-fold/lane-fold.yml"
-    },
-    "lane-worktree": {
-      "description": "Create and remove lane worktrees inside the ignored .worktrees/, refusing any root that would exceed Windows MAX_PATH.",
-      "legs": [
-        "windows-x86_64-debug",
-        "linux-x86_64-debug"
-      ],
-      "action": "lane-worktree/lane-worktree.yml"
     },
     "owning-tree": {
       "description": "Name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment.",

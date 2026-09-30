@@ -11,11 +11,11 @@
 This file numbers the steps the older way; the crosswalk to `SKILL.md`'s 0–12 is at the top of
 `workflow-steps.md`.
 
-AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — where this file sends a FORK to the user as a §B decision, a meaning fork or a documented-behaviour change included, or a new engine mechanism at the plan's design audit, `SKILL.md`'s step 4, the agent now decides it by measurement and the references' own documentation, writes the rationale into the row and reports it veto-able. The gates' three ESCAPE HATCHES stay the operator's — a deferral, §A.7 clause c; carrying a net-open rise, the balance gate's escalation; growing a ratchet baseline, `UNCOVERED_BASELINE` and its kind — because standing orders govern all three: close, do not file; no follow-ups; a ratchet only comes down. Each is a PAUSE with one crisp question, never an agent decision (see SKILL.md, the decision gate)
+AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — where this file sends a FORK to the user as a §B decision, a meaning fork or a documented-behaviour change included, or a new engine mechanism at the plan's design audit, `SKILL.md`'s step 4, the session now decides it by measurement and the references' own documentation, writes the rationale into the row and reports it veto-able. The gates' three ESCAPE HATCHES stay the operator's — a deferral, §A.7 clause c; carrying a net-open rise, the balance gate's escalation; growing a ratchet baseline, `UNCOVERED_BASELINE` and its kind — because standing orders govern all three: close, do not file; no follow-ups; a ratchet only comes down. Each is a PAUSE with one crisp question, never the session's decision (see SKILL.md, the decision gate)
 
 ## B. The pause-and-ask gate — the most important behavioral rule
 
-AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — forks, meaning forks included, are decided by the agent and reported veto-able; the gates' escape hatches — a deferral, carrying a net-open rise, growing a ratchet baseline — stay the operator's, and the loop pauses only for the cases of the decision gate, each with one crisp question (see SKILL.md)
+AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — forks, meaning forks included, are decided by the session and reported veto-able; the gates' escape hatches — a deferral, carrying a net-open rise, growing a ratchet baseline — stay the operator's, and the loop pauses only for the cases of the decision gate, each with one crisp question (see SKILL.md)
 
 The loop is autonomous for **execution** but escalates **decisions** to the user. When any
 of the following appears, **PAUSE the loop and ask the user — do not assume a default, do
@@ -60,6 +60,8 @@ The loop resumes only after the user answers. While paused, do not start a diffe
   drifted is worse than a missing one, because it is trusted.
 - Check `git status` + current branch + the last commit subject. A `… WIP` cycle in flight
   means **this cycle finishes it** (it is the priority).
+- `dssharness list-orchestrator`: an open agent is a lane in flight, and finishing it comes first
+  (orchestration.md).
 - Read §0.1 of plan 00 and skim the WORKING registry for open anchors --
   `_deferred-anchor-registry-production.md`, which since 2026-09-16 is the only one. ⚠ **Not
   `-done.md`**: it is the archive
@@ -141,8 +143,9 @@ cheaper than after the diff lands. (This is the gate run on the linkage P1+P2 pl
 
 ### Step 4 — Implement
 - **DELEGATE, IN PARALLEL (§C.0).** Split the plan by DISJOINT file sets — engine `.cpp/.hpp`
-  vs `src/dss-config/**.json` vs `examples/` vs `tests/` — and launch one agent per set IN
-  ONE MESSAGE so they run concurrently. Name each agent's owned paths and its forbidden
+  vs `src/dss-config/**.json` vs `examples/` vs `tests/` — make each set a LANE
+  (orchestration.md: `create-agent`, then its subagent aimed at the worktree) and launch the
+  subagents IN ONE MESSAGE so they run concurrently. Name each lane's owned paths and its forbidden
   paths explicitly. Hand each the §A invariants, the house comment style, and the known
   traps for its area. The orchestrator integrates and verifies; it does not hand-type every
   edit.
@@ -162,7 +165,8 @@ cheaper than after the diff lands. (This is the gate run on the linkage P1+P2 pl
   `unsigned long`→`int64_t`] is a hard ERROR under clang `-Wc++11-narrowing` but GCC/MSVC
   accept it, so the local MSVC+gcc gate misses it — use `static_cast<T>(expr)`). Local
   green ≠ CI green.
-- Fold every FOLD-NOW finding. Then rebuild + re-run the full ctest.
+- Apply every FOLD-NOW finding — on a lane's work, by sending the lane back and folding it again
+  (orchestration.md). Then rebuild + re-run the full ctest.
 - **Re-review the fold.** If folding *changed logic* (anything beyond comments / renames /
   formatting), run a **second `/pr-review-toolkit:review-pr` pass scoped to the fold's diff** — a
   fold can introduce its own bugs (the 2nd-order-fold discipline). Fold-and-re-review until a

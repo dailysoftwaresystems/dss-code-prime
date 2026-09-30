@@ -27,7 +27,8 @@ commit's author will actually see it.
 ## The deletion waves, named once
 `W-anchors` · ~~`W-build` (`local-build`)~~ **LANDED** · ~~`W-test` (`run-gate`)~~ **LANDED** ·
 ~~`W-sync` (`wsl-leg`, `remote-leg`, `macos-leg`, `ssh-macos`, `ssh-arm64-vps`, `carriage-excludes`,
-`check-carriage-paths`)~~ **LANDED** · `W-worktrees` (`lane-worktree`) · `W-run`
+`check-carriage-paths`)~~ **LANDED** · ~~`W-worktrees` (`lane-worktree`, with `lane-fold`)~~ **LANDED
+2026-09-29** (DssHarness's orchestrator verbs) · `W-run`
 (`sqlite-runtime-bench`, `sqlite-round-trip`, `macho-alias-ld64-matrix`) · `W-buildtime`
 (`profile-compile`, `compile-bench`) · `W-lineendings` · ~~`W-cilegs`~~ **LANDED** · `W-buildchecks`
 (`check-ninja-deps`, `check-root-litter`) · `W-secrets` · `W-lastconsumer` (`repo-tree`,
@@ -430,7 +431,8 @@ The 20: `anchor_balance_selftest_guard`, `anchors_selftest_guard`,
 `check-shell-portability`, `check-guard-output-encoding`, `check-plan-citations`,
 `check-stale-refusal-citations`, `check-wrapped-anchor-ids`, `check-diagnostic-codes`,
 `check-pkg-pipeline`, `corpus-census`, `lane-fold`, `check-anchor-balance` and `refresh_landing_log`
-have stopped importing it — and S6 keeps every one of those. 🧠INFERRED consequence: **`owning-tree`
+have stopped importing it — and S6 keeps every one of those (ⓘ `lane-fold` was retired 2026-09-29 with
+`W-worktrees`, so eleven remain). 🧠INFERRED consequence: **`owning-tree`
 outlives the migration** unless its `repoRoot()` resolution is replaced for the survivors.
 
 ---
@@ -817,7 +819,7 @@ it. Reported to the operator.
 | `check-anchor-registry` | `check-anchor-citations` | the markdown CELL-WIDTH / unescaped-pipe property over ALL of `.plans/` (✔MEASURED **340 tables, 4264 rows, 42 files**; `read-anchors --lint` sees the two registry files only); the RETIRED-ID matcher; the QUOTED-NOT-CITED expiry mechanism; every per-root collapse floor; the 21-arm self-test | guard KEPT; `anchor_citations_guard` added BESIDE it for the coverage the tool adds |
 | `check-line-endings` | `fix-line-endings --check --all` | Check A (HEAD **blobs**) and Check B (index blobs) — the tool judges the working tree; Check C (a pinned source git calls binary); Checks E1/E2 (✔MEASURED **72 files with no declared ending**, considered and not judged; and untracked files); **Check F entirely** — *"a CR instrument that cannot see one"*, which is half the stated PURPOSE; `--files`; `SCAN_FLOOR`; the watchdog and its 5-arm proof | ⛔ NOT DELETED |
 | `check-ninja-deps` | **none** | ✔MEASURED: all ten `dssharness help` topics grepped for `ninja\|depfile\|header dep` — **zero matches**. `build` checks PRODUCTS, not dependency RECORDS | ⛔ NOT DELETED |
-| `lane-worktree` | `create-worktree` / `delete-worktree` / `list-worktree` | `--preserve-to`, the VERIFIED evidence copy — the harness can only refuse or delete; and the **seed-manifest write `scripts/lane-fold/lane-fold.py` reads to adjudicate a fold** | ⛔ NOT DELETED — deleting it breaks fold adjudication |
+| `lane-worktree` | `create-worktree` / `delete-worktree` / `list-worktree` | `--preserve-to`, the VERIFIED evidence copy — the harness can only refuse or delete; and the **seed-manifest write `scripts/lane-fold/lane-fold.py` reads to adjudicate a fold** | ✅ DELETED 2026-09-29 with `lane-fold`: DssHarness's orchestrator verbs cover both gaps — `create-agent` writes the agent's seed record and `fold-agent` adjudicates against it, and `delete-agent` keeps the evidence, each copy read back, before any removal (✔MEASURED 2026-09-29: the seed adjudicated in this checkout; the evidence kept byte-identical in a throwaway repository) |
 
 ★ The path-budget and evidence gates DID port cleanly and are visible in `.harness-config/config.json`
 as `worktrees.pathBudgetReserve` / `pathLimit` / `pathBudgetMargin` / `evidenceRoots` — ✔MEASURED,
@@ -832,9 +834,12 @@ Twelve directories that SURVIVE every wave import it: `check-anchor-balance`,
 `run_git()` and `root_arms`, the shared arm set each consumer's self-test runs against its own
 resolver. No DssHarness verb offers any of the three. ⇒ **the ⟶ 25 directory target is ⟶ 26**, and
 the ⟶ 8 FILE target is unaffected because `owning-tree` ships no `.sh` and no `.ps1`.
+ⓘ 2026-09-29: `lane-fold` left with `W-worktrees`, so ELEVEN of those directories survive; the directory
+target above was derived with it among the survivors and is re-derived by the next census, not here.
 ⓘ `scripts/anchors/` retires the same way and for the same reason: its eight SHELL twins are the
 door and are replaced, while `anchors.py` stays as the library `check-anchor-balance`,
-`check-stale-blockers` and `lane-fold` import. A directory is not the unit of this migration; a
+`check-stale-blockers`, `apply-registry-row` and `anchor-rows` import (and `lane-fold` did, until its
+retirement on 2026-09-29). A directory is not the unit of this migration; a
 PROGRAM is.
 
 ### 17.5 `.harness-config/runner/actions` NOW HOLDS A SHELL PROGRAM, WHICH §9 SAID IT DID NOT

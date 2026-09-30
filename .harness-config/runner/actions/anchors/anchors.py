@@ -24,7 +24,7 @@ DELETED. What stays is what a reader, a guard or a caller of the door needs:
   * the READER -- `read_rows`, `find`, `lint`, and the `read` / `list` verbs;
   * the VOCABULARY -- the status words and cells, the bands, the table shape -- so a caller
     maps a lane's text to the door's words through one table;
-  * the LAUNCHER -- `door_write`, the one composition of a door call that `lane-fold`,
+  * the LAUNCHER -- `door_write`, the one composition of a door call that
     `apply-registry-row` and `anchor-rows` share: the cells go by FILE (a 48 KB row once crossed
     Windows' 32,767-character command line), an update names only the fields that CHANGE (a cell the
     door is not asked to write keeps its bytes), and the call runs without the caller's git
@@ -382,9 +382,9 @@ def lint(root):
 
 # ───────────────────────────────── the door ───────────────────────────────────
 #
-# ★★★ THE ONE COMPOSITION OF A ROW WRITE. `lane-fold` (a lane's landing), `apply-registry-row`
-# (a lane's one-line row file) and `anchor-rows` (a fold's batch of cell files) all end here, so
-# the argv, the cell files, the executable and the refusals below exist once.
+# ★★★ THE ONE COMPOSITION OF A ROW WRITE. `apply-registry-row` (a one-line row file) and
+# `anchor-rows` (a batch of cell files) both end here, so the argv, the cell files, the executable
+# and the refusals below exist once. (A lane's rows go through DssHarness's `fold-agent` instead.)
 # ✔MEASURED 2026-09-23 on DssHarness 0.5.8, in git fixture trees: the door refuses a
 # pre-escaped pipe, an empty Trigger, a new id no guard could resolve, a priority or status
 # outside the vocabulary, `write-anchor` over an existing row, `set-anchor` on a missing one,

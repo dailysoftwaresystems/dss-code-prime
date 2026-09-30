@@ -2,19 +2,20 @@
 
 The rules step 5 carries after its opening sentences (the opening is in `workflow-steps.md`). Read them
 before writing any lane brief, and again when a lane reports. What to delegate and the four-agent cap
-are in `delegation.md`; worktrees are in `worktrees.md`.
+are in `delegation.md`; the lane lifecycle — its agent, seed, fold, rows and deletion — is in
+`orchestration.md`; plain worktrees are in `worktrees.md`.
 
 ## Contents
 - Rule 1 — Contention is per FILE, not per directory
-- Rule 2 — The orchestrator is a lane too — one lane at a time holds `src/dss-config/**` or `src/core/types/*schema*`; `.plans/**` is a guard input; ask what a file is an INPUT to
+- Rule 2 — The orchestrator's own edits obey lane ownership — one lane at a time holds `src/dss-config/**` or `src/core/types/*schema*`; `.plans/**` is a guard input; ask what a file is an INPUT to
 - Rule 3 — A lane that builds gets its own build tree
-- Rule 4 — A lane that writes scratch files gets its own scratch directory — and writes its rows to a rows directory there
+- Rule 4 — A lane that writes scratch files gets its own work directory — and writes its rows to its agent's rows directory
 - Rule 5 — An anchor id is never line-wrapped — and a whole-tree number is not a lane's
 - Rule 6 — A brief states an interface only if its author has run it, and a mechanism only with an instrument; a lane that refutes its brief is the control loop working
 - Rule 7 — A brief that assigns `tests/<dir>/` grants its `CMakeLists.txt` append-only
 - Rule 8 — A message to a live lane restates its subject and owned paths
-- Rule 9 — The deliverable travels in the report, never as a path — except the registry rows, which go to a rows directory
-- Rule 10 — Copy a file into your scratch directory before editing it — your only sanctioned undo
+- Rule 9 — The deliverable travels in the report, never as a path — except the registry rows, which go to the agent's rows directory
+- Rule 10 — Copy a file into your work directory before editing it — your only sanctioned undo
 - Rule 11 — A byte-identity baseline is an isolating pair, never inherited
 - Rule 12 — A path somebody else must resolve is absolute; a negative result carries its scope; a brief that relays a prior lane's artifact opens one first
 
@@ -34,9 +35,9 @@ are in `delegation.md`; worktrees are in `worktrees.md`.
    the work: grant the file, say why it is safe, and **resume the SAME agent** rather than
    spawning a fresh one that has to re-derive everything.
 
-### 2. The orchestrator is a lane too — one lane at a time holds `src/dss-config/**` or `src/core/types/*schema*`; `.plans/**` is a guard input; ask what a file is an INPUT to
+### 2. The orchestrator's own edits obey lane ownership — one lane at a time holds `src/dss-config/**` or `src/core/types/*schema*`; `.plans/**` is a guard input; ask what a file is an INPUT to
 
-   ★★ **THE ORCHESTRATOR IS A LANE TOO — ITS OWN EDITS OBEY THE SAME OWNERSHIP.**
+   ★★ **THE ORCHESTRATOR'S OWN EDITS OBEY THE SAME OWNERSHIP AS A LANE'S.**
    `src/dss-config/**` is a FILE SET like any other, and a config document is an INPUT to
    every lane's build. Editing one while a lane is running does not merely risk a merge
    conflict — it changes what that lane's binaries MEAN between two runs.
@@ -83,7 +84,11 @@ are in `delegation.md`; worktrees are in `worktrees.md`.
    written down rather than sitting in a wrong number.
    ⇒ the orchestrator announces `src/dss-config/**` **and `.plans/**`** among its owned
    paths, and holds a row application or a ratchet re-baseline until the lanes whose gates
-   read them have reported — the same hold it already owes a config edit.
+   read them have reported — the same hold it already owes a config edit. ★ UNDER AGENTS THE HOLD
+   SITS ON `refresh-agent`, NOT ON THE FOLD: a fold writes only the MAIN tree's `.plans/**`, which no live
+   lane's gate reads — each lane's gate reads its own worktree — while `refresh-agent` writes a live
+   lane's own `.plans/**` between two of its gates, the P31 shape exactly. Refresh a lane only between its
+   gates, and tell it what was refreshed (rule 8; `references/orchestration.md`).
    ★★ **THE GENERAL FORM, WHICH IS THE PART WORTH CARRYING: ASK WHAT A FILE IS AN
    INPUT TO, NOT WHICH DIRECTORY IT LIVES IN.** Both instances of this defect came from
    reasoning about the directory — the first framed the hazard as *a config document is
@@ -99,38 +104,45 @@ are in `delegation.md`; worktrees are in `worktrees.md`.
    between two runs of the same binary. **A gate result taken from a shared build tree is not
    attributable to anything** — which makes it worthless exactly when it matters, during a
    red-on-disable observation.
-   ⇒ Name the lane's build tree in its brief (`build/<lane>`), and clear it once green (the
-   one-root rule). ⏳ SCRIPT-ERA (superseded 2026-09-24: `dssharness build` in the lane's worktree names the directory itself, `<lane>/build/<variant>`; see build-layout.md) `dssharness build` gives each leg its own variant-keyed directory INSIDE the
-   tree it is run in, so a lane worktree isolates itself — ✔MEASURED from one:
-   `-S <lane>/. -B <lane>/build/x86_64-mingw-gcc-debug`.
+   ⇒ A lane builds in its own agent worktree: `dssharness build` gives each leg its own variant-keyed
+   directory INSIDE the tree it is run in, so the worktree isolates itself — ✔MEASURED from one:
+   `-S <lane>/. -B <lane>/build/x86_64-mingw-gcc-debug` — and `delete-agent` removes it with the worktree
+   (build-layout.md). ⚠ **"The tree it is run in" is the lane's only if the brief makes it so:** a
+   subagent's shell goes back to the MAIN checkout between calls, so a bare `dssharness build` or `test`
+   builds and tests the main tree. The brief has the lane run every `dssharness` command with
+   `-C <repo>/.worktrees/<o>/<a>` and give every path it edits under that root, absolute; and a lane is
+   never spawned with the Agent tool's own `isolation: "worktree"`, whose checkout no fold reads
+   (`references/orchestration.md`).
 
-### 4. A lane that writes scratch files gets its own scratch directory — and writes its rows to a rows directory there
+### 4. A lane that writes scratch files gets its own work directory — and writes its rows to its agent's rows directory
 
-   ★★ **AND A LANE THAT WRITES SCRATCH FILES GETS ITS OWN SCRATCH DIRECTORY.** The per-lane
+   ★★ **AND A LANE THAT WRITES SCRATCH FILES GETS ITS OWN WORK DIRECTORY.** The per-lane
    BUILD tree isolates artifacts; it isolates neither the scratchpad nor the working tree.
    ⚠ ✔MEASURED 2026-08-20 (cycle P23):
    four lanes were given one `scratchpad/<cycle>/` directory, one lane's
    mutation harness was OVERWRITTEN by another lane's file of the same name mid-run, and the
    next three red-on-disable cycles executed the WRONG SCRIPT with the first lane's arguments.
    Nothing was corrupted only because that harness restored its subject from a `finally` and
-   verified the hash. ⇒ Name `scratchpad/<cycle>/<lane>/` in the brief.
+   verified the hash. ⇒ Every lane has its own work directory, `<repo>/.orchestrators/<o>/work/<a>/`, made
+   by `create-agent`; the brief names it as an absolute path.
    ★★★ **AND THE BRIEF MUST REQUIRE THE LANE TO *WRITE ITS ROW TO A FILE* THERE, NOT MERELY TO
    EMIT IT.** ✔MEASURED TWICE in cycle P44: a finished lane's task transcript came back **0 BYTES**,
    so its row — correct, complete, already written — reached the orchestrator not at all. The
    second time it was a lane that had emitted the row as a TOOL OUTPUT rather than as prose, which
    a text-only harvester silently drops. **Both failures look identical from the orchestrator's
    side: a harvest that simply reports one fewer row, indistinguishable from a lane that produced
-   none.** ⇒ Every brief names an exact ROWS DIRECTORY — an absolute path, or one that names its root
-   (rule 12) — and says: write each row there in anchor-rows' format,
-   `<rows dir>/<ANCHOR ID>/{priority,status,trigger,closing,crossrefs}.txt` — UTF-8 with no byte-order mark,
+   none.** ⇒ Every brief names its agent's ROWS DIRECTORY as an absolute path (rule 12),
+   `<repo>/.orchestrators/<o>/agents/<a>/rows/` — which `create-agent` makes (✔MEASURED 2026-09-30 in a
+   throwaway repository; an agent the orchestration release made has none, and its lane makes it) — and says: write each row there,
+   `<rows dir>/<ANCHOR ID>/{status,trigger,closing,cross-refs}.txt`, plus `priority.txt` for a NEW row — UTF-8 with no byte-order mark,
    one file per cell, each cell VERBATIM on one line (the door stores a line break as a space, so a wrapped
    id or path is stored cut), each written from the stored text (`dssharness read-anchor <ID> --json`) or the
    lane's own words and NEVER from a redacted display, whose masks are not the text (✔MEASURED 2026-09-26:
    `C 6.7.2.5's` displayed as `C <ip>'s`, and a cell copied from the display stored the mask), a pipe written plain (the door escapes it, and refuses one already escaped),
-   nothing else in the directory, and a NEW row carrying at least `priority`, `status` and `trigger` — and
-   reply with the directory, the ids (the NEW ones named as new: the fold declares them with the stage step's
-   `new` input) and each cell file's md5. Rule 9 holds the scope split: the rows go to
-   that directory, everything else travels inline. ⚠ The recovery is
+   nothing else in the directory (`fold-agent` refuses any other file, `crossrefs.txt` included, and a row
+   missing a cell) — and reply with the ids, the NEW ones named as new: they become the fold's `--new`, and
+   the fold refuses a new id nobody named, a cut id or path, a citation no row holds and a lost cell not
+   accepted (`references/orchestration.md`, "The rows directory"). Rule 9 holds the scope split: the rows go to that directory, everything else travels inline. ⚠ The recovery is
    always to ASK THE LANE TO WRITE IT — **never to retype the row from a report**, because a
    retyped row can WRAP an anchor id, and a wrapped id does not fail: it goes invisible to every
    grep and MINTS a false one.
@@ -212,18 +224,17 @@ are in `delegation.md`; worktrees are in `worktrees.md`.
    recipient; one that only names the work cannot.** Redundancy in the addressing is what makes
    mis-delivery detectable at the destination, which is the only place it can still be caught.
 
-### 9. The deliverable travels in the report, never as a path — except the registry rows, which go to a rows directory
+### 9. The deliverable travels in the report, never as a path — except the registry rows, which go to the agent's rows directory
 
    ★★ **THE DELIVERABLE TRAVELS IN THE REPORT, NEVER AS A PATH — AND THE BRIEF SAYS SO.** A lane's
    red-on-disable transcript, its md5s and any number the fold will quote come back INLINE in the reply;
-   its registry rows are the one exception, and go to a rows directory (rule 4). `scratchpad/<cycle>/<lane>/` keeps its P23 job — a private place for
-   harnesses and intermediates — and stops being a place a RESULT is left.
+   its registry rows are the one exception, and go to its agent's rows directory (rule 4). Its work directory
+   keeps its P23 job — a private place for harnesses and intermediates — and is not a place a RESULT is left.
    ★★★ **THE SCOPE SPLIT, stated once (the P31 / P44 resolution, 2026-09-25):** REGISTRY ROWS are written
-   to a rows directory in the lane's scratch, in anchor-rows' format — one file per cell, each cell VERBATIM
-   (P44, rule 4) — at a path that is ABSOLUTE or names its root, because a worktree lane's scratch is not the
-   main tree's (P31 below, rule 12); the report names the directory, the ids and each cell file's md5.
-   Everything else a lane delivers — findings, measurements, verdicts, transcripts, md5s — travels INLINE in
-   the report (P31).
+   to the agent's rows directory — one file per cell, each cell VERBATIM (P44, rule 4) — at its ABSOLUTE path
+   in the main checkout, which the lane's worktree does not contain (P31 below, rule 12); the report names the
+   ids, and `fold-agent` checks and applies them. Everything else a lane delivers — findings, measurements, verdicts,
+   transcripts, md5s — travels INLINE in the report (P31).
    ⚠ ✔MEASURED 2026-08-24 (cycle P31): TWO lanes in one
    cycle reported by citing a path, and both paths were empty when the orchestrator read them — one
    of them holding the lane's **registry row**, which IS that lane's deliverable, and the other a
@@ -236,13 +247,15 @@ are in `delegation.md`; worktrees are in `worktrees.md`.
    the worktree half at all, because the ignore rule is not what separates the two trees.
    ⇒ **The one-line test to put in the brief:** *if the orchestrator would have to open a file to
    fold your work — the registry rows excepted (rule 4) — the work is not reported yet.*
-   ⇒ **A lane that uses a `git worktree` NAMES IT in its report**, because the orchestrator must
-   remove it once its last review is done — `lane-fold.py land`, which removes its host copies too; a
-   fold never removes anything — and cannot remove one it does not know about.
+   ⇒ **A lane that makes a worktree of its own beyond its agent's — a probe — removes it itself
+   (`delete-worktree`) before it reports, and NAMES it in its report**, so the orchestrator can check
+   `list-worktree` and remove one the lane could not; whoever creates a worktree removes it (worktrees.md).
+   The lane's own agent worktree goes with `delete-agent` after its last review; a fold never removes a
+   worktree. ⇒ **And a lane never commits in its worktree:** `fold-agent` refuses a lane that did.
 
-### 10. Copy a file into your scratch directory before editing it — your only sanctioned undo
+### 10. Copy a file into your work directory before editing it — your only sanctioned undo
 
-   ★★ **AND BEFORE EDITING A FILE YOU OWN, COPY IT INTO YOUR SCRATCH DIRECTORY — that
+   ★★ **AND BEFORE EDITING A FILE YOU OWN, COPY IT INTO YOUR WORK DIRECTORY — that
    copy is your ONLY sanctioned undo.** The standing order forbids `git stash` / `checkout --` /
    `clean` / `reset` because the tree is shared, and that prohibition is correct and stays
    BLANKET. ⚠ But it was SILENT about a need it creates: a lane that corrupts its own
@@ -252,7 +265,7 @@ are in `delegation.md`; worktrees are in `worktrees.md`.
    disclosed it unprompted. ★ **The disclosure is the only reason anyone knows** — a restored
    file looks exactly like a file that was never edited, so this violation leaves nothing in any
    diff, which makes it the one class of rule-break that cannot be caught after the fact.
-   ⇒ restore from your scratch copy: it restores exactly one file, cannot reach another lane's
+   ⇒ restore from your work-directory copy: it restores exactly one file, cannot reach another lane's
    work even by mistake, and needs no judgement about what `--` would have swept.
    ★ The distinction to hold: **the ban is on the INSTRUMENT, not on the intent.** Undoing your
    own bad edit is legitimate; doing it with a tree-wide tool is not. And the prohibition keeps NO
@@ -290,7 +303,8 @@ are in `delegation.md`; worktrees are in `worktrees.md`.
    answer to the name `scratchpad/`: the repository's (gitignored) and the SESSION's, under
    `…/AppData/Local/Temp/claude/<project>/<session>/scratchpad/`, which is outside the repo
    entirely. A lane writing to one and reporting a bare relative path sends the orchestrator to the
-   other, and both readings are plausible.
+   other, and both readings are plausible. A lane's own work and rows directories add a third root — the
+   MAIN checkout's `.orchestrators/`, which its worktree does not contain — so they too are named absolute.
    ★★★ **AND THE CLAUSE THE ORCHESTRATOR'S OWN ERROR HERE ADDS, WHICH BINDS EVERY
    PARTY: A NEGATIVE RESULT CARRIES THE SCOPE IT WAS TAKEN OVER.** ⚠ ✔MEASURED 2026-08-24
    (cycle P31): the orchestrator ran `find` over the REPO root, found none of a lane's seven
