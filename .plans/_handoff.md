@@ -82,6 +82,110 @@ below is IN it.
 
 ## §0.0 — STATE
 
+### ★ LANES ARE DSSHARNESS AGENTS — READ THIS FIRST: `lane-fold` and `lane-worktree` are deleted, every lane is a DssHarness agent, and the fold checks every lane row itself
+
+**WHERE WE ARE.** Branch `feature/c23-conformance-burndown-ah-1`, cut from main at `9c4b98f9` (PR #58, merged
+2026-09-29). This commit is the migration the operator asked for on 2026-09-29: *"let's migrate our skills to
+mandatory use dssharness instead of lane-fold.py"* … *"Once it's working, remove lane-fold.py."*
+- **Deleted:** `.harness-config/runner/actions/lane-fold/` and `lane-worktree/`, their `predefinedRunners`, the ctest
+  guards `lane_fold_selftest_guard` and `lane_worktree_guard`, their `cmake/DssTestBudgets.cmake` rows, and their
+  rows in both generated action indexes.
+- **The dss-cycle skill** makes the orchestrator/agent verbs MANDATORY for every lane — a lane is any subagent that
+  changes the repository's files. `references/orchestration.md` is the one statement of the lifecycle: layout, names,
+  aiming a lane's subagent at its worktree (`-C`, absolute paths, never the Agent tool's `isolation: "worktree"`), seed
+  and refresh (the `.plans/**` hold sits on `refresh-agent`), the fold (NOT all or nothing: a file changing under it
+  stops it part way, 21), re-application, the rows directory and the fold's own checks (`--new`, `--accept-lost`),
+  deletion, and the orchestrator's deletion at the cycle's end (the operator's words verbatim, and the five
+  conditions read from them and from the tool). SKILL.md
+  and the other references point to it.
+- **`dssharness init`** rewrote the managed `.gitignore` block (`/.worktrees/*`, `/.orchestrators/*`, each with a
+  tracked `.gitkeep`); `create-orchestrator` refused until it did (seen in the session, not logged).
+- **`check-doc-census`** skips `.orchestrators/`, where an orchestrator keeps copies of documents — made in agent
+  `lfm/dc` and folded with `fold-agent`. New arm 11b; ✔MEASURED red-on-disable: the control (run
+  20260930-011150-c8a36a90) green, the SKIP_DIRS mutant (run 20260930-011209-5e956a21) red on exactly 11b, the
+  source md5 read moved and returned in the session (not in the logs).
+- **FOUND, REPORTED AND FIXED WITHIN THE CYCLE: the orchestration release's `fold-agent` made none of the four row
+  checks — a cut value, a citation of no row, an undeclared new id, a lost cell.**
+  ✔MEASURED 2026-09-29 in a throwaway repository: it stored an id cut after a hyphen, a path cut after its `/` and a
+  citation of no row, and a mistyped existing id carrying a priority became a new CLOSED row while the row it meant
+  stayed open; `read-anchors --lint` found nothing. Sent to the repo-harness session with three smaller findings. The
+  next release, installed 2026-09-30, fixes all four findings — the two wording ones DOCUMENTED by its help, the
+  rest ✔MEASURED 2026-09-30 in a new throwaway repository: the fold
+  refuses an undeclared new id (`--new`, naming the rows that begin the same way), a cut id or path, a citation no
+  row holds, all in one dry run, and `--apply` refuses a lost cell until `--accept-lost` names it, the dry run
+  showing its word diff; the door
+  itself refuses a cut value (exit 10) and a citation of no row (13) for every write; `create-agent` makes `rows/`.
+  A name-filtered run under it before any edit (run 20260930-122132-9a7cb3d3, windows-x86_64-debug, `--no-build`):
+  36 of 36 passed, the 16 `repo-guard` guards among them — to iterate, not to conclude; the gate below concludes. The skill's interim
+  `anchor-rows` pre-check lived one day and was dropped; `anchor-rows` is again the orchestrator's own batch. A fifth
+  finding, sent 2026-09-30 (the dry run's summary pointed at "the last line" while the command is on the line above
+  it), is fixed in repo-harness PR #22, not yet released; the skill names the `to write them:` line, true of both.
+- **Also ✔MEASURED 2026-09-29.** In this checkout: an agent created and seeded, a write and a deletion folded, a rows
+  directory refused on a dry run over the old `crossrefs.txt`, `delete-agent` removing the host copies on WSL, macOS
+  and the arm64 VPS, a recorded subagent session's transcripts kept, a `sync --dry-run` (one host, WSL) listing
+  nothing below either directory. In a throwaway repository: rows applied (a close MOVED to the done registry), a
+  changed declaration applied anew, an unchanged one left alone and one changed over a registry change refusing the
+  whole fold — all three by dry runs (the first by `--apply` on 2026-09-30); `refresh-agent` and `seed-agent` with their refusals and `--force`; a file under each evidence root kept
+  byte-identical by `delete-agent`; a deleted agent's name refused; `delete-orchestrator` refusing without
+  `--delete-evidence`.
+- **Review.** Three independent read-only reviewers (completeness, skill coherence, claims): 0 BLOCKER, 13 MAJOR
+  across them (overlapping), the rest MINOR/NIT; every finding fixed or dispositioned. A final review, paused by the
+  operator mid-run, found 17 more (FR1 the tree was not yet gated; FR2 a finding after the gate must re-flow through
+  it); FR1 answered by the gate below, FR16 made moot by the new release, the rest fixed. The fresh final review: PASS
+  — 0 BLOCKER, 0 MAJOR, 5 MINOR, 9 NIT, all fixed; its re-verification PASS, 5 NIT, fixed after the gate (text only,
+  below).
+- **Gate.** ✔MEASURED, run 20260930-130355-93a72391, on this commit's tree before its last text fixes: OK — 8 legs
+  passed. `windows-x86_64-debug` (GNU 13.2.0, MinGW) 2537/2537 · `windows-x86_64-release` (MSVC 19.51) 2537/2537 ·
+  `linux-x86_64-{debug,release}` (GNU 13.3.0) 2506/2506 each · `linux-arm64-{debug,release}` (GNU 13.3.0, the VPS)
+  2506/2506 each · `macos-arm64-{debug,release}` (AppleClang 21) 2506/2506 each. The six indirect legs skip the
+  `repo-guard` label by design, so every guard ran on the two Windows legs. The gated bytes differ from this commit's
+  only in text that guards alone read — this block's result lines and the re-verification's five wording fixes
+  (dss-harness.md, `anchor-rows`' docstring, this block, the VERBS row) — so the `repo-guard` label re-ran on both
+  Windows legs on this commit's bytes; its run id and counts are in this commit's message. An earlier gate (run
+  20260930-012432-13a4b1de, on the orchestration release and the tree before the review fixes) passed 8/8 too.
+- **Registry.** ✔MEASURED at this commit against `9c4b98f9`: `check-anchor-balance` → "OK - the balance holds: 620
+  open now against 620 at 9c4b98f9" (0 closed, 0 opened, 0 counted); `read-anchors --lint` 0 findings;
+  `check-anchor-citations --current-tree` OK, 18174 citations over 3697 files. Two open rows edited through the door
+  (`anchor-rows` stage/check/apply in four batches, each LOST cell read):
+  `D-HARNESS-ACTION-PROGRAM-VERBS-WITHOUT-A-HARNESS-STEP` (the lane programs' instances retired; stale remedy phrases
+  struck; the evidence claim split into what was measured and what is documented) and
+  `D-AUDIT-P68-ROUND-13-MINOR-FINDINGS` (its `mig` item names `fold-agent` and the door's new refusals).
+- **Hosts.** ✔MEASURED (the first gate's log): the WSL copy kept the retired `lane-fold/` holding an empty `build/`
+  (sync's WARN; both WSL legs, linux-x86_64 Debug and Release, passed with it): removed once with `rmdir`. macOS and
+  the VPS had it removed by the sync ("which the deletion emptied").
+- **What the orchestrator got wrong.** (1) The first mitigation for the unmeasured row path — "every fold is followed
+  by `check-anchor-registry` and `check-anchor-balance`" — covered nothing: neither reads a registry cell's
+  citations; three reviewers caught it. (2) "All or nothing" was copied from `fold-agent --help` over the fuller
+  `help orchestrators`. (3) Three outputs printed an account name unredacted: a Python traceback's interpreter path, a
+  `cut` of the probe's raw jsonl, and an `ls -la` owner column on the WSL host (no secret, host address or key path).
+  (4) A `cd` in the shell twice moved the session's working directory; restored at once. (5) The review dispositions
+  said a guard ran on all eight legs; it ran on the two Windows legs, the only ones that run `repo-guard` (the final
+  review caught it).
+
+**WHERE WE NEED TO GET.** Unchanged from round 13 and the PR exit below — C conformance and the production backend,
+the registry's open rows first. The row checks this cycle found missing are in the tool since 2026-09-30.
+
+**PRIORITIES.**
+1. NEXT — the operator runs the pipes on this branch's PR (never an agent), and merges.
+2. QUEUED — the next cycle, the first under agents: round 13's NEXT list (below) and the three rows the PR exit found
+   (`D-PERF-DSS-FULL-SOURCE-SQLITE-COMPILE-TIME-ROSE-A-FIFTH-TO-A-QUARTER-SINCE-2026-08-28`, the four-leg run refusing
+   its own leg at the shared WSL clone, and read-leg-path's over-masking).
+3. QUEUED — measure `apply-registry-row` through the new door (cut value, citation of no row), then strike the two
+   `mig` items of `D-AUDIT-P68-ROUND-13-MINOR-FINDINGS` it would close (INFERRED today).
+
+**CONCURRENT BRANCHES / PRs.** None in this repository. The repo-harness session shipped the four findings.
+
+**TIMELINE.** 2026-09-29: PR #58 merged (`9c4b98f9`); the orchestration release installed; the migration, its probes,
+the first 8-leg gate and three reviews with their fixes; the final review paused by the operator. 2026-09-30: the
+release with the row checks installed; resumed, re-measured, the pre-check dropped; the fresh final review, the gate
+on the final tree; this commit. The orchestrator `lfm` is deleted with its evidence as the cycle's last act, after
+the push.
+
+**NEXT — THE OPERATOR RUNS THE PIPES ON THIS BRANCH'S PR, THEN MERGES IT.** Then the next cycle takes round 13's NEXT
+list and the three rows the P68 exit found, each lane an agent.
+
+---
+
 ### ★ P68 PR EXIT — READ THIS FIRST: the migrated sqlite action runs its own exit on all four hosts, SQLite's corpus is green everywhere at one pinned revision, and the benchmark found DSS compiling a fifth to a quarter slower than a month ago
 
 **THE PR EXIT, after round 13's commit `737078de`** — the regime of this PR's handoff: units on every leg, `veryquick`
@@ -274,7 +378,7 @@ changed, and the eight `harness/` entries that read them were rebuilt and re-run
 
 **Registry.** ✔MEASURED at this commit against `6181ba84`: `check-anchor-balance` → "OK - the balance holds: 620 open now against 620 at 6181ba84" — 3 rows born closed (the lane tooling's, P2), 0 counted; `read-anchors --lint` 0 findings; `check-anchor-citations --current-tree` OK. At `4a16954a`, against round 13's `737078de`: `check-anchor-balance` → "OK - the balance holds: 620 open now against 617 at 737078de" — 5 new rows: 2 born closed (X1's, P3) and 3 `🔵 DISCLOSED` rows of debt this exit found and did not create (the compile-time rise, P2, measured at round 12's commit; the four-leg run's clone contention, P2; read-leg-path's over-masking, P3), 0 closed, 0 reopened, 0 dropped; counted 611 → 611. Against round 12's `547f316f`, the base of round 13's balance: 615 → 620 raw, 5 closed, 10 opened (1 created, 9 disclosed), counted −4. Banding **P0 0 · P1 62 · P2 211 · P3 332 · P4 11 · P5 4**; `read-anchors --lint` 0 findings.
 
-**NEXT — THE OPERATOR RUNS THE PIPES AGAIN, THEN MERGES PR #58.** Then the next PR takes round 13's NEXT list (above) and three rows this exit
+**NEXT (DONE 2026-09-29: PR #58 merged as `9c4b98f9`) — THE OPERATOR RUNS THE PIPES AGAIN, THEN MERGES PR #58.** Then the next PR takes round 13's NEXT list (above) and three rows this exit
 found: the compile-time rise (`D-PERF-DSS-FULL-SOURCE-SQLITE-COMPILE-TIME-ROSE-A-FIFTH-TO-A-QUARTER-SINCE-2026-08-28`),
 the four-leg run refusing its own leg at the shared WSL clone, and read-leg-path's over-masking.
 

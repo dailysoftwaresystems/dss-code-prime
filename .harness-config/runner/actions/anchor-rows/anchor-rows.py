@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# PURPOSE: stage, check and apply one fold's deferred-anchor rows as a batch through the door, rehearsed in a throwaway repository first, all or nothing, every row read back.
-"""anchor-rows.py -- ONE FOLD'S REGISTRY ROWS, AS A BATCH, THROUGH THE DOOR.
+# PURPOSE: stage, check and apply a batch of the orchestrator's own deferred-anchor rows through the door, rehearsed in a throwaway repository first, all or nothing, every row read back.
+"""anchor-rows.py -- A BATCH OF THE ORCHESTRATOR'S OWN REGISTRY ROWS, THROUGH THE DOOR.
 
-★★★ WHY THIS EXISTS. A lane files the rows its work opened or closed as cell files, and the orchestrator
-applies them when it folds the lane. Until 2026-09-25 that was five scripts in a session toolkit (copy the
+★★★ WHY THIS EXISTS. The orchestrator files the rows its own work opened or closed as cell files and applies
+them as one batch (built in round 13 for a lane's rows, which since 2026-09-29 go in with the lane's fold). Until 2026-09-25 that was five scripts in a session toolkit (copy the
 rows turning pre-escaped pipes back, prune them to the fold's ids, precheck each cell against the stored
 row, diff the cells that lose text, pre-flight and apply through the door), and every defect below was
 paid for once in them:
@@ -11,33 +11,36 @@ paid for once in them:
   * a `--dry-run` that was not an option was silently ignored, and the "dry run" APPLIED;
   * a row's status printed through a cp1252 console killed the loop after its first write;
   * a composer that joined wrapped lines with a space stored `tests/hir/ test_x.cpp` in the archive.
-This is their one successor: a CALLER of the door in the anchors family, beside `lane-fold` and
-`apply-registry-row`, reaching it only through `anchors.door_write`, the one launcher the three share.
+This is their one successor: a CALLER of the door in the anchors family, beside `apply-registry-row`,
+reaching it only through `anchors.door_write`, the one launcher the two share. (A lane's rows never come here:
+DssHarness's `fold-agent` applies an agent's rows directory, making the cut, citation, new-id and lost-cell
+checks below itself -- ✔MEASURED 2026-09-30 in a throwaway repository.)
 
-THE ROW DIRECTORY, the one format a lane writes and this reads:
+THE ROW DIRECTORY, the format DssHarness's agent rows use too, which this reads:
 
-    <rows dir>/<ANCHOR ID>/{priority,status,trigger,closing,crossrefs}.txt
+    <rows dir>/<ANCHOR ID>/{priority,status,trigger,closing,cross-refs}.txt
 
-UTF-8 (a byte-order mark is refused: the door refuses it too). `cross-refs.txt` is read as crossrefs, and a
-row holding BOTH spellings is refused rather than settled by preference. Any other file is refused -- a
+UTF-8 (a byte-order mark is refused: the door refuses it too). `crossrefs.txt`, this program's first spelling, is
+read as cross-refs too -- never in a lane's rows, where `fold-agent` refuses it -- and a row holding BOTH
+spellings is refused rather than settled by preference. Any other file is refused -- a
 draft beside real cells is how a row goes wrong unseen -- except that `stage --live-only` skips the
-`*.applied` files a lane renamed after an earlier application. A directory name is an anchor id under the
+`*.applied` files renamed after an earlier application. A directory name is an anchor id under the
 grammar the tree's config.json declares (`anchors.idPrefix`, `minimumIdSegments`: `anchors.id_grammar`, never
 a pattern typed here). A NEW row needs `priority`, `status` and `trigger`: the door requires the first and the
 third, and a born-closed row whose `status.txt` is missing would land OPEN. A STAGED row may also hold
-`declared-new`, the marker `stage` writes for an id its `new` input names; in a lane's rows it is refused -- a
-row is declared new by the fold, at stage, never by a file a lane left.
+`declared-new`, the marker `stage` writes for an id its `new` input names; in a rows directory it is refused -- a
+row is declared new by `stage`'s `new` input, never by a file left in the directory.
 
 THE THREE VERBS -- each writes nothing it was not asked to, and each refuses before it writes:
 
-  stage <lane rows> <staged dir> --only <ID>... [--new <ID>...] [--live-only]
+  stage <rows dir> <staged dir> --only <ID>... [--new <ID>...] [--live-only]
       Copies EXACTLY the named rows into a NEW directory, each pre-escaped pipe `\\|` turned back into
       `|` and reported per cell (the door escapes every pipe itself, and refuses a pipe already escaped
-      because it cannot tell it from a deliberate backslash). A named id the lane never wrote is refused
+      because it cannot tell it from a deliberate backslash). A named id the rows directory does not hold is refused
       -- a typo would silently drop a row -- and every `--only` given counts: a second one ADDS its ids
       (a repeated option that kept only its last value would silently drop the first one's rows). The
       ids `--new` names are the rows the batch may CREATE: each is marked in the staged record, and one
-      `--only` does not carry is refused. The lane's rows it did NOT carry are named. The lane's own files
+      `--only` does not carry is refused. The rows it did NOT carry are named. The directory's own files
       are never edited, and nothing is pruned in place: the staged directory is the fold's record of what
       it carried, written as `<staged>.partial`, every file read back, then renamed -- a stage that stops
       part-way leaves no staged directory for `check` or `apply` to take as the whole batch.
@@ -84,7 +87,9 @@ THE ORDER, AND WHAT RESOLVES A CITATION. NEW rows are written before the updates
 interrupted part-way (a killed process, a lost machine) then never leaves a stored row citing a row that is
 not there yet -- CRASH CONSISTENCY, not enforcement. ✔MEASURED 2026-09-25 on DssHarness 0.5.12, in a
 throwaway repository: `write-anchor` and `set-anchor` do not check the ids a cell cites -- a cell naming a row
-no registry holds is written, dry run and real alike. And NO GUARD READS THE REGISTRIES' OWN CITATIONS:
+no registry holds is written, dry run and real alike (since 2026-09-30 the door refuses one, exit 13 -- ✔MEASURED
+in a throwaway repository -- so this program's check is the second, and the one that sees the whole batch
+before its first write). And NO GUARD READS THE REGISTRIES' OWN CITATIONS:
 `dssharness check-anchor-citations` resolves ids cited under `anchors.citationRoots`, which holds no `.plans`,
 and `check-anchor-registry` scans `src/`, `examples/` and `docs/` (✔READ 2026-09-26, both tools' own words). So
 this program resolves them itself: every id a row of the batch NEWLY cites -- in a new row, every id it cites;
@@ -102,8 +107,8 @@ form would CHANGE, so a cell the lane did not change keeps its stored bytes.
 
 THE HARNESS STEPS. The three verbs are MANUAL steps of anchor-rows.yml, run through DssHarness on the `rows`
 runner -- ONE leg, this machine's own tree, run in place: the registries a fold writes are that tree's, and a
-host's synced copy holds no lane's rows directory (`.worktrees` and `.temp` are ignored, and only what git does not
-ignore travels). A step's run line hands every input over as `<input>=<value>`, defaults included, and `--step`
+host's synced copy holds no rows directory (`.orchestrators`, `.worktrees` and `.temp` are ignored, and only what
+git does not ignore travels). A step's run line hands every input over as `<input>=<value>`, defaults included, and `--step`
 turns them into the verb's own arguments; STEP_INPUTS is the one statement of each step's inputs, and the self-test
 holds anchor-rows.yml to it. A list input is comma-separated, or `@<file>` naming a list file, one item a line
 (blank lines and `#` comments skipped); a path is relative to the tree unless absolute. Every remedy this program
@@ -113,20 +118,20 @@ Exit codes: 0 OK (for `check`, a batch that rehearses clean) · 2 refused, nothi
 `apply`, everything written restored) · 3 usage error.
 
 Usage -- through the harness (`-C <tree>` names the tree):
-    dssharness run rows --manual-step stage --input rows=<lane rows> --input staged=<staged> --input only=<ID>,...
+    dssharness run rows --manual-step stage --input rows=<rows dir> --input staged=<staged> --input only=<ID>,...
                         [--input new=<ID>,...]
     dssharness run rows --manual-step check --input staged=<staged>
     dssharness run rows --manual-step apply --input staged=<staged> [--input acceptLost=<ID>:<cell>,...]
     dssharness run anchor-rows                     (the self-test, on both local legs; ctest runs it too)
 What each step runs -- the program's own verbs:
-    anchor-rows.py stage <lane rows> <staged> --only ID [ID ...] [--new ID [ID ...]] [--live-only]
+    anchor-rows.py stage <rows dir> <staged> --only ID [ID ...] [--new ID [ID ...]] [--live-only]
     anchor-rows.py check <staged>
     anchor-rows.py apply <staged> [--accept-lost ID:cell ...]
     anchor-rows.py --step <stage|check|apply> <input>=<value>...
     anchor-rows.py --self-test
 `--only` and `--new` may each be given more than once; every id they name counts. `--repo <path>` names another tree
-deliberately, on EITHER side of the verb (the rule lane-fold and lane-worktree follow: a flag one program of the
-family takes after its verb, the next must not refuse there); without it the tree acted on is the one this file
+deliberately, on EITHER side of the verb (a flag one program of the family takes after its verb, the next must
+not refuse there); without it the tree acted on is the one this file
 lives in. A step takes no `--repo`: it acts on the tree the harness runs it in.
 """
 from __future__ import annotations

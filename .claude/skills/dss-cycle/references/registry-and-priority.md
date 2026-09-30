@@ -45,8 +45,9 @@ this repository's configuration, and which of this repository's own programs (it
 - **Closing a row MOVES it.** It is deleted from its working registry and appended to the archive's
   matching table. Reopening moves it BACK. Neither is an edit in place.
 - **You do not do this by hand.** The door — `dssharness set-anchor`, and `write-anchor` for a new
-  row — performs the move as part of writing the row; `apply-registry-row` and `lane-fold` hand
-  their rows to it. Hand-editing the tables is how the two halves drift.
+  row — performs the move as part of writing the row; `fold-agent` applies a lane's rows the same
+  way, and `apply-registry-row` and `anchor-rows` hand the orchestrator's own rows to it. Hand-editing the
+  tables is how the two halves drift.
 - **`check-anchor-balance` refuses both directions** (ARM 6's sibling, the partition arm): a CLOSED
   row left in a working registry, or an OPEN row filed in the archive. The second is the dangerous
   one — every queue in this project reads the two working registries ONLY, so a live row filed in
@@ -107,8 +108,11 @@ A row is WRITTEN by DssHarness's `write-anchor` (a new row) or `set-anchor` (an 
 nothing else; `read-anchor` / `read-anchors` read it (`references/anchors-and-deferrals.md`).
 `.harness-config/runner/actions/anchors/anchors.py` has no write verb: it is the reader
 (`read` / `list [--lint]`, each taking `--production` / `--done` and only those two — the harness
-registry retired on 2026-09-16) and the one launcher that `lane-fold` and `apply-registry-row` call
-the door through. [→ `anchor-rows` is its third caller: it applies a lane's rows directory as one batch, rehearsed first, all or nothing](lane-discipline.md) That launcher refuses, before the door, a status or band outside the vocabulary, an update naming no
+registry retired on 2026-09-16) and the one launcher that `apply-registry-row` and `anchor-rows` call
+the door through (`anchor-rows` applies a directory of the orchestrator's cell files as one batch, rehearsed
+first, all or nothing; a LANE's rows go through `fold-agent`, which itself refuses a cut value, a citation no
+row holds, an undeclared new id and a lost cell not accepted — and since 2026-09-30 the door refuses the first
+two for every write, orchestration.md). That launcher refuses, before the door, a status or band outside the vocabulary, an update naming no
 field, and a cell the door would store broken, judged as the door will store it (a line break becomes a
 space): an anchor id broken after a hyphen or wrapped inside a segment, or a path cut after its `/`. These
 checks are keyed on the id grammar config.json declares (`anchors.idPrefix`, `minimumIdSegments`). An update

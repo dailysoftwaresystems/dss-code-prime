@@ -58,18 +58,18 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
 
 | step | what must hold | open |
 |---|---|---|
-| 0 | the handoff is the previous cycle's claim, not ground truth; orient from `_deferred-anchor-registry-production.md` (`dssharness read-anchors --pending`), never the `-done.md` archive; a red baseline with no WIP-repair context is decided and reported veto-able, never silently (AMENDED 2026-09-21); READ CI (`dssharness check-ci-legs`): a red leg is a HARD STOP on picking work, and repairing it is a FIX | `workflow-steps.md`, `round-gate-and-ci.md` |
+| 0 | the handoff is the previous cycle's claim, not ground truth; orient from `_deferred-anchor-registry-production.md` (`dssharness read-anchors --pending`), never the `-done.md` archive; a red baseline with no WIP-repair context is decided and reported veto-able, never silently (AMENDED 2026-09-21); READ CI (`dssharness check-ci-legs`): a red leg is a HARD STOP on picking work, and repairing it is a FIX; `dssharness list-orchestrator`: an open agent is a lane in flight | `workflow-steps.md`, `round-gate-and-ci.md`, `orchestration.md` |
 | 1 | an explicit argument overrides the auto-pick, never the bar, the pause gate or the hard stops; a dry §0.1 promotes an ELIGIBLE anchor (unconditional, or its trigger fired); a harness row never enters on its own ticket | `workflow-steps.md`, `registry-and-priority.md` |
 | 2 | blockers come from §0.1's "Blocked by" column, the registry, and any "requires deferrals" note | `workflow-steps.md` |
 | 3 | delegate the plan (`/feature-dev:feature-dev`, a `Plan` or `code-architect` agent) | `delegation.md` |
 | 4 | independence is the point; a new engine mechanism also gets a decision brief to the user, veto-able | `workflow-steps.md`, `full-procedure.md` |
-| 5 | each lane's owned and forbidden PATHS named; its own build tree and scratch directory; a new `D-*` cited in `src/` registered in the same commit | `delegation.md`, `lane-discipline.md`, `worktrees.md`, `build-layout.md` |
+| 5 | each lane's owned and forbidden PATHS named; each lane its own agent (`dssharness create-agent`: its worktree, the build tree going inside it, and its work, plans and rows directories), its subagent aimed at that worktree (`-C`, absolute paths); a new `D-*` cited in `src/` registered in the same commit | `orchestration.md`, `delegation.md`, `lane-discipline.md`, `build-layout.md` |
 | 6 | `/pr-review-toolkit:review-pr`, the agnosticism pass and the CI-hazard screen | `workflow-steps.md`, `full-procedure.md` |
 | 7 | net OPEN ≤ 0 against the cycle's start commit, and `check-anchor-registry` run too; a round of lanes owes EIGHT runs | `gate-and-cross-plan.md`, `round-gate-and-ci.md`, `no-follow-ups.md` |
 | 8 | `dssharness set-anchor <ANCHOR> --status closed --closing '...'`; a new row is `dssharness write-anchor`; both WRITE unless given `--anchor-dry-run` | `anchors-and-deferrals.md`, `registry-and-priority.md` |
 | 9 | plans updated in the SAME commit as the code; the handoff answers its five questions | `gate-and-cross-plan.md` |
 | 10 | the `dss-audit` rule-lens and guardrails on the complete, gate-passed cycle | `workflow-steps.md`, `full-procedure.md` |
-| 11 | subject `Cycle <id>: <concise summary>`; the `Co-authored-by:` trailer from the session, never hardcoded; pushing does NOT start CI; open the PR if absent; seed the next lane set only after this step | `workflow-steps.md`, `lane-sets-and-folding.md` |
+| 11 | subject `Cycle <id>: <concise summary>`; the `Co-authored-by:` trailer from the session, never hardcoded; pushing does NOT start CI; open the PR if absent; create the next lane set's agents only after this step, the finished set's deleted after their last review; at the cycle's end, `delete-orchestrator` | `workflow-steps.md`, `lane-sets-and-folding.md`, `orchestration.md` |
 | 12 | the anchor line carries numbers; `next:` matches the handoff's top NEXT entry | `output-contract.md` |
 
 ## Hard rules — one line each
@@ -82,7 +82,7 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
   correct construct, DSS must too; a reference's failure is never evidence against DSS; probe each
   reference separately → `references/reference-compilers.md`.
 - ★★★★ **The disjunction decides ACCEPTANCE, not MEANING** (2026-08-28): references splitting on what
-  a valid program means is a fork the agent DECIDES (2026-09-21) by measurement and the references' own
+  a valid program means is a fork the session DECIDES (2026-09-21) by measurement and the references' own
   documentation — the refusal cost in the row, the decision reported veto-able → same file.
 - ★★★★ **The union is over what WORKS** (2026-09-02): no privileged reference, no tiebreaker vertex; a
   quality split is not a meaning fork — measure which reference works (the defective AND the healthy
@@ -109,33 +109,44 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
 - ★★★★ **No follow-ups** (2026-08-26): a row you open, you close — this cycle or the next; found new
   work → DO IT; "refused but not fixed" is not closed; NET OPEN ≤ 0 against the cycle's start commit,
   and a rise is a HARD STOP; mark a shipped row ✅ the moment it ships → `references/no-follow-ups.md`.
-- A lane that EXITS discharges nothing (2026-08-27): spawn a new `/dss-cycle` lane for its remnant
-  rows; run BOTH `check-anchor-balance` and `check-anchor-registry` — a green balance is not evidence
+- A lane that EXITS discharges nothing (2026-08-27): spawn a remnant LANE for its remnant rows — a new
+  agent of the same orchestrator, briefed as lane `<o>/<a>`, which runs `/dss-cycle` as a lane and never
+  orchestrates (`references/orchestration.md`); run BOTH `check-anchor-balance` and `check-anchor-registry` — a green balance is not evidence
   that nothing was opened → same file.
 
 **Lanes**
 - Delegation is the default; at most FOUR reasoning agents live at once (2026-08-19); scripts do not count,
   memory does: two heavy local jobs at most, each admitted below 76% committed memory, on the orchestrator's
   GO, cores from config, no `-j` (✔MEASURED P68 round 9); every brief says "anchor AND close" → `references/delegation.md`.
-- Contention is per FILE; the orchestrator is a lane too; at most ONE lane holds `src/dss-config/**`
-  or `src/core/types/*schema*`; `.plans/**` is a guard input; each lane gets its own build tree and
-  scratch directory → `references/lane-discipline.md`.
-- A lane's registry rows go to a ROWS DIRECTORY in its scratch, at an absolute path — anchor-rows'
-  `<dir>/<ANCHOR ID>/<cell>.txt`, one file per cell, VERBATIM — the report naming the directory, the ids (the NEW
-  ones named as new) and each cell file's md5; all else travels INLINE (rule 9); a brief states an interface only if its author ran it;
-  an anchor id is never line-wrapped → same file.
-- ★★★★ **"Complete" means FOLDED** (2026-08-28): on a lane's report, fold it, apply its rows, re-derive the
-  balance; a reported-but-unfolded lane is still in flight → `references/lane-sets-and-folding.md`.
+- Contention is per FILE; the orchestrator's own edits obey lane ownership; at most ONE lane holds `src/dss-config/**`
+  or `src/core/types/*schema*`; `.plans/**` is a guard input, so a lane is refreshed only between its gates;
+  each lane gets its own agent — worktree, build tree, work directory → `references/lane-discipline.md`.
+- A lane's registry rows go to its agent's ROWS DIRECTORY, at an absolute path —
+  `<repo>/.orchestrators/<o>/agents/<a>/rows/<ANCHOR ID>/{status,trigger,closing,cross-refs}.txt`, plus
+  `priority.txt` for a new row, one file per cell, VERBATIM, never applied by hand — the report naming the ids
+  (the NEW ones named as new, which become the fold's `--new`); the fold itself refuses a cut id or path, a
+  citation no row holds, an undeclared new id and a lost cell not accepted; all else travels INLINE (rule 9); a brief
+  states an interface only if its author ran it; an anchor id is never line-wrapped → same file,
+  `references/orchestration.md`.
+- ★★★★ **"Complete" means FOLDED** (2026-08-28): on a lane's report, `dssharness fold-agent <o> <a>`, read the
+  dry run, then `--apply` with `--new` for the report's new ids and `--accept-lost` for each lost cell read (its
+  work AND its rows), then re-derive the balance and run
+  `check-anchor-registry`; a reported-but-unfolded lane is still in flight → `references/lane-sets-and-folding.md`.
 - ★★★ **A completed, folded, green lane set is a commit point** (2026-08-28): commit, push, open the PR
-  if absent — THEN seed the next set → same file.
+  if absent — THEN, with the finished set's agents already deleted after their last review, create the next set →
+  same file.
 - ⛔ **Never `git stash` / `checkout --` / `clean` / `reset` in the shared tree** — the ban is BLANKET;
-  before editing a file you own, copy it into your scratch directory (the only sanctioned undo); stage by
+  before editing a file you own, copy it into your work directory (the only sanctioned undo); stage by
   explicit path, never `git add -A` → `references/lane-discipline.md`, `references/gate-and-cross-plan.md`.
-- ★★★ **A lane worktree lives at `<repo>/.worktrees/<short-name>`** (2026-08-26), made by
-  `dssharness create-worktree`, then — MANDATORY, before any work — `lane-fold.py seed <lane>`, which resets
-  a stale same-name seed manifest that would make the fold SILENTLY DROP the lane's work (P57); keep names
-  short (≤10 characters, MAX_PATH); the lane that takes a worktree owns removing it; a byte-changing
-  measurement runs in a worktree, never in the shared tree → `references/worktrees.md`.
+- ★★★★ **A lane is a DssHarness AGENT — MANDATORY** (2026-09-29): a lane is any subagent that changes the
+  repository's files; `dssharness create-agent <o> <a>` makes its worktree at `<repo>/.worktrees/<o>/<a>` and
+  seeds it in one act, `fold-agent` folds it and applies its rows, and `delete-agent`, after its LAST review,
+  keeps its evidence and the recorded session's transcripts and removes the worktree and every host copy —
+  never `create-worktree` for a lane, never a hand copy, never a hand-applied row; its subagent works only in
+  that worktree (`-C`, absolute paths), never with the Agent tool's own `isolation: "worktree"`; the cycle's
+  orchestrator is deleted only at the cycle's end (every agent deleted, all green, the review's findings fixed
+  and the final review passed, gated on ALL legs, committed and pushed to the PR); a byte-changing measurement
+  runs in a worktree, never in the shared tree → `references/orchestration.md`, `references/worktrees.md`.
 
 **Gate, CI and hosts**
 - ★★★★ **The end-of-round gate is `{Debug, Release} × four legs` — EIGHT runs** (2026-09-14), reported
@@ -143,7 +154,8 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
 - ⛔ **Never make CI run** — no label, no re-run, no push to re-trigger; ✅ always READ it
   (`dssharness check-ci-legs`): a red leg is a HARD STOP on proceeding, never on fixing → same file.
 - ★★★ **A gate host holds the repo and nothing else** (2026-08-25): a push is a SYNC, the main tree's sync
-  never carries a worktree — a worktree's own host copy goes with `dssharness delete-worktree` — and the
+  never carries a worktree — an agent's host copies go with `delete-agent`, a plain worktree's with
+  `delete-worktree` — and the
   cleanup is the cycle's job; ★★★ **every leg host keeps a clone, and the leg cleans up after itself**
   (2026-08-26): PREPARE → SYNC → RUN → RESTORE, the restore on every exit path; `-fd`, never `-fdx` →
   `references/leg-hosts.md`.
@@ -151,15 +163,15 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
   per leg — and a lane builds inside its own worktree, whose build goes with it → `references/build-layout.md`.
 
 **Tools**
-- ⛔★★★ **Build, sync, test and worktree management go through DssHarness, never a script**
-  (2026-09-24): the one exception is a DssHarness bug, reported, and the one NAMED INTERIM is the lane-fold
-  program's `seed` / `land` until the action declares them as manual steps; a big, reusable or shell-hard
-  program becomes an ACTION → `references/dss-harness.md`.
+- ⛔★★★ **Build, sync, test, worktree and lane management go through DssHarness, never a script**
+  (2026-09-24; lanes since 2026-09-29, the orchestrator and agent verbs): the one exception is a DssHarness
+  bug, reported; a big, reusable or shell-hard program becomes an ACTION → `references/dss-harness.md`,
+  `references/orchestration.md`.
 - ★★★ **Use the program that exists — fix it rather than routing around it** (2026-08-19) → `references/actions.md`.
 - An action added, renamed, deleted or repurposed updates both indexes in the same commit
   (`dssharness run check-scripts-index-write`); no `.sh` and no `.ps1` under the actions
   root (2026-09-21) → same file.
-- ★★★ **Any issue found in DssHarness is reported in the cycle that finds it** (2026-09-16): SENT by the agent to
+- ★★★ **Any issue found in DssHarness is reported in the cycle that finds it** (2026-09-16): SENT by the session to
   the repo-harness session — the local session working in the repo-harness checkout — the operator told it was
   sent (2026-09-21); never worked around locally → `references/output-contract.md`, `references/dss-harness.md`.
 
@@ -178,7 +190,7 @@ Operator ruling 2026-09-21, verbatim: *"you do everything. I'm not your babysitt
 autonomous for execution AND for decisions (the gate as written before: `references/triggers-and-hard-stops.md`):
 
 - **Decide, do not ask.** A fork (a MEANING fork included), a documented-behaviour change and a new engine
-  mechanism at step 4 are DECIDED by the agent, by measurement and the references' own documentation. A fork
+  mechanism at step 4 are DECIDED by the session, by measurement and the references' own documentation. A fork
   is *real* only if you can state ≥2 concrete, defensible long-term designs; **never invent a fork to escape the work.**
 - **Write the rationale into the row** (and the owning plan, so it is not re-litigated), and **report the decision,
   veto-able, in the decision-brief shape:** (1) the problem, in one or two sentences; (2) 2–4 candidate
@@ -224,7 +236,7 @@ never lowers the bar.
 5. **A direct answer to a direct question.**
 6. ★★★ **A DssHarness finding** — even when it neither fails nor blocks this cycle: what was run, what
    happened, what should have happened, and the repo-harness path + SYMBOL (never a line number) — SENT by
-   the agent to the repo-harness session, the operator told it was sent (2026-09-21).
+   the session to the repo-harness session, the operator told it was sent (2026-09-21).
 
 **Form, not just category:** the fact and its measurement, then stop — no significance commentary, no
 meta, no derivation, no roads not taken, no relayed lane report; 1–3 lines unless it is a decision brief or a pause.
@@ -251,22 +263,25 @@ next: <one line, matching the top NEXT entry in .plans/_handoff.md>
   whether an anchor is eligible.
 - Read `references/operator-discipline.md` when reporting or claiming anything — the bar applies to
   the operator, not only to the code, and it opens with the **never-cite-a-line-number** rule.
-- Read `references/dss-harness.md` **before running anything that touches a leg, a worktree or an
-  anchor** — the tool every build, sync, test and worktree operation goes through, and that file
+- Read `references/dss-harness.md` **before running anything that touches a leg, a worktree, a lane or
+  an anchor** — the tool every build, sync, test, worktree and lane operation goes through, and that file
   says which of its verbs exist, which of this repository's programs it runs as actions, what this
   repository's `.harness-config/config.json` declares, and the exit codes to act on. ⛔ A defect in
   the tool is a repo-harness issue, never a local workaround, **and it is REPORTED in the cycle that
-  finds it** (ruling 2026-09-16) — SENT by the agent to the repo-harness session, the operator told it
+  finds it** (ruling 2026-09-16) — SENT by the session to the repo-harness session, the operator told it
   was sent (2026-09-21); see output-contract item 6.
 - Read `references/actions.md` **before writing any script, probe, or one-off shell pipeline** —
   the index of every program this repository already ships, each with its purpose. Most of what a
   cycle needs is already there, and re-typing it inline re-opens the edge cases it was taught
   (`wsl.exe` quoting, heredocs eating backslashes, unanchored rsync excludes, ssh dropping PATH).
-- Read `references/worktrees.md` before any byte-changing measurement or agent worktree operation.
+- Read `references/orchestration.md` **before creating, folding or deleting a lane** — the one statement
+  of the lane lifecycle under DssHarness's orchestrator and agent verbs: layout, names, seeding, the fold and
+  its rows, evidence, transcripts, host copies, and when the orchestrator itself is deleted.
+- Read `references/worktrees.md` before any byte-changing measurement or plain worktree operation.
 - Read `references/build-layout.md` before creating ANY build tree (step 5) and before reporting a
   cycle complete (step 11) — **one root `build/`, subdirectories for distinct builds, and a lane's build
-  goes with its worktree.** Operator instruction 2026-08-17; a lane worktree that survives its landing
-  blocks the completion report the same way the anchor-balance gate does.
+  goes with its worktree.** Operator instruction 2026-08-17; an agent still open after its set's last
+  review blocks the completion report the same way the anchor-balance gate does.
 - Read `references/workflow-steps.md` when a checklist line is not enough — steps 0–12 in full.
 - Read `references/full-procedure.md` for the longer, older-numbered pause gate, steps, hard stops, stop handling.
 - Read `references/reference-compilers.md` before deciding what a reference's behaviour is evidence FOR.

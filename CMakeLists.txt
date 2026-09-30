@@ -712,8 +712,8 @@ if(DSS_BUILD_TESTS)
     # the decoy's litter, and the tool ignored it and named THIS root. That is the
     # property `leg_tree_git_unsteered` gave the script, and a git hook exporting
     # `GIT_INDEX_FILE` is why it is not hypothetical.
-    # ★★ IT LEAVES THE BASH BLOCK ENTIRELY. This entry used to be registered beside
-    # `lane_worktree_guard` because it needed a bash proven able to open a `C:/` path —
+    # ★★ IT LEAVES THE BASH BLOCK ENTIRELY. This entry used to be registered in that
+    # block because it needed a bash proven able to open a `C:/` path —
     # and it was the entry that block once lost SILENTLY when no such bash was found.
     # It now needs no shell at all, so the one host question left is whether the tool is
     # present, which `dss_add_harness_guard` refuses loudly about.
@@ -827,28 +827,11 @@ if(DSS_BUILD_TESTS)
     # the one `.sh` left in the tree is an example's product test data, exercised by that
     # example's own run on the POSIX legs.
 
-    # Lane-worktree gate (2026-09-01, P50 -- `remove` discarded an unpreserved scratchpad).
-    # `lane-worktree remove` used to delete a lane's ignored evidence without asking, and the
-    # preserve step was a convention living in the orchestrator's head. ✔MEASURED the day the gate
-    # landed: a `cp … && lane-worktree remove` one-liner lost a lane's whole evidence tree because
-    # the destination's parent did not exist and the silence read as success. The gate moved the
-    # rule into the tool; this entry is what keeps it there.
-    # ★ INTEGRATION ARMS BY NECESSITY: the defect was in what the verb DOES to a real tree, so each
-    # arm drives the real program against a real worktree in a fenced temp fixture and asserts the
-    # exit code, the MESSAGE, and -- wherever the verb claims a removal -- that the directory is
-    # independently gone.
-    # ★★ ONE PYTHON PROGRAM SINCE 2026-09-21. It was a `.sh`/`.ps1` pair plus a bash self-test
-    # launched through a bash PROBE (a bare `bash` on Windows resolves to the WSL shim, which
-    # cannot open a `C:/` path), with a refusal arm for a host no bash passed. The probe, its
-    # refusal, `leg_tree_guard` (the shell tree helper's self-test, whose properties now live in
-    # `owning_tree_selftest_guard`) and every other consumer of that bash left with the twins; the
-    # subject is now driven in-process, with no interpreter to find.
-    add_test(
-        NAME lane_worktree_guard
-        COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/lane-worktree/lane-worktree.py"
-                --self-test
-        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ⓘ `lane_worktree_guard` STOOD HERE AND IS GONE WITH ITS SUBJECT (2026-09-29). It pinned
+    # `lane-worktree.py`, the lane worktree program, whose one enduring rule -- a removal keeps the
+    # lane's evidence, each copy verified, before it removes anything -- DssHarness's `delete-agent`
+    # now carries itself (✔MEASURED 2026-09-29 in a throwaway repository: a file under each evidence
+    # root kept byte-identical; the dss-cycle skill's orchestration reference).
 
     # Citation-stability guard (2026-08-19 — line-number citations were silently invalidated).
     # A `path:line` citation is a claim about a file that nothing rechecks: insert
@@ -1004,7 +987,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-doc-census/check-doc-census.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    # ★ And its self-test, for the reason the three entries below carry: a
+    # ★ And its self-test, for the reason the two entries below carry: a
     # self-test behind a flag nobody types is not a test. Every arm is a
     # REFUSAL plus a CONTROL that must stay green, and each was proven able to
     # fail by deleting the refusal it aims at — including both directions of the
@@ -1036,30 +1019,9 @@ if(DSS_BUILD_TESTS)
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # `lane-fold.py --self-test` — registered 2026-09-02 (P53) for exactly the
-    # reason the entry above exists, and it is the SAME defect class: a self-test
-    # behind a flag nobody passes.
-    #
-    # ⚠ ✔MEASURED at the P53 fold by lane `lw`, which could not fix it because
-    # this file is outside a lane's set: `lane_worktree_guard` was registered and
-    # its Python TWIN was not, so `lane-fold`'s arms ran only when somebody typed
-    # them. That asymmetry is the dangerous half — the two verbs are one
-    # workflow, `lane-fold` is the one that WRITES over the main tree, and every
-    # arm it carries is a way a fold can destroy work while reporting success
-    # (an INHERITED path silently reverting a sibling lane; a DRIFTED destination
-    # that must refuse the WHOLE fold; a deletion whose destination moved).
-    #
-    # ★ The arms are all REFUSALS by design — a fold that copies the right files
-    # is right by construction and proves nothing — so this entry cannot pass
-    # without the instrument demonstrating it can fail. P53 added arms (i) and
-    # (j): driven from ANOTHER repository's cwd the root still names the tree the
-    # FILE lives in, and `--repo` still reaches elsewhere deliberately.
-    add_test(
-        NAME lane_fold_selftest_guard
-        COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/lane-fold/lane-fold.py"
-                --self-test
-        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ⓘ `lane_fold_selftest_guard` STOOD HERE AND IS GONE WITH ITS SUBJECT (2026-09-29).
+    # `lane-fold.py` seeded, folded and landed lanes until DssHarness's orchestrator verbs
+    # (`create-agent`, `fold-agent`, `delete-agent`) took that whole workflow over.
 
     # `anchors.py --self-test` — registered 2026-09-02 (P54), and it is the THIRD
     # self-test behind a flag nobody passes found by

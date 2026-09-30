@@ -99,12 +99,14 @@ THE CONTRACT, and every clause is a way a documented figure can lie:
   6. at least one document was read at all.
 
 ⚠ THE EXCLUSIONS ARE PART OF THE CONTRACT AND ARE TESTED AS SUCH. `.worktrees/`
-holds full checkouts of this repository while lanes are in flight; scanning them
-would red this guard on another lane's half-finished document, and widening the
-exclusion until the red stops is how an exclusion silently swallows the real
-tree. Self-test arm 11 asserts a drifted claim inside `.worktrees/` is IGNORED
-and arm 12 asserts one in the live tree beside it is still CAUGHT, so the
-exclusion is pinned in BOTH directions -- see
+holds full checkouts of this repository while lanes are in flight, and
+`.orchestrators/` what DssHarness keeps for them -- plans, work files and kept
+evidence, copies of documents among them; scanning either would red this guard
+on another lane's half-finished document, and widening the exclusion until the
+red stops is how an exclusion silently swallows the real tree. Self-test arms 11
+and 11b assert a drifted claim inside `.worktrees/` and inside `.orchestrators/`
+is IGNORED and arm 12 asserts one in the live tree beside them is still CAUGHT,
+so the exclusion is pinned in BOTH directions -- see
 `[[feedback-an-escape-every-row-triggers-disarms-the-guard]]`.
 
 ★★★ THE SECOND CLAUSE: A QUANTIFIED CLAIM ABOUT THE CORPUS, IN CONFIG PROSE. A figure
@@ -180,8 +182,7 @@ EXIT_OK, EXIT_DISAGREE, EXIT_COLLAPSE, EXIT_USAGE = 0, 1, 2, 3
 REPAIR_VERB = "dssharness run check-doc-census-write"
 
 # The tree acted on defaults to the one THIS SCRIPT LIVES IN, never the caller's
-# cwd -- the same rule `.harness-config/runner/actions/lane-worktree/` follows, and for the same reason:
-# a guard that silently measures whichever directory it was launched from is a
+# cwd, because a guard that silently measures whichever directory it was launched from is a
 # guard that can be made green by cd-ing somewhere else.
 def self_repo():
     """The tree THIS FILE lives in, by the owner's walk -- never a count of `..`.
@@ -271,8 +272,12 @@ SCANNED_SUFFIXES = (".md", ".c", ".h", ".cpp", ".hpp", ".inc", ".s", ".py", ".sh
                     ".ps1", ".cmake", ".txt", ".json", ".yml", ".yaml")
 
 # Directories never scanned. `.worktrees` holds in-flight lane checkouts of this
-# same repository (see the header); the rest are build output and secrets.
-SKIP_DIRS = {".git", ".worktrees", ".secrets", "node_modules", "__pycache__"}
+# same repository and `.orchestrators` what DssHarness keeps for them (see the
+# header); the rest are build output and secrets. Both are DssHarness's own, and
+# `dssharness init` ignores them in the CONTENTS shape (`/.orchestrators/*` beside a
+# kept `.gitkeep`), which `scratch_dirs` rightly does not read as a directory home:
+# `/.harness-config/*` has that shape too, and the files it re-includes ARE documents.
+SKIP_DIRS = {".git", ".worktrees", ".orchestrators", ".secrets", "node_modules", "__pycache__"}
 SKIP_DIR_PREFIXES = ("build",)
 
 # ⚠⚠ AND SO IS EVERY DIRECTORY `.gitignore` DECLARES, FOR THE SAME REASON `.worktrees`
@@ -880,6 +885,13 @@ def selftest():
         _write(os.path.join(wt, "README.md"),
                "# lane copy\n\n%s**1**\n" % _mark("manifests"))
         ok &= _arm("11 WORKTREE-IGNORED", both, EXIT_OK, says="every documented figure")
+        # 11b: ... and so is one inside `.orchestrators/` (a lane's work copy of a
+        #      document, which DssHarness keeps beside the lane's plans and evidence).
+        orch = os.path.join(both, ".orchestrators", "o", "work", "a", "examples")
+        os.makedirs(orch, exist_ok=True)
+        _write(os.path.join(orch, "README.md"),
+               "# work copy\n\n%s**1**\n" % _mark("manifests"))
+        ok &= _arm("11b ORCHESTRATORS-IGNORED", both, EXIT_OK, says="every documented figure")
         # 12: ... and the SAME drift in the live tree beside it is still CAUGHT, so
         #     the exclusion cannot have widened to swallow the real document.
         _write(os.path.join(both, "examples", "README.md"),

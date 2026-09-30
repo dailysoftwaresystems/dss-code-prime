@@ -32,9 +32,9 @@ that is a delegation you skipped.
 | 1–2 pick / clear blockers | `Explore` or `general-purpose` | when it means sweeping plans, the registry, or `src/` to locate work |
 | 3 plan | `Plan` / `feature-dev:code-architect` | returns the execution plan; you judge it |
 | **3.5 design-audit** | **independent `general-purpose`** | MUST be a fresh agent — the point is that it did not author the plan |
-| 4 implement | one agent per DISJOINT file set, **in parallel** | see the parallelism rule below |
+| 4 implement | one LANE per DISJOINT file set, **in parallel** — a DssHarness agent and its subagent | see the parallelism rule below and orchestration.md |
 | 5 review & fold | `pr-review-toolkit:*` / `feature-dev:code-reviewer` | |
-| 7–8 deferrals + cross-plan | `general-purpose` | mechanical registry/plan reconciliation |
+| 7–8 deferrals + cross-plan | the orchestrator itself, or a LANE | mechanical registry/plan reconciliation; a subagent that writes `.plans/**` changes the repository, so it is a lane with its own agent (orchestration.md) — its registry rows through its agent's rows directory only, never the registry files (the fold refuses a registry the lane changed as a file) |
 | **8.5 code-audit** | **independent `general-purpose`, READ-ONLY** | must not be the agent that wrote the code |
 
 **PARALLELISM:** when a step splits into disjoint file sets — engine `.cpp` vs `*.json`
@@ -118,8 +118,8 @@ own private `build-warn/` reddened by 23 errors in files it did not own; and one
 scratchpad script overwritten mid-run by a sibling. **Ownership partitions WRITES; it does not
 partition the COMPILER, the build dir, or the scratchpad.**
 
-★★ **A BYTE-CHANGING MEASUREMENT GOES IN A `git worktree` — PASTE `worktrees.md` §H.0 INTO THE
-BRIEF, DO NOT CITE IT.** §H.0 already names *"red-on-disable mutants"* explicitly and predates
+★★ **A BYTE-CHANGING MEASUREMENT GOES IN A WORKTREE — THE LANE'S OWN AGENT WORKTREE, OR A PLAIN PROBE
+ONE — PASTE `worktrees.md` §H.0 INTO THE BRIEF, DO NOT CITE IT.** §H.0 already names *"red-on-disable mutants"* explicitly and predates
 the incidents above, so the gap is not knowledge — it is that a brief which says *"prove
 red-on-disable"* and never says *where* leaves a lane to mutate shipped source in the shared
 tree, which is the obvious reading. ✔The cost of getting this right is trivial and measured: a
@@ -131,7 +131,12 @@ sibling lane the same day hit the wall, moved to a throwaway worktree, verified,
   wider the window.** ✔The orchestrator was fooled by exactly this: a gate run mid-window reported
   a clean verdict and a next-free diagnostic ordinal ~200 slots off, from bytes existing in no real
   tree. Nothing was wrong with the instrument.
-- Give each lane a **lane-private scratch subdirectory**; the session scratchpad is shared.
+- Give each lane its **agent's work directory**, `<repo>/.orchestrators/<o>/work/<a>/`, as an absolute path;
+  the session scratchpad is shared (orchestration.md).
+- Creating, folding and deleting a lane's agent is the ORCHESTRATOR's, never the lane's: `create-agent`
+  before the lane is spawned, its subagent id recorded with `create-agent … --session <id>` as soon as it is,
+  `fold-agent` on its report (`--new` for its new ids), `delete-agent` after its last review. `--parallel 4` makes the tool refuse a
+  fifth open lane; the ≤4-reasoning-agents rule above still counts reviewers and planners too.
 
 **★ DO NOT DELEGATE — the orchestrator keeps these:**
 - **Step 6, the gate** (builds, ctest, the eight-run `{Debug, Release} × four legs` gate, the sqlite re-probe). A delegated
