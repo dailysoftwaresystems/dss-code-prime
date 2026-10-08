@@ -49,7 +49,7 @@ Cycle <id>:
 - [ ] 8  Pin every deferral — a row closes by MOVING (`set-anchor`)
 - [ ] 9  Cross-plan update — including the rewrite of `.plans/_handoff.md`, same commit as the code
 - [ ] 10 Self-audit before lock — INDEPENDENT; a finding → back to 5 and re-flow; a design choice → decided, reported
-- [ ] 11 Commit (`-s`, the handoff staged in THIS commit) and push — once per completed, folded lane set
+- [ ] 11 Commit (`-s`, the handoff staged in THIS commit) and push — a checkpoint after EVERY fold, and the round's commit once per completed, folded lane set
 - [ ] 12 Report (the output contract below) and end
 ```
 
@@ -141,6 +141,10 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
   dry run, then `--apply` with `--new` for the report's new ids and `--accept-lost` for each lost cell read (its
   work AND its rows), then re-derive the balance and run
   `check-anchor-registry`; a reported-but-unfolded lane is still in flight → `references/lane-sets-and-folding.md`.
+- ★★★★ **Every fold is committed and pushed — a checkpoint between waves** (2026-10-08, operator: *"It's
+  totally wrong 600+ files without push"*): fold → checks → refresh the siblings (BEFORE the commit) → write the
+  inventories → commit → push; the message says what ran, what did not, and every known red; the agents stay
+  open and the eight-run gate stays owed at the round's close → `references/lane-sets-and-folding.md`.
 - ★★★ **A completed, folded, green lane set is a commit point** (2026-08-28): commit, push, open the PR
   if absent — THEN, with the finished set's agents already deleted after their last review, create the next set →
   same file.

@@ -4,9 +4,47 @@ When a lane's work counts as landed, and when a set of lanes is committed, pushe
 the next set.
 
 ## Contents
+- EVERY FOLD is a commit + push — a checkpoint between waves (operator ruling 2026-10-08)
 - A completed set of lanes is a commit point (operator ruling 2026-08-28)
 - "Complete" means FOLDED — a lane that has reported is not done; the sequence at a set boundary; why
   the next set is created only after the commit
+
+## ★★★★ EVERY FOLD IS A COMMIT + PUSH — A CHECKPOINT BETWEEN WAVES — operator ruling 2026-10-08
+
+> *"please commit + push between waves, It's totally wrong 600+ files without push"* — operator, on a
+> round whose main tree held four folds and 665 uncommitted paths for a day and a half.
+
+The set boundary below is the ROUND's commit. It is no longer the first one. **A lane's fold is
+committed and pushed as soon as its fold checks pass** — while the other lanes of the set are still
+working. Unpushed work is lost with one disk and invisible to the operator; the size of a fold is the
+most the main tree may ever hold uncommitted.
+
+1. **The order is fold → checks → refresh the siblings → write the inventories → commit → push.** The
+   checks are the fold's own: the anchor balance against the cycle's start commit, the registry lint,
+   `check-anchor-citations`, `check-anchor-registry`. The siblings are refreshed BEFORE the commit:
+   ✔MEASURED 2026-10-08, `refresh-agent` sees only the main tree's UNCOMMITTED changes — after the
+   commit it answers "holds the main tree's copy" for a path whose lane copy is older (reported to the
+   tool's own repository). A sibling in the middle of a run is refreshed when the run ends; the commit
+   waits for it rather than leaving it stale.
+2. **The inventory baselines are written at every fold**, not at the round's end — the emitted anchor
+   ids, the doc census, the plan citations — so a checkpoint's guards are green.
+3. **A checkpoint is not a gate, and its message says so.** It states what ran (each lane's five legs
+   on its own tree, the fold checks) and what did not (the eight-run gate on the combined tree, the
+   sqlite recompile, the final review), names every known red, carries the anchor line with numbers,
+   and says *do not run the pipes on this commit* when a red is known. The subject is
+   `Cycle <id> round <n>, checkpoint <k>: <what folded>`. `.plans/_handoff.md` carries a short
+   in-flight block at the top of its state section in the same commit — what the checkpoint carries,
+   what it does not, where the round stands — and is REWRITTEN only at the round's close.
+4. **The agents stay open across a checkpoint.** A lane's worktree stays on the base commit it was
+   created on; the main tree's HEAD moves away from it. So nothing the orchestrator runs may read "the
+   main tree's HEAD" as a lane's base — the base is the lane worktree's own HEAD, and the balance is
+   always taken with `--base <the cycle's start commit>`. Lanes read registry rows from the MAIN tree;
+   their worktree's copy of the registry is not refreshed.
+5. **Lanes hand back at each natural fold point** — a coherent item set that is pinned, mutated and
+   green on five legs, the P0 work first so it is pushed first — instead of accumulating one large
+   wave. The independent re-review follows the commit; its findings lead the lane's next fold.
+6. **The round's close is unchanged**: every lane re-reviewed clean, the eight runs, the sqlite
+   recompile, the final review, the agents deleted, the handoff rewritten — one more commit and push.
 
 ## ★★★ A COMPLETED SET OF LANES IS A COMMIT POINT — operator ruling 2026-08-28
 
