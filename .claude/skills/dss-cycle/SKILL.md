@@ -166,6 +166,8 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
   with the build type beside each number → `references/round-gate-and-ci.md`.
 - ⛔ **Never make CI run** — no label, no re-run, no push to re-trigger; ✅ always READ it
   (`dssharness check-ci-legs`): a red leg is a HARD STOP on proceeding, never on fixing → same file.
+  ★ The one exception is a PR exit the operator ORDERS to end with the pipes (2026-10-08): then the
+  cycle's last steps are commit, push, add the `Run Pipes` label, watch CI to green; the merge stays theirs.
 - ★★★ **A gate host holds the repo and nothing else** (2026-08-25): a push is a SYNC, the main tree's sync
   never carries a worktree — an agent's host copies go with `delete-agent`, a plain worktree's with
   `delete-worktree` — and the

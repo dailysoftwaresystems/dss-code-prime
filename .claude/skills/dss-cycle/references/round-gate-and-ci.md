@@ -41,6 +41,20 @@ leg NAME now, and `dssharness legs` lists every one that can run.
   round owes.
 - ✅ **ALWAYS read whatever verdict already exists.** Reading costs nothing, and step 0 now does it
   with `dssharness check-ci-legs`. A red leg is a HARD STOP on *proceeding*, never on *fixing*.
+- ★★★ **THE ONE EXCEPTION IS A PR EXIT THE OPERATOR ORDERS — and then the pipes are the cycle's own
+  last steps.** Operator, 2026-10-08, verbatim: *"on finishing this cycle I'll turn on the pipes and
+  try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and
+  monitor CI until green"*. When — and ONLY when — the operator has said a cycle ends this way:
+  1. the cycle's close is everything it always was (every lane re-reviewed clean, the eight runs, the
+     sqlite recompile and `veryquick`, the final review, the handoff rewritten, commit, push);
+  2. THEN the session adds the `Run Pipes` label to the PR itself, and says it did;
+  3. THEN it watches the verdict to GREEN — a red leg is diagnosed and FIXED (a fix, never a re-run
+     for luck), the fix goes through the fold checks and is pushed, which starts the next run — and
+     reports each leg with its build type; the cycle is not finished, and its orchestrator is not
+     deleted, while a leg is red or unread;
+  4. the MERGE stays the operator's.
+  Without that instruction for the PR in hand, the ban above is whole: no label, no re-run, no push
+  to obtain a verdict. The instruction is per PR exit; it is not a standing licence.
 
 ★ **This corrects a framing I first wrote into a row, and the correction is the point.** I filed
 *"no step of `/dss-cycle` reads CI at all"* as though the READING were the defect, and then

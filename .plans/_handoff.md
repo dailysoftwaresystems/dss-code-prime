@@ -107,6 +107,14 @@ round's close; each checkpoint's commit message says what was and was not run on
   `dssharness read-anchors --pending --open --band P0`. A disclosed row is OPEN WORK (operator ruling of the same
   day): the round's remaining waves close them, the largest on their own plans. The orchestrator's ledger is local,
   not in the repository (`.orchestrators/p69/plans/p69/ledger.md`).
+- **HOW THIS CYCLE ENDS — operator, 2026-10-08, verbatim:** *"on finishing this cycle I'll turn on the pipes and
+  try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and monitor CI until
+  green"*. So P69 is this PR's EXIT: its four lanes finish what they are in (no second round opens in this PR — what
+  is measured and unbuilt goes to the next cycle through the registry and each lane's findings), then every lane
+  re-reviewed clean, every owed mutant read, the eight runs, the sqlite recompile and `veryquick`, the final review,
+  this file rewritten, commit, push — and THEN the session adds the `Run Pipes` label itself and watches CI to
+  green, fixing what is red. The merge is the operator's. `speedtest1` is not owed: the cycle did not aim at compile
+  time or the optimizer pipeline.
 - **Everything below this block describes the tree at `71648598`** and is rewritten at the round's close.
 
 ### ★ LANES ARE DSSHARNESS AGENTS — READ THIS FIRST: `lane-fold` and `lane-worktree` are deleted, every lane is a DssHarness agent, and the fold checks every lane row itself
