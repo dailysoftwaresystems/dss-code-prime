@@ -5617,7 +5617,7 @@ TEST(MirLoweringC, ForwardReferenceCallResolvesViaPrePass) {
 // through that table, so an aliased synthetic id fabricates a named strong
 // definition from an anonymous string literal (the sqlite3.c+shell.c probe's
 // bogus `sqlite3_stmt`/`Fts5Tokenizer` cross-CU redefinitions). RED-ON-
-// DISABLE: drop the `std::max(..., config.syntheticSymbolFloor)` seed → the
+// DISABLE: state 0 in `lowerToMir`'s `stateSymbolIdEnd(config.syntheticSymbolFloor)` → the
 // promoted global's id lands inside the semantic table (this fixture's
 // table carries param/local records well past the function count).
 TEST(MirLoweringC, SyntheticGlobalSymbolsRespectSemanticFloor) {

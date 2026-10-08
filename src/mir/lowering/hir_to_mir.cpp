@@ -607,84 +607,54 @@ struct Lowerer {
     std::unordered_map<std::uint32_t, HirNodeId> stringLiteralNodeBySymbol_;
     std::unordered_map<std::uint32_t, HirNodeId> unnamedStaticNodeBySymbol_;
 
-    // D-LK4-RODATA-PRODUCER-STRING (2026-06-02): synthetic-symbol
-    // counter for string-literal-promoted globals. Initialized to
-    // 1 + max(existing function/extern/global SymbolId.v) on first
-    // use so synthetic symbols can't collide with user-declared
-    // ones. Mirrors the `entry_trampoline.cpp::maxExistingSymbolIdV`
-    // pattern used by D-LK10-ENTRY Slice C. Lazy seeding lets the
-    // pre-passes (`collectFunctions` / `collectGlobals` /
-    // `collectExterns`) populate the symbol sets BEFORE the first
-    // expression lowering reaches a string literal.
+    // ── THE SYMBOLS THIS TIER MINTS (string/float literal objects, jump tables,
+    //    FP sign masks, static unnamed objects, the block symbol of a label whose
+    //    address a static initializer takes) COME THROUGH THE MODULE'S ONE DOOR
+    //    (`MirBuilder::mintSymbol`, P69 round 5) ──
     //
-    // Encoded as `optional<uint32_t>` (type-design audit fold,
-    // 2026-06-02): a `(bool seeded, uint32_t value)` two-field
-    // pair admits the contradictory state `(false, 17)` that no
-    // invariant pinned. `optional<uint32_t>` encodes "unseeded +
-    // value" in one type-enforced state; `if (!opt.has_value())`
-    // is the lazy-seed gate.
-    std::optional<std::uint32_t> nextSyntheticGlobalSym_;
-    // Returns a fresh SymbolId, OR an invalid `SymbolId{}` if the
-    // mint would wrap around UINT32_MAX. The caller is expected to
-    // fail loud on the invalid sentinel — silent-failure HIGH-1
-    // audit fold (2026-06-02): mirrors the D-LK10-ENTRY Slice C
-    // discipline `SymbolId{} == 0` sentinel + caller-checked
-    // wraparound, anchored by the prior `3541177` audit fold's
-    // `SymbolIdSpaceExhaustionFailsLoud` precedent. Without this
-    // guard, a 2^32-occurrence string-literal corpus would silently
-    // wrap and collide with SymbolId{0} / user symbols.
-    [[nodiscard]] SymbolId mintSyntheticGlobalSymbol() {
-        if (!nextSyntheticGlobalSym_.has_value()) {
-            std::uint32_t maxV = 0;
-            for (auto v : functionSymbols) {
-                if (v > maxV) maxV = v;
-            }
-            for (auto v : globalSymbols) {
-                if (v > maxV) maxV = v;
-            }
-            // Cross-tier collision protection (code-architect audit
-            // fold, 2026-06-02): `collectExterns` (search by name
-            // — line numbers drift) inserts every extern's
-            // `SymbolId.v` into `functionSymbols`. The scan above
-            // therefore covers functions + externs + globals — the
-            // three user-symbol categories MIR sees. The HIR builder's
-            // `freshSymbol()` runs past `model.symbols().size()`
-            // for HIR-synthesized symbols; those SymbolIds are
-            // ALREADY in `functionSymbols`/`globalSymbols` by the
-            // time `mintSyntheticGlobalSymbol()` first runs, so
-            // the lazy seed naturally clears them too.
-            //
-            // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): the scan alone is
-            // NOT enough — the SEMANTIC symbol table also holds typedefs,
-            // tags, fields, locals, and injected constants, none of which
-            // are MIR-visible, and the LK11 merge maps every MIR symbol to
-            // a NAME through that table. A synthetic id landing inside the
-            // table fabricates a NAMED strong def from an anonymous literal
-            // global (bogus cross-CU collisions; potential silent
-            // mis-merge). `config.syntheticSymbolFloor` (the pipeline
-            // passes `model.symbols().size()`) lifts the seed clear of the
-            // whole semantic id space.
-            //
-            // UINT32_MAX seed: refuse to seed at the saturated
-            // edge so the immediate `*nextSyntheticGlobalSym_`
-            // read below never wraps. The caller fail-louds.
-            if (maxV == std::numeric_limits<std::uint32_t>::max()) {
-                return SymbolId{};
-            }
-            nextSyntheticGlobalSym_ =
-                std::max(maxV + 1u, config.syntheticSymbolFloor);
-        }
-        std::uint32_t const minted = *nextSyntheticGlobalSym_;
-        // Wrap detection (silent-failure HIGH-1 audit fold): if
-        // `minted == UINT32_MAX`, advancing would wrap to 0
-        // (collide with the invalid sentinel). Refuse and let the
-        // caller fail loud.
-        if (minted == std::numeric_limits<std::uint32_t>::max()) {
-            return SymbolId{};
-        }
-        nextSyntheticGlobalSym_ = minted + 1u;
-        return SymbolId{minted};
+    // So the module's end (`Mir::symbolIdEnd`) is past each of them — which is
+    // what a later tier relies on for the ones that are neither a function nor an
+    // object of the module (a pre-minted block symbol): it continues the module's
+    // ids (`MirSymbolIdContinuation`) and needs no scan of its own to clear them.
+    //
+    // The module is told the END of the id space its unit was analysed in when it
+    // is made (`lowerToMir` states `config.syntheticSymbolFloor` — the name
+    // table's end — to the builder), so a minted id is past every record the
+    // table holds: typedefs, tags, fields, locals and injected constants as well
+    // as the functions and objects MIR sees. c86
+    // (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS) is why: the whole-program merge maps
+    // a MIR symbol to a NAME through that table, so an id inside it made a NAMED
+    // strong definition of an anonymous literal.
+    //
+    // What the table's end does not cover is a caller that states NO table (a
+    // fixture that lowers hand-built HIR: the end stated is 0) and a symbol this
+    // unit holds that the MODULE never will — an import's row lives beside the
+    // Mir, not in it. So `lower()` raises the end past every symbol the collect
+    // pre-passes found (`collectFunctions` / `collectThreadShimSymbols` /
+    // `collectGlobals` / `collectExterns`) ONCE, after the last of them and before
+    // anything is minted: the unit's whole symbol set is in the two sets by then
+    // (the one later insertion is an id this minter itself handed out). Every
+    // mint that follows — this tier's, and once the module is frozen mem2reg's
+    // zero and the synthesis passes' — asks the module alone and is clear of the
+    // unit's imports. With a table stated it changes nothing: the table's end is
+    // past them all already.
+    //
+    // NOT covered, and not needed: CST→HIR's `freshSymbol()` temporaries are
+    // minted from the table's end too, so a number here can equal one of theirs.
+    // They are LOCALS — declared and referenced inside one function body, found
+    // through `addressableLocal` / `symbolToValue` before any module-level set is
+    // asked, and never a `GlobalAddr` — so the two never meet as MIR symbols.
+    // (The comment that stood here said those temporaries were already in
+    // `functionSymbols` / `globalSymbols`; they never were.)
+    void keepSymbolIdEndClearOfUnitSymbols() {
+        for (auto v : functionSymbols) mir.keepSymbolIdsClearOf(SymbolId{v});
+        for (auto v : globalSymbols)   mir.keepSymbolIdsClearOf(SymbolId{v});
     }
+    // Returns a fresh SymbolId, OR an invalid `SymbolId{}` when the id space is
+    // exhausted (advancing would wrap onto 0, the invalid sentinel). Every caller
+    // fails loud on the invalid id — the `SymbolIdSpaceExhaustionFailsLoud`
+    // discipline.
+    [[nodiscard]] SymbolId mintSyntheticGlobalSymbol() { return mir.mintSymbol(); }
 
     // Emit an unsupported-construct diagnostic anchored at the HIR node's
     // source span (via the optional source map). The buffer/span both
@@ -18023,6 +17993,12 @@ struct Lowerer {
         collectThreadShimSymbols();   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
         collectGlobals(root);
         collectExterns(root);
+        // Every symbol the UNIT holds is collected now — its functions, its
+        // objects, its shim symbols, its imports — and nothing has been minted:
+        // carry them into the module's symbol-id end, once (see
+        // `mintSyntheticGlobalSymbol`). `classifyGlobals` is the first thing that
+        // can mint (a string literal a static initializer points at).
+        keepSymbolIdEndClearOfUnitSymbols();
         classifyGlobals(root);
         for (HirNodeId decl : hir.moduleDecls(root)) {
             HirKind const dk = hir.kind(decl);
@@ -18193,6 +18169,11 @@ HirToMirResult lowerToMir(Hir const&               hir,
         ? MirAliasingMode::StrictTBAA
         : MirAliasingMode::Permissive);
     lwr.mir.setCharTypesAliasAll(config.charTypesAliasAll);
+    // The END of the id space this unit was analysed in — its name table's end,
+    // or 0 from a caller with no table. Stated ONCE, here, where the module is
+    // made from the model; every minter of the module asks the module from now
+    // on (`MirBuilder::mintSymbol`) and none is handed the number again.
+    lwr.mir.stateSymbolIdEnd(config.syntheticSymbolFloor);
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();

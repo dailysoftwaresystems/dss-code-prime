@@ -134,6 +134,22 @@ round's close; each checkpoint's commit message says what was and was not run on
   this tree: **622 open against 620** — 24 closed, 26 opened (1 created, 25 disclosed), REAL net +2 until those
   four close. `link/test_common_symbols` has a NAMED time-budget row from this commit (its weak-name cells ask the
   reference linkers; 161 s on the slowest debug leg); its sanitized figure is unmeasured.
+- **Checkpoint 4 (2026-10-08) = the library-and-runtime lane's early fold**: 37 paths (9 new). It fixes the two
+  regressions that lane's previous fold introduced (named under "What it does NOT carry" above): a bare relocatable
+  link gets its members' answer, and a document that is not an archive's is refused the archive weak-reference
+  search; a weak reference to a name DSS's runtime realizes binds on every format (the pull asks the corpus by
+  name). And it makes ONE DOOR for a fresh symbol id: the module carries the end of its symbol-id space and five
+  minters ask it — the optimizer's zero constant could take an id the name table or an import already held, a
+  SILENT release miscompile ✔MEASURED on all five targets. **That P0 row stays `disclosed`, "fix folded"**: a sixth
+  minter (the block-symbol minter of the MIR-to-LIR lowering) goes through the same door in the C front end lane's
+  fold, and the row closes then — a row with six minters is not closed on five. Two files that this lane and the
+  writers-and-linker lane both changed were merged three-way BY HAND into the main tree (both merges clean, the
+  merged bytes equal to the lane's own trial merge): **no lane built that composition** — its first full-suite
+  reading, on one leg, follows this commit, and the eight-run gate reads it whole. ✔MEASURED by the lane on its
+  bytes before the merge: the full suite on five legs (three legs 2680 of 2680; the two Windows legs 2707 of 2710,
+  the three reds being repository guards reading that worktree's stale copies), and 28 mutants read, each alone.
+  ✔MEASURED on the main tree after the fold: the same checks and guards as above pass. Balance unchanged: 622 open
+  against 620. Three mutants of an earlier row of that lane need an ELF host and are owed before the round's close.
 - **HOW THIS CYCLE ENDS — operator, 2026-10-08, verbatim:** *"on finishing this cycle I'll turn on the pipes and
   try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and monitor CI until
   green"*. So P69 is this PR's EXIT: its four lanes finish what they are in (no second round opens in this PR — what

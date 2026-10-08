@@ -74,10 +74,11 @@ class DiagnosticReporter;
 // all-weak arm keeps one), and stays internal to that image (never exported, never
 // preemptible). tests/mir/test_synth_shim_collapse_linkage.cpp pins it.
 //
-// `nameTableEnd` is one past the highest id the CALLER's name table holds
-// (mir/merge/synth_symbol_floor.hpp): every helper import is minted above it as well as
-// above every id the module and the recipe map hold, so no helper id is a name the table
-// gives to something else. Required — tests/mir/test_synth_symbol_floor.cpp pins it.
+// Every helper import's symbol is minted by the MODULE (`Mir::symbolIdEnd`,
+// `MirBuilder::mintSymbolOrAbort` — see mir/merge/synth_symbol_floor.hpp): past every id
+// the module holds and every id the name table it was made from holds — and past every id
+// the recipe map holds — so no helper id is a name the table gives to something else. No
+// caller hands this pass an end; tests/mir/test_synth_symbol_floor.cpp pins the ids.
 [[nodiscard]] DSS_EXPORT bool
 synthesizeThreadsShim(Mir&                                                  mir,
                       TypeInterner&                                         interner,
@@ -85,7 +86,6 @@ synthesizeThreadsShim(Mir&                                                  mir,
                       std::optional<LibrarySynthesis> const&                librarySynthesis,
                       CSymbolDecorationScheme                               scheme,
                       std::vector<ExternImport>&                            externImports,
-                      std::uint32_t                                         nameTableEnd,
                       DiagnosticReporter&                                   reporter);
 
 } // namespace dss

@@ -15,7 +15,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <limits>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -398,10 +397,10 @@ public:
         }
     }
 
-    // Reset per-function state between functions in the same module.
-    // ⚠ `nextSyntheticSymbol_` is NOT reset — a minted global symbol is
-    // MODULE-scoped, so re-seeding it per function would hand two functions the
-    // same id and collapse their zero globals onto one arena slot.
+    // Reset per-function state between functions in the same module. The id a
+    // zero global takes is MODULE-scoped and is not this pass's to count at all:
+    // the module's builder mints it (`MirBuilder::mintSymbol`), so two functions
+    // cannot be handed the same one.
     void resetPerFunction() {
         promoted_.clear();
         allocaElementType_.clear();
@@ -479,29 +478,32 @@ private:
     // wrong. (The double-rounding caveat the literal promoter carries for decimal
     // source text cannot apply to a value the compiler itself produced.)
     //
-    // ★★ `SymbolBinding::Local` IS LOAD-BEARING, NOT TIDINESS, and it is what makes
-    // minting a symbol SAFE from the optimizer tier at all. The MIR-tier optimizer
-    // has no `syntheticSymbolFloor` (that config reaches `hir_to_mir` only), so the
-    // only seed available here is "one past the highest symbol this module already
-    // carries" — which is NOT provably clear of the semantic symbol table, and
-    // `mergeCuMirs` maps a MIR symbol to a NAME through `model.recordFor`. A
-    // GLOBAL-bound global whose id aliased a semantic record would enter the merge
-    // as a NAMED strong definition: it could collapse onto a same-named definition
-    // in another CU, or land in `plan.definedNames` and cause a real FFI import to
-    // be stripped and rewired onto this constant — the c86
-    // D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS class. `mergeCuMirs` filters
-    // `SymbolBinding::Local` out of BOTH `definedNames` and the cross-CU resolver,
-    // and `assignSymbol` gives every Local def a FRESH module-private merged id, so
-    // a Local zero-constant is structurally incapable of unifying with anything.
-    // Local is also simply CORRECT for an anonymous constant nothing outside this
-    // module can name.
+    // ★★ THE SYMBOL COMES THROUGH THE MODULE'S ONE DOOR (`MirBuilder::mintSymbol`,
+    // P69 round 5), so it is past the whole id space the module was made in — the
+    // name table as well as the symbols the module holds. Until then this pass
+    // counted its own seed, "one past the highest function or global", because the
+    // table's end reached `hir_to_mir` alone; that seed is INSIDE the table for
+    // every ordinary unit, and it did not even clear the module's extern imports.
+    // ✔MEASURED 2026-10-08: the zero took id 154 in a unit whose table ends at 159;
+    // where the id it took was a block-scope extern's, a single-unit release
+    // relocatable build was REFUSED (the import "is declared more than once") and
+    // a two-unit release image linked with no diagnostic and died on its first
+    // call (0xC0000005) — `GlobalAddr(165)` named the constant and the import at
+    // once. The comment that stood here argued the LOCAL binding made the seed
+    // safe at the merge; it never spoke for the single-unit route, nor for an id
+    // an import already had.
+    //
+    // `SymbolBinding::Local` is still what an anonymous constant nothing outside
+    // the module can name must be: `mergeCuMirs` keeps a Local definition out of
+    // `definedNames` and of the cross-CU resolver, and gives it a fresh
+    // module-private merged id.
     //
     // `isConst=true` routes it to `.rodata` (`asm.cpp` treats `isConst` as the
     // single section authority) — a zero constant is never written, and read-only
     // is where the row that opened this work said it belongs.
     [[nodiscard]] MirInstId materializeRodataZero(MirBuilder& dst, TypeId ty,
                                                   TypeKind tk) {
-        SymbolId const sym = mintSyntheticSymbol();
+        SymbolId const sym = dst.mintSymbolOrAbort("opt::passes::Mem2Reg");
         MirLiteralValue zero;
         zero.value = 0.0;   // +0.0 — all-zero bits in every IEEE format
         zero.core  = tk;
@@ -517,37 +519,6 @@ private:
         std::array<MirInstId, 1> const ops{addr};
         ++rodataZerosMinted_;
         return dst.addInst(MirOpcode::Load, ops, ty);
-    }
-
-    // A module-fresh SymbolId: one past the highest symbol the SOURCE module
-    // carries (functions + globals), then monotonically increasing for the rest of
-    // this `runMem2Reg` call. Seeded LAZILY so a module that never needs an FPR
-    // zero pays nothing. See `materializeRodataZero` for why the binding — not the
-    // seed — is what makes this safe.
-    [[nodiscard]] SymbolId mintSyntheticSymbol() {
-        if (nextSyntheticSymbol_ == 0) {
-            std::uint32_t maxV = 0;
-            std::size_t const nf = src_.moduleFuncCount();
-            for (std::uint32_t i = 0; i < nf; ++i) {
-                maxV = std::max(maxV, src_.funcSymbol(src_.funcAt(i)).v);
-            }
-            std::size_t const ng = src_.moduleGlobalCount();
-            for (std::uint32_t i = 0; i < ng; ++i) {
-                maxV = std::max(maxV, src_.globalSymbol(src_.globalAt(i)).v);
-            }
-            if (maxV >= std::numeric_limits<std::uint32_t>::max() - 1u) {
-                // The same saturated-edge refusal `mintSyntheticGlobalSymbol` makes:
-                // advancing would wrap onto 0, the invalid sentinel, and alias a
-                // real symbol. Nothing downstream could detect that, so abort.
-                std::fprintf(stderr,
-                    "dss::opt::passes::Mem2Reg fatal: synthetic SymbolId space "
-                    "exhausted (module max symbol v=%u) — cannot mint the "
-                    "anonymous rodata zero constant.\n", maxV);
-                std::abort();
-            }
-            nextSyntheticSymbol_ = maxV + 1u;
-        }
-        return SymbolId{nextSyntheticSymbol_++};
     }
 
     [[nodiscard]] MirInstId resolveToNewId(
@@ -629,9 +600,6 @@ private:
     std::size_t retagsInserted_   = 0;
     std::size_t rodataZerosMinted_ = 0;
     std::uint32_t nextMarker_     = 1;
-    // 0 = "not yet seeded" (a real SymbolId is never 0 — that value is the invalid
-    // sentinel). MODULE-scoped: never cleared by resetPerFunction.
-    std::uint32_t nextSyntheticSymbol_ = 0;
     std::uint64_t lastLivenessNs_ = 0;  // env-gated timing of the Step-4b liveness fixpoint
 
     // ── PASS-scoped dominance substrate (D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION) ──

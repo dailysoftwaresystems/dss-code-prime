@@ -2725,7 +2725,7 @@ struct DSS_EXPORT ObjectFormatData {
     //     D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE — whether a
     //     static link's archive search fetches a member for a weak reference
     //     nothing it linked defines (`ArchiveWeakReferenceSearch` above). Stated
-    //     by the archive-member documents; refused on an image by validate().
+    //     by the archive documents alone; refused on every other by validate().
     std::optional<ArchiveWeakReferenceSearch> archiveWeakReferenceSearch;
 
     // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET:

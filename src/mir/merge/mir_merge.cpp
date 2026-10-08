@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <format>       // ffiImportKey — the length-prefixed import-identity key
 #include <functional>
+#include <limits>       // SymbolAllocator::end — saturate at the last id
 #include <optional>     // the per-CU subset-import filter
 #include <string>
 #include <unordered_map>
@@ -48,6 +49,7 @@ public:
                 "already taken (unified-symbol allocation invariant).\n", v);
             std::abort();
         }
+        handedOut_(v);
         return SymbolId{v};
     }
     // Mint the next free id.
@@ -55,12 +57,29 @@ public:
         while (used_.count(next_)) ++next_;
         std::uint32_t const v = next_++;
         used_.insert(v);
+        handedOut_(v);
         return SymbolId{v};
     }
     [[nodiscard]] bool isFree(std::uint32_t v) const { return used_.count(v) == 0; }
 
+    // One past the highest id this allocator has handed out: the END of the
+    // merged module's id space, which is a NEW space (no unit's name table
+    // describes it — the merged names are the plan's own `symbolNames`, every key
+    // of which was handed out here). `mergeCuMirs` states it to the merged
+    // module's builder, so whatever mints into the merged module afterwards asks
+    // the module and clears every merged id — the ones the module holds, the
+    // imports' (their rows live beside it) and the ones a name alone holds.
+    [[nodiscard]] std::uint32_t end() const noexcept { return end_; }
+
 private:
+    void handedOut_(std::uint32_t v) noexcept {
+        constexpr std::uint32_t kLast = std::numeric_limits<std::uint32_t>::max();
+        std::uint32_t const past = v == kLast ? kLast : v + 1u;
+        if (past > end_) end_ = past;
+    }
+
     std::uint32_t                     next_;
+    std::uint32_t                     end_ = 1;
     std::unordered_set<std::uint32_t> used_;
 };
 
@@ -1337,6 +1356,10 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         }
     }
 
+    // The merged module's id space ends where the allocator stopped. Stated HERE,
+    // after the last allocation, so the module carries it (`Mir::symbolIdEnd`)
+    // and the passes that synthesize into the merged module ask the module.
+    builder.stateSymbolIdEnd(alloc.end());
     Mir merged = std::move(builder).finish();
 
     // Canonical-marker stamping (D-OPT4-1): clones copy markers verbatim

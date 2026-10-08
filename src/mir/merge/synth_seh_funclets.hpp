@@ -117,10 +117,11 @@ struct DSS_EXPORT MirSehScope {
 // was undecorated, which is correct on pe and would be wrong the instant a
 // decorating format declared a personality.
 //
-// `nameTableEnd` is one past the highest id the CALLER's name table holds
-// (mir/merge/synth_symbol_floor.hpp): every funclet and the personality import are
-// minted above it as well as above every id the module holds, so none carries a name the
-// table gives to something else. Required — tests/mir/test_synth_symbol_floor.cpp pins it.
+// Every funclet's symbol and the personality import's are minted by the MODULE
+// (`Mir::symbolIdEnd`, `MirBuilder::mintSymbolOrAbort` — see
+// mir/merge/synth_symbol_floor.hpp): past every id the module holds and every id the name
+// table it was made from holds, so none carries a name the table gives to something else.
+// No caller hands this pass an end; tests/mir/test_synth_symbol_floor.cpp pins the ids.
 [[nodiscard]] DSS_EXPORT bool
 synthesizeSehFunclets(Mir&                                  mir,
                       TypeInterner&                         interner,
@@ -129,7 +130,6 @@ synthesizeSehFunclets(Mir&                                  mir,
                       CSymbolDecorationScheme               scheme,
                       std::string_view                      formatName,
                       std::vector<MirSehScope>&             outScopes,
-                      std::uint32_t                         nameTableEnd,
                       DiagnosticReporter&                   reporter);
 
 } // namespace dss

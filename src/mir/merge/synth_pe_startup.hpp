@@ -163,11 +163,11 @@ class DiagnosticReporter;
 // fields are unusable. NO resolved entry (a library TU with no `main`) is a clean
 // no-op: there is nothing to materialize into.
 //
-// `nameTableEnd` is one past the highest id the CALLER's name table holds
-// (mir/merge/synth_symbol_floor.hpp): the init and its imports are minted above it as
-// well as above every id the module holds, so the init — a GLOBAL definition — is never
-// published under a name the table gives to something else. Required —
-// tests/mir/test_synth_symbol_floor.cpp pins it.
+// The init's symbol and its imports' are minted by the MODULE (`Mir::symbolIdEnd`,
+// `MirBuilder::mintSymbolOrAbort` — see mir/merge/synth_symbol_floor.hpp): past every id
+// the module holds and every id the name table it was made from holds, so the init — a
+// GLOBAL definition — is never published under a name the table gives to something else.
+// No caller hands this pass an end; tests/mir/test_synth_symbol_floor.cpp pins the ids.
 [[nodiscard]] DSS_EXPORT bool
 realizeEntryShape(Mir&                              mir,
                   TypeInterner&                     interner,
@@ -177,7 +177,6 @@ realizeEntryShape(Mir&                              mir,
                   std::optional<ProcessArgs> const& processArgs,
                   CSymbolDecorationScheme           scheme,
                   std::string_view                  formatName,
-                  std::uint32_t                     nameTableEnd,
                   DiagnosticReporter&               reporter);
 
 } // namespace dss

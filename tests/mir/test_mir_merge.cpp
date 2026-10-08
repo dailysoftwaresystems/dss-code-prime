@@ -41,7 +41,6 @@
 #include "link/object_format_schema.hpp"        // the shipped runtimeLibraries table
 #include "mir/merge/synth_pe_startup.hpp"       // realizeEntryShape (UCRT-P4)
 #include "mir/merge/synth_seh_funclets.hpp"     // synthesizeSehFunclets (c116)
-#include "mir/merge/synth_symbol_floor.hpp"     // kNoNameTable, nameTableEndOf (P69 round 4)
 #include "mir/merge/synth_threads_shim.hpp"      // synthesizeThreadsShim (FC17.9a)
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
@@ -2099,7 +2098,7 @@ TEST(RealizeEntryShape, ArgcArgvVerbOnAZeroParamEntryHitsTheArityBackstop) {
         mir, in, entry, ext,
         verbRealizedBy(peEntryVerbs(), EntryMaterialization::ArgcArgv),
         ucrtAccessorPa(), CSymbolDecorationScheme::None,
-        "pe64-x86_64-windows-exec", kNoNameTable, rep));
+        "pe64-x86_64-windows-exec", rep));
     EXPECT_EQ(test_support::countCode(
                   rep, DiagnosticCode::K_EntryVerbUnmaterializable), 1u)
         << allDiagText(rep);
@@ -2201,7 +2200,7 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
         DiagnosticReporter        rep;
         ok = realizeEntryShape(mir, in, entry, ext, verb, ucrtAccessorPa(),
                                CSymbolDecorationScheme::None,
-                               "pe64-x86_64-windows-exec", kNoNameTable, rep);
+                               "pe64-x86_64-windows-exec", rep);
         diagText = allDiagText(rep);
         std::vector<std::string> names;
         for (auto const& e : ext) names.push_back(e.mangledName);
@@ -2364,7 +2363,7 @@ TEST(RealizeEntryShape, CrtEnvironmentFollowsMsvcsOwnStartupOrder) {
         ASSERT_TRUE(realizeEntryShape(mir, in, entry, ext,
                                       verbRealizedBy(peEntryVerbs(), c.verb),
                                       ucrtAccessorPa(), CSymbolDecorationScheme::None,
-                                      "pe64-x86_64-windows-exec", kNoNameTable, rep))
+                                      "pe64-x86_64-windows-exec", rep))
             << allDiagText(rep);
         EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
 
@@ -2423,7 +2422,7 @@ TEST(RealizeEntryShape, StackEnvironmentIsArgvPlusArgcPlusOneSlots) {
     ASSERT_TRUE(realizeEntryShape(
         mir, in, entry, ext,
         verbRealizedBy(elfVerbs, EntryMaterialization::ArgcArgvEnvp), stackVectorPa(),
-        CSymbolDecorationScheme::None, "elf64-x86_64-linux-exec", kNoNameTable, rep))
+        CSymbolDecorationScheme::None, "elf64-x86_64-linux-exec", rep))
         << allDiagText(rep);
     EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
     EXPECT_TRUE(ext.empty()) << "the entry stack needs no import";
@@ -2527,7 +2526,7 @@ TEST(RealizeEntryShape, ALoaderDeliveredFormPassesThroughUntouched) {
         ASSERT_TRUE(realizeEntryShape(mir, in, entry, ext,
                                       verbRealizedBy(machoVerbs, verb), std::nullopt,
                                       CSymbolDecorationScheme::LeadingUnderscore,
-                                      "macho64-arm64-darwin-exec", kNoNameTable, rep))
+                                      "macho64-arm64-darwin-exec", rep))
             << allDiagText(rep);
         EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
         EXPECT_EQ(mir.moduleFuncCount(), 1u) << "dyld already delivered them";
@@ -2581,7 +2580,7 @@ TEST(RealizeEntryShape, AMechanismThatCannotRealizeTheVerbIsRefused) {
         DiagnosticReporter        rep;
         EXPECT_FALSE(realizeEntryShape(mir, in, entry, ext, c.verb, c.pa,
                                        CSymbolDecorationScheme::None,
-                                       "<hand-built>", kNoNameTable, rep));
+                                       "<hand-built>", rep));
         EXPECT_EQ(test_support::countCode(
                       rep, DiagnosticCode::K_NoMatchingObjectFormat), 1u)
             << allDiagText(rep);
@@ -2607,7 +2606,7 @@ TEST(RealizeEntryShape, AnEnvironmentVerbOnATwoParameterEntryHitsTheArityBacksto
         mir, in, entry, ext,
         verbRealizedBy(peEntryVerbs(), EntryMaterialization::ArgcArgvEnvp),
         ucrtAccessorPa(), CSymbolDecorationScheme::None,
-        "pe64-x86_64-windows-exec", kNoNameTable, rep));
+        "pe64-x86_64-windows-exec", rep));
     EXPECT_EQ(test_support::countCode(
                   rep, DiagnosticCode::K_EntryVerbUnmaterializable), 1u)
         << allDiagText(rep);
@@ -2631,7 +2630,7 @@ TEST(RealizeEntryShape, NarrowMainBindsUcrtNarrowAccessors) {
         mir, in, entry, ext,
         verbRealizedBy(peEntryVerbs(), EntryMaterialization::ArgcArgv),
         ucrtAccessorPa(), CSymbolDecorationScheme::None,
-        "pe64-x86_64-windows-exec", kNoNameTable, rep))
+        "pe64-x86_64-windows-exec", rep))
         << allDiagText(rep);
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -2698,7 +2697,7 @@ TEST(RealizeEntryShape, WideWmainBindsUcrtWideAccessors) {
         mir, in, entry, ext,
         verbRealizedBy(peEntryVerbs(), EntryMaterialization::ArgcWargv),
         ucrtAccessorPa(), CSymbolDecorationScheme::None,
-        "pe64-x86_64-windows-exec", kNoNameTable, rep))
+        "pe64-x86_64-windows-exec", rep))
         << allDiagText(rep);
     std::unordered_map<std::string, ExternImport const*> byName;
     for (auto const& e : ext) byName.emplace(e.mangledName, &e);
@@ -2737,7 +2736,7 @@ TEST(RealizeEntryShape, VoidMainNeedsNoSynth) {
         mir, in, entry, ext,
         verbRealizedBy(peEntryVerbs(), EntryMaterialization::None),
         ucrtAccessorPa(), CSymbolDecorationScheme::None,
-        "pe64-x86_64-windows-exec", kNoNameTable, rep))
+        "pe64-x86_64-windows-exec", rep))
         << allDiagText(rep);
     EXPECT_EQ(rep.errorCount(), 0u)
         << "a no-op must be SILENT, not merely non-fatal: " << allDiagText(rep);
@@ -2770,7 +2769,7 @@ TEST(RealizeEntryShape, StackVectorMechanismIsANoOp) {
     ASSERT_TRUE(realizeEntryShape(
         mir, in, entry, ext,
         verbRealizedBy(elfVerbs, EntryMaterialization::ArgcArgv), pa,
-        CSymbolDecorationScheme::None, "elf64-x86_64-linux-exec", kNoNameTable, rep))
+        CSymbolDecorationScheme::None, "elf64-x86_64-linux-exec", rep))
         << allDiagText(rep);
     EXPECT_EQ(mir.moduleFuncCount(), 1u)
         << "the stack-vector mechanism materializes in the entry trampoline";
@@ -2811,7 +2810,7 @@ TEST(RealizeEntryShape, NoMechanismIsANoOp) {
     ASSERT_TRUE(realizeEntryShape(
         mir, in, entry, ext,
         verbRealizedBy(machoVerbs, EntryMaterialization::ArgcArgv), std::nullopt,
-        CSymbolDecorationScheme::LeadingUnderscore, "macho64-arm64-darwin-exec", kNoNameTable, rep))
+        CSymbolDecorationScheme::LeadingUnderscore, "macho64-arm64-darwin-exec", rep))
         << allDiagText(rep);
     EXPECT_EQ(rep.errorCount(), 0u)
         << "\"no mechanism\" is an ANSWER, so this must be SILENT rather than merely "
@@ -2846,7 +2845,7 @@ TEST(RealizeEntryShape, CrtImportNamesAreCMangledForTheFormat) {
     ASSERT_TRUE(realizeEntryShape(mir, in, entry, ext,
                                   EntryMaterialization::ArgcArgv, ucrtAccessorPa(),
                                   CSymbolDecorationScheme::LeadingUnderscore,
-                                  "<hypothetical-decorating-format>", kNoNameTable, rep))
+                                  "<hypothetical-decorating-format>", rep))
         << allDiagText(rep);
     std::unordered_map<std::string, ExternImport const*> byName;
     for (auto const& e : ext) byName.emplace(e.mangledName, &e);
@@ -2926,7 +2925,7 @@ TEST(SynthSehFunclets, ExtractsFilterFuncletAndStubsParent) {
     DiagnosticReporter        rep;
     ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
                                       CSymbolDecorationScheme::None,
-                                      "pe64-x86_64-windows-exec", scopes, kNoNameTable, rep));
+                                      "pe64-x86_64-windows-exec", scopes, rep));
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -3063,7 +3062,7 @@ TEST(SynthSehFunclets, LabelAddressInAFilterExpressionIsRefusedNotCloned) {
     DiagnosticReporter        rep;
     EXPECT_FALSE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
                                        CSymbolDecorationScheme::None,
-                                       "pe64-x86_64-windows-exec", scopes, kNoNameTable, rep))
+                                       "pe64-x86_64-windows-exec", scopes, rep))
         << "a parent block address cannot be carried into a funclet";
     EXPECT_GT(rep.errorCount(), 0u) << "and the refusal must be REPORTED, not silent";
     bool named = false;
@@ -3084,7 +3083,7 @@ TEST(SynthSehFunclets, NoSehIsANoOp) {
     DiagnosticReporter        rep;
     ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
                                       CSymbolDecorationScheme::None,
-                                      "pe64-x86_64-windows-exec", scopes, kNoNameTable, rep));
+                                      "pe64-x86_64-windows-exec", scopes, rep));
     EXPECT_EQ(mir.moduleFuncCount(), 1u) << "no __try → no funclet appended";
     EXPECT_TRUE(ext.empty())             << "no __try → no personality import";
     EXPECT_TRUE(scopes.empty())          << "no __try → no scope records";
@@ -3112,7 +3111,7 @@ TEST(SynthSehFunclets, NoDeclaredPersonalityRefusesOnlyWhenARegionResolves) {
         DiagnosticReporter        rep;
         EXPECT_FALSE(synthesizeSehFunclets(mir, in, ext, std::nullopt,
                                            CSymbolDecorationScheme::None,
-                                           "elf64-x86_64-linux-exec", scopes, kNoNameTable, rep))
+                                           "elf64-x86_64-linux-exec", scopes, rep))
             << "a resolved SEH region under a format declaring NO sehPersonality "
                "must FAIL LOUD — the pre-UCRT-P4 pass silently planted an "
                "`msvcrt.dll` import, which on an ELF image is an undefined symbol "
@@ -3137,7 +3136,7 @@ TEST(SynthSehFunclets, NoDeclaredPersonalityRefusesOnlyWhenARegionResolves) {
         DiagnosticReporter        rep;
         ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, std::nullopt,
                                           CSymbolDecorationScheme::None,
-                                          "elf64-x86_64-linux-exec", scopes, kNoNameTable, rep))
+                                          "elf64-x86_64-linux-exec", scopes, rep))
             << allDiagText(rep);
         EXPECT_FALSE(rep.hasErrors())
             << "a format that declares no personality must stay usable for every "
@@ -3216,7 +3215,7 @@ TEST(SynthSehFunclets, MultiBlockGuardedBodyIsContiguousAndBounded) {
     DiagnosticReporter        rep;
     ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
                                       CSymbolDecorationScheme::None,
-                                      "pe64-x86_64-windows-exec", scopes, kNoNameTable, rep));
+                                      "pe64-x86_64-windows-exec", scopes, rep));
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     EXPECT_EQ(rep.errorCount(), 0u);
     ASSERT_EQ(scopes.size(), 1u);
@@ -3396,7 +3395,7 @@ TEST(SynthSehFunclets, RelayoutLeavesStructCfMarkersCanonical) {
     DiagnosticReporter        rep;
     ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
                                       CSymbolDecorationScheme::None,
-                                      "pe64-x86_64-windows-exec", scopes, kNoNameTable, rep));
+                                      "pe64-x86_64-windows-exec", scopes, rep));
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_EQ(scopes.size(), 1u);
     ASSERT_EQ(mir.moduleFuncCount(), 2u) << "parent + the appended filter funclet";
@@ -3533,7 +3532,7 @@ TEST(SynthSehFunclets, FilterReadingParentLocalEmitsRecoverParentFrameSlot) {
     DiagnosticReporter        rep;
     ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
                                       CSymbolDecorationScheme::None,
-                                      "pe64-x86_64-windows-exec", scopes, kNoNameTable, rep));
+                                      "pe64-x86_64-windows-exec", scopes, rep));
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     EXPECT_EQ(rep.errorCount(), 0u);
     ASSERT_EQ(scopes.size(), 1u);
@@ -3597,7 +3596,7 @@ TEST(SynthThreadsShim, SynthesizesDefinitionAndHelperImportNotTheShimName) {
     DiagnosticReporter rep;
     LibrarySynthesis const win32{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"};
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, win32, CSymbolDecorationScheme::None,
-                                      externs, kNoNameTable, rep));
+                                      externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     // M4(a): SymbolId{10} (mtx_lock) is now a DEFINED module function.
@@ -3645,7 +3644,7 @@ TEST(SynthThreadsShim, EmptyRecipeMapIsNoOp) {
     // nullopt vehicle: the empty-map gate MUST short-circuit BEFORE the vehicle check, so
     // an empty map is a clean no-op even with no declared vehicle (elf's steady state).
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, std::nullopt, CSymbolDecorationScheme::None,
-                                      externs, kNoNameTable, rep));
+                                      externs, rep));
     EXPECT_FALSE(rep.hasErrors());
     EXPECT_EQ(mir.moduleFuncCount(), 1u) << "no shim appended for an empty map";
     EXPECT_TRUE(externs.empty()) << "no import planted for an empty map";
@@ -3680,7 +3679,7 @@ TEST(SynthThreadsShim, ThrdCreateDirectPassesStartRoutineNoTrampoline) {
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
                                       LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"},
-                                      CSymbolDecorationScheme::None, externs, kNoNameTable, rep));
+                                      CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     // DIRECT-PASS adds ONLY thrd_create (main + thrd_create) — no trampoline function.
@@ -3823,7 +3822,7 @@ TEST(SynthThreadsShim, ThrdExitConvertsExplicitlyToEachVehiclesExitParameterType
         DiagnosticReporter rep;
         ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
                                           LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"},
-                                          CSymbolDecorationScheme::None, externs, kNoNameTable, rep));
+                                          CSymbolDecorationScheme::None, externs, rep));
         EXPECT_FALSE(rep.hasErrors());
 
         MirInstId const code = exitArgOperandOf(mir, externs, "ExitThread");
@@ -3869,7 +3868,7 @@ TEST(SynthThreadsShim, ThrdExitConvertsExplicitlyToEachVehiclesExitParameterType
         DiagnosticReporter rep;
         ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
                                           LibrarySynthesis{LibrarySynthVehicle::Pthread, RuntimeLibraryRole::CLibrary, "/usr/lib/libSystem.B.dylib"},
-                                          CSymbolDecorationScheme::LeadingUnderscore, externs, kNoNameTable, rep));
+                                          CSymbolDecorationScheme::LeadingUnderscore, externs, rep));
         EXPECT_FALSE(rep.hasErrors());
 
         // LeadingUnderscore mangling — libSystem exports `_pthread_exit`.
@@ -3938,7 +3937,7 @@ TEST(SynthThreadsShim, OnlyReferencedRecipesAreSynthesized) {
     ASSERT_TRUE(synthesizeThreadsShim(
         mir, in, recipes,
         LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"},
-        CSymbolDecorationScheme::None, externs, kNoNameTable, rep));
+        CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     std::unordered_map<std::uint32_t, bool> defined;
@@ -3986,7 +3985,7 @@ TEST(SynthThreadsShim, UnreferencedRecipesNeedNoVehicle) {
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, std::nullopt,
-                                      CSymbolDecorationScheme::LeadingUnderscore, externs, kNoNameTable, rep));
+                                      CSymbolDecorationScheme::LeadingUnderscore, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
     EXPECT_EQ(mir.moduleFuncCount(), 1u) << "no recipe is referenced, so no body is synthesized";
     EXPECT_TRUE(externs.empty()) << "and no helper is imported";
@@ -4035,7 +4034,7 @@ TEST(SynthThreadsShim, RetiredCallOnceRecipeIsRefusedOnBothVehicles) {
         std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "call_once"}};
         std::vector<ExternImport> externs;
         DiagnosticReporter rep;
-        EXPECT_FALSE(synthesizeThreadsShim(mir, in, recipes, v.synthesis, v.scheme, externs, kNoNameTable, rep))
+        EXPECT_FALSE(synthesizeThreadsShim(mir, in, recipes, v.synthesis, v.scheme, externs, rep))
             << "call_once is no recipe since P69 — the pass must refuse it, not synthesize it";
         EXPECT_TRUE(rep.hasErrors());
         for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i)
@@ -4076,7 +4075,7 @@ TEST(SynthThreadsShim, ThrdJoinIsMultiBlockAndVerifies) {
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
                                       LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"},
-                                      CSymbolDecorationScheme::None, externs, kNoNameTable, rep));
+                                      CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     MirFuncId joinFn{};
@@ -4174,8 +4173,7 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
     std::vector<ExternImport> externs = merged->externImports;
     LibrarySynthesis const win32{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"};
     ASSERT_TRUE(synthesizeThreadsShim(merged->mir, merged->host.interner(),
-                                      mergedRecipes, win32, CSymbolDecorationScheme::None, externs,
-                                      nameTableEndOf(merged->symbolNames), rep));
+                                      mergedRecipes, win32, CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     bool defined = false;
@@ -4185,6 +4183,101 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
 
     MirVerifier verifier{merged->mir, &merged->host.interner()};
     EXPECT_TRUE(verifier.verify(rep)) << "the merged + shim-synthesized module must verify";
+}
+
+// ── The merged module carries the END of the merge's whole allocation (P69 round 5,
+// D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE) ──
+// The merged id space is a NEW one, and not every id in it is a symbol the merged module
+// holds: a library-shim symbol is REFERENCED-ONLY until the pass after the merge defines
+// it — step 3c gives it a merged id and a NAME (`symbolNames`) and nothing else. Every
+// pass that then mints a symbol for the merged module (the entry init, a funclet, a helper
+// import) asks the MODULE (`MirBuilder::mintSymbol`), so `mergeCuMirs` states its
+// allocator's end to the module it builds. Counted from the merged module's definitions
+// instead, the next id here is the shim's own: the entry init — a GLOBAL definition, and
+// the first symbol minted after the merge — would be published as `mtx_lock`.
+// The shim is numbered ABOVE every definition on purpose (SymbolId{200}; CU0 keeps its
+// values), as a shipped header's declaration is in a unit that declares it after its own
+// functions. RED-on-disable: state anything but `alloc.end()` in `mergeCuMirs`.
+TEST(MirMerge, TheMergedModuleCarriesTheEndOfTheMergesAllocation) {
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32_0 = in0.primitive(TypeKind::I32);
+    TypeId const pV0   = in0.pointer(in0.primitive(TypeKind::Void));
+    TypeId const mainSig = in0.fnSig({}, i32_0, CallConv::CcMS64);
+    std::array<TypeId, 1> const lockParams{pV0};
+    TypeId const lockSig = in0.fnSig(lockParams, i32_0, CallConv::CcSysV);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        mb.addFunction(mainSig, SymbolId{100});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        MirInstId const slot     = mb.addInst(MirOpcode::Alloca, {}, pV0, 40);
+        MirInstId const lockAddr = mb.addGlobalAddr(SymbolId{200}, in0.pointer(lockSig));
+        MirInstId const callOps[] = {lockAddr, slot};
+        mb.addInst(MirOpcode::Call, callOps, i32_0);
+        mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+        mir0 = std::move(mb).finish();
+    }
+    std::unordered_map<std::uint32_t, std::string> const recipes0{{200u, "mtx_lock"}};
+
+    TypeInterner in1{CompilationUnitId{2}};
+    TypeId const i32_1 = in1.primitive(TypeKind::I32);
+    TypeId const sig1  = in1.fnSig({}, i32_1, CallConv::CcSysV);
+    Mir mir1;
+    {
+        MirBuilder mb;
+        mb.addFunction(sig1, SymbolId{50});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(7), i32_1));
+        mir1 = std::move(mb).finish();
+    }
+
+    MergeCuInput cu0{&mir0, &in0, namerOf({{100, "main"}, {200, "mtx_lock"}}), {}};
+    cu0.synthRecipes = &recipes0;
+    MergeCuInput cu1{&mir1, &in1, namerOf({{50, "helper"}}), {}};
+    std::vector<MergeCuInput> cus{cu0, cu1};
+
+    std::vector<std::string> const entries{"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    Mir const& mm = merged->mir;
+    std::uint32_t highestDefined = 0;
+    for (std::uint32_t i = 0; i < mm.moduleFuncCount(); ++i) {
+        std::uint32_t const v = mm.funcSymbol(mm.funcAt(i)).v;
+        if (v > highestDefined) highestDefined = v;
+    }
+    for (std::uint32_t i = 0; i < mm.moduleGlobalCount(); ++i) {
+        std::uint32_t const v = mm.globalSymbol(mm.globalAt(i)).v;
+        if (v > highestDefined) highestDefined = v;
+    }
+    std::optional<std::uint32_t> shimV;
+    for (auto const& [v, name] : merged->symbolNames) {
+        EXPECT_LT(v, mm.symbolIdEnd())
+            << "'" << name << "' (merged id " << v << ") is outside the merged module's id "
+               "space (its end is " << mm.symbolIdEnd() << ")";
+        if (name == "mtx_lock") shimV = v;
+    }
+    ASSERT_TRUE(shimV.has_value()) << "step 3c must name the referenced-only shim's merged id";
+    ASSERT_GT(*shimV, highestDefined)
+        << "CONTROL: the fixture must leave a NAMED id above every definition of the merged "
+           "module — otherwise a count from the definitions clears it by accident and this "
+           "test observes nothing";
+
+    // What every synthesis pass after the merge does: continue the merged module's ids,
+    // then mint. The id is none the merge named.
+    MirBuilder rebuilt;
+    rebuilt.continueSymbolIdsOf(mm);
+    SymbolId const fresh = rebuilt.mintSymbol();
+    EXPECT_GT(fresh.v, *shimV) << "the first id minted for the merged module";
+    auto const named = merged->symbolNames.find(fresh.v);
+    EXPECT_TRUE(named == merged->symbolNames.end())
+        << "the first id minted for the merged module is " << fresh.v
+        << ", which the merge named '" << (named == merged->symbolNames.end() ? "" : named->second)
+        << "'";
 }
 
 // ── D-CSUBSET-C11-THREADS-MACHO: the `pthread` vehicle (Darwin libSystem) ──────────────
@@ -4217,7 +4310,7 @@ TEST(SynthThreadsShim, PthreadVehicleSynthesizesDefinitionAndPthreadHelperImport
     DiagnosticReporter rep;
     LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, RuntimeLibraryRole::CLibrary, "/usr/lib/libSystem.B.dylib"};
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthread, CSymbolDecorationScheme::LeadingUnderscore,
-                                      externs, kNoNameTable, rep));
+                                      externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     bool foundLockDef = false;
@@ -4272,7 +4365,7 @@ TEST(SynthThreadsShim, MissingLibrarySynthesisWithReferencedRecipeFailsLoud) {
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
     EXPECT_FALSE(synthesizeThreadsShim(mir, in, recipes, std::nullopt, CSymbolDecorationScheme::LeadingUnderscore,
-                                       externs, kNoNameTable, rep))
+                                       externs, rep))
         << "a referenced recipe + no vehicle MUST fail loud, never assume a primitive family";
     EXPECT_TRUE(rep.hasErrors());
 }
@@ -4325,7 +4418,7 @@ TEST(SynthThreadsShim, PthreadEveryRecipeEmitsAndVerifies) {
         DiagnosticReporter rep;
         LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, RuntimeLibraryRole::CLibrary, "/usr/lib/libSystem.B.dylib"};
         ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthread, CSymbolDecorationScheme::LeadingUnderscore,
-                                          externs, kNoNameTable, rep))
+                                          externs, rep))
             << "recipe '" << c.recipe << "' must synthesize";
         EXPECT_FALSE(rep.hasErrors()) << c.recipe;
 
@@ -4412,7 +4505,7 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
     LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, RuntimeLibraryRole::CLibrary, "/usr/lib/libSystem.B.dylib"};
     ASSERT_TRUE(synthesizeThreadsShim(merged->mir, merged->host.interner(),
                                       mergedRecipes, pthread, CSymbolDecorationScheme::LeadingUnderscore,
-                                      externs, nameTableEndOf(merged->symbolNames), rep));
+                                      externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     bool importedPthreadLock = false;

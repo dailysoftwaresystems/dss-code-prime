@@ -5,7 +5,7 @@
 #include "core/types/type_lattice/core_type.hpp"       // TypeKind, CallConv
 #include "core/types/type_lattice/type_interner.hpp"
 #include "ffi/mangling/c_mangle.hpp"   // applyCMangling (per-format CRT import names)
-#include "mir/merge/synth_symbol_floor.hpp"  // highestTakenSymbolIdV (the module's + the name table's ids)
+#include "mir/merge/synth_symbol_floor.hpp"  // continueSymbolIdsPastImports (the rebuild continues the module's ids)
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"   // rederiveStructCfMarkers (multi-block synth body)
@@ -59,16 +59,17 @@ void emitErr(DiagnosticReporter& rep, DiagnosticCode code, std::string msg) {
     rep.report(std::move(d));
 }
 
-// ⓘ THE MINT FLOOR IS `highestTakenSymbolIdV` (mir/merge/synth_symbol_floor.hpp), shared
-// with the SEH-funclet and threads-shim passes. Its module scan keeps this pass's old
-// reason for scanning GLOBALS — synthetic string-literal globals are minted ABOVE every
-// function/extern id (`syntheticSymbolFloor`), so a scan without them would let the init
-// duplicate a real global's id, and the linker would silently mis-bind the entry onto
-// that DATA symbol — an entry that "runs" a string literal. And it adds the caller's NAME
-// TABLE, which the old private scan could not see: the init is a GLOBAL definition the
-// lower half publishes under whatever name the table gives its id — ✔MEASURED P69 round 4,
-// an x86_64 Linux image of `int main(int argc, char **argv, char **envp)` carried this
-// init as `T __func__`.
+// ⓘ THE INIT'S SYMBOL AND ITS IMPORTS' COME FROM THE MODULE (`MirBuilder::mintSymbolOrAbort`,
+// the one door — see mir/merge/synth_symbol_floor.hpp), as the SEH-funclet and
+// threads-shim passes' do. The module's end is past every id it holds — its GLOBALS
+// matter: synthetic string-literal globals are minted ABOVE every function/extern id, so
+// an id that cleared only those would let the init duplicate a real global's, and the
+// linker would silently mis-bind the entry onto that DATA symbol, an entry that "runs" a
+// string literal — and past every id the NAME TABLE the module was made from holds, which
+// a scan of the module cannot see: the init is a GLOBAL definition the lower half
+// publishes under whatever name the table gives its id — ✔MEASURED P69 round 4, an x86_64
+// Linux image of `int main(int argc, char **argv, char **envp)` carried this init as
+// `T __func__`.
 
 // ⓘ THE SIGNATURE CLASSIFIER AND THE DECLARED-SET RENDERER USED TO LIVE HERE
 // AND ARE DELIBERATELY GONE. This pass classified the resolved entry's MIR
@@ -119,7 +120,6 @@ bool realizeEntryShape(Mir&                              mir,
                        std::optional<ProcessArgs> const& processArgs,
                        CSymbolDecorationScheme           scheme,
                        std::string_view                  formatName,
-                       std::uint32_t                     nameTableEnd,
                        DiagnosticReporter&               reporter) {
     // No resolved entry (a library TU with no `main`) — nothing to gate and
     // nothing to materialize.
@@ -321,10 +321,12 @@ bool realizeEntryShape(Mir&                              mir,
 
     // Rebuild the module (Mir is frozen): clone every existing function verbatim,
     // then APPEND the synth function, then clone globals — the prune_unreachable
-    // rebuild idiom. The mint floor is read BEFORE any import is appended.
-    std::uint32_t const maxV = highestTakenSymbolIdV(mir, externImports, nameTableEnd);
-    SymbolId const synthSym{maxV + 1};
+    // rebuild idiom. The rebuilt module continues the source's symbol ids, and the
+    // new symbols are minted from it.
+    constexpr char const* kMinter = "realizeEntryShape";
     MirBuilder builder;
+    continueSymbolIdsPastImports(builder, mir, externImports);
+    SymbolId const synthSym = builder.mintSymbolOrAbort(kMinter);
     IdentityClonePolicy policy;
     for (std::uint32_t i = 0; i < nf; ++i) {
         opt::passes::MirFunctionRebuilder rb{mir, builder, policy};
@@ -408,12 +410,15 @@ bool realizeEntryShape(Mir&                              mir,
         std::string const argvAccessorName =
             wide ? pa.wideArgvAccessorFn : pa.narrowArgvAccessorFn;
 
-        // Mint the CRT import symbols above the synth function.
-        SymbolId const cfgSym{maxV + 2};
-        SymbolId const argcAccSym{maxV + 3};
-        SymbolId const argvAccSym{maxV + 4};
-        SymbolId const envInitSym{maxV + 5};   // used iff passesEnvironment
-        SymbolId const envAccSym{maxV + 6};    // used iff passesEnvironment
+        // Mint the CRT import symbols after the synth function's — the
+        // environment pair only when the entry takes one.
+        SymbolId const cfgSym     = builder.mintSymbolOrAbort(kMinter);
+        SymbolId const argcAccSym = builder.mintSymbolOrAbort(kMinter);
+        SymbolId const argvAccSym = builder.mintSymbolOrAbort(kMinter);
+        SymbolId const envInitSym =
+            passesEnvironment ? builder.mintSymbolOrAbort(kMinter) : SymbolId{};
+        SymbolId const envAccSym =
+            passesEnvironment ? builder.mintSymbolOrAbort(kMinter) : SymbolId{};
 
         // Register the CRT imports (all FUNCTION imports, not data). Their library
         // is the ROLE-resolved image — see `RuntimeLibraryRole`; nothing here spells

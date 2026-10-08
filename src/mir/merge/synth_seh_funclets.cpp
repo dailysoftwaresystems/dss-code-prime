@@ -5,7 +5,7 @@
 #include "core/types/type_lattice/core_type.hpp"       // TypeKind, CallConv
 #include "core/types/type_lattice/type_interner.hpp"
 #include "ffi/mangling/c_mangle.hpp"   // applyCMangling (per-format personality name)
-#include "mir/merge/synth_symbol_floor.hpp"  // highestTakenSymbolIdV (the module's + the name table's ids)
+#include "mir/merge/synth_symbol_floor.hpp"  // continueSymbolIdsPastImports (the rebuild continues the module's ids)
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"  // rederiveStructCfMarkers (the relayout's duty)
@@ -42,11 +42,11 @@ void emitErr(DiagnosticReporter& rep, std::string msg) {
     rep.report(std::move(d));
 }
 
-// ⓘ THE MINT FLOOR for the funclet and personality symbols is `highestTakenSymbolIdV`
-// (mir/merge/synth_symbol_floor.hpp), shared with the entry-shape and threads-shim passes:
-// every id the module holds (its globals load-bearing — synthetic string-literal globals
-// hold the highest ids) AND every id the caller's name table holds, which names whatever
-// symbol a funclet's id lands on.
+// ⓘ THE FUNCLET AND PERSONALITY SYMBOLS COME FROM THE MODULE (`MirBuilder::mintSymbolOrAbort`,
+// the one door — see mir/merge/synth_symbol_floor.hpp), as the entry-shape and
+// threads-shim passes' do: past every id the module holds (its globals load-bearing —
+// synthetic string-literal globals hold the highest ids) AND every id the name table the
+// module was made from holds, which names whatever symbol a funclet's id lands on.
 
 // One collected `__try` region, resolved to concrete blocks + the minted funclet
 // symbol. `filterBB` is the single block ending in SehFilterReturn (c115 lowers the
@@ -485,7 +485,6 @@ bool synthesizeSehFunclets(Mir&                                  mir,
                            CSymbolDecorationScheme               scheme,
                            std::string_view                      formatName,
                            std::vector<MirSehScope>&             outScopes,
-                           std::uint32_t                         nameTableEnd,
                            DiagnosticReporter&                   reporter) {
     // (0) Fast presence scan — no SehTryBegin anywhere ⇒ clean no-op.
     bool anySeh = false;
@@ -505,10 +504,14 @@ bool synthesizeSehFunclets(Mir&                                  mir,
     if (!anySeh) return true;
 
     // (1) Collect every region + mint funclet symbols. One personality import is
-    //     shared across all regions.
-    std::uint32_t maxV = highestTakenSymbolIdV(mir, externImports, nameTableEnd);
-    SymbolId const personalitySym{maxV + 1};
-    std::uint32_t nextSymV = maxV + 1;
+    //     shared across all regions. The symbols are minted from the module the
+    //     rebuild in (2) fills, so its builder opens here: it continues the
+    //     source's symbol ids. (A return before (2) drops the builder and the ids
+    //     it minted with it; `mir` is untouched.)
+    constexpr char const* kMinter = "synthesizeSehFunclets";
+    MirBuilder builder;
+    continueSymbolIdsPastImports(builder, mir, externImports);
+    SymbolId const personalitySym = builder.mintSymbolOrAbort(kMinter);
 
     std::vector<Region> regions;
     for (std::uint32_t fi = 0; fi < nf0; ++fi) {
@@ -584,7 +587,7 @@ bool synthesizeSehFunclets(Mir&                                  mir,
             // run). `beginBlock` = tryBB (bodyBlocks[0] by construction — the entry).
             r.endBB = r.bodyBlocks.back();
 
-            r.funcletSym = SymbolId{++nextSymV};
+            r.funcletSym = builder.mintSymbolOrAbort(kMinter);
             regions.push_back(r);
         }
     }
@@ -677,7 +680,7 @@ bool synthesizeSehFunclets(Mir&                                  mir,
     //     the stub policy), then append one funclet per region, then globals.
     //     The rebuild mints FRESH block ids in a new arena, so capture each SEH
     //     parent's old→new block map to re-key the scope records afterward.
-    MirBuilder builder;
+    //     (`builder` was opened in (1), where the symbols were minted from it.)
     IdentityClonePolicy identity;
     std::unordered_map<std::uint32_t, MirBlockId> oldToNewBlock;  // old.v → new block
     for (std::uint32_t fi = 0; fi < nf0; ++fi) {

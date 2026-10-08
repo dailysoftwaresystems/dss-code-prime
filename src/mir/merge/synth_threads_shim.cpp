@@ -6,7 +6,7 @@
 #include "core/types/type_lattice/core_type.hpp"       // TypeKind, CallConv
 #include "core/types/type_lattice/type_interner.hpp"
 #include "link/extern_reference_gate.hpp"   // mirReferenceTargetIds (the referenced-only rule, MIR tier)
-#include "mir/merge/synth_symbol_floor.hpp"  // highestTakenSymbolIdV (the module's + the name table's ids)
+#include "mir/merge/synth_symbol_floor.hpp"  // continueSymbolIdsPastImports (the rebuild continues the module's ids)
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"   // rederiveStructCfMarkers (Cycle-2 thrd_join multi-block)
@@ -68,7 +68,6 @@ bool synthesizeThreadsShim(
     std::optional<LibrarySynthesis> const&                librarySynthesis,
     CSymbolDecorationScheme                               scheme,
     std::vector<ExternImport>&                            externImports,
-    std::uint32_t                                         nameTableEnd,
     DiagnosticReporter&                                   reporter) {
     // Presence gate: no tagged shim symbol ⇒ clean no-op (every elf + every non-threads
     // pe/macho TU). Keys on the map (a data property), never a format check.
@@ -263,23 +262,24 @@ bool synthesizeThreadsShim(
     // ── Rebuild the module (Mir is frozen): clone every existing function verbatim,
     //    then APPEND each shim function, then clone globals — the shared rebuild idiom. ──
     MirBuilder builder;
+    // The fresh helper imports are minted from the module (the one door —
+    // synth_symbol_floor.hpp): the rebuilt module continues the source's symbol ids, so
+    // a helper's id is past every id the module holds and every id the NAME TABLE it was
+    // made from holds (a shipped constant such as `thrd_success` is named there and is
+    // never a function, global or extern). AND past every pre-minted shim symbol: one is
+    // NOT yet a defined function / global / extern, so in a module made from no table (a
+    // unit test's) the module's end does not cover it and a fresh helper could take a
+    // shim id. Over the WHOLE recipe map, not only the referenced recipes: an
+    // unreferenced recipe's symbol is still minted and still named, so a helper sharing
+    // its id would share its name.
+    continueSymbolIdsPastImports(builder, mir, externImports);
+    for (auto const& [symV, _] : recipeBySymbol) builder.keepSymbolIdsClearOf(SymbolId{symV});
     IdentityClonePolicy policy;
     std::size_t const nf = mir.moduleFuncCount();
     for (std::uint32_t i = 0; i < nf; ++i) {
         opt::passes::MirFunctionRebuilder rb{mir, builder, policy};
         rb.rebuildFunction(mir.funcAt(i));
     }
-
-    // Floor for fresh helper imports: above every id the module holds, every id the
-    // caller's NAME TABLE holds (`nameTableEnd`, synth_symbol_floor.hpp — a shipped constant
-    // such as `thrd_success` is named there and is never a function, global or extern), AND
-    // every pre-minted shim symbol (NOT yet a defined function / global / extern, so the
-    // module scan would miss it → a fresh helper could collide with a shim id; the recipe
-    // loop keeps a module without a name table, a unit test's, clear of them too). Over the
-    // WHOLE recipe map, not only the referenced recipes: an unreferenced recipe's symbol is
-    // still minted and still named, so a helper sharing its id would share its name.
-    std::uint32_t nextSymV = highestTakenSymbolIdV(mir, externImports, nameTableEnd);
-    for (auto const& [symV, _] : recipeBySymbol) nextSymV = std::max(nextSymV, symV);
 
     // On-demand kernel32 import, deduped by mangledName. Seed from the existing imports
     // so a TU that ALSO `#include`s <windows.h> (which eagerly imports the cond-var / CS
@@ -300,7 +300,7 @@ bool synthesizeThreadsShim(
         if (auto it = helperSyms.find(mangled); it != helperSyms.end()) {
             hs = it->second;
         } else {
-            hs = SymbolId{++nextSymV};
+            hs = builder.mintSymbolOrAbort("synthesizeThreadsShim");
             helperSyms.emplace(mangled, hs);
             ExternImport imp;
             imp.symbol      = hs;
@@ -472,9 +472,9 @@ bool synthesizeThreadsShim(
     // vehicle — "no `___dss_once_tramp` in a Mach-O arm64 image" — searched for a name the
     // body did not have.) call_once is DSS's runtime source on pe and libSystem's
     // pthread_once on Mach-O since P69, so nothing minted here is DEFINED any more — and
-    // since P69 round 4 the floor also clears every id the caller's name table holds
-    // (`nameTableEnd`), so a minted helper import's id is no name the table gives to
-    // anything else either.
+    // the module's own end (`Mir::symbolIdEnd`, which every helper import is minted from)
+    // clears every id the name table holds, so a minted helper import's id is no name the
+    // table gives to anything else either.
 
     for (auto const& [symV, recipe] : recipes) {
         SymbolId const sym{symV};

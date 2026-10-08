@@ -194,24 +194,32 @@ struct DSS_EXPORT MirLoweringConfig {
     // has_value() guard mirrors `variadicVectorCountReg.has_value()`.
     std::optional<VaListLayout> vaListLayout;
 
-    // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): the FIRST SymbolId value the
-    // synthetic-global minter (`mintSyntheticGlobalSymbol` — string/float
-    // literal promotion, jump tables, FP sign masks) may use. The pipeline
-    // passes the SEMANTIC SYMBOL TABLE's END (`model.symbols().size()`), so a
-    // synthetic id can NEVER alias a semantic record: the minter's own scan
-    // covers only MIR-VISIBLE symbols (functions/globals/externs), but the
-    // semantic table also holds typedefs, tags, fields, locals, and injected
-    // constants — and the LK11 whole-program merge maps every MIR symbol to a
-    // NAME through that table (`nameOf` → `recordFor`). Pre-fix, a per-CU
-    // synthetic literal global whose id landed on (say) the `sqlite3_stmt`
-    // TYPEDEF record entered the merge as a NAMED STRONG GLOBAL DEFINITION —
-    // two CUs doing the same produced bogus K_SymbolRedefinedAcrossUnits
-    // (witnessed: the c86 sqlite3.c+shell.c probe's five opaque-tag
-    // collisions), and an alias onto a record whose name a sibling CU
-    // genuinely defines would MIS-MERGE references onto an anonymous string
-    // literal (a silent miscompile class). Default 0 = the pre-fix seeding
-    // (test fixtures / golden-MIR stability — their single-CU output never
-    // consults names).
+    // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): the FIRST SymbolId value any
+    // symbol synthesized for the module may take — the END of the id space the
+    // unit was analysed in. The pipeline passes the SEMANTIC SYMBOL TABLE's END
+    // (`model.symbols().size()`), so a synthetic id can NEVER alias a semantic
+    // record: the symbols MIR sees are functions, objects and imports, but the
+    // table also holds typedefs, tags, fields, locals, and injected constants —
+    // and the LK11 whole-program merge maps every MIR symbol to a NAME through
+    // that table (`nameOf` → `recordFor`). Pre-fix, a per-CU synthetic literal
+    // global whose id landed on (say) the `sqlite3_stmt` TYPEDEF record entered
+    // the merge as a NAMED STRONG GLOBAL DEFINITION — two CUs doing the same
+    // produced bogus K_SymbolRedefinedAcrossUnits (witnessed: the c86
+    // sqlite3.c+shell.c probe's five opaque-tag collisions), and an alias onto a
+    // record whose name a sibling CU genuinely defines would MIS-MERGE references
+    // onto an anonymous string literal (a silent miscompile class).
+    //
+    // ★ READ BY ONE STATEMENT (P69 round 5): `lowerToMir` states it to the
+    // module's builder (`MirBuilder::stateSymbolIdEnd`) when the module is made,
+    // and the MODULE carries it from there (`Mir::symbolIdEnd`) through every
+    // rebuild. This tier's own minter, mem2reg's zero constant and the three
+    // synthesis passes all ask the module (`MirBuilder::mintSymbol`); none is
+    // handed this number, so none can be handed a wrong one. Until then four
+    // callers each carried it separately and the optimizer's minter had none.
+    //
+    // Default 0 = a caller with no table (test fixtures / golden-MIR stability —
+    // their single-CU output never consults names): the module's end is then one
+    // past the highest symbol the unit holds.
     std::uint32_t syntheticSymbolFloor = 0;
 };
 

@@ -435,13 +435,16 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
                  std::span<SymbolId const> entryRoots) {
     DceResult result{};
     MirBuilder builder;
-    // DCE bypasses `cloneGlobalsOrCarveOut` (see comment below); we
-    // duplicate that helper's alias-mode propagation here so the
-    // fixed-point pipeline loop doesn't silently downgrade strict-TBAA
-    // or char-aliases-all to defaults on the iteration following DCE
-    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE).
-    builder.setAliasingMode(mir.aliasingMode());
-    builder.setCharTypesAliasAll(mir.charTypesAliasAll());
+    // DCE bypasses `cloneGlobalsOrCarveOut` (see comment below), so it calls
+    // the one list of module facts itself (`MirBuilder::carryModuleFactsOf`,
+    // what that helper calls): the alias-mode propagation, so the fixed-point
+    // pipeline loop doesn't silently downgrade strict-TBAA or
+    // char-aliases-all to defaults on the iteration following DCE
+    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE), and the continuation of
+    // the module's symbol ids — DCE deletes the highest-numbered definitions as
+    // readily as any, and a module that counted its id space from what survived
+    // would hand a later mint an id the name table still holds.
+    builder.carryModuleFactsOf(mir);
 
     // DCE has the same runtime-init carve-out as the other passes but
     // CANNOT use the shared `cloneGlobalsOrCarveOut` helper: DCE elides

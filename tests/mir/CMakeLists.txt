@@ -183,11 +183,16 @@ dss_add_test(NAME mir/test_mir_try_accessors
 dss_add_test(NAME mir/test_static_pointer_cast_chain
              SOURCES test_static_pointer_cast_chain.cpp)
 
-# P69 round 4 lane `lm` — the NAME-TABLE FLOOR of the MIR-tier synthesis passes
-# (mir/merge/synth_symbol_floor.hpp): the entry-shape init, the SEH funclets and the
-# threads helper imports mint above every id the caller's name table holds, so no
-# synthesized symbol is published under a name the table gives to something else
-# (an x86_64 Linux image published its init as `__func__` before). Pass arms,
-# single-CU pipeline arms, and a source scan that keeps the test-only end out of src/.
+# P69 rounds 4 and 5 lane `lm` — THE MODULE'S SYMBOL-ID SPACE AND ITS ONE DOOR
+# (`Mir::symbolIdEnd`, `MirBuilder::mintSymbol`, mir/merge/synth_symbol_floor.hpp):
+# HIR→MIR's literal objects, the optimizer's zero constant, the entry-shape init, the
+# SEH funclets and the threads helper imports are all minted by the module, past every
+# id the name table it was made from holds, so no synthesized symbol is published
+# under a name the table gives to something else or shares an id with an import (an
+# x86_64 Linux image published its init as `__func__`; a release build minted its
+# zero constant on an import's id). The door, a unit lowered with no table, pass
+# arms, single-CU pipeline arms at both configurations, and two source scans (no
+# counted SymbolId under src/mir or src/opt; every module builder states or continues
+# its ids). The merged route's statement is pinned in test_mir_merge.cpp.
 dss_add_test(NAME mir/test_synth_symbol_floor
              SOURCES test_synth_symbol_floor.cpp)

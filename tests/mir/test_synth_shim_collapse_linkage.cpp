@@ -50,7 +50,6 @@
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
-#include "mir/merge/synth_symbol_floor.hpp"  // kNoNameTable (a hand-built module has no name table)
 #include "mir/merge/synth_threads_shim.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
@@ -192,7 +191,7 @@ TEST(SynthShimCollapseLinkage, EveryThreadsBodyIsWeakAndHiddenOnBothVehicles) {
             {10, "mtx_init"}, {11, "mtx_lock"}, {12, "cnd_wait"}};
         std::vector<ExternImport> externs;
         DiagnosticReporter rep;
-        ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, v.synthesis, v.scheme, externs, kNoNameTable, rep));
+        ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, v.synthesis, v.scheme, externs, rep));
         ASSERT_FALSE(rep.hasErrors());
 
         std::size_t added = 0;

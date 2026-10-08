@@ -24,7 +24,6 @@
 #include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
 #include "mir/merge/synth_pe_startup.hpp"  // realizeEntryShape (the argv spine)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
-#include "mir/merge/synth_symbol_floor.hpp"  // nameTableEndOf (the merged name table's end)
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/transport.hpp"
@@ -2325,10 +2324,10 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     if (!merged || reporter.errorCount() != mergeEntry) return std::nullopt;
 
     // The merged module's ids are named through `symbolNames` — which also holds ids no
-    // module scan sees (a shim symbol the merge pre-registered, not yet defined) — so the
-    // three synthesis passes below mint above its end as well as the module's
-    // (mir/merge/synth_symbol_floor.hpp). Nothing below adds a name before the last of them.
-    std::uint32_t const mergedNameTableEnd = nameTableEndOf(merged->symbolNames);
+    // module scan sees (a shim symbol the merge pre-registered, not yet defined). The
+    // merge stated the end of that whole allocation to the merged module
+    // (`Mir::symbolIdEnd`), so the three synthesis passes below ask the module for their
+    // fresh ids and are handed no end here (mir/merge/synth_symbol_floor.hpp).
 
     // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
     // MATERIALIZE the resolved entry's arguments per its verb × the format's declared
@@ -2353,7 +2352,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     if (!realizeEntryShape(merged->mir, merged->host.interner(),
                            merged->userEntrySymbol, merged->externImports,
                            entryVerb, (*formatR)->processArgs(), cSymDecor,
-                           (*formatR)->name(), mergedNameTableEnd, reporter)) {
+                           (*formatR)->name(), reporter)) {
         return std::nullopt;  // unusable mechanism — fail-loud already reported.
     }
 
@@ -2433,8 +2432,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         }
         if (!synthesizeThreadsShim(merged->mir, merged->host.interner(),
                                    mergedThreadsRecipes, (*formatR)->librarySynthesis(),
-                                   cSymDecor, merged->externImports, mergedNameTableEnd,
-                                   reporter)) {
+                                   cSymDecor, merged->externImports, reporter)) {
             return std::nullopt;  // internal invariant breach (vocab/switch drift) — reported.
         }
         // (P69: the <stdio.h> printf-family shim sibling that stood here is RETIRED — the pe
@@ -2505,8 +2503,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     if (!synthesizeSehFunclets(merged->mir, merged->host.interner(),
                                merged->externImports,
                                (*formatR)->sehPersonality(), cSymDecor,
-                               (*formatR)->name(), sehScopes, mergedNameTableEnd,
-                               reporter)) {
+                               (*formatR)->name(), sehScopes, reporter)) {
         return std::nullopt;  // unsupported SEH shape (c116b frontier) — fail-loud reported.
     }
 

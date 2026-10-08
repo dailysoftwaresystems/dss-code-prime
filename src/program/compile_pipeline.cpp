@@ -868,6 +868,9 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // synthetic literal global whose id aliased a typedef/tag/field/constant
     // record would enter the merge as a NAMED strong definition (bogus
     // cross-CU redefinitions; potential silent mis-merge onto a literal).
+    // ★ THIS IS THE ONE PLACE the table's end is stated (P69 round 5): the
+    // module carries it from here (`Mir::symbolIdEnd`), and every later minter —
+    // the optimizer's, the three synthesis passes' — asks the module.
     mirCfg.syntheticSymbolFloor =
         static_cast<std::uint32_t>(model.symbols().size());
     // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the RESOLVED calling
@@ -2168,12 +2171,11 @@ bool synthesizeLibraryShims(CuMirModule& cuMir, DiagnosticReporter& reporter) {
     // vehicle (pe→kernel32, macho→pthread); a clean no-op when `threadsRecipes` is empty
     // (every elf + non-threads TU). The interner is the CU model's; the vehicle comes from
     // `cuMir.librarySynthesis`. false ⇒ an internal invariant breach (vocab/switch drift),
-    // already reported. The name table this CU's ids are named through is its semantic
-    // model's, indexed by id, so its end is `symbols().size()` (mir/merge/synth_symbol_floor.hpp).
+    // already reported. The helper imports' ids come from the module, which carries the
+    // end of the name table it was made from (mir/merge/synth_symbol_floor.hpp).
     return synthesizeThreadsShim(cuMir.mir, cuMir.model.lattice().interner(),
                                  threadsRecipes, cuMir.librarySynthesis,
                                  cuMir.cSymbolDecoration, cuMir.externImports,
-                                 static_cast<std::uint32_t>(cuMir.model.symbols().size()),
                                  reporter);
 }
 
@@ -2223,14 +2225,14 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // like any other function; the interner is the CU model's (the type space this
     // CU's TypeIds index into).
     // Every id this lower half names goes through `nameOf` = the model's records, so
-    // both synthesis passes here mint above the model's id space as well as the module's
-    // (mir/merge/synth_symbol_floor.hpp; ✔MEASURED P69 round 4: without it an x86_64
-    // Linux image published this init as `T __func__`).
-    std::uint32_t const nameTableEnd = static_cast<std::uint32_t>(model.symbols().size());
+    // both synthesis passes here mint above the model's id space as well as the module's:
+    // the MODULE carries that end and hands out the ids (mir/merge/synth_symbol_floor.hpp;
+    // ✔MEASURED P69 round 4: an id counted from the module alone published this init as
+    // `T __func__` in an x86_64 Linux image).
     if (!realizeEntryShape(cuMir.mir, model.lattice().interner(),
                            userEntry, cuMir.externImports,
                            entryVerb, processArgs, cuMir.cSymbolDecoration,
-                           formatName, nameTableEnd, reporter)) {
+                           formatName, reporter)) {
         return std::nullopt;  // unusable mechanism — fail-loud already reported.
     }
 
@@ -2254,7 +2256,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     if (!synthesizeSehFunclets(cuMir.mir, model.lattice().interner(),
                                cuMir.externImports, sehPersonality,
                                cuMir.cSymbolDecoration, formatName,
-                               sehScopes, nameTableEnd, reporter)) {
+                               sehScopes, reporter)) {
         return std::nullopt;  // unsupported SEH shape (c116b frontier) / no declared
                               // personality — fail-loud.
     }
@@ -2554,13 +2556,23 @@ struct PlatformExternRealization {
 // keeps its single meaning ("the corpus directory could not be located", benign,
 // route unbound); a conflict is signalled by `reporter.errorCount()` having
 // moved, which is the `tierClean` idiom used throughout this file.
+//
+// ── `answer` — WHICH of the corpus's two bodies the caller is asking about
+// (P69 round 5). `Realized`, the default and both binders' question: the rows
+// an IMAGE of the platform exports here. `ProvidedByShippedSource`, the archive
+// search's question for a weak reference: the rows whose body the platform
+// states DSS's runtime ships as source on this format (`realization.<format>`),
+// through the same forward and reverse lookups, so no second reading of the
+// corpus exists for it.
 [[nodiscard]] std::optional<std::unordered_map<std::string, PlatformExternRealization>>
 realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
                                      TargetSchema const&          target,
                                      ObjectFormatSchema const&    format,
                                      CompilationUnitId            latticeOwner,
                                      std::string_view             latticeLabel,
-                                     DiagnosticReporter&          reporter) {
+                                     DiagnosticReporter&          reporter,
+                                     ffi::ShippedRealizationStatus answer =
+                                         ffi::ShippedRealizationStatus::Realized) {
     std::unordered_map<std::string, PlatformExternRealization> out;
     if (onBinaryNames.empty()) return out;
 
@@ -2686,8 +2698,9 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
             // `UnavailableForFormat` and `NoLibraryForFormat` all mean "the
             // platform states no image for this name here" ⇒ absent, so the
             // caller routes it unbound. Enumerated by the status check, never
-            // fallen through.
-            if (row->second.status != ffi::ShippedRealizationStatus::Realized) {
+            // fallen through. (`answer` is `Realized` unless the caller asked
+            // for the shipped-source rows instead.)
+            if (row->second.status != answer) {
                 continue;
             }
             out.emplace(onBinaryNames[i],
@@ -2736,7 +2749,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     std::unordered_map<std::string, PlatformExternRealization> byLinkName;
     std::unordered_set<std::string>                            ambiguous;
     for (auto const& [cName, row] : *wholeCorpus) {
-        if (row.status != ffi::ShippedRealizationStatus::Realized) continue;
+        if (row.status != answer) continue;
         std::string onBinary =
             ffi::linkNameFor(cName, /*asmLabel=*/{}, scheme, row.linkName);
         if (onBinary.empty()) continue;
@@ -2990,11 +3003,21 @@ partitionResolveLibraries(std::span<ResolveLibrarySpec const> libraries,
 // through the `container: "archive"` schema, so that schema is the one that
 // wrote the bytes being read back.
 //
-// ⓘ WHY A NON-IMAGE LINK FORMAT SHORT-CIRCUITS rather than resolving. On the
-// fat-archive path the link format is itself a relocatable one (`-staticlib`,
-// or the bare `.o` format), so its own `relocations()` IS an object-relocation
-// table -- the identity case, not a fallback to something merely close. That
-// path was already correct and stays free of the scan.
+// ⓘ WHY AN ARCHIVE LINK FORMAT SHORT-CIRCUITS rather than resolving. On the
+// fat-archive path the link format IS the `container: "archive"` document, the
+// one that wrote the members -- the identity case, not a fallback to something
+// merely close. That path was already correct and stays free of the scan.
+//
+// ★ A BARE RELOCATABLE LINK FORMAT RESOLVES ITS SIBLING, AS AN IMAGE DOES (P69
+// round 5, D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE). It took
+// the identity case until then, on the true ground that its relocation table is
+// an object's; but the member document also states what an ARCHIVE SEARCH does
+// (`archiveWeakReferenceSearch`, `archiveCommonResolution`), and those answers
+// live on the archive document ALONE, so a relocatable link that met either
+// question was refused where every reference linker's `-r` links it
+// (✔MEASURED 2026-10-08: GNU ld 2.42 and ld.lld 18 leave the weak reference
+// unresolved and fetch nothing, ld64 fetches the member -- the image link's own
+// answers). One document per family states them; every link reads that one.
 struct ArchiveMemberFormat {
     // The resolved answer, or null until first use. Points either at the link's
     // own schema (the identity case) or into `owned`.
@@ -3036,9 +3059,10 @@ archiveMemberFormat(ArchiveMemberFormat&          cache,
         d.severity = DiagnosticSeverity::Error;
         d.actual   = std::format(
             "static-link: cannot determine the object format of archive member "
-            "'{}' in '{}'. The link is producing '{}', whose relocation "
-            "vocabulary describes an IMAGE and was never promised to describe a "
-            "relocatable member; the member's own object format {}. {} "
+            "'{}' in '{}'. The link is producing '{}', which is not an archive "
+            "document: an archive's members are described by the format's "
+            "archive-writing sibling, never by the document of the artifact being "
+            "linked; the member's own object format {}. {} "
             "Anchored: "
             "D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT.",
             memberName, core::genericSpelling(archivePath), linkFormat.name(),
@@ -3051,9 +3075,10 @@ archiveMemberFormat(ArchiveMemberFormat&          cache,
         return nullptr;
     };
 
-    // The identity case: a relocatable link format already speaks the object
-    // vocabulary (see the note above).
-    if (!linkFormat.isImageFlavor()) {
+    // The identity case: an ARCHIVE document is its members' own (see the note
+    // above). Every other link format -- an image, a bare relocatable --
+    // resolves the archive-writing sibling.
+    if (linkFormat.isStaticArchive()) {
         cache.schema = &linkFormat;
         return cache.schema;
     }
@@ -3617,6 +3642,47 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     std::size_t                               weakCursor = 0;
     std::optional<ArchiveWeakReferenceSearch> weakRule;
     bool                                      weakRuleRead = false;
+    // ── A WEAK REFERENCE TO A NAME THE RUNTIME REALIZES (P69 round 5) ────────
+    // To a program, DSS's runtime IS the platform's library: a name whose body
+    // the platform states DSS ships as source on this format (a descriptor's
+    // `realization.<format>`, the row that puts the body in a runtime archive)
+    // answers a weak reference as a name the platform's own image exports does —
+    // the reference BINDS, on every format, whatever the members' document says
+    // an archive search does for a weak reference. ✔MEASURED 2026-10-08: glibc
+    // 2.39 (gcc 13.3.0 and clang 18.1.3, x86_64; gcc, aarch64) and libSystem
+    // (Apple clang 21, both arches) bind a weak reference to `strtol` and to
+    // `puts` on their default, dynamic link. Until round 5 the search treated a
+    // runtime archive as an operator's, so on the `doNotFetch` formats `strtol`
+    // read as NULL on pe (DSS ships its body) beside a `puts` that bound (the
+    // UCRT's image exports it). Asked of the corpus by NAME, through the one
+    // on-binary-name query both binders use — never of the archive, whose name
+    // and path say nothing — and once per search for every weak name still open.
+    // nullopt after a report: the corpus disagreed with itself about a name asked.
+    std::unordered_set<std::string> runtimeNamesAsked;
+    std::unordered_set<std::string> runtimeRealized;
+    auto const runtimeRealizes = [&](std::string const& name) -> std::optional<bool> {
+        if (runtimeNamesAsked.insert(name).second) {
+            std::vector<std::string> ask{name};
+            for (std::size_t k = weakCursor + 1; k < weakReferences.size(); ++k) {
+                std::string const& later = weakReferences[k];
+                if (definedNames.count(later) != 0 || armap.find(later) == armap.end()) continue;
+                if (runtimeNamesAsked.insert(later).second) ask.push_back(later);
+            }
+            auto const corpusEntry = reporter.errorCount();
+            auto const shipped = realizePlatformExternsByOnBinaryName(
+                ask, target, format, substrate::mintMonotonicId<CompilationUnitId>(), format.name(),
+                reporter, ffi::ShippedRealizationStatus::ProvidedByShippedSource);
+            if (!tierClean(reporter, corpusEntry)) return std::nullopt;
+            // No corpus located: a statement about the environment — no name is the runtime's.
+            if (shipped.has_value()) {
+                for (auto const& [realizedName, row] : *shipped) {
+                    (void)row;
+                    runtimeRealized.insert(realizedName);
+                }
+            }
+        }
+        return runtimeRealized.count(name) != 0;
+    };
     for (;;) {
         for (; cursor < worklist.size(); ++cursor) {
             std::string const& name = worklist[cursor];
@@ -3668,7 +3734,12 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                 reporter.report(std::move(d));
                 return std::nullopt;
             }
-            if (*weakRule == ArchiveWeakReferenceSearch::FetchMember) {
+            // `doNotFetch` leaves the name to the runtime's question (above the loop).
+            std::optional<bool> const fetches =
+                *weakRule == ArchiveWeakReferenceSearch::FetchMember ? std::optional<bool>{true}
+                                                                     : runtimeRealizes(name);
+            if (!fetches.has_value()) return std::nullopt;   // reported
+            if (*fetches) {
                 worklist.push_back(name);
                 weakFetched = true;
             }

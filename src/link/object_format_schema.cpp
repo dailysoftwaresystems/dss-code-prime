@@ -987,16 +987,21 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "relocatable artifact — and an archive's members are each "
                  "linked alone, so the declaration would never be read.");
         }
-        // P69 round 4 (lane `lm`): `archiveWeakReferenceSearch`, like
-        // `archiveCommonResolution`, is read from the document of an archive's
-        // MEMBERS, which an image never is.
-        if (archiveWeakReferenceSearch.has_value() && image) {
+        // P69 round 4 (lane `lm`): `archiveWeakReferenceSearch` is read from the
+        // document of an archive's MEMBERS — the `container: "archive"` document,
+        // and no other. Round 5: a bare relocatable link reads its archive-writing
+        // sibling's answer as an image link does, so a copy on the relocatable
+        // document would never be read, and one answer per family cannot drift
+        // from a second.
+        if (archiveWeakReferenceSearch.has_value()
+            && container != ObjectFormatContainer::Archive) {
             fail("/archiveWeakReferenceSearch",
-                 "'archiveWeakReferenceSearch' is declared on an IMAGE flavor: "
-                 "whether an archive search fetches a member for a weak reference "
-                 "is read from the document that describes the archive's MEMBERS, "
-                 "which an image never is, so the declaration would never be "
-                 "read.");
+                 "'archiveWeakReferenceSearch' is declared on a document that is "
+                 "not an ARCHIVE's: whether an archive search fetches a member for "
+                 "a weak reference is read from the document that describes the "
+                 "archive's MEMBERS -- the `container: \"archive\"` document, which "
+                 "every link of the family resolves -- so the declaration would "
+                 "never be read.");
         }
         // P69 (lane `lm`, D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO):
         // `weakResolvedToNothing` is read only by an image that binds a weak

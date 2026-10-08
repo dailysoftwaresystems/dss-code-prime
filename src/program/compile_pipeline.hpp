@@ -375,8 +375,8 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // ── AND WHAT THE MERGED ROUTE COSTS TO REACH AT ALL ────────────────────────
 // ✔MEASURED — the merged route is reachable ONLY through
 // `Program::compileUnits` with ≥2 sources, and
-// <!--census:examples:top.sources-->34 of the
-// <!--census:examples:manifests-->1040 shipped corpus example manifests declare a
+// <!--census:examples:top.sources-->35 of the
+// <!--census:examples:manifests-->1043 shipped corpus example manifests declare a
 // multi-source `sources` array, so the corpus exercises it roughly 3% as often
 // as the single-CU route.
 // ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census

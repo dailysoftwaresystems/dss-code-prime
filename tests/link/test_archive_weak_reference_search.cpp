@@ -12,12 +12,23 @@
 // The members' document states the answer (`archiveWeakReferenceSearch`), and the pull reads it for every weak row
 // `linker::weakReferenceAwaitsTheArchiveRule` answers for. Until round 4 the pull followed a weak reference as a
 // strong one, so ELF and PE links fetched a member none of their reference linkers fetches.
+//
+// ROUND 5. A RELOCATABLE link (`-r`) reads the same document, the one its archive-writing sibling is, and gets the
+// image link's answer (✔MEASURED 2026-10-08, lane lm): GNU ld 2.42 and ld.lld 18 (x86_64), GNU ld (aarch64) and GNU
+// ld's PE linker link it, fetch nothing and leave the weak reference in the artifact; ld64 (arm64 and x86_64) fetches
+// the member. Round 4 answered a bare relocatable link from its own document, which states nothing, so the link was
+// refused. And a weak reference to a name DSS's runtime realizes from its own source on the link's format (a
+// descriptor's `realization.<format>`) is fetched on every format, as a weak reference to a name the platform's own
+// library image exports binds: glibc 2.39 and libSystem bind `strtol` and `puts` on their default link (✔MEASURED
+// 2026-10-08). Round 4 searched a runtime archive as an operator's, so pe read `strtol` (DSS's body) as NULL beside
+// a `puts` that bound (the UCRT's image).
 #include "asm/asm.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/extern_reference_gate.hpp"
 #include "link/format/coff_object_reader.hpp"
+#include "link/format/elf_object_reader.hpp"
 #include "link/format/pe.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
@@ -133,25 +144,53 @@ struct Use {
     return path;
 }
 
-// How many members the pull fetches for `uses` against the archive, linking to `imageFormat`; nullopt on a refusal
-// (its diagnostics in `rep`).
-[[nodiscard]] std::optional<std::size_t> pulledFor(char const* imageFormat, fs::path const& archive,
-                                                   std::vector<Use> const& uses, DiagnosticReporter& rep) {
-    auto const L = load("x86_64", imageFormat);
-    if (!L.target || !L.format) return std::nullopt;
-    AssembledModule const caller = callerOf(*L.target, uses);
+// How many members the pull fetches for `uses` against the archive, linking with the document `format`; nullopt on a
+// refusal (its diagnostics in `rep`).
+[[nodiscard]] std::optional<std::size_t> pulledWith(TargetSchema const& target, ObjectFormatSchema const& format,
+                                                    fs::path const& archive, std::vector<Use> const& uses,
+                                                    DiagnosticReporter& rep) {
+    AssembledModule const caller = callerOf(target, uses);
     std::vector<fs::path> const archives{archive};
-    auto const pulled = pullStaticArchiveMembers(std::span<AssembledModule const>{&caller, 1}, archives, {},
-                                                 *L.target, *L.format, rep);
+    auto const pulled =
+        pullStaticArchiveMembers(std::span<AssembledModule const>{&caller, 1}, archives, {}, target, format, rep);
     if (!pulled.has_value()) return std::nullopt;
     return pulled->size();
+}
+
+// The same, linking to the shipped document `linkFormat` (an image's, or a bare relocatable's).
+[[nodiscard]] std::optional<std::size_t> pulledFor(char const* linkFormat, fs::path const& archive,
+                                                   std::vector<Use> const& uses, DiagnosticReporter& rep) {
+    auto const L = load("x86_64", linkFormat);
+    if (!L.target || !L.format) return std::nullopt;
+    return pulledWith(*L.target, *L.format, archive, uses, rep);
+}
+
+// The import row of `m` named `name` (nullptr: none).
+[[nodiscard]] ExternImport const* rowNamed(AssembledModule const& m, std::string const& name) {
+    for (auto const& e : m.externImports) {
+        if (e.mangledName == name) return &e;
+    }
+    return nullptr;
+}
+
+// The shipped document `format` as its file states it, less the key `archiveWeakReferenceSearch`: a members' document
+// that leaves the question open.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const> withoutTheWeakAnswer(std::string const& format) {
+    auto const path = dss::test::configRoot() / "object-formats" / (format + ".format.json");
+    std::ifstream in{path};
+    auto doc = nlohmann::json::parse(in);
+    EXPECT_EQ(doc.erase("archiveWeakReferenceSearch"), 1u) << format << " no longer states the key this test removes";
+    auto loaded = ObjectFormatSchema::loadFromText(doc.dump(), format + " - archiveWeakReferenceSearch");
+    EXPECT_TRUE(loaded.has_value()) << format << " must load without the key: it is optional until the question arises";
+    return loaded.has_value() ? *loaded : nullptr;
 }
 
 }  // namespace
 
 // ══ The documents ═════════════════════════════════════════════════════════════
 
-// Every archive-member document states its reference linkers' measured answer, and no image document states one.
+// Every archive-member document states its reference linkers' measured answer, and no other document of its family
+// states one — an image's and a bare relocatable's link both read the archive document, so the family has one answer.
 TEST(ArchiveWeakReferenceSearch, EachMembersDocumentStatesWhatItsLinkersDo) {
     struct Want {
         char const*                                format;
@@ -164,15 +203,21 @@ TEST(ArchiveWeakReferenceSearch, EachMembersDocumentStatesWhatItsLinkersDo) {
                           Want{"macho64-arm64-darwin-staticlib", ArchiveWeakReferenceSearch::FetchMember},
                           Want{"elf64-x86_64-linux-exec", std::nullopt},
                           Want{"pe64-x86_64-windows-exec", std::nullopt},
-                          Want{"macho64-arm64-darwin-exec", std::nullopt}}) {
+                          Want{"macho64-arm64-darwin-exec", std::nullopt},
+                          Want{"elf64-x86_64-linux", std::nullopt},
+                          Want{"elf64-aarch64-linux", std::nullopt},
+                          Want{"pe64-x86_64-windows", std::nullopt},
+                          Want{"macho64-x86_64-darwin", std::nullopt},
+                          Want{"macho64-arm64-darwin", std::nullopt}}) {
         auto const f = ObjectFormatSchema::loadShipped(w.format);
         ASSERT_TRUE(f.has_value()) << w.format;
         EXPECT_EQ((*f)->archiveWeakReferenceSearch(), w.answer) << w.format;
     }
 }
 
-// The key is read from an archive's MEMBER document: on an image it is refused by name, and so is a value outside the
-// closed set. CONTROL: a member document with a value from the set loads.
+// The key is read from an archive's MEMBER document: on an image it is refused by name, on a bare relocatable
+// document too (round 5: its link reads the archive document, so a second copy there could only drift), and so is a
+// value outside the closed set. CONTROL: a member document with a value from the set loads.
 TEST(ArchiveWeakReferenceSearch, TheKeyIsRefusedOnAnImageAndOutsideItsValues) {
     auto const withKey = [](std::string const& format, nlohmann::json value) {
         auto const path = dss::test::configRoot() / "object-formats" / (format + ".format.json");
@@ -186,6 +231,13 @@ TEST(ArchiveWeakReferenceSearch, TheKeyIsRefusedOnAnImageAndOutsideItsValues) {
     bool named = false;
     for (auto const& d : onImage.error()) named = named || d.path == "/archiveWeakReferenceSearch";
     EXPECT_TRUE(named);
+    for (char const* relocatable : {"elf64-x86_64-linux", "pe64-x86_64-windows", "macho64-arm64-darwin"}) {
+        auto const onRelocatable = withKey(relocatable, "doNotFetch");
+        ASSERT_FALSE(onRelocatable.has_value()) << relocatable << ": a second copy of the family's answer";
+        bool namedThere = false;
+        for (auto const& d : onRelocatable.error()) namedThere = namedThere || d.path == "/archiveWeakReferenceSearch";
+        EXPECT_TRUE(namedThere) << relocatable;
+    }
     auto const badValue = withKey("pe64-x86_64-windows-staticlib", "fetch");
     ASSERT_FALSE(badValue.has_value()) << "a value outside the closed set must be refused";
     bool listed = false;
@@ -270,25 +322,154 @@ TEST(ArchiveWeakReferenceSearch, AMachOLinkFetchesTheMemberForAWeakReference) {
     EXPECT_EQ(*weakOnly, 1u) << "ld64 extracts the member for an undefined weak reference";
 }
 
+// A RELOCATABLE link reads its members' document — the archive-writing sibling's, as an image link does — so `-r`
+// gets the answer every reference linker of the format gives it (✔MEASURED 2026-10-08): GNU ld and ld.lld fetch
+// nothing, GNU ld's PE linker fetches nothing for a weak external that asks no library search, ld64 fetches the
+// member. CONTROLS: a strong reference to the same name fetches the member on each, and a COFF weak external that
+// states SEARCH_LIBRARY is fetched for.
+TEST(ArchiveWeakReferenceSearch, ARelocatableLinkGetsItsMembersAnswer) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "weak-archive-relocatable"};
+    DiagnosticReporter rep;
+    auto const elf = archiveOf(scratch.path(), "elf64-x86_64-linux-staticlib", memberDefining("hook", "other"));
+    ASSERT_FALSE(elf.empty());
+    auto const elfWeak = pulledFor("elf64-x86_64-linux", elf, {{"hook", SymbolBinding::Weak}}, rep);
+    ASSERT_TRUE(elfWeak.has_value()) << "`ld -r` links this:" << diagnosticsOf(rep);
+    EXPECT_EQ(*elfWeak, 0u) << "GNU ld -r and ld.lld -r fetch nothing for a weak reference";
+    auto const elfStrong = pulledFor("elf64-x86_64-linux", elf, {{"hook", SymbolBinding::Global}}, rep);
+    ASSERT_TRUE(elfStrong.has_value()) << diagnosticsOf(rep);
+    EXPECT_EQ(*elfStrong, 1u) << "CONTROL: a strong reference fetches the member";
+
+    auto const pe = archiveOf(scratch.path(), "pe64-x86_64-windows-staticlib", memberDefining("hook", "other"));
+    ASSERT_FALSE(pe.empty());
+    auto const peWeak = pulledFor("pe64-x86_64-windows", pe, {{"hook", SymbolBinding::Weak}}, rep);
+    ASSERT_TRUE(peWeak.has_value()) << diagnosticsOf(rep);
+    EXPECT_EQ(*peWeak, 0u) << "GNU ld's PE linker -r fetches nothing for a weak function";
+    auto const peSearching =
+        pulledFor("pe64-x86_64-windows", pe, {{"hook", SymbolBinding::Weak, /*searchesArchives=*/true}}, rep);
+    ASSERT_TRUE(peSearching.has_value()) << diagnosticsOf(rep);
+    EXPECT_EQ(*peSearching, 1u) << "CONTROL: SEARCH_LIBRARY asks for the search";
+
+    auto const macho = archiveOf(scratch.path(), "macho64-x86_64-darwin-staticlib", memberDefining("_hook", "_other"));
+    ASSERT_FALSE(macho.empty());
+    auto const machoWeak = pulledFor("macho64-x86_64-darwin", macho, {{"_hook", SymbolBinding::Weak}}, rep);
+    ASSERT_TRUE(machoWeak.has_value()) << diagnosticsOf(rep);
+    EXPECT_EQ(*machoWeak, 1u) << "ld64 -r fetches the member for a weak reference";
+}
+
+// What the relocatable link writes: the weak reference it fetched nothing for is still a WEAK undefined name of the
+// artifact, so the image link that takes the artifact decides it (and leaves it unresolved, with nothing to define
+// it). CONTROL: the artifact does not define the name.
+TEST(ArchiveWeakReferenceSearch, ARelocatableArtifactKeepsTheWeakReferenceNothingWasFetchedFor) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "weak-archive-relocatable-artifact"};
+    auto const archive = archiveOf(scratch.path(), "elf64-x86_64-linux-staticlib", memberDefining("hook", "other"));
+    ASSERT_FALSE(archive.empty());
+    auto const L = load("x86_64", "elf64-x86_64-linux");
+    ASSERT_TRUE(L.target && L.format);
+    std::vector<AssembledModule> modules{callerOf(*L.target, {{"hook", SymbolBinding::Weak}})};
+    std::vector<fs::path> const archives{archive};
+    DiagnosticReporter rep;
+    auto pulled = pullStaticArchiveMembers(modules, archives, {}, *L.target, *L.format, rep);
+    ASSERT_TRUE(pulled.has_value()) << diagnosticsOf(rep);
+    ASSERT_TRUE(pulled->empty());
+    auto const artifact = linker::link(std::span<AssembledModule const>{modules}, *L.target, *L.format, rep);
+    ASSERT_TRUE(artifact.ok()) << diagnosticsOf(rep);
+    auto const back = elf::readRelocatableObject(artifact.bytes, *L.target, *L.format, rep);
+    ASSERT_TRUE(back.has_value()) << diagnosticsOf(rep);
+    auto const* row = rowNamed(*back, "hook");
+    ASSERT_NE(row, nullptr) << "the reference is gone from the artifact";
+    EXPECT_EQ(row->binding, SymbolBinding::Weak) << "the reference must stay weak: a strong one fails the image link";
+    for (auto const& ms : back->symbols) EXPECT_NE(ms.name, "hook") << "CONTROL: nothing was fetched to define it";
+}
+
 // A members' document that states no answer leaves the question to a refusal, by name, the moment it arises — a weak
-// reference whose name a member defines. The bare relocatable document is the members' own when the link format is
-// itself relocatable (`archiveMemberFormat`'s identity case), and it states nothing. CONTROL: a weak reference no
-// member defines asks nothing, and the same link stands.
+// reference whose name a member defines. No shipped family leaves it open (round 5: a bare relocatable link reads
+// its sibling's), so the open document is a shipped members' document less the key, which the pull reads as the
+// link's own. CONTROL: a weak reference no member defines asks nothing, and the same link stands.
 TEST(ArchiveWeakReferenceSearch, AnUnstatedAnswerIsRefusedByNameWhenTheQuestionArises) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "weak-archive-unstated"};
     auto const archive = archiveOf(scratch.path(), "elf64-x86_64-linux-staticlib", memberDefining("hook", "other"));
     ASSERT_FALSE(archive.empty());
+    auto const L = load("x86_64", "elf64-x86_64-linux-staticlib");
+    ASSERT_TRUE(L.target && L.format);
+    ASSERT_TRUE(L.format->archiveWeakReferenceSearch().has_value()) << "the shipped document states it";
+    auto const open = withoutTheWeakAnswer("elf64-x86_64-linux-staticlib");
+    ASSERT_NE(open, nullptr);
+    ASSERT_FALSE(open->archiveWeakReferenceSearch().has_value());
     DiagnosticReporter refusedRep;
-    auto const refused = pulledFor("elf64-x86_64-linux", archive, {{"hook", SymbolBinding::Weak}}, refusedRep);
+    auto const refused = pulledWith(*L.target, *open, archive, {{"hook", SymbolBinding::Weak}}, refusedRep);
     EXPECT_FALSE(refused.has_value()) << "an unstated answer must not be guessed";
     EXPECT_NE(diagnosticsOf(refusedRep).find("'archiveWeakReferenceSearch'"), std::string::npos)
         << diagnosticsOf(refusedRep);
     EXPECT_NE(diagnosticsOf(refusedRep).find("'hook' is a WEAK reference"), std::string::npos)
         << diagnosticsOf(refusedRep);
     DiagnosticReporter controlRep;
-    auto const control = pulledFor("elf64-x86_64-linux", archive, {{"absent", SymbolBinding::Weak}}, controlRep);
+    auto const control = pulledWith(*L.target, *open, archive, {{"absent", SymbolBinding::Weak}}, controlRep);
     ASSERT_TRUE(control.has_value()) << diagnosticsOf(controlRep);
     EXPECT_EQ(*control, 0u);
+    DiagnosticReporter statedRep;
+    auto const stated = pulledWith(*L.target, *L.format, archive, {{"hook", SymbolBinding::Weak}}, statedRep);
+    ASSERT_TRUE(stated.has_value()) << "CONTROL: the shipped document answers:" << diagnosticsOf(statedRep);
+    EXPECT_EQ(*stated, 0u);
+}
+
+// A link format that has NO archive-writing sibling (wasm32-v1, spirv-1.6) cannot say whose members an archive
+// holds, so the question is refused by name where it arises — never answered by the link's own document, which is
+// what a non-image document did until round 5 (the refusal then came one step later, from a backend with no member
+// reader, under another code).
+TEST(ArchiveWeakReferenceSearch, ALinkFormatWithNoArchiveSiblingIsRefusedByName) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "weak-archive-no-sibling"};
+    auto const archive = archiveOf(scratch.path(), "elf64-x86_64-linux-staticlib", memberDefining("hook", "other"));
+    ASSERT_FALSE(archive.empty());
+    for (char const* const format : {"wasm32-v1", "spirv-1.6"}) {
+        SCOPED_TRACE(format);
+        DiagnosticReporter rep;
+        auto const pulled = pulledFor(format, archive, {{"hook", SymbolBinding::Weak}}, rep);
+        EXPECT_FALSE(pulled.has_value()) << "a document with no archive sibling answered for an archive's members";
+        EXPECT_NE(diagnosticsOf(rep).find("archive-writing sibling"), std::string::npos) << diagnosticsOf(rep);
+    }
+}
+
+// ══ A name the runtime realizes ═══════════════════════════════════════════════
+
+// To a program, DSS's runtime is the platform's library: a weak reference to a name whose body a descriptor states
+// DSS ships as source on the link's format binds — the member that defines it is fetched — whatever the members'
+// document says of an operator's archive. The corpus is asked by name (the shipped descriptors' `realization`
+// rows): `strtol` and `memset_explicit` on pe, `memset_explicit` alone on ELF, where glibc's image exports `strtol`.
+// CONTROLS: `hook`, which no descriptor declares, follows the members' document on both; and `strtol` on ELF does
+// too — the same name, the platform's own image's there, so an operator's archive that defines it is not searched
+// for a weak reference, as GNU ld does not search one.
+TEST(ArchiveWeakReferenceSearch, AWeakReferenceToANameTheRuntimeRealizesIsFetched) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "weak-archive-runtime-name"};
+    DiagnosticReporter rep;
+    auto const pe = archiveOf(scratch.path(), "pe64-x86_64-windows-staticlib", memberDefining("strtol", "hook"));
+    ASSERT_FALSE(pe.empty());
+    auto const peRuntime = pulledFor("pe64-x86_64-windows-exec", pe, {{"strtol", SymbolBinding::Weak}}, rep);
+    ASSERT_TRUE(peRuntime.has_value()) << diagnosticsOf(rep);
+    EXPECT_EQ(*peRuntime, 1u) << "pe: DSS ships `strtol`'s body, so the weak reference binds";
+    auto const peHook = pulledFor("pe64-x86_64-windows-exec", pe, {{"hook", SymbolBinding::Weak}}, rep);
+    ASSERT_TRUE(peHook.has_value()) << diagnosticsOf(rep);
+    EXPECT_EQ(*peHook, 0u) << "CONTROL: a name no descriptor declares follows the members' document";
+    auto const peRelocatable = pulledFor("pe64-x86_64-windows", pe, {{"strtol", SymbolBinding::Weak}}, rep);
+    ASSERT_TRUE(peRelocatable.has_value()) << diagnosticsOf(rep);
+    EXPECT_EQ(*peRelocatable, 1u) << "a relocatable link asks the same question";
+
+    auto const elfC23 =
+        archiveOf(scratch.path(), "elf64-x86_64-linux-staticlib", memberDefining("memset_explicit", "hook"));
+    ASSERT_FALSE(elfC23.empty());
+    auto const elfRuntime =
+        pulledFor("elf64-x86_64-linux-exec", elfC23, {{"memset_explicit", SymbolBinding::Weak}}, rep);
+    ASSERT_TRUE(elfRuntime.has_value()) << diagnosticsOf(rep);
+    EXPECT_EQ(*elfRuntime, 1u) << "ELF: DSS ships `memset_explicit`'s body (glibc 2.39 has none)";
+    auto const elfHook = pulledFor("elf64-x86_64-linux-exec", elfC23, {{"hook", SymbolBinding::Weak}}, rep);
+    ASSERT_TRUE(elfHook.has_value()) << diagnosticsOf(rep);
+    EXPECT_EQ(*elfHook, 0u) << "CONTROL: a name no descriptor declares follows the members' document";
+
+    std::filesystem::remove(elfC23);
+    auto const elfLibc = archiveOf(scratch.path(), "elf64-x86_64-linux-staticlib", memberDefining("strtol", "hook"));
+    ASSERT_FALSE(elfLibc.empty());
+    auto const elfImageName = pulledFor("elf64-x86_64-linux-exec", elfLibc, {{"strtol", SymbolBinding::Weak}}, rep);
+    ASSERT_TRUE(elfImageName.has_value()) << diagnosticsOf(rep);
+    EXPECT_EQ(*elfImageName, 0u) << "CONTROL: on ELF `strtol` is libc.so.6's, not a body DSS ships";
 }
 
 // ══ COFF: the policy read, written back, and folded ══════════════════════════
@@ -320,13 +501,6 @@ namespace {
         i += aux;
     }
     return std::nullopt;
-}
-
-[[nodiscard]] ExternImport const* rowNamed(AssembledModule const& m, std::string const& name) {
-    for (auto const& e : m.externImports) {
-        if (e.mangledName == name) return &e;
-    }
-    return nullptr;
 }
 
 }  // namespace
