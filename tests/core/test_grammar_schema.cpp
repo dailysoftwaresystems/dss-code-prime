@@ -292,6 +292,42 @@ TEST(GrammarSchema, CommitAfterPrefixRejectsNonBoolean) {
     }));
 }
 
+// P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): the `notFollowedBy`
+// not-predicate is a non-empty array of TOKEN kind names. A rule name, an unknown kind, an
+// empty array or a bare string is refused loud at load (C_UnknownShape) — never read as a
+// predicate that can never fire.
+TEST(GrammarSchema, NotFollowedByNamesTokenKindsOnly) {
+    auto const load = [](std::string_view nf) {
+        std::string const doc =
+            std::string{R"({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "shapes": {
+        "root": { "sequence": ["Identifier"], "notFollowedBy": )"}
+            + std::string{nf} + R"( }
+      }
+    })";
+        return GrammarSchema::loadFromText(doc);
+    };
+    {
+        auto ok = load(R"(["Identifier"])");
+        ASSERT_TRUE(ok.has_value()) << ok.error()[0].message;
+        GrammarSchema const& s = **ok;
+        EXPECT_EQ(s.notFollowedBy(s.rules().find("root")).size(), 1u)
+            << "the predicate's one token kind reached the compiled rule";
+    }
+    for (std::string_view bad : {std::string_view{R"(["root"])"},
+                                 std::string_view{R"(["NoSuchToken"])"},
+                                 std::string_view{R"([])"},
+                                 std::string_view{R"("Identifier")"}}) {
+        auto r = load(bad);
+        ASSERT_FALSE(r.has_value()) << bad;
+        EXPECT_TRUE(std::ranges::any_of(r.error(), [](auto const& d) {
+            return d.code == DiagnosticCode::C_UnknownShape;
+        })) << bad;
+    }
+}
+
 // ─── loadShipped + the on-disk toy.lang.json ─────────────────────────────
 
 TEST(GrammarSchema, LoadShippedToy) {
@@ -5943,6 +5979,117 @@ TEST(GrammarSchema, SemanticsBuiltinFunctionsVariadicNotBool) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// ── libraryBuiltins + a builtin's libraryFallback (P69, lane `cs`, review m10) ──────────
+// ONE test per refusal the loader states, each pinning its own MESSAGE (several share a
+// code), each over a config whose one defect is that refusal's — and a CONTROL that the
+// same config without it loads. RED-ON-DISABLE: drop any one refusal and its test loads.
+namespace {
+[[nodiscard]] std::string librarySemantics(std::string_view semanticsBody) {
+    return std::string{R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { )JSON"} + std::string{semanticsBody} + " }\n}";
+}
+void expectRefused(std::string_view semanticsBody, DiagnosticCode code,
+                   std::string_view message) {
+    auto r = GrammarSchema::loadFromText(librarySemantics(semanticsBody));
+    ASSERT_FALSE(r.has_value()) << semanticsBody;
+    EXPECT_TRUE(hasDiagCode(r.error(), code)) << semanticsBody << errorDiags(r.error());
+    EXPECT_TRUE(hasDiagMessage(r.error(), message))
+        << semanticsBody << " — expected \"" << message << "\"" << errorDiags(r.error());
+}
+}  // namespace
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsLoadAndNameTheirLibraryFunction) {
+    auto r = GrammarSchema::loadFromText(librarySemantics(
+        R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs", "strlen" ] })"));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    LibraryBuiltins const& lb = (*r)->semantics().libraryBuiltins;
+    EXPECT_EQ(lb.libraryFunctionOf("__builtin_strlen"), "strlen");
+    EXPECT_EQ(lb.libraryFunctionOf("__builtin_abs"), "abs");
+    EXPECT_TRUE(lb.libraryFunctionOf("__builtin_memcpy").empty()) << "not listed";
+    EXPECT_TRUE(lb.libraryFunctionOf("strlen").empty()) << "the bare name is no builtin";
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsNotAnObjectIsRefused) {
+    expectRefused(R"("libraryBuiltins": [ "abs" ])", DiagnosticCode::C_InvalidSemantics,
+                  "'semantics.libraryBuiltins' must be an object");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsUnknownKeyIsRefused) {
+    expectRefused(
+        R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs" ], "functons": [] })",
+        DiagnosticCode::C_InvalidSemantics, "unknown key 'functons'");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsPrefixMissingOrEmptyIsRefused) {
+    expectRefused(R"("libraryBuiltins": { "functions": [ "abs" ] })",
+                  DiagnosticCode::C_MissingField, "'prefix' is required");
+    expectRefused(R"("libraryBuiltins": { "prefix": "", "functions": [ "abs" ] })",
+                  DiagnosticCode::C_MissingField, "'prefix' is required");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsFunctionsMissingOrEmptyIsRefused) {
+    expectRefused(R"("libraryBuiltins": { "prefix": "__builtin_" })",
+                  DiagnosticCode::C_MissingField, "'functions' is required");
+    expectRefused(R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [] })",
+                  DiagnosticCode::C_MissingField, "'functions' is required");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsFunctionEntryThatIsNoNameIsRefused) {
+    expectRefused(R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ 42 ] })",
+                  DiagnosticCode::C_InvalidSemantics,
+                  "each 'functions' entry must be a non-empty string");
+    expectRefused(R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs", "" ] })",
+                  DiagnosticCode::C_InvalidSemantics,
+                  "each 'functions' entry must be a non-empty string");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsFunctionsUnsortedOrDuplicatedAreRefused) {
+    expectRefused(
+        R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ "strlen", "abs" ] })",
+        DiagnosticCode::C_InvalidSemantics, "'functions' must be sorted and unique");
+    expectRefused(
+        R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs", "abs" ] })",
+        DiagnosticCode::C_InvalidSemantics, "'functions' must be sorted and unique");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinThatIsAlsoABuiltinFunctionsRowIsRefused) {
+    expectRefused(
+        R"("builtinFunctions": [ { "name": "__builtin_abs", "result": "I32", "params": [ "I32" ] } ],
+           "libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs" ] })",
+        DiagnosticCode::C_InvalidSemantics, "one name, two meanings");
+    auto ok = GrammarSchema::loadFromText(librarySemantics(
+        R"("builtinFunctions": [ { "name": "__builtin_labs", "result": "I32", "params": [ "I32" ] } ],
+           "libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs" ] })"));
+    EXPECT_TRUE(ok.has_value()) << "CONTROL: disjoint names load" << errorDiags(ok.error());
+}
+
+TEST(GrammarSchema, SemanticsBuiltinLibraryFallbackThatIsNoNameIsRefused) {
+    expectRefused(R"("builtinFunctions": [ { "name": "B", "result": "F64",
+                                             "lowering": "quiet_nan", "libraryFallback": 7 } ])",
+                  DiagnosticCode::C_InvalidSemantics,
+                  "'libraryFallback' must be a non-empty string");
+    expectRefused(R"("builtinFunctions": [ { "name": "B", "result": "F64",
+                                             "lowering": "quiet_nan", "libraryFallback": "" } ])",
+                  DiagnosticCode::C_InvalidSemantics,
+                  "'libraryFallback' must be a non-empty string");
+    auto ok = GrammarSchema::loadFromText(librarySemantics(
+        R"("builtinFunctions": [ { "name": "B", "result": "F64",
+                                   "lowering": "quiet_nan", "libraryFallback": "nan" } ])"));
+    EXPECT_TRUE(ok.has_value()) << "CONTROL: a named fallback on `quiet_nan` loads"
+                                << errorDiags(ok.error());
+}
+
+TEST(GrammarSchema, SemanticsBuiltinLibraryFallbackOnAVerbWithoutAConstantFormIsRefused) {
+    expectRefused(R"("builtinFunctions": [ { "name": "B", "result": "I32", "params": [ "I32" ],
+                                             "lowering": "first_argument",
+                                             "libraryFallback": "abs" } ])",
+                  DiagnosticCode::C_InvalidSemantics, "has no such form");
+}
+
 // ── constMarker (the language's qualifier vocabulary, `semantics` level) ──
 // P68 round 9 (lane `cs`): the qualifier tokens are declared ONCE, in the
 // semantics block; a declaration row takes them by derivation and may no longer
@@ -8336,4 +8483,65 @@ TEST(GrammarSchema, StaticInitializerFormsLoadAndEveryMalformedShapeFailsLoud) {
     // An UNDECLARED block is no rule at all: the producer is told nothing (its static
     // objects may be initialized at run time).
     EXPECT_FALSE(otherConstantFormsOf(std::nullopt).has_value());
+}
+
+// P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): WHERE the predicate is
+// admitted — only on a SPECULATIVE alt's candidate that is never the alt's fallback reading for one
+// of its FIRST tokens and never commits after its prefix. Each other way into the rule enters it
+// without a probe, where the predicate cannot be tested; such a grammar is refused at load
+// (C_UnknownShape) rather than skipping the predicate in silence. RED-ON-DISABLE: drop
+// `validateNotFollowedBy` → every refusal below loads.
+TEST(GrammarSchema, NotFollowedByIsAdmittedOnlyWhereAProbeEvaluatesIt) {
+    auto const load = [](std::string const& shapes) {
+        std::string const doc = std::string{R"({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        "A": [{ "kind": "AKind" }],
+        "B": [{ "kind": "BKind" }],
+        "C": [{ "kind": "CKind" }],
+        "X": [{ "kind": "XKind" }]
+      },
+      "shapes": )"} + shapes + "\n    }";
+        return GrammarSchema::loadFromText(doc);
+    };
+    std::string const pair =
+        R"("pair": { "sequence": ["AKind", "BKind"], "notFollowedBy": ["CKind"] })";
+    std::string const triple = R"("triple": { "sequence": ["AKind", "BKind", "CKind"] })";
+    std::string const spec = R"("speculative": true, "lookahead": 3)";
+    {
+        auto ok = load("{ \"root\": { \"alt\": [\"pair\", \"triple\"], " + spec + " }, " + pair
+                       + ", " + triple + " }");
+        ASSERT_TRUE(ok.has_value()) << ok.error()[0].message;
+    }
+    struct Bad { char const* why; std::string shapes; char const* needle; };
+    Bad const bads[] = {
+        {"the declared-last candidate",
+         "{ \"root\": { \"alt\": [\"triple\", \"pair\"], " + spec + " }, " + pair + ", " + triple
+             + " }",
+         "FALLBACK reading"},
+        {"no later candidate starts with its first token",
+         "{ \"root\": { \"alt\": [\"pair\", \"other\"], " + spec + " }, " + pair
+             + R"(, "other": { "sequence": ["XKind"] } })",
+         "FALLBACK reading"},
+        {"a sequence element", "{ \"root\": { \"sequence\": [\"pair\", \"CKind\"] }, " + pair + " }",
+         "outside a speculative alt's candidate list"},
+        {"a candidate of a NON-speculative alt",
+         "{ \"root\": { \"alt\": [\"pair\", \"triple\"] }, " + pair + ", " + triple + " }",
+         "outside a speculative alt's candidate list"},
+        {"beside commitAfterPrefix",
+         "{ \"root\": { \"alt\": [\"pair\", \"triple\"], " + spec + " }, "
+             + R"("pair": { "sequence": ["AKind", "BKind"], "notFollowedBy": ["CKind"], )"
+             + R"("commitAfterPrefix": true }, )" + triple + " }",
+         "mutually exclusive"},
+    };
+    for (Bad const& b : bads) {
+        auto r = load(b.shapes);
+        ASSERT_FALSE(r.has_value()) << b.why;
+        EXPECT_TRUE(std::ranges::any_of(r.error(), [&](auto const& d) {
+            return d.code == DiagnosticCode::C_UnknownShape
+                && d.message.find(b.needle) != std::string::npos;
+        })) << b.why;
+    }
 }

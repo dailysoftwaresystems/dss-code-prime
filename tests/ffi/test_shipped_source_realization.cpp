@@ -60,6 +60,8 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_registry.hpp"
 
 #include "repo_root.hpp"
 
@@ -337,20 +339,25 @@ TEST(ShippedSourceRealization, EveryRuntimeFileIsNamedByADescriptor) {
 }
 
 // ── R3 ───────────────────────────────────────────────────────────────────────
-// No format carries BOTH an image and a source, at the EFFECTIVE (merged) level
-// — the per-symbol override merged over the descriptor's, exactly as the
-// injector and the realization oracle merge them. Checking only the raw override
-// would miss the commonest shape: a descriptor-level image plus a per-symbol
-// source.
+// No format carries BOTH an image and a source AT ONE LEVEL — the descriptor's own
+// pair, or one symbol's own pair — and no symbol re-imports a format its
+// descriptor realizes from source. ★ P69 (the R3 precedence): a symbol's OWN
+// source over the image it INHERITS is ONE owner, not two — the row names its body,
+// as a per-symbol `library` override names its image — and the reader records it by
+// giving the symbol an empty image there (see `ShippedSymbol::library`), which the
+// last arm below checks through the real reader.
 TEST(ShippedSourceRealization, NoFormatDeclaresBothAnImageAndASource) {
     forEachDescriptor([&](fs::path const& p, json const& doc) {
         auto const docLib  = formatKeysOf(doc, "library");
         auto const docReal = formatKeysOf(doc, "realization");
+        auto contains = [](std::vector<std::string> const& v, std::string const& f) {
+            return std::find(v.begin(), v.end(), f) != v.end();
+        };
         auto check = [&](std::vector<std::string> const& lib,
                          std::vector<std::string> const& real,
                          std::string const& ctx) {
             for (auto const& f : real)
-                EXPECT_EQ(std::find(lib.begin(), lib.end(), f), lib.end())
+                EXPECT_FALSE(contains(lib, f))
                     << "R3: " << p.filename().generic_string() << ' ' << ctx
                     << " declares BOTH 'library." << f << "' and 'realization."
                     << f << "' — two owners for one body. Preferring either "
@@ -363,17 +370,107 @@ TEST(ShippedSourceRealization, NoFormatDeclaresBothAnImageAndASource) {
         for (auto const& sym : doc.at("symbols")) {
             std::string const ctx = "symbols[" + std::to_string(i++) + "]";
             if (!sym.is_object()) continue;
-            auto lib  = docLib;
-            auto real = docReal;
-            for (auto const& f : formatKeysOf(sym, "library"))
-                if (std::find(lib.begin(), lib.end(), f) == lib.end())
-                    lib.push_back(f);
-            for (auto const& f : formatKeysOf(sym, "realization"))
-                if (std::find(real.begin(), real.end(), f) == real.end())
-                    real.push_back(f);
-            check(lib, real, ctx);
+            auto const symLib  = formatKeysOf(sym, "library");
+            auto const symReal = formatKeysOf(sym, "realization");
+            check(symLib, symReal, ctx);
+            for (auto const& f : docReal)
+                if (!contains(symReal, f))
+                    EXPECT_FALSE(contains(symLib, f))
+                        << "R3: " << p.filename().generic_string() << ' ' << ctx
+                        << " imports on '" << f << "' where its descriptor realizes "
+                           "every symbol from source — two owners for one body.";
         }
     });
+}
+
+// ★ The precedence, THROUGH THE READER (P69). A symbol's own source on a format
+// whose import it would inherit reads clean, is realized from the source there,
+// carries an EMPTY image there (what every binder fold routes unbound), and keeps
+// the inherited image on every other format. The three refusals of the same rule —
+// both at the root, both on the symbol, the symbol's import under the
+// descriptor's source — each fail to read, naming the two owners and where.
+TEST(ShippedSourceRealization, ASymbolsOwnSourceSupersedesTheImportItInherits) {
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const dir = fs::temp_directory_path() / "dss-r3-precedence";
+    fs::create_directories(dir);
+    auto write = [&](std::string const& name, std::string const& text) {
+        fs::path const at = dir / name;
+        std::ofstream(at, std::ios::binary) << text;
+        return at;
+    };
+    auto read = [&](fs::path const& at, dss::DiagnosticReporter& rep) {
+        dss::TypeInterner interner{dss::CompilationUnitId{1}};
+        dss::TypeRegistry typeReg;
+        return dss::ffi::readShippedLibDescriptor(at, interner, typeReg, rep);
+    };
+    {
+        auto const at = write("precedence_ok.json", R"JSON({
+            "header": "precedence_ok.h",
+            "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+            "symbols": [
+              { "name": "shipped_fn", "signature": "fn() -> i32",
+                "realization": { "pe": { "source": "runtime/platform/src/atomic.c" } } },
+              { "name": "imported_fn", "signature": "fn() -> i32" }
+            ]
+        })JSON");
+        dss::DiagnosticReporter rep;
+        auto const desc = read(at, rep);
+        ASSERT_TRUE(desc.has_value()) << (rep.all().empty() ? std::string{} : rep.all().front().actual);
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(desc->symbols.size(), 2u);
+        auto const& shipped = desc->symbols.at(0);
+        ASSERT_EQ(shipped.name, "shipped_fn");
+        ASSERT_EQ(shipped.library.count("pe"), 1u) << "the supersession must be recorded on the symbol";
+        EXPECT_EQ(shipped.library.at("pe"), "") << "an EMPTY image: the source, not ucrtbase, owns the body";
+        EXPECT_EQ(shipped.library.count("elf"), 0u) << "the other formats keep the inherited import";
+        EXPECT_EQ(desc->symbols.at(1).library.size(), 0u) << "a row without its own source is untouched";
+        ASSERT_EQ(shipped.realization.count("pe"), 1u);
+        EXPECT_EQ(shipped.realization.at("pe"), "runtime/platform/src/atomic.c");
+        EXPECT_EQ(desc->library.at("pe"), "ucrtbase.dll") << "the descriptor's own map is not rewritten";
+    }
+    struct Refusal {
+        char const* file;
+        char const* text;
+        char const* names;
+    };
+    Refusal const refusals[] = {
+        {"precedence_root_both.json", R"JSON({
+            "header": "rb.h",
+            "library": { "pe": "ucrtbase.dll" },
+            "realization": { "pe": { "source": "runtime/platform/src/atomic.c" } },
+            "symbols": [ { "name": "rb_fn", "signature": "fn() -> i32" } ]
+        })JSON", "(root)"},
+        {"precedence_symbol_both.json", R"JSON({
+            "header": "sb.h",
+            "symbols": [ { "name": "sb_fn", "signature": "fn() -> i32",
+                           "library": { "pe": "ucrtbase.dll" },
+                           "realization": { "pe": { "source": "runtime/platform/src/atomic.c" } } } ]
+        })JSON", "symbols[0] ('sb_fn')"},
+        {"precedence_symbol_import_under_source.json", R"JSON({
+            "header": "su.h",
+            "realization": { "pe": { "source": "runtime/platform/src/atomic.c" } },
+            "symbols": [ { "name": "su_fn", "signature": "fn() -> i32",
+                           "library": { "pe": "ucrtbase.dll" } } ]
+        })JSON", "symbols[0] ('su_fn')"},
+    };
+    for (Refusal const& r : refusals) {
+        SCOPED_TRACE(r.file);
+        dss::DiagnosticReporter rep;
+        EXPECT_FALSE(read(write(r.file, r.text), rep).has_value());
+        // The refusal states R3's CONDITION — two owners for one body — and where; an
+        // anchor id is bookkeeping for a comment, not compiler output (the
+        // emitted-anchor-ids guard), so the message is matched by what it says.
+        bool namedTwoOwners = false, namedWhere = false;
+        for (auto const& d : rep.all()) {
+            namedTwoOwners = namedTwoOwners || d.actual.find("two owners for one body") != std::string::npos;
+            namedWhere     = namedWhere || d.actual.find(r.names) != std::string::npos;
+        }
+        EXPECT_TRUE(namedTwoOwners);
+        EXPECT_TRUE(namedWhere) << "the refusal must name " << r.names;
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 // ── THE TREE'S OWN SHAPE ─────────────────────────────────────────────────────

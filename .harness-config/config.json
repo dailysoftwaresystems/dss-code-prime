@@ -8,7 +8,14 @@
     "stallSeconds": 1800,
     "durationWarningFactor": 3.0,
     "clockStepToleranceMilliseconds": 2000,
-    "processSampleSeconds": 5
+    "processSampleSeconds": 5,
+    // HEAVY-LEG ADMISSION (DssHarness 0.6.5): a build or test leg, and a run of a runner with `requireBuild` or
+    // `"heavy": true`, takes one of its PHYSICAL machine's slots -- at most two at once, across every command and every
+    // tree that declares admission (this machine's WSL legs count against Windows) -- then starts only below 76% memory
+    // (Windows: commit charge over commit limit), re-read after a settle while another leg holds a slot. A wait names
+    // each holder; past the wait the leg is `not-admitted` (exit 7), never `failed`. Each lane and the orchestrator
+    // run their heavy jobs through it: no slot directory and no memory script by hand.
+    "admission": { "heavyLegs": 2, "maxMemoryPercent": 76 }
   },
   "toolchains": {
     // EVERY toolchain NAMES its compiler (`env` CC/CXX) and HOLDS the build to it (`compilerId`,
@@ -195,8 +202,10 @@
       // resolved no address and skipped its legs, so a gate "passed" having run nothing on them. DssHarness 0.5.12:
       // `wakeWaitSeconds` keeps looking the host up for that long before skipping; `holdAwakeSeconds` runs
       // `keepAwake` on the Mac for that long AFTER each command, so the next one finds it awake (a running leg
-      // already holds it with its own caffeinate). 30 follows the report addendum's dark-wake timings; 600 covers
-      // the gaps between one lane's commands without holding the machine awake all night.
+      // already holds it with its own caffeinate). 30 follows the report addendum's dark-wake timings. The hold is
+      // 14400: ✔MEASURED P69 (2026-10-06), 600 did NOT cover the gaps between a lane's commands — the Mac slept and
+      // refused ssh twice in one day (14:25, 19:01), each time hours after the last Mac leg, because a lane's next
+      // Mac run waits on its siblings' folds; four hours spans those gaps and still ends within the night.
       "macos": {
         "repositoryPath": "~/src/dss-code-prime",
         "keepAwake": [
@@ -208,7 +217,7 @@
         "connectTimeoutSeconds": 25,
         "keepAliveSeconds": 30,
         "wakeWaitSeconds": 30,
-        "holdAwakeSeconds": 600
+        "holdAwakeSeconds": 14400
       },
       "arm64-vps": {
         "repositoryPath": "~/src/Github/dss-code-prime",
@@ -690,6 +699,20 @@
     // host, and placing a file would overwrite that copy under whatever lane is using it.
     // A BATCH (`batch_b64`) runs many probes in one run: one sync, one pull, and a Mac kept awake for
     // all of them (MEASURED 2026-09-23: the Mac fell asleep between single-probe runs a minute apart).
+    "redact": {
+      "description": "The one redactor's self-test, on every leg: what must never leave a machine depends on that host's own account and machine names.",
+      "legs": [
+        "windows-x86_64-debug",
+        "windows-x86_64-release",
+        "linux-x86_64-debug",
+        "linux-x86_64-release",
+        "macos-arm64-debug",
+        "macos-arm64-release",
+        "linux-arm64-debug",
+        "linux-arm64-release"
+      ],
+      "action": "redact/redact.yml"
+    },
     "probe-reference-cc": {
       "description": "Compiles one probe, or a batch of probes in ONE run (sources given as base64), with the reference compiler of the leg's own host, and prints and keeps the report redacted: the compiler's identity, the compile's exit code and diagnostics, and by mode the program's output and exit code, the assembly, a dump of the object, or what the compiler printed. A refused compile is reported as a measurement.",
       "legs": [
@@ -705,13 +728,28 @@
       "action": "probe-reference-cc/probe-reference-cc.yml",
       "stallSeconds": 420
     },
-    // THE PROTOTYPE CENSUS (P68 round 12, lane lm): every shipped prototype judged against the TYPE the leg's own
-    // platform header gives it, twice: by DSS's own `_Generic`, in a program the leg's dsscp builds and runs there,
-    // and by the leg's reference compiler over the descriptor's rendered text. `requireBuild` because it runs the
-    // leg's dsscp ({product}). No Windows leg yet: verdict (a) reads clang's `(aka ...)` refusal, and cl has no such
-    // form.
+    // THE PROTOTYPE CENSUS (P68 round 12, lane lm; its values step and derived pair P69; cl's dialect P69, lane hm):
+    // every shipped prototype, and every integer value, judged against the leg's own platform header, as the
+    // action's file says. ITS REFERENCE, on every leg, is the action's `cc` input, `cc` by default, whose dialect the
+    // program reads from the compiler itself: clang's or gcc's `--version` banner, or the banner MSVC's cl prints
+    // when run with no arguments; any other compiler is refused by name. On Linux and macOS `cc` is the toolchain's
+    // own compiler. THE TWO WINDOWS LEGS (P69, lane lm's request, routed through lane hm) have no `cc` on their PATH
+    // (✔MEASURED 2026-10-07, probe-reference-cc runs 20261007-162639-c36d903d and 20261007-162815-a31bef4d):
+    // windows-x86_64-debug has the MinGW-w64 gcc 13.2.0 its toolchain builds with, and windows-x86_64-release that
+    // gcc and its Visual Studio environment's cl 19.51. So a run with the default refuses on both, by name, and a run
+    // names each Windows leg's own compiler: `--input cc=gcc` on the MinGW leg, `--input cc=cl` on the MSVC leg -- an
+    // input reaches every leg the run names, so such a run names its legs. The leg's own compiler is declared ONCE,
+    // as its toolchain's `CC` above, and a run step cannot be handed it: DssHarness 0.6.10 gives a run step neither
+    // the toolchain's env nor a name for its compiler (✔MEASURED 2026-10-07 on windows-x86_64-debug,
+    // windows-x86_64-release, linux-x86_64-debug and macos-arm64-debug, `CC` unset in the step's environment), which
+    // is the open work of
+    // D-HARNESS-PROTOTYPE-CENSUS-DEFAULT-REFERENCE-IS-ABSENT-ON-ITS-WINDOWS-LEGS.
+    // No `requireBuild`: every step names `{product}`, so DssHarness builds each leg first, whichever runner starts it
+    // (`help runners`).
     "prototype-census": {
       "legs": [
+        "windows-x86_64-debug",
+        "windows-x86_64-release",
         "linux-x86_64-debug",
         "linux-x86_64-release",
         "macos-arm64-debug",
@@ -720,7 +758,6 @@
         "linux-arm64-release"
       ],
       "action": "prototype-census/prototype-census.yml",
-      "requireBuild": true,
       "stallSeconds": 1800
     },
     // ★★★ THE MANUAL END-TO-END CORPUS. Declared here because a runner is reachable ONLY through
@@ -810,20 +847,12 @@
       "action": "anchor-rows/anchor-rows.yml"
     },
     "anchors": {
-      "description": "Read and lint deferred-anchor registry rows, and launch the one door that writes them, dssharness write-anchor and set-anchor.",
+      "description": "The self-test of the library the anchors family shares: the registry row reader, its vocabulary and the one launcher of the door, dssharness write-anchor and set-anchor.",
       "legs": [
         "windows-x86_64-debug",
         "linux-x86_64-debug"
       ],
       "action": "anchors/anchors.yml"
-    },
-    "apply-registry-row": {
-      "description": "Replace one deferred-anchor registry row with a lane's verbatim row text from a file.",
-      "legs": [
-        "windows-x86_64-debug",
-        "linux-x86_64-debug"
-      ],
-      "action": "apply-registry-row/apply-registry-row.yml"
     },
     "burndown-queue": {
       "description": "Re-derive the prioritized burndown queue from the registry, production errors first.",
@@ -833,13 +862,23 @@
       ],
       "action": "burndown-queue/burndown-queue.yml"
     },
-    "check-anchor-balance": {
-      "description": "Refuse a cycle that ends with more OPEN deferral-registry rows than it began.",
+    "anchor-debt": {
+      "description": "Report the registry's DEBT the balance gate does not -- a closure verdict under a non-closure marker, a gated row with no open opener, a blocker already discharged, an unclassifiable closing-work marker, OPEN-vs-GATED prose, a `[[...]]` pointer that names no row -- and refuse what a change introduced that way. The balance itself, a lost row's refusal included, is `dssharness check-anchor-balance`.",
       "legs": [
         "windows-x86_64-debug",
         "linux-x86_64-debug"
       ],
-      "action": "check-anchor-balance/check-anchor-balance.yml"
+      "action": "anchor-debt/anchor-debt.yml"
+    },
+    "anchor-debt-debt": {
+      "description": "Report the registry DEBT against a base ref, and refuse what a change introduced into it -- a row it added or edited into debt, or a pointer it left dangling -- anchor-debt's debt step, on this machine's own tree (it reads the registries at the base through git, which no synced copy carries).",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "debt"
+      ],
+      "action": "anchor-debt/anchor-debt.yml"
     },
     "check-anchor-registry": {
       "description": "Refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells.",
@@ -854,6 +893,16 @@
       "legs": [
         "windows-x86_64-debug",
         "linux-x86_64-debug"
+      ],
+      "action": "check-diagnostic-codes/check-diagnostic-codes.yml"
+    },
+    "check-diagnostic-codes-cross-branch": {
+      "description": "Check DiagnosticCode ordinals across every worktree and unmerged ref of this machine's repository -- check-diagnostic-codes's cross-branch step, on this machine's own tree (a synced copy carries no git worktrees).",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "cross-branch"
       ],
       "action": "check-diagnostic-codes/check-diagnostic-codes.yml"
     },
@@ -908,6 +957,16 @@
       "legs": [
         "windows-x86_64-debug",
         "linux-x86_64-debug"
+      ],
+      "action": "check-guard-output-encoding/check-guard-output-encoding.yml"
+    },
+    "check-guard-output-encoding-write": {
+      "description": "Shorten the output-encoding inventory to what is still unprotected (it may only shrink) -- check-guard-output-encoding's write step, on this machine's own tree.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "write"
       ],
       "action": "check-guard-output-encoding/check-guard-output-encoding.yml"
     },
@@ -987,6 +1046,16 @@
       ],
       "action": "check-plan-citations/check-plan-citations.yml"
     },
+    "check-plan-citations-baseline": {
+      "description": "Establish new ground for the plans' citation baseline (it can RAISE a ceiling, and says so) -- check-plan-citations's baseline step, on this machine's own tree.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "baseline"
+      ],
+      "action": "check-plan-citations/check-plan-citations.yml"
+    },
     "check-retyped-closed-sets": {
       "description": "Census the diagnostics that RETYPE a closed vocabulary instead of projecting it.",
       "legs": [
@@ -1030,6 +1099,26 @@
       ],
       "action": "check-stale-refusal-citations/check-stale-refusal-citations.yml"
     },
+    "check-stale-refusal-citations-write": {
+      "description": "Burn down the stale-refusal-citation inventory (it may only LOWER) -- check-stale-refusal-citations's write step, on this machine's own tree.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "write"
+      ],
+      "action": "check-stale-refusal-citations/check-stale-refusal-citations.yml"
+    },
+    "check-stale-refusal-citations-baseline": {
+      "description": "Establish new ground for the stale-refusal-citation inventory (it can RAISE a ceiling, and says so) -- check-stale-refusal-citations's baseline step, on this machine's own tree.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "baseline"
+      ],
+      "action": "check-stale-refusal-citations/check-stale-refusal-citations.yml"
+    },
     "check-wall-clock-in-tests": {
       "description": "Refuse a new wall-clock duration literal in test code outside the shared measured budget.",
       "legs": [
@@ -1043,6 +1132,26 @@
       "legs": [
         "windows-x86_64-debug",
         "linux-x86_64-debug"
+      ],
+      "action": "check-wrapped-anchor-ids/check-wrapped-anchor-ids.yml"
+    },
+    "check-wrapped-anchor-ids-write": {
+      "description": "Burn down the wrapped-anchor-id inventory (it may only LOWER) -- check-wrapped-anchor-ids's write step, on this machine's own tree.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "write"
+      ],
+      "action": "check-wrapped-anchor-ids/check-wrapped-anchor-ids.yml"
+    },
+    "check-wrapped-anchor-ids-baseline": {
+      "description": "Establish new ground for the wrapped-anchor-id inventory (it can RAISE a ceiling, and says so) -- check-wrapped-anchor-ids's baseline step, on this machine's own tree.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "baseline"
       ],
       "action": "check-wrapped-anchor-ids/check-wrapped-anchor-ids.yml"
     },
@@ -1070,6 +1179,13 @@
         "linux-x86_64-debug"
       ],
       "action": "corpus-census/corpus-census.yml"
+      // ⓘ NO `requireBuild` (2026-10-06, the P69 re-review's MINOR 8): the action's manual `census` and
+      // `census-self-test` steps compile the corpus with `{product}`, and DssHarness builds the leg before any step
+      // that names it, whichever runner starts the step -- so the key added a build to this runner's plain run
+      // alone, the self-test, which compiles nothing. Those two steps declare `heavy: true` themselves. ✔MEASURED
+      // 2026-10-06 on windows-x86_64-debug, without the key: the plain run built nothing (run
+      // 20261006-232902-182b5fa5, 3 s), and `--manual-step census` configured and built the leg, then censused
+      // (run 20261006-233347-8c5e271b).
     },
     "examples-census": {
       "description": "Re-derive every corpus-manifest figure examples/README.md states, by parsing the manifests.",
@@ -1087,13 +1203,49 @@
       ],
       "action": "owning-tree/owning-tree.yml"
     },
+    // ★ ONE CLASS PER CORPUS, ON THE LEG WHOSE CORPUS IT IS (2026-10-01, P69 lane hm; the P69 review's MAJOR 2): a
+    // manifest is one platform's corpus, and its class (pe, elf, macho) is its own target's format kind, so the check
+    // and the regeneration run on the SAME leg, with that leg's own build -- name one leg and its manifest per run
+    // (`--legs <leg> --input manifest=<...>`). The regeneration writes its step's kept output, never the tracked
+    // file: on a remote leg that would rewrite only the host's copy. The Mac leg is RELEASE: the macho corpus is
+    // staged by the `sqlite` runner, whose one Mac leg is macos-arm64-release, so a census there needs only the
+    // build that run made, where a debug leg would build the tree a second time on that host.
+    // ⓘ NEITHER RUNNER DECLARES `requireBuild` (2026-10-06): both steps name `{product}`, so DssHarness builds the leg
+    // before them whichever runner starts them, and the key would add nothing; both steps declare `heavy: true`.
     "pragma-profile-census": {
-      "description": "Census `#pragma` usage across the corpus and hold the profile to its expected shape.",
+      "description": "Census `#pragma` usage across one leg's corpus under that corpus's own class and hold it to the expected set.",
       "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug",
+        "macos-arm64-release"
+      ],
+      "steps": [
+        "census"
+      ],
+      "action": "pragma-profile-census/pragma-profile-census.yml"
+    },
+    "pragma-profile-census-update": {
+      "description": "Regenerate the #pragma expected set with one leg's class measured anew, into the step's kept output -- pragma-profile-census's update step.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug",
+        "macos-arm64-release"
+      ],
+      "steps": [
+        "update"
+      ],
+      "action": "pragma-profile-census/pragma-profile-census.yml"
+    },
+    "pragma-profile-census-self-test": {
+      "description": "The pragma census program's own arms, with no compiler and no build -- the ones ctest runs as harness/pragma_profile_census_selftest.",
+      "legs": [
+        "windows-x86_64-debug",
         "linux-x86_64-debug"
       ],
-      "action": "pragma-profile-census/pragma-profile-census.yml",
-      "requireBuild": true
+      "steps": [
+        "self-test"
+      ],
+      "action": "pragma-profile-census/pragma-profile-census.yml"
     },
     "profile-compile": {
       "description": "Compile one fixed subject with a RELEASE dsscp on this host and report where the time went, so the HOST is the only variable across legs.",
@@ -1108,6 +1260,16 @@
       "legs": [
         "windows-x86_64-debug",
         "linux-x86_64-debug"
+      ],
+      "action": "refresh_landing_log/refresh_landing_log.yml"
+    },
+    "refresh_landing_log-write": {
+      "description": "Regenerate the PR landing-log hash anchors in the plans from git log -- refresh_landing_log's write step, on this machine's own tree.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "write"
       ],
       "action": "refresh_landing_log/refresh_landing_log.yml"
     },

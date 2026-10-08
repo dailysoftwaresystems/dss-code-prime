@@ -80,7 +80,7 @@ recommendation. Everything else is a sentence or three. AMENDED 2026-09-21 by th
 A one-line cycle summary — priority closed, anchors touched, test delta, commit hash — plus:
 
 ```
-anchors: opened N, closed M, net ±K — OPEN was <before>, now <after>
+anchors: closed M, opened N (created C, disclosed D), real net ±K — OPEN was <before>, now <after>
 next: <one line, matching the top NEXT entry in .plans/_handoff.md>
 ```
 

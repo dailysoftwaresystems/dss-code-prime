@@ -22,3 +22,14 @@ steps:
     run: |
       python3 ./check-scripts-index.py --write
     successPattern: '^check-scripts-index: OK \('
+
+  # The self-test ALONE, without verifying the tree -- `dssharness run check-scripts-index --manual-step self-test`:
+  # the instrument's arms read while the tree itself is red, or while a mutant is being read.
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-scripts-index.py --selftest
+    successPattern: '^scripts-index: self-test OK - \d+ arms'
+    requireInputsUnmoved: true

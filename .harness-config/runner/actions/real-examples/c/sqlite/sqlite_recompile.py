@@ -31,7 +31,8 @@ and the unit gate compiles none of sqlite's 189 TUs. This mode is that check as 
   R6  the per-TU census, asked of its owner (`harness_legs.py --recompile-verdicts`) and printed
       verbatim: the table, every INCOMPLETE reason, and the summary line LAST --
       `recompile: <leg> sqlite=<sha12> tus=N reference_ok=N dss_ok=N blockers=N`, the commit named being the
-      pinned one (legs.json `stageBuild.sqliteCommit`) the stage was verified to hold.
+      one the STAGE recorded (its full sha; the summary prints twelve digits), handed to the census beside the
+      pin (legs.json `stageBuild.sqliteCommit`): a census whose stage is not the pin is INCOMPLETE.
 
 Everything it writes is under `<OUT_DIR>/recompile/<leg>/`, never a run's own leg directory.
 Exit 0 only when the census is clean (no blocker, and nothing it could not see); 1 otherwise, every
@@ -155,11 +156,13 @@ def header_stage_dirs(st, leg):
             os.path.join(base, "cfg", leg.build.get("configStageKey") or "?"))
 
 
-def stage_findings(st, stage_build, leg, verify_guards, verify_answers, coherence):
+def stage_findings(st, stage_build, leg, verify_guards, verify_answers, coherence, tracked_changes=None):
     """Every reason the staged sqlite state `st` (a `sqlite_stage.StageResult`) is NOT what a run
     would compile for `leg` today; [] = current. `stage_build` is the catalogue's CURRENT
     declaration (`sqlite_stage.parse_stage_build`); `verify_guards` / `verify_answers` are
-    stage-zinc's own verifiers; `coherence(dirs) -> (ok, text)` runs the one-vintage gate."""
+    stage-zinc's own verifiers; `coherence(dirs) -> (ok, text)` runs the one-vintage gate;
+    `tracked_changes(checkout) -> (changed, why)` reads an IN-PLACE stage's checkout (default:
+    `sqlite_stage.tracked_changes`)."""
     why = []
     sb = stage_build
     # ★ THE SUBJECT FIRST (2026-09-25): a stage of another sqlite revision than the pin compiles another
@@ -169,6 +172,24 @@ def stage_findings(st, stage_build, leg, verify_guards, verify_answers, coherenc
     if not (len(head) >= 7 and pin.startswith(head)):
         why.append("the stage's sqlite is %s, not the pinned %s (legs.json stageBuild.sqliteCommit): a "
                    "stage of another revision compiles another subject" % (head or "<unrecorded>", pin[:12]))
+    elif head != pin:
+        # ★ THE STAGE RECORDS ITS OWN FULL SHA (2026-09-30, the round-12 audit's S2): the summary names what the
+        # stage compiled, not the catalogue's pin, and an abbreviation of unknown length -- what a stage written
+        # before this rule recorded -- cannot fill the summary's twelve digits.
+        why.append("the stage records the sqlite it compiled only as the abbreviation %s, not the full sha the "
+                   "summary names (a stage written before 2026-09-30)" % head)
+    # ★ AN IN-PLACE STAGE IS ITS CHECKOUT (2026-09-30, the round-12 audit's S1): its build reads the checkout's
+    # sources where they stand, so a tracked file changed there since the stage was made is compiled as the pin.
+    # A staged COPY is self-contained: its checkout was proved clean when the copy was made.
+    in_place = st.copy_to_stage is False
+    if in_place:
+        changed, cant = (tracked_changes or S.tracked_changes)(st.sqlite_dir)
+        if cant:
+            why.append("the stage's checkout %s cannot be shown to hold no local change: %s" % (st.sqlite_dir, cant))
+        elif changed:
+            why.append("the stage's checkout %s differs from its HEAD in %d tracked file(s) (%s%s): the build reads "
+                       "those sources in place, so it would compile them as the pin"
+                       % (st.sqlite_dir, len(changed), ", ".join(changed[:3]), " ..." if len(changed) > 3 else ""))
     # The Tcl the stage's headers follow (2026-09-26, the PR exit): the one every leg's pinned library
     # declares. A stage staged against another Tcl compiles references that library cannot resolve.
     tcl = sb.get("tcl_version") or ""
@@ -233,8 +254,8 @@ def stage_findings(st, stage_build, leg, verify_guards, verify_answers, coherenc
 
 def coherence_gate(label, checkout=None):
     """`coherence(dirs) -> (ok, report)`: `sqlite_coherence.py` over the stage's directories. A staged COPY
-    is self-contained, so no --checkout (the shared clone may have moved on); an IN-PLACE stage is the
-    clone itself, so `checkout` names it and the stage's identity must be that checkout's."""
+    is self-contained, so no --checkout (the checkout it was copied from may have moved on); an IN-PLACE
+    stage is its checkout, so `checkout` names it and the stage's identity must be that checkout's."""
     def run(dirs):
         pick = ["--checkout", checkout] if checkout else []
         r = C.capture(C.python_argv(os.path.join(C.HERE, "sqlite_coherence.py"), "--label", label,
@@ -287,10 +308,11 @@ def load_stage(run, leg, driver=None):
         return load_stage(run, leg, None)
     checkout = None
     if not st.copy_to_stage:
-        # ★ IN PLACE (a POSIX host's stage): its sources and its build dir ARE the shared clone, which any run
-        # on this host may pull and re-configure -- so the recompile holds the clone lock for READ from here
-        # to its end (a writer waits for it), and the one-vintage gate compares the stage with that
-        # CHECKOUT. A staged copy (a Windows host's) is self-contained and needs neither.
+        # ★ IN PLACE (a POSIX host's stage): its sources and its build dir ARE its checkout -- the one this
+        # output tree keeps for itself (`sqlite_stage.consumer_checkout`), which the tree's next run re-stages --
+        # so the recompile holds that checkout's clone lock for READ from here to its end (a writer is refused
+        # while it holds it), and the one-vintage gate compares the stage with that CHECKOUT. A staged copy (a
+        # Windows host's) is self-contained and needs neither.
         run.clone_lock = P.CloneLock(st.sqlite_dir_posix)
         run.clone_lock.read("build_and_test.py --recompile %s (reads the clone's build in place)"
                             % leg.label, log)
@@ -392,8 +414,13 @@ def recompile(run, label, driver):
              % (leg.label, cfg.dss_config, dss_build, res.time_suffix,
                 res.path or res.error or log_path))
     log.step("R6  The per-TU census")
+    # ★ WHAT THE STAGE COMPILED, AND THE PIN, SEPARATELY (2026-09-30, the round-12 audit's S2): the summary named
+    # the catalogue's pin, whatever the stage held -- a restatement of the declaration, never a measurement. The
+    # census is handed the FULL sha the stage recorded and the pin, names the first, and calls a census whose
+    # stage is not the pin INCOMPLETE.
     r = run.resolver.call(["--recompile-verdicts", leg.label, "--manifest", manifest,
-                           "--sqlite-head", S.parse_stage_build(run.stage_build)["sqlite_commit"][:12],
+                           "--sqlite-head", run.stage.sqlite_head or "",
+                           "--sqlite-pin", S.parse_stage_build(run.stage_build)["sqlite_commit"],
                            "--compile-log", log_path, "--dss-build", dss_build,
                            "--dss-build-detail", res.error or "",
                            "--oracle-log", leg.oracle.get("log") or os.path.join(
@@ -412,13 +439,14 @@ def recompile(run, label, driver):
     return 0 if (r.rc == 0 and rec.get("clean") is True) else 1
 
 
-def main(label, driver, knobs=None):
-    """`build_and_test.py --recompile <leg> [--dss PATH] [--dss-config C]`. `driver` is the build_and_test
-    module that called (its Step 0, its Steps 3-4, its vocabulary reader and its placement rule), passed
-    rather than re-imported; `knobs` the command-line values `sqlite_common.Config` takes."""
+def main(label, driver, knobs=None, step=None):
+    """`build_and_test.py --recompile <leg> [--dss PATH] [--dss-config C] [--step=recompile]`. `driver` is the
+    build_and_test module that called (its Step 0, its Steps 3-4, its vocabulary reader and its placement rule),
+    passed rather than re-imported; `knobs` the command-line values `sqlite_common.Config` takes; `step` the
+    DssHarness step the run line names (step mode: every other steering variable set is refused)."""
     run = None
     try:
-        run = C.Run(C.Config(knobs))
+        run = C.Run(C.Config(knobs, step=step))
         driver.place_run(run)
         run.stage_root = run.out_dir
         run.out_dir = os.path.join(run.stage_root, RECOMPILE_DIR)

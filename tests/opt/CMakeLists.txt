@@ -49,3 +49,11 @@ dss_add_test(NAME opt/test_inline_asm_rebuild_carriage
 # cost every helper a call for a replacement that cannot happen.
 dss_add_test(NAME opt/test_preemptible_definition_not_inlined
              SOURCES test_preemptible_definition_not_inlined.cpp)
+
+# D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: DCE's roots follow
+# what the module IS to the link that completes it (`opt::ModuleExtent`) — a
+# LinkInput keeps every external-linkage definition, hidden ones included; only
+# a WholeImage may delete a hidden definition nothing reaches, and it keeps the
+# entry it is handed. Hand-built MIR: format-blind, every host.
+dss_add_test(NAME opt/test_dce_module_extent
+             SOURCES test_dce_module_extent.cpp)

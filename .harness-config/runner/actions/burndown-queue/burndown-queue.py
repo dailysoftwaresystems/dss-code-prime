@@ -18,7 +18,7 @@ status claims in the queue were wrong in three different directions.
 A hand-written queue is stale the moment the next cycle closes a row. This reads the
 rows and sorts them, so the queue is a VIEW, never a copy.
 
-★ IT REUSES `check-anchor-balance` RATHER THAN RE-IMPLEMENTING IT. That script owns
+★ IT REUSES `anchor-debt` RATHER THAN RE-IMPLEMENTING IT. That program owns
 this repository's hard-won vocabulary for "is this row open", "is it gated", "has its
 trigger fired", "is its opener discharged" -- a regex family whose comments record six
 separate defects, including two where a NEGATED or ATTRIBUTIVE mention flipped a
@@ -51,13 +51,14 @@ shipped compiler does something WRONG, not that it is missing something:
   P4 RECORD        the plans, the registry, the documentation.
   P5 ENV           environment and upstream: explicitly not ours to fix in the compiler.
 
-USAGE
-    python burndown_queue.py                    # the whole queue, banded
-    python burndown_queue.py --band P0 P1       # only those bands
-    python burndown_queue.py --schedulable      # drop rows whose trigger has not fired
-    python burndown_queue.py --top 40           # first N after sorting
-    python burndown_queue.py --counts           # band/severity census only
-    python burndown_queue.py --json
+USAGE -- through DssHarness, never this program started by hand (check-scripts-index clause 13)
+    dssharness run burndown-queue                                    # the band/severity census
+    dssharness run burndown-queue --manual-step queue                # the whole queue, banded
+        --input band=P0,P1          only those bands
+        --input schedulable=true    drop rows whose trigger has not fired
+        --input top=40              first N after sorting
+        --input evidence=true       the phrase that banded each row
+    The listed rows are also kept as JSON, the step's burndown-queue.json.
 
 ★ NO `.ps1` TWIN, DELIBERATELY: a `.py` runs unchanged on every host this project gates
 on, so a PowerShell sibling would be a second implementation of something never split.
@@ -111,15 +112,15 @@ def repo_root():
 
 
 ROOT = repo_root()
-BALANCE_PY = os.path.join(ROOT, ".harness-config", "runner", "actions",
-                          "check-anchor-balance", "check-anchor-balance.py")
+VOCABULARY_PY = os.path.join(ROOT, ".harness-config", "runner", "actions",
+                             "anchor-debt", "anchor-debt.py")
 
 # A hyphenated filename is not an importable module name, so load it by path. This is
 # the reuse the standing order demands -- see the module docstring.
-if not os.path.isfile(BALANCE_PY):
+if not os.path.isfile(VOCABULARY_PY):
     sys.exit("burndown-queue: cannot find %s -- this instrument REUSES its row "
-             "vocabulary and must not re-implement it." % BALANCE_PY)
-_spec = importlib.util.spec_from_file_location("check_anchor_balance", BALANCE_PY)
+             "vocabulary and must not re-implement it." % VOCABULARY_PY)
+_spec = importlib.util.spec_from_file_location("anchor_debt", VOCABULARY_PY)
 bal = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bal)
 
@@ -248,7 +249,7 @@ _ANCHOR_TOKEN = re.compile(r"D-[A-Z0-9]+(?:-[A-Z0-9]+)+")
 #   3. COUNTERFACTUAL -- "would have SILENTLY ACCEPTED", "would become a silent
 #      miscompile". A hazard avoided is not a hazard shipped.
 #
-# ⚠ The window looks only BEHIND the hit, exactly as `check-anchor-balance`'s
+# ⚠ The window looks only BEHIND the hit, exactly as `anchor-debt`'s
 # `_DECL_NEGATOR` does, so a phrase that CONTAINS a negator is unaffected.
 # ⚠ Deliberately CONSERVATIVE. For a queue the safe error is leaving a row in P0 --
 # you read it and demote it by hand -- never hiding one. And nothing is hidden anyway:
@@ -272,7 +273,7 @@ def own_claim(flat, match):
     """True when `match` is a claim about THIS row rather than about a cited one.
 
     ★ The discriminator is the house one, lifted in SHAPE (not by import, because
-    `declares_no_trigger` hard-codes its own pattern) from `check-anchor-balance`'s
+    `declares_no_trigger` hard-codes its own pattern) from `anchor-debt`'s
     `declares_no_trigger`: a row's own verdict says "is a silent miscompile", never
     "[[D-OTHER]], which is a silent miscompile". If an anchor id sits between the
     nearest clause boundary and the phrase, the phrase is about somebody else.
@@ -354,7 +355,7 @@ def severity_of(status):
 def load_row_text(root):
     """-> {"relpath#anchor": (full_flat_row, status_cell)} for every table row.
 
-    ⚠ Reads the WHOLE row, not `check-anchor-balance`'s status EXCERPT: an excerpt is
+    ⚠ Reads the WHOLE row, not `anchor-debt`'s status EXCERPT: an excerpt is
     truncated, and banding on a truncated cell is how a sieve reports a plausible zero.
     Cells are split with that module's own `split_row`, so an escaped pipe is not
     mistaken for a separator -- a defect it measured across 161 rows.
@@ -437,8 +438,8 @@ def build(root):
         # ⚠⚠ AN OPEN ROW IN THE ARCHIVE IS A STRUCTURAL FAILURE, NOT A ROW TO BAND.
         # The archive holds finished work; a live row filed there is invisible to this
         # queue by design, so silently banding it would hide the one defect the split
-        # of 2026-09-01 made possible. `check-anchor-balance`'s partition arm refuses
-        # it too -- this is the SAME invariant seen from the consumer's side, and a
+        # of 2026-09-01 made possible. `dssharness check-anchor-balance` refuses
+        # it too (✔MEASURED 2026-09-30, 0.6.4) -- this is the SAME invariant seen from the consumer's side, and a
         # consumer that quietly copes is how an invariant stops being one.
         if bucket == BUCKET_ARCHIVE:
             sys.exit("burndown-queue: FAIL -- %s is OPEN in the ARCHIVE (%s). The two "
@@ -472,7 +473,7 @@ def build(root):
             "sev": severity_of(status),
             "sev_name": SEV_NAME.get(severity_of(status), "-"),
             # SCHEDULABLE means: not gated at all, or gated by something already
-            # discharged. `check-anchor-balance` owns both of those verdicts.
+            # discharged. `anchor-debt` owns both of those verdicts.
             "schedulable": (not gated) or unblocked,
             "unblocked": unblocked,
             "status": status[:160],
@@ -486,16 +487,42 @@ def build(root):
     return items, residue, scan
 
 
+def _flag(value):
+    """`true` / `false` -- how a harness step hands a flag over, every input passed, defaults included. Anything
+    else is refused by argparse, naming it."""
+    v = str(value).strip().lower()
+    if v not in ("true", "false"):
+        raise argparse.ArgumentTypeError("%r is neither true nor false" % value)
+    return v == "true"
+
+
+def _bands(value):
+    """`P0,P1` -> ("P0", "P1"); empty -> () -- every band. An unknown band is refused by name."""
+    items = tuple(v.strip() for v in value.split(",") if v.strip())
+    bad = [v for v in items if v not in BANDS]
+    if bad:
+        raise argparse.ArgumentTypeError("unknown band(s) %s -- the bands are %s"
+                                         % (", ".join(bad), " ".join(BANDS)))
+    return items
+
+
 def main(argv):
+    # ★ EVERY OPTION TAKES ITS VALUE AS `--name=value`, AND AN EMPTY, 0 OR false VALUE IS THE DEFAULT (2026-09-30,
+    # cycle P69): the `queue` step hands over every input it declares, defaults included -- a step is how this
+    # queue is read, never this program started by hand (check-scripts-index clause 13).
     ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("--band", nargs="+", choices=BANDS)
-    ap.add_argument("--schedulable", action="store_true")
-    ap.add_argument("--top", type=int)
+    ap.add_argument("--band", type=_bands, default=(),
+                    help="the bands to list, comma-separated (P0,P1); empty lists every band")
+    ap.add_argument("--schedulable", type=_flag, nargs="?", const=True, default=False)
+    ap.add_argument("--top", type=int, default=0, help="at most this many rows; 0 lists every one")
     ap.add_argument("--counts", action="store_true")
-    ap.add_argument("--json", action="store_true")
-    ap.add_argument("--evidence", action="store_true",
+    ap.add_argument("--json", default="", metavar="PATH",
+                    help="ALSO write the listed rows and the residue as JSON to PATH")
+    ap.add_argument("--evidence", type=_flag, nargs="?", const=True, default=False,
                     help="print the phrase that banded each row")
     a = ap.parse_args(argv)
+    if a.top < 0:
+        ap.error("--top=%d: a count of rows is 0 (every one) or more" % a.top)
 
     items, residue, scan = build(ROOT)
     shown = [r for r in items
@@ -505,8 +532,9 @@ def main(argv):
         shown = shown[:a.top]
 
     if a.json:
-        print(json.dumps({"items": shown, "residue": residue}, indent=2))
-        return 0
+        with io.open(a.json, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump({"items": shown, "residue": residue}, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
 
     print("burndown-queue: %d OPEN row(s) across .plans/ -- %d SCHEDULABLE, %d gated "
           "on a trigger that has not fired"
@@ -577,13 +605,14 @@ def _demoted_report(items):
     for r in sorted(dem, key=lambda x: x["anchor"])[:25]:
         print("    %-3s %s\n         %s" % (r["band"], r["anchor"], r["demoted"]))
     if len(dem) > 25:
-        print("    ... and %d more (--json for all)" % (len(dem) - 25))
+        print("    ... and %d more (the `queue` step's burndown-queue.json holds every row)"
+              % (len(dem) - 25))
 
 
 def _residue_report(residue):
     if not residue:
         return
-    print("\n⚠ RESIDUE -- %d row(s) counted OPEN by check-anchor-balance whose table "
+    print("\n⚠ RESIDUE -- %d row(s) counted OPEN by anchor-debt's scan whose table "
           "line this reader could not locate. NOT dropped, because the residue of an "
           "enumeration must never be silent:" % len(residue))
     for k in sorted(residue)[:40]:

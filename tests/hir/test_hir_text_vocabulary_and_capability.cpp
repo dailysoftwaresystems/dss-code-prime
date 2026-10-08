@@ -40,7 +40,7 @@ namespace {
 
 // Wrap a body line in a minimal well-formed module.
 [[nodiscard]] std::string moduleWith(std::string_view bodyLine) {
-    return std::string("dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+    return std::string("dsshir 7\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                        "  function %1 : fn() -> void {\n    block {\n      ")
          + std::string(bodyLine) + "\n      return void\n    }\n  }\n}\n";
 }
@@ -152,6 +152,8 @@ TEST(HirTextVocabulary, VariadicAccessKeywordsRouteToTheExpressionParser) {
         {"va_start", "expr va_start : void (lit int 0 : i32)"},
         {"va_arg",   "expr va_arg : i32 (lit int 0 : i32, lit int 1 : i32)"},
         {"va_end",   "expr va_end : void (lit int 0 : i32)"},
+        // P69 (D-C-STDARG-VA-COPY-MISSING): the fourth, [dest, src].
+        {"va_copy",  "expr va_copy : void (lit int 0 : i32, lit int 1 : i32)"},
     };
     for (Case const& c : cases) {
         ParseOutcome const o = parseText(moduleWith(c.line));
@@ -426,7 +428,7 @@ TEST(HirTextVocabulary, BuiltinCallLoweringSentinelZeroIsRefused) {
 // reason that has nothing to do with the keyword being readable.
 TEST(HirTextVocabulary, LabelAddressKeywordRoundTripsThroughTheReader) {
     std::string const text =
-        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 7\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      label L1:\n        return void\n"
         "      expr labeladdr L1 : ptr<void>\n"
@@ -463,11 +465,12 @@ TEST(HirTextVocabulary, ExpressionNodesInStatementPositionAreNotDegradedToError)
         {"va_arg",    "va_arg : i32 (lit int 0 : i32, lit int 1 : i32)"},
         {"va_start",  "va_start : void (lit int 0 : i32)"},
         {"va_end",    "va_end : void (lit int 0 : i32)"},
+        {"va_copy",   "va_copy : void (lit int 0 : i32, lit int 1 : i32)"},
         {"labeladdr", "labeladdr L1 : ptr<void>"},
     };
     for (Case const& c : cases) {
         std::string const text =
-            "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+            "dsshir 7\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
             "  function %1 : fn() -> void {\n    block {\n"
             "      label L1:\n        unreachable\n      "
             + std::string(c.line) + "\n      return void\n    }\n  }\n}\n";

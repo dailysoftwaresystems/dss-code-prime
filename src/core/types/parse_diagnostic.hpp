@@ -2601,6 +2601,48 @@ enum class DiagnosticCode : std::uint16_t {
     // diagnostic the constraint asks for. A WARNING, suppressible; `--warnings-as-errors`
     // restores the refusal. `.actual` is the comma expression.
     S_StaticInitializerUsesTheCommaOperator = 0xE08B,
+    // P69 (lane `cs`, D-C-A-STORAGE-CLASS-SPECIFIER-IN-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR):
+    // a C23 compound literal's storage-class specifiers are not ones its "as if" definition
+    // `SC typeof(T) ID = { IL };` admits in the literal's own scope (C23 6.5.3.6p4) — a
+    // specifier the declaration row of that scope does not map (`register` outside every
+    // function body, C 6.9p2), or ONE specifier named twice (6.5.3.6 footnote 97, which a
+    // declaration's own specifier prefix does not share: clang accepts `static static int
+    // g;`). ✔MEASURED gcc 13.3.0 -std=c2x, the one reference that builds these literals:
+    // "file-scope compound literal specifies 'register'", "duplicate 'static'" (probe-
+    // reference-cc run 20260930-212815-0195cf2c). The other constraints the definition would
+    // break keep their own codes (two storage classes: S_ConflictingStorageClassSpecifiers; a
+    // block-scope `thread_local` without `static`: S_ThreadLocalRequiresStaticOrExtern). An
+    // ERROR: the literal's storage duration is then unknown. `.actual` names the specifier.
+    S_CompoundLiteralStorageClassInvalid  = 0xE08C,
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): an operand a
+    // builtin requires to be an INTEGER CONSTANT EXPRESSION (in its declared range) is not
+    // one — `__builtin_object_size`'s `type` (0..3) — or `__builtin_nan`'s operand is not a
+    // string literal in a language naming no library function to call instead. ✔MEASURED
+    // gcc 13.3.0 and clang 18.1.3 refuse the first (lane `cs`'s probe r5s s33). An ERROR:
+    // the answer cannot be computed. `.actual` names the builtin and the operand's role.
+    S_BuiltinArgumentNotConstant          = 0xE08D,
+    // P69 (lane `cs`): a type-generic checked-arithmetic builtin (`__builtin_add_overflow`)
+    // given an operand that is not an integer, a result operand that does not point to a
+    // modifiable integer object, or not three operands. ✔MEASURED gcc 13.3.0 and clang
+    // 18.1.3 refuse a `double *` result (r5s s34); clang accepts `_Bool *` and enumeration
+    // results, which DSS therefore accepts. An ERROR. `.actual` names the operand.
+    S_BuiltinOverflowOperandType          = 0xE08E,
+    // P69 (lane `cs`): a LIBRARY builtin (`__builtin_strlen`) whose library function the
+    // translation unit does not declare and the platform does not provide on this target —
+    // no shipped descriptor declares it, or not on this object format. An ERROR at the use:
+    // the call has no function to bind and no signature to type it by. `.actual` names the
+    // spelling, the library function and the reason.
+    S_LibraryBuiltinUnavailable           = 0xE08F,
+    // P69 (lane `cs`, D-C-DECIMAL-CONSTANT-PAST-LONG-LONG-IS-REFUSED-WHERE-EVERY-REFERENCE-ACCEPTS-IT):
+    // a DECIMAL integer constant past every SIGNED type its suffix admits
+    // (`9223372036854775808`, `...L`, `...LL` in C) is read as the language's declared
+    // `decimalPastRange` type (`unsigned long long`). C 6.4.4p2 makes the constant a
+    // constraint violation, so a diagnostic is required; a WARNING, because the
+    // literal is typed and compiled — ✔MEASURED clang 18.1.3 ("interpreting as
+    // unsigned", -Wimplicitly-unsigned-literal) and gcc 13.3.0 ("so large that it is
+    // unsigned") both warn and build (lane `cs`'s probe x3). The phase-4 twin is
+    // P_PreprocessorIfLiteralImplicitlyUnsigned. `.actual` names the literal and the type.
+    S_IntegerLiteralImplicitlyUnsigned    = 0xE090,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -4275,6 +4317,15 @@ enum class DiagnosticCode : std::uint16_t {
     //   encoder, the first aborts inside `LirLiteralPool::at` and the
     //   second aborts inside `LirRegConstraintPool::at`; the verifier
     //   names the instruction first.
+    //   ★ ALSO the side structures OUTSIDE the module that name its
+    //   BLOCKS (`lir/lir_descriptor_blocks.hpp`,
+    //   D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS):
+    //   a jump-table slot, a static
+    //   `&&label` binding or a `__try` scope whose MIR→LIR block id has no
+    //   image in the final LIR — or a rebuild that changed its blocks and
+    //   publishes no image to follow them through. Bound anyway, the id
+    //   lands on another block's bytes: a switch that dispatches to the
+    //   wrong case, or a `__try` that guards the wrong code.
     // L_SideStructurePoolShrank: the module produced by a rebuild has
     //   FEWER entries in a pool than the module that went in — the
     //   signature of a forgotten `copyModuleSideStructures`. Checked
@@ -4906,6 +4957,13 @@ enum class DiagnosticCode : std::uint16_t {
     //   per-code cap can drop this diagnostic silently, which restores
     //   first-wins with no flag and no trace. See the rationale block in
     //   `core/types/unsuppressable_codes.cpp`.
+    //   ★ THE SAME RULE ACROSS A BINDING: a REFERENCE whose storage duration
+    //   disagrees with the DEFINITION it binds to is this code too — where the
+    //   definition is a library's (`ffi::reportLibraryThreadStorageDisagreement`)
+    //   and where it is another linked unit's
+    //   (`linker::reportThreadStorageDisagreements`, P69 round 4): two
+    //   attributes that select the access model, one per side, and no basis to
+    //   choose between them — the fault of two rows that disagree.
     K_ExternImportAttributeConflict = 0x801B,
     // K_FormatLacksProcessExit (D-LK10-ENTRY §2.13): the emitted image's ENTRY
     //   would have no process-exit path BECAUSE THE FORMAT DECLARES NO
@@ -5324,7 +5382,40 @@ enum class DiagnosticCode : std::uint16_t {
     //   where gcc's link of the same archive exits 42).
     //   Always an Error, so it needs no row in the unsuppressable table.
     K_ImportReferenceUnbindable    = 0x802A,
-    // K-NEXT-SLOT: 0x802B — grep this marker before adding a K_* code.
+    // K_LinkerDirectiveUnhonourable (D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE,
+    //   P69) — ERROR, by the directive's own text. A request a foreign COFF object
+    //   hands its final linker in its directive section (`.drectve`) that no DSS
+    //   link can honour as written: an option the format's directive vocabulary
+    //   (`pe.linkerDirectives`) declares no meaning for, a declared option whose
+    //   value is malformed (an `/EXPORT:` rename or ordinal, an `/INCLUDE:` of no
+    //   name, an `-aligncomm:` past 2^13), or two directives that contradict each
+    //   other (one name hidden and exported, one alternate name given two
+    //   fallbacks). The object is well-formed — this is not `F_CorruptedBinary` —
+    //   and the request is the program's: silently dropping it would link a
+    //   different program than the one the producer asked for. Always an Error,
+    //   so it needs no row in the unsuppressable table.
+    K_LinkerDirectiveUnhonourable  = 0x802B,
+    // K_LinkerDirectiveIgnored (D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE,
+    //   P69 round 4) — WARNING. A linker-directive request the link drops as the
+    //   reference linkers drop it, said rather than dropped in silence: an option
+    //   the format's vocabulary does not list (link.exe warns LNK4229, GNU ld
+    //   "unrecognized"), a value link.exe warns about and replaces with its
+    //   default (a subsystem version below its minimum, LNK4010; a section
+    //   alignment that is not a power of two, LNK4043), a later `/ENTRY:` naming
+    //   another symbol (LNK4258), a second `/EXPORT:` of one name (LNK4197), a
+    //   `/SECTION:` naming a section the image lacks (LNK4039), a
+    //   `/FAILIFMISMATCH:` disagreement (GNU ld links it), and a stack or heap
+    //   request in a link whose image the loader reads neither from (a DLL).
+    //   Suppressible: the build proceeds with the meaning the references give it.
+    K_LinkerDirectiveIgnored       = 0x802C,
+    // K_CommonSymbolUnallocatable (D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS,
+    //   P69 round 4) — ERROR, by name. A COMMON symbol whose storage no DSS link
+    //   allocates: a THREAD-LOCAL common (ELF `STT_TLS` + `SHN_COMMON`, gas's
+    //   `.tls_common`, which GNU ld places in `.tbss`). Read as an ordinary common
+    //   it would be allocated once in `.bss` and every thread would share it.
+    //   Always an Error, so it needs no row in the unsuppressable table.
+    K_CommonSymbolUnallocatable    = 0x802D,
+    // K-NEXT-SLOT: 0x802E — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

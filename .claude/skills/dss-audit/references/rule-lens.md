@@ -53,7 +53,9 @@ This is where the auditor earns its keep. Each entry: the **class**, its **tell*
 7. **Cross-platform / CI blind spot.** Local-green that is CI-red. *Tell:* MSVC builds clean but a
    header (`<format>`, `<span>`, `<algorithm>`, `<cstdint>`) is used without explicit include (MSVC's
    transitive includes mask it; GCC/Clang don't); gtest `ASSERT_*` in a non-void helper. *Disproof:*
-   only CI confirms it — the auditor **flags it unverified** (§K), never claims green it cannot run.
+   the eight-run gate (`dssharness test --legs gate`) builds with gcc, clang and MSVC on its four legs,
+   and CI's verdicts are read with `dssharness check-ci-legs`; what neither shows the auditor **flags
+   unverified** (§K), never claims green it did not observe.
 
 8. **Over-claimed close.** An anchor marked fully closed when only part of its stated scope landed.
    *Tell:* the registry/anchor text describes more than the commit delivered. *Disproof:* read the

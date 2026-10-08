@@ -379,8 +379,8 @@ list(APPEND DSS_PCH_HEADERS "\"${DSS_HOST_COMPILER_STAMP_HEADER}\"")
 # 1,440,179-byte `git diff HEAD`): 63 ms + 231 ms ≈ 0.3 s, ONCE per build.
 #
 # ★★ THE INCLUSION IS SCOPED ON PURPOSE, and this is the part to defend in
-# review. The generated header changes on every dirty edit, so every TU that
-# `#include`s it recompiles on every dirty edit. Reaching it requires opting in
+# review. The generated header changes on every edit of the compiler's declared
+# inputs (below), so every TU that `#include`s it recompiles on every such edit. Reaching it requires opting in
 # through `dss_use_build_stamp()` — a target that does not ask cannot see the
 # header at all. The intended includer is the runtime object cache TU and
 # nothing else; a widely-included header pulling this in would rebuild the world
@@ -391,12 +391,48 @@ set(DSS_BUILD_STAMP_DIR "${CMAKE_BINARY_DIR}/generated")
 set(DSS_BUILD_STAMP_HEADER
     "${DSS_BUILD_STAMP_DIR}/program/dss_build_stamp_generated.hpp")
 
+# ★★★ WHAT THE COMPILER IS BUILT FROM — the ONE declaration the stamp reads, both
+# with git (the dirt of these paths) and without (their content). Read WHOLE: the
+# compiler's sources and config documents (`src`), the scripts that build it
+# (`cmake`, this file) and `VERSION` — except the RECORDS, files under them that
+# build nothing, each named: the harness deletion inventory and the test-budget
+# checker that sit beside the build's modules. Their CMake scripts only: the test
+# trees one configure reads beside the compiler's, whose scripts could reach a
+# product target while their sources build only tests. Nothing else is compiled
+# into the compiler.
+# ✔MEASURED 2026-10-06 (cycle P69, lane `hm`): with the whole tree's dirt an edit to
+# any file relinked 550 targets, and without git the stamp moved on EVERY build of a
+# DssHarness copy (which holds no `.git`), relinking them with nothing changed. The
+# same day's re-review found the two records read with `cmake`, so an edit of either
+# moved the stamp as well. Why records are NAMED rather than `cmake` made a scripts-
+# only directory: a file added under `cmake/` and not declared is then still READ —
+# the stamp's asymmetry (an uncertain case degrades toward "differ"), where a
+# scripts-only `cmake` would let a new non-script build input there (a template a
+# `configure_file` reads) change the compiler without moving its stamp. Why they stay
+# beside the modules: moving them rewrites every citation of them, the anchor
+# registries' included. Comma-separated, because a `;` list would be split into
+# separate arguments of the command below. `build/build_stamp_identity` proves the
+# mechanism and this declaration.
+set(DSS_BUILD_STAMP_INPUTS "src,cmake,CMakeLists.txt,VERSION")
+set(DSS_BUILD_STAMP_RECORDS "cmake/DssHarnessDeletionInventory.md,cmake/DssTestBudgetsCheck.py")
+set(DSS_BUILD_STAMP_SCRIPT_DIRS "tests,integrated_tests")
+# ★ AND THE DECLARATION IS CHECKED, NOT TRUSTED: a directory this configure processes
+# that lies under neither list is refused, by name, once every `add_subdirectory` of
+# this file has run — a stamp that does not move when such a directory does is the
+# silent direction. Its scope (directories, not every file a script reads) is stated
+# in the module.
+include("${CMAKE_SOURCE_DIR}/cmake/DssBuildStampDeclaration.cmake")
+cmake_language(DEFER CALL dss_build_stamp_check_declaration DSS_BUILD_STAMP_INPUTS DSS_BUILD_STAMP_SCRIPT_DIRS)
+
 add_custom_target(dss_build_stamp_generate
     COMMAND ${CMAKE_COMMAND}
             "-DDSS_STAMP_VERSION=${DSS_VERSION}"
             "-DDSS_STAMP_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
             "-DDSS_STAMP_GIT=${GIT_EXECUTABLE}"
             "-DDSS_STAMP_OUTPUT=${DSS_BUILD_STAMP_HEADER}"
+            "-DDSS_STAMP_INPUTS=${DSS_BUILD_STAMP_INPUTS}"
+            "-DDSS_STAMP_RECORDS=${DSS_BUILD_STAMP_RECORDS}"
+            "-DDSS_STAMP_SCRIPT_DIRS=${DSS_BUILD_STAMP_SCRIPT_DIRS}"
             -P "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake"
     BYPRODUCTS "${DSS_BUILD_STAMP_HEADER}"
     COMMENT "dss: computing DSS_BUILD_STAMP"
@@ -649,22 +685,34 @@ if(DSS_BUILD_TESTS)
     # snapshot; the proof's builds start in temporary directories no cwd walk can climb out of.
     dss_use_config_snapshot(harness/cmake_import_any_cwd)
 
-    # ── The two remote-leg readers check their own arms (2026-09-24, lane mig) ──
+    # ── The two remote-leg readers and the ONE redactor they print through (2026-09-24, lane mig; the
+    #    redactor its own action since 2026-09-30, cycle P69) ──
     # `probe-reference-cc` measures a reference compiler on a leg's own host and `read-leg-path` reads a
-    # file back from one; both print what they measure through ONE redactor (read-leg-path owns it,
-    # probe-reference-cc inherits it). Their `--selftest`s hold the refusals, the redaction in both
-    # directions (a name inside `13.3.0-6ubuntu2` or `dsscp` survives; `<name>@h`, `/home/<name>/`
-    # and every other shape the old substring rule caught is still redacted), the empty-TU probe and
-    # the linked-image dump. ⓘ NEW: until now no gate ran either self-test.
-    # ★ NOT `repo-guard`, ON PURPOSE, like their neighbours above: the probe's arms compile, link,
-    # run and dump with the HOST's own compiler and dump tool, which differ per leg, so every leg
-    # runs them -- and a leg without a reference compiler or a dump tool is a named FAILURE there,
-    # never a skip.
+    # file back from one; both print what they measure through `redact`, which owns every redaction rule
+    # (and which a session pipes its own output through). `harness/redact_selftest` holds the rules in both
+    # directions -- a name inside `13.3.0-6ubuntu2` or `dsscp` survives, every leaking shape is masked, a
+    # host named like a word of the tree's own vocabulary is kept only where the tree says so -- against an
+    # exact arm count; the readers' `--selftest`s hold their refusals, the empty-TU probe, the linked-image
+    # dump and the redaction reached through their own input paths.
+    # ★ NOT `repo-guard`, ON PURPOSE, like their neighbours above: what must be hidden depends on the
+    # HOST's own account and machine names, and the probe's arms compile, link, run and dump with the host's
+    # own compiler and dump tool -- so every leg runs them, and a leg without a reference compiler or a dump
+    # tool is a named FAILURE there, never a skip.
+    # ★ `--expect-cl=yes` where THIS build's C++ compiler is MSVC: that leg's cl arms must run, so a cl the
+    # developer environment did not provide FAILS instead of being skipped (the round-12 audit). Always a
+    # value. Decided at CONFIGURE time from `CMAKE_CXX_COMPILER_ID`, never a `$<CXX_COMPILER_ID:...>`
+    # generator expression: ✔MEASURED 2026-09-30 on the arm64 VPS, CMake refuses that one in `add_test`
+    # ("may only be used with binary targets") and the configure fails.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        set(_dss_probe_expect_cl "yes")
+    else()
+        set(_dss_probe_expect_cl "no")
+    endif()
     add_test(
         NAME harness/probe_reference_cc_selftest
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/probe-reference-cc/probe-reference-cc.py"
-                --selftest
+                --selftest "--expect-cl=${_dss_probe_expect_cl}"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(
         NAME harness/read_leg_path_selftest
@@ -672,6 +720,58 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/read-leg-path/read-leg-path.py"
                 --selftest
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(
+        NAME harness/redact_selftest
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/redact/redact.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ── The corpus pragma census's own arms (2026-10-01, cycle P69, lane hm) ──
+    # The census itself runs on the leg whose corpus it reads (`dssharness run pragma-profile-census`), never here;
+    # these arms hold its logic on every leg, with no compiler: a corpus's class is its own target's format kind,
+    # each TU's two sentinels (one before it, one after it) are pragmas the REAL config claims (so they speak only
+    # when the census disarmed it), a census is whole only when both spoke in every TU and its log holds no other
+    # error and no elided pragma diagnostic, and a regeneration replaces one class alone.
+    add_test(
+        NAME harness/pragma_profile_census_selftest
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/pragma-profile-census/pragma-profile-census.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ── The prototype census's own arms (2026-10-07, cycle P69, lane hm) ──
+    # The census itself runs on the leg whose headers it judges (`dssharness run prototype-census`), never here.
+    # These arms hold its logic on every leg: the reference's diagnostic dialect, read through a synthesized
+    # header and from cl's measured lines; a header with more rows than a reference judges in one TU; the census
+    # line's accounting; the reference's judgement of a rendered prototype; DSS's own `_Generic` judge, compiled by
+    # THIS build's dsscp and run here; and the values step. So the entry hands the program the dsscp this build
+    # made, the host's processor in the harness's spelling, and THIS BUILD'S OWN C COMPILER.
+    # ★ THE REFERENCE is `CMAKE_C_COMPILER` on every leg, with no branch on which compiler it is: the census reads
+    # the dialect from the compiler itself -- clang's and gcc's `--version` banner, the banner MSVC's cl prints when
+    # run with no arguments -- and refuses any other compiler by name, never skipping. So the MSVC legs judge
+    # through cl, the MinGW leg through its gcc, Linux through gcc and the Mac through AppleClang.
+    # ⚠ READ THE CACHED PATH, NEVER THE ID. The top-level `project()` enables CXX only; C is enabled inside
+    # googletest's own `project()`, and CMake sets `CMAKE_C_COMPILER_ID` as a variable of THAT directory, while
+    # `CMAKE_C_COMPILER` is a cache entry every directory sees. Until 2026-10-07 this entry branched on
+    # `CMAKE_C_COMPILER_ID STREQUAL "MSVC"` here, which is never true in this directory, so on both MSVC legs it
+    # took its other branch and handed the census cl.exe, which the census then refused by name (the P69
+    # fixed-point re-review's MAJOR 1, MEASURED there through the file-API toolchains reply: C id None, path cl.exe).
+    # ★ THE PROCESSOR is `x86_64` or `arm64`, the spelling the object-format documents' `targetArch` uses. Any
+    # other host processor is passed as CMake reads it, and the census refuses it by name, never guessing a pair.
+    set(_dss_census_reference "${CMAKE_C_COMPILER}")
+    if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+        set(_dss_census_processor "x86_64")
+    elseif(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        set(_dss_census_processor "arm64")
+    else()
+        set(_dss_census_processor "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+    endif()
+    add_test(
+        NAME harness/prototype_census_selftest
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/prototype-census/prototype-census.py"
+                --selftest "--tree=${CMAKE_SOURCE_DIR}" "--processor=${_dss_census_processor}"
+                "--dsscp=$<TARGET_FILE:dsscp>" "--cc=${_dss_census_reference}"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/prototype-census")
 
     # ── The anchor CITATION question, asked by the tool ───────────────────────
     # ⛔⛔ THIS IS AN ADDITION, NOT A REPLACEMENT, AND THAT IS A MEASURED DECISION
@@ -747,8 +847,8 @@ if(DSS_BUILD_TESTS)
     # is one contract expressed twice, and this guard's whole subject is a fact
     # expressed in two places drifting apart. Paying that cost inside the guard
     # against it would be the joke it sounds like. Python is already a
-    # development dependency here — five of the eight `check-*` scripts are
-    # Python, including `check-anchor-balance`, which every cycle must run — so
+    # development dependency here — every action's program is Python (the actions
+    # root may hold no `.sh` or `.ps1`: `check-scripts-index` clause 11) — so
     # the interpreter is REQUIRED rather than optional: a guard that silently
     # skips when a tool is missing is the vacuous pass this entry exists to
     # refuse.
@@ -931,7 +1031,7 @@ if(DSS_BUILD_TESTS)
     # bookkeeping: it belongs in a comment at the emit site, and the message
     # states the condition and the action. Per-file inventory, only ever
     # lowered; the literals come from `check-no-abort-in-tests`' scanner and the
-    # id shape from `check-anchor-balance`, never from a copy here. Like its
+    # id shape from `anchor-debt`, never from a copy here. Like its
     # siblings, the no-argument form verifies the tree AND runs the self-test.
     add_test(
         NAME emitted_anchor_ids_guard
@@ -1000,22 +1100,22 @@ if(DSS_BUILD_TESTS)
                 --selftest
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # ★ `check-anchor-balance` needs a BASE REF to compare against, so its
-    # ordinary form cannot be a ctest entry — a cycle supplies that ref. Its
-    # `--self-test` has no such obstacle: it runs its whole case set over the
-    # real arithmetic — the guard prints the count itself, and no figure is
-    # quoted here on purpose — including the red-on-disable proving the
-    # `+bookkept` term is load-bearing. ⚠ This comment said "58 cases", which was
-    # true at HEAD and made FALSE BY THIS CYCLE'S OWN EDITS to the same guard
-    # (✔MEASURED at the fold: 78). A count in a comment is a measurement with no
-    # instrument attached — the reader cannot re-derive it and no guard can check
-    # it — so it decays silently in the direction of looking authoritative.
-    # Registering the self-test is what stops the instrument that judges every
-    # cycle from being the one thing no cycle checks.
+    # ★ `anchor-debt` (until 2026-09-30 `check-anchor-balance`, whose balance,
+    # partition and Status/Trigger arms are DssHarness's now) judges a change
+    # against a BASE REF, so its `debt` step cannot be a ctest entry — a cycle
+    # supplies that ref. Its `--self-test` has no such obstacle: it runs its
+    # whole case set against an exact ratchet the program keeps, and no figure is
+    # quoted here on purpose. ⚠ This comment once said "58 cases", true at HEAD
+    # and made FALSE BY THAT CYCLE'S OWN EDITS (✔MEASURED at the fold: 78). A
+    # count in a comment is a measurement with no instrument attached — the reader
+    # cannot re-derive it and no guard can check it — so it decays silently in the
+    # direction of looking authoritative. The program is also the row-vocabulary
+    # library five actions load by path, so its self-test is what keeps the one
+    # owner of "what an open row is" checked.
     add_test(
-        NAME anchor_balance_selftest_guard
+        NAME anchor_debt_selftest_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/anchor-debt/anchor-debt.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
@@ -1097,15 +1197,9 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/refresh_landing_log/refresh_landing_log.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    # ⚠ Two of those consumers had a self-test and NO entry: a self-test behind a flag
-    # nobody passes, the shape of the entries above.
-    # One of them WRITES registry rows under the root it resolves.
-    add_test(
-        NAME apply_registry_row_selftest_guard
-        COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/apply-registry-row/apply-registry-row.py"
-                --self-test
-        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ⓘ `apply_registry_row_selftest_guard` stood here (retired 2026-09-30, cycle P69, with its program:
+    # `dssharness write-anchor` / `set-anchor` with cell files replace one row, and the door refuses a value it
+    # would store cut and a citation no row holds -- the two checks that program's launcher had restated).
     # ⓘ `carriage_excludes_selftest_guard` stood here. `carriage-excludes.py`
     # derived a transport exclude list from what git ignores, so no carriage
     # re-typed one; DssHarness's `sync` owns that question now, from the same
@@ -1124,7 +1218,7 @@ if(DSS_BUILD_TESTS)
     # `anchor_registry_guard` RECOVERS a wrapped citation (its `WRAP_JOIN_AWK`
     # joins the fragment to the next line's head token) and then resolves the
     # joined name — recovery, not refusal, because refusing would red hundreds of
-    # lines of honest text. `check-anchor-balance` reads WHOLE-LINE ids, so a
+    # lines of honest text. `anchor-debt`'s scan reads WHOLE-LINE ids, so a
     # wrapped one is not there at all. ⇒ the gap is that nothing COUNTS them, and
     # ✔MEASURED 2026-08-23 the population is 290 sites across 145 files.
     #
@@ -1161,7 +1255,7 @@ if(DSS_BUILD_TESTS)
     # ⚠ THE `ⓘ` NOTE IN THE BLOCK ABOVE — `check-ninja-deps` "has no argument-free
     # form to register" — IS TRUE ONLY OF ITS PROBE FORM, AND IS STALE AS WRITTEN;
     # correcting it in place is left to the owner of that block. Its `--self-test`
-    # takes no build directory at all — exactly the shape `anchor_balance_selftest_guard`
+    # takes no build directory at all — exactly the shape `anchor_debt_selftest_guard`
     # exists for — so the instrument that decides whether a gate may be trusted was
     # itself the one thing no gate checked. ✔MEASURED 2026-08-23: pointed at a
     # directory that does not exist it printed `SKIP` and exited 0, while its own
@@ -1387,7 +1481,7 @@ if(DSS_BUILD_TESTS)
     # ⓘ `.plans/` is deliberately NOT governed — 40 of the 49 tree-wide
     # candidates live there, 27 in the registry alone, in documents rewritten
     # every cycle; and a registry row contradicting its own verdict is already
-    # `check-anchor-balance`'s mismarked-closure arm.
+    # `anchor-debt`'s mismarked-closure arm.
     #
     # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
     # the tree and then drives its arms against fixtures SYNTHESIZED into a temp
@@ -1612,5 +1706,26 @@ if(DSS_BUILD_TESTS)
                 "-DDSS_HCS_GENERATOR=${CMAKE_GENERATOR}"
                 "-DDSS_HCS_PCH_DISABLED=${CMAKE_DISABLE_PRECOMPILE_HEADERS}"
                 -P "${CMAKE_SOURCE_DIR}/cmake/DssHostCompilerStamp.cmake")
+    # The compiler's BUILD stamp, proven in throwaway trees by the script that computes it (2026-10-06,
+    # cycle P69, lane `hm`): without git the value is the declared inputs' CONTENT, so an unchanged tree
+    # stamps the same value and leaves the header alone, and a source's bytes, a new file, a rename, a test
+    # tree's CMake script or VERSION moves it while a test's source, a document, a plan or a harness file
+    # does not; with git only the inputs' dirt counts, both ways; a declared input that names nothing is
+    # refused. One arm stamps THIS tree under its own declaration without git, and four configure fixture
+    # projects with this build's generator to prove the configure-time check of the declaration. Every leg
+    # runs it: what git a leg has, and whether its tree is a work tree, are the host's.
+    add_test(
+        NAME build/build_stamp_identity
+        COMMAND ${CMAKE_COMMAND}
+                -DDSS_STAMP_MODE=selftest
+                "-DDSS_STAMP_SCRATCH=${CMAKE_BINARY_DIR}/build-stamp-selftest"
+                "-DDSS_STAMP_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+                "-DDSS_STAMP_GIT=${GIT_EXECUTABLE}"
+                "-DDSS_STAMP_INPUTS=${DSS_BUILD_STAMP_INPUTS}"
+                "-DDSS_STAMP_RECORDS=${DSS_BUILD_STAMP_RECORDS}"
+                "-DDSS_STAMP_SCRIPT_DIRS=${DSS_BUILD_STAMP_SCRIPT_DIRS}"
+                "-DDSS_STAMP_GENERATOR=${CMAKE_GENERATOR}"
+                "-DDSS_STAMP_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+                -P "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake")
 endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DssTestBudgets.cmake")  # every ctest entry's TIMEOUT — keep this LAST

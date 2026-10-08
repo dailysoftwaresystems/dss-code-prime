@@ -771,14 +771,16 @@ tlsAccessModelFromName(std::string_view s) noexcept {
 // that names the PE `_tls_index` slot — a LINK-TIER writer-minted SINGLETON
 // (never a MIR symbol) that the `pe-indexed` access sequence's riprel read
 // targets AND the PE writer binds. It is a HIGH sentinel a DENSE per-CU
-// SymbolId (minted upward from 1) can never reach, so on the single-CU
-// emission path (the only path a thread-local access + definition co-reside
-// on today) it survives from MIR→LIR lowering to `pe.cpp` UNREMAPPED and the
-// writer binds `symbolVa[reserved] = _tls_index VA` unambiguously. On a
-// multi-CU merge the retarget would remap it to a fresh dense id → the riprel
-// reloc resolves against no `symbolVa` entry → FAIL-LOUD undefined (multi-file
-// extern-`thread_local` is the deferred `D-PIPELINE-CU5-MULTIFILE-EXTERN-DATA`
-// surface; never a silent wrong-address). Both `mir_to_lir.cpp` (the lowering)
+// SymbolId (minted upward from 1) can never reach, so it survives from MIR→LIR
+// lowering to `pe.cpp` UNREMAPPED and the writer binds
+// `symbolVa[reserved] = _tls_index VA` unambiguously — on the single-CU path
+// and through the multi-CU merge alike, which keeps the value (`mergeModules`'
+// `mergedIdFor`) and resolves it as the writer's (`resolveCrossCuSymbols`).
+// Until P69 round 4 the merge REMAPPED it to a fresh dense id no writer binds,
+// so a PE program with a thread-local was refused beside ANY other unit — a
+// static-library member, an object input:
+//   D-LK-PE-THREAD-LOCAL-PROGRAM-REFUSED-BESIDE-ANY-OTHER-UNIT
+// Both `mir_to_lir.cpp` (the lowering)
 // and `pe.cpp` (the writer) read this ONE constant — a plain `std::uint32_t`
 // so this leaf header stays free of the `strong_ids.hpp` dependency; each side
 // wraps it in `SymbolId{...}` at use.

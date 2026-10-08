@@ -56,7 +56,7 @@ experiment pins the wiring.
 WRITTEN HERE: the tool exited ZERO on a directory that does not exist.
 ✔MEASURED 2026-08-23 at 6dc63be0, from the repo root:
 
-    $ python .harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py build-dbg
+    $ python <this program> build-dbg        (started by hand, as every program was then)
     ninja-deps: SKIP build-dbg -- no build.ninja (not a ninja build dir)
     rc=0
     $ ls -d build-dbg
@@ -88,10 +88,11 @@ described `check()`, which skipped. One code path, one fix, and it is in
 ⇒ the illegitimate case (a stale path silently returning 0) is now unreachable,
 and the legitimate one is visible in the command line that requested it.
 
-Usage:
-    python .harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py [build-dir ...]     # default: build/dbg, else build-dbg, in THIS script's tree
-    python .harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py --allow-non-ninja <dir>
-    python .harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py --self-test
+Usage: `dssharness run check-ninja-deps` -- its steps run `--self-test`, then the leg's own build directory
+(`{buildDir}`, which the runner's `requireBuild` just built). The program's forms:
+    [build-dir ...]                 # default: build/dbg, else build-dbg, in THIS script's tree
+    --allow-non-ninja <dir>         # a directory that is not a ninja build, named on purpose
+    --self-test
 
 The default is TRANSITION-SAFE by design. The repo is moving to a single build
 root (`build/<name>`; see .claude/skills/dss-cycle/references/build-layout.md), and

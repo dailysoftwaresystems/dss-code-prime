@@ -94,10 +94,17 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
   later, and still gets its row → `references/registry-and-priority.md`.
 - Two files: `_deferred-anchor-registry-production.md` (every still-open row — orient from it alone)
   and `_deferred-anchor-registry-done.md` (the archive — never read it to choose work). ★★★ **Closing a
-  row MOVES it** there, reopening moves it back (2026-09-01); `check-anchor-balance` refuses both a
-  closed row left behind and an open row filed in the archive.
+  row MOVES it** there, reopening moves it back (2026-09-01); `dssharness check-anchor-balance` refuses
+  both a closed row left behind and an open row filed in the archive.
 - A row is six cells, `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |`;
-  `🔵 DISCLOSED` is for debt this cycle FOUND, never for debt it created.
+  `🔵 DISCLOSED` is for debt this cycle FOUND, never for debt it created — and it is OPEN WORK, not a
+  way to finish a finding.
+- ★★★★ **Disclosed is NOT closed, and "close anchors" means the disclosed ones too** (2026-10-08): a
+  defect met while closing another row is FIXED in the same wave, pre-existing or not; a new disclosed
+  row is a RARE exception — really big, not doable in the context — on a MEASURED size the orchestrator
+  rules on, default *close it now*; "scheduled for a later round for cycle size alone" is not a blocker;
+  existing disclosed rows are closed along the way and a new round takes them first; report closed /
+  opened (created, disclosed) / the REAL net, never the counted figure alone → `references/no-follow-ups.md`.
 - The door is `dssharness write-anchor` / `set-anchor`, which WRITE unless given `--anchor-dry-run`;
   a cell is read only with `read-anchor <ID> --json`; a row is never hand-assembled, hand-edited or
   hand-read → also `references/anchors-and-deferrals.md`.
@@ -111,13 +118,15 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
   and a rise is a HARD STOP; mark a shipped row ✅ the moment it ships → `references/no-follow-ups.md`.
 - A lane that EXITS discharges nothing (2026-08-27): spawn a remnant LANE for its remnant rows — a new
   agent of the same orchestrator, briefed as lane `<o>/<a>`, which runs `/dss-cycle` as a lane and never
-  orchestrates (`references/orchestration.md`); run BOTH `check-anchor-balance` and `check-anchor-registry` — a green balance is not evidence
+  orchestrates (`references/orchestration.md`); run BOTH `dssharness check-anchor-balance` and `dssharness run check-anchor-registry` — a green balance is not evidence
   that nothing was opened → same file.
 
 **Lanes**
 - Delegation is the default; at most FOUR reasoning agents live at once (2026-08-19); scripts do not count,
-  memory does: two heavy local jobs at most, each admitted below 76% committed memory, on the orchestrator's
-  GO, cores from config, no `-j` (✔MEASURED P68 round 9); every brief says "anchor AND close" → `references/delegation.md`.
+  memory does: DssHarness ADMITS heavy legs itself (`defaults.admission`: two at once per physical machine, each
+  started below 76% memory; a wait names its holders; no GO, no slot directory), cores from config, no `-j`
+  (the limit ✔MEASURED P68 round 9; `help admission`); every brief says "anchor AND close", and that a
+  disclosed row needs the orchestrator's ruling on a measured size → `references/delegation.md`.
 - Contention is per FILE; the orchestrator's own edits obey lane ownership; at most ONE lane holds `src/dss-config/**`
   or `src/core/types/*schema*`; `.plans/**` is a guard input, so a lane is refreshed only between its gates;
   each lane gets its own agent — worktree, build tree, work directory → `references/lane-discipline.md`.
@@ -245,7 +254,7 @@ Rigor is unchanged: the detail goes into the row and the handoff, not the reply.
 A one-line cycle summary — priority closed, anchors touched, test delta, commit hash — plus:
 
 ```
-anchors: opened N, closed M, net ±K — OPEN was <before>, now <after>
+anchors: closed M, opened N (created C, disclosed D), real net ±K — OPEN was <before>, now <after>
 next: <one line, matching the top NEXT entry in .plans/_handoff.md>
 ```
 

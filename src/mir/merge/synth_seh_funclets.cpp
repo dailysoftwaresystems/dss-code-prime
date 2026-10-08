@@ -5,6 +5,7 @@
 #include "core/types/type_lattice/core_type.hpp"       // TypeKind, CallConv
 #include "core/types/type_lattice/type_interner.hpp"
 #include "ffi/mangling/c_mangle.hpp"   // applyCMangling (per-format personality name)
+#include "mir/merge/synth_symbol_floor.hpp"  // highestTakenSymbolIdV (the module's + the name table's ids)
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"  // rederiveStructCfMarkers (the relayout's duty)
@@ -41,24 +42,11 @@ void emitErr(DiagnosticReporter& rep, std::string msg) {
     rep.report(std::move(d));
 }
 
-// Max SymbolId.v across every function, module global, and extern import — the
-// floor for minting fresh synthetic funclet/personality symbols (mirrors
-// synthesizePeStartup's maxSymbolIdV; the globals scan is load-bearing for the
-// same reason — synthetic string-literal globals hold the highest ids).
-[[nodiscard]] std::uint32_t
-maxSymbolIdV(Mir const& mir, std::vector<ExternImport> const& externs) {
-    std::uint32_t maxV = 0;
-    std::size_t const nf = mir.moduleFuncCount();
-    for (std::uint32_t i = 0; i < nf; ++i) {
-        maxV = std::max(maxV, mir.funcSymbol(mir.funcAt(i)).v);
-    }
-    std::size_t const ng = mir.moduleGlobalCount();
-    for (std::uint32_t i = 0; i < ng; ++i) {
-        maxV = std::max(maxV, mir.globalSymbol(mir.globalAt(i)).v);
-    }
-    for (auto const& e : externs) maxV = std::max(maxV, e.symbol.v);
-    return maxV;
-}
+// ⓘ THE MINT FLOOR for the funclet and personality symbols is `highestTakenSymbolIdV`
+// (mir/merge/synth_symbol_floor.hpp), shared with the entry-shape and threads-shim passes:
+// every id the module holds (its globals load-bearing — synthetic string-literal globals
+// hold the highest ids) AND every id the caller's name table holds, which names whatever
+// symbol a funclet's id lands on.
 
 // One collected `__try` region, resolved to concrete blocks + the minted funclet
 // symbol. `filterBB` is the single block ending in SehFilterReturn (c115 lowers the
@@ -497,6 +485,7 @@ bool synthesizeSehFunclets(Mir&                                  mir,
                            CSymbolDecorationScheme               scheme,
                            std::string_view                      formatName,
                            std::vector<MirSehScope>&             outScopes,
+                           std::uint32_t                         nameTableEnd,
                            DiagnosticReporter&                   reporter) {
     // (0) Fast presence scan — no SehTryBegin anywhere ⇒ clean no-op.
     bool anySeh = false;
@@ -517,7 +506,7 @@ bool synthesizeSehFunclets(Mir&                                  mir,
 
     // (1) Collect every region + mint funclet symbols. One personality import is
     //     shared across all regions.
-    std::uint32_t maxV = maxSymbolIdV(mir, externImports);
+    std::uint32_t maxV = highestTakenSymbolIdV(mir, externImports, nameTableEnd);
     SymbolId const personalitySym{maxV + 1};
     std::uint32_t nextSymV = maxV + 1;
 

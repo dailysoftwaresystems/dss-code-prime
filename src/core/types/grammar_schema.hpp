@@ -1304,6 +1304,12 @@ public:
     // language.
     [[nodiscard]] bool commitAfterPrefix(RuleId rule) const noexcept;
 
+    // P69 (lane `cs`): the token kinds that must NOT follow a cleanly-closed speculative
+    // probe of `rule` (`notFollowedBy` on the shape body — a PEG not-predicate); when the
+    // next token is one, the probe is abandoned and the alt tries its next candidate.
+    // Sorted by `.v`; empty for every rule that declares none.
+    [[nodiscard]] std::span<SchemaTokenId const> notFollowedBy(RuleId rule) const noexcept;
+
     // Pratt-walker wrapper rule ids declared by `expr.wrapperRules`
     // for `rule`. The loader auto-interned the declared names and
     // validated all three were present, so for an `isExprRule(rule)`

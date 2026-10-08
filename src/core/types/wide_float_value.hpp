@@ -44,6 +44,7 @@
 // handled (renormalized into a normal F80/F128 — the wider exponent absorbs it,
 // exactly as `appendF80Extended`/`appendF128` do).
 
+#include "core/types/float_format.hpp"              // the ONE owner of each format's characteristics
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind
 
 #include <array>
@@ -55,6 +56,16 @@
 #include <string>
 
 namespace dss {
+
+// ★ P69 (lane `cs`, review n13): THE canonical binary64 quiet NaN — sign clear, quiet bit set,
+// payload zero. The ONE NaN both IR texts spell `nan` (`.dsshir` and `.dssir`; every other NaN
+// is spelled by its 64-bit pattern, `float nanbits <u64>`), the NaN both readers produce for
+// `nan`, and the base `__builtin_nan` folds a payload into (gcc's rule: ✔MEASURED, lane
+// `cs`'s probe r5s s10, `nan("")` is exactly this pattern). Every tier names this constant
+// rather than asking the host: a platform's `strtod("nan")` need not be this pattern — MSVC's
+// UCRT answers 0x7fff'ffff'ffff'ffff (✔MEASURED, windows-x86_64-release run
+// 20261007-004516-4a5ffa65) — and neither, by the standard, need `quiet_NaN()`.
+inline constexpr std::uint64_t kCanonicalQuietNanBits = 0x7ff8000000000000ull;
 
 class WideFloatValue {
 public:
@@ -70,9 +81,12 @@ public:
     }
     [[nodiscard]] TypeKind kind() const noexcept { return kind_; }
 
-    // Significand precision (with the explicit leading bit): F80 = 64, F128 = 113.
+    // Significand precision (with the explicit leading bit): F80 = 64, F128 = 113 —
+    // READ from the representation table (core/types/float_format.hpp, P69 M3), the
+    // one statement of each format's characteristics.
     [[nodiscard]] static constexpr int significandBits(TypeKind k) noexcept {
-        return k == TypeKind::F128 ? 113 : 64;   // F80 (and the defensive default) → 64
+        // F80 (and the defensive default for a kind this engine does not carry).
+        return floatFormatOf(k == TypeKind::F128 ? TypeKind::F128 : TypeKind::F80)->precision;
     }
     [[nodiscard]] int significandBits() const noexcept { return significandBits(kind_); }
 
@@ -90,9 +104,11 @@ public:
         TypeKind      kind;
         std::uint32_t bits;
     };
+    // The widths are the representation table's (P69 M3), so they cannot drift from
+    // the precision and exponent field that make them up.
     static constexpr std::array<FormatBitWidth, 2> kFormatBitWidths{{
-        {TypeKind::F80, 80},
-        {TypeKind::F128, 128},
+        {TypeKind::F80, static_cast<std::uint32_t>(storageBits(*floatFormatOf(TypeKind::F80)))},
+        {TypeKind::F128, static_cast<std::uint32_t>(storageBits(*floatFormatOf(TypeKind::F128)))},
     }};
     [[nodiscard]] static constexpr std::optional<std::uint32_t>
     formatBitWidth(TypeKind k) noexcept {
@@ -126,8 +142,38 @@ public:
     [[nodiscard]] static WideFloatValue infinity(TypeKind k, bool sign) noexcept {
         WideFloatValue v; v.kind_ = k; v.class_ = Class::Infinity; v.sign_ = sign; return v;
     }
+    // ★ P69 (lane `cs`): a NaN keeps its FRACTION FIELD exactly as its format packs it —
+    // F80: the 63 bits below the explicit integer bit, in `sigHi_` (bit 62 the quiet bit);
+    // F128: the 112-bit fraction, bits 64..111 in `sigHi_` (bit 47 the quiet bit) and bits
+    // 0..63 in `sigLo_`. So a payload (`__builtin_nanl("1")`), a sign and a signalling NaN
+    // pack back as themselves: `pack ∘ fromPacked` is the identity on every NaN too. Before,
+    // every NaN packed as the canonical quiet one, and a payload was lost in silence.
+    // The CANONICAL quiet NaN is the quiet bit alone — the bytes `nan(k)` always packed.
     [[nodiscard]] static WideFloatValue nan(TypeKind k) noexcept {
-        WideFloatValue v; v.kind_ = k; v.class_ = Class::NaN; return v;
+        WideFloatValue v; v.kind_ = k; v.class_ = Class::NaN; v.sigHi_ = nanQuietBit(k);
+        return v;
+    }
+    // The quiet bit's place in the fraction field: F80 bit 62; F128 bit 111 (bit 47 of
+    // `sigHi_`). `isSupportedKind` gates every caller; any other kind answers F80's.
+    [[nodiscard]] static constexpr std::uint64_t nanQuietBit(TypeKind k) noexcept {
+        return k == TypeKind::F128 ? (std::uint64_t{1} << 47) : (std::uint64_t{1} << 62);
+    }
+    // A QUIET NaN carrying `payload` in its low fraction bits, the quiet bit forced — gcc's
+    // own placement (`real_nan`, then the format's encoder). ✔MEASURED (lane `cs`'s probe
+    // n01, gcc 13.3.0 and clang 18.1.3 alike): F80 `__builtin_nanl("1")` packs the
+    // significand c000000000000001, and a payload's bits above 61 are not kept
+    // (`"0xffffffffffffffff"` packs ffffffffffffffff). F128 keeps payload bits 0..110 — the
+    // low word whole, and bits 64..110 of `payloadHi`.
+    [[nodiscard]] static WideFloatValue quietNan(TypeKind k, std::uint64_t payloadLo,
+                                                 std::uint64_t payloadHi = 0) noexcept {
+        WideFloatValue v = nan(k);
+        if (k == TypeKind::F128) {
+            v.sigLo_  = payloadLo;
+            v.sigHi_ |= payloadHi & (nanQuietBit(k) - 1u);
+        } else {
+            v.sigHi_ |= payloadLo & (nanQuietBit(k) - 1u);
+        }
+        return v;
     }
 
     // Widen a host `double` (binary64) EXACTLY into F80/F128 (53-bit mantissa ⊆
@@ -142,6 +188,14 @@ public:
         std::uint64_t const frac52 = bits & 0x000F'FFFF'FFFF'FFFFull;
         if (exp11 == 0x7FFu) {
             v.class_ = (frac52 == 0) ? Class::Infinity : Class::NaN;
+            // A NaN's 52-bit fraction moves to the TOP of the wider field, so its quiet bit
+            // lands on the wide quiet bit and its payload rides along (P69, lane `cs`).
+            // ✔MEASURED (probe n02, gcc and clang folding alike): `(long double)
+            // __builtin_nan("0x800")` packs the F80 significand c000000000400000.
+            if (v.class_ == Class::NaN) {
+                if (k == TypeKind::F128) { v.sigHi_ = frac52 >> 4; v.sigLo_ = frac52 << 60; }
+                else                     { v.sigHi_ = frac52 << 11; }
+            }
             return v;
         }
         if (exp11 == 0) {
@@ -223,9 +277,23 @@ public:
     [[nodiscard]] bool isNaN()      const noexcept { return class_ == Class::NaN; }
     [[nodiscard]] bool isInfinity() const noexcept { return class_ == Class::Infinity; }
 
-    // Exact sign flip (the unary Neg fold). NaN keeps its (unspecified) sign.
+    // Exact sign flip (the unary Neg fold) — a NaN's too: gcc and clang fold
+    // `-__builtin_nanl("1")` to the same payload with the sign set (probe n01).
     [[nodiscard]] WideFloatValue negate() const noexcept {
         WideFloatValue v = *this; v.sign_ = !v.sign_; return v;
+    }
+
+    // An arithmetic operation with a NaN operand returns the FIRST NaN operand, quieted, with
+    // its own sign and payload (IEEE 754-2008 6.2.3's recommendation). ✔MEASURED (lane `cs`'s
+    // probe n02, gcc 13.3.0 and clang 18.1.3 folding alike): nan1 + 1, 1 + nan2, 1 - nan2
+    // (NOT negated), nan3 * 2, nan4 + nan5 (the first), -nan6 / 2 and 2 / -nan7 (the NaN's
+    // own sign, not the product's) each give that NaN. Before P69 every one was the
+    // canonical quiet NaN — unobservable while no folded NaN carried a payload.
+    [[nodiscard]] static WideFloatValue propagateNaN(WideFloatValue const& a,
+                                                     WideFloatValue const& b) noexcept {
+        WideFloatValue v = a.class_ == Class::NaN ? a : b;
+        v.sigHi_ |= nanQuietBit(v.kind_);
+        return v;
     }
 
     // ── Arithmetic (require both operands the SAME kind — the caller homogenizes
@@ -241,7 +309,7 @@ public:
         if (a.kind_ != b.kind_ || !isSupportedKind(a.kind_)) return std::nullopt;
         TypeKind const k = a.kind_;
         bool const sign = a.sign_ ^ b.sign_;
-        if (a.class_ == Class::NaN || b.class_ == Class::NaN) return nan(k);
+        if (a.class_ == Class::NaN || b.class_ == Class::NaN) return propagateNaN(a, b);
         if (a.class_ == Class::Infinity || b.class_ == Class::Infinity) {
             if (a.class_ == Class::Zero || b.class_ == Class::Zero) return nan(k);   // inf·0
             return infinity(k, sign);
@@ -263,7 +331,7 @@ public:
         if (a.kind_ != b.kind_ || !isSupportedKind(a.kind_)) return std::nullopt;
         TypeKind const k = a.kind_;
         bool const sign = a.sign_ ^ b.sign_;
-        if (a.class_ == Class::NaN || b.class_ == Class::NaN) return nan(k);
+        if (a.class_ == Class::NaN || b.class_ == Class::NaN) return propagateNaN(a, b);
         if (a.class_ == Class::Infinity) {
             if (b.class_ == Class::Infinity) return nan(k);   // inf/inf
             return infinity(k, sign);                          // inf/finite
@@ -341,7 +409,23 @@ public:
             double const inf = std::numeric_limits<double>::infinity();
             return sign_ ? -inf : inf;
         }
-        if (class_ == Class::NaN) return std::numeric_limits<double>::quiet_NaN();
+        if (class_ == Class::NaN) {
+            // The field's TOP 52 bits are the double's fraction — the payload below them is
+            // dropped, the quiet bit lands on the quiet bit, the sign is kept (P69, lane `cs`).
+            // ✔MEASURED (probe n02, gcc and clang folding alike): `(double)__builtin_nanl(
+            // "0x800")` is 0x7ff8000000000001. A field whose top 52 bits are all zero (a
+            // signalling NaN with only a low payload) would read as an infinity: gcc's
+            // encoder sets fraction bit 50 then, and so does this.
+            std::uint64_t frac52 = kind_ == TypeKind::F128
+                ? ((sigHi_ << 4) | (sigLo_ >> 60)) & 0x000F'FFFF'FFFF'FFFFull
+                : (sigHi_ >> 11) & 0x000F'FFFF'FFFF'FFFFull;
+            if (frac52 == 0) frac52 = std::uint64_t{1} << 50;
+            std::uint64_t const bits = (static_cast<std::uint64_t>(sign_) << 63)
+                                     | (std::uint64_t{0x7FF} << 52) | frac52;
+            double d = 0.0;
+            std::memcpy(&d, &bits, sizeof d);
+            return d;
+        }
 
         // value = ±T·2^(exponent_-127) with T = sigHi_:sigLo_ (128-bit, integer
         // bit at 127). Decide F64 normal vs subnormal from the UNROUNDED exponent
@@ -428,13 +512,23 @@ private:
     bool          sign_     = false;
     Class         class_    = Class::Zero;
     std::int32_t  exponent_ = 0;              // unbiased (value = ±sig·2^exponent_)
-    std::uint64_t sigHi_    = 0;              // significand, integer bit at bit 63
-    std::uint64_t sigLo_    = 0;              // low half (F128 uses bits 63..15; F80 = 0)
+    std::uint64_t sigHi_    = 0;              // significand, integer bit at bit 63 (a NaN:
+    std::uint64_t sigLo_    = 0;              //   its fraction field — see `nan`); low half
+                                              //   (F128 uses bits 63..15; F80 = 0)
     TypeKind      kind_     = TypeKind::F64;  // inert default; isSupportedKind gates
 
-    static constexpr std::int32_t kExpBias =  16383;
-    static constexpr std::int32_t kMaxExp  =  16383;   // max normal unbiased exponent
-    static constexpr std::int32_t kMinExp  = -16382;   // min normal unbiased exponent
+    // ONE exponent encoding serves both kinds — x87 extended and binary128 share the
+    // 15-bit field and its 16383 bias — read from the representation table, and the
+    // encoders' `0x7FFF` masks and `<< 15` sign shifts below rest on that width.
+    static constexpr std::int32_t kExpBias = exponentBias(*floatFormatOf(TypeKind::F80));
+    static constexpr std::int32_t kMaxExp  = ieeeMaxExponent(*floatFormatOf(TypeKind::F80));   // max normal unbiased exponent
+    static constexpr std::int32_t kMinExp  = ieeeMinExponent(*floatFormatOf(TypeKind::F80));   // min normal unbiased exponent
+    static_assert(floatFormatOf(TypeKind::F80)->exponentBits == 15
+                      && floatFormatOf(TypeKind::F128)->exponentBits == 15,
+                  "the F80/F128 encoders mask a 15-bit exponent field (0x7FFF) and shift the "
+                  "sign by 15 — a table row with another width needs its own encoding");
+    static_assert(exponentBias(*floatFormatOf(TypeKind::F80)) == exponentBias(*floatFormatOf(TypeKind::F128)),
+                  "one bias serves both kinds");
 
     // ── Portable 64×64 → 128 (lo, hi) via 32-bit halves — no __uint128/_umul128
     // (MSVC + clang + gcc compile this identically; the `BitIntValue::mul64`
@@ -593,7 +687,8 @@ private:
         TypeKind const k = a.kind_;
         WideFloatValue b = bIn;
         if (subtract) b.sign_ = !b.sign_;
-        if (a.class_ == Class::NaN || b.class_ == Class::NaN) return nan(k);
+        // The UNNEGATED operand: `1 - nan` returns the NaN as written (probe n02).
+        if (a.class_ == Class::NaN || b.class_ == Class::NaN) return propagateNaN(a, bIn);
         if (a.class_ == Class::Infinity || b.class_ == Class::Infinity) {
             if (a.class_ == Class::Infinity && b.class_ == Class::Infinity)
                 return (a.sign_ != b.sign_) ? nan(k) : infinity(k, a.sign_);   // inf + -inf = NaN
@@ -666,8 +761,9 @@ private:
         switch (class_) {
             case Class::Zero:     return {0, s << 15};
             case Class::Infinity: return {std::uint64_t{1} << 63, (s << 15) | 0x7FFFu};
-            case Class::NaN:      return {(std::uint64_t{1} << 63) | (std::uint64_t{1} << 62),
-                                          (s << 15) | 0x7FFFu};   // integer + quiet bit
+            case Class::NaN:      return {(std::uint64_t{1} << 63)                // integer bit
+                                              | (sigHi_ & 0x7FFF'FFFF'FFFF'FFFFull),  // the field
+                                          (s << 15) | 0x7FFFu};
             case Class::Normal: {
                 std::uint32_t const exp15 =
                     static_cast<std::uint32_t>(exponent_ + kExpBias) & 0x7FFFu;
@@ -681,8 +777,8 @@ private:
         switch (class_) {
             case Class::Zero:     return {0, s << 63};
             case Class::Infinity: return {0, (s << 63) | (std::uint64_t{0x7FFF} << 48)};
-            case Class::NaN:      return {0, (s << 63) | (std::uint64_t{0x7FFF} << 48)
-                                             | (std::uint64_t{1} << 47)};   // quiet
+            case Class::NaN:      return {sigLo_, (s << 63) | (std::uint64_t{0x7FFF} << 48)
+                                                  | (sigHi_ & 0xFFFF'FFFF'FFFFull)};   // the field
             case Class::Normal: {
                 std::uint32_t const exp15 =
                     static_cast<std::uint32_t>(exponent_ + kExpBias) & 0x7FFFu;
@@ -702,8 +798,9 @@ private:
         v.sign_ = ((hi >> 15) & 1u) != 0;
         std::uint32_t const exp15 = static_cast<std::uint32_t>(hi & 0x7FFFu);
         if (exp15 == 0x7FFFu) {
-            // integer bit set + fraction 0 → inf; fraction != 0 → NaN.
+            // integer bit set + fraction 0 → inf; fraction != 0 → NaN, its field kept.
             v.class_ = ((lo & 0x7FFF'FFFF'FFFF'FFFFull) == 0) ? Class::Infinity : Class::NaN;
+            if (v.class_ == Class::NaN) v.sigHi_ = lo & 0x7FFF'FFFF'FFFF'FFFFull;
             return v;
         }
         if (exp15 == 0 || lo == 0) { v.class_ = Class::Zero; return v; }
@@ -721,6 +818,7 @@ private:
         std::uint64_t const fracLo64 = lo;                         // fraction bits 0..63
         if (exp15 == 0x7FFFu) {
             v.class_ = (fracHi48 == 0 && fracLo64 == 0) ? Class::Infinity : Class::NaN;
+            if (v.class_ == Class::NaN) { v.sigHi_ = fracHi48; v.sigLo_ = fracLo64; }
             return v;
         }
         if (exp15 == 0 && fracHi48 == 0 && fracLo64 == 0) { v.class_ = Class::Zero; return v; }

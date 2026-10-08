@@ -26,7 +26,7 @@ ONE OWNER PER FACT:
   * the LITERALS come from `check-no-abort-in-tests`' `scan_code` -- the one owner of "what is code, what is a
     comment, what is a string", whose stripped text the other guards import -- never from a second C++ parser
     here;
-  * the ID SHAPE is `check-anchor-balance`'s `ANCHOR_TOKEN` (the vocabulary the registry guards share), read at a
+  * the ID SHAPE is `anchor-debt`'s `ANCHOR_TOKEN` (the vocabulary the registry guards share), read at a
     word boundary, so an id-shaped run that starts inside a longer word is not an id.
 
 THE RATCHET: `INVENTORY` holds a per-FILE count of anchor ids in literals -- per file, never per line, so an edit
@@ -40,10 +40,10 @@ its action; a test that asserted the id moves to the condition.
 statuses -- a guard whose proof sat behind a flag nothing passes proved nothing (the siblings' measured lesson).
 
 Exit codes: 0 clean (within the ratchet) -- 1 a new, grown or stale count -- 2 the scan collapsed -- 3 usage.
-Usage:
-    python .harness-config/runner/actions/check-emitted-anchor-ids/check-emitted-anchor-ids.py
-    python .harness-config/runner/actions/check-emitted-anchor-ids/check-emitted-anchor-ids.py --list
-    python .harness-config/runner/actions/check-emitted-anchor-ids/check-emitted-anchor-ids.py --selftest
+Usage -- each a step of the action, the program's own flag after the `#`:
+    dssharness run check-emitted-anchor-ids                           # verify, then the self-test
+    dssharness run check-emitted-anchor-ids --manual-step list        # --list
+    dssharness run check-emitted-anchor-ids --manual-step self-test   # --selftest
 """
 import importlib.util
 import io
@@ -95,7 +95,7 @@ INVENTORY = {
     "src/link/branch_veneers.cpp": 15,
     "src/link/entry_trampoline.cpp": 12,
     "src/link/format/ar.cpp": 12,
-    "src/link/format/coff_object_reader.cpp": 7,
+    "src/link/format/coff_object_reader.cpp": 6,
     "src/link/format/dwarf_cfi.hpp": 1,
     "src/link/format/dwarf_cfi_decode.hpp": 1,
     "src/link/format/elf.cpp": 32,
@@ -108,12 +108,12 @@ INVENTORY = {
     "src/link/format/macho_backend.cpp": 10,
     "src/link/format/macho_object_reader.cpp": 5,
     "src/link/format/object_atom_coverage.hpp": 2,
-    "src/link/format/pe.cpp": 31,
+    "src/link/format/pe.cpp": 30,
     "src/link/format/pe_backend.cpp": 7,
     "src/link/format/unwind_pointer_reloc.hpp": 2,
     "src/link/format/weak_definition_gate.hpp": 2,
     "src/link/image_request.cpp": 5,
-    "src/link/linker.cpp": 18,
+    "src/link/linker.cpp": 17,
     "src/link/object_format_schema.cpp": 25,
     "src/link/object_format_schema_json.cpp": 9,
     "src/lir/lir_callconv.cpp": 29,
@@ -163,10 +163,10 @@ def scan_code():
 
 
 def anchor_token():
-    """`check-anchor-balance`'s ANCHOR_TOKEN, at a word boundary on the left."""
+    """`anchor-debt`'s ANCHOR_TOKEN, at a word boundary on the left."""
     global _TOKEN
     if _TOKEN is None:
-        shape = _sibling("check-anchor-balance", "the anchor-id shape").ANCHOR_TOKEN.pattern
+        shape = _sibling("anchor-debt", "the anchor-id shape").ANCHOR_TOKEN.pattern
         _TOKEN = re.compile(r"(?<![A-Za-z0-9_])" + shape)
     return _TOKEN
 

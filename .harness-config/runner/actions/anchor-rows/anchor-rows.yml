@@ -60,9 +60,9 @@ steps:
     requireInputsUnmoved: true
 
   # `apply` writes the two registries -- tracked files -- by design, so it cannot carry requireInputsUnmoved.
-  # The door resolves no cited id, and no guard reads the registries' own citations (`check-anchor-citations`
-  # reads `anchors.citationRoots`, which holds no `.plans`): `check` and `apply` resolve every id the batch
-  # newly cites themselves, against both registries and the batch.
+  # The door resolves every id a value newly cites and refuses a value it would store cut (since 2026-09-30):
+  # `check` and `apply` meet both refusals at the rehearsal, which writes the batch -- new rows first -- through
+  # the real door in a throwaway repository before the real registries are opened.
   - name: apply
     manual: true
     workingDirectoryRoot: action

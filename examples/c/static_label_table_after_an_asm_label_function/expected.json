@@ -1,0 +1,44 @@
+{
+  "$comment": "★★★ A STATIC `&&label` TABLE LAID OUT AFTER A BLOCK-INSERTING PASS (P69, D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS). `static void *const tbl[] = {&&L0, &&L1, &&L2}; goto *tbl[i];` reads the label addresses out of DATA, so no instruction names the blocks: the pipeline binds each label's symbol after assembly, by MIR→LIR's block id, to the FINAL module's offsets (LirBlockSymbolBinding). A block id is an arena position, so every block a later pass inserts renumbers every block after it — an inline-asm template's label, and under a calling convention that walks the guard page, each runtime stack descent's walk. Shapes, each its own exit bit: a table BEFORE both (the control, 1), the template's loop (2), a table in a function after the template's (4), a template and a table in one function (8), a VLA frame (16), a table in a function after the VLA's (64), a VLA and a table in one function (128). ✔MEASURED 2026-10-07 on the build at 71648598 (the probe shape of bit 4): DSS REFUSED it — K_NoMatchingObjectFormat, 'a static initializer takes the address of block 3 … but the assembler published no byte offset for it' — on pe and elf, while gcc and clang (c2x) and mingw gcc ran it to 42 (gnu report ref-gnu-20261007-110448-688ad580, mingw run 20261007-110516-eb0d1c91; `-pedantic-errors` refuses `&&label` on all three, as the GNU extension it is), and the BEFORE control was 42 everywhere. The bits 64 and 128 shapes exist only on a target whose calling convention walks the guard page (pe64); elsewhere they are controls.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

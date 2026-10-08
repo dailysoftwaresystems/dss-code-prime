@@ -37,6 +37,8 @@
 #include "link/object_format_identity_doc.hpp"
 
 #include <algorithm>
+#include <array>     // the closed key sets of the identity blocks
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <limits>
@@ -50,6 +52,23 @@ namespace dss::link::format {
 namespace {
 
 char const* const kMachOBlocks[] = { "macho", "image" };
+
+// P69 (D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY): every block this
+// backend reads has a CLOSED key set — the shared check
+// (`dss::detail::rejectUnknownKeys`, which lets `$` prose through) bound to this
+// loader's sink and `path/key` convention, once for the six blocks below.
+template <std::size_t N>
+void closeBlock(nlohmann::json const&                    block,
+                std::array<std::string_view, N> const&   keys,
+                std::string_view                         path,
+                std::string_view                         label,
+                substrate::DiagnosticCollector&          coll) {
+    ::dss::detail::rejectUnknownKeys(block, keys, label,
+        [&](std::string_view key, std::string message) {
+            coll.emit(DiagnosticCode::C_MalformedJson, std::format("{}/{}", path, key),
+                      std::move(message));
+        });
+}
 
 // D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS. The weak-
 // definition spellings THIS backend's walker writes. One row: `macho.cpp`
@@ -312,6 +331,12 @@ public:
                 coll.emit(DiagnosticCode::C_MalformedJson, "/macho",
                           "'macho' must be an object when format.kind == 'macho'");
             } else {
+                // CLOSED (P69, D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY),
+                // like every block below: a misspelled key loaded clean and
+                // left the field it names at its default.
+                static constexpr std::array<std::string_view, 4> kMachoBlockKeys{
+                    "cputype", "cpusubtype", "flags", "filetype"};
+                closeBlock(m, kMachoBlockKeys, "/macho", "the 'macho' block", coll);
                 auto readU32 = [&](char const* field, std::uint32_t& out) {
                     if (!m.contains(field) || !m.at(field).is_number_integer())
                         return;
@@ -402,6 +427,11 @@ public:
                 coll.emit(DiagnosticCode::C_MalformedJson, "/image",
                           "'image' must be an object");
             } else {
+                static constexpr std::array<std::string_view, 11> kImageBlockKeys{
+                    "pageZeroSize", "segmentPageSize", "dylinkerPath", "installName",
+                    "loadDylibs", "bindNow", "codeSignatureSize", "useChainedFixups",
+                    "uuid", "codeSignature", "buildVersion"};
+                closeBlock(im, kImageBlockKeys, "/image", "the 'image' block", coll);
                 if (im.contains("pageZeroSize")) {
                     if (!im.at("pageZeroSize").is_number_integer()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
@@ -486,6 +516,11 @@ public:
                             } else if (arr[i].is_object()
                                     && arr[i].contains("path")
                                     && arr[i].at("path").is_string()) {
+                                static constexpr std::array<std::string_view, 1> kDylibRowKeys{
+                                    "path"};
+                                closeBlock(arr[i], kDylibRowKeys,
+                                           std::format("/image/loadDylibs/{}", i),
+                                           "a loadDylibs entry", coll);
                                 data.machoImage.loadDylibs.push_back(
                                     MachODylibRef{arr[i].at("path")
                                                       .get<std::string>()});
@@ -581,6 +616,8 @@ public:
                                   "/image/uuid",
                                   "'uuid' must be an object {derivation}");
                     } else {
+                        static constexpr std::array<std::string_view, 1> kUuidKeys{"derivation"};
+                        closeBlock(uu, kUuidKeys, "/image/uuid", "the 'uuid' block", coll);
                         MachOUuid uid;
                         bool ok = true;
                         // derivation (closed enum; default "content-hash").
@@ -640,6 +677,10 @@ public:
                                   "{kind, hashAlgorithm, pageSize, "
                                   "identifier}");
                     } else {
+                        static constexpr std::array<std::string_view, 4> kSignatureKeys{
+                            "kind", "hashAlgorithm", "pageSize", "identifier"};
+                        closeBlock(cs, kSignatureKeys, "/image/codeSignature",
+                                   "the 'codeSignature' block", coll);
                         MachOCodeSignature sig;
                         bool ok = true;
                         // kind (closed enum; default "adhoc").
@@ -819,6 +860,10 @@ public:
                                   "'buildVersion' must be an object "
                                   "{platform, minOs, sdk}");
                     } else {
+                        static constexpr std::array<std::string_view, 3> kBuildVersionKeys{
+                            "platform", "minOs", "sdk"};
+                        closeBlock(bv, kBuildVersionKeys, "/image/buildVersion",
+                                   "the 'buildVersion' block", coll);
                         // "X.Y" / "X.Y.Z" → (major<<16)|(minor<<8)|patch.
                         // major 16-bit, minor/patch 8-bit each (the
                         // build_version_command field layout).

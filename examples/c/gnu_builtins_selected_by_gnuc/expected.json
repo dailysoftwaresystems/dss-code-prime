@@ -1,0 +1,45 @@
+{
+  "$comment": "P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): DSS predefines `__GNUC__`, which routes real code into GCC's builtins -- `likely()` is `__builtin_expect` (Lua 5.4.7's `luai_likely`), sqlite's generate_series takes `__builtin_ceil` / `__builtin_floor` -- and DSS refused every one of them S_UndeclaredIdentifier. This program uses each with NO header: `__builtin_expect` at run time and as an integer constant expression (an enumerator, an array bound, `_Static_assert`) and in a static initializer; the library builtins strlen / memset / memcpy / memcmp / strcmp / ceil / floor / fabs (each binds to the C library function itself); the floating constants and a quiet NaN's payload bits; ffs / parity / popcountl / clzl / ctzl at the data model's `long` width; prefetch (its operand's side effects run) and assume_aligned; object_size's measured answers and its documented unknown answer through a pointer parameter; `__has_builtin` for each (a library builtin answers 1 exactly where the target's C library provides the function); and trap / abort on paths not taken. `__builtin_frame_address` and `__builtin_return_address` are not here: they were withdrawn, because their meaning needs frame records DSS does not keep yet. The exit code is a bitmask of the groups that misbehaved (see main.c). MEASURED 2026-10-07 through `dssharness run probe-reference-cc`, this file: gcc 13.3.0 and clang 18.1.3 at -std=c17 -pedantic-errors and -std=c2x (libm linked with -Wl,--no-as-needed,-lm, which gcc's -O0 `__builtin_ceil` call needs; run 20261007-051108-f15b991b, host run -051053-e84c156b) exit 42; mingw-w64 gcc 13.2.0 exits 42 at -std=c17 -pedantic-errors and -std=c2x (run 20261007-055301-8557b29f); MSVC 19.51 (no `__GNUC__`, the file's bare `return 42` arm) exits 42 too (run 20261007-051120-daad2ffd). Apple clang 21.0.0 exits 42 at -std=c17 -pedantic-errors and -std=c2x on this revision (run 20261007-192441-06d9d6ef, host run -192431-cfbf5c5e), as it ran the earlier revision, with the frame reads, on 2026-10-01 (run 20261001-040310-ad4f3a61). Every operand is derived from argc. The release arm is REPORT-ONLY: its value is that the optimized pipeline keeps an unevaluated object_size operand unevaluated and a prefetch operand's side effect.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": false
+    }
+  ]
+}

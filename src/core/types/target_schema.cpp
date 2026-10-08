@@ -3372,19 +3372,12 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                               || !cc.callerSaved.empty() || !cc.calleeSaved.empty()
                               || cc.shadowSpaceBytes != 0 || cc.redZoneBytes != 0
                               || cc.stackAlignment   != 0
-                              // D-LK10-ENTRY-TRAMP-PROLOGUE: a cc
-                              // declaring ONLY entryStackPointerBias
-                              // (with all other ABI fields zeroed)
-                              // would otherwise silently bypass the
-                              // `< stackAlignment` check below
-                              // (type-design C1 at the standing
-                              // audit). Include it in the trigger.
-                              || cc.entryStackPointerBias != 0
-                              // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY:
-                              // same protection for the new
-                              // callPushBytes field (a cc declaring
-                              // only callPushBytes would bypass the
-                              // multiple-of-alignment check below).
+                              // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: a cc
+                              // declaring ONLY callPushBytes (with all
+                              // other ABI fields zeroed) would otherwise
+                              // silently bypass the `< stackAlignment`
+                              // check below (type-design C1 at the
+                              // standing audit). Include it in the trigger.
                               || cc.callPushBytes != 0
                               // D-WIN64-LARGE-FRAME-STACK-PROBE: same
                               // protection for stackProbePageBytes (a cc
@@ -3421,25 +3414,14 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                          std::format("callingConvention '{}': redZoneBytes ({}) must be a multiple of stackAlignment ({})",
                                      cc.name, cc.redZoneBytes, cc.stackAlignment));
                 }
-                // D-LK10-ENTRY-TRAMP-PROLOGUE: entryStackPointerBias
-                // is an offset INTO the alignment quantum, NOT a
-                // multiple of it — must be strictly < stackAlignment.
-                if (cc.entryStackPointerBias >= cc.stackAlignment) {
-                    fail(std::format(
-                             "/callingConventions/{}/entryStackPointerBias", i),
-                         std::format(
-                             "callingConvention '{}': entryStackPointerBias "
-                             "({}) must be < stackAlignment ({}) — bias "
-                             "is an offset INTO the alignment quantum",
-                             cc.name, cc.entryStackPointerBias,
-                             cc.stackAlignment));
-                }
-                // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: callPushBytes is
-                // ALSO an offset INTO the alignment quantum (the
-                // CALL instruction's RSP delta is bounded by the
+                // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: callPushBytes is an
+                // offset INTO the alignment quantum, NOT a multiple of it
+                // (the CALL instruction's RSP delta is bounded by the
                 // architecture's pointer width, which divides
-                // stackAlignment). Strict-less-than matches
-                // entryStackPointerBias's invariant.
+                // stackAlignment) — and the entry trampoline's derived
+                // process-entry bias of a CALLED entry IS this value
+                // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION),
+                // so one strict-less-than check covers both uses.
                 if (cc.callPushBytes >= cc.stackAlignment) {
                     fail(std::format(
                              "/callingConventions/{}/callPushBytes", i),

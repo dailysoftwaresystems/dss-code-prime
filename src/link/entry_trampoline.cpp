@@ -284,13 +284,52 @@ bool injectEntryTrampoline(AssembledModule&          module,
         return false;
     }
 
+    // ★★ WHERE THE STACK STANDS AT THE ENTRY'S FIRST INSTRUCTION
+    // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
+    // DERIVED from two facts with one owner each: how the platform's
+    // loader enters the image (the FORMAT's `entryTransition`) and what a
+    // call does to the stack pointer (the convention's `callPushBytes`, an
+    // ISA fact). A loader that CALLS the entry has pushed a return
+    // address, so the stack is `callPushBytes` past the alignment
+    // quantum, exactly as at any function's entry; one that JUMPS has
+    // pushed nothing.
+    // ⚠ THIS USED TO BE THE CONVENTION'S OWN `entryStackPointerBias`, and
+    // that put a fact of the ENTRY MECHANISM on the wrong owner: one
+    // convention, `sysv_amd64`, serves ELF — whose kernel / ld.so JUMPS
+    // to the entry — and Mach-O, whose dyld CALLS LC_MAIN's entry. Its 0
+    // was right for ELF and wrong for Mach-O x86_64, where every DSS frame
+    // then ran 8 bytes off the 16-byte alignment: ✔MEASURED P69, a DSS
+    // frame's 16-aligned local at 8 mod 16, and libSystem's va_arg reading
+    // a DSS caller's stacked long double 8 bytes off ("0.00" for 7.75L) —
+    // silent under Rosetta, which does not fault an unaligned `movaps`.
+    // ✔MEASURED, every exec format, with the reference toolchains (a C
+    // function made the entry point, its 16-aligned locals' address mod
+    // 16): ELF x86_64 jumped; Mach-O x86_64 and pe64 called; arm64 cannot
+    // tell (BL pushes nothing — `callPushBytes` 0 — so the bias is 0
+    // either way).
+    auto const transition = format.entryTransition();
+    if (!transition.has_value()) {
+        // D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION: no default.
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("entry-trampoline: format '{}' declares "
+                         "processExit but no `entryTransition` — the "
+                         "trampoline cannot place its first call without "
+                         "knowing whether the loader CALLED the entry or "
+                         "JUMPED to it; declare `\"called\"` or `\"jumped\"`, "
+                         "as measured on the platform.",
+                         std::string{format.name()}));
+        return false;
+    }
+    std::uint32_t const entryBias =
+        *transition == EntryTransition::Called ? std::uint32_t{cc->callPushBytes} : 0u;
+
     // Look up all needed opcodes from the target schema (Slice A
     // ships `syscall`, `call_indirect_via_extern`, and the existing
     // `call` / `mov` / `unreachable` opcodes). `sub` is required
     // ONLY when alignedSizeWithBias(cc.shadowSpaceBytes,
-    // cc.stackAlignment, cc.entryStackPointerBias) > 0 — i.e. when
-    // the entry cc declares shadow space OR a non-zero process-
-    // entry RSP bias (closes D-LK10-ENTRY-TRAMP-PROLOGUE).
+    // cc.stackAlignment, entryBias) > 0 — i.e. when the entry cc
+    // declares shadow space OR the process entry leaves the stack off
+    // the quantum (closes D-LK10-ENTRY-TRAMP-PROLOGUE).
     auto const callOp     = target.opcodeByMnemonic("call");
     auto const movOp      = target.opcodeByMnemonic("mov");
     auto const unreachOp  = target.opcodeByMnemonic("unreachable");
@@ -535,14 +574,16 @@ bool injectEntryTrampoline(AssembledModule&          module,
     //    smallest frame-size adjust satisfying BOTH (a) the cc's
     //    shadow-space requirement and (b) the cc's stack-alignment
     //    at the call sites about to follow, given the process-entry
-    //    RSP bias the kernel/loader provides. Algorithm lives ONCE
-    //    in `alignedSizeWithBias()` (lir_callconv.hpp) so ML7 and
+    //    stack bias DERIVED above (`entryBias`: the format's
+    //    `entryTransition` × the cc's `callPushBytes`). Algorithm lives
+    //    ONCE in `alignedSizeWithBias()` (lir_callconv.hpp) so ML7 and
     //    the trampoline share one source of truth — see header
     //    docblock for the consumers + reasoning.
     //
     //    Result is non-zero only when shadowSpaceBytes != 0 OR the
-    //    process-entry RSP is misaligned for the cc (Windows PE:
-    //    32+8=40; SysV ELF / Mach-O / ARM64: 0).
+    //    process entry leaves the stack off the quantum: pe64 32
+    //    shadow + called 8 = 40; Mach-O x86_64 called 8 = 8; ELF x86_64
+    //    (jumped) and every arm64 (BL pushes nothing) 0.
     //
     //    No restoration is emitted — the exit mechanism never
     //    returns (the trampoline ends in `unreachable` / `ud2`).
@@ -552,7 +593,7 @@ bool injectEntryTrampoline(AssembledModule&          module,
     std::uint32_t const adjustBytes = alignedSizeWithBias(
         cc->shadowSpaceBytes,
         cc->stackAlignment,
-        cc->entryStackPointerBias);
+        entryBias);
     if (adjustBytes > 0) {
         if (!cc->stackPointer.has_value()) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,

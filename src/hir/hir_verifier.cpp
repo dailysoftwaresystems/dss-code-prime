@@ -116,6 +116,7 @@ bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     checkIntrinsicCalls(reporter);
     checkMemberAccess(reporter);
     checkConstructAggregate(reporter);
+    checkUnnamedObject(reporter);
     checkShaderRestrictions(reporter);
     checkInlineAsm(reporter);
     //
@@ -1215,16 +1216,25 @@ void HirVerifier::checkConstructAggregate(DiagnosticReporter& reporter) const {
             TypeId const childTy = hir_.typeId(kids[0]);
             if (!childTy.valid()) continue;
             auto const variants = interner_->operands(aggTy);
-            bool ok = false;
-            for (TypeId vty : variants) {
-                if (vty.v == childTy.v) { ok = true; break; }
+            // P69 (lane `cs`, D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED):
+            // the payload NAMES the member the child initializes, and the child must be of
+            // THAT member's type — "some variant's type" let a producer that forgot to name
+            // its member pass whenever the member shared member 0's type, and a member read
+            // would then fold the wrong member's claim.
+            std::uint32_t const member = hir_.payload(id);
+            if (member >= variants.size()) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("ConstructAggregate #{} (Union) names member {} of "
+                                     "{} declared variants",
+                                     id.v, member, variants.size()),
+                         sourceMap_);
+                continue;
             }
-            if (!ok) {
+            if (variants[member].v != childTy.v) {
                 reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
                          std::format("ConstructAggregate #{} (Union) child "
-                                     "type {} doesn't match any of the "
-                                     "{} declared variants",
-                                     id.v, childTy.v, variants.size()),
+                                     "type {} doesn't match member {}'s type {}",
+                                     id.v, childTy.v, member, variants[member].v),
                          sourceMap_);
             }
         } else if (kind == TypeKind::Array) {
@@ -1294,6 +1304,41 @@ void HirVerifier::checkConstructAggregate(DiagnosticReporter& reporter) const {
                                  "TypeKind ordinal {} (must be Struct, "
                                  "Union, or Array)",
                                  id.v, static_cast<unsigned>(kind)),
+                     sourceMap_);
+        }
+    }
+}
+
+void HirVerifier::checkUnnamedObject(DiagnosticReporter& reporter) const {
+    std::uint32_t const moduleTag = hir_.id().v;
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        if (hir_.kind(id) != HirKind::UnnamedObject) continue;
+        if (hasError(hir_.flags(id))) continue;
+        if (hir_.payload(id) >= kHirObjectStorageCount) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("UnnamedObject #{} carries storage {}, which names no "
+                                 "storage duration (automatic, static or thread)",
+                                 id.v, hir_.payload(id)),
+                     sourceMap_);
+            continue;
+        }
+        auto const kids = hir_.children(id);
+        if (kids.size() != 1u) continue;   // `checkNodeArity` reports the arity
+        TypeId const objTy  = hir_.typeId(id);
+        TypeId const initTy = hir_.typeId(kids[0]);
+        if (!objTy.valid() || !initTy.valid()) continue;   // `checkRequiredTypes`'
+        // The object's qualifier skin (`volatile`, `_Atomic`, an alignment) is the
+        // OBJECT's, and its value is read unqualified (C 6.3.2.1p2), so the two agree
+        // on the material type; without the interner the ids themselves must agree.
+        bool const agree = interner_ != nullptr
+            ? interner_->stripVolatile(objTy).v == interner_->stripVolatile(initTy).v
+            : objTy.v == initTy.v;
+        if (!agree) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("UnnamedObject #{} is typed {} but its initializer is "
+                                 "typed {} — the value a consumer peels and the object it "
+                                 "addresses would disagree", id.v, objTy.v, initTy.v),
                      sourceMap_);
         }
     }

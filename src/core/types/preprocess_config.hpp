@@ -5,6 +5,7 @@
 #include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> (leaf header)
 #include "core/types/type_lattice/core_type.hpp"  // TypeKind (the `type-size` kind's resolved core)
 
+#include <array>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -90,7 +91,7 @@ namespace dss {
 //               language cannot spell.
 enum class PredefinedMacroKind {
     Line, File, Constant, Date, Time, Counter, TypeSize, TypeUnsigned,
-    TypeName, TypeLimit, TypeSuffix
+    TypeName, TypeLimit, TypeSuffix, TypeFormat
 };
 
 // The kind's CONFIG SPELLING — the same verb `parsePredefinedMacroArray`
@@ -108,7 +109,7 @@ enum class PredefinedMacroKind {
 //
 // No fall-back row is reachable: `PredefinedMacroKind` has no invalid sentinel,
 // so every value the engine can hold is enumerated below.
-inline constexpr EnumNameTable<PredefinedMacroKind, 11> kPredefinedMacroKindTable{{{
+inline constexpr EnumNameTable<PredefinedMacroKind, 12> kPredefinedMacroKindTable{{{
     { PredefinedMacroKind::Line,         "line"          },
     { PredefinedMacroKind::File,         "file"          },
     { PredefinedMacroKind::Constant,     "constant"      },
@@ -120,6 +121,8 @@ inline constexpr EnumNameTable<PredefinedMacroKind, 11> kPredefinedMacroKindTabl
     { PredefinedMacroKind::TypeName,     "type-name"     },
     { PredefinedMacroKind::TypeLimit,    "type-limit"    },
     { PredefinedMacroKind::TypeSuffix,   "type-suffix"   },
+    // P69 (M4): the printf/scanf format string of a type — `__INT64_FMTd__`.
+    { PredefinedMacroKind::TypeFormat,   "type-format"   },
 }}};
 
 // The kinds whose row names a TYPE (the `type` key) and whose value the merge
@@ -133,6 +136,7 @@ predefinedMacroKindNamesAType(PredefinedMacroKind k) noexcept {
         case PredefinedMacroKind::TypeName:
         case PredefinedMacroKind::TypeLimit:
         case PredefinedMacroKind::TypeSuffix:
+        case PredefinedMacroKind::TypeFormat:
             return true;
         case PredefinedMacroKind::Line:
         case PredefinedMacroKind::File:
@@ -146,14 +150,22 @@ predefinedMacroKindNamesAType(PredefinedMacroKind k) noexcept {
 }
 
 // The kinds whose value needs the LANGUAGE as well as the pair — a spelling, a
-// literal suffix or a literal of the promoted type (P68 round 9). The merge
-// realizes them only when it is handed the language; `type-size` and
-// `type-unsigned` need the pair alone.
+// literal suffix, a literal of the promoted type (P68 round 9) or a format's length
+// modifier (P69). The merge realizes them only when it is handed the language;
+// `type-size` and `type-unsigned` need the pair alone.
 [[nodiscard]] constexpr bool
 predefinedMacroKindNeedsLanguage(PredefinedMacroKind k) noexcept {
     return k == PredefinedMacroKind::TypeName || k == PredefinedMacroKind::TypeLimit
-        || k == PredefinedMacroKind::TypeSuffix;
+        || k == PredefinedMacroKind::TypeSuffix || k == PredefinedMacroKind::TypeFormat;
 }
+
+// ══ THE CONVERSIONS A `type-format` ROW MAY NAME ═════════════════════════════
+// (P69, M4 of D-FFI-INTTYPES-H-SHIPS-FOUR-FORMAT-MACROS) C 7.23.6.1's integer
+// conversions — `d` `i` `o` `u` `x` `X` — and C23's binary `b` `B`: the letters a
+// `__<T>_FMT<c>__` predefine (and so a PRI/SCN macro) ends in. A CLOSED set, refused
+// by name at load: a row naming `f` or `s` would state a format no integer type has.
+inline constexpr std::array<std::string_view, 8> kTypeFormatConversions{
+    "d", "i", "o", "u", "x", "X", "b", "B"};
 
 // ══ THE CLOSED LIMIT VOCABULARY OF AN INTEGER TYPE ════════════════════════════
 // (P68 round 9) `max` / `min` / `width` — what a lattice-derived constant states
@@ -725,6 +737,29 @@ struct DSS_EXPORT PredefinedTypeSpelling {
 spellPredefinedType(std::span<PredefinedTypeSpelling const> spellings,
                     PredefinedTypeIdentity const& identity, DataModel dm) noexcept;
 
+// ══ HOW A LANGUAGE WRITES AN INTEGER TYPE'S FORMAT: `preprocess.typeFormatModifiers` ══
+// (P69, M4 of D-FFI-INTTYPES-H-SHIPS-FOUR-FORMAT-MACROS) A `type-format` macro's VALUE
+// is the string a printf/scanf conversion of its type is written with — a LENGTH
+// MODIFIER, then the row's conversion letter (`"ld"`). The modifiers are the
+// language's own formatted-I/O vocabulary (C 7.23.6.1: `hh` signed/unsigned char, `h`
+// short, none for int, `l` long, `ll` long long), declared as entries naming the TYPES
+// each applies to; every name is RESOLVED at language load by the one resolver
+// `typeNameSpellings` uses, so an entry can only mean the type the parser gives that
+// name. No representation fact is restated: `int64_t` is `long` on one pair and `long
+// long` on another, and the modifier follows the typedef, never a width. Two entries
+// naming one identity on some data model are refused (the modifier would depend on
+// list order); a pair realizing a type no entry covers refuses loud in the merge.
+struct DSS_EXPORT PredefinedTypeFormatModifier {
+    std::vector<PredefinedTypeSpelling> types;      // each resolved at language load
+    std::string                         modifier;   // "" for `int` — a real answer
+};
+
+// The modifier of the entry covering `identity` under `dm`, or nullopt when no entry
+// does. The ONE lookup a `type-format` row's value comes from.
+[[nodiscard]] DSS_EXPORT std::optional<std::string_view>
+formatModifierFor(std::span<PredefinedTypeFormatModifier const> modifiers,
+                  PredefinedTypeIdentity const& identity, DataModel dm) noexcept;
+
 // One typedef a SHIPPED descriptor declares, as decoded for one (language × pair):
 // the header it came from, its name, and its identity there. The merge decodes the
 // headers its `shippedTypedef` rows name and hands the result to
@@ -836,6 +871,9 @@ struct DSS_EXPORT PredefinedMacroDef {
     // `type-limit` rows only: WHICH limit of `sizedType` the macro states — its
     // `"limit"` key, from the one `kIntegerTypeLimitTable` (P68 round 9).
     IntegerTypeLimit    typeLimit = IntegerTypeLimit::Max;
+    // `type-format` rows only (P69, M4): the conversion letter the macro's format
+    // string ends in — its `"conversion"` key, one of `kTypeFormatConversions`.
+    std::string         formatConversion;
 
     // PROVENANCE — the JSON POINTER of this entry inside its declaring document
     // (e.g. "/preprocess/predefinedMacros/7"), set by the shared entry parser.
@@ -1481,6 +1519,13 @@ struct DSS_EXPORT PreprocessConfig {
     // `semantics`' type tables are read. OPTIONAL — empty means the language
     // spells no type, and a `type-name` row then cannot load.
     std::vector<PredefinedTypeSpelling> typeNameSpellings;
+
+    // P69 (M4): the language's printf/scanf LENGTH MODIFIERS, keyed by the types
+    // they apply to, which a `type-format` predefined macro's value is built from
+    // (see `PredefinedTypeFormatModifier`). Parsed with the preprocess block,
+    // RESOLVED once `semantics`' type tables are read. OPTIONAL — empty means the
+    // language writes no format, and a `type-format` row then cannot load.
+    std::vector<PredefinedTypeFormatModifier> typeFormatModifiers;
 
     // FC15c (`#pragma`; C 6.10.6): the PRAGMA directive WORD, matched by lexeme
     // TEXT against the token after `#` (like define/undef/include -- `pragma`

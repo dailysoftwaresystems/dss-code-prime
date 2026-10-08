@@ -874,6 +874,12 @@ bool GrammarSchema::commitAfterPrefix(RuleId rule) const noexcept {
     return r != nullptr && r->commitAfterPrefix;
 }
 
+std::span<SchemaTokenId const> GrammarSchema::notFollowedBy(RuleId rule) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return {};
+    return r->notFollowedBy;
+}
+
 ExprWrapperRules GrammarSchema::exprWrapperRules(RuleId rule) const noexcept {
     auto it = d_.exprWrapperRules.find(rule.v);
     if (it == d_.exprWrapperRules.end()) return ExprWrapperRules{};

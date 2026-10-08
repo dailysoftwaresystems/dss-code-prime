@@ -20,12 +20,21 @@
 //     never export.
 //   * `.reloc` completeness: an abs64 fn-ptr-table slot gets an
 //     IMAGE_REL_BASED_DIR64 entry (red-on-disable — the test computes
-//     the expected site RVA and finds the exact entry); a
-//     FUNCTION-extern-targeted slot legally bakes the import-THUNK VA
-//     (the c112 addr_import shape) and gets its DIR64 row.
-//   * Fail-loud belts: a data slot targeting an extern DATA import
-//     rejects naming D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR (the registered
-//     c150-CRITICAL PE half — pinned on the dll AND exec arms); an
+//     the expected site RVA and finds the exact entry).
+//   * Loader-bound import slots (P69, design c2 —
+//     D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): a slot holding an
+//     import's address (function OR datum) is the FirstThunk of an import
+//     descriptor of its own, holds its lookup entry and carries no DIR64
+//     row; a read-only one lies under the IAT directory in a read-only
+//     `.idata`. (A function slot USED to bake the import THUNK with a
+//     DIR64 row, and a data slot was refused.)
+//   * The RESIDUE design c2 cannot express (P69 review M1,
+//     D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE): an import's address PLUS an
+//     addend, or in a thread-local template, is written at load by a
+//     synthesized RUNNER the TLS directory names as its first callback; a
+//     read-only item holding one is laid out writable. (A DATA import there
+//     USED to be refused by name.)
+//   * Fail-loud belts: an
 //     ABSOLUTE function reloc into `.text` of a DYNAMIC_BASE image
 //     rejects (D-LK-PE-IMAGE-TEXT-ABS-RELOC); an imageEntryOverride
 //     on a dll module rejects (a dll has no image entry); a duplicate
@@ -50,6 +59,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -124,6 +134,70 @@ struct SectionView {
     for (std::size_t p = off; p < b.size() && b[p] != 0; ++p)
         s.push_back(static_cast<char>(b[p]));
     return s;
+}
+
+constexpr std::size_t kImportDirOff = kDataDirOff + 1 * 8;
+constexpr std::size_t kIatDirOff    = kDataDirOff + 12 * 8;
+
+// The section whose [virtualAddress, +virtualSize) holds `rva`.
+[[nodiscard]] SectionView sectionHolding(std::vector<std::uint8_t> const& img,
+                                         std::uint32_t rva) {
+    std::uint16_t const n = readU16LE(img, 0x86);
+    for (std::uint16_t i = 0; i < n; ++i) {
+        std::size_t const h = kSectionHdrsOff + static_cast<std::size_t>(i) * 40u;
+        SectionView s;
+        s.virtualSize    = readU32LE(img, h + 8);
+        s.virtualAddress = readU32LE(img, h + 12);
+        s.sizeOfRawData  = readU32LE(img, h + 16);
+        s.rawPointer     = readU32LE(img, h + 20);
+        s.found          = true;
+        if (rva >= s.virtualAddress && rva < s.virtualAddress + s.virtualSize) return s;
+    }
+    return SectionView{};
+}
+
+// The characteristics of the section whose header is named `name`.
+[[nodiscard]] std::uint32_t sectionCharacteristics(std::vector<std::uint8_t> const& img,
+                                                   std::string_view name) {
+    std::uint16_t const n = readU16LE(img, 0x86);
+    for (std::uint16_t i = 0; i < n; ++i) {
+        std::size_t const h = kSectionHdrsOff + static_cast<std::size_t>(i) * 40u;
+        if (readCStr(img, h).substr(0, 8) == name) return readU32LE(img, h + 36);
+    }
+    return 0;
+}
+
+// IMAGE_IMPORT_DESCRIPTOR, read back from the image bytes (PE/COFF §6.4.1):
+// the loader walks these until the all-zero one.
+struct ImportDescriptorView {
+    std::uint32_t originalFirstThunk = 0;
+    std::uint32_t name               = 0;
+    std::uint32_t firstThunk         = 0;
+};
+[[nodiscard]] std::vector<ImportDescriptorView>
+readImportDescriptors(std::vector<std::uint8_t> const& img) {
+    std::vector<ImportDescriptorView> out;
+    std::uint32_t const rva = readU32LE(img, kImportDirOff);
+    SectionView const s = sectionHolding(img, rva);
+    if (!s.found) return out;
+    for (std::size_t off = fileOff(s, rva);; off += 20) {
+        ImportDescriptorView d{readU32LE(img, off), readU32LE(img, off + 12),
+                               readU32LE(img, off + 16)};
+        if (d.originalFirstThunk == 0 && d.name == 0 && d.firstThunk == 0
+            && readU32LE(img, off + 4) == 0 && readU32LE(img, off + 8) == 0) {
+            break;
+        }
+        out.push_back(d);
+    }
+    return out;
+}
+[[nodiscard]] std::uint64_t readU64AtRva(std::vector<std::uint8_t> const& img,
+                                         std::uint32_t rva) {
+    return readU64LE(img, fileOff(sectionHolding(img, rva), rva));
+}
+[[nodiscard]] std::string readCStrAtRva(std::vector<std::uint8_t> const& img,
+                                        std::uint32_t rva) {
+    return readCStr(img, fileOff(sectionHolding(img, rva), rva));
 }
 
 // Every (siteRva) of the `.reloc` table's IMAGE_REL_BASED_DIR64 rows.
@@ -277,8 +351,12 @@ encodeUntrampolined(AssembledModule           mod,  // by value: stamped copy
 }
 
 // A data slot whose abs64 reloc targets an EXTERN import (isData
-// selectable): the D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR shapes.
-[[nodiscard]] AssembledModule makeExternSlotModule(bool externIsData) {
+// selectable): the D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR shapes. The slot sits at
+// offset 8 of a 24-byte item (a struct member / array element), so a check
+// that reads the item's FIRST word cannot pass by accident.
+[[nodiscard]] AssembledModule makeExternSlotModule(
+        bool externIsData, DataSectionKind section = DataSectionKind::Data,
+        std::int64_t addend = 0) {
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -287,14 +365,16 @@ encodeUntrampolined(AssembledModule           mod,  // by value: stamped copy
     mod.functions.push_back(std::move(fn));
     AssembledData slot;
     slot.symbol    = SymbolId{5};
-    slot.section   = DataSectionKind::Data;
-    slot.bytes     = std::vector<std::uint8_t>(8, 0);
+    slot.section   = section;
+    slot.bytes     = std::vector<std::uint8_t>(24, 0);
+    slot.bytes[0]  = 0x11;   // the neighbours of the slot keep their bytes
+    slot.bytes[16] = 0x22;
     slot.alignment = Alignment::of<8>();
     Relocation rel;
-    rel.offset = 0;
+    rel.offset = 8;
     rel.target = SymbolId{99};
     rel.kind   = RelocationKind{2};   // abs64
-    rel.addend = 0;
+    rel.addend = addend;
     slot.relocations.push_back(rel);
     mod.dataItems.push_back(std::move(slot));
     ExternImport imp;
@@ -310,6 +390,13 @@ encodeUntrampolined(AssembledModule           mod,  // by value: stamped copy
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
     return mod;
+}
+
+// Every diagnostic's text, for a failure message that explains itself.
+[[nodiscard]] std::string diagnosticsOf(DiagnosticReporter const& rep) {
+    std::string out;
+    for (auto const& d : rep.all()) out += "\n  " + d.actual;
+    return out;
 }
 
 [[nodiscard]] bool sawDiagnosticContaining(DiagnosticReporter const& rep,
@@ -558,59 +645,351 @@ TEST(PeDllWriter, FnPtrTableSlotGetsDir64BaseRelocation) {
         << " must carry an IMAGE_REL_BASED_DIR64 entry";
 }
 
-TEST(PeDllWriter, FunctionExternSlotBakesThunkVaAndGetsDir64) {
-    // The c112 `addr_import` shape (sqlite aSyscall[]) inside a DLL:
-    // a data slot targeting a FUNCTION extern legally bakes the FF 25
-    // import-THUNK VA (call-correct; MSVC's own `&puts` binds the
-    // local thunk) and the slot gets its DIR64 row so a rebase keeps
-    // it callable. This is the LEGAL half of
-    // D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR.
+// ── (4) Design c2 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB, the PE
+// half): a slot holding an import's address is bound BY THE LOADER, through an
+// import descriptor of its own. Every fact asserted by `expectLoaderBoundSlot` is
+// one the Windows loader was MEASURED to need (pe.cpp states each at the pass
+// that finds the slots); the runtime witness is the example
+// `library_function_address_equals_getprocaddress`. ──
+
+namespace {
+void expectLoaderBoundSlot(std::vector<std::uint8_t> const& img, std::uint32_t slotRva,
+                           std::string_view importName, std::string_view dllName) {
+    SCOPED_TRACE(std::string{importName});
+    auto const descs = readImportDescriptors(img);
+    ImportDescriptorView const* mine = nullptr;
+    for (auto const& d : descs) {
+        if (d.firstThunk == slotRva) mine = &d;
+    }
+    ASSERT_NE(mine, nullptr) << "no import descriptor names the slot at RVA 0x" << std::hex
+                             << slotRva << " as its FirstThunk: the loader never writes it";
+    ASSERT_NE(mine->originalFirstThunk, 0u)
+        << "a descriptor without a lookup array fails the load (0xC0000139, measured)";
+    std::uint64_t const lookup = readU64AtRva(img, mine->originalFirstThunk);
+    EXPECT_EQ(readU64AtRva(img, mine->originalFirstThunk + 8), 0u)
+        << "the lookup array ends after its one entry";
+    ASSERT_EQ(lookup >> 63, 0u) << "imported by name, not by ordinal";
+    EXPECT_EQ(readCStrAtRva(img, static_cast<std::uint32_t>(lookup) + 2), importName);
+    EXPECT_EQ(readCStrAtRva(img, mine->name), dllName);
+    EXPECT_EQ(readU64AtRva(img, slotRva), lookup)
+        << "until the loader binds it the slot holds its lookup entry (a zero word is left "
+           "unbound, measured)";
+    auto const sites = readDir64Sites(img);
+    EXPECT_EQ(std::count(sites.begin(), sites.end(), slotRva), 0)
+        << "a DIR64 row on a loader-bound slot would add the load delta to its lookup entry";
+}
+}  // namespace
+
+TEST(PeDllWriter, AFunctionImportSlotIsBoundByTheLoaderThroughADescriptorOfItsOwn) {
+    // The c112 `addr_import` shape (sqlite aSyscall[]) inside a DLL. It USED to
+    // bake the image's own FF 25 thunk with a DIR64 row: callable, but not the
+    // function's address, so `t[1] == puts` compared this image's thunk with the
+    // library's function and answered false.
     auto loaded = loadShippedDll();
     AssembledModule mod = makeExternSlotModule(/*externIsData=*/false);
     DiagnosticReporter rep;
     auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
-    ASSERT_FALSE(img.empty());
+    ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
     EXPECT_EQ(rep.errorCount(), 0u);
-
-    SectionView const text = findSection(img, ".text");
-    ASSERT_TRUE(text.found);
     SectionView const dataSec = findSection(img, ".data");
-    ASSERT_TRUE(dataSec.found);
-    // One 1-byte function then the thunk block: thunk VA = imageBase
-    // + textRva + 1.
-    std::uint64_t const thunkVa = 0x180000000ull + text.virtualAddress + 1u;
-    std::uint32_t const siteRva = dataSec.virtualAddress + 0u;
-    EXPECT_EQ(readU64LE(img, fileOff(dataSec, siteRva)), thunkVa);
-    auto const sites = readDir64Sites(img);
-    EXPECT_TRUE(std::find(sites.begin(), sites.end(), siteRva)
-                != sites.end());
+    ASSERT_TRUE(dataSec.found) << "a WRITABLE slot stays in .data";
+    expectLoaderBoundSlot(img, dataSec.virtualAddress + 8u, "puts", "msvcrt.dll");
+    EXPECT_EQ(img[fileOff(dataSec, dataSec.virtualAddress)], 0x11u);
+    EXPECT_EQ(img[fileOff(dataSec, dataSec.virtualAddress + 16u)], 0x22u);
+    // The library's own descriptor comes first and its IAT opens the IAT
+    // directory; the slot's descriptor follows it.
+    auto const descs = readImportDescriptors(img);
+    ASSERT_EQ(descs.size(), 2u) << "the library's descriptor and the slot's own";
+    EXPECT_EQ(descs[0].firstThunk, readU32LE(img, kIatDirOff));
 }
 
-// ── (4) D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR: the DATA-extern reject ──
-
-TEST(PeDllWriter, DataItemRelocTargetingExternDataFailsLoud) {
-    auto loaded = loadShippedDll();
-    AssembledModule mod = makeExternSlotModule(/*externIsData=*/true);
-    DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(img.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
-    EXPECT_TRUE(sawDiagnosticContaining(
-        rep, "D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR"));
-    EXPECT_TRUE(sawDiagnosticContaining(rep, "_fmode"));
-}
-
-TEST(PeExecWriterExternSlot, DataItemRelocTargetingExternDataFailsLoudOnExecToo) {
-    // The registered anchor is the PE IMAGE walker's (the exec arm has
-    // the identical latent bake since c149) — pin the reject on exec.
+TEST(PeExecWriterExternSlot, AFunctionImportSlotIsBoundByTheLoaderOnExecToo) {
     auto loaded = loadShippedExec();
-    AssembledModule mod = makeExternSlotModule(/*externIsData=*/true);
+    AssembledModule mod = makeExternSlotModule(/*externIsData=*/false);
     DiagnosticReporter rep;
     auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(img.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
-    EXPECT_TRUE(sawDiagnosticContaining(
-        rep, "D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR"));
+    ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
+    SectionView const dataSec = findSection(img, ".data");
+    ASSERT_TRUE(dataSec.found);
+    expectLoaderBoundSlot(img, dataSec.virtualAddress + 8u, "puts", "msvcrt.dll");
+}
+
+TEST(PeDllWriter, ADataImportSlotIsBoundByTheLoaderToo) {
+    // D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR, THE PE ARM: `int *p = &_fmode;` as a
+    // static initializer was REFUSED — a slot filled by a link-time relocation
+    // could only have held the IAT slot's own address, one indirection off. The
+    // loader writes the datum's address into a slot of its own.
+    for (bool const exec : {false, true}) {
+        SCOPED_TRACE(exec ? "exec" : "dll");
+        auto loaded = exec ? loadShippedExec() : loadShippedDll();
+        AssembledModule mod = makeExternSlotModule(/*externIsData=*/true);
+        DiagnosticReporter rep;
+        auto img = exec ? encodeUntrampolined(mod, *loaded.target, *loaded.format, rep)
+                        : pe::encode(mod, *loaded.target, *loaded.format, rep);
+        ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
+        EXPECT_EQ(rep.errorCount(), 0u);
+        SectionView const dataSec = findSection(img, ".data");
+        ASSERT_TRUE(dataSec.found);
+        expectLoaderBoundSlot(img, dataSec.virtualAddress + 8u, "_fmode", "msvcrt.dll");
+    }
+}
+
+TEST(PeDllWriter, AReadOnlySlotLiesUnderTheIatDirectoryAndIdataIsReadOnly) {
+    // A `const` table of import addresses — and the GOT slot the link mints for
+    // `&puts` in code — is READ-ONLY, so it must lie inside the IAT directory,
+    // the range the loader unprotects while it binds: outside it the load
+    // crashed with 0xC0000005, inside it the slot was bound and read
+    // PAGE_READONLY afterwards (measured). The item leaves `.rdata` for `.idata`,
+    // which is itself read-only now.
+    auto loaded = loadShippedDll();
+    AssembledModule mod = makeExternSlotModule(/*externIsData=*/false,
+                                               DataSectionKind::RelRoConst);
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_FALSE(findSection(img, ".rdata").found) << "the only read-only item moved to .idata";
+    auto const descs = readImportDescriptors(img);
+    ASSERT_EQ(descs.size(), 2u);
+    std::uint32_t const slotRva = descs[1].firstThunk;
+    std::uint32_t const iatRva = readU32LE(img, kIatDirOff);
+    std::uint32_t const iatSize = readU32LE(img, kIatDirOff + 4);
+    EXPECT_GE(slotRva, iatRva);
+    EXPECT_LE(slotRva + 8u, iatRva + iatSize) << "a read-only slot must lie inside the IAT directory";
+    expectLoaderBoundSlot(img, slotRva, "puts", "msvcrt.dll");
+    SectionView const home = sectionHolding(img, slotRva);
+    EXPECT_EQ(img[fileOff(home, slotRva - 8u)], 0x11u) << "the whole item moved, not just its slot";
+    EXPECT_EQ(img[fileOff(home, slotRva + 8u)], 0x22u);
+    EXPECT_EQ(sectionCharacteristics(img, ".idata"), 0x40000040u)
+        << "IMAGE_SCN_CNT_INITIALIZED_DATA | MEM_READ, from the document's `dynamic` row: no MEM_WRITE";
+
+    // ★ THE ITEM IS EXPORTED (`dss_slot`, Global), and `.edata` is laid out
+    // BEFORE `.idata`: its EAT entry is written once `.idata` is placed. It
+    // must name the item's NEW home — the item starts 8 bytes before its slot —
+    // or GetProcAddress hands the caller the RVA the item would have had.
+    std::uint32_t const dirRva = readU32LE(img, kExportDirOff);
+    ASSERT_NE(dirRva, 0u);
+    SectionView const edata = sectionHolding(img, dirRva);
+    std::size_t const dirOff = fileOff(edata, dirRva);
+    std::uint32_t const numNames = readU32LE(img, dirOff + 24);
+    std::uint32_t const eatRva   = readU32LE(img, dirOff + 28);
+    std::uint32_t const nameRva  = readU32LE(img, dirOff + 32);
+    std::uint32_t const ordRva   = readU32LE(img, dirOff + 36);
+    std::optional<std::uint32_t> slotItemRva;
+    for (std::uint32_t i = 0; i < numNames; ++i) {
+        std::uint32_t const nRva = readU32LE(img, fileOff(edata, nameRva) + 4u * i);
+        if (readCStr(img, fileOff(edata, nRva)) != "dss_slot") continue;
+        std::uint16_t const ord = readU16LE(img, fileOff(edata, ordRva) + 2u * i);
+        slotItemRva = readU32LE(img, fileOff(edata, eatRva) + 4u * ord);
+    }
+    ASSERT_TRUE(slotItemRva.has_value()) << "`dss_slot` must be exported";
+    EXPECT_EQ(*slotItemRva, slotRva - 8u)
+        << "the export must name the item where it now lies, inside `.idata`";
+}
+
+// ── (4b) What design c2 cannot express, because the loader writes an import's
+// address and nothing else: that address PLUS an addend (`&arr[3]` of a DLL
+// datum), and any such slot in a thread-local TEMPLATE (the loader copies the
+// starting thread's block before it binds). The image's RESIDUE RUNNER writes
+// them at load (P69 review M1 (a)/(b), D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE): a
+// synthesized function the TLS directory names as its FIRST callback, run on
+// DLL_PROCESS_ATTACH after the loader has bound the IAT and before any other
+// code of the image. Pinned here on hand-built modules: the callback array,
+// what the runner reads and where it writes, the file word of a residue slot,
+// and that a read-only residue item is laid out writable. The run is
+// `library_function_address_equals_getprocaddress`. ──
+
+namespace {
+
+constexpr std::size_t kTlsDirOff = kDataDirOff + 9 * 8;
+
+// The TLS directory's callback array, read back: every entry up to the null.
+struct TlsCallbacksView {
+    std::uint32_t              dirRva   = 0;
+    std::uint32_t              arrayRva = 0;
+    std::vector<std::uint64_t> entries;
+};
+[[nodiscard]] TlsCallbacksView readTlsCallbacks(std::vector<std::uint8_t> const& img) {
+    TlsCallbacksView out;
+    out.dirRva = readU32LE(img, kTlsDirOff);
+    if (out.dirRva == 0) return out;
+    std::uint64_t const imageBase = readU64LE(img, kImageBaseOff);
+    std::uint64_t const array = readU64AtRva(img, out.dirRva + 24u);   // AddressOfCallBacks
+    if (array == 0) return out;
+    out.arrayRva = static_cast<std::uint32_t>(array - imageBase);
+    for (std::uint32_t at = out.arrayRva;; at += 8u) {
+        std::uint64_t const entry = readU64AtRva(img, at);
+        if (entry == 0) break;
+        out.entries.push_back(entry);
+    }
+    return out;
+}
+
+// The runner's first instructions, as the x86_64 target encodes them: a 32-bit
+// `cmp edx, 1` (the callback's `reason` against DLL_PROCESS_ATTACH), then the
+// two-target `jne done` (`0F 85 rel32` + `E9 rel32`), then the first fix-up's
+// `lea rax, [rip + IAT entry]`. Returns the RVA that lea names, or nullopt when
+// the bytes are not that shape.
+[[nodiscard]] std::optional<std::uint32_t>
+runnerFirstSourceSlotRva(std::vector<std::uint8_t> const& img, std::uint32_t runnerRva) {
+    SectionView const text = sectionHolding(img, runnerRva);
+    std::size_t const at = fileOff(text, runnerRva);
+    std::array<std::uint8_t, 6> const cmpEdx1{0x81, 0xFA, 0x01, 0x00, 0x00, 0x00};
+    for (std::size_t i = 0; i < cmpEdx1.size(); ++i) {
+        if (img[at + i] != cmpEdx1[i]) return std::nullopt;
+    }
+    if (img[at + 6] != 0x0F || img[at + 7] != 0x85 || img[at + 12] != 0xE9) return std::nullopt;
+    std::size_t const lea = at + 17;
+    if (img[lea] != 0x48 || img[lea + 1] != 0x8D || (img[lea + 2] & 0xC7) != 0x05) {
+        return std::nullopt;
+    }
+    auto const disp = static_cast<std::int32_t>(readU32LE(img, lea + 3));
+    return static_cast<std::uint32_t>(static_cast<std::int64_t>(runnerRva) + 17 + 7 + disp);
+}
+
+}  // namespace
+
+TEST(PeDllWriter, ADataImportSlotWithAnAddendIsWrittenByTheResidueRunner) {
+    for (bool const exec : {false, true}) {
+        SCOPED_TRACE(exec ? "exec" : "dll");
+        auto loaded = exec ? loadShippedExec() : loadShippedDll();
+        AssembledModule mod = makeExternSlotModule(/*externIsData=*/true,
+                                                   DataSectionKind::Data, /*addend=*/24);
+        DiagnosticReporter rep;
+        auto img = exec ? encodeUntrampolined(mod, *loaded.target, *loaded.format, rep)
+                        : pe::encode(mod, *loaded.target, *loaded.format, rep);
+        ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
+        EXPECT_EQ(rep.errorCount(), 0u);
+        SectionView const text = findSection(img, ".text");
+        SectionView const dataSec = findSection(img, ".data");
+        ASSERT_TRUE(text.found);
+        ASSERT_TRUE(dataSec.found);
+        std::uint32_t const siteRva = dataSec.virtualAddress + 8u;
+        // The file word: 0 — a datum's address plus 24 is known only at load.
+        EXPECT_EQ(readU64LE(img, fileOff(dataSec, siteRva)), 0u);
+        auto const sites = readDir64Sites(img);
+        EXPECT_EQ(std::count(sites.begin(), sites.end(), siteRva), 0)
+            << "a DIR64 row would add the load delta to a word the runner overwrites";
+        auto const descs = readImportDescriptors(img);
+        ASSERT_EQ(descs.size(), 1u) << "no descriptor of its own: the loader cannot bind S+A";
+        // The runner: the ONE TLS callback, right after the module's 1-byte function.
+        auto const cbs = readTlsCallbacks(img);
+        ASSERT_NE(cbs.dirRva, 0u) << "an image with residue carries a TLS directory";
+        ASSERT_EQ(cbs.entries.size(), 1u) << "the residue runner, then the null";
+        std::uint64_t const imageBase = readU64LE(img, kImageBaseOff);
+        std::uint32_t const runnerRva = static_cast<std::uint32_t>(cbs.entries[0] - imageBase);
+        EXPECT_EQ(runnerRva, text.virtualAddress + 1u);
+        EXPECT_EQ(std::count(sites.begin(), sites.end(), cbs.dirRva + 24u), 1)
+            << "AddressOfCallBacks is a pointer into the image";
+        EXPECT_EQ(std::count(sites.begin(), sites.end(), cbs.arrayRva), 1)
+            << "and so is the runner's entry in the array";
+        // What it reads: the import's IAT entry — the library descriptor's FirstThunk,
+        // `_fmode` being its one import.
+        auto const source = runnerFirstSourceSlotRva(img, runnerRva);
+        ASSERT_TRUE(source.has_value()) << "the runner opens with cmp edx,1 / jne / lea rax,[rip+..]";
+        EXPECT_EQ(*source, descs[0].firstThunk) << "the fix-up starts from the bound IAT entry";
+    }
+}
+
+TEST(PeDllWriter, AFunctionImportSlotWithAnAddendHoldsItsThunkInTheFileAndIsRewritten) {
+    // A FUNCTION's residue slot keeps its thunk (+A) with its DIR64 row in the FILE —
+    // callable even in a thread that copied a template before the runner ran — and the
+    // runner overwrites it with the bound address + A at load.
+    auto loaded = loadShippedDll();
+    AssembledModule mod = makeExternSlotModule(/*externIsData=*/false,
+                                               DataSectionKind::Data, /*addend=*/4);
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    SectionView const text = findSection(img, ".text");
+    SectionView const dataSec = findSection(img, ".data");
+    ASSERT_TRUE(text.found);
+    ASSERT_TRUE(dataSec.found);
+    auto const cbs = readTlsCallbacks(img);
+    ASSERT_EQ(cbs.entries.size(), 1u) << "the residue runner";
+    std::uint64_t const imageBase = readU64LE(img, kImageBaseOff);
+    std::uint32_t const runnerRva = static_cast<std::uint32_t>(cbs.entries[0] - imageBase);
+    std::uint32_t const iatEntryRva = readImportDescriptors(img)[0].firstThunk;
+    // The file word: the import THUNK + 4 — `FF 25 rel32`, a jmp through puts's IAT entry.
+    std::uint32_t const siteRva = dataSec.virtualAddress + 8u;
+    std::uint64_t const fileWord = readU64LE(img, fileOff(dataSec, siteRva));
+    std::uint32_t const thunkRva = static_cast<std::uint32_t>(fileWord - 4u - imageBase);
+    std::size_t const thunkOff = fileOff(text, thunkRva);
+    ASSERT_EQ(img[thunkOff], 0xFFu);
+    ASSERT_EQ(img[thunkOff + 1], 0x25u);
+    EXPECT_EQ(thunkRva + 6u + readU32LE(img, thunkOff + 2), iatEntryRva)
+        << "the file word is the thunk through puts's IAT entry, plus 4";
+    auto const sites = readDir64Sites(img);
+    EXPECT_EQ(std::count(sites.begin(), sites.end(), siteRva), 1);
+    for (auto const& d : readImportDescriptors(img)) EXPECT_NE(d.firstThunk, siteRva);
+    auto const source = runnerFirstSourceSlotRva(img, runnerRva);
+    ASSERT_TRUE(source.has_value());
+    EXPECT_EQ(*source, iatEntryRva);
+}
+
+TEST(PeDllWriter, AReadOnlyResidueItemIsLaidOutWritable) {
+    // The runner writes after the loader has sealed `.rdata` and `.idata`, so a const
+    // table holding `&arr[1]` of a DLL datum lives in `.data` — neither where c2's
+    // read-only slots go (`.idata`) nor in `.rdata`.
+    auto loaded = loadShippedDll();
+    AssembledModule mod = makeExternSlotModule(/*externIsData=*/true,
+                                               DataSectionKind::RelRoConst, /*addend=*/4);
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
+    EXPECT_FALSE(findSection(img, ".rdata").found) << "the only read-only item moved";
+    SectionView const dataSec = findSection(img, ".data");
+    ASSERT_TRUE(dataSec.found) << "to WRITABLE .data";
+    EXPECT_NE(sectionCharacteristics(img, ".data") & 0x80000000u, 0u) << "IMAGE_SCN_MEM_WRITE";
+    EXPECT_EQ(img[fileOff(dataSec, dataSec.virtualAddress)], 0x11u) << "the whole item moved";
+    EXPECT_EQ(img[fileOff(dataSec, dataSec.virtualAddress + 16u)], 0x22u);
+    EXPECT_EQ(readTlsCallbacks(img).entries.size(), 1u);
+}
+
+TEST(PeExecWriterExternSlot, AThreadLocalTemplateSlotIsWrittenByTheRunnerInTheTemplateAndTheThread) {
+    // `_Thread_local put_fn f = puts;` — the loader copies the main thread's block from
+    // the template BEFORE it binds (measured, variant T1), so no loader-bound slot can
+    // serve it: the runner writes the TEMPLATE (every later thread copies it) and the
+    // RUNNING thread's own copy, reached through gs:[0x58][_tls_index].
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeExternSlotModule(/*externIsData=*/false, DataSectionKind::Tdata,
+                                               /*addend=*/0);
+    DiagnosticReporter rep;
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    auto const cbs = readTlsCallbacks(img);
+    ASSERT_EQ(cbs.entries.size(), 1u);
+    std::uint32_t const runnerRva =
+        static_cast<std::uint32_t>(cbs.entries[0] - readU64LE(img, kImageBaseOff));
+    SectionView const text = sectionHolding(img, runnerRva);
+    std::size_t const begin = fileOff(text, runnerRva);
+    // `mov r, gs:[0x58]` — the format's tlsAccess slot read: 65 4x 8B /r with an
+    // absolute SIB (04|r<<3, 25) and disp32 0x58.
+    bool sawTebRead = false;
+    for (std::size_t p = begin; p + 9 <= begin + 200 && p + 9 <= img.size(); ++p) {
+        if (img[p] == 0x65 && (img[p + 1] & 0xF0) == 0x40 && img[p + 2] == 0x8B
+            && (img[p + 3] & 0xC7) == 0x04 && img[p + 4] == 0x25 && readU32LE(img, p + 5) == 0x58) {
+            sawTebRead = true;
+        }
+    }
+    EXPECT_TRUE(sawTebRead) << "the runner reaches the running thread's block through gs:[0x58]";
+    auto const source = runnerFirstSourceSlotRva(img, runnerRva);
+    ASSERT_TRUE(source.has_value());
+    EXPECT_EQ(*source, readImportDescriptors(img)[0].firstThunk);
+}
+
+TEST(PeExecWriterExternSlot, AnImageWithNoResidueCarriesNoRunner) {
+    // Byte-identity for every other image: no residue, no runner, no callback array —
+    // and no TLS directory at all for an image with no thread-local data.
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeExternSlotModule(/*externIsData=*/false);
+    DiagnosticReporter rep;
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
+    EXPECT_EQ(readU32LE(img, kTlsDirOff), 0u);
+    EXPECT_FALSE(findSection(img, ".tls").found);
 }
 
 // ── (5) The remaining fail-loud belts ────────────────────────────
@@ -754,6 +1133,7 @@ TEST(PeDllFormatJsonValidate, EntryClusterRejected) {
     // (D-LK2-DLL-DLLMAIN-ENTRY is the pinned follow-up).
     auto r = ObjectFormatSchema::loadFromText(dllJsonWith(R"(
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "runtimeLibraries": [{"role":"cLibrary","image":"kernel32.dll"}],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "ExitProcess" },
     )"));
@@ -789,6 +1169,7 @@ TEST(PeDllFormatJsonValidate, ExecWithImageFileDllBitRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 8226, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]

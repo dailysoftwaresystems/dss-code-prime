@@ -54,7 +54,9 @@ at the end.
    either — spawn its remnant lane first (see the no-follow-ups ruling above) [→ no-follow-ups.md](no-follow-ups.md).
 2. Every lane's rows went in with its fold; re-derive the balance with
    `dssharness check-anchor-balance --base <cycle-start-sha>` and run `dssharness run check-anchor-registry`. [→ and `dssharness check-anchor-citations --current-tree`, which resolves a cited id only to a row of the two registries](no-follow-ups.md) **Both**, for
-   the reason that section gives: a green balance is not evidence that nothing was opened.
+   the reason that section gives: a green balance is not evidence that nothing was opened. Then the DEBT the
+   balance does not report, on this machine's tree: `dssharness run anchor-debt-debt --input
+   base=<cycle-start-sha>` — it refuses a row the cycle added or edited into debt.
 3. The full gate on the FOLDED tree — the leg matrix, not one host.
 4. The review to a fixed point and the independent self-audit (checklist steps 6 and 10). A finding on a
    lane's work sends the lane back to its SAME open agent — its subagent resumed, then `refresh-agent` where

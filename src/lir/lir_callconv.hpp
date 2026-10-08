@@ -122,9 +122,13 @@ namespace dss {
 //
 // Consumers:
 //   * Trampoline emitter (`src/link/entry_trampoline.cpp`): passes
-//     `rawBytes = cc.shadowSpaceBytes`, `entryBias =
-//     cc.entryStackPointerBias`. Result: 40 on Win64 (32 shadow +
-//     8 realign), 0 on SysV ELF / Mach-O / ARM64.
+//     `rawBytes = cc.shadowSpaceBytes` and the DERIVED process-entry
+//     bias — `cc.callPushBytes` when the exec format's
+//     `entryTransition` says the loader CALLS the entry, 0 when it
+//     JUMPS (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
+//     Result: 40 on pe64 (32 shadow + 8 realign), 8 on Mach-O x86_64
+//     (called, no shadow), 0 on ELF x86_64 (jumped) and on every arm64
+//     (BL pushes nothing).
 //   * ML7 callconv lowering (`lir_callconv.cpp::computeFrameLayout`):
 //     anchored D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY for when normal-
 //     function call-site shadow-space tightening lands (today ML7
@@ -141,7 +145,9 @@ namespace dss {
 // load time enforces these for cc fields):
 //   * `stackAlignment` is a non-zero power of two.
 //   * `entryBias < stackAlignment` (bias is an offset INTO the
-//     quantum, not a multiple of it).
+//     quantum, not a multiple of it — the target validator holds
+//     `callPushBytes` to it, the one value a derived bias can take
+//     besides 0).
 //
 // `stackAlignment == 0` returns `rawBytes` verbatim (degenerate
 // case for non-register-machine targets).
@@ -1001,6 +1007,12 @@ struct DSS_EXPORT LirCallconvResult {
     // Empty for a function whose frame is entirely absent (a zero-size frame
     // with no callee-saves changes nothing, so it has nothing to say).
     std::vector<LirFuncCfi> perFuncCfi;
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: this pass INSERTS blocks (the guard-page
+    // walk of a runtime stack descent, D-CSUBSET-VLA-WIN64-STACK-PROBE), so it publishes its block entry
+    // image: indexed by the SOURCE module's block arena (`LirBlockId.v`; slot 0 holds 0), the `.v` of the
+    // block of `lir` where that block's instructions begin. A source block's pieces run from there to the
+    // next source block's entry. `lir/lir_descriptor_blocks.hpp` follows the blocks data names through it.
+    std::vector<std::uint32_t> blockEntryImage;
     // True iff `materializeCallingConvention` ran to its successful conclusion.
     // Set ONLY at the final return, so EVERY failure early-return (a config /
     // per-function / SEH / VLA-verifier reject — each returns an empty or

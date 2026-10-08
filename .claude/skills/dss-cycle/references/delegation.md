@@ -88,12 +88,34 @@ fold, when no lane is live, so it gets the whole machine and the full `-j`. ⏳ 
 
 ★★★ **AND MEMORY IS A BUDGET TOO — ✔MEASURED P68 round 9, 2026-09-23.** Four lanes plus main's verify
 drove this host to its commit limit (**81.0 of 113.7 GB** committed) and the Claude host process died,
-and every lane agent with it. ⇒ **At most two heavy local jobs on this host at once, each admitted only
-below 76% committed memory, and a lane starts a heavy job only on the orchestrator's GO.** A heavy job is
-a build or a test run through DssHarness. There is no `-j` knob to divide any more: DssHarness sets each
-leg's parallelism from `.harness-config/config.json` — `buildCores` for the build, `testCores` for the
-tests — ✔MEASURED 2026-09-25: 6 each, the `defaults`, which `hosts.local` does not override. The
-admission gate is the orchestrator's — an interim until the host-memory-gate action lands in the next PR.
+and every lane agent with it. ⇒ **At most two heavy legs on a machine at once, each started only below 76%
+memory — and DssHarness ADMITS THEM ITSELF** (`.harness-config/config.json` `defaults.admission`:
+`heavyLegs` 2, `maxMemoryPercent` 76). A heavy leg is a `build` or `test` leg, or a `run` leg that BUILDS — its
+runner's `requireBuild`, or a step it runs that names `{product}` or `{buildDir}` — or one a runner's `"heavy":
+true` or a step's own `heavy: true` makes heavy, through whichever runner, `--manual-step` included (sqlite's
+`recompile` and `benchmark-speedtest1`, and the corpus and pragma censuses' compiling steps; DOCUMENTED, `dssharness
+help admission`); the repository guards stay light. It takes one of its PHYSICAL machine's slots in the order legs asked — every
+command and every tree that declares admission counts, this machine's WSL legs against Windows — then starts only
+below the limit (Windows: commit charge over commit limit), re-read after a settle while another leg holds a slot.
+A waiting leg prints each holder (tree, variant, leg, command, process, run); its line and `--json`'s `admission`
+give `admitted`, `waitedSeconds` and the memory figure; past `maxWaitMinutes` it is `not-admitted`, exit 7, never
+`failed`. ✔MEASURED 2026-10-01 (P69, lane `hm`), three commands in two trees: a heavy `run` in a throwaway second tree was "admitted at once", a `dssharness test` of the lane's worktree waited 1m04s for the settle another leg's slot asks and was admitted, and a third, the lane's linux `dssharness test`, printed "waits for one of this machine's 2 heavy-leg slot(s), 2 leg(s) ahead; held by" each of the two (tree, variant, leg, command, process, run, since) and was "admitted after 1m52s, memory 71.6% in use (commit 68.5 GiB of 95.7 GiB)" the moment a holder ended (runs 20261001-030428-a58e3b9a, 20261001-030430-b231813a, 20261001-030541-812a778b).
+⇒ **A lane runs its build or test and the harness queues it: no GO, no slot directory, no memory script by
+hand.** There is no `-j` knob to divide either: DssHarness sets each leg's parallelism from
+`.harness-config/config.json` — `buildCores` for the build, `testCores` for the tests — ✔MEASURED 2026-09-25:
+6 each, the `defaults`, which `hosts.local` does not override. Why the admission is DssHarness's and no
+ACTION's (✔MEASURED 2026-09-30, before the tool admitted legs): a command capped legs per machine only within itself
+(`defaults.maxParallelLegs`), and a `dssharness run` holds its tree-and-variant lock for its whole life, so a build
+or test of the same tree and variant started inside a step is refused as locked by its own parent — an action
+cannot hold a slot for the life of the job it admits (two sibling runs and two nested ones; a different variant's
+nested run passed). An ssh host admits by its own record the same way (✔MEASURED 2026-10-01: with the Mac's
+section declaring one slot, two Mac legs, each its own command there, ran one after the other, the second
+"admitted after 1m30s" naming the first as its holder; run 20261002-000725-ebf9dfb9). Admission also
+claims the ROOM a heavy leg's build needs where that need is known — `buildSpaceGiB`, or what a build of its
+variant recorded as it finished — against every other admitted leg's claim on that filesystem, from any command
+(`dssharness help admission`). A build nothing has measured there is admitted on its slot and memory alone, and a
+build's PEAK beyond what its directory comes to (a compiler's temporaries) is in no claim: read a host's room
+before a tree's first arm64 or macOS build (`dssharness clean --legs <leg> --dry-run` names it per leg).
 
 ⚠ **Why a cap at all, and it is not politeness to the host.** Two costs rise with lane count and
 neither is visible from inside a lane:
@@ -169,6 +191,19 @@ not at fault — the brief asked for anchors and got anchors. Put this in every 
 > specific missing prerequisite, an unfired trigger, or a decision only the operator can make.
 > "Out of scope", "bigger than this cycle", "a follow-up" and "the natural next step" are not
 > blockers. Bring me the decision; do not park it in the registry.
+> **A `🔵 DISCLOSED` row is an open row.** A defect you meet on the way is yours to FIX in this
+> wave, whether it pre-dates the cycle or not. If you believe one is too big to fix here, do not
+> file it: tell me its MEASURED size — the files, what must be built, what must be measured first
+> — and I rule. The default answer is "close it now". Close the disclosed rows that name a file
+> or a mechanism you are touching, in the same wave.
 
 Then CHECK the returned rows before you write them. An agent reporting "anchored 6 findings" is
 reporting six unfinished jobs unless every one says CLOSED.
+
+★★★★ **THE ORCHESTRATOR IS THE ONE WHO ERODED THIS, NOT THE LANES** — operator, 2026-10-08 (the
+ruling is in `no-follow-ups.md`). ✔MEASURED in cycle P69 round 1: the lanes brought sizes and
+decisions, as the paragraph above asks, and the orchestrator answered "ONE disclosed row, scheduled
+for a later round for cycle size alone" — again and again, each ruling defensible alone — until the
+round had closed 24 rows and opened 22. When a lane brings a finding with its size, the answer is
+*close it now* unless the size is really out of the wave's reach; "it keeps the round short" is
+not a reason, and neither is "the lane's wave is already large".

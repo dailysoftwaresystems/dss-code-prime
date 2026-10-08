@@ -1,0 +1,23 @@
+{
+  "$comment": "P69 (lane lm, the library-datum ALIAS key): glibc exports ONE environment object under three names, and DSS's <unistd.h> now says so with ONE row and its measured `aliases` ({\"elf\": [\"__environ\", \"_environ\"]}) instead of two unrelated rows. Every name must reach the same object: the program compares environ, __environ and _environ. ✔MEASURED, the same stdout and exit 42 from gcc 13.3.0 (-std=c2x and the GNU default), clang 18.1.3 and aarch64-linux-gnu-gcc (probe-reference-cc run 20261001-003100-d1e55e79). glibc's <unistd.h> declares __environ always and environ only under _GNU_SOURCE, never _environ, so the program declares environ and _environ itself (C 7.1.4) — compatible redeclarations of DSS's rows. ELF only: libSystem exports `environ` alone (measured), so the alias set — and this program — is glibc's.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "environ, __environ and _environ name one object: 1\n",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

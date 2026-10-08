@@ -52,6 +52,9 @@ maxExistingSymbolIdV(AssembledModule const& mod) noexcept {
         // aarch64 shared object whose address slot was already #11, and the
         // link refused it as "declared more than once".
         if (ext.addressSlotSymbol.v > maxV) maxV = ext.addressSlotSymbol.v;
+        // And its call entry taken as an address (P69 review M1 (c)), for the
+        // identical reason: an id that lives only on the row.
+        if (ext.callEntrySymbol.v > maxV) maxV = ext.callEntrySymbol.v;
     }
     for (auto const& d : mod.dataItems) {
         if (d.symbol.v > maxV) maxV = d.symbol.v;
@@ -60,6 +63,14 @@ maxExistingSymbolIdV(AssembledModule const& mod) noexcept {
         for (auto const& bs : fn.blockSymbols) {
             if (bs.symbol.v > maxV) maxV = bs.symbol.v;
         }
+    }
+    // ★ AND EVERY SYMBOL WHOSE ADDRESS IS 0 — the FOURTH widening (P69,
+    // D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO): the
+    // reference gate mints one per weak symbol it resolves to nothing, before
+    // the GOT-slot lowering and the entry trampoline mint theirs, and it lives
+    // only in this list.
+    for (SymbolId const s : mod.nullAddressSymbols) {
+        if (s.v > maxV) maxV = s.v;
     }
     return maxV;
 }

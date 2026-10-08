@@ -141,6 +141,27 @@ void wr64(std::vector<std::uint8_t>& b, std::size_t o, std::uint64_t v) {
     return sh ? static_cast<std::size_t>(rd64(b, sh + 24)) : 0;
 }
 
+// Give the UNDEFINED `.symtab` entry named `name` the st_info TYPE `type` (its binding kept). False when the
+// object has no such entry. The names are read through the symtab's own `sh_link` string table.
+[[nodiscard]] bool setUndefinedSymbolType(std::vector<std::uint8_t>& b, std::string const& name,
+                                          std::uint8_t type) {
+    std::size_t const sh = firstShdrOfType(b, 2);
+    if (sh == 0) return false;
+    std::size_t const body = static_cast<std::size_t>(rd64(b, sh + 24));
+    std::size_t const size = static_cast<std::size_t>(rd64(b, sh + 32));
+    auto const link = static_cast<std::uint16_t>(rd64(b, sh + 40) & 0xFFFFu);
+    std::size_t const strtab = static_cast<std::size_t>(rd64(b, shdrAt(b, link) + 24));
+    for (std::size_t off = body; off + 24 <= body + size; off += 24) {
+        auto const nameOff = static_cast<std::size_t>(rd64(b, off) & 0xFFFFFFFFu);   // st_name
+        if (rd16(b, off + 6) != 0) continue;                                         // st_shndx: UND only
+        std::string const n{reinterpret_cast<char const*>(b.data() + strtab + nameOff)};
+        if (n != name) continue;
+        b[off + 4] = static_cast<std::uint8_t>((b[off + 4] & 0xF0u) | (type & 0x0Fu));   // st_info
+        return true;
+    }
+    return false;
+}
+
 // A defined function/data reloc target, resolved by name for the round-trip
 // (raw SymbolId integers are per-CU and intentionally NOT preserved -- the
 // merge matches by name).
@@ -163,13 +184,16 @@ TEST(RelocatableObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
 
     // A module exercising every reconstructable field class:
     //   * lib_add   -- a plain function (no relocations).
-    //   * lib_greet -- a function with THREE relocations: a rel32 to a
-    //                  DEFINED rodata object (msg), a rel32 to an extern
-    //                  DATA object (env), and a rel32 CALL to an extern
-    //                  FUNCTION (puts). The writer emits PC32 for the first
-    //                  two and PLT32 for the call; the reader must map all
-    //                  three back to the SAME rel32 RelocationKind and
-    //                  infer isData from the PLT-vs-plain distinction.
+    //   * lib_greet -- a function with THREE relocations: an ADDRESS
+    //                  reference (`riprel32`) to a DEFINED rodata object
+    //                  (msg), one to an extern DATA object (env), and a
+    //                  `rel32` CALL to an extern FUNCTION (puts) — the kinds
+    //                  DSS's codegen gives them since P69
+    //                  (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB). The
+    //                  writer emits PC32 for the first two and PLT32 for the
+    //                  call; the reader must map each back to ITS OWN kind —
+    //                  PC32 to `riprel32`, PLT32 to `rel32` — and infer isData
+    //                  from the PLT-vs-plain distinction.
     //   * msg       -- a Rodata data item.
     //   * counter   -- a Data data item.
     //   * vtable    -- a RelRoConst data item carrying an abs64 reloc to
@@ -185,8 +209,8 @@ TEST(RelocatableObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
     AssembledFunction greet;
     greet.symbol = SymbolId{2};
     greet.bytes.assign(20, 0x90);            // 20 nops; only the relocs matter
-    greet.relocations.push_back(Relocation{2u,  SymbolId{10}, RelocationKind{1}, 0});   // -> msg (defined data)
-    greet.relocations.push_back(Relocation{8u,  SymbolId{20}, RelocationKind{1}, 0});   // -> env (extern data)
+    greet.relocations.push_back(Relocation{2u,  SymbolId{10}, RelocationKind{8}, 0});   // -> msg (defined data)
+    greet.relocations.push_back(Relocation{8u,  SymbolId{20}, RelocationKind{8}, 0});   // -> env (extern data)
     greet.relocations.push_back(Relocation{14u, SymbolId{21}, RelocationKind{1}, 0});   // -> puts (extern fn, call)
     mod.functions.push_back(greet);
 
@@ -273,9 +297,11 @@ TEST(RelocatableObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
     EXPECT_EQ(rMsg->offset, 2u);
     EXPECT_EQ(rEnv->offset, 8u);
     EXPECT_EQ(rPuts->offset, 14u);
-    // Every one maps back to the SAME rel32 kind (PC32 AND PLT32 -> kind 1).
-    EXPECT_EQ(rMsg->kind, RelocationKind{1});
-    EXPECT_EQ(rEnv->kind, RelocationKind{1});
+    // Each maps back to ITS OWN kind: PC32 -> `riprel32` (an address), PLT32
+    // -> `rel32` (a call). They used to collapse into one kind, which is what
+    // left the link unable to tell an address-taken function from a called one.
+    EXPECT_EQ(rMsg->kind, RelocationKind{8});
+    EXPECT_EQ(rEnv->kind, RelocationKind{8});
     EXPECT_EQ(rPuts->kind, RelocationKind{1});
     // Addend un-baked: the writer stored r_addend = 0 + addendBias(-4) = -4;
     // the reader recovers the DSS-native 0 (red-on-disable vs keeping -4).
@@ -306,15 +332,19 @@ TEST(RelocatableObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
     EXPECT_EQ(dVtable->relocations[0].addend, 0);
     EXPECT_EQ(nameOf(got, dVtable->relocations[0].target), "lib_add");
 
-    // -- extern imports: names + isData INFERENCE (PLT -> fn, plain -> data) --
+    // -- extern imports: names + the kind each states (PLT -> a function; a plain
+    //    PC32 against an STT_NOTYPE symbol states nothing, so its definition
+    //    decides, P69 D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA) --
     auto const* ePuts = externNamed(got, "puts");
     auto const* eEnv = externNamed(got, "env");
     ASSERT_NE(ePuts, nullptr);
     ASSERT_NE(eEnv, nullptr);
     EXPECT_FALSE(ePuts->isData)
-        << "puts is reached via a PLT32 reloc -> inferred a FUNCTION import";
-    EXPECT_TRUE(eEnv->isData)
-        << "env is reached via a plain PC32 reloc -> inferred a DATA import";
+        << "puts is reached via a PLT32 reloc -> a FUNCTION import";
+    EXPECT_EQ(ePuts->kindOrigin, ExternKindOrigin::Stated) << "a call states the kind";
+    EXPECT_EQ(eEnv->kindOrigin, ExternKindOrigin::Pending)
+        << "env is an STT_NOTYPE symbol reached via a plain PC32 reloc, which names a function and a datum alike "
+           "-> the object states no kind, and the definition the link finds decides it";
 
     // -- the module is well-formed for the merge --
     EXPECT_EQ(got.expectedFuncCount, 2u);
@@ -523,18 +553,24 @@ TEST(RelocatableObjectReader, ReadsRealGccObjectFunctionsSymbolsRelocations) {
     EXPECT_EQ(msg->section, DataSectionKind::Rodata);
     EXPECT_EQ(msg->bytes.size(), 12u);
 
-    // lib_greet carries the `call puts` relocation (PLT32 -> rel32 kind) and
-    // the section-relative `.rodata` reference to msg. Both recovered as
-    // rel32-kind relocations on lib_greet.
+    // lib_greet carries the `call puts` relocation (PLT32 -> the `rel32` CALL
+    // kind) and the section-relative `.rodata` reference to msg (PC32 -> the
+    // `riprel32` ADDRESS kind, since P69: the reader must not read an address
+    // as a call, D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB).
     ASSERT_EQ(greet->relocations.size(), 2u)
         << "lib_greet's two .rela.text entries (msg ref + puts call)";
     bool sawPutsCall = false;
     bool sawMsgRef = false;
     for (auto const& r : greet->relocations) {
-        EXPECT_EQ(r.kind, RelocationKind{1}) << "both are rel32-family";
-        EXPECT_EQ(r.addend, 0) << "gcc's -4 addend is the rel32 bias, un-baked to 0";
-        if (nameOf(got, r.target) == "puts") sawPutsCall = true;
-        if (nameOf(got, r.target) == "msg") sawMsgRef = true;
+        EXPECT_EQ(r.addend, 0) << "gcc's -4 addend is the rel32-family bias, un-baked to 0";
+        if (nameOf(got, r.target) == "puts") {
+            sawPutsCall = true;
+            EXPECT_EQ(r.kind, RelocationKind{1}) << "PLT32 is the CALL kind";
+        }
+        if (nameOf(got, r.target) == "msg") {
+            sawMsgRef = true;
+            EXPECT_EQ(r.kind, RelocationKind{8}) << "PC32 is the ADDRESS kind";
+        }
     }
     EXPECT_TRUE(sawPutsCall) << "one reloc must target the extern `puts`";
     // c167 SECTION-RELATIVE RESOLUTION (red-on-disable): gcc references `msg`
@@ -838,6 +874,77 @@ TEST(RelocatableObjectReader, AddressTakenExternFunctionStaysFunction) {
     EXPECT_FALSE(cb->isData)
         << "an extern reached by a PLT32 call is a FUNCTION even when also "
            "address-taken via abs64";
+    EXPECT_EQ(cb->kindOrigin, ExternKindOrigin::Stated)
+        << "the call states it, whatever else names it";
+}
+
+// P69 (D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA): an undefined symbol states its kind only by its st_info TYPE or
+// by a CALL relocation naming it. STT_NOTYPE — what gcc, clang and DSS's own writer give EVERY undefined symbol —
+// reached by an address or a GOT load states nothing: the row is `Pending`, and the definition the link finds
+// decides (a sibling unit's, or the library the archive-member binder matches). The SAME bytes with the two symbols
+// typed STT_FUNC / STT_OBJECT state code / data. Until P69 the untyped pair read back as two stated DATA imports,
+// so a member that reached a library FUNCTION only through the GOT conflicted with the program's declaration of it.
+TEST(RelocatableObjectReader, AnUntypedUndefinedSymbolStatesNoKindAndATypedOneStatesItsOwn) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const why = [](DiagnosticReporter const& r) {
+        std::string all;
+        for (auto const& d : r.all()) all += "\n  " + d.actual;
+        return all;
+    };
+    auto const kindOf = [&](char const* name) {
+        auto const* row = loaded.target->relocationByName(name);
+        EXPECT_NE(row, nullptr) << name;
+        return row != nullptr ? row->kind : RelocationKind{};
+    };
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction user;
+    user.symbol = SymbolId{1};
+    // lea fn_by_address(%rip),%rax ; mov datum_by_got@GOTPCREL(%rip),%rcx ; call called ; ret
+    user.bytes = {0x48, 0x8D, 0x05, 0, 0, 0, 0, 0x48, 0x8B, 0x0D, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0, 0xC3};
+    user.relocations.push_back(Relocation{3u, SymbolId{9}, kindOf("riprel32"), 0});            // R_X86_64_PC32
+    user.relocations.push_back(Relocation{10u, SymbolId{10}, kindOf("rex_gotpcrelx32"), -4});  // REX_GOTPCRELX
+    user.relocations.push_back(Relocation{15u, SymbolId{11}, kindOf("rel32"), 0});             // R_X86_64_PLT32
+    mod.functions.push_back(user);
+    mod.symbols = {ModuleSymbol{SymbolId{1}, "user", SymbolBinding::Global, SymbolVisibility::Default}};
+    mod.externImports = {
+        ExternImport{SymbolId{9}, "fn_by_address", "", /*isData=*/false},
+        ExternImport{SymbolId{10}, "datum_by_got", "", /*isData=*/true},
+        ExternImport{SymbolId{11}, "called", "", /*isData=*/false},
+    };
+    DiagnosticReporter wrep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+
+    {   // As written: every undefined symbol STT_NOTYPE.
+        DiagnosticReporter rrep;
+        auto const got = elf::readRelocatableObject(bytes, *loaded.target, *loaded.format, rrep);
+        ASSERT_TRUE(got.has_value()) << why(rrep);
+        auto const* byAddress = externNamed(*got, "fn_by_address");
+        auto const* byGot     = externNamed(*got, "datum_by_got");
+        auto const* called    = externNamed(*got, "called");
+        ASSERT_TRUE(byAddress && byGot && called);
+        EXPECT_EQ(byAddress->kindOrigin, ExternKindOrigin::Pending) << "an untyped symbol named by a PC32";
+        EXPECT_EQ(byGot->kindOrigin, ExternKindOrigin::Pending) << "an untyped symbol named by a GOT load";
+        EXPECT_EQ(called->kindOrigin, ExternKindOrigin::Stated) << "a call states code";
+        EXPECT_FALSE(called->isData);
+    }
+    // The negative the rule needs: the same object with the two symbols TYPED, which is a statement.
+    ASSERT_TRUE(setUndefinedSymbolType(bytes, "fn_by_address", 2));   // STT_FUNC
+    ASSERT_TRUE(setUndefinedSymbolType(bytes, "datum_by_got", 1));    // STT_OBJECT
+    {
+        DiagnosticReporter rrep;
+        auto const got = elf::readRelocatableObject(bytes, *loaded.target, *loaded.format, rrep);
+        ASSERT_TRUE(got.has_value()) << why(rrep);
+        auto const* byAddress = externNamed(*got, "fn_by_address");
+        auto const* byGot     = externNamed(*got, "datum_by_got");
+        ASSERT_TRUE(byAddress && byGot);
+        EXPECT_EQ(byAddress->kindOrigin, ExternKindOrigin::Stated);
+        EXPECT_FALSE(byAddress->isData) << "STT_FUNC states code";
+        EXPECT_EQ(byGot->kindOrigin, ExternKindOrigin::Stated);
+        EXPECT_TRUE(byGot->isData) << "STT_OBJECT states a datum";
+    }
 }
 
 // HIGH-3: a -ffunction-sections/-fdata-sections gcc object houses each body in
@@ -891,6 +998,7 @@ TEST(RelocatableObjectReader, Aarch64ExternCallTypedAsFunctionNotData) {
     ASSERT_NE(puts, nullptr) << "the UND `puts` reference must become an extern import";
     EXPECT_FALSE(puts->isData)
         << "puts is reached by R_AARCH64_CALL26 (a call) -- must be a FUNCTION import";
+    EXPECT_EQ(puts->kindOrigin, ExternKindOrigin::Stated) << "the call states the kind";
 }
 
 // CRITICAL red-pin: a crafted `.o` whose e_shstrndx section is SHT_NOBITS with

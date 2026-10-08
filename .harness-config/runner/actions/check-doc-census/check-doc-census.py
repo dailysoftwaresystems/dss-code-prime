@@ -141,11 +141,10 @@ to another clause (a value, a call argument, an array bound).
 Exit codes: 0 OK - 1 a document disagrees with the census - 2 the scan or a
 provider collapsed (structural: fix the scan, never lower the floor) - 3 usage.
 
-Usage:
-    python .harness-config/runner/actions/check-doc-census/check-doc-census.py             # verify
-    python .harness-config/runner/actions/check-doc-census/check-doc-census.py --write     # repair figures
-    python .harness-config/runner/actions/check-doc-census/check-doc-census.py --selftest  # prove it fails
-    python .harness-config/runner/actions/check-doc-census/check-doc-census.py --repo <p>  # act on another tree
+Usage -- each a step of the action, the program's own flag after the `#`:
+    dssharness run check-doc-census           # verify, then the self-test (--selftest: prove it fails)
+    dssharness run check-doc-census-write     # --write: repair the figures, this machine's own tree
+  `--repo <p>` acts on another tree: the self-test's fixture trees; no step passes it.
 """
 from __future__ import annotations
 
@@ -215,21 +214,9 @@ def _owning_tree_module():
     return mod
 
 
-def remedy_runner_fact():
-    """-> (ok, detail): the runner REPAIR_VERB names is declared in this tree's config.json, runs this action's
-    `write` step ALONE, on ONE leg whose definition names no other host -- this machine's own tree (P68 round 13's
-    audit, F1-A11: the remedy named the two-leg runner, whose `--manual-step write` rewrote the WSL leg's copy
-    too). Read from config, never assumed: a second leg added there reds the self-test."""
-    ot = _owning_tree_module()
-    cfg = ot.load_jsonc(os.path.join(self_repo(), ".harness-config", "config.json"))
-    name = REPAIR_VERB.split()[-1]
-    runner = (cfg.get("predefinedRunners") or {}).get(name) if isinstance(cfg, dict) else None
-    legs = (runner.get("legs") or []) if isinstance(runner, dict) else []
-    leg = (cfg.get("legs") or {}).get(legs[0]) if len(legs) == 1 else None
-    others = [k for k in (cfg.get("hosts") or {}) if k != "local" and isinstance(leg, dict) and k in leg]
-    ok = (isinstance(runner, dict) and runner.get("action") == "check-doc-census/check-doc-census.yml"
-          and runner.get("steps") == ["write"] and isinstance(leg, dict) and not others)
-    return ok, "runner %r: %r; its leg names another host: %r" % (name, runner, others)
+# ⓘ `remedy_runner_fact()` (P68 round 13, F1-A11) retired on 2026-09-30 with its arm: check-scripts-index
+# clause 13 is the ONE statement that a remedy names a runner config.json declares, and that a writer's
+# runner has ONE leg of this machine's own tree -- for every program, not for this one alone.
 
 
 # Where this repository's programs live, relative to a tree root: DssHarness's actions
@@ -292,31 +279,51 @@ SKIP_DIR_PREFIXES = ("build",)
 #   directory-only entries, so adding a scratch home to the ignore file is the whole
 #   edit and the two cannot drift. A hardcoded twin of `.temp`, `scratchpad`,
 #   `test-scratch`, ... is exactly the duplicate that goes stale on the next one.
-# ★ NAME-KEYED, MATCHING THE HARD LIST'S SEMANTICS: `.temp/` skips a directory called
-#   `.temp` at any depth, which is what os.walk pruning can express. A path-anchored
-#   ignore (`/src/dss-config/runtime/platform/dist/`) contributes its LAST segment
-#   only; over-skipping a same-named directory elsewhere is not a risk this guard runs,
-#   because every such entry names build output.
+# ★ READ AS GIT READS IT (corrected 2026-09-30, cycle P69): a bare name (`.temp/`) is that
+#   name at ANY depth; an entry with a slash at its start or in its middle is ANCHORED to
+#   the tree's root (`/src/dss-config/runtime/platform/dist/` is that one directory,
+#   `.claude/worktrees/` that one). Until then an anchored entry contributed its LAST
+#   segment as a name at any depth, so every `dist` and every `worktrees` directory was
+#   skipped -- and a future ignore line such as `sys/` or `lib/` would have silently cut
+#   `shippedLibs/sys/*.json` out of the claim-rot walk and out of the figure census (the
+#   round-12 audit's vector; ✔MEASURED that day no other such directory exists, so the live
+#   walk is unchanged). Arm 43 pins both halves.
 # ⚠ It DEGRADES TO THE HARD LIST when there is no `.gitignore` -- the self-test's
 #   synthetic roots rely on that, and arm 24 makes the degradation itself observable.
 def scratch_dirs(repo):
-    """Directory names `.gitignore` declares, so scratch is never read as a document."""
-    out = set()
+    """-> (names, paths): the directories `.gitignore` declares -- bare names skipped at any depth, anchored entries
+    as root-relative paths -- so scratch is never read as a document."""
+    names, paths = set(), set()
     try:
         text = io.open(os.path.join(repo, ".gitignore"), encoding="utf-8",
                        errors="replace").read()
     except OSError:
-        return out
+        return names, paths
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("!"):
             continue
         if not line.endswith("/"):
             continue                      # a file pattern, not a directory home
-        name = line.rstrip("/").rstrip("/").split("/")[-1]
-        if name and "*" not in name and "?" not in name:
-            out.add(name)
-    return out
+        body = line.rstrip("/")
+        if not body or any(c in body for c in "*?["):
+            continue
+        if "/" in body:
+            paths.add(body.lstrip("/"))   # anchored: that directory, relative to the root
+        else:
+            names.add(body)
+    return names, paths
+
+
+def _pruned(repo, dirpath, dirs, skip_names, skip_paths):
+    """The children of `dirpath` a walk descends into: not a skipped name, not an anchored path, not a build tree."""
+    keep = []
+    for d in sorted(dirs):
+        rel = os.path.relpath(os.path.join(dirpath, d), repo).replace(os.sep, "/")
+        if d in skip_names or rel in skip_paths or d.startswith(SKIP_DIR_PREFIXES):
+            continue
+        keep.append(d)
+    return keep
 
 # A marker, then optional markdown emphasis / whitespace, then the figure.
 # The figure may carry `,` thousands separators; the separator style is PRESERVED
@@ -373,10 +380,10 @@ class Claim:
 def scanned_docs(repo):
     """Every file the tree may carry a claim in, excluding the homes listed above."""
     out = []
-    skip = SKIP_DIRS | scratch_dirs(repo)
+    names, paths = scratch_dirs(repo)
+    skip = SKIP_DIRS | names
     for root, dirs, files in os.walk(repo):
-        dirs[:] = sorted(d for d in dirs
-                         if d not in skip and not d.startswith(SKIP_DIR_PREFIXES))
+        dirs[:] = _pruned(repo, root, dirs, skip, paths)
         for f in sorted(files):
             if f.lower().endswith(SCANNED_SUFFIXES):
                 out.append(os.path.join(root, f))
@@ -453,30 +460,60 @@ def provider_values(repo, name):
 # directions plus the window's edge.
 CLAIM_ROT_ROOT = os.path.join("src", "dss-config")
 CLAIM_ROT_WINDOW = 8        # the corpus word, the usage verb and the quantifier within this many words
-CLAIM_ROT_DOC_FLOOR = 1     # a walk that read no config document is a COLLAPSE, never a clean pass
+# ★ A FLOOR WELL BELOW THE LIVE COUNT, NOT AT ONE. ✔MEASURED 2026-09-30 (cycle P69): the walk reads 85 config
+# documents; at a floor of 1 a walk that COLLAPSED to anything from 1 to 84 -- a `.gitignore` directory entry that
+# happened to share a config directory's name was enough -- passed clean. The round-12 pattern of
+# check-plan-citations: a floor far enough below the live count that churn never trips it, and a PARTIAL-collapse
+# arm (41b: CLAIM_ROT_PARTIAL_DOCS documents) that must collapse, so lowering the floor back to 1 reds the self-test.
+# Raise it by MEASURING, never to make a red go away.
+CLAIM_ROT_DOC_FLOOR = 40
+CLAIM_ROT_PARTIAL_DOCS = 10
 
 _CR_WORD = re.compile(r"[\w'`./<>*-]+")
 _CR_USAGE = re.compile(r"^(uses?|used|using|calls?|called|references?|referenced|needs?|needed|"
-                       r"touch(?:es|ed)?|reach(?:es|ed)?|consumes?|consumed|spells?|spelled)$", re.I)
+                       r"touch(?:es|ed)?|reach(?:es|ed)?|consumes?|consumed|spells?|spelled|"
+                       r"includes?|included|including)$", re.I)
 _CR_QUANT_1 = re.compile(r"^(only|solely|exclusively|nothing|none|never|zero|neither|0)$", re.I)
 _CR_QUANT_2 = re.compile(r"\b(exactly (?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)|no other|"
                          r"no (?:consumer|caller|user|use|site|reference)s?|(?:does|do)(?:n't| not) "
                          r"(?:use|call|reference|need|touch|reach|spell|include)|the (?:sole|whole) consumer)\b",
                          re.I)
-_CR_CORPUS = re.compile(r"^(sqlite\w*|amalgamation|testfixture|tclsqlite\w*|os_unix\.c|os_win\.c|shell\.c|"
-                        r"sqlite3\.c|test\d+\.c|mem\d\.c|corpus)$", re.I)
-_CR_MEASURED = re.compile(r"✔\s*(?:RE-)?MEASURED|\bMEASURED\b|re-measured|grep-verified|\bverified\b", re.I)
-_CR_PINNED = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|[0-9a-f]{8,40})\b")
-_CR_ARTICLES = {"the", "a", "an", "this", "that", "each", "every", "its", "their", "one"}
+_CR_CORPUS = re.compile(r"^(sqlite\w*|sqlite\w*\.[ch]|amalgamation|testfixture|tclsqlite\w*|os_unix\.c|os_win\.c|"
+                        r"shell\.c|test\d+\.c|mem\d\.c|corpus)$", re.I)
+# ★ A PIN IS ONE OF THE REPOSITORY'S OWN MEASUREMENT MARKERS BESIDE A DATE OR A REVISION: `✔MEASURED`, the
+# capitalised `MEASURED` / `RE-MEASURED`, and the explicit acts `re-measured` and `grep-verified` -- never an
+# ordinary lower-case "measured" or "verified", never a negated one ("not verified", "NOT MEASURED"), and never a
+# run of digits alone (a revision holds a letter a-f). The round-12 audit found each of those passing an unpinned
+# claim. ✔MEASURED 2026-09-30 over the 85 live config documents: a ✔-only rule refused two sentences that ARE
+# pinned by these conventions (`MEASURED 2026-08-05`, `re-measured ... a790e273e2`), so the markers stay; what
+# goes is the lower-case prose word and the negation.
+_CR_MEASURED = re.compile(r"✔\s*(?:RE-)?MEASURED|(?<![Nn][Oo][Tt] )(?<![A-Za-z-])(?:RE-?MEASURED|MEASURED|"
+                          r"re-measured|grep-verified)(?![A-Za-z-])")
+_CR_PINNED = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|(?=[0-9a-f]*[a-f])[0-9a-f]{7,40})\b")
+# The words after which a usage word is a NOUN ("the reference resolves"). NOT the relative pronoun "that" nor
+# "one": "the only header that uses `_IOWR`" is a claim, and the round-12 audit found it escaping here.
+_CR_ARTICLES = {"the", "a", "an", "this", "each", "every", "its", "their"}
 _CR_HISTORY = re.compile(r"\b(?:note|hand-?off|handover|brief)\b[^.]{0,40}\bsaid\b|used to (?:say|read|assert)|"
                          r"previously read|\bIT READ\b|pre-\w+ comment|RETRACTED|WAS FALSE|asserted '|"
                          r"earlier revision|It previously|this comment used to", re.I)
 _CR_SENTENCE = re.compile(r"(?<=[.!?])(?<!e\.g\.)(?<!i\.e\.)(?<!etc\.)(?<!vs\.)(?<!cf\.)\s+")
 
 
+def _cr_token(raw):
+    """A word as the predicate reads it: its punctuation, backticks and emphasis stripped, a possessive dropped, a
+    path read by its basename -- so `` `os_unix.c` ``, `**sqlite**`, `SQLite's` and `src/os_unix.c` are the corpus
+    words they name (the round-12 audit: each escaped the corpus match)."""
+    t = raw.strip(".,;:()[]{}\"'`*")
+    t = re.sub(r"(?:'|’)s$", "", t)
+    if "/" in t:
+        t = t.rstrip("/").rsplit("/", 1)[-1]
+    return t.strip(".,;:()[]{}\"'`*")
+
+
 def claim_rot_verdict(sentence, window=CLAIM_ROT_WINDOW):
     """None (not a quantified corpus-usage claim), 'PINNED', 'HISTORY' or 'REFUSE'."""
-    toks = [m.group(0).strip(".,;:()[]{}\"'") for m in _CR_WORD.finditer(sentence)]
+    words = list(_CR_WORD.finditer(sentence))
+    toks = [_cr_token(m.group(0)) for m in words]
     # A usage word right after an article is a NOUN ("the reference resolves"), not a
     # claim about the corpus.
     usage = [i for i, t in enumerate(toks) if _CR_USAGE.match(t)
@@ -487,9 +524,13 @@ def claim_rot_verdict(sentence, window=CLAIM_ROT_WINDOW):
         quant.append(len(_CR_WORD.findall(sentence[:m.start()])))
     if not (usage and quant and corpus):
         return None
-    if not any(max(a, b, c) - min(a, b, c) <= window for a in usage for b in quant for c in corpus):
+    starts = [min(a, b, c) for a in usage for b in quant for c in corpus if max(a, b, c) - min(a, b, c) <= window]
+    if not starts:
         return None
-    if _CR_HISTORY.search(sentence):
+    # HISTORY only when the claim is REPORTED: the history phrase opens before the claim does ("this comment used to
+    # say sqlite uses only ..."). One after it ("... ; an earlier revision said otherwise") excuses nothing.
+    claim_at = words[min(starts)].start()
+    if any(h.start() < claim_at for h in _CR_HISTORY.finditer(sentence)):
         return "HISTORY"
     if _CR_MEASURED.search(sentence) and _CR_PINNED.search(sentence):
         return "PINNED"
@@ -513,9 +554,10 @@ def claim_rot_findings(repo):
     root = os.path.join(repo, CLAIM_ROT_ROOT)
     docs = sents = 0
     refused = []
-    skip = SKIP_DIRS | scratch_dirs(repo)
+    names, paths = scratch_dirs(repo)
+    skip = SKIP_DIRS | names
     for dp, dn, fn in os.walk(root):
-        dn[:] = sorted(d for d in dn if d not in skip)
+        dn[:] = [d for d in _pruned(repo, dp, dn, skip, paths)]
         for f in sorted(fn):
             if not f.endswith(".json"):
                 continue
@@ -533,9 +575,9 @@ def claim_rot_findings(repo):
                     if claim_rot_verdict(s) == "REFUSE":
                         refused.append((rel, pointer, s.strip()))
     if docs < CLAIM_ROT_DOC_FLOOR:
-        raise Collapse("the claim-rot clause read %d config document(s) under %s -- a walk that "
-                       "reads nothing is a structural failure, not a pass"
-                       % (docs, CLAIM_ROT_ROOT.replace(os.sep, "/")))
+        raise Collapse("the claim-rot clause read %d config document(s) under %s, below its floor of %d -- a walk "
+                       "that collapsed is a structural failure, not a pass (fix the walk, never the floor)"
+                       % (docs, CLAIM_ROT_ROOT.replace(os.sep, "/"), CLAIM_ROT_DOC_FLOOR))
     return docs, sents, refused
 
 
@@ -738,10 +780,14 @@ def _fixture(tmp, name, stub_body=None, doc_body=None, src_body=None,
         os.makedirs(code, exist_ok=True)
         io.open(os.path.join(code, "rebuild.hpp"), "wb").write(src_body.encode("utf-8"))
 
-    # The config document THE SECOND CLAUSE reads. EVERY fixture carries one, because the
-    # clause refuses a walk that reads none (arm 41); its prose makes no claim, so the
-    # figure arms keep measuring exactly what they measured before the clause existed.
+    # The config document THE SECOND CLAUSE reads. EVERY fixture carries one -- and FLOOR-MANY
+    # neutral ones beside it, because the clause refuses a walk that reads fewer than
+    # CLAIM_ROT_DOC_FLOOR documents (arms 41, 41b) and these arms run the guard as a SUBPROCESS,
+    # which cannot lower the floor. Their prose makes no claim, so the figure arms keep measuring
+    # exactly what they measured before the clause existed.
     _say(root, _NEUTRAL_PROSE)
+    for i in range(CLAIM_ROT_DOC_FLOOR):
+        _say(root, _NEUTRAL_PROSE, rel="shippedLibs/neutral/n%02d.json" % i)
     return root
 
 
@@ -783,6 +829,18 @@ def _write(p, s):
     io.open(p, "wb").write(s.encode("utf-8"))
 
 
+# ★ AN EXACT RATCHET (the round-12 audit: this self-test ANDed its verdicts and never counted them, so a deleted arm
+# passed). Every arm -- a subprocess arm, an in-process claim-rot arm, a provider arm, a printed fact -- lands here
+# where it is judged, and `selftest` fails on any count but EXPECTED_ARMS.
+_RAN = []
+EXPECTED_ARMS = 65   # arm 1c retired on 2026-09-30 (M6: check-scripts-index clause 13)
+
+
+def _count(ok):
+    _RAN.append(bool(ok))
+    return ok
+
+
 def _arm(label, root, expect_rc, says=None, write=False):
     argv = ["--repo", root] + (["--write"] if write else [])
     p = subprocess.run([sys.executable, os.path.abspath(__file__)] + argv,
@@ -794,7 +852,7 @@ def _arm(label, root, expect_rc, says=None, write=False):
     print("  %-34s rc=%d (want %d) %s" % (label, p.returncode, expect_rc, "OK" if ok else "FAIL"))
     if not ok:
         print("      says: %s" % out.strip().replace("\n", "\n      ")[:900])
-    return ok
+    return _count(ok)
 
 
 def selftest():
@@ -811,12 +869,6 @@ def selftest():
         ok &= _arm("1 FIGURE-DRIFTED", root, EXIT_DISAGREE, says="documented 634, actual 788")
         # 1b -- the refusal names the REPAIR as the harness runs it (the `write` manual step).
         ok &= _arm("1b REMEDY-IS-THE-HARNESS-STEP", root, EXIT_DISAGREE, says=REPAIR_VERB)
-        # 1c -- ...and the runner it names runs that step alone, on ONE leg of this machine's own tree (F1-A11).
-        _fact_ok, _fact_detail = remedy_runner_fact()
-        print("  %-34s %s" % ("1c REMEDY-RUNNER-IS-ONE-LEG", "OK" if _fact_ok else "FAIL"))
-        if not _fact_ok:
-            print("      %s" % _fact_detail[:600])
-        ok &= _fact_ok
 
         # 2 -- --write repairs it, and the repaired tree verifies clean.
         ok &= _arm("2 WRITE-REPAIRS", root, EXIT_OK, says="repaired", write=True)
@@ -829,11 +881,11 @@ def selftest():
         styled = _fixture(tmp, "styled")
         sd = _doc(styled)
         _write(sd, _read(sd).replace("**2678**", "**1,111**", 1))
-        _arm("2c-setup", styled, EXIT_DISAGREE)
-        _arm("2c-write", styled, EXIT_OK, write=True)
+        ok &= _arm("2c-setup", styled, EXIT_DISAGREE)          # a setup step is an arm: its failure is one
+        ok &= _arm("2c-write", styled, EXIT_OK, write=True)
         style_kept = "**2,678**" in _read(sd)
         print("  %-34s %s" % ("2c SEPARATOR-STYLE", "OK" if style_kept else "FAIL"))
-        ok &= style_kept
+        ok &= _count(style_kept)
 
         # 3 -- a key the provider does not report. A typo must not read as agreement.
         _write(d, _read(d).replace("census:examples:manifests",
@@ -979,15 +1031,15 @@ def selftest():
         rep = _fixture(tmp, "sourcewrite", src_body=_SRC_BODY)
         rp = _src(rep)
         _write(rp, _read(rp).replace("**11**", "**9**", 1))
-        _arm("22-setup", rep, EXIT_DISAGREE)
-        _arm("22-write", rep, EXIT_OK, write=True)
+        ok &= _arm("22-setup", rep, EXIT_DISAGREE)
+        ok &= _arm("22-write", rep, EXIT_OK, write=True)
         after = _read(rp)
         prose_kept = (after == _SRC_BODY)
         print("  %-34s %s" % ("22 WRITE-REPAIRS-SOURCE",
                               "OK" if prose_kept else "FAIL"))
         if not prose_kept:
             print("      got: %r" % after)
-        ok &= prose_kept
+        ok &= _count(prose_kept)
 
         # 23 -- a marker in a SOURCE file naming an unknown PROVIDER reds. The
         #       vocabulary check is not a markdown privilege.
@@ -1013,10 +1065,14 @@ def selftest():
         # has stopped matching, each produce a tidy zero that a rotted figure agrees with.
         ok &= _source_provider_arms(tmp)
 
-        # 28-42 -- THE SECOND CLAUSE.
+        # 28-52 -- THE SECOND CLAUSE.
         ok &= _claim_rot_arms(tmp)
 
-    print("check-doc-census --selftest: %s" % ("PASS" if ok else "FAIL"))
+    if len(_RAN) != EXPECTED_ARMS:
+        ok = False
+        print("check-doc-census --selftest: ARM COUNT %d, expected %d -- an arm was added or lost; EXPECTED_ARMS is "
+              "the ratchet" % (len(_RAN), EXPECTED_ARMS))
+    print("check-doc-census --selftest: %s (%d arm(s))" % ("PASS" if ok else "FAIL", len(_RAN)))
     return EXIT_OK if ok else EXIT_DISAGREE
 
 
@@ -1042,7 +1098,7 @@ def _rot(label, root, want_refused, says=None):
     print("  %-34s %s %s" % (label, got, "OK" if good else "FAIL"))
     if not good:
         print("      says: %s" % text[:900])
-    return good
+    return _count(good)
 
 
 def _claim_rot_arms(tmp):
@@ -1107,11 +1163,54 @@ def _claim_rot_arms(tmp):
     _say(root, "sqlite uses %s only." % " ".join(fill[:edge + 1]))
     ok &= _rot("40 WINDOW-PAST-EDGE-PASSES", root, False)
 
-    # 41 + 42 -- the clause's own collapses: no config document read, and one it cannot read.
+    # 41 + 41b + 42 -- the clause's own collapses: no config document read; a PARTIAL collapse (fewer than the
+    #                  floor, more than none -- at the old floor of 1 this arm passed clean, which is what reds a
+    #                  floor lowered back); and one it cannot read.
     shutil.rmtree(os.path.join(root, CLAIM_ROT_ROOT))
     ok &= _rot("41 NO-CONFIG-COLLAPSES", root, "read 0 config document(s)")
+    for i in range(CLAIM_ROT_PARTIAL_DOCS):
+        _say(root, _NEUTRAL_PROSE, rel="shippedLibs/neutral/n%02d.json" % i)
+    ok &= _rot("41b PARTIAL-COLLAPSE-COLLAPSES", root, "read %d config document(s)" % CLAIM_ROT_PARTIAL_DOCS)
     _say(root, None, doc='{"$comment": "a truncated document"')
     ok &= _rot("42 CONFIG-NOT-JSON-COLLAPSES", root, "is not JSON")
+
+    # 43 -- `.gitignore` READ AS GIT READS IT: an anchored entry skips that one directory, a bare name skips that
+    #       name at any depth, and a directory merely NAMED like an anchored entry's last segment is still read.
+    anch = _fixture(tmp, "claimrot-anchor")
+    _write(os.path.join(anch, ".gitignore"), "/src/dss-config/x/dist/\nscratch/\n")
+    _say(anch, _CR_BARE, rel="y/dist/claim.json")
+    _say(anch, _CR_BARE, rel="x/dist/skip.json")
+    _say(anch, _CR_BARE, rel="z/scratch/skip.json")
+    try:
+        _docs, _s, refused = claim_rot_findings(anch)
+        got = sorted(r[0] for r in refused)
+    except Collapse as e:
+        got = ["COLLAPSE: %s" % e]
+    anchored_ok = got == ["src/dss-config/y/dist/claim.json"]
+    print("  %-34s %s" % ("43 ANCHORED-IGNORE-SKIPS-ONE-DIR", "OK" if anchored_ok else "FAIL: %r" % got))
+    ok &= _count(anchored_ok)
+
+    # 44-52 -- THE ESCAPES THE ROUND-12 AUDIT CALLED BROAD, each now a REFUSAL (arms 29, 30, 33 and 35 are their
+    #          green controls: a real pin, a real revision, a reported history, a noun after an article).
+    esc = _fixture(tmp, "claimrot-escapes")
+    for label, sentence in (
+            ("44 RELATIVE-THAT-IS-NO-ARTICLE", "sqlite has one header that uses only `_IOWR`."),
+            ("45 BACKTICKED-CORPUS-WORD", "`os_unix.c` uses only `_IOWR`."),
+            ("46 POSSESSIVE-CORPUS-WORD", "SQLite's shell uses only `_IOWR`."),
+            ("47 PATH-CORPUS-WORD-BY-BASENAME", "src/os_unix.c uses only `_IOWR`."),
+            ("48 EMPHASIZED-CORPUS-WORD", "**sqlite** uses only `_IOWR`."),
+            ("49 INCLUDE-IS-A-USAGE-VERB", "sqlite doesn't include this header."),
+            ("50 HISTORY-AFTER-THE-CLAIM", "sqlite uses only `_IOWR`; an earlier revision said otherwise."),
+            ("51 BARE-VERIFIED-IS-NO-PIN", "sqlite uses only `_IOWR` (verified 2026-09-24)."),
+            ("52 DIGITS-ARE-NO-REVISION", "sqlite uses only `_IOWR` (✔MEASURED 20260924)."),
+            ("53 NEGATED-MEASURED-IS-NO-PIN", "sqlite uses only `_IOWR` (NOT MEASURED 2026-09-24).")):
+        _say(esc, sentence)
+        ok &= _rot(label, esc, True)
+    # 54 + 55 -- the repository's other markers ARE pins (the green halves of 51-53).
+    _say(esc, "sqlite uses only `_IOWR` (MEASURED 2026-09-24).")
+    ok &= _rot("54 CAPITAL-MEASURED-DATE-PASSES", esc, False)
+    _say(esc, "sqlite uses only `_IOWR`, re-measured against a790e273e2.")
+    ok &= _rot("55 RE-MEASURED-REVISION-PASSES", esc, False)
     return ok
 
 
@@ -1145,7 +1244,7 @@ def _source_provider_arms(tmp):
               % (name, p.returncode, expect_rc, "OK" if good else "FAIL"))
         if not good:
             print("      says: %s" % out.strip().replace("\n", "\n      ")[:600])
-        return good
+        return _count(good)
 
     # 26 -- the CONTROL first: a declaration that resolves must report the real count,
     #       so arm 27's red cannot be "the provider is broken".

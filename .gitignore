@@ -80,6 +80,15 @@
 # Provenance + md5s are in the example's `expected.json`.
 !tests/link/data/*.a
 
+# ★ COFF OBJECT fixtures (P69 round 4, D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE), the same negation for the
+# same reason, one extension on: `examples/c/pe_foreign_directive_entry` links a PREBUILT cl `/c` object NAMED to
+# the link -- an object input, whose `/ENTRY:` counts as link.exe counts one on its command line -- which no archive
+# can stand in for (a member the archive search pulls names no entry). Without this line the fixture is
+# un-committable and reaches no host's copy: ✔MEASURED 2026-10-07, the arm64 VPS leg's in-process runner failed that
+# example with "is not a regular file" while the archive-fed examples beside it passed. Scoped to this one directory
+# on purpose; provenance + md5 in the example's `expected.json`.
+!tests/link/data/*.obj
+
 # Executables
 *.exe
 *.out
@@ -123,6 +132,18 @@ tmp_probe/
 # scripts) — working files, never committed. (Prefer the out-of-repo session
 # scratchpad; this catches anything that lands here anyway.)
 scratchpad/
+# Editor working files (2026-10-01, cycle P69, lane hm). DssHarness carries every UNIGNORED file of the tree to a
+# remote leg's copy, tracked or not, and one that changes while a run goes makes that run's remote legs
+# `inputs-moved` (repo-harness's consumer note names an editor's swap file as the case) -- these change constantly
+# and are never source: Vim's swap files (`.<name>.swp`, or `_<name>.swp` on Windows, and `.swp` for a buffer with no
+# name -- the leading `.` or `_` is the swap file's own, so no source file named `*.swp` is caught), an editor's backup
+# copies, Visual Studio's and VS Code's own state at the root. ✔MEASURED that day: none is tracked, and none was
+# ignored.
+[._]*.sw[a-p]
+[._]sw[a-p]
+*~
+/.vs/
+/.vscode/
 # DSS CLI default output dir (target-spec-named subdirs of compiled binaries
 # from ad-hoc `dsscp <src>` runs; not a build-system dir).
 target/

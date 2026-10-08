@@ -1,0 +1,27 @@
+{
+  "$comment": "★★ A DIRECTIVE NO REFERENCE LINKER HONOURS IS WARNED AND IGNORED (P69 round 4, review-xa3 MINOR 3; D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE). The archive's one member is cl 19.44's `/c /O2 /MD /GS-` build of `#pragma comment(linker, \"/LARGEADDRESSAWARE\") int dss_warned_member(void) { return 42; }`. ✔MEASURED 2026-10-07 (`.orchestrators/p69/work/xa/r4fix/fix.log`): the same main.c built by cl and linked against this archive runs to 42 under link.exe 14.44, which warns `LNK4229: invalid directive '/LARGEADDRESSAWARE' encountered; ignored`; lld-link 19.1.5 refuses it ('not allowed in .drectve'), and GNU ld warns an option it does not recognize and links. Acceptance is the union's: a DSS link warns, `K_LinkerDirectiveIgnored`, and links. Before round 4 such an option was refused by name. The `release` arm pins that the warning is the link's, not the optimizer's.",
+  "$commentRedOnDisable": "REMOVE direction, executed 2026-10-07 (lane `xa`, ledger id `r4-UNLISTED4`): in `parseCoffLinkerDirectives` (`src/link/format/coff_linker_directives.hpp`), the warning for an option the vocabulary does not list becomes a refusal again (`out.warnings.push_back(std::format(` becomes `return std::unexpected(std::format(`, round 3's rule). Built and run through ctest by one harness call, source md5 4a525ccb -> 832679f9 -> 4a525ccb, run 20261007-092836-67a4c4c3 (windows-x86_64-debug): this example RED in BOTH runners, with `CoffLinkerDirectives.AnOptionNoReferenceHonoursIsWarnedAndHandedOn`, `.TheReaderHandsAnUndeclaredDirectiveAndAForeignNameToTheLink` and `CoffDirectiveImageRequests.RefusedByAnImageHandedOnByAnObject`. CONTROL: the restored bytes, green in the row's final runs.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectWarnings": [
+    { "code": "K_LinkerDirectiveIgnored", "line": 0, "col": 0, "positioned": false }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "cl 19.44 `/c /O2 /MD /GS-` + llvm-ar 19.1.5 `rcs --format=gnu` (member md5 a11ad6c32e3a0704adc7cf4ccf38d1e0, archive md5 d30c95d12d87c1f5fecbe73efeca434c). The witness is the directive itself.",
+          "path": "tests/link/data/libpe_directive_warned_x86_64_pe.a",
+          "containerWitness": "/LARGEADDRESSAWARE"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

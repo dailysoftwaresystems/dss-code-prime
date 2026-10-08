@@ -7,6 +7,7 @@
 #include "core/types/strong_ids.hpp"               // TypeId (HirAddressValue.pointeeType)
 
 #include <cstdint>
+#include <optional>  // HirAggregateValue::unionMember
 #include <string>
 #include <utility>   // std::pair — the iterative copy's (source, destination) work list
 #include <variant>
@@ -50,6 +51,14 @@ struct HirLiteralValue;
 // the time anything constructs or reads an aggregate value.
 struct HirAggregateValue {
     std::vector<HirLiteralValue> fields;
+    // P69 (lane `cs`, D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED): a UNION
+    // value's one field is the member its initializer made current, and this names WHICH
+    // member (its index among the union's variants) — the field's TYPE cannot, since two
+    // members may share one (`union { int a; int b; }`). Set by the evaluator from a union
+    // `ConstructAggregate`'s payload; ABSENT on a value whose member is not known (every
+    // non-union value, and a union value no producer named), and a member read of such a
+    // value is not a constant. FOLD-TRANSIENT: not serialized with a pooled literal.
+    std::optional<std::uint32_t> unionMember;
 
     // ★★★ THE TEARDOWN IS PART OF THE WALK, AND IT WAS THE ONE WALK NOBODY
     // WROTE — D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED
@@ -190,6 +199,7 @@ inline HirAggregateValue::HirAggregateValue(HirAggregateValue const& other) {
     while (!pending.empty()) {
         auto const [src, dst] = pending.back();
         pending.pop_back();
+        dst->unionMember = src->unionMember;
         dst->fields.reserve(src->fields.size());   // no reallocation below
         for (HirLiteralValue const& f : src->fields) {
             HirLiteralValue& d = dst->fields.emplace_back();

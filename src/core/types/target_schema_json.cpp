@@ -4578,7 +4578,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // instances carry the most `$...Comment` prose keys - which is
                 // exactly why the carve-out lives in `rejectUnknownKeys` as a
                 // PREFIX test rather than a literal `"$comment"` entry.
-                static constexpr std::array<std::string_view, 28> kCallConvKeys{
+                static constexpr std::array<std::string_view, 27> kCallConvKeys{
                     "name",
                     "argGprs", "argFprs", "returnGprs", "returnFprs",
                     "callerSaved", "calleeSaved",
@@ -4587,7 +4587,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     // per register class. Absent ⇒ the whole register.
                     "calleeSavedPreservedBits",
                     "stackAlignment", "shadowSpaceBytes", "redZoneBytes",
-                    "entryStackPointerBias", "callPushBytes",
+                    // ★ `entryStackPointerBias` IS DELIBERATELY ABSENT, so a
+                    // document still declaring it is REFUSED AT LOAD: the
+                    // process-entry bias is derived from the exec format's
+                    // `entryTransition` and `callPushBytes`, and a convention
+                    // carrying its own would be a second owner
+                    // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
+                    "callPushBytes",
                     "stackProbePageBytes", "aggregateMaxRegBytes",
                     "aggregateClassification", "slotAligned",
                     "variadicArgsAlwaysStack",
@@ -4776,19 +4782,15 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readBoundedInt(c, coll, ccPath, "stackAlignment",   cc.stackAlignment);
                 readBoundedInt(c, coll, ccPath, "shadowSpaceBytes", cc.shadowSpaceBytes);
                 readBoundedInt(c, coll, ccPath, "redZoneBytes",     cc.redZoneBytes);
-                // D-LK10-ENTRY-TRAMP-PROLOGUE: process-entry RSP bias
-                // when this cc is the entry cc. See target_schema.hpp
-                // for the per-cc concrete values. Validated below
-                // (must be < stackAlignment when set).
-                readBoundedInt(c, coll, ccPath, "entryStackPointerBias",
-                               cc.entryStackPointerBias);
                 // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: ISA-level
                 // call-instruction RSP-push width. x86_64 = 8 (CALL
                 // pushes 8-byte return address); ARM64 = 0 (BL writes
                 // LR, no push). Validated below: must be strictly <
                 // `stackAlignment` (the bias is an OFFSET into the
-                // alignment quantum, parallel to `entryStackPointerBias`'s
-                // contract).
+                // alignment quantum). Also the entry trampoline's
+                // process-entry bias wherever the exec format's
+                // `entryTransition` says the loader CALLS the entry
+                // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
                 readBoundedInt(c, coll, ccPath, "callPushBytes",
                                cc.callPushBytes);
                 // D-WIN64-LARGE-FRAME-STACK-PROBE: OS stack guard-page

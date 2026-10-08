@@ -1,0 +1,22 @@
+{
+  "$comment": "★★ WHAT A DSS IMAGE CANNOT CARRY IS REFUSED BY NAME (P69 round 4, D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE). The archive's one member is cl 19.44's `/c /O2 /MD /GS-` build of `#pragma comment(linker, \"/MERGE:.rdata=.text\")`, a `/manifestdependency:` on the common controls version 6, and `int dss_unhonourable_member(void) { return 42; }`. ✔MEASURED 2026-10-07 (`.orchestrators/p69/work/xa/r4fix/fix.log`): the same main.c built by cl and linked against this archive runs to 42 under link.exe 14.44 and lld-link 19.1.5 -- both merge `.rdata` into `.text`, which makes const data executable, and both embed the dependency in the image's manifest. A DSS image lays its sections out in its writer's fixed order and carries no manifest, so the image link refuses each request by name, with the reason its vocabulary row states: two `K_LinkerDirectiveUnhonourable`. A RELOCATABLE artifact holding the same member hands both on verbatim (`CoffDirectiveImageRequests.RefusedByAnImageHandedOnByAnObject`). NO `optimizedPipelines` ARM: a refusal builds no artifact for an optimized arm to differ from.",
+  "$commentRedOnDisable": "REMOVE direction, executed 2026-10-07 (lane `xa`, ledger id `r4-REFUSED`): in `decideUnitLinkerRequests` (`src/link/unit_linker_decisions.cpp`), the arm for a `refused` row's request returns before it refuses (`if constexpr (std::is_same_v<R, UnitUnhonourableRequest>) {` gains `if (true) return;`), so the image link drops `/MERGE:` and `/manifestdependency:` without a word, as HEAD's reader skipped them. Built and run through ctest by one harness call, source md5 fa050299 -> d5e10320 -> fa050299, run 20261007-102043-86b69904 (windows-x86_64-debug): this example RED in BOTH runners (the program links and its diagnostic set is empty), `CoffDirectiveImageRequests.RefusedByAnImageHandedOnByAnObject` with it. CONTROL: the restored bytes, green in the row's final runs.",
+  "language": "c",
+  "source": "main.c",
+  "expectDiagnostics": [
+    { "code": "K_LinkerDirectiveUnhonourable", "line": 0, "col": 0, "positioned": false },
+    { "code": "K_LinkerDirectiveUnhonourable", "line": 0, "col": 0, "positioned": false }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "prebuiltLibraries": [
+        {
+          "$comment": "cl 19.44 `/c /O2 /MD /GS-` + llvm-ar 19.1.5 `rcs --format=gnu` (member md5 2f3e2020e7e398073d4027ca1ba340fe, archive md5 4a6fc37177e8241c888404443fbe7102). The witness is the merge directive.",
+          "path": "tests/link/data/libpe_directive_unhonourable_x86_64_pe.a",
+          "containerWitness": "/MERGE:.rdata=.text"
+        }
+      ]
+    }
+  ]
+}

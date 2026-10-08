@@ -14,8 +14,8 @@ Body prose outside the markers is hand-written and never touched. Rows
 without an opening marker are opt-out — left untouched.
 
 Usage:
-    py .harness-config/runner/actions/refresh_landing_log/refresh_landing_log.py --check   # CI gate; exits non-zero on drift
-    py .harness-config/runner/actions/refresh_landing_log/refresh_landing_log.py --write   # apply rewrite in place
+    dssharness run refresh_landing_log                 # the self-test, the unit tests, then --check
+    dssharness run refresh_landing_log-write           # --write: apply the rewrite in place (this machine's tree)
 
 Configuration in `.harness-config/runner/actions/refresh_landing_log/landing-log-config.json` lists which plan files
 have landing logs and what commit-subject pattern matches PR landings.
@@ -466,24 +466,20 @@ def main() -> int:
         help="prove this tool reads the history of the tree it lives in, whatever git "
              "environment the caller exported (ctest: landing_log_git_environment_guard)",
     )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=CONFIG_PATH,
-        help="path to landing-log-config.json (default: .harness-config/runner/actions/refresh_landing_log/landing-log-config.json)",
-    )
     args = parser.parse_args()
     if args.self_test:
         return self_test()
 
-    plans = load_config(args.config)
+    plans = load_config(CONFIG_PATH)
     all_subjects = git_log_subjects()
 
     drift = False
+    missing = updated = 0
     for spec in plans:
         if not spec.path.exists():
             print(f"missing plan file: {spec.path}", file=sys.stderr)
             drift = True
+            missing += 1
             continue
         original, new = process_plan(spec, all_subjects)
         if original == new:
@@ -500,6 +496,7 @@ def main() -> int:
         if args.write:
             spec.path.write_text(new, encoding="utf-8")
             print(f"updated: {spec.path}")
+            updated += 1
 
     if drift and args.check:
         print("\nLanding-log hashes are out of date. Run with --write to regenerate.",
@@ -512,6 +509,14 @@ def main() -> int:
     if args.check:
         print(f"refresh_landing_log: --check OK ({len(plans)} plan file(s), every "
               f"landing-log marker current)")
+    if args.write:
+        # ★ A MISSING PLAN FILE FAILS THE WRITE TOO (2026-09-30): it used to print its name and exit 0, so a
+        # rewrite that skipped a plan read exactly like one that covered every plan.
+        if missing:
+            print(f"refresh_landing_log: --write FAILED -- {missing} configured plan file(s) missing (above)",
+                  file=sys.stderr)
+            return 1
+        print(f"refresh_landing_log: --write OK ({len(plans)} plan file(s), {updated} updated)")
     return 0
 
 

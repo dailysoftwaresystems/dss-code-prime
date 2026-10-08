@@ -110,7 +110,7 @@ scratch box a consumer builds its fixtures in. This file's `--self-test` proves 
 answer and proves the arms themselves can fail.
 
 Usage:
-    python .harness-config/runner/actions/owning-tree/owning-tree.py --self-test
+    dssharness run owning-tree      # its one step: --self-test (and ctest's owning_tree_selftest_guard)
 Exit codes: 0 OK · 1 self-test failed · 3 usage.
 """
 from __future__ import annotations

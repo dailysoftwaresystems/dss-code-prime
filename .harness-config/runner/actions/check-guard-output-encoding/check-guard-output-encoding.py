@@ -101,11 +101,11 @@ is disclosed by name on every run so no reader has to rediscover it.
 Exit codes: 0 OK · 1 a subject is unprotected, or an inventory entry is stale ·
 2 the scan collapsed (structural: fix the scan, never lower the floor) · 3 usage.
 
-Usage:
-    python .harness-config/runner/actions/check-guard-output-encoding/check-guard-output-encoding.py
-    python .harness-config/runner/actions/check-guard-output-encoding/check-guard-output-encoding.py --list
-    python .harness-config/runner/actions/check-guard-output-encoding/check-guard-output-encoding.py --write
-    python .harness-config/runner/actions/check-guard-output-encoding/check-guard-output-encoding.py --self-test
+Usage -- each a step of the action, the program's own flag after the `#`:
+    dssharness run check-guard-output-encoding                           # verify, then the self-test
+    dssharness run check-guard-output-encoding --manual-step list        # --list
+    dssharness run check-guard-output-encoding-write                     # --write, this machine's own tree
+    dssharness run check-guard-output-encoding --manual-step self-test   # --self-test
 The no-argument form verifies the tree AND runs the self-test, honouring both
 statuses -- a ctest entry that passes no flag must not be able to execute zero
 arms (a nonfatal guard degrades to a vacuous pass).
@@ -774,6 +774,7 @@ def main(argv):
                 print("  %-58s %-11s %s"
                       % (rel, verdict,
                          ", ".join(os.path.basename(c) for c in callers) or "-"))
+            print("guard-output-encoding: %d subject(s) listed" % len(subs))
             return EXIT_OK
         if "--write" in argv[1:]:
             return write_inventory(root, subs, load_inventory(root))

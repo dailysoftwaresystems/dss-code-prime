@@ -4,17 +4,51 @@ description: >-
   The action compiles the fixed kit with this leg's RELEASE dsscp and reports where the time went.
   The program documents itself in its own header; this file declares only how a
   runner starts it and what witnesses that it ran.
-inputs:
-  kit:
-    description: 'a materialized kit directory (profile-compile-support.py kit)'
-    required: true
-  target:
-    description: 'the ONE target every leg compiles, so the host is the only variable'
-    default: 'x86_64:elf64-x86_64-linux-exec'
 steps:
   - name: profile
     workingDirectoryRoot: action
+    inputs:
+      kit:
+        description: 'a materialized kit directory -- the `kit` step makes one -- relative to the tree'
+        required: true
+      target:
+        description: 'the ONE target every leg compiles, so the host is the only variable'
+        default: 'x86_64:elf64-x86_64-linux-exec'
+      jobs:
+        description: 'the gcc reference parallelism (the operator ruling of 2026-08-25: 6 cores)'
+        default: '6'
+      gccReference:
+        description: 'true also times gcc over the same TUs from the same manifest'
+        default: 'false'
+      # The yardstick's knobs (2026-10-01): stated here once, the values every quoted measurement used.
+      referenceCc:
+        description: 'the yardstick compiler, with gccReference true'
+        default: 'gcc'
+      referenceOpt:
+        description: 'its optimization flag'
+        default: '-O2'
+      referenceLinkLibs:
+        description: 'its link libraries, one value'
+        default: '-lz -lm -lpthread -ldl'
     run: |
-      python3 ./profile-compile.py --kit {kit} --target {target} --label {leg} --no-build --build-dir {buildDir}
+      python3 ./profile-compile.py --kit {kit} --target {target} --label {leg} --no-build --build-dir {buildDir} --out build/perf/{leg} --jobs {jobs} --gcc-reference {gccReference} --reference-cc {referenceCc} --reference-opt {referenceOpt} --reference-link-libs "{referenceLinkLibs}"
     successPattern: 'PROFILE-LEG-OK '
+    requireInputsUnmoved: true
+
+  # The KIT a profile compiles: a relocatable copy of a real manifest's sources, kept as this step's output
+  # (a directory, kept whole). Run at the tree's root, so the manifest and every root are tree paths.
+  - name: kit
+    manual: true
+    inputs:
+      manifest:
+        description: 'a real .dss-project.json, relative to the tree'
+        required: true
+      roots:
+        description: 'NAME=PATH items separated by ;, each a directory every manifest path must fall under'
+        required: true
+    run: |
+      python3 .harness-config/runner/actions/profile-compile/profile-compile-support.py kit --manifest {manifest} --root {roots} --out {stepBuild}/kit
+    outputs: [kit]
+    persist: true
+    successPattern: '^kit: \d+ sources, '
     requireInputsUnmoved: true

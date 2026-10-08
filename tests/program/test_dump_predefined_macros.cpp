@@ -826,13 +826,13 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
 // emits round-trips back to its enumerator, so the printed word is always a word
 // an operator can write into a config.
 TEST(DumpPredefinedMacros, EveryKindNameRoundTripsToItsEnumerator) {
-    constexpr std::array<PredefinedMacroKind, 11> kAll{
+    constexpr std::array<PredefinedMacroKind, 12> kAll{
         PredefinedMacroKind::Line, PredefinedMacroKind::File,
         PredefinedMacroKind::Constant, PredefinedMacroKind::Date,
         PredefinedMacroKind::Time, PredefinedMacroKind::Counter,
         PredefinedMacroKind::TypeSize, PredefinedMacroKind::TypeUnsigned,
         PredefinedMacroKind::TypeName, PredefinedMacroKind::TypeLimit,
-        PredefinedMacroKind::TypeSuffix};
+        PredefinedMacroKind::TypeSuffix, PredefinedMacroKind::TypeFormat};
     for (PredefinedMacroKind const k : kAll) {
         auto const name = predefinedMacroKindName(k);
         EXPECT_FALSE(name.empty());
@@ -860,6 +860,9 @@ TEST(DumpPredefinedMacros, EveryKindNameRoundTripsToItsEnumerator) {
               predefinedMacroKindName(PredefinedMacroKind::TypeLimit));
     EXPECT_NE(predefinedMacroKindName(PredefinedMacroKind::TypeLimit),
               predefinedMacroKindName(PredefinedMacroKind::TypeSuffix));
+    // P69 (M4): the format kind states a fourth fact about the same `type` key.
+    EXPECT_NE(predefinedMacroKindName(PredefinedMacroKind::TypeFormat),
+              predefinedMacroKindName(PredefinedMacroKind::TypeName));
     EXPECT_FALSE(predefinedMacroKindFromName("version").has_value())
         << "`version` is a LOAD-time lowering to Constant, not a runtime kind — "
            "a table row for it would claim a kind the engine cannot hold";

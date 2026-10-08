@@ -1394,8 +1394,9 @@ TEST(MirVerifier, QualifiedButDistinctPointeesStillRejected) {
 // conversion). So pointee identity at a call operand is not a MIR invariant
 // after optimization. Both directions are admitted: a `void*` ARGUMENT (the
 // Mem2Reg shape) and a `void*` PARAMETER (every synthesis pass spells an opaque
-// OS/CRT handle that way — synth_threads_shim passes `&__dss_once_tramp`, a
-// `ptr<FnSig>`, into InitOnceExecuteOnce's `void*`-declared slot).
+// OS/CRT handle that way, and a function's address handed to such a slot is a
+// `ptr<FnSig>` meeting `void*` — the shape synth_threads_shim's pe call_once passed
+// InitOnceExecuteOnce until P69 moved call_once to runtime source).
 TEST(MirVerifier, VoidPointerOnEitherSideIsCompatible) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i8     = in.primitive(TypeKind::I8);
@@ -1404,7 +1405,7 @@ TEST(MirVerifier, VoidPointerOnEitherSideIsCompatible) {
     TypeId const pVoid  = in.pointer(voidTy);
     TypeId const pI8    = in.pointer(i8);
     // param 0 = `va_list` (ptr<i8>) fed a ptr<void>; param 1 = ptr<void> fed a
-    // ptr<FnSig> (a function address, the once-trampoline shape).
+    // ptr<FnSig> (a function address in an opaque slot).
     std::array<TypeId, 2> const ps{pI8, pVoid};
     TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
     TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
@@ -1613,7 +1614,8 @@ TEST(MirVerifier, AQualifiedVoidParameterDoesNotEndTheOperandList) {
 }
 
 // Positive: an INDIRECT call — the callee is a register value (here an `Arg`
-// holding a function pointer, the synth_threads_shim once-adapter shape) — has
+// holding a function pointer, what a C call through a function-pointer
+// parameter lowers to; synth_threads_shim's call_once adapter had it until P69) — has
 // NO static callee, so there is no signature to check against. It must be
 // skipped CLEANLY, never flagged. Its operands deliberately match no signature.
 TEST(MirVerifier, IndirectCallWithNoStaticCalleeIsSkipped) {

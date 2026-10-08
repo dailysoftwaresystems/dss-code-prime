@@ -360,6 +360,22 @@ spellPredefinedType(std::span<PredefinedTypeSpelling const> spellings,
     return std::nullopt;
 }
 
+// Declared in `core/types/preprocess_config.hpp` (P69, M4). A plain scan, for the
+// reason `spellPredefinedType` is one: the load already refused two entries whose
+// types share an identity on any data model, so at most one entry can match.
+std::optional<std::string_view>
+formatModifierFor(std::span<PredefinedTypeFormatModifier const> modifiers,
+                  PredefinedTypeIdentity const& identity, DataModel dm) noexcept {
+    for (PredefinedTypeFormatModifier const& m : modifiers) {
+        for (PredefinedTypeSpelling const& t : m.types) {
+            if (t.resolved && t.identityUnder(dm) == identity) {
+                return std::string_view{m.modifier};
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 namespace detail {
 
 using json = nlohmann::json;
@@ -408,6 +424,9 @@ constexpr std::string_view kVersionKindName             = "version";
 // build-invariant, so an enum row would name a kind no expansion path ever sees.
 constexpr std::string_view kModelLimitKindName          = "model-limit";
 constexpr std::string_view kModelLimitKey               = "limit";
+// P69 (M4): a `type-format` row's CONVERSION letter — one of
+// `kTypeFormatConversions` (preprocess_config.hpp), refused by name elsewhere.
+constexpr std::string_view kTypeFormatConversionKey     = "conversion";
 
 // The model limits a `model-limit` row may name — a CLOSED vocabulary, each
 // spelling bound to the C++ constant that owns its value
@@ -472,7 +491,7 @@ DSS_CHECK_KEY_VOCABULARY(kSizedTypeObjectArmKeys);
 // the array is built (`namesWhere<M>`), so a new type-naming kind fails the build
 // here rather than leaving the sentence a lie.
 constexpr auto kTypeNamingKindNames =
-    namesWhere<5>(kPredefinedMacroKindTable, predefinedMacroKindNamesAType);
+    namesWhere<6>(kPredefinedMacroKindTable, predefinedMacroKindNamesAType);
 
 // Every key a `type` object may hold: the arms, and the one companion.
 constexpr std::array<std::string_view, 5> kSizedTypeObjectKeys{
@@ -609,10 +628,12 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
         {
             // 8 -> 9 (P68 round 8): `type`, the `type-size` kind's TYPE.
             // 9 -> 10 (P68 round 8): `limit`, the `model-limit` kind's LIMIT.
-            static constexpr std::array<std::string_view, 10> kMacroEntryKeys{
+            // 10 -> 11 (P69, M4): `conversion`, the `type-format` kind's LETTER.
+            static constexpr std::array<std::string_view, 11> kMacroEntryKeys{
                 "name", "kind", "value", "params", "componentWeights",
                 "availableObjectFormats", "impliedSurface",
-                kProgramRedefinitionKey, kSizedTypeKey, kModelLimitKey};
+                kProgramRedefinitionKey, kSizedTypeKey, kModelLimitKey,
+                kTypeFormatConversionKey};
             DSS_CHECK_KEY_VOCABULARY(kMacroEntryKeys);
             // The allowed list is RENDERED FROM THE TABLE by the shared check,
             // never retyped into the message — a hand-written list is one that
@@ -850,6 +871,47 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                                       PredefinedMacroKind::TypeLimit)));
             continue;
         }
+        // P69 (M4): `conversion` names a `type-format` row's LETTER — required
+        // there, from the closed `kTypeFormatConversions`, and refused on every
+        // other kind, where it would be read by nothing.
+        if (pm.kind == PredefinedMacroKind::TypeFormat) {
+            std::string const convPath =
+                std::format("{}/{}", mpath, kTypeFormatConversionKey);
+            std::string const accepted =
+                detail::renderAllowedList(kTypeFormatConversions, " / ");
+            if (!e.contains(kTypeFormatConversionKey)) {
+                coll.emit(DiagnosticCode::C_MissingField, convPath,
+                          std::format("a '{}' predefinedMacros entry requires '{}' — "
+                                      "the conversion its format string ends in (one "
+                                      "of {})",
+                                      predefinedMacroKindName(pm.kind),
+                                      kTypeFormatConversionKey, accepted));
+                continue;
+            }
+            json const& cv = e.at(kTypeFormatConversionKey);
+            bool known = false;
+            if (cv.is_string()) {
+                for (std::string_view const c : kTypeFormatConversions) {
+                    if (cv.get<std::string>() == c) known = true;
+                }
+            }
+            if (!known) {
+                coll.emit(entryCode, convPath,
+                          std::format("unknown integer conversion {} — accepted: {}",
+                                      cv.dump(), accepted));
+                continue;
+            }
+            pm.formatConversion = cv.get<std::string>();
+        } else if (e.contains(kTypeFormatConversionKey)) {
+            coll.emit(entryCode,
+                      std::format("{}/{}", mpath, kTypeFormatConversionKey),
+                      std::format("'{}' is valid only on a '{}' predefinedMacros "
+                                  "entry",
+                                  kTypeFormatConversionKey,
+                                  predefinedMacroKindName(
+                                      PredefinedMacroKind::TypeFormat)));
+            continue;
+        }
         // `componentWeights` belongs to the `version` kind alone. Silently
         // ignoring it elsewhere would let a typo'd `kind` ship a macro whose
         // declared encoding never ran.
@@ -880,6 +942,7 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                 case PredefinedMacroKind::TypeName:     return "spelling";
                 case PredefinedMacroKind::TypeLimit:    return "limit";
                 case PredefinedMacroKind::TypeSuffix:   return "integer-literal suffix";
+                case PredefinedMacroKind::TypeFormat:   return "printf/scanf format";
                 default:                                return "size";
             }
         };
@@ -1037,6 +1100,7 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                 if (chosen->source == PredefinedTypeSource::PointerTo
                     && (isTypeUnsigned || pm.kind == PredefinedMacroKind::TypeName
                         || pm.kind == PredefinedMacroKind::TypeSuffix
+                        || pm.kind == PredefinedMacroKind::TypeFormat
                         || (pm.kind == PredefinedMacroKind::TypeLimit
                             && pm.typeLimit != IntegerTypeLimit::Width))) {
                     coll.emit(entryCode,

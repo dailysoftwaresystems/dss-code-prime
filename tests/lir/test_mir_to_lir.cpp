@@ -781,6 +781,135 @@ TEST(MirToLir, NoExternAddrBindingKeepsAbsoluteLeaForExternValue) {
            "(capability-gated, not unconditional).";
 }
 
+// D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB (P69): a format may declare
+// BOTH `dataImportBinding: got-indirect` AND `externAddrBinding: got` — the ELF
+// DSO and every Mach-O image now do — and the combination is sound only because
+// `lowerGlobalAddr` takes the slot-indirect arm FIRST. A DATUM (in both sets)
+// must keep its image-bound slot (lea of the slot + a load), and a FUNCTION's
+// ADDRESS (only in the GOT set) must take `lea_extern_got`. Driven on BOTH
+// shipped targets, so x86_64's new `lea_extern_got` row (REX.W 8B, RIP-relative,
+// `gotriprel32_load`) is exercised as well as arm64's two-word macro.
+// RED-ON-DISABLE: swap the two arms' order → the datum takes the GOT macro.
+TEST(MirToLir, BothBindingsKeepADatumOnItsSlotAndSendAFunctionAddressToTheGot) {
+    for (char const* targetName : {"x86_64", "arm64"}) {
+        SCOPED_TRACE(targetName);
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
+        TypeId const sig =
+            interner.fnSig(std::span<TypeId const>{}, ptrT, CallConv::CcSysV);
+        // Two functions: `void *d(void) { return &datum; }` and
+        // `void *f(void) { return &func; }`, each GlobalAddr used as a VALUE.
+        MirBuilder mb;
+        SymbolId const datumSym{201};
+        SymbolId const funcSym{200};
+        mb.addFunction(sig, SymbolId{100});
+        MirBlockId const e0 = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e0);
+        mb.addReturn(mb.addGlobalAddr(datumSym, ptrT));
+        mb.addFunction(sig, SymbolId{101});
+        MirBlockId const e1 = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e1);
+        mb.addReturn(mb.addGlobalAddr(funcSym, ptrT));
+        Mir mir = std::move(mb).finish();
+
+        auto target = TargetSchema::loadShipped(targetName);
+        ASSERT_TRUE(target.has_value());
+        auto const leaOp = (*target)->opcodeByMnemonic("lea");
+        auto const gotOp = (*target)->opcodeByMnemonic("lea_extern_got");
+        ASSERT_TRUE(leaOp.has_value());
+        ASSERT_TRUE(gotOp.has_value())
+            << targetName << " must declare `lea_extern_got`";
+
+        std::vector<dss::ExternImport> externs;
+        dss::ExternImport datum;
+        datum.symbol      = datumSym;
+        datum.mangledName = "stdout";
+        datum.libraryPath = "libc.so.6";
+        datum.isData      = true;
+        externs.push_back(datum);
+        dss::ExternImport func;
+        func.symbol      = funcSym;
+        func.mangledName = "puts";
+        func.libraryPath = "libc.so.6";
+        func.isData      = false;
+        externs.push_back(func);
+
+        DiagnosticReporter rep;
+        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                               ExternCallDispatch::DirectPlt,
+                               DataImportBinding::GotIndirect,
+                               /*tlsAccess=*/std::nullopt,
+                               /*sehScopes=*/{},
+                               /*wideFloatSoftcallLibrary=*/std::nullopt,
+                               ExternAddrBinding::Got);
+        ASSERT_TRUE(lirR.ok);
+        Lir const& lir = lirR.lir;
+        auto const scan = [&](std::uint32_t fnIndex, std::uint32_t sym,
+                              bool& sawGot, bool& sawSlotLea) {
+            LirBlockId const bb = lir.funcBlockAt(lir.funcAt(fnIndex), 0);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+                LirInstId const inst = lir.blockInstAt(bb, i);
+                auto const ops = lir.instOperands(inst);
+                bool names = false;
+                for (auto const& o : ops) {
+                    if (o.kind == LirOperandKind::SymbolRef && o.symbolV == sym) {
+                        names = true;
+                    }
+                }
+                if (!names) continue;
+                if (lir.instOpcode(inst) == *gotOp) sawGot = true;
+                if (lir.instOpcode(inst) == *leaOp) sawSlotLea = true;
+            }
+        };
+        bool datumGot = false, datumLea = false, funcGot = false, funcLea = false;
+        scan(0, datumSym.v, datumGot, datumLea);
+        scan(1, funcSym.v, funcGot, funcLea);
+        EXPECT_TRUE(datumLea)
+            << "a DATUM keeps the slot the image binds for it: lea of the slot, "
+               "then a load (the slot-indirect arm, ordered first)";
+        EXPECT_FALSE(datumGot)
+            << "a DATUM must not take the GOT arm when the format also declares "
+               "got-indirect data";
+        EXPECT_TRUE(funcGot)
+            << "a FUNCTION's ADDRESS is loaded from a slot the link mints "
+               "(`lea_extern_got`), never taken as the image's own stub";
+        EXPECT_FALSE(funcLea)
+            << "no plain lea of the function: that would name the stub";
+        // A plain lea of the datum's symbol would also satisfy `datumLea`; the
+        // slot-indirect arm is told apart by the DEREF that follows it. Pinned
+        // as THE dataflow, not as an aggregate count of memory operands (P69
+        // review NIT: any helper's own memory access would have satisfied a
+        // count): a `load` AFTER the slot's lea whose BASE register is that
+        // lea's own result.
+        LirBlockId const datumBlock = lir.funcBlockAt(lir.funcAt(0), 0);
+        auto const loadOp = (*target)->opcodeByMnemonic("load");
+        ASSERT_TRUE(loadOp.has_value());
+        std::optional<LirReg> slotAddress;
+        bool readThroughTheSlot = false;
+        for (std::uint32_t i = 0; i < lir.blockInstCount(datumBlock); ++i) {
+            LirInstId const inst = lir.blockInstAt(datumBlock, i);
+            auto const ops = lir.instOperands(inst);
+            if (!slotAddress.has_value() && lir.instOpcode(inst) == *leaOp) {
+                for (auto const& o : ops) {
+                    if (o.kind == LirOperandKind::SymbolRef && o.symbolV == datumSym.v) {
+                        slotAddress = lir.instResult(inst);
+                    }
+                }
+                continue;
+            }
+            if (slotAddress.has_value() && lir.instOpcode(inst) == *loadOp && !ops.empty()
+                && ops[0].kind == LirOperandKind::Reg && ops[0].reg == *slotAddress) {
+                bool hasMemBase = false;
+                for (auto const& o : ops) hasMemBase = hasMemBase || o.kind == LirOperandKind::MemBase;
+                readThroughTheSlot = readThroughTheSlot || hasMemBase;
+            }
+        }
+        ASSERT_TRUE(slotAddress.has_value()) << "the datum's slot is reached by a lea";
+        EXPECT_TRUE(readThroughTheSlot)
+            << "the datum's slot is READ: a load whose base register is the slot lea's result";
+    }
+}
+
 // ─── FC1 (V2-4.X, 2026-06-10): SMod/UMod lowering + the role contract ──────
 
 namespace {

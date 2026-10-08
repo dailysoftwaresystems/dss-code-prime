@@ -582,3 +582,19 @@ target_include_directories(dss_analysis_semantic_test_generic_qualifier_axis
 # bit-field skipped — pinned over a synthetic type table, no front end in the way.
 dss_add_test(NAME analysis/semantic/test_initializer_cursor
              SOURCES test_initializer_cursor.cpp)
+
+# P69 (lane `cs`): a compound literal is an OBJECT — its const-ness, C23's storage-class
+# specifiers judged as the definition they stand for, and C23 6.6p6-p7's constants and
+# their members in integer constant expressions.
+dss_add_test(NAME analysis/semantic/test_compound_literal_objects
+             SOURCES test_compound_literal_objects.cpp)
+target_include_directories(dss_analysis_semantic_test_compound_literal_objects
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): the GNU builtins at
+# the semantic tier — which calls are integer constant expressions, which operands a builtin
+# requires to be constant or integral, and what a library builtin (`__builtin_strlen`) binds to.
+dss_add_test(NAME analysis/semantic/test_gnu_builtins
+             SOURCES test_gnu_builtins.cpp)
+target_include_directories(dss_analysis_semantic_test_gnu_builtins
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

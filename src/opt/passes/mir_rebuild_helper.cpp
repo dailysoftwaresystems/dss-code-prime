@@ -813,7 +813,9 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
             return;
         }
         case MirOpcode::Unreachable: {
-            MirInstId const newId = dst_.addUnreachable();
+            // P69: what the terminator asserts survives the rebuild.
+            MirInstId const newId = dst_.addUnreachable(
+                static_cast<MirUnreachableKind>(src_.instPayload(oldId)));
             remember(newId);
             return;
         }

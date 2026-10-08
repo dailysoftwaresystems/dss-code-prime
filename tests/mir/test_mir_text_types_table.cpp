@@ -315,7 +315,7 @@ TEST(MirTextTypesTable, ATypesEntryOrReferenceTheWriterCannotProduceIsRefusedByN
         {"an INLINE union in a module (v1's spelling)", "", "union \"U\" {i32}", "defined once in the `types`"},
     }};
     auto const wrap = [](char const* types, char const* ty) {
-        std::string s{"dssir 3\n"};
+        std::string s{"dssir 5\n"};
         if (*types != '\0') s += std::string{"types {\n"} + types + "}\n";
         s += "symbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : ";
         return s + ty + " = zero\n}\n";
@@ -349,7 +349,7 @@ TEST(MirTextTypesTable, AVersionOneTextIsRefusedByTheVersionCheck) {
     bool named = false;
     for (auto const& d : r.all())
         named = named || (d.code == DiagnosticCode::I_TextVersionMismatch
-                          && d.actual.find("expected version 3") != std::string::npos);
+                          && d.actual.find("expected version 5") != std::string::npos);
     EXPECT_TRUE(named);
 }
 

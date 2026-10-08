@@ -5,6 +5,7 @@
 #include "core/types/type_lattice/core_type.hpp"       // TypeKind, CallConv
 #include "core/types/type_lattice/type_interner.hpp"
 #include "ffi/mangling/c_mangle.hpp"   // applyCMangling (per-format CRT import names)
+#include "mir/merge/synth_symbol_floor.hpp"  // highestTakenSymbolIdV (the module's + the name table's ids)
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"   // rederiveStructCfMarkers (multi-block synth body)
@@ -58,33 +59,16 @@ void emitErr(DiagnosticReporter& rep, DiagnosticCode code, std::string msg) {
     rep.report(std::move(d));
 }
 
-// Max SymbolId.v across every defined function, every module GLOBAL, AND every
-// extern import — the floor for minting fresh synthetic symbols (mirrors the
-// entry-trampoline's maxExistingSymbolIdV, but at the MIR tier where there is no
-// AssembledModule).
-//
-// The globals scan is LOAD-BEARING, not defensive: the merged SymbolId space is
-// unified + monotonic, and synthetic string-literal globals are minted ABOVE every
-// function/extern id (compile_pipeline's `syntheticSymbolFloor`). So in a real
-// program (sqlite) the single HIGHEST SymbolId is almost always a global, not a
-// function. Omitting globals here (as the sibling entry_trampoline's maxExisting…
-// pointedly does NOT — it scans dataItems for exactly this reason) would let
-// synthetic symbols duplicate a real global's id, and the linker would silently
-// mis-bind the entry onto that DATA symbol — an entry that "runs" a string literal.
-[[nodiscard]] std::uint32_t
-maxSymbolIdV(Mir const& mir, std::vector<ExternImport> const& externs) {
-    std::uint32_t maxV = 0;
-    std::size_t const nf = mir.moduleFuncCount();
-    for (std::uint32_t i = 0; i < nf; ++i) {
-        maxV = std::max(maxV, mir.funcSymbol(mir.funcAt(i)).v);
-    }
-    std::size_t const ng = mir.moduleGlobalCount();
-    for (std::uint32_t i = 0; i < ng; ++i) {
-        maxV = std::max(maxV, mir.globalSymbol(mir.globalAt(i)).v);
-    }
-    for (auto const& e : externs) maxV = std::max(maxV, e.symbol.v);
-    return maxV;
-}
+// ⓘ THE MINT FLOOR IS `highestTakenSymbolIdV` (mir/merge/synth_symbol_floor.hpp), shared
+// with the SEH-funclet and threads-shim passes. Its module scan keeps this pass's old
+// reason for scanning GLOBALS — synthetic string-literal globals are minted ABOVE every
+// function/extern id (`syntheticSymbolFloor`), so a scan without them would let the init
+// duplicate a real global's id, and the linker would silently mis-bind the entry onto
+// that DATA symbol — an entry that "runs" a string literal. And it adds the caller's NAME
+// TABLE, which the old private scan could not see: the init is a GLOBAL definition the
+// lower half publishes under whatever name the table gives its id — ✔MEASURED P69 round 4,
+// an x86_64 Linux image of `int main(int argc, char **argv, char **envp)` carried this
+// init as `T __func__`.
 
 // ⓘ THE SIGNATURE CLASSIFIER AND THE DECLARED-SET RENDERER USED TO LIVE HERE
 // AND ARE DELIBERATELY GONE. This pass classified the resolved entry's MIR
@@ -135,6 +119,7 @@ bool realizeEntryShape(Mir&                              mir,
                        std::optional<ProcessArgs> const& processArgs,
                        CSymbolDecorationScheme           scheme,
                        std::string_view                  formatName,
+                       std::uint32_t                     nameTableEnd,
                        DiagnosticReporter&               reporter) {
     // No resolved entry (a library TU with no `main`) — nothing to gate and
     // nothing to materialize.
@@ -337,7 +322,7 @@ bool realizeEntryShape(Mir&                              mir,
     // Rebuild the module (Mir is frozen): clone every existing function verbatim,
     // then APPEND the synth function, then clone globals — the prune_unreachable
     // rebuild idiom. The mint floor is read BEFORE any import is appended.
-    std::uint32_t const maxV = maxSymbolIdV(mir, externImports);
+    std::uint32_t const maxV = highestTakenSymbolIdV(mir, externImports, nameTableEnd);
     SymbolId const synthSym{maxV + 1};
     MirBuilder builder;
     IdentityClonePolicy policy;

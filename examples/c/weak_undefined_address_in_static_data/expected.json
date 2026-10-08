@@ -1,0 +1,20 @@
+{
+  "$comment": "D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69, lane lm): the RUN witness for the ADDRESS of a weak symbol nothing defines taken in STATIC DATA -- `int *pwd = &wd;` and `void (*pwf)(void) = wf;` must both be NULL, and the control `int *ppresent = &present;` must not be (3 + 4 + 35 = 42; answering either weak pointer the other way adds 100). A static-data pointer names the symbol DIRECTLY (a relocation against the symbol, not a read through a slot), so it holds the symbol's VALUE, 0, which every image document answers for an ABSOLUTE field (`weakResolvedToNothing.absolute: zero`): the link writes 0 + A and leaves no load-time fix-up, in every image. MEASURED 2026-10-07 that the references run THIS program to 42 (dssharness probe-reference-cc, this file's code): gcc 13.3.0 + GNU ld 2.42 (-O0 -no-pie, -O2 -pie), clang 18 + ld.lld 18 (-O0 -no-pie, -O2 -pie) and clang 18 + lld-link on PE, run 20261007-081305-8067e92f; aarch64 gcc 13 + GNU ld (-O0 -no-pie, -O2 -pie), run 20261007-081354-4f1e0abe. BEFORE P69 the null SLOT an image gave a weak DATUM was the symbol itself, so `pwd` held the slot's own non-null address (MEASURED at the merged P69 tree: `int *p = &wd; return p == 0 ? 42 : 1;` linked on all five images and the pe64 program exited 1), and a weak FUNCTION was refused on every image, so `pwf` did not link at all. The darwin arms are built on every host and RUN on the macOS leg; on the x86_64 Linux leg the elf-x86_64 arms run natively and the elf-arm64 arms under qemu, and on the arm64 Linux leg the elf-arm64 arms run natively while the elf-x86_64 arms are skipped (that host declares no translation for them) -- MEASURED 2026-10-07 under the red-on-disable mutant below, which made exactly those arms exit 235 (run 20261007-092543-058ea781). The optimized arms are what prove no pass folds 'a declared object's address is never null' into the two tests. RED-ON-DISABLE: classify a data item's absolute pointer as a read through a slot (`classifyWeakNullReference` returning ThroughASlot for it -- the pre-P69 shape, where the null slot was the symbol) -> `pwd` and `pwf` hold the slot's address -> exit 235 (100 + 100 + 35).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "x86_64:elf64-x86_64-linux-pie", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:elf64-aarch64-linux-pie", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" },
+    { "spec": "x86_64:macho64-x86_64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

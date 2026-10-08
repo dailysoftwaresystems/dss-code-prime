@@ -62,7 +62,8 @@ def load_manifest(path):
 # the path rather than a file quietly missing from the kit.
 def cmd_kit(args):
     roots = []
-    for spec in args.root:
+    # `NAME=PATH` items separated by `;` (repeatable too) -- how the `kit` step hands its `roots` over.
+    for spec in [s.strip() for given in args.root for s in given.split(';') if s.strip()]:
         if '=' not in spec:
             die('--root wants NAME=PATH, got %r' % spec)
         name, path = spec.split('=', 1)
@@ -326,6 +327,13 @@ def cmd_timed_gate(args):
 # file list.
 # ✔MEASURED 2026-08-18 on WSL (x86_64), 103 TUs, gcc 13 -O2:
 #       -j1  21.5 s      -j32  4.8 s        (DSS on that host: 1m40.8 s)
+# ★ THE YARDSTICK'S KNOBS ARE THE `profile` STEP'S INPUTS (2026-10-01, the P69 review's NIT 7): the compiler,
+# its optimization flag and its link libraries arrive as `--cc`, `--opt` and `--link-libs`, REQUIRED -- the step
+# states their values once (`referenceCc` gcc, `referenceOpt` -O2, `referenceLinkLibs` -lz -lm -lpthread -ldl,
+# the values every measurement this project quotes was taken with), as compile-bench's knobs are its inputs.
+# (2026-09-30 had fixed them here as constants, because no caller passed them; a fixed knob is still a knob.)
+
+
 def cmd_gcc_reference(args):
     d = load_manifest(args.manifest)
     srcs = d['sources']
@@ -477,8 +485,8 @@ def main():
 
     p = sub.add_parser('kit', help='build a relocatable profiling kit')
     p.add_argument('--manifest', required=True, help='a real .dss-project.json')
-    p.add_argument('--root', action='append', default=[], metavar='NAME=PATH',
-                   help='declare a root every manifest path must fall under')
+    p.add_argument('--root', action='append', default=[], metavar='NAME=PATH[;NAME=PATH...]',
+                   help='declare the roots every manifest path must fall under')
     p.add_argument('--out', required=True)
     p.set_defaults(fn=cmd_kit)
 
@@ -503,9 +511,9 @@ def main():
     p.add_argument('--manifest', required=True)
     p.add_argument('--out', required=True)
     p.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
-    p.add_argument('--cc', default='gcc')
-    p.add_argument('--opt', default='-O2')
-    p.add_argument('--link-libs', default='-lz -lm -lpthread -ldl')
+    p.add_argument('--cc', required=True, help='the reference compiler (the step input referenceCc)')
+    p.add_argument('--opt', required=True, help='its optimization flag, as --opt=-O2 (referenceOpt)')
+    p.add_argument('--link-libs', required=True, help='its link libraries, one value (referenceLinkLibs)')
     p.set_defaults(fn=cmd_gcc_reference)
 
     p = sub.add_parser('agg-trace', help='aggregate a DSS_OPT_TRACE log')

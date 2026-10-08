@@ -603,7 +603,13 @@ struct MingwWitness {
 [[nodiscard]] MingwWitness mingwWitness(std::filesystem::path const& dir) {
     MingwWitness w;
     w.dir = dir;
+#if defined(_WIN32)
     if (std::system("where gcc >nul 2>&1") != 0) return w;
+#else
+    // `where` and `nul` are cmd.exe's: on a POSIX shell `>nul` creates a FILE
+    // named `nul` in the working directory (P69, found in passing).
+    return w;
+#endif
     std::filesystem::path probe;
     w.usable = w.build("toolchain_check.c", "int p(void){return 0;}\n", "-O0", probe);
     return w;

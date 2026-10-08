@@ -1,0 +1,27 @@
+{
+  "$comment": "★★ A MEMBER THE ARCHIVE SEARCH PULLS NAMES NO ENTRY (P69 round 4, D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE) -- a fork in what the program MEANS, decided by the format's vendor. The archive's one member is the object `examples/c/pe_foreign_directive_entry` names directly: cl 19.44's `/c /O2 /MD /GS-` build of `#pragma comment(linker, \"/ENTRY:dss_member_entry\") int dss_member_entry(void) { return 42; }`. ✔MEASURED 2026-10-07 (`.orchestrators/p69/work/xa/r4probe/m8/m8.log`, the same main.c built by cl): pulled from the archive, link.exe 14.44 starts the image in the C runtime's startup and `main` runs (7) -- link.exe fixes the entry before it searches an archive, so a member it pulls cannot move it (a member stating only `/SUBSYSTEM:WINDOWS` links under mainCRTStartup there too) -- and GNU ld 2.42 reads no MS `/ENTRY:` at all (7); lld-link 19.1.5 alone starts the member's function (42). A DSS link takes link.exe's answer and says so: the request is dropped with `K_LinkerDirectiveIgnored`, and `main` runs. The `release` arm pins that optimizing the DSS half changes nothing.",
+  "$commentRedOnDisable": "REMOVE direction, executed 2026-10-07 (lane `xa`, ledger id `r4-PULLENTRY`): in `pullStaticArchiveMembers` (`src/program/compile_pipeline.cpp`), `for (auto& member : pulled) linker::dropPulledMemberEntryRequests(member.linkerRequests);` becomes `for (auto& member : pulled) (void)member;`, so a member the archive search pulled keeps its `/ENTRY:` -- lld-link's answer, not link.exe's -- and the image starts in the member's function without a word. Built and run through ctest by one harness call, source md5 fd60be23 -> 042c9ac4 -> fd60be23, run 20261007-092311-d403dd26 (windows-x86_64-debug): this example RED in BOTH runners. CONTROL, in that run: `examples/c/pe_foreign_directive_entry` -- the same object NAMED to the link -- stayed GREEN in both runners; and the restored bytes are green in the row's final runs.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 7,
+  "expectWarnings": [
+    { "code": "K_LinkerDirectiveIgnored", "line": 0, "col": 0, "positioned": false }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "cl 19.44 `/c /O2 /MD /GS-` + llvm-ar 19.1.5 `rcs --format=gnu` (member md5 0faf02c1c4638168646d0fb44dbfa2e9, archive md5 566b460a2c678ef548cd7068fa3e9016). The witness is the directive itself.",
+          "path": "tests/link/data/libpe_directive_entry_x86_64_pe.a",
+          "containerWitness": "/ENTRY:dss_member_entry"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

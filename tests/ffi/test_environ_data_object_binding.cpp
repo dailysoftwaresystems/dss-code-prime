@@ -25,7 +25,9 @@
 //          `nm -D` and `objdump -T` concurring). A program's own declaration
 //          binds it through the GOT (`dataImportBinding: got-indirect`: the
 //          exec DEFINES NOTHING, so no spelling can split the object).
-//          `__environ` stays a row as well — glibc declares it unconditionally.
+//          `__environ` (which glibc declares unconditionally) and `_environ`
+//          are the row's elf `aliases` (P69: one row per object; the reader
+//          declares each alias as a row of its own name).
 //   macho  the same row: libSystem exports `_environ` (Mach-O's spelling of
 //          the C name); DSS binds it as a `__got` non-lazy pointer from
 //          libSystem, which is where Apple's own link binds it.
@@ -52,10 +54,10 @@
 //
 // So this file pins, each of which fails silently if edited:
 //
-//   (1) THE ROWS' SHAPE: `environ` and `__environ` are external DATA objects
-//       typed `char **` (`ptr<ptr<char>>`; any other depth reshapes every
-//       environ[i]); `environ` on EXACTLY {elf, macho}, `__environ` on EXACTLY
-//       {elf}. Widening either to pe plants a data import no Windows CRT
+//   (1) THE ROW'S SHAPE: `environ` is an external DATA object typed `char **`
+//       (`ptr<ptr<char>>`; any other depth reshapes every environ[i]) on
+//       EXACTLY {elf, macho}, with `__environ` and `_environ` its aliases on elf
+//       ONLY — never rows of their own. Widening any to pe plants a data import no Windows CRT
 //       exports: the loader refuses the binary (0xC0000139
 //       STATUS_ENTRYPOINT_NOT_FOUND) with no link error and no diagnostic
 //       naming the JSON, for every binary that references the name.
@@ -246,6 +248,18 @@ struct Realizations {
                 }
                 if (availableOn(resolvedAvailability(doc, row), fmt)) r.symbols.push_back(where);
             }
+            // P69: a row's `aliases` on `fmt` are declared names of that row's
+            // object (the reader appends a row for each), so they realize the
+            // name just as a row would.
+            for (auto const& row : doc.at("symbols")) {
+                if (!row.is_object() || !row.contains("aliases") || !row.at("aliases").is_object())
+                    continue;
+                auto const lst = row.at("aliases").find(std::string{fmt});
+                if (lst == row.at("aliases").end() || !lst->is_array()) continue;
+                for (auto const& a : *lst) {
+                    if (a.is_string() && a.get<std::string>() == name) r.symbols.push_back(where);
+                }
+            }
         }
         if (doc.contains("macros") && doc.at("macros").is_array()) {
             for (auto const& m : doc.at("macros")) {
@@ -331,13 +345,22 @@ TEST(EnvironDataObjectBinding, RealUnistdJsonEnvironObjectOnElfAndMacho) {
            "accessor), and dropping either of the two refuses the POSIX spelling "
            "there again";
 
-    json const* dunder = findNamed(doc, "symbols", "__environ");
-    ASSERT_NE(dunder, nullptr)
-        << "unistd.json must keep `__environ` — glibc's UNCONDITIONALLY declared "
-           "spelling of the same object";
-    expectEnvironmentDataRow(*dunder, "__environ");
-    EXPECT_TRUE(availabilityIsExactly(doc, *dunder, {"elf"}))
-        << "`__environ` is glibc's name: elf ONLY";
+    // P69: ONE row per object. `__environ` — glibc's UNCONDITIONALLY declared
+    // spelling — and `_environ` are the SAME object, so they are this row's
+    // `aliases` on elf (the reader declares each as a row of its own name), never
+    // rows of their own; libSystem exports `environ` alone (✔MEASURED).
+    EXPECT_EQ(findNamed(doc, "symbols", "__environ"), nullptr)
+        << "`__environ` must not be a row of its own: one object has one row, and "
+           "a second row for it is a second declaration the linker cannot know is "
+           "the same object";
+    ASSERT_TRUE(envRow->contains("aliases") && envRow->at("aliases").is_object())
+        << "`environ` must carry glibc's other names of the object";
+    json const& aliases = envRow->at("aliases");
+    ASSERT_TRUE(aliases.contains("elf")) << "glibc's aliases are elf's";
+    EXPECT_EQ(aliases.at("elf"), json::array({"__environ", "_environ"}))
+        << "glibc exports the object as `environ`, `__environ` and `_environ`";
+    EXPECT_FALSE(aliases.contains("macho")) << "libSystem exports `environ` alone";
+    EXPECT_FALSE(aliases.contains("pe")) << "no Windows CRT exports the data object";
 
     EXPECT_FALSE(hasMacroNamed(doc, "environ"))
         << "unistd.json must not realize `environ` as a MACRO beside the data "

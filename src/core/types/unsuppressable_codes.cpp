@@ -1992,6 +1992,11 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     // is exactly why both references make it an ordinary, silenceable warning
     // (clang's is even named: -Wimplicitly-unsigned-literal) rather than an
     // error. `--warnings-as-errors` is the lever for a project that wants it out.
+    // S_IntegerLiteralImplicitlyUnsigned (P69, its phase-7 twin) is NOT a member for
+    // the same two prongs: the literal is typed `decimalPastRange` whether or not the
+    // warning shows, so suppressing it changes no answer and hides no failure — and
+    // its dedup of the Pass-1.5 pre-stamp's second visit RELIES on it staying
+    // suppressible (the reporter's duplicate window applies only to such codes).
     // P_ClosedByEndOfInput (P68 round 8,
     // D-ASM-UNTERMINATED-BLOCK-COMMENT-AT-END-OF-FILE-REFUSED) is deliberately NOT
     // a member, by the same two prongs: the input is ACCEPTED and assembled

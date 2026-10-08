@@ -2070,8 +2070,10 @@ encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
 // cst_to_hir.cpp ConstructAggregate):
 //   * struct — one value field per type field (omitted slots are synthetic
 //     zero-fills) → `agg.fields[i]` ↔ field `i` at `fieldOffsets[i]`.
-//   * union  — a brace-init sets the FIRST member only → a 1-field value →
-//     field 0 ↔ member 0 at offset 0; the union's remaining bytes stay zero.
+//   * union  — an initializer sets ONE member, the one it designates (C
+//     6.7.9p17; the first when it designates none) → a 1-field value that NAMES
+//     its member (`agg.unionMember`) → field 0 ↔ member `m` at `fieldOffsets[m]`
+//     (0 for every union member); the union's remaining bytes stay zero.
 //   * array  — `agg.fields[i]` ↔ element `i` at `base + i*elemStride`; a
 //     short initializer leaves the trailing elements zero.
 //
@@ -2176,7 +2178,8 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         // performs exactly one encode at `fieldOffsets[0] == 0` into a `buf` the
         // caller pre-zeroed to the layout size. Nothing can be lost. Without this
         // route the truthful predicate would refuse `static union U u = {1};`, which
-        // gcc, clang and MSVC all accept.
+        // gcc, clang and MSVC all accept. (That one encode is at the member the
+        // value NAMES — `fieldOffsets[m]`, also 0 — see the pairing below.)
         //
         // ⚠ THE ONE-CHILD PREMISE IS ASSERTED, NOT ASSUMED — see the MIR twin's note
         // for the three-guarantee measurement (both HIR producers plus
@@ -2211,6 +2214,36 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         auto const ops = in.operands(ty);
         if (ops.size() != lay->fieldOffsets.size()) return false;
         if (agg.fields.size() > ops.size()) return false;   // too many inits → fail loud
+        // ★ D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED (P69, lane
+        // `cs`): WHICH MEMBER a union's one field initializes is the VALUE's fact, never
+        // the field's position. This arm used to pair field 0 with member 0 for a union
+        // too, so `static union { int i; float f; } u = { .f = 42.0f };` encoded the
+        // float against `int` and was refused, and `static union { char c; int i; } u =
+        // { .i = 0x01020304 };` was stored through the char member's ONE byte — a
+        // silent wrong image (✔MEASURED, gcc, clang, mingw-w64 gcc and MSVC run both 42).
+        // A union value with a field must name its member, and the member must be one
+        // the union has; every producer names it (the constant evaluator and
+        // `tryClassifyAggregateConst` from the union `ConstructAggregate`'s payload, the
+        // `.dssir` reader from `agg member N`), so either refusal is an upstream defect
+        // surfacing here — loudly, never as a guess at member 0.
+        std::size_t unionMember = 0;
+        if (isUnion && !agg.fields.empty()) {
+            if (!agg.unionMember.has_value()) {
+                why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                        "a union's static initializer value names no member — the encoder "
+                        "cannot tell which member its one field initializes (C 6.7.9p17 lets "
+                        "it designate any), and member 0 would be a guess");
+                return false;
+            }
+            if (*agg.unionMember >= ops.size()) {
+                why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                        std::format("a union's static initializer value names member {} of "
+                                    "a union with {} member(s)",
+                                    *agg.unionMember, ops.size()));
+                return false;
+            }
+            unionMember = *agg.unionMember;
+        }
         // FC8 D-CSUBSET-BITFIELD-INIT: a struct/union WITH bit-fields packs each
         // bit-field's value into its allocation unit (`buf` is pre-zeroed, so the
         // OR is correct + leaves un-covered bits / omitted fields at 0). Fields
@@ -2219,26 +2252,32 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         // bit-fields (`unitBytes == 0`) recurse normally. `bitFields` non-empty
         // ⇔ the struct has a bit-field (the layout authority's invariant); the
         // byte path below is byte-identical for a bit-field-free composite.
+        //
+        // `i` walks the VALUE's fields and `m` names the TYPE member field `i`
+        // initializes: the same index for a struct, the member the value names for a
+        // union. Every type-side read below — the member's type, offset, bit-field
+        // placement and width — is asked of `m`, never of `i`.
         for (std::size_t i = 0; i < agg.fields.size(); ++i) {
+            std::size_t const m = isUnion ? unionMember : i;
             bool const isBitfield =
-                i < lay->bitFields.size() && lay->bitFields[i].unitBytes != 0;
+                m < lay->bitFields.size() && lay->bitFields[m].unitBytes != 0;
             if (!isBitfield) {
                 // A zero-width bit-field marker (`unsigned : 0;`) has no storage
                 // (`unitBytes == 0` AND `fieldBitWidth` present); its `fieldOffsets`
                 // entry aliases the NEXT unit, so a full-width write here would
                 // touch that neighbour unit. Skip it (its synthetic child is 0).
-                if (in.fieldBitWidth(ty, i).has_value()) continue;
-                if (!encodeAggregateValue(ops[i], agg.fields[i], in, lp, dm, buf,
-                                          base + lay->fieldOffsets[i], relocs,
+                if (in.fieldBitWidth(ty, m).has_value()) continue;
+                if (!encodeAggregateValue(ops[m], agg.fields[i], in, lp, dm, buf,
+                                          base + lay->fieldOffsets[m], relocs,
                                           absPtrRelocKind, why))
                     return false;
                 continue;
             }
             // Pack one bit-field: read its scalar value, mask to width, shift to
-            // bitOffset, OR into the unit at `base + fieldOffsets[i]`. The unit
+            // bitOffset, OR into the unit at `base + fieldOffsets[m]`. The unit
             // load/store width is `unitBytes` (little-endian, matching the MIR
             // read-modify-write codegen + the layout's LSB-first packing).
-            BitFieldPlacement const& p = lay->bitFields[i];
+            BitFieldPlacement const& p = lay->bitFields[m];
             // ⚠ THE u64 PACKING BELOW IS ONLY VALID UP TO 64 BITS AND 8 UNIT BYTES,
             // and past those bounds it is not merely approximate — it is the SAME
             // `>> (j*8)` UB the 128-bit arm was walled for: `placed` is a
@@ -2277,19 +2316,19 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
             // the MIR bit-field insert applies, so a signed negative field packs
             // identically whichever tier writes it.
             std::optional<std::uint64_t> bitsOpt;
-            if (materialScalarKind(in, ops[i]) == TypeKind::BitInt) {
-                auto const bv = bitIntLiteralValue(agg.fields[i], in, ops[i], why);
+            if (materialScalarKind(in, ops[m]) == TypeKind::BitInt) {
+                auto const bv = bitIntLiteralValue(agg.fields[i], in, ops[m], why);
                 if (!bv.has_value()) return false;    // `why` already written
                 bitsOpt = bv->low64();
             } else {
                 bitsOpt = decodeScalarLiteralBits(agg.fields[i],
-                                                  materialScalarKind(in, ops[i]));
+                                                  materialScalarKind(in, ops[m]));
             }
             if (!bitsOpt.has_value()) return false;   // non-int bit-field leaf → fail loud
             std::uint64_t const mask =
                 p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
             std::uint64_t const placed = (*bitsOpt & mask) << p.bitOffset;
-            std::uint64_t const unitBase = base + lay->fieldOffsets[i];
+            std::uint64_t const unitBase = base + lay->fieldOffsets[m];
             if (unitBase + p.unitBytes > buf.size()) return false;  // layout↔buf disagreement
             for (std::uint32_t j = 0; j < p.unitBytes; ++j)
                 buf[unitBase + j] |= static_cast<std::uint8_t>((placed >> (j * 8)) & 0xFFu);

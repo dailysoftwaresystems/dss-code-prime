@@ -51,9 +51,17 @@
 
   "$dataImportBindingComment": "c151 (D-LK1-4 PIE half): extern library DATA objects bind GOT-INDIRECT -- the walker reserves a GOT slot per imported object and emits R_X86_64_GLOB_DAT against it; ld.so writes the object's address into the slot and the c117/c149 GotIndirect lowering (lea-of-slot + deref) reads it. This is gcc's PIE data-import shape too (-fPIE code reaches extern objects through the GOT). It is now ALSO what the exec sibling declares: the copy-relocation alternative was DELETED from the vocabulary outright (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET — claiming one name of an aliased libc object split it silently), so \"got-indirect\" is the only ELF data-import model that exists and no flavour-specific validate() rule is needed to keep the other one out; the loader's closed-enum reject refuses the spelling.",
   "dataImportBinding": "got-indirect",
+  "weakResolvedToNothing": {
+    "$comment": "P69 (lane lm, D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO): what a reference NAMING a weak symbol this image resolves to nothing computes, per field class. A PIE moves with the base the loader picks, so no displacement reaches 0: pcRelative and branch are refused. An absolute field holds the constant 0 + A and needs no load-time fix-up, because DSS binds the symbol to nothing at link time. MEASURED 2026-10-07 (probe runs 20261007-062240-74d10632 and 20261007-070411-5f8a91bf, gcc 13.3.0 + GNU ld 2.42 and clang 18 + ld.lld 18, -pie): R_X86_64_PC32 and R_X86_64_32 are REFUSED by both ('can not be used when making a PIE object; recompile with -fPIE' / 'cannot be used against symbol; recompile with -fPIC'), because the references keep the symbol DYNAMIC (.dynsym WEAK UND) and those fields cannot carry a dynamic relocation; `.quad w` reads 0 under both, through a dynamic R_X86_64_64 ld.so resolves to 0 - DSS writes the same 0 as a constant, the absolute 32-bit field included. A guarded `call w` links under both through a PLT entry whose slot ld.so leaves 0; DSS gives a symbol bound to nothing no such entry, so a branch to it is refused here (reach the symbol through the GOT, as gcc -fPIE does for the address).",
+    "absolute": "zero",
+    "pcRelative": "refused",
+    "branch": "refused"
+  },
 
   "$supportedDataSectionsComment": "rodata (read-only, R+X PT_LOAD #1 -- reloc-FREE items only: a reloc-bearing rodata item would need a load-time write into a read-only page, D-LK-DYN-RODATA-ITEM-RELOC fails loud), data (mutable initialized globals, R+W PT_LOAD #2), bss (zero-init, NOBITS tail of PT_LOAD #2), relro (reloc-bearing CONST data, c145 -- merged into `.data` by the dynamic arm so its R_X86_64_RELATIVE slots land in writable pages, exactly why gcc places such data in .data.rel.ro). NO tdata/tbss: see the top-level $comment (D-LK-DYN-TLS-MODEL); every thread_local fails loud at the MIR->LIR gate / linker section gate by this set's absence.",
   "supportedDataSections": ["rodata", "data", "bss", "relro"],
+  "$commonYieldsToComment": "P69 round 4 (D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT): which definitions a COMMON (`SHN_COMMON`, what gcc and clang write for a tentative definition under -fcommon) yields to when this link holds another definition of its name -- `strongDefinition`: a STRONG definition replaces it; a WEAK one (STB_WEAK) does not, and the common, allocated as the name's storage, outranks it -- the System V gABI's rule (\"the link editor honors the common definition and ignores the weak ones\"). ✔MEASURED 2026-10-07 (`.orchestrators/p69/work/xa/r4probe/m15/elf_weak_common.sh`: `int c;` under -fcommon beside `__attribute__((weak)) int c = 5;`, both link orders): GNU ld 2.42 (gcc 13.3.0 on x86_64, and the aarch64 cross run under qemu-aarch64) and ld.lld 18.1.3 run the program with the common's 0; a strong `int c = 5;` replaces it. Mach-O's and PE's linkers answer the other way (`anyDefinition`). Read by `linker::allocateCommonDefinitions` and by a static link's archive search, which fetches for a common only a member whose definition the common yields to -- here a GLOBAL datum (`archiveCommonResolution`).",
+  "commonYieldsTo": "strongDefinition",
 
   "$artifactProfilesComment": "This format SERVES the runnable-console-binary profile (plan 06 AP3) -- a PIE is an executable, so cli, exactly like the ET_EXEC sibling. The lib profile is NOT served (nothing links against a PIE; that is the elf64-x86_64-linux-dyn .so).",
   "artifactProfiles": ["cli"],
@@ -86,6 +94,8 @@
 
   "$entryCallingConventionComment": "ENTRY CLUSTER member. SysV AMD64 calling convention -- status (user fn return value in rax) is moved into argGprs[0] = rdi before the exit call. Read via `target.callingConventionByName(\"sysv_amd64\")` at trampoline-build time.",
   "entryCallingConvention": "sysv_amd64",
+  "$entryTransitionComment": "D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION: the ELF loader JUMPS to the entry — the kernel to a static image's e_entry, ld.so (a `jmp`) to a dynamic one's — with the stack 16-byte-aligned and no return address pushed, so the entry trampoline's process-entry bias is 0 (`sysv_amd64`'s callPushBytes is not added). ✔MEASURED P69 (probes/entryref.c and entryref_static.c: a C function made the entry point, its 16-aligned locals' address mod 16 in the exit status, 100 = called, 188 = jumped): gcc 13.3.0 and clang 18.1.3, -O0 and -O2, default-PIE (run 20261001-032102-8526afd5), -no-pie dynamic, -static and -static-pie (run 20261001-032947-70315a38) — every one 188. (The probe's first cut measured nothing: gcc 13.3.0 folded `(uintptr_t)aligned_local % 16` to a constant — run 20261001-031833-c1986d08 — so the address now passes through a volatile.)",
+  "entryTransition": "jumped",
 
   "$processArgsComment": "ENTRY CLUSTER member. c88 (D-RUNTIME-MAIN-ARGC-ARGV): program-entry argc/argv materialization, identical to the ET_EXEC sibling. SysV AMD64 psABI 3.4.1 -- at the process entry point argc sits at [rsp+0] and the NULL-terminated argv vector IN PLACE at [rsp+8]; ld.so transfers control to a PIE's e_entry with this exact layout (the ABI stack contract is loader-preserved). The trampoline emits `mov rdi,[rsp+0]` + `lea rsi,[rsp+8]` before any SP adjustment and before `call main`. D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: `envpFollowsArgvTerminator` + `vectorSlotBytes` declare where the ENVIRONMENT vector sits in this same layout -- one 8-byte slot past argv's NULL terminator, i.e. at argv + (argc+1)*8, a RUNTIME address no static offset can name. They are read only for the `argc-argv-envp` verb: the entry is retargeted to a synthesized init that takes the (argc, argv) the trampoline materializes, computes envp from them and calls the 3-parameter `main`; the trampoline itself is unchanged. The format loader refuses the pair without that verb (dead config) and the verb without the pair. MEASURED 2026-09-24 under glibc's own startup (gcc 13.3.0, clang 18.1.3, x86_64): envp - argv == argc + 1.",
   "processArgs": {
@@ -106,7 +116,9 @@
     "type": "dyn",
     "pageAlign": 4096,
     "interpreter": "/lib64/ld-linux-x86-64.so.2",
-    "bindNow": true
+    "bindNow": true,
+    "$dynamicRelocationTypesComment": "P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): the dynamic relocations this image's loader applies, BY ROLE (x86_64 psABI: R_X86_64_GLOB_DAT = 6, R_X86_64_JUMP_SLOT = 7, R_X86_64_RELATIVE = 8). `globDat` fills a slot through the lookup an executable's undefined-with-value definition satisfies; `jumpSlot` through the PLT-class lookup that SKIPS it - the only way a canonical stub's own slot binds to the library instead of to the stub - and it is written to .rela.dyn under this image's eager binding (DF_1_NOW), never to a lazy .rela.plt (D-LK6-11); `relative` is base + addend. These used to be `e_machine` switches in elf.cpp.",
+    "dynamicRelocationTypes": { "globDat": 6, "jumpSlot": 7, "relative": 8 }
   },
     "$staticInitializersComment": "D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: WHO runs this format's STATIC-INITIALIZER SCHEDULE -- the functions a C source marked `__attribute__((constructor))` / `((destructor))`. `entryTrampoline`: the `_start` DSS synthesizes for this format calls each scheduled function around the user entry, in the order the linker computed.\nIT IS THE ONLY THING THAT COULD, AND THAT IS MEASURED RATHER THAN ASSUMED. DSS links no crt and emits no DT_INIT_ARRAY -- `readelf -d` on a DSS elf64-x86_64-linux-exec artifact shows an eleven-entry dynamic section (NEEDED/STRTAB/STRSZ/SYMTAB/SYMENT/HASH/RELA/RELASZ/RELAENT/FLAGS_1/NULL) and no init tag at all; ld.so walks the TAG, never a section. PE is the same story for a different reason: `_initterm` runs only when the UCRT startup object is linked, and DSS synthesizes `_start` and calls ExitProcess directly.\nSO THIS FORMAT EMITS NO `.init_array` / `__mod_init_func` / `.CRT` SECTION, and that is a decision rather than an omission: on an image DSS produces and starts, such a section would be bytes nothing reads. The other arm of this key, `imageLoader`, exists for the case where the platform loader owns the channel (dyld and S_MOD_INIT_FUNC_POINTERS is the real one) -- it is selectable and the trampoline emitter honours it by emitting NO calls, but no shipped document selects it yet, because selecting it needs a WRITER that emits a loader-recognized section and a measurement on the platform. Choosing it here today would mean nothing runs the initializers at all.",
   "staticInitializers": { "runner": "entryTrampoline" },
@@ -204,9 +216,11 @@
   "relocations": [
     {
       "$comment": "The pc-relative kinds are the only ones legal in ET_DYN `.text` (an absolute fixup in code would need DT_TEXTREL -- D-LK-DYN-TEXT-ABS-RELOC fails loud). kind numbers match the target schema rows (the cross-reference unifier requires both sides).",
-      "name": "R_X86_64_PC32",
+      "$roleComment": "P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): since P69 only a CALL declares `rel32`, so this row is the CALL row and says so (`isCall`), and the kind-8 row below owns R_X86_64_PC32: an address-taking or memory operand. The image link reads the role off these rows to tell a reference that CALLS a library function (the stub serves it) from one that takes its ADDRESS (the stub must then be the function's CANONICAL address, which this image states in its `.dynsym`).",
+      "name": "R_X86_64_PLT32",
       "kind": 1,
-      "nativeId": 2
+      "nativeId": 4,
+      "isCall": true
     },
     {
       "$comment": "abs64 -- legal in DATA items only on this arm: the walker patches the slot with the base-relative value AND emits an R_X86_64_RELATIVE row for it (the load slide completes the address); extern-targeted slots emit a symbol-based R_X86_64_64 row with the slot zeroed instead (the c150 review-fold shape).",
@@ -220,11 +234,10 @@
       "nativeId": 10
     },
     {
-      "$comment": "P68 round 9 (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the target's `riprel32` — a memory operand's displacement from the NEXT instruction, a DATA reference. ELF writes it as R_X86_64_PC32 (never PLT32: ✔MEASURED 2026-09-23, gas 2.42 writes PC32 for `leaq ext_fn(%rip)`), so this row is an EMISSION ALIAS of the `rel32` row's wire type and decodes as that row.",
-      "name": "R_X86_64_PC32_RIPREL",
+      "$comment": "P68 round 9 (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the target's `riprel32` — a memory operand's displacement from the NEXT instruction, a DATA reference. ELF writes it as R_X86_64_PC32 (never PLT32: ✔MEASURED 2026-09-23, gas 2.42 writes PC32 for `leaq ext_fn(%rip)`), and since P69 this row OWNS R_X86_64_PC32 on decode as well: the `rel32` row became R_X86_64_PLT32, the CALL row (`isCall`), so the image link can tell a reference that takes an address from one that calls (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB). Until P69 this row was an emission alias of the `rel32` row and decoded as that row.",
+      "name": "R_X86_64_PC32",
       "kind": 8,
-      "nativeId": 2,
-      "emitOnly": true
+      "nativeId": 2
     },
     {
       "$comment": "P68 round 11 (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS): `pcrel32`, what a lowered GOT-slot-relative reference becomes — see the exec sibling's row (hand-sync).",

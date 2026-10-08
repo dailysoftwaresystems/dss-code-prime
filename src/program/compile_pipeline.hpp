@@ -527,6 +527,33 @@ struct CompileOptions {
     // Inlining pass byte-identical.
     std::vector<SymbolBinding> preemptibleDefinitionBindings{};
 
+    // ── ★★ [[D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS]]: THE VISIBILITY
+    //    A STATIC-ARCHIVE BUILD GIVES THE DEFINITIONS IT COMPILES ────────────
+    // The ARCHIVE's declaration, for the one artifact kind whose definitions
+    // are still to be linked into an image: every member this build COMPILES
+    // has EVERY external definition restated as this visibility in its symbol
+    // table, whatever its source declared — libgcc.a's semantics (its build
+    // hides every global its members define), not `-fvisibility=`'s default
+    // for unattributed definitions. Set by exactly one build — the nested one
+    // that materialises a shipped runtime archive (`Program::
+    // setArchiveDefinitionVisibility`) — because a shipped runtime unit's
+    // definitions are the implementation of whatever image links them, and
+    // never that image's API.
+    //
+    // ★ RESTATED AFTER THE OPTIMIZER, ON THE LOWERED MEMBER, AND THAT ORDER IS
+    // LOAD-BEARING. The DCE pass roots a definition only while
+    // `isExternallyVisible` holds, so a hidden definition the member itself
+    // never calls is DEAD to it — right for a whole image, wrong for a member
+    // whose callers are in OTHER units
+    // ([[D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS]]). Hiding
+    // the runtime before the optimizer would delete it from its own archive at
+    // `--config=release`.
+    //
+    // ⓘ An extracted archive member or an object input carries the visibility
+    // its own input gave it — this build compiled neither.
+    // nullopt (every other build) ⇒ byte-identical.
+    std::optional<SymbolVisibility> archiveDefinitionVisibility{};
+
     // Selects the default optimizer pipeline when `pipelineOverride`
     // is null. Resolved via `resolvePipelineName` (a constexpr table
     // indexed by ordinal — NO `if (config == Release)` branches per
@@ -610,6 +637,25 @@ struct CompileOptions {
     // `compileOneTarget` takes only the PATH for the same reason it does for
     // `ar` archives.
     std::vector<std::filesystem::path> objectInputs;
+
+    // ── ★ D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: WHICH
+    //    OF `resolveLibraries`' ARCHIVES THE DRIVER RESOLVED FOR THE SHIPPED
+    //    RUNTIME ───────────────────────────────────────────────────────────
+    // The paths `Program::compileFiles` appended to `resolveLibraries` from
+    // `resolveShippedRuntimeArchives` — recorded beside them, by the same
+    // statement, so the two lists cannot disagree. Read for ONE decision: an
+    // IMAGE's link (a relocatable object is never one) that takes no object
+    // input and no archive OUTSIDE this list is a
+    // `opt::ModuleExtent::WholeImage`. A shipped runtime member names no
+    // definition of the program: its external references are its own runtime
+    // names and library names a conforming program may not define with
+    // external linkage (C 7.1.3), so it cannot be what keeps a hidden
+    // definition of the program alive. An operator's archive or object can —
+    // a library calling back a hook the application defines is an ordinary
+    // shape — so either one makes the image's optimize a `LinkInput`.
+    // Empty (every build that resolves no shipped runtime) ⇒ every archive
+    // counts as the operator's.
+    std::vector<std::filesystem::path> shippedRuntimeArchives;
 };
 
 // Resolve `CompileConfig` to a shipped pipeline name. Uses a
@@ -866,36 +912,6 @@ struct DSS_EXPORT CuMirModule {
     // "absent" representable): every loaded schema carries a real scheme, because
     // `ObjectFormatData::validate()` requires one on every format, unconditionally.
     CSymbolDecorationScheme cSymbolDecoration = CSymbolDecorationScheme::Unspecified;
-    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the RESOLVED calling convention's WHOLE
-    // `vaListLayout` block, captured here for the SAME reason as `librarySynthesis`/
-    // `objectFormat` — the LOWER half sees only this struct, and `synthesizeStdioShim`'s
-    // variadic-forwarding arm (a printf-family shim forwards its caller's va_list into the
-    // UCRT `__stdio_common_v*` core) needs the target's va_list model to pick the right MIR
-    // leaf, or to fail loud on a model it has no arm for.
-    //
-    // ★ THE WHOLE BLOCK, NOT JUST `.strategy` — and that is a CORRECTNESS requirement, not
-    // tidiness. This field used to be a bare `std::optional<VaListStrategy>`, which was
-    // enough only for as long as `HomogeneousPointer` meant Win64. It does not:
-    // `arm64.target.json`'s `apple_arm64` CC declares `homogeneous_pointer` WITH
-    // `variadicUsesOverflowBase: true`, and that second field is what decides between
-    // `VaHomeArgAreaAddr` and `VaOverflowArgAreaAddr` in `hir_to_mir`'s real `va_start`
-    // lowering. Passing the strategy alone dropped it on the floor, so the shim could only
-    // ever emit the home leaf — silently pointing `ap` at named-arg storage on any
-    // overflow-base target. Threading the layout WHOLE means the shim and the real lowering
-    // read the same field off the same struct: one source of truth, no rule to drift.
-    //
-    // ★ OPTIONAL, DEFAULTED EMPTY — deliberately, and for the same reason its two siblings
-    // above keep "absent" representable (`librarySynthesis` is an optional; `objectFormat`
-    // defaults to an `Unknown` SENTINEL, not to a real format). A default-constructed
-    // `VaListLayout` is a REAL one (its `strategy` defaults to SysVRegisterSave for
-    // pre-FC12b back-compat), so defaulting rather than emptying would make "the resolved
-    // CC declares no `vaListLayout`" indistinguishable downstream from "the resolved CC
-    // declares SysVRegisterSave": a config gap would then arrive at the synth pass wearing a
-    // legitimate model's face and be refused (or, one day, ACCEPTED) for the wrong reason,
-    // with a diagnostic pointing at the wrong end of the pipeline. `synthesizeStdioShim`
-    // fails loud on nullopt. Consulted only when a stdio recipe actually appears — an empty
-    // recipe map is a clean no-op either way.
-    std::optional<VaListLayout> vaListLayout;
 
     // ── THE THIN-LTO PER-TU IMPORT STAGE'S OUTPUT (D-OPT11-LAZY-IMPORT-EDGE) ──
     //
@@ -987,11 +1003,6 @@ buildCuMir(CompilationUnit const&         cu,
 struct DSS_EXPORT CuHirModule {
     SemanticModel                   model;
     std::unique_ptr<CstToHirResult> hir;
-    // FC12b: the RESOLVED calling convention's whole `vaListLayout` block, or
-    // nullopt when the CC declares no variadic-callee ABI. Carried out of the
-    // front half rather than re-resolved by the lower half, because resolving
-    // the same fact twice is how two halves of one compile come to disagree.
-    std::optional<VaListLayout>     vaListLayout;
 };
 
 // Run semantic analysis and CST→HIR for ONE compilation unit against ONE
@@ -1064,6 +1075,21 @@ optimizeModule(Mir&                  mir,
                TypeInterner const&   interner,
                CompileOptions const& opts,
                PipelineStage         stage,
+               // ★★ D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS:
+               // what THIS module is to the link that completes it
+               // (`opt::ModuleExtent` — a `LinkInput` roots every definition
+               // with external linkage; only a `WholeImage` may treat a hidden
+               // definition nothing reaches as dead), and, for a `WholeImage`,
+               // the definitions the image's entry trampoline reaches by name.
+               // NO DEFAULT, as `objectInputs` has none: every route that
+               // optimizes a real build must answer, because a default would
+               // let a new route silently inherit the answer of another. The
+               // stage does not decide it: a Program-stage module is a
+               // `LinkInput` when it is a static-archive member, a relocatable
+               // object, a thin unit, or an image linked with object inputs or
+               // operator archives.
+               opt::ModuleExtent         extent,
+               std::span<SymbolId const> entryRoots,
                DiagnosticReporter&   reporter,
                // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the
                // module's extern table. `opt::optimize`'s unconditional strip
@@ -1093,6 +1119,29 @@ verifySynthesizedModule(Mir const&          mir,
                         TypeInterner const& interner,
                         DiagnosticReporter& reporter);
 
+// ★★ D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY — ONE PLACEMENT FOR THE
+// LIBRARY SHIMS, AT EVERY ROUTE: synthesize them BEFORE the module's FINAL optimize.
+//
+// A library shim (a `synthesize` recipe — <threads.h>'s, the one family left) is an
+// ordinary function body standing in for a library function, so it is OPTIMIZER
+// INPUT: the release pipeline must see it, and the same source must not get a
+// differently-optimized shim depending only on how many units it was built from.
+// The merge seam (`Program::compileOneTarget`) always synthesized before the merged
+// module's optimize; the single-module routes synthesized inside
+// `lowerCuMirToAssembly`, after it. They now call THIS, before their Program-stage
+// `optimizeModule`: the sole-CU route, each static-archive member, and
+// `assembleUnit`. `program/test_synth_verify_seam_guard` pins the order at every
+// route (the placement is unobservable in today's shim bytes — ✔MEASURED 2026-10-01,
+// both Mach-O arches, one CU vs two, baseline vs release: identical `_mtx_*` sizes,
+// because a WEAK body is never inlined — so the pin is structural, like the verify
+// seam's).
+// What the LOWER half still synthesizes after the final optimize — the entry shape
+// and the SEH funclets — is a lowering artifact, and is placed the same way at both
+// seams. Returns false only on an internal invariant breach (a recipe of no family),
+// already reported.
+[[nodiscard]] DSS_EXPORT bool synthesizeLibraryShims(CuMirModule&        cuMir,
+                                                     DiagnosticReporter& reporter);
+
 // LOWER half: MIR → LIR → liveness → regalloc → rewrite → legalize → callconv →
 // assemble → symbol-table populate → user-entry scan. Consumes the `CuMirModule`
 // (its `externImports` are MOVED into MIR→LIR; its `mir` + `model` are read). Returns
@@ -1101,7 +1150,7 @@ verifySynthesizedModule(Mir const&          mir,
 // UCRT-P4 (was c111): the four format-declared blocks the entry spine reads, passed
 // as values rather than as an `ObjectFormatSchema&` so this driver half keeps its
 // existing dependency shape (the same reason `librarySynthesis` /
-// `cSymbolDecoration` / `vaListLayout` already arrive through `CuMirModule`):
+// `cSymbolDecoration` already arrive through `CuMirModule`):
 //   * `processArgs`    — the program-entry argument MECHANISM (nullopt when the
 //                        format declares none, which is correct on Mach-O: dyld
 //                        delivers argc/argv in the argument registers).

@@ -11,6 +11,7 @@
 #include "core/types/type_lattice/composite_definition.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_registry.hpp"
+#include "core/types/wide_float_value.hpp"  // kCanonicalQuietNanBits — the NaN the text spells `nan`
 #include "hir/attributes/diagnostic_info.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/attributes/shader_intrinsic.hpp"
@@ -24,8 +25,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>    // P69: the `nanbits` pattern's range check
+#include <cmath>     // P69: std::isnan (a NaN's payload is spelled by its bits)
 #include <cstdint>
 #include <cstdlib>   // std::strtod — the float reader decodes token TEXT
+#include <cstring>   // P69: std::memcpy (a NaN's bit pattern)
 #include <deque>
 #include <format>
 #include <limits>
@@ -233,10 +237,15 @@ enum class HirTextExprKw : std::uint8_t {
     // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
     // `rmw %<old-value sym> : <type> (<target>, <update>)`.
     Rmw,
+    // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT):
+    // `unnamed <storage> : <type> (<init>)` — `storage` one of `kHirObjectStorageTable`.
+    Unnamed,
+    // P69 (D-C-STDARG-VA-COPY-MISSING): `va_copy : void (<dest>, <src>)`.
+    VaCopy,
 
     Count_  // keep last — counts the members; deliberately UNLISTED below
 };
-inline constexpr EnumNameTable<HirTextExprKw, 26> kHirTextExprKwTable{{{
+inline constexpr EnumNameTable<HirTextExprKw, 28> kHirTextExprKwTable{{{
     { HirTextExprKw::Lit,        "lit"         },
     { HirTextExprKw::Ref,        "ref"         },
     { HirTextExprKw::Call,       "call"        },
@@ -263,9 +272,22 @@ inline constexpr EnumNameTable<HirTextExprKw, 26> kHirTextExprKwTable{{{
     { HirTextExprKw::VaArg,      "va_arg"      },
     { HirTextExprKw::VaEnd,      "va_end"      },
     { HirTextExprKw::Rmw,        "rmw"         },
+    { HirTextExprKw::Unnamed,    "unnamed"     },
+    { HirTextExprKw::VaCopy,     "va_copy"     },
 }}};
 DSS_CHECK_ENUM_NAME_TABLE(kHirTextExprKwTable);
 DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextExprKwTable));
+
+// P69: the storage-duration spellings of an `unnamed` node — ONE owner, read by the
+// writer and the reader alike, so an unknown spelling is refused naming the set.
+inline constexpr EnumNameTable<HirObjectStorage, 3> kHirObjectStorageTable{{{
+    { HirObjectStorage::Automatic, "automatic" },
+    { HirObjectStorage::Static,    "static"    },
+    { HirObjectStorage::Thread,    "thread"    },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kHirObjectStorageTable);
+static_assert(kHirObjectStorageTable.rows.size() == kHirObjectStorageCount,
+              "kHirObjectStorageTable must spell every HirObjectStorage");
 
 // ★★★ THE COMPLETENESS CHECK WELL-FORMEDNESS CANNOT GIVE, and it is the reason
 // `Count_` exists on an enum that is otherwise a pure spelling set.
@@ -785,6 +807,8 @@ exprKwForKind(HirKind k) noexcept {
         case HirKind::VaArg:              return HirTextExprKw::VaArg;
         case HirKind::VaEnd:              return HirTextExprKw::VaEnd;
         case HirKind::ReadModifyWrite:    return HirTextExprKw::Rmw;
+        case HirKind::UnnamedObject:      return HirTextExprKw::Unnamed;
+        case HirKind::VaCopy:             return HirTextExprKw::VaCopy;
 
         // ── everything that is NOT written in expression position ──
         // `Error` and `Extension` are the deliberate subtlety: they DO render
@@ -1897,7 +1921,8 @@ private:
             case HirKind::LabelAddressOf: case HirKind::VaStart:
             case HirKind::VaArg:       case HirKind::VaEnd:
             case HirKind::TypeRef:     case HirKind::CaseArm:
-            case HirKind::ReadModifyWrite:
+            case HirKind::ReadModifyWrite: case HirKind::UnnamedObject:
+            case HirKind::VaCopy:
             case HirKind::Count_:
                 report(std::format("unexpected node kind '{}' in statement position",
                                    hirKindName(hir_.kind(id))),
@@ -2285,6 +2310,22 @@ private:
                 header(); out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
                 appendType(hir_.typeId(id)); out_ += ' ';
                 operands(hir_.children(id)); return;
+            case HirKind::UnnamedObject: {
+                // `unnamed <storage> : <type> (<init>)` — the storage duration by name.
+                std::uint32_t const p = hir_.payload(id);
+                std::string_view const storage =
+                    p < kHirObjectStorageCount
+                        ? kHirObjectStorageTable.nameOrEmpty(static_cast<HirObjectStorage>(p))
+                        : std::string_view{};
+                if (storage.empty()) {
+                    report(std::format("unnamed-object storage {} names no storage duration", p),
+                           DiagnosticSeverity::Error);
+                }
+                header(); out_ += ' ';
+                out_ += storage.empty() ? std::string_view{"?"} : storage;
+                out_ += " : "; appendType(hir_.typeId(id)); out_ += ' ';
+                operands(hir_.children(id)); return;
+            }
             case HirKind::IntrinsicCall: {
                 header(); out_ += ' ';
                 std::uint32_t const p = hir_.payload(id);
@@ -2316,7 +2357,15 @@ private:
             case HirKind::Call:               typedCall(); return;
             case HirKind::Cast:               typedCall(); return;
             case HirKind::Index:              typedCall(); return;
-            case HirKind::ConstructAggregate: typedCall(); return;
+            case HirKind::ConstructAggregate:
+                // P69 (D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED): a
+                // union aggregate names the member its child initializes — `construct #N :`,
+                // spelled only when N is not the first member, so every other aggregate (and a
+                // union initialized through member 0) writes exactly as before.
+                header();
+                if (hir_.payload(id) != 0) out_ += std::format(" #{}", hir_.payload(id));
+                out_ += " : "; appendType(hir_.typeId(id)); out_ += ' ';
+                operands(hir_.children(id)); return;
             case HirKind::Ternary:            typedCall(); return;
             case HirKind::LogicalAnd:         typedCall(); return;
             case HirKind::LogicalOr:          typedCall(); return;
@@ -2325,6 +2374,7 @@ private:
             case HirKind::VaStart:            typedCall(); return;
             case HirKind::VaArg:              typedCall(); return;
             case HirKind::VaEnd:              typedCall(); return;
+            case HirKind::VaCopy:             typedCall(); return;
             case HirKind::AddressOf:          typedCall(); return;
             case HirKind::Deref:              typedCall(); return;
             case HirKind::LabelAddressOf:
@@ -2465,6 +2515,18 @@ private:
             // std::format renders non-finite doubles as `inf`/`-inf`/`nan`, which
             // takeFloat() accepts back — so they round-trip too (e.g. synthetic
             // HIR from constant folding).
+            // ★ P69 (lane `cs`): EXCEPT a NaN that is not the canonical quiet one — a
+            // payload (`__builtin_nan("1")`) or a sign — which `nan` would read back as a
+            // DIFFERENT value through a clean reporter. It is spelled by its 64-bit
+            // pattern, `nanbits <u64>`; every other value prints exactly as before.
+            if (std::isnan(*d)) {
+                std::uint64_t bits = 0;
+                std::memcpy(&bits, d, sizeof bits);
+                if (bits != kCanonicalQuietNanBits) {
+                    out_ += std::format("float nanbits {}", bits);
+                    return;
+                }
+            }
             out_ += "float "; out_ += std::format("{}", *d); return;
         }
         if (auto const* s = std::get_if<std::string>(&v.value)) {
@@ -3519,7 +3581,33 @@ private:
         if (peekIs(Tk::Ident)) {
             std::string const& t = lex_.peek().text;
             if (t == "inf") { lex_.take(); return std::numeric_limits<double>::infinity(); }
-            if (t == "nan") { lex_.take(); return std::numeric_limits<double>::quiet_NaN(); }
+            if (t == "nan") {
+                // EXACTLY the canonical quiet NaN the writer spells `nan` (core's
+                // `kCanonicalQuietNanBits`, P69 review n13) — never the host's own NaN.
+                lex_.take();
+                double d = 0.0;
+                std::memcpy(&d, &kCanonicalQuietNanBits, sizeof d);
+                return d;
+            }
+            // P69 (lane `cs`): a NaN by its bit pattern — what the writer spells for any
+            // NaN but the canonical quiet one, so its payload and sign come back.
+            if (t == "nanbits") {
+                lex_.take();
+                if (!peekIs(Tk::Int)) { malformed("expected the 64-bit pattern after 'nanbits'"); return 0.0; }
+                Tok const b = lex_.take();
+                char* end = nullptr;
+                errno = 0;
+                unsigned long long const raw = std::strtoull(b.text.c_str(), &end, 10);
+                if (errno == ERANGE || end != b.text.c_str() + b.text.size()) {
+                    malformed("malformed 'nanbits' pattern '" + b.text + "'");
+                    return 0.0;
+                }
+                std::uint64_t const bits = raw;
+                double d = 0.0;
+                std::memcpy(&d, &bits, sizeof d);
+                if (!std::isnan(d)) { malformed("'nanbits' pattern is not a NaN"); return 0.0; }
+                return d;
+            }
         }
         malformed("expected float"); return 0.0;
     }
@@ -4716,6 +4804,28 @@ private:
                 f.attrs    = std::move(attrs);
                 return openParenOperands(stack, done, std::move(f));
             }
+            case HirTextExprKw::Unnamed: {
+                // `unnamed <storage> : <type> (<init>)` — the writer's mirror; the storage
+                // spelling is refused naming the accepted set.
+                NodeParseFrame f;
+                f.kind     = NodeParseFrame::Kind::ParenOperands;
+                f.nodeKind = HirKind::UnnamedObject;
+                f.flags    = flags;
+                std::string const storage = takeIdent();
+                if (auto const s = kHirObjectStorageTable.fromName(storage)) {
+                    f.payload = static_cast<std::uint32_t>(*s);
+                } else {
+                    malformed(std::format("unknown unnamed-object storage '{}' — accepted: {}",
+                                          storage,
+                                          detail::renderAllowedList(
+                                              allNames(kHirObjectStorageTable))));
+                    f.payload = static_cast<std::uint32_t>(HirObjectStorage::Automatic);
+                }
+                f.type     = parseTypeAnnot();
+                f.preIdx   = idx;
+                f.attrs    = std::move(attrs);
+                return openParenOperands(stack, done, std::move(f));
+            }
             case HirTextExprKw::Member:
             case HirTextExprKw::Swizzle: {
                 expect(Tk::Hash, "'#'");
@@ -4754,7 +4864,19 @@ private:
             }
             case HirTextExprKw::Cast:       return typedCall(HirKind::Cast);
             case HirTextExprKw::Index:      return typedCall(HirKind::Index);
-            case HirTextExprKw::Construct:  return typedCall(HirKind::ConstructAggregate);
+            case HirTextExprKw::Construct: {
+                // `construct [#member] : <type> (<fields>)` — the writer's mirror: a union
+                // aggregate's member index when it is not 0 (P69), else none.
+                NodeParseFrame f;
+                f.kind     = NodeParseFrame::Kind::ParenOperands;
+                f.nodeKind = HirKind::ConstructAggregate;
+                f.flags    = flags;
+                f.payload  = accept(Tk::Hash) ? takeU32("union member index") : 0u;
+                f.type     = parseTypeAnnot();
+                f.preIdx   = idx;
+                f.attrs    = std::move(attrs);
+                return openParenOperands(stack, done, std::move(f));
+            }
             case HirTextExprKw::Ternary:    return typedCall(HirKind::Ternary);
             case HirTextExprKw::LogicalAnd: return typedCall(HirKind::LogicalAnd);
             case HirTextExprKw::LogicalOr:  return typedCall(HirKind::LogicalOr);
@@ -4765,6 +4887,7 @@ private:
             case HirTextExprKw::VaStart:    return typedCall(HirKind::VaStart);
             case HirTextExprKw::VaArg:      return typedCall(HirKind::VaArg);
             case HirTextExprKw::VaEnd:      return typedCall(HirKind::VaEnd);
+            case HirTextExprKw::VaCopy:     return typedCall(HirKind::VaCopy);
             // The row-count sentinel. It is UNLISTED in the table, so `fromName`
             // cannot produce it and this arm cannot be reached from any input —
             // it exists because `-Werror=switch` is the pairing guard, and a

@@ -38,6 +38,14 @@
 //   * quick_exit binds GLIBC_2.24 on both ELF arches: glibc exports a compat
 //     instance beside it (GLIBC_2.10 on x86_64, GLIBC_2.17 on aarch64 — the
 //     aarch64 BASE version, which an unversioned reference would bind).
+//   * strtoull binds glibc's C23 entry point `__isoc23_strtoull` (@GLIBC_2.38) on both
+//     ELF arches, as gcc -std=c2x does (P69, D-C-GLIBC-C23-ENTRY-POINTS-NOT-BOUND); the
+//     probe's ELF import lists name it. On pe and Mach-O it is DSS's C23 entry point
+//     `__dss_isoc23_strtoull` (runtime/platform/src/stdlib_strto.c, P69
+//     D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM), defined in the image, which
+//     reaches the platform's own strtoull through a private row — so the plain
+//     `strtoull` / `_strtoull` the probe's pe and Mach-O lists name is still imported,
+//     now by DSS's runtime rather than by the probe.
 //   * at_quick_exit is glibc's libc_nonshared.a stub, so on ELF it maps onto
 //     `__cxa_at_quick_exit` (the null DSO handle the atexit mapping passes too);
 //     the UCRT's is `_crt_at_quick_exit` (as atexit's is `_crt_atexit`); Apple
@@ -109,11 +117,11 @@ struct Pair {
           "_Exit", "quick_exit", "_crt_at_quick_exit", "mblen"}},
         {"x86_64:elf64-x86_64-linux-exec", "x86_64", "elf64-x86_64-linux-exec", "probe",
          2147483647, "(__ctype_get_mb_cur_max ())", "__ctype_get_mb_cur_max", "GLIBC_2.24",
-         {"__ctype_get_mb_cur_max", "div", "ldiv", "lldiv", "atoll", "llabs", "strtoull",
+         {"__ctype_get_mb_cur_max", "div", "ldiv", "lldiv", "atoll", "llabs", "__isoc23_strtoull",
           "strtof", "_Exit", "quick_exit", "__cxa_at_quick_exit", "mblen", "aligned_alloc"}},
         {"arm64:elf64-aarch64-linux-exec", "arm64", "elf64-aarch64-linux-exec", "probe",
          2147483647, "(__ctype_get_mb_cur_max ())", "__ctype_get_mb_cur_max", "GLIBC_2.24",
-         {"__ctype_get_mb_cur_max", "div", "ldiv", "lldiv", "atoll", "llabs", "strtoull",
+         {"__ctype_get_mb_cur_max", "div", "ldiv", "lldiv", "atoll", "llabs", "__isoc23_strtoull",
           "strtof", "_Exit", "quick_exit", "__cxa_at_quick_exit", "mblen", "aligned_alloc"}},
         {"arm64:macho64-arm64-darwin-exec", "arm64", "macho64-arm64-darwin-exec", "probe",
          2147483647, "((size_t)__mb_cur_max)", "__mb_cur_max", "",
@@ -251,9 +259,7 @@ constexpr char const* kProbe =
     "        + (long long)strtof(\"1\", 0) + mblen(\"a\", 1)\n"
     "        + d.quot + l.quot + ll.quot + (long long)mb + RAND_MAX + EXIT_SUCCESS + EXIT_FAILURE\n"
     "        + (long long)offsetof(lldiv_t, rem);\n"
-    "#if !defined(_WIN32)\n"
     "    void *p = aligned_alloc(16, 16); free(p);\n"
-    "#endif\n"
     "    if (at_quick_exit(h) != 0 || table[0] == 0) return (int)v;\n"
     "    quick_exit((int)v);\n"
     "}\n";
@@ -351,14 +357,31 @@ TEST(StdlibHIsoSurface, EveryS1FactHoldsOnEveryExecutablePair) {
                                                            : "_crt_at_quick_exit"), nullptr);
         }
 
-        // aligned_alloc: imported where the library exports one (not the UCRT).
-        EXPECT_EQ(symbol("aligned_alloc") != nullptr, kind != ObjectFormatKind::Pe);
+        // aligned_alloc: declared on every pair since P69 — the library's export where it
+        // has one, DSS's runtime source on pe (the UCRT exports none; test (3) below).
+        EXPECT_NE(symbol("aligned_alloc"), nullptr);
 
-        // div_t / ldiv_t / lldiv_t: declared, `long` 32 bits on LLP64 only.
-        for (char const* t : {"div_t", "ldiv_t", "lldiv_t"}) {
-            bool found = false;
-            for (auto const& td : desc->typedefs) found = found || td.name == t;
-            EXPECT_TRUE(found) << t << " is not declared";
+        // div_t / ldiv_t / lldiv_t: declared, and each member the width its C type has on
+        // this pair's data model — `long` is 32 bits on LLP64 only. (This comment used to
+        // claim the width while the code checked only the name — a round-12 audit finding,
+        // D-AUDIT-P68-ROUND-12-MINOR-FINDINGS; P69 makes the check.)
+        struct DivType {
+            char const* name;
+            TypeKind    lp64;
+            TypeKind    llp64;
+        };
+        for (DivType const& d : {DivType{"div_t", TypeKind::I32, TypeKind::I32},
+                                 DivType{"ldiv_t", TypeKind::I64, TypeKind::I32},
+                                 DivType{"lldiv_t", TypeKind::I64, TypeKind::I64}}) {
+            TypeId ty{};
+            for (auto const& td : desc->typedefs)
+                if (td.name == d.name) ty = td.type;
+            ASSERT_TRUE(ty.valid()) << d.name << " is not declared";
+            auto const members = interner.operands(ty);
+            ASSERT_EQ(members.size(), 2u) << d.name << ": {quot, rem}";
+            TypeKind const want = model == DataModel::Llp64 ? d.llp64 : d.lp64;
+            for (TypeId const m : members)
+                EXPECT_EQ(interner.kind(m), want) << d.name << " on " << fmt;
         }
 
         // <stddef.h>'s `offsetof` (D-FFI-OFFSETOF-MACRO, corrected in the same fold): the
@@ -408,5 +431,159 @@ TEST(StdlibHIsoSurface, TheProbeLinksAndImportsEachPairsEntryPoints) {
         EXPECT_TRUE(missing.empty())
             << "not imported: [" << dss::test_support::joinDependencies(missing) << "]; imported: ["
             << dss::test_support::joinDependencies(names) << "]";
+    }
+}
+
+// ── (3) THE REST OF C23's <stdlib.h>, PER PAIR (P69 row 1 of the same anchor) ─────
+//
+// The names round 12 left, through the real reader on every executable pair:
+//   * mbtowc, wctomb, mbstowcs, wcstombs, strtold — the platform's own export on every
+//     pair (✔MEASURED P69: glibc 2.39, the UCRT through MSVC 19.51 and mingw-w64 13.2.0,
+//     libSystem), each typed with the PAIR's wchar_t — u16 on pe, i32 on ELF x86_64 and
+//     Mach-O, u32 on ELF aarch64 (stddef.json's ABI typedef) — and long double;
+//   * strfromd, strfromf, strfroml — glibc's exports (@GLIBC_2.25) on ELF;
+//     runtime/platform/src/stdlib_strfrom.c on pe and Mach-O, whose libraries export none;
+//   * free_sized, free_aligned_sized — runtime/platform/src/stdlib.c on EVERY pair (no
+//     platform exports either);
+//   * aligned_alloc — the platform's on ELF and Mach-O, runtime/platform/src/
+//     stdlib_aligned_alloc.c on pe (the UCRT exports none);
+//   * C23 7.24p2's once trio — once_flag (a REFERENCE to <threads.h>'s, its one owner),
+//     ONCE_FLAG_INIT and call_once — each IDENTICAL to threads.json's for the pair: the
+//     macro's replacement, the typedef's type, and the call_once row's signature, link
+//     name and realization (DSS's runtime/platform/src/threads_once.c on pe, libSystem's
+//     pthread_once on Mach-O, glibc's call_once on ELF). Two descriptors declare the trio,
+//     so this is the test that keeps them one declaration.
+// RED-ON-DISABLE: drop any row and it reds on every pair that lost it; give strfromd an
+// ELF realization and both ELF pairs red; let stdlib.json's Mach-O ONCE_FLAG_INIT drift
+// from threads.json's ({816954554}, the PTHREAD_ONCE_INIT signature) and both Mach-O pairs red.
+TEST(StdlibHIsoSurface, TheRestOfC23sStdlibIsDeclaredAndBoundOnEveryPair) {
+    ASSERT_NE(cLanguage(), nullptr);
+    fs::path const path = stdlibDescriptor();
+    ASSERT_FALSE(path.empty());
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    for (Pair const& p : pairs()) {
+        SCOPED_TRACE(p.spec);
+        auto targetR = TargetSchema::loadShipped(p.arch);
+        ASSERT_TRUE(targetR.has_value()) << p.arch;
+        auto formatR = ObjectFormatSchema::loadShipped(p.formatDoc);
+        ASSERT_TRUE(formatR.has_value()) << p.formatDoc;
+        ObjectFormatKind const kind = (*formatR)->kind();
+        std::string const      fmt{objectFormatKindName(kind)};
+        bool const             pe    = kind == ObjectFormatKind::Pe;
+        bool const             elf   = kind == ObjectFormatKind::Elf;
+        bool const             arm64 = std::string_view{p.arch} == "arm64";
+        PredefinedTypeFacts const typeFacts = predefinedTypeFactsFor(**targetR, **formatR);
+        ShippedPairFacts const facts{cLanguage().get(), typeFacts.dataModel, typeFacts.charIsUnsigned,
+                                     typeFacts.abiTypedefs, typeFacts.longDoubleFormat};
+
+        // ONE interner for both descriptors, so a type both spell is one TypeId.
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto read = [&](fs::path const& file) -> std::optional<ShippedLibDescriptor> {
+            DiagnosticReporter rep;
+            auto desc = readShippedLibDescriptor(file, interner, typeReg, rep, (*formatR)->dataModel(),
+                                                 std::string_view{p.arch}, kind, {}, nullptr, &facts);
+            EXPECT_FALSE(rep.hasErrors()) << file.filename().string() << ": "
+                                          << (rep.all().empty() ? std::string{} : rep.all().front().actual);
+            return desc;
+        };
+        auto const stdlib  = read(path);
+        auto const threads = read(path.parent_path() / "threads.json");
+        ASSERT_TRUE(stdlib.has_value());
+        ASSERT_TRUE(threads.has_value());
+        auto row = [&](ShippedLibDescriptor const& d, std::string_view n) -> ShippedSymbol const* {
+            ShippedSymbol const* found = nullptr;
+            for (auto const& s : d.symbols) {
+                if (s.name != n || !availableOn(s, fmt)) continue;
+                EXPECT_EQ(found, nullptr) << n << " has two rows on " << fmt;
+                found = &s;
+            }
+            return found;
+        };
+        // The unit a row is realized from on THIS pair, or "" for an import.
+        auto unitOf = [&](ShippedSymbol const& s) -> std::string {
+            auto const r = s.realization.find(fmt);
+            return r == s.realization.end() ? std::string{} : r->second;
+        };
+
+        // The imports, with the pair's wchar_t and long double.
+        TypeKind const wcharKind = pe ? TypeKind::U16 : (elf && arm64 ? TypeKind::U32 : TypeKind::I32);
+        TypeKind const ldKind    = pe || (arm64 && !elf) ? TypeKind::F64
+                                                         : (arm64 ? TypeKind::F128 : TypeKind::F80);
+        for (char const* n : {"mbtowc", "wctomb", "mbstowcs", "wcstombs", "strtold"}) {
+            SCOPED_TRACE(n);
+            ShippedSymbol const* s = row(*stdlib, n);
+            ASSERT_NE(s, nullptr) << n << " is not declared on " << fmt;
+            EXPECT_EQ(unitOf(*s), "") << "every platform exports it";
+            EXPECT_TRUE(s->linkName.empty());
+        }
+        auto pointeeKind = [&](TypeId ptr) {
+            auto const ops = interner.operands(ptr);
+            return ops.empty() ? TypeKind::Void : interner.kind(ops[0]);
+        };
+        ShippedSymbol const* mbtowc = row(*stdlib, "mbtowc");
+        ShippedSymbol const* strtold = row(*stdlib, "strtold");
+        ASSERT_NE(mbtowc, nullptr);
+        ASSERT_NE(strtold, nullptr);
+        auto const mbParams = interner.fnArgumentParams(mbtowc->signature);
+        ASSERT_FALSE(mbParams.empty());
+        EXPECT_EQ(pointeeKind(mbParams[0]), wcharKind) << "mbtowc's wchar_t * is the pair's wchar_t";
+        EXPECT_EQ(interner.kind(interner.fnResult(strtold->signature)), ldKind)
+            << "strtold returns the pair's long double";
+
+        // The realized names.
+        for (char const* n : {"strfromd", "strfromf", "strfroml"}) {
+            ShippedSymbol const* s = row(*stdlib, n);
+            ASSERT_NE(s, nullptr) << n;
+            EXPECT_EQ(unitOf(*s), elf ? std::string{} : std::string{"runtime/platform/src/stdlib_strfrom.c"}) << n;
+        }
+        for (char const* n : {"free_sized", "free_aligned_sized"}) {
+            ShippedSymbol const* s = row(*stdlib, n);
+            ASSERT_NE(s, nullptr) << n;
+            EXPECT_EQ(unitOf(*s), "runtime/platform/src/stdlib.c") << n;
+        }
+        ShippedSymbol const* aa = row(*stdlib, "aligned_alloc");
+        ASSERT_NE(aa, nullptr);
+        EXPECT_EQ(unitOf(*aa), pe ? std::string{"runtime/platform/src/stdlib_aligned_alloc.c"} : std::string{});
+        for (ShippedSymbol const* s : {row(*stdlib, "strfromd"), row(*stdlib, "free_sized"), aa}) {
+            std::string const unit = s == nullptr ? std::string{} : unitOf(*s);
+            if (!unit.empty()) EXPECT_TRUE(fs::exists(*cfg / unit)) << unit << " does not exist";
+        }
+
+        // The once trio: one declaration, written in two descriptors.
+        ShippedMacro const* init = nullptr;
+        ShippedMacro const* initT = nullptr;
+        for (auto const& m : stdlib->macros) if (m.name == "ONCE_FLAG_INIT") init = &m;
+        for (auto const& m : threads->macros) if (m.name == "ONCE_FLAG_INIT") initT = &m;
+        ASSERT_NE(init, nullptr) << "<stdlib.h> declares no ONCE_FLAG_INIT";
+        ASSERT_NE(initT, nullptr);
+        EXPECT_EQ(init->replacement, initT->replacement);
+        EXPECT_EQ(init->replacement, kind == ObjectFormatKind::MachO ? "{816954554}" : "{0}");
+        TypeId flag{};
+        TypeId flagT{};
+        for (auto const& t : stdlib->typedefs) if (t.name == "once_flag") flag = t.type;
+        for (auto const& t : threads->typedefs) if (t.name == "once_flag") flagT = t.type;
+        ASSERT_TRUE(flag.valid()) << "<stdlib.h> declares no once_flag";
+        EXPECT_EQ(flag, flagT) << "once_flag is <threads.h>'s, never a second definition";
+        ShippedSymbol const* once  = row(*stdlib, "call_once");
+        ShippedSymbol const* onceT = row(*threads, "call_once");
+        ASSERT_NE(once, nullptr) << "<stdlib.h> declares no call_once";
+        ASSERT_NE(onceT, nullptr);
+        EXPECT_EQ(once->signature, onceT->signature);
+        EXPECT_EQ(once->linkName, onceT->linkName);
+        EXPECT_EQ(unitOf(*once), unitOf(*onceT));
+        EXPECT_TRUE(once->synthesize.empty()) << "call_once is no synthesized recipe since P69";
+        EXPECT_EQ(unitOf(*once), pe ? std::string{"runtime/platform/src/threads_once.c"} : std::string{});
+        EXPECT_EQ(once->linkName, kind == ObjectFormatKind::MachO ? std::string{"pthread_once"} : std::string{});
+        // pe's unit reaches kernel32 through threads.json's one private row, on pe only.
+        ShippedSymbol const* ioe = row(*threads, "__dss_platform_init_once_execute_once");
+        if (pe) {
+            ASSERT_NE(ioe, nullptr);
+            EXPECT_EQ(ioe->linkName, "InitOnceExecuteOnce");
+            EXPECT_EQ(unitOf(*ioe), "");
+        } else {
+            EXPECT_EQ(ioe, nullptr) << "only pe's call_once needs the platform's one-time primitive";
+        }
     }
 }

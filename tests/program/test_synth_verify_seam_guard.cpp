@@ -317,4 +317,110 @@ void driver() {
            "ORIGINAL text — a same-length blanking is what makes that true";
 }
 
+// ══ D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY — THE LIBRARY SHIMS ARE
+//    OPTIMIZER INPUT ON EVERY ROUTE ══════════════════════════════════════════
+//
+// ✔DECIDED (P69): a library shim (a `synthesize` recipe) is synthesized BEFORE its
+// module's FINAL optimize at every route — the sole-CU route, each static-archive
+// member, the merge seam, and `assembleUnit` — where the single-module routes used
+// to synthesize inside `lowerCuMirToAssembly`, after it. The contract is on
+// `synthesizeLibraryShims`' declaration.
+//
+// ⚠ WHY THIS IS A SOURCE-ORDER PIN, like the verify seam's above. ✔MEASURED
+// 2026-10-01 with the P69 lane-lm dsscp: a <threads.h> program built as one CU and
+// as two, at the baseline and at release, on both Mach-O arches, emits `_mtx_init`,
+// `_mtx_lock` and `_mtx_unlock` at IDENTICAL sizes — a WEAK body is never inlined
+// (inlining.cpp refuses a Weak callee) and no other pass changes these bodies — so
+// no emitted byte tells the two placements apart today. The property that must not
+// regress is the ORDER, so this reads the source, with the same blanking and the
+// same call-form matching as the verify-seam arms.
+namespace {
+
+// Every offset of `needle` in the blanked `code`.
+[[nodiscard]] std::vector<std::size_t> offsetsOf(std::string const& code,
+                                                 std::string_view   needle) {
+    std::vector<std::size_t> hits;
+    for (std::size_t at = code.find(needle); at != std::string::npos;
+         at = code.find(needle, at + 1)) {
+        hits.push_back(at);
+    }
+    return hits;
+}
+
+[[nodiscard]] std::string blankedSource(std::string_view relative) {
+    std::string const text = readSource(relative);
+    EXPECT_FALSE(text.empty()) << relative << " read back empty";
+    std::string code = blankNonCode(text);
+    EXPECT_EQ(code.size(), text.size()) << relative;
+    EXPECT_NE(code, text) << relative << ": the blanking pass changed nothing";
+    return code;
+}
+
+}  // namespace
+
+// THE DRIVER (program.cpp): every final-module optimize — the member's, the sole
+// CU's and the merged module's — is preceded, since the previous one, by exactly ONE
+// library-shim synthesis call (`synthesizeLibraryShims` on the single-module routes,
+// `synthesizeThreadsShim` over the merged recipe map on the merge seam). Moving a
+// route's synthesis back behind its optimize leaves an optimize with none in front
+// of it and the next one with two — red either way, naming the optimize.
+TEST(LibraryShimSeamGuard, EveryFinalOptimizeInTheDriverFollowsItsModulesShimSynthesis) {
+    std::string const code = blankedSource("src/program/program.cpp");
+    std::vector<std::size_t> const optimizes = callFormOffsets(code, "optimizeModule");
+    std::vector<std::size_t> synths = callFormOffsets(code, "synthesizeLibraryShims");
+    std::vector<std::size_t> const merged = callFormOffsets(code, "synthesizeThreadsShim");
+    synths.insert(synths.end(), merged.begin(), merged.end());
+    ASSERT_EQ(optimizes.size(), 3u)
+        << "program.cpp optimizes THREE final modules (a static-archive member, the "
+           "sole CU, the merged module); a route added or removed must be declared "
+           "here deliberately";
+    ASSERT_EQ(synths.size(), 3u)
+        << "program.cpp must synthesize the library shims once per final-module "
+           "route — found " << synths.size();
+    std::size_t previous = 0;
+    for (std::size_t k = 0; k < optimizes.size(); ++k) {
+        std::size_t inFront = 0;
+        for (std::size_t const s : synths) {
+            if (s >= previous && s < optimizes[k]) ++inFront;
+        }
+        EXPECT_EQ(inFront, 1u)
+            << "final-module optimize #" << (k + 1) << " of program.cpp (offset "
+            << optimizes[k] << ") must be preceded, since the previous one, by "
+               "exactly one library-shim synthesis — the shims are optimizer INPUT";
+        previous = optimizes[k];
+    }
+}
+
+// THE LOWER HALF (compile_pipeline.cpp): `synthesizeThreadsShim` is called exactly
+// once, inside `synthesizeLibraryShims` — i.e. in front of `lowerCuMirToAssembly`'s
+// definition, never inside it — and `assembleUnit` synthesizes, then optimizes at
+// the Program stage, then lowers, in that order.
+TEST(LibraryShimSeamGuard, TheLowerHalfSynthesizesNoShimAndAssembleUnitSynthesizesBeforeItsOptimize) {
+    std::string const code = blankedSource("src/program/compile_pipeline.cpp");
+    std::vector<std::size_t> const threads = offsetsOf(code, "synthesizeThreadsShim(");
+    ASSERT_EQ(threads.size(), 1u)
+        << "compile_pipeline.cpp must call synthesizeThreadsShim exactly once — "
+           "from synthesizeLibraryShims";
+    std::vector<std::size_t> const helperDefs = offsetsOf(code, "bool synthesizeLibraryShims(");
+    std::vector<std::size_t> const lowerDefs =
+        offsetsOf(code, "lowerCuMirToAssembly(CuMirModule&");
+    ASSERT_EQ(helperDefs.size(), 1u) << "synthesizeLibraryShims' definition";
+    ASSERT_EQ(lowerDefs.size(), 1u) << "lowerCuMirToAssembly's definition";
+    EXPECT_GT(threads.front(), helperDefs.front())
+        << "the one synthesizeThreadsShim call belongs to synthesizeLibraryShims";
+    EXPECT_LT(threads.front(), lowerDefs.front())
+        << "the LOWER half must not synthesize a library shim — it runs after the "
+           "module's final optimize, which is the placement this guard forbids";
+
+    std::vector<std::size_t> const helperCalls = callFormOffsets(code, "synthesizeLibraryShims");
+    ASSERT_EQ(helperCalls.size(), 1u) << "assembleUnit's one call";
+    std::size_t const optimize = code.find("!optimizeModule(", helperCalls.front());
+    std::size_t const lower = code.find("lowerCuMirToAssembly(", helperCalls.front());
+    ASSERT_NE(optimize, std::string::npos)
+        << "assembleUnit must run the Program-stage optimize after synthesizing";
+    ASSERT_NE(lower, std::string::npos);
+    EXPECT_LT(optimize, lower)
+        << "assembleUnit: synthesize, then optimize, then lower — in that order";
+}
+
 } // namespace

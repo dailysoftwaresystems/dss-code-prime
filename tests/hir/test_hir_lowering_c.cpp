@@ -7010,8 +7010,12 @@ TEST(HirLoweringC, D5_3_CompoundLiteralInVarDeclInit) {
     HirNodeId fn = firstFunction(res->hir);
     HirNodeId init = firstVarInitOfFn(res->hir, fn);
     ASSERT_TRUE(init.valid());
-    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
-    EXPECT_EQ(res->hir.children(init).size(), 2u);
+    // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): the literal is
+    // an unnamed OBJECT whose value is the aggregate.
+    ASSERT_EQ(res->hir.kind(init), HirKind::UnnamedObject);
+    HirNodeId const value = res->hir.unnamedObjectValue(init);
+    EXPECT_EQ(res->hir.kind(value), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(value).size(), 2u);
 }
 
 // A NON-CONSTANT index designator (`[n] = 7`, `n` a mutable local) must be
@@ -7600,8 +7604,11 @@ TEST(HirLoweringC, D5_4_UnionCompoundLiteral) {
     HirNodeId fn = firstFunction(res->hir);
     HirNodeId init = firstVarInitOfFn(res->hir, fn);
     ASSERT_TRUE(init.valid());
-    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
-    EXPECT_EQ(res->hir.children(init).size(), 1u);
+    // P69: an unnamed object whose value is the one-slot union aggregate.
+    ASSERT_EQ(res->hir.kind(init), HirKind::UnnamedObject);
+    HirNodeId const value = res->hir.unnamedObjectValue(init);
+    EXPECT_EQ(res->hir.kind(value), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(value).size(), 1u);
 }
 
 // Member access on a union: `u.c` must resolve via the existing
@@ -9844,18 +9851,28 @@ constexpr char const* kPrintfRedeclSrc =
     "int printf(const char *fmt, ...);\n"
     "int main(void) { return printf(\"hi\\n\"); }\n";
 
+// ★ P69: the same shape on a recipe of the one synthesized family left — the shim
+// claim's own reproducer since the pe printf family became DSS's runtime source.
+constexpr char const* kMtxLockRedeclSrc =
+    "#include <threads.h>\n"
+    "int mtx_lock(void *m);\n"
+    "int main(void) { return mtx_lock(0); }\n";
+
 } // namespace
 
-// THE PRIMARY PIN. Under pe the re-declared `printf` must reach the synth
+// THE PRIMARY PIN. Under pe the re-declared recipe symbol must reach the synth
 // recipe map — keyed by the USER prototype's symbol, since goal-2 deleted the
 // descriptor's — and must plant NO import row. Both halves are asserted: a
 // recipe entry alongside a surviving import would still fail the load, and no
 // import with no recipe would be an undefined symbol.
 //
 // RED BEFORE TF-C112 on BOTH assertions: the map was empty and the import row
-// was present.
+// was present. ★ P69: re-pointed from `printf` (DSS's runtime source since P69 —
+// its own pin follows) to `mtx_lock`, a recipe of the one synthesized family
+// left; the claim under test is the same helper, reached by the same bare
+// prototype over the same `#include`.
 TEST(HirLoweringC, TFC112RedeclaredPeShimSymbolLowersToARecipeNotAnImport) {
-    SemanticModel model = analyzeRealStdioAt(kPrintfRedeclSrc,
+    SemanticModel model = analyzeRealStdioAt(kMtxLockRedeclSrc,
                                              ObjectFormatKind::Pe,
                                              DataModel::Llp64);
     ASSERT_FALSE(model.hasErrors());
@@ -9863,25 +9880,77 @@ TEST(HirLoweringC, TFC112RedeclaredPeShimSymbolLowersToARecipeNotAnImport) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok);
 
-    SymbolId const printfSym = symbolIdNamed(model, "printf");
-    ASSERT_TRUE(printfSym.valid());
-    auto const it = res->synthRecipeBySymbol.find(printfSym.v);
+    SymbolId const lockSym = symbolIdNamed(model, "mtx_lock");
+    ASSERT_TRUE(lockSym.valid());
+    auto const it = res->synthRecipeBySymbol.find(lockSym.v);
     ASSERT_NE(it, res->synthRecipeBySymbol.end())
         << "the user's prototype must inherit the suppressed row's REALIZATION: "
            "without a recipe entry HIR->MIR never seeds the symbol and no shim "
            "body is ever emitted";
-    EXPECT_EQ(it->second, "printf");
+    EXPECT_EQ(it->second, "mtx_lock");
 
-    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u)
-        << "ucrtbase.dll exports no bare `printf` — an import row here is a "
-           "binary that fails to LOAD (0xC0000139) with no diagnostic anywhere";
+    EXPECT_EQ(externRowsNamed(*res, "mtx_lock"), 0u)
+        << "no pe image exports `mtx_lock` — an import row here is a binary that "
+           "fails to LOAD (0xC0000139) with no diagnostic anywhere";
 
-    // The four SIBLINGS this TU did not re-declare take the injected path and
-    // must be unaffected — the fix must not have moved the whole family.
-    for (char const* sibling : {"fprintf", "sprintf", "vfprintf", "sscanf"})
+    // The SIBLINGS this TU did not re-declare take the injected path and must be
+    // unaffected — the fix must not have moved the whole family. (P69: `cnd_wait`
+    // replaces `call_once`, which is DSS's runtime source on pe now — an extern row,
+    // bound to no image, by design.)
+    for (char const* sibling : {"mtx_init", "mtx_unlock", "thrd_yield", "cnd_wait"})
         EXPECT_EQ(externRowsNamed(*res, sibling), 0u) << sibling;
-    // ...while the UCRT cores the shims call ARE ordinary imports.
-    EXPECT_EQ(externRowsNamed(*res, "__stdio_common_vfprintf"), 1u);
+}
+
+// ★ P69 (D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM): THE SHIPPED-SOURCE
+// ARM, on the very reproducer TF-C112 was measured on — and on its C99 6.7.4p7
+// inline-definition twin, the second site that displaces a shipped row. pe's
+// `printf` is DSS's runtime source now, so the re-declared name must bind THAT
+// realization: NO recipe entry (a shim would be a second body), exactly ONE extern
+// row, named by the row's LINK NAME `__dss_isoc23_printf` (what the runtime unit's
+// archive member defines) and bound to NO image. RED if the suppressed row lost
+// either property: the plain name is defined by nothing DSS links on pe, and a
+// `ucrtbase.dll` binding is the 0xC0000139 load failure TF-C112 measured, again.
+TEST(HirLoweringC, TFC112RedeclaredPeStdioSymbolBindsTheShippedSourceLinkName) {
+    for (char const* src :
+         {kPrintfRedeclSrc,
+          "#include <stdio.h>\n"
+          "inline int printf(const char *fmt, ...) { return -1; }\n"
+          "int main(void) { return printf(\"inl\\n\"); }\n"}) {
+        SCOPED_TRACE(src);
+        SemanticModel model = analyzeRealStdioAt(src, ObjectFormatKind::Pe,
+                                                 DataModel::Llp64);
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok);
+
+        SymbolId const printfSym = symbolIdNamed(model, "printf");
+        ASSERT_TRUE(printfSym.valid());
+        EXPECT_EQ(res->synthRecipeBySymbol.count(printfSym.v), 0u)
+            << "P69 retired the stdio recipes — a recipe here is a second owner of "
+               "the body runtime/platform/src/stdio.c provides";
+        ASSERT_EQ(externRowsNamed(*res, "printf"), 1u);
+        for (auto const& e : res->externDecls) {
+            if (e.canonicalName != "printf") continue;
+            EXPECT_EQ(e.linkName, "__dss_isoc23_printf")
+                << "the plain name is defined by nothing DSS links on pe";
+            auto const pe = e.libraryOverride.find("pe");
+            EXPECT_TRUE(e.noLibraryBinding
+                        || (pe != e.libraryOverride.end() && pe->second.empty()))
+                << "the extern must bind NO image — ucrtbase.dll exports no printf";
+            EXPECT_FALSE(e.isEagerImport);
+        }
+        // The siblings this TU did not re-declare take the injected path and
+        // bind the same way: each by its own link name, with no image.
+        for (std::string const sibling : {"fprintf", "sprintf", "vfprintf", "sscanf"}) {
+            ASSERT_EQ(externRowsNamed(*res, sibling), 1u) << sibling;
+            for (auto const& e : res->externDecls) {
+                if (e.canonicalName != sibling) continue;
+                EXPECT_EQ(e.linkName, "__dss_isoc23_" + sibling);
+                EXPECT_TRUE(e.noLibraryBinding) << sibling;
+            }
+        }
+    }
 }
 
 // THE AGNOSTICISM PIN. The SAME source under elf: glibc exports a real
@@ -9917,22 +9986,24 @@ TEST(HirLoweringC, TFC112RedeclaredElfStdioSymbolStaysAnOrdinaryImport) {
 // body per recipe id, built against the descriptor's signature, so binding a
 // divergent prototype to it would marshal the call under one ABI and answer it
 // under another — silently. Refusing is the only honest answer, and the refused
-// set is essentially clang's own "conflicting types for 'printf'".
+// set is essentially clang's own "conflicting types for 'mtx_lock'".
 //
 // Asserted THREE-SIDED: the diagnostic fires, the lowering is NOT ok, and
 // neither escape hatch is taken — no recipe entry (which would emit a wrong-ABI
-// shim) and no import row (which would not load).
+// shim) and no import row (which would not load). ★ P69: re-pointed from
+// `printf` to `mtx_lock` with the primary pin; the shipped-source `printf`'s own
+// refusal is the declaration-tier pin after the inline-definition arms below.
 TEST(HirLoweringC, TFC112IncompatibleRedeclarationOfAShimSymbolFailsLoud) {
     SemanticModel model = analyzeRealStdioAt(
-        "#include <stdio.h>\n"
-        "int printf(const char *fmt);\n"   // NOT variadic — cannot be the shim
-        "int main(void) { return printf(\"hi\\n\"); }\n",
+        "#include <threads.h>\n"
+        "int mtx_lock(int m);\n"   // an int, not a pointer — cannot be the shim
+        "int main(void) { return mtx_lock(0); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
     // ★ P44 ([[D-CSUBSET-INCOMPATIBLE-REDECL-DIAGNOSED-AT-CALL-SITE-NOT-DECLARATION]]):
     // this used to `ASSERT_FALSE(model.hasErrors())` — the semantic tier said
     // NOTHING about a declaration that contradicts the platform's own, which is
     // the wrong-TIER half of that row and is why the identical source on an ELF
-    // target (where `printf` is an ordinary import, so this gate never runs)
+    // target (where the name is an ordinary import, so this gate never runs)
     // compiled completely clean. The declaration-site diagnostic now fires, and
     // this gate is the BACKSTOP rather than the only voice. Both must speak: a
     // shim gate that went quiet once the analyzer complained would leave the
@@ -9946,10 +10017,10 @@ TEST(HirLoweringC, TFC112IncompatibleRedeclarationOfAShimSymbolFailsLoud) {
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 1u)
         << "a silently wrong-ABI call is exactly the class this project refuses "
            "to ship; the mismatch must be named, not absorbed";
-    SymbolId const printfSym = symbolIdNamed(model, "printf");
-    ASSERT_TRUE(printfSym.valid());
-    EXPECT_EQ(res->synthRecipeBySymbol.count(printfSym.v), 0u);
-    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u);
+    SymbolId const lockSym = symbolIdNamed(model, "mtx_lock");
+    ASSERT_TRUE(lockSym.valid());
+    EXPECT_EQ(res->synthRecipeBySymbol.count(lockSym.v), 0u);
+    EXPECT_EQ(externRowsNamed(*res, "mtx_lock"), 0u);
 }
 
 // THE ARITY ARM of the same refusal, on a DIFFERENT recipe — so the gate is
@@ -9957,9 +10028,9 @@ TEST(HirLoweringC, TFC112IncompatibleRedeclarationOfAShimSymbolFailsLoud) {
 // and so the "which axis diverged" reporting has a second witness.
 TEST(HirLoweringC, TFC112WrongArityRedeclarationOfAShimSymbolFailsLoud) {
     SemanticModel model = analyzeRealStdioAt(
-        "#include <stdio.h>\n"
-        "int sprintf(char *b, const char *f, int extra, ...);\n"
-        "int main(void) { char b[8]; return sprintf(b, \"%d\", 1, 2); }\n",
+        "#include <threads.h>\n"
+        "int mtx_init(void *m, int type, int extra);\n"
+        "int main(void) { return mtx_init(0, 0, 0); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
     // P44: the declaration-site diagnostic now fires here too — see the
     // arity-arm's sibling above for why both tiers must speak.
@@ -9969,7 +10040,7 @@ TEST(HirLoweringC, TFC112WrongArityRedeclarationOfAShimSymbolFailsLoud) {
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 1u);
-    EXPECT_EQ(externRowsNamed(*res, "sprintf"), 0u);
+    EXPECT_EQ(externRowsNamed(*res, "mtx_init"), 0u);
 }
 
 // THE NON-SHIM SUPPRESSED ROW IS UNTOUCHED (the selectivity guard). `puts` is a
@@ -10006,39 +10077,40 @@ TEST(HirLoweringC, TFC112RedeclaredNonRecipePeRowStillSynthesizesTheImport) {
 // displaces a shipped row and then synthesizes an extern for it. It carried the
 // identical defect, and it was found only by tracing every reader of
 // `suppressedShippedSymbolFor` instead of only the site the defect report
-// named. MEASURED before the refactor, on exactly this source: the same
-// `ExternImport{printf, ucrtbase.dll}`, rc=0, no diagnostic, and the same
-// 0xC0000139 at process start.
+// named. MEASURED before the refactor, on the `printf` spelling of this source:
+// the same `ExternImport{printf, ucrtbase.dll}`, rc=0, no diagnostic, and the
+// same 0xC0000139 at process start. (★ P69: re-pointed to `mtx_lock` with the
+// primary pin; the `printf` spelling is the shipped-source pin's second source.)
 //
 // Handing the shim over is not a workaround for the suppression — the external
 // definition 6.7.4p7 sends the call to IS the shim on such a target.
 TEST(HirLoweringC, TFC112InlineDefinitionOfAShimSymbolAlsoInheritsTheShim) {
     SemanticModel model = analyzeRealStdioAt(
-        "#include <stdio.h>\n"
-        "inline int printf(const char *fmt, ...) { return -1; }\n"
-        "int main(void) { return printf(\"inl\\n\"); }\n",
+        "#include <threads.h>\n"
+        "inline int mtx_lock(void *m) { return -1; }\n"
+        "int main(void) { return mtx_lock(0); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok);
-    SymbolId const printfSym = symbolIdNamed(model, "printf");
-    ASSERT_TRUE(printfSym.valid());
-    auto const it = res->synthRecipeBySymbol.find(printfSym.v);
+    SymbolId const lockSym = symbolIdNamed(model, "mtx_lock");
+    ASSERT_TRUE(lockSym.valid());
+    auto const it = res->synthRecipeBySymbol.find(lockSym.v);
     ASSERT_NE(it, res->synthRecipeBySymbol.end());
-    EXPECT_EQ(it->second, "printf");
-    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u)
+    EXPECT_EQ(it->second, "mtx_lock");
+    EXPECT_EQ(externRowsNamed(*res, "mtx_lock"), 0u)
         << "the suppressed inline definition must inherit the shim, not plant a "
-           "ucrtbase import that cannot load";
+           "kernel32 import that cannot load";
 }
 
 // ...and its refusal arm, so the signature gate is pinned at BOTH sites rather
 // than only at the one the shared helper was written for.
 TEST(HirLoweringC, TFC112IncompatibleInlineDefinitionOfAShimSymbolFailsLoud) {
     SemanticModel model = analyzeRealStdioAt(
-        "#include <stdio.h>\n"
-        "inline int printf(const char *fmt) { return -1; }\n"   // not variadic
-        "int main(void) { return printf(\"inl\\n\"); }\n",
+        "#include <threads.h>\n"
+        "inline int mtx_unlock(int m) { return -1; }\n"   // an int, not a pointer
+        "int main(void) { return mtx_unlock(0); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
     // P44: the declaration-site diagnostic now fires for the inline-definition
     // spelling as well — the C99 6.7.4p7 arm is a DECLARATION for compatibility
@@ -10049,7 +10121,30 @@ TEST(HirLoweringC, TFC112IncompatibleInlineDefinitionOfAShimSymbolFailsLoud) {
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 1u);
-    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u);
+    EXPECT_EQ(externRowsNamed(*res, "mtx_unlock"), 0u);
+}
+
+// ★ P69: THE SHIPPED-SOURCE ROW'S REFUSAL LIVES AT THE DECLARATION, as every
+// non-shim row's does (`puts`). A prototype contradicting pe's `printf` row is
+// refused by C23 6.7p4 at the semantic tier, so the driver never lowers it; the
+// HIR shim gate is NOT its backstop any more (there is no fixed synthesized body
+// to protect — the runtime unit is compiled C like any other definition), and
+// firing it would name a shim that does not exist. RED if the declaration-tier
+// diagnostic stops firing for a shipped-source row.
+TEST(HirLoweringC, TFC112IncompatibleRedeclarationOfAShippedSourceSymbolIsRefusedAtTheDeclaration) {
+    SemanticModel model = analyzeRealStdioAt(
+        "#include <stdio.h>\n"
+        "int printf(const char *fmt);\n"   // NOT variadic
+        "int main(void) { return printf(\"hi\\n\"); }\n",
+        ObjectFormatKind::Pe, DataModel::Llp64);
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "C23 6.7p4 wants the diagnostic AT THE DECLARATION";
+    EXPECT_TRUE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 0u)
+        << "no shim realizes pe's printf since P69";
 }
 
 // ★★ D-CSUBSET-ENUM-FNSIG-NULLPTR-CONDITIONS-SKIP-THE-TRUTHINESS-CHOKEPOINT
@@ -12389,5 +12484,136 @@ TEST(HirLoweringC, DeclaredLinkageAfterTheDefinitionIsIgnoredAndSaidSo) {
                "gcc applies it; DSS follows clang, and moving to gcc's answer is "
                "an architectural decision, not a bug fix";
         EXPECT_EQ(got->visibility, SymbolVisibility::Default) << src;
+    }
+}
+
+// ── P69 (lane `cs`): A COMPOUND LITERAL LOWERS TO ITS OWN OBJECT ──────────────────────────
+// D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT: every literal is an
+// `UnnamedObject` whose one child is its initializer value and whose payload is the storage
+// duration the semantic tier decided — automatic inside a function body, static outside
+// every one (C 6.5.2.5p5) or with C23 `static`, thread with `thread_local` — and a const
+// static one is recorded read-only on the SAME side table a const global's is.
+// RED-ON-DISABLE: `lowerCompoundLiteral` returning its brace list's value → no UnnamedObject.
+namespace {
+struct UnnamedFound { HirNodeId node; HirObjectStorage storage; };
+[[nodiscard]] std::vector<UnnamedFound> unnamedObjects(Hir const& hir) {
+    std::vector<UnnamedFound> out;
+    for (std::uint32_t i = 1; i < hir.nodeCount(); ++i) {
+        HirNodeId const n{i, hir.id().v};
+        if (hir.kind(n) == HirKind::UnnamedObject)
+            out.push_back({n, hir.unnamedObjectStorage(n)});
+    }
+    return out;
+}
+} // namespace
+
+TEST(HirLoweringC, EveryCompoundLiteralIsAnUnnamedObjectOfItsStorage) {
+    struct Case { char const* src; HirObjectStorage storage; bool readOnly; };
+    for (Case const& c : {
+             Case{"int main(int argc, char **argv) { (void)argv; int *p = &(int){ argc }; "
+                  "return *p; }\n", HirObjectStorage::Automatic, false},
+             Case{"int *p = &(int){ 42 };\nint main(void) { return *p; }\n",
+                  HirObjectStorage::Static, false},
+             Case{"const int *p = &(const int){ 42 };\nint main(void) { return *p; }\n",
+                  HirObjectStorage::Static, true},
+             Case{"int main(void) { int *p = &(static int){ 42 }; return *p; }\n",
+                  HirObjectStorage::Static, false},
+             Case{"int main(void) { int *p = &(static thread_local int){ 42 }; return *p; }\n",
+                  HirObjectStorage::Thread, false},
+         }) {
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << c.src << (model.diagnostics().all().empty()
+                             ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr && res->ok)
+            << c.src << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const found = unnamedObjects(res->hir);
+        ASSERT_EQ(found.size(), 1u) << c.src;
+        EXPECT_EQ(found[0].storage, c.storage) << c.src;
+        EXPECT_EQ(res->hir.children(found[0].node).size(), 1u) << c.src;
+        auto const* m = res->mutabilityMap.tryGet(found[0].node);
+        EXPECT_EQ(m != nullptr && m->isConst, c.readOnly) << c.src;
+    }
+}
+
+// C 6.5.3.2p1 / 6.3.2.1p3: no address of a `register` object — a C23 `(register T){ … }`
+// literal included — and no pointer from a `register` ARRAY, a subscript included
+// (D-C-A-REGISTER-ARRAY-DECAY-IS-NOT-REFUSED). gcc, clang and MSVC refuse each refused line
+// (runs 20260930-214035-a7fd710e, -214612-2a65f721; gcc -std=c2x for the literals,
+// 20260930-212759-cd6e2714 b04, -212829-175f46fc b19); an array MEMBER of a `register`
+// structure is built by clang and MSVC.
+// RED-ON-DISABLE: drop `refusedRegisterArrayDecay`'s calls → the array lines lower "ok";
+// drop the compound-literal half of `addressForbiddingObject` → the first line does.
+TEST(HirLoweringC, RegisterObjectsAddressAndArrayDecayAreRefused) {
+    for (char const* src : {
+             "int main(void) { int *p = &(register int){ 42 }; return *p; }\n",
+             "int main(int argc, char **argv) { (void)argv; register int a[2] = { 1, 41 }; "
+             "return a[argc] + 1; }\n",
+             "int main(int argc, char **argv) { (void)argv; register int a[2] = { 1, 41 }; "
+             "int *p = a; return p[argc] + 1; }\n",
+             "int main(int argc, char **argv) { (void)argv; "
+             "return (register int[]){ 1, 41 }[argc] + 1; }\n",
+         }) {
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors())
+            << src << (model.diagnostics().all().empty()
+                           ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_FALSE(res->ok) << src;
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_AddressOfRegisterObject), 1u) << src;
+    }
+    SemanticModel model = analyzeC(
+        "struct S { int v[2]; };\n"
+        "int main(int argc, char **argv) { (void)argv; register struct S s = { { 1, 41 } }; "
+        "return s.v[argc] + 1; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok) << "an array member of a register structure decays (clang, MSVC) "
+                         << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// P69 review n15: the designated-object walk is bounded by the HIR arena, never by a step
+// count — a member of a `register` structure reached through ANY depth of members is still
+// part of the register object, and taking its address is refused (C 6.5.3.2p1; gcc and clang
+// refuse `&s.m.x` of a `register` structure). The walk used to give up after 256 steps and
+// answer "no object", so a 300-member chain took the address in silence.
+// RED-ON-DISABLE: restore the 256-step limit in `designatedObjectRoot` → the register line
+// lowers "ok". CONTROL: the same chain on an ordinary object lowers.
+TEST(HirLoweringC, ARegisterObjectsAddressIsRefusedThroughAnyDepthOfMembers) {
+    constexpr int kDepth = 300;
+    std::string types = "struct S0 { int x; };\n";
+    for (int i = 1; i <= kDepth; ++i)
+        types += "struct S" + std::to_string(i) + " { struct S" + std::to_string(i - 1)
+               + " m; };\n";
+    std::string chain;
+    for (int i = 0; i < kDepth; ++i) chain += ".m";
+    auto const program = [&](char const* storage) {
+        return types + "int main(void) { " + storage + "struct S" + std::to_string(kDepth)
+             + " s; int *p = &s" + chain + ".x; (void)p; return 0; }\n";
+    };
+    {
+        SemanticModel model = analyzeC(program("register "));
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_FALSE(res->ok) << "the address of a register structure's member, 300 deep";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_AddressOfRegisterObject), 1u);
+    }
+    {
+        SemanticModel model = analyzeC(program(""));
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_TRUE(res->ok) << "CONTROL: an ordinary object's member, 300 deep "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
     }
 }

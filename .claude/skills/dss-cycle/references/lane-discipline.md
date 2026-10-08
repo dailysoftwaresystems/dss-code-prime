@@ -75,7 +75,7 @@ are in `delegation.md`; the lane lifecycle — its agent, seed, fold, rows and d
    a lane's `plan_citations_guard` was RED in one gate and GREEN in the next **with no edit
    of its own in between**, because the orchestrator applied registry rows and re-baselined
    the citation ratchet while that gate was in flight. `anchor_registry_guard`,
-   `plan_citations_guard`, `check-anchor-balance`, `check-stale-refusal-citations` and
+   `plan_citations_guard`, `dssharness check-anchor-balance`, `anchor-debt`, `check-stale-refusal-citations` and
    `check-retyped-closed-sets` all take `.plans/**` as their SUBJECT ⇒ a row written
    mid-gate moves a lane's verdict exactly as a config edit moves a lane's binary.
    ★ **THE DIRECTION THAT COSTS SOMETHING IS THE FLATTERING ONE.** That guard went
@@ -113,6 +113,10 @@ are in `delegation.md`; the lane lifecycle — its agent, seed, fold, rows and d
    `-C <repo>/.worktrees/<o>/<a>` and give every path it edits under that root, absolute; and a lane is
    never spawned with the Agent tool's own `isolation: "worktree"`, whose checkout no fold reads
    (`references/orchestration.md`).
+   ★ **AND IT WAITS ITS TURN BY ITSELF.** A lane's `dssharness build` or `test` is a heavy leg that DssHarness
+   admits (`defaults.admission`: two per physical machine, each started below 76% memory, across every lane's
+   tree): the lane takes no slot and asks for no GO, a waiting leg prints who holds each slot, and `not-admitted`
+   (exit 7) is a verdict of its own, never a failure of the lane's change (`references/delegation.md`).
 
 ### 4. A lane that writes scratch files gets its own work directory — and writes its rows to its agent's rows directory
 

@@ -1,0 +1,330 @@
+{
+  "$comment": "check-scripts-index clause 13, the verb census's record. `verbs`: each command-line token a program dispatches on that no step and no ctest entry reaches, with the category that DOES reach it -- driven (a named RUNNING program -- one a step or a ctest entry starts, or a module such a program imports -- that names the program, or imports a module that does, passes it in an argument list), self-driven (the running program passes it to itself), alias (of a spelling reached or recorded, held in one comparison or declaration), test-source (a test source outside the actions names the program and the token) -- and a `why`. A `*` token covers every token of its program, each one still verified; an exact record wins over it. Every record is verified on every run; there is no category for 'run by hand'. `treeWriters`: the steps that write this machine's tree, each reachable through a one-leg runner of this machine's own tree.",
+  "treeWriters": [
+    "anchor-rows/apply",
+    "check-doc-census/write",
+    "check-guard-output-encoding/write",
+    "check-plan-citations/baseline",
+    "check-plan-citations/write",
+    "check-scripts-index/write",
+    "check-stale-refusal-citations/baseline",
+    "check-stale-refusal-citations/write",
+    "check-wrapped-anchor-ids/baseline",
+    "check-wrapped-anchor-ids/write",
+    "refresh_landing_log/write"
+  ],
+  "verbs": [
+    {
+      "program": "anchor-rows/anchor-rows.py",
+      "token": "--repo",
+      "category": "self-driven",
+      "why": "the self-test and the rehearsal start this program against a throwaway repository's tree; a step acts on the tree the program lives in"
+    },
+    {
+      "program": "check-doc-census/check-doc-census.py",
+      "token": "--repo",
+      "category": "self-driven",
+      "why": "the self-test starts this program against the fixture repositories it synthesizes"
+    },
+    {
+      "program": "check-doc-census/source-census.py",
+      "token": "--repo",
+      "category": "driven",
+      "by": [
+        "check-doc-census/check-doc-census.py"
+      ],
+      "why": "check-doc-census starts the source census over the tree it verifies"
+    },
+    {
+      "program": "check-guard-output-encoding/check-guard-output-encoding.py",
+      "token": "--selftest",
+      "category": "alias",
+      "of": "--self-test",
+      "why": "the older spelling of --self-test, accepted by the same test"
+    },
+    {
+      "program": "check-line-endings/check-line-endings.py",
+      "token": "--files",
+      "category": "self-driven",
+      "why": "the self-test starts this program on a control file it writes; a reader's query is the `files` step (a list file)"
+    },
+    {
+      "program": "check-line-endings/check-line-endings.py",
+      "token": "--watchdog-probe",
+      "category": "self-driven",
+      "why": "the watchdog's self-test starts this program as the child that must be killed"
+    },
+    {
+      "program": "check-line-endings/check-line-endings.py",
+      "token": "--watchdog-probe-child",
+      "category": "self-driven",
+      "why": "the watchdog's self-test starts this program as the child whose grandchild must be killed"
+    },
+    {
+      "program": "check-ninja-deps/check-ninja-deps.py",
+      "token": "--allow-non-ninja",
+      "category": "test-source",
+      "by": "CMakeLists.txt",
+      "why": "the build/ninja-deps-freshness ctest entry passes it when CMake configured a non-Ninja generator, decided at configure time from CMAKE_GENERATOR; every DssHarness toolchain requests Ninja, so no harness run passes it and the skip it grants cannot be reached from a Ninja tree"
+    },
+    {
+      "program": "examples-census/examples-census.py",
+      "token": "--json",
+      "category": "driven",
+      "by": [
+        "check-doc-census/check-doc-census.py"
+      ],
+      "why": "check-doc-census reads the examples census as JSON to verify the figures documents quote"
+    },
+    {
+      "program": "profile-compile/profile-compile-support.py",
+      "token": "*",
+      "category": "driven",
+      "by": [
+        "profile-compile/profile-compile.py",
+        "compile-bench/compile-bench.py",
+        "real-examples/c/sqlite/build_and_test.py"
+      ],
+      "why": "profile-compile starts the support program for each subcommand it runs (build-type, manifest, timed-gate, gcc-reference, agg-trace); compile-bench and the sqlite driver's compiler probe ask its build-type of their compiler"
+    },
+    {
+      "program": "real-examples/c/sqlite/benchmark_speedtest1.py",
+      "token": "--derive-only",
+      "category": "self-driven",
+      "why": "a Windows measuring host re-runs this program inside WSL as its DERIVE HALF (validate_mode)"
+    },
+    {
+      "program": "real-examples/c/sqlite/benchmark_speedtest1.py",
+      "token": "--path-style",
+      "category": "self-driven",
+      "why": "the derive half is started with --path-style windows by the measuring host"
+    },
+    {
+      "program": "real-examples/c/sqlite/benchmark_speedtest1.py",
+      "token": "--recipe-transform",
+      "category": "self-driven",
+      "why": "the measuring host hands the derive half the leg's recipe transform"
+    },
+    {
+      "program": "real-examples/c/sqlite/benchmark_speedtest1.py",
+      "token": "--selftest",
+      "category": "alias",
+      "of": "--self-test",
+      "why": "the older spelling of --self-test, declared by the same add_argument"
+    },
+    {
+      "program": "real-examples/c/sqlite/benchmark_speedtest1.py",
+      "token": "--sqlite-dir",
+      "category": "self-driven",
+      "why": "the measuring host hands the derive half the sqlite checkout it resolved"
+    },
+    {
+      "program": "real-examples/c/sqlite/benchmark_speedtest1.py",
+      "token": "--stack-reserve",
+      "category": "self-driven",
+      "why": "the measuring host hands the derive half the leg's stack reserve"
+    },
+    {
+      "program": "real-examples/c/sqlite/benchmark_speedtest1.py",
+      "token": "--target",
+      "category": "self-driven",
+      "why": "the measuring host hands the derive half the leg's target spec (hop_argv)"
+    },
+    {
+      "program": "real-examples/c/sqlite/cli-smoke.py",
+      "token": "*",
+      "category": "driven",
+      "by": [
+        "real-examples/c/sqlite/build_and_test.py",
+        "real-examples/c/sqlite/sqlite_build.py",
+        "real-examples/c/sqlite/sqlite_recompile.py",
+        "real-examples/c/sqlite/sqlite_report.py",
+        "real-examples/c/sqlite/sqlite_smoke.py",
+        "sqlite-round-trip/sqlite-round-trip.py",
+        "real-examples/c/sqlite/test_driver_contracts.py",
+        "real-examples/c/sqlite/test_confound_scope.py"
+      ],
+      "why": "the corpus driver's CLI smoke gate (sqlite_smoke, run by the driver, the build and the recompile), the round trip's CLI arm and the driver's contract suites start it with these"
+    },
+    {
+      "program": "real-examples/c/sqlite/gen-pe64-manifest.py",
+      "token": "*",
+      "category": "driven",
+      "by": [
+        "real-examples/c/sqlite/sqlite_base.py",
+        "real-examples/c/sqlite/benchmark_speedtest1.py",
+        "real-examples/c/sqlite/harness_legs.py",
+        "real-examples/c/sqlite/test_driver_contracts.py"
+      ],
+      "why": "the driver's pe64 manifest step (sqlite_base) and the benchmark's pe64 derive start the generator with these; the contract suite pins the call"
+    },
+    {
+      "program": "real-examples/c/sqlite/harness_legs.py",
+      "token": "*",
+      "category": "driven",
+      "by": [
+        "real-examples/c/sqlite/sqlite_common.py",
+        "real-examples/c/sqlite/sqlite_build.py",
+        "real-examples/c/sqlite/sqlite_launch.py",
+        "real-examples/c/sqlite/sqlite_libs.py",
+        "real-examples/c/sqlite/sqlite_recompile.py",
+        "real-examples/c/sqlite/sqlite_report.py",
+        "real-examples/c/sqlite/sqlite_smoke.py",
+        "real-examples/c/sqlite/sqlite_units.py",
+        "real-examples/c/sqlite/sqlite_verdicts.py",
+        "real-examples/c/sqlite/build_and_test.py",
+        "real-examples/c/sqlite/benchmark_speedtest1.py",
+        "real-examples/c/sqlite/cli-smoke.py",
+        "sqlite-round-trip/sqlite-round-trip.py",
+        "real-examples/c/sqlite/test_driver_contracts.py",
+        "real-examples/c/sqlite/test_confound_scope.py"
+      ],
+      "why": "the corpus driver's modules ask the leg resolver through its verb CLI (sqlite_common's resolver), as do the benchmark, the CLI smoke gate and the round trip; --launchers-available only the contract suites pass (a launcher set fixed for the pin)"
+    },
+    {
+      "program": "real-examples/c/sqlite/harness_legs.py",
+      "token": "--max-seconds",
+      "category": "self-driven",
+      "why": "the monitor child is given the execution's lifetime"
+    },
+    {
+      "program": "real-examples/c/sqlite/harness_legs.py",
+      "token": "--measure-run-dir",
+      "category": "self-driven",
+      "why": "a precondition is measured by this program re-run on the run directory"
+    },
+    {
+      "program": "real-examples/c/sqlite/harness_legs.py",
+      "token": "--monitor-execution",
+      "category": "self-driven",
+      "why": "an execution is watched by this program re-run as its monitor child"
+    },
+    {
+      "program": "real-examples/c/sqlite/harness_legs.py",
+      "token": "--precondition",
+      "category": "self-driven",
+      "why": "the re-run is told which declared precondition to measure"
+    },
+    {
+      "program": "real-examples/c/sqlite/harness_legs.py",
+      "token": "--probe-only",
+      "category": "self-driven",
+      "why": "--plan measures each kernel by re-running this program with exactly the probes a leg there requires"
+    },
+    {
+      "program": "real-examples/c/sqlite/harness_legs.py",
+      "token": "--stop-file",
+      "category": "self-driven",
+      "why": "the monitor child stops when its stop file appears"
+    },
+    {
+      "program": "real-examples/c/sqlite/harness_legs.py",
+      "token": "--timeline",
+      "category": "self-driven",
+      "why": "the monitor child writes the execution's timeline"
+    },
+    {
+      "program": "real-examples/c/sqlite/speedtest1_bench.py",
+      "token": "*",
+      "category": "driven",
+      "by": [
+        "real-examples/c/sqlite/benchmark_speedtest1.py",
+        "real-examples/c/sqlite/sqlite_compiler.py",
+        "real-examples/c/sqlite/build_and_test.py",
+        "real-examples/c/sqlite/sqlite_recompile.py",
+        "real-examples/c/sqlite/test_driver_contracts.py"
+      ],
+      "why": "the benchmark runs its measurement core with these; the driver's compiler probe asks the core's preflight"
+    },
+    {
+      "program": "real-examples/c/sqlite/sqlite_base.py",
+      "token": "*",
+      "category": "driven",
+      "by": [
+        "real-examples/c/sqlite/build_and_test.py",
+        "real-examples/c/sqlite/test_driver_contracts.py"
+      ],
+      "why": "Step 0 starts each module's self-test with --self-test"
+    },
+    {
+      "program": "real-examples/c/sqlite/sqlite_base.py",
+      "token": "--selftest",
+      "category": "alias",
+      "of": "--self-test",
+      "why": "the older spelling of --self-test, held in the same comparison"
+    },
+    {
+      "program": "real-examples/c/sqlite/sqlite_coherence.py",
+      "token": "*",
+      "category": "driven",
+      "by": [
+        "real-examples/c/sqlite/build_and_test.py",
+        "real-examples/c/sqlite/sqlite_build.py",
+        "real-examples/c/sqlite/sqlite_recompile.py",
+        "real-examples/c/sqlite/test_driver_contracts.py"
+      ],
+      "why": "the build and the recompile check a stage's coherence with these; Step 0 starts its self-test"
+    },
+    {
+      "program": "real-examples/c/sqlite/sqlite_coherence.py",
+      "token": "--selftest",
+      "category": "alias",
+      "of": "--self-test",
+      "why": "the older spelling of --self-test, held in the same comparison"
+    },
+    {
+      "program": "real-examples/c/sqlite/sqlite_corpus.py",
+      "token": "*",
+      "category": "driven",
+      "by": [
+        "real-examples/c/sqlite/build_and_test.py",
+        "real-examples/c/sqlite/test_driver_contracts.py"
+      ],
+      "why": "Step 0 starts each module's self-test with --self-test"
+    },
+    {
+      "program": "real-examples/c/sqlite/sqlite_procs.py",
+      "token": "*",
+      "category": "driven",
+      "by": [
+        "real-examples/c/sqlite/build_and_test.py",
+        "real-examples/c/sqlite/test_driver_contracts.py"
+      ],
+      "why": "Step 0 starts each module's self-test with --self-test"
+    },
+    {
+      "program": "real-examples/c/sqlite/sqlite_stage.py",
+      "token": "*",
+      "category": "driven",
+      "by": [
+        "real-examples/c/sqlite/build_and_test.py",
+        "real-examples/c/sqlite/test_driver_contracts.py"
+      ],
+      "why": "the driver stages sqlite through this program's clone / derive CLI with these (inside WSL on a Windows host); Step 0 starts its self-test"
+    },
+    {
+      "program": "real-examples/c/sqlite/sqlite_stage.py",
+      "token": "--sqlite-repo-url",
+      "category": "self-driven",
+      "why": "the self-test stages from a local bare repository; the driver's runs clone the pinned default"
+    },
+    {
+      "program": "real-examples/c/sqlite/stage-zinc.py",
+      "token": "*",
+      "category": "driven",
+      "by": [
+        "real-examples/c/sqlite/sqlite_build.py",
+        "real-examples/c/sqlite/sqlite_common.py",
+        "real-examples/c/sqlite/harness_legs.py",
+        "real-examples/c/sqlite/test_driver_contracts.py"
+      ],
+      "why": "the driver's stage step builds the zinc and sqlite configuration headers with these"
+    },
+    {
+      "program": "real-examples/c/sqlite/test_driver_contracts.py",
+      "token": "--child",
+      "category": "self-driven",
+      "why": "the contract suite re-runs itself as the child of its process-chain arms"
+    }
+  ]
+}

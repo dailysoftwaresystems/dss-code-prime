@@ -46,9 +46,9 @@ this repository's configuration, and which of this repository's own programs (it
   matching table. Reopening moves it BACK. Neither is an edit in place.
 - **You do not do this by hand.** The door — `dssharness set-anchor`, and `write-anchor` for a new
   row — performs the move as part of writing the row; `fold-agent` applies a lane's rows the same
-  way, and `apply-registry-row` and `anchor-rows` hand the orchestrator's own rows to it. Hand-editing the
+  way, and `anchor-rows` hands the orchestrator's own batch of rows to it. Hand-editing the
   tables is how the two halves drift.
-- **`check-anchor-balance` refuses both directions** (ARM 6's sibling, the partition arm): a CLOSED
+- **`dssharness check-anchor-balance` refuses both directions**: a CLOSED
   row left in a working registry, or an OPEN row filed in the archive. The second is the dangerous
   one — every queue in this project reads the two working registries ONLY, so a live row filed in
   the archive can never be picked up.
@@ -80,6 +80,12 @@ controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 DISCL
   prevent, produced BY the gate. A disclosed row is **OPEN WORK**: it counts in every total, it
   files in the working registry, and `--done` refuses it. It is exempt from the net-increase
   FAILURE and from nothing else.
+- ★★★★ **And it is not a way to FINISH a finding** (operator, 2026-10-08: *"disclosed is not
+  closed"*). The word answers "whose debt is this?"; it never answers "is the work done?". A defect
+  met while closing another row is fixed in the same wave; a disclosed row is left open only as a
+  rare exception — really big, not doable in the context — on a measured size the orchestrator
+  rules on, and never because a later round is more convenient. The whole ruling, with the
+  measurement that caused it: `no-follow-ups.md`.
 - ⚠ **The claim is checkable, so claiming it falsely is a lie about history, not a formatting
   choice.** It asserts the defect PRE-DATES this cycle, and a reviewer can look for it in the base
   ref. Use it for a defect you merely faced; never for one you introduced.
@@ -96,9 +102,10 @@ controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 DISCL
   that does not compile, link or parse today · `P2` DIVERGENT, a product-namespace divergence or an absent
   capability · `P3` HARNESS, the test / gate / build / cycle instruments · `P4` RECORD, the plans, the
   registry, the documentation · `P5` ENV, environment and upstream — not ours to fix in the compiler.
-- ⚠ **`check-anchor-balance` ARM 6 refuses a row whose `Status` column contradicts the verdict
-  leading its `Trigger` prose.** Two cells now state the same fact, so they can disagree — silently,
-  because the gate would believe the column while every human reads the prose.
+- ⚠ **The door refuses a row whose `Status` column contradicts the verdict leading its `Trigger`
+  prose** (`anchors.triggerCarriesVerdict`), and `dssharness read-anchors --lint` reports one written by
+  hand. Two cells state the same fact, so they can disagree — silently, because the gate would believe
+  the column while every human reads the prose.
 - ★ **Plan-side §3.1 tables were NOT migrated** and still use the four-cell shape. Both are
   recognized; only the registry documents changed. SUPERSEDED 2026-09-25 by the registries being the only home a row can have — a plan-side table is no longer a sanctioned home, and the live balance, `dssharness check-anchor-balance`, reads only the two registries (see no-follow-ups.md)
 
@@ -106,18 +113,17 @@ controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 DISCL
 
 A row is WRITTEN by DssHarness's `write-anchor` (a new row) or `set-anchor` (an existing one), and by
 nothing else; `read-anchor` / `read-anchors` read it (`references/anchors-and-deferrals.md`).
-`.harness-config/runner/actions/anchors/anchors.py` has no write verb: it is the reader
-(`read` / `list [--lint]`, each taking `--production` / `--done` and only those two — the harness
-registry retired on 2026-09-16) and the one launcher that `apply-registry-row` and `anchor-rows` call
-the door through (`anchor-rows` applies a directory of the orchestrator's cell files as one batch, rehearsed
-first, all or nothing; a LANE's rows go through `fold-agent`, which itself refuses a cut value, a citation no
-row holds, an undeclared new id and a lost cell not accepted — and since 2026-09-30 the door refuses the first
-two for every write, orchestration.md). That launcher refuses, before the door, a status or band outside the vocabulary, an update naming no
-field, and a cell the door would store broken, judged as the door will store it (a line break becomes a
-space): an anchor id broken after a hyphen or wrapped inside a segment, or a path cut after its `/`. These
-checks are keyed on the id grammar config.json declares (`anchors.idPrefix`, `minimumIdSegments`). An update
-names only the fields that change. The verdict split and in-line whitespace have been the door's own checks
-since DssHarness 0.5.9.
+`.harness-config/runner/actions/anchors/anchors.py` has no command-line verb but its self-test: it is the
+LIBRARY other actions load — the row reader, the vocabulary, and the one launcher `anchor-rows` calls the door
+through (`anchor-rows` applies a directory of the orchestrator's cell files as one batch, rehearsed first, all
+or nothing; a LANE's rows go through `fold-agent`, orchestration.md). That launcher refuses, before the door,
+only this repository's vocabulary — a status or band outside it — and an update naming no field; an update
+names only the fields that change. Everything a cell may store is the DOOR's to judge, for every write: the
+verdict split, and since 2026-09-30 a value it would store CUT (an id broken across a
+line, before or after a hyphen; a path's directory ending a line, or a joined space after a `/`: exit 10) and an
+id a cell newly cites that no row holds (exit 13), judged by resolution against the id grammar config.json
+declares (`anchors.idPrefix`, `minimumIdSegments`) — ✔MEASURED that day in a throwaway repository. A cut or a
+citation the stored cell already held is history, never judged again.
 
 ```
 dssharness write-anchor  D-<AREA>-<NAME> --priority P1 --status open \
@@ -181,11 +187,12 @@ neither was detectable downstream: an author PRE-ESCAPING by hand, and the raw-l
 ⚠ **Do not quote a per-bucket count from here or from the handoff — re-derive it.** ✔MEASURED
 2026-08-25, and the correction is the reason this warning is here: the P34 handoff's own
 "475 production OPEN" was wrong by 20, caught only by cross-checking the per-bucket split against
-`check-anchor-balance`'s registry total. The instrument, which reuses that gate's own row scanner
-rather than re-typing the "is this row open" vocabulary:
+the gate's registry total. The instruments now (the retired program's `--breakdown` / `--denominator` modes
+were deleted on 2026-09-30):
 
 ```
-python .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py --breakdown --denominator registry ⏳ SCRIPT-ERA (superseded 2026-09-17: a band's count is `dssharness read-anchors --pending --open --band <P>`, whose listing ends with it; see the paragraph below)
+dssharness read-anchors --pending --open --band <P>    # one band; the listing ends with its count
+dssharness read-anchors --pending --open               # the whole; its count is the sum the bands must make
 ```
 
 ⚠ That gate canonicalises BOTH registry files to ONE key — deliberately, so that MOVING a row

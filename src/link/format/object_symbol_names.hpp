@@ -280,9 +280,14 @@ public:
     //     exactly `hidden` and `internal` while leaving `protected` a plain
     //     external -- i.e. the Mach-O bit is `!isExternallyVisible(...)` over
     //     the pair, which is why that predicate stays and is consulted THERE.
-    //   * COFF has no visibility axis; mingw-w64 gcc warns and ignores the
-    //     attribute, so the PE writer needs no visibility code at all and gets
-    //     the reference's answer (EXTERNAL, real name) for free.
+    //   * COFF has no visibility FIELD. The symbol stays EXTERNAL with its real
+    //     name, and a definition this predicate keeps out of the image's exports
+    //     is stated as a LINKER DIRECTIVE instead (P69): clang's windows-gnu
+    //     target writes ` -exclude-symbols:<name>` into `.drectve` (✔MEASURED
+    //     2026-10-01, lane lm), and the PE writer writes the hide directive its
+    //     format declares (`pe.linkerDirectives`) for every hidden name, the
+    //     canonical's and each alias's, which the COFF reader lifts back to
+    //     Hidden. (mingw-w64 gcc 13.2.0 warns and ignores the attribute.)
     [[nodiscard]] SymbolVisibility
     definedVisibility(SymbolId id) const {
         if (auto const it = definedBySym_.find(id.v); it != definedBySym_.end()) {

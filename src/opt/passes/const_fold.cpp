@@ -38,6 +38,7 @@ HirLiteralValue toHirLiteral(MirLiteralValue const& src) {
             HirAggregateValue agg;
             agg.fields.reserve(arm.fields.size());
             for (auto const& f : arm.fields) agg.fields.push_back(toHirLiteral(f));
+            agg.unionMember = arm.unionMember;   // a union value's member (P69)
             dst.value = std::move(agg);
         } else if constexpr (std::is_same_v<T, MirSymbolAddrValue>) {
             // F5: a symbol-address literal is a MIR-tier link-time constant with
@@ -73,6 +74,7 @@ MirLiteralValue toMirLiteral(HirLiteralValue const& src) {
             MirAggregateValue agg;
             agg.fields.reserve(arm.fields.size());
             for (auto const& f : arm.fields) agg.fields.push_back(toMirLiteral(f));
+            agg.unionMember = arm.unionMember;   // a union value's member (P69)
             dst.value = std::move(agg);
         } else if constexpr (std::is_same_v<T, HirAddressValue>) {
             // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD): mirror the main hir_to_mir

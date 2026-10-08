@@ -327,15 +327,19 @@ TEST(MachoObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
            "reconstructs those literal bytes";
     EXPECT_EQ(nameOf(got, dVtable->relocations[0].target), "add");
 
-    // -- extern imports: names + isData INFERENCE (call -> fn, address -> data) --
+    // -- extern imports: names + the kind each states (a call -> a function; an
+    //    address states nothing, so its definition decides, P69
+    //    D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA) --
     auto const* ePuts = externNamed(got, "puts");
     auto const* eEnv = externNamed(got, "env");
     ASSERT_NE(ePuts, nullptr);
     ASSERT_NE(eEnv, nullptr);
     EXPECT_FALSE(ePuts->isData)
-        << "puts is reached via a BRANCH26 call -> inferred a FUNCTION import";
-    EXPECT_TRUE(eEnv->isData)
-        << "env is reached via a PAGE21 address reloc -> inferred a DATA import";
+        << "puts is reached via a BRANCH26 call -> a FUNCTION import";
+    EXPECT_EQ(ePuts->kindOrigin, ExternKindOrigin::Stated) << "a call states the kind";
+    EXPECT_EQ(eEnv->kindOrigin, ExternKindOrigin::Pending)
+        << "env is reached via a PAGE21 address reloc, which names a function and a datum alike -> the "
+           "object states no kind, and the definition the link finds decides it";
 
     // -- the module is well-formed for the merge --
     EXPECT_EQ(got.expectedFuncCount, 2u);
@@ -630,8 +634,9 @@ TEST(MachoObjectReader, X86_64ExternClassComesFromTheDeclaredCallRole) {
                                 SymbolVisibility::Default}};
     // Both are seeded isData=TRUE on the way in, so a reader that simply
     // preserved the writer's value could not pass the first assertion, and a
-    // reader that forced every reached extern to a function could not pass the
-    // second. The seed is not the answer in either direction.
+    // reader that forced every reached extern to a function (a Stated row)
+    // could not pass the second. The seed is not the answer in either
+    // direction: the wire carries no kind but the call's.
     mod.externImports = {
         ExternImport{SymbolId{20}, "puts", "/usr/lib/libSystem.B.dylib", /*isData=*/true},
         ExternImport{SymbolId{21}, "env",  "/usr/lib/libSystem.B.dylib", /*isData=*/true},
@@ -660,10 +665,12 @@ TEST(MachoObjectReader, X86_64ExternClassComesFromTheDeclaredCallRole) {
            "declares `\"isCall\": true` on -> a FUNCTION import. The target's "
            "formula for this kind is `linear`, so a formula-derived answer "
            "cannot get here";
-    EXPECT_TRUE(eEnv->isData)
+    EXPECT_EQ(ePuts->kindOrigin, ExternKindOrigin::Stated);
+    EXPECT_EQ(eEnv->kindOrigin, ExternKindOrigin::Pending)
         << "reached by X86_64_RELOC_UNSIGNED_8, which declares no call role "
-           "-> the DATA seed stands. Without this half, 'every reached extern "
-           "is a function' would also be green";
+           "-> the object states NO kind, and the definition decides it (P69, "
+           "D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA). Without this half, "
+           "'every reached extern is a function' would also be green";
 }
 
 // -- 5c. A MACH-O FORMAT THAT FORGETS THE DECLARATION REFUSES, NEVER
@@ -890,6 +897,9 @@ TEST(MachoObjectReader, EmitOnlyAliasIsHonouredNotRefused) {
         << "the call signal belongs to the OWNING row and must survive the "
            "alias -- `isCall` is read through the very map the alias is "
            "excluded from (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL)";
+    EXPECT_EQ(ep->kindOrigin, ExternKindOrigin::Stated)
+        << "and the call is what states the kind (a row the alias displaced "
+           "would read back Pending)";
 }
 
 

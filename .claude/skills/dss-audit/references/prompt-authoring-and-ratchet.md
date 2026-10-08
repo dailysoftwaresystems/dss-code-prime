@@ -11,7 +11,8 @@ The proven shape:
 2. **Prove-don't-assert gates** — the test that must go **red** if the thing is wrong (red-on-disable
    for guards; effectiveness assertion for optimizations; non-default-through-the-wire for config),
    *demonstrated*, not claimed.
-3. **An explicit closure gate** — "Do NOT mark `D-*` closed until (a) … (b) … (c) all CI legs green."
+3. **An explicit closure gate** — "Do NOT mark `D-*` closed until (a) … (b) … (c) the eight-run gate is
+   green on every leg (`dssharness test --legs gate`) and CI's legs read green (`dssharness check-ci-legs`)."
 4. **The standing rules**, restated for re-affirmation — best-long-term / no-workaround / source-target-linker agnostic /
    fail-loud — and a note that any new shared-code path must be config-driven.
 5. **Cross-platform reminder** when the change is encoding/include-heavy.

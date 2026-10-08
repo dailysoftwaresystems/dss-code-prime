@@ -595,9 +595,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // capability was simply unavailable here. Also gone with the copy: the
     // omitted `pltNativeId` leg. Mach-O declares no PLT-variant id (an extern
     // call is BRANCH26/BRANCH against the same id whether or not ld64
-    // synthesizes a stub), so the shared builder's leg costs nothing on every
-    // shipped document -- but it is now read from the SCHEMA rather than
-    // assumed absent by this reader.
+    // synthesizes a stub), and since P69 no format can: the key is retired
+    // and refused by the loader, and a call is a ROW of its own marked
+    // `isCall`, read from the SCHEMA like every other row.
     auto decode = objectFormatSchema.relocationDecodeTable();
     if (!decode) {
         return fail(DiagnosticCode::F_CorruptedBinary,
@@ -650,6 +650,43 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         std::uint8_t const typeBits = s.type & kNTypeMask;
         bool const isExt = (s.type & kNExtBit) != 0u;
 
+        if (typeBits == kNTypeUndf && isExt && s.value != 0u) {
+            // A COMMON symbol: an EXTERNAL `N_UNDF` with a non-zero `n_value`
+            // is a tentative DEFINITION of `n_value` bytes, its alignment's
+            // log2 in bits 8-11 of `n_desc` (<mach-o/nlist.h> GET_COMM_ALIGN),
+            // 0 meaning "the size rounded up to a power of two, at most 2^15"
+            // (ld64's reading). Read as the row that says so
+            // (`ExternImport::commonSize`, P69,
+            // D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS): this arm used to
+            // fall through to the import below, so an object DEFINING storage
+            // was read as one demanding it. clang writes one for every
+            // tentative definition under -fcommon. A weak reference bit on a
+            // common names no shape ld64 defines and is refused.
+            if (s.name.empty() || (s.desc & kNDescWeakRef) != 0u) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: COMMON symbol #" + std::to_string(i)
+                    + " ('" + s.name + "', n_desc " + std::to_string(s.desc)
+                    + ") is nameless or marked a weak reference -- neither describes "
+                      "storage a link could allocate.");
+            }
+            std::uint8_t const alignLog2 = static_cast<std::uint8_t>((s.desc >> 8) & 0x0Fu);
+            std::uint64_t alignment = std::uint64_t{1} << alignLog2;
+            if (alignLog2 == 0u) {
+                alignment = 1;
+                while (alignment < s.value && alignment < (std::uint64_t{1} << 15)) alignment <<= 1;
+            }
+            ExternImport common;
+            common.symbol           = SymbolId{i};
+            common.mangledName      = s.name;
+            common.isData           = true;
+            common.binding          = SymbolBinding::Global;
+            common.commonSize       = s.value;
+            common.commonAlignment  = alignment;
+            common.commonVisibility = machoVisibility(s.type);
+            externBySym.emplace(i, mod.externImports.size());
+            mod.externImports.push_back(std::move(common));
+            continue;
+        }
         if (typeBits == kNTypeUndf) {
             // N_UNDF -> an undefined reference -> an extern import. A nameless
             // UND slot (index 0 / padding) carries no import identity.
@@ -657,10 +694,20 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             ExternImport ext;
             ext.symbol      = SymbolId{i};
             ext.mangledName = s.name;
-            // Mach-O nlist carries NO type hint (no STT_FUNC), so seed DATA
-            // and force to false (function) ONLY when a CALL/BRANCH-class
-            // reloc targets it (step 7) -- the agnostic function signal.
-            ext.isData      = true;
+            // Mach-O nlist carries NO type hint (no STT_FUNC), so the object
+            // states the kind only by a CALL: a BRANCH-class reloc makes the
+            // row a stated function (step 7), the agnostic function signal.
+            // Any other reference -- a GOT load, a SIGNED or UNSIGNED field --
+            // names a function and a datum alike and states nothing, so the
+            // row starts `Pending` and its DEFINITION decides, as ld64 takes it
+            // (D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA, P69; the ELF reader's
+            // undefined-symbol arm has the rule in full). It was seeded DATA
+            // until P69, so a DSS member that took `&puts` without calling it
+            // minted a DATA import that conflicted with the program's own
+            // declaration (✔MEASURED 2026-10-01, run 20261002-000334-c812a53b:
+            // the arm64 Mach-O arm of staticlib_reads_a_library_datum).
+            ext.kindOrigin  = ExternKindOrigin::Pending;
+            ext.isData      = false;   // meaningless while Pending
             // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the REFERENCE
             // binding, lifted from the one n_desc bit that carries it. Reading
             // it as Global -- which is what this arm did until the import row
@@ -1207,6 +1254,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // content reached via a section symbol -- the gap-atom / foreign-clang
     // follow-up) is skipped; DSS output has none. A per-entry miss WITHIN a
     // reconstructed section still fails loud (never silently drop a reloc).
+    //
+    // The symbols that OWN a reconstructed body. A relocation target defined in
+    // a section that is NOT one of them names an OFFSET in that section rather
+    // than an identity the merge can bind -- the rebind in the loop below.
+    std::unordered_set<std::uint32_t> atomSymIdx;
+    for (auto const& f : mod.functions) atomSymIdx.insert(f.symbol.v);
+    for (auto const& d : mod.dataItems) atomSymIdx.insert(d.symbol.v);
     auto findInterval = [](std::vector<Interval> const& ivs, std::uint64_t off)
         -> Interval const* {
         for (auto const& iv : ivs) {
@@ -1382,7 +1436,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 *storage, *tri, std::nullopt,
                 std::span<std::uint8_t const>{
                     bytes.data() + static_cast<std::size_t>(sec.offset + rAddress),
-                    fieldWidth});
+                    fieldWidth},
+                decode->addendLoweringOf(nativeId));
             if (!recovered.has_value()) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "macho::readRelocatableObject: relocation at section offset "
@@ -1391,32 +1446,88 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
             std::int64_t const addend = *recovered;
 
-            Relocation rel;
-            rel.offset = static_cast<std::uint32_t>(rAddress - iv->start);
             // (6.44): a target naming an ALIAS binds to the atom that owns the
             // body, because only the owner is a declared definition -- an id
             // that owns no body is `K_SymbolUndefined` at the linker's compound
             // index. The addend needs no adjustment: an alias shares its owner's
             // offset exactly, so the same S makes the same address.
-            rel.target = SymbolId{ownerOf(rSymNum)};
+            std::uint32_t const targetIdx = ownerOf(rSymNum);
+            SymbolId     relTarget = SymbolId{targetIdx};
+            std::int64_t relAddend = addend;
+
+            // SECTION-RELATIVE: a target DEFINED in a section that owns no body
+            // -- an INTERIOR LABEL. DSS's own writer names every jump-table slot
+            // and every `&&label` through one (`macho.cpp`'s synthetic per-block
+            // labels, N_ALT_ENTRY in `__text`), and the classification above
+            // keeps such a label off the atom boundaries. It used to stay the
+            // target, which no atom owns and the linker's compound index never
+            // declares, so a DSS static library holding a dense switch could not
+            // be linked into a Mach-O image: `K_SymbolUndefined` once per table
+            // slot (D-LINK-OBJECT-READERS-DROP-INTERIOR-SYMBOL-OFFSET; ✔MEASURED
+            // P69 on both Mach-O arches, where the same library links on ELF). It
+            // is rebound to the atom that holds the offset, with the residual, by
+            // the rule every reader shares (`section_relative_target.hpp`). With
+            // MH_SUBSECTIONS_VIA_SYMBOLS the atoms are NOT a unit, so only the
+            // atom that CONTAINS the offset may stand in for it -- which for an
+            // interior label is always its own function.
+            Nlist const& tsym = syms[targetIdx];
+            bool const definedInASection =
+                (tsym.type & kNStabMask) == 0u
+                && (tsym.type & kNTypeMask) == kNTypeSect
+                && tsym.sect >= 1u
+                && static_cast<std::size_t>(tsym.sect) <= sections.size();
+            if (definedInASection && !atomSymIdx.contains(targetIdx)) {
+                Section const& tsec = sections[tsym.sect - 1u];
+                std::int64_t const bindBase =
+                    static_cast<std::int64_t>(tsym.value - tsec.addr) + addend;
+                std::int64_t const searchOff = link::format::sectionRelativeSearchOffset(
+                    bindBase, tri->pcRelative, /*referenceIsInData=*/!patchesText,
+                    static_cast<std::int64_t>(tri->addendBias),
+                    static_cast<std::int64_t>(rAddress)
+                        - static_cast<std::int64_t>(iv->start));
+                auto const bound = link::format::bindSectionRelativeReference(
+                    link::format::sectionAtomSpans(funcIntervalsBySec, tsym.sect),
+                    link::format::sectionAtomSpans(dataIntervalsBySec, tsym.sect),
+                    bindBase, searchOff, sectionsAreUnits);
+                if (!bound.has_value()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: relocation at section offset "
+                        + std::to_string(rAddress) + " in '" + sec.segName + ","
+                        + sec.sectName + "' targets '" + tsym.name
+                        + "' (defined in '" + tsec.segName + "," + tsec.sectName
+                        + "' with no body of its own) + offset "
+                        + std::to_string(searchOff) + ", which " + bound.error()
+                        + ".");
+                }
+                relTarget = bound->isFunction
+                                ? mod.functions[bound->outIdx].symbol
+                                : mod.dataItems[bound->outIdx].symbol;
+                relAddend = bound->residual;
+            }
+
+            Relocation rel;
+            rel.offset = static_cast<std::uint32_t>(rAddress - iv->start);
+            rel.target = relTarget;
             rel.kind   = kind;
-            rel.addend = addend;
+            rel.addend = relAddend;
             if (patchesText) mod.functions[iv->outIdx].relocations.push_back(rel);
             else             mod.dataItems[iv->outIdx].relocations.push_back(rel);
 
-            // isData inference: an extern reached through a relocation the
-            // FORMAT declares `"isCall": true` on -- ARM64_RELOC_BRANCH26,
-            // X86_64_RELOC_BRANCH -- is a FUNCTION, so force isData=false. A
-            // plain address reloc (PAGE21/PAGEOFF12/UNSIGNED) leaves the DATA
-            // seed intact. Mirrors the ELF reader's reloc-typed extern rule.
-            // Mach-O's nlist_64 carries no STT_FUNC-style type hint, so this
-            // relocation is the ONLY class signal a name-only reference offers.
+            // The kind a CALL states: an extern reached through a relocation
+            // the FORMAT declares `"isCall": true` on -- ARM64_RELOC_BRANCH26,
+            // X86_64_RELOC_BRANCH -- is a FUNCTION, stated by the object. A
+            // plain address reloc (PAGE21/PAGEOFF12/UNSIGNED/GOT_LOAD) states
+            // nothing and leaves the row `Pending` for its definition. Mirrors
+            // the ELF reader's reloc-typed extern rule. Mach-O's nlist_64
+            // carries no STT_FUNC-style type hint, so this relocation is the
+            // ONLY class signal a name-only reference offers.
             //
             // ── THE EMPTY-SET REFUSAL (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL) ──
-            // A Mach-O format that declares NO `isCall` row at all cannot
-            // classify an extern it meets through a relocation, and the DATA
-            // seed would then be a SILENT GUESS -- not a diagnostic, a wrong
-            // answer. Refuse instead, naming the extern and the format.
+            // A Mach-O format that declares NO `isCall` row at all cannot read
+            // the statement every call makes, so a CALLED extern would reach
+            // its definition as though it stated nothing -- a misreading of the
+            // object, not a diagnostic. Refuse instead, naming the extern and
+            // the format.
             //
             // ⚠ THIS ARM IS NOT DEAD CODE AND IS NOT A HYPOTHETICAL. It is
             // what every macho64-x86_64 archive member that called a library
@@ -1437,12 +1548,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                         + "' is reached by a relocation, but Mach-O format '"
                         + std::string{objectFormatSchema.name()}
                         + "' declares no relocation row with \"isCall\": true "
-                        "-- a function-vs-data classification cannot be made, "
-                        "and guessing DATA would silently mis-type the import "
-                        "(D-LK-MACHO-ISDATA-NO-CALL-SIGNAL).");
+                        "-- a call cannot be told from an address, so the "
+                        "function a call states could not be read off the "
+                        "object (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL).");
                 }
                 if (callSignalNativeIds.contains(nativeId)) {
-                    mod.externImports[ex->second].isData = false;
+                    mod.externImports[ex->second].isData     = false;
+                    mod.externImports[ex->second].kindOrigin = ExternKindOrigin::Stated;
                 }
             }
         }

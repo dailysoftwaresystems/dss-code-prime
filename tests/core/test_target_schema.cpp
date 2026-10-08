@@ -969,47 +969,51 @@ TEST(TargetSchema, ShippedX86_64HasBothSysVAndMsX64) {
     EXPECT_EQ(msx64->shadowSpaceBytes, 32);
     EXPECT_EQ(msx64->redZoneBytes, 0);
 
-    // D-LK10-ENTRY-TRAMP-PROLOGUE: shipped entry-stack-pointer-bias
-    // values must match the OS-loader convention for each cc.
-    // Regression to either would silently mis-emit the trampoline
-    // prologue (caught end-to-end by Slice C's runnable smoke on
-    // Windows, but byte-pin here catches cross-host CI before the
-    // smoke runs).
-    EXPECT_EQ(sysv->entryStackPointerBias, 0)
-        << "SysV kernel JUMPs to _start with RSP 16-aligned and no "
-           "return address — bias must be 0";
-    EXPECT_EQ(msx64->entryStackPointerBias, 8)
-        << "Win64 RtlUserThreadStart CALLs the entry point — bias "
-           "must be 8 (RSP ≡ 8 mod 16 at the first trampoline op)";
+    // ⓘ P69 (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION):
+    // the two expectations that stood here pinned each convention's own
+    // process-entry bias (sysv 0, ms_x64 8). A convention no longer carries
+    // one — the bias depends on how the platform's LOADER enters the image,
+    // a fact of the exec FORMAT (`entryTransition`), and the one sysv_amd64
+    // convention serves an ELF entry that is jumped to and a Mach-O entry
+    // that is called. The trampoline derives it (`callPushBytes` when
+    // called), and tests/link/test_lk10_entry_slice_c.cpp pins the emitted
+    // prologue per exec format; `EntryStackPointerBiasIsRefusedAtLoad` below
+    // pins that no convention can carry the key again.
 }
 
-TEST(TargetSchema, EntryStackPointerBiasGreaterThanOrEqualAlignmentRejected) {
-    // D-LK10-ENTRY-TRAMP-PROLOGUE validator: the bias is an offset
-    // INTO the stackAlignment quantum and MUST be strictly less
-    // than it. A bias equal to (or greater than) alignment would
-    // denote a full alignment cycle (== 0) or be nonsense — fail
-    // loud at schema-load rather than silently producing the wrong
-    // adjust at the trampoline-emit site.
-    auto r = TargetSchema::loadFromText(
-        R"({"dssTargetVersion":1,"target":{"name":"X"},
+TEST(TargetSchema, EntryStackPointerBiasIsRefusedAtLoad) {
+    // P69 (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION): a
+    // calling convention declaring `entryStackPointerBias` — ANY value, the
+    // old in-range 8 included — is REFUSED at load, naming the key. The
+    // process-entry bias is derived from the exec format's `entryTransition`
+    // and the convention's `callPushBytes`; a convention carrying its own
+    // would be a second owner, and the old one gave Mach-O x86_64 ELF's
+    // answer. (This test replaced `EntryStackPointerBiasGreaterThanOr
+    // EqualAlignmentRejected`, which pinned the retired key's range check.)
+    // The control arm is the same row without the key, which loads.
+    // The positive shape `LinkRegisterResolvesToDeclaredGpr` loads (a declared
+    // stackPointer is required of a register-machine convention).
+    auto load = [](char const* extra) {
+        return TargetSchema::loadFromText(
+            std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
-            "registers":[{"name":"rsp","class":"gpr"}],
+            "registers":[
+              {"name":"x0","class":"gpr","widthBytes":8},
+              {"name":"sp","class":"gpr","widthBytes":8}
+            ],
             "callingConventions":[
-              {"name":"bad","argGprs":["rsp"],
-               "stackAlignment":16,"entryStackPointerBias":16}
-            ]})");
+              {"name":"cc","argGprs":["x0"],"stackPointer":"sp","stackAlignment":16)"} + extra + "}]}");
+    };
+    EXPECT_TRUE(load("").has_value()) << "control: the row without the key must load";
+    auto r = load(R"(,"entryStackPointerBias":8)");
     EXPECT_FALSE(r.has_value());
     if (!r.has_value()) {
-        bool sawBiasMsg = false;
-        for (auto const& d : r.error()) {
-            if (d.message.find("entryStackPointerBias") != std::string::npos) {
-                sawBiasMsg = true;
-                break;
-            }
-        }
-        EXPECT_TRUE(sawBiasMsg)
-            << "validator must surface entryStackPointerBias in the "
-               "diagnostic so the schema author can triage";
+        bool named = false;
+        for (auto const& d : r.error())
+            if (d.message.find("entryStackPointerBias") != std::string::npos
+                || d.path.find("entryStackPointerBias") != std::string::npos)
+                named = true;
+        EXPECT_TRUE(named) << "the refusal must name the retired key";
     }
 }
 
@@ -1017,10 +1021,11 @@ TEST(TargetSchema, CallPushBytesGreaterThanOrEqualAlignmentRejected) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY validator: callPushBytes is
     // the ISA-level CALL-instruction RSP push width, used by ML7
     // `computeFrameLayout` as the post-CALL alignment bias for non-
-    // leaf functions. Must be strictly less than stackAlignment —
-    // same invariant as entryStackPointerBias (the bias is an offset
-    // INTO the alignment quantum; equal-to-alignment would denote a
-    // full cycle, semantically zero but expressed wrong).
+    // leaf functions — and, since P69, the entry trampoline's derived
+    // process-entry bias wherever the loader CALLS the entry. Must be
+    // strictly less than stackAlignment (the bias is an offset INTO the
+    // alignment quantum; equal-to-alignment would denote a full cycle,
+    // semantically zero but expressed wrong).
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
@@ -1091,8 +1096,9 @@ TEST(TargetSchema, CallPushBytesShippedX8664SysVDeclaresEight) {
     EXPECT_STREQ(msx64Cc->name.c_str(), "ms_x64");
     EXPECT_EQ(msx64Cc->callPushBytes, 8)
         << "x86_64 CALL pushes 8-byte return address regardless of "
-           "OS — ms_x64 coincides with sysv_amd64 on this ISA fact "
-           "(diverges on entryStackPointerBias)";
+           "OS — ms_x64 coincides with sysv_amd64 on this ISA fact (the "
+           "process-entry bias derived from it differs only by each exec "
+           "format's `entryTransition`)";
 }
 
 TEST(TargetSchema, SlotAlignedShippedMsX64IsTrueOthersFalse) {

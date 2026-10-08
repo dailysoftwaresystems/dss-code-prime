@@ -330,3 +330,58 @@ dss_add_test(NAME ffi/test_binary_architecture_field
 # shipped config, so it runs through ctest (the config snapshot).
 dss_add_test(NAME ffi/test_shipped_derived_constants
              SOURCES test_shipped_derived_constants.cpp)
+
+# P69 (lane lm — D-C-GLIBC-C23-ENTRY-POINTS-NOT-BOUND): every C23 conversion DSS ships on ELF
+# imports glibc's own C23 entry point `__isoc23_<name>` under a version requirement for
+# GLIBC_2.38, on both ELF arches, and no other import requires that version. Compiles a probe
+# in process and reads the image's `.gnu.version` / `.gnu.version_r` through
+# tests/test_support/image_dependency_table.hpp.
+dss_add_test(NAME ffi/test_glibc_c23_entry_points
+             SOURCES test_glibc_c23_entry_points.cpp)
+
+# P69 (lane lm — D-C-STDIO-H-LACKS-THIRTEEN-ISO-FUNCTIONS): <stdio.h>'s C 7.23 surface per
+# executable pair — the thirteen functions, fpos_t and the per-library macro values through
+# the real descriptor reader, how each printf/scanf entry point is realized (glibc's C23 entry
+# points on ELF, DSS's runtime source on pe and Mach-O), and one probe per pair compiled in
+# process whose image must import exactly those entry points. Reads images through
+# tests/test_support/image_dependency_table.hpp.
+dss_add_test(NAME ffi/test_stdio_h_iso_surface
+             SOURCES test_stdio_h_iso_surface.cpp)
+
+# P69 (lane lm — D-FFI-INTTYPES-H-SHIPS-FOUR-FORMAT-MACROS): <inttypes.h>'s C 7.8 surface per
+# executable pair — every PRI/SCN macro an alias of its `type-format` predefine (C23's binary ones on
+# every pair), imaxdiv_t, and the six functions' bindings (the four conversions: glibc's C23 entry
+# points on ELF, DSS's runtime source on pe and Mach-O), through the real reader and through one probe
+# per pair compiled in process. Reads images through tests/test_support/image_dependency_table.hpp.
+dss_add_test(NAME ffi/test_inttypes_h_surface
+             SOURCES test_inttypes_h_surface.cpp)
+
+# P69 (lane lm — D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM): the 22 rows whose meaning
+# C23 changed (the printf and scanf families, strtol/strtoul/strtoll/strtoull, strtoimax/strtoumax/
+# wcstoimax/wcstoumax) bound per executable pair through the real reader — glibc's own on ELF, DSS's
+# runtime source under `__dss_isoc23_<name>` on pe and Mach-O — and the private `__dss_platform_*`
+# rows that are the only way DSS's units reach the platform.
+dss_add_test(NAME ffi/test_c23_conversion_bindings
+             SOURCES test_c23_conversion_bindings.cpp)
+
+# P69 (lane lm — D-C-UNISTD-H-LACKS-SEVEN-POSIX-TYPEDEFS): POSIX's <unistd.h> typedefs (size_t,
+# ssize_t, off_t, pid_t, intptr_t, and uid_t/gid_t where the platform has them) from <unistd.h>
+# ALONE, each type's C identity asserted per executable pair against the references.
+dss_add_test(NAME ffi/test_unistd_h_typedefs
+             SOURCES test_unistd_h_typedefs.cpp)
+
+# P69 round 4 (lane lm; the review's NIT 14): a `variants` block two of whose arms can both
+# match one pair is refused on EVERY read — full, format-less, without the long-double axis —
+# by the symbol-string, typedef and macro readers alike (`whensCanCoMatch`), so a read that
+# cannot decide one arm no longer selects the other where a read that can refuses both.
+dss_add_test(NAME ffi/test_variant_arms_co_match
+             SOURCES test_variant_arms_co_match.cpp)
+
+# P69 round 4 (lane lm; the re-review of lane cs, finding 1): an ALIAS row of the corpus index
+# carries its two availability gates — the format that lists it, and its document's — so the
+# index's answer for an alias (the `__has_builtin` question) equals the full read's on every
+# format; and an alias listed for a format on which its row is not available is refused at load.
+# Drives the index through `DSS_CONFIG_ROOT` over scratch corpora, so it MUST run under ctest.
+# Writes its descriptors as text and reads them through the shipped reader: no json link.
+dss_add_test(NAME ffi/test_shipped_alias_row_gates
+             SOURCES test_shipped_alias_row_gates.cpp)

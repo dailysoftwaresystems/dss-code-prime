@@ -48,17 +48,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # USAGE
 #
-#   # on the BUILD host, right after the sqlite driver (build_and_test.py) produced OUT_DIR:
-#   sqlite-round-trip.py pack --out-dir <OUT_DIR> --leg pe64-x86_64 \
-#       --built-on wsl-x86_64 --sqlite-header <BLD>/sqlite3.h \
-#       --sqlite-sha <upstream sha> --dss-sha <compiler sha> --dest <payload dir>
-#
-#   # ... carry <payload dir> to the target machine with the appropriate carriage ...
-#
-#   # on the TARGET host:
-#   sqlite-round-trip.py verify --payload <payload dir>
-#   sqlite-round-trip.py run --payload <payload dir> --workdir <scratch> \
-#       --ran-on windows --json <result.json>
+#   # on the BUILD leg, right after the sqlite driver (build_and_test.py) produced OUT_DIR there:
+#   dssharness run sqlite-round-trip --legs <build leg> --manual-step pack --input outDir=<OUT_DIR> \
+#       --input sqliteLeg=pe64-x86_64 --input legSpec=x86_64:pe64-x86_64 --input sqliteHeader=<BLD>/sqlite3.h
+#   # ... the payload is that run's KEPT output; carry it, verified file by file as it lands:
+#   dssharness sync --artifact <that run id>
+#   # on the TARGET leg (the payload's tree path is the kept output's path in that run):
+#   dssharness run sqlite-round-trip --legs <target leg> --input payload=<its tree path> \
+#       --input testFiles=<a .test file>[,...]
+#   (`verify` retired on 2026-09-30: the carry verifies each file on arrival and `run` re-verifies the
+#   payload's own hashes before any arm.)
 #
 # EXIT CODES (the same on every host, so a caller can branch on them):
 #   0  every requested arm passed
@@ -320,13 +319,6 @@ def verify_payload(payload: Path) -> dict:
     return m
 
 
-def cmd_verify(a: argparse.Namespace) -> int:
-    m = verify_payload(Path(a.payload).resolve())
-    print("payload VERIFIES: %d file(s), leg %s built on %s, sqlite %s"
-          % (len(m["files"]), m["leg"], m["builtOn"], m["expectVersion"]))
-    return 0
-
-
 # ── run ──────────────────────────────────────────────────────────────────────
 
 def make_executable(path: Path) -> None:
@@ -512,6 +504,14 @@ def cmd_run(a: argparse.Namespace) -> int:
     return rc_overall
 
 
+def _flag(value):
+    """`true` / `false` -- how a harness step hands a flag over; anything else is refused, named."""
+    v = str(value).strip().lower()
+    if v not in ("true", "false"):
+        raise argparse.ArgumentTypeError("%r is neither true nor false" % value)
+    return v == "true"
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="sqlite-round-trip.py")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -531,30 +531,34 @@ def main(argv=None) -> int:
     q.add_argument("--dest", required=True)
     q.set_defaults(fn=cmd_pack)
 
-    q = sub.add_parser("verify", help="re-hash an arrived payload")
-    q.add_argument("--payload", required=True)
-    q.set_defaults(fn=cmd_verify)
-
     q = sub.add_parser("run", help="execute a carried payload on THIS host")
     q.add_argument("--payload", required=True)
     q.add_argument("--workdir", required=True)
     q.add_argument("--ran-on", required=True)
-    q.add_argument("--launcher", action="append", default=[], metavar="TOKEN",
-                   help="use the =FORM (--launcher=-x86_64): a launcher token may lead with a dash")
-    q.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
+    q.add_argument("--launcher", action="append", default=[], metavar="TOKEN[,TOKEN...]",
+                   help="use the =FORM (--launcher=-x86_64): a launcher token may lead with a dash; "
+                        "several tokens comma-separated, in order")
+    q.add_argument("--env", action="append", default=[], metavar="NAME=VALUE[;NAME=VALUE...]")
     q.add_argument("--tcl-library", default="")
     q.add_argument("--cli-smoke", default="")
     q.add_argument("--cli-target", default="")
-    q.add_argument("--test-file", action="append", default=[], metavar="PATH",
-                   help="repeatable; each upstream .test file gets its OWN fresh run directory")
+    q.add_argument("--test-file", action="append", default=[], metavar="PATH[,PATH...]",
+                   help="repeatable, or comma-separated; each upstream .test file gets its OWN "
+                        "fresh run directory")
     q.add_argument("--testdir-seed", default="")
-    q.add_argument("--skip-cli", action="store_true")
-    q.add_argument("--skip-units", action="store_true")
+    q.add_argument("--skip-cli", type=_flag, nargs="?", const=True, default=False)
+    q.add_argument("--skip-units", type=_flag, nargs="?", const=True, default=False)
     q.add_argument("--timeout", type=int, default=3600)
     q.add_argument("--json", default="")
     q.set_defaults(fn=cmd_run)
 
     a = p.parse_args(argv)
+    if a.cmd == "run":
+        # ★ ONE VALUE CARRIES A LIST (2026-09-30): a harness step hands each input over whole, so launcher
+        # tokens and test files arrive comma-separated and env items `;`-separated; an empty value is none.
+        a.launcher = [t for given in a.launcher for t in given.split(",") if t]
+        a.env = [e.strip() for given in a.env for e in given.split(";") if e.strip()]
+        a.test_file = [f.strip() for given in a.test_file for f in given.split(",") if f.strip()]
     return a.fn(a)
 
 

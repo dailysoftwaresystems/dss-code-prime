@@ -2053,6 +2053,15 @@ encode(AssembledModule const&    module,
         for (auto const& rel : fn.relocations) noteExternTarget(rel.target);
     for (auto const& di : module.dataItems)
         for (auto const& rel : di.relocations) noteExternTarget(rel.target);
+    // A COMMON row (P69, D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS) is a
+    // DEFINITION handed on to the final linker: it gets its record whether or
+    // not a relocation names it (spelled in the emission loop below).
+    std::unordered_map<SymbolId, ExternImport const*> commonRowOf;
+    for (auto const& imp : module.externImports) {
+        if (imp.commonSize == 0u) continue;
+        commonRowOf.emplace(imp.symbol, &imp);
+        noteExternTarget(imp.symbol);
+    }
     for (auto const& e : externSyms) {
         if (symIdxBySymbol.emplace(e, nextSymIdx).second) ++nextSymIdx;
     }
@@ -2508,6 +2517,29 @@ encode(AssembledModule const&    module,
     for (auto const& e : externSyms) {
         std::string const symName = objNames.externName(e, "_sym_");
         std::uint32_t const nameOff = strtab.add(symName);
+        if (auto const common = commonRowOf.find(e); common != commonRowOf.end()) {
+            // The common: N_UNDF|N_EXT with the SIZE in n_value and the
+            // alignment's log2 in bits 8-11 of n_desc (<mach-o/nlist.h>
+            // SET_COMM_ALIGN), private-extern when its visibility hides it —
+            // what clang writes under -fcommon.
+            ExternImport const& row = *common->second;
+            std::uint8_t const nType = isExternallyVisible(SymbolBinding::Global,
+                                                           row.commonVisibility)
+                                           ? static_cast<std::uint8_t>(N_UNDF | N_EXT)
+                                           : static_cast<std::uint8_t>(N_UNDF | N_EXT | N_PEXT);
+            auto const alignLog2 = static_cast<std::uint16_t>(std::countr_zero(row.commonAlignment));
+            if (alignLog2 > 0x0Fu) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("macho::encode (MH_OBJECT): the common symbol '{}' asks for "
+                                 "2^{} bytes of alignment, and n_desc carries a common's "
+                                 "alignment in four bits (at most 2^15).",
+                                 symName, alignLog2));
+                return {};
+            }
+            appendNlist(nameOff, nType, /*n_sect=*/0,
+                        static_cast<std::uint16_t>(alignLog2 << 8), row.commonSize);
+            continue;
+        }
         // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the n_desc half of
         // this record now carries the import's REFERENCE binding, read through
         // the `externName`/`externBinding` lockstep pair rather than hardcoded —

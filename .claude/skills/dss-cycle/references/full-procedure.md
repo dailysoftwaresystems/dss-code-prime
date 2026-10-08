@@ -228,7 +228,9 @@ independent audit.) Running it here catches such a thing **before** anything is 
 Emit a one-line cycle summary: priority closed, anchors touched, test delta, commit hash.
 
 **★ The anchor line is MANDATORY and it carries the numbers, not an adjective:**
-`anchors: opened N, closed M, net ±K — OPEN was <before>, now <after>`. The Step 6 balance gate
+`anchors: closed M, opened N (created C, disclosed D), real net ±K — OPEN was <before>, now <after>`
+— a row born `🔵 DISCLOSED` is OPENED work and is counted here even though the gate's own "counted"
+figure leaves it out (operator, 2026-10-08: disclosed is not closed — `no-follow-ups.md`). The Step 6 balance gate
 already refuses `after > before`, so this line is the receipt, not the check. "Anchored a few
 follow-ups" is not a report; it is the thing the gate exists to make impossible to say.
 

@@ -11,6 +11,7 @@
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_layout.hpp"  // NonObjectTypeSizes (operand sizes)
 
+#include <algorithm>   // std::lower_bound (LibraryBuiltins::libraryFunctionOf)
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -1654,6 +1655,59 @@ enum class BuiltinLowering : std::uint16_t {
     // never a fall-through; code the expression still emits lowers into a fresh
     // dead block the unreachable-prune drops.
     Unreachable,
+    // ── P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): the GNU
+    // builtins DSS's own GNU-dialect predefine routes real code into. Each verb is named for what
+    // it COMPUTES, never for a spelling; the `.lang.json` rows bind spellings to them.
+    // APPENDED, so every earlier ordinal keeps its value (the BuiltinCall payload prints
+    // numerically in `.dsshir` text — the AtomicLoad/Store precedent).
+    //
+    // `FirstArgument`: the call's value is its FIRST operand converted to the result type.
+    // Every operand is still evaluated — they are arguments (C 6.5.2.2) — and the call is
+    // constant when its operands are. `__builtin_expect`, `__builtin_expect_with_probability`
+    // (a branch-probability HINT) and `__builtin_assume_aligned` (an alignment PROMISE): DSS
+    // exploits neither, so what remains of each is its first operand.
+    FirstArgument,
+    // `Parity`: popcount(x) & 1, over the Popcount primitive (`__builtin_parity{,l,ll}`).
+    Parity,
+    // `Trap`: ENDS the block in a DELIBERATE trap — MIR's `Unreachable` terminator marked
+    // `MirUnreachableKind::Trap`, which no transformation may treat as undefined behaviour
+    // the way `__builtin_unreachable`'s `Assumed` one may be.
+    Trap,
+    // `Prefetch`: a cache HINT. The operands are evaluated (their side effects happen) and no
+    // instruction is emitted: no target can declare a prefetch encoding yet (the target
+    // schema has no such row), so the hint is dropped on every target.
+    Prefetch,
+    // `Infinity`: the result type's positive infinity (`__builtin_inf*`, `__builtin_huge_val*`)
+    // — a constant, lowered to a literal before HIR.
+    Infinity,
+    // `QuietNan`: the result type's QUIET NaN whose payload a STRING-LITERAL operand spells
+    // (strtol's syntax — gcc's documented rule), a constant lowered to a literal before HIR.
+    // With any other operand the call is the row's `libraryFallback` function instead.
+    QuietNan,
+    // `Alloca`: `size` bytes of the CALLING function's frame, aligned for any object, live
+    // until it returns — the runtime-sized frame allocation a variable-length array uses,
+    // without the VLA's scope teardown; and it PINS every enclosing VLA scope, whose teardown
+    // would free it.
+    Alloca,
+    // `ObjectSize`: `__builtin_object_size(p, type)` — a COMPILE-TIME answer the semantic tier
+    // computes (the bytes from `p` to the end of the object or subobject it designates, or
+    // the documented unknown answer). Its operands are never evaluated.
+    ObjectSize,
+    // `AddOverflow` / `SubOverflow` / `MulOverflow`: the INFINITE-PRECISION result of the
+    // operation over the two operands' own types, stored modulo the result object's width
+    // through the third operand; the call yields whether the stored value differs from the
+    // infinite-precision one. Lowered to ordinary HIR arithmetic before HIR→MIR.
+    AddOverflow,
+    SubOverflow,
+    MulOverflow,
+    // `AddOverflowP` / `SubOverflowP` / `MulOverflowP` (gcc's `__builtin_*_overflow_p(a, b,
+    // c)`): the same infinite-precision result, cast to the THIRD operand's type — its own,
+    // unpromoted, or a bit-field's precision — and the call yields whether the cast changed
+    // it. Nothing is stored; the third operand's value is never read (its side effects are
+    // evaluated). An integer constant expression when `a` and `b` are.
+    AddOverflowP,
+    SubOverflowP,
+    MulOverflowP,
 };
 
 // ── THE ONE OWNER OF THE `lowering` SPELLINGS ────────────────────────────
@@ -1678,7 +1732,7 @@ enum class BuiltinLowering : std::uint16_t {
 // `enum_name_table.hpp`'s `nameOrEmpty` note describes, so the projection below
 // uses `nameOrEmpty`: an unlisted value renders EMPTY rather than wearing row
 // 0's spelling (`"umulh"`), which is what `name()` would have done.
-inline constexpr EnumNameTable<BuiltinLowering, 38> kBuiltinLoweringTable{{{
+inline constexpr EnumNameTable<BuiltinLowering, 52> kBuiltinLoweringTable{{{
     { BuiltinLowering::UMulHigh,              "umulh"                    },
     // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS)
     { BuiltinLowering::AtomicCas,             "atomic_cas"               },
@@ -1734,6 +1788,21 @@ inline constexpr EnumNameTable<BuiltinLowering, 38> kBuiltinLoweringTable{{{
     { BuiltinLowering::AtomicFetchAnd,        "atomic_fetch_and"         },
     { BuiltinLowering::AtomicExchange,        "atomic_exchange"          },
     { BuiltinLowering::AtomicCompareExchange, "atomic_compare_exchange"  },
+    // P69 (lane `cs`): the GNU builtins the GNU-dialect predefine routes real code into.
+    { BuiltinLowering::FirstArgument,         "first_argument"           },
+    { BuiltinLowering::Parity,                "parity"                   },
+    { BuiltinLowering::Trap,                  "trap"                     },
+    { BuiltinLowering::Prefetch,              "prefetch"                 },
+    { BuiltinLowering::Infinity,              "infinity"                 },
+    { BuiltinLowering::QuietNan,              "quiet_nan"                },
+    { BuiltinLowering::Alloca,                "alloca"                   },
+    { BuiltinLowering::ObjectSize,            "object_size"              },
+    { BuiltinLowering::AddOverflow,           "add_overflow"             },
+    { BuiltinLowering::SubOverflow,           "sub_overflow"             },
+    { BuiltinLowering::MulOverflow,           "mul_overflow"             },
+    { BuiltinLowering::AddOverflowP,          "add_overflow_p"           },
+    { BuiltinLowering::SubOverflowP,          "sub_overflow_p"           },
+    { BuiltinLowering::MulOverflowP,          "mul_overflow_p"           },
 }}};
 // ★ THE UNDER-FILL GUARD, and for a hand-written table this long it is not
 // ceremony: `EnumNameTable<BuiltinLowering, N>` with N-1 initializers is legal
@@ -1767,6 +1836,24 @@ builtinLoweringFromName(std::string_view name) noexcept {
 [[nodiscard]] inline constexpr std::string_view
 builtinLoweringName(BuiltinLowering lowering) noexcept {
     return kBuiltinLoweringTable.nameOrEmpty(lowering);
+}
+
+// P69 (lane `cs`): the verbs whose CONSTANT form has a precondition the call may not meet,
+// and that are then an ordinary call of a library function instead — the row's
+// `libraryFallback` (`__builtin_nan(s)` with a non-literal `s` calls libm's `nan`, as gcc
+// and clang do). A `libraryFallback` on a row whose verb has no such precondition would be
+// a knob that does nothing, and the loader refuses it there.
+[[nodiscard]] inline constexpr bool
+builtinLoweringHasLibraryFallback(BuiltinLowering lowering) noexcept {
+    return lowering == BuiltinLowering::QuietNan;
+}
+
+// P69 (lane `cs`): the three `_p` checked-arithmetic predicates (`AddOverflowP`…).
+[[nodiscard]] inline constexpr bool
+builtinLoweringIsOverflowPredicate(BuiltinLowering lowering) noexcept {
+    return lowering == BuiltinLowering::AddOverflowP
+        || lowering == BuiltinLowering::SubOverflowP
+        || lowering == BuiltinLowering::MulOverflowP;
 }
 
 // SE6: a built-in function the engine binds into a CU-wide "builtins"
@@ -1889,6 +1976,42 @@ struct DSS_EXPORT BuiltinFunctionMapping {
     // struct above documents. Absent (the default) ⇒ the declared signature binds
     // verbatim, exactly as every pre-existing row does.
     std::optional<BuiltinGenericPointee> genericPointee;
+    // P69 (lane `cs`): OPTIONAL — the C library function a call of this builtin IS when the
+    // verb's constant form does not apply (`builtinLoweringHasLibraryFallback`): the semantic
+    // tier then binds the call to that library function exactly as `__builtin_<name>`
+    // binds a library builtin (`SemanticConfig::libraryBuiltins`). Empty ⇒ none.
+    std::string libraryFallback;
+};
+
+// P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): GCC's LIBRARY
+// builtins — `<prefix><name>` for each C library function `name` the dialect documents
+// ("Other Built-in Functions Provided by GCC": `__builtin_strlen`, `__builtin_memcpy`,
+// `__builtin_ceil`, `__builtin_printf`, …). A call of one IS a call of the library function:
+// the semantic tier binds the spelling, on its first use in a translation unit, to the
+// function the unit itself declares under that name at file scope, or else to the
+// platform's realization of it (the shipped-descriptor corpus — the realization a bare
+// prototype of the name gets), minted import-only and bound in no scope, so the library
+// name itself stays undeclared. The list is the DIALECT's; whether a platform provides a
+// function is the corpus's, and a use of one it does not provide is refused at the use,
+// naming the function — so `__has_builtin` answers 1 for a listed spelling exactly where
+// the platform provides the function on the active target (P69 review M3), never for the
+// listing alone.
+struct DSS_EXPORT LibraryBuiltins {
+    std::string              prefix;      // `__builtin_`; empty ⇒ the language declares none
+    std::vector<std::string> functions;   // the library names, sorted and unique (load-checked)
+    // The library function `spelled` names, or empty when it names none.
+    [[nodiscard]] std::string_view libraryFunctionOf(std::string_view spelled) const noexcept {
+        if (prefix.empty() || spelled.size() <= prefix.size()
+            || spelled.substr(0, prefix.size()) != prefix)
+            return {};
+        std::string_view const name = spelled.substr(prefix.size());
+        auto const it = std::lower_bound(functions.begin(), functions.end(), name,
+                                         [](std::string const& a, std::string_view b) {
+                                             return std::string_view{a} < b;
+                                         });
+        return (it != functions.end() && std::string_view{*it} == name)
+                   ? std::string_view{*it} : std::string_view{};
+    }
 };
 
 // D5.1: a member-access expression rule. When Pass 2 sees a node with this
@@ -1952,16 +2075,38 @@ struct DSS_EXPORT CastRule {
 // checks). Deliberately a SEPARATE vocabulary from `CastRule`: a
 // compound literal is C 6.5.2.5 postfix syntax, NOT a conversion — no
 // operand child exists and the explicit-cast matrix must never run
-// against the brace-init (the per-element checks live in the HIR
-// brace-init lowering, contextually typed by the stamped type).
+// against the brace-init (each ELEMENT is judged against the subobject it
+// initializes, by the semantic tier's brace-element check since P69, and
+// placed by the HIR brace-init lowering, contextually typed by the
+// stamped type).
 // Pre-sweep only struct-ref type children worked (the struct-name
 // resolution stamped them as a side effect); builtin keywords and
 // typedef names in compound-literal position resolved to NOTHING and
 // the HIR lowering fail-louded.
+//
+// P69 (D-C-A-STORAGE-CLASS-SPECIFIER-IN-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR, C23
+// 6.5.3.6): a row may also name a STORAGE-CLASS SPECIFIER child (`storageChild`) —
+// C23's `( storage-class-specifiers type-name ) braced-initializer`. The standard
+// judges those specifiers "as if" the literal were the definition `SC typeof(T) ID =
+// { IL };` in its own scope (6.5.3.6p4), so the row names the two DECLARATION rows
+// that definition would be — `storageAsFileScopeDeclaration` outside every function
+// body, `storageAsBlockScopeDeclaration` inside one — and the semantic tier reads
+// THEIR `linkageSpecifiers` (the same facets, exclusion groups and exceptions a
+// declaration's own specifier prefix is judged by). A specifier the named row does
+// not map is one that scope's declaration does not admit (C 6.9p2's file-scope
+// `register`). `repeatedStorageSpecifierRefused` states C23 6.5.3.6's footnote 97: a
+// literal naming one storage-class specifier twice violates the constraint, whatever
+// a declaration's own leniency is.
 struct DSS_EXPORT CompoundLiteralRule {
     RuleId        rule{};
     std::uint32_t typeChild = 0;      // visible-child index of the type subtree
     std::string   ruleName;           // source spelling, for diagnostics
+    std::optional<std::uint32_t> storageChild;   // visible-child index of the specifiers
+    RuleId        storageAsFileScopeDeclaration{};
+    std::string   storageAsFileScopeDeclarationName;
+    RuleId        storageAsBlockScopeDeclaration{};
+    std::string   storageAsBlockScopeDeclarationName;
+    bool          repeatedStorageSpecifierRefused = false;
 };
 
 // Identifier-use recognition. The named rule (whose RuleId the loader
@@ -2459,6 +2604,18 @@ struct DSS_EXPORT IntegerLiteralTypingRule {
     // in scope. Absent ⇒ one of the other two shapes.
     std::optional<DataModelTypeRef> fixedType;
     IntegerLiteralOutOfRange        outOfRange = IntegerLiteralOutOfRange::Wrap;
+    // P69 (lane `cs`, D-C-DECIMAL-CONSTANT-PAST-LONG-LONG-IS-REFUSED-WHERE-EVERY-REFERENCE-ACCEPTS-IT):
+    // a LADDER rule's reading of a DECIMAL magnitude past every `decimal` candidate
+    // (`9223372036854775808`, `...L`, `...LL` in C). Present ⇒ the literal is typed as this
+    // type when it holds the magnitude, and the typing REPORTS the reinterpretation
+    // (`IntegerLadderResult::reinterpretedUnsigned`, `PhaseFourLiteral`'s twin), which each
+    // tier turns into a warning: the constant has no type in its own list, a constraint
+    // violation (C 6.4.4p2) whose diagnostic is required. The loader admits it only on a
+    // ladder rule whose every `decimal` candidate is SIGNED, and only an UNSIGNED integer
+    // type at least as wide as each of them, under every data model — so "past the list"
+    // is exactly "reinterpreted as unsigned". Absent ⇒ such a magnitude has no type:
+    // S_IntegerLiteralTooLarge, and phase 4 refuses it too.
+    std::optional<DataModelTypeRef> decimalPastRange;
 };
 
 // ── FC3.5 sweep-c2: float-literal typing (`semantics.floatLiteralTyping`) ──
@@ -3650,6 +3807,12 @@ struct DSS_EXPORT SemanticConfig {
     std::uint32_t vaStartApChild = 0;
     RuleId        vaEndRule{};        std::string vaEndRuleName;
     std::uint32_t vaEndApChild   = 0;
+    // P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): `va_copy(dest, src)` (C 7.16.1.2) —
+    // stamped `void`, both operands type-checked as va_lists. Optional inside the block:
+    // absent, the language has no copy surface; present, both child indices are required.
+    RuleId        vaCopyRule{};       std::string vaCopyRuleName;
+    std::uint32_t vaCopyDestinationChild = 0;
+    std::uint32_t vaCopySourceChild      = 0;
     // C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): the `_Static_assert`/`static_assert`
     // static-assertion DECLARATION rule. When Pass 2 visits a node of this rule it
     // const-evaluates the FIRST meaningful child (the condition — the `assignmentExpr`
@@ -3727,6 +3890,7 @@ struct DSS_EXPORT SemanticConfig {
     // (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF). See CompoundLiteralRule.
     std::vector<CompoundLiteralRule> compoundLiteralRules;
     std::vector<BuiltinFunctionMapping> builtinFunctions;  // SE6 builtins
+    LibraryBuiltins                     libraryBuiltins;   // P69: `__builtin_<libfn>`
     std::vector<ReturnRule>         returnRules;       // GAP A return-type checking
     // Rules that establish a break/continue-valid context (while/for/do/
     // switch). Bundled rule+ruleName via ScopeRule — same house pattern.

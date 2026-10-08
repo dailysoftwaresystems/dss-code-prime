@@ -18,13 +18,12 @@ this program under Git Bash -- and every path it hands a native tool is an
 absolute path in the host's own form.
 
 ── HOW TO RUN THE FULL FOUR-LEG PROFILE FROM A COLD START ───────────────────
- 0. Once, on a host that has a STAGED subject (the Windows box, after a
-    real-examples/c/sqlite run has staged sqlite and emitted a manifest):
-      python .harness-config/runner/actions/profile-compile/profile-compile-support.py kit \
-          --manifest build/real-examples/c/sqlite/windows/sqlite3.elf64-x86_64.dss-project.json \
-          --root stage=build/real-examples/c/sqlite/windows/stage \
-          --root libs="$USERPROFILE/.cache/dsscp/harness-libs" \
-          --out build/perf/kit
+ 0. Once, on a host that has a STAGED subject (the Windows box, after a sqlite run
+    has staged sqlite and emitted a manifest), the action's `kit` step -- its kit is
+    the step's kept output, `<the step's build directory>/kit`:
+      dssharness run profile-compile --manual-step kit \
+          --input manifest=build/real-examples/c/sqlite/windows/sqlite3.elf64-x86_64.dss-project.json \
+          --input "roots=stage=build/real-examples/c/sqlite/windows/stage;libs=<the harness libraries>"
     The kit is COPIED, never re-staged: the sqlite harness pulls upstream on
     every run, so a host that stages for itself is not compiling the same
     program as its peers.
@@ -34,37 +33,36 @@ absolute path in the host's own form.
       dssharness run profile-compile --legs linux-x86_64-release
     Only a RELEASE leg that the `profile-compile` runner in `.harness-config/config.json`
     declares: the program refuses any dsscp that is not a Release build (below).
-    ⚠ A leg that needs `sync` (WSL, ssh) waits on DssHarness round four, whose sync
-    ships actions.
-    By hand on one host, the same program:
-      python3 .harness-config/runner/actions/profile-compile/profile-compile.py --kit build/perf/kit \
-          --label win-x86_64 --target x86_64:elf64-x86_64-linux-exec
- 2. The yardstick, on any host with gcc (the same TUs, the same manifest):
-      python3 .harness-config/runner/actions/profile-compile/profile-compile-support.py gcc-reference \
-          --manifest build/perf/wsl-x86_64/subject.dss-project.json \
-          --out build/perf/wsl-x86_64 --jobs 32
+ 2. The yardstick, on any leg with gcc (the same TUs, the same manifest): the same step with
+    `--input gccReference=true`, the reference compiler, its optimization and its link
+    libraries being the step's `referenceCc`, `referenceOpt` and `referenceLinkLibs` inputs
+    (gcc, -O2, -lz -lm -lpthread -ldl unless a run says otherwise).
     ✔MEASURED 2026-08-18 on WSL, 103 TUs, gcc 13 -O2: -j1 21.5 s, -j32 4.8 s,
     against DSS's 1m40.8 s on that same host.
 
 Usage:
   profile-compile.py --kit <dir> --target <spec> --label <name>
-                     [--repo <dir>] [--build-dir <dir>] [--no-build]
-                     [--out <dir>] [--jobs N] [--gcc-reference]
+                     [--build-dir <dir>] [--no-build]
+                     [--out <dir>] [--jobs N] [--gcc-reference true|false]
+                     [--reference-cc <cc> --reference-opt <flag> --reference-link-libs <libs>]
 
   --kit <dir>        a materialized kit (`profile-compile-support.py kit`). REQUIRED.
   --target <spec>    the ONE <target>:<format> every leg compiles. REQUIRED.
   --label <name>     names this leg in the report and in the witness line. REQUIRED.
-  --repo <dir>       the dsscp checkout (default: the tree this file lives in).
   --build-dir <dir>  the compiler's build tree (default: <repo>/build/rel).
   --no-build         time the dsscp already in the build tree; configure nothing.
   --out <dir>        logs, the subject manifest and the image (default:
                      <repo>/build/perf/<label>).
   --jobs N           build and gcc-reference parallelism (default: DSS_JOBS, then 6).
-  --gcc-reference    also time gcc over the same TUs from the same manifest.
+  --gcc-reference B  true also times gcc over the same TUs from the same manifest.
+  --reference-cc C, --reference-opt F, --reference-link-libs L
+                     the yardstick's compiler, optimization flag and link libraries --
+                     the step's inputs, REQUIRED with --gcc-reference true (a value that
+                     begins with `-` is still the option's value).
   -h, --help         show this help and exit.
-  A relative --kit, --out or --build-dir is taken from the repository root; a
-  relative --repo from the directory the program is run in. Every value flag
-  needs a non-empty value; anything else on the command line is refused.
+  A relative --kit, --out or --build-dir is taken from the repository root -- the
+  tree this file lives in. Every value flag needs a non-empty value; anything else
+  on the command line is refused.
 
 Output: the last line is `PROFILE-LEG-OK <label>   (out: <dir>)` on success, and
 `PROFILE-LEG-FAILED <label> rc=<rc>  (log: <file>)` when the compile failed -- the
@@ -100,12 +98,18 @@ TOOL = "profile-compile"
 OK_TOKEN = "PROFILE-LEG-OK"
 FAILED_TOKEN = "PROFILE-LEG-FAILED"
 
-VALUE_FLAGS = ("--kit", "--target", "--label", "--repo", "--build-dir", "--out", "--jobs")
-SWITCHES = ("--no-build", "--gcc-reference")
+# ★ `--gcc-reference` TAKES `true` OR `false` (2026-09-30): the `profile` step hands every input over, its
+# default included, and a switch cannot be passed conditionally. `--repo` is RETIRED the same day: the tree
+# profiled is the one this file lives in, which is the tree the harness step runs in.
+# ★ THE YARDSTICK'S KNOBS ARE THE STEP'S INPUTS (2026-10-01, the P69 review's NIT 7): `--reference-cc`,
+# `--reference-opt` and `--reference-link-libs`, handed to the support's `gcc-reference` -- as compile-bench made
+# its own knobs inputs, so no value a measurement depends on is fixed inside a program.
+VALUE_FLAGS = ("--kit", "--target", "--label", "--build-dir", "--out", "--jobs", "--gcc-reference",
+               "--reference-cc", "--reference-opt", "--reference-link-libs")
+SWITCHES = ("--no-build",)
 DEFAULT_JOBS = 6
 
-# The support program, taken from the REPOSITORY being profiled (as it always was),
-# not from beside this file: `--repo` names the tree whose tools run.
+# The support program, taken from the REPOSITORY being profiled -- the tree this file lives in.
 SUPPORT_REL = (".harness-config", "runner", "actions", "profile-compile",
                "profile-compile-support.py")
 
@@ -157,8 +161,9 @@ def parse_cli(argv):
     misspelling) is a REFUSAL, never a shrug: silently ignoring one is how a run ends
     up not measuring what its command line said it measured. A value flag with a
     missing or EMPTY value is refused by name."""
-    o = {"kit": "", "target": "", "label": "", "repo": "", "build_dir": "", "out": "",
-         "jobs": "", "no_build": False, "gcc_reference": False, "help": False}
+    o = {"kit": "", "target": "", "label": "", "build_dir": "", "out": "",
+         "jobs": "", "no_build": False, "gcc_reference": "false", "reference_cc": "", "reference_opt": "",
+         "reference_link_libs": "", "help": False}
     i, n = 0, len(argv)
     while i < n:
         a = argv[i]
@@ -184,6 +189,13 @@ def parse_cli(argv):
         die("--label is required (it names this leg in the report)")
     if o["jobs"]:
         _positive_jobs(o["jobs"], "--jobs")
+    if o["gcc_reference"] not in ("true", "false"):
+        die("--gcc-reference is true or false, got '%s'" % o["gcc_reference"])
+    o["gcc_reference"] = o["gcc_reference"] == "true"
+    if o["gcc_reference"]:
+        for flag in ("--reference-cc", "--reference-opt", "--reference-link-libs"):
+            if not o[flag[2:].replace("-", "_")]:
+                die("%s is required with --gcc-reference true (the yardstick's knobs are the step's inputs)" % flag)
     return o
 
 
@@ -255,11 +267,11 @@ def _owning_tree_root():
         die("cannot name the tree this program lives in: %s" % exc)
 
 
-def resolve_repo(opt_repo):
-    """The dsscp checkout to profile: `--repo` (from the caller's directory), else the
-    tree this file lives in -- a profiler that has to be told where it is can be
-    pointed at a different checkout than the compiler it just built."""
-    repo = os.path.abspath(opt_repo) if opt_repo else _owning_tree_root()
+def resolve_repo():
+    """The dsscp checkout to profile: the tree this file lives in -- a profiler that has to be told
+    where it is can be pointed at a different checkout than the compiler it just built (`--repo` did
+    exactly that until its retirement on 2026-09-30)."""
+    repo = _owning_tree_root()
     if not os.path.isdir(os.path.join(repo, "src", "dss-config")):
         die("%s is missing — that is not a dsscp checkout"
             % os.path.join(repo, "src", "dss-config"))
@@ -456,7 +468,7 @@ def main(argv=None):
         return 0
 
     augment_path()
-    repo = resolve_repo(o["repo"])
+    repo = resolve_repo()
     # ★★★ NAME THE CONFIG TREE. `findShippedConfig` prefers $DSS_CONFIG_ROOT and
     # otherwise WALKS UP FROM THE CWD, so a leg driven over ssh (cwd = $HOME) finds
     # nothing and the compile dies, while a leg driven from Windows INTO WSL silently
@@ -547,7 +559,9 @@ def main(argv=None):
     if o["gcc_reference"]:
         say(label, "gcc yardstick (same TUs, same manifest)")
         rc, _ = support(repo, support_path, ["gcc-reference", "--manifest", man, "--out", out,
-                                             "--jobs", str(effective_jobs(o["jobs"]))])
+                                             "--jobs", str(effective_jobs(o["jobs"])),
+                                             "--cc=%s" % o["reference_cc"], "--opt=%s" % o["reference_opt"],
+                                             "--link-libs=%s" % o["reference_link_libs"]])
         if rc != 0:
             die("the gcc reference failed")
 

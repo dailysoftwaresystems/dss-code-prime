@@ -140,7 +140,13 @@ class TypeRegistry;
 // (P68 round 12, lane `cs`): `enum E : long` and `enum E` are different types
 // (C23 6.2.7p1), and v5 wrote both as `enum "E" : i64`. A v5 reader meeting the
 // v6 spelling reads `enum "E"` and then meets `fixed` with no rule for it.
-inline constexpr std::uint32_t kHirTextFormatVersion = 6;
+// v7 added the `unnamed` expression — `unnamed <storage> : <type> (<init>)`, an
+// unnamed OBJECT (C's compound literal) of automatic, static or thread storage
+// (P69, lane `cs`, D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT). A
+// v6 reader meeting it has no rule for the keyword — and one that skipped it would
+// rebuild the literal as its initializer's VALUE, the very aliasing the node exists
+// to end.
+inline constexpr std::uint32_t kHirTextFormatVersion = 7;
 
 // ── kHirTextMaxNodeDepth — THE FORMAT'S DECLARED NESTING LIMIT ────────────────
 //

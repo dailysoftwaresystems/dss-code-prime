@@ -4085,8 +4085,14 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // `__unix`, `__ELF__` (✔MEASURED gcc 13.3.0 + clang 18.1.3, x86_64 and aarch64);
     // each carries the `impliedSurface` it backs (test_os_identity_predefines pins them
     // on every real pair). 164 un-gated, 13 pe-gated, 3 macho-gated, 6 elf-gated = 186.
-    EXPECT_EQ(pms.size(), 186u)
-        << "c declares 164 un-gated + 13 pe-gated + 3 macho-gated + 6 elf-gated predefined macros";
+    // P69 (lane lm, M4 of D-FFI-INTTYPES-H-SHIPS-FOUR-FORMAT-MACROS): +120 UN-GATED rows, the
+    // `type-format` family (`__<T>_FMT<c>__` — the printf/scanf length modifier of a TYPE and
+    // one conversion, the string <inttypes.h>'s PRI/SCN macros alias); each names a TYPE and is
+    // realized per (language × pair), un-gated for the `type-size` rows' reason
+    // (test_type_format_predefines pins the family). 284 un-gated, 13 pe-gated, 3 macho-gated,
+    // 6 elf-gated = 306.
+    EXPECT_EQ(pms.size(), 306u)
+        << "c declares 284 un-gated + 13 pe-gated + 3 macho-gated + 6 elf-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -4138,8 +4144,9 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
         << "elf targets must predefine exactly the six names gcc and clang define for a "
            "linux triple in their ISO modes (`linux`/`unix` are GNU-mode only and belong "
            "to the program)";
-    EXPECT_EQ(ungated, 164u)
-        << "the 122 GNU integer-type rows (`type-name`/`type-limit`/`type-suffix`, P68 "
+    EXPECT_EQ(ungated, 284u)
+        << "the 120 `type-format` rows (`__<T>_FMT<c>__`, P69 M4, realized per pair) + "
+           "the 122 GNU integer-type rows (`type-name`/`type-limit`/`type-suffix`, P68 "
            "round 9, realized per pair) + "
            "the 3 `type-unsigned` rows (__CHAR_UNSIGNED__/__WCHAR_UNSIGNED__/"
            "__WINT_UNSIGNED__, P68 round 9, realized per pair) + "
@@ -7362,8 +7369,9 @@ TEST(Preprocessor, FunctionLikePredefineErasesArgsOnPe) {
 }
 
 // FC17.9(a) (D-CSUBSET-C11-THREADS-TRAMPOLINES / -MACHO): <threads.h> is now COMPLETE on
-// ALL legs — thrd_create/call_once/thrd_join land on elf (libc FFI), pe64 (kernel32 synth)
-// AND macho (libSystem pthread synth: pthread_create/pthread_once/pthread_join). So a
+// ALL legs — thrd_create/call_once/thrd_join land on elf (libc FFI), pe64 (kernel32 synth;
+// call_once DSS's runtime source over InitOnceExecuteOnce since P69) AND macho (libSystem
+// pthread synth over pthread_create/pthread_join; call_once IS pthread_once). So a
 // conforming impl must NOT define `__STDC_NO_THREADS__` on ANY target (C11 6.10.8.3 /
 // C23 6.10.9.3) — the macro is REMOVED from c.lang.json entirely. RED-on-disable:
 // re-add the macro (any gating) → the corresponding arm flips to the no_threads
@@ -16385,4 +16393,36 @@ TEST(Preprocessor, SqlitesEbcdicGuardIsAHighByteCharConstantAndStillFolds) {
         << "with no target threaded, a high-byte character constant in `#if` "
            "must fail loud — the refusal keys on the OPERAND, not on whether "
            "this particular comparison happens to be sign-agnostic";
+}
+
+// ── P69 (lane `cs`, D-PP-IF-SUFFIXED-DECIMAL-PAST-INTMAX-IS-READ-UNSIGNED-IN-SILENCE) ──────────
+// The `l` and `ll` spellings of a decimal past INTMAX_MAX are reinterpreted exactly as the
+// unsuffixed one: every candidate of their rules is signed too. ✔MEASURED 2026-10-01 (lane
+// `cs`'s probe x2, linux run 20261001-040717-5c2f17f3): gcc 13.3.0 and clang 18.1.3 warn on
+// all of them and read them UNSIGNED (`#if 9223372036854775808LL < 0` takes the #else);
+// ISO C 6.4.4p2 requires the diagnostic. MSVC 19.51 is silent and reads the `LL` one signed
+// (run 20261001-040746-9806f843) — the fork is decided for the documented unsigned reading.
+// RED-ON-DISABLE: restore the `suffix.empty()` condition → the suffixed arms lose the warning.
+TEST(PreprocessorIfIntmax, ALongSuffixedDecimalAboveIntmaxMaxWarnsToo) {
+    for (char const* e : {"9223372036854775808L > 0", "9223372036854775808LL > 0",
+                          "9223372036854775808ll > 0", "18446744073709551615LL > 0"}) {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm(e, r), "taken_if") << e;
+        EXPECT_EQ(ppCodeSeverity(r,
+                      DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned),
+                  DiagnosticSeverity::Warning) << e;
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << e;
+    }
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("9223372036854775808LL < 0", r), "taken_else")
+            << "read UNSIGNED, as gcc and clang read it";
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned));
+    }
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("9223372036854775808ULL > 0", r), "taken_if");
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned))
+            << "CONTROL: an unsigned suffix reinterprets nothing";
+    }
 }

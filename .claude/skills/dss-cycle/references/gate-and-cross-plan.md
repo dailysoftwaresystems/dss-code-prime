@@ -180,9 +180,26 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   dssharness check-anchor-balance --base <cycle-start-sha>   # the live balance; --json writes the receipt
   ```
 
-  It prints OPEN-at-base, OPEN-now, and **the name of every row that opened or closed** — the count
-  alone cannot tell you which, and "which" is the question. Exit 1 when the cycle leaves more open
-  than it found. ⏳ SCRIPT-ERA (superseded 2026-09-17: the live balance is the `dssharness check-anchor-balance` verb, and its exit codes are DssHarness's own; see dss-harness.md)
+  It compares the OPEN rows at the base with those now and exits 1 when the cycle leaves more open than
+  it found; a new `🔵 DISCLOSED` row — debt that pre-dates the cycle — is not counted (✔MEASURED
+  2026-09-30 in a throwaway repository). Its mirror on the closed side: a row closed since the base whose
+  Trigger opens with the bookkeeping pair `✅🧾` — the work pre-dates the cycle and only the mark is
+  repaired — leaves the open count but is credited with nothing; the change line reads `N closed (K
+  bookkeeping)` and lists it `[bookkeeping: not credited]` (✔MEASURED 2026-10-06 in a throwaway
+  repository). It also FAILS on a row lost since the base — one neither registry holds now, deleted or
+  its id changed by hand, open or closed where the cycle began: a row moves, and is never deleted; a lost
+  closed row changes no count and is listed `[lost: already closed]` (✔MEASURED 2026-10-07 in throwaway
+  repositories). What the balance does not report, `anchor-debt` does, and the round close runs it too:
+
+  ```bash
+  dssharness run anchor-debt-debt --input base=<cycle-start-sha>   # this machine's tree: it reads git at the base
+  ```
+
+  — a closure verdict under a non-closure marker, a gated row whose opener is not open, a discharged
+  blocker, an unclassifiable closing-work marker, OPEN-vs-GATED prose and a `[[...]]` pointer that names no
+  row: each printed as DEBT when it was already there at the base, and REFUSED when the cycle introduced it —
+  a row it added or edited that way, or a pointer whose target row it deleted or renamed. The done
+  registry's dangling pointers are counted, never listed: the archive is past (operator, 2026-09-16).
 
   `after > before` ⇒ **the gate FAILS.** Close the difference, or escalate the one you cannot close
   as a **§B decision** — the user chooses to carry it; the cycle does not decide that for itself.
@@ -194,45 +211,23 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   improvement. ✔MEASURED 2026-08-11, on the very cycle that introduced the gate — the row it could
   not see was a HIGH-severity speculative-load-hoist miscompile. The tool inverts the rule:
   **a row is OPEN unless its status cell carries an explicit `✅`**, so a glyph nobody has thought of
-  yet counts as open, which is the safe direction. `--self-test` pins that inversion (including a
-  deliberately novel glyph); run it if you touch the script. Enumerating the open glyphs is the same
+  yet counts as open, which is the safe direction. `anchor-debt`'s self-test pins that inversion (a
+  deliberately novel glyph included) in the row vocabulary the guards share. Enumerating the open glyphs is the same
   mistake as enumerating build-directory layouts — define the complement, not the variants.
   Opening rows is fine and often right; ENDING ON A HIGHER NUMBER is what is forbidden, because that
   is the arithmetic by which a 3,000-row audit trail became a 350-row backlog nobody reads.
 
-  ★★★ **THE DENOMINATOR IS `registry + plans`, NOT THE REGISTRY ALONE — widened 2026-08-13, and
-  finding this was the THIRD and FOURTH times this one instrument under-counted.** §F.2 sanctions
-  **two homes** for an anchor (this registry AND the owning plan's deferral table) and §F.4 lets a
-  `src/` citation resolve to either — but the tool counted only registry rows. ⇒ **a cycle that
-  closed a registry row and deferred the work into a plan row was reported as an IMPROVEMENT.**
-  Both homes are now counted, so MOVING a deferral between them is arithmetically NEUTRAL. SUPERSEDED 2026-09-25 by the registries being the only home a row can have — the door writes nothing else, so a plan-side deferral table is no longer a sanctioned home, ✔MEASURED that day the program's plan-side count was 0, and the live balance is the `dssharness check-anchor-balance` verb, which compares by id across both registries; the program's registry+plans denominator, its --breakdown and its DEBT lines are history (see no-follow-ups.md)
-  - **✔MEASURED the day it was fixed: `661 → 662 → 987`**, decomposing with no residue. The
-    registry-only number was itself wrong (**+2 −1**): the row regex `^\| \`(D-[A-Z0-9-]+)\` \|`
-    admitted no `_`, so **two OPEN rows were INVISIBLE** — the two whose ids carry an underscore,
-    one naming `QEMU_LD_PREFIX` and the other `x86_64` — ★ **a row the gate cannot SEE cannot be seen
-    to OPEN either** — and one row it counted lives in the registry's own **“Allowlist (code-internal
-    pins, NOT deferrals)”** table. The remaining **+325** is the plan side (231 deferred-items, 84
-    reserved, 10 registry-shaped).
-  - **No stored baseline exists and none is needed:** both sides of the comparison use the same rule,
-    so widening moves the HEADLINE, never the DELTA. Cross-checked at `--base HEAD~1`, which
-    reproduces the recorded asm-arm64 **+20** exactly. `--denominator registry` reproduces the
-    pre-2026-08-13 headline on demand, and the output always NAMES which denominator gated.
-  - ⚠⚠ **RECOGNITION IS BY COLUMN SHAPE, NEVER BY HEADING NUMBER — “§3.1” is NOT the contract, and
-    assuming it was would have missed most of the tables.** ✔MEASURED: `17-shader-gpu-plan` keeps its
-    anchor table at **§5.4** while its §3.1 is a `Tier | Example` prose table; `23-full-c-plan`'s §3.1
-    is **not a table at all**; `09.5`/`24`/`28` use §9/§6/§12 and `08` uses §2.5–§2.8. Three anchor
-    shapes are counted (the registry's 4-column; `# | Deferred item |` with **five** different tails;
-    and `Anchor | Owns`, which has **no status column** so every row is unconditionally OPEN); four
-    non-deferral shapes are excluded BY NAME. SUPERSEDED 2026-09-01 by the six-cell registry row — the registry documents use `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |`; the program still recognizes the four-cell shape, which survives in plan-side §3.1 tables and plan-17 §5.4, but since 2026-09-25 a plan-side table is no longer a home a row can have, and the live balance, `dssharness check-anchor-balance`, reads only the two registries (see no-follow-ups.md) Row inclusion is decided **by table, never by how an
-    anchor is spelled** — which is what makes the underscore blind spot unrepeatable by construction.
-  - **Severity rule, and it is not a softening: FATAL iff the measurement is INCOMPLETE.** An
-    unrecognized table shape or an orphan row means rows exist that could not be counted → exit 1. A
-    merely *interrupted* table (e.g. an inline HTML comment parked mid-body, which severs the rows
-    below it from their header) loses nothing once the reader steps over it → loud WARN. Never
-    silently skip a table: a silently skipped table is the exact defect this whole rule exists about.
-  - `--self-test` covers **32** cases including a deliberately novel glyph in a plan row, a mid-prose
-    `✅` that must still count OPEN, a `✅` in a non-status column, an underscore name, a strikethrough
-    name, an orphan row, and a mid-table comment. Run it if you touch the script.
+  ★★ **WHAT THE COUNT READS, AND WHY.** The balance reads the two registries only — since 2026-09-25 a
+  plan-side deferral table is no longer a home a row can have, so deferring work into a plan cannot make
+  a cycle look better — and a table is recognized by its COLUMN SHAPE, never by a heading number. Each
+  rule is paid for: an instrument that counted the registry alone once reported a cycle that deferred a
+  registry row into a plan row as an IMPROVEMENT; a row regex that admitted no `_` hid two OPEN rows (a
+  row the gate cannot SEE cannot be seen to OPEN either); and a table matched by its section number
+  would have missed most of them. The arithmetic is DssHarness's since 2026-09-17; the retired
+  program's `--denominator`, `--breakdown` and `--per-bucket` modes were deleted with its balance on
+  2026-09-30, and `anchor-debt` keeps its row scanner — the shape recognition, FATAL iff the measurement
+  is INCOMPLETE, and a self-test covering a novel glyph, a mid-prose `✅` that must still count OPEN,
+  an underscore name and an orphan row.
 
   ★★ **THE FAILURE MODE THIS EXISTS TO KILL, ✔MEASURED 2026-08-11 and it is not subtle:** a lane was
   dispatched to FIX the predefined-macro set. When it was stopped it had written **nine new OPEN rows
@@ -285,10 +280,10 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   - A collapsed parse (enum block not found, implausibly few enumerators, no test sources) exits **2**
     rather than reporting "0 duplicates, OK" — the instrument that enforces the witness lesson must not
     embody its inverse.
-  - `--self-test` covers the collision shapes a text-compare would miss (`0xd029` vs `0xD029`,
+  - Its self-test covers the collision shapes a text-compare would miss (`0xd029` vs `0xD029`,
     decimal vs hex), the commented-out-enumerator false positive, the comment-strip property, and the
-    collapse guards. Run it if you touch the script.
-  - ★ **Before you ALLOCATE, run it with `--cross-branch`:** [→ `--cross-branch` is not a runner step yet, so it runs as `python .harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py --cross-branch`](actions.md) the plain form's "next free" is only this
+    collapse guards (`dssharness run check-diagnostic-codes --manual-step self-test`).
+  - ★ **Before you ALLOCATE, run it with `--cross-branch`:** [→ it runs on this machine's own tree, whose git worktrees and refs no synced copy carries: `dssharness run check-diagnostic-codes-cross-branch`](actions.md) the plain form's "next free" is only this
     tree's answer, while `--cross-branch` also reads every other worktree's working header and every ref
     not merged into HEAD, fails on an ordinal two of them allocated differently, and prints the next free
     slot per band over all of them — the number an allocator actually needs.
@@ -308,8 +303,9 @@ Keep the plans honest in the **same commit** as the code:
   `_deferred-anchor-registry-done.md`. Add new anchors with `dssharness write-anchor <ID> ...` (it
   WRITES unless given `--anchor-dry-run`).
   **The row is never DELETED** — the audit trail is load-bearing, which is exactly why the archive
-  exists rather than a deletion (operator, 2026-09-01). ⚠ Hand-editing a table is refused by
-  `check-anchor-balance`'s partition arm; a hand-typed row can also wrap the anchor id, which does
+  exists rather than a deletion (operator, 2026-09-01). ⚠ A hand-edited table is refused by
+  `dssharness check-anchor-balance` (a row in the wrong registry) and by `read-anchors --lint`; a
+  hand-typed row can also wrap the anchor id, which does
   not fail — it disappears from every grep and mints a false id at the same time.
 - Record the cycle in the running cycle-log (memory entry per the established convention).
 - Update the `dss-code-prime` skill if a convention changed.

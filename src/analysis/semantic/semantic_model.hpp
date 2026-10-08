@@ -938,6 +938,58 @@ struct DSS_EXPORT ShippedExternSymbol {
 // the link WITHOUT passing through `SemanticModel::shippedExterns()`, so every
 // property the injected path reads off a row has to ride here too or that
 // property is silently dropped for exactly the declarations users write most.
+// ── P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): ONE compound
+// literal's OBJECT facts, as the semantic tier decided them ────────────────────────────
+//
+// A compound literal is an unnamed OBJECT (C 6.5.2.5p4), not its initializer's value, and
+// the tier that resolves its type name is the one that knows what kind of object: whether
+// it is const (so it may sit in read-only data, and a read through its address may fold),
+// its STORAGE DURATION — decided HERE, once, from its position and its C23 storage-class
+// specifiers — and whether its address may be taken. The HIR lowering reads THIS record —
+// never re-deriving any of it — and states it on the `UnnamedObject` node and its side
+// tables, exactly as a declaration's `SymbolRecord` feeds a `Global`'s.
+struct CompoundLiteralFacts {
+    // C 6.5.2.5p5 / C23 6.5.3.6p4-p7: STATIC outside every function body or with the
+    // `staticStorage` facet (C23 `static`); THREAD with the `threadStorage` facet
+    // (`thread_local`); AUTOMATIC otherwise.
+    enum class Storage : std::uint8_t { Automatic, Static, Thread };
+    Storage storage         = Storage::Automatic;
+    // The OBJECT is const: its type name's qualifier at the object's own level — for an
+    // array, the element's (C 6.7.3p10: an array's qualifiers are its elements') — or a
+    // `constexpr` specifier (C23 6.7.2p16: "a const-qualification is implicitly added to the
+    // object's type"). "Absent is not unqualified": a type name whose qualifiers cannot be
+    // read leaves this false, the WRITABLE placement, never wrong for a program C permits.
+    bool isConst            = false;
+    bool isConstexpr        = false;   // `constexpr` — a compound literal CONSTANT (C23 6.6p6)
+    // The `addressNotTakeable` facet (C23 `register`): the operand of unary `&` shall not
+    // designate it (C 6.5.3.2p1) — named after the config facet that says so.
+    bool addressNotTakeable = false;
+};
+
+// ── P69 (C23 6.6p6-p7): A CONSTANT SUBOBJECT, AS THE SEMANTIC TIER RESOLVED IT ─────────
+// A compound literal constant, or the `.member` of a structure or union constant, whose
+// value an integer constant expression may read: the initializer VALUE that initializes
+// it (read in `initScope`), or zero when no initializer names it, and its declared type.
+// Recorded for every such node the semantic tier meets, so the CST→HIR tier's own
+// constant evaluator (an index designator's `[s.b]`) reads the SAME answer instead of
+// re-deriving the placement — one owner, both tiers.
+struct ConstantSubobjectFact {
+    NodeId  initExpr{};
+    ScopeId initScope{};
+    TypeId  type{};
+    bool    zeroValue = false;
+};
+
+// ── P69 (lane `cs`): THE NaN PAYLOAD A FOLDED `__builtin_nan` CALL SPELLS ─────────────────────
+// Recorded on the CALL node of a `quiet_nan` builtin whose operand is a string literal gcc's
+// parser consumes wholly: the payload's low and high 64 bits, read by the CST→HIR tier to build
+// the literal in the call's own format. A binary128 `long double` keeps payload bits 0..110,
+// so one 64-bit word would not carry it.
+struct NanPayload {
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+};
+
 struct DSS_EXPORT SuppressedShippedSymbol {
     // The descriptor's per-object-format `library` map ("pe"/"elf"/"macho" →
     // runtime image), carried verbatim; folded to one string per target
@@ -1026,6 +1078,10 @@ public:
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
                   UnitAttribute<bool>                    nullPointerConstantNodes,
+                  UnitAttribute<CompoundLiteralFacts>    compoundLiteralFacts,
+                  UnitAttribute<ConstantSubobjectFact>   constantSubobjects,
+                  UnitAttribute<NanPayload>              nanPayloads,
+                  UnitAttribute<TypeId>                  overflowPredicateTargets,
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   std::unordered_map<std::string, SuppressedShippedSymbol>
                                                          suppressedShippedLibraries,
@@ -1059,6 +1115,10 @@ public:
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
           nullPointerConstantNodes_(std::move(nullPointerConstantNodes)),
+          compoundLiteralFacts_(std::move(compoundLiteralFacts)),
+          constantSubobjects_(std::move(constantSubobjects)),
+          nanPayloads_(std::move(nanPayloads)),
+          overflowPredicateTargets_(std::move(overflowPredicateTargets)),
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
@@ -1173,6 +1233,28 @@ public:
     // structural literal `0`, which the coerce arm admits directly).
     [[nodiscard]] bool isNullPointerConstant(NodeId id) const {
         return nullPointerConstantNodes_.has(id);
+    }
+
+    // P69: the object facts of the compound literal at `id` (see `CompoundLiteralFacts`),
+    // or nullptr when `id` is no compound literal the analyzer typed.
+    [[nodiscard]] CompoundLiteralFacts const* compoundLiteralFactsFor(NodeId id) const {
+        return compoundLiteralFacts_.tryGet(id);
+    }
+    // P69: the constant subobject at `id` (see `ConstantSubobjectFact`), or nullptr.
+    // P69 (lane `cs`): the payload a folded `quiet_nan` builtin call spells (`NanPayload`),
+    // or null — the call was bound to the library function instead.
+    [[nodiscard]] NanPayload const* nanPayloadFor(NodeId id) const {
+        return nanPayloads_.tryGet(id);
+    }
+    // P69 (lane `cs`): the type a `__builtin_*_overflow_p` call's result is cast to — its
+    // third operand's own type, or `_BitInt(w)` of a bit-field's width and signedness — or
+    // InvalidType (the semantic tier refused the call's operands).
+    [[nodiscard]] TypeId overflowPredicateTargetFor(NodeId id) const {
+        TypeId const* t = overflowPredicateTargets_.tryGet(id);
+        return t != nullptr ? *t : InvalidType;
+    }
+    [[nodiscard]] ConstantSubobjectFact const* constantSubobjectFor(NodeId id) const {
+        return constantSubobjects_.tryGet(id);
     }
 
     // The full attributes — convenient for tooling / forEach iteration.
@@ -1311,6 +1393,11 @@ private:
     // TREE-KEYED UnitAttribute (NodeId is tree-local — a flat set would alias node
     // indices across a multi-source CU's trees → cross-tree silent miscompile).
     UnitAttribute<bool>                                   nullPointerConstantNodes_;
+    // P69: per compound-literal node, its object facts (TREE-KEYED, as above).
+    UnitAttribute<CompoundLiteralFacts>                   compoundLiteralFacts_;
+    UnitAttribute<ConstantSubobjectFact>                  constantSubobjects_;
+    UnitAttribute<NanPayload>                             nanPayloads_;
+    UnitAttribute<TypeId>                                 overflowPredicateTargets_;
     // FF11: descriptor externs minted from resolved shipped-lib JSON
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.

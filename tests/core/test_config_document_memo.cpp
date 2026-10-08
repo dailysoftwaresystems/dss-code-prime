@@ -136,6 +136,8 @@ namespace {
         num(s.exprMinPrecedence(rule));
         num(s.typeNameCommitRule(rule).v);
         num(static_cast<int>(s.typeNameCommitPolarity(rule)));
+        out += "N";   // P69: the `notFollowedBy` predicate
+        for (auto const t : s.notFollowedBy(rule)) num(t.v);
         out += "F";
         for (auto const t : s.firstSetOf(rule)) num(t.v);
         out += "L";

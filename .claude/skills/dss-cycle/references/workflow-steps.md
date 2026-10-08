@@ -116,9 +116,9 @@ hand-typing every edit or reading every subsystem.
    rows go in with its fold — `fold-agent --apply --new <ID>…` hands its rows directory to the same door,
    checking every cell first (orchestration.md). A NEW row is `dssharness write-anchor <ID> ...` (it WRITES unless given
    `--anchor-dry-run`). ⚠ Never
-   hand-edit a table: `check-anchor-balance`'s partition arm fails the tree for a closed row left
-   behind or an open row filed in the archive, and its ARM 6 fails it for a `Status` column that
-   contradicts its own `Trigger` prose.
+   hand-edit a table: `dssharness check-anchor-balance` fails the tree for a closed row left
+   behind or an open row filed in the archive, and a `Status` column that contradicts its own
+   `Trigger` prose is the door's refusal and `dssharness read-anchors --lint`'s report.
 9. **Cross-plan update**, including rewriting `.plans/_handoff.md`, in the same commit as the code.
 10. **Self-audit before lock** — an **independent** subagent runs the `dss-audit` rule-lens and
     guardrails on the complete, gate-passed cycle. On findings, return to step 5 and re-flow through

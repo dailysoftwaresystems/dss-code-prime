@@ -267,8 +267,6 @@ def main(argv=None):
                         "/opt/local/lib/...). Split on the LAST '=', matching the DSS "
                         "CLI's --resolve-library <path>[=<import-name>].")
     p.add_argument("--artifact-name", default="testfixture")
-    p.add_argument("--extra-define", action="append", default=[], metavar="NAME[=VALUE]",
-                   help="an extra define prepended to the recipe defines (opt-in shim only)")
     p.add_argument("--recipe-transform", default="windows-selfconfig",
                    choices=RECIPE_TRANSFORMS,
                    help="how to adapt the POSIX-derived recipe defines for this "
@@ -293,7 +291,8 @@ def main(argv=None):
 
     sources = read_lines(args.tus)
     includes = read_lines(args.includes)
-    defines = [strip_d(d) for d in args.extra_define] + [strip_d(d) for d in read_lines(args.defines)]
+    # (`--extra-define`, an opt-in shim no caller ever passed, retired on 2026-09-30.)
+    defines = [strip_d(d) for d in read_lines(args.defines)]
 
     # ── recipe transform ──────────────────────────────────────────────────────
     # `windows-selfconfig`: the recipe defines are captured from a POSIX

@@ -572,3 +572,22 @@ target_link_libraries(dss_program_test_emit_hir_round_trips_every_example
 # `dynlib_runpath_origin` / `dynlib_runpath_absent_exits_127` is the run.
 dss_add_test(NAME program/test_image_runpath_build
              SOURCES test_image_runpath_build.cpp)
+
+# D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS: the shipped runtime is built
+# HIDDEN, once for the whole archive — the mechanism (an archive build restates
+# every external definition it compiles, after the optimizer, deleting none at
+# release) and the declaration (an ELF `.so` and a Mach-O `.dylib` linking the
+# runtime export their own function alone, the runtime body proved inside).
+# HOST-INDEPENDENT: built and decoded, never executed — the corpus example
+# `shared_library_exports_its_own_api_alone` is the run.
+dss_add_test(NAME program/test_archive_definition_visibility
+             SOURCES test_archive_definition_visibility.cpp)
+
+# D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: the four faces end to
+# end at the baseline and at release — a static-library member keeps its hidden
+# definitions, an image keeps the hidden definition an object input or a sibling
+# CU calls, a hidden `main` is still the entry — and the CONTROL that a whole
+# image still deletes an unreached hidden definition at release. HOST-INDEPENDENT:
+# built and decoded, never executed (three corpus examples are the runs).
+dss_add_test(NAME program/test_release_hidden_definitions
+             SOURCES test_release_hidden_definitions.cpp)

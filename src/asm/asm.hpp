@@ -12,6 +12,7 @@
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/unit_linker_requests.hpp"
 #include "lir/lir.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
@@ -526,6 +527,17 @@ struct DSS_EXPORT ModuleSymbol {
     // the COMDAT Selection byte. See `core/types/symbol_attrs.hpp` for why this
     // is a second axis rather than two more `SymbolBinding` enumerators.
     DuplicateMatch   duplicateMatch = DuplicateMatch::Any;
+    // P69 round 4 (D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT): a
+    // WEAK definition whose own spelling YIELDS to a COMMON of its name, even
+    // where its format's weak definitions replace one (`commonYieldsTo`). Set by
+    // the COFF object reader for a WEAK EXTERNAL whose default is a body of its
+    // object (MinGW gcc's `__attribute__((weak))`): PE/COFF 5.5.3 uses the
+    // default only "if sym1 is not present at link time", and a common makes it
+    // present — ✔MEASURED 2026-10-07, GNU ld 2.42's PE linker runs that program
+    // with the common's 0, where link.exe and lld-link let a COMDAT select-any
+    // definition replace the common. Read only when `binding == Weak`, by
+    // `linker::allocateCommonDefinitions` and the archive search.
+    bool             yieldsToACommon = false;
 };
 
 struct DSS_EXPORT AssembledModule {
@@ -573,6 +585,20 @@ struct DSS_EXPORT AssembledModule {
     // `dataItems` populate) is anchored as a follow-up cycle.
     std::vector<AssembledData>     dataItems;
 
+    // ── D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69) ──
+    //
+    // Symbols whose ADDRESS IS 0: a weak symbol the link resolved to NOTHING,
+    // as the PC-relative and branch fields that name it directly see it (a
+    // reference through a slot reads the symbol's own null slot instead, and an
+    // absolute field is written by the link itself). Minted only by
+    // `linker::link`'s reference gate, and only where the image document
+    // answers `zero` for such a field (`weakResolvedToNothing`) — which the
+    // loader allows only on a writer that places the image at its link address
+    // (`ObjectFormatBackend::writesNullAddressReferences`); that writer gives
+    // each the address 0. Never carried by a module a compiler or an object
+    // reader produced.
+    std::vector<SymbolId>          nullAddressSymbols;
+
     // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ──
     //
     // The module's STATIC-INITIALIZER SCHEDULE, copied verbatim from
@@ -592,6 +618,16 @@ struct DSS_EXPORT AssembledModule {
     // first, then a deterministic tie-break across every module), so it happens
     // once, in the one place that can see every translation unit.
     std::vector<LirStaticInitEntry> staticInitSchedule;
+
+    // ── D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE (P69 round 4) ──
+    //
+    // What this unit asks of the LINK beyond its own symbols: the image requests,
+    // the exports and the hides its linker directives state (a foreign COFF
+    // object's `.drectve`), and the tokens a relocatable artifact holding it
+    // hands on verbatim. Empty for every unit but a foreign COFF object's; the
+    // cross-unit merge folds each unit's in unit order
+    // (`appendUnitLinkerRequests`), and `linker::link` decides them.
+    UnitLinkerRequests             linkerRequests;
 
     // D-LK10-ENTRY Slice C (plan 14 §2.13): override of the image
     // entry-point function index. When set, the format walker

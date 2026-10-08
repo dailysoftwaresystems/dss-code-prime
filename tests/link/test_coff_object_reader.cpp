@@ -65,6 +65,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -632,8 +633,9 @@ TEST(CoffObjectReader, ExternDtypeFunctionInfersFunction) {
 // IMAGE_REL_AMD64_REL32 / ADDR64 / ADDR32 / SECREL and not one of them is
 // branch-only -- REL32 is both the `call` displacement and the `lea rip+d`
 // data displacement -- so declaring the role on any of them would re-commit
-// the very conflation this anchor removed, in a new field. PE also declares no
-// `pltNativeId`, so `callSignalNativeIds` is EMPTY on every shipped PE format
+// the very conflation this anchor removed, in a new field. (Nor can any format
+// spell a call as a second wire id any more: `pltNativeId` is retired since
+// P69.) So `callSignalNativeIds` is EMPTY on every shipped PE format
 // today and this leg would otherwise be untested code.
 //
 // ★ THE FIXTURE IS THEREFORE A FICTION, DELIBERATELY AND VISIBLY. It is the
@@ -838,6 +840,227 @@ TEST(CoffObjectReader, EmitOnlyAliasIsHonouredNotRefused) {
 }
 
 // ============================================================================
+// P69 (D-LK-COFF-READER-REFUSED-CL-REL32-BYTES-AFTER-FIELD-TYPES): cl's
+// IMAGE_REL_AMD64_REL32_1.._5. The PE format defines REL32_N as REL32 measured
+// from N bytes past the field (lld-link: S + field - (P + 4 + N)), so cl leaves
+// the offset from the symbol in the field and lets the TYPE carry the immediate
+// that follows; clang and GNU as write REL32 with the lowered addend in the
+// field instead. ✔MEASURED 2026-10-07 (cl 19.51 /O2): REL32_1 on
+// `cmp dword ptr [x],2` and `mov byte ptr [x],11h`, REL32_4 on
+// `mov dword ptr [x+24h],9` with 0x24 in the field — and DSS refused every
+// such object ("relocation Type 5 ... is not declared").
+//
+// The pin rewrites DSS's own REL32 sites the way cl writes them — the type to
+// 4 + N, the field to the addend plus N — and asks both PE object documents for
+// the relocations DSS wrote. Its two controls: with the lowering flag removed
+// the same bytes read N too high (so the flag, and nothing else, lowers them),
+// and with the family removed they are refused (so the family decodes them).
+// ============================================================================
+
+namespace {
+
+constexpr std::size_t kFhNumSections   = 2;    // u16 NumberOfSections
+constexpr std::size_t kSectTableOff    = 20;   // no optional header in an .obj
+constexpr std::size_t kSectHdrSz       = 40;
+constexpr std::size_t kSectRawPtrOff   = 20;   // u32 PointerToRawData
+constexpr std::size_t kSectRelocPtrOff = 24;   // u32 PointerToRelocations
+constexpr std::size_t kSectNumRelocOff = 32;   // u16 NumberOfRelocations
+constexpr std::size_t kRelocRecSz      = 10;   // VirtualAddress, SymbolTableIndex, Type
+
+struct Rel32nSite {
+    std::uint8_t  n       = 0;   // bytes after the field
+    std::uint32_t fieldAt = 0;   // offset of the field in `f` (and in `.text`: `f` is its only function)
+};
+
+// One function `f` with a RIP-relative site per byte count N = 1..5 after its field, each reading `d + 8` — DSS addend
+// 8 - N, because the x86 walker lowers the addend by the bytes after the field. N = 1, 2, 4 are the instructions an
+// imm8 / imm16 / imm32 follows. No x86-64 instruction puts 3 or 5 bytes after a disp32, but the format defines both
+// types and one rule reads all five, so filler stands in for the immediate there.
+[[nodiscard]] std::vector<std::uint8_t> rel32nObject(Loaded const& loaded, std::vector<Rel32nSite>& sites) {
+    std::vector<std::uint8_t> code;
+    auto const site = [&](std::initializer_list<std::uint8_t> opcode, std::uint8_t n,
+                          std::initializer_list<std::uint8_t> after) {
+        code.insert(code.end(), opcode);
+        sites.push_back(Rel32nSite{n, static_cast<std::uint32_t>(code.size())});
+        code.insert(code.end(), {0, 0, 0, 0});
+        code.insert(code.end(), after);
+    };
+    site({0x83, 0x3D}, 1, {0x02});                              // cmp  dword ptr [rip+d+8], 2
+    site({0x66, 0xC7, 0x05}, 2, {0x34, 0x12});                  // mov  word ptr [rip+d+8], 0x1234
+    site({0x0F, 0x1F, 0x05}, 3, {0x90, 0x90, 0x90});            // nop  dword ptr [rip+d+8] ; filler
+    site({0xC7, 0x05}, 4, {0x78, 0x56, 0x34, 0x12});            // mov  dword ptr [rip+d+8], 0x12345678
+    site({0x0F, 0x1F, 0x05}, 5, {0x90, 0x90, 0x90, 0x90, 0x90});
+    code.push_back(0xC3);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{1};
+    f.bytes  = std::move(code);
+    for (auto const& s : sites) {
+        Relocation r{s.fieldAt, SymbolId{2}, RelocationKind{8}, 8 - static_cast<std::int64_t>(s.n)};
+        r.bytesAfterField = s.n;
+        f.relocations.push_back(r);
+    }
+    mod.functions.push_back(std::move(f));
+    AssembledData d;
+    d.symbol    = SymbolId{2};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = std::vector<std::uint8_t>(16, 0);
+    d.alignment = Alignment::of<8>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols = {ModuleSymbol{SymbolId{1}, "f", SymbolBinding::Global, SymbolVisibility::Default},
+                   ModuleSymbol{SymbolId{2}, "d", SymbolBinding::Global, SymbolVisibility::Default}};
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_EQ(rep.errorCount(), 0u) << "DSS must write the five-site object";
+    return bytes;
+}
+
+// What a read relocation of `f` says: its kind, its addend and the name it reaches, by field offset.
+struct ReadSite {
+    std::uint32_t kind = 0;
+    std::int64_t  addend = 0;
+    std::string   target;
+};
+[[nodiscard]] std::optional<std::map<std::uint32_t, ReadSite>>
+readSitesOf(std::vector<std::uint8_t> const& obj, TargetSchema const& t, ObjectFormatSchema const& f,
+            DiagnosticReporter& rep) {
+    auto got = pe::readRelocatableObject(obj, t, f, rep);
+    if (!got.has_value()) return std::nullopt;
+    auto const* fn = funcNamed(*got, "f");
+    if (fn == nullptr) return std::nullopt;
+    std::map<std::uint32_t, ReadSite> out;
+    for (auto const& r : fn->relocations) out[r.offset] = ReadSite{r.kind.v, r.addend, nameOf(*got, r.target)};
+    return out;
+}
+
+// The shipped relocatable PE document, as text, with `edit` applied to its REL32 row.
+[[nodiscard]] std::string peDocWithRel32Row(std::function<void(nlohmann::json&)> const& edit) {
+    auto const root = dss::test::findConfigRoot();
+    if (!root.has_value()) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
+        return {};
+    }
+    std::ifstream in{*root / "object-formats" / "pe64-x86_64-windows.format.json", std::ios::binary};
+    std::string const text{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+    nlohmann::json doc = nlohmann::json::parse(text);
+    bool found = false;
+    for (auto& row : doc.at("relocations")) {
+        if (row.at("name") == "IMAGE_REL_AMD64_REL32") {
+            edit(row);
+            found = true;
+        }
+    }
+    if (!found) ADD_FAILURE() << "the REL32 row moved -- re-derive this fixture";
+    return doc.dump();
+}
+
+}  // namespace
+
+TEST(CoffObjectReader, ClRel32BytesAfterFieldTypesReadAsRel32WithTheAddendLowered) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<Rel32nSite> sites;
+    auto obj = rel32nObject(loaded, sites);
+    ASSERT_FALSE(obj.empty());
+    ASSERT_EQ(sites.size(), 5u);
+
+    // CONTROL: what DSS wrote, read back — REL32 (kind 1) with the lowered addend.
+    DiagnosticReporter crep;
+    auto const control = readSitesOf(obj, *loaded.target, *loaded.format, crep);
+    ASSERT_TRUE(control.has_value()) << "DSS's own object must read back; errors=" << crep.errorCount();
+    ASSERT_EQ(control->size(), 5u);
+    for (auto const& s : sites) {
+        auto const it = control->find(s.fieldAt);
+        ASSERT_NE(it, control->end()) << "N=" << int{s.n};
+        EXPECT_EQ(it->second.addend, 8 - static_cast<std::int64_t>(s.n)) << "N=" << int{s.n};
+        EXPECT_EQ(it->second.target, "d") << "N=" << int{s.n};
+    }
+
+    // Rewrite every site the way cl writes it: the type to REL32_N (4 + N), the field to the addend PLUS N.
+    std::size_t text = 0;
+    for (std::uint16_t i = 0; i < rd16(obj, kFhNumSections); ++i) {
+        std::size_t const h = kSectTableOff + static_cast<std::size_t>(i) * kSectHdrSz;
+        if (std::string{reinterpret_cast<char const*>(obj.data() + h), 5} == ".text") text = h;
+    }
+    ASSERT_NE(text, 0u) << "no `.text` section header";
+    std::uint32_t const rawPtr   = rd32(obj, text + kSectRawPtrOff);
+    std::uint32_t const relocPtr = rd32(obj, text + kSectRelocPtrOff);
+    std::uint16_t const nReloc   = rd16(obj, text + kSectNumRelocOff);
+    ASSERT_EQ(nReloc, 5u);
+    for (std::uint16_t i = 0; i < nReloc; ++i) {
+        std::size_t const rec = relocPtr + static_cast<std::size_t>(i) * kRelocRecSz;
+        std::uint32_t const va = rd32(obj, rec);
+        auto const s = std::ranges::find(sites, va, &Rel32nSite::fieldAt);
+        ASSERT_NE(s, sites.end()) << "a relocation at " << va << " that no site wrote";
+        ASSERT_EQ(rd16(obj, rec + 8), 4u) << "DSS writes every site as REL32 (N=" << int{s->n} << ")";
+        wr16(obj, rec + 8, static_cast<std::uint16_t>(4u + s->n));
+        wr32(obj, rawPtr + va, rd32(obj, rawPtr + va) + s->n);
+        EXPECT_EQ(rd32(obj, rawPtr + va), 8u) << "cl's field holds the offset from the symbol (N=" << int{s->n} << ")";
+    }
+
+    // Both object documents read cl's spelling to exactly what DSS wrote: the static link reads every loose `.obj`
+    // and archive member through the `-staticlib` one, a relocatable link through the bare one.
+    for (char const* name : {"pe64-x86_64-windows", "pe64-x86_64-windows-staticlib"}) {
+        auto const fmt = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(fmt.has_value()) << name;
+        DiagnosticReporter rep;
+        auto const asCl = readSitesOf(obj, *loaded.target, **fmt, rep);
+        ASSERT_TRUE(asCl.has_value()) << name << " must read REL32_1.._5; errors=" << rep.errorCount()
+                                      << (rep.all().empty() ? std::string{} : ": " + rep.all().front().actual);
+        for (auto const& s : sites) {
+            auto const it = asCl->find(s.fieldAt);
+            ASSERT_NE(it, asCl->end()) << name << " N=" << int{s.n};
+            auto const& want = control->at(s.fieldAt);
+            EXPECT_EQ(it->second.kind, want.kind) << name << " N=" << int{s.n} << ": REL32_N decodes to REL32's kind";
+            EXPECT_EQ(it->second.addend, want.addend)
+                << name << " N=" << int{s.n} << ": the TYPE lowers the addend by N";
+            EXPECT_EQ(it->second.target, want.target) << name << " N=" << int{s.n};
+        }
+    }
+
+    // CONTROL 1: the same bytes through a document that keeps the family and drops the flag read N too high.
+    {
+        auto const doc = peDocWithRel32Row([](nlohmann::json& row) { row.erase("bytesAfterFieldLowersTheAddend"); });
+        auto const fmt = ObjectFormatSchema::loadFromText(doc, "pe64-x86_64-no-lowering");
+        ASSERT_TRUE(fmt.has_value()) << "a family whose types do not lower the addend is Mach-O's shape, and loads";
+        DiagnosticReporter rep;
+        auto const unlowered = readSitesOf(obj, *loaded.target, **fmt, rep);
+        ASSERT_TRUE(unlowered.has_value());
+        for (auto const& s : sites) {
+            EXPECT_EQ(unlowered->at(s.fieldAt).addend, control->at(s.fieldAt).addend + s.n)
+                << "N=" << int{s.n} << ": without the flag nothing lowers the field's offset";
+        }
+    }
+    // CONTROL 2: without the family the types are not declared at all.
+    {
+        auto const doc = peDocWithRel32Row([](nlohmann::json& row) {
+            row.erase("nativeIdByBytesAfterField");
+            row.erase("bytesAfterFieldLowersTheAddend");
+        });
+        auto const fmt = ObjectFormatSchema::loadFromText(doc, "pe64-x86_64-no-family");
+        ASSERT_TRUE(fmt.has_value());
+        DiagnosticReporter rep;
+        EXPECT_FALSE(pe::readRelocatableObject(obj, *loaded.target, **fmt, rep).has_value())
+            << "REL32_1 is undeclared without the family, and an undeclared type is refused";
+    }
+}
+
+// The flag states how a family's types read their addend; on a row with no family it states nothing a reader could
+// apply, and the document is refused where it says so.
+TEST(CoffObjectReader, AnAddendLoweringFlagWithNoBytesAfterFieldTypesIsRefused) {
+    auto const doc = peDocWithRel32Row([](nlohmann::json& row) { row.erase("nativeIdByBytesAfterField"); });
+    auto const fmt = ObjectFormatSchema::loadFromText(doc, "pe64-x86_64-orphan-flag");
+    ASSERT_FALSE(fmt.has_value());
+    bool named = false;
+    for (auto const& d : fmt.error()) {
+        if (d.path.ends_with("/bytesAfterFieldLowersTheAddend")) named = true;
+    }
+    EXPECT_TRUE(named) << "the refusal must point at the flag";
+}
+
+// ============================================================================
 // TF-C53 (D-LK-COFF-READER-FOREIGN-OBJECT): read a REAL cl.exe/clang-cl `.obj`
 // + a real multi-member `.lib` (cross-object COMDAT dedup). Two tiers:
 //   * HERMETIC synthetic pins (run everywhere) -- a hand-rolled COFF builder
@@ -1014,6 +1237,13 @@ bindingOf(AssembledModule const& m, std::string const& name) {
     for (auto const& s : m.symbols) if (s.name == name) return s.binding;
     return std::nullopt;
 }
+// Whether a defined symbol's own spelling yields to a COMMON of its name (`ModuleSymbol::yieldsToACommon`); nullopt
+// if unknown.
+[[nodiscard]] std::optional<bool>
+yieldsToACommonOf(AssembledModule const& m, std::string const& name) {
+    for (auto const& s : m.symbols) if (s.name == name) return s.yieldsToACommon;
+    return std::nullopt;
+}
 [[nodiscard]] bool sawCode(DiagnosticReporter const& rep, DiagnosticCode code) {
     for (auto const& d : rep.all()) if (d.code == code) return true;
     return false;
@@ -1074,6 +1304,10 @@ TEST(CoffForeignObject, DataComdatAnyLiftsWeak) {
     EXPECT_EQ(*b, SymbolBinding::Weak)
         << "ANY(2)/SAME_SIZE(3)/EXACT_MATCH(4) lift to Weak so the all-weak merge "
            "dedups duplicates -- red-on-disable vs the pre-TF-C53 hardcoded Global";
+    // P69 round 4: a COMDAT select-any is this format's own weak definition, which REPLACES a common of its name
+    // (link.exe, lld-link; `commonYieldsTo`), so its spelling does not yield to one — unlike a weak external's body
+    // (`CoffWeakExternal.SectionBackedDefaultBindsTheWeakNameToThatBody`).
+    EXPECT_EQ(yieldsToACommonOf(*got, "W"), std::optional<bool>{false});
 }
 
 // -- Gate 3: LARGEST / ASSOCIATIVE on a kind-resolved COMDAT -> FAIL LOUD ----
@@ -1452,6 +1686,93 @@ TEST(CoffForeignObjectNative, SingleClObjStaticLinkExitsFortyTwo) {
     EXPECT_EQ(r.exitCode, 42u)
         << "THE witness: exit 42 = foo() pulled from a real cl.exe `.obj` (wrapped in "
            "a real lib.exe `.lib`), read by the COFF foreign-object reader, merged, run";
+#endif
+}
+
+// -- THE WITNESS for REL32_1.._5: cl's stores and compares of globals link under DSS as under link.exe ----------------
+// (D-LK-COFF-READER-REFUSED-CL-REL32-BYTES-AFTER-FIELD-TYPES.) Every store of an immediate into a global and every
+// compare of one against an immediate is a REL32_1 or REL32_4 in a cl object (✔MEASURED 2026-10-07, cl 19.51 /O2), and
+// DSS refused each such object at READ. The objects are checked to carry both types, so this cannot pass by cl writing
+// plain REL32 instead; the hermetic half of the pin is ClRel32BytesAfterFieldTypesReadAsRel32WithTheAddendLowered.
+TEST(CoffForeignObjectNative, ClRel32BytesAfterFieldSitesLinkUnderDssAsUnderLinkExe) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "compiles with cl.exe; Windows only";
+#else
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-foreign"};
+    auto const dir = scratch.path();
+    auto const msvc = native_probe::locateMsvcToolchain(dir);
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
+
+    // Initialized definitions, so no common is involved: one store per immediate width, one at an offset into an
+    // array, and an imm8 compare — each a REL32_N site in widths.obj, and main's checks more of them.
+    { std::ofstream f{dir / "widths.c"};
+      f << "unsigned char  g8 = 1;\n"
+           "unsigned short g16 = 1;\n"
+           "unsigned int   g32 = 1;\n"
+           "unsigned int   garr[8] = {1, 1, 1, 1, 1, 1, 1, 1};\n"
+           "void store_all(void) { g8 = 0x11; g16 = 0x2222; g32 = 0x33333333u; garr[5] = 0x44444444u; }\n"
+           "int g32_is_seven(void) { return g32 == 7u; }\n"; }
+    { std::ofstream f{dir / "widths_main.c"};
+      f << "extern unsigned char g8; extern unsigned short g16; extern unsigned int g32; extern unsigned int garr[8];\n"
+           "void store_all(void); int g32_is_seven(void);\n"
+           "int main(void) {\n"
+           "    int bad = 0;\n"
+           "    store_all();\n"
+           "    if (g8 != 0x11) bad |= 1;\n"
+           "    if (g16 != 0x2222) bad |= 2;\n"
+           "    if (g32 != 0x33333333u) bad |= 4;\n"
+           "    if (garr[5] != 0x44444444u || garr[4] != 1u || garr[6] != 1u) bad |= 8;\n"
+           "    if (g32_is_seven()) bad |= 16;\n"
+           "    g32 = 7u;\n"
+           "    if (!g32_is_seven()) bad |= 32;\n"
+           "    return bad != 0 ? 100 + bad : 42;\n"
+           "}\n"; }
+    ASSERT_TRUE(env.run("cl /nologo /c /O2 /MD widths.c widths_main.c")) << "cl must compile both TUs";
+
+    // The objects carry the types this pins (Types 5 = REL32_1 and 8 = REL32_4), read off every section's records.
+    std::vector<std::uint16_t> types;
+    for (char const* o : {"widths.obj", "widths_main.obj"}) {
+        auto const b = readFile(dir / o);
+        ASSERT_GT(b.size(), 20u) << o;
+        for (std::uint16_t i = 0; i < rd16(b, 2); ++i) {
+            std::size_t const h = 20 + static_cast<std::size_t>(i) * 40;
+            std::uint32_t const relocPtr = rd32(b, h + 24);
+            std::uint16_t const n = rd16(b, h + 32);
+            for (std::uint16_t k = 0; k < n; ++k) types.push_back(rd16(b, relocPtr + k * 10u + 8u));
+        }
+    }
+    EXPECT_NE(std::ranges::find(types, std::uint16_t{5}), types.end()) << "cl wrote no REL32_1 -- the pin is vacuous";
+    EXPECT_NE(std::ranges::find(types, std::uint16_t{8}), types.end()) << "cl wrote no REL32_4 -- the pin is vacuous";
+
+    // The reference: link.exe's program of the same two objects.
+    ASSERT_TRUE(env.run("link /nologo /OUT:ref.exe widths_main.obj widths.obj")) << "link.exe must link them";
+    auto const ref = test_support::runBinary(dir / "ref.exe");
+    ASSERT_TRUE(ref.spawned) << ref.diagnostic;
+    ASSERT_EQ(ref.exitCode, 42u) << "link.exe's program -- the control -- must exit 42";
+
+    std::filesystem::create_directories(dir / "dss.out");
+    Program p;
+    p.setOutputDir(dir / "dss.out");
+    DiagnosticReporter rep;
+    int const rc = p.compileFiles(
+        std::vector<std::string>{(dir / "widths_main.obj").string(), (dir / "widths.obj").string()}, "c",
+        std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
+    std::string errs;
+    for (auto const& d : rep.all()) errs += "\n  " + d.actual;
+    ASSERT_EQ(rc, 0) << "DSS must link cl's REL32_1 / REL32_4 objects:" << errs;
+    std::filesystem::path exe;
+    for (auto const& e : std::filesystem::directory_iterator(dir / "dss.out")) {
+        if (e.path().extension() == ".exe") exe = e.path();
+    }
+    ASSERT_FALSE(exe.empty()) << "DSS wrote no executable";
+    auto const r = test_support::runBinary(exe);
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u) << "100 + bits: 1 g8, 2 g16, 4 g32, 8 garr[5] or its neighbours, 16/32 the imm8 "
+                                  "compare -- the store or compare whose field read at the wrong address";
 #endif
 }
 
@@ -2340,6 +2661,14 @@ symIdOfName(AssembledModule const& m, std::string const& name) {
     for (auto const& e : m.externImports) if (e.mangledName == n) return true;
     return false;
 }
+[[nodiscard]] ExternImport const* externRowNamed(AssembledModule const& m, std::string const& n) {
+    for (auto const& e : m.externImports) if (e.mangledName == n) return &e;
+    return nullptr;
+}
+constexpr std::uint32_t kScnDirective = 0x00100A00u;  // LNK_INFO | LNK_REMOVE | ALIGN_1BYTES (.drectve)
+[[nodiscard]] BSec directiveSection(std::string_view text) {
+    return BSec{".drectve", kScnDirective, std::vector<std::uint8_t>(text.begin(), text.end()), {}};
+}
 
 constexpr std::uint8_t  kClassWeakExternal  = 105u;
 constexpr std::uint32_t kWeakSearchNoLibrary = 1u;
@@ -2391,6 +2720,12 @@ TEST(CoffWeakExternal, SectionBackedDefaultBindsTheWeakNameToThatBody) {
     EXPECT_EQ(bindingOf(*got, "wfn"), SymbolBinding::Weak);
     EXPECT_EQ(bindingOf(*got, "Wbody"), SymbolBinding::Global)
         << "the renamed body keeps the STRONG linkage the object gave it";
+    // P69 round 4 (D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT): the weak name yields to a COMMON of it,
+    // as PE/COFF 5.5.3 makes it yield to any definition ("if sym1 is not present at link time"; GNU ld's PE linker
+    // gives a MinGW common beside this shape its own 0, ✔MEASURED 2026-10-07) — where this format's own weak
+    // definition, a COMDAT select-any, replaces one. The renamed body is an ordinary strong definition.
+    EXPECT_EQ(yieldsToACommonOf(*got, "wfn"), std::optional<bool>{true});
+    EXPECT_EQ(yieldsToACommonOf(*got, "Wbody"), std::optional<bool>{false});
 
     // One atom, two names -- the equal-offset alias rule, not two twin atoms.
     auto const wfnId  = symIdOfName(*got, "wfn");
@@ -2456,6 +2791,48 @@ TEST(CoffWeakExternal, AbsoluteDefaultIsAWeakUndefinedReferenceAndIsReadAsOne) {
     // no object.
     EXPECT_FALSE(hasExternNamed(*got, "Wabs"))
         << "the fallback is the ANSWER to the weak reference, not a second import";
+}
+
+// -- (b2) An UNDEFINED default: the reference's FALLBACK -----------------------
+//
+// PE/COFF 5.5.3: "if sym1 is not present at link time, sym2 is used to resolve references instead" -- and sym2 may
+// itself be an undefined symbol another object defines, which is exactly an `/alternatename:` (P69). This arm read
+// EVERY non-section default as "nothing", which binds the name to address 0 where the reference linkers bind it to
+// the default; it is now the row's `fallbackName`, decided by the link.
+TEST(CoffWeakExternal, AnUndefinedDefaultIsTheReferencesFallback) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"probe", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"Wfb", 0, 0, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"maybe", 0, 0, kDtypeFunction, kClassWeakExternal, std::nullopt,
+              BWeakAux{"Wfb", kWeakSearchAlias, std::nullopt}}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    auto const* maybe = externRowNamed(*got, "maybe");
+    ASSERT_NE(maybe, nullptr);
+    EXPECT_EQ(maybe->binding, SymbolBinding::Weak);
+    EXPECT_EQ(maybe->fallbackName, "Wfb") << "an undefined default is where the name resolves when nothing defines it";
+    EXPECT_TRUE(hasExternNamed(*got, "Wfb")) << "the default keeps its own row, so the link can bind it";
+}
+
+// Any other non-section default -- an ABSOLUTE value other than 0 -- names an address no measured producer writes and
+// DSS cannot carry, so it is refused rather than read as 0.
+TEST(CoffWeakExternal, AnAbsoluteDefaultOtherThanZeroIsRefused) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"probe", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"Wabs5", 5, 0xFFFFu, 0, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"maybe", 0, 0, kDtypeFunction, kClassWeakExternal, std::nullopt,
+              BWeakAux{"Wabs5", kWeakSearchNoLibrary, std::nullopt}}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawDetail(rep, "neither a body of this object, nor an undefined symbol"));
 }
 
 // -- (c) THE PIN THAT KEEPS THE DISPATCH TOTAL -------------------------------
@@ -2688,29 +3065,41 @@ TEST(CoffWeakExternal, NamelessWeakExternalFailsLoudRatherThanBeingDropped) {
     EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
 }
 
-// -- (f) COMMON symbols: a DEFINITION, never an import -----------------------
+// -- (f) COMMON symbols: a DEFINITION, read as the common it is ---------------
 //
-// Found while making the storage-class dispatch total, and it is a silent wrong
-// answer in the worst direction. PE/COFF 5.4.2: an EXTERNAL record with UNDEF
-// section number and a NON-ZERO Value is a COMMON symbol whose Value is its
-// SIZE. The reader read it as an extern import -- so an object that DEFINES
-// storage was reconstructed as one that DEMANDS it, and the definition vanished
-// on re-emission. ✔MEASURED, mingw gcc 13.2.0 with -fcommon: a tentative
-// definition emits (sec 0)(ty 0)(scl 2) with Value 4.
-TEST(CoffWeakExternal, CommonSymbolFailsLoudRatherThanReadingAsAnImport) {
+// PE/COFF 5.4.2: an EXTERNAL record with UNDEF section number and a NON-ZERO
+// Value is a COMMON symbol whose Value is its SIZE. The reader once read it as
+// an extern import -- an object that DEFINES storage reconstructed as one that
+// DEMANDS it -- and then REFUSED it, on the premise that "cl.exe never emits it
+// for C". ✔MEASURED 2026-10-06 that premise is false: cl 19.51 writes EVERY C
+// tentative definition this way (`int c;` Value 4, `int a[40];` Value 0xA0, run
+// 20261006-224902-a6201782), as mingw gcc 13.2.0 does under -fcommon. P69 reads
+// it as the common it is (D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS).
+TEST(CoffWeakExternal, CommonSymbolIsReadAsACommonDefinitionNotAnImport) {
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
     auto const obj = buildCoff(
         {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
         {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
          BSym{"cvar", 4 /* SIZE, not an offset */, 0, 0, kClassExternal,
-              std::nullopt, std::nullopt}});
+              std::nullopt, std::nullopt},
+         BSym{"carr", 0xA0, 0, 0, kClassExternal, std::nullopt, std::nullopt}});
     DiagnosticReporter rep;
     auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
-    EXPECT_FALSE(got.has_value());
-    EXPECT_TRUE(sawDetail(rep, "COMMON symbol"));
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    auto const* cvar = externRowNamed(*got, "cvar");
+    ASSERT_NE(cvar, nullptr) << "a common is a row that SAYS it is one, not a dropped record";
+    EXPECT_EQ(cvar->commonSize, 4u);
+    EXPECT_EQ(cvar->commonAlignment, 4u) << "link.exe's alignment for a 4-byte common";
+    EXPECT_TRUE(cvar->isData);
+    EXPECT_EQ(cvar->binding, SymbolBinding::Global);
+    auto const* carr = externRowNamed(*got, "carr");
+    ASSERT_NE(carr, nullptr);
+    EXPECT_EQ(carr->commonSize, 0xA0u);
+    EXPECT_EQ(carr->commonAlignment, 32u) << "link.exe caps a common's alignment at 32";
+    EXPECT_FALSE(bindingOf(*got, "cvar").has_value()) << "storage is the link's to allocate, once per name";
     // A zero-Value UNDEF external is an ordinary import and must stay one --
-    // the guard has to discriminate, not merely refuse UNDEF externals.
+    // the arm has to discriminate, not read every UNDEF external as a common.
     auto const ok = buildCoff(
         {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
         {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
@@ -2718,7 +3107,193 @@ TEST(CoffWeakExternal, CommonSymbolFailsLoudRatherThanReadingAsAnImport) {
     DiagnosticReporter rep2;
     auto got2 = pe::readRelocatableObject(ok, *loaded.target, *loaded.format, rep2);
     ASSERT_TRUE(got2.has_value()) << "errs=" << rep2.errorCount();
-    EXPECT_TRUE(hasExternNamed(*got2, "imp"));
+    auto const* imp = externRowNamed(*got2, "imp");
+    ASSERT_NE(imp, nullptr);
+    EXPECT_EQ(imp->commonSize, 0u);
+}
+
+// `-aligncomm:` is a COMMON's alignment, and says nothing about any other name (✔MEASURED 2026-10-06 under GNU ld
+// 2.42 and lld-link 18, runs 20261006-222413-52787563 and 20261006-222558-072ac1f9): the common is aligned at least
+// as the directive asks, a defined function it names is untouched, a name nothing carries is no error.
+TEST(CoffDirectiveRead, AnAligncommWidensItsCommonAndNothingElse) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}},
+         directiveSection(" -aligncomm:cvar,6 -aligncomm:carr,2 -aligncomm:fn,5 -aligncomm:nobody,4")},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"cvar", 4, 0, 0, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"carr", 0xA0, 0, 0, kClassExternal, std::nullopt, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    auto const* cvar = externRowNamed(*got, "cvar");
+    ASSERT_NE(cvar, nullptr);
+    EXPECT_EQ(cvar->commonAlignment, 64u) << "the directive widens the common to 2^6";
+    auto const* carr = externRowNamed(*got, "carr");
+    ASSERT_NE(carr, nullptr);
+    EXPECT_EQ(carr->commonAlignment, 32u) << "a directive asking LESS than link.exe gives narrows nothing";
+    EXPECT_EQ(funcNamed(*got, "fn") != nullptr, true);
+    EXPECT_FALSE(hasExternNamed(*got, "nobody")) << "a name no record carries gets no row";
+}
+
+// `/INCLUDE:X` makes X a REQUIRED reference of the object (link.exe imports an otherwise unreferenced
+// `/INCLUDE:puts`, ✔MEASURED 2026-10-06, run 20261006-222410-df088936): the object's own undefined record's row,
+// or a fresh one when no code names X; a name the object defines needs nothing more.
+TEST(CoffDirectiveRead, AnIncludeMakesTheNameARequiredReference) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}},
+         directiveSection(" /INCLUDE:puts /INCLUDE:fn /INCLUDE:ext /INCLUDE:puts")},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"ext", 0, 0, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    auto const* puts = externRowNamed(*got, "puts");
+    ASSERT_NE(puts, nullptr) << "a required name no code names gets a row of its own";
+    EXPECT_TRUE(puts->requiredByDirective);
+    EXPECT_EQ(puts->kindOrigin, ExternKindOrigin::Pending) << "a directive states no code-vs-data kind";
+    std::size_t putsRows = 0;
+    for (auto const& e : got->externImports) putsRows += e.mangledName == "puts" ? 1u : 0u;
+    EXPECT_EQ(putsRows, 1u) << "an include repeated is one requirement";
+    auto const* ext = externRowNamed(*got, "ext");
+    ASSERT_NE(ext, nullptr);
+    EXPECT_TRUE(ext->requiredByDirective) << "the object's own record's row carries the requirement";
+    EXPECT_FALSE(hasExternNamed(*got, "fn")) << "a name the object defines is satisfied by that definition";
+}
+
+// `/alternatename:A=B` gives every reference to A that nothing defines the fallback B (✔MEASURED 2026-10-06,
+// link.exe 14.51 and lld-link 18): the reader STATES it on A's row (its own record's, or a fresh carrier when no code
+// here names A) and keeps a row for a B it does not define; an A this object defines makes it a no-op.
+TEST(CoffDirectiveRead, AnAlternateNameGivesTheReferenceItsFallback) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}},
+         directiveSection(" /alternatename:ext=fbk /alternatename:fn=other /alternatename:nobody=fn")},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"ext", 0, 0, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    auto const* ext = externRowNamed(*got, "ext");
+    ASSERT_NE(ext, nullptr);
+    EXPECT_EQ(ext->fallbackName, "fbk");
+    auto const* fbk = externRowNamed(*got, "fbk");
+    ASSERT_NE(fbk, nullptr) << "a fallback this object does not define gets a row, so a library can bind it";
+    EXPECT_TRUE(fbk->fallbackName.empty());
+    EXPECT_FALSE(hasExternNamed(*got, "other")) << "an A this object defines makes the directive a no-op";
+    EXPECT_FALSE(hasExternNamed(*got, "fn"));
+    auto const* carrier = externRowNamed(*got, "nobody");
+    ASSERT_NE(carrier, nullptr) << "the directive is carried for the OTHER objects' references to the name";
+    EXPECT_EQ(carrier->fallbackName, "fn");
+}
+
+TEST(CoffDirectiveRead, TwoFallbacksForOneNameAreRefused) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}},
+         directiveSection(" /alternatename:ext=a /alternatename:ext=b")},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"ext", 0, 0, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::K_LinkerDirectiveUnhonourable));
+    EXPECT_TRUE(sawDetail(rep, "two fallbacks"));
+}
+
+// A weak external whose default is an undefined symbol already gives its name a fallback (the record arm); a
+// directive of the same object naming a DIFFERENT one gives the name two, which no order between the record and the
+// directive settles -- refused, as two directives are. A directive restating the record's own default is one fallback.
+TEST(CoffDirectiveRead, AWeakExternalsDefaultAndADirectiveGivingTwoFallbacksAreRefused) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const objectWith = [](std::string_view directive) {
+        return buildCoff(
+            {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}, directiveSection(directive)},
+            {BSym{"probe", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+             BSym{"Wfb", 0, 0, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+             BSym{"maybe", 0, 0, kDtypeFunction, kClassWeakExternal, std::nullopt,
+                  BWeakAux{"Wfb", kWeakSearchAlias, std::nullopt}}});
+    };
+    {
+        DiagnosticReporter rep;
+        auto const got =
+            pe::readRelocatableObject(objectWith(" /alternatename:maybe=other"), *loaded.target, *loaded.format, rep);
+        EXPECT_FALSE(got.has_value()) << "which fallback wins must not be decided by which one is read last";
+        EXPECT_TRUE(sawCode(rep, DiagnosticCode::K_LinkerDirectiveUnhonourable));
+        EXPECT_TRUE(sawDetail(rep, "two fallbacks"));
+    }
+    {   // CONTROL: the same fallback stated twice is one.
+        DiagnosticReporter rep;
+        auto const got =
+            pe::readRelocatableObject(objectWith(" /alternatename:maybe=Wfb"), *loaded.target, *loaded.format, rep);
+        ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+        auto const* maybe = externRowNamed(*got, "maybe");
+        ASSERT_NE(maybe, nullptr);
+        EXPECT_EQ(maybe->fallbackName, "Wfb");
+        EXPECT_EQ(maybe->binding, SymbolBinding::Weak);
+    }
+}
+
+// EVERY id the reader mints past the symbol table comes from ONE counter (P69 review-xa3 MAJOR 2). The directive rows
+// -- an `/INCLUDE:` of a name no record carries, an `/alternatename:` carrier and its fallback -- and the anonymous gap
+// atoms (bytes of a data section no symbol covers: MinGW gcc -O2's jump table) counted from the same base, so the first
+// of each shared ONE SymbolId, and a reference into the gap's bytes named the directive's row -- which the link binds
+// to an import, or follows to a fallback. With both in one object, every id is distinct and the code's reference into
+// the gap still names the gap's own atom.
+TEST(CoffDirectiveRead, ADirectiveRowAndAGapAtomNeverShareAnId) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<std::uint8_t> rdata(0x40, 0u);
+    for (std::size_t i = 0; i < rdata.size(); ++i) rdata[i] = static_cast<std::uint8_t>(i);
+    // `fn`: `lea rax, [rip + .rdata]; ret` -- the address of the section's anonymous leading range, through the
+    // section symbol, as a jump-table dispatch reaches it.
+    std::vector<std::uint8_t> const text{0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, text, {BReloc{3u, ".rdata", 4u /* REL32 */}}},
+         BSec{".rdata", kScnRData, rdata, {}},
+         directiveSection(" /alternatename:nobody=fbk /INCLUDE:puts")},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt},
+         BSym{".rdata", 0, 2, 0, kClassStatic, std::uint8_t{0} /* a section-definition aux, no COMDAT */},
+         BSym{"msg", 0x20, 2, 0, kClassStatic, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+
+    // The shape holds what the claim is about: three directive rows and one anonymous atom.
+    for (char const* name : {"nobody", "fbk", "puts"}) {
+        EXPECT_NE(externRowNamed(*got, name), nullptr) << name << " gets a row of its own";
+    }
+    AssembledData const* gapAtom = nullptr;
+    for (auto const& d : got->dataItems) {
+        bool named = false;
+        for (auto const& sy : got->symbols) named = named || (sy.symbol == d.symbol);
+        if (!named) gapAtom = &d;
+    }
+    ASSERT_NE(gapAtom, nullptr) << "the bytes before `msg` are an atom of their own";
+    EXPECT_EQ(gapAtom->bytes.size(), 0x20u);
+
+    std::map<std::uint32_t, std::string> owner;
+    auto const claim = [&](SymbolId id, std::string what) {
+        auto const [it, fresh] = owner.emplace(id.v, what);
+        EXPECT_TRUE(fresh) << "SymbolId " << id.v << " is both " << it->second << " and " << what;
+    };
+    for (auto const& f : got->functions) claim(f.symbol, "function " + nameOf(*got, f.symbol));
+    for (auto const& d : got->dataItems) {
+        claim(d.symbol, &d == gapAtom ? std::string{"the gap atom"} : "datum " + nameOf(*got, d.symbol));
+    }
+    for (auto const& e : got->externImports) claim(e.symbol, "the row of " + e.mangledName);
+
+    auto const* fn = funcNamed(*got, "fn");
+    ASSERT_NE(fn, nullptr);
+    ASSERT_EQ(fn->relocations.size(), 1u);
+    EXPECT_EQ(fn->relocations.front().target, gapAtom->symbol)
+        << "the code's reference into the gap names the gap's atom, never a directive's row";
 }
 
 // ══ THE SAME CLAIM AGAINST THE REAL PRODUCER ════════════════════════════════
@@ -2761,10 +3336,17 @@ struct MingwGcc {
 [[nodiscard]] MingwGcc locateMingwGcc(std::filesystem::path const& work) {
     MingwGcc g;
     g.work = work;
+#if defined(_WIN32)
     if (std::system("where gcc >nul 2>&1") != 0) {
         g.detail = "no gcc on PATH -- the mingw witness is inert on this host";
         return g;
     }
+#else
+    // `where` and `nul` are cmd.exe's: on a POSIX shell `>nul` creates a FILE
+    // named `nul` in the working directory (P69, found in passing).
+    g.detail = "not a Windows host -- the mingw witness is inert here";
+    return g;
+#endif
     // PRESENT: prove it can build before promising a red on failure.
     std::filesystem::path probe;
     MingwGcc probeGcc; probeGcc.work = work;

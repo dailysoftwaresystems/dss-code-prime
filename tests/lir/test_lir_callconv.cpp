@@ -260,6 +260,345 @@ TEST(LirCallconv, SysVLargeFrameEmitsPlainSubNotStackProbe) {
         << "sysv (stackProbePageBytes=0) must NEVER emit stack_probe";
 }
 
+// ── D-CSUBSET-VLA-WIN64-STACK-PROBE: the DYNAMIC guard-page walk ──────────────────
+//
+// Under a cc that declares a guard page (ms_x64, stackProbePageBytes 4096) every
+// RUNTIME descent `sub_sp_reg SP, size` becomes `___chkstk_ms`'s loop: touch the word
+// just below SP; while more than a page remains, step SP down a page and touch it;
+// then descend by the remainder and touch the new bottom (the design note above
+// `DynamicProbeBlocks` in lir_callconv.cpp). A cc that declares no page (sysv_amd64)
+// keeps the bare descent. The runtime witness is
+// examples/c/vla_and_alloca_past_the_guard_page, where a bare descent faults with
+// 0xC0000005 on the far end of a block; these pin the SHAPE, which that example only
+// sees in aggregate — touch (1) above all, which DSS's own frames seldom need (their
+// saved-register stores usually touch the page SP sits in already).
+
+namespace {
+
+// `sub_sp_reg SP, <size> ; ret` — the descent with its size already in a register, as
+// regalloc leaves it — as a one-block function whose one allocation names `ccIndex`.
+struct DescentModule {
+    Lir           lir;
+    LirAllocation alloc;
+};
+
+[[nodiscard]] DescentModule
+descentOnlyModule(TargetSchema const& sch, std::uint16_t ccIndex,
+                  std::uint16_t spOrd, std::uint16_t sizeOrd) {
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{77});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    std::array<LirOperand, 2> ops{
+        LirOperand::makeReg(makePhysicalReg(spOrd, LirRegClass::GPR)),
+        LirOperand::makeReg(makePhysicalReg(sizeOrd, LirRegClass::GPR))};
+    b.addInst(*sch.opcodeByMnemonic("sub_sp_reg"), InvalidLirReg, ops);
+    b.addReturn(*sch.opcodeByMnemonic("ret"), std::span<LirOperand const>{});
+    DescentModule out{std::move(b).finish(), {}};
+    out.alloc.perFunc.emplace_back();
+    out.alloc.perFunc.back().ok                     = true;
+    out.alloc.perFunc.back().originalSymbol         = SymbolId{77};
+    out.alloc.perFunc.back().callingConventionIndex = ccIndex;
+    out.alloc.perFunc.back().numSpillSlots          = 0;
+    return out;
+}
+
+// `or_mem [SP + offset], 0` — one page touch.
+[[nodiscard]] bool
+isProbeTouch(Lir const& lir, LirInstId inst, std::uint16_t orMem,
+             std::uint16_t spOrd, std::int32_t offset) {
+    auto const o = lir.instOperands(inst);
+    return lir.instOpcode(inst) == orMem && o.size() == 4
+        && o[0].kind == LirOperandKind::ImmInt && o[0].immInt32 == 0
+        && o[1].kind == LirOperandKind::Reg && o[1].reg.isPhysical != 0
+        && o[1].reg.id == spOrd
+        && o[2].kind == LirOperandKind::MemBase
+        && o[3].kind == LirOperandKind::MemOffset && o[3].offset == offset;
+}
+
+// `<op> reg, imm` over a physical register.
+[[nodiscard]] bool
+isRegImm(Lir const& lir, LirInstId inst, std::uint16_t op, std::uint16_t regOrd,
+         std::int32_t imm) {
+    auto const o = lir.instOperands(inst);
+    return lir.instOpcode(inst) == op && o.size() == 2
+        && o[0].kind == LirOperandKind::Reg && o[0].reg.isPhysical != 0
+        && o[0].reg.id == regOrd
+        && o[1].kind == LirOperandKind::ImmInt && o[1].immInt32 == imm;
+}
+
+// Does `blk` end in `jcc cond → ifTrue | ifFalse`?
+[[nodiscard]] bool
+endsInCondBr(Lir const& lir, LirBlockId blk, std::uint16_t jcc, TargetCondCode cond,
+             LirBlockId ifTrue, LirBlockId ifFalse) {
+    std::uint32_t const n = lir.blockInstCount(blk);
+    if (n == 0) return false;
+    LirInstId const t = lir.blockInstAt(blk, n - 1);
+    auto const succs = lir.blockSuccessors(blk);
+    return lir.instOpcode(t) == jcc
+        && lir.instPayload(t) == static_cast<std::uint32_t>(cond)
+        && succs.size() == 2 && succs[0].v == ifTrue.v && succs[1].v == ifFalse.v;
+}
+
+} // namespace
+
+TEST(LirCallconv, MsX64RuntimeDescentWalksEveryPageTopDown) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const* cc = sch.callingConvention(1);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_STREQ(cc->name.c_str(), "ms_x64");
+    ASSERT_GT(cc->stackProbePageBytes, 0u) << "the walk's premise: ms_x64 declares a page";
+    ASSERT_TRUE(cc->stackPointer.has_value());
+    std::uint16_t const spOrd = cc->stackPointer->ordinal;
+    auto const raxOrd = sch.registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+    std::uint16_t const rax = static_cast<std::uint16_t>(*raxOrd);
+    auto const orMem    = sch.opcodeByMnemonic("or_mem");
+    auto const cmp      = sch.opcodeByMnemonic("cmp");
+    auto const jcc      = sch.opcodeByMnemonic("jcc");
+    auto const sub      = sch.opcodeByMnemonic("sub");
+    auto const subSpReg = sch.opcodeByMnemonic("sub_sp_reg");
+    auto const ret      = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(orMem.has_value() && cmp.has_value() && jcc.has_value()
+                && sub.has_value() && subSpReg.has_value() && ret.has_value());
+    std::int32_t const page = static_cast<std::int32_t>(cc->stackProbePageBytes);
+
+    auto m = descentOnlyModule(sch, /*ccIndex=*/1, spOrd, rax);
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+    ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& out = result.lir;
+    LirFuncId const fn = out.funcAt(0);
+    // The source block, then the walk's step and tail, in THAT layout order: the tail
+    // inherits the source block's terminator, so it must be laid out where the
+    // source block's successors expect it.
+    ASSERT_EQ(out.funcBlockCount(fn), 3u)
+        << "one source block + the walk's two, laid out right after it";
+    LirBlockId const entry = out.funcBlockAt(fn, 0);
+    LirBlockId const step  = out.funcBlockAt(fn, 1);
+    LirBlockId const tail  = out.funcBlockAt(fn, 2);
+
+    // The source block ends: touch (1) at [SP-8], `cmp size, page`, `jcc ule → tail |
+    // step` — a descent of at most a page skips the loop.
+    std::uint32_t const en = out.blockInstCount(entry);
+    ASSERT_GE(en, 3u);
+    EXPECT_TRUE(isProbeTouch(out, out.blockInstAt(entry, en - 3), *orMem, spOrd, -8))
+        << "touch (1): the word just below SP, before anything descends — the touch "
+           "a helper's CALL makes with its return-address push";
+    EXPECT_TRUE(isRegImm(out, out.blockInstAt(entry, en - 2), *cmp, rax, page))
+        << "the walk counts the descent's own size register against the cc's page";
+    EXPECT_TRUE(endsInCondBr(out, entry, *jcc, TargetCondCode::Ule, tail, step))
+        << "at most one page left: straight to the descent";
+
+    // The step is exactly one page: SP down a page, touch it, count it, test again.
+    ASSERT_EQ(out.blockInstCount(step), 5u);
+    EXPECT_TRUE(isRegImm(out, out.blockInstAt(step, 0), *sub, spOrd, page));
+    EXPECT_TRUE(isProbeTouch(out, out.blockInstAt(step, 1), *orMem, spOrd, 0))
+        << "touch (2): every page the descent crosses, top-down";
+    EXPECT_TRUE(isRegImm(out, out.blockInstAt(step, 2), *sub, rax, page));
+    EXPECT_TRUE(isRegImm(out, out.blockInstAt(step, 3), *cmp, rax, page));
+    EXPECT_TRUE(endsInCondBr(out, step, *jcc, TargetCondCode::Ugt, step, tail))
+        << "more than a page left: another step";
+
+    // The tail: the ORIGINAL descent by the remainder, then touch (3), then the rest
+    // of the source block (here the epilogue and the `ret`).
+    std::uint32_t const tn = out.blockInstCount(tail);
+    ASSERT_GE(tn, 3u);
+    LirInstId const descent = out.blockInstAt(tail, 0);
+    ASSERT_EQ(out.instOpcode(descent), *subSpReg);
+    auto const dOps = out.instOperands(descent);
+    ASSERT_EQ(dOps.size(), 2u);
+    EXPECT_EQ(static_cast<std::uint32_t>(dOps[0].reg.id), spOrd);
+    EXPECT_EQ(static_cast<std::uint32_t>(dOps[1].reg.id), rax)
+        << "the descent by the register the loop counted down";
+    EXPECT_TRUE(isProbeTouch(out, out.blockInstAt(tail, 1), *orMem, spOrd, 0))
+        << "touch (3): the new bottom, so what follows starts from a committed page";
+    EXPECT_EQ(out.instOpcode(out.blockInstAt(tail, tn - 1)), *ret);
+    EXPECT_EQ(countOpcodeInModule(out, *orMem), 3u);
+    EXPECT_EQ(countOpcodeInModule(out, *subSpReg), 1u);
+
+    // The epilogue's `restore_state` re-arms the frame PAST the `ret` — at the end of
+    // the block the `ret` landed in, which the walk made the tail.
+    ASSERT_EQ(result.perFuncCfi.size(), 1u);
+    bool sawRestore = false;
+    for (LirCfiOp const& op : result.perFuncCfi[0].ops) {
+        if (op.kind != CfiOpKind::RestoreState) continue;
+        sawRestore = true;
+        EXPECT_TRUE(op.atBlockEnd);
+        EXPECT_EQ(op.block.v, tail.v)
+            << "restore_state names the block that holds the ret, not the source "
+               "block's first part";
+    }
+    EXPECT_TRUE(sawRestore) << "precondition: the epilogue brackets its teardown";
+}
+
+// The control: the SAME descent under a cc that declares no page is the bare `sub`.
+TEST(LirCallconv, SysVRuntimeDescentStaysTheBareDescent) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const* cc = sch.callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_EQ(cc->stackProbePageBytes, 0u) << "the control's premise: sysv declares no page";
+    ASSERT_TRUE(cc->stackPointer.has_value());
+    auto const raxOrd = sch.registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+    auto m = descentOnlyModule(sch, /*ccIndex=*/0, cc->stackPointer->ordinal,
+                               static_cast<std::uint16_t>(*raxOrd));
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+    ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_EQ(result.lir.funcBlockCount(result.lir.funcAt(0)), 1u);
+    EXPECT_EQ(countOpcodeInModule(result.lir, *sch.opcodeByMnemonic("or_mem")), 0u);
+    EXPECT_EQ(countOpcodeInModule(result.lir, *sch.opcodeByMnemonic("cmp")), 0u);
+    EXPECT_EQ(countOpcodeInModule(result.lir, *sch.opcodeByMnemonic("sub_sp_reg")), 1u);
+}
+
+// A schema that declares the page but not one of the walk's verbs refuses by name
+// rather than leave a descent unwalked; the same schema still materializes a descent
+// under the cc that declares no page, so the refusal is the PAGE's, not the verb's.
+TEST(LirCallconvAbi, RuntimeDescentUnderAPageWithoutTheTouchVerbFailsLoud) {
+    auto mutatedR = ::dss::test_support::mutateShippedTargetSchemaJson(
+        "x86_64", {"or_mem"});
+    ASSERT_TRUE(mutatedR.has_value());
+    TargetSchema const& sch = **mutatedR;
+    ASSERT_FALSE(sch.opcodeByMnemonic("or_mem").has_value())
+        << "mutateShippedTargetSchemaJson contract violated: `or_mem` survived";
+    auto const* ms = sch.callingConvention(1);
+    auto const* sysv = sch.callingConvention(0);
+    ASSERT_TRUE(ms != nullptr && sysv != nullptr);
+    ASSERT_GT(ms->stackProbePageBytes, 0u);
+    ASSERT_TRUE(ms->stackPointer.has_value());
+    auto const raxOrd = sch.registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+    std::uint16_t const rax = static_cast<std::uint16_t>(*raxOrd);
+
+    auto m = descentOnlyModule(sch, /*ccIndex=*/1, ms->stackPointer->ordinal, rax);
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::L_RequiredLirOpcodeMissing), 1u);
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("'or_mem'") != std::string::npos) named = true;
+    }
+    EXPECT_TRUE(named) << "the refusal names the missing verb";
+
+    auto c = descentOnlyModule(sch, /*ccIndex=*/0, sysv->stackPointer->ordinal, rax);
+    DiagnosticReporter crep;
+    auto control = materializeCallingConvention(c.lir, sch, c.alloc, crep);
+    EXPECT_TRUE(control.ok()) << "no page, no walk, no verb needed";
+}
+
+// From C source: a VLA and `__builtin_alloca` are walked ALIKE under ms_x64 (both are
+// the one `sub_sp_reg` MIR→LIR lowers a runtime-sized Alloca to) and neither under
+// sysv. Also pinned here, because the walk COUNTS THE SIZE REGISTER DOWN: MIR→LIR's
+// descent operand is a register defined for it alone — exactly one use, the descent
+// (`lowerVlaAlloca`'s contract) — and each walk's blocks sit in layout right after the
+// block that holds the descent. The third source puts the descent in a block that is
+// NOT the function's last (a VLA inside an `if`), so blocks appended after the whole
+// function instead of after their own block are told apart from the right layout.
+TEST(LirCallconv, MsX64WalksAVlaAndAnAllocaAlikeAndSysVWalksNeither) {
+    std::array<char const*, 3> const sources{
+        "int f(int n) { volatile char a[n]; a[0] = 1; return a[0] + (n > 1); }\n",
+        "int f(int n) { volatile char *p = __builtin_alloca(n); p[0] = 1;"
+        " return p[0] + (n > 1); }\n",
+        "int f(int n) { int r = 0; if (n > 0) { volatile char a[n]; a[0] = 1; r = a[0]; }"
+        " return r + 1; }\n"};
+    for (char const* src : sources) {
+        for (std::uint16_t const ccIndex : {std::uint16_t{1}, std::uint16_t{0}}) {
+            SCOPED_TRACE(std::format("cc {}: {}", ccIndex, src));
+            auto bundle = lowerThroughRewrite(src, ccIndex);
+            ASSERT_TRUE(bundle.lowered.lir.ok);
+            ASSERT_TRUE(bundle.rewritten.ok);
+            TargetSchema const& sch = *bundle.lowered.target;
+            auto const subSpReg = sch.opcodeByMnemonic("sub_sp_reg");
+            auto const orMem    = sch.opcodeByMnemonic("or_mem");
+            auto const jcc      = sch.opcodeByMnemonic("jcc");
+            ASSERT_TRUE(subSpReg.has_value() && orMem.has_value() && jcc.has_value());
+
+            // The producer contract, read off the PRE-allocation module.
+            {
+                Lir const& pre = bundle.lowered.lir.lir;
+                LirFuncId const pf = pre.funcAt(0);
+                std::optional<LirReg> size;
+                std::uint32_t descents = 0;
+                for (std::uint32_t bi = 0; bi < pre.funcBlockCount(pf); ++bi) {
+                    LirBlockId const blk = pre.funcBlockAt(pf, bi);
+                    for (std::uint32_t k = 0; k < pre.blockInstCount(blk); ++k) {
+                        LirInstId const in = pre.blockInstAt(blk, k);
+                        if (pre.instOpcode(in) != *subSpReg) continue;
+                        ++descents;
+                        auto const o = pre.instOperands(in);
+                        ASSERT_EQ(o.size(), 2u);
+                        ASSERT_EQ(o[1].kind, LirOperandKind::Reg);
+                        size = o[1].reg;
+                    }
+                }
+                ASSERT_EQ(descents, 1u);
+                ASSERT_TRUE(size.has_value());
+                ASSERT_EQ(static_cast<std::uint32_t>(size->isPhysical), 0u)
+                    << "the size is a virtual register";
+                std::uint32_t uses = 0;
+                for (std::uint32_t bi = 0; bi < pre.funcBlockCount(pf); ++bi) {
+                    LirBlockId const blk = pre.funcBlockAt(pf, bi);
+                    for (std::uint32_t k = 0; k < pre.blockInstCount(blk); ++k) {
+                        for (auto const& o : pre.instOperands(pre.blockInstAt(blk, k))) {
+                            if (o.kind == LirOperandKind::Reg && o.reg == *size) ++uses;
+                        }
+                    }
+                }
+                EXPECT_EQ(uses, 1u)
+                    << "the descent's size register has one use, the descent, so the "
+                       "walk may count it down";
+            }
+
+            DiagnosticReporter ccRep;
+            auto result = materializeCallingConvention(bundle.rewritten.lir, sch,
+                                                       bundle.alloc, ccRep);
+            ASSERT_TRUE(result.ok())
+                << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
+            auto const* cc = sch.callingConvention(ccIndex);
+            ASSERT_NE(cc, nullptr);
+            EXPECT_EQ(countOpcodeInModule(result.lir, *subSpReg), 1u);
+            EXPECT_EQ(countOpcodeInModule(result.lir, *orMem),
+                      cc->stackProbePageBytes > 0 ? 3u : 0u);
+            if (cc->stackProbePageBytes == 0) continue;
+            // Layout: [B, step, tail] — B ends in the walk's first test (→ tail |
+            // step), and the step and the tail follow it immediately.
+            Lir const& out = result.lir;
+            LirFuncId const fn = out.funcAt(0);
+            std::optional<std::uint32_t> bIndex;
+            for (std::uint32_t bi = 0; bi < out.funcBlockCount(fn); ++bi) {
+                LirBlockId const blk = out.funcBlockAt(fn, bi);
+                std::uint32_t const n = out.blockInstCount(blk);
+                if (n == 0) continue;
+                LirInstId const t = out.blockInstAt(blk, n - 1);
+                if (out.instOpcode(t) == *jcc
+                    && out.instPayload(t)
+                           == static_cast<std::uint32_t>(TargetCondCode::Ule)
+                    && n >= 3
+                    && out.instOpcode(out.blockInstAt(blk, n - 3)) == *orMem) {
+                    bIndex = bi;
+                }
+            }
+            ASSERT_TRUE(bIndex.has_value()) << "the block that opens the walk";
+            ASSERT_LT(*bIndex + 2, out.funcBlockCount(fn));
+            LirBlockId const b    = out.funcBlockAt(fn, *bIndex);
+            LirBlockId const step = out.funcBlockAt(fn, *bIndex + 1);
+            LirBlockId const tail = out.funcBlockAt(fn, *bIndex + 2);
+            auto const succs = out.blockSuccessors(b);
+            ASSERT_EQ(succs.size(), 2u);
+            EXPECT_EQ(succs[0].v, tail.v) << "the tail is laid out two after the source block";
+            EXPECT_EQ(succs[1].v, step.v) << "the step is laid out right after it";
+            EXPECT_EQ(out.instOpcode(out.blockInstAt(tail, 0)), *subSpReg);
+        }
+    }
+}
+
 TEST(LirCallconv, StraightLineFunctionGetsPrologueEpilogueAndZeroFrameOps) {
     auto bundle = lowerThroughRewrite("int f(int x) { return x + x; }");
     ASSERT_TRUE(bundle.lowered.lir.ok);

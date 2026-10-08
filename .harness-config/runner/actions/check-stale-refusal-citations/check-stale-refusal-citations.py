@@ -26,7 +26,13 @@ A finding is ONE SENTENCE that satisfies all six:
   (2) EVERY row id it cites is CLOSED;
   (3) after the ids are MASKED OUT, it carries a PERSISTENCE word followed within
       26 characters by a REFUSAL word (or the predicative `still/stays/remains
-      open`);
+      open`), that word not a `still` bound to a participle in the claim's
+      subject (`a document still declaring it is REFUSED`) -- a `still` whose
+      last word before it is a copula (is/are/was/were/be/been/being, remain(s)/
+      remained, stay(s)/stayed, `'s`/`'re`; `the fix is still pending ...`) is the
+      predicate's, and a coordinator (and/or/but/so/yet/nor) between the
+      participle and the copula (`... still pending so the call is REFUSED`)
+      joins a clause of its own: neither is;
   (4) no past-tense GOVERNOR sits immediately before that phrase;
   (5) no RETRACTION marker appears anywhere in the sentence;
   (6) no RESIDUAL-BOUNDARY qualifier scopes the claim to something OUTSIDE what
@@ -120,7 +126,7 @@ Every file `git ls-files --cached --others --exclude-standard` reports, MINUS
     on routine work is a guard that gets weakened, which asserts nothing.
     ★ AND THE PLAN SIDE IS ALREADY GOVERNED, BY THE INSTRUMENT THAT OWNS IT: a
     registry row whose own opening verdict contradicts its marker is
-    `check-anchor-balance`'s mismarked-closure arm, and a row that still PRESENTS
+    `anchor-debt`'s mismarked-closure arm, and a row that still PRESENTS
     as blocked while its trigger has fired is that same instrument's `unblocked`
     arm. A closed row's status cell RECAPPING what used to be refused is not a
     defect at all -- it is what a closure looks like.
@@ -130,7 +136,7 @@ Every file `git ls-files --cached --others --exclude-standard` reports, MINUS
     live statement of what the compiler does, and nothing rewrites them per cycle.
 
 ── THE ROW SETS: IMPORTED, NEVER RE-DERIVED ────────────────────────────────────
-`check-anchor-balance` is imported and asked for both populations.
+`anchor-debt` is imported and asked for both populations.
   * A ROW IS CLOSED IFF ITS STATUS CELL BEGINS WITH THE CLOSURE MARK after
     `lstrip("*_ ")` -- `is_closed()`, unchanged and unread by this file. THE
     COMPLEMENT IS DEFINED, NEVER THE VARIANTS: an ad-hoc enumeration of status
@@ -200,11 +206,11 @@ with exit 2, never a pass. An empty scan is a COLLAPSE (a guard that fails OPEN 
 the worst kind).
 
 Usage:
-    python .harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py
-    python .harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py --list
-    python .harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py --write
-    python .harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py --baseline
-    python .harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py --selftest
+    dssharness run check-stale-refusal-citations                              verify, then self-test
+    dssharness run check-stale-refusal-citations --manual-step list           every site, ceilings ignored
+    dssharness run check-stale-refusal-citations-write                        burn down (--write)
+    dssharness run check-stale-refusal-citations-baseline                     new ground (--baseline)
+    dssharness run check-stale-refusal-citations --manual-step self-test      the self-test alone
 
 ★★ THE NO-ARGUMENT FORM (the ctest form) VERIFIES THE TREE **AND THEN RUNS THE
 SELF-TEST**, honouring both statuses and short-circuiting NEITHER. A guard whose
@@ -341,7 +347,7 @@ def sentences(text):
 
 # ── the vocabulary. Each list is a POSITIVE declaration, so it is enumerated ──
 # and every member was read in the tree before it was added. That is the same
-# licence `check-anchor-balance`'s WALK_BACK list takes and for the same reason:
+# licence `anchor-debt`'s WALK_BACK list takes and for the same reason:
 # there is no complement of "asserts a refusal persists" to invert. The residual
 # risk is a MISS, never a false accusation, and a miss is this guard's safe
 # direction.
@@ -375,6 +381,46 @@ OPEN_CLAIM = r"\b(?:STILL|STAYS?|REMAINS?)[-\s]+OPEN\b"
 
 CLAIM = re.compile(r"\b(?:%s)\b[^.;!?]{0,%d}?\b(?:%s)\b|%s"
                    % (PERSISTENCE, GAP, REFUSAL, OPEN_CLAIM), re.IGNORECASE)
+
+# ★★ A `STILL` BOUND TO A PARTICIPLE IN THE CLAIM'S SUBJECT PERSISTS THAT ACTION, NOT THE REFUSAL.
+# ✔MEASURED 2026-10-07 on the integrated P69 tree: `target_schema_json.cpp` says a document "still declaring" a
+# removed key "is REFUSED AT LOAD", citing the CLOSED row whose closure removed the key -- the refusal is what that
+# closure DELIVERED, the sentence is TRUE, and this guard went red on it. The tell is a CONSTRUCTION, not a word
+# list: `still <word>ing`, then no comma, then a finite `is`/`are` IMMEDIATELY before the refusal word -- the
+# predicate carries no persistence word of its own. `still being refused` is not that (no copula before the
+# refusal word), and `still pending, so the call is refused` is not either (a comma ends the participle's reach):
+# both stay findings. A skipped match is searched past its own `still` only, so a persistence word later in the
+# same sentence (`... is refused and stays refused`) still convicts.
+# ★ AND THE CONSTRUCTION SAYS WHERE THE `STILL` SITS (corrected 2026-10-07, the P69 fixed-point re-review's MINOR 2:
+# until then it never located the subject, and the comma alone decided). A `still` whose last word before it is a
+# copula (`the fix is still pending ...`, `it's still ...`) is in the PREDICATE -- the persistence claim this guard
+# exists to catch -- and a coordinator between the participle and the copula (`still pending so the call is
+# refused`, `still missing and is unsupported`) joins a second clause whose refusal is a claim of its own. Either
+# refuses the skip. ✔MEASURED by that review on a verbatim copy of CLAIM, PARTICIPLE_BOUND, the skip loop, GOVERNOR,
+# RETRACTION and BOUNDARY: "the fix is still pending so the call is refused", "... still pending and the call is
+# refused", "the lowering is still missing and is unsupported" and "it is still failing and is rejected fail-loud"
+# each convicted before the narrowing and were SILENCED by it. ⚠ Only NON-WORD characters may sit between the copula
+# and the `still`: a sentence keeps the comment markers of the lines it spans (`is // still`, `is # still`, `**is**
+# still`), and a masked id is non-word too (`is (<id>) still`), so neither may hide the copula.
+PARTICIPLE_BOUND = re.compile(r"STILL\s+[A-Z]+ING\b(?P<between>[^,]*?)\b(?:IS|ARE)\s+(?:%s)$" % REFUSAL,
+                              re.IGNORECASE)
+PREDICATE_STILL = re.compile(r"(?:\b(?:IS|ARE|WAS|WERE|BE|BEEN|BEING|REMAINS?|REMAINED|STAYS?|STAYED)|"
+                             r"\w['’](?:S|RE))\W*$", re.IGNORECASE)
+COORDINATED = re.compile(r"\b(?:AND|OR|BUT|SO|YET|NOR)\b", re.IGNORECASE)
+
+
+def _participle_bound(m, masked):
+    """Is this CLAIM match (in `masked`) a `still` bound to a participle in the claim's SUBJECT (PARTICIPLE_BOUND)?
+    Never when the `still` follows a finite verb or copula, nor when a coordinator joins the participle's clause to
+    the refusal's."""
+    pb = PARTICIPLE_BOUND.match(m.group(0))
+    if pb is None:
+        return False
+    if PREDICATE_STILL.search(masked[:m.start()]):
+        return False
+    if COORDINATED.search(pb.group("between")):
+        return False
+    return True
 
 # ★★★ A REFUSAL SCOPED TO A **BOUNDARY OUTSIDE WHAT THE ROW CLOSED** IS TRUE, NOT
 # STALE, AND IT IS THE LARGEST FALSE-POSITIVE CLASS THIS GUARD HAS.
@@ -439,6 +485,8 @@ def claim_in(sentence, anchor_token):
     """
     masked = anchor_token.sub(lambda m: MASK_CHAR * len(m.group(0)), sentence)
     m = CLAIM.search(masked)
+    while m is not None and _participle_bound(m, masked):
+        m = CLAIM.search(masked, m.start() + len(m.group(0).split(None, 1)[0]))
     if m is None:
         return None
     if GOVERNOR.search(masked[:m.start()]) or RETRACTION.search(masked):
@@ -452,7 +500,7 @@ def findings_in(text, anchor_token, names, closed):
     """-> [(cited_ids, excerpt, sentence)] for one file's text.
 
     `names` is every id that HAS a row; `closed` is the subset whose every home
-    is closed. Both come from `check-anchor-balance`; neither is derived here.
+    is closed. Both come from `anchor-debt`; neither is derived here.
     """
     found = []
     for sentence in sentences(text):
@@ -469,25 +517,24 @@ def findings_in(text, anchor_token, names, closed):
 
 
 # ═══════════════════════ THE ROW SETS AND THE GOVERNED SET ═══════════════════
-def _load_anchor_balance(root):
-    """`check-anchor-balance` as a module, or a loud death.
+def _load_anchor_debt(root):
+    """`anchor-debt` as a module, or a loud death.
 
     Imported rather than copied for the reason `check-wrapped-anchor-ids` imports
     it: two copies of "what a row is and when it is closed" is exactly the drift
     the whole registry discipline exists to stop. The import fails LOUD if the
     sibling moves.
     """
-    sibling = os.path.join(root, ACTIONS_REL, "check-anchor-balance",
-                           "check-anchor-balance.py")
+    sibling = os.path.join(root, ACTIONS_REL, "anchor-debt", "anchor-debt.py")
     if not os.path.isfile(sibling):
         raise Collapse(
             "cannot find the shared anchor vocabulary at %s.\n"
             "  This guard must take its row population, its closed-status rule and "
-            "its anchor-token pattern from that script, or the two instruments "
+            "its anchor-token pattern from that program, or the two instruments "
             "start disagreeing about what a CLOSED row IS. Restore the sibling; do "
             "NOT copy its definitions here."
             % os.path.relpath(sibling, root).replace("\\", "/"))
-    spec = importlib.util.spec_from_file_location("_anchor_balance", sibling)
+    spec = importlib.util.spec_from_file_location("_anchor_debt", sibling)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -501,7 +548,7 @@ def row_sets(root):
     The closed set is therefore the COMPLEMENT, computed rather than matched --
     no glyph is enumerated anywhere in this file.
     """
-    ab = _load_anchor_balance(root)
+    ab = _load_anchor_debt(root)
     try:
         scan = ab.scan_worktree(root)
     except SystemExit as exc:                # `scan_worktree` exits on a bad tree
@@ -686,8 +733,7 @@ def report_comment_divergence(comment):
     print("  commit landed.")
     print("  FIX: DECIDE WHICH SIDE IS TRUE FIRST; the repair is not symmetric.")
     print("  If the CODE is right, re-stamp the JSON:")
-    print("      python .harness-config/runner/actions/check-stale-refusal-citations/"
-          "check-stale-refusal-citations.py --write")
+    print("      dssharness run check-stale-refusal-citations-write")
     print("  If the JSON is right, edit `_INVENTORY_COMMENT` to match it -")
     print("  running `--write` would DESTROY the corrected text. The species is")
     print("  this guard's own subject: a claim TRUE WHEN IT WAS TYPED and FALSE")
@@ -805,8 +851,7 @@ def run(root, write=False, baseline=False):
         print("  You corrected sentences without lowering the ceiling. Unclaimed")
         print("  headroom is exactly where the next one hides. Re-baseline in the")
         print("  same commit:")
-        print("      python .harness-config/runner/actions/check-stale-refusal-citations/"
-              "check-stale-refusal-citations.py --write")
+        print("      dssharness run check-stale-refusal-citations-write")
         print("  That verb only lowers, so it cannot hide a regression while it does.")
         return EXIT_RATCHET
 
@@ -859,11 +904,11 @@ def list_sites(root):
 # 2026-09-01, so a
 # bare two-segment fixture is now a citation of an anchor with no row, INSIDE the
 # guard that reports stale citations, and the registry guard refuses the whole
-# tree for it. `check-anchor-balance`'s two-segment `ANCHOR_TOKEN` still matches
+# tree for it. `anchor-debt`'s two-segment `ANCHOR_TOKEN` still matches
 # the ASSEMBLED value at run time, which is what the arms need.
 # ✔MEASURED on this file's first draft: an over-threshold fixture reddened
 # `check-anchor-registry` at once. Settled precedent, not preference --
-# `check-anchor-balance`'s self-test renamed eleven such
+# the self-test of `anchor-debt` (then `check-anchor-balance`) renamed eleven such
 # names rather than allowlisting them, because an allowlist entry silences a name
 # repo-wide and forever; the fragment pattern is that ruling's successor.
 # ⚠ THE TRAP THAT ROW RECORDS FROM ITS OWN FIX IS PROSE: it came back twice, once
@@ -872,7 +917,7 @@ def list_sites(root):
 # rule as the literals, and the one fixture that NEEDS a realistic length is
 # ASSEMBLED from fragments no grep can join.
 
-EXPECTED_ARMS = 70
+EXPECTED_ARMS = 78  # 70 until 2026-10-07: the participle-bound `still`, four arms; then where the `still` sits, four
 
 # The one synthetic plan document every arm's temp repo carries. The closure mark
 # is taken from the shared module at run time rather than written here -- this
@@ -931,8 +976,7 @@ def _tmp_repo(root, files, ceilings, closed_mark, subject_mark=None,
     payload = dict(files)
     payload[".plans/00-synthetic.md"] = _plan_text(closed_mark,
                                                    subject_mark=subject_mark)
-    sibling = os.path.join(ACTIONS_REL, "check-anchor-balance",
-                           "check-anchor-balance.py")
+    sibling = os.path.join(ACTIONS_REL, "anchor-debt", "anchor-debt.py")
     with io.open(os.path.join(root, sibling), encoding="utf-8") as fh:
         payload[sibling.replace(os.sep, "/")] = fh.read()
     for rel, text in payload.items():
@@ -977,7 +1021,7 @@ def selftest(root):
         print("  [%s] %s%s" % ("ok " if cond else "FAIL", label,
                                (" (" + detail + ")") if detail else ""))
 
-    ab = _load_anchor_balance(root)
+    ab = _load_anchor_debt(root)
     tok = ab.ANCHOR_TOKEN
     NAMES = {_CLOSED_ROW, _OPEN_ROW, _LONG_CLOSED_ROW, _FILLER_ROW}
     CLOSED = {_CLOSED_ROW, _LONG_CLOSED_ROW, _FILLER_ROW}
@@ -1054,6 +1098,41 @@ def selftest(root):
           "not a live-blocker claim",
           hits("emitted into the entry block, which is still the open block here "
                "(%s).\n" % _CLOSED_ROW) == [])
+    # ★ THE PARTICIPLE-BOUND `still` (2026-10-07): the target_schema_json.cpp sentence, its control with `still` on
+    # the predicate, a comma ending the participle's reach, and a later persistence word still convicting.
+    check("a STILL bound to a participle in the subject (`a document still declaring it is REFUSED`) is "
+          "not a finding, and the skip is what stops it",
+          hits("so a document still declaring it is refused at load (%s).\n" % _CLOSED_ROW) == []
+          and CLAIM.search("so a document still declaring it is refused at load (%s)." % _CLOSED_ROW)
+          is not None)
+    check("... but the SAME sentence with STILL on the predicate is a finding",
+          [h[0] for h in hits("so a document declaring it is still refused at load (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("... and a comma ends the participle's reach (`still pending, so the call is refused`)",
+          [h[0] for h in hits("the fix is still pending, so the call is refused (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("... and a later persistence word in the same sentence still convicts",
+          [h[0] for h in hits("a document still declaring it is refused and stays refused (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    # ★ WHERE THE `still` SITS (2026-10-07, the re-review's MINOR 2): the review's two silenced sentences, then each
+    # half of the construction alone -- a `still` after a copula with no coordinator (across a wrapped comment line,
+    # so the marker between them is pinned too), and a coordinator with the `still` in the subject -- so disabling
+    # either half reds an arm of its own. The review's two each carry BOTH halves, so neither can tell them apart.
+    check("a STILL after a copula, then a coordinated clause, convicts (`the fix is still pending so the call is "
+          "refused`)",
+          [h[0] for h in hits("the fix is still pending so the call is refused (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("... as does `the lowering is still missing and is unsupported`",
+          [h[0] for h in hits("the lowering is still missing and is unsupported (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("a STILL after a copula is the PREDICATE's, with no coordinator at all, and a wrapped comment line "
+          "between them does not hide the copula (`the loader is // still declaring it is refused`)",
+          [h[0] for h in hits("// the loader is\n// still declaring it is refused at load (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("a coordinator between the participle and the copula convicts, the STILL in the subject "
+          "(`a document still pending so the call is refused`)",
+          [h[0] for h in hits("a document still pending so the call is refused (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
 
     # ── A2. the RESIDUAL-BOUNDARY exemption ─────────────────────────────────
     # ★★ THE LARGEST FALSE-POSITIVE CLASS, and it is a TRUE sentence citing a
@@ -1297,7 +1376,7 @@ def selftest(root):
               "identical sentence is GREEN",
               rc == EXIT_OK and "0 site(s)" in out, "rc=%d" % rc)
 
-        # A repo with no `check-anchor-balance` at all.
+        # A repo with no `anchor-debt` at all.
         box = tempfile.mkdtemp(prefix="stale-refusal-noab-")
         boxes.append(box)
         os.makedirs(os.path.join(box, ".plans"))
@@ -1310,7 +1389,7 @@ def selftest(root):
                      encoding="utf-8", newline="\n") as fh:
             fh.write(two)
         rc, out = _capture(box)
-        check("a MISSING check-anchor-balance is a COLLAPSE (the import fails "
+        check("a MISSING anchor-debt is a COLLAPSE (the import fails "
               "loud)", rc == EXIT_COLLAPSE and "shared anchor vocabulary" in out)
 
         # ── F. the plan tree really is out of the governed set ──────────────

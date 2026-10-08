@@ -32,9 +32,10 @@
 //
 // Text grammar (representative):
 //
-//   dssir 3
+//   dssir 5
 //   types {
 //     type 1 = struct "Node" {i32, ptr<type 1>}
+//     type 2 = union "U" {i32, f32}
 //   }
 //   symbols {
 //     %1 "main"
@@ -42,6 +43,7 @@
 //   }
 //   module {
 //     global %3 : i32 = lit int 0 : i32
+//     global %4 : type 2 = lit agg member 1 { lit float 42 : f32 } : union
 //     function %1 : fn() -> i32 {
 //       block %b1 [entry] {
 //         %v2 = const : i32 (lit int 42 : i32)
@@ -60,6 +62,12 @@
 // `std::bad_alloc`), a self-referential composite had no spelling, and every layout
 // channel was lost on the way back. An inline `struct "N" {…}` in a v2 module is
 // refused by name, and a `dssir 1` text by the version check.
+//
+// ★ v5 (P69, lane `cs`): A UNION VALUE NAMES ITS MEMBER — `lit agg member N {…} : union`, N the
+// index among the union's members of the one its field initializes (C 6.7.9p17 lets an initializer
+// designate any member; the field's type cannot say which, since two members may share one). The
+// reader refuses `member` on a non-union literal and a union literal with a field but no member;
+// the static-data encoder refuses a member the union does not have.
 //
 // ★★ ONE INSTRUCTION PER LINE, and it is a RULE of this grammar rather than a
 // habit of the emitter. `parseInstruction` refuses any instruction whose line

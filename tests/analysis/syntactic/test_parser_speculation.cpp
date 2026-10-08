@@ -562,6 +562,9 @@ TEST(ParserSpeculation, COperandAltBranchesAreInDeclaredOrder) {
     const std::vector<std::string> declared{
         "stringLiteralExpr",
         "charLiteralExpr",
+        // P69: C23's storage-class compound literal `( static T ){ … }`, declared just
+        // before the plain one (each fails one token past the `(` of the other's form).
+        "storageCompoundLiteralExpr",
         "compoundLiteralExpr",
         "sizeofExpr",            // FC6
         // P31 [[D-CSUBSET-ALIGNOF-VALUE-OPERAND]]: was `alignofType` (the FORM).
@@ -574,6 +577,7 @@ TEST(ParserSpeculation, COperandAltBranchesAreInDeclaredOrder) {
         "vaStartExpr",           // FC12a-core (D-FC12A-VARIADIC-CALLEE)
         "vaArgExpr",             // FC12a-core
         "vaEndExpr",             // FC12a-core
+        "vaCopyExpr",            // P69 (`va_copy`)
         "genericExpr",           // FC16 (D-CSUBSET-GENERIC-SELECTION, `_Generic`)
         // P31: the three GNU compile-time OPERATORS. Keyword-led, so the LL(k)
         // predictive prune discards each in ONE token for every operand that is
@@ -989,8 +993,8 @@ flatChainParseMetrics(std::shared_ptr<GrammarSchema const> const& schema,
 // this non-recursive chain does not, which is why the two tests carry
 // different bounds — the separate row is
 // D-PARSE-DEEP-NEST-RECURSION-MEMORY.
-// ⚠ FOR ITS STATUS ASK THE INSTRUMENT — `python
-// .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py` — never a comment: a
+// ⚠ FOR ITS STATUS ASK THE INSTRUMENT — `dssharness read-anchor
+// D-PARSE-DEEP-NEST-RECURSION-MEMORY` — never a comment: a
 // status word in prose is a measurement with no instrument attached, which is
 // how this sentence rotted in the first place.
 TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {
@@ -1454,4 +1458,71 @@ TEST(ParserSpeculation, FinalCandidateDescentIsGatedOnTheFallbackReading) {
     Tree ok = parseWithSchema(kFallbackReadingGateSchema, "A C N N ;");
     EXPECT_FALSE(ok.diagnostics().hasErrors());
     EXPECT_EQ(countNodesByRule(ok, "unboundedCase"), 1u);
+}
+
+// ── P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): `notFollowedBy` ───────────
+// The facet is a generic PEG NOT-PREDICATE on a speculative candidate's FOLLOWER: a candidate that
+// closes cleanly but is followed by a listed token kind is not the alt's reading. C uses it for
+// `sizeof ( T ) {` (the compound literal); nothing in the engine knows that — this grammar names no
+// C construct. `stmt` may itself consume a trailing `C`, so a parse that IGNORED the predicate
+// would still succeed: only the predicate makes `pair` + `C` a non-reading. The loader admits the
+// facet only where a probe evaluates it (`GrammarSchema.NotFollowedByIsAdmittedOnlyWhereAProbeEvaluatesIt`).
+// RED-ON-DISABLE: (a) drop the predicate from `decideClosedCandidate_` → the probe case parses
+// `pair` and `C`; (b) let the unique-survivor descent enter a predicate-carrying candidate without
+// a probe (`candidateNeedsProbe_` asking only the type-name guard) → the survivor case parses in
+// silence.
+namespace {
+
+[[nodiscard]] std::string notFollowedBySchema(std::string_view itemAlt) {
+    return std::string{R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "NotFollowedBySpec", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "A":  [{ "kind": "AKind" }],
+    "B":  [{ "kind": "BKind" }],
+    "C":  [{ "kind": "CKind" }],
+    "X":  [{ "kind": "XKind" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root":   { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":   { "sequence": ["item", { "optional": "CKind" }, "Semi"] },
+    "item":   { "alt": )JSON"} + std::string{itemAlt} + R"JSON(, "speculative": true, "lookahead": 3 },
+    "pair":   { "sequence": ["AKind", "BKind"], "notFollowedBy": ["CKind"] },
+    "triple": { "sequence": ["AKind", "BKind", "CKind"] },
+    "axe":    { "sequence": ["AKind", "XKind"] },
+    "other":  { "sequence": ["XKind"] }
+  }
+})JSON";
+}
+
+} // namespace
+
+TEST(ParserSpeculation, NotFollowedByVetoesACleanCloseOnEveryPathToTheCandidate) {
+    std::string const probeAlt = notFollowedBySchema(R"(["pair", "triple", "other"])");
+    // The probe: `pair` closes on `A B`, but `C` follows — the alt takes `triple`.
+    Tree vetoed = parseWithSchema(probeAlt, "A B C ;");
+    EXPECT_FALSE(vetoed.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(vetoed, "triple"), 1u) << "`A B C` must parse as triple";
+    EXPECT_EQ(countNodesByRule(vetoed, "pair"), 0u) << "`pair` must not commit before `C`";
+    // The control: no `C` follows — `pair` is the reading.
+    Tree kept = parseWithSchema(probeAlt, "A B ; X ;");
+    EXPECT_FALSE(kept.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(kept, "pair"), 1u);
+    EXPECT_EQ(countNodesByRule(kept, "other"), 1u);
+
+    // A LONE PRUNED SURVIVOR: `axe` needs `X` second, so on `A B` the predictive prune leaves
+    // `pair` as the only candidate. Entering it without a probe would read `A B` and let `stmt`
+    // take the `C` — the reading the grammar's own predicate forbids. It must be refused.
+    std::string const survivorAlt = notFollowedBySchema(R"(["pair", "axe"])");
+    Tree survivor = parseWithSchema(survivorAlt, "A B C ;");
+    EXPECT_TRUE(survivor.diagnostics().hasErrors())
+        << "the predicate must hold on the unique-survivor path too";
+    EXPECT_EQ(countNodesByRule(survivor, "pair"), 0u);
+    Tree survivorOk = parseWithSchema(survivorAlt, "A B ; A X ;");
+    EXPECT_FALSE(survivorOk.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(survivorOk, "pair"), 1u);
+    EXPECT_EQ(countNodesByRule(survivorOk, "axe"), 1u);
 }

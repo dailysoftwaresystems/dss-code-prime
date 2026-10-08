@@ -126,6 +126,7 @@
 #include "core/types/entry_shape.hpp"         // EntryMaterialization (the verb)
 #include "core/types/target_schema.hpp"       // ProcessArgs
 
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -161,6 +162,12 @@ class DiagnosticReporter;
 // mechanism this pass has no arm for, or when the declared mechanism's own
 // fields are unusable. NO resolved entry (a library TU with no `main`) is a clean
 // no-op: there is nothing to materialize into.
+//
+// `nameTableEnd` is one past the highest id the CALLER's name table holds
+// (mir/merge/synth_symbol_floor.hpp): the init and its imports are minted above it as
+// well as above every id the module holds, so the init — a GLOBAL definition — is never
+// published under a name the table gives to something else. Required —
+// tests/mir/test_synth_symbol_floor.cpp pins it.
 [[nodiscard]] DSS_EXPORT bool
 realizeEntryShape(Mir&                              mir,
                   TypeInterner&                     interner,
@@ -170,6 +177,7 @@ realizeEntryShape(Mir&                              mir,
                   std::optional<ProcessArgs> const& processArgs,
                   CSymbolDecorationScheme           scheme,
                   std::string_view                  formatName,
+                  std::uint32_t                     nameTableEnd,
                   DiagnosticReporter&               reporter);
 
 } // namespace dss

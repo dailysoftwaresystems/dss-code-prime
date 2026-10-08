@@ -447,3 +447,10 @@ dss_add_test(NAME core/test_checkpoint_cost
 if(WIN32)
     target_link_libraries(dss_core_test_checkpoint_cost PRIVATE psapi)
 endif()
+
+# P69 (lane lm — M3 of D-C-FLOAT-H-AND-FLOAT-PREDEFINES-MISSING): C's floating
+# characteristics from ONE owner per representation (core/types/float_format.hpp) —
+# every characteristic computed from the table's primary facts and pinned against the
+# standard's values, the host's std::numeric_limits and the hex spellings parsed back;
+# WideFloatValue and floatKindInfo derive from it.
+dss_add_test(NAME core/test_float_format SOURCES test_float_format.cpp)

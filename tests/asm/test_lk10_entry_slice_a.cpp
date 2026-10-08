@@ -158,10 +158,16 @@ TEST(LK10EntrySliceA, CallIndirectViaExternEmitsRel32Reloc) {
            "would double-count it and silently skew the IAT-slot VA. "
            "test-analyzer dim-2 H1 / 2-agent convergence at 756c5ea "
            "audit (FOLD-NOW pin against D-AS4-4 producer regression).";
-    auto const rel32Info =
-        (*schema)->relocationByName("rel32");
-    ASSERT_NE(rel32Info, nullptr);
-    EXPECT_EQ(relocs[0].kind, rel32Info->kind);
+    // ★ P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): the field names
+    // the IAT SLOT — a memory operand, a DATA reference — so it carries
+    // `riprel32`, the kind every RIP-relative memory and address operand
+    // declares; `rel32` is the CALL kind, and a reader that took this field as
+    // a call would call the slot's symbol a function. Same arithmetic
+    // (linear, pc-relative, bias -4), so the bytes are unchanged.
+    auto const riprel32Info =
+        (*schema)->relocationByName("riprel32");
+    ASSERT_NE(riprel32Info, nullptr);
+    EXPECT_EQ(relocs[0].kind, riprel32Info->kind);
 }
 
 TEST(LK10EntrySliceA, FullTrampolineShapeSyscallArm) {

@@ -54,20 +54,26 @@
 //     data that carries load-time relocations"), so a re-emission routes a
 //     reloc-bearing const item to a section that permits relocations.
 //   * (4) the reverse reloc map keys on the raw IMAGE_RELOCATION.Type ==
-//     the schema's `nativeId`. There is NO `pltNativeId` variant on PE (an
-//     extern call is a plain REL32 against the undefined symbol), and no
+//     the schema's `nativeId`, or one of the ids a row's
+//     `nativeIdByBytesAfterField` family declares: cl's REL32_1.._5
+//     (Types 5-9) read as REL32 with the addend their type lowers it by
+//     (`bytesAfterFieldLowersTheAddend`, P69,
+//     D-LK-COFF-READER-REFUSED-CL-REL32-BYTES-AFTER-FIELD-TYPES; the reader
+//     refused all five before). There is no second wire id for a call on PE (an
+//     extern call is a plain REL32 against the undefined symbol; the
+//     `pltNativeId` key that once spelled one on ELF is retired since P69), and no
 //     shipped PE document declares a `"isCall": true` row either -- COFF
 //     x86_64 has no branch-only relocation, REL32 being both the call
 //     displacement and the `lea rip+d` data displacement -- so
 //     `callSignalNativeIds` is EMPTY; see the isData note.
 //   * (5) each IMAGE_RELOCATION becomes a `Relocation{offset, target, kind,
-//     addend}`. COFF has NO addend column (like Mach-O): a DATA-section
-//     reloc's addend lives IN the patched slot bytes (widthBytes LE at
-//     VirtualAddress -- the writer's in-place convention), while a `.text`
-//     reloc carries addend 0 (the writer rejects a non-zero `.text`
-//     addend). The target-schema `addendBias` is un-baked so a re-emission
-//     re-adds it once (0 for the non-pcrel absolute kinds a data slot uses
-//     -- a schema invariant).
+//     addend}`. COFF has NO addend column (like Mach-O): a reloc's addend
+//     lives IN the patched field (widthBytes LE at VirtualAddress), in
+//     `.text` exactly as in data, and is read by the one owner of that rule
+//     (`link/format/relocation_addend.hpp`) -- clang and cl both write
+//     non-zero `.text` addends. The target-schema `addendBias` is un-baked
+//     so a re-emission re-adds it once (0 for the non-pcrel absolute kinds
+//     a data slot uses -- a schema invariant).
 //   * (6) COFF name mangling is IDENTITY on PE x64 (unlike Mach-O's leading
 //     underscore): a symbol name is read VERBATIM. Names <= 8 bytes are
 //     INLINE (NUL-padded) in the 8-byte field; longer names use the
@@ -150,6 +156,19 @@
 //     an extern that reaches the exec walker unresolved is rejected loud by
 //     the linker's unbound-extern gate regardless, so isData never drives a
 //     silent miscompile.
+//   * an EXTERNAL UNDEF symbol with a non-zero Value is a COMMON (PE/COFF
+//     5.4.2: the Value is its size; cl writes every C tentative definition
+//     so) and becomes a COMMON row (`ExternImport::commonSize`), aligned as
+//     the COFF linkers align it (`naturalCoffCommonAlignment`, widened by a
+//     `-aligncomm:` directive), which the link allocates once per name
+//     (P69, D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS).
+//   * the directive section's requests are read through the format's
+//     vocabulary (`coff_linker_directives.hpp`) and applied against what the
+//     object defines: a hidden or exported definition, an `/INCLUDE:` (a
+//     required reference), an `/alternatename:` (a fallback, as a weak
+//     external's undefined default is one), a `-aligncomm:`; an option the
+//     vocabulary does not declare is refused by name (P69,
+//     D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE).
 //
 // Fail-loud discipline (mirrors the c164 ELF + c168 Mach-O readers): EVERY
 // field is bounds-checked with the overflow-safe `rangeExceedsBuffer`

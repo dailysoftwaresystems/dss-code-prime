@@ -5,6 +5,7 @@ happens when the lane that owns a row is gone.
 
 ## Contents
 - The rule
+- `DISCLOSED` is not closed — and "close anchors" means the disclosed ones too (2026-10-08)
 - The gate — this is measured, not asserted
 - A row that is SHIPPED but not marked ✅ is an anchor "rising" for free
 - A lane that EXITS discharges nothing — and a lane that REPORTS has not landed
@@ -34,6 +35,51 @@ the decision. The absence of this section IS the defect this section closes.**
 4. **"Refused but not fixed" is NOT closed.** Neither is "measured and understood". Neither is
    "the row now describes the real scope". A row closes when the BEHAVIOUR changed.
 
+### ★★★★ `DISCLOSED` IS NOT CLOSED — AND "CLOSE ANCHORS" MEANS THE DISCLOSED ONES TOO — operator ruling 2026-10-08
+
+> *"disclosed is not closed, and when I tell to close anchors, is to not be a fucking lazy to open
+> disclosed fucking issues when closing other issues. Try the best to close disclosed issues along
+> the way, unless it's really a big thing not doable in the context, rare exceptions, stuff like
+> that"*
+
+✔MEASURED at the moment of the ruling (cycle P69, round 1, `dssharness check-anchor-balance` against
+the cycle's start commit): **"24 closed, 22 opened (1 created, 21 disclosed); counted -23"** — the
+gate read **−23** while the registry had gone from **620 open rows to 618**. From outside, a round
+that had closed two dozen rows had done almost nothing, and the gate said it was the best round in
+the project. Several of the 21 had been filed BY RULING — "scheduled for a later round for cycle size
+alone" — on work the lane that found it had sized at one configuration key and about 150 lines.
+`DISCLOSED` exists so that a pre-existing defect is written down instead of hidden (see
+`registry-and-priority.md`); it was being used as the cheap way to finish a finding.
+
+1. **A disclosed row is OPEN WORK, and filing it finishes nothing.** The gate's exemption — a
+   disclosed row is not a *rise* — is an honesty device, never a discharge. The number the operator
+   reads is the REAL open count.
+2. **A defect met while closing another row is FIXED in the same wave, by the lane that met it** —
+   pre-existing or not. "It pre-dates the cycle" decides which STATUS word a row carries *if a row
+   must exist at all*; it never decides whether the work is done now. Rule 2 above ("found
+   something new → DO IT") binds HEAD's debt exactly as it binds the cycle's own.
+3. **A new disclosed row is a RARE EXCEPTION**, admissible only when the fix is really big and not
+   doable in the context: a mechanism that needs its own plan and design audit, a prerequisite that
+   another lane must build first, a file another lane holds and cannot merge in time.
+   ⛔ **"Scheduled for a later round for cycle size alone" is NOT a blocker**, and it is no longer an
+   acceptable closing cell for work a lane can do inside its wave. Neither is "it is not what this
+   lane was briefed for".
+4. **The lane does not grant itself the exception, and the orchestrator does not grant it to keep a
+   round short.** The lane states the MEASURED size — the files, what must be built, what must be
+   measured first — and the orchestrator rules; the default answer is *close it now*. A long round
+   that closes what it finds is the instruction; a short round that files what it finds is the
+   failure this section names.
+5. **Existing disclosed rows are closed along the way.** A lane that touches the file or the
+   mechanism a disclosed row names closes that row in the same wave; a new round takes the disclosed
+   rows FIRST, highest band first, before any new capability; and a brief for a lane names the
+   disclosed rows in its path as work, not as background.
+6. **Report three numbers, never the counted one alone:** closed · opened, split into created and
+   disclosed · the REAL net (open now minus open at the cycle's start). A report that says only "the
+   balance holds" has hidden exactly the figure being asked about.
+7. **A reviewer treats a disclosed row left open without a real blocker as a finding**, and so does
+   the orchestrator's own fold check: read each disclosed row a lane files as a claim that the work
+   could not be done, and ask for the size before accepting it.
+
 ### The gate — this is measured, not asserted
 
 `dssharness check-anchor-balance` **already** implements *"a cycle may not end with more OPEN
@@ -57,6 +103,10 @@ skew — have none.
 ⚠ **The delta the operator cares about is NET OPEN, and it must be ≤ 0.** A cycle that closes
 three and opens three has, from outside, done nothing. Report closed / opened / **net** as three
 separate numbers in the cycle report — a single total hides exactly the thing being asked about.
+⚠ **And the gate's own "counted" figure is NOT that delta**: it leaves the rows born `🔵 DISCLOSED`
+out, so a round can print a large negative number while the registry barely moves (✔MEASURED
+2026-10-08: counted −23, real −2). Read the `change` line it prints — *closed, opened (created,
+disclosed)* — and report the REAL net beside the counted one (the section above).
 
 ### ⚠ A row that is SHIPPED but not marked ✅ is an anchor "rising" for free
 
@@ -96,7 +146,7 @@ without filing its row — the orchestrator SPAWNS A NEW LANE to close the remna
 explicitly: a new agent of the same orchestrator, briefed as lane `<o>/<a>`, which runs `/dss-cycle` AS A
 LANE and never orchestrates (orchestration.md). "Next cycle will notice" is the follow-up culture this section ends.
 
-⚠⚠ **AND THE BALANCE GATE IS BLIND TO HALF OF IT. `check-anchor-balance` COUNTS *ROWS*, so an
+⚠⚠ **AND THE BALANCE GATE IS BLIND TO HALF OF IT. `dssharness check-anchor-balance` COUNTS *ROWS*, so an
 anchor cited in source with NO ROW IS INVISIBLE TO IT.** ✔MEASURED P40: it reported **"opened 0"**
 while a finished lane had cited a minted anchor id across **six** files with
 no row anywhere in `.plans/`. Only `.harness-config/runner/actions/check-anchor-registry/check-anchor-registry.py` catches

@@ -2114,9 +2114,10 @@ struct Parser::Impl {
     //     `parenExpr` — and descending into a rule the fallback would not have
     //     replayed changes which diagnostics the author sees. That gate is also
     //     what keeps the speculation ceilings reachable on a cast chain.
-    //   * no `commitRequiresTypeName` triage on it — that guard needs a probe
-    //     to roll back, exactly as the unique-production direct descent already
-    //     requires.
+    //   * no facet on it that is decided only when a PROBE closes
+    //     (`candidateNeedsProbe_`: the `commitRequiresTypeName` triage, the
+    //     `notFollowedBy` predicate) — each needs a probe to roll back, exactly as
+    //     the unique-production direct descent already requires.
     //   * no nullable tail — an alt that may legitimately SKIP must keep that
     //     option, and committing forecloses it (D-PARSE-SPECULATIVE-OPTIONAL).
     //
@@ -2137,7 +2138,7 @@ struct Parser::Impl {
         if (speculationDepth != 0) return false;
         if (walker.nullableTail()) return false;
         const RuleId last = site.candidates[site.next];
-        if (schema->typeNameCommitRule(last).valid()) return false;
+        if (candidateNeedsProbe_(last)) return false;
         const SchemaTokenId tokKind =
             effectiveKind(tokens.peek(), identifierKind, errorKind);
         if (lastStructuralCandidate_(tokKind) != last) return false;
@@ -2171,6 +2172,19 @@ struct Parser::Impl {
         (void)finishFailedSpeculation_();
     }
 
+    // P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): a candidate the
+    // parser must PROBE rather than enter directly, because a facet of it is decided only
+    // when its probe closes and only a probe can roll it back — the type-name triage
+    // (`commitRequiresTypeName`) and the follower not-predicate (`notFollowedBy`). The two
+    // probe-free descents (`finalCandidateDirectDescent_`, the unique-survivor descent) ask
+    // this ONE question, so neither can skip a facet the other honours. (The loader's
+    // `validateNotFollowedBy` closes the remaining ways in: a non-candidate reference and
+    // the alt's fallback replay.)
+    [[nodiscard]] bool candidateNeedsProbe_(RuleId rule) const {
+        return schema->typeNameCommitRule(rule).valid()
+            || !schema->notFollowedBy(rule).empty();
+    }
+
     // The branch frame closed with the probe still clean: the FC2 type-name
     // commit guard decides. A `commitRequiresTypeName`-marked branch commits
     // only per the generic triage (lone-identifier type names need
@@ -2180,6 +2194,24 @@ struct Parser::Impl {
     // candidate — the value reading.
     void decideClosedCandidate_() {
         SpeculationSite& site = specStack.back();
+        // P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): the branch's
+        // NOT-PREDICATE on its follower (`notFollowedBy`, config-declared): a clean close
+        // followed by one of those token kinds is not this branch's reading — `sizeof ( T )`
+        // followed by `{` is `sizeof` of the compound literal `( T ){ … }` (C 6.5.2.5, a
+        // postfix-expression) — so the site tries its next candidate, exactly as a refused
+        // type-name commit does.
+        if (auto const notAfter = schema->notFollowedBy(site.branch); !notAfter.empty()) {
+            // The follower is the next SIGNIFICANT token — trivia looked through exactly as
+            // the alt's own dispatch does. The raw `tokens.peek()` this read first was the
+            // whitespace, newline or comment between `)` and `{`, so `sizeof (int[]) {1, 2}`
+            // stayed a parse error while `sizeof (int[]){1, 2}` parsed (✔MEASURED, probe nfb).
+            SchemaTokenId const next = peekSignificantKind(0);
+            if (std::binary_search(notAfter.begin(), notAfter.end(), next,
+                                   [](SchemaTokenId a, SchemaTokenId b) { return a.v < b.v; })) {
+                abandonAndAdvance_();
+                return;
+            }
+        }
         if (const RuleId typeRule = schema->typeNameCommitRule(site.branch);
             typeRule.valid()) {
             if (!typeNameCommitApproved_(site.branch, typeRule,
@@ -2680,15 +2712,16 @@ struct Parser::Impl {
                 // every OTHER branch was proven unable to match the
                 // upcoming tokens, so the survivor is the only possible
                 // parse — committing to it discards nothing. A surviving
-                // candidate WITH a commit guard is excluded (it keeps
-                // speculating so the binder triage runs: the genuine
-                // `(Identifier)` cast-vs-paren case where both `castExpr`
-                // and `parenExpr` survive is unaffected, and a lone
-                // guarded survivor still gets its triage). Fully generic —
-                // no token, rule, or language is named.
+                // candidate WITH a facet decided only when its probe closes
+                // (`candidateNeedsProbe_`: a commit guard, a follower
+                // predicate) is excluded (it keeps speculating so the binder
+                // triage / the predicate runs: the genuine `(Identifier)`
+                // cast-vs-paren case where both `castExpr` and `parenExpr`
+                // survive is unaffected, and a lone guarded survivor still gets
+                // its triage). Fully generic — no token, rule, or language is
+                // named.
                 if (candidates.size() == 1
-                    && !schema->typeNameCommitRule(candidates.front())
-                            .valid()) {
+                    && !candidateNeedsProbe_(candidates.front())) {
                     const RuleId only = candidates.front();
                     if (schema->isExprRule(only)) {
                         prattWalker->walkExpression(

@@ -65,8 +65,10 @@ class HarnessDie(Exception):
 
 
 class CloneLockBlocked(HarnessDie):
-    """Another harness run owns the shared sqlite clone: exit 3, first stderr line
-    `DSS-CLONE-LOCK-BLOCKED` (a contract callers read)."""
+    """Another harness run holds the sqlite checkout this run stages from: exit 3, first stderr line
+    `DSS-CLONE-LOCK-BLOCKED` (a contract callers read). Each run's own checkout is its output tree's
+    (`sqlite_stage.consumer_checkout`), so two runs meet here only on a checkout a person named for both
+    (SQLITE_DIR, by hand)."""
     exit_code = 3
 
 
@@ -284,43 +286,111 @@ def host_is_wsl():
         return False
 
 
+_WSL_DISTRIBUTIONS = {}
+
+
+def wsl_distribution(tree=None):
+    """The WSL distribution this harness's POSIX half runs in on a Windows host: the ONE distribution the WSL legs
+    of the tree's own DssHarness configuration declare (`.harness-config/config.json`, `legs.<leg>.wsl` -- the linux
+    x86_64 legs), READ, never typed here. ★ (2026-09-30, the round-12 audit's S8): the POSIX half used to enter
+    `wsl.exe -e`, the machine's DEFAULT distribution -- whatever a person last set -- while the WSL legs run in the
+    one their configuration names, so the derive could configure sqlite in one Linux and the WSL leg run in
+    another. ONE READER: the resolver's (`harness_legs.py --wsl-distribution`), the same one that enters the
+    distribution into every argv the legs' launchers, path translator, probes and sweeps are spawned with -- a
+    second reader here would be a second place for the two halves to disagree. Refused, by name (the resolver's
+    words), when the configuration cannot be read, when no leg declares a distribution, and when the legs declare
+    two. Read once per tree; `tree` is the self-tests'."""
+    key = tree or ""
+    if key not in _WSL_DISTRIBUTIONS:
+        r = Resolver(host_os(), host_arch()).call(
+            ["--wsl-distribution"] + (["--config-tree", tree] if tree else []), catalogue=False)
+        if r.rc != 0:
+            die("the WSL distribution the POSIX half runs in could not be read (the resolver exited %d):\n%s"
+                % (r.rc, last_lines(r.err or r.out, 6)))
+        try:
+            name = json.loads(r.out)["wslDistribution"]
+        except (ValueError, KeyError, TypeError):
+            name = None
+        if not isinstance(name, str) or not name:
+            die("the resolver's --wsl-distribution exited 0 but named no distribution:\n%s"
+                % first_lines(r.out, 4))
+        _WSL_DISTRIBUTIONS[key] = name
+    return _WSL_DISTRIBUTIONS[key]
+
+
 class PosixSide:
     """Where this harness's POSIX half runs: in THIS process on a POSIX host, and inside WSL
-    (`wsl.exe -e …`, never a login shell, never `wsl.exe --`) on a Windows host -- the ONE
-    host-keyed switch the Windows driver had (`HostNeedsWsl`), which decides WHERE the POSIX
-    toolchain runs and never which legs exist."""
+    (`wsl.exe -d <distribution> -e …`, never a login shell, never `wsl.exe --`) on a Windows host --
+    the ONE host-keyed switch the Windows driver had (`HostNeedsWsl`), which decides WHERE the POSIX
+    toolchain runs and never which legs exist. The distribution is the one the tree's WSL legs declare
+    (`wsl_distribution`), read when first needed -- never the machine's default; `distribution` is the
+    self-tests' injection."""
 
-    def __init__(self, host):
+    def __init__(self, host, distribution=None):
         self.needs_wsl = host == "windows"
+        self._distribution = distribution
+
+    @property
+    def distribution(self):
+        """The WSL distribution the POSIX half runs in ("" on a POSIX host), read once."""
+        if not self.needs_wsl:
+            return ""
+        if self._distribution is None:
+            self._distribution = wsl_distribution()
+        return self._distribution
+
+    def entry(self):
+        """The argv prefix that enters the POSIX side: `wsl.exe -d <distribution> -e` on a Windows host, nothing
+        on a POSIX host -- the ONE spelling every command into the POSIX side takes."""
+        return ["wsl.exe", "-d", self.distribution, "-e"] if self.needs_wsl else []
 
     def argv(self, args):
-        return (["wsl.exe", "-e"] + [str(a) for a in args]) if self.needs_wsl else [str(a) for a in args]
+        return self.entry() + [str(a) for a in args]
 
     def to_posix(self, path):
         """A host path in the POSIX side's namespace (`wslpath -a -u` inside WSL)."""
         if not self.needs_wsl:
             return path
-        r = capture(["wsl.exe", "-e", "wslpath", "-a", "-u", path], timeout=60)
+        argv = self.argv(["wslpath", "-a", "-u", path])
+        r = capture(argv, timeout=60)
         out = r.out.replace("\0", "").strip().splitlines()
         if r.rc != 0 or not out:
-            die("could not translate '%s' into WSL's namespace (wsl.exe -e wslpath -a -u exited %d: %s)"
-                % (path, r.rc, (r.err or r.out).replace("\0", "").strip()[:200]))
+            die("could not translate '%s' into WSL's namespace (`%s` exited %d: %s)"
+                % (path, " ".join(argv[:-1]), r.rc, (r.err or r.out).replace("\0", "").strip()[:200]))
         return out[-1].strip()
 
     def to_host(self, path):
         """A POSIX-side path in THIS host's namespace (`wslpath -m`, forward slashes)."""
         if not self.needs_wsl:
             return path
-        r = capture(["wsl.exe", "-e", "wslpath", "-m", path], timeout=60)
+        argv = self.argv(["wslpath", "-m", path])
+        r = capture(argv, timeout=60)
         out = r.out.replace("\0", "").strip().splitlines()
         if r.rc != 0 or not out:
-            die("could not translate the WSL path '%s' back to this host (wslpath -m exited %d)"
-                % (path, r.rc))
+            die("could not translate the WSL path '%s' back to this host (`%s` exited %d)"
+                % (path, " ".join(argv[:-1]), r.rc))
         return out[-1].strip()
 
 
 def which(name):
     return shutil.which(name)
+
+
+def posix_cache_root(environ=None):
+    """The POSIX side's user cache, `$XDG_CACHE_HOME`, else `$HOME/.cache`, read from `environ` -- the POSIX
+    side's OWN environment (this process's by default: the rule runs where that side is; a Windows driver asks
+    WSL for the two values and hands them here). ONE rule for everything the harness keeps in that cache: the
+    checkouts' lock state (`sqlite_procs.clone_lock_key`) and a Windows consumer's own sqlite checkout
+    (`sqlite_stage.consumer_checkout`). Refused when neither is set: there is no other home to fall back to."""
+    env = os.environ if environ is None else environ
+    base = env.get("XDG_CACHE_HOME") or ""
+    if not base:
+        home = env.get("HOME") or ""
+        if not home:
+            die("neither XDG_CACHE_HOME nor HOME is set on the POSIX side, so the harness's cache there (the "
+                "checkouts' lock state, a Windows consumer's own checkout) has no home.")
+        base = home + "/.cache"
+    return base
 
 
 # ── what this host can do, and whether it must ──────────────────────────────────────
@@ -466,19 +536,27 @@ def site_pinned(site, lack):
                                                                     runs[TEST_ONLY_HOST].outcomes())
 
 
-def wsl_usable(runner=None, which_=None):
-    """(usable, why) for this host's WSL: usable when `wsl.exe` is on PATH AND runs a command in a
-    distribution -- `wsl.exe -e echo <WSL_ANSWER>` exits 0 and prints the token. `why` is the measured
-    reason it is not, in wsl.exe's own words (its UTF-16 output read without the NULs). The real host
-    is probed once per process; `runner` (argv -> Result) and `which_` are the self-tests' injections."""
+def wsl_usable(runner=None, which_=None, side=None):
+    """(usable, why) for this host's WSL: usable when `wsl.exe` is on PATH AND runs a command in the
+    distribution the POSIX half runs in (`PosixSide`: the one the tree's WSL legs declare, 2026-09-30) --
+    `wsl.exe -d <it> -e echo <WSL_ANSWER>` exits 0 and prints the token. `why` is the measured reason it is
+    not, in wsl.exe's own words (its UTF-16 output read without the NULs), or why the distribution cannot be
+    named. The real host is probed once per process; `runner` (argv -> Result), `which_` and `side` (a
+    PosixSide) are the self-tests' injections."""
     global _WSL_USABLE
-    real = runner is None and which_ is None
+    real = runner is None and which_ is None and side is None
     if real and _WSL_USABLE is not None:
         return _WSL_USABLE
+    argv = None
     if not (which_ or shutil.which)("wsl.exe"):
         got = (False, "wsl.exe is not on PATH")
     else:
-        argv = ["wsl.exe", "-e", "echo", WSL_ANSWER]
+        try:
+            argv = (side or PosixSide("windows")).argv(["echo", WSL_ANSWER])
+        except HarnessDie as exc:
+            got = (False, "wsl.exe is on PATH but the distribution the POSIX half runs in cannot be named: %s"
+                   % " ".join(str(exc).split()))
+    if argv is not None:
         r = (runner or (lambda a: capture(a, timeout=WSL_PROBE_TIMEOUT_S)))(argv)
         if r.rc == 0 and WSL_ANSWER in (r.out or "").replace("\0", ""):
             got = (True, "")
@@ -533,8 +611,10 @@ def output_tree(repo_root, host, out_dir=""):
     """The sqlite harness's OUTPUT TREE, the ONE rule every mode reads: OUT_DIR (`out_dir`, when set -- as the
     variable holds it: `path_knob` normalises it here, once, for every caller), else
     `<repo_root>/build/real-examples/c/sqlite`, under `windows/` on a Windows host. The driver's run and its
-    stage live under it, the recompile finds that stage there, and the speedtest1 benchmark keeps its pinned
-    checkout, its scratch and its default output there -- inside the tree, never beside it."""
+    stage live under it -- on a POSIX host its own sqlite checkout too, `checkout/` (a Windows host's is in WSL's
+    cache, keyed by this tree: `sqlite_stage.consumer_checkout`) -- the recompile finds that stage there, and the
+    speedtest1 benchmark keeps its pinned checkout, its scratch and its default output there -- inside the tree,
+    never beside it."""
     out_dir = path_knob(out_dir, "OUT_DIR")
     if out_dir:
         return os.path.abspath(out_dir)
@@ -734,6 +814,24 @@ def cpu_count():
         return os.cpu_count() or 4
 
 
+# ★ WHAT STEERS A RUN -- ONE STATEMENT (2026-09-30, the round-12 audit's S4): every environment variable the driver's
+# run reads -- each one `Config` reads below (DC-30 holds this tuple to Config's own source), and DSS_LOADEXT_HELPER,
+# which the resolver reads in the run's own child. By hand every one still steers a run: a person sets it on purpose.
+# In STEP mode -- the driver started by a DssHarness step, which says so on its run line (`--step=<name>`; DssHarness
+# sets no variable of its own that a program could read it from, `dssharness help runners`) -- each one SET that is
+# not an input the step declares is REFUSED by name: a step takes its values on its command line, from its inputs, and
+# a variable a person or a host's profile left in the environment would otherwise steer every step that host runs,
+# unseen by the run line and by the step's report (a leg dropped by DSS_LEGS was only warned about, and the success
+# line still printed).
+STEERING = ("SRC_DIR", "DSS_REPO_URL", "SQLITE_REPO_URL", "SQLITE_DIR", "SQLITE_WSL_DIR", "OUT_DIR", "DSS_JOBS",
+            "JOBS", "DSS_BRANCH", "DSS_COMMIT", "DSS_ALLOW_FRESH_CLONE", "DSS_TCL_VERSION", "DSS_TIER",
+            "DSS_TEST_FILE", "DSS_CONFIG", "DSS_CONFOUNDS", "DSS_TIER_EXCLUDES", "DSS_MAX_RESUMES",
+            "DSS_SEGMENT_STALL", "DSS_PROGRESS_INTERVAL", "DSS_SEGMENT_TIMEOUT", "DSS_KILL_SETTLE",
+            "DSS_STRICT_ARM_VERDICTS", "DSS_ALLOW_NONRELEASE_COMPILER", "DSS_LEGS", "DSS_RUN_FIDELITY",
+            "DSS_SKIP_SELFTEST", "DSS_CONFIG_ROOT", "DSS_BIN", "TCL_DLL", "ZLIB_DLL", "DSS_HOST_LIBDIR",
+            "DSS_LOADEXT_HELPER")
+
+
 class Config:
     """Every environment knob of both old drivers, read and VALIDATED once, before Step 1 does
     anything (a malformed number died in shell arithmetic or an `[int]` cast hours in).
@@ -747,17 +845,19 @@ class Config:
     KNOBS = (("tier", "--tier", "DSS_TIER"), ("dss_config", "--dss-config", "DSS_CONFIG"),
              ("test_file", "--test-file", "DSS_TEST_FILE"), ("dss_bin", "--dss", "DSS_BIN"))
 
-    def __init__(self, knobs=None):
+    def __init__(self, knobs=None, step=None):
         self.src_dir = path_knob(env("SRC_DIR"), "SRC_DIR")    # "" = the tree this harness ships in
         self.dss_repo_url = env("DSS_REPO_URL",
                                 "git@github.com:dailysoftwaresystems/dss-code-prime.git")
         self.sqlite_repo_url = env("SQLITE_REPO_URL", "https://github.com/sqlite/sqlite.git")
-        # THE POSIX-SIDE path of the shared sqlite clone (the .ps1 named it SQLITE_WSL_DIR).
+        # An EXPLICIT sqlite checkout, named by hand as its POSIX-side path (the .ps1 named it SQLITE_WSL_DIR).
+        # Unset -- as every harness step leaves it -- each run stages from ITS OWN checkout
+        # (`sqlite_stage.consumer_checkout`: inside its output tree, or in WSL's cache keyed by it).
         a, b = env("SQLITE_DIR"), env("SQLITE_WSL_DIR")
         if a and b and a != b:
-            die("SQLITE_DIR='%s' and SQLITE_WSL_DIR='%s' name two different clones; both name the "
-                "POSIX-side sqlite clone of this run, so set one of them." % (a, b))
-        self.sqlite_dir = a or b                           # "" = ~/src/sqlite on the POSIX side
+            die("SQLITE_DIR='%s' and SQLITE_WSL_DIR='%s' name two different checkouts; both name the "
+                "POSIX-side sqlite checkout of this run, so set one of them." % (a, b))
+        self.sqlite_dir = a or b                           # "" = this run's own checkout
         self.out_dir = path_knob(env("OUT_DIR"), "OUT_DIR")    # "" = derived from the tree (Run)
         # DSS_JOBS (the .ps1's name) wins over JOBS (the .sh's); both validated.
         jobs_name = "DSS_JOBS" if env("DSS_JOBS").strip() else "JOBS"
@@ -816,6 +916,26 @@ class Config:
                     "harness step uses -- unset %s." % (flag, given, var, named, var))
             setattr(self, attr, given)
             self.by[attr] = flag
+        # ★ STEP MODE (2026-09-30, the round-12 audit's S4 and S6; `STEERING` says why). `step` is the name the run
+        # line gave with `--step=`; its inputs are the knobs its command line carries, and every OTHER steering
+        # variable set in the step's environment is refused by name -- before anything is read from the host.
+        self.step = step or ""
+        self.strict_by = "DSS_STRICT_ARM_VERDICTS=1" if self.strict else ""
+        if self.step:
+            declared = set(var for attr, _flag, var in self.KNOBS if attr in knobs)
+            ambient = [v for v in STEERING if os.environ.get(v) not in (None, "") and v not in declared]
+            if ambient:
+                die("the `%s` step is steered by its own inputs alone, on its command line (sqlite.yml): %s %s set in "
+                    "this step's environment and %s no input of it -- unset %s. A DssHarness step takes a value only "
+                    "through `--input <name>=<value>`, for an input sqlite.yml declares; by hand (no --step) the "
+                    "driver still reads every one of them."
+                    % (self.step, ", ".join(ambient), "is" if len(ambient) == 1 else "are",
+                       "is" if len(ambient) == 1 else "are", " ".join(ambient)))
+            # ...and a STEP's leg set cannot shrink: every environmental skip -- a launcher prerequisite or a
+            # declared build input this host lacks -- FAILS a step, as DSS_STRICT_ARM_VERDICTS=1 makes it fail by
+            # hand, because the step's leg set is the catalogue's and nothing on its command line can narrow it.
+            self.strict = True
+            self.strict_by = "the `%s` harness step (a step's leg set may not shrink)" % self.step
 
     def corpus_label(self):
         """What the unit corpus of this run IS, named ONCE for every line that reports it: the one file a
@@ -850,7 +970,7 @@ class Run:
         self.clone_lock = None
         self.stage = None          # sqlite_stage.StageResult (Steps 3–4 + header discovery)
         self.stage_dir = ""        # where a Windows host's staged copy lives
-        self.sqlite_dir_posix = "" # the shared sqlite clone, spelled on the POSIX side
+        self.sqlite_dir_posix = "" # this run's sqlite checkout, spelled on the POSIX side
         self.zinc_stage_dirs = {}  # headerStageKey -> the staged zlib header dir
         self.cfg_stage_dirs = {}   # configStageKey -> the staged sqlite_cfg.h dir
         self.gen_caps = {}         # what the manifest generator accepts (probed)

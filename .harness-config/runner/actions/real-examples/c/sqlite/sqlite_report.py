@@ -258,8 +258,10 @@ def step9(run):
                        "artifact was exercised and the reason is OURS\")." % (len(poisoned),
                                                                              " ".join(poisoned)))
     if env_skips and cfg.strict:
-        reasons.append("%d ENVIRONMENTAL skip(s) and DSS_STRICT_ARM_VERDICTS=1: %s — each is a DECLARED "
-                       "input this machine could not supply." % (len(env_skips), " ".join(env_skips)))
+        reasons.append("%d ENVIRONMENTAL skip(s) and a STRICT run (%s): %s — each is a DECLARED input this "
+                       "machine could not supply." % (len(env_skips),
+                                                        getattr(cfg, "strict_by", "") or "DSS_STRICT_ARM_VERDICTS=1",
+                                                        " ".join(env_skips)))
     if lc.verified == 0:
         if lc.environmental > 0:
             reasons.append("NO declared leg reached a VERIFIED verdict, and %d non-verification(s) are "

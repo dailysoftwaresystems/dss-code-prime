@@ -1,0 +1,24 @@
+{
+  "$comment": "★★ A LINKED OBJECT'S IMAGE REQUESTS LAND IN THE HEADER (P69 round 4, D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE). The archive's one member is cl 19.44's `/c /O2 /MD /GS-` build of six `#pragma comment(linker, ...)` lines and `int dss_header_member(void) { return 0; }` -- its `.drectve`: `/HEAP:0x200000,0x10000 /VERSION:3.5 /SUBSYSTEM:WINDOWS,6.02 /ENTRY:mainCRTStartup /BASE:0x200000000 /ALIGN:0x2000`. main.c reads each field back from its own image: the heap reserve and commit (2), the image version 3.5 (3), the GUI subsystem (4), its version 6.02 (5) and the operating-system version link.exe sets with it (6), the 8 KiB section alignment (7) and every section's address on it (8). The image is a GUI one and still exits 42: its startup calls `main`, the C runtime's console startup the member names. ✔MEASURED 2026-10-07 (`.orchestrators/p69/work/xa/r4fix/fix.log`): the same main.c built by cl and linked against this archive runs to 42 under link.exe 14.44; lld-link 19.1.5 refuses the member (`/HEAP:`, `/VERSION:`, `/BASE:` and `/ALIGN:` are 'not allowed in .drectve'), and acceptance is the union's. The preferred base is not read back: the image is DYNAMIC_BASE, so the loader places it where it chooses (the header field is pinned by `CoffDirectiveImageRequests.TheHeaderRequestsLandWithLinkExesPrecedence`). The member's `/ENTRY:mainCRTStartup` is the startup the image has anyway, and a member the archive search pulls names no entry (`examples/c/pe_foreign_directive_entry_from_an_archive_member_warned`), so it changes nothing and says nothing.",
+  "$commentRedOnDisable": "REMOVE direction, executed 2026-10-07 (lane `xa`, ledger id `r4-SUBSYSTEM`): in `effectivePeHeader` (`src/link/format/pe.cpp`), `if (d.subsystem.has_value()) {` becomes `if (false && d.subsystem.has_value()) {`, so the document's console subsystem and its versions stand. Built and run through ctest by one harness call, source md5 a1922da3 -> 4e4b4c47 -> a1922da3, run 20261007-091720-94f9819a (windows-x86_64-debug): this example RED in BOTH runners, `CoffDirectiveImageRequests.TheHeaderRequestsLandWithLinkExesPrecedence` with it. CONTROL: the restored bytes, green in the row's final runs.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "cl 19.44 `/c /O2 /MD /GS-` + llvm-ar 19.1.5 `rcs --format=gnu` (member md5 d7bc5e40e2383473079585e1fa6bf963, archive md5 8a7f811abe26e4905628c5b1a8445d84). The witness is the first of the member's directives.",
+          "path": "tests/link/data/libpe_directive_header_x86_64_pe.a",
+          "containerWitness": "/HEAP:0x200000,0x10000"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

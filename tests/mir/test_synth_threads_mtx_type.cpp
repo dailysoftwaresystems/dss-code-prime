@@ -77,6 +77,7 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "mir/merge/synth_symbol_floor.hpp"  // kNoNameTable (a hand-built module has no name table)
 #include "mir/merge/synth_threads_shim.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
@@ -219,7 +220,7 @@ TEST(SynthThreadsMtxType, PthreadMtxInitHonoursTheTypeArgument) {
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthreadVehicle(),
                                       CSymbolDecorationScheme::LeadingUnderscore,
-                                      externs, rep));
+                                      externs, kNoNameTable, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     auto const fn = findFunc(mir, kMtxInitSym);
@@ -319,7 +320,7 @@ TEST(SynthThreadsMtxType, PthreadMtxInitStaysASingleBlockRecipe) {
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthreadVehicle(),
                                       CSymbolDecorationScheme::LeadingUnderscore,
-                                      externs, rep));
+                                      externs, kNoNameTable, rep));
     auto const fn = findFunc(mir, kMtxInitSym);
     ASSERT_TRUE(fn.has_value());
     EXPECT_EQ(mir.funcBlockCount(*fn), 1u)
@@ -338,7 +339,7 @@ TEST(SynthThreadsMtxType, Win32MtxInitTouchesNoMutexAttrAndReadsNoTypeArgument) 
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, win32Vehicle(),
-                                      CSymbolDecorationScheme::None, externs, rep));
+                                      CSymbolDecorationScheme::None, externs, kNoNameTable, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     auto const fn = findFunc(mir, kMtxInitSym);

@@ -533,7 +533,8 @@ private:
                 return;
             }
             case MirOpcode::Unreachable:
-                dst_.addUnreachable();
+                // P69: what the terminator asserts survives the merge.
+                dst_.addUnreachable(static_cast<MirUnreachableKind>(src_.instPayload(id)));
                 return;
             case MirOpcode::IndirectBr: {
                 // D-CSUBSET-COMPUTED-GOTO: ★ THE SILENT-MISCOMPILE CLONE SITE (MF-A).

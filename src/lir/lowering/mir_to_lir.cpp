@@ -1214,16 +1214,33 @@ struct Lowerer {
     // address is taken) when the format declares `externAddrBinding ==
     // Got`. Distinct from `slotIndirectAddrSymbols_` (the Mach-O DSS-local
     // __got model, data-only): there the __got slot is DSS-bound + reached
-    // via lea+deref; HERE the FOREIGN linker owns the slot, reached via
-    // the arm64 GOT-page relocs of the `lea_extern_got` macro. The two
-    // are mutually exclusive by FORMAT (a format declares dataImportBinding
-    // OR externAddrBinding, never both), so their arms never contend.
-    // Likewise disjoint from the `externCallDispatch == IndirectSlot`
-    // contribution above: no shipped format declares BOTH `got` and
-    // `indirect-slot`, and the slot-deref arm is ordered first anyway.
+    // via lea+deref; HERE the slot is one the LINK makes (a foreign
+    // linker's GOT, or `lowerGotSlotReferences` in DSS's own image link),
+    // reached through the `lea_extern_got` row. ★ P69
+    // (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): a format MAY
+    // declare BOTH, and the ELF DSO and every Mach-O image do, deliberately:
+    // a DATUM is in both sets and takes the slot-indirect arm, which
+    // `lowerGlobalAddr` orders FIRST, so it keeps the slot the image binds
+    // for it; a FUNCTION is only in this set, so its ADDRESS takes the GOT
+    // arm while a call to it still folds to a direct call. (This used to
+    // say the two were mutually exclusive by format; nothing validated
+    // that, and the order below is what makes the combination sound.)
+    // The `externCallDispatch == IndirectSlot` contribution above combines
+    // with it the same way, and the PE relocatable documents declare both
+    // (P69 review M2): a WEAK import is in the slot-indirect set too, so it
+    // keeps its object-carried `.refptr` slot — its call site dereferences
+    // that slot, and the slot-deref arm is ordered first — while a STRONG
+    // function import's address takes the GOT arm (COFF has no GOT
+    // relocation, so the link gives it a carried pointer,
+    // `lowerGotSlotReferences`; P69 re-review MAJOR 2).
     // Empty for every non-`got` module ⇒ lowering byte-identical.
     std::optional<ExternAddrBinding> externAddrBinding_;
     std::unordered_set<std::uint32_t> externAddrGotSymbols_;
+    // ★★ P69 round 4 (D-LIR-WEAK-FUNCTION-NAMED-DIRECTLY-WHERE-NO-FIELD-REACHES-ZERO):
+    // every WEAK import. Its ADDRESS takes the GOT arm above on every format,
+    // and a call to it outside the slot shape is a call THROUGH that address
+    // (`weakImportCalledThroughItsAddress`) — see the constructor.
+    std::unordered_set<std::uint32_t> weakImportSymbols_;
 
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the ACTIVE format's thread-local
     // access block + the ctor-populated set of THREAD-LOCAL SymbolIds
@@ -1493,9 +1510,29 @@ struct Lowerer {
         // explicitly declared GotIndirect binding — a nullopt binding (a
         // relocatable format, which binds no imports) leaves the set empty
         // rather than guessing an indirection level.
+        // ★★ P69 (D-LIR-THREAD-LOCAL-IMPORT-STAMPED-READ-THROUGH-A-SLOT): a
+        // THREAD-LOCAL import never joins this set, under this binding or the
+        // dispatch below. Its access is the format's TLS sequence
+        // (`lowerThreadLocalGlobalAddr`, which `lowerGlobalAddr` runs FIRST),
+        // and no model DSS lowers reads an address slot: local-exec adds a
+        // link-time tpoff to the thread pointer, `pe-indexed` reads the
+        // image's `_tls_index`, `macho-tlv` calls through the variable's own
+        // descriptor (the one that would, initial-exec, is unimplemented and
+        // refused by name, D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC). The set is
+        // what the import row's `readThroughSlot` is stamped from, so a
+        // thread-local in it left stamped as a slot read its code never
+        // makes, and the link then minted an address slot for the
+        // definition and retargeted the thread-pointer relocation into it —
+        // ✔MEASURED at HEAD 71648598 and this round's tree alike: a DSS
+        // `extern _Thread_local int shared;` read against gcc's or clang's
+        // object of `_Thread_local int shared = 7;` was refused on both ELF
+        // execs (`K_RelocationKindMismatch`, the writer's thread-local
+        // data-item backstop) where GNU ld and ld.lld link it and it exits 7.
         if (dataImportBinding_ == DataImportBinding::GotIndirect) {
             for (auto const& e : externImports) {
-                if (e.isData) slotIndirectAddrSymbols_.insert(e.symbol.v);
+                if (e.isData && !e.isThreadLocal) {
+                    slotIndirectAddrSymbols_.insert(e.symbol.v);
+                }
             }
         }
         // D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET
@@ -1523,16 +1560,21 @@ struct Lowerer {
         // slot deref — the half-narrowing the linker's own comment warns
         // about (retarget narrowed, call shape format-wide) is a miscompile,
         // and the two halves moving together is what makes this one safe.
+        // (A thread-local import stays out here too — the rule above, which is
+        // about the ACCESS, not the binding: a weak thread-local's access reads
+        // no `.refptr` slot either.)
         if (externCallDispatch_ == ExternCallDispatch::IndirectSlot) {
             for (auto const& e : externImports) {
-                if (importTakesSlot(e.binding)) {
+                if (importTakesSlot(e.binding) && !e.isThreadLocal) {
                     slotIndirectAddrSymbols_.insert(e.symbol.v);
                 }
             }
         }
         // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got`
-        // extern-address format (arm64 ELF relocatable / static-archive
-        // member), an undefined extern's ADDRESS-as-a-VALUE must
+        // extern-address format (every relocatable and static-archive
+        // document since P69 — the arm64 ELF ones since TF-C52 — and the
+        // images that cannot make a stub canonical: ELF `-dyn`, Mach-O, PE),
+        // an undefined extern's ADDRESS-as-a-VALUE must
         // materialize through a foreign-linker GOT slot (the
         // `lea_extern_got` macro), NOT an absolute page-pair lea a foreign
         // default-PIE link would reject. Collect ALL extern imports —
@@ -1545,6 +1587,28 @@ struct Lowerer {
         // arm; only the value/argument use reaches the GOT macro.)
         if (externAddrBinding_ == ExternAddrBinding::Got) {
             for (auto const& e : externImports) {
+                externAddrGotSymbols_.insert(e.symbol.v);
+            }
+        }
+        // ★★ P69 round 4 (D-LIR-WEAK-FUNCTION-NAMED-DIRECTLY-WHERE-NO-FIELD-REACHES-ZERO):
+        // A WEAK import may resolve to NOTHING, and then neither a displacement
+        // nor a branch reaches it in an image the loader moves or whose writer
+        // gives the branch no stub (`weakResolvedToNothing` refuses both there),
+        // while a SLOT holding 0 is what every image link makes for it
+        // (`lowerGotSlotReferences`, `resolvedToNothing`). So its ADDRESS takes
+        // the GOT arm on every format, and a call to it is a call through that
+        // address (`weakImportCalledThroughItsAddress`): gcc's own shape for a
+        // weak symbol on aarch64 and under -fPIE / -fno-plt, clang's on PE (a
+        // slot for both the test and the call), ld64's GOT load (✔MEASURED, the
+        // row's probe runs). Keyed on the BINDING, never on a format: the
+        // address of a symbol that may be absent is read, not computed. A DATUM
+        // whose format binds data imports through a slot keeps that arm, which
+        // `lowerGlobalAddr` orders first; a format that already reaches weak
+        // imports through its own slot (`indirectSlotBindings: ["weak"]`) keeps
+        // that call shape, which `externRefUsesSlot` answers first.
+        for (auto const& e : externImports) {
+            if (e.binding == SymbolBinding::Weak) {
+                weakImportSymbols_.insert(e.symbol.v);
                 externAddrGotSymbols_.insert(e.symbol.v);
             }
         }
@@ -1794,6 +1858,18 @@ struct Lowerer {
     // the only way they can still agree.
     [[nodiscard]] bool externRefUsesSlot(SymbolId s) const noexcept {
         return slotIndirectAddrSymbols_.contains(s.v);
+    }
+
+    // ★★ P69 round 4 (D-LIR-WEAK-FUNCTION-NAMED-DIRECTLY-WHERE-NO-FIELD-REACHES-ZERO):
+    // is a call to `s` a call THROUGH its address? For a WEAK import outside
+    // the slot shape, yes: the address comes out of the GOT arm (a slot holding
+    // 0 when nothing defines the name) and the call branches to the register,
+    // so a guarded call never taken links on every image and an unguarded one
+    // jumps to 0 as the references' PLT entry does. Read by the direct-callee
+    // fold (which must then keep the address) and by `lowerCall` (which must
+    // then call the register), so the two cannot disagree.
+    [[nodiscard]] bool weakImportCalledThroughItsAddress(SymbolId s) const noexcept {
+        return weakImportSymbols_.contains(s.v) && !externRefUsesSlot(s);
     }
 
     // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: may this artifact's
@@ -7028,7 +7104,30 @@ struct Lowerer {
             emitAlignUpToPowerOfTwo(sizeWithHeadroom, stackAlign,
                                     "a variable-length array's runtime byte size");
         if (!size16Opt.has_value()) { poisonValue(id); return; }
-        LirReg const size16 = *size16Opt;
+        LirReg size16 = *size16Opt;
+        // ★ THE DESCENT'S SIZE OPERAND IS A REGISTER DEFINED FOR IT ALONE. Under a
+        //   calling convention that declares a guard page, the callconv pass COUNTS
+        //   THIS REGISTER DOWN while it walks the pages the descent crosses
+        //   (D-CSUBSET-VLA-WIN64-STACK-PROBE) — sound only because nothing reads it
+        //   after the descent. The headroom add and the align-up above each define a
+        //   fresh register, but an alignment of 1 hands back the align-up's INPUT, so
+        //   with no headroom either the descent would read the program's own size
+        //   value, which other instructions may still read. That one case gets a copy
+        //   of its own, so the contract holds by construction whatever a target
+        //   declares (no shipped cc aligns its stack to 1, so no shipped byte moves).
+        if (size16 == *sizeRaw) {
+            auto const movOp = opcode(MnemonicSlot::Mov);
+            if (!movOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Mov,
+                                    "a variable-length array's stack-descent size");
+                poisonValue(id);
+                return;
+            }
+            LirReg const own = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> ops{LirOperand::makeReg(size16)};
+            emitInst(*movOp, own, ops, /*payload=*/0, /*flags=*/0);  // width 64
+            size16 = own;
+        }
         // `sub sp, size16`: descend the stack. operand0 = the physical SP (the r/m
         // destination+source1 on x86, the baked Rd=Rn=sp on arm64), operand1 = the
         // aligned byte count. result:none (SP mutates in place). A physical-reg
@@ -9902,6 +10001,9 @@ struct Lowerer {
         }
         MirInstId const user = it->second.user;
         if (mir.instOpcode(user) != MirOpcode::Call) return false;
+        // P69 round 4: a weak import's callee address is READ, not folded —
+        // `lowerCall` calls through it (`weakImportCalledThroughItsAddress`).
+        if (weakImportCalledThroughItsAddress(mir.globalAddrSymbol(gaId))) return false;
         auto const userOps = mir.instOperands(user);
         // operand[0] is the callee slot; a GlobalAddr at operand ≥ 1 is a call
         // ARGUMENT (`f(&g)`), not the callee — keep its lea.
@@ -10408,8 +10510,10 @@ struct Lowerer {
             return;
         }
         // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got`
-        // extern-address format (arm64 ELF relocatable / static-archive
-        // member), an undefined extern's ADDRESS as a live code-form VALUE
+        // extern-address format (every relocatable and static-archive
+        // document since P69 — the arm64 ELF ones since TF-C52 — and the
+        // images that cannot make a stub canonical: ELF `-dyn`, Mach-O, PE),
+        // an undefined extern's ADDRESS as a live code-form VALUE
         // materializes through a foreign-linker GOT slot — the arm64
         // `lea_extern_got` macro `adrp Xd,:got:sym` + `ldr Xd,[Xd,:got_lo12:
         // sym]` (R_AARCH64_ADR_GOT_PAGE + R_AARCH64_LD64_GOT_LO12_NC). A
@@ -10665,8 +10769,12 @@ struct Lowerer {
         // disjoint from function symbols by construction. No exclusion
         // needed here.
         MirInstId const calleeMir = operands[0];
+        // P69 round 4: a WEAK import outside the slot shape is called through
+        // the address its GlobalAddr materialized (the GOT arm) — the
+        // indirect-call form below, exactly as a function pointer is.
         bool const calleeIsGlobalAddr =
-            mir.instOpcode(calleeMir) == MirOpcode::GlobalAddr;
+            mir.instOpcode(calleeMir) == MirOpcode::GlobalAddr
+            && !weakImportCalledThroughItsAddress(mir.globalAddrSymbol(calleeMir));
 
         // Determine extern-vs-internal based on the GlobalAddr's
         // SymbolId. An indirect callee (no GlobalAddr) is never an

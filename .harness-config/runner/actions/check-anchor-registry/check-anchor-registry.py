@@ -83,8 +83,8 @@ Exit codes: 0 clean · 1 an anchor resolves nowhere · 2 a scan collapsed · 3 a
 row drops content · 4 a retired id is cited · 5 a quotation declaration is refused ·
 6 the self-test failed.
 
-Usage (from anywhere -- the tree is the one this file lives in, never the cwd):
-    python .harness-config/runner/actions/check-anchor-registry/check-anchor-registry.py
+Usage (the tree is the one this file lives in, never the cwd):
+    dssharness run check-anchor-registry      # its one step: the self-test, then the verify
 """
 from __future__ import annotations
 

@@ -434,6 +434,12 @@ private:
     // otherwise silently produce mis-shaped aggregates downstream.
     void checkConstructAggregate(DiagnosticReporter& reporter) const;
 
+    // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): every
+    // `UnnamedObject` carries a storage duration its payload can name, and its one
+    // child — the initializer — has the object's own type, so the value a consumer
+    // peels (`Hir::unnamedObjectValue`) and the object a consumer addresses agree.
+    void checkUnnamedObject(DiagnosticReporter& reporter) const;
+
     // Shader restrictions (HR6, plan §2.8): inside a `ShaderUsable` function's
     // subtree — no recursion (call-graph cycle), no indirect / function-pointer
     // call, no call to a non-shader (host) function. Each violation emits

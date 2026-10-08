@@ -89,9 +89,10 @@ deferral is the rare exception that must earn its place, not the convenient way 
 
    `set-anchor` patches only the fields you name, preserves the rest byte-for-byte, deletes the row
    from its working registry and appends it to the archive's matching table. Reopening (`--status
-   open`) moves it back. `check-anchor-balance` fails the tree for a closed row left in a working
-   registry, for an open row filed in the archive, and for a `Status` column that contradicts the
-   verdict leading its own `Trigger` prose.
+   open`) moves it back. `dssharness check-anchor-balance` fails the tree for a closed row left in a
+   working registry and for an open row filed in the archive; a `Status` column that contradicts the
+   verdict leading its own `Trigger` prose is refused by the door and reported by
+   `dssharness read-anchors --lint`.
 3. **State its priority explicitly** in the row's `Priority` cell — `P0`..`P5`, the bands defined in
    `registry-and-priority.md`, a declaration `burndown-queue` seeds and then reads. A row waiting on a
    named trigger carries `⏳ GATED` in its `Status` cell: do not build until the trigger fires. Work that

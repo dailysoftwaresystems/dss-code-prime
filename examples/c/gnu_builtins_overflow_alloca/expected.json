@@ -1,0 +1,45 @@
+{
+  "$comment": "P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): GCC's checked-arithmetic and stack-allocation builtins, refused S_UndeclaredIdentifier until this row. `__builtin_{add,sub,mul}_overflow` compute the INFINITE-PRECISION result over the operands' own types, store it modulo the result object's width and answer whether the two differ: lowered as ordinary HIR arithmetic over a type wide enough for both -- int64, `__int128` (the i64 x i64 product), unsigned `__int128` (the u64 x u64 one), or a `_BitInt`. The typed spellings (s/u x add/sub/mul x int/long/long long) bind the same three verbs. A `_Bool` result keeps the exact result's low bit and an enumeration result its underlying width: clang's meaning (gcc refuses both), exercised under `__clang__`, which DSS defines. `__builtin_alloca` is the runtime-sized frame allocation a VLA uses, 16-aligned, live until return, and an alloca inside a VLA scope PINS that scope as a whole (gcc's documented rule), decided before any of the scope is lowered: a `goto` out of it taken before the alloca runs again keeps the blocks too (bit 32). A pinned scope still frees the unpinned VLAs nested in it on a `continue` and on a `goto` (bit 64: 200 iterations of a 64 KiB inner array, 12.5 MiB were none freed; each array is sixteen pages, so on pe every iteration's descent walks the guard pages -- D-CSUBSET-VLA-WIN64-STACK-PROBE, whose trigger was this shape running 0xC0000005). The exit code is a bitmask of the groups that misbehaved (see main.c). MEASURED 2026-10-07 through `dssharness run probe-reference-cc`, this file: gcc 13.3.0 at -std=c17 -pedantic-errors and -std=c2x exits 42 and clang 18.1.3 exits 32 in both -- clang at -O0 frees the alloca'd blocks at that `goto`, which gcc's documented rule keeps (run 20261007-100859-d30eaca3, host run -100850-de58cc23); both exit 42 at -std=c2x -O2 (run 20261007-100919-1b37eef6, host run -100905-166ba638); mingw-w64 gcc 13.2.0 exits 42 at -std=c17 -pedantic-errors and -std=c2x (run 20261007-100932-24196c6e) and at -std=c2x -O2 (run 20261007-100935-cca8b07a); MSVC 19.51 (no `__GNUC__`: a bare `return 42`) exits 42 (run 20261007-100937-d1de98fd); AppleClang exits 32 at -std=c17 -pedantic-errors and -std=c2x, clang's bit 32 again (macos-arm64-release, run 20261007-100954-d293f8c6, host run -100940-19803876). Every operand derives from argc. The release arm is REPORT-ONLY: its value is that the optimized pipeline neither folds a checked operation wrong nor moves an alloca'd block's lifetime.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": false
+    }
+  ]
+}

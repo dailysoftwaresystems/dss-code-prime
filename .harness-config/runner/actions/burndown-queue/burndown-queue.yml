@@ -11,3 +11,27 @@ steps:
       python3 ./burndown-queue.py --counts
     successPattern: 'burndown-queue: \d+ OPEN row\(s\)'
     requireInputsUnmoved: true
+
+  # The QUEUE itself, banded and sorted -- a READING verb, and a VIEW, never a copy: re-run rather than quote.
+  - name: queue
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      band:
+        description: "the bands to list, comma-separated, e.g. P0,P1; empty lists every band"
+        default: ''
+      top:
+        description: "at most this many rows after sorting; 0 lists every one"
+        default: '0'
+      schedulable:
+        description: "true drops the rows whose trigger has not fired"
+        default: 'false'
+      evidence:
+        description: "true prints the phrase that banded each row"
+        default: 'false'
+    run: |
+      python3 ./burndown-queue.py --band="{band}" --top="{top}" --schedulable="{schedulable}" --evidence="{evidence}" --json="{stepBuild}/burndown-queue.json"
+    outputs: [burndown-queue.json]
+    persist: true
+    successPattern: '^burndown-queue: \d+ OPEN row\(s\)'
+    requireInputsUnmoved: true

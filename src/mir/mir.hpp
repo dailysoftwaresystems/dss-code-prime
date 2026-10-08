@@ -913,7 +913,8 @@ public:
     // pieces (SysV ≤16B → 2). Each `values[i]` is a piece value (I64/F64); the
     // callconv pass moves piece i into its per-class return register.
     MirInstId addReturnMulti(std::span<MirInstId const> values);
-    MirInstId addUnreachable();
+    // P69: `kind` is the `MirUnreachableKind` the terminator asserts (its payload).
+    MirInstId addUnreachable(MirUnreachableKind kind = MirUnreachableKind::Assumed);
 
     // ── introspection (read-only on the in-progress build) ──
     // True iff the currently-open block has been sealed (i.e. one of the

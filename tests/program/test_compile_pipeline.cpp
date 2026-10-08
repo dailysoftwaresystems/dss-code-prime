@@ -2214,9 +2214,12 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
         CompileOptions opts{DiagnosticBudget::libraryDefault()};
         opts.pipelineOverride = &inlining;
         auto const before = rep.errorCount();
+        // The merged module is the whole program of an image with no foreign
+        // input (D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS).
         ASSERT_TRUE(optimizeModule(merged->mir, **targetR,
                                    merged->host.interner(), opts,
-                                   PipelineStage::Program, rep))
+                                   PipelineStage::Program,
+                                   opt::ModuleExtent::WholeImage, {}, rep))
             << "optimizing the merged module with [Inlining] must succeed";
         EXPECT_EQ(rep.errorCount(), before)
             << "the merged-module optimize must not emit any error";
@@ -2237,7 +2240,8 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
         opts.pipelineOverride = &identity;
         ASSERT_TRUE(optimizeModule(merged->mir, **targetR,
                                    merged->host.interner(), opts,
-                                   PipelineStage::Program, rep));
+                                   PipelineStage::Program,
+                                   opt::ModuleExtent::WholeImage, {}, rep));
         EXPECT_EQ(countOpInModule(merged->mir, MirOpcode::Call), 1u)
             << "with an [Identity] pipeline (no Inlining) the cross-CU Call MUST survive "
                "— the inlining in arm 1 is what removes it (RED-on-disable witness)";
@@ -2334,7 +2338,12 @@ TEST(Program_WholeProgramMerge, ShippedStageRoutingInlinesCrossCuAtProgramStage)
     // ── PROGRAM direction: the full document over the merged module. ──
     auto const before = rep.errorCount();
     ASSERT_TRUE(optimizeModule(merged->mir, **targetR, merged->host.interner(),
-                               relOpts, PipelineStage::Program, rep))
+                               relOpts, PipelineStage::Program,
+                               opt::ModuleExtent::WholeImage,
+                               merged->userEntrySymbol.has_value()
+                                   ? std::span<SymbolId const>{&*merged->userEntrySymbol, 1}
+                                   : std::span<SymbolId const>{},
+                               rep))
         << "the program stage over the merged module must succeed through the "
            "shipped release document";
     EXPECT_EQ(rep.errorCount(), before);

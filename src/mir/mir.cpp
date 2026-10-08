@@ -1484,9 +1484,10 @@ MirInstId MirBuilder::addReturnMulti(std::span<MirInstId const> values) {
     return id;
 }
 
-MirInstId MirBuilder::addUnreachable() {
+MirInstId MirBuilder::addUnreachable(MirUnreachableKind kind) {
     detail::MirInst pod;
     pod.opcode = MirOpcode::Unreachable;
+    pod.payload = static_cast<std::uint32_t>(kind);   // P69: what it asserts
     MirInstId const id = appendInst_(pod, {}, /*terminates=*/true);
     recordSuccessors_(MirOpcode::Unreachable, {});  // same symmetry as addReturn
     return id;

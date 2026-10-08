@@ -11,10 +11,11 @@ paid for once in them:
   * a `--dry-run` that was not an option was silently ignored, and the "dry run" APPLIED;
   * a row's status printed through a cp1252 console killed the loop after its first write;
   * a composer that joined wrapped lines with a space stored `tests/hir/ test_x.cpp` in the archive.
-This is their one successor: a CALLER of the door in the anchors family, beside `apply-registry-row`,
-reaching it only through `anchors.door_write`, the one launcher the two share. (A lane's rows never come here:
+This is their one successor: a CALLER of the door in the anchors family, reaching it only through
+`anchors.door_write`, its one launcher (`apply-registry-row`, the other caller, was retired on 2026-09-30:
+`dssharness write-anchor` / `set-anchor` with cell files do its whole job). (A lane's rows never come here:
 DssHarness's `fold-agent` applies an agent's rows directory, making the cut, citation, new-id and lost-cell
-checks below itself -- ✔MEASURED 2026-09-30 in a throwaway repository.)
+checks itself -- ✔MEASURED 2026-09-30 in a throwaway repository.)
 
 THE ROW DIRECTORY, the format DssHarness's agent rows use too, which this reads:
 
@@ -46,14 +47,12 @@ THE THREE VERBS -- each writes nothing it was not asked to, and each refuses bef
       part-way leaves no staged directory for `check` or `apply` to take as the whole batch.
   check <staged dir>
       READ-ONLY. A staged directory holding no row is refused (a vacuous batch is not a clean one). Every
-      row is validated (the vocabulary through `anchors.normalise_status` / `normalise_priority`, the
-      content refusals through `anchors.cell_refusals`, judged as the door will store the text), found in
-      the registries -- EXISTING, or NEW only when the batch DECLARED it new (an id no registry holds and
-      nobody declared is a typo that would mint a second row: refused, `apply-registry-row`'s rule; a row
+      row is validated (the vocabulary through `anchors.normalise_status` / `normalise_priority`, and a
+      pre-escaped pipe), found in the registries -- EXISTING, or NEW only when the batch DECLARED it new (an
+      id no registry holds and nobody declared is a typo that would mint a second row: refused; a row
       declared new that a registry holds other than as declared is refused too -- one standing exactly as
       declared is the batch's own, landed; an id with two rows is refused: a human settles a duplicate) --
-      every id a row NEWLY cites must resolve, and each supplied cell of an existing row is
-      judged against the stored one:
+      and each supplied cell of an existing row is judged against the stored one:
           SAME      the door would store exactly what is stored
           RESPACED  the words agree, the spacing does not (the stored bytes change, the words do not)
           KEPT      the stored text survives, verbatim and word for word, inside the new -- an addendum
@@ -85,18 +84,18 @@ touched by `check` at all.
 
 THE ORDER, AND WHAT RESOLVES A CITATION. NEW rows are written before the updates, each group by id: a batch
 interrupted part-way (a killed process, a lost machine) then never leaves a stored row citing a row that is
-not there yet -- CRASH CONSISTENCY, not enforcement. ✔MEASURED 2026-09-25 on DssHarness 0.5.12, in a
-throwaway repository: `write-anchor` and `set-anchor` do not check the ids a cell cites -- a cell naming a row
-no registry holds is written, dry run and real alike (since 2026-09-30 the door refuses one, exit 13 -- ✔MEASURED
-in a throwaway repository -- so this program's check is the second, and the one that sees the whole batch
-before its first write). And NO GUARD READS THE REGISTRIES' OWN CITATIONS:
-`dssharness check-anchor-citations` resolves ids cited under `anchors.citationRoots`, which holds no `.plans`,
-and `check-anchor-registry` scans `src/`, `examples/` and `docs/` (✔READ 2026-09-26, both tools' own words). So
-this program resolves them itself: every id a row of the batch NEWLY cites -- in a new row, every id it cites;
-in an existing row, every id its new text cites that the stored cell did not -- must be a row of either
-registry or of the batch (`anchors.cited_ids`; a family mention such as `<prefix>-AREA-*` cites nothing), and
-`check` and `apply` refuse one that is not. A citation already stored is history and is not re-judged:
-✔MEASURED 2026-09-26, 616 stored citations resolve to no row, most of them to the retired harness registry.
+not there yet -- CRASH CONSISTENCY -- and a row of the batch citing another NEW row of the batch finds it
+written. What a cell may store is the DOOR's to judge, and since 2026-09-30 it judges it by RESOLUTION
+(✔MEASURED that day in a throwaway repository, DssHarness 0.6.4; `anchors.py`'s parity arms (36a)..(36h) pin
+it): a value it would store CUT -- an id broken across a line, before a hyphen or after one, a path's
+directory ending a line, a joined space after a `/` -- is refused with exit 10, and an id a cell NEWLY cites
+that no row holds with exit 13; a cut or a citation the stored cell already held is history, not judged again
+(✔MEASURED 2026-09-26, 616 stored citations resolve to no row, most of them to the retired harness registry).
+Because the REHEARSAL writes the whole batch through that door in this order, both refusals are met there,
+before the real registries are opened. This program's own copies of those rules (`cell_refusals`, and a
+citation resolver over the batch) were a second owner that was wrong both ways -- blind to a break inside an
+id's last segment and to one before a hyphen, and refusing a correct cell that lists whole ids one per line,
+which the door stores -- and are gone.
 
 READ-BACK. What the door stores is compared with what was declared, as the door stores it: a line break
 collapses, with the whitespace either side of it, into one space; every other run of spaces or tabs is kept;
@@ -158,6 +157,10 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 ACTIONS = os.path.dirname(HERE)
 
 REFUSED, USAGE = 2, 3
+# The self-test's arms, counted EXACTLY: an arm deleted, or one added without this line, fails the self-test
+# (the round-12 audit's R3/R9 class; 2026-09-30, P69 lane `hm`). 84 since 2026-10-06: (z6), the order a detail is
+# redacted and cut in.
+EXPECTED_ARMS = 84
 
 
 class Refused(Exception):
@@ -197,12 +200,13 @@ def anchors():
                  "the registry reader, the vocabulary and the door's launcher live there")
 
 
-def repo_root(override=None):
+def repo_root(override=None, here=None):
     """The tree acted on: the one THIS FILE lives in (never the caller's working directory), or
-    `override`'s git top level, named deliberately with `--repo`."""
+    `override`'s git top level, named deliberately with `--repo`. `here` is the self-test's: a file outside
+    every tree, to show the refusal (arm (z1))."""
     if override is None:
         try:
-            return os.path.realpath(ot().resolve(__file__, reads_git=True))
+            return os.path.realpath(ot().resolve(here or __file__, reads_git=True))
         except ot().Refusal as exc:
             raise Refused("%s\n  pass --repo <path> to name a tree deliberately." % exc)
     top, why = ot().git_top_level(override)
@@ -364,10 +368,11 @@ Plan = collections.namedtuple("Plan", "anchor kind cells stored verdicts fields 
 # kind: "new" (write-anchor), "update" (set-anchor), "landed" (every supplied cell already SAME)
 
 
-def validate(row, roots, grammar):
-    """-> ({cell: normalised value}, [problem]): the vocabulary, the pre-escaped pipe and the content
-    refusals the door does not make (judged as the door will store the text, under the tree's id `grammar`),
-    each named with the row and the cell."""
+def validate(row):
+    """-> ({cell: normalised value}, [problem]): the vocabulary and the pre-escaped pipe, each named with the row
+    and the cell. A value the door would store CUT and an id a cell newly cites that no row holds are the DOOR's
+    refusals (exit 10 / 13, ✔MEASURED 2026-09-30), met at the rehearsal before the real registries are touched --
+    this program's copies of those rules were a second owner that was wrong both ways, and are gone."""
     A = anchors()
     values, problems = {}, []
     for cell, text in row.cells.items():
@@ -385,8 +390,6 @@ def validate(row, roots, grammar):
             if ESCAPED_PIPE in text:
                 problems.append("%s/%s holds a pre-escaped pipe -- the door escapes every pipe itself; "
                                 "`stage` turns a lane's back into a bare one" % (row.anchor, cell))
-            for why in A.cell_refusals(text, roots, grammar):
-                problems.append("%s/%s %s" % (row.anchor, cell, why))
             values[cell] = text
     return values, problems
 
@@ -394,27 +397,22 @@ def validate(row, roots, grammar):
 def plan_rows(root, rows):
     """-> ([Plan] in APPLY ORDER, [problem]). Reads the registries once; writes nothing. Refused, each named: a row
     `validate` refuses; an id with two rows; an id no registry holds that the batch did not DECLARE new (a mistyped
-    id would mint a second row and leave the real one untouched -- `apply-registry-row`'s `--insert` rule, the
-    audit's F1-A4); a row declared new that a registry already holds OTHER than as declared (one standing exactly
-    as declared is this batch's own, landed: a re-run writes nothing); a NEW row missing a cell the door requires;
-    and an id a row NEWLY cites that is a row of neither registry nor the batch (the door checks no cited id and no
-    guard reads the registries' own citations -- the audit's F1-A3). A citation already stored is history, never
-    re-judged: in an existing row only the ids its new text cites and its stored cell did not are resolved."""
+    id would mint a second row and leave the real one untouched -- the audit's F1-A4); a row declared new that a
+    registry already holds OTHER than as declared (one standing exactly as declared is this batch's own, landed: a
+    re-run writes nothing); and a NEW row missing a cell the door requires. An id a row newly cites that no row
+    holds is the DOOR's refusal (exit 13, since 2026-09-30): the rehearsal writes the batch in this order, new rows
+    first, so a citation of the batch's own new row resolves and any other is refused there, before the real
+    registries are touched."""
     A = anchors()
-    try:
-        grammar, roots = A.id_grammar(root), A.tree_dirs(root)
-    except A.Refused as exc:
-        return [], ["the rows cannot be checked against this tree (%s)" % exc]
     try:
         index = {}
         for r in A.read_rows(root):
             index.setdefault(r.name, []).append(r)
     except A.Refused as exc:
         return [], ["the registries cannot be read (%s)" % exc]
-    known = set(index) | set(row.anchor for row in rows)
     plans, problems = [], []
     for row in rows:
-        values, probs = validate(row, roots, grammar)
+        values, probs = validate(row)
         if probs:
             problems += probs
             continue
@@ -436,7 +434,6 @@ def plan_rows(root, rows):
                                    ", ".join("%s.txt" % c for c in missing)))
                 continue
             fields = dict((FIELD[c], values[c]) for c in values)
-            cites = dict((c, A.cited_ids(A.door_form(values[c]), grammar)) for c in PROSE if c in values)
             plan = Plan(row.anchor, "new", values, None, dict((c, "NEW") for c in values), fields, {})
         else:
             r = found[0]
@@ -462,16 +459,8 @@ def plan_rows(root, rows):
                                 % (row.anchor, r.rel, ", ".join("%s %s" % (c, verdicts[c]) for c in CELLS
                                                                 if verdicts.get(c, "SAME") != "SAME")))
                 continue
-            cites = dict((c, A.cited_ids(A.door_form(values[c]), grammar) - A.cited_ids(stored[c], grammar))
-                         for c in PROSE if c in values and verdicts[c] != "SAME")
             plan = Plan(row.anchor, "update" if fields else "landed", values, stored, verdicts, fields, diffs)
-        dangling = [(cell, cid) for cell in sorted(cites) for cid in sorted(cites[cell] - known)]
-        for cell, cid in dangling:
-            problems.append("%s/%s cites %s, a row of neither registry nor this batch -- a citation nothing resolves "
-                            "(the door checks no cited id, and no guard reads the registries' own citations): name "
-                            "the row it means, or add that row to the batch" % (row.anchor, cell, cid))
-        if not dangling:
-            plans.append(plan)
+        plans.append(plan)
     order = {"new": 0, "update": 1, "landed": 2}
     plans.sort(key=lambda p: (order[p.kind], p.anchor))
     return plans, problems
@@ -696,6 +685,13 @@ def rehearse(root, plans, door=None, balance=None):
         os.makedirs(os.path.join(tree, ".harness-config"))
         with io.open(os.path.join(tree, ".harness-config", "config.json"), "w", encoding="utf-8") as fh:
             json.dump({"anchors": cfg}, fh, indent=1)
+        # ...and the tree's TOP-LEVEL DIRECTORY NAMES, each holding a placeholder git tracks: the door refuses a path
+        # cut by a joined-line space only where the path starts at a directory at the top of the tree (`dssharness
+        # help anchors`), so a rehearsal without them would pass a cut the real apply refuses.
+        for name in sorted(os.listdir(root)):
+            if name != ".git" and os.path.isdir(os.path.join(root, name)):
+                os.makedirs(os.path.join(tree, name), exist_ok=True)
+                io.open(os.path.join(tree, name, ".rehearsal-placeholder"), "w").close()
         for args in (["init", "-q", tree], ["-C", tree, "add", "-A"],
                      ["-C", tree, "-c", "user.email=anchor-rows@example.invalid", "-c", "user.name=anchor-rows",
                       "-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", "the registries as they stand"]):
@@ -754,9 +750,8 @@ def cmd_stage(root, src, dst, only, live_only, new=(), write=None):
                 row.cells[cell] = text.replace(ESCAPED_PIPE, "|")
                 unescaped["%s/%s" % (row.anchor, cell)] = n
     if not problems:
-        roots = anchors().tree_dirs(root)
         for row in rows:
-            problems += validate(row, roots, grammar)[1]
+            problems += validate(row)[1]
     if problems:
         raise Refused("%d problem(s), nothing staged:\n   %s" % (len(problems), "\n   ".join(problems)))
     meant = {}
@@ -913,6 +908,40 @@ def cmd_apply(root, staged, accepted, door=None, balance=None, lint=None):
 
 # ──────────────────────────────── self-test ────────────────────────────────
 
+# ── A FAILING ARM'S DETAIL, AS IT MAY BE PRINTED (2026-10-01, the P69 review's MINOR 5; ONE implementation since
+#    2026-10-06, the re-review's NIT 10) ──
+# THE redactor (`redact/redact.py`, loaded ONCE by path) marks the system temp directory `<temp>` (on Windows it lies
+# under the profile), runs over the WHOLE text, and only then is the text cut: a cut taken first can split a name the
+# rules would have masked whole (the review found anchors' arm (36h) printing the profile's temp path). All three are
+# the redactor's own (`lazy_redactor`, its `places`, `cut`); `_redact()[1].redactor` holds what it built, so arm
+# (z6) can put a stand-in in its place.
+_REDACT = []
+
+
+def _redact():
+    """-> [the redact module, its lazily built shown()], loaded once, by path, from the sibling action."""
+    if not _REDACT:
+        sys.dont_write_bytecode = True   # a by-path load must not leave a __pycache__ in another action's directory
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "redact", "redact.py")
+        if not os.path.isfile(path):
+            sys.exit("anchor-rows: cannot find %s -- the redaction rule lives there and nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_redact", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _REDACT.extend((mod, mod.lazy_redactor(tree=None, places={"<temp>": tempfile.gettempdir()})))
+    return _REDACT
+
+
+def _shown(text):
+    return _redact()[1](text)
+
+
+def _cut(text, n):
+    """`_shown(text)`, then its first n characters (n > 0) or its last -n (n < 0): the redactor's own `cut`."""
+    mod, shown = _redact()
+    return mod.cut(shown, text, n)
+
+
 def self_test():
     """Red-on-disable, on git fixture repositories and the REAL door. Every refusal asserts its MESSAGE,
     and each family has a control that passes, so a program refusing everything cannot produce this
@@ -926,14 +955,11 @@ def self_test():
     A_, B_, C_, N_ = fx + "-ALPHA", fx + "-BETA", fx + "-GAMMA", fx + "-NEWONE"
     A = anchors()
 
-    tmp_root = tempfile.gettempdir()
-
     def pin(ok, why, detail=""):
         count[0] += 1
-        # a failing arm's detail names fixture paths: the system temp directory is masked, because on Windows it lies
-        # under the user profile and a run's log must not name the account (the audit's F1-A12)
-        shown = str(detail).replace(tmp_root, "<temp>").replace(tmp_root.replace("\\", "\\\\"), "<temp>")
-        print("  %-4s %s%s" % ("ok" if ok else "FAIL", why, ("   " + shown[:300]) if detail and not ok else ""))
+        # a failing arm's detail names fixture paths: the temp directory, then THE redactor, before the cut (the
+        # audit's F1-A12, and the P69 review's MINOR 5)
+        print("  %-4s %s%s" % ("ok" if ok else "FAIL", why, ("   " + _cut(detail, 300)) if detail and not ok else ""))
         if not ok:
             failed[0] += 1
 
@@ -1011,6 +1037,7 @@ def self_test():
         top = tempfile.mkdtemp(prefix="anchor-rows-stage-")
         boxes.append(top)
         tree = fixture_tree()
+        reg_tree_before = reg(tree)
         src = os.path.join(top, "lane-rows")
         rowdir(src, A_, status="open", trigger="🟠 **OPEN** a " + ESCAPED_PIPE + " b", closing="c")
         rowdir(src, B_, status="open", trigger="🟠 **OPEN** beta", priority="P3", cross_refs="r")
@@ -1042,6 +1069,12 @@ def self_test():
         why = refused(cmd_stage, tree, enc, os.path.join(top, "s5"), [A_], False) or ""
         pin("trigger.txt is not UTF-8" in why and "closing.txt opens with a byte-order mark" in why,
             "(s5) a non-UTF-8 cell and a BOM-led cell are both refused, each named", why)
+        hollow = os.path.join(top, "hollow-rows")
+        os.makedirs(os.path.join(hollow, A_))
+        why = refused(cmd_stage, tree, hollow, os.path.join(top, "s5a"), [A_], False) or ""
+        pin("%s holds no cell file" % A_ in why and "nothing staged" in why
+            and not os.path.exists(os.path.join(top, "s5a")),
+            "(s5a) a row directory holding no cell file is refused, naming it, and nothing is staged", why)
         applied = os.path.join(top, "applied-rows")
         rowdir(applied, A_, status="open", trigger="🟠 **OPEN** t")
         write(os.path.join(applied, A_, "trigger.txt.applied"), "old")
@@ -1052,18 +1085,25 @@ def self_test():
             and sorted(os.listdir(os.path.join(out, A_))) == ["status.txt", "trigger.txt"]
             and "skipped trigger.txt.applied" in said,
             "(s6) an *.applied cell is refused without --live-only, and skipped, said, with it", why + why2)
-        # (s7) a path cut, in EVERY shape a lane's cell file holds it -- the line break the door will join included
-        # (the audit's F1-A1: the first arm synthesized only the already-joined space, and the refusal could not see
-        # a break).
+        # (s7) a PATH CUT, in EVERY shape a lane's cell file holds it -- the line break the door will join included
+        # (the audit's F1-A1) -- is the DOOR's refusal since 2026-09-30 (✔MEASURED that day; `anchors.py` parity arm
+        # (36f)): stage CARRIES the row, and check's REHEARSAL -- a throwaway repository holding the registries and the
+        # tree's top-level directory names, so a joined space after a `/` is judged as the real apply will judge it --
+        # refuses it before any real registry is opened.
         for label, text in (("(s7) the already-joined space", "see tests/hir/ test_brace.cpp for it"),
                             ("(s7b) a line break after the `/`", "see tests/hir/\ntest_brace.cpp for it"),
                             ("(s7c) a line break and an indent after the `/`", "see tests/hir/\n    test_brace.cpp"),
                             ("(s7d) a CRLF after the `/`", "see tests/hir/\r\ntest_brace.cpp for it")):
-            cut = os.path.join(top, "cut-rows-%s" % label[1:4].strip(")"))
+            key = label[1:4].strip(")")
+            cut = os.path.join(top, "cut-rows-%s" % key)
             rowdir(cut, A_, status="open", trigger="🟠 **OPEN** " + text)
-            why = refused(cmd_stage, tree, cut, os.path.join(top, "s7-" + label[1:4].strip(")")), [A_], False) or ""
-            pin("joined-line space" in why and "trigger" in why,
-                "%s: a path cut there is refused at stage, naming the cell -- the door would store it cut" % label, why)
+            staged_cut = os.path.join(top, "s7-" + key)
+            rc, said, why = ran(cmd_stage, tree, cut, staged_cut, [A_], False)
+            # `ran`, never `refused`: the door's own words are what the rehearsal PRINTS, before check refuses
+            _rc, said, why = ran(cmd_check, tree, staged_cut) if rc == 0 else (rc, said, "stage refused it: " + why)
+            pin("rehearsal failed" in why and "path" in said.lower() and reg(tree) == reg_tree_before,
+                "%s: a path cut there is carried by stage and refused by the DOOR at check's rehearsal, the real "
+                "registries untouched" % label, _cut(said + why, -300))
         good = os.path.join(top, "staged")
         rc, said, why = ran(cmd_stage, tree, src, good, [A_, B_], False)
         staged_a = (io.open(os.path.join(good, A_, "trigger.txt"), encoding="utf-8").read()
@@ -1130,7 +1170,7 @@ def self_test():
         pin(rc1 == 0 and rc2 == 0 and rel(os.path.join(top, "u1")) == rel(os.path.join(top, "u2"))
             and rel(os.path.join(top, "u1")),
             "(u1) --repo is taken on EITHER side of the verb -- the family's rule -- and stages the same rows",
-            (rc1, rc2, said1[-200:], said2[-200:]))
+            (rc1, rc2, _cut(said1, -200), _cut(said2, -200)))
         rc3, said3, _w3 = ran(main, ["stage", os.path.join(top, "u-rows"), os.path.join(top, "u3"), "--only", N_,
                                      "--repo"])
         rc4, said4, _w4 = ran(main, ["--repo", tree, "check", os.path.join(top, "u1"), "--repo", tree])
@@ -1143,7 +1183,7 @@ def self_test():
         pin(rc5 == 0 and os.path.isdir(os.path.join(top, "u5"))
             and sorted(os.listdir(os.path.join(top, "u5"))) == sorted([A_, B_]),
             "(u2) --only given twice carries BOTH ids -- a repeated option keeping only its last value would drop "
-            "the first one's rows with nothing said", (rc5, said5[-200:], why5,
+            "the first one's rows with nothing said", (rc5, _cut(said5, -200), why5,
                                                         os.path.isdir(os.path.join(top, "u5"))
                                                         and sorted(os.listdir(os.path.join(top, "u5")))))
 
@@ -1180,13 +1220,18 @@ def self_test():
         pin(any("is NEW" in x and "missing priority.txt, status.txt" in x for x in probs),
             "(c5) a NEW row missing its priority and status is refused, naming both", probs)
         rowdir(os.path.join(top, "c6"), A_, trigger="🟠 **OPEN** " + "D-" + "FIXTURE-\nROWS-ALPHA wrapped")
-        _p, probs = plan_rows(t, rows_of(os.path.join(top, "c6"), t))
-        pin(any("broken after a hyphen" in x for x in probs),
-            "(c6) an anchor id wrapped across a line break is refused, as the door would store it", probs)
+        _rc, said, why = ran(cmd_check, t, os.path.join(top, "c6"))
+        pin("rehearsal failed" in why and "cut where a line ends" in said,
+            "(c6) an anchor id wrapped across a line break is refused by the DOOR at check's rehearsal (a cut value, "
+            "exit 10) -- this program no longer restates the rule", _cut(why, -300))
         rowdir(os.path.join(top, "c7"), A_, status="wibble")
         _p, probs = plan_rows(t, rows_of(os.path.join(top, "c7"), t))
         pin(any("CONTROLLED VOCABULARY" in x for x in probs),
             "(c7) a status outside the vocabulary is refused before any door", probs)
+        rowdir(os.path.join(top, "c7p"), A_, priority="P9")
+        _p, probs = plan_rows(t, rows_of(os.path.join(top, "c7p"), t))
+        pin(any(x.startswith("%s/priority: " % A_) for x in probs),
+            "(c7p) a priority outside the bands is refused before any door, naming the row's priority cell", probs)
         rowdir(os.path.join(top, "c7b"), A_, closing="a " + ESCAPED_PIPE + " b")
         _p, probs = plan_rows(t, rows_of(os.path.join(top, "c7b"), t))
         pin(any("pre-escaped pipe" in x for x in probs),
@@ -1209,7 +1254,7 @@ def self_test():
             "(c9) CONTROL: check rehearses the batch clean in a throwaway repository, prints each LOST cell's word "
             "diff, the batch's own balance with the gate's verdict (a born-closed row opens nothing) and the APPLY "
             "STEP it needs -- the harness form, its acceptLost naming the LOST cell, never the program's flag -- and "
-            "leaves the real registries byte-identical", said[-700:])
+            "leaves the real registries byte-identical", _cut(said, -700))
         split = os.path.join(top, "c10")
         rowdir(split, A_, status="closed")
         why = refused(cmd_check, t, split) or ""
@@ -1217,9 +1262,10 @@ def self_test():
             "(c10) a batch the DOOR refuses (status CLOSED beside an OPEN Trigger, the verdict split) fails the "
             "rehearsal, and the real registries stay untouched", why)
 
-        # (n) NEW IS DECLARED, NEVER INFERRED (the audit's F1-A4: `apply-registry-row` refuses a row no registry
-        # holds unless `--insert` declares it; a batch writer that inferred NEW from a failed lookup let a full row
-        # under a misspelt id land as a second row while the real one stayed open).
+        # (n) NEW IS DECLARED, NEVER INFERRED (the audit's F1-A4, after the rule of the since-retired
+        # `apply-registry-row`, which refused a row no registry held unless `--insert` declared it; a batch writer
+        # that inferred NEW from a failed lookup let a full row under a misspelt id land as a second row while the
+        # real one stayed open).
         typo = os.path.join(top, "n1")
         rowdir(typo, A_ + "X", priority="P2", status="closed", trigger="✅ **CLOSED** closed under a typo",
                closing="done", crossrefs="none")
@@ -1243,18 +1289,19 @@ def self_test():
             and not os.path.exists(os.path.join(n3, A_, NEW_MARKER)) and "declared NEW: %s" % N_ in said
             and not probs and [(p.anchor, p.kind) for p in _p] == [(N_, "new"), (A_, "update")],
             "(n3) CONTROL: `new` carries the declaration through stage into the staged record, and check plans that "
-            "row NEW beside an undeclared update", (said[-300:], probs, [(p.anchor, p.kind) for p in _p]))
+            "row NEW beside an undeclared update", (_cut(said, -300), probs, [(p.anchor, p.kind) for p in _p]))
 
-        # (k) A CITATION THE BATCH INTRODUCES MUST RESOLVE (the audit's F1-A3: the door checks no cited id, and no
-        # guard reads the registries' own citations -- `check-anchor-citations` reads `anchors.citationRoots`).
+        # (k) A CITATION THE BATCH INTRODUCES MUST RESOLVE (the audit's F1-A3). Since 2026-09-30 the DOOR resolves every
+        # id a value newly cites (exit 13, ✔MEASURED; `anchors.py` parity arms (36a)/(36d)), and the rehearsal writes
+        # the batch in apply order -- new rows first -- so the refusal is met there, before any real registry opens.
         dangling = fx + "-NOSUCH"
         k1 = os.path.join(top, "k1")
         rowdir(k1, B_, crossrefs="x | y and [[%s]]" % dangling)
-        why = refused(cmd_check, t, k1) or ""
-        pin("%s/crossrefs cites %s, a row of neither registry nor this batch" % (B_, dangling) in why
+        _rc, said, why = ran(cmd_check, t, k1)
+        pin("rehearsal failed" in why and dangling in said and "which no row of either registry holds" in said
             and reg(t) == before,
-            "(k1) a cell citing an id that is a row of neither registry nor the batch is REFUSED, naming the row, the "
-            "cell and the id", why)
+            "(k1) a cell citing an id that is a row of neither registry nor the batch is REFUSED by the door at the "
+            "rehearsal, naming the id", _cut(why, -300))
         hist = fixture_tree()
         pend = os.path.join(hist, *cfg["pendingAnchorsPath"].split("/"))
         body = io.open(pend, encoding="utf-8", newline="").read().replace(
@@ -1265,10 +1312,11 @@ def self_test():
                trigger="🟠 **OPEN** blocked by %s and %s-* rows" % (A_, fx))
         declare_new(k2, N_)
         rowdir(k2, B_, crossrefs="x | y, once [[%s]] -- and now [[%s]]" % (dangling, N_))
-        _p, probs = plan_rows(hist, rows_of(k2, hist))
-        pin(not probs and sorted(p.anchor for p in _p) == sorted([N_, B_]),
-            "(k2) CONTROL: a registry row, a row of the SAME batch and a family mention resolve, and a dangling "
-            "citation the stored cell ALREADY held is history, kept verbatim and not re-judged", probs)
+        rc, said, why = ran(cmd_check, hist, k2)
+        pin(rc == 0 and "rehearsal failed" not in said + why,
+            "(k2) CONTROL: at the rehearsal, through the real door, a registry row, a row of the SAME batch (written "
+            "first) and a family mention resolve, and a dangling citation the stored cell ALREADY held is history, "
+            "kept verbatim and not re-judged", _cut(said + why, -300))
         empty = os.path.join(top, "e1")
         os.makedirs(empty)
         why = refused(cmd_check, t, empty) or ""
@@ -1284,17 +1332,17 @@ def self_test():
                  "missingAtBase": [], "findings": []}
         rc, said, why = ran(cmd_check, t, staged, receipt("not a receipt", 1))
         pin(rc == REFUSED and "UNREADABLE" in said and "rehearsal failed" in why,
-            "(b1) an UNREADABLE balance receipt FAILS the rehearsal -- never \"rehearses clean\"", (said[-300:], why))
+            "(b1) an UNREADABLE balance receipt FAILS the rehearsal -- never \"rehearses clean\"", (_cut(said, -300), why))
         rc, said, why = ran(cmd_check, t, staged, receipt(dict(clean, passed=False, findings=[{"what": "misfiled"}]),
                                                           1))
         pin(rc == REFUSED and "balance gate FAIL: 1 finding(s)" in said and "rehearsal failed" in why,
-            "(b2) a receipt carrying a FINDING (a misfiled or malformed registry) fails the rehearsal", said[-300:])
+            "(b2) a receipt carrying a FINDING (a misfiled or malformed registry) fails the rehearsal", _cut(said, -300))
         rc, said, why = ran(cmd_check, t, staged, receipt(dict(clean, passed=False, netNew=1, openNow=3,
                                                                opened=[{"anchor": N_}]), 1))
         pin(rc == 0 and "balance gate FAIL (net +1) -- judged at the round gate, not here" in said
             and "check OK" in said,
             "(b3) CONTROL: a net increase is SAID as the gate's FAIL and left to the round gate -- a batch may open "
-            "disclosed or gated work -- so it does not fail the rehearsal", (said[-300:], why))
+            "disclosed or gated work -- so it does not fail the rehearsal", (_cut(said, -300), why))
 
         # (w) KEPT IS WORD FOR WORD (the audit's F1-A10): an extended first or last word is a LOST cell.
         pin(cell_verdict("closing", "unfixed", "fixed") == "LOST"
@@ -1317,7 +1365,8 @@ def self_test():
         pin(rc == 0 and "%s is not an anchor id (Q-" % A_ in why2 and "is not an anchor id (D-" not in why2
             and "USAGE" not in said3,
             "(g1) a tree whose config.json declares the prefix Q stages a Q row, refuses a D one as no anchor id, and "
-            "takes a Q acceptance -- the grammar is config's, never typed here", (said[-200:], why, why2, said3[-200:]))
+            "takes a Q acceptance -- the grammar is config's, never typed here",
+            (_cut(said, -200), why, why2, _cut(said3, -200)))
 
         # (m) A REFUSAL OF THE FAMILY'S OTHER TYPES IS A REFUSAL (the audit's F1-A8): exit 2 and its words, never a
         # traceback -- here a tree whose config.json declares no id grammar.
@@ -1325,7 +1374,7 @@ def self_test():
         rc, said, why = ran(main, ["--repo", mt, "check", staged])
         pin(rc == REFUSED and "anchor-rows: REFUSED --" in said and "idPrefix" in said and not why,
             "(m1) a sibling refusal (anchors': the tree declares no id grammar) reaches the step as REFUSED, exit 2 "
-            "-- never a traceback", (rc, said[-300:], why))
+            "-- never a traceback", (rc, _cut(said, -300), why))
 
         # ── (a) APPLY -- each refusal arm on a FRESH fixture, so a mutant that lets one arm write cannot
         # redden the next for the wrong reason (only the named reason may go red) ───────────────
@@ -1377,7 +1426,7 @@ def self_test():
             and "every id the batch newly cites resolved" in said and "check-anchor-citations" not in said,
             "(a5) CONTROL: apply writes the batch, the born-closed row lands in the archive, a cell SAME to the stored "
             "one is not sent and keeps its double space, and the closing line says what was resolved -- never "
-            "naming a guard that reads no registry", said[-500:])
+            "naming a guard that reads no registry", _cut(said, -500))
         rc, said, why = ran(cmd_apply, t, staged, [])
         pin(rc == 0 and "APPLIED 0 row(s)" in said and "3 already landed" in said,
             "(a6) a batch that already landed writes nothing and says so, so a fold can be re-run", said + why)
@@ -1402,7 +1451,7 @@ def self_test():
             and "INTERRUPTED (OSError: an injected launch failure)" in said and "written before it: %s" % N_ in said
             and "RESTORED byte for byte" in said,
             "(x1) an EXCEPTION between two writes restores both registries byte for byte, says what had landed, and "
-            "is raised again -- never a batch half-applied and unsaid", (raised, said[-400:]))
+            "is raised again -- never a batch half-applied and unsaid", (raised, _cut(said, -400)))
         x2 = fixture_tree()
 
         def writer_then_refusal(tree_, anchor, fields, new, apply_it):
@@ -1493,12 +1542,17 @@ def self_test():
             "(h3) an `@<file>` list reads one item a line, blank lines and `#` comments skipped, each item trimmed",
             "got=%r" % got)
 
+        with io.open(os.path.join(here, "lists", "not-utf8.txt"), "wb") as fh:
+            fh.write(b"\xff\xfe not utf-8\n")
+
         def step_refused(verb, tokens):
             try:
                 step_argv(here, verb, tokens)
                 return None
             except StepRefused as exc:
                 return str(exc)
+            except Exception as exc:  # noqa: BLE001 -- any OTHER raise fails its arm BY NAME, never the whole run
+                return "RAISED %s: %s" % (type(exc).__name__, exc)
         for label, verb, tokens, needle in (
                 ("(h4) a step the table lacks is REFUSED", "land", [], "declares no such step"),
                 ("(h4) a token that is not <input>=<value> is REFUSED", "check", ["justaword"],
@@ -1516,7 +1570,10 @@ def self_test():
                 ("(h4) an EMPTY list item (a stray comma) is REFUSED", "apply",
                  ["staged=s", "acceptLost=%s:trigger,," % A_], "EMPTY item"),
                 ("(h4) an `@<file>` naming no file is REFUSED", "stage",
-                 ["rows=r", "staged=s", "only=@nope.txt", "new=", "liveOnly=false"], "names no list file")):
+                 ["rows=r", "staged=s", "only=@nope.txt", "new=", "liveOnly=false"], "names no list file"),
+                ("(h4) an `@<file>` whose bytes are not UTF-8 is REFUSED, named -- never a traceback", "stage",
+                 ["rows=r", "staged=s", "only=@lists/not-utf8.txt", "new=", "liveOnly=false"],
+                 "names a list file that is not UTF-8")):
             why = step_refused(verb, tokens) or ""
             pin(needle in why, label, why or "not refused")
         h5rows, h5staged = os.path.join(here, "h5-rows"), os.path.join(here, "h5-staged")
@@ -1529,24 +1586,85 @@ def self_test():
             and all(os.path.isfile(os.path.join(h5staged, x, NEW_MARKER)) for x in (N_, C_)),
             "(h5) a step whose verb succeeds carries EVERY item of its list to the verb, and ends with its closing "
             "line, which its successPattern reads", "rc=%r out=%s %s staged=%s"
-            % (rc, said.strip()[-300:], why, sorted(os.listdir(h5staged)) if os.path.isdir(h5staged) else None))
+            % (rc, _cut(said.strip(), -300), why, sorted(os.listdir(h5staged)) if os.path.isdir(h5staged) else None))
         rc, said, why = ran(main, ["--step", "check", "staged=%s" % os.path.join(here, "no-such-staged")])
         rc2, said2, why2 = ran(main, ["--step", "check", "bogus=1"])
         pin(rc == REFUSED and "no rows directory" in said and (STEP_DONE % "check") not in said
             and rc2 == USAGE and "no input 'bogus'" in said2 and (STEP_DONE % "check") not in said2,
             "(h5) ...and a step whose verb refuses (exit 2), or whose inputs are refused (exit 3), ends WITHOUT it",
-            "rc=%r out=%s | rc=%r out=%s" % (rc, (said + why).strip()[-200:], rc2, (said2 + why2).strip()[-200:]))
-        whole = ot().load_jsonc(os.path.join(repo_root(), ".harness-config", "config.json"))
-        whole = whole if isinstance(whole, dict) else {}
-        runner = (whole.get("predefinedRunners") or {}).get(ROWS_RUNNER)
-        legs = (runner.get("legs") or []) if isinstance(runner, dict) else []
-        leg = ((whole.get("legs") or {}).get(legs[0]) if len(legs) == 1 else None) or {}
-        other_host = [k for k in (whole.get("hosts") or {}) if k != "local" and k in leg]
-        pin(isinstance(runner, dict) and runner.get("action") == "anchor-rows/anchor-rows.yml" and len(legs) == 1
-            and bool(leg) and not other_host,
-            "(h6) config.json declares the `%s` runner every remedy names: anchor-rows.yml on ONE leg, and that "
-            "leg runs on this machine's own tree (its definition names no other host) -- never a host's synced "
-            "copy" % ROWS_RUNNER, "runner=%r leg=%r other host=%r" % (runner, leg, other_host))
+            "rc=%r out=%s | rc=%r out=%s"
+            % (rc, _cut((said + why).strip(), -200), rc2, _cut((said2 + why2).strip(), -200)))
+        # (h6), which held config.json's `rows` runner to ONE leg of this machine's tree, retired on 2026-09-30:
+        # check-scripts-index clause 13 holds every remedy's runner to config.json, and a writer's to one leg.
+
+        nogit = tempfile.mkdtemp(prefix="anchor-rows-nogit-")
+        boxes.append(nogit)
+        why = refused(repo_root, nogit) or ""
+        pin("no git working tree contains" in why,
+            "(r0) --repo naming a directory in no git working tree is refused, naming it", why)
+
+        # ── (z) THE LAST REFUSAL SITES WITHOUT AN ARM (2026-09-30, P68 round 13's audit, M3) ─────────────────
+        # A read of every `raise Refused` / `raise StepRefused` / `raise SystemExit` against the arms above found
+        # these five unarmed; each now fails BY NAME if its refusal stops saying what it says.
+        orphan = os.path.join(nogit, "anchor-rows.py")
+        write(orphan, "# a copy of this program outside every tree\n")
+        why = refused(repo_root, None, orphan) or ""
+        pin("pass --repo <path> to name a tree deliberately" in why,
+            "(z1) a copy that lives in NO tree, run without --repo, is refused naming how to name one", why)
+        missing = os.path.join(nogit, "no-such-sibling.py")
+        try:
+            _load(missing, "anchor_rows_selftest_missing", "what this arm says lives there")
+            said = ""
+        except SystemExit as exc:
+            said = str(exc)
+        pin("cannot find" in said and missing in said and "what this arm says lives there" in said,
+            "(z2) a sibling program that is not where it is loaded from is refused, naming what lives there",
+            said)
+        noanchors = tempfile.mkdtemp(prefix="anchor-rows-noanchors-")
+        boxes.append(noanchors)
+        write(os.path.join(noanchors, ".harness-config", "config.json"), json.dumps({"legs": {}}))
+        why = refused(anchors_config, noanchors) or ""
+        pin("declares no `anchors` registries" in why,
+            "(z3) a tree whose configuration declares no `anchors` registries is refused, naming its config.json",
+            why)
+        git_owner = ot()
+        real_git = git_owner.run_git
+
+        class _GitRefused:
+            returncode, stdout, stderr = 128, b"", b"synthetic: git cannot initialise here"
+
+        def failing_init(args, **kw):
+            return _GitRefused() if args[:1] == ["init"] else real_git(args, **kw)
+        rehearsed = fixture_tree()
+        git_owner.run_git = failing_init
+        try:
+            why = refused(rehearse, rehearsed, []) or ""
+        finally:
+            git_owner.run_git = real_git
+        pin("the rehearsal repository could not be prepared" in why and "synthetic: git cannot initialise" in why,
+            "(z4) a rehearsal repository git cannot prepare is refused, naming the git step and git's own words",
+            why)
+        rc, said, why = ran(main, ["no-such-verb"])
+        rc2, said2, why2 = ran(main, ["--step"])
+        pin(rc == USAGE and "anchor-rows: USAGE --" in said and "no-such-verb" in said
+            and rc2 == USAGE and "--step needs a step name" in said2,
+            "(z5) a verb the program does not have, and a --step naming none, are USAGE refusals (exit 3), named",
+            "rc=%r out=%s | rc=%r out=%s"
+            % (rc, _cut((said + why).strip(), -200), rc2, _cut((said2 + why2).strip(), -200)))
+        # (z6) the P69 review's MINOR 5: `_cut` hands the redactor the WHOLE text and cuts what comes back -- a cut
+        # taken first leaves a piece of a name no rule knows. A stand-in redactor masking one made-up account proves
+        # the ORDER through this program's own `_cut`, never the rules (redact.py's own arms); the real one is put
+        # back before the arm is judged.
+        built = _redact()[1].redactor
+        real_redactor = list(built)
+        built[:] = [lambda t: t.replace("zqxacct", "<user>")]
+        try:
+            cuts = (_cut("x" * 20 + " zqxacct ran", 24), _cut("ran by zqxacct", -5))
+        finally:
+            built[:] = real_redactor
+        pin(not any(piece in "|".join(cuts) for piece in ("zqx", "qxa", "xac", "acc", "cct")),
+            "(z6) a failing arm's detail is redacted WHOLE, then cut: no piece of a name survives a cut at its head "
+            "or its tail", repr(cuts))
 
         # ── (r) THE ROOT IS THE TREE THIS FILE LIVES IN ──────────────────────────────
         with contextlib.redirect_stderr(io.StringIO()):
@@ -1556,6 +1674,10 @@ def self_test():
     finally:
         for b in boxes:
             ot().remove_tree(b)
+    if count[0] != EXPECTED_ARMS:
+        print("  FAIL the self-test ran %d arm(s) and EXPECTED_ARMS says %d: an arm was deleted, or added without "
+              "its count" % (count[0], EXPECTED_ARMS))
+        failed[0] += 1
     print("anchor-rows self-test: %d arm(s), %d failed" % (count[0], failed[0]))
     return 1 if failed[0] else 0
 
@@ -1585,7 +1707,8 @@ STEP_INPUTS = collections.OrderedDict([
 # What a step prints last when its verb returned 0, and the successPattern anchor-rows.yml gives it (arm (h1)).
 STEP_DONE = "anchor-rows step %s: done"
 STEP_PATTERN = "^anchor-rows step %s: done\\b"
-# The runner config.json declares for these steps (arm (h6) holds config.json to it): every remedy names it.
+# The runner config.json declares for these steps (check-scripts-index clause 13 holds every remedy's runner
+# to config.json, and a writer's to ONE leg of this machine's own tree): every remedy names it.
 ROWS_RUNNER = "rows"
 
 
@@ -1634,8 +1757,13 @@ def _step_items(root, verb, name, value):
         path = _tree_path(root, value[1:])
         if not os.path.isfile(path):
             raise StepRefused("--step %s: %s=%s names no list file (%s)" % (verb, name, value, path))
-        with io.open(path, encoding="utf-8") as fh:
-            return [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+        try:
+            with io.open(path, encoding="utf-8") as fh:
+                return [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+        except UnicodeDecodeError as exc:
+            # ✔MEASURED 2026-09-30 (the round-13 audit's M3): this read raised out of the step as a traceback
+            raise StepRefused("--step %s: %s=%s names a list file that is not UTF-8 (%s: %s)"
+                              % (verb, name, value, path, exc))
     items = [v.strip() for v in value.split(",")]
     if not all(items):
         raise StepRefused("--step %s: %s=%r holds an EMPTY item -- a stray comma; name every item, or use @<file>"

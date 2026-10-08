@@ -5,9 +5,46 @@ description: >-
   The program documents itself in its own header; this file declares only how a
   runner starts it and what witnesses that it ran.
 steps:
+  # Every knob of the bench is an input here, spelled `--name=value`; an empty value is the program's default.
   - name: bench
     workingDirectoryRoot: action
+    inputs:
+      target:
+        description: 'a <target>:<format> spec; empty derives it from this host (and prints it)'
+        default: ''
+      language:
+        description: 'the source language for dsscp'
+        default: 'c'
+      runs:
+        description: 'measured runs per cell'
+        default: '10'
+      warmup:
+        description: 'discarded runs per cell'
+        default: '2'
+      jobs:
+        description: 'dsscp --jobs for the parallel multi-TU arm'
+        default: '6'
+      subjects:
+        description: 'subject ids, comma-separated; empty measures every built-in'
+        default: ''
+      multiTus:
+        description: 'TU counts for the generated multi-TU ladder, comma-separated'
+        default: '1,4,17'
+      extraSubjects:
+        description: 'real subjects of your own, ID=PATH[,PATH...] items separated by ;'
+        default: ''
+      cc:
+        description: 'where reference compilers live, NAME=PATH items separated by ;'
+        default: ''
+      requireBuildType:
+        description: 'refuse unless dsscp was built this way'
+        default: 'Release'
+      label:
+        description: 'names this leg in the report; empty derives it from the host'
+        default: ''
     run: |
-      python3 ./compile-bench.py --dsscp {buildDir}/bin/dss/dsscp
+      python3 ./compile-bench.py --dsscp {buildDir}/bin/dss/dsscp --target="{target}" --language="{language}" --runs="{runs}" --warmup="{warmup}" --jobs="{jobs}" --subjects="{subjects}" --multi-tus="{multiTus}" --extra-subject="{extraSubjects}" --cc="{cc}" --require-build-type="{requireBuildType}" --label="{label}" --out="{stepBuild}/work" --json="{stepBuild}/compile-bench.json"
+    outputs: [compile-bench.json]
+    persist: true
     successPattern: 'floor is the per-invocation cost'
     requireInputsUnmoved: true

@@ -2943,6 +2943,7 @@ TEST(PeExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
@@ -3488,6 +3489,7 @@ namespace {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "aapcs64",
+      "entryTransition": "called",
       "pe": {"machine": 43620, "characteristics": 34, "type": "exec"},
       "optionalHeader": {"magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "majorOperatingSystemVersion": 6, "minorOperatingSystemVersion": 0, "majorSubsystemVersion": 6, "minorSubsystemVersion": 0, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096},
       "sections": [
@@ -4468,6 +4470,7 @@ TEST(PeExecFormatJsonValidate, MissingImageBaseRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4517,6 +4520,7 @@ TEST(PeExecFormatJsonValidate, NonPow2SectionAlignmentRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 3000, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4573,6 +4577,7 @@ TEST(PeExecFormatJsonValidate, NonPow2FileAlignmentRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 600, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4608,6 +4613,7 @@ TEST(PeExecFormatJsonValidate, SectionAlignmentBelowPageSizeRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 512, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4642,6 +4648,7 @@ TEST(PeExecFormatJsonValidate, MissingSubsystemRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4671,6 +4678,7 @@ TEST(PeExecFormatJsonValidate, MissingStackHeapSizesRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4705,6 +4713,7 @@ TEST(PeExecFormatJsonValidate, SectionAlignmentLessThanFileAlignmentRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 8192, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4740,6 +4749,7 @@ TEST(PeExecFormatJsonValidate, VirtualAddressNotMultipleOfSectionAlignmentReject
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4097}]
@@ -5353,7 +5363,9 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8},
         "class":"elf64","data":"lsb","machine":62,"type":"exec",
         "pageAlign":4096,
         "interpreter":"/lib64/ld-linux-x86-64.so.2",
@@ -5767,6 +5779,7 @@ TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "ExitProcess" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "supportedDataSections": ["rodata"],
       "pe": {"machine": 34404, "characteristics": 34, "type": "exec"},
       "optionalHeader": {"magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "majorOperatingSystemVersion": 6, "minorOperatingSystemVersion": 0, "majorSubsystemVersion": 6, "minorSubsystemVersion": 0, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096},
@@ -5790,6 +5803,57 @@ TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {
     EXPECT_EQ(::dss::test_support::countCode(rep,
                   DiagnosticCode::K_NoMatchingObjectFormat),
               1u);
+}
+
+TEST(PeExecWriter, AnImageWithImportsRefusesADocumentWithNoDynamicRow) {
+    // P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB, design c2): `.idata`'s
+    // name and Characteristics come from the document's `dynamic` row — the row
+    // that makes it READ-ONLY, which a loader-bound read-only slot inside it
+    // relies on. The writer used to hardcode 0xC0000040; a document that states
+    // no row now gets a refusal naming the kind, never a guessed section.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    char const* const kJson = R"({
+      "$comment": "Synthetic PE-Exec schema: imports, and no `dynamic` sections[] row.",
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".exe",
+  "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
+      "format": {"name": "pe-exec-no-dynamic-row", "version": "1.0", "kind": "pe"},
+      "entryPoint": "",
+      "runtimeLibraries": [{"role":"cLibrary","image":"kernel32.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "ExitProcess" },
+      "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
+      "supportedDataSections": ["rodata"],
+      "pe": {"machine": 34404, "characteristics": 34, "type": "exec"},
+      "optionalHeader": {"magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "majorOperatingSystemVersion": 6, "minorOperatingSystemVersion": 0, "majorSubsystemVersion": 6, "minorSubsystemVersion": 0, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096},
+      "sections": [
+        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
+      ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
+      "relocations": [
+        {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
+        {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
+        {"name":"IMAGE_REL_AMD64_ADDR32","kind":3,"nativeId":2}
+      ]
+    })";
+    auto fmt = ObjectFormatSchema::loadFromText(kJson, "synthetic");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod = makeModuleWithOneExtern({0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_EQ(::dss::test_support::countCode(rep, DiagnosticCode::K_NoMatchingObjectFormat), 1u);
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        named = named || d.actual.find("section kind 'dynamic'") != std::string::npos;
+    }
+    EXPECT_TRUE(named) << "the refusal must name the missing row's kind";
 }
 
 TEST(PeExecWriter, SizeOfInitializedDataSumsRdataAndIdata) {
@@ -5861,12 +5925,14 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "ExitProcess" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "supportedDataSections": ["rodata"],
       "pe": {"machine": 34404, "characteristics": 34, "type": "exec"},
       "optionalHeader": {"magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "majorOperatingSystemVersion": 6, "minorOperatingSystemVersion": 0, "majorSubsystemVersion": 6, "minorSubsystemVersion": 0, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096, "attributeCertReserveSize": 64},
       "sections": [
         {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096},
-        {"kind":"rodata","name":".rdata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}
+        {"kind":"rodata","name":".rdata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0},
+        {"kind":"dynamic","name":".idata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}
       ],
       "relocationAddends": "inPlace",
       "inputSectionPlacement": "unit",
@@ -6564,6 +6630,94 @@ peObjSectionDefAux(std::vector<std::uint8_t> const& obj,
     return mod;
 }
 
+// ── S + A, AS A LINKER COMPUTES IT —
+//    D-LK-PE-OBJ-PDATA-FIELDS-COUNT-THE-FUNCTION-OFFSET-TWICE ──
+//
+// COFF has no addend column: a linker adds the NAMED symbol's value to the
+// 4 bytes the relocation patches. ✔MEASURED 2026-09-30 on one DSS object,
+// `lld-link` 18 and GNU ld 2.42 alike, and MSVC's own objects state their
+// `.pdata` as `$LN4 + 0` / `$LN4 + <length>`. So the only honest reading of an
+// unwind field is `value(symbol) + field`, and a pin that reads the field
+// alone — as the one-function pin below did — cannot tell an addend stated in
+// the symbol's coordinate from one stated in the section's: a function at
+// offset 0 is the one case where the two agree, and it was the only case
+// pinned. Every function here sits somewhere else.
+struct ObjSymbolAt {
+    std::uint32_t value         = 0;
+    std::int16_t  sectionNumber = 0;
+};
+
+[[nodiscard]] ObjSymbolAt
+peObjSymbolAt(std::vector<std::uint8_t> const& obj, std::uint32_t idx) {
+    std::uint32_t const symPtr = readU32LE(obj, 8);
+    std::size_t const   rec    = static_cast<std::size_t>(symPtr)
+                            + static_cast<std::size_t>(idx) * 18u;
+    if (obj.size() < rec + 18u) return {};
+    return {readU32LE(obj, rec + 8),
+            static_cast<std::int16_t>(readU16LE(obj, rec + 12))};
+}
+
+// The value a linker writes into the field at `fieldOffset` of `sec`, in the
+// coordinates of the named symbol's own section: value(symbol) + the field.
+struct ResolvedField {
+    std::string   symbol;
+    std::int16_t  sectionNumber = 0;
+    std::uint32_t resolved      = 0;
+    std::uint32_t field         = 0;
+};
+
+[[nodiscard]] std::optional<ResolvedField>
+resolveUnwindField(std::vector<std::uint8_t> const& obj,
+                   ObjSectionHeader const& sec, std::uint32_t fieldOffset) {
+    for (auto const& r : peObjRelocations(obj, sec)) {
+        if (r.virtualAddress != fieldOffset) continue;
+        auto const body = peObjSectionBytes(obj, sec);
+        if (body.size() < static_cast<std::size_t>(fieldOffset) + 4u) return std::nullopt;
+        auto const at = peObjSymbolAt(obj, r.symbolTableIndex);
+        std::uint32_t const field = readU32LE(body, fieldOffset);
+        return ResolvedField{peObjSymbolName(obj, r.symbolTableIndex),
+                             at.sectionNumber, at.value + field, field};
+    }
+    return std::nullopt;
+}
+
+// THREE framed functions, laid out one after another, so two of them sit at a
+// non-zero `.text` offset — the offsets where a doubled addend lands in
+// somebody else's code or in no code at all.
+[[nodiscard]] AssembledModule makePeObjThreeFrameModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 3;
+    char const* const names[] = {"fa", "fb", "fc"};
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        AssembledModule one = makePeObjUnwindModule(/*withCfi=*/true,
+                                                    /*withTry=*/false);
+        AssembledFunction fn = std::move(one.functions.front());
+        fn.symbol = SymbolId{10u + i};
+        mod.functions.push_back(std::move(fn));
+        mod.symbols.push_back(ModuleSymbol{SymbolId{10u + i}, names[i],
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+    }
+    return mod;
+}
+
+// The `__try` module with a framed function IN FRONT of the guarded one, so
+// the scope table's interior offsets are offsets into a function that does
+// not start at `.text` offset 0.
+[[nodiscard]] AssembledModule makePeObjTryAtANonZeroOffsetModule() {
+    AssembledModule tryMod = makePeObjTryModule();
+    AssembledModule lead = makePeObjUnwindModule(/*withCfi=*/true,
+                                                 /*withTry=*/false);
+    AssembledFunction leadFn = std::move(lead.functions.front());
+    leadFn.symbol = SymbolId{9};
+    tryMod.functions.insert(tryMod.functions.begin(), std::move(leadFn));
+    tryMod.expectedFuncCount = 3;
+    tryMod.symbols.push_back(ModuleSymbol{SymbolId{9}, "lead",
+                                          SymbolBinding::Global,
+                                          SymbolVisibility::Default});
+    return tryMod;
+}
+
 // The same one-function shape, but its definition is WEAK — so its body is a
 // COMDAT and its unwind tables must be COMDATs associative to it.
 [[nodiscard]] AssembledModule makePeObjWeakUnwindModule() {
@@ -6769,13 +6923,19 @@ TEST(PeObjWriter, OrdinaryFramesCarryPdataAndXdataShapedLikeGccs) {
     // THE ADDENDS ARE IN THE FIELD, and that is the half a relocation-count
     // assertion cannot see: a table with the right relocations and zeroed
     // fields describes every function as starting at its section's origin.
+    // ⚠ ONE function at offset 0 is the one case where an addend stated from
+    // the FUNCTION and one stated from `.text` agree, so these three reads
+    // cannot see a wrong coordinate on their own; the S + A pin below
+    // (`EveryRuntimeFunctionResolvesToItsOwnFunctionUnderSPlusA`) is the one
+    // that can (D-LK-PE-OBJ-PDATA-FIELDS-COUNT-THE-FUNCTION-OFFSET-TWICE).
     auto const body = peObjSectionBytes(obj, *pdata);
     ASSERT_EQ(body.size(), 12u);
-    EXPECT_EQ(readU32LE(body, 0), 0u) << "BeginAddress = offset in .text";
+    EXPECT_EQ(readU32LE(body, 0), 0u)
+        << "BeginAddress = offset FROM the named function: 0";
     EXPECT_EQ(readU32LE(body, 4), 9u)
-        << "EndAddress = Begin + the function's 9 machine-code bytes; a "
-           "[Begin, End) that does not cover the body leaves a fault in the "
-           "tail with no unwind entry";
+        << "EndAddress = the function's 9 machine-code bytes, FROM the named "
+           "function; a [Begin, End) that does not cover the body leaves a "
+           "fault in the tail with no unwind entry";
     EXPECT_EQ(readU32LE(body, 8), 0u) << "UnwindInfoAddress = offset in .xdata";
 
     // The first two name the FUNCTION and the third names `.xdata` — this
@@ -6786,6 +6946,170 @@ TEST(PeObjWriter, OrdinaryFramesCarryPdataAndXdataShapedLikeGccs) {
               peObjSymbolName(obj, rels[1].symbolTableIndex));
     EXPECT_EQ(peObjSymbolName(obj, rels[2].symbolTableIndex), ".xdata");
     EXPECT_NE(peObjSymbolName(obj, rels[0].symbolTableIndex), ".xdata");
+}
+
+TEST(PeObjWriter, EveryRuntimeFunctionResolvesToItsOwnFunctionUnderSPlusA) {
+    // ★★ D-LK-PE-OBJ-PDATA-FIELDS-COUNT-THE-FUNCTION-OFFSET-TWICE. The writer
+    // stamped each function's offset IN `.text` into Begin/End while the
+    // relocation named the FUNCTION symbol, so a linker produced 2 x the
+    // offset: ✔MEASURED 2026-09-30, `lld-link` 18 and GNU ld 2.42 both placed
+    // a DSS object's second function at 0x32 for 0x19, and the OS's
+    // RtlLookupFunctionEntry then found no entry of its own for every
+    // function but the first. The pin resolves every field the way a linker
+    // does, on functions that do NOT start at offset 0.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    DiagnosticReporter rep;
+    auto obj = pe::encode(makePeObjThreeFrameModule(), *loaded.target,
+                          *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(obj.empty());
+
+    auto const secs = peObjSections(obj);
+    auto const* text  = findSection(secs, ".text");
+    auto const* xdata = findSection(secs, ".xdata");
+    auto const* pdata = findSection(secs, ".pdata");
+    ASSERT_NE(text, nullptr);
+    ASSERT_NE(xdata, nullptr);
+    ASSERT_NE(pdata, nullptr);
+    ASSERT_EQ(pdata->sizeOfRawData, 36u) << "three RUNTIME_FUNCTIONs";
+
+    std::uint32_t previousEnd = 0;
+    std::size_t   nonZeroStarts = 0;
+    std::vector<std::uint32_t> unwindInfoAt;
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        std::uint32_t const at = i * 12u;
+        auto const begin = resolveUnwindField(obj, *pdata, at);
+        auto const end   = resolveUnwindField(obj, *pdata, at + 4u);
+        auto const info  = resolveUnwindField(obj, *pdata, at + 8u);
+        ASSERT_TRUE(begin && end && info)
+            << "RUNTIME_FUNCTION #" << i << " must relocate all three fields";
+        // The function named is one of the three, in `.text`, and Begin lands
+        // EXACTLY on it: S + A == S, i.e. the addend is 0 from the function.
+        EXPECT_EQ(begin->sectionNumber, text->ordinal);
+        auto const named = peObjSymbolAt(
+            obj, peObjRelocations(obj, *pdata)[i * 3u].symbolTableIndex);
+        EXPECT_EQ(begin->resolved, named.value)
+            << "RUNTIME_FUNCTION #" << i << " (" << begin->symbol
+            << ") Begin resolves to 0x" << std::hex << begin->resolved
+            << " but its function starts at 0x" << named.value
+            << " - an addend stated from `.text` against the function "
+               "symbol counts the offset twice";
+        EXPECT_EQ(end->symbol, begin->symbol);
+        EXPECT_EQ(end->resolved, begin->resolved + 9u)
+            << "End must be the function's own end: Begin + its 9 bytes";
+        EXPECT_GE(begin->resolved, previousEnd)
+            << "the three ranges must tile `.text` in order, never overlap";
+        previousEnd = end->resolved;
+        if (begin->resolved != 0u) ++nonZeroStarts;
+        // UnwindInfo names `.xdata`'s section symbol (value 0), so the field
+        // IS the blob's offset, and each blob is a version-1 UNWIND_INFO.
+        EXPECT_EQ(info->symbol, ".xdata");
+        auto const xbody = peObjSectionBytes(obj, *xdata);
+        ASSERT_LT(info->resolved, xbody.size());
+        EXPECT_EQ(xbody[info->resolved] & 0x07u, 1u)
+            << "UnwindInfo must point at an UNWIND_INFO header (version 1)";
+        unwindInfoAt.push_back(info->resolved);
+    }
+    EXPECT_EQ(nonZeroStarts, 2u)
+        << "the fixture is only a pin if two of its functions sit past offset 0";
+    EXPECT_LE(previousEnd, text->sizeOfRawData);
+    std::sort(unwindInfoAt.begin(), unwindInfoAt.end());
+    EXPECT_EQ(std::adjacent_find(unwindInfoAt.begin(), unwindInfoAt.end()),
+              unwindInfoAt.end())
+        << "each function must point at ITS OWN UNWIND_INFO";
+}
+
+TEST(PeObjWriter, AScopeTableAtANonZeroOffsetResolvesToItsOwnGuardedRange) {
+    // ★★ THE SAME DEFECT'S OTHER HALF. The scope table's Begin / End /
+    // JumpTarget are INTERIOR offsets of the guarded function and its
+    // HandlerAddress the filter funclet's start; `buildFunctionUnwindInfo`
+    // states each as {symbol, offset into it} and writes a placeholder 0,
+    // and the object arm used to relocate the field WITHOUT ever writing the
+    // offset into it — so every scope claimed the guarded range was
+    // [function start, function start) and resumed at the function's first
+    // byte. `ATryRegionCarriesItsScopeTableIntoTheObject` counted five
+    // relocations of the right type and could not see it.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaWithPersonalityAndRvaRelocJson(),
+        "synthetic-pe-obj-personality-rva");
+    ASSERT_TRUE(fmt.has_value());
+
+    DiagnosticReporter rep;
+    auto obj = pe::encode(makePeObjTryAtANonZeroOffsetModule(), **target,
+                          **fmt, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(obj.empty());
+
+    auto const secs = peObjSections(obj);
+    auto const* xdata = findSection(secs, ".xdata");
+    ASSERT_NE(xdata, nullptr);
+    auto const rels = peObjRelocations(obj, *xdata);
+    ASSERT_EQ(rels.size(), 5u);
+
+    // Where the guarded function landed, read off the symbol table — the
+    // coordinate its three interior scope fields must resolve into.
+    std::optional<std::uint32_t> guardedAt;
+    std::uint32_t const numSyms = readU32LE(obj, 12);
+    for (std::uint32_t i = 0; i < numSyms; ++i) {
+        if (peObjSymbolName(obj, i) == "guarded") {
+            guardedAt = peObjSymbolAt(obj, i).value;
+        }
+    }
+    ASSERT_TRUE(guardedAt.has_value());
+    ASSERT_NE(*guardedAt, 0u)
+        << "the fixture is only a pin if the guarded function sits past offset 0";
+
+    // Read the five fields back by ROLE rather than by position, so a failure
+    // says which role went wrong.
+    for (auto const& r : rels) {
+        ASSERT_TRUE(resolveUnwindField(obj, *xdata, r.virtualAddress).has_value())
+            << "an `.xdata` relocation at " << r.virtualAddress
+            << " must patch a field inside the section";
+    }
+    // The HandlerAddress is the one field naming neither the guarded function
+    // nor the personality: the filter funclet, a DIFFERENT function, whose own
+    // start it must resolve to (addend 0 from the funclet).
+    std::size_t personality = 0, guardedFields = 0, handler = 0;
+    for (auto const& r : rels) {
+        auto const f = *resolveUnwindField(obj, *xdata, r.virtualAddress);
+        if (f.symbol == "__C_specific_handler") {
+            EXPECT_EQ(f.field, 0u) << "the personality is the extern itself";
+            ++personality;
+        } else if (f.symbol == "guarded") {
+            ++guardedFields;
+        } else {
+            auto const at = peObjSymbolAt(obj, r.symbolTableIndex);
+            EXPECT_NE(at.value, *guardedAt)
+                << "HandlerAddress names the filter funclet, not the guarded body";
+            EXPECT_EQ(f.resolved, at.value)
+                << "HandlerAddress must be the filter funclet's own start";
+            ++handler;
+        }
+    }
+    EXPECT_EQ(personality, 1u);
+    EXPECT_EQ(guardedFields, 3u);
+    EXPECT_EQ(handler, 1u);
+    // The three `guarded` fields, in the order the builder wrote them:
+    // Begin (+4), End (+8), JumpTarget (+8).
+    std::vector<std::uint32_t> guardedResolved;
+    for (auto const& r : rels) {
+        auto const f = *resolveUnwindField(obj, *xdata, r.virtualAddress);
+        if (f.symbol == "guarded") guardedResolved.push_back(f.resolved);
+    }
+    ASSERT_EQ(guardedResolved.size(), 3u);
+    EXPECT_EQ(guardedResolved[0], *guardedAt + 4u)
+        << "scope BeginAddress must be 4 bytes INTO the guarded function";
+    EXPECT_EQ(guardedResolved[1], *guardedAt + 8u)
+        << "scope EndAddress must be 8 bytes into the guarded function";
+    EXPECT_EQ(guardedResolved[2], *guardedAt + 8u)
+        << "scope JumpTarget must be 8 bytes into the guarded function";
 }
 
 TEST(PeObjWriter, AModuleWithNoFrameInformationGrowsNoUnwindSections) {
@@ -6865,6 +7189,15 @@ TEST(PeObjWriter, AWeakFunctionsUnwindTablesAreComdatsAssociativeToItsBody) {
         EXPECT_EQ(aux->number, static_cast<std::uint16_t>(weakTextOrdinal))
             << name << "'s associated section must be the weak function's own "
                        "COMDAT `.text`, not section 1";
+        // D-LK-PE-OBJ-ASSOCIATIVE-UNWIND-SECTION-PRECEDES-ITS-COMDAT: the
+        // section an associative COMDAT names must PRECEDE it. ✔MEASURED
+        // 2026-10-06 (run 20261006-215740-5f83e38e): link.exe 14.51 refuses a
+        // forward association outright — `fatal error LNK1243: invalid or
+        // corrupt file: COMDAT section 0x6 associated with following section
+        // 0x12` — while lld-link and GNU ld link it, and DSS's own reader skips
+        // the metadata whatever its ordinal, so no round trip can see it.
+        EXPECT_LT(weakTextOrdinal, peObjSectionOrdinal(secs, name, /*occurrence=*/0))
+            << name << " must come AFTER the COMDAT `.text` it is associative to";
     }
 }
 

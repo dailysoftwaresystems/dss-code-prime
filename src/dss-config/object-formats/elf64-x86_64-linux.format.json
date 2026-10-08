@@ -2,10 +2,8 @@
   "$comment": "ELF64 relocatable + dynamic for x86_64 (Linux / SysV). First shipped object-format JSON (plan 14 LK1, 2026-05-29). Consumed by `src/link/format/elf.cpp` via the format-blind linker engine. Section names + flags + ELF identity fields are the SAME values readelf prints; relocation `nativeId` values are the ELF type numbers stored in `r_info` low 32 bits.",
 
   "dssObjectFormatVersion": 1,
-  "$absentKeyRationaleComment": "Machine-read by tests/link/test_object_format_family_symmetry.cpp: every root key a SIBLING of this format declares and this file does not must appear below with a non-empty reason, and every entry below must correspond to a real absence. Both directions fail loud, so this table can neither be skipped nor rot after a gap is closed.",
-  "$absentKeyRationale": {
-    "externAddrBinding": "DELIBERATE, and the aarch64 sibling that DOES declare it says so itself: 'DSS-NEUTRAL to x86_64 (its `&extern` value is a PC-relative rel32, already PIE-safe) ... so ONLY the relocatable + static-archive formats declare it' (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT, TF-C52). Taking the ADDRESS of a preemptible extern as a live value needs a foreign-linker GOT slot on arm64 because an absolute `adrp`+`add` page-pair against a symbol that may bind externally is REJECTED by a default-PIE link; x86_64's rel32 form is already position-independent, so declaring `got` here would force a GOT indirection gcc/clang do not emit for the same source. An ARCH-SPECIFIC ABI fact, not an unfinished copy."
-  },
+  "$externAddrBindingComment": "P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB, and half (2) of D-LK-MEMBER-DIRECT-LIBRARY-DATUM-BOUND-TO-THE-SLOT): an undefined extern's ADDRESS as a live VALUE — function or datum — is LOADED from the GOT slot the final linker makes (`lea_extern_got`, R_X86_64_REX_GOTPCRELX), exactly as the aarch64 sibling has since TF-C52. The absence this replaces was justified as 'x86_64's rel32 form is already position-independent'; ✔MEASURED 2026-09-30 that it is position-independent and still not ONE answer for a FUNCTION: the PC-relative form gas writes for `.s` `leaq puts(%rip)` (R_X86_64_PC32) is bound by GNU ld -no-pie to a stub it does not make canonical (&puts != dlsym, exit 1) and refused outright by GNU ld -pie ('recompile with -fPIE'), while lld makes that stub canonical in both modes (exit 42) — right under one reference linker, wrong or refused under the other. The GOT form is what gcc -O2 default (PIE) writes for `&puts`, and for DSS's OWN object it is MEASURED right rather than inferred from gcc's: tests/link/test_relocatable_got_load_reference_link.cpp (P69 send-back, review M4) links it with GNU ld -no-pie and -pie on both Linux ISAs, and with ld.lld where the host has one, and every address it hands over equals what dlsym answers. For a datum it also retires the copy relocation a foreign link otherwise has to make for DSS's own objects.",
+  "externAddrBinding": "got",
 
   "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: ELF has NO image field for a stack SIZE on ANY flavor -- PT_GNU_STACK encodes stack EXECUTABILITY, not size. The kernel sizes the initial thread's stack from the process limit (`ulimit -s` / setrlimit RLIMIT_STACK) and further threads from pthread_attr_setstacksize, so nothing the linker writes can change it. A `stackReserve` / `--stack-reserve` request is therefore REFUSED with that remedy rather than silently dropped -- which is also why the sqlite full tier passes on Linux (8 MiB by default) and overflowed on Windows at 1 MiB.",
 
@@ -66,6 +64,8 @@
 
   "$supportedDataSectionsComment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE: a relocatable object DOES carry data — a global lands in `.rodata`/`.data`/`.bss`/`.data.rel.ro` with `sh_addr=0` and a section-relative `.symtab` entry (STT_OBJECT, st_shndx = the data section, st_value = offset) the FINAL linker binds. Same `AssembledModule.dataItems` producer path as exec (format-blind); the ET_REL writer emits the section bytes + data symbols + relocs against them instead of resolving to absolute VAs. D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST global that carries LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;` — sqlite's VFS method tables + `aSyscall[]`) lands in `relro` (ELF `.data.rel.ro`) and the writer emits its OWN relocations into `.rela.data.rel.ro` (R_X86_64_64); a reloc-bearing MUTABLE pointer global lands in `.data` and gets `.rela.data`. TLS (`tdata`/`tbss`) is deferred to a follow-up.",
   "supportedDataSections": ["rodata", "data", "bss", "relro"],
+  "$commonYieldsToComment": "P69 round 4 (D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT): which definitions a COMMON (`SHN_COMMON`, what gcc and clang write for a tentative definition under -fcommon) yields to when this link holds another definition of its name -- `strongDefinition`: a STRONG definition replaces it; a WEAK one (STB_WEAK) does not, and the common, allocated as the name's storage, outranks it -- the System V gABI's rule (\"the link editor honors the common definition and ignores the weak ones\"). ✔MEASURED 2026-10-07 (`.orchestrators/p69/work/xa/r4probe/m15/elf_weak_common.sh`: `int c;` under -fcommon beside `__attribute__((weak)) int c = 5;`, both link orders): GNU ld 2.42 (gcc 13.3.0 on x86_64, and the aarch64 cross run under qemu-aarch64) and ld.lld 18.1.3 run the program with the common's 0; a strong `int c = 5;` replaces it. Mach-O's and PE's linkers answer the other way (`anyDefinition`). Read by `linker::allocateCommonDefinitions` and by a static link's archive search, which fetches for a common only a member whose definition the common yields to -- here a GLOBAL datum (`archiveCommonResolution`).",
+  "commonYieldsTo": "strongDefinition",
 
   "elf": {
     "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian); `osabi` = ELFOSABI_NONE (SysV, conventional for relocatable .o); `machine` = EM_X86_64 (62).",
@@ -202,11 +202,11 @@
   "inputSectionPlacement": "unit",
   "relocations": [
     {
-      "$comment": "PC-relative 32-bit (call / jmp rel32). ELF type R_X86_64_PC32 = 2. `kind` = 1 matches x86_64.target.json's `rel32` row. `pltNativeId` = 4 (R_X86_64_PLT32): when this rel32 targets an UNDEFINED extern (a `call` to a libc function the FINAL linker resolves), the writer emits PLT32 instead so a foreign PIE link routes it through a linker-built PLT — a bare PC32 against an undefined symbol errors under -pie (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE). Same S+A-P formula, same -4 addend.",
-      "name": "R_X86_64_PC32",
+      "$comment": "A CALL's displacement (call / jmp rel32): ELF type R_X86_64_PLT32 = 4, `kind` = 1 = x86_64.target.json's `rel32`, which since P69 only a CALL declares (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB: every address-taking and memory operand moved to `riprel32`, kind 8, below). `isCall` states the ROLE, so this is the format's call signal both ways: DSS writes every call as PLT32 (what gcc has written for every call since binutils 2.31, local targets included; a bare PC32 against an undefined symbol errors under -pie, D-LK-OBJECT-EXTERN-CALL-RELOCATABLE), and a reader takes a PLT32 as a CALL, never as an address. Same S+A-P formula and -4 addend as PC32.",
+      "name": "R_X86_64_PLT32",
       "kind": 1,
-      "nativeId": 2,
-      "pltNativeId": 4
+      "nativeId": 4,
+      "isCall": true
     },
     {
       "$comment": "Absolute 64-bit. ELF type R_X86_64_64 = 1. `kind` = 2 matches x86_64.target.json's `abs64` row.",
@@ -221,14 +221,14 @@
       "nativeId": 10
     },
     {
-      "$comment": "D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS: the DWARF FDE `initial_location` pointer in a relocatable `.eh_frame` (DW_EH_PE_pcrel|sdata4). SAME ELF wire type as the kind-1 row above (R_X86_64_PC32 = 2); the `_UNBIASED` suffix is a DSS-side disambiguator, NOT a psABI spelling -- the format loader requires row names to be unique and both rows emit r_type 2. The two DSS kinds differ ONLY in the implicit addend the emitter bakes in (kind 1 `rel32` = -4, correct for a call site whose displacement is relative to the instruction END; kind 5 `pcrel32` = 0, correct for a DATA word). No `pltNativeId`: an FDE pointer never names an extern call, and routing it through a PLT stub would make the unwinder's PC lookup land on jump-stub bytes. ✔MEASURED 2026-08-13 against `gcc -c`: `readelf -r` shows `R_X86_64_PC32  .text + <fnOffset>` on every FDE.",
+      "$comment": "D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS: the DWARF FDE `initial_location` pointer in a relocatable `.eh_frame` (DW_EH_PE_pcrel|sdata4) -- the target's `pcrel32` (kind 5, addend bias 0: a DATA word whose displacement is measured from the word itself). SAME ELF wire type as the kind-8 `R_X86_64_PC32` row below (r_type 2), which OWNS it: a reader decodes every r_type 2 as kind 8 `riprel32` (addend bias -4, a memory operand's displacement from the NEXT instruction), and this row is `emitOnly`, the emission alias through which the writer reaches the same type with an unbiased addend -- the two kinds differ ONLY in that implicit bias, which the wire format does not carry. The `_UNBIASED` suffix is a DSS-side disambiguator, NOT a psABI spelling (the format loader requires row names to be unique). The CALL kind (kind 1 `rel32`) no longer shares the type: since P69 it is R_X86_64_PLT32. Not `isCall`: an FDE pointer never names an extern call, and routing it through a PLT stub would make the unwinder's PC lookup land on jump-stub bytes. ✔MEASURED 2026-08-13 against `gcc -c`: `readelf -r` shows `R_X86_64_PC32  .text + <fnOffset>` on every FDE.",
       "name": "R_X86_64_PC32_UNBIASED",
       "kind": 5,
       "nativeId": 2,
       "emitOnly": true
     },
     {
-      "$comment": "D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: GOT-slot-relative reference, ELF type R_X86_64_GOTPCREL = 9. `kind` = 7 matches x86_64.target.json's `gotpcrel32` row. DECODE-ONLY IN PRACTICE: DSS never emits this type -- it is declared so a REAL foreign static-archive member can be READ (a distro glibc `libc.a` carries 78 of them, in exit.o / fork.o / uselocale.o / setlocale.o / memstream.o and eight more). No `pltNativeId`: a GOT-slot reference never names a call, and routing it through a PLT stub would make the loaded value the stub address instead of the symbol's.",
+      "$comment": "D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: GOT-slot-relative reference, ELF type R_X86_64_GOTPCREL = 9. `kind` = 7 matches x86_64.target.json's `gotpcrel32` row. DECODE-ONLY IN PRACTICE: DSS never emits this type -- it is declared so a REAL foreign static-archive member can be READ (a distro glibc `libc.a` carries 78 of them, in exit.o / fork.o / uselocale.o / setlocale.o / memstream.o and eight more). Not `isCall`: a GOT-slot reference never names a call, and routing it through a PLT stub would make the loaded value the stub address instead of the symbol's.",
       "name": "R_X86_64_GOTPCREL",
       "kind": 7,
       "nativeId": 9
@@ -246,10 +246,16 @@
       "nativeId": 42
     },
     {
-      "$comment": "P68 round 9 (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the target's `riprel32` — a memory operand's displacement from the NEXT instruction, a DATA reference. ELF writes it as R_X86_64_PC32 (never PLT32: ✔MEASURED 2026-09-23, gas 2.42 writes PC32 for `leaq ext_fn(%rip)`), so this row is an EMISSION ALIAS of the `rel32` row's wire type and decodes as that row.",
-      "name": "R_X86_64_PC32_RIPREL",
+      "$comment": "P68 round 9 (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the target's `riprel32` — a memory operand's displacement from the NEXT instruction, a DATA or ADDRESS reference, never a call. ELF writes it as R_X86_64_PC32 (never PLT32: ✔MEASURED 2026-09-23, gas 2.42 writes PC32 for `leaq ext_fn(%rip)`). ★ P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): this row now OWNS the PC32 wire type, so a reader takes a foreign R_X86_64_PC32 as what it is — an address or a memory operand (gcc's `movq stdout(%rip)`, a -fno-pic `leaq puts(%rip)`) — and the link can see that the address of a function was taken. It used to decode as the CALL kind, so no reader could tell the two apart.",
+      "name": "R_X86_64_PC32",
       "kind": 8,
-      "nativeId": 2,
+      "nativeId": 2
+    },
+    {
+      "$comment": "P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): the target's `gotriprel32_load` — the GOT-load of an extern's ADDRESS that x86_64's `lea_extern_got` row writes under `externAddrBinding: got` — spelled R_X86_64_REX_GOTPCRELX = 42 with r_addend -4, byte-for-byte what gcc -O2 default (PIE) writes for `movq puts@GOTPCREL(%rip), %rax`. An EMISSION ALIAS of the kind-10 row's wire type, which is how a reader decodes it.",
+      "name": "R_X86_64_REX_GOTPCRELX_LOAD",
+      "kind": 12,
+      "nativeId": 42,
       "emitOnly": true
     }
   ]

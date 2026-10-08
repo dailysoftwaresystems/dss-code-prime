@@ -527,12 +527,18 @@ TEST(RuntimeLibraryRoles, EveryShippedFormatsRolesResolveConsistently) {
     // counting keys in the format files.
     // ★★ PINNING IT AT THE LIVE VALUE IS SAFE *AND* STRICTER, because this
     // population only ever GROWS: a format gaining a role-naming block raises
-    // the count, so an addition can never false-red this. The realization arc
-    // will raise it (macho64-x86_64-darwin-exec gains librarySynthesis ⇒ 17).
+    // the count, so an addition can never false-red this.
     // ⇒ RAISE this when a vehicle lands; NEVER lower it to green a break. A
     // removed role claim is precisely the regression this exists to catch.
-    EXPECT_GE(rolesChecked, 12u)
-        << "only " << rolesChecked << " role claims were checked, against 12 "
+    // ✔RAISED P69 (lane lm) 12 -> 13: macho64-x86_64-darwin-exec gained its
+    // `librarySynthesis` (pthread, role cLibrary — the coordinator's grant,
+    // C11 threads on every pair). Counted over the shipped documents by the
+    // same rule as this sweep — a role-naming processExit / processArgs /
+    // sehPersonality / librarySynthesis block — 13 on 2026-10-01. (The old
+    // forecast here said that change would make it 17; it was counting from
+    // the 16 present blocks the note above refutes.)
+    EXPECT_GE(rolesChecked, 13u)
+        << "only " << rolesChecked << " role claims were checked, against 13 "
            "measured live — a block stopped naming a role, so the two-copies-"
            "of-one-fact agreement it used to force is no longer being checked "
            "anywhere. Find the block that lost its role; do not lower this.";

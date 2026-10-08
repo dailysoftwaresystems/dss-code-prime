@@ -4,7 +4,8 @@
   "standard": "c89",
   "library": { "pe": { "role": "cLibrary" }, "elf": "libm.so.6", "macho": { "role": "cLibrary" } },
   "floatConstants": [
-    { "name": "INFINITY", "value": "inf", "type": "f64" },
+    { "$comment": "P69 round 4 (D-FFI-DESCRIPTOR-FLOAT-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR): C 7.12p4 -- INFINITY 'expands to a constant expression of type float representing positive or unsigned infinity'; NAN (7.12p5) 'expands to a constant expression of type float representing a quiet NaN'; HUGE_VAL (7.12p3) is a positive DOUBLE. INFINITY was typed f64 here, so `sizeof INFINITY` was 8 and `_Generic(INFINITY, float: ...)` took no float arm, and NAN was absent. MEASURED, each reference defines all three after `#include <math.h>` alone with exactly these types (probes/mathinf.c, `_Generic` over each, exit 42): gcc 13.3.0 and clang 18.1.3 over glibc 2.39 (run 20261001-043814-1a4bac88), MSVC 19.51 and mingw-w64 13.2.0 over the UCRT (run 20261001-043838-0f23e0c9), Apple clang 21 on both Mach-O arches (run 20261001-045943-1ce3d762). Every one of them is a MACRO, which the preprocessor splices from these rows (`#ifdef INFINITY` holds) as the C front end's own constant of the stated type -- the first builtin of that type whose `lowering` is the value's (`infinity`, `quiet_nan`): `(__builtin_inff())`, `(__builtin_nanf(\"\"))`, `(__builtin_inf())`.", "name": "INFINITY", "value": "inf", "type": "f32" },
+    { "name": "NAN",      "value": "nan", "type": "f32" },
     { "name": "HUGE_VAL", "value": "inf", "type": "f64" }
   ],
   "symbols": [
@@ -30,6 +31,8 @@
     { "name": "tanh",  "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
     { "name": "log2",  "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
     { "name": "trunc", "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "$comment": "P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): C99 7.12.11.2 `nan` / `nanf` -- what `__builtin_nan(s)` / `__builtin_nanf(s)` CALL when `s` is not a string literal gcc's parser consumes wholly (gcc and clang both call libm's `nan` there: lane `cs`'s probe r5s s12), and the ordinary <math.h> functions too. glibc libm, the UCRT and libSystem all export both.", "name": "nan",  "signature": "fn(ptr<const<char>>) -> f64", "kind": "function", "linkage": "external" },
+    { "name": "nanf", "signature": "fn(ptr<const<char>>) -> f32", "kind": "function", "linkage": "external" },
     { "name": "acosh", "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
     { "name": "asinh", "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
     { "name": "atanh", "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },

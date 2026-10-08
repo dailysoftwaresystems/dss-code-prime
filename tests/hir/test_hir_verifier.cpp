@@ -1699,3 +1699,78 @@ TEST(HirVerifier, ArityFailureNamesTheConstructNotAnOrdinal) {
     EXPECT_NE(text.find("#" + std::to_string(bad.v)), std::string::npos)
         << "the node id must survive — it is the reporter's dedup key: " << text;
 }
+
+// P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): an `UnnamedObject`
+// carries a storage duration its payload can name, and its initializer has the object's
+// MATERIAL type — its value (what a consumer peels) and its object (what a consumer
+// addresses) must agree. A qualifier skin on the object alone (`volatile int`) is the
+// object's, and passes. RED-ON-DISABLE: drop `checkUnnamedObject` from `verify` → the two
+// refusals below read clean.
+TEST(HirVerifier, UnnamedObjectStorageAndInitializerTypeAreChecked) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const i64  = ti.primitive(TypeKind::I64);
+    TypeId const vi32 = ti.volatileQualified(i32);
+    {
+        HirBuilder b{"toy"};
+        HirNodeId const init = b.makeLiteral(i32, 0);
+        HirNodeId const obj  = b.makeUnnamedObject(init, vi32, dss::HirObjectStorage::Static);
+        Hir h = std::move(b).finish(obj);
+        DiagnosticReporter reporter;
+        EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)))
+            << "a volatile object initialized by an int value is well-formed";
+    }
+    {
+        HirBuilder b{"toy"};
+        HirNodeId const init = b.makeLiteral(i64, 0);
+        HirNodeId const obj  = b.makeUnnamedObject(init, i32, dss::HirObjectStorage::Automatic);
+        Hir h = std::move(b).finish(obj);
+        DiagnosticReporter reporter;
+        EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+        ASSERT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+        EXPECT_NE(reporter.all().front().actual.find("UnnamedObject"), std::string::npos);
+    }
+    {
+        HirBuilder b{"toy"};
+        HirNodeId const init = b.makeLiteral(i32, 0);
+        HirNodeId const obj  = b.addParent(HirKind::UnnamedObject, std::array{init}, i32,
+                                           /*payload=*/7);
+        Hir h = std::move(b).finish(obj);
+        DiagnosticReporter reporter;
+        EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+        ASSERT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+        EXPECT_NE(reporter.all().front().actual.find("storage 7"), std::string::npos)
+            << reporter.all().front().actual;
+    }
+}
+
+// P69 (D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED): a union aggregate's
+// payload NAMES the member its child initializes, and the child must be of THAT member's type —
+// "some member's type" let a producer that named no member pass whenever its child happened to
+// share member 0's type, and a member read then folded the wrong member.
+TEST(HirVerifier, AUnionAggregateNamesTheMemberItsChildInitializes) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const f32 = ti.primitive(TypeKind::F32);
+    std::array<TypeId, 2> const variants{i32, f32};
+    TypeId const u = ti.unionType("U", variants);
+    auto const verdict = [&](TypeId childTy, std::uint32_t member) {
+        HirBuilder b{"toy"};
+        HirNodeId const child = b.makeLiteral(childTy, 0);
+        HirNodeId const agg = b.makeConstructAggregate(std::array{child}, u,
+                                                       HirFlags::None, member);
+        Hir h = std::move(b).finish(agg);
+        DiagnosticReporter reporter;
+        bool const ok = HirVerifier{h, nullptr, &ti}.verify(reporter);
+        return std::pair{ok, reporter.all().empty() ? std::string{}
+                                                    : reporter.all().front().actual};
+    };
+    EXPECT_TRUE(verdict(i32, 0).first) << "member 0, an int child";
+    EXPECT_TRUE(verdict(f32, 1).first) << "member 1, a float child";
+    auto const wrong = verdict(f32, 0);
+    EXPECT_FALSE(wrong.first) << "a float child named as member 0 (the int)";
+    EXPECT_NE(wrong.second.find("member 0"), std::string::npos) << wrong.second;
+    auto const past = verdict(i32, 2);
+    EXPECT_FALSE(past.first) << "member 2 of a two-member union";
+    EXPECT_NE(past.second.find("member 2"), std::string::npos) << past.second;
+}

@@ -692,6 +692,16 @@ private:
                      "and no target was supplied to this preprocessor run: "
                      + std::string{text});
                 return std::nullopt;
+            case PhaseFourLiteralStatus::TooLarge:
+                // P69 (lane `cs`): a decimal magnitude past every SIGNED candidate of a
+                // rule that declares no `decimalPastRange` reading has no type — phase
+                // 7 refuses it (S_IntegerLiteralTooLarge), so phase 4 does too, rather
+                // than reading it as some width the language never named.
+                fail(DiagnosticCode::P_PreprocessorDirective,
+                     "integer constant in #if is too large for every type its suffix "
+                     "admits, and the language declares no reading past them "
+                     "('decimalPastRange'): " + std::string{text});
+                return std::nullopt;
             case PhaseFourLiteralStatus::NoRule:
                 break;
         }
@@ -708,9 +718,10 @@ private:
     }
 
     // ── D-PP-IF-LARGE-DECIMAL-LITERAL-HAS-NO-WARNING (C 6.10.1p4) ────────────
-    // The literal was REINTERPRETED: a decimal, unsuffixed spelling whose every
-    // ladder candidate is signed, taken as UNSIGNED because phase 4 has nothing
-    // wider than intmax_t to put it in. Both references say so out loud, on by
+    // The literal was REINTERPRETED: a decimal spelling whose every ladder candidate
+    // is signed — unsuffixed, `l` or `ll` (P69, lane `cs`: the suffixed two were
+    // silent) — taken as UNSIGNED because phase 4 has nothing wider than intmax_t to
+    // put it in. Both references say so out loud, on by
     // default, and then evaluate exactly as DSS does — so this is a warning, not
     // a refusal, and the branch is unaffected.
     //
@@ -1111,10 +1122,24 @@ private:
 }
 
 [[nodiscard]] bool languageDeclaresBuiltin(GrammarSchema const& schema,
-                                           std::string_view     name) {
+                                           std::string_view     name,
+                                           PpLibraryFunctionProvided const& libraryFunctionProvided) {
     for (auto const& b : schema.semantics().builtinFunctions) {
         if (b.name == name) return true;
     }
+    // P69 (lane `cs`): GCC's LIBRARY builtins — `__builtin_strlen` and its siblings — answer
+    // from the same declaration that binds them (`semantics.libraryBuiltins`), never from a
+    // second list. ✔MEASURED: gcc 13.3.0 and clang 18.1.3 answer 1 for `__builtin_strlen`,
+    // `__builtin_printf`, `__builtin_ceil`, `__builtin_memcpy` and `__builtin_abort`.
+    // ★ P69 review M3: and only where the call BINDS — a library builtin is the platform's
+    // function, and a use of one the platform does not provide on the active target is
+    // refused (S_LibraryBuiltinUnavailable), so answering 1 there would send a portable
+    // `#if __has_builtin(...)` guard into a call the next tier refuses. The platform half is
+    // the caller's (`PpLibraryFunctionProvided`); unset, no pair is in scope and the answer
+    // is 0, as the binder's is. A listed name is never also a keyword, so its answer is final.
+    if (std::string_view const lib = schema.semantics().libraryBuiltins.libraryFunctionOf(name);
+        !lib.empty())
+        return libraryFunctionProvided && libraryFunctionProvided(lib);
     // The GNU compile-time builtins are declared as grammar KEYWORDS rather
     // than `builtinFunctions` rows (they are operators wearing a call's
     // punctuation — their operands are type-names, not values). The config
@@ -1134,12 +1159,13 @@ private:
 
 [[nodiscard]] std::int64_t featureQueryAnswer(GrammarSchema const&     schema,
                                               FeatureQueryAnswerSource src,
-                                              std::string_view         arg) {
+                                              std::string_view         arg,
+                                              PpLibraryFunctionProvided const& libraryFunctionProvided) {
     switch (src) {
         case FeatureQueryAnswerSource::DeclaredAttributes:
             return languageDeclaresAttribute(schema, arg) ? 1 : 0;
         case FeatureQueryAnswerSource::DeclaredBuiltins:
-            return languageDeclaresBuiltin(schema, arg) ? 1 : 0;
+            return languageDeclaresBuiltin(schema, arg, libraryFunctionProvided) ? 1 : 0;
         case FeatureQueryAnswerSource::DeclaredLanguageFeatures:
             for (LanguageFeatureDef const& f :
                  schema.preprocess().languageFeatures) {
@@ -1465,6 +1491,7 @@ evaluateEmbedLimit(std::span<Token const>   clause,
                    PpHasEmbed const&        hasEmbed,
                    PpOperatorRevoked const& operatorRevoked,
                    PpCharConstantFacts const& charFacts,
+                   PpLibraryFunctionProvided const& libraryFunctionProvided,
                    PpTokenTextFn const&     textOf,
                    PpEmbedFail const&       fail) {
     std::string const& definedKw = schema.preprocess().definedOperator;
@@ -1509,7 +1536,7 @@ evaluateEmbedLimit(std::span<Token const>   clause,
         [](std::vector<Token> const& run) { return run; };
     auto const value = evaluateIfExpressionValue(
         expanded, schema, identity, isDefined, hasInclude, synth, productText,
-        rep, hasEmbed, operatorRevoked, charFacts);
+        rep, hasEmbed, operatorRevoked, charFacts, libraryFunctionProvided);
     if (!value.has_value()) {
         fail(anchor, "embed limit(...) is not an integer constant expression "
                      "(C23 6.10.4.2p1); see the preceding diagnostic");
@@ -1537,12 +1564,14 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      DiagnosticReporter&    rep,
                      PpHasEmbed const&      hasEmbed,
                      PpOperatorRevoked const& operatorRevoked,
-                     PpCharConstantFacts const& charFacts) {
+                     PpCharConstantFacts const& charFacts,
+                     PpLibraryFunctionProvided const& libraryFunctionProvided) {
     // C 6.10.2p12: the question asked of the value is whether it "evaluates to
     // nonzero" -- the value engine below is the whole implementation.
     auto const value = evaluateIfExpressionValue(
         operandTokens, schema, macroExpand, isDefined, hasInclude, synth,
-        productText, rep, hasEmbed, operatorRevoked, charFacts);
+        productText, rep, hasEmbed, operatorRevoked, charFacts,
+        libraryFunctionProvided);
     if (!value.has_value()) return std::nullopt;
     return value->bits != 0;
 }
@@ -1558,7 +1587,8 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
                           DiagnosticReporter&    rep,
                           PpHasEmbed const&      hasEmbed,
                           PpOperatorRevoked const& operatorRevoked,
-                          PpCharConstantFacts const& charFacts) {
+                          PpCharConstantFacts const& charFacts,
+                          PpLibraryFunctionProvided const& libraryFunctionProvided) {
     LiteralKinds const lits = gatherLiteralKinds(schema);
     // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: every operator arm below is gated on
     // this. An operator the program has `#undef`'d is no longer an operator —
@@ -2140,7 +2170,8 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
                                  lim->clauseEnd - lim->clauseBegin),
                     toks[lim->nameIndex], schema, macroExpand, isDefined,
                     hasInclude, synth, productText, rep, hasEmbed,
-                    operatorRevoked, charFacts, freshWordOf, failParam);
+                    operatorRevoked, charFacts, libraryFunctionProvided,
+                    freshWordOf, failParam);
                 // The nested expansion may have grown (and moved) the tail.
                 tail = productText ? productText() : std::string_view{};
                 if (!limit.has_value()) break;   // reported through failParam
@@ -2254,7 +2285,8 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
                 }
                 ++j;
                 afterDefined.push_back(
-                    mintNumber(featureQueryAnswer(schema, fq->answers, queried)));
+                    mintNumber(featureQueryAnswer(schema, fq->answers, queried,
+                                                  libraryFunctionProvided)));
                 i = j;
                 continue;
             }

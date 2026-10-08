@@ -387,6 +387,13 @@ struct CompiledRule {
     // rule, or language. Default false ⇒ standard rollback-on-failure
     // speculation.
     bool                       commitAfterPrefix = false;
+
+    // P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): a PEG NOT-PREDICATE
+    // on the rule's FOLLOWER (`notFollowedBy` on the shape body): a speculative probe of this
+    // rule that CLOSES cleanly is abandoned — the enclosing alt tries its next candidate —
+    // when the next token is one of these kinds. Sorted by `SchemaTokenId.v`. Config-sourced;
+    // the engine names no token. Empty (the default) ⇒ no predicate.
+    std::vector<SchemaTokenId> notFollowedBy;
 };
 
 } // namespace dss::detail

@@ -19,7 +19,7 @@ unreferenced. A wrapped id does not FAIL. It DISAPPEARS.
     would red hundreds of lines of honest text that no author can be held to.
     ⇒ a wrap that joins to a REAL id resolves, and nothing reds. That tolerance
     is exactly why the population accumulated.
-  * `check-anchor-balance` reads WHOLE-LINE ids (`ANCHOR_TOKEN` matches within
+  * `anchor-debt`'s scan reads WHOLE-LINE ids (`ANCHOR_TOKEN` matches within
     one line by construction), so a wrapped citation is simply not there.
 ⇒ The gap is not "no guard reads wrapped ids"; it is that **nothing counts
 them**. This guard is the counter, and its only verb is a RATCHET.
@@ -53,10 +53,10 @@ file the repository tracks, plus each untracked file it does not ignore.
 ── THE KEY SET, STATED EXPLICITLY ───────────────────────────────────────────────
 An anchor id, for this guard, is any id the plans DECLARE or CARRY:
   (a) the row name of every data row of every recognized anchor table under
-      `.plans/` -- taken from `check-anchor-balance.scan_worktree`, the same
+      `.plans/` -- taken from `anchor-debt.scan_worktree`, the same
       population its own opener-resolution arm resolves against; UNION
-  (b) every `check-anchor-balance.ANCHOR_TOKEN` match in every `.plans/*.md`.
-BOTH halves are IMPORTED from `check-anchor-balance`, never re-implemented: a
+  (b) every `anchor-debt.ANCHOR_TOKEN` match in every `.plans/*.md`.
+BOTH halves are IMPORTED from `anchor-debt`, never re-implemented: a
 second copy of "what an anchor id looks like" is how two instruments start
 disagreeing about the same tree.
   * WHY (b) IS NEEDED ON TOP OF (a): ✔MEASURED 2026-08-23 -- the registry row
@@ -125,10 +125,10 @@ A `.py` already runs on both hosts, and the operator ruled on 2026-08-19 that a
 Python guards have no twin for the same reason.
 
 Usage:
-    python .harness-config/runner/actions/check-wrapped-anchor-ids/check-wrapped-anchor-ids.py
-    python .harness-config/runner/actions/check-wrapped-anchor-ids/check-wrapped-anchor-ids.py --write
-    python .harness-config/runner/actions/check-wrapped-anchor-ids/check-wrapped-anchor-ids.py --baseline
-    python .harness-config/runner/actions/check-wrapped-anchor-ids/check-wrapped-anchor-ids.py --selftest
+    dssharness run check-wrapped-anchor-ids                              verify, then self-test
+    dssharness run check-wrapped-anchor-ids-write                        burn down (--write)
+    dssharness run check-wrapped-anchor-ids-baseline                     new ground (--baseline)
+    dssharness run check-wrapped-anchor-ids --manual-step self-test      the self-test alone
 
 ★★ THE NO-ARGUMENT FORM (the ctest form) VERIFIES THE TREE **AND THEN RUNS THE
 SELF-TEST**, honouring both statuses. ✔MEASURED 2026-08-22 on
@@ -365,24 +365,23 @@ def wraps_in(lines, keys):
 
 
 # ── the key set: IMPORTED, never re-derived ─────────────────────────────────
-def _load_anchor_balance(root):
-    """`check-anchor-balance` as a module, or a loud death.
+def _load_anchor_debt(root):
+    """`anchor-debt` as a module, or a loud death.
 
     Imported rather than copied for the reason `check-wall-clock-in-tests`
     imports its stripper from `check-no-abort-in-tests`: two copies of one
     definition is exactly the drift this whole registry discipline exists to
     stop. The import fails LOUD if the sibling moves.
     """
-    sibling = os.path.join(root, ACTIONS_REL, "check-anchor-balance",
-                           "check-anchor-balance.py")
+    sibling = os.path.join(root, ACTIONS_REL, "anchor-debt", "anchor-debt.py")
     if not os.path.isfile(sibling):
         raise Collapse(
             "cannot find the shared anchor vocabulary at %s.\n"
             "  This guard must take its key set and its anchor-token pattern from "
-            "that script, or the two instruments start disagreeing about what an "
+            "that program, or the two instruments start disagreeing about what an "
             "anchor id IS. Restore the sibling; do NOT copy its definitions here."
             % os.path.relpath(sibling, root).replace("\\", "/"))
-    spec = importlib.util.spec_from_file_location("_anchor_balance", sibling)
+    spec = importlib.util.spec_from_file_location("_anchor_debt", sibling)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -390,7 +389,7 @@ def _load_anchor_balance(root):
 
 def anchor_key_set(root):
     """Every anchor id the plans DECLARE (a) or CARRY (b). See the docstring."""
-    ab = _load_anchor_balance(root)
+    ab = _load_anchor_debt(root)
     keys = set(n.split("#", 1)[1] for n in ab.scan_worktree(root).names)
     plans = os.path.join(root, ab.PLANS_DIR)
     for name in sorted(os.listdir(plans)):
@@ -470,7 +469,7 @@ def census(root, files, keys):
 # text below states the RULE (empty means zero headroom) and names the row as the
 # species record rather than asserting anything about its status. A status word
 # in prose is a measurement with no instrument attached -- the instrument is
-# `python .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py`, and the row's own
+# `dssharness read-anchor <ID>`, and the row's own
 # status cell is the answer.
 # ★★★ AND AS OF CYCLE P30 THE AGREEMENT IS ENFORCED RATHER THAN HOPED FOR --
 # WHICH IS THE PART THE FIRST REPAIR MISSED. Rewording both sides fixed the
@@ -567,8 +566,7 @@ def report_comment_divergence(comment):
           "become false.", file=sys.stderr)
     print("  FIX: DECIDE WHICH SIDE IS TRUE FIRST; the repair is not symmetric. If "
           "the CODE is right, re-stamp the JSON:", file=sys.stderr)
-    print("      python .harness-config/runner/actions/check-wrapped-anchor-ids/check-wrapped-anchor-ids.py "
-          "--write", file=sys.stderr)
+    print("      dssharness run check-wrapped-anchor-ids-write", file=sys.stderr)
     print("  If the JSON is right, edit `_INVENTORY_COMMENT` to match it - running "
           "`--write` would DESTROY the corrected text. That is not hypothetical: it "
           "is what this literal did once. The species is a claim TRUE WHEN IT WAS "
@@ -690,8 +688,7 @@ def run(root, write, baseline=False):
         print("  You un-wrapped sites without lowering the ceiling. Unclaimed headroom "
               "is exactly where the next wrap hides. Re-baseline in the same commit:",
               file=sys.stderr)
-        print("      python .harness-config/runner/actions/check-wrapped-anchor-ids/check-wrapped-anchor-ids.py "
-              "--write", file=sys.stderr)
+        print("      dssharness run check-wrapped-anchor-ids-write", file=sys.stderr)
         return EXIT_RATCHET
 
     total = sum(counts.values())
@@ -893,10 +890,10 @@ def selftest():
 
         def synth(body, ceilings={}, comment=None):
             r = _tmp_repo({".plans/00-synthetic.md": PLAN,
-                           ".harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py":
+                           ".harness-config/runner/actions/anchor-debt/anchor-debt.py":
                                io.open(os.path.join(REPO, ACTIONS_REL,
-                                                    "check-anchor-balance",
-                                                    "check-anchor-balance.py"),
+                                                    "anchor-debt",
+                                                    "anchor-debt.py"),
                                        encoding="utf-8").read(),
                            "src/subject.cpp": body}, ceilings, comment)
             roots.append(r)
@@ -1031,7 +1028,7 @@ def selftest():
                        "src/subject.cpp": body2}, {"src/subject.cpp": 2})
         roots.append(r)
         rc, out = _run_capture(r)
-        check("a MISSING check-anchor-balance is a COLLAPSE (the import fails loud)",
+        check("a MISSING anchor-debt is a COLLAPSE (the import fails loud)",
               rc == EXIT_COLLAPSE and "shared anchor vocabulary" in out)
     finally:
         FILE_FLOOR, KEY_FLOOR = saved_floors

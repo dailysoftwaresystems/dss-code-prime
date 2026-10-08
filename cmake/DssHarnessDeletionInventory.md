@@ -25,7 +25,7 @@ commit's author will actually see it.
   the command again.
 
 ## The deletion waves, named once
-`W-anchors` · ~~`W-build` (`local-build`)~~ **LANDED** · ~~`W-test` (`run-gate`)~~ **LANDED** ·
+`W-anchors` (**PARTLY LANDED 2026-09-30**, §20) · ~~`W-build` (`local-build`)~~ **LANDED** · ~~`W-test` (`run-gate`)~~ **LANDED** ·
 ~~`W-sync` (`wsl-leg`, `remote-leg`, `macos-leg`, `ssh-macos`, `ssh-arm64-vps`, `carriage-excludes`,
 `check-carriage-paths`)~~ **LANDED** · ~~`W-worktrees` (`lane-worktree`, with `lane-fold`)~~ **LANDED
 2026-09-29** (DssHarness's orchestrator verbs) · `W-run`
@@ -840,7 +840,9 @@ target above was derived with it among the survivors and is re-derived by the ne
 door and are replaced, while `anchors.py` stays as the library `check-anchor-balance`,
 `check-stale-blockers`, `apply-registry-row` and `anchor-rows` import (and `lane-fold` did, until its
 retirement on 2026-09-29). A directory is not the unit of this migration; a
-PROGRAM is.
+PROGRAM is. ⓘ 2026-09-30 (§20): its importers are `anchor-rows` and `check-stale-blockers` alone —
+`apply-registry-row` retired, and `check-anchor-balance` (renamed `anchor-debt`) is the module `anchors.py`
+LOADS, not one that loads it.
 
 ### 17.5 `.harness-config/runner/actions` NOW HOLDS A SHELL PROGRAM, WHICH §9 SAID IT DID NOT
 ✔MEASURED: `macho-alias-ld64-matrix.remote.sh` moved there with mode **100755** (six tracked files
@@ -1107,6 +1109,22 @@ On both, the two macho legs BUILT and were skipped by `runOn=[darwin]`, and the 
 14-assertion smoke gate green on the 3 runnable legs. The first WSL attempt refused to start: Step 0 caught the clone
 lock still judging a four-line holder by its lstart line (19.5), and it was fixed and proven before the run was
 repeated.
+
+## 20. `W-anchors` — PARTLY LANDED 2026-09-30 (P69, lane `hm`)
+
+What left, what stays, and the measurement behind each. Each retired arm's defect was PLANTED in a throwaway
+repository (`git init` + `dssharness init`, `anchors.triggerCarriesVerdict: true` as this repository sets it) and
+DssHarness 0.6.4 reported it — a disposition is a measurement, never an inference from a verb's name.
+
+| Program | Disposition | Evidence (✔MEASURED 2026-09-30) |
+|---|---|---|
+| `apply-registry-row` | **DELETED** — the directory, its runner, `apply_registry_row_selftest_guard` | `set-anchor` with cell files replaces one row, and the door refuses what the launcher pre-checked: an id a cell newly cites that no row holds (exit 13) and a value it would store cut (exit 10) |
+| `check-anchor-balance` | **RENAMED `anchor-debt`**; its balance, its `--denominator` / `--breakdown` / `--per-bucket` modes and its partition and Status/Trigger arms **DELETED** | a new OPEN row since the base → `dssharness check-anchor-balance` exit 1, a new 🔵 DISCLOSED one not counted (by its STATUS cell); a CLOSED row in the pending registry and an OPEN one in the done registry → exit 1 (and `read-anchors --lint` exit 1 for the first); a Status/Trigger split written by hand → `read-anchors --lint` exit 1, the same split through the door → `write-anchor` exit 10 |
+| the balance's BOOKKEEPING arithmetic | **LOST with the balance, REPORTED, and DssHarness's since 0.6.7** — `anchor-debt`'s interim listing **DELETED** | ✔MEASURED 2026-10-01 (P69 send-back, DssHarness 0.6.6, the same throwaway setup with three OPEN seeds): one seed closed since the base with `✅ **CLOSED**` and, in a second repository, with `✅🧾 **CLOSED**` (the work predates the base, only the mark is repaired) — `check-anchor-balance --base HEAD` printed `1 closed, 0 opened ... counted -1` for BOTH, where the retired balance kept the second net-neutral (out of the open population, no credit). Reported to repo-harness; meanwhile `anchor-debt`'s `debt` step listed every `✅🧾` closure since the base as NOT PROGRESS. ✔MEASURED 2026-10-06 on 0.6.7, the same setup: the second now reads `1 closed (1 bookkeeping) ... counted 0`, the row `[bookkeeping: not credited]`, the first still `counted -1` — so the interim listing (`bookkeeping_since`, the scan's bookkeeping set, self-test arm (f2)) was deleted that day; 11 rows of the done registry carry the mark |
+| `anchors` | the CLI (`read`, `list`) **DELETED**; the LIBRARY stays | `read-anchor` / `read-anchors` answer both; its importers are `anchor-rows` and `check-stale-blockers` |
+| `anchor-debt` | STAYS | the registry DEBT no verb reports (a closure verdict under a non-closure marker, a gated row with no open opener, a discharged blocker, an unclassifiable closing-work marker, OPEN-vs-GATED prose, a `[[...]]` pointer that names no row) — its `debt` step, `dssharness run anchor-debt-debt` — and the row vocabulary five actions load. Its ARM 9 refused a row CLOSED at the base that neither registry holds now, while `check-anchor-balance` failed only a lost OPEN row (✔MEASURED 2026-10-06, P69 lane `hm`, DssHarness 0.6.7, throwaway repositories; reported to repo-harness); DELETED 2026-10-07, once the balance failed a lost closed row too (✔MEASURED that day on 0.6.9, throwaway repositories) |
+| `burndown-queue` | STAYS | no verb bands and sorts the queue; its `queue` step reads it |
+| `check-anchor-registry` | STAYS — not re-measured this cycle | — |
 
 ## Summary of disagreements with contract S4
 

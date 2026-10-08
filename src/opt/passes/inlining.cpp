@@ -499,6 +499,20 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             if (op == MirOpcode::StackSave || op == MirOpcode::StackRestore) {
                 return std::nullopt;
             }
+            // P69 (lane `cs`, review M2): do NOT inline a callee holding a RUNTIME-SIZED
+            // `Alloca` (one with a size operand — `__builtin_alloca(n)`; a VLA's own comes
+            // with the StackSave refused above, a fixed local's has no operand). Its block
+            // lives until the function holding it RETURNS: spliced into a caller it lives
+            // until the CALLER returns, and in the caller's loop no iteration gives its
+            // memory back. ✔MEASURED 2026-10-07 (lane `cs`'s probe il1): `static int h(int n)
+            // { char *p = __builtin_alloca(n); … }` called 10000 times with n = 4096
+            // overflowed the stack in the release pipeline (PE 0xC00000FD, ELF SIGSEGV) where
+            // gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 at -O2 run it to 42 — gcc's
+            // documented rule: a function that calls alloca is not inlined unless it is
+            // `always_inline`. Fail-SAFE: not inlining is unobservable.
+            if (op == MirOpcode::Alloca && !mir.instOperands(cid).empty()) {
+                return std::nullopt;
+            }
             // ── FRAME-SENSITIVE INTRINSIC REFUSAL ──
             // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC
             // Refuse to inline a callee whose body contains an `IntrinsicCall`.
@@ -1389,7 +1403,9 @@ private:
                 return;
             }
             case MirOpcode::Unreachable:
-                remember(dst_.addUnreachable());
+                // P69: what the terminator asserts survives the clone.
+                remember(dst_.addUnreachable(
+                    static_cast<MirUnreachableKind>(src_.instPayload(id))));
                 return;
             default:
                 std::fprintf(stderr,
@@ -1720,7 +1736,9 @@ private:
                 return;
             }
             case MirOpcode::Unreachable:
-                remember(dst_.addUnreachable());
+                // P69: what the terminator asserts survives the clone.
+                remember(dst_.addUnreachable(
+                    static_cast<MirUnreachableKind>(src_.instPayload(cid))));
                 return;
             default:
                 std::fprintf(stderr,

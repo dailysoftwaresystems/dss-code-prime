@@ -1,37 +1,95 @@
 #!/usr/bin/env python3
-"""prototype-census — does every prototype DSS ships have the TYPE the platform's own header gives it?
+"""prototype-census — does every prototype and every integer value DSS ships agree with the platform's own header?
 
-Over every `symbols` row of the tree's shipped descriptors (`src/dss-config/shippedLibs/**/*.json`) that the leg's
-pair sees, TWO verdicts per symbol, each from a different judge, because each judge is blind where the other sees:
+Over every row of the tree's shipped descriptors (`src/dss-config/shippedLibs/**/*.json`) that the leg's pair sees,
+the reference compiler of the leg's host and the leg's own dsscp are made to answer the same question.
 
-  (a) DSS JUDGES ITS OWN PROTOTYPE. The reference compiler first SPELLS the header's type for the symbol (a TU per
-      header initializes a struct from each symbol; clang's refusal names the type, typedefs expanded in its `(aka
-      …)` form). Then a program per header prints `_Generic(&sym, typeof(<that spelling>) *: "yes", default: "NO")`,
-      compiled by the leg's dsscp for the leg's own pair and RUN on the leg. It answers with DSS's own type system,
-      so it sees what DSS resolves — an untagged 64-bit core, a typedef's identity, a width — and nothing it
-      re-implements. ★ KNOWN BLINDNESS: DSS's `_Generic` treats function types differing only in a parameter's
-      POINTEE `const` as compatible (D-C-GENERIC-MATCHES-FUNCTION-TYPES-DIFFERING-IN-A-POINTEE-CONST, owned by the
-      C semantics lane), so verdict (a) answers "yes" for a prototype that drops a `const`. The self-test PINS that
-      blindness (arm `a-blind-const`): the day the fix lands the arm fails, and this note and the arm's expectation
-      are updated together.
-  (b) THE REFERENCE JUDGES THE DESCRIPTOR'S TEXT. The symbol's signature for the pair — the flat `signature`, or
-      the ONE `variants` arm whose `when` the pair matches, else the row's `default` arm (the reader's own rule; a
-      pair the reader would refuse is reported PAIR-REFUSED) — is rendered to C with typedef NAMES kept (the
-      reference resolves them its own way), and the reference compiles and runs `_Generic(&sym, <rendered> *:
-      "yes", default: "NO")` against its real header. It sees the prototype's SHAPE — a dropped `const`, an opaque
-      type modelled `void *`, a comparator's parameters — which (a) cannot, and trusts the typedef names, which (a)
-      checks.
+PROTOTYPES (the `census` step) — TWO verdicts per `symbols` row, each from a different judge, because each judge is
+blind where the other sees:
+
+  (a) DSS JUDGES ITS OWN PROTOTYPE. The reference compiler first SPELLS the type of `&sym` under the platform header
+      (a TU per header initializes `struct census_probe_sink *` from each `&sym`; the refusal names the address's
+      type, typedefs expanded where the compiler prints an `aka` form). Then a program per header prints
+      `_Generic(&sym, typeof(<that spelling>): "yes", default: "NO")`, compiled by the leg's dsscp for the leg's own
+      pair and RUN on the leg. It answers with DSS's own type system, so it sees what DSS resolves — an untagged 64-bit
+      core, a typedef's identity, a width — and nothing it re-implements. A parameter's POINTEE `const` is part of what
+      it compares (the self-test's `a-pointee-const` arm pins it): a prototype the probe DECLARES with `char *` is "NO"
+      against a header's `const char *`. A descriptor row that spells no qualifier at all makes NO claim about one,
+      though, so verdict (a) cannot see a `const` such a row dropped — verdict (b) is the judge that does. ★ A
+      reference that prints no `aka` form for a typedef (gcc keeps `FILE **`) hands DSS the typedef NAME, which DSS
+      resolves to its own typedef — so that typedef's identity is judged by clang legs only.
+  (b) THE REFERENCE JUDGES THE DESCRIPTOR'S TEXT. The symbol's signature for the pair — the flat `signature`, or the
+      ONE `variants` arm whose `when` the pair matches, else the row's `default` arm (the reader's own rule; a pair the
+      reader would refuse is reported PAIR-REFUSED) — is rendered to C with typedef NAMES kept (the reference resolves
+      them its own way), and the reference compiles and runs `_Generic(&sym, <rendered> *: "yes", default: "NO")`
+      against its real header. It sees the prototype's SHAPE — a dropped `const`, an opaque type modelled `void *`, a
+      comparator's parameters — which (a) cannot, and trusts the typedef names, which (a) checks.
   A symbol where the two disagree is a finding in itself; the report keeps both.
 
-Verdicts: yes · NO · REF-UNDECLARED (the reference's header does not declare it) · REF-CANNOT-SPELL (the reference
-cannot compile the rendered text, e.g. a DSS-only name) · DSS-REFUSED (DSS would not compile the judge probe) ·
-PAIR-REFUSED (no arm of the row's `signature` serves the pair, which the descriptor reader refuses).
-Last line: `prototype-census: OK format=… symbols=… a-yes=… a-no=… b-yes=… b-no=… disagree=… …`.
+VALUES (the `values` step) — every integer `constants` row and every macro whose replacement is an integer literal,
+in every descriptor the pair sees, BY NAME ONLY: a program per header prints `NAME=<value>` for each name the header
+defines as a macro (`#ifdef`, else `NAME=nodef`), compiled and run ONCE by the reference compiler and ONCE by the leg's
+dsscp. DSS's value is what DSS's own preprocessor selects — this program never re-implements the descriptor's variant
+selection. A name both define with different values is a MISMATCH and fails the step; a name only one side defines as a
+macro (an enum constant, a name the pair's header lacks) is reported, not judged. Built after P69 found Linux aarch64's
+O_DIRECTORY/O_NOFOLLOW/O_TMPFILE carrying x86_64's values (D-FFI-FCNTL-AARCH64-OPEN-FLAGS-TAKE-X86-64-VALUES).
+A FORK between two references' HEADERS of one pair, once DECIDED, is data beside this program (`decided-forks.json`:
+per format, dialect, header and name — both values, the authority, the reason). Such a name reads `decided`, counted
+apart from `match` and `mismatch` and named in the step's log (`VALUES DECIDED:`), only while BOTH recorded values
+still hold: a value that moved on either side, or a name the run never reads, fails the step and names the entry, so
+the decision is read again. An entry is its own format's and dialect's alone — no other leg reads it. ✔MEASURED
+2026-10-08, the first two: on pe, mingw-w64's <stdio.h> gives L_tmpnam 14 and TMP_MAX 32767 where the UCRT's own
+header, which cl reads, gives 260 and 2147483647 — and the MinGW gcc targets that same UCRT.
 
-Usage: prototype-census.py --tree=<repo> (--os=<os> --processor=<cpu> | --target=<arch:format-doc>) --dsscp=<path>
-                           --cc=<reference> [--flags=a,b] --out=<report.tsv> [--only=<header>]
-       prototype-census.py --selftest --tree=<repo> (--os=… --processor=… | --target=…) --dsscp=<path> --cc=<ref>
-The pair is the leg's NATIVE one (the judge program must RUN there), derived from the harness's {os}/{processor}."""
+THE PAIR is the leg's NATIVE one — the judge programs must RUN there — and it is DERIVED, never tabled: the host's
+executable format is read from this interpreter's own image (ELF, PE or Mach-O magic), the processor is the harness's
+`{processor}`, and the tree's object-format documents name the `cli` document(s) of that kind for that target. When
+several match (ELF's exec and pie) they must agree on every fact the descriptors are read with, or the run is refused.
+
+THE REFERENCE is `--cc`, always named: the ctest entry hands it the build's own C compiler, a run the step's `cc` input.
+Its dialect is READ from the compiler itself, never from its name: clang's and gcc's from their `--version` banner
+(✔MEASURED 2026-09-30, clang 18.1.3 and gcc 13.3.0); MSVC's cl, which answers no `--version`, from the banner it prints
+when run with no arguments (✔MEASURED 2026-10-07, cl 19.51.36260); any other compiler is refused by name, never parsed
+by guess. Each dialect carries how it is DRIVEN — its standard mode (gcc and clang `-std=gnu2x -D_GNU_SOURCE`, cl
+`/std:clatest`, which `typeof` needs), its syntax-only check, its output option — and how its diagnostics name the type
+of `&sym` and an undeclared name. `--flags` adds to that, in the reference's own spelling. cl (✔MEASURED 2026-10-07,
+windows-x86_64-release) prints its diagnostics on STDOUT, keeps typedef names (it has no `aka` form) and the calling
+convention (`__cdecl`, which DSS's own pe config erases), names the type in two shapes (C4047 for a function, an array
+or a pointer to a pointer, C4133 for an object), follows an undeclared name's C2065 with a C4133 naming `int *`, and
+stops judging a TU at 100 errors (C1003) — so the spelling step re-runs the rows a stopped TU never reached. It spells
+a struct, union or enum type WITHOUT its tag word (`tm *` for `struct tm *`), which is no C type to hand DSS, so the
+spelling step asks cl, in a TU of its own, which spelled names are only tags and of which kind (a tag's `typedef`
+line fails, C2061; `struct <a union's tag>` fails naming the kind, C2011), and puts the word back — that TU, too,
+re-run for the names a 100-error stop never reached. And its `_Generic` KEEPS a parameter's top-level `restrict` when
+it compares function types (✔MEASURED 2026-10-07: `void f(char *restrict)` against `void (*)(char *)` is NO on cl
+19.51.36260, and yes on gcc, clang and DSS, as C 6.7.6.3p15 has it), so on cl verdict (b) of a row whose header
+declares a restrict parameter is REF-CANNOT-JUDGE, never a NO: a descriptor's text cannot spell what is no part of a
+function's type, and cl answers NO whatever the row says. gcc and clang, for their part, PRINT a const or noreturn
+function's address type with the attribute as a decoration neither takes as part of a type — gcc first, clang last
+for noreturn, a form no compiler accepts as a type name (✔MEASURED 2026-10-08) — so the spelling step removes it, by
+a closed list held to each leg's compiler (`DECORATIONS`), counts the rows it removed one from
+(`ref-decoration-dropped`) and names the removal in the report's last column; any other attribute is handed on.
+
+Verdicts: yes · NO · REF-UNDECLARED (the reference's header does not declare it) · REF-NO-HEADER (the reference has
+no such header at all — Apple ships no <threads.h>) · REF-ERROR (the reference refused the spelling probe some other
+way) · REF-CANNOT-SPELL (the reference cannot compile the rendered text, e.g. a DSS-only name) · REF-CANNOT-JUDGE
+(verdict (b) alone: the reference's `_Generic` keeps a `restrict` its header declares on this row — above — so its
+NO is no verdict; verdict (a) still judges the row) · DSS-REFUSED (DSS would not compile the judge probe) ·
+PAIR-REFUSED (no arm of the row's `signature` serves the pair, which the descriptor reader refuses) · JUDGE-FAILED (a
+judge program exited non-zero — its stdout is never read as verdicts).
+THE CENSUS LINE COUNTS EVERY ROW: verdict (a)'s categories partition the symbols, and a report holding a verdict the
+line does not count fails the step (`prototype-census: FAILED — …`) — a census never passes over rows it does not
+account for. ✔MEASURED 2026-10-06: before this rule the Mac's line said OK over 25 `threads.json` rows (REF-ERROR —
+no <threads.h>) that no count named.
+Last line: `prototype-census: OK …` / `prototype-census: VALUES OK …` / `prototype-census: SELFTEST OK …`.
+
+Usage: prototype-census.py --tree=<repo> --processor=<cpu> --dsscp=<path> --cc=<reference> [--flags=a,b]
+                           --out=<report.tsv> [--only=<header>]
+       prototype-census.py --values --tree=<repo> --processor=<cpu> --dsscp=<path> --cc=<reference> [--flags=a,b]
+                           --out=<report.tsv>
+       prototype-census.py --selftest --tree=<repo> --processor=<cpu> --dsscp=<path> --cc=<reference> [--flags=a,b]
+`--cc` is required: a compiler path or a name on PATH. `--flags` is comma-separated and each flag is percent-decoded,
+so a comma INSIDE one flag is written `%2C`."""
 import argparse
 import glob
 import json
@@ -41,6 +99,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from urllib.parse import unquote
 
 # A report line can carry a character cp1252 cannot (a reference compiler's quote, a header's type spelling); on a
 # pipe under a Windows code page it would be lost or mangled, so both streams write UTF-8 from import on — argument
@@ -57,7 +116,7 @@ SCALAR = {'i8': 'signed char', 'u8': 'unsigned char', 'i16': 'short', 'u16': 'un
 BARE = {'i64', 'u64', 'i128', 'u128', 'f80', 'f128'}          # no C spelling without a tag: rendered to a marker
 NAMED = {'char': 'char', 'void': 'void', 'bool': '_Bool'}
 STRUCT_SPELLING = {'FILE': 'FILE', 'DIR': 'DIR', '_div_t': 'div_t', '_ldiv_t': 'ldiv_t', '_lldiv_t': 'lldiv_t'}
-MARKERS = ''.join('struct dss_census_bare_%s { int x; }; ' % c for c in sorted(BARE))
+MARKERS = ''.join('struct census_probe_bare_%s { int x; }; ' % c for c in sorted(BARE))
 TOKEN = re.compile(r'\s*(\.\.\.|->|[@~]\d+|\d+|[A-Za-z_][A-Za-z0-9_]*|"[^"]*"|[<>(),{}])')
 
 
@@ -148,7 +207,7 @@ def base_spelling(t):
     if k == 'scalar':
         if t[2]:
             return t[2]
-        return SCALAR[t[1]] if t[1] in SCALAR else 'struct dss_census_bare_%s' % t[1]
+        return SCALAR[t[1]] if t[1] in SCALAR else 'struct census_probe_bare_%s' % t[1]
     if k == 'named':
         return NAMED[t[1]]
     if k == 'ident':
@@ -178,13 +237,55 @@ def declarator(t, inner):
     return base_spelling(t) + (' ' + inner if inner else '')
 
 
-# ── the pair and the descriptors ─────────────────────────────────────────────────────────────────────────────────────
+# ── the pair ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+# The magic numbers of the three executable formats a host can run, read from this interpreter's OWN image: the kind of
+# executable the host runs is a fact of the host, never a table keyed on an operating-system name.
+EXEC_MAGIC = ((b'\x7fELF', 'elf'), (b'MZ', 'pe'), (b'\xcf\xfa\xed\xfe', 'macho'), (b'\xfe\xed\xfa\xcf', 'macho'),
+              (b'\xca\xfe\xba\xbe', 'macho'))
+
+
+def host_format_kind(image=None):
+    with open(image or sys.executable, 'rb') as f:
+        head = f.read(4)
+    for magic, kind in EXEC_MAGIC:
+        if head.startswith(magic):
+            return kind
+    return None
+
+
+def read_format_doc(tree, name):
+    return json.load(open(os.path.join(tree, 'src', 'dss-config', 'object-formats', name + '.format.json'),
+                          encoding='utf-8'))
+
+
+def pair_facts_of(doc):
+    return {'arch': doc.get('targetArch'), 'format': doc['format']['kind'], 'dataModel': doc.get('dataModel'),
+            'longDoubleFormat': doc.get('longDoubleFormat')}
+
+
+def native_target(tree, processor, kind):
+    """The DSS target spec (`arch:format-doc`) of the leg's own executables: every object-format document of the host's
+    kind for this processor that produces a `cli` artifact. Two that differ on a fact the descriptors are read with
+    are refused — never settled by picking one."""
+    if kind is None:
+        return None, 'the host runs an executable format this program cannot recognize'
+    found = []
+    for path in sorted(glob.glob(os.path.join(tree, 'src', 'dss-config', 'object-formats', '*.format.json'))):
+        doc = json.load(open(path, encoding='utf-8'))
+        if doc['format']['kind'] == kind and doc.get('targetArch') == processor \
+                and 'cli' in (doc.get('artifactProfiles') or []):
+            found.append((doc['format']['name'], pair_facts_of(doc)))
+    if not found:
+        return None, 'no object-format document is a %s cli format for the processor %r' % (kind, processor)
+    facts = {json.dumps(f, sort_keys=True) for _, f in found}
+    if len(facts) != 1:
+        return None, 'the %s cli formats for %r disagree on the pair facts: %s' % (
+            kind, processor, ', '.join('%s=%s' % (n, json.dumps(f, sort_keys=True)) for n, f in found))
+    return '%s:%s' % (processor, found[0][0]), None
+
+
 def pair_facts(tree, target):
-    arch, _, fmt_doc = target.partition(':')
-    d = json.load(open(os.path.join(tree, 'src', 'dss-config', 'object-formats', fmt_doc + '.format.json'),
-                       encoding='utf-8'))
-    return {'arch': arch, 'format': d['format']['kind'], 'dataModel': d.get('dataModel'),
-            'longDoubleFormat': d.get('longDoubleFormat')}
+    return pair_facts_of(read_format_doc(tree, target.partition(':')[2]))
 
 
 def when_matches(when, pair):
@@ -212,22 +313,31 @@ def pair_signature(sym, pair):
     return dflt[0] if dflt else None
 
 
-def visible_symbols(tree, pair, only=None):
+def pair_documents(tree, pair, only=None):
     root = os.path.join(tree, 'src', 'dss-config', 'shippedLibs')
-    idents, docs = {}, []
+    docs = []
     for f in sorted(glob.glob(os.path.join(root, '**', '*.json'), recursive=True)):
         d = json.load(open(f, encoding='utf-8'))
-        docs.append((os.path.relpath(f, root).replace(os.sep, '/'), d))
+        rel = os.path.relpath(f, root).replace(os.sep, '/')
+        if pair['format'] not in (d.get('availableObjectFormats') or ['elf', 'macho', 'pe']):
+            continue
+        if only and d.get('header') != only:
+            continue
+        docs.append((rel, d))
+    return docs
+
+
+def visible_symbols(tree, pair, only=None):
+    root = os.path.join(tree, 'src', 'dss-config', 'shippedLibs')
+    idents = {}
+    for f in sorted(glob.glob(os.path.join(root, '**', '*.json'), recursive=True)):
+        d = json.load(open(f, encoding='utf-8'))
         for st in d.get('structs', []):
             idents.setdefault(st['name'], STRUCT_SPELLING.get(st['name'], 'struct ' + st['name']))
         for td in d.get('typedefs', []):
             idents[td['name']] = td['name']
     rows = []
-    for rel, d in docs:
-        if pair['format'] not in (d.get('availableObjectFormats') or ['elf', 'macho', 'pe']):
-            continue
-        if only and d.get('header') != only:
-            continue
+    for rel, d in pair_documents(tree, pair, only):
         seen = set()
         for s in d.get('symbols', []):
             if pair['format'] not in (s.get('availableObjectFormats') or ['elf', 'macho', 'pe']) or s['name'] in seen:
@@ -238,35 +348,414 @@ def visible_symbols(tree, pair, only=None):
     return rows, idents
 
 
+INTEGER_LITERAL = re.compile(r'^\(?\s*[-+]?\s*(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)[uUlL]*\s*\)?$')
+
+
+def value_names(tree, pair):
+    """{(rel, header): [name, …]} — every integer `constants` row and every macro some arm of which is an integer
+    literal, of every descriptor the pair's format sees. NAMES ONLY: which arm (if any) serves the pair is DSS's own
+    preprocessor's answer, read back from the program it compiles."""
+    groups = {}
+    for rel, d in pair_documents(tree, pair):
+        names = []
+        for c in d.get('constants', []):
+            if c.get('preprocessorVisible') is False:
+                continue
+            if isinstance(c.get('value'), int) or any(isinstance(v.get('value'), int)
+                                                      for v in c.get('variants') or [] if isinstance(v, dict)):
+                names.append(c['name'])
+        for m in d.get('macros', []):
+            if 'params' in m:
+                continue
+            reps = [m.get('replacement')] + [v.get('replacement') for v in m.get('variants') or []
+                                             if isinstance(v, dict) and 'params' not in v]
+            if any(isinstance(r, str) and INTEGER_LITERAL.match(r.strip()) for r in reps):
+                names.append(m['name'])
+        if names:
+            groups[(rel, d['header'])] = sorted(set(names))
+    return groups
+
+
+def values_program(header, names):
+    """A header the compiler does not have prints `census_probe_header=absent` instead of failing to compile (Apple
+    ships no <stdbit.h>, ✔MEASURED 2026-09-30); a name it defines prints its value, one it does not `nodef`."""
+    body = []
+    for n in names:
+        body += ['#ifdef %s' % n, '    printf("%s=%%lld\\n", (long long)(%s));' % (n, n), '#else',
+                 '    puts("%s=nodef");' % n, '#endif']
+    return '\n'.join(['#include <stdio.h>', '#if __has_include(<%s>)' % header, '#include <%s>' % header,
+                      'int main(void) {'] + body + ['    return 0;', '}', '#else', 'int main(void) {',
+                      '    puts("census_probe_header=absent");', '    return 0;', '}', '#endif']) + '\n'
+
+
+VALUE_LINE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(nodef|absent|-?[0-9]+)$')
+
+
+def parse_values(text):
+    out = {}
+    for line in (text or '').splitlines():
+        m = VALUE_LINE.match(line.strip())
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
 # ── running things ───────────────────────────────────────────────────────────────────────────────────────────────────
 def run(argv, cwd, timeout=300, env=None):
+    """No program this census starts reads its standard input; it is closed, so one that tried (a compiler run with
+    no arguments, to print its banner) cannot wait on the step's."""
     p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env, encoding='utf-8',
-                       errors='replace')
+                       errors='replace', stdin=subprocess.DEVNULL)
     return p.returncode, p.stdout, p.stderr
 
 
-CLANG_INIT = re.compile(r":(\d+):\d+: error: initializing 'struct dss_census_sink' with an expression of "
-                        r"incompatible type '([^']*)'(?: \(aka '([^']*)'\))?")
-UNDECLARED = re.compile(r":(\d+):\d+: error: (?:use of undeclared identifier|call to undeclared)")
+def split_flags(value):
+    """`--flags`: comma-separated, each flag percent-decoded — the probe-reference-cc convention, so a comma INSIDE
+    one flag (`-Wl,-z,noexecstack`) is written `%2C`."""
+    return [unquote(item) for item in (value or '').split(',') if item != '']
 
 
-def reference_spellings(rows, cc, flags, work):
+# The three diagnostic dialects this program reads: how each is DRIVEN (its standard mode, its syntax-only check, the
+# options that quiet a judge program's compile and name its image) and how its diagnostics name the address type of
+# `&sym` a pointer initialization of `struct census_probe_sink *` refuses, an undeclared identifier, and a TU it
+# stopped judging. ✔MEASURED 2026-09-30 on clang 18.1.3 and gcc 13.3.0 (x86_64 and aarch64): gcc quotes with ‘’ under a
+# UTF-8 locale and with '' under the C locale, and neither stops (each told never to: `-ferror-limit=0`,
+# `-fmax-errors=0`). ✔MEASURED 2026-10-07 on MSVC's cl 19.51.36260 (windows-x86_64-release, probe-reference-cc runs
+# 20261007-192407-162eaca7 and 20261007-192415-f76f2e6f): every diagnostic on STDOUT as `<file>(<line>): warning
+# C<code>: ...`; `/Zs` reports what `/c` does, at the default warning level as at /W3 and /W4; the type of `&sym` in
+# C4047 "'initializing': 'census_probe_sink *' differs in levels of indirection from '<type>'" (a function, an array,
+# a pointer to a pointer) or C4133 "'initializing': incompatible types - from '<type>' to 'census_probe_sink *'" (an
+# object), the struct's tag word dropped; C2065 for an undeclared name; and "fatal error C1003: error count exceeds
+# 100; stopping compilation" on the line it stopped at, with nothing after it judged. `typeof` needs `/std:clatest`
+# (`/std:c11` refuses it, C2061), which leaves `__STDC__` undefined, so the UCRT also declares its non-standard names.
+# A const or noreturn function's address type, as gcc and clang PRINT it, carries the attribute as a decoration
+# neither takes as part of a type. gcc prints it first, `__attribute__((const)) double (*)(double)`, a spelling gcc
+# and clang both accept and ignore with a warning (gcc: "attribute does not apply to types"; clang: "attribute ignored
+# when parsing type"). clang prints noreturn last, `void (*)(int) __attribute__((noreturn))`, which no compiler
+# accepts as a type name, clang included. ✔MEASURED 2026-10-08 on gcc 13.2.0 (MinGW-w64), gcc 13.3.0 and Apple clang
+# 21.0.0 (probe-reference-cc runs 20261008-030455-c2dbd912, 20261008-030523-2d321664, 20261008-030734-bf53356e and
+# 20261008-030745-1b0463d9); cl prints neither. The census hands on the TYPE, so a decoration is removed -- by this
+# CLOSED list, never by a pattern over attributes: per dialect, the exact text, the END of the spelling the dialect
+# prints it at, and the WITNESS -- what the reference itself says when that text is written there in a type name, held
+# to the leg's own compiler by the self-test (arm `d-witness`). That what is removed is no part of the type BY THE
+# REFERENCE'S OWN JUDGEMENT is held there too: its own `_Generic` must take the bare spelling as the type of the
+# function it decorated itself (arms `d-noreturn`, `d-const`). Any other attribute, one at the other end and one
+# inside a type stay in the spelling and are refused by name downstream. The census line counts the rows a
+# decoration was removed from (`ref-decoration-dropped`) and the report names what was removed, row by row: a row
+# judged after a removal never reads like a row judged as spelled.
+DECORATIONS = {
+    'gcc': (('__attribute__((const))', 'leading', 'attribute does not apply to types'),
+            ('__attribute__((noreturn))', 'leading', 'attribute does not apply to types')),
+    'clang': (('__attribute__((noreturn))', 'trailing', "expected ')'"),),
+    'msvc': (),
+}
+Q_OPEN, Q_CLOSE = "['‘]", "['’]"
+DIALECTS = {
+    'clang': {
+        'spell': re.compile(r":(\d+):\d+: (?:warning|error): incompatible pointer types initializing "
+                            r"'struct census_probe_sink \*' with an expression of type '([^']*)'"
+                            r"(?: \(aka '([^']*)'\))?"),
+        'undeclared': re.compile(r":(\d+):\d+: error: (?:use of undeclared identifier|call to undeclared)"),
+        'standard': ['-std=gnu2x', '-D_GNU_SOURCE'],
+        'syntax': ['-fsyntax-only', '-ferror-limit=0'],
+        'quiet': ['-w'],
+        'output': ['-o', '{exe}'],
+        'tagless': False,
+        'generic_keeps_restrict': False,
+    },
+    'gcc': {
+        'spell': re.compile(r":(\d+):\d+: (?:warning|error): initialization of %sstruct census_probe_sink \*%s from "
+                            r"incompatible pointer type %s([^‘’']*)%s(?: \{aka %s([^‘’']*)%s\})?"
+                            % (Q_OPEN, Q_CLOSE, Q_OPEN, Q_CLOSE, Q_OPEN, Q_CLOSE)),
+        'undeclared': re.compile(r":(\d+):\d+: error: %s[^‘’']*%s undeclared" % (Q_OPEN, Q_CLOSE)),
+        'standard': ['-std=gnu2x', '-D_GNU_SOURCE'],
+        'syntax': ['-fsyntax-only', '-fmax-errors=0'],
+        'quiet': ['-w'],
+        'output': ['-o', '{exe}'],
+        'tagless': False,
+        'generic_keeps_restrict': False,
+    },
+    'msvc': {
+        'spell': None,                     # read by msvc_diagnostics(): by CODE, never by the message's words
+        'undeclared': None,
+        'standard': ['/std:clatest'],
+        'syntax': ['/nologo', '/Zs', '/diagnostics:classic'],
+        'quiet': ['/nologo', '/w'],
+        'output': ['/Fe{exe}'],
+        # cl spells a struct, union or enum type WITHOUT its tag word (`tm *` for `struct tm *`, ✔MEASURED
+        # 2026-10-07, probe-reference-cc run 20261007-212436-45695ebb), which is no C type to hand DSS: the census
+        # asks cl which spelled names are only tags, and of which kind (reference_tag_kinds), and puts the word back.
+        'tagless': True,
+        # cl's `_Generic` does not erase a PARAMETER's top-level `restrict` when it compares function types
+        # (✔MEASURED 2026-10-07, cl 19.51.36260, probe-reference-cc run 20261008-014747-3f3f43d5: `void f(char
+        # *restrict)` against `void (*)(char *)` is NO, `__restrict` the same, and a top-level `const` it does
+        # erase), where C 6.7.6.3p15 takes the parameter unqualified and gcc 13, Apple clang 21 and DSS answer yes
+        # (runs 20261008-014747-3f3f43d5 and 20261008-014812-7accf3cb). So its NO on a row whose header declares
+        # one is no verdict (reference_verdict); the self-test holds each dialect's entry to the leg's own compiler.
+        'generic_keeps_restrict': True,
+    },
+}
+# cl's own line, read by its CODE: `<file>(<line>): warning|error|fatal error C<nnnn>: <message>`, on the TU's own
+# lines only (a header's diagnostic names the header's file). The two codes that spell `&sym`'s type quote three
+# things — the context ('initializing'), the sink and the type, in an order that differs by code — so the type is the
+# one quoted string after the context that is not the sink, whatever words the message uses around it. The severity
+# words and the banner are cl's English ones, as measured: a cl whose banner is another is not identified, and the
+# census refuses it by name; a line whose severity word is another is not read, so its row is REF-ERROR, never a
+# spelling.
+MSVC_LINE = r"(?:^|[\\/])%s\((\d+)\)\s*:\s*(?:warning|error|fatal error)\s+(C\d{4})\s*:(.*)$"
+MSVC_SPELL_CODES = ('C4047', 'C4133')
+MSVC_SINK = ('census_probe_sink *', 'struct census_probe_sink *')
+MSVC_QUOTED = re.compile(r"'([^']*)'")
+# cl answers no `--version`; with no arguments it prints this banner (to stderr) and its usage, exiting 0.
+MSVC_BANNER = re.compile(r"Microsoft \(R\) C/C\+\+ Optimizing Compiler Version (\S+) for (\S+)")
+
+
+def output_args(dialect, exe):
+    return [a.format(exe=exe) for a in DIALECTS[dialect]['output']]
+
+
+def msvc_diagnostics(text, tu):
+    """cl's diagnostics of the TU `tu`: ({line: (declared, canonical)}, {undeclared lines}, the line it stopped at or
+    None). cl prints no `aka` form, so its spelling is both the declared and the canonical one."""
+    line_re = re.compile(MSVC_LINE % re.escape(tu))
+    found, undecl, stopped = {}, set(), None
+    for raw in text.splitlines():
+        m = line_re.search(raw.strip())
+        if not m:
+            continue
+        ln, code, message = int(m.group(1)), m.group(2), m.group(3)
+        if code == 'C2065':
+            undecl.add(ln)
+        elif code == 'C1003':
+            stopped = ln if stopped is None else min(stopped, ln)
+        elif code in MSVC_SPELL_CODES:
+            quoted = MSVC_QUOTED.findall(message)
+            rest = [q for q in quoted[1:] if q not in MSVC_SINK]
+            if len(quoted) == 3 and len(rest) == 1:
+                found.setdefault(ln, (rest[0], rest[0]))
+    return found, undecl, stopped
+
+
+def undecorated(spelling, dialect):
+    """(`spelling` without the decorations its dialect prints at an end of a type and does not take as part of it,
+    the texts removed) -- by DECORATIONS, the exact text at the end its entry names, and nothing else."""
+    removed, again = [], True
+    while again:
+        again = False
+        for text, where, _ in DECORATIONS[dialect]:
+            if where == 'leading' and spelling.startswith(text + ' '):
+                spelling, again = spelling[len(text):].lstrip(' '), True
+            elif where == 'trailing' and spelling.endswith(' ' + text):
+                spelling, again = spelling[:-len(text)].rstrip(' '), True
+            else:
+                continue
+            removed.append(text)
+    return spelling, removed
+
+
+def spelling_diagnostics(dialect, text, tu):
+    """({line: (declared, canonical)}, {undeclared lines}, the line the compiler stopped at or None, {line: the
+    decorations removed from its spelling}) for the TU `tu`."""
+    if dialect == 'msvc':
+        return msvc_diagnostics(text, tu) + ({},)
+    forms = DIALECTS[dialect]
+    found, gone = {}, {}
+    for m in forms['spell'].finditer(text):
+        declared, removed = undecorated(m.group(2), dialect)
+        canonical, removed_too = undecorated(m.group(3) or m.group(2), dialect)
+        found[int(m.group(1))] = (declared, canonical)
+        if removed or removed_too:
+            gone[int(m.group(1))] = ' '.join(dict.fromkeys(removed + removed_too))
+    undecl = {int(m.group(1)) for m in forms['undeclared'].finditer(text)}
+    return found, undecl, None, gone
+
+
+# ── the tag word cl drops ────────────────────────────────────────────────────────────────────────────────────────
+# The words of a cl spelling that are never a name to classify: the qualifiers, calling conventions and type
+# keywords it prints, and `bool`, its spelling of `_Bool`, which is no type name in a C TU that does not include
+# <stdbool.h> (✔MEASURED 2026-10-07: cl refuses `typedef bool x;` with C2061 there). A type KEYWORD left off this
+# list is harmless (cl accepts it as a type, so it keeps its spelling); a qualifier or a calling convention left off
+# would be read as a tag, which is why those are listed.
+SPELLING_WORDS = frozenset(('const', 'volatile', 'restrict', '__restrict', '_Atomic', '__unaligned', '__ptr32',
+                            '__ptr64', '__w64', '__cdecl', '__stdcall', '__fastcall', '__vectorcall', '__thiscall',
+                            '__clrcall', 'signed', 'unsigned', 'char', 'short', 'int', 'long', 'float', 'double',
+                            'void', '_Bool', 'bool', '_Complex', '__int8', '__int16', '__int32', '__int64',
+                            'struct', 'union', 'enum'))
+TAG_WORDS = ('struct', 'union', 'enum')
+SPELLED_WORD = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+# C2011's "'<name>': '<kind>' type redefinition", the kind a C keyword in quotes (✔MEASURED 2026-10-07, run
+# 20261007-212436-45695ebb: `struct <a union's tag> *` -> 'union', `union tm *` -> 'struct').
+MSVC_TAG_KIND = re.compile(r"'([^']*)'\s*:\s*'(struct|union|enum)'")
+
+
+def tagless_names(spelling):
+    """The names of a spelling that may be a tag cl printed without its word: every word that is not one of
+    SPELLING_WORDS and does not already follow a tag word."""
+    out, prev = [], None
+    for w in SPELLED_WORD.findall(spelling):
+        if w not in SPELLING_WORDS and prev not in TAG_WORDS and w not in out:
+            out.append(w)
+        prev = w
+    return out
+
+
+def tagless_candidates(spellings):
+    """The names to ask a tagless reference about, over rows' (declared, canonical) spellings: each ONCE, in the
+    order first seen. cl's two spellings of a row are one string, and a name asked twice doubles its lines in the tag
+    TU and halves what a round judges before the 100-error stop (✔MEASURED 2026-10-07: cl judges 50 struct tags a
+    round, probe-reference-cc run 20261008-023549-32645222; asked twice, it reached 25)."""
+    names = []
+    for pair in spellings:
+        for spelling in pair:
+            for n in tagless_names(spelling):
+                if n not in names:
+                    names.append(n)
+    return names
+
+
+def with_tags(spelling, kinds):
+    """`spelling` with each name of `kinds` ({name: 'struct'|'union'|'enum'}) preceded by its tag word, as a whole
+    word and only where no tag word precedes it already."""
+    def sub(m):
+        return '%s %s' % (kinds[m.group(0)], m.group(0)) if m.group(0) in kinds else m.group(0)
+    return re.sub(r'(?<![A-Za-z0-9_])(?<!struct )(?<!union )(?<!enum )[A-Za-z_][A-Za-z0-9_]*', sub, spelling)
+
+
+def msvc_tag_kinds(text, tu, names, first):
+    """cl's answer to a tag TU whose line `first + 2*i` is `typedef <names[i]> census_probe_type_<i>;` and line
+    `first + 2*i + 1` is `struct <names[i]> *census_probe_tag_<i>;`. -> ({name: kind} for every name that is NOT a
+    type -- an error, a C2xxx code, on its typedef line; ✔MEASURED 2026-10-07: C2061 for a tag, then C2059 -- of the
+    kind C2011 names on its struct line, else 'struct'}, the line cl stopped at or None)."""
+    line_re = re.compile(MSVC_LINE % re.escape(tu))
+    not_type, kind, stopped = set(), {}, None
+    for raw in text.splitlines():
+        m = line_re.search(raw.strip())
+        if not m:
+            continue
+        ln, code, message = int(m.group(1)), m.group(2), m.group(3)
+        if code == 'C1003':
+            stopped = ln if stopped is None else min(stopped, ln)
+            continue
+        i, which = divmod(ln - first, 2)
+        if not 0 <= i < len(names):
+            continue
+        if which == 0 and code.startswith('C2'):
+            not_type.add(names[i])
+        elif which == 1 and code == 'C2011':
+            k = MSVC_TAG_KIND.search(message)
+            if k:
+                kind[names[i]] = k.group(2)
+    return {n: kind.get(n, 'struct') for n in names if n in not_type}, stopped
+
+
+def reference_tag_kinds(header, names, cc, flags, dialect, work):
+    """{name: kind} for the names of a tagless dialect's spellings under <header> that are only a TAG, asked of the
+    reference itself in one TU per round; a TU it stopped judging has its later names re-run, and a TU that judged
+    none is never looped on -- those names keep the reference's spelling, which DSS then refuses by name."""
+    if dialect != 'msvc':
+        raise ValueError('the %s dialect drops tag words and has no reader for its tag TU' % dialect)
+    forms, kinds, pending = DIALECTS[dialect], {}, list(names)
+    while pending:
+        lines = ['#include <%s>' % header]
+        first = len(lines) + 1
+        for i, n in enumerate(pending):
+            lines += ['typedef %s census_probe_type_%d;' % (n, i), 'struct %s *census_probe_tag_%d;' % (n, i)]
+        with open(os.path.join(work, 'tags.c'), 'w', encoding='utf-8', newline='\n') as o:
+            o.write('\n'.join(lines) + '\n')
+        _, so, se = run([cc] + forms['standard'] + flags + forms['syntax'] + ['tags.c'], work)
+        got, stopped = msvc_tag_kinds(so + se, 'tags.c', pending, first)
+        judged = [n for i, n in enumerate(pending) if stopped is None or first + 2 * i + 1 < stopped]
+        kinds.update((n, k) for n, k in got.items() if n in judged)
+        if not judged:
+            break
+        pending = [n for n in pending if n not in judged]
+    return kinds
+
+
+def row_verdict(ln, found, undecl):
+    """An undeclared name is REF-UNDECLARED even where its line ALSO carries a spelling: cl takes an undeclared
+    identifier for an `int` and adds a C4133 naming 'int *' on the same line (✔MEASURED 2026-10-07), which spells no
+    symbol at all."""
+    if ln in undecl:
+        return 'REF-UNDECLARED'
+    return found.get(ln, 'REF-ERROR')
+
+
+def reference_dialect(cc, work):
+    """clang, gcc or msvc, read from the compiler itself; None (with what it printed) for anything else. clang and gcc
+    answer `--version`; cl answers no `--version` and prints its banner when run with no arguments."""
+    if not cc:
+        return None, 'no reference compiler is named (--cc is empty)'
+    try:
+        rc, so, se = run([cc, '--version'], work, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, 'cannot run %r --version: %s' % (cc, e)
+    banner = (so + se).strip()
+    first = banner.splitlines()[0] if banner else ''
+    if rc == 0 and 'clang' in first.lower():
+        return 'clang', first
+    if rc == 0 and ('gcc' in first.lower() or 'Free Software Foundation' in banner):
+        return 'gcc', first
+    try:
+        rc2, so2, se2 = run([cc], work, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, 'the reference %r is neither clang nor gcc (banner: %r), and cannot run alone: %s' % (cc, first, e)
+    m = MSVC_BANNER.search(so2 + se2)
+    if rc2 == 0 and m:
+        return 'msvc', m.group(0)
+    return None, 'the reference %r is neither clang, gcc nor cl (its --version banner: %r)' % (cc, first)
+
+
+def reference_spellings(rows, cc, flags, dialect, work, dropped=None):
+    """{(rel, name): (declared, canonical)} — the reference's spelling of the TYPE OF `&sym` — or a verdict string.
+    A compiler that STOPS judging a TU (cl at 100 errors, C1003) has every row from the line it stopped at re-run in a
+    TU of its own, until each row is judged; a TU that judged none of its rows is never looped on — each of those
+    rows is REF-ERROR. `dropped`, a mapping the caller hands in, receives {(rel, name): the decorations removed from
+    that row's spelling} (DECORATIONS)."""
+    forms = DIALECTS[dialect]
     out, groups = {}, {}
     for r in rows:
         groups.setdefault((r['rel'], r['header']), []).append(r)
     for (rel, header), items in groups.items():
-        lines = ['#include <%s>' % header, 'struct dss_census_sink { int x; };']
-        first = len(lines) + 1
-        lines += ['struct dss_census_sink dss_census_%d = %s%s;' % (i, '&' if r['kind'] == 'object' else '', r['name'])
-                  for i, r in enumerate(items)]
-        with open(os.path.join(work, 'ref.c'), 'w', encoding='utf-8', newline='\n') as o:
-            o.write('\n'.join(lines) + '\n')
-        _, _, err = run([cc] + flags + ['-fsyntax-only', '-ferror-limit=0', 'ref.c'], work)
-        found = {int(m.group(1)): (m.group(2), m.group(3) or m.group(2)) for m in CLANG_INIT.finditer(err)}
-        undecl = {int(m.group(1)) for m in UNDECLARED.finditer(err)}
-        for i, r in enumerate(items):
-            ln = first + i
-            out[(rel, r['name'])] = found.get(ln, 'REF-UNDECLARED' if ln in undecl else 'REF-ERROR')
+        pending = list(items)
+        while pending:
+            # A header the reference does not have at all is its own verdict, REF-NO-HEADER, read from a marker of
+            # this program's own (`__has_include`, the values step's rule) — never inferred from a missing spelling.
+            lines = ['#if __has_include(<%s>)' % header, '#include <%s>' % header,
+                     'struct census_probe_sink { int x; };']
+            first = len(lines) + 1
+            lines += ['struct census_probe_sink *census_probe_%d = &%s;' % (i, r['name'])
+                      for i, r in enumerate(pending)]
+            lines += ['#else', '#error census_probe_header_absent', '#endif']
+            with open(os.path.join(work, 'ref.c'), 'w', encoding='utf-8', newline='\n') as o:
+                o.write('\n'.join(lines) + '\n')
+            _, so, se = run([cc] + forms['standard'] + flags + forms['syntax'] + ['ref.c'], work)
+            text = so + se
+            if 'census_probe_header_absent' in text:
+                for r in pending:
+                    out[(rel, r['name'])] = 'REF-NO-HEADER'
+                break
+            found, undecl, stopped, gone = spelling_diagnostics(dialect, text, 'ref.c')
+            rest = []
+            for i, r in enumerate(pending):
+                ln = first + i
+                if stopped is not None and ln >= stopped:
+                    rest.append(r)
+                    continue
+                out[(rel, r['name'])] = row_verdict(ln, found, undecl)
+                if dropped is not None and ln in gone and isinstance(out[(rel, r['name'])], tuple):
+                    dropped[(rel, r['name'])] = gone[ln]
+            if len(rest) == len(pending):
+                for r in rest:
+                    out[(rel, r['name'])] = 'REF-ERROR'
+                break
+            pending = rest
+        if forms['tagless']:
+            keys = [(rel, r['name']) for r in items if isinstance(out.get((rel, r['name'])), tuple)]
+            names = tagless_candidates(out[k] for k in keys)
+            kinds = reference_tag_kinds(header, names, cc, flags, dialect, work) if names else {}
+            for k in keys:
+                out[k] = (with_tags(out[k][0], kinds), with_tags(out[k][1], kinds))
     return out
 
 
@@ -295,6 +784,15 @@ def run_verdicts(groups, compile_and_run):
     return out
 
 
+def judged_output(argv, work):
+    """Run a judge program. Its stdout is returned ONLY when it exited 0: a judge that crashed printed a partial list
+    of verdicts, and reading them would report the symbols it never reached as missing instead of the crash."""
+    rc, so, se = run(argv, work, timeout=60)
+    if rc != 0:
+        return None, 'JUDGE-FAILED:exit %d %s' % (rc, (se.strip().splitlines() or [''])[0][:120])
+    return so, None
+
+
 def dss_runner(dsscp, target, tree, work):
     env = dict(os.environ, DSS_CONFIG_ROOT=tree)
 
@@ -314,45 +812,69 @@ def dss_runner(dsscp, target, tree, work):
         if not exe:
             return None, 'no artifact'
         os.chmod(exe[0], 0o755)
-        return run([exe[0]], work, timeout=60)[1], None
+        return judged_output([exe[0]], work)
     return go
 
 
-def ref_runner(cc, flags, work):
+def ref_runner(cc, flags, dialect, work):
+    """The reference compiles and links a judge program, in its own dialect's spelling, and runs it. cl prints its
+    errors on stdout, gcc and clang on stderr, so both are read."""
+    forms = DIALECTS[dialect]
+
     def go(text, tag):
         src = os.path.join(work, 'ref_%s.c' % tag)
         with open(src, 'w', encoding='utf-8', newline='\n') as o:
             o.write(text)
         exe = os.path.join(work, 'ref_%s.exe' % tag)
-        rc, so, se = run([cc] + flags + ['-w', '-o', exe, src], work)
+        rc, so, se = run([cc] + forms['standard'] + flags + forms['quiet'] + output_args(dialect, exe) + [src], work)
         if rc != 0:
-            return None, next((l for l in se.splitlines() if 'error' in l), se.strip()[:160])
-        return run([exe], work, timeout=60)[1], None
+            said = so + se
+            return None, next((l for l in said.splitlines() if 'error' in l), said.strip()[:160])
+        return judged_output([exe], work)
     return go
 
 
-def census(tree, target, dsscp, cc, flags, only=None):
+# The words a reference spells a `restrict` qualifier with (cl 19.51 prints `restrict` for `__restrict` too).
+RESTRICT_WORDS = frozenset(('restrict', '__restrict'))
+
+
+def reference_verdict(vb, canonical, forms):
+    """Verdict (b) as the report keeps it: the reference's own, except a NO from a reference whose `_Generic` keeps
+    a parameter's top-level `restrict` (the dialect's `generic_keeps_restrict`) on a row whose address type it spells
+    with one. A descriptor's text cannot spell a parameter's qualifier — it is no part of a function's type (C
+    6.7.6.3p15) — so that reference answers NO whatever the row says: its NO is no verdict, and the row is
+    REF-CANNOT-JUDGE. A `restrict` deeper in the type gives the same answer: the spelling is not parsed for where
+    the word sits, no descriptor can spell one there either, and verdict (a) judges the row both ways."""
+    if vb == 'NO' and forms['generic_keeps_restrict'] \
+            and RESTRICT_WORDS.intersection(SPELLED_WORD.findall(canonical)):
+        return 'REF-CANNOT-JUDGE:its _Generic keeps a restrict its header declares'
+    return vb
+
+
+def census(tree, target, dsscp, cc, flags, dialect, only=None):
     pair = pair_facts(tree, target)
     rows, idents = visible_symbols(tree, pair, only)
     work = tempfile.mkdtemp(prefix='census-')
     try:
-        spell = reference_spellings(rows, cc, flags, work)
+        dropped = {}
+        spell = reference_spellings(rows, cc, flags, dialect, work, dropped)
         a_groups, b_groups, b_errors = {}, {}, {}
         for r in rows:
+            r['dropped'] = dropped.get((r['rel'], r['name']), '')
             s = spell.get((r['rel'], r['name']))
             if isinstance(s, tuple):
-                a_groups.setdefault((r['rel'], r['header']), []).append((r['name'], 'typeof(%s) *' % s[1]))
+                a_groups.setdefault((r['rel'], r['header']), []).append((r['name'], 'typeof(%s)' % s[1]))
                 if r['sig'] is None:                        # the reader refuses this row on the pair
                     b_errors[(r['rel'], r['name'])] = 'PAIR-REFUSED:no arm of the signature serves this pair'
                     continue
                 try:
-                    t = Parser(r['sig'], idents).type()
-                    ptr = declarator(('ptr', t), '').strip()
+                    # `&sym`'s type is a pointer to the row's type, for a function and an object alike.
+                    ptr = declarator(('ptr', Parser(r['sig'], idents).type()), '').strip()
                     b_groups.setdefault((r['rel'], r['header']), []).append((r['name'], ptr))
                 except Exception as e:                      # an unrenderable signature is a finding of its own
                     b_errors[(r['rel'], r['name'])] = 'UNRENDERABLE:%s' % e
         a = run_verdicts(a_groups, dss_runner(dsscp, target, tree, work))
-        b = run_verdicts(b_groups, ref_runner(cc, flags, work))
+        b = run_verdicts(b_groups, ref_runner(cc, flags, dialect, work))
     finally:
         shutil.rmtree(work, ignore_errors=True)
     report = []
@@ -365,26 +887,216 @@ def census(tree, target, dsscp, cc, flags, only=None):
         va = a.get(key, 'DSS-REFUSED:no verdict')
         vb = b_errors.get(key) or b.get(key, 'REF-CANNOT-SPELL:no verdict')
         if isinstance(va, tuple):
-            va = va[0] or 'DSS-REFUSED:' + (va[1] or '')[:120]
+            va = va[0] or (va[1] if (va[1] or '').startswith('JUDGE-FAILED') else 'DSS-REFUSED:' + (va[1] or '')[:120])
         if isinstance(vb, tuple):
-            vb = vb[0] or 'REF-CANNOT-SPELL:' + (vb[1] or '')[:120]
-        report.append((r, 'ok', s[0], s[1], va, vb))
+            vb = vb[0] or (vb[1] if (vb[1] or '').startswith('JUDGE-FAILED') else
+                           'REF-CANNOT-SPELL:' + (vb[1] or '')[:120])
+        report.append((r, 'ok', s[0], s[1], va, reference_verdict(vb, s[1], DIALECTS[dialect])))
     return pair, report
 
 
-def summarize(pair, report):
+# Verdict (a)'s categories: every row of a report has exactly one, so their counts sum to the symbols.
+A_CATEGORIES = ('yes', 'NO', 'REF-UNDECLARED', 'REF-NO-HEADER', 'REF-ERROR', 'DSS-REFUSED', 'JUDGE-FAILED')
+
+
+def summarize(pair, report, dialect):
+    """(ok, line): the census line, and whether it ACCOUNTS for every row — a verdict (a) outside A_CATEGORIES, or
+    counts that do not sum to the symbols, makes the line a FAILED one (the census never passes over a row it does
+    not count)."""
     c = {}
     for r, st, _, _, va, vb in report:
         for k, v in (('a', va), ('b', vb)):
-            key = '%s-%s' % (k, v.split(':', 1)[0])
+            key = '%s-%s' % (k, (v or 'NONE').split(':', 1)[0])
             c[key] = c.get(key, 0) + 1
         if va in ('yes', 'NO') and vb in ('yes', 'NO') and va != vb:
             c['disagree'] = c.get('disagree', 0) + 1
-    return ('prototype-census: OK format=%s symbols=%d a-yes=%d a-no=%d b-yes=%d b-no=%d disagree=%d '
-            'ref-undeclared=%d dss-refused=%d ref-cannot-spell=%d pair-refused=%d'
-            % (pair['format'], len(report), c.get('a-yes', 0), c.get('a-NO', 0), c.get('b-yes', 0), c.get('b-NO', 0),
-               c.get('disagree', 0), c.get('a-REF-UNDECLARED', 0), c.get('a-DSS-REFUSED', 0),
-               c.get('b-REF-CANNOT-SPELL', 0) + c.get('b-UNRENDERABLE', 0), c.get('b-PAIR-REFUSED', 0)))
+        if r.get('dropped'):
+            c['dropped'] = c.get('dropped', 0) + 1
+    counted = sum(c.get('a-' + k, 0) for k in A_CATEGORIES)
+    unknown = sorted(k[2:] for k in c if k.startswith('a-') and k[2:] not in A_CATEGORIES)
+    ok = counted == len(report) and not unknown
+    head = 'prototype-census: OK' if ok else ('prototype-census: FAILED — %d of %d row(s) carry a verdict (a) this line '
+                                             'does not count (%s); the counts follow'
+                                             % (len(report) - counted, len(report), ', '.join(unknown) or 'none named'))
+    return ok, ('%s format=%s dialect=%s symbols=%d a-yes=%d a-no=%d b-yes=%d b-no=%d disagree=%d '
+                'ref-undeclared=%d ref-no-header=%d ref-error=%d dss-refused=%d ref-cannot-spell=%d '
+                'ref-cannot-judge=%d pair-refused=%d judge-failed=%d ref-decoration-dropped=%d'
+                % (head, pair['format'], dialect, len(report), c.get('a-yes', 0), c.get('a-NO', 0), c.get('b-yes', 0),
+                   c.get('b-NO', 0), c.get('disagree', 0), c.get('a-REF-UNDECLARED', 0),
+                   c.get('a-REF-NO-HEADER', 0), c.get('a-REF-ERROR', 0), c.get('a-DSS-REFUSED', 0),
+                   c.get('b-REF-CANNOT-SPELL', 0) + c.get('b-UNRENDERABLE', 0), c.get('b-REF-CANNOT-JUDGE', 0),
+                   c.get('b-PAIR-REFUSED', 0), c.get('a-JUDGE-FAILED', 0) + c.get('b-JUDGE-FAILED', 0),
+                   c.get('dropped', 0)))
+
+
+# ── a DECIDED fork ───────────────────────────────────────────────────────────────────────────────────────────────
+# Two references of ONE pair can read two headers that give a name two values (✔MEASURED 2026-10-08: on pe,
+# mingw-w64's <stdio.h> gives L_tmpnam 14 and TMP_MAX 32767 where the UCRT's own header, which cl reads, gives 260 and
+# 2147483647 -- one library, the UCRT, both times). Which header is the pair's authority is a DECISION, recorded as
+# data beside this program, one entry per (format, dialect, header, name) with BOTH values. The values step reads
+# such a name as `decided` only while both recorded values still hold; anything else about it fails the step and
+# names the entry, so the decision is read again. A name the table does not hold is judged as every other is.
+DECIDED_FORKS = 'decided-forks.json'
+DECIDED_KEYS = ('format', 'dialect', 'header', 'name', 'reference', 'dss', 'authority', 'reason')
+
+
+def read_decided(path):
+    """The entries of a decided-forks table, each whole and none twice -- or ValueError saying which is not."""
+    try:
+        doc = json.load(open(path, encoding='utf-8'))
+    except (OSError, ValueError) as e:
+        raise ValueError('cannot read %s: %s' % (path, e))
+    entries = doc.get('decided') if isinstance(doc, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError('%s holds no `decided` list' % path)
+    seen = set()
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict) or sorted(e) != sorted(DECIDED_KEYS):
+            raise ValueError('entry %d of %s does not hold exactly %s' % (i, path, ', '.join(DECIDED_KEYS)))
+        key = decided_key(e)
+        if not all(isinstance(e[k], str) and e[k].strip() for k in DECIDED_KEYS if k not in ('reference', 'dss')) \
+                or not all(type(e[k]) is int for k in ('reference', 'dss')) or e['reference'] == e['dss']:
+            raise ValueError('entry %s of %s: every field is text but `reference` and `dss`, two DIFFERENT integers'
+                             % ('/'.join(map(str, key)), path))
+        if key in seen:
+            raise ValueError('entry %s is in %s twice' % ('/'.join(key), path))
+        seen.add(key)
+    return entries
+
+
+def decided_key(entry):
+    return tuple(entry[k] for k in ('format', 'dialect', 'header', 'name'))
+
+
+def decided_unreachable(tree, entries):
+    """[(entry key, why)] — the entries NO run of this census can meet: a format no object-format document of the
+    tree has, a dialect this program does not read, or a name the descriptors give that format no value for. (Which
+    legs exist is the harness's to say; an entry of a real format and dialect that no LEG pairs is met by none and
+    judged by none — each leg's self-test prints how many of the table's entries are its own.)"""
+    kinds = {json.load(open(p, encoding='utf-8'))['format']['kind']
+             for p in glob.glob(os.path.join(tree, 'src', 'dss-config', 'object-formats', '*.format.json'))}
+    out, names = [], {}
+    for e in entries:
+        key = decided_key(e)
+        if e['format'] not in kinds:
+            out.append((key, 'no object-format document is of the kind %r' % e['format']))
+        elif e['dialect'] not in DIALECTS:
+            out.append((key, 'this program reads no dialect %r' % e['dialect']))
+        else:
+            if e['format'] not in names:
+                read = value_names(tree, {'format': e['format']})
+                names[e['format']] = {(header, n) for (_, header), ns in read.items() for n in ns}
+            if (e['header'], e['name']) not in names[e['format']]:
+                out.append((key, 'the descriptors give the %s pair no value named %s in <%s>'
+                            % (e['format'], e['name'], e['header'])))
+    return out
+
+
+def values_side(runner, header, names, tag):
+    """One side's {name: printed value} for a header, and {name: why} for the names it cannot print. The whole header
+    is one program; if that program fails, each name is ISOLATED in a program of its own — a single macro that is not
+    an integer expression (an include guard defined empty: Apple's `__STDBOOL_H`, `__TARGETCONDITIONALS__`,
+    ✔MEASURED 2026-09-30) must not take the header's other names down with it."""
+    so, err = runner(values_program(header, names), tag)
+    if so is not None:
+        printed = parse_values(so)
+        if printed.get('census_probe_header') == 'absent':
+            return {n: 'absent' for n in names}, {}
+        return printed, {}
+    printed, errors = {}, {}
+    for k, n in enumerate(names):
+        one, why = runner(values_program(header, [n]), '%s_%d' % (tag, k))
+        if one is None:
+            errors[n] = why
+            continue
+        got = parse_values(one)
+        printed[n] = 'absent' if got.get('census_probe_header') == 'absent' else got.get(n)
+    return printed, errors
+
+
+def value_verdict(d, r):
+    if d == 'absent':
+        return 'DSS-NO-HEADER'
+    if r == 'absent':
+        return 'ref-no-header'
+    if d != 'nodef' and r != 'nodef':
+        return 'match' if int(d) == int(r) else 'MISMATCH'
+    if d == 'nodef' and r == 'nodef':
+        return 'neither-macro'
+    return 'dss-not-a-macro' if d == 'nodef' else 'ref-not-a-macro'
+
+
+def values_census(tree, target, dsscp, cc, flags, dialect, groups=None, decided=()):
+    """[(header, name, dss, ref, verdict)] and the failures. A failure is DSS's: a value program DSS could not build or
+    run, a name it printed nothing for, or a header of its own it does not have. What the REFERENCE cannot print (a
+    macro that is not an integer expression) or does not ship is reported per name and not judged. `decided`: the
+    decided forks (read_decided); an entry of this pair's format and this reference's dialect makes its name
+    `decided` while both sides print the values it records, and a FAILURE naming it otherwise — a value that moved, a
+    side that no longer prints one, or a name this run never reads."""
+    pair = pair_facts(tree, target)
+    groups = groups if groups is not None else value_names(tree, pair)
+    forks = {(e['header'], e['name']): e for e in decided
+             if e['format'] == pair['format'] and e['dialect'] == dialect}
+    work = tempfile.mkdtemp(prefix='census-values-')
+    rows, failures, met = [], [], set()
+    try:
+        dss, ref = dss_runner(dsscp, target, tree, work), ref_runner(cc, flags, dialect, work)
+        for i, ((rel, header), names) in enumerate(sorted(groups.items())):
+            dv, derr = values_side(dss, header, names, 'dss%d' % i)
+            rv, rerr = values_side(ref, header, names, 'ref%d' % i)
+            for n in names:
+                fork = forks.get((header, n))
+                if fork is not None:
+                    met.add((header, n))
+                    d = None if n in derr else dv.get(n)
+                    r = None if n in rerr else rv.get(n)
+                    if d == str(fork['dss']) and r == str(fork['reference']):
+                        rows.append((header, n, d, r, 'decided'))
+                    else:
+                        failures.append('<%s> %s: the decided fork %s no longer holds — DSS prints %s where it '
+                                        'records %d, the reference prints %s where it records %d; read the decision '
+                                        'again (%s)' % (header, n, '/'.join(decided_key(fork)), d or 'nothing',
+                                                        fork['dss'], r or 'nothing', fork['reference'], DECIDED_FORKS))
+                    continue
+                if n in derr:
+                    failures.append('<%s> %s: DSS could not print it: %s' % (header, n, (derr[n] or '')[:160]))
+                    continue
+                d = dv.get(n)
+                if d is None:
+                    failures.append('<%s> %s: DSS printed no line for it' % (header, n))
+                    continue
+                if n in rerr:
+                    rows.append((header, n, d, '-', 'ref-not-an-integer'))
+                    continue
+                r = rv.get(n)
+                if r is None:
+                    rows.append((header, n, d, '-', 'ref-printed-nothing'))
+                    continue
+                verdict = value_verdict(d, r)
+                if verdict == 'DSS-NO-HEADER':
+                    failures.append('<%s> %s: DSS has no such header on its own pair' % (header, n))
+                    continue
+                rows.append((header, n, d, r, verdict))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    for header, n in sorted(set(forks) - met):
+        failures.append('<%s> %s: the decided fork %s names a value this run never read; read the decision again '
+                        '(%s)' % (header, n, '/'.join(decided_key(forks[(header, n)])), DECIDED_FORKS))
+    return pair, rows, failures
+
+
+def values_summary(pair, rows, failures):
+    c = {}
+    for *_, v in rows:
+        c[v] = c.get(v, 0) + 1
+    ok = c.get('MISMATCH', 0) == 0 and not failures
+    return ok, ('prototype-census: VALUES %s format=%s arch=%s names=%d match=%d mismatch=%d decided=%d '
+                'dss-not-a-macro=%d ref-not-a-macro=%d neither-macro=%d ref-no-header=%d ref-not-an-integer=%d '
+                'ref-printed-nothing=%d failures=%d'
+                % ('OK' if ok else 'FAILED', pair['format'], pair['arch'], len(rows), c.get('match', 0),
+                   c.get('MISMATCH', 0), c.get('decided', 0), c.get('dss-not-a-macro', 0), c.get('ref-not-a-macro', 0),
+                   c.get('neither-macro', 0), c.get('ref-no-header', 0), c.get('ref-not-an-integer', 0),
+                   c.get('ref-printed-nothing', 0), len(failures)))
 
 
 # ── the self-test ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -409,23 +1121,407 @@ def selftest_b(pair):
                                          + [{'default': True, 'value': right}]}, 'yes'),
     ]
 # PART A — DSS judges, through the SAME judge program shape, functions the probe declares itself (no descriptor):
-# an exact match, a different parameter type, and ★ THE PINNED BLINDNESS: a parameter differing only in its POINTEE
-# const, which DSS's `_Generic` accepts today (D-C-GENERIC-MATCHES-FUNCTION-TYPES-DIFFERING-IN-A-POINTEE-CONST). When
-# the C semantics lane's fix lands, `a-blind-const` fails: flip its expectation to 'NO' and delete the KNOWN BLINDNESS
-# note in this file's header in the same edit.
+# an exact match, a different parameter type, and a parameter differing only in its POINTEE const — which DSS's
+# `_Generic` tells apart, as every reference compiler does (C 6.7.6.1p2, 6.7.6.3p15). The association is
+# `typeof(<type of &f>)`, the shape the census writes.
 SELFTEST_A = [
-    ('a-exact', 'void (char *)', 'yes'),
-    ('a-different-type', 'void (long)', 'NO'),
-    ('a-blind-const', 'void (const char *)', 'yes'),
+    ('a-exact', 'void (*)(char *)', 'yes'),
+    ('a-different-type', 'void (*)(long)', 'NO'),
+    ('a-pointee-const', 'void (*)(const char *)', 'NO'),
+]
+# PART S — the SPELLING step reads the reference's own refusal, through the dialect the banner named: a function and an
+# object are each spelled as the type of their ADDRESS (the census judges `&sym` against exactly that), and a name the
+# header does not declare is REF-UNDECLARED — on cl too, whose C2065 comes with a C4133 naming 'int *' on its line.
+SELFTEST_S = [
+    ('s-function', 'census_probe_function', 'function', 'double(*)(constchar*)'),
+    ('s-object', 'census_probe_object', 'object', 'int*'),
+    ('s-undeclared', 'census_probe_no_such_name', 'function', None),
+]
+# The header part S spells from: one function and one object whose types no reference spells differently — the arm
+# tests the dialect's PARSE, not a compiler's printing style. ✔MEASURED 2026-10-06: a `short` return is NOT such a
+# type — gcc 13.3.0 prints it `short int (*)(const char *)` where clang prints `short (*)(const char *)`, so the first
+# version of this arm failed on the arm64 VPS's gcc (run 20261006-185142-391e0747) with a correct parse.
+SELFTEST_S_HEADER = 'double census_probe_function(const char *);\nextern int census_probe_object;\n'
+# A dialect that spells one of part S's types its own way, by arm: cl names a function's calling convention,
+# `double (__cdecl *)(const char *)` (✔MEASURED 2026-10-07, cl 19.51.36260), which DSS's pe config erases — so that is
+# the spelling the census hands DSS, and the one the arm requires there.
+SELFTEST_S_DIALECT = {'msvc': {'s-function': 'double(__cdecl*)(constchar*)'}}
+# More rows of one header than any reference judges in one TU (cl stops at 100 errors): every one REF-UNDECLARED, so a
+# stopped TU's rows are re-run until each is judged — on every dialect, each by its own mechanism. (arm
+# `s-error-limit`)
+SELFTEST_S_LIMIT = 130
+# PART M — cl's diagnostics, READ from its measured lines (windows-x86_64-release, 2026-10-07), on every leg: the arms
+# need no cl, so the parse cl's legs depend on is held wherever the census runs. Each: an arm, the text, and the
+# (spellings, undeclared, stopped) msvc_diagnostics must read from it for the TU `ref.c`.
+SELFTEST_M = [
+    ('m-c4047', "C:\\w\\ref.c(13): warning C4047: 'initializing': 'census_probe_sink *' differs in levels of "
+                "indirection from 'double (__cdecl *)(const char *)'",
+     {13: ('double (__cdecl *)(const char *)', 'double (__cdecl *)(const char *)')}, set(), None),
+    ('m-c4133', "ref.c(14): warning C4133: 'initializing': incompatible types - from 'int *' to 'census_probe_sink *'",
+     {14: ('int *', 'int *')}, set(), None),
+    ('m-c2065', "ref.c(15): error C2065: 'census_probe_no_such_name': undeclared identifier\n"
+                "ref.c(15): warning C4133: 'initializing': incompatible types - from 'int *' to 'census_probe_sink *'",
+     {15: ('int *', 'int *')}, {15}, None),
+    ('m-c1003', "ref.c(101): error C2065: 'census_probe_missing_99': undeclared identifier\n"
+                "ref.c(102): fatal error C1003: error count exceeds 100; stopping compilation",
+     {}, {101}, 102),
+    ('m-other-file', "C:\\sdk\\stdlib.h(13): warning C4047: 'initializing': 'census_probe_sink *' differs in levels "
+                     "of indirection from 'int *'\nmyref.c(14): error C2065: 'x': undeclared identifier\n"
+                     "ref.c(16): warning C4047: 'initializing': 'other *' differs in levels of indirection from 'int *'",
+     {}, set(), None),
+]
+# cl's answer to a TAG TU (reference_tag_kinds), read without cl: names a_tag, a_type, u_tag and e_tag from line 2,
+# two lines each -- a typedef line, then a struct line -- in the measured shapes (C2061 then C2059 on a tag's typedef
+# line; C2011 naming the kind on the struct line of a union's and an enum's tag; nothing for a typedef), and a TU cl
+# stopped at line 4. (arms `m-tag-kinds`, `m-tag-stop`)
+SELFTEST_M_TAGS = [
+    ('m-tag-kinds', "tags.c(2): error C2061: syntax error: identifier 'census_probe_type_0'\n"
+                    "tags.c(2): error C2059: syntax error: ';'\n"
+                    "tags.c(6): error C2061: syntax error: identifier 'census_probe_type_2'\n"
+                    "tags.c(6): error C2059: syntax error: ';'\n"
+                    "tags.c(7): error C2011: 'u_tag': 'union' type redefinition\n"
+                    "C:\\sdk\\tags.h(1): note: see declaration of 'u_tag'\n"
+                    "tags.c(8): error C2061: syntax error: identifier 'census_probe_type_3'\n"
+                    "tags.c(8): error C2059: syntax error: ';'\n"
+                    "tags.c(9): error C2011: 'e_tag': 'enum' type redefinition",
+     ['a_tag', 'a_type', 'u_tag', 'e_tag'], ({'a_tag': 'struct', 'u_tag': 'union', 'e_tag': 'enum'}, None)),
+    ('m-tag-stop', "tags.c(2): error C2061: syntax error: identifier 'census_probe_type_0'\n"
+                   "tags.c(4): fatal error C1003: error count exceeds 100; stopping compilation",
+     ['a_tag', 'b_tag', 'c_tag'], ({'a_tag': 'struct'}, 4)),
+]
+# Which words of a cl spelling are names to classify -- each asked about once over a header's rows -- and how a tag
+# word goes back in: a whole word, never twice. (arms `m-tagless-names`, `m-with-tags`)
+SELFTEST_M_WORDS = (
+    ("int (__cdecl *)(const char *const ,stat *const )", ['stat']),
+    ("unsigned __int64 (__cdecl *)(bool *,_locale_t,struct tm *)", ['_locale_t']),
+)
+SELFTEST_M_WITH_TAGS = ("tm *(__cdecl *)(const tm *const ,struct tm *,tm_x)", {'tm': 'struct'},
+                        "struct tm *(__cdecl *)(const struct tm *const ,struct tm *,tm_x)")
+# PART T — a spelled STRUCT, UNION and ENUM type keeps its tag word on every dialect, and DSS takes the spelling as the
+# type it is: gcc and clang print the word, cl drops it (✔MEASURED 2026-10-07) and the census puts it back by asking
+# cl which names are only tags. Each row: an arm, the name, its kind, and a tag phrase its spelling must hold; the DSS
+# judge declares the same header and defines its names.
+SELFTEST_T_HEADER = ('struct census_probe_tag_s { int x; };\nunion census_probe_tag_u { int y; };\n'
+                     'enum census_probe_tag_e { CENSUS_PROBE_TAG_E0 };\n'
+                     'typedef struct census_probe_tag_s census_probe_tag_t;\n'
+                     'extern struct census_probe_tag_s census_probe_tag_sobj;\n'
+                     'extern union census_probe_tag_u census_probe_tag_uobj;\n'
+                     'extern enum census_probe_tag_e census_probe_tag_eobj;\n'
+                     'struct census_probe_tag_s *census_probe_tag_fn(union census_probe_tag_u *, census_probe_tag_t *);\n')
+SELFTEST_T_DEFINITIONS = ('struct census_probe_tag_s census_probe_tag_sobj;\n'
+                          'union census_probe_tag_u census_probe_tag_uobj;\n'
+                          'enum census_probe_tag_e census_probe_tag_eobj;\n'
+                          'struct census_probe_tag_s *census_probe_tag_fn(union census_probe_tag_u *u, '
+                          'census_probe_tag_t *t) { (void)u; (void)t; return 0; }\n')
+SELFTEST_T = [
+    ('t-struct', 'census_probe_tag_sobj', 'object', 'struct census_probe_tag_s'),
+    ('t-union', 'census_probe_tag_uobj', 'object', 'union census_probe_tag_u'),
+    ('t-enum', 'census_probe_tag_eobj', 'object', 'enum census_probe_tag_e'),
+    ('t-function', 'census_probe_tag_fn', 'function', 'union census_probe_tag_u'),
+]
+# More tag names under one header than cl judges in one tag TU (two errors a tag, and it stops at 100): every
+# spelling must still get its word back, so the names a stopped tag TU never reached are re-run -- on every dialect,
+# each by its own mechanism (gcc and clang print the word). (arm `t-error-limit`)
+SELFTEST_T_LIMIT = 130
+# PART D — a DECORATION the reference prints and does not take as part of a type (DECORATIONS): a function declared
+# noreturn and one declared const, with the attribute where the compiler has it — the declarations the platform
+# headers make. The spelling the census hands on is the bare type on every dialect (gcc printed the attribute first,
+# clang prints noreturn last, cl prints none), the removal is RECORDED for the row, DSS's own `_Generic` takes the
+# bare spelling as the type of a function DSS sees declared `_Noreturn`, and so does the REFERENCE's own `_Generic`,
+# of the function it decorated itself — what was removed is no part of the type by the reference's own judgement,
+# which clang's witness text, a refusal of the form it prints, would not say alone. Each row: an arm, the name, the
+# bare spelling with its spaces removed, a dialect's own, and what each dialect is recorded to have had removed.
+# `d-witness` holds every entry of the leg's dialect to the leg's own compiler: the decoration written in a type
+# name, at the end the entry names, must draw the entry's witness from the reference (cl has no entry). The closed
+# list itself is held with no compiler by `d-closed-list` — each row a dialect, a spelling, what is handed on and
+# what was removed: only an entry's exact text at its own end goes — and the census line's count by `d-counted`.
+SELFTEST_D_HEADER = ('#if defined(__GNUC__)\n'
+                     '__attribute__((noreturn)) void census_probe_noreturn(int);\n'
+                     '__attribute__((const)) int census_probe_const(int);\n'
+                     '#else\n'
+                     '_Noreturn void census_probe_noreturn(int);\n'
+                     'int census_probe_const(int);\n'
+                     '#endif\n')
+SELFTEST_D_DEFINITIONS = ('_Noreturn void census_probe_noreturn(int x) { (void)x; for (;;) { } }\n'
+                          'int census_probe_const(int x) { return x; }\n')
+SELFTEST_D = [
+    ('d-noreturn', 'census_probe_noreturn', 'void(*)(int)', {'msvc': 'void(__cdecl*)(int)'},
+     {'gcc': '__attribute__((noreturn))', 'clang': '__attribute__((noreturn))'}),
+    ('d-const', 'census_probe_const', 'int(*)(int)', {'msvc': 'int(__cdecl*)(int)'},
+     {'gcc': '__attribute__((const))'}),
+]
+SELFTEST_D_LIST = [
+    ('gcc', '__attribute__((const)) double (*)(double)', 'double (*)(double)', ['__attribute__((const))']),
+    ('gcc', '__attribute__((noreturn)) void (*)(int)', 'void (*)(int)', ['__attribute__((noreturn))']),
+    ('gcc', '__attribute__((ms_abi)) int (*)(int)', '__attribute__((ms_abi)) int (*)(int)', []),
+    ('gcc', 'void (*)(int) __attribute__((noreturn))', 'void (*)(int) __attribute__((noreturn))', []),
+    ('gcc', 'void (*)(__attribute__((noreturn)) void (*)(int))', 'void (*)(__attribute__((noreturn)) void (*)(int))',
+     []),
+    ('clang', 'void (*)(int) __attribute__((noreturn))', 'void (*)(int)', ['__attribute__((noreturn))']),
+    ('clang', '__attribute__((noreturn)) void (*)(int)', '__attribute__((noreturn)) void (*)(int)', []),
+    ('clang', 'int (*)(int) __attribute__((const))', 'int (*)(int) __attribute__((const))', []),
+    ('msvc', 'void (__cdecl *)(int) __attribute__((noreturn))', 'void (__cdecl *)(int) __attribute__((noreturn))', []),
+]
+# PART R — a PARAMETER's top-level `restrict`. `b-restrict-parameter` holds the dialect's `generic_keeps_restrict` to
+# the leg's own reference, through the census's own judge: a function a synthetic header declares with a restrict
+# parameter, judged against the same type spelled without one, is "yes" from a reference that erases the qualifier
+# (gcc, clang) and REF-CANNOT-JUDGE from one that keeps it (cl) — never that reference's NO. `b-cannot-judge` holds
+# the RULE on every leg, with no compiler — each row a verdict, the spelling it came with, whether the reference
+# keeps the qualifier, and how the report keeps it: a NO becomes no verdict only where the reference keeps the
+# qualifier AND spells one as a whole word; a yes and every other verdict are the reference's own.
+SELFTEST_R_HEADER = 'static void census_probe_restrict(char *restrict p) { (void)p; }\n'
+SELFTEST_R_TEXT = 'void (*)(char *)'
+SELFTEST_R_RULE = [
+    ('NO', 'int (__cdecl *)(mtx_t *restrict ,const struct timespec *restrict )', True, 'REF-CANNOT-JUDGE'),
+    ('NO', 'void (__cdecl *)(char *__restrict )', True, 'REF-CANNOT-JUDGE'),
+    ('NO', 'int (__cdecl *)(mtx_t *,restrict_t *)', True, 'NO'),
+    ('yes', 'void (__cdecl *)(char *restrict )', True, 'yes'),
+    ('REF-CANNOT-SPELL:census_probe', 'void (__cdecl *)(char *restrict )', True, 'REF-CANNOT-SPELL'),
+    ('NO', 'void (*)(char *restrict)', False, 'NO'),
+]
+# The banner cl prints when run with no arguments (✔MEASURED 2026-10-07), and gcc's `--version` first line, which is
+# not cl's. (arm `m-banner`)
+SELFTEST_M_BANNER = ('Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36260 for x64',
+                     'gcc.EXE (MinGW-W64 x86_64-ucrt-posix-seh, built by Brecht Sanders, r8) 13.2.0')
+# A row whose header the reference does not have at all: its own verdict, REF-NO-HEADER (no reference header
+# file of that name exists on any -I path of the self-test).
+SELFTEST_S_NO_HEADER = ('s-no-header', 'census_probe_absent.h', 'census_probe_in_no_header', 'REF-NO-HEADER')
+# The census LINE accounts for every row: a report holding each verdict (a) category the census gives is OK and every
+# category's count is printed; one holding a verdict the line does not count is FAILED. (arm `s-accounting`)
+SELFTEST_ACCOUNTING_COUNTS = ('a-yes=1 a-no=1', 'ref-undeclared=1 ref-no-header=1 ref-error=1 dss-refused=1',
+                              'judge-failed=1')
+# PART V — the VALUES step, on a header BOTH sides get from the self-test alone, so no platform header can move it: DSS
+# reads a synthetic descriptor added to a COPY of the tree's config (through DSS_CONFIG_ROOT), the reference a
+# synthetic header on its -I path. Each row: the name, DSS's value, the reference header's definition (None = the
+# reference header does not define it), and the verdict the census must give. `v-no-header` names a second header
+# only DSS ships.
+SELFTEST_V = [
+    ('v-match', 'CENSUS_PROBE_RIGHT', 8, '8', 'match'),
+    ('v-mismatch', 'CENSUS_PROBE_WRONG', 7, '2147483647', 'MISMATCH'),
+    ('v-ref-empty-macro', 'CENSUS_PROBE_EMPTY', 1, '', 'ref-not-an-integer'),
+    ('v-dss-only', 'CENSUS_PROBE_DSS_ONLY', 42, None, 'ref-not-a-macro'),
+    ('v-decided', 'CENSUS_PROBE_DECIDED', 5, '6', 'decided'),
+]
+SELFTEST_V_NO_HEADER = ('v-no-header', 'CENSUS_PROBE_ONLY_DSS_HAS_THE_HEADER', 5, 'ref-no-header')
+# A DECIDED fork (the table's rule, on a synthetic table keyed to the leg's own format and dialect): `v-decided`,
+# above, is an entry whose two recorded values (DSS 5, the reference 6) both hold — counted `decided`, beside an
+# UNDECLARED mismatch that still fails the step (`v-line`: `mismatch=1 decided=1`, VALUES FAILED). Then a second
+# header, each of whose names DSS prints 5 and the reference 6, under entries that no longer hold — each row an arm,
+# the name, the entry's recorded (reference, dss), and a phrase the failure naming the entry must hold; the last
+# entry names a value the run never reads. `v-decided-table` reads the REAL table beside this program: none of its
+# entries may be one no run can meet, and an entry of a dialect this program does not read must be reported so.
+# An entry is keyed by format AND dialect: `v-decided-other-pair` hands the first run two more entries for a value
+# both sides print alike, one keyed to another format and one to another dialect, each recording values neither side
+# prints -- read on this pair, either would fail the step; they are not this pair's, so the name stays a `match`.
+SELFTEST_V_MOVED = [
+    ('v-decided-reference-moved', 'CENSUS_PROBE_REFERENCE_MOVED', (7, 5), 'the reference prints 6 where it records 7'),
+    ('v-decided-dss-moved', 'CENSUS_PROBE_DSS_MOVED', (6, 4), 'DSS prints 5 where it records 4'),
+    ('v-decided-unmet', 'CENSUS_PROBE_NEVER_READ', (6, 5), 'names a value this run never read'),
+]
+# The table's READER, with no compiler (`v-table-refused`): each of these documents is written and must be refused in
+# the words beside it -- no `decided` list, an entry with a field missing and one with a field more, two equal
+# values, a value that is text, a blank text field, an entry twice -- as must a file that is no JSON at all; and a
+# table of two whole entries is read as two. A document the reader BREAKS on (any error that is not its refusal) is
+# named by the arm too, never left to end the self-test on a traceback.
+SELFTEST_V_ENTRY = {'format': 'pe', 'dialect': 'gcc', 'header': 'census_probe.h', 'name': 'CENSUS_PROBE',
+                    'reference': 1, 'dss': 2, 'authority': 'the self-test', 'reason': 'the self-test'}
+SELFTEST_V_TABLES = [
+    ('holds no `decided` list', {'purpose': 'a table with no list'}),
+    ('does not hold exactly', {'decided': [{k: v for k, v in SELFTEST_V_ENTRY.items() if k != 'reason'}]}),
+    ('does not hold exactly', {'decided': [dict(SELFTEST_V_ENTRY, note='one field more')]}),
+    ('two DIFFERENT integers', {'decided': [dict(SELFTEST_V_ENTRY, dss=1)]}),
+    ('two DIFFERENT integers', {'decided': [dict(SELFTEST_V_ENTRY, reference='1')]}),
+    ('two DIFFERENT integers', {'decided': [dict(SELFTEST_V_ENTRY, reason=' ')]}),
+    ('twice', {'decided': [SELFTEST_V_ENTRY, dict(SELFTEST_V_ENTRY, reference=3)]}),
 ]
 
 
-def selftest(tree, target, dsscp, cc, flags):
+def selftest(tree, target, dsscp, cc, flags, dialect, forks):
     failures = []
     arms_b = selftest_b(pair_facts(tree, target))
     synth = tempfile.mkdtemp(prefix='census-selftest-')
     work = tempfile.mkdtemp(prefix='census-selftest-work-')
     try:
+        # ── flags are percent-decoded ─────────────────────────────────────────────────────────────────────────────
+        if split_flags('-Wl%2C-z%2Cnoexecstack,,-DX=a%20b') != ['-Wl,-z,noexecstack', '-DX=a b']:
+            failures.append('f-percent-decoding: %r' % split_flags('-Wl%2C-z%2Cnoexecstack,,-DX=a%20b'))
+        # ── the native pair is derived, and a host kind with no document is refused ───────────────────────────────
+        got, why = native_target(tree, target.partition(':')[0], 'no-such-kind')
+        if got is not None:
+            failures.append('p-unknown-kind: derived %r for a kind no document has' % got)
+        # ── part S ────────────────────────────────────────────────────────────────────────────────────────────────
+        with open(os.path.join(work, 'census_probe_s.h'), 'w', encoding='utf-8', newline='\n') as o:
+            o.write(SELFTEST_S_HEADER)
+        rows = [{'rel': 'selftest', 'header': 'census_probe_s.h', 'name': n, 'kind': k} for _, n, k, _ in SELFTEST_S]
+        spell = reference_spellings(rows, cc, flags + ['-I' + work], dialect, work)
+        for arm, name, _, want in SELFTEST_S:
+            want = SELFTEST_S_DIALECT.get(dialect, {}).get(arm, want)
+            s = spell.get(('selftest', name))
+            if want is None:
+                good = s == 'REF-UNDECLARED'
+            else:
+                good = isinstance(s, tuple) and s[1].replace(' ', '') == want
+            if not good:
+                failures.append('%s: spelling %r' % (arm, s))
+        many = [{'rel': 'selftest', 'header': 'census_probe_s.h', 'name': 'census_probe_missing_%d' % i,
+                 'kind': 'function'} for i in range(SELFTEST_S_LIMIT)]
+        got_many = reference_spellings(many, cc, flags + ['-I' + work], dialect, work)
+        wrong = [v for v in got_many.values() if v != 'REF-UNDECLARED']
+        if len(got_many) != SELFTEST_S_LIMIT or wrong:
+            failures.append('s-error-limit: %d of %d rows judged, %d of them not REF-UNDECLARED (the first: %r)'
+                            % (len(got_many), SELFTEST_S_LIMIT, len(wrong), wrong[:3]))
+        # ── part M (cl's measured diagnostics, read without cl) ──────────────────────────────────────────────────────
+        for arm, text, want_found, want_undecl, want_stopped in SELFTEST_M:
+            got = msvc_diagnostics(text, 'ref.c')
+            if got != (want_found, want_undecl, want_stopped):
+                failures.append('%s: read %r, want %r' % (arm, got, (want_found, want_undecl, want_stopped)))
+        if row_verdict(15, {15: ('int *', 'int *')}, {15}) != 'REF-UNDECLARED':
+            failures.append('m-c2065: an undeclared line that also spells a type was not REF-UNDECLARED')
+        cl_banner, gcc_banner = SELFTEST_M_BANNER
+        if not MSVC_BANNER.search(cl_banner) or MSVC_BANNER.search(gcc_banner):
+            failures.append('m-banner: cl %r, gcc %r' % (bool(MSVC_BANNER.search(cl_banner)),
+                                                       bool(MSVC_BANNER.search(gcc_banner))))
+        for arm, text, names, want in SELFTEST_M_TAGS:
+            got = msvc_tag_kinds(text, 'tags.c', names, 2)
+            if got != want:
+                failures.append('%s: read %r, want %r' % (arm, got, want))
+        words = [(s, tagless_names(s), want) for s, want in SELFTEST_M_WORDS]
+        if any(got != want for _, got, want in words):
+            failures.append('m-tagless-names: %r' % [(s, got) for s, got, want in words if got != want])
+        # ... and over rows, each name is asked about ONCE: a row's two spellings are one string on cl, and the first
+        # row comes round again.
+        once = tagless_candidates([(s, s) for s, _ in SELFTEST_M_WORDS] + [(SELFTEST_M_WORDS[0][0],) * 2])
+        if once != [n for _, want in SELFTEST_M_WORDS for n in want]:
+            failures.append('m-tagless-names: the names of the rows, each wanted once: %r' % once)
+        spelled, kinds, want = SELFTEST_M_WITH_TAGS
+        if with_tags(spelled, kinds) != want:
+            failures.append('m-with-tags: %r' % with_tags(spelled, kinds))
+        # ── part T (a tag word kept, and DSS takes the spelling) ──────────────────────────────────────────────────
+        with open(os.path.join(work, 'census_probe_t.h'), 'w', encoding='utf-8', newline='\n') as o:
+            o.write(SELFTEST_T_HEADER)
+        rows_t = [{'rel': 'selftest', 'header': 'census_probe_t.h', 'name': n, 'kind': k} for _, n, k, _ in SELFTEST_T]
+        spell_t = reference_spellings(rows_t, cc, flags + ['-I' + work], dialect, work)
+        judge_t = dss_runner(dsscp, target, tree, work)
+        for arm, name, _, phrase in SELFTEST_T:
+            s = spell_t.get(('selftest', name))
+            if not (isinstance(s, tuple) and phrase.replace(' ', '') in s[1].replace(' ', '')):
+                failures.append('%s: spelling %r holds no %r' % (arm, s, phrase))
+                continue
+            text = '\n'.join(['#include <stdio.h>', SELFTEST_T_HEADER + SELFTEST_T_DEFINITIONS + 'int main(void) {',
+                              '    puts(_Generic(&%s, typeof(%s): "yes", default: "NO"));' % (name, s[1]),
+                              '    return 0;', '}']) + '\n'
+            so, err = judge_t(text, arm)
+            got = (so or '').strip() or 'DSS-REFUSED:%s' % err
+            if got != 'yes':
+                failures.append('%s: DSS verdict %r on the spelling %r' % (arm, got, s[1]))
+        with open(os.path.join(work, 'census_probe_tl.h'), 'w', encoding='utf-8', newline='\n') as o:
+            o.write(''.join('struct census_probe_many_%d { int x; };\nextern struct census_probe_many_%d '
+                            'census_probe_many_obj_%d;\n' % (i, i, i) for i in range(SELFTEST_T_LIMIT)))
+        got_tl = reference_spellings([{'rel': 'selftest', 'header': 'census_probe_tl.h',
+                                       'name': 'census_probe_many_obj_%d' % i, 'kind': 'object'}
+                                      for i in range(SELFTEST_T_LIMIT)], cc, flags + ['-I' + work], dialect, work)
+        bare = []
+        for i in range(SELFTEST_T_LIMIT):
+            s = got_tl.get(('selftest', 'census_probe_many_obj_%d' % i))
+            if not (isinstance(s, tuple) and s[1].replace(' ', '') == 'structcensus_probe_many_%d*' % i):
+                bare.append(s)
+        if bare:
+            failures.append('t-error-limit: %d of %d spellings are not the tagged type (the first: %r)'
+                            % (len(bare), SELFTEST_T_LIMIT, bare[:2]))
+        # ── part D (a decoration is not handed on, and DSS takes the bare type) ───────────────────────────────────
+        with open(os.path.join(work, 'census_probe_d.h'), 'w', encoding='utf-8', newline='\n') as o:
+            o.write(SELFTEST_D_HEADER)
+        gone_d = {}
+        spell_d = reference_spellings([{'rel': 'selftest', 'header': 'census_probe_d.h', 'name': n,
+                                        'kind': 'function'} for _, n, _, _, _ in SELFTEST_D],
+                                      cc, flags + ['-I' + work], dialect, work, gone_d)
+        ref_d = ref_runner(cc, flags + ['-I' + work], dialect, work)
+        for arm, name, want, own, removed in SELFTEST_D:
+            s = spell_d.get(('selftest', name))
+            if not (isinstance(s, tuple) and s[1].replace(' ', '') == own.get(dialect, want)):
+                failures.append('%s: spelling %r, want %r' % (arm, s, own.get(dialect, want)))
+                continue
+            if gone_d.get(('selftest', name), '') != removed.get(dialect, ''):
+                failures.append('%s: recorded as removed %r, want %r' % (arm, gone_d.get(('selftest', name), ''),
+                                                                        removed.get(dialect, '')))
+                continue
+            text = '\n'.join(['#include <stdio.h>', SELFTEST_D_DEFINITIONS + 'int main(void) {',
+                              '    puts(_Generic(&%s, typeof(%s): "yes", default: "NO"));' % (name, s[1]),
+                              '    return 0;', '}']) + '\n'
+            so, err = judge_t(text, arm)
+            got = (so or '').strip() or 'DSS-REFUSED:%s' % err
+            if got != 'yes':
+                failures.append('%s: DSS verdict %r on the spelling %r' % (arm, got, s[1]))
+            text = '\n'.join(['#include <stdio.h>', '#include <census_probe_d.h>',
+                              SELFTEST_D_DEFINITIONS + 'int main(void) {',
+                              '    puts(_Generic(&%s, %s: "yes", default: "NO"));' % (name, s[1]),
+                              '    return 0;', '}']) + '\n'
+            so, err = ref_d(text, arm)
+            got = (so or '').strip() or 'REF-REFUSED:%s' % err
+            if got != 'yes':
+                failures.append('%s: the reference\'s own verdict %r on the spelling %r, the type of a function it '
+                                'decorated itself' % (arm, got, s[1]))
+        unwitnessed = []
+        for k, (text, where, witness) in enumerate(DECORATIONS[dialect]):
+            written = '%s void (*)(int)' % text if where == 'leading' else 'void (*)(int) %s' % text
+            with open(os.path.join(work, 'witness.c'), 'w', encoding='utf-8', newline='\n') as o:
+                o.write('typedef typeof(%s) census_probe_witness_%d;\n' % (written, k))
+            _, so, se = run([cc] + DIALECTS[dialect]['standard'] + flags + DIALECTS[dialect]['syntax'] + ['witness.c'],
+                            work)
+            if witness not in so + se:
+                unwitnessed.append((text, where, witness, (so + se).strip()[:200]))
+        if unwitnessed:
+            failures.append('d-witness: the reference did not say what its entry records: %r' % unwitnessed)
+        listed = [(d, s, undecorated(s, d), (bare, removed)) for d, s, bare, removed in SELFTEST_D_LIST]
+        if any(got != want for _, _, got, want in listed):
+            failures.append('d-closed-list: %r' % [(d, s, got) for d, s, got, want in listed if got != want])
+        _, line_d = summarize({'format': 'selftest'},
+                              [({'rel': 'selftest', 'name': 'd0', 'dropped': SELFTEST_D_LIST[0][3][0]}, 'ok', '', '',
+                                'yes', 'yes'), ({'rel': 'selftest', 'name': 'd1'}, 'ok', '', '', 'yes', 'yes')],
+                              dialect)
+        if not line_d.endswith(' ref-decoration-dropped=1'):
+            failures.append('d-counted: two rows, one judged after a removal, read %r' % line_d)
+        # ── part R (a parameter's restrict, and the reference that keeps it) ──────────────────────────────────────
+        with open(os.path.join(work, 'census_probe_r.h'), 'w', encoding='utf-8', newline='\n') as o:
+            o.write(SELFTEST_R_HEADER)
+        key_r = ('selftest', 'census_probe_restrict')
+        spell_r = reference_spellings([{'rel': 'selftest', 'header': 'census_probe_r.h',
+                                        'name': 'census_probe_restrict', 'kind': 'function'}],
+                                      cc, flags + ['-I' + work], dialect, work).get(key_r)
+        raw_r = run_verdicts({('selftest', 'census_probe_r.h'): [('census_probe_restrict', SELFTEST_R_TEXT)]},
+                             ref_runner(cc, flags + ['-I' + work], dialect, work)).get(key_r)
+        raw_r = raw_r[0] if isinstance(raw_r, tuple) else raw_r
+        got_r = reference_verdict(raw_r, spell_r[1] if isinstance(spell_r, tuple) else '', DIALECTS[dialect])
+        want_r = 'REF-CANNOT-JUDGE' if DIALECTS[dialect]['generic_keeps_restrict'] else 'yes'
+        if (got_r or '').split(':', 1)[0] != want_r:
+            failures.append('b-restrict-parameter: reported %r, want %s (the reference answered %r and spells the '
+                            'type %r)' % (got_r, want_r, raw_r, spell_r))
+        rule = [(vb, spelled, keeps, reference_verdict(vb, spelled, {'generic_keeps_restrict': keeps}), want)
+                for vb, spelled, keeps, want in SELFTEST_R_RULE]
+        cannot = reference_verdict('NO', SELFTEST_R_RULE[0][1], {'generic_keeps_restrict': True})
+        _, line_j = summarize({'format': 'selftest'},
+                              [({'rel': 'selftest', 'name': 'j'}, 'ok', '', '', 'NO', cannot)], dialect)
+        if any(got.split(':', 1)[0] != want for _, _, _, got, want in rule) \
+                or ' b-no=0 ' not in line_j or ' ref-cannot-judge=1 ' not in line_j:
+            failures.append('b-cannot-judge: %r; the line of one such row: %r'
+                            % ([x for x in rule if x[3].split(':', 1)[0] != x[4]], line_j))
+        arm_n, header_n, name_n, want_n = SELFTEST_S_NO_HEADER
+        got_n = reference_spellings([{'rel': 'selftest', 'header': header_n, 'name': name_n, 'kind': 'function'}],
+                                    cc, flags + ['-I' + work], dialect, work).get(('selftest', name_n))
+        if got_n != want_n:
+            failures.append('%s: spelling %r, want %r' % (arm_n, got_n, want_n))
+        every = ['yes', 'NO', 'REF-UNDECLARED', 'REF-NO-HEADER', 'REF-ERROR', 'DSS-REFUSED:probe', 'JUDGE-FAILED:exit 1']
+        rep = [({'rel': 'selftest', 'name': 'n%d' % i}, 'ok', '', '', v, 'yes') for i, v in enumerate(every)]
+        ok_all, line_all = summarize({'format': 'selftest'}, rep, dialect)
+        if not (ok_all and line_all.startswith('prototype-census: OK ')
+                and all(p in line_all for p in SELFTEST_ACCOUNTING_COUNTS)):
+            failures.append('s-accounting: a report of every verdict (a) category read %r' % line_all)
+        ok_new, line_new = summarize({'format': 'selftest'},
+                                     rep + [({'rel': 'selftest', 'name': 'u'}, 'ok', '', '', 'UNCOUNTED', 'yes')],
+                                     dialect)
+        if ok_new or not line_new.startswith('prototype-census: FAILED'):
+            failures.append('s-accounting: a report holding a verdict the line does not count read %r' % line_new)
+        # ── part B ────────────────────────────────────────────────────────────────────────────────────────────────
         os.makedirs(os.path.join(synth, 'src', 'dss-config', 'shippedLibs'))
         shutil.copytree(os.path.join(tree, 'src', 'dss-config', 'object-formats'),
                         os.path.join(synth, 'src', 'dss-config', 'object-formats'))
@@ -440,70 +1536,196 @@ def selftest(tree, target, dsscp, cc, flags):
                 failures.append('%s: the pair selected no arm of the synthetic signature' % arm)
                 continue
             ptr = declarator(('ptr', Parser(rows[0]['sig'], idents).type()), '').strip()
-            got = run_verdicts({('string.json', 'string.h'): [(name, ptr)]}, ref_runner(cc, flags, work))
+            got = run_verdicts({('string.json', 'string.h'): [(name, ptr)]}, ref_runner(cc, flags, dialect, work))
             v = got.get(('string.json', name))
             v = v[0] if isinstance(v, tuple) else v
             if v != want:
                 failures.append('%s: reference verdict %r, want %r' % (arm, v, want))
+        # ── part A ────────────────────────────────────────────────────────────────────────────────────────────────
         judge = dss_runner(dsscp, target, tree, work)
         for arm, ctype, want in SELFTEST_A:
-            text = '\n'.join(['#include <stdio.h>', 'void dss_census_f(char *p) { (void)p; }', 'int main(void) {',
-                              '    puts(_Generic(&dss_census_f, typeof(%s) *: "yes", default: "NO"));' % ctype,
+            text = '\n'.join(['#include <stdio.h>', 'void census_probe_f(char *p) { (void)p; }', 'int main(void) {',
+                              '    puts(_Generic(&census_probe_f, typeof(%s): "yes", default: "NO"));' % ctype,
                               '    return 0;', '}']) + '\n'
             so, err = judge(text, arm)
             got = (so or '').strip() or 'DSS-REFUSED:%s' % err
             if got != want:
-                note = ' — has the pointee-const fix landed? update the pin' if arm == 'a-blind-const' else ''
-                failures.append('%s: DSS verdict %r, want %r%s' % (arm, got, want, note))
+                failures.append('%s: DSS verdict %r, want %r' % (arm, got, want))
+        # A judge that exits non-zero is never read as verdicts, even when it printed one.
+        crash = '\n'.join(['#include <stdio.h>', 'int main(void) {', '    puts("yes census_probe_f");',
+                           '    return 3;', '}']) + '\n'
+        so, err = judge(crash, 'a-judge-exit')
+        if so is not None or not (err or '').startswith('JUDGE-FAILED:exit 3'):
+            failures.append('a-judge-exit: a judge exiting 3 read as %r / %r' % (so, err))
+        # ── part V ────────────────────────────────────────────────────────────────────────────────────────────────
+        vtree = os.path.join(synth, 'values-tree')
+        shutil.copytree(os.path.join(tree, 'src', 'dss-config'), os.path.join(vtree, 'src', 'dss-config'))
+        libs = os.path.join(vtree, 'src', 'dss-config', 'shippedLibs')
+        with open(os.path.join(libs, 'census_probe_v.json'), 'w', encoding='utf-8') as o:
+            json.dump({'header': 'census_probe_v.h', 'standard': 'c89',
+                       'constants': [{'name': n, 'value': v, 'type': 'i32'} for _, n, v, _, _ in SELFTEST_V]}, o)
+        arm_h, name_h, value_h, want_h = SELFTEST_V_NO_HEADER
+        with open(os.path.join(libs, 'census_probe_dss_only.json'), 'w', encoding='utf-8') as o:
+            json.dump({'header': 'census_probe_dss_only.h', 'standard': 'c89',
+                       'constants': [{'name': name_h, 'value': value_h, 'type': 'i32'}]}, o)
+        refdir = os.path.join(work, 'values-reference')
+        os.makedirs(refdir)
+        with open(os.path.join(refdir, 'census_probe_v.h'), 'w', encoding='utf-8', newline='\n') as o:
+            o.write(''.join('#define %s %s\n' % (n, d) for _, n, _, d, _ in SELFTEST_V if d is not None))
+        vpair = pair_facts(vtree, target)
+
+        def fork(header, name, reference, dss):
+            return {'format': vpair['format'], 'dialect': dialect, 'header': header, 'name': name,
+                    'reference': reference, 'dss': dss, 'authority': 'the self-test', 'reason': 'the self-test'}
+        elsewhere = [dict(fork('census_probe_v.h', 'CENSUS_PROBE_RIGHT', 6, 5), **other) for other in (
+            {'format': next(k for k in ('elf', 'macho', 'pe') if k != vpair['format'])},
+            {'dialect': next(k for k in sorted(DIALECTS) if k != dialect)})]
+        _, vrows, vfail = values_census(vtree, target, dsscp, cc, flags + ['-I' + refdir], dialect, {
+            ('census_probe_v.json', 'census_probe_v.h'): sorted(n for _, n, _, _, _ in SELFTEST_V),
+            ('census_probe_dss_only.json', 'census_probe_dss_only.h'): [name_h]},
+            decided=[fork('census_probe_v.h', 'CENSUS_PROBE_DECIDED', 6, 5)] + elsewhere)
+        got = {n: v for _, n, _, _, v in vrows}
+        for arm, name, _, _, want in SELFTEST_V + [(arm_h, name_h, value_h, None, want_h)]:
+            if got.get(name) != want:
+                failures.append('%s: values verdict %r, want %r (failures: %s)' % (arm, got.get(name), want,
+                                                                                    '; '.join(vfail)))
+        if vfail:
+            failures.append('v-no-failure: the synthetic values run reported failures: %s' % '; '.join(vfail))
+        if got.get('CENSUS_PROBE_RIGHT') != 'match' or any('CENSUS_PROBE_RIGHT' in f for f in vfail):
+            failures.append('v-decided-other-pair: an entry of another format (%s) or of another dialect (%s) was '
+                            'read on this pair: verdict %r, failures %r'
+                            % (elsewhere[0]['format'], elsewhere[1]['dialect'], got.get('CENSUS_PROBE_RIGHT'), vfail))
+        ok_v, line_v = values_summary(vpair, vrows, vfail)
+        if ok_v or ' mismatch=1 decided=1 ' not in line_v or not line_v.startswith('prototype-census: VALUES FAILED '):
+            failures.append('v-line: an undeclared mismatch beside a decided entry read %r' % line_v)
+        moved = [n for _, n, _, _ in SELFTEST_V_MOVED[:2]]
+        with open(os.path.join(libs, 'census_probe_f.json'), 'w', encoding='utf-8') as o:
+            json.dump({'header': 'census_probe_f.h', 'standard': 'c89',
+                       'constants': [{'name': n, 'value': 5, 'type': 'i32'} for n in moved]}, o)
+        with open(os.path.join(refdir, 'census_probe_f.h'), 'w', encoding='utf-8', newline='\n') as o:
+            o.write(''.join('#define %s 6\n' % n for n in moved))
+        _, frows, ffail = values_census(vtree, target, dsscp, cc, flags + ['-I' + refdir], dialect, {
+            ('census_probe_f.json', 'census_probe_f.h'): sorted(moved)},
+            decided=[fork('census_probe_f.h', n, ref_v, dss_v) for _, n, (ref_v, dss_v), _ in SELFTEST_V_MOVED])
+        for arm, name, _, phrase in SELFTEST_V_MOVED:
+            said = [f for f in ffail if '> %s: ' % name in f]
+            if len(said) != 1 or phrase not in said[0] or any(n == name for _, n, _, _, _ in frows):
+                failures.append('%s: the run said %r of it (rows: %r)' % (arm, said, frows))
+        if len(ffail) != len(SELFTEST_V_MOVED):
+            failures.append('v-decided-unmet: %d failure(s) for %d entries that do not hold: %r'
+                            % (len(ffail), len(SELFTEST_V_MOVED), ffail))
+        table = os.path.join(work, 'census_probe_table.json')
+        unrefused = []
+        for phrase, doc in SELFTEST_V_TABLES + [('cannot read', None)]:
+            with open(table, 'w', encoding='utf-8') as o:
+                o.write('{' if doc is None else json.dumps(doc))
+            try:
+                unrefused.append((phrase, read_decided(table)))
+            except ValueError as e:
+                if phrase not in str(e):
+                    unrefused.append((phrase, str(e)))
+            except Exception as e:                      # no refusal at all: the reader BROKE on the document
+                unrefused.append((phrase, '%s: %s' % (type(e).__name__, e)))
+        with open(table, 'w', encoding='utf-8') as o:
+            json.dump({'decided': [SELFTEST_V_ENTRY, dict(SELFTEST_V_ENTRY, name='CENSUS_PROBE_OTHER')]}, o)
+        try:
+            whole = len(read_decided(table))
+        except ValueError as e:
+            whole = str(e)
+        if unrefused or whole != 2:
+            failures.append('v-table-refused: tables read that must be refused, or refused in other words: %r; a '
+                            'table of two whole entries read as %r' % (unrefused, whole))
+        mine = [e for e in forks if e['format'] == vpair['format'] and e['dialect'] == dialect]
+        print('prototype-census: decided forks: %d entr%s, %d of them this leg\'s (%s, %s)'
+              % (len(forks), 'y' if len(forks) == 1 else 'ies', len(mine), vpair['format'], dialect))
+        for e in forks:
+            print('prototype-census: decided fork %s: %s' % ('/'.join(decided_key(e)),
+                                                             'this leg\'s' if e in mine else 'not this leg\'s'))
+        lost = decided_unreachable(tree, forks)
+        probe = decided_unreachable(tree, [fork('census_probe_v.h', 'CENSUS_PROBE_DECIDED', 6, 5),
+                                           dict(fork('stdio.h', 'TMP_MAX', 1, 2), dialect='census-probe-no-dialect')])
+        if lost or len(probe) != 2 or 'no value named' not in probe[0][1] or 'reads no dialect' not in probe[1][1]:
+            failures.append('v-decided-table: entries no run can meet: %r; two entries that cannot be met, a name '
+                            'no descriptor has and a dialect not read, were reported %r' % (lost, probe))
     finally:
         shutil.rmtree(synth, ignore_errors=True)
         shutil.rmtree(work, ignore_errors=True)
     for f in failures:
         print('SELFTEST FAIL: ' + f)
-    n = len(SELFTEST_A) + len(arms_b)
+    # f-percent-decoding, p-unknown-kind, a-judge-exit; part S + s-error-limit + s-no-header + s-accounting; part M +
+    # m-banner + the two tag readings + m-tagless-names + m-with-tags; part T + t-error-limit; part D + d-witness +
+    # d-closed-list + d-counted; part R's b-restrict-parameter and b-cannot-judge; parts B, A, V; v-no-header and
+    # v-no-failure; v-line and v-decided-other-pair; the entries that no longer hold; v-table-refused and
+    # v-decided-table.
+    n = (3 + len(SELFTEST_S) + 1 + 2 + len(SELFTEST_M) + 1 + len(SELFTEST_M_TAGS) + 2 + len(SELFTEST_T) + 1 +
+         len(SELFTEST_D) + 3 + 2 + len(arms_b) + len(SELFTEST_A) + len(SELFTEST_V) + 2 + 2 +
+         len(SELFTEST_V_MOVED) + 2)
     print('prototype-census: SELFTEST %s (%d arms)' % ('FAILED' if failures else 'OK', n))
     return 1 if failures else 0
-
-
-# The leg's NATIVE pair — the one whose judge program the leg can RUN — from the harness's own {os}/{processor}
-# (derived by the tool, never typed). A leg this table does not name is refused by name, not guessed.
-NATIVE_TARGET = {
-    ('linux', 'x86_64'): 'x86_64:elf64-x86_64-linux-exec',
-    ('linux', 'arm64'): 'arm64:elf64-aarch64-linux-exec',
-    ('macos', 'arm64'): 'arm64:macho64-arm64-darwin-exec',
-    ('windows', 'x86_64'): 'x86_64:pe64-x86_64-windows-exec',
-}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--tree', required=True)
-    ap.add_argument('--target', default='')
-    ap.add_argument('--os', default='')
-    ap.add_argument('--processor', default='')
+    ap.add_argument('--processor', required=True)
     ap.add_argument('--dsscp', required=True)
-    ap.add_argument('--cc', default='clang')
-    ap.add_argument('--flags', default='-std=gnu2x,-D_GNU_SOURCE')
+    ap.add_argument('--cc', required=True)
+    ap.add_argument('--flags', default='')
     ap.add_argument('--out', default='')
     ap.add_argument('--only', default='')
     ap.add_argument('--selftest', action='store_true')
+    ap.add_argument('--values', action='store_true')
     a = ap.parse_args()
-    flags = [f for f in a.flags.split(',') if f]
-    if not a.target:
-        a.target = NATIVE_TARGET.get((a.os, a.processor), '')
-        if not a.target:
-            print('prototype-census: REFUSED — no native pair for os=%r processor=%r (known: %s)'
-                  % (a.os, a.processor, ', '.join('%s/%s' % k for k in sorted(NATIVE_TARGET))))
+    flags = split_flags(a.flags)
+    target, why = native_target(a.tree, a.processor, host_format_kind())
+    if target is None:
+        print('prototype-census: REFUSED — no native pair: %s' % why)
+        return 2
+    work = tempfile.mkdtemp(prefix='census-dialect-')
+    try:
+        dialect, banner = reference_dialect(a.cc, work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if dialect is None:
+        print('prototype-census: REFUSED — %s' % banner)
+        return 2
+    forks = []
+    if a.selftest or a.values:
+        try:
+            forks = read_decided(os.path.join(os.path.dirname(os.path.abspath(__file__)), DECIDED_FORKS))
+        except ValueError as e:
+            print('prototype-census: REFUSED — the decided forks: %s' % e)
             return 2
     if a.selftest:
-        return selftest(a.tree, a.target, a.dsscp, a.cc, flags)
-    pair, report = census(a.tree, a.target, a.dsscp, a.cc, flags, a.only or None)
+        return selftest(a.tree, target, a.dsscp, a.cc, flags, dialect, forks)
+    if not a.out:
+        print('prototype-census: REFUSED — --out names no report file')
+        return 2
+    if a.values:
+        pair, rows, failures = values_census(a.tree, target, a.dsscp, a.cc, flags, dialect, decided=forks)
+        with open(a.out, 'w', encoding='utf-8', newline='\n') as o:
+            o.write('header\tname\tdss\treference\tverdict\n')
+            for row in rows:
+                o.write('\t'.join(str(x) for x in row) + '\n')
+        for f in failures:
+            print('VALUES FAIL: ' + f)
+        for header, name, d, r, v in rows:
+            if v == 'MISMATCH':
+                print('VALUES MISMATCH: <%s> %s dss=%s reference=%s' % (header, name, d, r))
+            elif v == 'decided':
+                print('VALUES DECIDED: <%s> %s dss=%s reference=%s (%s)' % (header, name, d, r, DECIDED_FORKS))
+        ok, line = values_summary(pair, rows, failures)
+        print(line)
+        return 0 if ok else 1
+    pair, report = census(a.tree, target, a.dsscp, a.cc, flags, dialect, a.only or None)
     with open(a.out, 'w', encoding='utf-8', newline='\n') as o:
-        o.write('descriptor\tsymbol\treference_declared\treference_canonical\tverdict_a_dss\tverdict_b_reference\n')
+        o.write('descriptor\tsymbol\treference_declared\treference_canonical\tverdict_a_dss\tverdict_b_reference\t'
+                'reference_decoration_dropped\n')
         for r, st, decl, canon, va, vb in report:
-            o.write('\t'.join([r['rel'], r['name'], decl, canon, va, vb]) + '\n')
-    print(summarize(pair, report))
-    return 0
+            o.write('\t'.join([r['rel'], r['name'], decl, canon, va, vb, r.get('dropped', '')]) + '\n')
+    ok, line = summarize(pair, report, dialect)
+    print(line)
+    return 0 if ok else 1
 
 
 if __name__ == '__main__':
