@@ -93,11 +93,16 @@ round's close; each checkpoint's commit message says what was and was not run on
   tree with `dssharness check-anchor-balance --base 71648598`: **618 open against 620**; 24 closed, 22 opened
   (1 created, 21 disclosed), so the REAL net is −2. Registry lint: 0 findings.
 - **What it does NOT carry.** ✔MEASURED: the combined tree has been through NO gate run (each lane ran its five legs
-  on its own tree before its fold). Known reds: the three inventory guards (`emitted_anchor_ids_guard`,
-  `doc_census_guard`, `plan_citations_guard`), whose baselines are written after a fold; two regressions the library
-  lane's fold introduced, found by its re-review and fixed in that lane's next fold (a weak reference binding against
-  the runtime archive on pe64; the archive member format on the relocatable documents); that re-review's thirteen
-  findings. **Do not run the pipes on a checkpoint commit.**
+  on its own tree before its fold). Known reds: two regressions the library lane's fold introduced, found by its
+  re-review and fixed in that lane's next fold (a weak reference binding against the runtime archive on pe64; the
+  archive member format on the relocatable documents); that re-review's thirteen findings. **Do not run the pipes
+  on a checkpoint commit.**
+- **The inventory guards are green from the commit after checkpoint 1** (✔MEASURED 2026-10-08 on the two local
+  legs: `check-emitted-anchor-ids`, `check-plan-citations`, `check-doc-census`, and the stale-refusal guard run
+  last). The plan-citations red was NOT new citations: three rows closed this round MOVED to the done registry
+  carrying 25 old `path:line` citations (✔MEASURED per row with the guard's own counter). Their positions were
+  removed from the cells — the ceiling was not raised — and the production registry's ceiling came down 236 → 213.
+  A row is closed with its positional citations removed, or this guard trips at every closure.
 - **Where the round stands.** Four lanes are mid-wave on the same agents. The P0 rows this round found are listed by
   `dssharness read-anchors --pending --open --band P0`. A disclosed row is OPEN WORK (operator ruling of the same
   day): the round's remaining waves close them, the largest on their own plans. The orchestrator's ledger is local,

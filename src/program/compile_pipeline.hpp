@@ -134,8 +134,8 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // so `doc_census_guard` re-derives them on every ctest run and a drift is a RED
 // rather than a discovery. The PATTERN lives in that document, not here — a
 // pattern quoted in prose is prose, and rots exactly like the number did:
-//     <!--census:source:program.exportedDecls-->27 exported declarations
-// — <!--census:source:program.exportedFunctions-->22 exported functions plus
+//     <!--census:source:program.exportedDecls-->28 exported declarations
+// — <!--census:source:program.exportedFunctions-->23 exported functions plus
 // <!--census:source:program.exportedStructs-->5 exported structs (`CuMirModule`,
 // `CuHirModule`, `EntryCandidate`, `ResolvedEntry`, `ResolveLibraryPartition`).
 //
@@ -375,8 +375,8 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // ── AND WHAT THE MERGED ROUTE COSTS TO REACH AT ALL ────────────────────────
 // ✔MEASURED — the merged route is reachable ONLY through
 // `Program::compileUnits` with ≥2 sources, and
-// <!--census:examples:top.sources-->32 of the
-// <!--census:examples:manifests-->968 shipped corpus example manifests declare a
+// <!--census:examples:top.sources-->34 of the
+// <!--census:examples:manifests-->1033 shipped corpus example manifests declare a
 // multi-source `sources` array, so the corpus exercises it roughly 3% as often
 // as the single-CU route.
 // ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census

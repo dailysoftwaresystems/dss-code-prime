@@ -108,7 +108,7 @@ INVENTORY = {
     "src/link/format/macho_backend.cpp": 10,
     "src/link/format/macho_object_reader.cpp": 5,
     "src/link/format/object_atom_coverage.hpp": 2,
-    "src/link/format/pe.cpp": 30,
+    "src/link/format/pe.cpp": 29,
     "src/link/format/pe_backend.cpp": 7,
     "src/link/format/unwind_pointer_reloc.hpp": 2,
     "src/link/format/weak_definition_gate.hpp": 2,
