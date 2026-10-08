@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Shared symbol-NAMING substrate for the object/image writers — the ONE owner of
@@ -433,5 +434,60 @@ private:
         aliasesBySym_;
     std::unordered_map<std::uint32_t, ExternImport const*> externBySym_;
 };
+
+// ── A REFERENCE TO A NAME ITS OWN MODULE DEFINES ───────────────────────────
+//    D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME
+//
+// An object reader states a plain reference row for a relocation its object
+// writes through a WEAK name of a body that has another external name (THE
+// WEAK-NAME RULE, `object_atom_coverage.hpp`), so such a row names a definition
+// of the SAME module. An image resolves it by name like any other reference;
+// the three predicates below are what the link and the object writers read of
+// that shape.
+
+// A PLAIN reference row: not a common (a definition the link allocates) and not
+// a preemption reference (the loader's to resolve, on purpose).
+[[nodiscard]] inline bool isPlainNameReference(ExternImport const& e) noexcept {
+    return !e.mangledName.empty() && e.commonSize == 0u && !e.isPreemptionReference;
+}
+
+// Does `module` hold a plain reference row whose name one of its own
+// external-linkage definitions carries? An IMAGE of one such unit takes the
+// by-name resolution a link of several units takes (`linker::link`).
+[[nodiscard]] inline bool namesADefinitionOfItsOwn(AssembledModule const& module) {
+    std::unordered_set<std::string_view> defined;
+    for (ModuleSymbol const& ms : module.symbols) {
+        if (ObjectSymbolNames::hasExternalLinkage(ms)) defined.insert(ms.name);
+    }
+    if (defined.empty()) return false;
+    for (ExternImport const& e : module.externImports) {
+        if (isPlainNameReference(e) && defined.contains(e.mangledName)) return true;
+    }
+    return false;
+}
+
+// THE OBJECT WRITERS' ARM. `recordOfDefinedName` maps each external-linkage
+// name the writer gave a record of its own -- a canonical name's or an alias's
+// -- to that record's symbol-table index. A plain reference row naming one of
+// them gets NO undefined record: its id is pointed at the record of the NAME,
+// so a relocation through a weak name names the WEAK record -- what gcc, clang
+// and Apple's assembler write, and what lets a later link give the name to
+// another definition while the body keeps its other name. (An undefined record
+// of a name the same object defines is a shape no reference tool writes.)
+// Called once every defined record is registered and before the undefined ones
+// are.
+inline void pointOwnNameReferencesAtTheirRecords(
+    AssembledModule const&                                module,
+    std::unordered_map<std::string, std::uint32_t> const& recordOfDefinedName,
+    std::unordered_map<SymbolId, std::uint32_t>&          symIdxBySymbol) {
+    if (recordOfDefinedName.empty()) return;
+    for (ExternImport const& e : module.externImports) {
+        if (!isPlainNameReference(e)) continue;
+        if (auto const own = recordOfDefinedName.find(e.mangledName);
+            own != recordOfDefinedName.end()) {
+            symIdxBySymbol.emplace(e.symbol, own->second);
+        }
+    }
+}
 
 } // namespace dss::link::format

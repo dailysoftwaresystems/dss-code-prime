@@ -1,8 +1,11 @@
 #pragma once
 
+#include "core/types/enum_name_table.hpp"   // EnumNameTable (the two closed sets a directive row states)
+
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -17,11 +20,12 @@
 // lld-link 19.1.5 export a name another object defines; lld-link -lldmingw
 // excludes one). The object reader reads them against its format's directive
 // vocabulary (`LinkerDirectiveMeaning`) into this record; `linker::link`
-// decides them across the link's units with the precedence link.exe gives each
-// (`decideUnitLinkerRequests`) into the `DirectiveImageSettings` the image
-// writer realizes, and a relocatable artifact hands every one it does not
-// restate from its own rows on to its final linker, verbatim (`handOn`). Every
-// unit but a foreign COFF object's carries an empty one.
+// decides them across the link's units with the precedence the format's
+// vocabulary states for each option (`decideUnitLinkerRequests`) into the
+// `DirectiveImageSettings` the image writer realizes, and a relocatable artifact
+// hands every one it does not restate from its own rows on to its final linker,
+// verbatim (`handOn`). Every unit but a foreign COFF object's carries an empty
+// one.
 //
 // Lives in `core/types` because `AssembledModule` (asm) carries it and the
 // linker and the PE writer consume it; neither tier owns the other's headers.
@@ -60,10 +64,31 @@ struct SectionAttributeRequest {
 
 struct UnitStackRequest            { ReserveCommit sizes; };
 struct UnitHeapRequest             { ReserveCommit sizes; };
-struct UnitSubsystemRequest        { SubsystemSetting setting; };
+// `unsupported`: non-empty when the directive names a subsystem a reference
+// linker takes and NO DSS image starts under (the vocabulary's
+// `unsupportedSubsystems`), holding the row's reason. It is a subsystem request
+// all the same: settled against the other units' by the option's precedence,
+// and refused by name only where it would STAND -- a reference linker that
+// takes the last `/SUBSYSTEM:` links a NATIVE one a later CONSOLE replaces.
+struct UnitSubsystemRequest {
+    SubsystemSetting setting;
+    std::string      unsupported{};
+    friend bool operator==(UnitSubsystemRequest const&, UnitSubsystemRequest const&) = default;
+};
 // `runtimeStartup`: the name is the C runtime's own startup (the format's
 // vocabulary lists it), which in a DSS image is the target's startup.
-struct UnitEntryRequest            { std::string symbol; bool runtimeStartup = false; };
+// `unsupported`: non-empty when the name is a runtime startup NO DSS image
+// provides (the vocabulary's `unsupportedStartups`), holding the row's reason.
+// It is an ENTRY request all the same -- settled against the other units' by
+// the option's precedence, and dropped from a member the archive search pulls
+// like any entry -- and the image link refuses it by name only where it would
+// stand (P69 send-back 5, review-xa4 NIT 7).
+struct UnitEntryRequest {
+    std::string symbol;
+    bool        runtimeStartup = false;
+    std::string unsupported{};
+    friend bool operator==(UnitEntryRequest const&, UnitEntryRequest const&) = default;
+};
 struct UnitSectionAttributeRequest { SectionAttributeRequest request; };
 struct UnitChecksumRequest         {};
 struct UnitImageVersionRequest     { VersionPair version; };
@@ -84,22 +109,74 @@ using UnitImageRequestValue = std::variant<UnitStackRequest, UnitHeapRequest, Un
                                            UnitMismatchCheck, UnitDllImageRequest,
                                            UnitUnhonourableRequest>;
 
+// ── THE TWO ANSWERS A FORMAT STATES ABOUT A REQUEST ONE LINK DECIDES ACROSS ITS
+//    UNITS (P69 send-back 5, review-xa4 MINOR 6) ────────────────────────────
+// Which unit's request STANDS when two units of one link state one option, and
+// what a link that makes a SHARED LIBRARY does with the request, are facts of
+// the format's own linkers -- link.exe keeps the first `/STACK:` where lld-link
+// takes the last (✔MEASURED 2026-10-07) -- so neither is code. The format's
+// directive vocabulary states both per option
+// (`PeLinkerDirectiveRow::unitPrecedence` / `inSharedLibrary`, required on every
+// row whose request is decided across units and refused at load on any other),
+// the object reader stamps each request with its row's answers, and the
+// decision (`linker::decideUnitLinkerRequests`) reads them from the REQUEST.
+enum class UnitRequestPrecedence : std::uint8_t {
+    First,     // the first unit's request stands; a later one is dropped
+    Last,      // the last unit's request stands; an earlier one is dropped
+    InOrder,   // every request applies, in unit order: a section's attribute
+               // edits compose; a setting that holds ONE value ends at the last
+};
+inline constexpr EnumNameTable<UnitRequestPrecedence, 3> kUnitRequestPrecedenceTable{{{
+    { UnitRequestPrecedence::First,   "first"   },
+    { UnitRequestPrecedence::Last,    "last"    },
+    { UnitRequestPrecedence::InOrder, "inOrder" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kUnitRequestPrecedenceTable);
+
+enum class SharedLibraryDisposition : std::uint8_t {
+    Honoured,  // a shared library takes the request as a program does
+    Ignored,   // warned and dropped, with the row's reason
+    Refused,   // refused by name, with the row's reason
+};
+inline constexpr EnumNameTable<SharedLibraryDisposition, 3> kSharedLibraryDispositionTable{{{
+    { SharedLibraryDisposition::Honoured, "honoured" },
+    { SharedLibraryDisposition::Ignored,  "ignored"  },
+    { SharedLibraryDisposition::Refused,  "refused"  },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kSharedLibraryDispositionTable);
+
 struct UnitImageRequest {
     std::string           spelled;   // the directive as the object wrote it, for diagnostics
     UnitImageRequestValue value;
+    // The object or archive member that stated the directive -- `main.obj`,
+    // `libdir.a(member.obj)` -- which every diagnostic about it names. Stamped
+    // where the unit is read from its file (`nameStatingUnit`); empty for a unit
+    // handed to the link in memory.
+    std::string              unit{};
+    // The stating row's two answers (above). A request no link settles across
+    // units (a mismatch check, `/DLL`, one no DSS image can carry) keeps the
+    // defaults, which nothing reads for it.
+    UnitRequestPrecedence    precedence      = UnitRequestPrecedence::InOrder;
+    SharedLibraryDisposition inSharedLibrary = SharedLibraryDisposition::Honoured;
+    std::string              inSharedLibraryReason{};
 };
 
 // `/EXPORT:[exported=]internal[,DATA][,PRIVATE]` -- the image exports the
 // definition named `internal` under `exported` (the same name unless renamed).
 // PRIVATE keeps a name out of an import library only, which a DSS link does not
 // write: the image's export table holds it all the same (✔MEASURED 2026-10-07,
-// link.exe and lld-link).
+// link.exe and lld-link). Two units exporting ONE name for two definitions are
+// settled by the row's `precedence`, like an image setting.
 struct UnitExportRequest {
     std::string internalName;
     std::string exportedName;
     bool        isData    = false;
     bool        isPrivate = false;
     std::string spelled;
+    std::string              unit{};   // as `UnitImageRequest::unit`
+    UnitRequestPrecedence    precedence      = UnitRequestPrecedence::InOrder;
+    SharedLibraryDisposition inSharedLibrary = SharedLibraryDisposition::Honoured;
+    std::string              inSharedLibraryReason{};
     friend bool operator==(UnitExportRequest const&, UnitExportRequest const&) = default;
 };
 
@@ -112,8 +189,9 @@ struct UnitLinkerRequests {
     std::vector<std::string>       hides;
     // The directive tokens a RELOCATABLE artifact holding this unit restates
     // verbatim, in directive order: every one whose request the artifact does
-    // not restate from its own rows (a hide of its own definition, an include,
-    // an alternate name and a common's alignment are restated from those).
+    // not restate from its own rows (a hide of its own definition, an include
+    // of a name it does not define, an alternate name and a common's alignment
+    // are restated from those).
     std::vector<std::string>       handOn;
     // What a link that makes an IMAGE says about a request it drops as the
     // reference linkers drop it (an option no reference honours in a directive,
@@ -126,6 +204,17 @@ struct UnitLinkerRequests {
         return image.empty() && exports.empty() && hides.empty() && handOn.empty() && warnings.empty();
     }
 };
+
+// Name the unit that stated `requests` on every one of them -- the object's
+// file name, or `archive(member)` -- so each diagnostic a link makes of a
+// request or a stored warning says WHOSE directive it is (P69 send-back 5,
+// review-xa4 NIT 11). Called once per unit, where the unit is read from its
+// file, before anything folds two units' requests together.
+inline void nameStatingUnit(UnitLinkerRequests& requests, std::string_view unit) {
+    for (auto& r : requests.image) r.unit = unit;
+    for (auto& e : requests.exports) e.unit = unit;
+    for (auto& w : requests.warnings) w = "'" + std::string{unit} + "': " + w;
+}
 
 // One link's units' requests, folded into the merged module's in UNIT order --
 // the order the link's precedence is read from (the first or the last unit's

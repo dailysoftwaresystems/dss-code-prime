@@ -19,10 +19,13 @@
 //     image RUN. Under every linker the member's code form, its static and its const static are one value; under
 //     DSS's link that value is the one GetProcAddress answers (design c2), and under a foreign linker it is the
 //     image's import thunk, never GetProcAddress's (MinGW's meaning). Windows-only; each arm SKIPS, naming the absent
-//     toolchain, rather than reddens.
+//     toolchain, rather than reddens. The foreign arms keep the C runtime's startup out, so their image starts at
+//     the process-ending raw entry of `pe_raw_entry.hpp` -- a third DSS object -- and not at `main`: returning from
+//     a raw PE entry ends the thread, not the process (measured there, on this very program).
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "program/program.hpp"
+#include "pe_raw_entry.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
 #include "../core/native_c_probe.hpp"
@@ -215,12 +218,14 @@ TEST(PeObjectFunctionAddress, EveryReferenceToALibraryFunctionsAddressIsTheSameP
 
 namespace {
 
-// The DSS-built objects every arm links: the member and the program.
+// The DSS-built objects every foreign arm links: the member, the program, and the image's raw entry
+// (`pe_raw_entry.hpp`: it calls `main` and ends the PROCESS with what `main` returns).
 struct DssObjects {
     fs::path    member;
     fs::path    main;
+    fs::path    entry;
     std::string diagnostics;
-    [[nodiscard]] bool ok() const { return !member.empty() && !main.empty(); }
+    [[nodiscard]] bool ok() const { return !member.empty() && !main.empty() && !entry.empty(); }
 };
 
 [[nodiscard]] DssObjects buildDssObjects(fs::path const& dir) {
@@ -228,9 +233,15 @@ struct DssObjects {
     DiagnosticReporter rep;
     o.member = buildObj(dir, "member", kMember, rep);
     o.main = buildObj(dir, "main", kMain, rep);
+    o.entry = buildObj(dir, "entry", test::pe_raw_entry::kSource, rep);
     o.diagnostics = diagnosticsOf(rep);
     return o;
 }
+
+// The two halves of a foreign link line that name the image's entry: `/ENTRY:<symbol>` for link.exe and
+// lld-link, `-e <symbol>` for GNU ld. One spelling of the symbol, `pe_raw_entry.hpp`'s.
+[[nodiscard]] std::string msEntryOption() { return std::string{"/ENTRY:"} + test::pe_raw_entry::kSymbol; }
+[[nodiscard]] std::string gnuEntryOption() { return std::string{"-e "} + test::pe_raw_entry::kSymbol; }
 
 // One linker line in `dir`, its output KEPT in `<dir>/<logName>`: a link that fails says why in the assertion
 // (`tailOf`), not only that it failed. `tools` set: the line runs under the process's MSVC developer environment
@@ -298,10 +309,12 @@ TEST(PeObjectFunctionAddressReferenceLinkNative, LinkExeGivesTheMembersEveryForm
     ASSERT_TRUE(tools.ready()) << tools.describe();
     auto const objs = buildDssObjects(dir);
     ASSERT_TRUE(objs.ok()) << objs.diagnostics;
-    // `/NODEFAULTLIB` + `/ENTRY:main` keep the CRT out: the subject is the two DSS objects and the import libraries.
-    ASSERT_TRUE(linkCapturing(&tools, dir, "link /nologo /OUT:fa_link.exe /ENTRY:main /SUBSYSTEM:CONSOLE "
-                              "/NODEFAULTLIB main.obj member.obj kernel32.lib ucrt.lib", "link.txt"))
-        << "link.exe must link the two DSS objects against kernel32.lib and ucrt.lib"
+    // `/NODEFAULTLIB` + `/ENTRY:` keep the CRT out: the subject is the two DSS objects and the import libraries,
+    // and the image starts at the process-ending raw entry (`entry.obj`).
+    ASSERT_TRUE(linkCapturing(&tools, dir, "link /nologo /OUT:fa_link.exe " + msEntryOption()
+                              + " /SUBSYSTEM:CONSOLE /NODEFAULTLIB main.obj member.obj entry.obj kernel32.lib ucrt.lib",
+                              "link.txt"))
+        << "link.exe must link the DSS objects against kernel32.lib and ucrt.lib"
         << linkOutput(dir, "link.txt", "link.exe");
     expectOneAddress(dir / "fa_link.exe", 42u, "link.exe");
 }
@@ -320,10 +333,10 @@ TEST(PeObjectFunctionAddressReferenceLinkNative, LldLinkGivesTheMembersEveryForm
     ASSERT_TRUE(tools.ready()) << tools.describe();
     auto const objs = buildDssObjects(dir);
     ASSERT_TRUE(objs.ok()) << objs.diagnostics;
-    ASSERT_TRUE(linkCapturing(&tools, dir, "\"" + lld.string() + "\" /nologo /OUT:fa_lld.exe /ENTRY:main "
-                              "/SUBSYSTEM:CONSOLE /NODEFAULTLIB main.obj member.obj kernel32.lib ucrt.lib",
+    ASSERT_TRUE(linkCapturing(&tools, dir, "\"" + lld.string() + "\" /nologo /OUT:fa_lld.exe " + msEntryOption()
+                              + " /SUBSYSTEM:CONSOLE /NODEFAULTLIB main.obj member.obj entry.obj kernel32.lib ucrt.lib",
                               "lld.txt"))
-        << "lld-link must link the two DSS objects against kernel32.lib and ucrt.lib"
+        << "lld-link must link the DSS objects against kernel32.lib and ucrt.lib"
         << linkOutput(dir, "lld.txt", "lld-link");
     expectOneAddress(dir / "fa_lld.exe", 42u, "lld-link");
 }
@@ -342,11 +355,11 @@ TEST(PeObjectFunctionAddressReferenceLinkNative, GnuLdGivesTheMembersEveryFormOf
 #endif
     auto const objs = buildDssObjects(dir);
     ASSERT_TRUE(objs.ok()) << objs.diagnostics;
-    // `-nostartfiles -e main` keeps the CRT's startup out; MinGW's default libraries supply puts (ucrt) and the
-    // kernel32 imports.
-    ASSERT_TRUE(linkCapturing(nullptr, dir, "gcc -nostartfiles -e main -o fa_gnu.exe main.obj member.obj -lkernel32",
-                              "gnu.txt"))
-        << "GNU ld must link the two DSS objects" << linkOutput(dir, "gnu.txt", "GNU ld");
+    // `-nostartfiles -e <the raw entry>` keeps the CRT's startup out; MinGW's default libraries supply puts (ucrt)
+    // and the kernel32 imports.
+    ASSERT_TRUE(linkCapturing(nullptr, dir, "gcc -nostartfiles " + gnuEntryOption()
+                              + " -o fa_gnu.exe main.obj member.obj entry.obj -lkernel32", "gnu.txt"))
+        << "GNU ld must link the DSS objects" << linkOutput(dir, "gnu.txt", "GNU ld");
     expectOneAddress(dir / "fa_gnu.exe", 42u, "GNU ld");
 }
 

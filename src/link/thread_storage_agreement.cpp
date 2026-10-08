@@ -104,8 +104,10 @@ std::size_t reportThreadStorageDisagreements(std::span<AssembledModule const>   
         auto const   found = rit->second.find(ref.reference.symbol.v);
         Reach const  none{};
         Reach const& r = found != rit->second.end() ? found->second : none;
-        // Named by no relocation of its unit: not judged (the header says why).
-        if (!r.tlsKind.has_value() && !r.ordinaryKind.has_value()) continue;
+        // Named by no relocation of its unit: judged only where its object's own symbol record states the storage
+        // duration (the header says why, and which reference linkers judge one).
+        bool const reached = r.tlsKind.has_value() || r.ordinaryKind.has_value();
+        if (!reached && !row->recordStatesStorageDuration) continue;
         bool const            refIsTls = row->isThreadLocal || r.tlsKind.has_value();
         DefinitionShape const shape    = shapeOf(defUnit, ref.definition.symbol);
         bool const            defIsTls = shape == DefinitionShape::ThreadLocalObject;
@@ -116,15 +118,20 @@ std::size_t reportThreadStorageDisagreements(std::span<AssembledModule const>   
                                                   : std::format("CU #{} (in `{}`)", refUnit.cuId.v, fnName);
         std::string message;
         if (!refIsTls) {
+            std::string const how =
+                reached ? std::format("refers to it as an ORDINARY object (through the '{}' relocation)",
+                                      r.ordinaryKind.value_or(std::string{"?"}))
+                        : std::string{"holds it as an ORDINARY object (its object's symbol record states one -- a "
+                                      "COMMON, a tentative definition -- though no code of the unit reads it)"};
             message = std::format(
-                "symbol '{}': {} refers to it as an ORDINARY object (through the '{}' relocation), but the "
+                "symbol '{}': {} {}, but the "
                 "definition the link binds it to, in CU #{}, has THREAD STORAGE DURATION. C23 6.7.2p3 requires "
                 "`thread_local` on every declaration of one object, and neither access can stand in for the other: an "
                 "ordinary reference reaches ONE address for the whole process, and a thread-local object is one object "
                 "per thread, at an offset from the thread pointer. GNU ld refuses the same link (\"TLS definition in "
                 "... mismatches non-TLS reference in ...\"). Declare the reference `thread_local`, or link the "
                 "ordinary definition it was written against.",
-                row->mangledName, who, r.ordinaryKind.value_or(std::string{"?"}), defUnit.cuId.v);
+                row->mangledName, who, how, defUnit.cuId.v);
         } else {
             std::string const how =
                 row->isThreadLocal

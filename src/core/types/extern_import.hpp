@@ -119,6 +119,23 @@ struct DSS_EXPORT ExternImport {
     // `ffi::ingest`, and the assembly + pulled-archive-member ones in
     // `program/compile_pipeline.cpp`.
     bool        isThreadLocal = false;
+    // ★ THE OBJECT'S OWN SYMBOL RECORD STATES THE NAME'S STORAGE DURATION (P69,
+    // `link/thread_storage_agreement.hpp`). TRUE only on a row an OBJECT READER
+    // made from a record whose TYPE says whether the object is thread-local —
+    // today the ELF reader's COMMON rows: every common it reads is typed an
+    // ordinary object (a thread-local common is refused at the read). The link
+    // then judges the row against the definition its name binds to EVEN WHERE NO
+    // RELOCATION OF THE UNIT NAMES IT, as GNU ld and ld.lld compare the two
+    // records; a row whose record states nothing (a COFF symbol, a Mach-O nlist,
+    // a C declaration no code uses) is judged by the access its unit's code
+    // makes, and not at all where it makes none — which is what link.exe,
+    // lld-link and Apple's ld do with the same pair. Distinct from
+    // `isThreadLocal` just above, which is a DECLARATION's claim: this one says
+    // only that the record made a statement, and the statement is "ordinary".
+    // Read by `linker::reportThreadStorageDisagreements` alone, on the units a
+    // link is given; the cross-unit merge does not carry it (that header says
+    // why it need not).
+    bool        recordStatesStorageDuration = false;
     // D-LK-EXTERN-DATA-IMPORT: the imported DATA object's byte size +
     // alignment, DERIVED from the declared type's layout at HIR→MIR
     // (`computeLayout` under the active target's aggregate-layout

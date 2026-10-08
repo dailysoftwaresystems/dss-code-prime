@@ -25,10 +25,14 @@
 //   * TIER 2 (`PeObjectUnwindReferenceLinkNative`) — the RUNTIME witness. Hands
 //     the SAME object to link.exe and to MinGW's linker and RUNS the image; the
 //     program asks the OS for each of its own functions' entries. Windows-only,
-//     and it SKIPS, naming the absent toolchain, rather than reddens.
+//     and it SKIPS, naming the absent toolchain, rather than reddens. The image
+//     starts at the process-ending raw entry of `pe_raw_entry.hpp` (one more
+//     DSS object), not at `main`: returning from a raw PE entry ends the
+//     thread, not the process.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "program/program.hpp"
+#include "pe_raw_entry.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
 #include "../core/native_c_probe.hpp"
@@ -105,6 +109,25 @@ constexpr char const* kSubject =
 [[nodiscard]] std::vector<std::uint8_t> readFile(fs::path const& p) {
     std::ifstream in{p, std::ios::binary};
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// The image's raw entry (`pe_raw_entry.hpp`), compiled through the production
+// driver and placed beside the subject as `<dir>/entry.obj`. False on a compile
+// failure; every caller asserts.
+[[nodiscard]] bool buildEntryObj(fs::path const& dir, DiagnosticReporter& rep) {
+    auto const src = writeSrc(dir, "entry.c", test::pe_raw_entry::kSource);
+    auto const out = dir / "entry.out";
+    fs::create_directories(out);
+    Program p;
+    p.setOutputDir(out);
+    int const rc = p.compileFiles(std::vector<std::string>{src.string()}, "c",
+                                  std::vector<std::string>{
+                                      "x86_64:pe64-x86_64-windows"},
+                                  rep);
+    if (rc != 0 || !fs::exists(out / "entry.obj")) return false;
+    fs::copy_file(out / "entry.obj", dir / "entry.obj",
+                  fs::copy_options::overwrite_existing);
+    return true;
 }
 
 // ── The smallest COFF reader tier 1 needs — a WIRE LAYOUT the PE/COFF
@@ -209,9 +232,9 @@ TEST(PeObjectUnwindReferenceLink, EveryRuntimeFunctionOfACompiledObjectNamesItsO
 
 namespace {
 
-// MinGW's linker, reached through the `gcc` on PATH (`-nostartfiles -e main`
-// keeps the CRT out: the subject is ONE object). `where` is Windows-only, so on
-// any other host this reports ABSENT.
+// MinGW's linker, reached through the `gcc` on PATH (`-nostartfiles -e <the raw
+// entry>` keeps the CRT out: the subject is ONE object, beside the entry's).
+// `where` is Windows-only, so on any other host this reports ABSENT.
 struct MingwGcc {
     bool usable = false;
     std::string detail;
@@ -248,8 +271,9 @@ TEST(PeObjectUnwindReferenceLinkNative, LinkExeImageFindsEveryFunctionsOwnEntry)
     auto const obj = buildObj(dir, rep);
     ASSERT_FALSE(obj.empty()) << "errs=" << rep.errorCount();
     fs::copy_file(obj, dir / "rt.obj", fs::copy_options::overwrite_existing);
-    ASSERT_TRUE(env.run("link /nologo /OUT:rt.exe /ENTRY:main /SUBSYSTEM:CONSOLE "
-                        "/NODEFAULTLIB rt.obj kernel32.lib"))
+    ASSERT_TRUE(buildEntryObj(dir, rep)) << "errs=" << rep.errorCount();
+    ASSERT_TRUE(env.run(std::string{"link /nologo /OUT:rt.exe /ENTRY:"} + test::pe_raw_entry::kSymbol
+                        + " /SUBSYSTEM:CONSOLE /NODEFAULTLIB rt.obj entry.obj kernel32.lib"))
         << "link.exe must link the DSS object against kernel32.lib alone";
     auto const r = test_support::runBinary(dir / "rt.exe");
     ASSERT_TRUE(r.spawned) << r.diagnostic;
@@ -270,8 +294,10 @@ TEST(PeObjectUnwindReferenceLinkNative, MingwImageFindsEveryFunctionsOwnEntry) {
     auto const obj = buildObj(dir, rep);
     ASSERT_FALSE(obj.empty()) << "errs=" << rep.errorCount();
     fs::copy_file(obj, dir / "rt.obj", fs::copy_options::overwrite_existing);
-    std::string const cmd = "cd /d \"" + dir.string()
-                          + "\" && gcc -nostartfiles -e main -o rt_mingw.exe rt.obj -lkernel32 >nul 2>&1";
+    ASSERT_TRUE(buildEntryObj(dir, rep)) << "errs=" << rep.errorCount();
+    std::string const cmd = "cd /d \"" + dir.string() + "\" && gcc -nostartfiles -e "
+                          + test::pe_raw_entry::kSymbol
+                          + " -o rt_mingw.exe rt.obj entry.obj -lkernel32 >nul 2>&1";
     ASSERT_EQ(std::system(("\"" + cmd + "\"").c_str()), 0)
         << "MinGW's linker must link the DSS object against kernel32";
     auto const r = test_support::runBinary(dir / "rt_mingw.exe");

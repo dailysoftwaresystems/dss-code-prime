@@ -9,14 +9,18 @@ namespace dss::linker {
 
 // Does a COMMON (tentative) definition of a name YIELD to `definition`, another
 // definition of that name — does the definition replace the common (true), or
-// does the common outrank it (false)? ONE answer for both places a common meets
+// does the common outrank it (false)? ONE answer for every place a common meets
 // a definition (P69 round 4,
 // D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT): the link that
 // allocates commons (`allocateCommonDefinitions`, `link/linker.cpp`) and the
-// archive search that decides which member a common's name fetches
-// (`pullStaticArchiveMembers`, `program/compile_pipeline.cpp`), so the member
-// the search fetches is the definition the link then lets win. Until round 4's
-// end each spelled the rule for itself.
+// archive search (`pullStaticArchiveMembers`, `program/compile_pipeline.cpp`),
+// which asks it twice — of a MEMBER, to decide which one a common's name
+// fetches, so the member fetched is the definition the link then lets win; and
+// of every definition ALREADY in the link, to decide whether the name is still a
+// common at all, so a weak definition the common outranks does not end its
+// search (send-back 5: until then the search took any linked definition of the
+// name for an answer). Until round 4's end each place spelled the rule for
+// itself.
 //   * A STRONG definition replaces a common under every linker measured.
 //   * A WEAK definition whose own spelling yields to a common
 //     (`ModuleSymbol::yieldsToACommon`: a COFF weak external whose default is a

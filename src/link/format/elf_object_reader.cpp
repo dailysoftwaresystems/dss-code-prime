@@ -3,6 +3,7 @@
 #include "link/format/foreign_section_alignment.hpp"
 #include "link/format/section_relative_target.hpp"
 #include "link/format/object_atom_coverage.hpp"
+#include "link/format/record_symbol_ids.hpp"
 #include "link/format/object_format_backends.hpp"
 #include "link/format/relocation_addend.hpp"
 
@@ -441,8 +442,14 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     std::uint64_t const strOff = secs[symtab.link].offset;
     std::uint64_t const strEnd = strOff + secs[symtab.link].size;  // in-bounds (checked)
 
-    // -- (4) Decode every symbol; assign SymbolId = symtab index -----
+    // -- (4) Decode every symbol ------------------------------------
+    // A record's id is `symbolIds.of(its index)` — THE ONE RULE every object
+    // reader states its ids by (`record_symbol_ids.hpp`). An ELF table's record 0
+    // is the null symbol and names nothing, so every id here is its record's
+    // index, as it always was; the rule is asked all the same, so that no reader
+    // keeps one of its own.
     std::size_t const numSyms = static_cast<std::size_t>(symtab.size / kSymSz);
+    link::format::RecordSymbolIds symbolIds{static_cast<std::uint32_t>(numSyms)};
     std::vector<Sym> syms(numSyms);
     for (std::size_t i = 0; i < numSyms; ++i) {
         std::size_t const so = static_cast<std::size_t>(symtab.offset) + i * kSymSz;
@@ -614,6 +621,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             /*name=*/sy.name, /*sectionName=*/sec.name};
     };
     std::unordered_map<std::uint32_t, std::uint32_t> atomOwnerBySym;
+    // The names a relocation KEEPS instead of the atom this pass gives it: THE
+    // WEAK-NAME RULE (`object_atom_coverage.hpp`), decided on the alias sets
+    // here and read by the relocation pass.
+    link::format::WeakNameReferences weakNames;
     {
         std::vector<link::format::AtomStartCandidate> candidates;
         for (std::size_t i = 0; i < numSyms; ++i) {
@@ -631,6 +642,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 atomOwnerBySym.emplace(candidates[i].symbolId, owner[i]);
             }
         }
+        weakNames.decideFrom(candidates, owner, symbolIds);
     }
     // The atom identity a symbol resolves to: itself unless it aliases another.
     // Consulted at BOTH sites that need it -- the walk (does this symbol slice a
@@ -665,7 +677,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // measurement is at `kGotBaseSymbolName`.
             if (sy.name == kGotBaseSymbolName) continue;
             ExternImport ext;
-            ext.symbol      = SymbolId{static_cast<std::uint32_t>(i)};
+            ext.symbol      = symbolIds.of(static_cast<std::uint32_t>(i));
             ext.mangledName = sy.name;
             // THE KIND IS WHAT THE OBJECT STATES, AND NOTHING ELSE
             // (D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA, P69). STT_FUNC states
@@ -755,13 +767,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                       "tentative definitions in .tbss), or link with GNU ld.");
             }
             ExternImport common;
-            common.symbol           = SymbolId{static_cast<std::uint32_t>(i)};
+            common.symbol           = symbolIds.of(static_cast<std::uint32_t>(i));
             common.mangledName      = sy.name;
             common.isData           = true;
             common.binding          = SymbolBinding::Global;
             common.commonSize       = sy.size;
             common.commonAlignment  = sy.value;
             common.commonVisibility = stvToVisibility(stVis(sy.other));
+            // An ELF symbol's TYPE states its storage duration -- this one is not
+            // `STT_TLS` (refused above) -- and GNU ld and ld.lld compare it with
+            // the definition's whether or not the unit reads the name
+            // (`ExternImport::recordStatesStorageDuration`).
+            common.recordStatesStorageDuration = true;
             externBySym.emplace(static_cast<std::uint32_t>(i), mod.externImports.size());
             mod.externImports.push_back(std::move(common));
             continue;
@@ -771,7 +788,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // section-backed body. Recorded as a ModuleSymbol so a reloc
             // target still resolves by identity.
             if (!sy.name.empty() && type != kSttSection) {
-                mod.symbols.push_back(ModuleSymbol{SymbolId{static_cast<std::uint32_t>(i)},
+                mod.symbols.push_back(ModuleSymbol{symbolIds.of(static_cast<std::uint32_t>(i)),
                                                    sy.name, stbToBinding(stBind(sy.info)),
                                                    stvToVisibility(stVis(sy.other))});
             }
@@ -795,7 +812,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // named LOCAL identity (the merge's handling of section-relative
             // references is c165's static-link concern).
             std::string const nm = sy.name.empty() ? sec.name : sy.name;
-            mod.symbols.push_back(ModuleSymbol{SymbolId{static_cast<std::uint32_t>(i)},
+            mod.symbols.push_back(ModuleSymbol{symbolIds.of(static_cast<std::uint32_t>(i)),
                                                nm, SymbolBinding::Local,
                                                stvToVisibility(stVis(sy.other))});
             continue;
@@ -805,7 +822,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // (`rk` -- exact name, then `.text.`/`.data.`-style prefix, then flags).
         auto pushModuleSym = [&] {
             if (!sy.name.empty())
-                mod.symbols.push_back(ModuleSymbol{SymbolId{static_cast<std::uint32_t>(i)},
+                mod.symbols.push_back(ModuleSymbol{symbolIds.of(static_cast<std::uint32_t>(i)),
                                                    sy.name, stbToBinding(stBind(sy.info)),
                                                    stvToVisibility(stVis(sy.other))});
         };
@@ -856,7 +873,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         if (std::uint32_t const owner = ownerOf(static_cast<std::uint32_t>(i));
             owner != static_cast<std::uint32_t>(i)) {
             if (!sy.name.empty()) {
-                aliasRows.push_back(ModuleSymbol{SymbolId{owner}, sy.name,
+                aliasRows.push_back(ModuleSymbol{symbolIds.of(owner), sy.name,
                                                  stbToBinding(stBind(sy.info)),
                                                  stvToVisibility(stVis(sy.other))});
             }
@@ -881,7 +898,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 std::size_t const bodyOff =
                     static_cast<std::size_t>(sec.offset + sy.value);
                 AssembledFunction fn;
-                fn.symbol = SymbolId{static_cast<std::uint32_t>(i)};
+                fn.symbol = symbolIds.of(static_cast<std::uint32_t>(i));
                 fn.bytes.assign(bytes.begin() + bodyOff,
                                 bytes.begin() + bodyOff + sy.size);
                 funcIntervalsBySec[sy.shndx].push_back(
@@ -916,7 +933,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // slice their bytes; zero-fill (.bss / .tbss) reserve the size
             // with empty bytes (the `reservedSize` invariant).
             AssembledData di;
-            di.symbol    = SymbolId{static_cast<std::uint32_t>(i)};
+            di.symbol    = symbolIds.of(static_cast<std::uint32_t>(i));
             di.section   = *dk;
             di.alignment = alignFromSection(sec.addrAlign);  // section-granular (see header)
             if (isZeroFill(*dk)) {
@@ -1103,7 +1120,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             std::size_t const bodyOff =
                 static_cast<std::size_t>(psec.offset + c.sectionOffset);
             AssembledFunction fn;
-            fn.symbol = SymbolId{symIdx};
+            fn.symbol = symbolIds.of(symIdx);
             fn.bytes.assign(bytes.begin() + bodyOff,
                             bytes.begin() + bodyOff + static_cast<std::size_t>(size));
             funcIntervalsBySec[static_cast<std::uint16_t>(c.sectionKey)].push_back(
@@ -1155,7 +1172,6 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
         return k.has_value() ? dataSectionKindOf(*k) : std::nullopt;
     };
-    std::uint32_t nextSyntheticId = static_cast<std::uint32_t>(numSyms);
     for (std::uint16_t si = 0; si < eShnum; ++si) {
         Shdr const& sec = secs[si];
         if ((sec.flags & kShfAlloc) == 0u || sec.size == 0u
@@ -1179,7 +1195,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         auto emitGap = [&](std::uint64_t gapStart, std::uint64_t gapEnd) {
             if (gapEnd <= gapStart) return;
             AssembledData di;
-            di.symbol    = SymbolId{nextSyntheticId++};
+            di.symbol    = symbolIds.fresh();
             di.section   = *dk;
             di.alignment = alignFromSection(sec.addrAlign);
             std::size_t const b0 = static_cast<std::size_t>(sec.offset + gapStart);
@@ -1398,7 +1414,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // number -- doing it by identity says what is meant and keeps the
             // three readers' handling of one shape identical.)
             std::uint32_t const targetSym = ownerOf(symIdx);
-            SymbolId     relTarget = SymbolId{targetSym};
+            SymbolId     relTarget = symbolIds.of(targetSym);
             std::int64_t relAddend = nativeAddend;
             if (!atomSymIdx.contains(targetSym)) {
                 Sym const& tsym = syms[targetSym];
@@ -1452,6 +1468,19 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                                     : mod.dataItems[bound->outIdx].symbol;
                     relAddend = bound->residual;
                 }
+            }
+            // THE WEAK-NAME RULE (`object_atom_coverage.hpp`): a relocation
+            // written through a WEAK name of a body that has another external
+            // name keeps the NAME -- a plain reference row the link resolves by
+            // name, to an override where one is linked and to this very body
+            // otherwise -- instead of the atom (6.44) chose for it. The addend
+            // is the name's own: the name sits at the atom's start.
+            if (auto const weakName = weakNames.referenceFor(symIdx, symbolIds)) {
+                if (weakName->fresh) {
+                    mod.externImports.push_back(
+                        link::format::referenceRowOfAWeakName(*weakName, mod.dataItems));
+                }
+                relTarget = weakName->id;
             }
             Relocation rel;
             rel.offset = static_cast<std::uint32_t>(rOffset - iv->start);
@@ -1800,12 +1829,6 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // already correct -- which is why the two tests above pass again.
     {
         std::vector<std::pair<std::size_t, AssembledFunction>> padAtoms;
-        std::uint32_t nextPadId = static_cast<std::uint32_t>(numSyms);
-        for (auto const& f : mod.functions)
-            nextPadId = std::max(nextPadId, f.symbol.v + 1u);
-        for (auto const& d : mod.dataItems)
-            nextPadId = std::max(nextPadId, d.symbol.v + 1u);
-
         for (auto& [secIdx, ivs] : funcIntervalsBySec) {
             if (ivs.size() < 2) continue;
             if (secIdx >= secs.size()) continue;
@@ -1866,10 +1889,14 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 std::size_t const off =
                     static_cast<std::size_t>(psec.offset + gapStart);
                 AssembledFunction pad;
-                // A fresh id above every real symbol, with NO ModuleSymbol --
-                // the module-private, never-cross-CU-folded discipline the
-                // (6.5) data gap atoms already use.
-                pad.symbol = SymbolId{nextPadId++};
+                // A fresh id no record holds, with NO ModuleSymbol -- the
+                // module-private, never-cross-CU-folded discipline the (6.5)
+                // data gap atoms already use. From the object's ONE counter
+                // (`symbolIds`): the gap atoms and a weak name's reference row
+                // draw from it too, and a second counter seeded from the
+                // functions and data items alone gave such a row and the first
+                // padding atom one id.
+                pad.symbol = symbolIds.fresh();
                 pad.bytes.assign(bytes.begin() + off,
                                  bytes.begin() + off
                                      + static_cast<std::size_t>(gapLen));

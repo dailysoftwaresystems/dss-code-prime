@@ -95,6 +95,39 @@ inline constexpr std::uint64_t kCoffCommonNaturalAlignmentCap = 32;
     return alignment;
 }
 
+// The meanings whose requests ONE LINK DECIDES ACROSS ITS UNITS: the nine image
+// settings, each held once by an image, and the exports, one per exported name.
+// A row of one of these states which unit's request stands and what a shared
+// library does with it (`PeLinkerDirectiveRow::unitPrecedence` /
+// `inSharedLibrary`: the loader requires both here and refuses either on any
+// other row), and the parse stamps each request with its row's answers. P69
+// send-back 5 (review-xa4 MINOR 6).
+[[nodiscard]] constexpr bool isDecidedAcrossUnits(LinkerDirectiveMeaning meaning) noexcept {
+    switch (meaning) {
+        case LinkerDirectiveMeaning::ExportSymbol:
+        case LinkerDirectiveMeaning::StackSize:
+        case LinkerDirectiveMeaning::HeapSize:
+        case LinkerDirectiveMeaning::Subsystem:
+        case LinkerDirectiveMeaning::EntryPoint:
+        case LinkerDirectiveMeaning::SectionAttributes:
+        case LinkerDirectiveMeaning::ImageChecksum:
+        case LinkerDirectiveMeaning::ImageVersion:
+        case LinkerDirectiveMeaning::ImageBase:
+        case LinkerDirectiveMeaning::SectionAlignment:
+            return true;
+        case LinkerDirectiveMeaning::HideSymbols:
+        case LinkerDirectiveMeaning::IncludeSymbol:
+        case LinkerDirectiveMeaning::AlternateName:
+        case LinkerDirectiveMeaning::CommonAlignment:
+        case LinkerDirectiveMeaning::MismatchCheck:
+        case LinkerDirectiveMeaning::DllImage:
+        case LinkerDirectiveMeaning::Refused:
+        case LinkerDirectiveMeaning::Ignored:
+            return false;
+    }
+    return false;
+}
+
 namespace detail {
 
 [[nodiscard]] inline std::vector<std::string> tokenizeWindowsCommandLine(std::string_view s) {
@@ -332,8 +365,24 @@ parseCoffLinkerDirectives(std::string_view text, PeLinkerDirectives const& vocab
             continue;
         }
         std::string const spelled = std::string{tok.front()} + std::string{option} + ":";
+        // A request the link decides ACROSS its units carries its row's two answers to that decision. The format's
+        // loader requires both on such a row, so one that states none is a vocabulary built in memory: refused
+        // rather than given a precedence nobody stated.
+        bool const acrossUnits = isDecidedAcrossUnits(row->meaning);
+        if (acrossUnits && (!row->unitPrecedence.has_value() || !row->inSharedLibrary.has_value())) {
+            return std::unexpected(std::format(
+                "directive '{}' is decided across the link's units, and the format's vocabulary row for '{}' states "
+                "no 'unitPrecedence' or no 'inSharedLibrary': there is no precedence to assume",
+                tok, row->option));
+        }
         auto const image = [&](UnitImageRequestValue v) {
-            out.image.push_back(UnitImageRequest{tok, std::move(v)});
+            UnitImageRequest request{tok, std::move(v)};
+            if (acrossUnits) {
+                request.precedence            = *row->unitPrecedence;
+                request.inSharedLibrary       = *row->inSharedLibrary;
+                request.inSharedLibraryReason = row->inSharedLibraryReason;
+            }
+            out.image.push_back(std::move(request));
             out.handOn.push_back(handOnText);
         };
         auto const noValue = [&]() -> std::optional<std::string> {
@@ -360,8 +409,8 @@ parseCoffLinkerDirectives(std::string_view text, PeLinkerDirectives const& vocab
             case LinkerDirectiveMeaning::ExportSymbol: {
                 // `[exported=]internal[,DATA][,PRIVATE]` (✔MEASURED 2026-10-07: link.exe and lld-link export a
                 // rename under its new name only, and keep a PRIVATE one in the image's table). An ordinal
-                // (`,@n`), NONAME and a forwarder (`internal` naming `dll.function`) ask for an export table DSS
-                // does not build.
+                // (`,@n`), NONAME and a forwarder (`exported=dll.function`) ask for an export table DSS does not
+                // build.
                 auto parts = detail::splitOnComma(value);
                 if (parts.empty() || parts[0].empty()) {
                     return std::unexpected(std::format("directive '{}' names no symbol to export", tok));
@@ -378,8 +427,13 @@ parseCoffLinkerDirectives(std::string_view text, PeLinkerDirectives const& vocab
                         "directive '{}' must read '{}[<exported>=]<name>', two non-empty names", tok, spelled));
                 }
                 // A forwarder, an ordinal and NONAME ask for an export table a DSS image does not write: refused
-                // by the link that makes an image, handed on by a relocatable artifact.
-                if (e.internalName.find('.') != std::string::npos) {
+                // by the link that makes an image, handed on by a relocatable artifact. A FORWARDER is spelled
+                // with its `=` (`exported=dll.function`): ✔MEASURED 2026-10-08 (link.exe 14.44.35228 and lld-link
+                // 19.1.5 on clang 19.1.5 objects), `/export:f.v2` -- in a directive and on the command line --
+                // exports the SYMBOL `f.v2` at its address, a dotted name nothing defines is refused as an
+                // unresolved symbol, and only `fwd=kernel32.Sleep` is "forwarded to". So a dotted name with no `=`
+                // is a symbol's name like any other (review-xa4 NIT 8).
+                if (eq != std::string_view::npos && e.internalName.find('.') != std::string::npos) {
                     image(UnitUnhonourableRequest{std::format(
                         "it asks for a FORWARDER export (to '{}'), which a DSS image's export table does not "
                         "write; '{}[<exported>=]<name>[,DATA][,PRIVATE]' is honoured",
@@ -413,6 +467,9 @@ parseCoffLinkerDirectives(std::string_view text, PeLinkerDirectives const& vocab
                         *unassigned, spelled)});
                     break;
                 }
+                e.precedence            = *row->unitPrecedence;
+                e.inSharedLibrary       = *row->inSharedLibrary;
+                e.inSharedLibraryReason = row->inSharedLibraryReason;
                 out.exports.push_back(std::move(e));
                 out.handOn.push_back(handOnText);
                 break;
@@ -453,7 +510,10 @@ parseCoffLinkerDirectives(std::string_view text, PeLinkerDirectives const& vocab
                         if (detail::equalsIgnoringCase(u.name, name)) unsupported = &u;
                     }
                     if (unsupported != nullptr) {
-                        image(UnitUnhonourableRequest{
+                        // A SUBSYSTEM request all the same (`UnitSubsystemRequest::unsupported`): settled against
+                        // the other units' by the option's precedence, and refused where it would stand.
+                        image(UnitSubsystemRequest{
+                            SubsystemSetting{},
                             std::format("it names the subsystem '{}': {}", name, unsupported->reason)});
                         break;
                     }
@@ -502,7 +562,11 @@ parseCoffLinkerDirectives(std::string_view text, PeLinkerDirectives const& vocab
                     if (u.name == value) unsupported = &u;
                 }
                 if (unsupported != nullptr) {
-                    image(UnitUnhonourableRequest{
+                    // An ENTRY request all the same (`UnitEntryRequest::unsupported`, review-xa4 NIT 7): dropped
+                    // and warned for a member the archive search pulls, like any entry; settled against the other
+                    // units' by the option's precedence; refused where it would stand.
+                    image(UnitEntryRequest{
+                        std::string{value}, false,
                         std::format("it names the C runtime's '{}' startup: {}", value, unsupported->reason)});
                     break;
                 }

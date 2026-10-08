@@ -263,8 +263,8 @@ TEST(PeForeignImportAddressNative, MsvcAndMingwObjectsAndDssCodeAgreeOnOneAddres
 // ✔MEASURED 2026-09-30 / 2026-10-01 on this host's gcc 13.2.0 (ucrt): plain `-O2` computes `&puts` as
 // `leaq puts(%rip)` — a displacement, which reaches nothing outside the image, so only the image's import THUNK —
 // and writes the static `{puts}` as an ADDR64 (it also carries an unused `.rdata$.refptr.puts`). GNU ld, link.exe
-// 14.51 and lld-link each bind BOTH to the one thunk: code == static, != GetProcAddress (exit 42 under all three,
-// work/xa/m1probe). DSS gives that object the same meaning (`pcRelativeImportAddress: callEntry`): every address
+// 14.51 and lld-link each bind BOTH to the one thunk: code == static, != GetProcAddress (exit 42 under all three).
+// DSS gives that object the same meaning (`pcRelativeImportAddress: callEntry`): every address
 // the UNIT takes of `puts` is the thunk, so the unit agrees with itself, while DSS's own code — and every other
 // unit — keeps the loader-bound address GetProcAddress answers.
 namespace {

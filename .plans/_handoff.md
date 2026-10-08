@@ -117,6 +117,23 @@ round's close; each checkpoint's commit message says what was and was not run on
   set on the three local legs (the gate reads it). One harness row stays OPEN on a named blocker outside this
   repository: a run step cannot be handed the leg's own compiler, so the census has no default reference on the
   two Windows legs.
+- **Checkpoint 3 (2026-10-08) = the writers-and-linker lane's first fold of this wave, made CODE-FIRST**: 131 paths
+  (79 changed, 52 new). What it fixes, all of it the base's debt: a reference written through a weak name was bound
+  to the body (silent — DSS 7/7/7 where four reference linkers give 9/9/7; one rule now in three readers, three
+  writers and two merge arms); the COFF and Mach-O readers gave record zero the invalid symbol id, so a relinked
+  datum lost its name (silent); Apple `ld -r` products were refused for the relocation pairs in `__eh_frame` and
+  every arm64 Mach-O object carrying that section was refused as corrupted (both loud); the archive search no
+  longer ends at a definition a common outranks; an `/ENTRY:` a named object states and does not define is a
+  required reference. ✔MEASURED by the lane on the folded bytes: the full suite on five legs (three legs 2688
+  passed; the two Windows legs 2713 of 2718, the five reds being repository guards reading that worktree's stale
+  registry and inventory copies). ✔MEASURED on the main tree after the fold, two local legs each: balance, lint,
+  citations, the registry check, the three inventory guards, `check-line-endings`, `refresh_landing_log` and the
+  stale-refusal guard (last) pass. **CODE-FIRST means: of the fold's 98 mutants 5 were read red and 93 are NOT READ
+  YET**, so its four rows (two P0, two P1) are born `disclosed` with "fix folded" in their closing cells and close
+  only when their pins are read — the lane reads them on this commit in three measurement worktrees. Balance on
+  this tree: **622 open against 620** — 24 closed, 26 opened (1 created, 25 disclosed), REAL net +2 until those
+  four close. `link/test_common_symbols` has a NAMED time-budget row from this commit (its weak-name cells ask the
+  reference linkers; 161 s on the slowest debug leg); its sanitized figure is unmeasured.
 - **HOW THIS CYCLE ENDS — operator, 2026-10-08, verbatim:** *"on finishing this cycle I'll turn on the pipes and
   try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and monitor CI until
   green"*. So P69 is this PR's EXIT: its four lanes finish what they are in (no second round opens in this PR — what

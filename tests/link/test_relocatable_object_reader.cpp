@@ -1575,17 +1575,71 @@ TEST(RelocatableObjectReader, EqualStValueAliasSharesOneAtomAndItsRelocations) {
     EXPECT_EQ(alias->symbol, atom.symbol);
     EXPECT_EQ(alias->binding, SymbolBinding::Weak);
 
-    // BOTH halves of the rule, in one relocation: its SITE (section offset 8)
-    // lies in the span the two names share and must reach the one atom, and its
-    // TARGET named `fn2` -- an identity that owns no body once the twin is gone
-    // -- so it must bind to the atom instead of failing `K_SymbolUndefined`.
+    // BOTH halves of the rule, in one relocation. Its SITE (section offset 8)
+    // lies in the span the two names share and must reach the one atom. Its
+    // TARGET named `fn2` -- an identity that owns no body once the twin is gone,
+    // so it must not fail `K_SymbolUndefined` -- and `fn2` is the WEAK name of a
+    // body that has ANOTHER external name, so the reference KEEPS THE NAME
+    // (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME): a plain
+    // reference row of `fn2`, which the link binds to whatever WINS `fn2`.
+    // ★ THIS PIN ASSERTED THE OPPOSITE UNTIL P69 ("it must bind to the atom"),
+    // and that was a silent wrong link: ✔MEASURED 2026-10-08, gcc 13.3 + GNU ld
+    // 2.42 call a strong `fn2` of another object from here (9) where DSS, bound
+    // to the atom at read time, kept calling this body (7).
     ASSERT_EQ(atom.relocations.size(), 1u);
     EXPECT_EQ(atom.relocations[0].offset, 8u);
-    EXPECT_EQ(atom.relocations[0].target, atom.symbol);
-    EXPECT_EQ(nameOf(*got, atom.relocations[0].target), "fn1");
+    ExternImport const* byName        = nullptr;
+    std::size_t         rowsOfTheName = 0;
+    for (auto const& e : got->externImports) {
+        if (e.mangledName != "fn2") continue;
+        ++rowsOfTheName;
+        byName = &e;
+    }
+    ASSERT_EQ(rowsOfTheName, 1u) << "the weak name states ONE reference row";
+    EXPECT_NE(byName->symbol, atom.symbol)
+        << "the row's id is the NAME's, which no body holds";
+    EXPECT_EQ(atom.relocations[0].target, byName->symbol);
+    EXPECT_FALSE(byName->isData) << "the body the name is a name of is a function";
+    EXPECT_FALSE(byName->isThreadLocal);
+    EXPECT_EQ(byName->binding, SymbolBinding::Global);
+    EXPECT_TRUE(byName->libraryPath.empty());
+    EXPECT_TRUE(byName->fallbackName.empty());
+    EXPECT_EQ(byName->commonSize, 0u) << "a plain reference, never a common";
     EXPECT_EQ(atom.relocations[0].addend, 64)
-        << "an alias binds BY IDENTITY, so the addend survives untouched -- "
-           "exactly what the owner's own name would have got";
+        << "the reference binds BY IDENTITY, so the addend survives untouched -- "
+           "exactly what any other unit's reference to the name carries";
+}
+
+// THE CONTROL of the weak-name rule: the same two names on one body, BOTH
+// STRONG. A strong name can only ever denote this body (a second strong
+// definition of it is a refused link), so its relocation takes the alias remap
+// and binds to the atom, and no row of the name is stated. Without this arm the
+// test above could be satisfied by a reader that kept EVERY aliased name.
+TEST(RelocatableObjectReader, EqualStValueStrongAliasStillBindsItsRelocationToTheAtom) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    DiagnosticReporter wrep;
+    auto obj = elf::encode(twoFunctionsOneCallingTheOther(), *loaded.target,
+                           *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+    ASSERT_EQ(symField(obj, 3, kStValueOff), 16u);
+    setSymField(obj, 3, kStValueOff, 0u);   // the same start as fn1; GLOBAL kept
+
+    DiagnosticReporter rep;
+    auto got = elf::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errors=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    ASSERT_EQ(got->functions.size(), 1u);
+    AssembledFunction const& atom = got->functions[0];
+    EXPECT_EQ(externNamed(*got, "fn1"), nullptr);
+    EXPECT_EQ(externNamed(*got, "fn2"), nullptr)
+        << "a STRONG alias states no reference row: it cannot be overridden";
+    ASSERT_EQ(atom.relocations.size(), 1u);
+    EXPECT_EQ(atom.relocations[0].target, atom.symbol)
+        << "the relocation through a strong alias binds to the one atom";
+    EXPECT_EQ(atom.relocations[0].addend, 64);
 }
 
 // THE REFUSAL. Two symbols at one offset whose declared extents DISAGREE are

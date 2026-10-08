@@ -2665,6 +2665,39 @@ symIdOfName(AssembledModule const& m, std::string const& name) {
     for (auto const& e : m.externImports) if (e.mangledName == n) return &e;
     return nullptr;
 }
+// THE ONE REFERENCE ROW OF A KEPT WEAK NAME (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME): a relocation
+// written through a WEAK name of a body that has another external name keeps the name, as a PLAIN reference row --
+// strong, no library, no fallback, no common storage -- under an id no definition of the object holds, so the link
+// binds it to whatever WINS the name. nullptr, with a failure recorded, when the module holds none or several.
+[[nodiscard]] ExternImport const* weakNameReferenceRow(AssembledModule const& m, std::string const& name) {
+    ExternImport const* row  = nullptr;
+    std::size_t         rows = 0;
+    for (auto const& e : m.externImports) {
+        if (e.mangledName != name) continue;
+        ++rows;
+        row = &e;
+    }
+    if (rows != 1) {
+        ADD_FAILURE() << "`" << name << "` has " << rows << " reference row(s); a kept weak name states exactly one";
+        return nullptr;
+    }
+    EXPECT_TRUE(row->libraryPath.empty()) << name;
+    EXPECT_TRUE(row->fallbackName.empty()) << name;
+    EXPECT_EQ(row->commonSize, 0u) << name;
+    EXPECT_EQ(row->binding, SymbolBinding::Global) << name;
+    EXPECT_FALSE(row->requiredByDirective) << name;
+    for (auto const& s : m.symbols) {
+        EXPECT_NE(s.symbol, row->symbol) << "the row's id is the NAME's, and `" << s.name << "` holds it";
+    }
+    return row;
+}
+// How many relocations of the module -- its functions' and its data items' -- target `id`.
+[[nodiscard]] std::size_t relocationsTargeting(AssembledModule const& m, SymbolId id) {
+    std::size_t n = 0;
+    for (auto const& f : m.functions) for (auto const& r : f.relocations) n += r.target == id ? 1u : 0u;
+    for (auto const& d : m.dataItems) for (auto const& r : d.relocations) n += r.target == id ? 1u : 0u;
+    return n;
+}
 constexpr std::uint32_t kScnDirective = 0x00100A00u;  // LNK_INFO | LNK_REMOVE | ALIGN_1BYTES (.drectve)
 [[nodiscard]] BSec directiveSection(std::string_view text) {
     return BSec{".drectve", kScnDirective, std::vector<std::uint8_t>(text.begin(), text.end()), {}};
@@ -3392,9 +3425,8 @@ TEST(CoffWeakExternalNative, RealMingwWeakDefinitionBindsTheBodyToItsRealName) {
 
     // `wfn` is DEFINED by this object. Assert the resolved NAME and BINDING --
     // "the read returned success" would have been satisfied by the old
-    // behaviour too, which read `wfn` as an undefined strong extern.
-    EXPECT_FALSE(hasExternNamed(*got, "wfn"))
-        << "`wfn` is defined in the very object being read";
+    // behaviour too, which read `wfn` as an undefined strong extern. (The row
+    // of `wfn` this object ALSO states is its caller's reference, below.)
     auto const* body = funcNamed(*got, "wfn");
     ASSERT_NE(body, nullptr) << "the body must carry its real name";
     EXPECT_GT(body->bytes.size(), 0u);
@@ -3415,12 +3447,25 @@ TEST(CoffWeakExternalNative, RealMingwWeakDefinitionBindsTheBodyToItsRealName) {
         << "the renamed body and the real name address ONE atom";
     EXPECT_EQ(renamed->binding, SymbolBinding::Global);
 
-    // And `caller`'s call must reach that atom rather than a dangling id.
+    // And `caller`'s call is written THROUGH THE WEAK NAME (✔MEASURED: its
+    // REL32 names `wfn`, the class-105 record) of a body that has another
+    // external name -- gcc's renamed one. It KEEPS THE NAME: one plain reference
+    // row of `wfn`, under an id of the name, which the link binds to whatever
+    // WINS `wfn` (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME).
+    // ★ THIS PIN ASSERTED THE OPPOSITE UNTIL P69 ("the call binds to the atom
+    // `wfn` names", and no row of the name), and that was a silent wrong link
+    // of EVERY MinGW weak definition: ✔MEASURED 2026-10-08, beside a strong
+    // `wfn` of another object GNU ld calls the override from here (2) where DSS,
+    // bound to the atom at read time, kept calling this body (1).
     auto const* caller = funcNamed(*got, "caller");
     ASSERT_NE(caller, nullptr);
     ASSERT_EQ(caller->relocations.size(), 1u);
-    EXPECT_EQ(caller->relocations[0].target, *symIdOfName(*got, "wfn"))
-        << "the call to `wfn` binds to the atom `wfn` names";
+    auto const* byName = weakNameReferenceRow(*got, "wfn");
+    ASSERT_NE(byName, nullptr);
+    EXPECT_FALSE(byName->isData) << "the body the name is a name of is a function";
+    EXPECT_EQ(caller->relocations[0].target, byName->symbol)
+        << "the call to `wfn` names `wfn`, not the body it happens to be a name of here";
+    EXPECT_NE(byName->symbol, *symIdOfName(*got, "wfn"));
 #endif
 }
 
@@ -3448,7 +3493,6 @@ TEST(CoffWeakExternalNative, RealMingwWeakAliasBindsBothNamesToOneBody) {
                                          *loaded.format, rep);
     ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
 
-    EXPECT_FALSE(hasExternNamed(*got, "alias_fn"));
     EXPECT_EQ(bindingOf(*got, "alias_fn"), SymbolBinding::Weak);
     EXPECT_EQ(bindingOf(*got, "real_fn"), SymbolBinding::Global);
     auto const aliasId = symIdOfName(*got, "alias_fn");
@@ -3456,6 +3500,25 @@ TEST(CoffWeakExternalNative, RealMingwWeakAliasBindsBothNamesToOneBody) {
     ASSERT_TRUE(aliasId.has_value() && realId.has_value());
     EXPECT_EQ(*aliasId, *realId)
         << "an alias and its target are two names for ONE body";
+
+    // `use` calls the body THROUGH THE WEAK ALIAS (✔MEASURED: its REL32 names
+    // `alias_fn`), and the body has other external names, so the call keeps the
+    // name: one plain reference row of `alias_fn` that the call targets
+    // (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME). Until P69 this
+    // test asserted that NO row of `alias_fn` exists; the call was bound to the
+    // body at read time, and a strong `alias_fn` of another object never reached
+    // `use` -- ✔MEASURED 2026-10-08: 7 under DSS where GNU ld, link.exe and
+    // lld-link give 9.
+    auto const* use = funcNamed(*got, "use");
+    ASSERT_NE(use, nullptr);
+    auto const* byName = weakNameReferenceRow(*got, "alias_fn");
+    ASSERT_NE(byName, nullptr);
+    EXPECT_FALSE(byName->isData);
+    ASSERT_EQ(use->relocations.size(), 1u);
+    EXPECT_EQ(use->relocations[0].target, byName->symbol);
+    EXPECT_EQ(relocationsTargeting(*got, byName->symbol), 1u);
+    EXPECT_FALSE(hasExternNamed(*got, "real_fn"))
+        << "a STRONG name states no reference row: it cannot be overridden";
 #endif
 }
 
@@ -3693,16 +3756,32 @@ TEST(CoffWeakExternalNative, RealMingwWeakDataDefinitionBindsToItsRealName) {
                                          *loaded.format, rep);
     ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
 
-    EXPECT_FALSE(hasExternNamed(*got, "wdata"))
-        << "the object DEFINES `wdata`; an import row here is the same defect "
-           "the function case had";
     EXPECT_EQ(bindingOf(*got, "wdata"), SymbolBinding::Weak);
     auto const* d = dataNamed(*got, "wdata");
-    ASSERT_NE(d, nullptr) << "the datum must be reachable under its real name";
+    ASSERT_NE(d, nullptr) << "the datum must be reachable under its real name: "
+                             "the object DEFINES `wdata`";
     // The initialiser is the strongest available property: a row that carries
     // the name but not the bytes would satisfy every assertion above.
     ASSERT_GE(d->bytes.size(), 4u);
     EXPECT_EQ(d->bytes[0], 7u) << "the weak datum's initialiser, little-endian";
+
+    // `get` takes the address THROUGH THE WEAK NAME (✔MEASURED: its REL32 names
+    // `wdata`, the class-105 record; no `.refptr`), and the datum has another
+    // external name (gcc's renamed `.weak.wdata.get`), so the reference keeps
+    // the name: one plain DATA reference row of `wdata`
+    // (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME). Until P69 this
+    // test asserted that no row of `wdata` exists -- right about the DEFINITION,
+    // and the very collapse that kept `get` on this datum beside an override.
+    auto const* byName = weakNameReferenceRow(*got, "wdata");
+    ASSERT_NE(byName, nullptr);
+    EXPECT_TRUE(byName->isData) << "the body the name is a name of is a datum";
+    EXPECT_FALSE(byName->isThreadLocal);
+    auto const* getFn = funcNamed(*got, "get");
+    ASSERT_NE(getFn, nullptr);
+    ASSERT_EQ(getFn->relocations.size(), 1u);
+    EXPECT_EQ(getFn->relocations[0].target, byName->symbol);
+    EXPECT_EQ(relocationsTargeting(*got, d->symbol), 0u)
+        << "nothing in this object names the datum by its body";
 #endif
 }
 

@@ -1,8 +1,13 @@
 #pragma once
 
+#include "asm/asm.hpp"                  // AssembledData -- what a kept weak name's body is
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/extern_import.hpp" // ExternImport -- the reference row of a kept weak name
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/section_kind.hpp"  // DataSectionKind
+#include "core/types/strong_ids.hpp"    // SymbolId
 #include "core/types/symbol_attrs.hpp"  // SymbolBinding / SymbolVisibility / isExternallyVisible
+#include "link/format/record_symbol_ids.hpp"   // RecordSymbolIds -- the ids a kept weak name is stated in
 
 #include <algorithm>
 #include <cstdint>
@@ -12,6 +17,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 // Shared relocatable-object READER substrate: decide, in neutral coordinates,
@@ -413,6 +419,187 @@ struct AtomStartCandidate {
         g = h;
     }
     return true;
+}
+
+// ═══ THE WEAK-NAME RULE ════════════════════════════════════════════════════
+//    D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME
+//
+// ★★★ THE FAILURE. The alias rule above sends every relocation naming an
+// aliased symbol to the atom that owns the body. For a STRONG name nothing is
+// lost by that: the name can only ever denote this body. A WEAK name is the one
+// another object may define again, and every reference linker resolves a
+// reference BY NAME -- so a reference an object writes through its own weak name
+// follows the name to whatever wins it. Bound to the atom at READ time, the
+// reference was decided before the link knew the winner, and SILENTLY: the unit
+// kept reaching its own body beside an override every other unit reached.
+//
+// ✔MEASURED 2026-10-08. One object holds `other` (strong), `shared` (a WEAK
+// name of the same body, which returns 7) and a caller that reaches the body
+// through `shared`; a second object defines `shared` strong (9). Linked as the
+// pair then the override / the override then the pair / the pair alone:
+//   * GNU ld 2.42, gcc 13.3 ELF objects (`weak, alias`)                9 / 9 / 7
+//   * GNU ld 2.42, MinGW gcc 13.2 COFF objects                         9 / 9 / 7
+//   * link.exe 14.44 and lld-link 19.1.5, clang 19.1.5 COFF objects
+//     of its MSVC target and of its GNU target                         9 / 9 / 7
+//   * Apple's ld (ld-1267 for arm64 and x86_64, ld64-957.1), a pair
+//     its assembler wrote (`.weak_definition`; Apple clang refuses
+//     the alias attribute)                                             9 / 9 / 7
+//   * DSS before this rule, ELF and PE                                 7 / 7 / 7
+// A function and a datum alike. It is also the shape of EVERY MinGW
+// `__attribute__((weak))` definition -- gcc writes the body under an external
+// name of its own and the weak name as a weak external beside it -- so a weak
+// function overridden elsewhere kept being called from its own object.
+//
+// ★★ THE RULE. A relocation written through a WEAK name of a body that has
+// ANOTHER external-linkage name KEEPS THAT NAME: the reader leaves it on an id
+// of the NAME, never the atom's, and states a plain reference row of the name
+// under that id. The link's by-name resolution then binds it as it binds any
+// other unit's reference -- to an override, to a common, or to this very body.
+// A relocatable artifact keeps the row, and its writer points the relocation at
+// the weak name's own record (`object_symbol_names.hpp`), which is what `ld -r`
+// hands on (✔MEASURED 2026-10-08, GNU ld 2.42 on ELF: the artifact's relocation
+// still names the weak symbol, a referencing unit's inside the artifact too).
+//
+// ★ WHY ONLY "BESIDE ANOTHER EXTERNAL NAME". A weak name that is its body's only
+// external name needs no row: when it loses, the whole atom folds onto the
+// winner and every reference to the atom goes with it (the merge's shadow
+// rule). A body with a second external name is the one that SURVIVES its weak
+// name's defeat, and a reference bound to the atom survived with it.
+//
+// ★ ONE QUESTION, ASKED BY THREE READERS AND THE MERGE.
+// `weakNamesBesideAnotherExternalName` owns it; the readers ask it of the names
+// of their alias sets, the merge of a unit's symbol rows. Nothing here knows a
+// format.
+
+// One NAME an atom carries. `atom` is whatever identity the caller gives the
+// body (a reader's owning symbol id, a module's `SymbolId::v`); it is only
+// compared.
+struct AtomName {
+    std::uint32_t    atom    = 0;
+    SymbolBinding    binding = SymbolBinding::Global;
+    std::string_view name;
+};
+
+// THE QUESTION. Parallel to `names`: true for a WEAK name whose atom carries
+// another external-linkage name -- a binding other than Local, under a
+// different non-empty spelling.
+[[nodiscard]] inline std::vector<bool>
+weakNamesBesideAnotherExternalName(std::span<AtomName const> names) {
+    std::vector<bool>        kept(names.size(), false);
+    std::vector<std::size_t> order(names.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return names[a].atom < names[b].atom;
+    });
+    for (std::size_t g = 0; g < order.size();) {
+        std::size_t h = g + 1;
+        while (h < order.size() && names[order[h]].atom == names[order[g]].atom) ++h;
+        for (std::size_t k = g; k < h; ++k) {
+            AtomName const& weak = names[order[k]];
+            if (weak.binding != SymbolBinding::Weak || weak.name.empty()) continue;
+            for (std::size_t j = g; j < h; ++j) {
+                AtomName const& other = names[order[j]];
+                if (other.binding == SymbolBinding::Local || other.name.empty()
+                    || other.name == weak.name) {
+                    continue;
+                }
+                kept[order[k]] = true;
+                break;
+            }
+        }
+        g = h;
+    }
+    return kept;
+}
+
+// ★★ THE READERS' HALF: which symbols of one object keep their name, and the id
+// a relocation through each targets.
+//
+// ★ TWO COORDINATES, NEVER MIXED. A candidate's `symbolId` and its owner are
+// RECORD INDICES — what the alias resolution ranks by and what a relocation
+// names on the wire. What leaves this class is an ID, made by the object's
+// `RecordSymbolIds` (`record_symbol_ids.hpp`) — and record 0's id is NOT its
+// index. An index compared with an id is right for every record but that one,
+// for which `referenceRowOfAWeakName` would find no data item and state the
+// weak name of a DATUM as a function.
+class WeakNameReferences {
+public:
+    // Decided from the alias resolution's own inputs and its answer
+    // (`ownerSymbolId` as `resolveEqualOffsetAtomAliases` filled it): a
+    // candidate's atom is the symbol that owns its body.
+    void decideFrom(std::span<AtomStartCandidate const> candidates,
+                    std::span<std::uint32_t const>      ownerSymbolId,
+                    RecordSymbolIds const&              ids) {
+        std::vector<AtomName> names;
+        names.reserve(candidates.size());
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            names.push_back(AtomName{ownerSymbolId[i], candidates[i].binding,
+                                     candidates[i].name});
+        }
+        std::vector<bool> const kept = weakNamesBesideAnotherExternalName(names);
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (!kept[i]) continue;
+            bool const ownsItsAtom = ownerSymbolId[i] == candidates[i].symbolId;
+            kept_.emplace(candidates[i].symbolId,
+                          Kept{candidates[i].name, ids.of(ownerSymbolId[i]),
+                               ownsItsAtom ? std::optional<SymbolId>{}
+                                           : std::optional<SymbolId>{ids.of(candidates[i].symbolId)},
+                               std::nullopt});
+        }
+    }
+
+    // What a relocation naming a kept weak name targets.
+    struct Reference {
+        SymbolId         id{};           // the id of the NAME: its row's, and the relocation's target
+        bool             fresh = false;  // the first relocation through it: the caller states the row
+        std::string_view name;
+        SymbolId         atom{};         // the body the name is a name of
+    };
+
+    // nullopt: record `recordIndex` keeps no name, and a relocation naming it
+    // takes the alias remap as before. Otherwise the id of the NAME: the
+    // symbol's own id, which no body holds once the alias rule gave the atom to
+    // another name -- or, when this weak name is the one that OWNS the atom, a
+    // fresh id of `ids`, the object's one counter of ids no record holds.
+    [[nodiscard]] std::optional<Reference> referenceFor(std::uint32_t    recordIndex,
+                                                        RecordSymbolIds& ids) {
+        auto const it = kept_.find(recordIndex);
+        if (it == kept_.end()) return std::nullopt;
+        Kept&      k     = it->second;
+        bool const fresh = !k.row.has_value();
+        if (fresh) k.row = k.own.has_value() ? *k.own : ids.fresh();
+        return Reference{*k.row, fresh, k.name, k.atom};
+    }
+
+private:
+    struct Kept {
+        std::string             name;
+        SymbolId                atom{};   // the id of the body's owning symbol
+        std::optional<SymbolId> own;      // the symbol's own id; nullopt where it OWNS the atom
+        std::optional<SymbolId> row;      // settled by the first relocation through the name
+    };
+    std::unordered_map<std::uint32_t, Kept> kept_;   // by RECORD INDEX
+};
+
+// The plain reference row a kept weak name states: the name, and what its body
+// IS -- a datum or a function, thread-local or not -- read off the atoms the
+// reader sliced (a body that is no data item is a function). The link holds
+// that statement against the definition the name finally binds to, and refuses
+// a disagreement about thread storage by name.
+[[nodiscard]] inline ExternImport
+referenceRowOfAWeakName(WeakNameReferences::Reference const& ref,
+                        std::span<AssembledData const>       dataItems) {
+    ExternImport row;
+    row.symbol      = ref.id;
+    row.mangledName = std::string{ref.name};
+    for (AssembledData const& d : dataItems) {
+        if (d.symbol != ref.atom) continue;
+        row.isData        = true;
+        row.isThreadLocal = d.section == DataSectionKind::Tdata
+                            || d.section == DataSectionKind::Tbss;
+        break;
+    }
+    return row;
 }
 
 // ★★★ THE GEOMETRY FALLBACK. Given the atoms a reader HAS reconstructed and the

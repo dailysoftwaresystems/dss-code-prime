@@ -206,6 +206,13 @@ set(_DSS_TB_NAMED
     #   ceilings, like every entry that never needed its own.
     "link/test_coff_object_reader|18|89|34"
     "link/test_pe_object_data_import_slot|14|71|33"
+    # ★ link/test_common_symbols: NAMED 2026-10-08 (cycle P69, lane xa), when the suite gained its
+    # weak-name cells, each of which asks the leg's reference linkers the same question. ✔MEASURED
+    # in full-suite runs: MinGW Debug 161.45 s with one reference arm (linux-arm64 146 s,
+    # macos-arm64 142 s, linux-x86_64 46 s); MinGW Release 104.29 s with three reference arms on
+    # PATH (81.29 s with the leg's own one). It read 20.24 / 14.90 s before those cells. Sanitized
+    # is NOT measured -- no run of that class has read it -- and takes the unit ceiling until one does.
+    "link/test_common_symbols|53|105|162"
     "core/test_type_kind_vocabulary_projection|103|4|17"
     "analysis/semantic/test_fc3_width_semantics|96|6|19"
     "analysis/preprocess/test_preprocess_no_rework|94|5|18"

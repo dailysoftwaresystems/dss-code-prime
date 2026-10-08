@@ -12,7 +12,7 @@
    its IAT entry and stores it plus 8 into `p`. It was `extern_data_addr_reject_pe` until P69 round 3, when it was
    renamed for what it witnesses (it refuses nothing).
 
-   THE REFERENCES (✔MEASURED 2026-10-01, this source's shape, work/xa/drafts/mbprobe): MinGW gcc 13.2.0 + GNU ld 2.42
+   THE REFERENCES (✔MEASURED 2026-10-01, this source's shape): MinGW gcc 13.2.0 + GNU ld 2.42
    link it and run it to 42 at -O0 and -O2 through their runtime pseudo-relocations, `p - 1` being the address
    GetProcAddress gives `_mbcasemap` — one working reference makes it REQUIRED. cl 19.51 and clang-cl (/O2 /MD) link
    a plain `extern` of it too, but bind the name to the import library's THUNK (`&_mbcasemap` != GetProcAddress, exit

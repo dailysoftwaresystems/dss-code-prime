@@ -14,7 +14,10 @@
 //     field patched to the x86_64 Variant II offset of a lone 4-byte template (-4) — which also shows the merge binds
 //     a thread-local reference to a sibling's thread-local definition correctly when the row reads no slot;
 //   * a reference no relocation names is not judged: it reaches no reference linker either (gcc writes no symbol for
-//     an extern nothing uses), so refusing it would reject a program every reference accepts.
+//     an extern nothing uses), so refusing it would reject a program every reference accepts — UNLESS its object's own
+//     symbol record states the storage duration: gcc writes a tentative definition nothing reads as an ELF symbol
+//     typed an ordinary object, and GNU ld and ld.lld refuse it against a thread-local definition, while link.exe,
+//     lld-link and Apple's ld link the same pair (a COFF record and a Mach-O nlist state none) and the program runs.
 // The same refusal on gcc's own objects — a COMMON against a thread-local archive member — runs natively on the Linux
 // legs (`CommonSymbolsNative.ACommonAgainstAThreadLocalMemberIsRefusedByName`, test_common_symbols.cpp); the two
 // corpus examples `thread_local_definition_for_an_ordinary_reference_refused` and
@@ -185,7 +188,10 @@ void linkPair(Pair const& p, AssembledModule ref, AssembledModule def, Linked& o
     std::vector<AssembledModule> mods;
     mods.push_back(std::move(ref));
     mods.push_back(std::move(def));
-    out.image = linker::link(std::span<AssembledModule const>{mods}, *L.target, *L.format, out.rep);
+    // The artifact's name: the Mach-O document's code-signature identity is a function of it, so a cell whose link
+    // reaches that image's writer needs one (the refused cells never get that far).
+    out.image = linker::link(std::span<AssembledModule const>{mods}, *L.target, *L.format, out.rep,
+                             ImageRequest{.artifactFileName = "thread_storage_image"});
 }
 
 void expectRefusedByName(Linked const& l, char const* what, char const* how) {
@@ -280,6 +286,66 @@ TEST(ThreadStorageAgreement, AReferenceNoRelocationNamesIsNotJudged) {
     linkPair(elf, referenceUnit(false, Reads::Nothing, false), definitionUnit(true), l);
     EXPECT_TRUE(l.image.ok()) << diagnosticsOf(l.rep);
     EXPECT_TRUE(textsOf(l.rep, DiagnosticCode::K_ExternImportAttributeConflict).empty()) << diagnosticsOf(l.rep);
+}
+
+// A reference no relocation names IS judged where its object's own symbol record states the storage duration
+// (`ExternImport::recordStatesStorageDuration`). ✔MEASURED 2026-10-08, a tentative `int c;` that nothing reads beside
+// a thread-local definition of `c`, both object orders: gcc 13.3.0 writes the common as an ELF symbol typed an
+// ordinary OBJECT, and GNU ld 2.42 ("TLS definition in ... mismatches non-TLS reference in ...") and ld.lld 18.1.3
+// ("TLS attribute mismatch: c") REFUSE the pair; cl 19.44 and clang 19.1.5 write a COFF record, and Apple clang 21 a
+// Mach-O nlist, that state no storage duration, and link.exe 14.44, lld-link 19.1.5 and Apple's ld LINK it to a
+// program that runs. So the row carries what its record states: with it, refused by name; without it, linked and
+// unjudged. The same pair as a COMMON row (`commonSize`), which the link's first pass turns into a reference of the
+// thread-local definition it yields to, answers the same way.
+TEST(ThreadStorageAgreement, AnUnreadReferenceIsJudgedWhereItsRecordStatesItsStorageDuration) {
+    auto const unread = [](bool arm64, bool common, bool recordStates) {
+        AssembledModule m = referenceUnit(arm64, Reads::Nothing, /*declaredThreadLocal=*/false);
+        ExternImport&   row = m.externImports[0];
+        row.recordStatesStorageDuration = recordStates;
+        if (common) {
+            row.dataSizeBytes   = 0;
+            row.dataAlignBytes  = 0;
+            row.commonSize      = 4;
+            row.commonAlignment = 4;
+        }
+        return m;
+    };
+    for (auto const& p : kExecs) {
+        for (bool const common : {false, true}) {
+            SCOPED_TRACE(std::string{p.format} + (common ? ", a common" : ", a reference"));
+            Linked l;
+            linkPair(p, unread(isArm64(p), common, /*recordStates=*/true), definitionUnit(/*threadLocal=*/true), l);
+            EXPECT_FALSE(l.image.ok());
+            auto const named = textsOf(l.rep, DiagnosticCode::K_ExternImportAttributeConflict);
+            ASSERT_EQ(named.size(), 1u) << diagnosticsOf(l.rep);
+            EXPECT_NE(named[0].find("symbol 'shared': CU #1 holds it as an ORDINARY object"), std::string::npos)
+                << named[0];
+            EXPECT_NE(named[0].find("no code of the unit reads it"), std::string::npos) << named[0];
+            EXPECT_NE(named[0].find("in CU #2, has THREAD STORAGE DURATION"), std::string::npos) << named[0];
+            EXPECT_TRUE(textsOf(l.rep, DiagnosticCode::K_RelocationKindMismatch).empty()) << diagnosticsOf(l.rep);
+        }
+    }
+    // CONTROLS. A record that states nothing is not judged, as a common or as a reference, on any format — the COFF
+    // and the Mach-O shape on the formats whose reference linkers link it, and an in-memory unit's row everywhere.
+    for (auto const& p : kExecs) {
+        for (bool const common : {false, true}) {
+            SCOPED_TRACE(std::string{"CONTROL, "} + p.format + (common ? ", a common" : ", a reference"));
+            Linked l;
+            linkPair(p, unread(isArm64(p), common, /*recordStates=*/false), definitionUnit(/*threadLocal=*/true), l);
+            EXPECT_TRUE(l.image.ok()) << diagnosticsOf(l.rep);
+            EXPECT_EQ(l.rep.errorCount(), 0u) << diagnosticsOf(l.rep);
+            EXPECT_TRUE(textsOf(l.rep, DiagnosticCode::K_ExternImportAttributeConflict).empty())
+                << diagnosticsOf(l.rep);
+        }
+    }
+    // And a record that states an ordinary object agrees with an ordinary definition: linked.
+    for (auto const& p : kExecs) {
+        SCOPED_TRACE(std::string{"CONTROL, an ordinary definition, "} + p.format);
+        Linked l;
+        linkPair(p, unread(isArm64(p), /*common=*/true, /*recordStates=*/true), definitionUnit(/*threadLocal=*/false), l);
+        EXPECT_TRUE(l.image.ok()) << diagnosticsOf(l.rep);
+        EXPECT_EQ(l.rep.errorCount(), 0u) << diagnosticsOf(l.rep);
+    }
 }
 
 // ══ A PE program with a thread-local, beside another unit ════════════════════

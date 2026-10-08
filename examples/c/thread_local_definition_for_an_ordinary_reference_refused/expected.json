@@ -1,5 +1,5 @@
 {
-  "$comment": "★★ A THREAD-LOCAL DEFINITION FOR AN ORDINARY REFERENCE IS REFUSED BY NAME AT THE BINDING (P69 round 4, D-LK-THREAD-STORAGE-DISAGREEMENT-REFUSED-ONLY-BY-THE-WRITER-BACKSTOP). Each arm's archive is ONE DSS static library of two members, built by the lane's Windows debug dsscp (`.orchestrators/p69/work/xa/r4tls/fixtures/build_fixtures.sh`): `member_reader.c` = `extern int shared; int read_shared(void) { return shared; }`, and `member_definer.c` = `int shared = 7;`. main.c defines `shared` with THREAD STORAGE DURATION and calls `read_shared`, so the archive search pulls the reader, whose ordinary reference binds to main's thread-local definition. C23 6.7.2p3 requires `thread_local` on every declaration of one object, and an ordinary reference reaches ONE address for the process where a thread-local is one object per thread. GNU ld 2.42 refuses the same shape ('TLS definition in ... mismatches non-TLS reference in ...') and so does ld.lld 18.1.3 (✔MEASURED 2026-10-07 on gcc 13.3.0 objects, `.orchestrators/p69/work/xa/r4probe/m10` and `m11`). ✔MEASURED before this round's check, the same archives (`r4tls/fixtures/probe_examples_pre.log`): every arm was refused only by its image writer's CRIT-1 backstop, `K_RelocationKindMismatch`, naming SymbolIds and explaining it as an address constant the program never wrote. Now ONE `K_ExternImportAttributeConflict`, before the merge, naming `shared`, both units and `read_shared`. NO `optimizedPipelines` ARM: a refusal builds no artifact for an optimized arm to differ from.",
+  "$comment": "★★ A THREAD-LOCAL DEFINITION FOR AN ORDINARY REFERENCE IS REFUSED BY NAME AT THE BINDING (P69 round 4, D-LK-THREAD-STORAGE-DISAGREEMENT-REFUSED-ONLY-BY-THE-WRITER-BACKSTOP). Each arm's archive is ONE DSS static library of two members, built by DSS itself and checked in, because a refusal manifest cannot build a prerequisite (the runner refuses `dependsOn` beside `expectDiagnostics`): `member_reader.c` = `extern int shared; int read_shared(void) { return shared; }`, and `member_definer.c` = `int shared = 7;` -- the two sources, with the `dsscp` commands that build the four archives from them, are `tests/link/data/libthread_storage.member_reader.source.c` and `tests/link/data/libthread_storage.member_definer.source.c`. main.c defines `shared` with THREAD STORAGE DURATION and calls `read_shared`, so the archive search pulls the reader, whose ordinary reference binds to main's thread-local definition. C23 6.7.2p3 requires `thread_local` on every declaration of one object, and an ordinary reference reaches ONE address for the process where a thread-local is one object per thread. GNU ld 2.42 refuses the same shape ('TLS definition in ... mismatches non-TLS reference in ...') and so does ld.lld 18.1.3 (✔MEASURED 2026-10-07 on gcc 13.3.0 objects). ✔MEASURED before this round's check, on the same archives: every arm was refused only by its image writer's CRIT-1 backstop, `K_RelocationKindMismatch`, naming SymbolIds and explaining it as an address constant the program never wrote. Now ONE `K_ExternImportAttributeConflict`, before the merge, naming `shared`, both units and `read_shared`. NO `optimizedPipelines` ARM: a refusal builds no artifact for an optimized arm to differ from.",
   "$commentRedOnDisable": "REMOVE direction, executed 2026-10-07 (lane `xa`, ledger id `r4-TSA`): in `linker::link` (`src/link/linker.cpp`), `reportThreadStorageDisagreements(modules, image.resolvedCrossCuRefs, targetSchema, reporter);` becomes `if (false) reportThreadStorageDisagreements(...);`, so the link never compares a reference's storage duration with its definition's and the image writers' backstop is the only refusal again. Built and run through ctest by one harness call, source md5 ba482574 -> 2327652a -> ba482574, run 20261007-155747-f2f6f7e1 (windows-x86_64-debug, linux-arm64-debug): this example RED in BOTH runners, with `ThreadStorageAgreement.AnOrdinaryReferenceToAThreadLocalDefinitionIsRefusedByName`, `ThreadStorageAgreement.AThreadLocalReferenceToAnOrdinaryDefinitionIsRefusedByName`, `ThreadStorageAgreement.AReferenceItsCodeReachesThroughAThreadLocalRelocationIsAThreadLocalOne`; on linux-arm64-debug (host run 20261007-155741-5e8fd5de, read from the run's own printed tail) the same five ctest entries red and `link/test_common_symbols`, whose one red case is `CommonSymbolsNative.ACommonAgainstAThreadLocalMemberIsRefusedByName` (gcc's own `-fcommon` object and `__thread` member, natively). CONTROL: the unmutated bytes green on the same filter in run 20261007-150637-60d194f7 (windows-x86_64-debug, linux-x86_64-debug, linux-arm64-debug, 10 of 10 each) and, with lane `lm`'s fold merged in, on a filter holding this example in run 20261007-163110-f12fa24d (windows-x86_64-debug and linux-arm64-debug, 177 of 177 each), and the restored bytes green in the row's final runs.",
   "language": "c",
   "source": "main.c",
@@ -11,7 +11,7 @@
       "spec": "x86_64:pe64-x86_64-windows-exec",
       "prebuiltLibraries": [
         {
-          "$comment": "DSS `x86_64:pe64-x86_64-windows-staticlib` of member_reader.c + member_definer.c (archive md5 f430a020b3cfd655142fcf90a9f3cead).",
+          "$comment": "DSS `x86_64:pe64-x86_64-windows-staticlib` of member_reader.c + member_definer.c (archive md5 f430a020b3cfd655142fcf90a9f3cead). Sources and rebuild commands: `tests/link/data/libthread_storage.member_reader.source.c`.",
           "path": "tests/link/data/libthread_storage_x86_64_pe.a",
           "containerWitness": "read_shared"
         }
@@ -21,7 +21,7 @@
       "spec": "x86_64:elf64-x86_64-linux-exec",
       "prebuiltLibraries": [
         {
-          "$comment": "DSS `x86_64:elf64-x86_64-linux-staticlib` of member_reader.c + member_definer.c (archive md5 ddbb4eb366bbc2f73245ab4ba815d853).",
+          "$comment": "DSS `x86_64:elf64-x86_64-linux-staticlib` of member_reader.c + member_definer.c (archive md5 ddbb4eb366bbc2f73245ab4ba815d853). Sources and rebuild commands: `tests/link/data/libthread_storage.member_reader.source.c`.",
           "path": "tests/link/data/libthread_storage_x86_64_elf.a",
           "containerWitness": "read_shared"
         }
@@ -31,7 +31,7 @@
       "spec": "arm64:elf64-aarch64-linux-exec",
       "prebuiltLibraries": [
         {
-          "$comment": "DSS `arm64:elf64-aarch64-linux-staticlib` of member_reader.c + member_definer.c (archive md5 a83b6e52771266424c79f0e356d01d2c).",
+          "$comment": "DSS `arm64:elf64-aarch64-linux-staticlib` of member_reader.c + member_definer.c (archive md5 a83b6e52771266424c79f0e356d01d2c). Sources and rebuild commands: `tests/link/data/libthread_storage.member_reader.source.c`.",
           "path": "tests/link/data/libthread_storage_aarch64_elf.a",
           "containerWitness": "read_shared"
         }
@@ -41,7 +41,7 @@
       "spec": "arm64:macho64-arm64-darwin-exec",
       "prebuiltLibraries": [
         {
-          "$comment": "DSS `arm64:macho64-arm64-darwin-staticlib` of member_reader.c + member_definer.c (archive md5 8c40cf7c7fe82e3d42db614d9390ca41).",
+          "$comment": "DSS `arm64:macho64-arm64-darwin-staticlib` of member_reader.c + member_definer.c (archive md5 8c40cf7c7fe82e3d42db614d9390ca41). Sources and rebuild commands: `tests/link/data/libthread_storage.member_reader.source.c`.",
           "path": "tests/link/data/libthread_storage_arm64_macho.a",
           "containerWitness": "read_shared"
         }

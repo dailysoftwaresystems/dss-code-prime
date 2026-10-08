@@ -2,6 +2,7 @@
 #include "link/format/coff_linker_directives.hpp"   // parseCoffLinkerDirectives — (3b)
 #include "link/format/foreign_section_alignment.hpp"
 #include "link/format/object_atom_coverage.hpp"
+#include "link/format/record_symbol_ids.hpp"
 #include "link/format/object_format_backends.hpp"
 #include "link/format/relocation_addend.hpp"
 #include "link/format/section_relative_target.hpp"
@@ -901,7 +902,14 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     }
     auto const& callSignalNativeIds = decode->callSignalNativeIds;
 
-    // -- (5) Decode every IMAGE_SYMBOL; assign SymbolId = symtab index ----
+    // -- (5) Decode every IMAGE_SYMBOL ------------------------------------
+    //
+    // A record's id is `symbolIds.of(its index)` — THE ONE RULE
+    // (`record_symbol_ids.hpp`): the index, and for record 0, whose index is the
+    // invalid id, the first id past the table. Everything this reader keys by a
+    // symbol below is keyed by the record INDEX (which is also where its
+    // auxiliary slots and a weak external's default are found); an id is made
+    // where a value enters the module.
     //
     // A record's ordinal is NOT its symbol index, and it never was safe to
     // assume so: a record declaring NumberOfAuxSymbols>0 is followed by that
@@ -918,6 +926,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // its aux slots, and the `1 + numAux` walk is what keeps a relocation's
     // symbol index meaning the same record on the way back in as it did on the
     // way out (`PeWriter.RelocationToAWeakDefinitionResolvesPastTheAuxSlot`).
+    link::format::RecordSymbolIds symbolIds{numSymbols};
     std::vector<Sym>  syms(numSymbols);
     std::vector<bool> auxSlot(numSymbols, false);
     // A `std::size_t` cursor (not u32): the `+= 1 + numAux` skip past a
@@ -1403,7 +1412,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
             {
                 ExternImport weakExt;
-                weakExt.symbol      = SymbolId{i};
+                weakExt.symbol      = symbolIds.of(i);
                 weakExt.mangledName = s.name;
                 weakExt.isData      = !declaresFunction(s);
                 weakExt.binding     = SymbolBinding::Weak;
@@ -1510,7 +1519,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     alignment = std::max(alignment, std::uint64_t{1} << asked->second);
                 }
                 ExternImport common;
-                common.symbol           = SymbolId{i};
+                common.symbol           = symbolIds.of(i);
                 common.mangledName      = s.name;
                 common.isData           = true;
                 common.binding          = SymbolBinding::Global;
@@ -1524,7 +1533,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 continue;
             }
             ExternImport ext;
-            ext.symbol      = SymbolId{i};
+            ext.symbol      = symbolIds.of(i);
             ext.mangledName = s.name;
             // isData from the COFF derived-type hint: the canonical function
             // test is `(type & DTYPE_MASK) == DTYPE_FUNCTION` (bits 4..5 = the
@@ -1546,7 +1555,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // ModuleSymbol so a reloc target still resolves by identity (the
             // ELF SHN_ABS / Mach-O N_ABS analog).
             if (!s.name.empty()) {
-                mod.symbols.push_back(ModuleSymbol{SymbolId{i}, s.name, binding,
+                mod.symbols.push_back(ModuleSymbol{symbolIds.of(i), s.name, binding,
                                                    SymbolVisibility::Default});
             }
             continue;
@@ -1700,7 +1709,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // Recorded as a LOCAL ModuleSymbol and NOT an atom boundary for
             // now, so it never splits the function/data item that contains its
             // interior offset.
-            mod.symbols.push_back(ModuleSymbol{SymbolId{i}, s.name,
+            mod.symbols.push_back(ModuleSymbol{symbolIds.of(i), s.name,
                 SymbolBinding::Local, SymbolVisibility::Default});
             // ...and STAGE it for the shared header
             // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
@@ -1740,13 +1749,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
 
     // (3b), completed — the requests applied against what this object DEFINES.
     //
-    // A fresh SymbolId for a row or an alias no record of this object owns: past
-    // every record index, which is every id this reader mints from the table.
-    // ★ ONE counter for EVERY id minted past the table: these rows and the
-    // anonymous gap atoms of step (6.45) both draw from it. Two counters from one
-    // base gave the first directive row and the first gap atom ONE id (P69
-    // review-xa3 MAJOR 2), and a relocation to the gap's bytes then named the row.
-    std::uint32_t nextFreshSymbol = numSymbols;
+    // A fresh SymbolId for a row or an alias no record of this object owns:
+    // `symbolIds.fresh()`, past every id a record takes.
+    // ★ ONE counter for EVERY id minted past the table: these rows, the
+    // anonymous gap atoms of step (6.45) and the weak names' reference rows all
+    // draw from it. Two counters from one base gave the first directive row and
+    // the first gap atom ONE id (P69 review-xa3 MAJOR 2), and a relocation to the
+    // gap's bytes then named the row.
     // Does this object make an EXTERNAL definition of `name`? A COMMON is one
     // (`ExternImport::commonSize`): it defines storage, though it is a row.
     auto const definesExternally = [&](std::string const& name) {
@@ -1768,7 +1777,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     };
     auto const freshRow = [&](std::string const& name) -> ExternImport& {
         ExternImport row;
-        row.symbol      = SymbolId{nextFreshSymbol++};
+        row.symbol      = symbolIds.fresh();
         row.mangledName = name;
         // A directive states no code-vs-data kind; the definition the link
         // finds decides it (the `__imp_X` fold's rule, `ExternKindOrigin`).
@@ -1831,7 +1840,28 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
     for (auto const& name : includedByDirective) {
-        if (definesExternally(name)) continue;
+        if (definesExternally(name)) {
+            // The object's OWN definition: the link needs nothing more of it, and
+            // no row states the request -- so a relocatable artifact restates it
+            // in the vocabulary's own spelling (`handOn`), or its final linker
+            // would never be asked to keep the definition the object asked it to
+            // keep (P69 send-back 5, review-xa4 NIT 9).
+            auto const& vocab = objectFormatSchema.pe().linkerDirectives;
+            auto const spelled =
+                vocab.has_value()
+                    ? coffLinkerDirectiveText(
+                          CoffDirectiveStatements{{}, std::span<std::string const>{&name, 1}, {}, {}}, *vocab)
+                    : std::expected<std::string, std::string>{std::unexpected(std::string{
+                          "the format declares no directive vocabulary"})};
+            if (!spelled.has_value() || spelled->empty() || spelled->front() != ' ') {
+                return fail(DiagnosticCode::K_LinkerDirectiveUnhonourable,
+                    "pe::readRelocatableObject: the object's include directive names its own definition '"
+                    + name + "', and it cannot be handed on: "
+                    + (spelled.has_value() ? std::string{"its spelling is empty"} : spelled.error()) + ".");
+            }
+            mod.linkerRequests.handOn.push_back(spelled->substr(1));
+            continue;
+        }
         if (includeRow != nullptr) {
             for (auto const& runtime : includeRow->runtimeSymbols) {
                 if (runtime.name == name) {
@@ -1897,7 +1927,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // classification loop; pushing a second one would duplicate the name in
         // `mod.symbols` (see `DefSym::moduleSymbolAlreadyPushed`).
         if (!d.name.empty() && !d.moduleSymbolAlreadyPushed) {
-            mod.symbols.push_back(ModuleSymbol{SymbolId{d.symIdx}, d.name,
+            mod.symbols.push_back(ModuleSymbol{symbolIds.of(d.symIdx), d.name,
                                                d.binding, d.visibility,
                                                d.duplicateMatch, d.yieldsToACommon});
         }
@@ -2013,6 +2043,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // (`atomEndFor`), so equal-offset candidates get equal extents by
     // construction and the conflicting-extent refusal cannot fire here.
     std::unordered_map<std::uint32_t, std::uint32_t> atomOwnerBySym;
+    // The names a relocation KEEPS instead of the atom this pass gives it: THE
+    // WEAK-NAME RULE (`object_atom_coverage.hpp`), decided on the alias sets
+    // here and read by the relocation pass.
+    link::format::WeakNameReferences weakNames;
     {
         std::vector<link::format::AtomStartCandidate> candidates;
         for (auto const& [ordinal, defs] : defsBySection) {
@@ -2035,6 +2069,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 atomOwnerBySym.emplace(candidates[i].symbolId, owner[i]);
             }
         }
+        weakNames.decideFrom(candidates, owner, symbolIds);
     }
     // The atom identity a symbol resolves to: itself unless it aliases another.
     // Consulted at BOTH sites that need it -- the slicing loop (does this
@@ -2049,6 +2084,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // id -> row lookup over `AssembledModule::symbols` keeps the FIRST row for
     // an id, so the canonical name must be recorded before any alias of it.
     std::vector<ModuleSymbol> aliasRows;
+    // The records that OWN a reconstructed body, by record index — filled where
+    // each named atom is cut. The relocation pass asks it of a target (step 7).
+    std::unordered_set<std::uint32_t> atomSymIdx;
 
     // Whether this object's input sections are UNITS of placement: the format's
     // declared rule (`inputSectionPlacement`), applied to an object that has no
@@ -2114,13 +2152,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     // already pushed carries the WRONG id and retargeting it is
                     // the correct repair, not skipping it.
                     for (auto& ms : mod.symbols) {
-                        if (ms.symbol == SymbolId{defs[k].symIdx}) {
-                            ms.symbol = SymbolId{owner};
+                        if (ms.symbol == symbolIds.of(defs[k].symIdx)) {
+                            ms.symbol = symbolIds.of(owner);
                             break;
                         }
                     }
                 } else if (!defs[k].name.empty()) {
-                    ModuleSymbol alias{SymbolId{owner}, defs[k].name, defs[k].binding,
+                    ModuleSymbol alias{symbolIds.of(owner), defs[k].name, defs[k].binding,
                                        defs[k].visibility};
                     alias.yieldsToACommon = defs[k].yieldsToACommon;
                     aliasRows.push_back(std::move(alias));
@@ -2142,12 +2180,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 }
                 std::size_t const bodyOff = static_cast<std::size_t>(sec.rawPtr + off);
                 AssembledFunction fn;
-                fn.symbol = SymbolId{defs[k].symIdx};
+                fn.symbol = symbolIds.of(defs[k].symIdx);
                 fn.bytes.assign(bytes.begin() + bodyOff,
                                 bytes.begin() + bodyOff + static_cast<std::size_t>(len));
                 fn.inputSection = sliceOf(ordinal, off);
                 funcIntervalsBySec[ordinal].push_back(
                     Interval{off, len, mod.functions.size()});
+                atomSymIdx.insert(defs[k].symIdx);
                 mod.functions.push_back(std::move(fn));
                 pushModuleSym(defs[k]);
                 continue;
@@ -2168,7 +2207,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // slice their bytes; a zero-fill (bss) section reserves the size
             // with empty bytes (the reservedSize invariant).
             AssembledData di;
-            di.symbol    = SymbolId{defs[k].symIdx};
+            di.symbol    = symbolIds.of(defs[k].symIdx);
             di.section   = *dk;
             di.alignment = alignFromCharacteristics(sec.chars);  // section-granular
             di.inputSection = sliceOf(ordinal, off);
@@ -2190,6 +2229,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
             dataIntervalsBySec[ordinal].push_back(
                 Interval{off, len, mod.dataItems.size()});
+            atomSymIdx.insert(defs[k].symIdx);
             mod.dataItems.push_back(std::move(di));
             pushModuleSym(defs[k]);
         }
@@ -2257,11 +2297,11 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                      ordinal, sec.rawSize, covered)) {
                 AssembledData di;
                 // A SymbolId past the symbol table, from the ONE counter (3b)'s
-                // rows draw from too, collides with no record's and no row's,
+                // rows draw from too (`symbolIds`), collides with no record's and no row's,
                 // and NO ModuleSymbol is recorded -- the atom stays
                 // module-private and is never folded cross-CU by name, which is
                 // right for bytes that have no name.
-                di.symbol    = SymbolId{nextFreshSymbol++};
+                di.symbol    = symbolIds.fresh();
                 di.section   = *dk;
                 // The gap's bytes belong to the SAME section, so they carry the
                 // same declared alignment as the named atoms around them --
@@ -2340,12 +2380,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // relocs but NO reconstructed atom fails loud (mirror the c168 fold --
     // never silently drop a section's relocations).
     //
-    // The symbols that OWN a reconstructed body. A relocation target defined in
-    // a section that is NOT one of them names an OFFSET in that section rather
-    // than an identity the merge can bind -- the rebind in the loop below.
-    std::unordered_set<std::uint32_t> atomSymIdx;
-    for (auto const& f : mod.functions) atomSymIdx.insert(f.symbol.v);
-    for (auto const& d : mod.dataItems) atomSymIdx.insert(d.symbol.v);
+    // A relocation target defined in a section that is NOT one of the records
+    // that own a reconstructed body (`atomSymIdx`, filled by the slicing loop)
+    // names an OFFSET in that section rather than an identity the merge can
+    // bind -- the rebind in the loop below.
     auto findInterval = [](std::vector<Interval> const& ivs, std::uint64_t off)
         -> Interval const* {
         for (auto const& iv : ivs) {
@@ -2517,7 +2555,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // index. The addend needs no adjustment: an alias shares its owner's
             // offset exactly, so the same S makes the same address.
             std::uint32_t const targetIdx = ownerOf(symIdx);
-            SymbolId     relTarget = SymbolId{targetIdx};
+            SymbolId     relTarget = symbolIds.of(targetIdx);
             std::int64_t relAddend = addend;
 
             // SECTION-RELATIVE: a target DEFINED in a section that owns no body
@@ -2569,6 +2607,19 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 relAddend = bound->residual;
             }
 
+            // THE WEAK-NAME RULE (`object_atom_coverage.hpp`): a relocation
+            // written through a WEAK name of a body that has another external
+            // name keeps the NAME -- a plain reference row the link resolves by
+            // name, to an override where one is linked and to this very body
+            // otherwise -- instead of the atom (6.44) chose for it. The addend
+            // is the name's own: the name sits at the atom's start.
+            if (auto const weakName = weakNames.referenceFor(symIdx, symbolIds)) {
+                if (weakName->fresh) {
+                    mod.externImports.push_back(
+                        link::format::referenceRowOfAWeakName(*weakName, mod.dataItems));
+                }
+                relTarget = weakName->id;
+            }
             Relocation rel;
             rel.offset = static_cast<std::uint32_t>(va - iv->start);
             rel.target = relTarget;

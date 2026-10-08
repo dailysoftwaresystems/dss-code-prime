@@ -2,7 +2,7 @@
 // directions: what DSS writes into `.drectve` for a definition its visibility keeps out of an image's exports, and
 // what it reads out of anyone's `.drectve`.
 //
-// COFF has no visibility field. ✔MEASURED 2026-10-01 (this host, work/xa/drectve_probe): clang
+// COFF has no visibility field. ✔MEASURED 2026-10-01 (this host): clang
 // `--target=x86_64-w64-windows-gnu -c` writes `visibility("hidden") int helper` as an ordinary EXTERNAL symbol plus
 // ` -exclude-symbols:helper`; a DLL built from that object exports `lib_entry` ALONE under GNU ld 2.42 (MinGW-w64)
 // and ld.lld's MinGW mode, and `helper` too without the attribute; link.exe 14.51 warns LNK4229 and ignores the
@@ -583,7 +583,7 @@ TEST(CoffLinkerDirectives, TheReaderHandsAnUndeclaredDirectiveAndAForeignNameToT
     }
     // An export is a REFERENCE of the object, as an include is: link.exe and lld-link pull the archive member that
     // defines an exported name nothing else names, and bind one only an import library defines (✔MEASURED
-    // 2026-10-07, r4probe/m7) -- so a name the object does not define gets a required row, and one it does gets none.
+    // 2026-10-07) -- so a name the object does not define gets a required row, and one it does gets none.
     auto const requiredRow = [](AssembledModule const& m, std::string_view name) {
         std::size_t rows = 0;
         bool required = false;
@@ -885,6 +885,43 @@ TEST(CoffLinkerDirectives, TheLoaderRefusesEveryMalformedOrMisplacedVocabulary) 
              d["pe"]["linkerDirectives"]["directives"][1]["runtimeSymbols"] = nlohmann::json{{"_tls_used", "x"}};
          },
          "/pe/linkerDirectives/directives/1/runtimeSymbols", "belongs to a 'includeSymbol' row"},
+        // P69 send-back 5 (review-xa4 MINOR 6): the two answers a row states about a request one link decides
+        // across its units — required there, refused anywhere else, each a closed set. Row 10 is `stack` (`first`,
+        // `ignored` with its reason), row 20 `version` (`last`, `honoured`), row 5 `defaultlib` (`ignored`).
+        {"a setting row that states no precedence", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][10].erase("unitPrecedence"); },
+         "/pe/linkerDirectives/directives/10/unitPrecedence", "states no 'unitPrecedence'"},
+        {"a precedence that is none of the three", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][10]["unitPrecedence"] = "newest"; },
+         "/pe/linkerDirectives/directives/10/unitPrecedence", "'unitPrecedence' must be"},
+        {"a precedence on a row no link decides across units", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][5]["unitPrecedence"] = "first"; },
+         "/pe/linkerDirectives/directives/5/unitPrecedence",
+         "belongs to a row whose request one link decides across its units"},
+        {"a setting row that states no shared-library answer", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][20].erase("inSharedLibrary"); },
+         "/pe/linkerDirectives/directives/20/inSharedLibrary", "states no 'inSharedLibrary'"},
+        {"a shared-library answer that is none of the three", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][20]["inSharedLibrary"] = "sometimes"; },
+         "/pe/linkerDirectives/directives/20/inSharedLibrary", "'inSharedLibrary' must be"},
+        {"a row a shared library ignores that states no reason", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][10].erase("inSharedLibraryReason"); },
+         "/pe/linkerDirectives/directives/10/inSharedLibraryReason", "states no 'inSharedLibraryReason'"},
+        {"an empty shared-library reason", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][10]["inSharedLibraryReason"] = ""; },
+         "/pe/linkerDirectives/directives/10/inSharedLibraryReason",
+         "'inSharedLibraryReason' must be a non-empty string"},
+        {"a shared-library reason on a row a shared library honours", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][20]["inSharedLibraryReason"] = "stale"; },
+         "/pe/linkerDirectives/directives/20/inSharedLibraryReason",
+         "only a row whose 'inSharedLibrary' is 'ignored' or 'refused' states"},
+        {"two options of one setting that state two precedences", "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d["pe"]["linkerDirectives"]["directives"].push_back(nlohmann::json::parse(
+                 R"({"option": "stacksize", "meaning": "stackSize", "unitPrecedence": "last",
+                     "inSharedLibrary": "ignored", "inSharedLibraryReason": "as the stack row"})"));
+         },
+         "/pe/linkerDirectives/directives/27", "both mean 'stackSize' and state different"},
         {"a section name past eight bytes", "pe64-x86_64-windows",
          [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["section"] = ".directives"; },
          "/pe/linkerDirectives/section", "exceeds the 8 bytes"},
@@ -1048,7 +1085,8 @@ TEST(CoffLinkerDirectivesLink, ARequiredNameNothingDefinesIsRefusedByName) {
     EXPECT_FALSE(l->image.ok());
     EXPECT_NE(diagnosticsOf(l->rep).find("undefined symbol 'nobody_defines_this'"), std::string::npos)
         << diagnosticsOf(l->rep);
-    EXPECT_NE(diagnosticsOf(l->rep).find("linker directive (`/INCLUDE:` or `/EXPORT:`) requires"), std::string::npos)
+    EXPECT_NE(diagnosticsOf(l->rep).find("linker directive (`/INCLUDE:`, `/EXPORT:` or `/ENTRY:`) requires"),
+              std::string::npos)
         << diagnosticsOf(l->rep);
 }
 

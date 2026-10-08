@@ -497,6 +497,9 @@ TEST(PeObjectDataImportSlotNative, LinkExeLinksAndRunsAnUnresolvedWeakDataImport
     // `/NODEFAULTLIB` + `/ENTRY:main` keeps the CRT out of it: the subject is
     // ONE object and its relocations, and a CRT would add symbols whose failure
     // would be indistinguishable from this one's.
+    // (A raw entry that RETURNS ends only its thread -- `pe_raw_entry.hpp`.
+    // These programs import NOTHING, the shape measured there never to wait,
+    // 0 of 320; an import from a second dll is what makes such a process wait.)
     ASSERT_TRUE(env.run("link /nologo /OUT:wkdata.exe /ENTRY:main "
                         "/SUBSYSTEM:CONSOLE /NODEFAULTLIB wkdata.obj"))
         << "link.exe must LINK a DSS object whose weak data import resolves to "

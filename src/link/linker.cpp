@@ -21,6 +21,8 @@
 #include "link/weak_resolved_to_nothing.hpp"   // what a reference to a weak symbol resolved to nothing computes
 #include "link/format/elf.hpp"
 #include "link/format/macho.hpp"
+#include "link/format/object_atom_coverage.hpp"   // weakNamesBesideAnotherExternalName — the weak-name rule
+#include "link/format/object_symbol_names.hpp"    // namesADefinitionOfItsOwn — its single-unit arm
 #include "link/format/pe.hpp"
 #include "link/format/spirv.hpp"
 #include "link/format/wasm.hpp"
@@ -100,9 +102,65 @@ moreConstrainingVisibility(SymbolVisibility a, SymbolVisibility b) noexcept {
 // key — the same SymbolId declared twice in THIS CU (across functions, data, or
 // externs) — is an ambiguous-resolution error: the `emplace`-failure detects it,
 // unifying the former cross-table + within-table duplicate checks into one gate.
+//
+// ★★ THE INVALID ID NAMES NOTHING (P69,
+// D-LK-OBJECT-READERS-GAVE-RECORD-ZERO-THE-INVALID-SYMBOL-ID). `SymbolId{}`
+// marks an item that needs no identity: an UNLABELLED data item (the assembly
+// front end's bytes written before any label — `asm.hpp`, "anonymous data"),
+// which every object writer and the image data layout pass over when they give
+// symbols their records and addresses. What makes such an item anonymous is
+// that NOTHING NAMES IT AND NOTHING REFERS TO IT — and since a writer cannot
+// tell that from the id alone, this gate holds every unit to it before any
+// writer runs (every writer is reached through `linker::link`): a NAME bound to
+// the invalid id (a symbol row, an import row) and a REFERENCE to it (a
+// relocation's target) are refused here, by name. Before this gate they were
+// not: the COFF and the Mach-O readers gave the symbol of record 0 that id, the
+// datum it named was written as unlabelled bytes, and its name was gone from
+// the artifact with no diagnostic.
+//   * An unlabelled data item itself declares nothing: two of them do not
+//     collide, and it is no definition a reference could find.
+//   * A FUNCTION under the invalid id is declared as it always was — no two of
+//     them in one unit — and judged by the same two facts: a name or a
+//     reference under that id is refused whatever carries it. (The MIR tier
+//     builds a module's runtime-initializer function under it, unnamed and
+//     unreferenced; a unit holding one is refused upstream today, by the
+//     data lowering.)
+//   * An import row NOTHING refers to never reaches a writer, whatever its id:
+//     the reference gate (`rejectOrDropUnreferencedExterns`) drops it from the
+//     emission module before this gate sees that module.
+//   * The relocation checks further down (`resolveCrossCuSymbols` and the
+//     emission path's two loops) ask for an undeclared VALID target only: the
+//     invalid one is this gate's refusal, said once.
 void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                         AssembledModule const& m,
                         DiagnosticReporter& reporter) {
+    auto const refuseTheInvalidId = [&](std::string const& what) {
+        report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
+               what + " (CU #" + std::to_string(m.cuId.v) + ") carries the INVALID symbol id. "
+               "Only an item that nothing names and nothing refers to may go without an id "
+               "(an unlabelled data item): a definition named under that id would be written "
+               "as unlabelled bytes and lose its name, and a reference to it reaches nothing. "
+               "The unit's producer must give every named or referenced symbol an id of its own.");
+    };
+    for (auto const& ms : m.symbols) {
+        if (!ms.symbol.valid()) refuseTheInvalidId("the name '" + ms.name + "'");
+    }
+    auto const holderName = [&](SymbolId id) -> std::string {
+        for (auto const& s : m.symbols) {
+            if (s.symbol == id && !s.name.empty()) return "'" + s.name + "'";
+        }
+        return "#" + std::to_string(id.v);
+    };
+    auto const refuseReferencesToTheInvalidId = [&](std::vector<Relocation> const& relocs,
+                                                    char const* holderKind, SymbolId holder) {
+        for (auto const& rel : relocs) {
+            if (rel.target.valid()) continue;
+            refuseTheInvalidId("the target of the relocation at offset " + std::to_string(rel.offset)
+                               + " of " + holderKind + " " + holderName(holder));
+        }
+    };
+    for (auto const& fn : m.functions) refuseReferencesToTheInvalidId(fn.relocations, "function", fn.symbol);
+    for (auto const& di : m.dataItems) refuseReferencesToTheInvalidId(di.relocations, "data item", di.symbol);
     auto declare = [&](SymbolId sym, SymbolKind kind, char const* what) {
         if (!index.emplace(LinkedSymbolKey{m.cuId, sym}, kind).second) {
             report(reporter, DiagnosticCode::K_SymbolUndefined,
@@ -122,7 +180,11 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     for (auto const& fn : m.functions)
         for (auto const& bs : fn.blockSymbols)
             declare(bs.symbol, SymbolKind::BlockLocal, "synthetic block symbol");
-    for (auto const& di : m.dataItems) declare(di.symbol, SymbolKind::Data, "data item");
+    for (auto const& di : m.dataItems) {
+        // An unlabelled item declares nothing (the note above this function).
+        if (!di.symbol.valid()) continue;
+        declare(di.symbol, SymbolKind::Data, "data item");
+    }
     // D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69): a
     // symbol whose address is 0 — the face a PC-relative or branch field sees of
     // a weak symbol the gate resolved to nothing — is declared so the
@@ -148,6 +210,11 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                    "ExternImport[" + std::to_string(i) + "] (symbol #" +
                    std::to_string(ext.symbol.v) + ") has empty mangledName — "
                    "import-table entries require a non-empty symbol name.");
+        }
+        if (!ext.symbol.valid()) {
+            // An import row is a NAME; under the invalid id it names nothing.
+            refuseTheInvalidId("the import '" + ext.mangledName + "'");
+            continue;
         }
         declare(ext.symbol, SymbolKind::Extern, "extern import");
         // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING (the ADDRESS half):
@@ -479,7 +546,9 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                     nullBound.push_back(ext.symbol);
                     anyDrop = true;
                 } else if (!allowUndefinedExterns && ext.requiredByDirective) {
-                    // The `/INCLUDE:` and `/EXPORT:` arm: the generic message
+                    // The `/INCLUDE:`, `/EXPORT:` and `/ENTRY:` arm (the entry a
+                    // named object states and does not define: P69 send-back 5,
+                    // `linker::requireEntryReference`): the generic message
                     // below would point at a prototype that does not exist — no
                     // code names this symbol; a linker directive of the object
                     // asked for it.
@@ -492,8 +561,8 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                     report(reporter, DiagnosticCode::K_SymbolUndefined,
                            DiagnosticSeverity::Error,
                            "undefined symbol '" + ext.mangledName + "' — a linked "
-                           "object's linker directive (`/INCLUDE:` or `/EXPORT:`) "
-                           "requires the "
+                           "object's linker directive (`/INCLUDE:`, `/EXPORT:` or "
+                           "`/ENTRY:`) requires the "
                            "link to define it, and no linked compilation unit "
                            "defines it and no library import binds it. A DSS link "
                            "takes no library from a directive (`/DEFAULTLIB:`), so "
@@ -1096,6 +1165,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
                            std::unordered_map<LinkedSymbolKey, SymbolKind> const& compoundIndex,
                            LinkedImage&        image,
+                           bool                relocatableArtifact,
                            DiagnosticReporter& reporter) {
     // (1) DEFINITION merge + weak-vs-strong — delegated to the PURE, tier-neutral
     // `resolveCrossCuDefs` kernel (Cycle 24). Flatten every module's symbol table into
@@ -1246,15 +1316,50 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
     // the defect one tier below where it was fixed, with no diagnostic anywhere.
     // The row says what it is; this loop believes it rather than re-deriving it
     // from a name match (see `ExternImport::isPreemptionReference`).
+    // ★★ THE WEAK-NAME RULE, the artifact's arm
+    // (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME). An IMAGE binds
+    // every reference below, a reference a unit wrote through its OWN weak name
+    // included (`link/format/object_atom_coverage.hpp`): that is the by-name
+    // resolution the rule exists to reach. A RELOCATABLE artifact does not bind
+    // one whose name is won by a WEAK name of a body that has another external
+    // name. The name is still weak in the artifact, so a later link may give it
+    // to another definition, and a relocation bound to the body here could not
+    // follow it there: the row stays a reference, and the artifact's writer
+    // points it at the weak name's own record. ✔MEASURED 2026-10-08, GNU ld
+    // 2.42 `-r` on ELF: the relocations of the name's own unit AND of another
+    // unit of the artifact still name the weak symbol, and the artifact linked
+    // beside an override runs the override in both (99), alone the body (77).
+    std::unordered_set<std::string> weakNamesHandedOn;   // "cu:symbol:name"
+    if (relocatableArtifact) {
+        for (auto const& m : modules) {
+            std::vector<dss::link::format::AtomName> names;
+            names.reserve(m.symbols.size());
+            for (auto const& s : m.symbols) {
+                names.push_back(dss::link::format::AtomName{s.symbol.v, s.binding, s.name});
+            }
+            std::vector<bool> const kept =
+                dss::link::format::weakNamesBesideAnotherExternalName(names);
+            for (std::size_t k = 0; k < kept.size(); ++k) {
+                if (!kept[k]) continue;
+                weakNamesHandedOn.insert(std::format("{}:{}:{}", m.cuId.v,
+                                                     m.symbols[k].symbol.v,
+                                                     m.symbols[k].name));
+            }
+        }
+    }
     image.resolvedCrossCuRefs.clear();
     for (auto const& m : modules) {
         for (auto const& ext : m.externImports) {
             if (ext.isPreemptionReference) continue;
             auto it = resolution.winners.find(ext.mangledName);
-            if (it != resolution.winners.end()) {
-                image.resolvedCrossCuRefs.push_back(LinkedImage::CrossCuRef{
-                    LinkedSymbolKey{m.cuId, ext.symbol}, it->second});
+            if (it == resolution.winners.end()) continue;
+            if (weakNamesHandedOn.contains(std::format("{}:{}:{}", it->second.cuId.v,
+                                                       it->second.symbol.v,
+                                                       ext.mangledName))) {
+                continue;   // handed on, by name
             }
+            image.resolvedCrossCuRefs.push_back(LinkedImage::CrossCuRef{
+                LinkedSymbolKey{m.cuId, ext.symbol}, it->second});
         }
     }
     // (3) Per-CU relocation resolution — every relocation target must resolve to a symbol
@@ -1268,7 +1373,8 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
     for (auto const& m : modules) {
         for (auto const& fn : m.functions) {
             for (auto const& rel : fn.relocations) {
-                if (!compoundIndex.contains(LinkedSymbolKey{m.cuId, rel.target})
+                if (rel.target.valid()   // the invalid id: `buildCompoundIndex` refused it
+                    && !compoundIndex.contains(LinkedSymbolKey{m.cuId, rel.target})
                     && !isWriterReservedSymbolIdValue(rel.target.v)) {
                     report(reporter, DiagnosticCode::K_SymbolUndefined,
                            DiagnosticSeverity::Error,
@@ -1290,7 +1396,8 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
         // runtime, exactly the class the function-reloc loop already guards.
         for (auto const& di : m.dataItems) {
             for (auto const& rel : di.relocations) {
-                if (!compoundIndex.contains(LinkedSymbolKey{m.cuId, rel.target})
+                if (rel.target.valid()   // the invalid id: `buildCompoundIndex` refused it
+                    && !compoundIndex.contains(LinkedSymbolKey{m.cuId, rel.target})
                     && !isWriterReservedSymbolIdValue(rel.target.v)) {
                     report(reporter, DiagnosticCode::K_SymbolUndefined,
                            DiagnosticSeverity::Error,
@@ -1500,6 +1607,18 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         // through, so either pick would bind half this CU's references to the wrong
         // body. That is precisely the "genuinely-unsupported merge interaction"
         // K_CrossCuMergeUnsupported is reserved for.
+        //
+        // ★ WHAT STILL REACHES IT
+        // (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME). An object
+        // reader no longer writes a reference made through a WEAK name against the
+        // atom: it keeps the NAME (THE WEAK-NAME RULE,
+        // `link/format/object_atom_coverage.hpp`), and each name binds to its own
+        // winner, which is what every reference linker does with this very shape and
+        // what this refusal used to stand in for. What still names the ATOM is a
+        // reference with no name to keep: a section-relative one into the body, a
+        // constructor or entry schedule, or a unit whose producer wrote its
+        // relocations against the body. For those the sentence above holds, and the
+        // refusal stands.
         //
         // ★ ONE DIAGNOSTIC PER ATOM — AND THAT NOW HOLDS FOR BOTH HALVES OF THE
         // WORD "once". The memoizing `remap.emplace` below short-circuits every
@@ -2160,8 +2279,12 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             bool const shadowed = isShadowedAtom(i, di.symbol);
             if (shadowed && !di.inputSection.has_value()) continue;  // shadowed global data — drop
             AssembledData out = di;
-            out.symbol = shadowed ? keptShadowedId()
-                                  : SymbolId{mergedIdFor(i, di.symbol)};
+            // An unlabelled item (the invalid id) stays one: it has no identity for
+            // the merge to renumber, and one merged id for every unlabelled item of
+            // a unit would make them one symbol.
+            out.symbol = shadowed              ? keptShadowedId()
+                         : di.symbol.valid()   ? SymbolId{mergedIdFor(i, di.symbol)}
+                                               : SymbolId{};
             remapUnit(i, out.inputSection);
             retargetRelocs(i, out.relocations);  // same chokepoint as the function path
             combined.dataItems.push_back(std::move(out));
@@ -2601,6 +2724,72 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     return false;
 }
 
+// ── A RELOCATABLE ARTIFACT'S COMMON OVER THE WEAK DEFINITIONS IT OUTRANKS
+//    (P69 send-back 5, review-xa4 NIT 15) ──────────────────────────────────
+// `ld -r` hands such a common ON, as a common: ✔MEASURED 2026-10-08, GNU ld
+// 2.42 — its ELF linker on x86_64 and aarch64 (and ld.lld 18.1.3), a gcc
+// `-fcommon` `int c;` beside `__attribute__((weak)) int c = 5;` in both orders,
+// and its PE linker on MinGW gcc 13.2's weak external: the artifact's `c` is the
+// COMMON (ELF: `GLOBAL DEFAULT COM`), which a later link allocates (the program
+// reads 0), replaces by a strong definition WITHOUT a duplicate (7), or folds
+// with a larger common (64 bytes). Where a common yields to any definition the
+// artifact holds the definition instead, as Apple's `ld -r` and GNU ld's PE
+// linker on a select-any definition do — the caller's `yieldedTo` arm.
+// So each weak definition of `name` in `out` gives the name up, and the common
+// row is left for the merge to carry:
+//   * a body whose ONLY name it is keeps its bytes under a module-private
+//     identity (`ld -r` keeps them too, unnamed), and the id every relocation of
+//     its unit names becomes a plain reference to the name — which the merge
+//     folds with the common (`mergeModules`: "a common folded with a plain
+//     reference of its name stays the common"), so that unit reads the common
+//     as every other unit does. The reference states what the body was, a datum
+//     or a function, thread-local or not, and the merge refuses a common it
+//     disagrees with by name;
+//   * a body that has another name too keeps it and loses only this one. A
+//     reference its unit wrote through the name is a plain reference row of the
+//     name already (THE WEAK-NAME RULE, `link/format/object_atom_coverage.hpp`:
+//     an object reader keeps such a relocation on the name), so it folds with
+//     the common exactly as the first bullet's does; a relocation that names
+//     the BODY stays on the body, which keeps its other name.
+// Until send-back 5 the artifact ALLOCATED the common here, strong: beside a
+// strong definition a later link saw two definitions of one name, and beside a
+// larger common an object too small for it.
+void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule>& out) {
+    for (auto& m : out) {
+        for (std::size_t r = m.symbols.size(); r-- > 0;) {
+            if (m.symbols[r].name != name || m.symbols[r].binding != SymbolBinding::Weak) continue;
+            SymbolId const id = m.symbols[r].symbol;
+            std::size_t names = 0;
+            for (auto const& row : m.symbols) names += row.symbol == id ? 1u : 0u;
+            m.symbols.erase(m.symbols.begin() + static_cast<std::ptrdiff_t>(r));
+            if (names != 1u) continue;   // the body keeps its other name
+            // A module-private identity for the body: the ONE taken-id scan's
+            // next id (`link/fresh_symbol_ids.hpp`). The module is mutated before
+            // the next mint, so each call returns a new one.
+            SymbolId const fresh{maxExistingSymbolIdV(m) + 1u};
+            ExternImport   ref;
+            ref.symbol      = id;
+            ref.mangledName = name;
+            for (auto& f : m.functions) {
+                if (f.symbol == id) f.symbol = fresh;
+            }
+            for (auto& d : m.dataItems) {
+                if (d.symbol != id) continue;
+                d.symbol          = fresh;
+                ref.isData        = true;
+                ref.isThreadLocal = d.section == DataSectionKind::Tdata
+                                    || d.section == DataSectionKind::Tbss;
+            }
+            // What names the BODY, not the name, follows the body.
+            for (auto& s : m.staticInitSchedule) {
+                if (s.symbol == id) s.symbol = fresh;
+            }
+            if (m.userEntrySymbol == id) m.userEntrySymbol = fresh;
+            m.externImports.push_back(std::move(ref));
+        }
+    }
+}
+
 // ── A COMMON SYMBOL'S STORAGE (P69,
 //    D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS) ───────────────────────────
 //
@@ -2634,10 +2823,11 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
 //     order) with the most constraining of their visibilities.
 // An IMAGE does this for every common. A RELOCATABLE artifact hands a common on
 // to its final linker — the merge folds two of one name (`mergeModules`) —
-// except where a unit of it defines the name: a definition the common yields to
-// still turns each common into a reference, and a WEAK one the common outranks
-// still loses, because one object cannot carry a common and a definition of one
-// name. Returns TRUE when no row is a common (`out` untouched).
+// and one object cannot carry a common and a definition of one name, so where a
+// unit of it defines the name one of the two goes: a definition the common
+// yields to still turns each common into a reference, and a WEAK one the common
+// outranks gives the NAME up (`handTheNameToTheCommon`). Returns TRUE when no
+// row is a common (`out` untouched).
 [[nodiscard]] bool allocateCommonDefinitions(std::span<AssembledModule const> modules,
                                              ObjectFormatSchema const&         format,
                                              std::vector<AssembledModule>&     out,
@@ -2706,11 +2896,16 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                                name, format.name()));
             return false;
         }
-        // Otherwise the common is allocated below and, being strong, outranks every
-        // weak definition of the name: ELF's answer, and on every format a weak
-        // definition whose own spelling yields to a common (a COFF weak external's
-        // body).
-        if (!image && !weakDefinitions.contains(name)) continue;   // the final linker's
+        // Otherwise the common outranks every weak definition of the name: ELF's
+        // answer, and on every format a weak definition whose own spelling yields
+        // to a common (a COFF weak external's body). An image allocates it below,
+        // and being strong it wins.
+        if (!image) {
+            // The final linker's to allocate: the artifact hands the common on,
+            // and each weak definition it outranks gives the name up.
+            if (weakDefinitions.contains(name)) handTheNameToTheCommon(name, out);
+            continue;
+        }
         CommonRow        winner     = rows.front();
         std::uint64_t    size       = 0;
         std::uint64_t    alignment  = 1;
@@ -3085,9 +3280,21 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // CU, resolve symbols, then pre-merge the resolved CUs into ONE combined module that
     // flows through the SAME single-CU emission path below (kind validation + walker).
     // N==1 uses the sole module directly (path unchanged).
-    AssembledModule mergedStorage;                 // populated only for N>1
+    AssembledModule mergedStorage;                 // populated only when the units are merged
     AssembledModule const* selectedInput = &modules[0];
-    if (modules.size() > 1) {
+    // ★★ THE WEAK-NAME RULE, the single unit's arm
+    // (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME). ONE unit that
+    // references one of its own external-linkage names BY NAME — an object reader
+    // states such a row for a relocation written through a weak name of a body
+    // that has another one (`link/format/object_atom_coverage.hpp`) — takes, in an
+    // IMAGE, the by-name resolution a link of several units takes: the merge of
+    // one, where the name's winner is the unit's own definition. A relocatable
+    // artifact of one unit merges nothing: its writer points the row at the
+    // name's own record.
+    bool const aLoneUnitNamesItsOwnDefinition =
+        modules.size() == 1 && objectFormatSchema.isImageFlavor()
+        && dss::link::format::namesADefinitionOfItsOwn(modules[0]);
+    if (modules.size() > 1 || aLoneUnitNamesItsOwnDefinition) {
         std::size_t const errsBeforeMerge = reporter.errorCount();
         // Per-CU validation (within-CU duplicate SymbolId + empty extern name) via
         // the same compound-key gate the single-CU path uses; cross-CU entries never
@@ -3099,7 +3306,9 @@ LinkedImage link(std::span<AssembledModule const> modules,
         for (auto const& m : modules) buildCompoundIndex(compoundIndex, m, reporter);
         // DEFINITION merge + weak-vs-strong (-> resolvedGlobalDefs) + REFERENCE
         // resolution (-> resolvedCrossCuRefs) + per-CU undefined-reloc check.
-        resolveCrossCuSymbols(modules, compoundIndex, image, reporter);
+        resolveCrossCuSymbols(modules, compoundIndex, image,
+                              /*relocatableArtifact=*/!objectFormatSchema.isImageFlavor(),
+                              reporter);
         // ★ P69 round 4: a reference and the definition it binds to must agree on
         // storage duration — refused BY NAME here, before the merge mints a slot for
         // it or a writer's CRIT-1 backstop meets it naming SymbolIds
@@ -3696,7 +3905,8 @@ LinkedImage link(std::span<AssembledModule const> modules,
             //       mints + binds; the writer defines it into symbolVa or
             //       fails loud, exactly like an extern import in (b)).
             // Anything else is a hard undefined.
-            if (!symbolIndex.contains(LinkedSymbolKey{module.cuId, reloc.target})
+            if (reloc.target.valid()   // the invalid id: `buildCompoundIndex` refused it
+                && !symbolIndex.contains(LinkedSymbolKey{module.cuId, reloc.target})
                 && !isWriterReservedSymbolIdValue(reloc.target.v)) {
                 std::string msg = "relocation in symbol #";
                 msg += std::to_string(fn.symbol.v);
@@ -3730,7 +3940,8 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // image flows through THIS single-CU path).
     for (auto const& di : module.dataItems) {
         for (auto const& reloc : di.relocations) {
-            if (!symbolIndex.contains(LinkedSymbolKey{module.cuId, reloc.target})
+            if (reloc.target.valid()   // the invalid id: `buildCompoundIndex` refused it
+                && !symbolIndex.contains(LinkedSymbolKey{module.cuId, reloc.target})
                 && !isWriterReservedSymbolIdValue(reloc.target.v)) {
                 std::string msg = "data-item relocation in symbol #";
                 msg += std::to_string(di.symbol.v);

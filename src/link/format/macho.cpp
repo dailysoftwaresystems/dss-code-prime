@@ -2038,6 +2038,32 @@ encode(AssembledModule const&    module,
     }
     if (hasBss && !registerDataSyms(bssLayout, IDX_BSS, bssAddr)) return {};
 
+    // THE WEAK-NAME RULE, this writer's arm
+    // (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME): a plain
+    // reference row naming one of this object's own external-linkage names gets
+    // no N_UNDF record. Its id is the nlist of the NAME, so a relocation written
+    // through a weak name names the `.weak_definition` symbol, as Apple's
+    // assembler writes it (✔MEASURED 2026-10-08: BR26 / X86_64_RELOC_BRANCH
+    // against `weak external _shared`). The emission below writes each canonical
+    // record followed by its aliases, in `definedAliases` order.
+    {
+        std::unordered_map<std::string, std::uint32_t> recordOfDefinedName;
+        auto const noteNamesOf = [&](SymbolId id) {
+            std::uint32_t const canonical = symIdxBySymbol.at(id);
+            if (objNames.definedBinding(id) != SymbolBinding::Local) {
+                recordOfDefinedName.emplace(objNames.definedName(id, "_sym_"), canonical);
+            }
+            std::uint32_t next = canonical + 1u;
+            for (ModuleSymbol const* alias : objNames.definedAliases(id)) {
+                recordOfDefinedName.emplace(alias->name, next++);
+            }
+        };
+        for (auto const& f : funcSyms) noteNamesOf(f.symId);
+        for (auto const& d : dataSyms) noteNamesOf(d.symId);
+        link::format::pointOwnNameReferencesAtTheirRecords(module, recordOfDefinedName,
+                                                           symIdxBySymbol);
+    }
+
     // Undefined externs: any reloc target that is neither a defined
     // function nor a defined data symbol. Scans DATA-ITEM relocations too
     // (the ELF c145 mirror) — a relro const table of libc function pointers

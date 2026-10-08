@@ -4728,6 +4728,9 @@ encode(AssembledModule const&    module,
         std::uint8_t  type  = 0;   // STT_FUNC / STT_OBJECT
     };
     std::vector<AliasSite> aliasSites;
+    // THE WEAK-NAME RULE's writer arm (`object_symbol_names.hpp`): the record
+    // each external-linkage name got, a canonical name's or an alias's.
+    std::unordered_map<std::string, std::uint32_t> recordOfDefinedName;
 
     // Emit one defined FUNCTION symbol (STT_FUNC, shndx=.text).
     //
@@ -4764,6 +4767,9 @@ encode(AssembledModule const&    module,
                   stvForVisibility(objNames.definedVisibility(f.symId)),
                   /*shndx=.text*/ 1, stValue, f.size);
         symIdxBySymbol.emplace(f.symId, idx);
+        if (objNames.definedBinding(f.symId) != SymbolBinding::Local) {
+            recordOfDefinedName.emplace(symName, idx);
+        }
         aliasSites.push_back({f.symId, /*shndx=*/1, stValue, f.size,
                               STT_FUNC});
     };
@@ -4812,6 +4818,7 @@ encode(AssembledModule const&    module,
                           sectionIdx, layout.itemOffsets[j],
                           di.sizeInSection());
                 symIdxBySymbol.emplace(di.symbol, idx);
+                if (bind != SymbolBinding::Local) recordOfDefinedName.emplace(symName, idx);
                 aliasSites.push_back({di.symbol, sectionIdx,
                                       layout.itemOffsets[j],
                                       di.sizeInSection(), STT_OBJECT});
@@ -4866,6 +4873,8 @@ encode(AssembledModule const&    module,
     for (auto const& site : aliasSites) {
         for (ModuleSymbol const* alias : objNames.definedAliases(site.symId)) {
             std::uint32_t const aliasNameOff = strtab.add(alias->name);
+            recordOfDefinedName.emplace(
+                alias->name, static_cast<std::uint32_t>(symtab.size() / 24));
             appendSym(aliasNameOff,
                       makeStInfo(stbForBinding(alias->binding), site.type),
                       stvForVisibility(alias->visibility),
@@ -4913,6 +4922,16 @@ encode(AssembledModule const&    module,
                       0, SHN_UNDEF, 0, 0);
             symIdxBySymbol.emplace(rel.target, idx);
         };
+        // THE WEAK-NAME RULE, this writer's arm
+        // (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME): a plain
+        // reference row naming one of this object's own external-linkage names
+        // gets no SHN_UNDEF record. Its id is the record of the NAME, so a
+        // relocation written through a weak name names the WEAK symbol, as gcc
+        // writes it and `ld -r` hands it on (✔MEASURED 2026-10-08, GNU ld 2.42:
+        // `R_X86_64_PLT32 shared` against `FUNC WEAK shared`). BEFORE the two
+        // loops below, which give every still-unmapped target a record.
+        link::format::pointOwnNameReferencesAtTheirRecords(module, recordOfDefinedName,
+                                                           symIdxBySymbol);
         // A COMMON row (P69, D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS) is a
         // DEFINITION handed on to the final linker, so it gets its record
         // whether or not a relocation names it: `SHN_COMMON`, the alignment in

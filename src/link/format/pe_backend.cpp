@@ -111,6 +111,7 @@ void readLinkerDirectives(nlohmann::json const&           block,
     }
     static constexpr std::array<std::string_view, 4> kBlockKeys{
         "section", "characteristics", "optionPrefixes", "directives"};
+    DSS_CHECK_KEY_VOCABULARY(kBlockKeys);
     ::dss::detail::rejectUnknownKeys(block, kBlockKeys, "the 'linkerDirectives' block",
         [&](std::string_view key, std::string message) {
             emit(std::format("{}/{}", kPath, key), std::move(message));
@@ -147,9 +148,13 @@ void readLinkerDirectives(nlohmann::json const&           block,
              "vocabulary of nothing would refuse every directive of every object");
         ok = false;
     } else {
-        static constexpr std::array<std::string_view, 9> kRowKeys{
+        static constexpr std::array<std::string_view, 12> kRowKeys{
             "option", "meaning", "reason", "subsystems", "unsupportedSubsystems", "minimumVersion",
-            "runtimeStartups", "unsupportedStartups", "runtimeSymbols"};
+            "runtimeStartups", "unsupportedStartups", "runtimeSymbols", "unitPrecedence",
+            "inSharedLibrary", "inSharedLibraryReason"};
+        // The declared extent against the initializer, at compile time: an extent one too large zero-fills and
+        // whitelists the empty key, and two lanes that each add a key merge to a wrong one without a marker.
+        DSS_CHECK_KEY_VOCABULARY(kRowKeys);
         auto const& rows = block.at("directives");
         for (std::size_t i = 0; i < rows.size(); ++i) {
             std::string const at = std::format("{}/directives/{}", kPath, i);
@@ -321,8 +326,103 @@ void readLinkerDirectives(nlohmann::json const&           block,
                 if (onlyOn("runtimeSymbols", LinkerDirectiveMeaning::IncludeSymbol)) {
                     readReasons("runtimeSymbols", row.runtimeSymbols);
                 }
+                // The two answers a row states about a request ONE LINK DECIDES
+                // ACROSS ITS UNITS (P69 send-back 5, review-xa4 MINOR 6): which
+                // unit's request stands when two state the option, and what a
+                // link that makes a shared library does with it. Each is this
+                // format's vendor linker's fact, so the row states it and the
+                // decision reads it. Such a row that states none is REFUSED --
+                // there is no precedence to fall back on -- and a row of any
+                // other meaning states neither (nothing would read it).
+                bool const acrossUnits = ::dss::pe::isDecidedAcrossUnits(*meaning);
+                auto const closedAnswer = [&](char const* key, auto const& table, auto& into,
+                                              std::string_view why) {
+                    if (!r.contains(key)) {
+                        if (acrossUnits) {
+                            emit(std::format("{}/{}", at, key),
+                                 std::format("option '{}' is '{}', which one link decides across its "
+                                             "units, and states no '{}' ({}): {}",
+                                             row.option, kLinkerDirectiveMeaningTable.name(*meaning),
+                                             key,
+                                             ::dss::detail::renderAllowedList(allNames(table), " / "),
+                                             why));
+                            ok = false;
+                        }
+                        return;
+                    }
+                    if (!acrossUnits) {
+                        emit(std::format("{}/{}", at, key),
+                             std::format("'{}' belongs to a row whose request one link decides across "
+                                         "its units; option '{}' is '{}', which nothing would read it "
+                                         "for",
+                                         key, row.option, kLinkerDirectiveMeaningTable.name(*meaning)));
+                        ok = false;
+                        return;
+                    }
+                    auto const answer = r.at(key).is_string()
+                                            ? table.fromName(r.at(key).get<std::string>())
+                                            : std::nullopt;
+                    if (!answer.has_value()) {
+                        emit(std::format("{}/{}", at, key),
+                             std::format("'{}' must be {}", key,
+                                         ::dss::detail::renderAllowedList(allNames(table), " / ")));
+                        ok = false;
+                        return;
+                    }
+                    into = *answer;
+                };
+                closedAnswer("unitPrecedence", kUnitRequestPrecedenceTable, row.unitPrecedence,
+                             "which unit's request stands when two units of one link state the "
+                             "option is the vendor linker's rule, and a link has none to assume");
+                closedAnswer("inSharedLibrary", kSharedLibraryDispositionTable, row.inSharedLibrary,
+                             "whether a link that makes a shared library takes the request, drops "
+                             "it or refuses it is the format's to say");
+                bool const excusedInSharedLibrary =
+                    row.inSharedLibrary.has_value()
+                    && *row.inSharedLibrary != SharedLibraryDisposition::Honoured;
+                if (r.contains("inSharedLibraryReason")) {
+                    auto const& why = r.at("inSharedLibraryReason");
+                    if (!why.is_string() || why.get<std::string>().empty()) {
+                        emit(at + "/inSharedLibraryReason",
+                             "'inSharedLibraryReason' must be a non-empty string");
+                        ok = false;
+                    } else if (!excusedInSharedLibrary) {
+                        emit(at + "/inSharedLibraryReason",
+                             std::format("option '{}' states an 'inSharedLibraryReason', which only a "
+                                         "row whose 'inSharedLibrary' is 'ignored' or 'refused' states",
+                                         row.option));
+                        ok = false;
+                    } else {
+                        row.inSharedLibraryReason = why.get<std::string>();
+                    }
+                } else if (excusedInSharedLibrary) {
+                    emit(at + "/inSharedLibraryReason",
+                         std::format("option '{}' is '{}' in a shared library and states no "
+                                     "'inSharedLibraryReason': say why dropping or refusing the "
+                                     "request there is right",
+                                     row.option,
+                                     kSharedLibraryDispositionTable.name(*row.inSharedLibrary)));
+                    ok = false;
+                }
             }
             out.directives.push_back(std::move(row));
+        }
+        // Two options of ONE meaning are one request to the link, which settles
+        // them against each other: they cannot state two answers.
+        for (std::size_t a = 0; a < out.directives.size(); ++a) {
+            for (std::size_t b = a + 1; b < out.directives.size(); ++b) {
+                auto const& x = out.directives[a];
+                auto const& y = out.directives[b];
+                if (x.meaning != y.meaning || !::dss::pe::isDecidedAcrossUnits(x.meaning)) continue;
+                if (x.unitPrecedence != y.unitPrecedence || x.inSharedLibrary != y.inSharedLibrary) {
+                    emit(std::format("{}/directives/{}", kPath, b),
+                         std::format("options '{}' and '{}' both mean '{}' and state different "
+                                     "'unitPrecedence' or 'inSharedLibrary': one link settles their "
+                                     "requests against each other, by one answer",
+                                     x.option, y.option, kLinkerDirectiveMeaningTable.name(x.meaning)));
+                    ok = false;
+                }
+            }
         }
     }
     if (ok) data.pe.linkerDirectives = std::move(out);
@@ -523,6 +623,7 @@ public:
                 // clean and left the field it names at its default.
                 static constexpr std::array<std::string_view, 4> kPeBlockKeys{
                     "machine", "characteristics", "type", "linkerDirectives"};
+                DSS_CHECK_KEY_VOCABULARY(kPeBlockKeys);
                 ::dss::detail::rejectUnknownKeys(
                     p, kPeBlockKeys, "the 'pe' block",
                     [&](std::string_view key, std::string message) {
@@ -574,6 +675,7 @@ public:
                     "majorSubsystemVersion", "minorSubsystemVersion", "subsystem",
                     "dllCharacteristics", "sizeOfStackReserve", "sizeOfStackCommit",
                     "sizeOfHeapReserve", "sizeOfHeapCommit", "attributeCertReserveSize"};
+                DSS_CHECK_KEY_VOCABULARY(kOptionalHeaderKeys);
                 ::dss::detail::rejectUnknownKeys(
                     oh, kOptionalHeaderKeys, "the 'optionalHeader' block",
                     [&](std::string_view key, std::string message) {

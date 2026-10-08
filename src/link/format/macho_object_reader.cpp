@@ -1,7 +1,9 @@
 #include "link/format/macho_object_reader.hpp"
 #include "link/format/dwarf_cfi_decode.hpp"
 #include "link/format/foreign_section_alignment.hpp"
+#include "link/format/macho_relocation_info.hpp"
 #include "link/format/object_atom_coverage.hpp"
+#include "link/format/record_symbol_ids.hpp"
 #include "link/format/object_format_backends.hpp"
 #include "link/format/relocation_addend.hpp"
 #include "link/format/section_relative_target.hpp"
@@ -134,14 +136,10 @@ static_assert(kNDescAltEntry != kNDescNoDeadStrip,
 constexpr std::uint32_t kSectTypeMask = 0x000000FFu;
 constexpr std::uint32_t kSZerofill    = 1;
 
-// relocation_info.r_info bit layout (LSB): r_symbolnum bits 0..23,
-// r_pcrel bit 24, r_length bits 25..26, r_extern bit 27, r_type bits
-// 28..31. The PACKED nativeId the format schema stores is
-// (r_type<<28)|(r_length<<25)|(r_pcrel<<24) -- everything EXCEPT the
-// walker-owned r_extern (bit 27) and r_symbolnum (bits 0..23).
-constexpr std::uint32_t kRInfoSymbolnumMask = 0x00FFFFFFu;
-constexpr std::uint32_t kRInfoExternBit     = 1u << 27;
-constexpr std::uint32_t kRInfoNativeIdMask  = 0xF7000000u;
+// relocation_info.r_info: its bit layout, and the PACKED nativeId a format
+// document stores, are `macho_relocation_info.hpp`'s (`kRInfo*`,
+// `relocationFieldBytes`) -- one home, shared with the backend's load-time
+// rules for the ids a document declares.
 
 // ── THE "EXTERN IS A FUNCTION" SIGNAL IS DECLARED, NOT DERIVED ──────────
 //
@@ -605,7 +603,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     }
     auto const& callSignalNativeIds = decode->callSignalNativeIds;
 
-    // -- (5) Decode every nlist_64; assign SymbolId = symtab index ---
+    // -- (5) Decode every nlist_64 ---------------------------------------
+    // A record's id is `symbolIds.of(its index)` — THE ONE RULE
+    // (`record_symbol_ids.hpp`): the index, and for record 0, whose index is the
+    // invalid id, the first id past the table. Everything this reader keys by a
+    // symbol below is keyed by the record INDEX; an id is made where a value
+    // enters the module.
+    link::format::RecordSymbolIds symbolIds{nsyms};
     std::vector<Nlist> syms(nsyms);
     for (std::uint32_t i = 0; i < nsyms; ++i) {
         std::size_t const so = static_cast<std::size_t>(*symoff)
@@ -676,7 +680,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 while (alignment < s.value && alignment < (std::uint64_t{1} << 15)) alignment <<= 1;
             }
             ExternImport common;
-            common.symbol           = SymbolId{i};
+            common.symbol           = symbolIds.of(i);
             common.mangledName      = s.name;
             common.isData           = true;
             common.binding          = SymbolBinding::Global;
@@ -692,7 +696,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // UND slot (index 0 / padding) carries no import identity.
             if (s.name.empty()) continue;
             ExternImport ext;
-            ext.symbol      = SymbolId{i};
+            ext.symbol      = symbolIds.of(i);
             ext.mangledName = s.name;
             // Mach-O nlist carries NO type hint (no STT_FUNC), so the object
             // states the kind only by a CALL: a BRANCH-class reloc makes the
@@ -726,7 +730,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // ModuleSymbol so a reloc target still resolves by identity (the
             // reserved-index analog of the ELF reader's SHN_ABS handling).
             if (!s.name.empty()) {
-                mod.symbols.push_back(ModuleSymbol{SymbolId{i}, s.name,
+                mod.symbols.push_back(ModuleSymbol{symbolIds.of(i), s.name,
                     isExt ? SymbolBinding::Global : SymbolBinding::Local,
                     machoVisibility(s.type)});
             }
@@ -876,7 +880,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // a silent wrong address. Kept module-private, a sibling reference
             // instead fails loud (`K_SymbolUndefined`, nothing declares it),
             // which is the correct posture until the interior-VA follow-up lands.
-            mod.symbols.push_back(ModuleSymbol{SymbolId{i}, s.name,
+            mod.symbols.push_back(ModuleSymbol{symbolIds.of(i), s.name,
                 SymbolBinding::Local, machoVisibility(s.type)});
             // ...and STAGE it for the coverage guard
             // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
@@ -932,7 +936,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // A geometry-promoted symbol already has its ModuleSymbol from the
         // classification loop (see `DefSym::moduleSymbolAlreadyPushed`).
         if (!d.name.empty() && !d.moduleSymbolAlreadyPushed) {
-            mod.symbols.push_back(ModuleSymbol{SymbolId{d.symIdx}, d.name,
+            mod.symbols.push_back(ModuleSymbol{symbolIds.of(d.symIdx), d.name,
                                                d.binding, d.visibility});
         }
     };
@@ -1051,6 +1055,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // (`atomEndFor`), so equal-offset candidates get equal extents by
     // construction and the conflicting-extent refusal cannot fire here.
     std::unordered_map<std::uint32_t, std::uint32_t> atomOwnerBySym;
+    // The names a relocation KEEPS instead of the atom this pass gives it: THE
+    // WEAK-NAME RULE (`object_atom_coverage.hpp`), decided on the alias sets
+    // here and read by the relocation pass.
+    link::format::WeakNameReferences weakNames;
     {
         std::vector<link::format::AtomStartCandidate> candidates;
         for (auto const& [ordinal, defs] : defsBySection) {
@@ -1074,6 +1082,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 atomOwnerBySym.emplace(candidates[i].symbolId, owner[i]);
             }
         }
+        weakNames.decideFrom(candidates, owner, symbolIds);
     }
     // The atom identity a symbol resolves to: itself unless it aliases another.
     // Consulted at BOTH sites that need it -- the slicing loop (does this
@@ -1088,6 +1097,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // id -> row lookup over `AssembledModule::symbols` keeps the FIRST row for
     // an id, so the canonical name must be recorded before any alias of it.
     std::vector<ModuleSymbol> aliasRows;
+    // The records that OWN a reconstructed body, by record index — filled where
+    // each atom is cut. The relocation pass asks it of a target (step 7).
+    std::unordered_set<std::uint32_t> atomSymIdx;
 
     // Slice each section's atoms by SORTED n_value. What reached
     // `defsBySection` is every defined symbol that STARTS A BODY: the wire's
@@ -1126,13 +1138,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     // already pushed carries the WRONG id and retargeting it is
                     // the correct repair, not skipping it.
                     for (auto& ms : mod.symbols) {
-                        if (ms.symbol == SymbolId{defs[k].symIdx}) {
-                            ms.symbol = SymbolId{owner};
+                        if (ms.symbol == symbolIds.of(defs[k].symIdx)) {
+                            ms.symbol = symbolIds.of(owner);
                             break;
                         }
                     }
                 } else if (!defs[k].name.empty()) {
-                    aliasRows.push_back(ModuleSymbol{SymbolId{owner}, defs[k].name,
+                    aliasRows.push_back(ModuleSymbol{symbolIds.of(owner), defs[k].name,
                                                      defs[k].binding,
                                                      defs[k].visibility});
                 }
@@ -1155,12 +1167,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 std::size_t const bodyOff =
                     static_cast<std::size_t>(sec.offset + off);
                 AssembledFunction fn;
-                fn.symbol = SymbolId{defs[k].symIdx};
+                fn.symbol = symbolIds.of(defs[k].symIdx);
                 fn.bytes.assign(bytes.begin() + bodyOff,
                                 bytes.begin() + bodyOff + static_cast<std::size_t>(len));
                 fn.inputSection = sliceOf(ordinal, off);
                 funcIntervalsBySec[ordinal].push_back(
                     Interval{off, len, mod.functions.size()});
+                atomSymIdx.insert(defs[k].symIdx);
                 mod.functions.push_back(std::move(fn));
                 pushModuleSym(defs[k]);
                 continue;
@@ -1184,7 +1197,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // slice their bytes; zero-fill (bss) reserves the size with empty
             // bytes (the reservedSize invariant).
             AssembledData di;
-            di.symbol    = SymbolId{defs[k].symIdx};
+            di.symbol    = symbolIds.of(defs[k].symIdx);
             di.section   = *dk;
             di.alignment = alignFromLog2(sec.align);
             di.inputSection = sliceOf(ordinal, off);
@@ -1208,6 +1221,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
             dataIntervalsBySec[ordinal].push_back(
                 Interval{off, len, mod.dataItems.size()});
+            atomSymIdx.insert(defs[k].symIdx);
             mod.dataItems.push_back(std::move(di));
             pushModuleSym(defs[k]);
         }
@@ -1255,12 +1269,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // follow-up) is skipped; DSS output has none. A per-entry miss WITHIN a
     // reconstructed section still fails loud (never silently drop a reloc).
     //
-    // The symbols that OWN a reconstructed body. A relocation target defined in
-    // a section that is NOT one of them names an OFFSET in that section rather
-    // than an identity the merge can bind -- the rebind in the loop below.
-    std::unordered_set<std::uint32_t> atomSymIdx;
-    for (auto const& f : mod.functions) atomSymIdx.insert(f.symbol.v);
-    for (auto const& d : mod.dataItems) atomSymIdx.insert(d.symbol.v);
+    // A relocation target defined in a section that is NOT one of the records
+    // that own a reconstructed body (`atomSymIdx`, filled by the slicing loop)
+    // names an OFFSET in that section rather than an identity the merge can
+    // bind -- the rebind in the loop below.
     auto findInterval = [](std::vector<Interval> const& ivs, std::uint64_t off)
         -> Interval const* {
         for (auto const& iv : ivs) {
@@ -1289,10 +1301,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // and whatever a COMPACT-encoded section still fails to carry is stated
         // once, at full volume, by step (8) below; repeating it per relocation
         // would bury it. ⚠ A DWARF-ENCODED unwind section is a DIFFERENT
-        // case and step (8) REFUSES it here rather than reaching this arm: its
-        // FDE binding reads the pcrel value STORED in the field, so a relocation
-        // this reader skipped would mean the stored value is only half the
-        // reference and every bound function could be the wrong one. ⚠ THE TEST IS THE KIND, NEVER THE NAME, and never `nreloc == 0`:
+        // case: its FDE binding reads the pcrel value STORED in the field, so a
+        // relocation this reader skipped would mean the stored value is only
+        // half the reference and every bound function could be the wrong one.
+        // Its relocations are therefore not skipped but APPLIED, by step (8)
+        // itself on a copy of the section before the decoder runs (the
+        // difference pairs a relocatable link leaves there), and any other
+        // relocation there is refused by name. ⚠ THE TEST IS THE KIND, NEVER THE NAME, and never `nreloc == 0`:
         // an UNCLASSIFIED reloc-bearing section still falls through to the
         // refusal below, which is what keeps an unknown foreign section loud.
         if (sec.kind.has_value()
@@ -1452,7 +1467,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // index. The addend needs no adjustment: an alias shares its owner's
             // offset exactly, so the same S makes the same address.
             std::uint32_t const targetIdx = ownerOf(rSymNum);
-            SymbolId     relTarget = SymbolId{targetIdx};
+            SymbolId     relTarget = symbolIds.of(targetIdx);
             std::int64_t relAddend = addend;
 
             // SECTION-RELATIVE: a target DEFINED in a section that owns no body
@@ -1505,6 +1520,19 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 relAddend = bound->residual;
             }
 
+            // THE WEAK-NAME RULE (`object_atom_coverage.hpp`): a relocation
+            // written through a WEAK name of a body that has another external
+            // name keeps the NAME -- a plain reference row the link resolves by
+            // name, to an override where one is linked and to this very body
+            // otherwise -- instead of the atom (6.44) chose for it. The addend
+            // is the name's own: the name sits at the atom's start.
+            if (auto const weakName = weakNames.referenceFor(rSymNum, symbolIds)) {
+                if (weakName->fresh) {
+                    mod.externImports.push_back(
+                        link::format::referenceRowOfAWeakName(*weakName, mod.dataItems));
+                }
+                relTarget = weakName->id;
+            }
             Relocation rel;
             rel.offset = static_cast<std::uint32_t>(rAddress - iv->start);
             rel.target = relTarget;
@@ -1600,6 +1628,195 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 && sec.size != 0u;   // nothing described, nothing to say
         };
 
+        // ── THE RELOCATIONS OF A DWARF CALL-FRAME SECTION ARE DIFFERENCE PAIRS ──
+        //
+        // P69, D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ. Applies
+        // every relocation of `sec` to `frame`, a COPY of the section's bytes,
+        // so the decoder below reads what a compiler's object holds. The one
+        // shape applied is the pair the format document declares
+        // (`MachODifferenceRelocation`): a SUBTRAHEND entry, then at the same
+        // address the MINUEND entry, both naming symbols this object DEFINES —
+        //     field = minuend's address - subtrahend's address + the addend the field stores
+        // computed in the object's own flat address space, the space the FDE
+        // binding works in. The arithmetic is the linker's own, so nothing here
+        // assumes what the two labels mark (✔MEASURED: in a relocatable link's
+        // product `func.eh - EH_Frame1 + 4` is the FDE's CIE pointer and
+        // `<function> - func.eh - 8` its pc-begin; in an arm64 compiler's own
+        // object `<function> - <the section's start label> - <field offset>` is
+        // the pc-begin). Nor does it assume the table's ORDER beyond a pair's
+        // own two entries: the arm64 compiler writes the later record first.
+        // Everything else is REFUSED BY NAME: an entry that starts no declared
+        // pair, a pair split across addresses, a section-number entry
+        // (r_extern=0), a symbol this object does not define — the difference
+        // of addresses in two objects is no constant of this one — two pairs on
+        // one field, a value the field cannot hold. False = already reported.
+        auto applyUnwindDifferencePairs =
+            [&](Section const& sec, std::string const& where,
+                std::vector<std::uint8_t>& frame) -> bool {
+            auto refuse = [&](DiagnosticCode code, std::string detail) -> bool {
+                report(reporter, code, DiagnosticSeverity::Error,
+                       "macho::readRelocatableObject: unwind section '" + where
+                       + "' " + std::move(detail));
+                return false;
+            };
+            auto const& declared = objectFormatSchema.macho().differenceRelocations;
+            // (The relocation table lies within the file: checked where the
+            // section's header was read.)
+            struct Entry {
+                std::uint64_t address  = 0;
+                std::uint32_t nativeId = 0;
+                std::uint32_t symNum   = 0;
+                bool          isExtern = false;
+            };
+            auto entryAt = [&](std::uint32_t e) -> Entry {
+                std::size_t const ro = static_cast<std::size_t>(sec.reloff)
+                                     + static_cast<std::size_t>(e) * kRelocInfoSz;
+                std::uint32_t const rInfo = rdU32(bytes, ro + 4);
+                return Entry{rdU32(bytes, ro + 0), rInfo & kRInfoNativeIdMask,
+                             rInfo & kRInfoSymbolnumMask,
+                             (rInfo & kRInfoExternBit) != 0u};
+            };
+            // The flat address of a symbol this object DEFINES in a section.
+            auto definedAddress =
+                [&](std::uint32_t symNum) -> std::optional<std::uint64_t> {
+                if (symNum >= nsyms) return std::nullopt;
+                Nlist const& s = syms[symNum];
+                bool const inASection =
+                    (s.type & kNStabMask) == 0u
+                    && (s.type & kNTypeMask) == kNTypeSect && s.sect >= 1u
+                    && static_cast<std::size_t>(s.sect) <= sections.size();
+                if (!inASection) return std::nullopt;
+                return s.value;
+            };
+            auto symbolText = [&](std::uint32_t symNum) -> std::string {
+                if (symNum >= nsyms) {
+                    return "symbol #" + std::to_string(symNum)
+                         + ", which is past the symbol table";
+                }
+                return "'" + syms[symNum].name + "' (symbol #"
+                     + std::to_string(symNum) + ")";
+            };
+            std::unordered_set<std::uint64_t> patched;
+            for (std::uint32_t e = 0; e < sec.nreloc; e += 2u) {
+                Entry const sub = entryAt(e);
+                auto const pair = std::find_if(
+                    declared.begin(), declared.end(),
+                    [&](MachODifferenceRelocation const& d) {
+                        return d.subtrahendNativeId == sub.nativeId;
+                    });
+                if (pair == declared.end()) {
+                    return refuse(DiagnosticCode::F_UnsupportedBinaryFormat,
+                        "carries relocation #" + std::to_string(e) + " (wire type "
+                        + std::to_string(sub.nativeId) + " at section offset "
+                        + std::to_string(sub.address)
+                        + "), which is not the subtrahend of a difference pair "
+                          "Mach-O format '" + std::string{objectFormatSchema.name()}
+                        + "' declares (`macho.differenceRelocations`). The one "
+                          "relocation shape this reader applies to DWARF "
+                          "call-frame information is that pair -- a symbol to "
+                          "subtract, then at the same address the symbol it is "
+                          "subtracted from -- which is what a relocatable link "
+                          "(`ld -r`) and an arm64 compiler leave there; a "
+                          "reference of any other shape (a personality routine "
+                          "or a language-specific data area reached through "
+                          "another object) is not carried.");
+                }
+                if (e + 1u >= sec.nreloc) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
+                        "ends on the subtrahend of a difference pair (relocation #"
+                        + std::to_string(e) + " at section offset "
+                        + std::to_string(sub.address)
+                        + "): the minuend that must follow it is missing.");
+                }
+                Entry const min = entryAt(e + 1u);
+                if (min.nativeId != pair->minuendNativeId
+                    || min.address != sub.address) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
+                        "carries the subtrahend of a difference pair at section "
+                        "offset " + std::to_string(sub.address) + " (relocation #"
+                        + std::to_string(e) + ") followed by wire type "
+                        + std::to_string(min.nativeId) + " at section offset "
+                        + std::to_string(min.address)
+                        + ", where the format declares its minuend as wire type "
+                        + std::to_string(pair->minuendNativeId)
+                        + " at the same offset.");
+                }
+                if (!sub.isExtern || !min.isExtern) {
+                    return refuse(DiagnosticCode::F_UnsupportedBinaryFormat,
+                        "carries a difference pair at section offset "
+                        + std::to_string(sub.address) + " whose "
+                        + std::string{!sub.isExtern ? "subtrahend" : "minuend"}
+                        + " names a SECTION rather than a symbol (r_extern=0); "
+                          "this reader applies the pair only between two "
+                          "symbols.");
+                }
+                auto const subAddr = definedAddress(sub.symNum);
+                auto const minAddr = definedAddress(min.symNum);
+                if (!subAddr.has_value() || !minAddr.has_value()) {
+                    return refuse(DiagnosticCode::F_UnsupportedBinaryFormat,
+                        "carries a difference pair at section offset "
+                        + std::to_string(sub.address) + " that names "
+                        + symbolText(!subAddr.has_value() ? sub.symNum : min.symNum)
+                        + ", which this object does not define in one of its "
+                          "sections; the difference of two addresses is a "
+                          "constant this reader can state only when both are "
+                          "this object's own.");
+                }
+                // The field's width is the entries' own (`r_length`), which the
+                // matched wire id carries; the loader holds a pair's two ids
+                // to one width.
+                std::uint64_t const width =
+                    relocationFieldBytes(pair->subtrahendNativeId);
+                if (rangeExceedsBuffer(sub.address, width, frame.size())) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
+                        "carries a difference pair whose " + std::to_string(width)
+                        + "-byte field at section offset "
+                        + std::to_string(sub.address) + " runs past the section.");
+                }
+                if (!patched.insert(sub.address).second) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
+                        "carries two difference pairs on the field at section "
+                        "offset " + std::to_string(sub.address) + ".");
+                }
+                // The addend the field stores, sign-extended; then the pair,
+                // modulo 2^64 as the linker computes it.
+                std::uint64_t stored = 0;
+                for (std::uint64_t b = 0; b < width; ++b) {
+                    stored |= static_cast<std::uint64_t>(
+                                  frame[static_cast<std::size_t>(sub.address + b)])
+                              << (8u * b);
+                }
+                if (width < 8u
+                    && (stored & (std::uint64_t{1} << (8u * width - 1u))) != 0u) {
+                    stored |= ~std::uint64_t{0} << (8u * width);
+                }
+                std::uint64_t const value = *minAddr - *subAddr + stored;
+                if (width < 8u) {
+                    // A field narrower than the address is read by the decoder
+                    // as a signed OR an unsigned quantity (a pc-relative
+                    // displacement, a distance back to the CIE): it must hold
+                    // the value under one of the two readings.
+                    std::int64_t const asSigned = static_cast<std::int64_t>(value);
+                    std::int64_t const lowest =
+                        -(std::int64_t{1} << (8u * width - 1u));
+                    std::int64_t const highest =
+                        (std::int64_t{1} << (8u * width)) - 1;
+                    if (asSigned < lowest || asSigned > highest) {
+                        return refuse(DiagnosticCode::F_CorruptedBinary,
+                            "carries a difference pair at section offset "
+                            + std::to_string(sub.address) + " that resolves to "
+                            + std::to_string(asSigned) + ", which its "
+                            + std::to_string(width) + "-byte field cannot hold.");
+                    }
+                }
+                for (std::uint64_t b = 0; b < width; ++b) {
+                    frame[static_cast<std::size_t>(sub.address + b)] =
+                        static_cast<std::uint8_t>(value >> (8u * b));
+                }
+            }
+            return true;
+        };
+
         // ── PASS ONE: EVERY ENCODING THIS READER CAN CARRY ────────────────
         //
         // ⚠⚠ THE TWO PASSES ARE ORDERED, AND THE ORDER IS THE WHOLE POINT --
@@ -1654,35 +1871,65 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + "', which this reader has no decoder for. Refusing rather "
                       "than reading it as DWARF.");
             }
-            // ⚠ NO RELOCATIONS, AND THAT IS CHECKED RATHER THAN ASSUMED.
-            // ✔MEASURED (Apple clang, both the fixture and a fresh `cc -arch
-            // x86_64 -c`): `__TEXT,__eh_frame` has nreloc 0 -- the FDE's
-            // `initial_location` is a pcrel DELTA resolved inside the object's
-            // own flat address space, which is the OPPOSITE of the ELF
-            // relocatable convention where that field is zero and a relocation
-            // carries the whole reference. So the binding below reads the
-            // STORED value, and a relocation nobody applied would make that
-            // value half of a reference -- binding every FDE to a wrong
-            // function while reporting success.
-            if (sec.nreloc != 0u) {
-                return fail(DiagnosticCode::F_CorruptedBinary,
-                    "macho::readRelocatableObject: unwind section '" + where
-                    + "' carries " + std::to_string(sec.nreloc)
-                    + " relocation(s). A DWARF call-frame section in a Mach-O "
-                      "relocatable resolves each FDE's `initial_location` as a "
-                      "pc-relative delta within the object's own address space "
-                      "and carries none; a relocation here means the stored "
-                      "delta is only part of the reference, and binding on it "
-                      "would attach unwind rules to the wrong functions.");
-            }
+            // ⚠ THE STORED VALUE IS THE WHOLE REFERENCE ONLY WHERE NO
+            // RELOCATION COMPLETES IT, and which of the two an object is is
+            // READ from it, never assumed. ✔MEASURED on a COMPILER's object
+            // (Apple clang, both the fixture and a fresh `cc -arch x86_64 -c`):
+            // `__TEXT,__eh_frame` has nreloc 0 -- the FDE's `initial_location`
+            // is a pcrel DELTA resolved inside the object's own flat address
+            // space, which is the OPPOSITE of the ELF relocatable convention
+            // where that field is zero and a relocation carries the whole
+            // reference. So the binding below reads the STORED value.
+            //
+            // ⚠ A LINKER's relocatable product is NOT that shape (P69,
+            // D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ: until it
+            // this arm refused every relocation-bearing call-frame section,
+            // and with it an object Apple's ld links into a program that
+            // runs). ✔MEASURED 2026-10-08 (Apple clang 21.0.0 with ld-1267,
+            // and the same with `-ld_classic`; one- and two-function units;
+            // with and without `-x`): `ld -r` of an x86_64 unit writes FOUR
+            // relocations per FDE here -- two (SUBTRACTOR, UNSIGNED) pairs, all
+            // extern: `func.eh - EH_Frame1` on the FDE's CIE-pointer field and
+            // `<function> - func.eh` on its pc-begin field -- and stores only
+            // the ADDENDS (4 and -8), beside local symbols `EH_Frame1` and one
+            // `func.eh` per FDE, which the symbol loop never publishes (they
+            // are defined in a section that carries no linkable body). The
+            // stored value really is half of a reference there: Apple's own
+            // `dwarfdump --eh-frame` cannot read that section either, because
+            // it applies no relocation. So the pairs are APPLIED -- on a COPY
+            // of the section, in the object's own address space -- which hands
+            // the decoder exactly the bytes a compiler's object holds; which
+            // entries form a pair is the format document's
+            // (`macho.differenceRelocations`), and any other relocation in the
+            // section is refused by name (`applyUnwindDifferencePairs`).
+            //
+            // ⚠ AND AN arm64 COMPILER's OWN OBJECT IS NOT THE x86_64 SHAPE
+            // EITHER (P69, D-LK-MACHO-ARM64-EH-FRAME-SECTION-REFUSED-AT-READ).
+            // ✔MEASURED 2026-10-08, Apple clang 21.0.0: where an arm64 object
+            // carries the section at all -- for a function whose frame the
+            // compact encoding cannot describe, which
+            // `-fasynchronous-unwind-tables` makes of any function with an
+            // epilogue -- each FDE's pc-begin is ALREADY one such pair
+            // (`<function>` minus the section's start label) and only the
+            // CIE pointer is stored resolved. The same arm completes it.
             if (rangeExceedsBuffer(sec.offset, sec.size, bytes.size())) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "macho::readRelocatableObject: unwind section '" + where
                     + "' body runs past the end of the file.");
             }
+            std::span<std::uint8_t const> frameBytes = bytes.subspan(
+                static_cast<std::size_t>(sec.offset),
+                static_cast<std::size_t>(sec.size));
+            std::vector<std::uint8_t> resolvedFrameBytes;
+            if (sec.nreloc != 0u) {
+                resolvedFrameBytes.assign(frameBytes.begin(), frameBytes.end());
+                if (!applyUnwindDifferencePairs(sec, where, resolvedFrameBytes)) {
+                    return std::nullopt;   // already reported
+                }
+                frameBytes = resolvedFrameBytes;
+            }
             auto const decoded = link::format::decodeEhFrame(
-                bytes.subspan(static_cast<std::size_t>(sec.offset),
-                              static_cast<std::size_t>(sec.size)),
+                frameBytes,
                 link::format::dwarfRegisterMappingOf(targetSchema),
                 "macho::readRelocatableObject", reporter);
             if (!decoded.has_value()) return std::nullopt;  // already reported

@@ -53,10 +53,12 @@
 #include "core/types/target_schema.hpp"
 #include "link/format/macho.hpp"
 #include "link/format/macho_object_reader.hpp"
+#include "link/linker.hpp"   // the image half of the call-frame pins
 #include "link/object_format_schema.hpp"
 
 #include "clang_macho_equal_offset_label_object.inc"
 #include "clang_macho_subsections_object.inc"
+#include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "repo_root.hpp"   // the ONE test-side repo/config-root resolver
 
 #include <gtest/gtest.h>
@@ -69,6 +71,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1760,4 +1763,798 @@ TEST(MachOObjectReader, DeclaredSectionAlignmentSurvivesTheRoundTrip) {
     EXPECT_NE(rWide->alignment.bytes(), rNarrow->alignment.bytes())
         << "a reader answering one constant for every section would satisfy "
            "either assertion above on its own";
+}
+
+// ============ MachoUnwindRelocations =================================
+// THE DWARF CALL-FRAME SECTION WHOSE REFERENCES ARE RELOCATION PAIRS (P69)
+//   D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ
+//   D-LK-MACHO-ARM64-EH-FRAME-SECTION-REFUSED-AT-READ
+//
+// A compiler's x86_64 Mach-O object stores each reference of `__TEXT,__eh_frame`
+// RESOLVED and carries no relocation there. Two other producers do not:
+//   * a relocatable link (`ld -r`), on BOTH ISAs, keeps every such reference as
+//     a PAIR of relocations -- the symbol to subtract, then at the same address
+//     the symbol it is subtracted from -- and stores only the addend;
+//   * an arm64 COMPILER's own object, where it carries the section at all,
+//     already keeps each record's function address as one such pair.
+// The reader refused the first by name and the second as "corrupted" (the arm64
+// documents had no row for the section); it now classifies the section on both
+// ISAs and applies the pairs its format document declares
+// (`macho.differenceRelocations`) on a copy of the section before it decodes.
+//
+// THE FIXTURES are Apple's own bytes: `tests/link/data/relinked_unwind.source.c`
+// carries their source, the commands and the toolchain. The object AS COMPILED
+// is the CONTROL of every pin -- the relinked object must read EXACTLY as it
+// does -- so these pins run on every host; what DSS's programs of such objects
+// exit with is measured where Apple's tools run (`RecordSymbolIdsNative`, and
+// the example `examples/c/macho_relinked_object_call_frames`).
+// =====================================================================
+
+namespace {
+
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::countWithMessage;
+using dss::link_format::test::rejectSummary;
+
+[[nodiscard]] std::vector<std::uint8_t> unwindFixture(char const* name) {
+    auto const path = dss::test::repoRoot() / "tests" / "link" / "data" / name;
+    std::ifstream in{path, std::ios::binary};
+    if (!in.good()) {
+        ADD_FAILURE() << "cannot open " << path.string();
+        return {};
+    }
+    std::string const raw{std::istreambuf_iterator<char>{in},
+                          std::istreambuf_iterator<char>{}};
+    return std::vector<std::uint8_t>(raw.begin(), raw.end());
+}
+
+[[nodiscard]] std::string shippedFormatText(char const* stem) {
+    auto const root = dss::test::findConfigRoot();
+    if (!root.has_value()) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
+        return {};
+    }
+    std::ifstream in{*root / "object-formats" / (std::string{stem} + ".format.json"),
+                     std::ios::binary};
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+void wr32(std::vector<std::uint8_t>& b, std::size_t o, std::uint32_t v) {
+    for (std::size_t k = 0; k < 4; ++k) {
+        b[o + k] = static_cast<std::uint8_t>(v >> (8u * k));
+    }
+}
+
+// Where `__TEXT,__eh_frame`'s record, bytes and relocation table sit in an
+// MH_OBJECT, and where its symbol table is -- found by walking the load
+// commands, since these are a reference toolchain's layouts, not DSS's.
+struct UnwindLayout {
+    bool          found      = false;
+    std::size_t   recordOff  = 0;   // the section_64 record
+    std::size_t   bodyOff    = 0;
+    std::size_t   bodySize   = 0;
+    std::size_t   relocOff   = 0;
+    std::uint32_t relocCount = 0;
+    SymtabLoc     symtab{0, 0, 0};
+};
+
+[[nodiscard]] UnwindLayout unwindLayoutOf(std::vector<std::uint8_t> const& obj) {
+    UnwindLayout out;
+    if (obj.size() < 32) return out;
+    auto fixedName = [&](std::size_t at) {
+        std::string n;
+        for (std::size_t k = 0; k < 16 && obj[at + k] != 0; ++k) {
+            n.push_back(static_cast<char>(obj[at + k]));
+        }
+        return n;
+    };
+    std::uint32_t const ncmds = rd32(obj, 16);
+    std::size_t         cmd   = 32;
+    for (std::uint32_t i = 0; i < ncmds && cmd + 8 <= obj.size(); ++i) {
+        std::uint32_t const kind = rd32(obj, cmd);
+        std::uint32_t const size = rd32(obj, cmd + 4);
+        if (kind == 0x19u) {   // LC_SEGMENT_64: 72 bytes, then its section_64 records (80 each)
+            std::uint32_t const nsects = rd32(obj, cmd + 64);
+            for (std::uint32_t s = 0; s < nsects; ++s) {
+                std::size_t const rec = cmd + 72 + static_cast<std::size_t>(s) * 80;
+                if (fixedName(rec) != "__eh_frame" || fixedName(rec + 16) != "__TEXT") continue;
+                out.found      = true;
+                out.recordOff  = rec;
+                out.bodySize   = rd32(obj, rec + 40);
+                out.bodyOff    = rd32(obj, rec + 48);
+                out.relocOff   = rd32(obj, rec + 56);
+                out.relocCount = rd32(obj, rec + 60);
+            }
+        } else if (kind == 0x2u) {   // LC_SYMTAB
+            out.symtab = SymtabLoc{rd32(obj, cmd + 8), rd32(obj, cmd + 12), rd32(obj, cmd + 16)};
+        }
+        if (size == 0) break;
+        cmd += size;
+    }
+    return out;
+}
+
+[[nodiscard]] std::string saidBy(DiagnosticReporter const& rep) {
+    std::string out;
+    for (auto const& d : rep.all()) out += "\n  " + d.actual;
+    return out;
+}
+
+[[nodiscard]] bool saidWithCode(DiagnosticReporter const& rep, DiagnosticCode code,
+                                std::string_view fragment) {
+    for (auto const& d : rep.all()) {
+        if (d.code == code && d.actual.find(fragment) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// One ISA's fixtures, the documents a reader is handed for them, and what was
+// MEASURED at their build (Apple clang 21.0.0, ld-1267).
+struct UnwindCase {
+    char const*              target;
+    char const*              compiled;
+    char const*              relinked;
+    std::vector<char const*> documents;
+    // The document an IMAGE of the ISA is linked under, and the ISA's one
+    // instruction that returns: the body of the unit that holds the image's
+    // entry in the image pin (x86_64 `ret`; arm64 `ret`, little-endian).
+    char const*              image;
+    std::vector<std::uint8_t> returns;
+    // The relocation count of `__TEXT,__eh_frame` in each object: the x86_64
+    // compiler writes none; the arm64 compiler one pair per record; the linker
+    // two pairs per record on both.
+    std::uint32_t            compiledRelocations;
+    std::uint32_t            relinkedRelocations;
+    // The byte length each function's record covers, `_dss_unwind_first` then
+    // `_dss_unwind_shared` -- different, so a record on the wrong function shows.
+    std::uint32_t            extents[2];
+    // The (subtrahend, minuend) wire ids the documents declare, as MEASURED in
+    // these fixtures' relocation tables.
+    std::vector<MachODifferenceRelocation> pairs;
+};
+
+[[nodiscard]] std::vector<UnwindCase> unwindCases() {
+    return {
+        UnwindCase{"x86_64", "compiled_unwind_x86_64_macho.o", "relinked_unwind_x86_64_macho.o",
+                   {"macho64-x86_64-darwin", "macho64-x86_64-darwin-staticlib"},
+                   "macho64-x86_64-darwin-exec", {0xC3}, 0u, 8u, {11u, 14u},
+                   {MachODifferenceRelocation{1409286144u, 67108864u},
+                    MachODifferenceRelocation{1442840576u, 100663296u}}},
+        UnwindCase{"arm64", "compiled_unwind_arm64_macho.o", "relinked_unwind_arm64_macho.o",
+                   {"macho64-arm64-darwin", "macho64-arm64-darwin-staticlib"},
+                   "macho64-arm64-darwin-exec", {0xC0, 0x03, 0x5F, 0xD6}, 4u, 8u, {8u, 24u},
+                   {MachODifferenceRelocation{369098752u, 100663296u},
+                    MachODifferenceRelocation{335544320u, 67108864u}}},
+    };
+}
+
+constexpr char const* kUnwindFunctions[] = {"_dss_unwind_first", "_dss_unwind_shared"};
+
+[[nodiscard]] std::uint64_t rd64(std::vector<std::uint8_t> const& b, std::size_t o) {
+    return static_cast<std::uint64_t>(rd32(b, o))
+         | (static_cast<std::uint64_t>(rd32(b, o + 4)) << 32);
+}
+
+// The call-frame records of a linked IMAGE: where each begins and how far it
+// reaches. The image's own CIE states how a record's address fields are
+// encoded; the two encodings a Mach-O image of these targets can carry are
+// read, and any other is SAID rather than guessed at. nullopt: the image has no
+// `__TEXT,__eh_frame`.
+struct ImageFrame {
+    std::uint64_t begin  = 0;
+    std::uint64_t length = 0;
+};
+
+[[nodiscard]] std::optional<std::vector<ImageFrame>>
+imageCallFrames(std::vector<std::uint8_t> const& image) {
+    auto const at = unwindLayoutOf(image);
+    if (!at.found) return std::nullopt;
+    std::uint64_t const     sectionVa = rd64(image, at.recordOff + 32);
+    std::size_t const       end       = at.bodyOff + at.bodySize;
+    std::vector<ImageFrame> frames;
+    std::uint8_t            encoding = 0xFFu;
+    for (std::size_t p = at.bodyOff; p + 8 <= end;) {
+        std::uint32_t const length = rd32(image, p);
+        if (length == 0) break;
+        std::size_t const body = p + 4;
+        if (rd32(image, body) == 0) {   // a CIE
+            std::size_t        q       = body + 4;
+            std::uint8_t const version = image[q++];
+            std::string        augmentation;
+            while (image[q] != 0) augmentation.push_back(static_cast<char>(image[q++]));
+            ++q;
+            auto const skipLeb = [&] {
+                while ((image[q++] & 0x80u) != 0) {}
+            };
+            skipLeb();   // code alignment
+            skipLeb();   // data alignment
+            if (version == 1) {
+                ++q;     // the return-address column is one byte in version 1
+            } else {
+                skipLeb();
+            }
+            if (augmentation != "zR") {
+                ADD_FAILURE() << "the image's CIE states augmentation '" << augmentation
+                              << "', which this pin does not read";
+                return frames;
+            }
+            skipLeb();   // the augmentation data's length
+            encoding = image[q];
+        } else {
+            std::size_t const   field   = body + 4;
+            std::uint64_t const fieldVa = sectionVa + (field - at.bodyOff);
+            ImageFrame          frame;
+            if (encoding == 0x1Bu) {          // pc-relative, signed, four bytes
+                frame.begin  = fieldVa + static_cast<std::uint64_t>(static_cast<std::int64_t>(
+                                             static_cast<std::int32_t>(rd32(image, field))));
+                frame.length = rd32(image, field + 4);
+            } else if (encoding == 0x10u) {   // pc-relative, eight bytes
+                frame.begin  = fieldVa + rd64(image, field);
+                frame.length = rd64(image, field + 8);
+            } else {
+                ADD_FAILURE() << "the image's CIE states pointer encoding " << static_cast<unsigned>(encoding)
+                              << " (decimal), which this pin does not read";
+                return frames;
+            }
+            frames.push_back(frame);
+        }
+        p = body + length;
+    }
+    return frames;
+}
+
+// `stem`'s shipped document with ONE change, loaded.
+template <typename Mutate>
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema> shippedFormatWith(char const* stem, Mutate mutate) {
+    auto const text = shippedFormatText(stem);
+    if (text.empty()) return nullptr;
+    nlohmann::json doc = nlohmann::json::parse(text);
+    mutate(doc);
+    auto loaded = ObjectFormatSchema::loadFromText(doc.dump(), "a-shipped-document-with-one-change");
+    if (!loaded.has_value()) {
+        ADD_FAILURE() << stem << " with one change must still load: " << rejectSummary(loaded);
+        return nullptr;
+    }
+    return std::move(loaded).value();
+}
+
+} // namespace
+
+// THE PIN. Apple's relocatable link of the two-function unit reads EXACTLY as
+// the compiler's object of it does: the same two bodies, each with the
+// call-frame record of ITS OWN function (the extents differ, so a record
+// attached to the other function could not agree), and nothing left over --
+// the local labels the producers wrote into the section (`EH_Frame1`, one
+// `func.eh` per record) name no symbol of the module, and no function arrives
+// undescribed.
+TEST(MachoUnwindRelocations, ARelocatableLinksProductReadsAsTheCompiledObjectDoes) {
+    for (auto const& c : unwindCases()) {
+        auto const compiledBytes = unwindFixture(c.compiled);
+        auto const relinkedBytes = unwindFixture(c.relinked);
+        ASSERT_FALSE(compiledBytes.empty());
+        ASSERT_FALSE(relinkedBytes.empty());
+        // THE PREMISE, read off the fixtures: each has the relocation count
+        // measured at its build.
+        auto const compiledLayout = unwindLayoutOf(compiledBytes);
+        auto const relinkedLayout = unwindLayoutOf(relinkedBytes);
+        ASSERT_TRUE(compiledLayout.found) << c.compiled << " holds no `__TEXT,__eh_frame`";
+        ASSERT_TRUE(relinkedLayout.found) << c.relinked << " holds no `__TEXT,__eh_frame`";
+        ASSERT_EQ(compiledLayout.relocCount, c.compiledRelocations)
+            << c.compiled << ": the fixture is not the shape this pin was measured on";
+        ASSERT_EQ(relinkedLayout.relocCount, c.relinkedRelocations)
+            << c.relinked << ": the fixture is not the shape this pin was measured on";
+        for (char const* document : c.documents) {
+            SCOPED_TRACE(std::string{c.target} + " / " + document);
+            auto loaded = loadShipped(c.target, document);
+            ASSERT_TRUE(loaded.target && loaded.format);
+            DiagnosticReporter crep;
+            auto const compiled = macho::readRelocatableObject(compiledBytes, *loaded.target,
+                                                               *loaded.format, crep);
+            ASSERT_TRUE(compiled.has_value()) << "CONTROL: the compiler's object reads:" << saidBy(crep);
+            DiagnosticReporter rrep;
+            auto const relinked = macho::readRelocatableObject(relinkedBytes, *loaded.target,
+                                                               *loaded.format, rrep);
+            ASSERT_TRUE(relinked.has_value())
+                << "Apple's relocatable link of the object must read:" << saidBy(rrep);
+            EXPECT_EQ(crep.errorCount(), 0u) << saidBy(crep);
+            EXPECT_EQ(rrep.errorCount(), 0u) << saidBy(rrep);
+            EXPECT_EQ(rrep.all().size(), crep.all().size())
+                << "the product is read with no more said than the compiler's object is:" << saidBy(rrep);
+            EXPECT_FALSE(saidWithCode(crep, DiagnosticCode::K_UnwindRuleUnrepresentable, ""))
+                << "CONTROL: every function of the compiler's object arrives described:" << saidBy(crep);
+            EXPECT_FALSE(saidWithCode(rrep, DiagnosticCode::K_UnwindRuleUnrepresentable, ""))
+                << "every function arrives described:" << saidBy(rrep);
+
+            ASSERT_EQ(relinked->functions.size(), compiled->functions.size());
+            for (std::size_t k = 0; k < 2; ++k) {
+                SCOPED_TRACE(kUnwindFunctions[k]);
+                auto const* want = funcNamed(*compiled, kUnwindFunctions[k]);
+                auto const* got  = funcNamed(*relinked, kUnwindFunctions[k]);
+                ASSERT_NE(want, nullptr);
+                ASSERT_NE(got, nullptr);
+                EXPECT_EQ(got->bytes, want->bytes);
+                ASSERT_TRUE(want->cfi.has_value()) << "CONTROL: the compiled object's function is described";
+                ASSERT_TRUE(got->cfi.has_value())
+                    << "the relinked object's function arrived with no call-frame record";
+                EXPECT_EQ(want->cfi->codeLength, c.extents[k])
+                    << "CONTROL: the record the compiler wrote for THIS function";
+                EXPECT_EQ(got->cfi->codeLength, want->cfi->codeLength);
+                EXPECT_EQ(got->cfi->initial, want->cfi->initial);
+                ASSERT_EQ(got->cfi->ops.size(), want->cfi->ops.size());
+                for (std::size_t o = 0; o < want->cfi->ops.size(); ++o) {
+                    EXPECT_EQ(got->cfi->ops[o].pcOffset, want->cfi->ops[o].pcOffset) << "rule #" << o;
+                }
+            }
+            ASSERT_NE(c.extents[0], c.extents[1])
+                << "THE PREMISE: the two records have different extents, so one attached to the "
+                   "other function could not have agreed with the control";
+            for (auto const* module : {&*compiled, &*relinked}) {
+                for (auto const& s : module->symbols) {
+                    EXPECT_NE(s.name, "EH_Frame1") << "a label of the call-frame section was published";
+                    EXPECT_NE(s.name, "func.eh") << "a label of the call-frame section was published";
+                    EXPECT_NE(s.name, "ltmp2") << "a label of the call-frame section was published";
+                }
+                EXPECT_EQ(externNamed(*module, "EH_Frame1"), nullptr);
+                EXPECT_EQ(externNamed(*module, "func.eh"), nullptr);
+                EXPECT_EQ(externNamed(*module, "ltmp2"), nullptr);
+            }
+        }
+    }
+}
+
+// AN arm64 COMPILER's OWN OBJECT THAT CARRIES THE SECTION
+// (D-LK-MACHO-ARM64-EH-FRAME-SECTION-REFUSED-AT-READ). It is the section ROW
+// that reads it -- the shipped document MINUS that one row refuses the object
+// as it was refused before, naming the section -- and the PAIRS that bind its
+// records: the same object under the document MINUS its pairs is refused naming
+// the key, because on arm64 the compiler itself leaves each record's function
+// address to a pair.
+TEST(MachoUnwindRelocations, AnArm64CompilersOwnObjectCarryingTheSectionReads) {
+    auto const bytes = unwindFixture("compiled_unwind_arm64_macho.o");
+    ASSERT_FALSE(bytes.empty());
+    auto const at = unwindLayoutOf(bytes);
+    ASSERT_TRUE(at.found);
+    ASSERT_NE(at.relocCount, 0u) << "THE PREMISE: the arm64 compiler's own object carries relocations there";
+    for (char const* document : {"macho64-arm64-darwin", "macho64-arm64-darwin-staticlib"}) {
+        SCOPED_TRACE(document);
+        auto loaded = loadShipped("arm64", document);
+        ASSERT_TRUE(loaded.target && loaded.format);
+        DiagnosticReporter rep;
+        auto const read = macho::readRelocatableObject(bytes, *loaded.target, *loaded.format, rep);
+        ASSERT_TRUE(read.has_value()) << saidBy(rep);
+        EXPECT_EQ(rep.errorCount(), 0u) << saidBy(rep);
+        for (char const* name : kUnwindFunctions) {
+            auto const* fn = funcNamed(*read, name);
+            ASSERT_NE(fn, nullptr) << name;
+            EXPECT_TRUE(fn->cfi.has_value()) << name << " arrived with no call-frame record";
+        }
+
+        // THE ROW is the fix: without it the section is one DSS cannot classify.
+        auto const noRow = shippedFormatWith(document, [](nlohmann::json& d) {
+            auto& sections = d.at("sections");
+            for (auto it = sections.begin(); it != sections.end(); ++it) {
+                if (it->value("name", std::string{}) == "__eh_frame") {
+                    sections.erase(it);
+                    return;
+                }
+            }
+            ADD_FAILURE() << "THE PREMISE: the shipped document declares a `__eh_frame` row";
+        });
+        ASSERT_NE(noRow, nullptr);
+        DiagnosticReporter rowRep;
+        EXPECT_FALSE(macho::readRelocatableObject(bytes, *loaded.target, *noRow, rowRep).has_value())
+            << "CONTROL: without its row the section's own label has nowhere to live";
+        EXPECT_NE(saidBy(rowRep).find("'__TEXT,__eh_frame'"), std::string::npos) << saidBy(rowRep);
+
+        // THE PAIRS bind the records: without them the stored value is half a reference.
+        auto const noPairs = shippedFormatWith(
+            document, [](nlohmann::json& d) { d.at("macho").erase("differenceRelocations"); });
+        ASSERT_NE(noPairs, nullptr);
+        DiagnosticReporter pairRep;
+        EXPECT_FALSE(macho::readRelocatableObject(bytes, *loaded.target, *noPairs, pairRep).has_value());
+        EXPECT_TRUE(saidWithCode(pairRep, DiagnosticCode::F_UnsupportedBinaryFormat,
+                                 "`macho.differenceRelocations`"))
+            << saidBy(pairRep);
+    }
+}
+
+// THE IMAGE HALF: A FUNCTION THAT ARRIVES DESCRIBED REACHES THE IMAGE DESCRIBED
+// (the Mach-O part of D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE).
+// Reading a record is half of carrying it. A PROGRAM is linked from two units,
+// as a real one is -- a unit of its own that holds the entry (one instruction,
+// no record), then one of these objects: the compiler's own and the relocatable
+// link's product, both ISAs. Two units take the MERGE, which copies every
+// function into the one module the image writer is handed; a record dropped
+// there would leave the readers' pins and the writer's all green. The image
+// holds, for each of the object's two functions, ONE call-frame record that
+// begins at the function's own address and reaches exactly as far as the
+// OBJECT's record did, and no other record: neither the program's own entry
+// function nor the entry the link adds has one. CONTROL: the same units with
+// the object's records taken away link to an image with no such section, so the
+// records found are the object's and not something the image writer makes for
+// every function.
+// ✔MEASURED 2026-10-08 on the images `dsscp` builds of the two examples (a DSS
+// `main` beside each object): three records -- `_main`'s and the two below, at
+// 8 and 24 bytes on arm64, 11 and 14 on x86_64 -- and the image of the
+// relocatable link's product is byte-identical to the image of the compiler's
+// object.
+TEST(MachoUnwindRelocations, TheImageDescribesEachFunctionAsItsObjectDid) {
+    for (auto const& c : unwindCases()) {
+        auto member = loadShipped(c.target, c.documents[0]);
+        auto exec   = loadShipped(c.target, c.image);
+        ASSERT_TRUE(member.target && member.format && exec.format);
+        for (char const* fixture : {c.compiled, c.relinked}) {
+            SCOPED_TRACE(std::string{c.target} + " / " + fixture);
+            auto const bytes = unwindFixture(fixture);
+            ASSERT_FALSE(bytes.empty());
+            DiagnosticReporter rrep;
+            auto read = macho::readRelocatableObject(bytes, *member.target, *member.format, rrep,
+                                                     CompilationUnitId{2});
+            ASSERT_TRUE(read.has_value()) << saidBy(rrep);
+            ASSERT_EQ(read->functions.size(), 2u);
+
+            // The program's own unit: its entry, which describes no frame.
+            AssembledModule own;
+            own.cuId              = CompilationUnitId{1};
+            own.expectedFuncCount = 1;
+            AssembledFunction start;
+            start.symbol = SymbolId{1};
+            start.bytes  = c.returns;
+            own.functions.push_back(std::move(start));
+            own.symbols         = {ModuleSymbol{SymbolId{1}, "_dss_image_pin_entry", SymbolBinding::Global,
+                                                SymbolVisibility::Default}};
+            own.userEntrySymbol = SymbolId{1};
+
+            std::vector<AssembledModule> units;
+            units.push_back(own);
+            units.push_back(*read);
+            DiagnosticReporter lrep;
+            auto const linked = linker::link(std::span<AssembledModule const>{units}, *member.target, *exec.format,
+                                             lrep, ImageRequest{.artifactFileName = "unwind_image"});
+            ASSERT_TRUE(linked.ok()) << saidBy(lrep);
+            auto const frames = imageCallFrames(linked.bytes);
+            ASSERT_TRUE(frames.has_value()) << "the image carries no `__TEXT,__eh_frame`";
+            auto const at = unwindLayoutOf(linked.bytes);
+            for (std::size_t k = 0; k < 2; ++k) {
+                SCOPED_TRACE(kUnwindFunctions[k]);
+                std::size_t const record = nlistOffsetOfName(linked.bytes, at.symtab, kUnwindFunctions[k]);
+                ASSERT_NE(record, static_cast<std::size_t>(-1)) << "the image names the function";
+                std::uint64_t const address   = rd64(linked.bytes, record + 8);
+                std::size_t         described = 0;
+                for (auto const& frame : *frames) {
+                    if (frame.begin != address) continue;
+                    ++described;
+                    EXPECT_EQ(frame.length, c.extents[k])
+                        << "the image's record reaches as far as the OBJECT's record did";
+                }
+                EXPECT_EQ(described, 1u) << "ONE record of the image begins at the function";
+            }
+            EXPECT_EQ(frames->size(), 2u)
+                << "the image describes the object's two functions and nothing else: the program's own entry "
+                   "function states no record and the entry the link adds has none";
+
+            std::vector<AssembledModule> bareUnits;
+            bareUnits.push_back(own);
+            bareUnits.push_back(*read);
+            for (auto& fn : bareUnits[1].functions) fn.cfi.reset();
+            DiagnosticReporter brep;
+            auto const bareImage = linker::link(std::span<AssembledModule const>{bareUnits}, *member.target,
+                                                *exec.format, brep,
+                                                ImageRequest{.artifactFileName = "unwind_image"});
+            ASSERT_TRUE(bareImage.ok()) << saidBy(brep);
+            EXPECT_FALSE(unwindLayoutOf(bareImage.bytes).found)
+                << "CONTROL: with the records taken away the image has no call-frame section at all";
+        }
+    }
+}
+
+// EVERY OTHER SHAPE IS REFUSED BY NAME. Each cell changes ONE fact of the
+// relinked fixture's relocation table (in memory) and reads it: an entry that
+// starts no declared pair, a subtrahend followed by another type, a pair split
+// across addresses, a section-number entry, a symbol the object does not
+// define, a field that runs past the section, two pairs on one field, a table
+// that ends on a subtrahend, a value its field cannot hold. The control is the
+// first test: the same bytes, unchanged, read. Both ISAs (✔MEASURED off the
+// fixtures): entries 0 and 1 are the first record's 4-byte pair, 2 and 3 its
+// 8-byte pair.
+TEST(MachoUnwindRelocations, EveryOtherRelocationShapeIsRefusedByName) {
+    // A `relocation_info` is eight bytes: `r_address`, then a word holding the
+    // symbol number (bits 0-23), pc-relative (24), length (25-26), extern (27)
+    // and type (28-31).
+    struct Cell {
+        char const*                                    label;
+        void (*mutate)(std::vector<std::uint8_t>&, UnwindLayout const&);
+        DiagnosticCode                                 code;
+        char const*                                    says;
+    };
+    Cell const kCells[] = {
+        {"the first entry is the minuend's type, which starts no pair",
+         [](std::vector<std::uint8_t>& b, UnwindLayout const& l) {
+             // swap entries 0 and 1 (a subtrahend and its minuend)
+             for (std::size_t k = 0; k < 8; ++k) std::swap(b[l.relocOff + k], b[l.relocOff + 8 + k]);
+         },
+         DiagnosticCode::F_UnsupportedBinaryFormat, "is not the subtrahend of a difference pair"},
+        {"the entry after the subtrahend is another type",
+         [](std::vector<std::uint8_t>& b, UnwindLayout const& l) {
+             // r_type is the top four bits of the second word: UNSIGNED (0) -> 1
+             wr32(b, l.relocOff + 12, rd32(b, l.relocOff + 12) ^ (1u << 28));
+         },
+         DiagnosticCode::F_CorruptedBinary, "where the format declares its minuend as wire type"},
+        {"the minuend sits at another address",
+         [](std::vector<std::uint8_t>& b, UnwindLayout const& l) {
+             wr32(b, l.relocOff + 8, rd32(b, l.relocOff + 8) + 4u);
+         },
+         DiagnosticCode::F_CorruptedBinary, "at the same offset"},
+        {"the pair's field runs past the section",
+         [](std::vector<std::uint8_t>& b, UnwindLayout const& l) {
+             // both entries of the first (4-byte) pair, two bytes before the end
+             std::uint32_t const at = static_cast<std::uint32_t>(l.bodySize) - 2u;
+             wr32(b, l.relocOff, at);
+             wr32(b, l.relocOff + 8, at);
+         },
+         DiagnosticCode::F_CorruptedBinary, "runs past the section"},
+        {"the subtrahend names a section, not a symbol",
+         [](std::vector<std::uint8_t>& b, UnwindLayout const& l) {
+             wr32(b, l.relocOff + 4, rd32(b, l.relocOff + 4) & ~(1u << 27));
+         },
+         DiagnosticCode::F_UnsupportedBinaryFormat, "names a SECTION rather than a symbol (r_extern=0)"},
+        {"the subtrahend's symbol is not defined by this object",
+         [](std::vector<std::uint8_t>& b, UnwindLayout const& l) {
+             // the nlist_64 the first entry names: N_SECT (0x0e) -> N_UNDF, section 0
+             std::uint32_t const sym = rd32(b, l.relocOff + 4) & 0x00FFFFFFu;
+             std::size_t const   rec = l.symtab.symoff + static_cast<std::size_t>(sym) * kNlistSize;
+             b[rec + kNlistTypeOff]     = static_cast<std::uint8_t>(b[rec + kNlistTypeOff] & ~0x0Eu);
+             b[rec + kNlistTypeOff + 1] = 0;
+         },
+         DiagnosticCode::F_UnsupportedBinaryFormat, "which this object does not define in one of its sections"},
+        {"two pairs patch one field",
+         [](std::vector<std::uint8_t>& b, UnwindLayout const& l) {
+             // the second pair (entries 2 and 3) moved onto the first pair's address
+             std::uint32_t const first = rd32(b, l.relocOff);
+             wr32(b, l.relocOff + 16, first);
+             wr32(b, l.relocOff + 24, first);
+         },
+         DiagnosticCode::F_CorruptedBinary, "carries two difference pairs on the field"},
+        {"the table ends on a subtrahend",
+         [](std::vector<std::uint8_t>& b, UnwindLayout const& l) {
+             wr32(b, l.recordOff + 60, l.relocCount - 1u);
+         },
+         DiagnosticCode::F_CorruptedBinary, "the minuend that must follow it is missing"},
+        {"the difference does not fit its field",
+         [](std::vector<std::uint8_t>& b, UnwindLayout const& l) {
+             // the minuend's symbol of the first (4-byte) pair, moved 2^40 bytes up
+             std::uint32_t const sym = rd32(b, l.relocOff + 12) & 0x00FFFFFFu;
+             std::size_t const   rec = l.symtab.symoff + static_cast<std::size_t>(sym) * kNlistSize;
+             b[rec + 8 + 5] = 1;   // n_value is the record's last eight bytes
+         },
+         DiagnosticCode::F_CorruptedBinary, "-byte field cannot hold"},
+    };
+    for (auto const& c : unwindCases()) {
+        auto const pristine = unwindFixture(c.relinked);
+        ASSERT_FALSE(pristine.empty());
+        auto const at = unwindLayoutOf(pristine);
+        ASSERT_TRUE(at.found);
+        ASSERT_GE(at.relocCount, 4u);
+        auto loaded = loadShipped(c.target, c.documents.front());
+        ASSERT_TRUE(loaded.target && loaded.format);
+        for (auto const& cell : kCells) {
+            SCOPED_TRACE(std::string{c.target} + ": " + cell.label);
+            auto bytes = pristine;
+            cell.mutate(bytes, at);
+            ASSERT_NE(bytes, pristine) << "the cell changed nothing";
+            DiagnosticReporter rep;
+            auto const read = macho::readRelocatableObject(bytes, *loaded.target, *loaded.format, rep);
+            EXPECT_FALSE(read.has_value()) << "this shape must not be read as though the pair had been applied";
+            EXPECT_TRUE(saidWithCode(rep, cell.code, cell.says)) << "said:" << saidBy(rep);
+            EXPECT_TRUE(saidWithCode(rep, cell.code, "unwind section '__TEXT,__eh_frame'"))
+                << "the refusal names the section:" << saidBy(rep);
+        }
+    }
+}
+
+// THE ADDEND A NARROW FIELD STORES IS SIGNED. The fixtures' four-byte fields
+// all store +4, so nothing above tells a sign-extended addend from a
+// zero-extended one. This states the SAME reference with a negative addend:
+// the first record's own label is moved eight bytes up (in memory), its
+// four-byte field stores -4 where it stored +4, and its eight-byte field 0
+// where it stored -8 -- every difference comes out as before, so the object
+// must read exactly as the unchanged one does. Read as an unsigned number the
+// -4 is four gigabytes, and the pair is refused as one its field cannot hold.
+TEST(MachoUnwindRelocations, ANegativeAddendInANarrowFieldIsAnAddend) {
+    for (auto const& c : unwindCases()) {
+        SCOPED_TRACE(c.target);
+        auto const pristine = unwindFixture(c.relinked);
+        ASSERT_FALSE(pristine.empty());
+        auto const at = unwindLayoutOf(pristine);
+        ASSERT_TRUE(at.found);
+        ASSERT_GE(at.relocCount, 4u);
+        std::uint32_t const narrowField = rd32(pristine, at.relocOff);        // entries 0 and 1
+        std::uint32_t const wideField   = rd32(pristine, at.relocOff + 16);   // entries 2 and 3
+        std::uint32_t const label       = rd32(pristine, at.relocOff + 12) & 0x00FFFFFFu;
+        // THE PREMISE: the label the narrow pair is measured TO is the one the
+        // wide pair is measured FROM, and the fields store +4 and -8.
+        ASSERT_EQ(rd32(pristine, at.relocOff + 20) & 0x00FFFFFFu, label);
+        ASSERT_EQ(rd32(pristine, at.bodyOff + narrowField), 4u);
+        ASSERT_EQ(rd32(pristine, at.bodyOff + wideField), 0xFFFFFFF8u);
+        ASSERT_EQ(rd32(pristine, at.bodyOff + wideField + 4), 0xFFFFFFFFu);
+
+        auto bytes = pristine;
+        std::size_t const rec = at.symtab.symoff + static_cast<std::size_t>(label) * kNlistSize;
+        ASSERT_LT(bytes[rec + 8], 0xF8u) << "the label's address does not carry into its next byte";
+        bytes[rec + 8] = static_cast<std::uint8_t>(bytes[rec + 8] + 8u);   // n_value += 8
+        wr32(bytes, at.bodyOff + narrowField, 0xFFFFFFFCu);                 // +4 -> -4
+        wr32(bytes, at.bodyOff + wideField, 0u);                            // -8 -> 0
+        wr32(bytes, at.bodyOff + wideField + 4, 0u);
+
+        auto loaded = loadShipped(c.target, c.documents.front());
+        ASSERT_TRUE(loaded.target && loaded.format);
+        DiagnosticReporter wantRep;
+        auto const want = macho::readRelocatableObject(pristine, *loaded.target, *loaded.format, wantRep);
+        ASSERT_TRUE(want.has_value()) << "CONTROL:" << saidBy(wantRep);
+        DiagnosticReporter gotRep;
+        auto const got = macho::readRelocatableObject(bytes, *loaded.target, *loaded.format, gotRep);
+        ASSERT_TRUE(got.has_value())
+            << "a negative addend in a four-byte field is an addend, not a number its field cannot hold:"
+            << saidBy(gotRep);
+        for (char const* name : kUnwindFunctions) {
+            auto const* w = funcNamed(*want, name);
+            auto const* g = funcNamed(*got, name);
+            ASSERT_NE(w, nullptr);
+            ASSERT_NE(g, nullptr);
+            ASSERT_TRUE(w->cfi.has_value());
+            ASSERT_TRUE(g->cfi.has_value()) << name;
+            EXPECT_EQ(g->cfi->codeLength, w->cfi->codeLength) << name;
+            EXPECT_EQ(g->cfi->ops.size(), w->cfi->ops.size()) << name;
+        }
+    }
+}
+
+// THE PAIRS ARE THE DOCUMENT'S. The shipped document MINUS exactly
+// `macho.differenceRelocations` still loads -- the key is a fact about what a
+// reader of the format applies, not a required one -- and under it the
+// linker's product is refused naming the key. The compiler's object is the
+// control on x86_64, where it carries no relocation there and reads as before;
+// on arm64 it carries its own pairs and is refused with the product.
+TEST(MachoUnwindRelocations, ADocumentThatDeclaresNoPairRefusesTheSectionNamingTheKey) {
+    for (auto const& c : unwindCases()) {
+        SCOPED_TRACE(c.target);
+        auto const compiledBytes = unwindFixture(c.compiled);
+        auto const relinkedBytes = unwindFixture(c.relinked);
+        ASSERT_FALSE(compiledBytes.empty());
+        ASSERT_FALSE(relinkedBytes.empty());
+        auto loaded = loadShipped(c.target, c.documents.front());
+        ASSERT_TRUE(loaded.target && loaded.format);
+        auto const stripped = shippedFormatWith(c.documents.front(), [](nlohmann::json& d) {
+            ASSERT_TRUE(d.at("macho").contains("differenceRelocations"))
+                << "THE PREMISE: the shipped document declares its pairs";
+            d.at("macho").erase("differenceRelocations");
+        });
+        ASSERT_NE(stripped, nullptr);
+
+        DiagnosticReporter rep;
+        auto const refused = macho::readRelocatableObject(relinkedBytes, *loaded.target, *stripped, rep);
+        EXPECT_FALSE(refused.has_value())
+            << "a format that declares no difference pair cannot complete the section's references";
+        EXPECT_TRUE(saidWithCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat, "`macho.differenceRelocations`"))
+            << "the refusal names the key whose rows are the whole fix:" << saidBy(rep);
+
+        DiagnosticReporter crep;
+        auto const compiled = macho::readRelocatableObject(compiledBytes, *loaded.target, *stripped, crep);
+        if (c.compiledRelocations == 0u) {
+            EXPECT_TRUE(compiled.has_value())
+                << "CONTROL: the compiler's object carries no relocation there and needs no pair:" << saidBy(crep);
+        } else {
+            EXPECT_FALSE(compiled.has_value())
+                << "this ISA's compiler leaves a pair there too, so its own object needs the key as well";
+        }
+    }
+}
+
+// A PIN ON THE SHIPPED VALUES: each member document declares exactly the wire
+// ids MEASURED in its ISA's fixtures, and no image document declares any (the
+// loader refuses the key there; this reads that none tries).
+TEST(MachoUnwindRelocations, TheShippedDocumentsDeclareTheMeasuredPairs) {
+    for (auto const& c : unwindCases()) {
+        for (char const* document : c.documents) {
+            SCOPED_TRACE(document);
+            auto const loaded = ObjectFormatSchema::loadShipped(document);
+            ASSERT_TRUE(loaded.has_value());
+            auto const& declared = (*loaded)->macho().differenceRelocations;
+            ASSERT_EQ(declared.size(), c.pairs.size());
+            for (std::size_t i = 0; i < c.pairs.size(); ++i) {
+                EXPECT_EQ(declared[i].subtrahendNativeId, c.pairs[i].subtrahendNativeId) << "pair #" << i;
+                EXPECT_EQ(declared[i].minuendNativeId, c.pairs[i].minuendNativeId) << "pair #" << i;
+            }
+        }
+    }
+    for (char const* image : {"macho64-x86_64-darwin-exec", "macho64-x86_64-darwin-dylib",
+                              "macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib"}) {
+        auto const loaded = ObjectFormatSchema::loadShipped(image);
+        ASSERT_TRUE(loaded.has_value()) << image;
+        EXPECT_TRUE((*loaded)->macho().differenceRelocations.empty()) << image;
+    }
+}
+
+// THE LOADER HOLDS THE TABLE TO ITS RULES, each at its own JSON pointer: a
+// subtrahend id a relocation row already claims, one subtrahend naming two
+// minuends, a subtrahend that is another pair's minuend, two ids that state
+// different widths, a pc-relative id, an id that sets a bit belonging to one
+// entry, a width restated beside the ids (the ids carry it: not a key), and
+// the table on a document no reader is handed.
+TEST(MachoUnwindRelocations, TheLoaderHoldsThePairsToTheirRules) {
+    struct Cell {
+        char const* label;
+        char const* stem;
+        void (*mutate)(nlohmann::json&);
+        char const* path;
+        char const* says;
+    };
+    Cell const kCells[] = {
+        {"a relocation row claims the subtrahend's wire id", "macho64-x86_64-darwin",
+         [](nlohmann::json& d) {
+             d["macho"]["differenceRelocations"][0]["subtrahendNativeId"] = d["relocations"][0]["nativeId"];
+         },
+         "/macho/differenceRelocations/0/subtrahendNativeId", "decodes to no RelocationKind"},
+        {"one subtrahend names two minuends", "macho64-x86_64-darwin",
+         [](nlohmann::json& d) {
+             d["macho"]["differenceRelocations"][1]["subtrahendNativeId"] =
+                 d["macho"]["differenceRelocations"][0]["subtrahendNativeId"];
+         },
+         "/macho/differenceRelocations/1/subtrahendNativeId", "one subtrahend names one minuend"},
+        {"a subtrahend is another pair's minuend", "macho64-x86_64-darwin",
+         [](nlohmann::json& d) {
+             d["macho"]["differenceRelocations"][1]["subtrahendNativeId"] =
+                 d["macho"]["differenceRelocations"][0]["minuendNativeId"];
+         },
+         "/macho/differenceRelocations/1/subtrahendNativeId", "both the start of a pair and the end of one"},
+        {"one row whose two ids are one", "macho64-arm64-darwin",
+         [](nlohmann::json& d) {
+             d["macho"]["differenceRelocations"][0]["minuendNativeId"] =
+                 d["macho"]["differenceRelocations"][0]["subtrahendNativeId"];
+         },
+         "/macho/differenceRelocations/0/subtrahendNativeId", "both the start of a pair and the end of one"},
+        {"the two ids state different widths", "macho64-arm64-darwin",
+         [](nlohmann::json& d) {
+             // the 8-byte subtrahend beside the 4-byte pair's minuend
+             d["macho"]["differenceRelocations"][0]["minuendNativeId"] =
+                 d["macho"]["differenceRelocations"][1]["minuendNativeId"];
+         },
+         "/macho/differenceRelocations/0/minuendNativeId", "state different widths"},
+        {"a pc-relative id", "macho64-arm64-darwin",
+         [](nlohmann::json& d) {
+             auto& id = d["macho"]["differenceRelocations"][0]["subtrahendNativeId"];
+             id = id.get<std::uint32_t>() | (1u << 24);
+         },
+         "/macho/differenceRelocations/0/subtrahendNativeId", "is pc-relative"},
+        {"an id that sets a bit belonging to one entry", "macho64-x86_64-darwin",
+         [](nlohmann::json& d) {
+             auto& id = d["macho"]["differenceRelocations"][0]["minuendNativeId"];
+             id = id.get<std::uint32_t>() | (1u << 27);
+         },
+         "/macho/differenceRelocations/0/minuendNativeId", "sets bits that belong to ONE relocation entry"},
+        {"a width restated beside the ids", "macho64-arm64-darwin",
+         [](nlohmann::json& d) { d["macho"]["differenceRelocations"][0]["fieldBytes"] = 8; },
+         "/macho/differenceRelocations/0/fieldBytes", "unknown key"},
+        {"the table on an image document", "macho64-x86_64-darwin-exec",
+         [](nlohmann::json& d) {
+             d["macho"]["differenceRelocations"] = nlohmann::json::array(
+                 {nlohmann::json{{"subtrahendNativeId", 1409286144}, {"minuendNativeId", 67108864}}});
+         },
+         "/macho/differenceRelocations/0", "nothing would read the table"},
+    };
+    for (auto const& cell : kCells) {
+        SCOPED_TRACE(cell.label);
+        auto const text = shippedFormatText(cell.stem);
+        ASSERT_FALSE(text.empty());
+        {
+            auto const control = ObjectFormatSchema::loadFromText(text, cell.stem);
+            ASSERT_TRUE(control.has_value()) << "the unmodified document must load: " << rejectSummary(control);
+        }
+        nlohmann::json doc = nlohmann::json::parse(text);
+        cell.mutate(doc);
+        auto const r = ObjectFormatSchema::loadFromText(doc.dump(), cell.stem);
+        EXPECT_FALSE(r.has_value()) << "the rule did not fire";
+        EXPECT_GE(countAtPath(r, cell.path), 1u) << rejectSummary(r);
+        EXPECT_GE(countWithMessage(r, cell.says), 1u) << rejectSummary(r);
+    }
 }

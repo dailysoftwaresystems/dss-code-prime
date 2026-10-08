@@ -1091,6 +1091,22 @@ struct DSS_EXPORT PeLinkerDirectiveRow {
     // DSS link does, each refused by name with its `reason` when an object asks
     // for one it does not define.
     std::vector<PeDirectiveNamedValue> runtimeSymbols;
+    // Rows whose request ONE LINK DECIDES ACROSS ITS UNITS only -- the nine
+    // image settings and `exportSymbol` (`pe::isDecidedAcrossUnits`) -- where the
+    // loader REQUIRES both and refuses either on any other row (P69 send-back 5,
+    // review-xa4 MINOR 6): which unit's request stands when two units of one
+    // link state the option, and what a link that makes a shared library does
+    // with it. Both are this format's vendor linker's facts (✔MEASURED
+    // 2026-10-07, link.exe 14.44.35228: the first `/STACK:`, `/HEAP:`, `/BASE:`,
+    // `/ENTRY:` and `/EXPORT:`, the last `/SUBSYSTEM:`, `/VERSION:` and
+    // `/ALIGN:`, `/SECTION:` in order; lld-link takes the last `/STACK:` and
+    // `/ENTRY:`), carried on each request and read there by
+    // `linker::decideUnitLinkerRequests`: no option's precedence is code.
+    // `inSharedLibraryReason` is required when the answer is `ignored` or
+    // `refused`, and refused otherwise.
+    std::optional<UnitRequestPrecedence>    unitPrecedence;
+    std::optional<SharedLibraryDisposition> inSharedLibrary;
+    std::string                             inSharedLibraryReason;
 };
 
 struct DSS_EXPORT PeLinkerDirectives {
@@ -1200,6 +1216,40 @@ machoObjectTypeFromName(std::string_view s) noexcept {
     return kMachOObjectTypeTable.fromName(s);
 }
 
+// ── A DIFFERENCE written as TWO relocation entries (P69,
+//    D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ) ──
+//
+// Mach-O states `A - B + addend` in a data field as a PAIR of `relocation_info`
+// entries at ONE `r_address`: first the SUBTRAHEND (the symbol to subtract —
+// X86_64_RELOC_SUBTRACTOR, ARM64_RELOC_SUBTRACTOR), then the MINUEND (the symbol
+// it is subtracted from — the UNSIGNED type), with the addend stored in the
+// field. One row declares one such pair by its two wire ids, packed as a
+// `relocations` row's `nativeId` is: type, length and pc-relative bit. The
+// WIDTH of the field the pair patches is not restated: each id carries it
+// (`r_length`, `macho::relocationFieldBytes`), and the loader refuses a pair
+// whose two ids state different widths.
+//
+// ★ WHY A TABLE OF ITS OWN and not a key on a `relocations` row. A relocation
+//   row maps a wire id to a universal `RelocationKind`, which the target
+//   document gives its arithmetic and its width; a subtrahend entry has no kind
+//   (it is half of a reference), and a format uses a pair on a field no row of
+//   it describes — arm64 declares no 4-byte absolute kind at all, and the CIE
+//   pointer of a call-frame record is four bytes on both ISAs. So a pair names
+//   both of its ids itself.
+//
+// ⚠ WHO READS IT: the Mach-O object READER, for a DWARF call-frame section
+//   (✔MEASURED 2026-10-08, Apple clang 21.0.0 with ld-1267). A relocatable
+//   LINK's product (`ld -r`) keeps EVERY reference of that section as such a
+//   pair, on both ISAs; an arm64 COMPILER's own object already keeps each
+//   record's function address as one, where a compiler's x86_64 object stores
+//   the resolved value and carries no relocation. So it is declared by the
+//   documents a reader is handed (`filetype: object`) and REFUSED on an image
+//   document, where nothing would read it.
+struct DSS_EXPORT MachODifferenceRelocation {
+    std::uint32_t subtrahendNativeId = 0;  // the entry naming the symbol to subtract
+    std::uint32_t minuendNativeId    = 0;  // the entry that follows it at the same address
+};
+
 struct DSS_EXPORT MachOIdentity {
     std::uint32_t cputype = 0;       // CPU_TYPE_X86_64=0x01000007
                                      // / CPU_TYPE_ARM64=0x0100000C
@@ -1225,6 +1275,11 @@ struct DSS_EXPORT MachOIdentity {
                                      //   D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM and
                                      //   the rationale in each object
                                      //   format's `macho.$comment`.
+    // The (subtrahend, minuend) relocation pairs a READER of this format
+    // applies — the JSON key `macho.differenceRelocations`; see
+    // `MachODifferenceRelocation`. Empty = the document declares none, and a
+    // reader then refuses a call-frame section that carries a relocation.
+    std::vector<MachODifferenceRelocation> differenceRelocations;
 };
 
 // ── Mach-O image block (loaded when filetype is MH_EXECUTE or

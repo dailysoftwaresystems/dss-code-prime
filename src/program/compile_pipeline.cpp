@@ -3150,8 +3150,17 @@ readArchiveMemberModule(std::span<std::uint8_t const> memberBytes,
         reporter.report(std::move(d));
         return std::nullopt;
     }
-    return backend->readRelocatableObject(memberBytes, target, format,
-                                          reporter, memberCu);
+    auto unit = backend->readRelocatableObject(memberBytes, target, format,
+                                               reporter, memberCu);
+    // P69 send-back 5 (review-xa4 NIT 11): every request the unit states names
+    // the unit -- the object's file, or `archive(member)` -- from here on, so
+    // each diagnostic a link makes of one says whose directive it is.
+    if (unit.has_value() && !unit->linkerRequests.empty()) {
+        std::string const file = archivePath.filename().string();
+        nameStatingUnit(unit->linkerRequests,
+                        memberName == file ? file : std::format("{}({})", file, memberName));
+    }
+    return unit;
 }
 
 namespace {
@@ -3237,10 +3246,35 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     // object input that DEFINES a name must suppress the pull of an archive
     // member defining it too, or the link merges two definitions of one symbol.
     std::unordered_set<std::string> definedNames;
+    // ── WHAT A COMMON MEETS IN THE LINK (P69 send-back 5, review-xa4 MINOR 1) ──
+    // `definedNames` answers a REFERENCE: any external-linkage definition
+    // satisfies one, and so does a common (`noteCommonsOf`, below). A COMMON asks
+    // another question of the same definitions: it stays a common, and its own
+    // search stays open (the commons round of the loop below), until a definition
+    // it YIELDS to is in the link — `linker::commonYieldsToDefinition`, the ONE
+    // answer the link's allocation gives too. `yieldedToNames` holds the names
+    // some linked definition answered "yes" for; `openYieldNames` those a WEAK
+    // definition leaves to a link document that does not say. Until send-back 5
+    // the search asked `definedNames` for both, so a weak definition the common
+    // OUTRANKS ended the common's search: on ELF a program holding `c` as a
+    // common, weak in a second object and strong in an archive read 0 where GNU
+    // ld reads the archive's 7 (✔MEASURED 2026-10-08, GNU ld 2.42, x86_64 and
+    // aarch64).
+    std::unordered_set<std::string> yieldedToNames;
+    std::unordered_set<std::string> openYieldNames;
+    auto const noteDefinition = [&](ModuleSymbol const& ms) {
+        definedNames.insert(ms.name);
+        auto const yields = linker::commonYieldsToDefinition(format, ms);
+        if (!yields.has_value()) {
+            openYieldNames.insert(ms.name);
+        } else if (*yields) {
+            yieldedToNames.insert(ms.name);
+        }
+    };
     for (auto const& clientModule : clientModules) {
         for (auto const& ms : clientModule.symbols) {
             if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
-                definedNames.insert(ms.name);
+                noteDefinition(ms);
             }
         }
     }
@@ -3291,7 +3325,8 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     // definition then wins, `linker::allocateCommonDefinitions`), while link.exe,
     // lld-link, GNU ld's PE linker and ld.lld by default keep the common and
     // fetch nothing (✔MEASURED 2026-10-07). The members' document states which
-    // (`archiveCommonResolution`): a kept common satisfies its name here exactly
+    // (`archiveCommonResolution`, asked in the COMMONS ROUND of the loop below): a
+    // kept common satisfies its name here exactly
     // as a definition does, so no member is fetched for it; one this pull cannot
     // place, because the document states nothing, is refused by name the moment
     // an archive defines it — no shipped member document since P69 round 4, when
@@ -3312,15 +3347,15 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     //   * GNU ld's ELF linker, where a common outranks a WEAK definition: the first
     //     GLOBAL datum (bfd elflink.c, `elf_link_is_defined_archive_symbol` ->
     //     `is_global_data_symbol_definition`). ✔MEASURED 2026-10-07 (gcc 13.3.0,
-    //     GNU ld 2.42, `.orchestrators/p69/work/xa/r4probe/m5`; the aarch64 cross
-    //     gcc and ld, the same answers, `r4probe/m5a64`): a member whose `c` is
+    //     GNU ld 2.42; the aarch64 cross gcc and ld, the same answers): a member
+    //     whose `c` is
     //     STB_GLOBAL data — `.data`, `.bss`, `.rodata`, hidden, thread-local — is
     //     fetched; one whose `c` is weak, a common or a function is not; and the
     //     search goes on past one that is not (common-, weak- and function-then-
     //     strong archives all fetch the strong member).
     //   * Apple's ld, where a weak definition replaces a common: the first datum,
     //     weak or not. ✔MEASURED 2026-10-07 (Apple clang 21's ld-1267, arm64 and
-    //     x86_64, `r4probe/m14mac`): a member whose `_c` is `__data`, zerofill,
+    //     x86_64): a member whose `_c` is `__data`, zerofill,
     //     `__const`, private-extern, weak or thread-local data is fetched, a
     //     function or a common is not, and the search goes on past a function
     //     (function-then-strong fetches the strong member, weak-then-strong the
@@ -3387,18 +3422,128 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
         }
         return false;
     };
-    auto const settleCommonsOf = [&](AssembledModule const& m) -> bool {
+    // The commons of the link, each name once, in the order they entered it —
+    // the client modules', then each pulled member's. A common DEFINES its name,
+    // so it answers every reference to it from here on; whether the search
+    // replaces it is the commons round's question.
+    std::vector<std::string>        commonNames;
+    std::unordered_set<std::string> commonNameSet;
+    auto const noteCommonsOf = [&](AssembledModule const& m) {
         for (auto const& ext : m.externImports) {
             if (ext.commonSize == 0u || ext.mangledName.empty()) continue;
-            auto const definer = armap.find(ext.mangledName);
-            if (definer == armap.end()) continue;   // no archive defines it: nothing to decide
-            auto const [ai, mi] = definer->second;
-            std::string_view const memberName = archives[ai].archive.members[mi].name;
+            definedNames.insert(ext.mangledName);
+            if (commonNameSet.insert(ext.mangledName).second) {
+                commonNames.push_back(ext.mangledName);
+            }
+        }
+    };
+    for (auto const& clientModule : clientModules) noteCommonsOf(clientModule);
+
+    // (archiveIdx << 32) | memberIndex of every member already pulled -- the LAZY
+    // dedup so a member defining several referenced symbols is pulled once.
+    std::unordered_set<std::uint64_t> pulledMembers;
+    auto memberKey = [](std::size_t ai, std::size_t mi) -> std::uint64_t {
+        return (static_cast<std::uint64_t>(ai) << 32)
+             |  static_cast<std::uint64_t>(static_cast<std::uint32_t>(mi));
+    };
+
+    // Pulls member (ai, mi) into the link — for a reference the worklist holds,
+    // or for a common (the commons round): reads it, and notes its commons, its
+    // definitions and its uses. The uses join the search as the client's do
+    // (`noteUse`: the worklist, or the weak references that await their round);
+    // they are answered when the loop next runs, never here. False after
+    // reporting why the member could not be read.
+    auto const pullMember = [&](std::size_t ai, std::size_t mi) -> bool {
+        ffi::ArMember const& member = archives[ai].archive.members[mi];
+        std::span<std::uint8_t const> const memberBytes{
+            archives[ai].bytes.data() + static_cast<std::size_t>(member.dataOffset),
+            static_cast<std::size_t>(member.size)};
+
+        // Parse the member back into a mergeable module via the shared
+        // per-format reader chokepoint (fresh cuId minted inside; a format
+        // with no reader arm fails loud there).
+        auto member_mod =
+            readArchiveMemberModule(memberBytes, target, format, memberFormat,
+                                    archivePaths[ai], member.name, reporter);
+        if (!member_mod) return false;   // member-read fail-loud
+        // A pulled member's own commons, by the same rule as the client's.
+        noteCommonsOf(*member_mod);
+
+        // A pulled member's EXTERNAL-LINKAGE definitions satisfy later worklist
+        // names; its OWN unresolved externs feed the next pass -- the
+        // transitive lazy-pull (a member referencing another member). Same
+        // predicate as the client scan above and as the armap writer, for the
+        // reason stated there
+        // (D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL): a member that
+        // defines a hidden non-static function HAS satisfied that name, and a
+        // resolver that disagreed with the index it just searched would pull a
+        // second member defining the same symbol.
+        for (auto const& ms : member_mod->symbols) {
+            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
+                noteDefinition(ms);
+            }
+        }
+        // The member's own uses, by the same gate as the client's.
+        auto const memberTargets = linker::relocationTargetIds(*member_mod);
+        for (auto const& ext : member_mod->externImports) {
+            if (!ext.mangledName.empty()
+                && linker::externSurvivesReferenceGate(ext, memberTargets)) {
+                noteUse(ext);
+            }
+        }
+        pulled.push_back(std::move(*member_mod));
+        return true;
+    };
+
+    // ── THE COMMONS ROUND (P69 send-back 5, review-xa4 MINOR 1) ─────────────
+    // Run each time the search has answered every reference it holds (the
+    // worklist's, then the weak round's — the loop below says why in that order): every
+    // name STILL a common — no definition it yields to is in the link
+    // (`yieldedToNames`) — whose members' document says `fetchDefinition` fetches
+    // the first member, in the archive's own order, that defines it as a datum
+    // the common yields to (`memberDefinesADatumTheCommonYieldsTo`). EVERY common
+    // the round began with is walked before the search answers the references
+    // the fetched members brought, and those members' own commons wait for the
+    // next round. nullopt after reporting; otherwise whether a member was fetched.
+    //   * WHY AFTER THE REFERENCES, AND WHY ALL OF THEM FIRST: it is what Apple's
+    //     ld does, and the one order under which both families' measured programs
+    //     come out. ✔MEASURED 2026-10-08, Apple clang 21's ld-1267 (arm64, x86_64)
+    //     and ld64-957.1: a program holding `c` as a common and calling `f` against
+    //     an archive of W (`f` + a WEAK `c`) and S (a strong `c`) reads W's `c` and
+    //     never fetches S, in both member orders — the reference is answered
+    //     first, W's weak definition replaces the common (Mach-O: `commonYieldsTo`
+    //     `anyDefinition`), and nothing is still a common. And a program holding
+    //     two commons T1 and T2 against X (a strong T1 + a call of `u`), U (`u` + a
+    //     weak T2) and T (a strong T2) fetches T whenever T precedes U in the
+    //     archive and never otherwise, whatever X's place and the names' order:
+    //     T2 was walked before X's `u` was answered.
+    //   * GNU ld's ELF linker walks the archive's index instead, entry by entry,
+    //     fetching for an undefined name and — for a common — a global datum, and
+    //     it reaches the same programs in every cell measured (✔MEASURED
+    //     2026-10-08, GNU ld 2.42, x86_64 and aarch64: the two shapes above read
+    //     the STRONG definition in every order, a weak definition never ending a
+    //     common's search there). The two orders part only where an archive holds
+    //     two STRONG definers of one name and a reference fetches the second: GNU
+    //     ld has by then fetched the first for the common and refuses the link
+    //     ("multiple definition"); this search answers the reference first, the
+    //     common yields to that member's definition, and the program links with
+    //     it — a link that works where a reference linker refuses, never a
+    //     different answer where one works.
+    auto const fetchDefinitionsForCommons = [&]() -> std::optional<bool> {
+        bool              fetched  = false;
+        std::size_t const roundEnd = commonNames.size();
+        for (std::size_t k = 0; k < roundEnd; ++k) {
+            std::string const name = commonNames[k];   // a copy: a pull grows the vector
+            if (yieldedToNames.contains(name)) continue;   // a definition replaced it
+            auto const listed = armapEntries.find(name);
+            if (listed == armapEntries.end()) continue;   // no archive defines it: nothing to decide
+            auto const [fai, fmi] = listed->second.front();
+            std::string_view const memberName = archives[fai].archive.members[fmi].name;
             if (!commonResolutionRead) {
                 commonResolutionRead = true;
                 ObjectFormatSchema const* const memberSchema = archiveMemberFormat(
-                    memberFormat, format, target, archivePaths[ai], memberName, reporter);
-                if (memberSchema == nullptr) return false;   // reported
+                    memberFormat, format, target, archivePaths[fai], memberName, reporter);
+                if (memberSchema == nullptr) return std::nullopt;   // reported
                 commonResolution = memberSchema->archiveCommonResolution();
             }
             if (!commonResolution.has_value()) {
@@ -3413,44 +3558,46 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                     "nothing (link.exe, lld-link, GNU ld's PE linker), is the members' "
                     "format's 'archiveCommonResolution', which '{}' does not state -- "
                     "refusing rather than guess one.",
-                    ext.mangledName, memberName, core::genericSpelling(archivePaths[ai]),
+                    name, memberName, core::genericSpelling(archivePaths[fai]),
                     memberFormat.schema != nullptr ? memberFormat.schema->name()
                                                    : format.name());
                 reporter.report(std::move(d));
-                return false;
+                return std::nullopt;
             }
-            if (*commonResolution == ArchiveCommonResolution::KeepCommon) {
-                definedNames.insert(ext.mangledName);
-                continue;
+            if (*commonResolution == ArchiveCommonResolution::KeepCommon) continue;
+            // FetchDefinition. A WEAK definition already in the link, under a link
+            // document that does not say whether the common yields to it, leaves
+            // open whether this name is still a common at all.
+            if (openYieldNames.contains(name)) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "static-link: '{}' is a COMMON (tentative) definition of a linked "
+                    "object, another linked unit defines it WEAK, and member '{}' of "
+                    "archive '{}' defines it as well. Whether the common yields to the "
+                    "weak definition, which ends the search for it (Apple's ld), or "
+                    "outranks it, so the search goes on (GNU ld), is format '{}''s "
+                    "'commonYieldsTo', which it does not state -- refusing rather than "
+                    "guess one.",
+                    name, memberName, core::genericSpelling(archivePaths[fai]), format.name());
+                reporter.report(std::move(d));
+                return std::nullopt;
             }
-            // FetchDefinition, with the predicate above: the member the worklist
-            // then pulls for the name is the first that defines it as a datum the
-            // common yields to; with none, the common is the definition.
-            if (definedNames.contains(ext.mangledName)) continue;   // already defined: nothing to fetch
-            bool answered = false;
-            for (auto const& [cai, cmi] : armapEntries[ext.mangledName]) {
-                auto const qualifies = memberDefinesADatumTheCommonYieldsTo(cai, cmi, ext.mangledName);
-                if (!qualifies.has_value()) return false;   // reported
-                if (*qualifies) {
-                    armap[ext.mangledName] = std::pair{cai, cmi};
-                    answered = true;
-                    break;
-                }
+            for (auto const& [cai, cmi] : listed->second) {
+                // A member already in the link has had its say: its definition of
+                // the name, if any, is one the common outranks.
+                if (pulledMembers.contains(memberKey(cai, cmi))) continue;
+                auto const qualifies = memberDefinesADatumTheCommonYieldsTo(cai, cmi, name);
+                if (!qualifies.has_value()) return std::nullopt;   // reported
+                if (!*qualifies) continue;
+                pulledMembers.insert(memberKey(cai, cmi));
+                if (!pullMember(cai, cmi)) return std::nullopt;   // reported
+                fetched = true;
+                break;
             }
-            if (!answered) definedNames.insert(ext.mangledName);
         }
-        return true;
-    };
-    for (auto const& clientModule : clientModules) {
-        if (!settleCommonsOf(clientModule)) return std::nullopt;
-    }
-
-    // (archiveIdx << 32) | memberIndex of every member already pulled -- the LAZY
-    // dedup so a member defining several referenced symbols is pulled once.
-    std::unordered_set<std::uint64_t> pulledMembers;
-    auto memberKey = [](std::size_t ai, std::size_t mi) -> std::uint64_t {
-        return (static_cast<std::uint64_t>(ai) << 32)
-             |  static_cast<std::uint64_t>(static_cast<std::uint32_t>(mi));
+        return fetched;
     };
 
     // ★ A FALLBACK B (`/alternatename:A=B`, or a weak external deferring to B —
@@ -3480,45 +3627,7 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                                                // own gate handles (never pulled here)
             auto const [ai, mi] = it->second;
             if (!pulledMembers.insert(memberKey(ai, mi)).second) continue;  // lazy dedup
-
-            ffi::ArMember const& member = archives[ai].archive.members[mi];
-            std::span<std::uint8_t const> const memberBytes{
-                archives[ai].bytes.data() + static_cast<std::size_t>(member.dataOffset),
-                static_cast<std::size_t>(member.size)};
-
-            // Parse the member back into a mergeable module via the shared
-            // per-format reader chokepoint (fresh cuId minted inside; a format
-            // with no reader arm fails loud there).
-            auto member_mod =
-                readArchiveMemberModule(memberBytes, target, format, memberFormat,
-                                        archivePaths[ai], member.name, reporter);
-            if (!member_mod) return std::nullopt;   // member-read fail-loud
-            // A pulled member's own commons, by the same rule as the client's.
-            if (!settleCommonsOf(*member_mod)) return std::nullopt;
-
-            // A pulled member's EXTERNAL-LINKAGE definitions satisfy later worklist
-            // names; its OWN unresolved externs feed the next pass -- the
-            // transitive lazy-pull (a member referencing another member). Same
-            // predicate as the client scan above and as the armap writer, for the
-            // reason stated there
-            // (D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL): a member that
-            // defines a hidden non-static function HAS satisfied that name, and a
-            // resolver that disagreed with the index it just searched would pull a
-            // second member defining the same symbol.
-            for (auto const& ms : member_mod->symbols) {
-                if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
-                    definedNames.insert(ms.name);
-                }
-            }
-            // The member's own uses, by the same gate as the client's.
-            auto const memberTargets = linker::relocationTargetIds(*member_mod);
-            for (auto const& ext : member_mod->externImports) {
-                if (!ext.mangledName.empty()
-                    && linker::externSurvivesReferenceGate(ext, memberTargets)) {
-                    noteUse(ext);
-                }
-            }
-            pulled.push_back(std::move(*member_mod));
+            if (!pullMember(ai, mi)) return std::nullopt;   // reported
         }
         // THE WEAK ROUND: each weak reference the search left unresolved, by the
         // members' document — fetched as a strong reference where it says
@@ -3565,6 +3674,27 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
             }
         }
         if (weakFetched) continue;   // the search resumes with the fetched names
+        // THE COMMONS ROUND (`fetchDefinitionsForCommons`, above): the names still
+        // common, now that every reference is answered — the strong ones by the
+        // worklist, the weak ones by the weak round.
+        // ★ AFTER THE WEAK ROUND, BY MEASUREMENT. ✔MEASURED 2026-10-08 on Apple's ld
+        // (Apple clang 21's ld-1267 for arm64 and x86_64, and ld64-957.1; probe
+        // runs 20261008-084313-c1f1b501 and 20261008-084342-4a820962, which agree
+        // cell for cell): a program holding a WEAK reference `w` and a common `c`
+        // against an archive of m1 (`w`) and m2 (`c` and `w`) is REFUSED for a
+        // duplicate `w` — m1 was fetched for the reference, then m2 for the common,
+        // where this round first would have loaded m2 alone — and against m0 (`c`)
+        // and m1 (`w` and `c`) it loads m1 ALONE, whose `c` ends the common's
+        // search (this round first would have loaded m0, then m1: a duplicate
+        // `c`). A STRONG reference to `w` gives the same cells. The order shows
+        // only where both rounds can fetch, which is Mach-O's member documents
+        // alone: an ELF member document fetches nothing for a weak reference, and
+        // a PE one neither that nor a definition for a common.
+        {
+            auto const fetchedForACommon = fetchDefinitionsForCommons();
+            if (!fetchedForACommon.has_value()) return std::nullopt;   // reported
+            if (*fetchedForACommon) continue;   // the search resumes with those members' uses
+        }
         // The search has answered every name it holds: offer each fallback whose A
         // it left unresolved.
         std::unordered_set<std::string> libraryBound;
@@ -3925,6 +4055,11 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
             linkFormat, memberFormat, objectPath,
             objectPath.filename().string(), reporter);
         if (!object_mod) return std::nullopt;   // read fail-loud already reported
+        // P69 send-back 5 (review-xa4 MINOR 3): an object NAMED to the link keeps
+        // its `/ENTRY:`, and the entry's name is a reference the archive search
+        // answers (`linker::requireEntryReference`). An image link decides it; a
+        // relocatable artifact hands the directive on and decides nothing.
+        if (linkFormat.isImageFlavor()) linker::requireEntryReference(*object_mod);
         objects.push_back(std::move(*object_mod));
     }
     return objects;

@@ -1860,6 +1860,8 @@ encode(AssembledModule const&    module,
         bool          hasWeakExternAux     = false;
         std::uint32_t auxWeakTagIndex      = 0;  // symtab index of the DEFAULT
         std::uint32_t auxWeakCharacteristics = 0;
+        // The record's own SymbolTableIndex, stamped by `appendEntry`.
+        std::uint32_t tableIndex = 0;
     };
     std::vector<CoffSymEntry> symEntries;
     std::uint32_t slotsMinted = 0;
@@ -1871,6 +1873,7 @@ encode(AssembledModule const&    module,
     auto appendEntry = [&](CoffSymEntry e) -> std::uint32_t {
         std::uint32_t const idx = slotsMinted;
         slotsMinted += (e.hasSectionDefAux || e.hasWeakExternAux) ? 2u : 1u;
+        e.tableIndex = idx;
         symEntries.push_back(std::move(e));
         return idx;
     };
@@ -2256,6 +2259,26 @@ encode(AssembledModule const&    module,
     if (hasData && !appendDataSyms(dataLayout, IDX_DATA)) return {};
     if (hasRelRo && !appendDataSyms(relroLayout, IDX_RELRO)) return {};
     if (hasBss && !appendDataSyms(bssLayout, IDX_BSS)) return {};
+
+    // THE WEAK-NAME RULE, this writer's arm (`object_symbol_names.hpp`): a
+    // plain reference row naming one of this object's own external-linkage names
+    // gets no UNDEF record. Its id is the record of the NAME, so a relocation
+    // written through a weak name names the weak external itself, as MinGW gcc
+    // and clang write it (✔MEASURED 2026-10-08: `IMAGE_REL_AMD64_REL32 shared`
+    // against the class-105 record). Every record appended so far is a
+    // DEFINITION's: an EXTERNAL one in a section, or the weak external an alias
+    // is written as.
+    {
+        std::unordered_map<std::string, std::uint32_t> recordOfDefinedName;
+        for (auto const& e : symEntries) {
+            bool const namesADefinition =
+                e.storageClass == IMAGE_SYM_CLASS_WEAK_EXTERNAL
+                || (e.storageClass == IMAGE_SYM_CLASS_EXTERNAL && e.sectionNumber > 0);
+            if (namesADefinition) recordOfDefinedName.emplace(e.name, e.tableIndex);
+        }
+        link::format::pointOwnNameReferencesAtTheirRecords(module, recordOfDefinedName,
+                                                           symIdxBySymbol);
+    }
 
     // Undefined externs: any reloc target that is neither a defined
     // function / block / data / weak symbol. Scans DATA-ITEM relocations too
@@ -3498,8 +3521,7 @@ classifyImportSlot(AssembledData const& di, Relocation const& rel,
 // The format document's header, with the program's own request
 // (`ImageRequest::stackReserveBytes`) and its units' decided directives
 // (`ImageRequest::directives`) applied field by field, the way link.exe
-// realizes each (✔MEASURED 2026-10-07, link.exe 14.44.35228 and lld-link 19.1.5,
-// `.orchestrators/p69/work/xa/r4probe/m4`):
+// realizes each (✔MEASURED 2026-10-07, link.exe 14.44.35228 and lld-link 19.1.5):
 //   * stack / heap: reserve and commit rounded UP to a multiple of 4; a reserve
 //     below the commit with the commit unstated becomes the commit (link.exe
 //     writes 0x1000 for 0, 0x10 and 0x800); a stated stack commit above its
