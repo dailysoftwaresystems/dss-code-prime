@@ -143,6 +143,29 @@ def _repo_root() -> Path:
 REPO_ROOT = _repo_root()
 
 
+class HistoryUnreadable(Exception):
+    """`git log` could not read the history of the tree this file lives in."""
+
+    def __init__(self, returncode: int, said: str) -> None:
+        super().__init__(returncode, said)
+        self.returncode = returncode
+        self.said = said
+
+
+def unreadable_history(exc: HistoryUnreadable) -> str:
+    """The refusal for a tree whose history git cannot read: this program's words, with git's own first line.
+
+    The landing-log hashes are RENDERED FROM the history, so a tree without one is neither current nor out of
+    date -- it is unanswerable, and the exit code says so (2: neither 0, "every marker current", nor 1, drift).
+    """
+    lines = [line.strip() for line in exc.said.splitlines() if line.strip()]
+    return ("refresh_landing_log: REFUSED -- `git log` cannot read the history of %s (exit %d: %s). The "
+            "landing-log hashes are rendered from that history and from nothing else, so no plan was checked and "
+            "none is reported current. A tree with no commit git can reach -- a synced copy, an export -- cannot "
+            "answer this: run it in a checkout that holds the history."
+            % (REPO_ROOT, exc.returncode, lines[0] if lines else "git printed nothing"))
+
+
 def git_log_subjects() -> list[tuple[str, str]]:
     """Return (full_sha, subject) pairs for every commit reachable from HEAD.
 
@@ -156,7 +179,11 @@ def git_log_subjects() -> list[tuple[str, str]]:
     `git log` reads no index). `--check` could not show it on that tree only because no commit
     there matches a configured subject pattern, so both histories rendered every marker empty;
     against a history that does match, the verdict flips (self-test arm 3).
-    ⇒ `owning-tree.run_git`. A failing `git log` still raises, as `check_output` did.
+    ⇒ `owning-tree.run_git`.
+    ★ A FAILING `git log` RAISES `HistoryUnreadable`, with git's exit code and git's own words, and `main`
+    answers it with a refusal (exit 2). It raised `CalledProcessError` and nothing caught it: ✔MEASURED
+    2026-10-08, on a git work tree with no commit -- what a synced copy of this repository is on another
+    machine -- `--check` answered with a traceback naming a line of this file, and the tree's condition nowhere.
     """
     p = _owning_tree().run_git(
         ["log", "--pretty=format:%H %s"],
@@ -166,7 +193,7 @@ def git_log_subjects() -> list[tuple[str, str]]:
         encoding="utf-8",
     )
     if p.returncode != 0:
-        raise subprocess.CalledProcessError(p.returncode, p.args, p.stdout, p.stderr)
+        raise HistoryUnreadable(p.returncode, (p.stderr or p.stdout or "").strip())
     out = p.stdout
     rows = [line.split(" ", 1) for line in out.splitlines() if line]
     rows.reverse()
@@ -325,7 +352,7 @@ _FX_PATTERN = r"^Fixture landing (FX[0-9]+)[a-z]?(?:\s+(review)(?:\s+round-([0-9
 _FX_PLAN = (".plans/fx-landing-plan.md",
             "# fixture plan\n\n### PR landing log\n\n| PR | hashes |\n|---|---|\n"
             "| FX1 | <!-- LANDING-LOG-HASHES: FX1 --><!-- /LANDING-LOG-HASHES --> |\n")
-SELF_TEST_ARMS = 6
+SELF_TEST_ARMS = 7
 
 
 def self_test() -> int:
@@ -342,7 +369,9 @@ def self_test() -> int:
       (3) GIT_DIR                  another repository             -> --check rc 0 (negative: bare git log lacks FX1)
       (4) GIT_DIR + GIT_WORK_TREE  another repository             -> --check rc 0 (negative proven the same way)
       (5) GIT_INDEX_FILE           another repository's, ABSOLUTE -> --check rc 0, and bare git log is unmoved by it
-      (6) the fixture box is removed, git's read-only objects included
+      (6) NO HISTORY               a git work tree, no commit     -> --check rc 2 and the refusal's sentence:
+                                   never 0 (a tree nobody read, reported current), never 1 (drift), no traceback
+      (7) the fixture box is removed, git's read-only objects included
     """
     import shutil
     import tempfile
@@ -395,8 +424,8 @@ def self_test() -> int:
         git(other, "add", "-A")
         git(other, "commit", "-q", "--no-verify", "-m", "an unrelated commit")
 
-        def check(extra: dict) -> tuple[int, str]:
-            p = subprocess.run([sys.executable, str(tool), "--check"], cwd=str(box),
+        def check(extra: dict, of: Path = tool) -> tuple[int, str]:
+            p = subprocess.run([sys.executable, str(of), "--check"], cwd=str(box),
                                env=dict(base, GIT_CEILING_DIRECTORIES=str(box), **extra),
                                capture_output=True, text=True, encoding="utf-8", errors="replace",
                                timeout=180)
@@ -427,9 +456,30 @@ def self_test() -> int:
                 "(%d) a caller's %s naming another repository leaves --check reading its own history"
                 % (n, label),
                 "bare-git-log-lacks-FX1=%s (expected %s) rc=%d %s" % (lacks, steers_bare_git, rc, said[-200:]))
+
+        # (6) A TREE WITH NO HISTORY: this tool, its owner, its config and the MARKED plan in a git work tree that
+        # holds no commit. `git log` fails there, and the copy must SAY so and exit 2. The plan carries a hash on
+        # purpose: a tool that went on with an empty history would render the marker empty and call it drift
+        # (rc 1), so the three wrong answers -- clean, drift, traceback -- each read differently from the right one.
+        bare = box / "nohistory"
+        bare_actions = bare / ".harness-config" / "runner" / "actions"
+        bare_tool = bare_actions / "refresh_landing_log" / "refresh_landing_log.py"
+        bare_tool.parent.mkdir(parents=True)
+        shutil.copyfile(Path(__file__).resolve(), bare_tool)
+        shutil.copyfile(tool.parent / "landing-log-config.json", bare_tool.parent / "landing-log-config.json")
+        (bare_actions / "owning-tree").mkdir(parents=True)
+        shutil.copyfile(owner, bare_actions / "owning-tree" / "owning-tree.py")
+        (bare / _FX_PLAN[0]).parent.mkdir(parents=True)
+        (bare / _FX_PLAN[0]).write_text(marked, encoding="utf-8", newline="\n")
+        git(bare, "init", "-q")
+        rc, said = check({}, bare_tool)
+        arm(rc == 2 and "REFUSED -- `git log` cannot read the history of" in said and "no plan was checked" in said
+            and "Traceback" not in said,
+            "(6) a tree with no commit is REFUSED in a sentence (rc 2): nothing checked, nothing reported current",
+            "rc=%d %s" % (rc, said[-300:]))
     finally:
         gone = ot.remove_tree(str(box))
-    arm(gone, "(6) the fixture box is removed -- git's read-only objects included", "left behind: %s" % box)
+    arm(gone, "(7) the fixture box is removed -- git's read-only objects included", "left behind: %s" % box)
 
     if len(ran) != SELF_TEST_ARMS:
         print("refresh_landing_log self-test: FAIL -- %d arm(s) ran, %d expected" % (len(ran), SELF_TEST_ARMS))
@@ -438,7 +488,8 @@ def self_test() -> int:
         print("refresh_landing_log self-test: FAIL -- %d of %d arm(s)" % (len(failed), len(ran)))
         return 1
     print("refresh_landing_log self-test: OK -- %d arm(s): the landing log is read from this tree's own "
-          "history under GIT_DIR, GIT_DIR + GIT_WORK_TREE and an absolute GIT_INDEX_FILE" % len(ran))
+          "history under GIT_DIR, GIT_DIR + GIT_WORK_TREE and an absolute GIT_INDEX_FILE, and a tree with no "
+          "history is refused in a sentence" % len(ran))
     return 0
 
 
@@ -453,7 +504,7 @@ def main() -> int:
     mode.add_argument(
         "--check",
         action="store_true",
-        help="exit non-zero if any plan file would change",
+        help="exit 1 if any plan file would change, 2 if this tree's history cannot be read",
     )
     mode.add_argument(
         "--write",
@@ -471,7 +522,12 @@ def main() -> int:
         return self_test()
 
     plans = load_config(CONFIG_PATH)
-    all_subjects = git_log_subjects()
+    try:
+        all_subjects = git_log_subjects()
+    except HistoryUnreadable as exc:
+        # Refused before any plan is read: nothing is checked, nothing is written.
+        print(unreadable_history(exc), file=sys.stderr)
+        return 2
 
     drift = False
     missing = updated = 0

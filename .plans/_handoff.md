@@ -107,6 +107,16 @@ round's close; each checkpoint's commit message says what was and was not run on
   `dssharness read-anchors --pending --open --band P0`. A disclosed row is OPEN WORK (operator ruling of the same
   day): the round's remaining waves close them, the largest on their own plans. The orchestrator's ledger is local,
   not in the repository (`.orchestrators/p69/plans/p69/ledger.md`).
+- **Checkpoint 2 (2026-10-08) = the harness lane's final fold**: the prototype census (its verdict (b) no longer has
+  an escape class, an absent reference compiler is refused in the program's own words, every arm has a mutant), the
+  stale-refusal guard's stated predicate, and the landing log refusing a tree without history in a sentence instead
+  of a traceback. ✔MEASURED on the main tree after the fold, two local legs each: the three inventory guards,
+  `check-line-endings`, `refresh_landing_log` and the stale-refusal guard (last) pass; balance, lint, citations and
+  the registry check pass. Owed before the round's close and labelled per item in the rows: the three censuses and
+  65 census mutants re-read on the final bytes (they were read one edit earlier), and the ctest form of that lane's
+  set on the three local legs (the gate reads it). One harness row stays OPEN on a named blocker outside this
+  repository: a run step cannot be handed the leg's own compiler, so the census has no default reference on the
+  two Windows legs.
 - **HOW THIS CYCLE ENDS — operator, 2026-10-08, verbatim:** *"on finishing this cycle I'll turn on the pipes and
   try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and monitor CI until
   green"*. So P69 is this PR's EXIT: its four lanes finish what they are in (no second round opens in this PR — what

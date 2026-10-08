@@ -50,8 +50,15 @@ THE REFERENCE is `--cc`, always named: the ctest entry hands it the build's own 
 Its dialect is READ from the compiler itself, never from its name: clang's and gcc's from their `--version` banner
 (✔MEASURED 2026-09-30, clang 18.1.3 and gcc 13.3.0); MSVC's cl, which answers no `--version`, from the banner it prints
 when run with no arguments (✔MEASURED 2026-10-07, cl 19.51.36260); any other compiler is refused by name, never parsed
-by guess. Each dialect carries how it is DRIVEN — its standard mode (gcc and clang `-std=gnu2x -D_GNU_SOURCE`, cl
-`/std:clatest`, which `typeof` needs), its syntax-only check, its output option — and how its diagnostics name the type
+by guess. A reference the host does not have AT ALL is refused in this program's own words (`absent_reference`), not
+the system's — which differ from host to host, so the absence is asked of the PATH and never read off the error
+(`reference_dialect`): it names the missing program, says that the census has no reference of its own and never
+picks one — which compiler a leg builds with is the leg's fact, and a PATH does not say — how a run names the leg's
+(`--input cc=<name>`), and which of the compilers it reads the step's PATH holds (✔MEASURED 2026-10-08: neither
+Windows leg has a `cc`, the default of a run's `cc` input, so a run there that names none ends at its first step,
+exit 2, with that refusal). Each dialect carries how it is DRIVEN — its standard mode (gcc and clang
+`-std=gnu2x -D_GNU_SOURCE`, cl `/std:clatest`, which `typeof` needs), its syntax-only check, its output option — and
+how its diagnostics name the type
 of `&sym` and an undeclared name. `--flags` adds to that, in the reference's own spelling. cl (✔MEASURED 2026-10-07,
 windows-x86_64-release) prints its diagnostics on STDOUT, keeps typedef names (it has no `aka` form) and the calling
 convention (`__cdecl`, which DSS's own pe config erases), names the type in two shapes (C4047 for a function, an array
@@ -61,26 +68,42 @@ a struct, union or enum type WITHOUT its tag word (`tm *` for `struct tm *`), wh
 spelling step asks cl, in a TU of its own, which spelled names are only tags and of which kind (a tag's `typedef`
 line fails, C2061; `struct <a union's tag>` fails naming the kind, C2011), and puts the word back — that TU, too,
 re-run for the names a 100-error stop never reached. And its `_Generic` KEEPS a parameter's top-level `restrict` when
-it compares function types (✔MEASURED 2026-10-07: `void f(char *restrict)` against `void (*)(char *)` is NO on cl
-19.51.36260, and yes on gcc, clang and DSS, as C 6.7.6.3p15 has it), so on cl verdict (b) of a row whose header
-declares a restrict parameter is REF-CANNOT-JUDGE, never a NO: a descriptor's text cannot spell what is no part of a
-function's type, and cl answers NO whatever the row says. gcc and clang, for their part, PRINT a const or noreturn
-function's address type with the attribute as a decoration neither takes as part of a type — gcc first, clang last
-for noreturn, a form no compiler accepts as a type name (✔MEASURED 2026-10-08) — so the spelling step removes it, by
-a closed list held to each leg's compiler (`DECORATIONS`), counts the rows it removed one from
-(`ref-decoration-dropped`) and names the removal in the report's last column; any other attribute is handed on.
+it compares function types — a callback's parameter's too (✔MEASURED 2026-10-07 and 2026-10-08: `void f(char
+*restrict)` against `void (*)(char *)` is NO on cl 19.51.36260, and yes on gcc, clang and DSS, as C 6.7.6.3p15 has
+it) — while a descriptor's text cannot spell what is no part of a function's type. So on cl a row whose verdict (b)
+is NO and whose spelling holds a parameter's `restrict` is ASKED AGAIN, in the form cl answers (✔MEASURED 2026-10-08,
+probe-reference-cc run 20261008-085400-883c8a53): first THE WITNESS — cl's own spelling as the type of `&sym`, the
+qualifier on both sides, must be yes — then the descriptor's text against that spelling with each parameter's
+`restrict` removed, `_Generic((<spelling>)0, <text>: …)`, the qualifier on NEITHER side; that yes or NO is the
+verdict (threads.json's `mtx_timedlock`, whose header declares two restrict parameters and whose descriptor models
+both `ptr<void>`, is a NO in that form as it is on Linux, and would be a yes with the right text). Only a `restrict`
+that ENDS a parameter is removed; a pointee's is part of the type on every reference and stays. REF-CANNOT-JUDGE is
+left for the row where that question cannot be put, its reason in the cell. gcc and clang, for their part, PRINT a
+const or noreturn function's address type with the attribute as a decoration neither takes as part of a type — gcc
+first, clang last for noreturn, a form no compiler accepts as a type name (✔MEASURED 2026-10-08) — so the spelling
+step removes it, by a closed list held to each leg's compiler (`DECORATIONS`) and only on a row where the
+reference's own `_Generic` takes the bare spelling as the type of THAT row's symbol (gcc prints the noreturn of a
+function an OBJECT points to at the front too, and does not take the bare type there), counts the rows it removed
+one from (`ref-decoration-dropped`) and names the removal in the report's last column; any other attribute, and a
+removal the reference does not witness, is handed on.
 
 Verdicts: yes · NO · REF-UNDECLARED (the reference's header does not declare it) · REF-NO-HEADER (the reference has
 no such header at all — Apple ships no <threads.h>) · REF-ERROR (the reference refused the spelling probe some other
 way) · REF-CANNOT-SPELL (the reference cannot compile the rendered text, e.g. a DSS-only name) · REF-CANNOT-JUDGE
-(verdict (b) alone: the reference's `_Generic` keeps a `restrict` its header declares on this row — above — so its
-NO is no verdict; verdict (a) still judges the row) · DSS-REFUSED (DSS would not compile the judge probe) ·
-PAIR-REFUSED (no arm of the row's `signature` serves the pair, which the descriptor reader refuses) · JUDGE-FAILED (a
-judge program exited non-zero — its stdout is never read as verdicts).
-THE CENSUS LINE COUNTS EVERY ROW: verdict (a)'s categories partition the symbols, and a report holding a verdict the
-line does not count fails the step (`prototype-census: FAILED — …`) — a census never passes over rows it does not
-account for. ✔MEASURED 2026-10-06: before this rule the Mac's line said OK over 25 `threads.json` rows (REF-ERROR —
-no <threads.h>) that no count named.
+(verdict (b) alone, on a reference whose `_Generic` keeps a parameter's `restrict`: the question could not be put
+without it — the spelling holds a `restrict` this program cannot place, or the reference does not take its own
+spelling as the symbol's type; the reason is in the cell, and verdict (a) still judges the row) · DSS-REFUSED (DSS
+would not compile the judge probe) · PAIR-REFUSED (no arm of the row's `signature` serves the pair, which the
+descriptor reader refuses) · JUDGE-FAILED (a judge program exited non-zero — its stdout is never read as verdicts).
+A cell that keeps a compiler's or a judge's message keeps it on ONE line, named relative to the scratch directory
+the program was compiled in, whole up to a bound; past it the message's START and its END are both kept around a
+`[...]` (its code opens it, and a parse refusal of DSS's closes with what it met), each cut at a word's end.
+THE CENSUS LINE COUNTS EVERY ROW: verdict (a)'s categories partition the symbols and so do verdict (b)'s, and a
+report holding a verdict of either that the line does not count fails the step (`prototype-census: FAILED — …`) — a
+census never passes over rows it does not account for. ✔MEASURED 2026-10-06: before this rule the Mac's line said OK
+over 25 `threads.json` rows (REF-ERROR — no <threads.h>) that no count named; and until 2026-10-08 only verdict
+(a)'s list was held — a verdict (b) outside every count read `OK … b-yes=1`, every other (b) field 0 (the P69
+review's measurement on a copy of `summarize`; the `s-accounting` arm now holds both lists).
 Last line: `prototype-census: OK …` / `prototype-census: VALUES OK …` / `prototype-census: SELFTEST OK …`.
 
 Usage: prototype-census.py --tree=<repo> --processor=<cpu> --dsscp=<path> --cc=<reference> [--flags=a,b]
@@ -438,11 +461,19 @@ def split_flags(value):
 # CLOSED list, never by a pattern over attributes: per dialect, the exact text, the END of the spelling the dialect
 # prints it at, and the WITNESS -- what the reference itself says when that text is written there in a type name, held
 # to the leg's own compiler by the self-test (arm `d-witness`). That what is removed is no part of the type BY THE
-# REFERENCE'S OWN JUDGEMENT is held there too: its own `_Generic` must take the bare spelling as the type of the
-# function it decorated itself (arms `d-noreturn`, `d-const`). Any other attribute, one at the other end and one
-# inside a type stay in the spelling and are refused by name downstream. The census line counts the rows a
-# decoration was removed from (`ref-decoration-dropped`) and the report names what was removed, row by row: a row
-# judged after a removal never reads like a row judged as spelled.
+# REFERENCE'S OWN JUDGEMENT is not a property of the list, though: it is WITNESSED ROW BY ROW (keep_unwitnessed) --
+# a removal is made only where the reference's own `_Generic` takes the bare spelling as the type of that row's
+# symbol. ✔MEASURED 2026-10-08, gcc 13.2.0 (probe-reference-cc run 20261008-085400-883c8a53): the address of an
+# OBJECT declared `void (*p)(int) __attribute__((noreturn))` is spelled `__attribute__((noreturn)) void (**)(int)`,
+# the nested function type's noreturn at the front too, and gcc's `_Generic` answers NO to `void (**)(int)` for it
+# -- where it answers yes to the bare type of a noreturn FUNCTION's address; Apple clang 21 prints that object's
+# type `void (**)(int) __attribute__((noreturn))` and DOES take the bare type (run 20261008-085224-eb714084). A
+# row whose removal the reference does not witness keeps the reference's own spelling and is in no count. The
+# self-test holds the witness on a plain function (arms `d-noreturn`, `d-const`), on that object (`d-nested`) and,
+# with no compiler, the rule itself (`d-unwitnessed`). Any other attribute, one at the other end and one inside a
+# type stay in the spelling and are refused by name downstream. The census line counts the rows a decoration was
+# removed from (`ref-decoration-dropped`) and the report names what was removed, row by row: a row judged after a
+# removal never reads like a row judged as spelled.
 DECORATIONS = {
     'gcc': (('__attribute__((const))', 'leading', 'attribute does not apply to types'),
             ('__attribute__((noreturn))', 'leading', 'attribute does not apply to types')),
@@ -450,12 +481,20 @@ DECORATIONS = {
     'msvc': (),
 }
 Q_OPEN, Q_CLOSE = "['‘]", "['’]"
+# gcc's and clang's line that says a name is UNDECLARED is read on the TU's OWN lines only, as cl's lines are
+# (MSVC_LINE): the file name the compiler prints, at the start of a line or after a directory separator, then
+# `:<line>:<column>: error: `. A header's own undeclared name sits on a line whose NUMBER a row's line can share, and
+# is not that row's (✔MEASURED 2026-10-08, probe-reference-cc runs 20261008-085224-eb714084 and
+# 20261008-085400-883c8a53: the header's `<header>:<line>:<column>: error: …` beside the TU's own, on other lines,
+# gcc 13.2.0 and Apple clang 21). The `%s` is the TU's name, escaped. The SPELLING patterns need no such anchor: they
+# name `struct census_probe_sink`, which only the TU declares, after its includes.
+GNU_OWN_LINE = r"(?m)(?:^|[\\/])%s:(\d+):\d+: error: "
 DIALECTS = {
     'clang': {
         'spell': re.compile(r":(\d+):\d+: (?:warning|error): incompatible pointer types initializing "
                             r"'struct census_probe_sink \*' with an expression of type '([^']*)'"
                             r"(?: \(aka '([^']*)'\))?"),
-        'undeclared': re.compile(r":(\d+):\d+: error: (?:use of undeclared identifier|call to undeclared)"),
+        'undeclared': GNU_OWN_LINE + r"(?:use of undeclared identifier|call to undeclared)",
         'standard': ['-std=gnu2x', '-D_GNU_SOURCE'],
         'syntax': ['-fsyntax-only', '-ferror-limit=0'],
         'quiet': ['-w'],
@@ -467,7 +506,7 @@ DIALECTS = {
         'spell': re.compile(r":(\d+):\d+: (?:warning|error): initialization of %sstruct census_probe_sink \*%s from "
                             r"incompatible pointer type %s([^‘’']*)%s(?: \{aka %s([^‘’']*)%s\})?"
                             % (Q_OPEN, Q_CLOSE, Q_OPEN, Q_CLOSE, Q_OPEN, Q_CLOSE)),
-        'undeclared': re.compile(r":(\d+):\d+: error: %s[^‘’']*%s undeclared" % (Q_OPEN, Q_CLOSE)),
+        'undeclared': GNU_OWN_LINE + r"%s[^‘’']*%s undeclared" % (Q_OPEN, Q_CLOSE),
         'standard': ['-std=gnu2x', '-D_GNU_SOURCE'],
         'syntax': ['-fsyntax-only', '-fmax-errors=0'],
         'quiet': ['-w'],
@@ -490,8 +529,15 @@ DIALECTS = {
         # (✔MEASURED 2026-10-07, cl 19.51.36260, probe-reference-cc run 20261008-014747-3f3f43d5: `void f(char
         # *restrict)` against `void (*)(char *)` is NO, `__restrict` the same, and a top-level `const` it does
         # erase), where C 6.7.6.3p15 takes the parameter unqualified and gcc 13, Apple clang 21 and DSS answer yes
-        # (runs 20261008-014747-3f3f43d5 and 20261008-014812-7accf3cb). So its NO on a row whose header declares
-        # one is no verdict (reference_verdict); the self-test holds each dialect's entry to the leg's own compiler.
+        # (runs 20261008-014747-3f3f43d5 and 20261008-014812-7accf3cb). A descriptor's text cannot spell that
+        # qualifier, so cl's plain NO on a row whose header declares one says nothing about the row -- but cl DOES
+        # answer when the qualifier is on both sides or on neither (✔MEASURED 2026-10-08, run
+        # 20261008-085400-883c8a53: its own spelling against `&sym` is yes; that spelling without its parameters'
+        # restrict, cast onto 0, is yes against the right text and NO against a wrong one; the same cast with the
+        # qualifier kept is NO against the right text, so it is the removal that makes it answer; a callback's
+        # parameter is kept the same way; a POINTEE's restrict is part of the type there as everywhere). So such a
+        # NO is asked again in that form (asked_again), and the self-test holds each dialect's entry, and the
+        # form, to the leg's own compiler.
         'generic_keeps_restrict': True,
     },
 }
@@ -554,20 +600,46 @@ def undecorated(spelling, dialect):
 
 
 def spelling_diagnostics(dialect, text, tu):
-    """({line: (declared, canonical)}, {undeclared lines}, the line the compiler stopped at or None, {line: the
-    decorations removed from its spelling}) for the TU `tu`."""
+    """({line: (declared, canonical)}, {undeclared lines}, the line the compiler stopped at or None, {line: (the
+    decorations removed from its spelling, the (declared, canonical) spelling AS PRINTED)}) for the TU `tu`. The
+    spelling as printed is kept beside a removal because the removal is still to be witnessed, row by row
+    (keep_unwitnessed)."""
     if dialect == 'msvc':
         return msvc_diagnostics(text, tu) + ({},)
     forms = DIALECTS[dialect]
     found, gone = {}, {}
     for m in forms['spell'].finditer(text):
-        declared, removed = undecorated(m.group(2), dialect)
-        canonical, removed_too = undecorated(m.group(3) or m.group(2), dialect)
+        printed = (m.group(2), m.group(3) or m.group(2))
+        declared, removed = undecorated(printed[0], dialect)
+        canonical, removed_too = undecorated(printed[1], dialect)
         found[int(m.group(1))] = (declared, canonical)
         if removed or removed_too:
-            gone[int(m.group(1))] = ' '.join(dict.fromkeys(removed + removed_too))
-    undecl = {int(m.group(1)) for m in forms['undeclared'].finditer(text)}
+            gone[int(m.group(1))] = (' '.join(dict.fromkeys(removed + removed_too)), printed)
+    undecl = {int(m.group(1)) for m in re.finditer(forms['undeclared'] % re.escape(tu), text)}
     return found, undecl, None, gone
+
+
+KEPT_LIMIT = 600
+
+
+def kept_message(text, limit=KEPT_LIMIT):
+    """A compiler's or a judge's message as a report cell keeps it: ONE line (every run of whitespace a single
+    space, so a tab or a line break never splits a row of the report), whole up to `limit` characters. Past that its
+    START and its END are both kept, around a `[...]` that says something was left out: a message opens with its
+    code, and a parse refusal of DSS's closes with what it met (`… — got ')'`) after a list of what it expected
+    that outgrows any bound (✔MEASURED 2026-10-08, the Mac's plain census, run 20261008-101158-9c7dd27f: two
+    `P_NoAlternativeMatched` cells past 600 characters, cut before those closing words while only the start was
+    kept). The end is given a quarter of the bound. Each side is cut at a word's END -- never mid-word, never
+    silently; an end that holds no word boundary is left out whole, and a start that holds none is cut at its
+    share of the bound, there being no word to end on."""
+    line = ' '.join((text or '').split())
+    if len(line) <= limit:
+        return line
+    tail = limit // 4
+    cut = line.rfind(' ', 0, limit - tail + 1)
+    back = line.find(' ', max(len(line) - tail - 1, cut + 1))
+    head = line[:cut] if cut > 0 else line[:limit - tail]
+    return head + ' [...]' + (line[back:] if back >= 0 else '')
 
 
 # ── the tag word cl drops ────────────────────────────────────────────────────────────────────────────────────────
@@ -681,14 +753,44 @@ def row_verdict(ln, found, undecl):
     return found.get(ln, 'REF-ERROR')
 
 
-def reference_dialect(cc, work):
-    """clang, gcc or msvc, read from the compiler itself; None (with what it printed) for anything else. clang and gcc
-    answer `--version`; cl answers no `--version` and prints its banner when run with no arguments."""
+# The compilers whose dialect this program reads, under the names a PATH holds them by.
+REFERENCES_READ = ('clang', 'gcc', 'cl')
+
+
+def absent_reference(cc, which=shutil.which):
+    """The refusal of a reference compiler the host does not have, in this program's words rather than the system's
+    (which are in the host's language, and are not the same from host to host — `reference_dialect` says how the
+    absence is decided): which program is missing, that the census has no reference of its own and never picks one,
+    how a run names the leg's, and which of the compilers it reads the step's PATH holds — a list to choose from,
+    never a choice: which of them the LEG builds with is the leg's fact, and a PATH does not say."""
+    here = [name for name in REFERENCES_READ if which(name)]
+    return ('the reference compiler %r is not on this host: no program of that name can be started (`--cc`; on a '
+            'run, the step\'s `cc` input). The census has no reference of its own and never picks one: name the '
+            'compiler this leg builds with, `--input cc=<name>` on a run. Of the compilers it reads (%s), this '
+            'step\'s PATH holds: %s' % (cc, ', '.join(REFERENCES_READ), ', '.join(here) or 'none of them'))
+
+
+def reference_dialect(cc, work, start=None, which=shutil.which):
+    """clang, gcc or msvc, read from the compiler itself; None (with what it printed, or why it could not be started)
+    for anything else. clang and gcc answer `--version`; cl answers no `--version` and prints its banner when run with
+    no arguments. `start` and `which` are what starts a program and what looks a name up on the PATH — `run` and
+    `shutil.which` — named so that the self-test holds each way a start fails, on every leg."""
+    start = start or run
     if not cc:
         return None, 'no reference compiler is named (--cc is empty)'
     try:
-        rc, so, se = run([cc, '--version'], work, timeout=60)
+        rc, so, se = start([cc, '--version'], work, timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
+        # WHETHER THE PROGRAM IS WHAT IS MISSING is asked of the PATH, never read off the error, which is not the same
+        # from host to host: a name no directory holds is "file not found" on Windows and macOS and "permission
+        # denied" on a host one of whose PATH entries refuses the lookup (✔MEASURED 2026-10-08 on the WSL leg:
+        # `[Errno 13]`, and `[Errno 2]` once that one entry is taken off the PATH), and a working directory
+        # that does not exist is "file not found" too wherever the directory is entered before the program is looked
+        # for (✔MEASURED on macOS: `[Errno 2]`, naming the directory). So a compiler is ABSENT when its start failed,
+        # the directory it was to run in exists, and the PATH holds no file of that name, executable or not; a file
+        # that is there and cannot be started keeps the system's words.
+        if isinstance(e, OSError) and os.path.isdir(work) and which(cc, os.F_OK) is None:
+            return None, absent_reference(cc, which)
         return None, 'cannot run %r --version: %s' % (cc, e)
     banner = (so + se).strip()
     first = banner.splitlines()[0] if banner else ''
@@ -697,7 +799,7 @@ def reference_dialect(cc, work):
     if rc == 0 and ('gcc' in first.lower() or 'Free Software Foundation' in banner):
         return 'gcc', first
     try:
-        rc2, so2, se2 = run([cc], work, timeout=60)
+        rc2, so2, se2 = start([cc], work, timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
         return None, 'the reference %r is neither clang nor gcc (banner: %r), and cannot run alone: %s' % (cc, first, e)
     m = MSVC_BANNER.search(so2 + se2)
@@ -711,13 +813,14 @@ def reference_spellings(rows, cc, flags, dialect, work, dropped=None):
     A compiler that STOPS judging a TU (cl at 100 errors, C1003) has every row from the line it stopped at re-run in a
     TU of its own, until each row is judged; a TU that judged none of its rows is never looped on — each of those
     rows is REF-ERROR. `dropped`, a mapping the caller hands in, receives {(rel, name): the decorations removed from
-    that row's spelling} (DECORATIONS)."""
+    that row's spelling} (DECORATIONS) -- for the rows whose removal the reference itself witnessed, and no other
+    (keep_unwitnessed)."""
     forms = DIALECTS[dialect]
     out, groups = {}, {}
     for r in rows:
         groups.setdefault((r['rel'], r['header']), []).append(r)
     for (rel, header), items in groups.items():
-        pending = list(items)
+        pending, removed = list(items), {}
         while pending:
             # A header the reference does not have at all is its own verdict, REF-NO-HEADER, read from a marker of
             # this program's own (`__has_include`, the values step's rule) — never inferred from a missing spelling.
@@ -743,13 +846,17 @@ def reference_spellings(rows, cc, flags, dialect, work, dropped=None):
                     rest.append(r)
                     continue
                 out[(rel, r['name'])] = row_verdict(ln, found, undecl)
-                if dropped is not None and ln in gone and isinstance(out[(rel, r['name'])], tuple):
-                    dropped[(rel, r['name'])] = gone[ln]
+                if ln in gone and isinstance(out[(rel, r['name'])], tuple):
+                    removed[r['name']] = gone[ln]
             if len(rest) == len(pending):
                 for r in rest:
                     out[(rel, r['name'])] = 'REF-ERROR'
                 break
             pending = rest
+        if removed:
+            held = keep_unwitnessed(rel, header, removed, out, ref_runner(cc, flags, dialect, work))
+            if dropped is not None:
+                dropped.update(((rel, name), texts) for name, texts in held.items())
         if forms['tagless']:
             keys = [(rel, r['name']) for r in items if isinstance(out.get((rel, r['name'])), tuple)]
             names = tagless_candidates(out[k] for k in keys)
@@ -764,24 +871,49 @@ def verdict_program(header, lines, prelude=''):
                      ['    return 0;', '}']) + '\n'
 
 
-def run_verdicts(groups, compile_and_run):
-    """groups: {(rel, header): [(name, generic-association-type)]} → {(rel, name): verdict}; isolates refusals."""
+def run_verdicts(groups, compile_and_run, tag=''):
+    """groups: {(rel, header): [(name, generic-association-type[, the controlling expression])]} → {(rel, name):
+    verdict}; isolates refusals. The controlling expression is `&name` unless the item gives its own (asked_again
+    asks about a TYPE, cast onto 0). `tag` prefixes the scratch names of this call's programs."""
+    def asks(item):
+        return '    puts(_Generic(%s, %s: "yes %s", default: "NO %s"));' % (
+            item[2] if len(item) > 2 else '&' + item[0], item[1], item[0], item[0])
     out = {}
     for (rel, header), items in groups.items():
-        text = verdict_program(header, ['    puts(_Generic(&%s, %s: "yes %s", default: "NO %s"));' % (n, t, n, n)
-                                        for n, t in items], prelude=MARKERS)
-        so, err = compile_and_run(text, 'all')
+        text = verdict_program(header, [asks(item) for item in items], prelude=MARKERS)
+        so, err = compile_and_run(text, tag + 'all')
         if so is not None:
             for line in so.splitlines():
                 v, _, n = line.partition(' ')
                 out[(rel, n)] = v
             continue
-        for k, (n, t) in enumerate(items):
-            one = verdict_program(header, ['    puts(_Generic(&%s, %s: "yes %s", default: "NO %s"));' % (n, t, n, n)],
-                                  prelude=MARKERS)
-            so, err = compile_and_run(one, 'one%d' % k)
-            out[(rel, n)] = so.split(' ', 1)[0] if so else None, err
+        for k, item in enumerate(items):
+            so, err = compile_and_run(verdict_program(header, [asks(item)], prelude=MARKERS), '%sone%d' % (tag, k))
+            out[(rel, item[0])] = so.split(' ', 1)[0] if so else None, err
     return out
+
+
+def verdict_of(value):
+    """(the word a judge printed or None, why it printed none) of one run_verdicts value: a row judged in its
+    header's whole program is the bare word, an isolated row a pair."""
+    return value if isinstance(value, tuple) else (value, None)
+
+
+def keep_unwitnessed(rel, header, removed, spellings, judge):
+    """THE WITNESS OF A REMOVAL, row by row. `removed`: {name: (the decorations removed, the spelling as printed)} of
+    one header's rows; `spellings`: {(rel, name): (declared, canonical)}, the bare ones. → {name: the decorations
+    removed} for the rows whose BARE canonical spelling the reference's own `_Generic` takes as the type of `&name`
+    (`judge`: the reference's compile-and-run). Every other row -- a NO, a spelling the reference will not compile,
+    no answer at all -- gets the spelling as printed back in `spellings` and is in no count: what the reference
+    does not witness is not removed."""
+    asked = run_verdicts({(rel, header): [(name, spellings[(rel, name)][1]) for name in removed]}, judge, 'witness_')
+    held = {}
+    for name, (texts, printed) in removed.items():
+        if verdict_of(asked.get((rel, name)))[0] == 'yes':
+            held[name] = texts
+        else:
+            spellings[(rel, name)] = printed
+    return held
 
 
 def judged_output(argv, work):
@@ -789,7 +921,7 @@ def judged_output(argv, work):
     of verdicts, and reading them would report the symbols it never reached as missing instead of the crash."""
     rc, so, se = run(argv, work, timeout=60)
     if rc != 0:
-        return None, 'JUDGE-FAILED:exit %d %s' % (rc, (se.strip().splitlines() or [''])[0][:120])
+        return None, 'JUDGE-FAILED:exit %d %s' % (rc, kept_message((se.strip().splitlines() or [''])[0]))
     return so, None
 
 
@@ -805,7 +937,7 @@ def dss_runner(dsscp, target, tree, work):
         rc, so, se = run([dsscp, '--compile', src, '--language', 'c', '--target', target, '--output', outdir], work,
                          env=env)
         if rc != 0:
-            return None, next((l for l in (so + se).splitlines() if 'error[' in l), (so + se).strip()[:160])
+            return None, kept_message(next((l for l in (so + se).splitlines() if 'error[' in l), so + se))
         stem = 'dss_%s' % tag
         exe = [p for p in glob.glob(os.path.join(outdir, '**', '*'), recursive=True)
                if os.path.isfile(p) and os.path.basename(p) in (stem, stem + '.exe', 'main', 'main.exe')]
@@ -818,37 +950,170 @@ def dss_runner(dsscp, target, tree, work):
 
 def ref_runner(cc, flags, dialect, work):
     """The reference compiles and links a judge program, in its own dialect's spelling, and runs it. cl prints its
-    errors on stdout, gcc and clang on stderr, so both are read."""
+    errors on stdout, gcc and clang on stderr, so both are read. The program is compiled by a name RELATIVE to
+    `work`, the compiler's working directory, as the spelling and tag TUs are: a compiler names the file in its
+    diagnostics as it was named to it, and a report cell that kept one would otherwise open with the scratch
+    directory's path. (The built judge is RUN by its full path: a relative program name is resolved against the
+    parent's directory on Windows, not the child's.)"""
     forms = DIALECTS[dialect]
 
     def go(text, tag):
-        src = os.path.join(work, 'ref_%s.c' % tag)
-        with open(src, 'w', encoding='utf-8', newline='\n') as o:
+        src, exe = 'ref_%s.c' % tag, 'ref_%s.exe' % tag
+        with open(os.path.join(work, src), 'w', encoding='utf-8', newline='\n') as o:
             o.write(text)
-        exe = os.path.join(work, 'ref_%s.exe' % tag)
         rc, so, se = run([cc] + forms['standard'] + flags + forms['quiet'] + output_args(dialect, exe) + [src], work)
         if rc != 0:
             said = so + se
-            return None, next((l for l in said.splitlines() if 'error' in l), said.strip()[:160])
-        return judged_output([exe], work)
+            return None, kept_message(next((l for l in said.splitlines() if 'error' in l), said))
+        return judged_output([os.path.join(work, exe)], work)
     return go
 
 
-# The words a reference spells a `restrict` qualifier with (cl 19.51 prints `restrict` for `__restrict` too).
+# ── a parameter's restrict, on a reference whose `_Generic` keeps it ────────────────────────────────────────────
+# The words a reference spells a `restrict` qualifier with (cl 19.51 prints `restrict` for `__restrict` too), the
+# words a pointer's qualifier run can hold in a reference's spelling, and the calling conventions a declarator group
+# can open with (`(__cdecl *)`).
 RESTRICT_WORDS = frozenset(('restrict', '__restrict'))
+POINTER_QUALIFIERS = frozenset(('const', 'volatile', 'restrict', '__restrict', '_Atomic', '__unaligned', '__ptr32',
+                                '__ptr64', '__w64'))
+CALLING_WORDS = frozenset(('__cdecl', '__stdcall', '__fastcall', '__vectorcall', '__thiscall', '__clrcall'))
+SPELLING_TOKEN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*|\.\.\.|\S')
 
 
-def reference_verdict(vb, canonical, forms):
-    """Verdict (b) as the report keeps it: the reference's own, except a NO from a reference whose `_Generic` keeps
-    a parameter's top-level `restrict` (the dialect's `generic_keeps_restrict`) on a row whose address type it spells
-    with one. A descriptor's text cannot spell a parameter's qualifier — it is no part of a function's type (C
-    6.7.6.3p15) — so that reference answers NO whatever the row says: its NO is no verdict, and the row is
-    REF-CANNOT-JUDGE. A `restrict` deeper in the type gives the same answer: the spelling is not parsed for where
-    the word sits, no descriptor can spell one there either, and verdict (a) judges the row both ways."""
-    if vb == 'NO' and forms['generic_keeps_restrict'] \
-            and RESTRICT_WORDS.intersection(SPELLED_WORD.findall(canonical)):
-        return 'REF-CANNOT-JUDGE:its _Generic keeps a restrict its header declares'
-    return vb
+def without_parameter_restrict(spelling):
+    """(`spelling` with every `restrict` that is a PARAMETER's own top-level qualifier removed, how many were
+    removed, [where] for each `restrict` this program cannot place).
+
+    A parameter's own qualifier is no part of a function's type (C 6.7.6.3p15), so removing one leaves the type the
+    type it was; a POINTEE's restrict is part of the type and must stay (✔MEASURED 2026-10-08 on gcc 13.2.0 and Apple
+    clang 21, probe-reference-cc runs 20261008-085400-883c8a53 and 20261008-085224-eb714084: their `_Generic` takes
+    the spelling with a parameter's restrict removed as the same type -- a plain parameter, a callback's, a restrict
+    pointer to an array, one beside a const -- and answers NO when a pointee's is removed). The rule reads the
+    spelling of an ADDRESS type, whose own top-level pointer carries no qualifier. A `restrict` in the qualifier run
+    of a `*` is
+      a PARAMETER's, removed, when the run ENDS a parameter: the next token is a `,` of a parameter list, the `)`
+        that closes one, or the `)` of a declarator group (`(*restrict )` of a pointer to an array) that sits,
+        through declarator groups only, in a parameter list -- at any depth of function types;
+      a POINTEE's, kept, when a `*`, a `(` or a `[` follows it: the restrict pointer is then what something points
+        to, returns or holds (a callback's RETURN type is the case two references judge differently -- gcc drops
+        the qualifier, clang keeps it -- and each goes on answering that one its own way);
+      UNPLACED anywhere else -- after no `*`, at the end of the whole spelling, in parentheses that are neither a
+        declarator group nor a parameter list (an `_Atomic(`, a `typeof(`) -- never removed, and reported.
+    A parenthesis opens a DECLARATOR group when a `*` is its first token after any calling-convention words, a
+    PARAMETER LIST when it follows a `)`, and neither otherwise."""
+    tokens = [(m.group(0), m.start(), m.end()) for m in SPELLING_TOKEN.finditer(spelling)]
+
+    def group_kind(i):
+        j = i + 1
+        while j < len(tokens) and tokens[j][0] in CALLING_WORDS:
+            j += 1
+        if j < len(tokens) and tokens[j][0] == '*':
+            return 'declarator'
+        return 'parameters' if i > 0 and tokens[i - 1][0] == ')' else 'other'
+
+    def where(k):
+        return spelling[max(0, tokens[k][1] - 16):tokens[k][2] + 8].strip()
+
+    stack, cut, unplaced, i = [], [], [], 0
+    while i < len(tokens):
+        word = tokens[i][0]
+        if word == '(':
+            stack.append(group_kind(i))
+        elif word == ')':
+            if stack:
+                stack.pop()
+        elif word == '*':
+            j = i + 1
+            while j < len(tokens) and tokens[j][0] in POINTER_QUALIFIERS:
+                j += 1
+            mine = [k for k in range(i + 1, j) if tokens[k][0] in RESTRICT_WORDS]
+            after = tokens[j][0] if j < len(tokens) else None
+            if after == ',':
+                placed = 'parameter' if stack and stack[-1] == 'parameters' else None
+            elif after == ')':
+                depth = len(stack) - 1
+                while depth >= 0 and stack[depth] == 'declarator':
+                    depth -= 1
+                placed = 'parameter' if depth >= 0 and stack[depth] == 'parameters' else None
+            else:
+                placed = 'pointee' if after in ('*', '(', '[') else None
+            for k in mine:
+                if placed == 'parameter':
+                    cut.append((tokens[k][1], tokens[k][2]))
+                elif placed is None:
+                    unplaced.append(where(k))
+            i = j
+            continue
+        elif word in RESTRICT_WORDS:
+            unplaced.append(where(i))
+        i += 1
+    bare = spelling
+    for start, end in reversed(cut):
+        bare = bare[:start] + bare[end:]
+    return bare, len(cut), unplaced
+
+
+def asked_again(groups, spell, keys, runner):
+    """Verdict (b) of the rows `keys`, put to a reference whose `_Generic` keeps a parameter's `restrict` in the form
+    that reference ANSWERS. Per row: THE WITNESS first -- its own spelling must be the type of `&name` by its own
+    `_Generic` (the qualifier on both sides), so that what is asked next is asked about the symbol's type and no
+    other; then THE QUESTION WITH THE QUALIFIER ON NEITHER SIDE -- the descriptor's text against that spelling
+    without its parameters' restrict, cast onto 0. → {key: 'yes' | 'NO' | a JUDGE-FAILED cell | a REF-CANNOT-JUDGE
+    cell carrying its own reason}, for the rows that question changes or cannot be put for; a row whose spelling
+    holds a `restrict` in no parameter's place is not in it (its plain verdict stands: a pointee's restrict is part
+    of the type, and no descriptor spells one)."""
+    out, witness, question = {}, {}, {}
+    for group, items in groups.items():
+        for name, text in items:
+            key = (group[0], name)
+            if key not in keys:
+                continue
+            bare, removed, unplaced = without_parameter_restrict(spell[key][1])
+            if unplaced:
+                out[key] = ('REF-CANNOT-JUDGE:its spelling holds a restrict this program cannot place (near `%s`)'
+                            % kept_message(unplaced[0]))
+            elif removed:
+                witness.setdefault(group, []).append((name, spell[key][1]))
+                question.setdefault(group, []).append((name, text, '(%s)0' % bare))
+    taken, ask = run_verdicts(witness, runner, 'witness_'), {}
+    for group, items in question.items():
+        for item in items:
+            key = (group[0], item[0])
+            word, why = verdict_of(taken.get(key))
+            if word == 'yes':
+                ask.setdefault(group, []).append(item)
+            elif (why or '').startswith('JUDGE-FAILED'):
+                out[key] = why
+            else:
+                out[key] = ('REF-CANNOT-JUDGE:the reference does not take its own spelling as the type of the '
+                            'symbol (%s)' % ('its _Generic answered %s' % word if word else why or 'no answer'))
+    answers = run_verdicts(ask, runner, 'bare_')
+    for group, items in ask.items():
+        for item in items:
+            key = (group[0], item[0])
+            word, why = verdict_of(answers.get(key))
+            if word in ('yes', 'NO'):
+                out[key] = word
+            elif (why or '').startswith('JUDGE-FAILED'):
+                out[key] = why
+            else:
+                out[key] = ("REF-CANNOT-JUDGE:the reference refused the question put without the parameters' "
+                            "restrict (%s)" % (why or 'no answer'))
+    return out
+
+
+def reference_verdicts(groups, spell, runner, forms):
+    """Verdict (b) of every row of `groups` ({(rel, header): [(name, the rendered type of `&name`)]}): the
+    reference's `_Generic(&name, <text>: …)`. On a reference whose `_Generic` keeps a parameter's `restrict` (the
+    dialect's `generic_keeps_restrict`), a NO on a row whose spelling holds that word says nothing yet -- no
+    descriptor's text can spell a parameter's qualifier -- so each such row is asked again in the form that
+    reference answers (asked_again). `spell`: {(rel, name): (declared, canonical)}."""
+    b = run_verdicts(groups, runner)
+    if forms['generic_keeps_restrict']:
+        again = {key for key, value in b.items() if verdict_of(value)[0] == 'NO'
+                 and RESTRICT_WORDS.intersection(SPELLED_WORD.findall(spell[key][1]))}
+        b.update(asked_again(groups, spell, again, runner))
+    return b
 
 
 def census(tree, target, dsscp, cc, flags, dialect, only=None):
@@ -874,7 +1139,7 @@ def census(tree, target, dsscp, cc, flags, dialect, only=None):
                 except Exception as e:                      # an unrenderable signature is a finding of its own
                     b_errors[(r['rel'], r['name'])] = 'UNRENDERABLE:%s' % e
         a = run_verdicts(a_groups, dss_runner(dsscp, target, tree, work))
-        b = run_verdicts(b_groups, ref_runner(cc, flags, dialect, work))
+        b = reference_verdicts(b_groups, spell, ref_runner(cc, flags, dialect, work), DIALECTS[dialect])
     finally:
         shutil.rmtree(work, ignore_errors=True)
     report = []
@@ -886,23 +1151,29 @@ def census(tree, target, dsscp, cc, flags, dialect, only=None):
             continue
         va = a.get(key, 'DSS-REFUSED:no verdict')
         vb = b_errors.get(key) or b.get(key, 'REF-CANNOT-SPELL:no verdict')
+        # A message a runner kept is already one line, relative to the scratch directory and cut on a word
+        # (kept_message): a cell takes it whole.
         if isinstance(va, tuple):
-            va = va[0] or (va[1] if (va[1] or '').startswith('JUDGE-FAILED') else 'DSS-REFUSED:' + (va[1] or '')[:120])
+            va = va[0] or (va[1] if (va[1] or '').startswith('JUDGE-FAILED') else 'DSS-REFUSED:' + (va[1] or ''))
         if isinstance(vb, tuple):
-            vb = vb[0] or (vb[1] if (vb[1] or '').startswith('JUDGE-FAILED') else
-                           'REF-CANNOT-SPELL:' + (vb[1] or '')[:120])
-        report.append((r, 'ok', s[0], s[1], va, reference_verdict(vb, s[1], DIALECTS[dialect])))
+            vb = vb[0] or (vb[1] if (vb[1] or '').startswith('JUDGE-FAILED') else 'REF-CANNOT-SPELL:' + (vb[1] or ''))
+        report.append((r, 'ok', s[0], s[1], va, vb))
     return pair, report
 
 
-# Verdict (a)'s categories: every row of a report has exactly one, so their counts sum to the symbols.
+# Verdict (a)'s categories, and verdict (b)'s: every row of a report has exactly one of each, so each list's counts
+# sum to the symbols. A row the spelling step could not spell carries that step's verdict in BOTH columns, which is
+# why the three REF- spelling verdicts are in both lists.
 A_CATEGORIES = ('yes', 'NO', 'REF-UNDECLARED', 'REF-NO-HEADER', 'REF-ERROR', 'DSS-REFUSED', 'JUDGE-FAILED')
+B_CATEGORIES = ('yes', 'NO', 'REF-UNDECLARED', 'REF-NO-HEADER', 'REF-ERROR', 'REF-CANNOT-SPELL', 'UNRENDERABLE',
+                'REF-CANNOT-JUDGE', 'PAIR-REFUSED', 'JUDGE-FAILED')
 
 
 def summarize(pair, report, dialect):
-    """(ok, line): the census line, and whether it ACCOUNTS for every row — a verdict (a) outside A_CATEGORIES, or
-    counts that do not sum to the symbols, makes the line a FAILED one (the census never passes over a row it does
-    not count)."""
+    """(ok, line): the census line, and whether it ACCOUNTS for every row -- by BOTH verdicts. A verdict (a) outside
+    A_CATEGORIES or a verdict (b) outside B_CATEGORIES, or counts of either that do not sum to the symbols, makes the
+    line a FAILED one that names the verdict and the side (the census never passes over a row it does not count).
+    A judge that failed is counted on the side it failed on."""
     c = {}
     for r, st, _, _, va, vb in report:
         for k, v in (('a', va), ('b', vb)):
@@ -912,20 +1183,23 @@ def summarize(pair, report, dialect):
             c['disagree'] = c.get('disagree', 0) + 1
         if r.get('dropped'):
             c['dropped'] = c.get('dropped', 0) + 1
-    counted = sum(c.get('a-' + k, 0) for k in A_CATEGORIES)
-    unknown = sorted(k[2:] for k in c if k.startswith('a-') and k[2:] not in A_CATEGORIES)
-    ok = counted == len(report) and not unknown
-    head = 'prototype-census: OK' if ok else ('prototype-census: FAILED — %d of %d row(s) carry a verdict (a) this line '
-                                             'does not count (%s); the counts follow'
-                                             % (len(report) - counted, len(report), ', '.join(unknown) or 'none named'))
+    uncounted = []
+    for side, categories in (('a', A_CATEGORIES), ('b', B_CATEGORIES)):
+        counted = sum(c.get('%s-%s' % (side, k), 0) for k in categories)
+        unknown = sorted(k[2:] for k in c if k.startswith(side + '-') and k[2:] not in categories)
+        if counted != len(report) or unknown:
+            uncounted.append('%d of %d row(s) carry a verdict (%s) this line does not count (%s)'
+                             % (len(report) - counted, len(report), side, ', '.join(unknown) or 'none named'))
+    ok = not uncounted
+    head = 'prototype-census: OK' if ok else 'prototype-census: FAILED — %s; the counts follow' % '; '.join(uncounted)
     return ok, ('%s format=%s dialect=%s symbols=%d a-yes=%d a-no=%d b-yes=%d b-no=%d disagree=%d '
                 'ref-undeclared=%d ref-no-header=%d ref-error=%d dss-refused=%d ref-cannot-spell=%d '
-                'ref-cannot-judge=%d pair-refused=%d judge-failed=%d ref-decoration-dropped=%d'
+                'ref-cannot-judge=%d pair-refused=%d a-judge-failed=%d b-judge-failed=%d ref-decoration-dropped=%d'
                 % (head, pair['format'], dialect, len(report), c.get('a-yes', 0), c.get('a-NO', 0), c.get('b-yes', 0),
                    c.get('b-NO', 0), c.get('disagree', 0), c.get('a-REF-UNDECLARED', 0),
                    c.get('a-REF-NO-HEADER', 0), c.get('a-REF-ERROR', 0), c.get('a-DSS-REFUSED', 0),
                    c.get('b-REF-CANNOT-SPELL', 0) + c.get('b-UNRENDERABLE', 0), c.get('b-REF-CANNOT-JUDGE', 0),
-                   c.get('b-PAIR-REFUSED', 0), c.get('a-JUDGE-FAILED', 0) + c.get('b-JUDGE-FAILED', 0),
+                   c.get('b-PAIR-REFUSED', 0), c.get('a-JUDGE-FAILED', 0), c.get('b-JUDGE-FAILED', 0),
                    c.get('dropped', 0)))
 
 
@@ -940,10 +1214,30 @@ DECIDED_FORKS = 'decided-forks.json'
 DECIDED_KEYS = ('format', 'dialect', 'header', 'name', 'reference', 'dss', 'authority', 'reason')
 
 
+class KeyWrittenTwice(Exception):
+    """A JSON object of the decided-forks table writes one key twice."""
+
+
+def each_key_once(pairs):
+    """An object of the table as a dict -- REFUSED, by the key's name, when it writes a key twice: JSON's reader
+    would keep the last value and say nothing, and which of two recorded values is the decision is not this
+    program's to pick (an entry's `dss` written twice; a second `decided` list)."""
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            raise KeyWrittenTwice(key)
+        seen[key] = value
+    return seen
+
+
 def read_decided(path):
-    """The entries of a decided-forks table, each whole and none twice -- or ValueError saying which is not."""
+    """The entries of a decided-forks table, each whole, none twice and no key written twice -- or ValueError saying
+    which is not."""
     try:
-        doc = json.load(open(path, encoding='utf-8'))
+        with open(path, encoding='utf-8') as f:
+            doc = json.load(f, object_pairs_hook=each_key_once)
+    except KeyWrittenTwice as e:
+        raise ValueError('%s writes the key `%s` twice in one object' % (path, e.args[0]))
     except (OSError, ValueError) as e:
         raise ValueError('cannot read %s: %s' % (path, e))
     entries = doc.get('decided') if isinstance(doc, dict) else None
@@ -1150,6 +1444,57 @@ SELFTEST_S_DIALECT = {'msvc': {'s-function': 'double(__cdecl*)(constchar*)'}}
 # stopped TU's rows are re-run until each is judged — on every dialect, each by its own mechanism. (arm
 # `s-error-limit`)
 SELFTEST_S_LIMIT = 130
+# An `undeclared` line of ANOTHER file is not the TU's (arm `s-other-file`), read with no compiler from each
+# dialect's measured shapes (2026-10-08): a header's own undeclared name sits on line 5, the number a row's line
+# shares, and that row keeps its spelling; a file whose name only ENDS in the TU's is another file; the TU named
+# through a directory is the TU. Each row: a dialect, the compiler's text, the lines that read undeclared, and the
+# line-5 row's verdict.
+# ⚠ THE TEXTS ARE WRITTEN WITH `@` WHERE THE COMPILER PRINTS THE COLON AFTER A FILE NAME, and `compiler_lines` puts
+# it back, so what the arm reads is the compiler's text byte for byte. A file name, a colon and a number is what the
+# repository's positional-citation guard counts as a citation of a line in ANY program it reads, this one included
+# (✔MEASURED 2026-10-08: the rows below, spelled as printed, moved this file's count from 0 to 12 and that guard
+# red); a compiler's own diagnostic cites nothing.
+def compiler_lines(text):
+    return text.replace('@', ':')
+
+
+SELFTEST_S_OTHER_FILE = [
+    ('gcc', compiler_lines(
+        "In file included from ref.c@2:\n"
+        "/usr/include/census_probe_other.h@5:45: error: ‘census_probe_in_header’ undeclared here (not in a "
+        "function); did you mean ‘census_probe_h’?\n"
+        "ref.c@5:44: warning: initialization of ‘struct census_probe_sink *’ from incompatible pointer type "
+        "‘int *’ [-Wincompatible-pointer-types]\n"
+        "ref.c@7:45: error: ‘census_probe_in_tu’ undeclared here (not in a function)\n"
+        "myref.c@9:45: error: 'census_probe_elsewhere' undeclared here (not in a function)"),
+     {7}, ('int *', 'int *')),
+    ('clang', compiler_lines(
+        "In file included from ref.c@2:\n"
+        "/usr/include/census_probe_other.h@5:45: error: use of undeclared identifier 'census_probe_in_header'\n"
+        "ref.c@5:27: warning: incompatible pointer types initializing 'struct census_probe_sink *' with an "
+        "expression of type 'int *' [-Wincompatible-pointer-types]\n"
+        "C:\\w\\ref.c@7:45: error: use of undeclared identifier 'census_probe_in_tu'\n"
+        "myref.c@9:45: error: use of undeclared identifier 'census_probe_elsewhere'"),
+     {7}, ('int *', 'int *')),
+]
+# A KEPT MESSAGE (arms `k-scratch-path`, `k-cut-on-a-word`). A judge program the reference REFUSES is named in its
+# refusal as it was named to the compiler -- relative to the scratch directory, so the cell that keeps the refusal
+# never opens with that directory's path (through the leg's own compiler: this program holds one syntax error). And
+# the message itself is kept on one line, whole up to its bound; past it its start and its end are kept around the
+# mark, each cut at a word's end -- the end left out whole where it holds no word boundary: each row a text, a bound,
+# and what is kept.
+SELFTEST_K_REFUSED = 'int census_probe_refused(void) { return census_probe_not ; ; + ; }\nint main(void) { return 0 }\n'
+SELFTEST_K_KEPT = [
+    ('a short message is kept whole', 40, 'a short message is kept whole'),
+    ('one\tline,\r\n  whatever   the compiler wrapped', 60, 'one line, whatever the compiler wrapped'),
+    ("error[P_Probe]: expected 'Identifier', 'IntLiteral', 'FloatLiteral', 'StringStart' or 'CharStart' — got ')'",
+     60, "error[P_Probe]: expected 'Identifier', [...] — got ')'"),
+    ('one two three four five six seven eight nine ten eleven', 40, 'one two three four five six [...] ten eleven'),
+    ('exactly-the-bound', 17, 'exactly-the-bound'),
+    ('the last word of this message is averyveryverylongtokenwithoutanyspace', 40,
+     'the last word of this message [...]'),
+    ('nowhitespaceanywhereinthismessage', 10, 'nowhites [...]'),
+]
 # PART M — cl's diagnostics, READ from its measured lines (windows-x86_64-release, 2026-10-07), on every leg: the arms
 # need no cl, so the parse cl's legs depend on is held wherever the census runs. Each: an arm, the text, and the
 # (spellings, undeclared, stopped) msvc_diagnostics must read from it for the TU `ref.c`.
@@ -1262,22 +1607,90 @@ SELFTEST_D_LIST = [
     ('clang', 'int (*)(int) __attribute__((const))', 'int (*)(int) __attribute__((const))', []),
     ('msvc', 'void (__cdecl *)(int) __attribute__((noreturn))', 'void (__cdecl *)(int) __attribute__((noreturn))', []),
 ]
-# PART R — a PARAMETER's top-level `restrict`. `b-restrict-parameter` holds the dialect's `generic_keeps_restrict` to
-# the leg's own reference, through the census's own judge: a function a synthetic header declares with a restrict
-# parameter, judged against the same type spelled without one, is "yes" from a reference that erases the qualifier
-# (gcc, clang) and REF-CANNOT-JUDGE from one that keeps it (cl) — never that reference's NO. `b-cannot-judge` holds
-# the RULE on every leg, with no compiler — each row a verdict, the spelling it came with, whether the reference
-# keeps the qualifier, and how the report keeps it: a NO becomes no verdict only where the reference keeps the
-# qualifier AND spells one as a whole word; a yes and every other verdict are the reference's own.
-SELFTEST_R_HEADER = 'static void census_probe_restrict(char *restrict p) { (void)p; }\n'
-SELFTEST_R_TEXT = 'void (*)(char *)'
-SELFTEST_R_RULE = [
-    ('NO', 'int (__cdecl *)(mtx_t *restrict ,const struct timespec *restrict )', True, 'REF-CANNOT-JUDGE'),
-    ('NO', 'void (__cdecl *)(char *__restrict )', True, 'REF-CANNOT-JUDGE'),
-    ('NO', 'int (__cdecl *)(mtx_t *,restrict_t *)', True, 'NO'),
-    ('yes', 'void (__cdecl *)(char *restrict )', True, 'yes'),
-    ('REF-CANNOT-SPELL:census_probe', 'void (__cdecl *)(char *restrict )', True, 'REF-CANNOT-SPELL'),
-    ('NO', 'void (*)(char *restrict)', False, 'NO'),
+# A REMOVAL IS WITNESSED ROW BY ROW. `d-nested` holds it to the leg's own compiler on the shape that found the rule:
+# an OBJECT that points to a noreturn function, declared the one way gcc honours (the attribute after the
+# declarator). Per dialect, the spelling the census hands on, its spaces removed, and what it records as removed
+# (✔MEASURED 2026-10-08, probe-reference-cc runs 20261008-085400-883c8a53, 20261008-091425-260d26e9 and
+# 20261008-085224-eb714084): gcc prints the attribute at the front and its own `_Generic` does NOT take the bare
+# type, so the spelling keeps it and nothing is recorded; clang prints it last and DOES, so it is removed and
+# recorded; cl is not handed the attribute at all. `d-unwitnessed` holds the rule with no compiler, through a
+# scripted judge: of two rows a decoration was removed from, the one the judge takes the bare type of stays bare
+# and is counted, the one it answers NO for gets its spelling back as printed and is in no count -- as does one the
+# judge will not compile, and one it gives no answer for.
+SELFTEST_D_NESTED_HEADER = ('#if defined(__GNUC__)\n'
+                            'extern void (*census_probe_nested)(int) __attribute__((noreturn));\n'
+                            '#else\n'
+                            'extern void (*census_probe_nested)(int);\n'
+                            '#endif\n')
+SELFTEST_D_NESTED = {'gcc': ('__attribute__((noreturn))void(**)(int)', ''),
+                     'clang': ('void(**)(int)', '__attribute__((noreturn))'),
+                     'msvc': ('void(__cdecl**)(int)', '')}
+SELFTEST_D_UNWITNESSED = [
+    # (name, the judge's answer: yes, NO, None = it will not compile the row, '' = it prints no line for the row)
+    ('census_probe_held', 'yes'), ('census_probe_refuted', 'NO'), ('census_probe_unspellable', None),
+    ('census_probe_unanswered', ''),
+]
+# PART R — a PARAMETER's top-level `restrict`, on every leg. The header declares two functions: one restrict
+# parameter; and one with a POINTEE's restrict, a callback whose parameter is restrict, and a restrict beside a
+# const. Each row: the name, a RIGHT text (it spells the pointee's restrict, which is part of the type, and no
+# parameter's, which is not) and a WRONG one (the first: another parameter type; the second: the pointee's restrict
+# left out -- wrong on EVERY reference, which is what holds the rule that a pointee's restrict is never removed).
+#   `b-restrict-parameter` holds the dialect's `generic_keeps_restrict` to the leg's own reference: its PLAIN
+#     `_Generic(&f, <the right text>)` is "yes" from a reference that erases the qualifier (gcc, clang) and "NO"
+#     from one that keeps it (cl).
+#   `b-restrict-right` and `b-restrict-wrong` are the census's own verdict (b) (reference_verdicts): yes for the
+#     right text and NO for the wrong one, on every leg -- on a keeping reference through the question asked again,
+#     where a plain NO, or a REF-CANNOT-JUDGE, would be no verdict at all.
+#   `b-restrict-again` puts that question to the leg's reference WHATEVER its dialect says (asked_again, forced), so
+#     the witness and the cast form are held to gcc and clang as they are to cl: yes and NO again.
+#   `b-restrict-placed` holds the removal with no compiler -- each row a spelling as a reference prints it (cl's,
+#     gcc's, clang's: ✔MEASURED 2026-10-08), the spelling without its parameters' restrict, how many were removed
+#     and how many the rule cannot place.
+#   `b-cannot-judge` holds what is left of REF-CANNOT-JUDGE, with no compiler, through a scripted judge -- each row
+#     a name, its spelling, the judge's plain answer, its answer to the witness and to the question asked again
+#     (None = it will not compile it), and what the report keeps (a verdict word, and for REF-CANNOT-JUDGE a phrase
+#     of its reason); then the same NO from a reference that ERASES the qualifier, which is never asked again; and
+#     the census line of one such row.
+SELFTEST_R_HEADER = ('static void census_probe_restrict(char *restrict p) { (void)p; }\n'
+                     'static void census_probe_restrict_deep(char *restrict *p, void (*f)(int *restrict),\n'
+                     '                                       char *const restrict q) { (void)p; (void)f; (void)q; }\n')
+SELFTEST_R = [
+    ('census_probe_restrict', 'void (*)(char *)', 'void (*)(int *)'),
+    ('census_probe_restrict_deep', 'void (*)(char *restrict *, void (*)(int *), char *)',
+     'void (*)(char **, void (*)(int *), char *)'),
+]
+SELFTEST_R_PLACED = [
+    ('void (__cdecl *)(char *restrict )', 'void (__cdecl *)(char * )', 1, 0),
+    ('void (__cdecl *)(char *__restrict )', 'void (__cdecl *)(char * )', 1, 0),
+    ('int (__cdecl *)(mtx_t *restrict ,const struct timespec *restrict )',
+     'int (__cdecl *)(mtx_t * ,const struct timespec * )', 2, 0),
+    ('void (__cdecl *)(char *restrict *,void (__cdecl *)(int *restrict ))',
+     'void (__cdecl *)(char *restrict *,void (__cdecl *)(int * ))', 1, 0),
+    ('void (__cdecl *)(char *restrict const )', 'void (__cdecl *)(char * const )', 1, 0),
+    ('void (__cdecl *)(int (*restrict )[3])', 'void (__cdecl *)(int (* )[3])', 1, 0),
+    ('void (*)(char * restrict,  const char * restrict,  int)', 'void (*)(char * ,  const char * ,  int)', 2, 0),
+    ('void (*)(char *const restrict)', 'void (*)(char *const )', 1, 0),
+    ('char *restrict *', 'char *restrict *', 0, 0),
+    ('void (*)(char *restrict (*)(void))', 'void (*)(char *restrict (*)(void))', 0, 0),
+    ('void (__cdecl *)(char *restrict [4])', 'void (__cdecl *)(char *restrict [4])', 0, 0),
+    ('int (__cdecl *)(mtx_t *,restrict_t *)', 'int (__cdecl *)(mtx_t *,restrict_t *)', 0, 0),
+    ('void (__cdecl *)(_Atomic(char *restrict ))', 'void (__cdecl *)(_Atomic(char *restrict ))', 0, 1),
+    ('void (__cdecl *restrict )(char *)', 'void (__cdecl *restrict )(char *)', 0, 1),
+    ('char *restrict', 'char *restrict', 0, 1),
+    ('void (__cdecl *)(int [restrict 4])', 'void (__cdecl *)(int [restrict 4])', 0, 1),
+]
+SELFTEST_R_CL = 'void (__cdecl *)(char *restrict )'
+SELFTEST_R_JUDGED = [
+    ('j_wrong', SELFTEST_R_CL, 'NO', 'yes', 'NO', 'NO', ''),
+    ('j_right', SELFTEST_R_CL, 'NO', 'yes', 'yes', 'yes', ''),
+    ('j_unwitnessed', SELFTEST_R_CL, 'NO', 'NO', 'yes', 'REF-CANNOT-JUDGE', 'its _Generic answered NO'),
+    ('j_unspelled', SELFTEST_R_CL, 'NO', None, 'yes', 'REF-CANNOT-JUDGE', 'does not take its own spelling'),
+    ('j_unasked', SELFTEST_R_CL, 'NO', 'yes', None, 'REF-CANNOT-JUDGE', 'refused the question'),
+    ('j_unplaced', 'void (__cdecl *)(_Atomic(char *restrict ))', 'NO', 'yes', 'yes', 'REF-CANNOT-JUDGE',
+     'cannot place'),
+    ('j_pointee', 'char *restrict *', 'NO', 'yes', 'yes', 'NO', ''),
+    ('j_plain_yes', SELFTEST_R_CL, 'yes', 'NO', 'NO', 'yes', ''),
+    ('j_no_restrict', 'int (__cdecl *)(mtx_t *,restrict_t *)', 'NO', 'yes', 'yes', 'NO', ''),
 ]
 # The banner cl prints when run with no arguments (✔MEASURED 2026-10-07), and gcc's `--version` first line, which is
 # not cl's. (arm `m-banner`)
@@ -1286,10 +1699,22 @@ SELFTEST_M_BANNER = ('Microsoft (R) C/C++ Optimizing Compiler Version 19.51.3626
 # A row whose header the reference does not have at all: its own verdict, REF-NO-HEADER (no reference header
 # file of that name exists on any -I path of the self-test).
 SELFTEST_S_NO_HEADER = ('s-no-header', 'census_probe_absent.h', 'census_probe_in_no_header', 'REF-NO-HEADER')
-# The census LINE accounts for every row: a report holding each verdict (a) category the census gives is OK and every
-# category's count is printed; one holding a verdict the line does not count is FAILED. (arm `s-accounting`)
-SELFTEST_ACCOUNTING_COUNTS = ('a-yes=1 a-no=1', 'ref-undeclared=1 ref-no-header=1 ref-error=1 dss-refused=1',
-                              'judge-failed=1')
+# The census LINE accounts for every row, by BOTH verdicts (arm `s-accounting`): a report holding each verdict (a)
+# category the census gives is OK and every category's count is printed, and so is one holding each verdict (b)
+# category -- a judge that failed counted on its own side; a report holding a verdict of EITHER side that the line
+# does not count is FAILED, and the line says which side and which verdict. Each report is its (a, b) pairs; a row
+# the spelling step could not spell carries one verdict in both columns, as the census writes it.
+SELFTEST_ACCOUNTING_A = [(v, 'yes') for v in ('yes', 'NO', 'DSS-REFUSED:probe', 'JUDGE-FAILED:exit 1')] + \
+                        [(v, v) for v in ('REF-UNDECLARED', 'REF-NO-HEADER', 'REF-ERROR')]
+SELFTEST_ACCOUNTING_A_COUNTS = ('symbols=7 a-yes=1 a-no=1 b-yes=4 b-no=0 ',
+                                'ref-undeclared=1 ref-no-header=1 ref-error=1 dss-refused=1',
+                                'a-judge-failed=1 b-judge-failed=0')
+SELFTEST_ACCOUNTING_B = [('yes', v) for v in ('yes', 'NO', 'REF-CANNOT-SPELL:probe', 'UNRENDERABLE:probe',
+                                              'REF-CANNOT-JUDGE:probe', 'PAIR-REFUSED:probe', 'JUDGE-FAILED:exit 1')] + \
+                        [(v, v) for v in ('REF-UNDECLARED', 'REF-NO-HEADER', 'REF-ERROR')]
+SELFTEST_ACCOUNTING_B_COUNTS = ('symbols=10 a-yes=7 a-no=0 b-yes=1 b-no=1 ',
+                                'ref-undeclared=1 ref-no-header=1 ref-error=1 dss-refused=0 ref-cannot-spell=2 '
+                                'ref-cannot-judge=1 pair-refused=1 a-judge-failed=0 b-judge-failed=1')
 # PART V — the VALUES step, on a header BOTH sides get from the self-test alone, so no platform header can move it: DSS
 # reads a synthetic descriptor added to a COPY of the tree's config (through DSS_CONFIG_ROOT), the reference a
 # synthetic header on its -I path. Each row: the name, DSS's value, the reference header's definition (None = the
@@ -1321,8 +1746,11 @@ SELFTEST_V_MOVED = [
 # The table's READER, with no compiler (`v-table-refused`): each of these documents is written and must be refused in
 # the words beside it -- no `decided` list, an entry with a field missing and one with a field more, two equal
 # values, a value that is text, a blank text field, an entry twice -- as must a file that is no JSON at all; and a
-# table of two whole entries is read as two. A document the reader BREAKS on (any error that is not its refusal) is
-# named by the arm too, never left to end the self-test on a traceback.
+# table of two whole entries is read as two. A KEY WRITTEN TWICE in one object is refused by the key's name: an
+# entry whose `dss` is written twice (JSON's reader would keep the last), and a table with a second `decided` list
+# (it would keep the second) -- those two are written as TEXT, since no document built here can hold them. A
+# document the reader BREAKS on (any error that is not its refusal) is named by the arm too, never left to end the
+# self-test on a traceback.
 SELFTEST_V_ENTRY = {'format': 'pe', 'dialect': 'gcc', 'header': 'census_probe.h', 'name': 'CENSUS_PROBE',
                     'reference': 1, 'dss': 2, 'authority': 'the self-test', 'reason': 'the self-test'}
 SELFTEST_V_TABLES = [
@@ -1333,7 +1761,24 @@ SELFTEST_V_TABLES = [
     ('two DIFFERENT integers', {'decided': [dict(SELFTEST_V_ENTRY, reference='1')]}),
     ('two DIFFERENT integers', {'decided': [dict(SELFTEST_V_ENTRY, reason=' ')]}),
     ('twice', {'decided': [SELFTEST_V_ENTRY, dict(SELFTEST_V_ENTRY, reference=3)]}),
+    ('the key `dss` twice', '{"decided": [%s, "dss": 3}]}' % json.dumps(SELFTEST_V_ENTRY)[:-1]),
+    ('the key `decided` twice', '{"decided": [], "decided": [%s]}' % json.dumps(SELFTEST_V_ENTRY)),
 ]
+
+
+def scripted_judge(answers):
+    """A judge with no compiler, for the self-test's rule arms: `answers` maps (the kind of program -- '' for a
+    plain one, else the prefix of its scratch tag: `witness`, `bare` --, a row's name) to the word the program
+    prints for that row, to '' (it prints no line for the row), or to None (a program holding the row does not
+    compile -- so run_verdicts judges the rows one by one, as it does for a real refusal). A program's rows are read
+    from its own text."""
+    def go(text, tag):
+        kind = tag.rpartition('_')[0]
+        said = [(name, answers.get((kind, name))) for name in re.findall(r'default: "NO ([A-Za-z0-9_]+)"', text)]
+        if any(word is None for _, word in said):
+            return None, 'the scripted judge will not compile %s' % ', '.join(n for n, word in said if word is None)
+        return ''.join('%s %s\n' % (word, name) for name, word in said if word), None
+    return go
 
 
 def selftest(tree, target, dsscp, cc, flags, dialect, forks):
@@ -1349,6 +1794,41 @@ def selftest(tree, target, dsscp, cc, flags, dialect, forks):
         got, why = native_target(tree, target.partition(':')[0], 'no-such-kind')
         if got is not None:
             failures.append('p-unknown-kind: derived %r for a kind no document has' % got)
+        # ── a reference the host does not have is refused in this program's words, and none is picked for it ──────
+        #    The name no host has goes through the REAL attempt to start it, so each leg's own error is read; then each
+        #    way a start fails is held with the error and the PATH given, the same on every leg.
+        absent = 'census-probe-no-such-compiler'
+        is_absent = 'the reference compiler %r is not on this host' % absent
+
+        def told(error, found, where=work):
+            """What a start that raises `error` is told as: `found` is the PATH's answer for the name, and gcc is
+            the one compiler beside it."""
+            def start(argv, cwd, timeout=0):
+                raise error
+            return reference_dialect(absent, where, start=start, which=lambda name, mode=os.X_OK: (
+                found if name == absent else '/census-probe/gcc' if name == 'gcc' else None))[1]
+        read_as, said = reference_dialect(absent, work)
+        nowhere = reference_dialect(absent, os.path.join(work, 'census-probe-no-such-directory'))
+        wrong = [what for what, good in (
+            ('the name no host has, through the real attempt to start it, was read as %r and told as %r'
+             % (read_as, said),
+             read_as is None and said.startswith(is_absent) and 'never picks one' in said
+             and '`--input cc=<name>`' in said),
+            ('"file not found" and no such file on the PATH is not told as an absent compiler',
+             told(FileNotFoundError(2, 'census-probe'), None).startswith(is_absent)),
+            ('"permission denied" and no such file on the PATH (an entry of the PATH refusing the lookup) is not '
+             'told as an absent compiler', told(PermissionError(13, 'census-probe'), None).startswith(is_absent)),
+            ('"permission denied" for a file that IS on the PATH is told as an absent compiler',
+             told(PermissionError(13, 'census-probe'), '/census-probe/' + absent).startswith('cannot run ')),
+            ('gcc alone on the PATH is not the list', told(FileNotFoundError(2, 'census-probe'), None)
+             .endswith('PATH holds: gcc')),
+            ('none of the three on the PATH is not the list',
+             absent_reference(absent, which=lambda name, mode=os.X_OK: None).endswith('PATH holds: none of them')),
+            ('a directory that does not exist was read as %r' % (nowhere,),
+             nowhere[0] is None and nowhere[1].startswith('cannot run ')),
+        ) if not good]
+        if wrong:
+            failures.append('r-absent-reference: ' + '; '.join(wrong))
         # ── part S ────────────────────────────────────────────────────────────────────────────────────────────────
         with open(os.path.join(work, 'census_probe_s.h'), 'w', encoding='utf-8', newline='\n') as o:
             o.write(SELFTEST_S_HEADER)
@@ -1370,6 +1850,25 @@ def selftest(tree, target, dsscp, cc, flags, dialect, forks):
         if len(got_many) != SELFTEST_S_LIMIT or wrong:
             failures.append('s-error-limit: %d of %d rows judged, %d of them not REF-UNDECLARED (the first: %r)'
                             % (len(got_many), SELFTEST_S_LIMIT, len(wrong), wrong[:3]))
+        # ... and an `undeclared` line of another file is not the TU's (each dialect's measured lines, no compiler).
+        other = []
+        for d, text, want_undecl, want_row in SELFTEST_S_OTHER_FILE:
+            found_o, undecl_o, _, _ = spelling_diagnostics(d, text, 'ref.c')
+            if undecl_o != want_undecl or row_verdict(5, found_o, undecl_o) != want_row:
+                other.append((d, sorted(undecl_o), row_verdict(5, found_o, undecl_o)))
+        if other:
+            failures.append('s-other-file: per dialect, the lines read undeclared and the verdict of the row on line '
+                            '5: %r' % other)
+        # ── a kept message: named relative to the scratch directory, and cut on a word ───────────────────────────
+        so_k, err_k = ref_runner(cc, flags, dialect, work)(SELFTEST_K_REFUSED, 'k')
+        if so_k is not None or 'ref_k.c' not in (err_k or '') or work in err_k or os.path.basename(work) in err_k:
+            failures.append('k-scratch-path: the reference\'s refusal of ref_k.c, compiled in %r, was kept as %r'
+                            % (work, err_k))
+        cut_k = [(text, limit, kept_message(text, limit)) for text, limit, want in SELFTEST_K_KEPT
+                 if kept_message(text, limit) != want]
+        if cut_k or len(kept_message('word ' * 400)) > KEPT_LIMIT + len(' [...] '):
+            failures.append('k-cut-on-a-word: %r; a 2000-character message kept at %d characters'
+                            % (cut_k, len(kept_message('word ' * 400))))
         # ── part M (cl's measured diagnostics, read without cl) ──────────────────────────────────────────────────────
         for arm, text, want_found, want_undecl, want_stopped in SELFTEST_M:
             got = msvc_diagnostics(text, 'ref.c')
@@ -1481,46 +1980,119 @@ def selftest(tree, target, dsscp, cc, flags, dialect, forks):
                               dialect)
         if not line_d.endswith(' ref-decoration-dropped=1'):
             failures.append('d-counted: two rows, one judged after a removal, read %r' % line_d)
+        # ... and a removal is WITNESSED row by row: by the leg's own compiler, on an object that points to a
+        # noreturn function; and by a scripted judge, with no compiler, both where every row's program compiles and
+        # where one row's does not (the rows are then judged one by one).
+        with open(os.path.join(work, 'census_probe_dn.h'), 'w', encoding='utf-8', newline='\n') as o:
+            o.write(SELFTEST_D_NESTED_HEADER)
+        key_dn, gone_dn = ('selftest', 'census_probe_nested'), {}
+        spell_dn = reference_spellings([{'rel': 'selftest', 'header': 'census_probe_dn.h',
+                                         'name': 'census_probe_nested', 'kind': 'object'}],
+                                       cc, flags + ['-I' + work], dialect, work, gone_dn).get(key_dn)
+        want_dn = SELFTEST_D_NESTED[dialect]
+        if not (isinstance(spell_dn, tuple) and spell_dn[1].replace(' ', '') == want_dn[0]) \
+                or gone_dn.get(key_dn, '') != want_dn[1]:
+            failures.append('d-nested: the address of an object that points to a noreturn function is handed on as '
+                            '%r with %r recorded as removed; want %r with %r'
+                            % (spell_dn, gone_dn.get(key_dn, ''), want_dn[0], want_dn[1]))
+        texts_u = DECORATIONS['gcc'][1][0]
+        bare_u, printed_u = ('void (**)(int)',) * 2, ('%s void (**)(int)' % texts_u,) * 2
+        for rows_u in (SELFTEST_D_UNWITNESSED, [row for row in SELFTEST_D_UNWITNESSED if row[1] is not None]):
+            spellings_u = {('selftest', name): bare_u for name, _ in rows_u}
+            held_u = keep_unwitnessed('selftest', 'census_probe_u.h',
+                                      {name: (texts_u, printed_u) for name, _ in rows_u}, spellings_u,
+                                      scripted_judge({('witness', name): word for name, word in rows_u}))
+            if held_u != {name: texts_u for name, word in rows_u if word == 'yes'} \
+                    or spellings_u != {('selftest', name): bare_u if word == 'yes' else printed_u
+                                       for name, word in rows_u}:
+                failures.append('d-unwitnessed: of the rows %r, counted as removed: %r; handed on: %r'
+                                % (rows_u, held_u, spellings_u))
+                break
         # ── part R (a parameter's restrict, and the reference that keeps it) ──────────────────────────────────────
         with open(os.path.join(work, 'census_probe_r.h'), 'w', encoding='utf-8', newline='\n') as o:
             o.write(SELFTEST_R_HEADER)
-        key_r = ('selftest', 'census_probe_restrict')
-        spell_r = reference_spellings([{'rel': 'selftest', 'header': 'census_probe_r.h',
-                                        'name': 'census_probe_restrict', 'kind': 'function'}],
-                                      cc, flags + ['-I' + work], dialect, work).get(key_r)
-        raw_r = run_verdicts({('selftest', 'census_probe_r.h'): [('census_probe_restrict', SELFTEST_R_TEXT)]},
-                             ref_runner(cc, flags + ['-I' + work], dialect, work)).get(key_r)
-        raw_r = raw_r[0] if isinstance(raw_r, tuple) else raw_r
-        got_r = reference_verdict(raw_r, spell_r[1] if isinstance(spell_r, tuple) else '', DIALECTS[dialect])
-        want_r = 'REF-CANNOT-JUDGE' if DIALECTS[dialect]['generic_keeps_restrict'] else 'yes'
-        if (got_r or '').split(':', 1)[0] != want_r:
-            failures.append('b-restrict-parameter: reported %r, want %s (the reference answered %r and spells the '
-                            'type %r)' % (got_r, want_r, raw_r, spell_r))
-        rule = [(vb, spelled, keeps, reference_verdict(vb, spelled, {'generic_keeps_restrict': keeps}), want)
-                for vb, spelled, keeps, want in SELFTEST_R_RULE]
-        cannot = reference_verdict('NO', SELFTEST_R_RULE[0][1], {'generic_keeps_restrict': True})
+        group_r = ('selftest', 'census_probe_r.h')
+        runner_r = ref_runner(cc, flags + ['-I' + work], dialect, work)
+        spell_r = reference_spellings([{'rel': 'selftest', 'header': 'census_probe_r.h', 'name': name,
+                                        'kind': 'function'} for name, _, _ in SELFTEST_R],
+                                      cc, flags + ['-I' + work], dialect, work)
+        if not all(isinstance(spell_r.get(('selftest', name)), tuple) for name, _, _ in SELFTEST_R):
+            for arm in ('b-restrict-parameter', 'b-restrict-right', 'b-restrict-wrong', 'b-restrict-again'):
+                failures.append('%s: the reference did not spell the restrict header\'s functions: %r'
+                                % (arm, spell_r))
+        else:
+            keeps = DIALECTS[dialect]['generic_keeps_restrict']
+            plain_r = run_verdicts({group_r: [(name, right) for name, right, _ in SELFTEST_R]}, runner_r)
+            plain_r = [verdict_of(plain_r.get(('selftest', name)))[0] for name, _, _ in SELFTEST_R]
+            if plain_r != ['NO' if keeps else 'yes'] * len(SELFTEST_R):
+                failures.append('b-restrict-parameter: the reference\'s plain answers to the right texts are %r; '
+                                'its dialect says its _Generic %s a parameter\'s restrict (spellings: %r)'
+                                % (plain_r, 'keeps' if keeps else 'erases', spell_r))
+            for arm, column, want in (('b-restrict-right', 1, 'yes'), ('b-restrict-wrong', 2, 'NO')):
+                got = reference_verdicts({group_r: [(row[0], row[column]) for row in SELFTEST_R]}, spell_r, runner_r,
+                                         DIALECTS[dialect])
+                got = [verdict_of(got.get(('selftest', row[0])))[0] or got.get(('selftest', row[0]))
+                       for row in SELFTEST_R]
+                if got != [want] * len(SELFTEST_R):
+                    failures.append('%s: verdict (b) of the restrict header\'s functions against %r is %r, want %s '
+                                    '(spellings: %r)' % (arm, [row[column] for row in SELFTEST_R], got, want,
+                                                         spell_r))
+            again = [asked_again({group_r: [(row[0], row[column]) for row in SELFTEST_R]}, spell_r,
+                                 {('selftest', row[0]) for row in SELFTEST_R}, runner_r) for column in (1, 2)]
+            again = [[answers.get(('selftest', row[0])) for row in SELFTEST_R] for answers in again]
+            if again != [['yes'] * len(SELFTEST_R), ['NO'] * len(SELFTEST_R)]:
+                failures.append('b-restrict-again: the question put with the qualifier on neither side answered %r '
+                                'for the right texts and %r for the wrong ones (spellings: %r)'
+                                % (again[0], again[1], spell_r))
+        placed = [(spelled, without_parameter_restrict(spelled), (bare, removed, unplaced))
+                  for spelled, bare, removed, unplaced in SELFTEST_R_PLACED]
+        placed = [(spelled, got) for spelled, got, want in placed
+                  if (got[0], got[1], len(got[2])) != want]
+        if placed:
+            failures.append('b-restrict-placed: %r' % placed)
+        group_j = ('selftest', 'census_probe_j.h')
+        spell_j = {('selftest', name): (spelled, spelled) for name, spelled, _, _, _, _, _ in SELFTEST_R_JUDGED}
+        script_j = {}
+        for name, _, plain, witness, bare, _, _ in SELFTEST_R_JUDGED:
+            script_j.update({('', name): plain, ('witness', name): witness, ('bare', name): bare})
+        items_j = [(name, 'void (*)(char *)') for name, _, _, _, _, _, _ in SELFTEST_R_JUDGED]
+        got_j = reference_verdicts({group_j: items_j}, spell_j, scripted_judge(script_j),
+                                   {'generic_keeps_restrict': True})
+        wrong_j = []
+        for name, _, _, _, _, want, phrase in SELFTEST_R_JUDGED:
+            cell = got_j.get(('selftest', name))
+            cell = verdict_of(cell)[0] or cell
+            if (cell or '').split(':', 1)[0] != want or phrase not in (cell or ''):
+                wrong_j.append((name, cell))
+        erased_j = reference_verdicts({group_j: items_j[:2]}, spell_j, scripted_judge(script_j),
+                                      {'generic_keeps_restrict': False})
+        cannot = got_j.get(('selftest', 'j_unwitnessed'))
         _, line_j = summarize({'format': 'selftest'},
                               [({'rel': 'selftest', 'name': 'j'}, 'ok', '', '', 'NO', cannot)], dialect)
-        if any(got.split(':', 1)[0] != want for _, _, _, got, want in rule) \
+        if wrong_j or [erased_j.get(('selftest', name)) for name, _ in items_j[:2]] != ['NO', 'NO'] \
                 or ' b-no=0 ' not in line_j or ' ref-cannot-judge=1 ' not in line_j:
-            failures.append('b-cannot-judge: %r; the line of one such row: %r'
-                            % ([x for x in rule if x[3].split(':', 1)[0] != x[4]], line_j))
+            failures.append('b-cannot-judge: rows kept otherwise than wanted: %r; an erasing reference\'s two NOs '
+                            'kept as %r; the line of one REF-CANNOT-JUDGE row: %r' % (wrong_j, erased_j, line_j))
         arm_n, header_n, name_n, want_n = SELFTEST_S_NO_HEADER
         got_n = reference_spellings([{'rel': 'selftest', 'header': header_n, 'name': name_n, 'kind': 'function'}],
                                     cc, flags + ['-I' + work], dialect, work).get(('selftest', name_n))
         if got_n != want_n:
             failures.append('%s: spelling %r, want %r' % (arm_n, got_n, want_n))
-        every = ['yes', 'NO', 'REF-UNDECLARED', 'REF-NO-HEADER', 'REF-ERROR', 'DSS-REFUSED:probe', 'JUDGE-FAILED:exit 1']
-        rep = [({'rel': 'selftest', 'name': 'n%d' % i}, 'ok', '', '', v, 'yes') for i, v in enumerate(every)]
-        ok_all, line_all = summarize({'format': 'selftest'}, rep, dialect)
-        if not (ok_all and line_all.startswith('prototype-census: OK ')
-                and all(p in line_all for p in SELFTEST_ACCOUNTING_COUNTS)):
-            failures.append('s-accounting: a report of every verdict (a) category read %r' % line_all)
-        ok_new, line_new = summarize({'format': 'selftest'},
-                                     rep + [({'rel': 'selftest', 'name': 'u'}, 'ok', '', '', 'UNCOUNTED', 'yes')],
-                                     dialect)
-        if ok_new or not line_new.startswith('prototype-census: FAILED'):
-            failures.append('s-accounting: a report holding a verdict the line does not count read %r' % line_new)
+        for side, pairs, counts, stray in (('a', SELFTEST_ACCOUNTING_A, SELFTEST_ACCOUNTING_A_COUNTS,
+                                            ('UNCOUNTED', 'yes')),
+                                           ('b', SELFTEST_ACCOUNTING_B, SELFTEST_ACCOUNTING_B_COUNTS,
+                                            ('yes', 'UNCOUNTED'))):
+            rep = [({'rel': 'selftest', 'name': 'n%d' % i}, 'ok', '', '', va, vb) for i, (va, vb) in enumerate(pairs)]
+            ok_all, line_all = summarize({'format': 'selftest'}, rep, dialect)
+            if not (ok_all and line_all.startswith('prototype-census: OK ') and all(p in line_all for p in counts)):
+                failures.append('s-accounting: a report of every verdict (%s) category read %r' % (side, line_all))
+            ok_new, line_new = summarize({'format': 'selftest'},
+                                         rep + [({'rel': 'selftest', 'name': 'u'}, 'ok', '', '') + stray], dialect)
+            if ok_new or not line_new.startswith('prototype-census: FAILED') \
+                    or 'a verdict (%s) this line does not count (UNCOUNTED)' % side not in line_new \
+                    or 'a verdict (%s) this line' % ('b' if side == 'a' else 'a') in line_new:
+                failures.append('s-accounting: a report holding a verdict (%s) the line does not count read %r'
+                                % (side, line_new))
         # ── part B ────────────────────────────────────────────────────────────────────────────────────────────────
         os.makedirs(os.path.join(synth, 'src', 'dss-config', 'shippedLibs'))
         shutil.copytree(os.path.join(tree, 'src', 'dss-config', 'object-formats'),
@@ -1618,7 +2190,7 @@ def selftest(tree, target, dsscp, cc, flags, dialect, forks):
         unrefused = []
         for phrase, doc in SELFTEST_V_TABLES + [('cannot read', None)]:
             with open(table, 'w', encoding='utf-8') as o:
-                o.write('{' if doc is None else json.dumps(doc))
+                o.write('{' if doc is None else doc if isinstance(doc, str) else json.dumps(doc))
             try:
                 unrefused.append((phrase, read_decided(table)))
             except ValueError as e:
@@ -1652,13 +2224,14 @@ def selftest(tree, target, dsscp, cc, flags, dialect, forks):
         shutil.rmtree(work, ignore_errors=True)
     for f in failures:
         print('SELFTEST FAIL: ' + f)
-    # f-percent-decoding, p-unknown-kind, a-judge-exit; part S + s-error-limit + s-no-header + s-accounting; part M +
-    # m-banner + the two tag readings + m-tagless-names + m-with-tags; part T + t-error-limit; part D + d-witness +
-    # d-closed-list + d-counted; part R's b-restrict-parameter and b-cannot-judge; parts B, A, V; v-no-header and
-    # v-no-failure; v-line and v-decided-other-pair; the entries that no longer hold; v-table-refused and
-    # v-decided-table.
-    n = (3 + len(SELFTEST_S) + 1 + 2 + len(SELFTEST_M) + 1 + len(SELFTEST_M_TAGS) + 2 + len(SELFTEST_T) + 1 +
-         len(SELFTEST_D) + 3 + 2 + len(arms_b) + len(SELFTEST_A) + len(SELFTEST_V) + 2 + 2 +
+    # f-percent-decoding, p-unknown-kind, r-absent-reference, a-judge-exit; part S + s-error-limit + s-other-file +
+    # s-no-header + s-accounting; k-scratch-path and k-cut-on-a-word; part M + m-banner + the two tag readings +
+    # m-tagless-names + m-with-tags; part T + t-error-limit; part D + d-witness + d-closed-list + d-counted +
+    # d-nested + d-unwitnessed; part R's b-restrict-parameter, b-restrict-right, b-restrict-wrong, b-restrict-again,
+    # b-restrict-placed and b-cannot-judge; parts B, A, V; v-no-header and v-no-failure; v-line and
+    # v-decided-other-pair; the entries that no longer hold; v-table-refused and v-decided-table.
+    n = (4 + len(SELFTEST_S) + 1 + 1 + 2 + 2 + len(SELFTEST_M) + 1 + len(SELFTEST_M_TAGS) + 2 + len(SELFTEST_T) + 1 +
+         len(SELFTEST_D) + 3 + 2 + 6 + len(arms_b) + len(SELFTEST_A) + len(SELFTEST_V) + 2 + 2 +
          len(SELFTEST_V_MOVED) + 2)
     print('prototype-census: SELFTEST %s (%d arms)' % ('FAILED' if failures else 'OK', n))
     return 1 if failures else 0
