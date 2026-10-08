@@ -2643,6 +2643,28 @@ enum class DiagnosticCode : std::uint16_t {
     // unsigned") both warn and build (lane `cs`'s probe x3). The phase-4 twin is
     // P_PreprocessorIfLiteralImplicitlyUnsigned. `.actual` names the literal and the type.
     S_IntegerLiteralImplicitlyUnsigned    = 0xE090,
+    // P69 round 4 (lane `cs`): a KNOWN attribute this compiler cannot honour where
+    // it is written — the language document knows the name, knows it CHANGES what
+    // is compiled, and there is no mechanism to apply it. Three reasons reach this
+    // one code, and `.actual` names the attribute and says which:
+    //   * an `unsupported` row of the attribute table (`vector_size`, `mode`): the
+    //     attribute changes the declared TYPE — the row's own `reason` is quoted;
+    //   * a `callingConvention` row naming a convention of the active target that
+    //     is NOT the one the pair compiles for (`ms_abi` under SysV): the call
+    //     sequence would be the wrong one;
+    //   * a `callingConvention` row judged with NO pair in scope (a direct-API
+    //     caller): there is nothing to compare the name against.
+    // ✔MEASURED before this code existed: each was an `S_UnknownAttribute` /
+    // `H_UnknownLinkageSpecifier` WARNING and the program compiled — `typedef int v4
+    // __attribute__((vector_size(16)));` to a 4-byte type where gcc 13.3.0 and
+    // clang 18.1.3 give 16, `int x __attribute__((mode(DI)));` to 4 bytes where
+    // both give 8, and an `ms_abi` function was called with the SysV sequence. A
+    // warning beside a wrong size is a wrong size. DISTINCT from the unknown-name
+    // codes on purpose: this attribute is not unknown, and telling the author it
+    // is would send them looking for a typo. An ERROR, and UNSUPPRESSABLE
+    // (`unsuppressable_codes.cpp`) — a suppressed refusal here is the silent wrong
+    // type it replaces.
+    S_AttributeNotHonoured                = 0xE091,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -3994,6 +4016,32 @@ enum class DiagnosticCode : std::uint16_t {
     // (K_NoMatchingObjectFormat "has a runtime initializer"), or reached the module
     // initializer's lowering. `.actual` states the two readings; the span is the initializer.
     H_StaticInitializerNotFolded  = 0xF01C,
+    // H_NonVoidFunctionEndReachable
+    //   [[D-C-A-NON-VOID-FUNCTION-WHOSE-END-IS-REACHABLE-IS-REFUSED]] (P69, lane `cs`).
+    //   A function that returns a value has a path that reaches the end of its
+    //   body without a `return`, in a language whose declaration form states
+    //   `nonVoidFunctionEndReached: returnsUnspecifiedValue` (C23 6.9.2p13: the
+    //   function is well-formed; only USING the value of such a call is
+    //   undefined). A WARNING, emitted ONCE per function by the CST->HIR lowering
+    //   as it completes the body; `.actual` names the function and the span is
+    //   the body's last token — the closing brace in a brace language, which is
+    //   where gcc, clang and MSVC put theirs. Under the other spelling of the
+    //   rule (`refused`, the default) this code is never emitted: the function
+    //   is refused by the verifier under H_VerifierFailure, as before.
+    //
+    //   ★ "CAN BE REACHED" IS THE VERIFIER'S STRUCTURAL ANSWER, the same
+    //   `pathTerminates` that decides the refusal and the implicit `return 0` —
+    //   one owner for the question. It is conservative: a body whose end no
+    //   execution reaches but whose shape does not show it is reported too
+    //   (and compiled correctly: the completion is then dead code).
+    //
+    //   ★ SUPPRESSIBLE, the `H_UnreachableCode` posture and for its reason:
+    //   the bytes are identical whether or not the advisory is rendered, so
+    //   silencing it can neither fail a build nor ship a different artifact.
+    //   ✔MEASURED 2026-10-08 (probe fo1): clang 18.1.3, Apple clang 21.0.0 and
+    //   MSVC 19.51 warn by default; gcc 13.3.0 and mingw-w64 gcc 13.2.0 only
+    //   under -Wall. None of the five refuses.
+    H_NonVoidFunctionEndReachable = 0xF01D,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,

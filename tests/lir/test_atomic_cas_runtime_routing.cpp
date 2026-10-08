@@ -25,6 +25,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
+#include "mir/merge/synth_seh_funclets.hpp"   // MirSehScope
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
@@ -206,4 +207,76 @@ TEST(AtomicCasRuntimeRouting, ATrapsTargetWithNoRuntimeRefusesTheUnderAlignedCas
     EXPECT_FALSE(L.result.ok)
         << "RED-ON-DISABLE: the native exclusive pair is a certain fault here";
     EXPECT_EQ(countEverywhere(L.result.lir, **target, "ldaxr"), 0);
+}
+
+// ── A GUARDED RANGE COVERS THE FUNCTION'S OWN BLOCKS AND NOTHING ELSE ────────
+// (D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES)
+//
+// A `__try` scope's range runs over the blocks the function's MIR blocks became.
+// The LL/SC retry loop is THREE blocks the lowering creates while lowering the
+// compare-exchange, so they are laid out after all of those — outside the range —
+// and its exclusive load and store address the program's object: a fault there
+// would escape the handler. ✔MEASURED P69 on pe64 for the other creator of such a
+// block (an `asm goto` whose output is stored through its object's address: the
+// process ended with 0xC0000005 inside a `__try`). The lowering therefore REFUSES
+// the statement by name; the rule reads the function's own scopes and no target
+// or format name, which is what the two arms below show: the SAME scope over the
+// SAME instruction is refused where the lowering creates blocks (arm64) and
+// accepted where it does not (x86_64, one `lock cmpxchg` in the block itself).
+[[nodiscard]] Lowered lowerCasInsideAGuardedBody(TargetSchema const& target,
+                                                 TypeInterner& interner) {
+    Mir mir = buildCasFnMir(/*provableAlign=*/4, interner);
+    MirFuncId const fn = mir.funcAt(0);
+    MirBlockId const only = mir.funcBlockAt(fn, 0);
+    MirSehScope scope;
+    scope.parentFuncSymbol = mir.funcSymbol(fn);
+    scope.beginBlock       = only;
+    scope.endBlock         = only;
+    scope.handlerBlock     = only;
+    std::array<MirSehScope, 1> const scopes{scope};
+    Lowered out;
+    std::vector<ExternImport> noExterns;
+    out.result = lowerToLir(mir, target, interner, out.rep, noExterns,
+                            ExternCallDispatch::DirectPlt, std::nullopt,
+                            std::nullopt, scopes, std::nullopt, std::nullopt,
+                            std::nullopt, elfRuntime(true));
+    return out;
+}
+
+TEST(AtomicCasRuntimeRouting, AnLlscLoopInsideAGuardedBodyIsRefusedByName) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    auto const L = lowerCasInsideAGuardedBody(**target, interner);
+    EXPECT_FALSE(L.result.ok)
+        << "RED-ON-DISABLE: the retry loop's exclusive load and store would sit in "
+           "blocks no scope guards";
+    std::size_t refusals = 0;
+    for (auto const& d : L.rep.all()) {
+        if (d.severity != DiagnosticSeverity::Error) continue;
+        ++refusals;
+        EXPECT_EQ(d.code, DiagnosticCode::L_UnsupportedLoweringForOpcode);
+        EXPECT_NE(d.actual.find("inside a guarded body"), std::string::npos) << d.actual;
+        EXPECT_NE(d.actual.find("retry loop"), std::string::npos) << d.actual;
+    }
+    EXPECT_EQ(refusals, 1u) << "one refusal, and nothing cascading from it";
+    EXPECT_EQ(countEverywhere(L.result.lir, **target, "ldaxr"), 0)
+        << "and no exclusive load was emitted on the way out";
+}
+
+TEST(AtomicCasRuntimeRouting, ACompareExchangeThatCreatesNoBlockIsAcceptedInsideAGuardedBody) {
+    // THE CONTROL, and the half that keeps the rule honest: the same scope over
+    // the same instruction on a target whose compare-exchange is ONE instruction
+    // in the guarded block itself. Nothing leaves the range, so nothing is refused
+    // — a rule that refused "an atomic in a `__try`" would red here.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    auto const L = lowerCasInsideAGuardedBody(**target, interner);
+    ASSERT_TRUE(L.result.ok) << (L.rep.all().empty() ? "" : L.rep.all()[0].actual);
+    EXPECT_EQ(countEverywhere(L.result.lir, **target, "lock_cmpxchg"), 1);
+    ASSERT_EQ(L.result.sehScopeDescriptors.size(), 1u);
+    EXPECT_EQ(L.result.sehScopeDescriptors[0].beginLirBlockV,
+              L.result.sehScopeDescriptors[0].endLirBlockV)
+        << "a single-block guarded body: its first and last block are one";
 }

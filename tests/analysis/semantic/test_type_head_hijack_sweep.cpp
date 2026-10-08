@@ -39,6 +39,7 @@
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_layout.hpp"
 #include "repo_root.hpp"
 
 #include <nlohmann/json.hpp>
@@ -336,12 +337,56 @@ TEST(TypeHeadHijackSweep, CastTypeRefFamilyMeasuresTheDecoratedTypedef) {
 // run OUT of the `typedefDeclSpecifiers` sibling prefix and INTO
 // `typedefHeadFull`, the type-resolved head — and then compiles the canonical
 // hijack program. Before the ambiguous-head guard this produced `int` with NO
-// diagnostic anywhere. It must now be a LOUD refusal.
+// diagnostic anywhere; with the guard it was a loud refusal.
+//
+// ★ P69 round 4 (lane `cs`): IT IS NOW NEITHER — THE SHAPE IS UNAMBIGUOUS, AND
+// HONOURED. An attribute specifier is opaque to every reader of a type-bearing
+// shape (`isAttributeSpecifierRule`), so the head resolver no longer sees the
+// word `aligned` at all: there is one type in this head, `long`, and nothing for
+// the guard to refuse. What the refusal protected has moved with it — an
+// attribute written in the head must not be DROPPED either — and
+// `headAttributeRuns` reads a specifier that is a direct child of a head as the
+// declaration's own, exactly as it reads a run among the specifiers. So the pin
+// asserts the three things a reader can observe: the head is `long`, the unit
+// compiles, and the alias carries the alignment the SAME program gets from the
+// shipped grammar, where the specifier rides the sibling prefix. (The guard keeps
+// its own pin just below, on a head that really holds two types.)
 //
 // A mutant over the SHIPPED document (rather than a synthetic grammar) is
 // deliberate: a synthetic fixture would keep passing if the real config ever
 // lost the sibling-slot discipline, which is the exact regression this guards.
-TEST(TypeHeadHijackSweep, WrongFixInsideTheHeadIsRefusedLoudly) {
+TEST(TypeHeadHijackSweep, AnAttributeInsideTheHeadIsTheDeclarationsOwn) {
+    // `aligned(16)` has to be a request the layout parameters admit, or neither
+    // grammar would align anything and the comparison would measure nothing.
+    constexpr AggregateLayoutParams kHonour{
+        .scalarAlignment       = ScalarAlignmentRule::Natural,
+        .maxAlignment          = 16,
+        .maxRequestedAlignment = 268435456};
+    char const* const kProgram = "typedef int aligned;\n"
+                                 "typedef __attribute__((aligned(16))) long T;\n"
+                                 "T v;\n";
+    auto const aliasAlign = [&](SemanticModel const& m) -> std::uint32_t {
+        SymbolRecord const* t = sym(m, "T");
+        if (t == nullptr || !t->type.valid()) return 0;
+        auto const l = computeLayout(t->type, m.lattice().interner(), kHonour,
+                                     DataModel::Lp64);
+        return l.has_value() ? l->align.bytes() : 0;
+    };
+
+    // The shipped grammar's answer for this very program.
+    std::uint32_t shippedAlign = 0;
+    {
+        auto cu = buildShippedUnit("c", {std::string{kProgram}});
+        assertNoBuilderErrors(*cu);
+        auto m = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                         kHonour);
+        EXPECT_FALSE(m.hasErrors());
+        shippedAlign = aliasAlign(m);
+        ASSERT_EQ(shippedAlign, 16u)
+            << "the shipped grammar no longer aligns the alias, so the comparison "
+               "below would hold for a dropped attribute too";
+    }
+
     nlohmann::json doc = shippedCJson();
 
     // Sanity: the shipped document really is in the SAFE shape this mutates
@@ -371,47 +416,89 @@ TEST(TypeHeadHijackSweep, WrongFixInsideTheHeadIsRefusedLoudly) {
 
     auto schema = GrammarSchema::loadFromText(doc.dump(), "<wrong-fix-mutant>");
     ASSERT_TRUE(schema.has_value())
-        << "the wrong-fix mutant must LOAD — the point is that it loads and then "
-           "miscompiles, which is why the refusal has to come from the resolver";
+        << "the wrong-fix mutant must LOAD — the point is what the engine then "
+           "makes of a specifier the grammar put inside the head";
 
     UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
-    builder.addInMemory("typedef int aligned;\n"
-                        "typedef __attribute__((aligned(16))) long T;\n"
-                        "T v;\n",
-                        "<mem>");
+    builder.addInMemory(kProgram, "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     auto m = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
-                     kLayout);
+                     kHonour);
 
-    // The DEFINING assertion: the decoration inside the head must not silently
-    // become the head type. Either the head is refused LOUDLY, or — if some
-    // future grammar makes this shape unambiguous again — `v` still types as
-    // `long`. What must NEVER happen is a clean compile typed `int`.
-    SymbolRecord const* v = sym(m, "v");
-    bool const refusedLoudly = m.hasErrors();
-    bool const stillLong =
-        v != nullptr && v->type.valid()
-        && m.lattice().interner().kind(v->type) == TypeKind::I64;
-    EXPECT_TRUE(refusedLoudly || stillLong)
-        << "THE SILENT MISCOMPILE IS BACK: an attribute placed inside "
-           "`typedefHeadFull` re-pointed the head at the typedef named "
-           "`aligned` and the program compiled clean as `int`. The decoration "
-           "must live in a SIBLING slot (the declaration row's "
-           "`specifierPrefix`), never inside the type-resolved head.";
-
-    // And the refusal must be the AMBIGUOUS-HEAD diagnostic specifically, not
-    // an incidental parse failure that would mask the class if the grammar
-    // shifted underneath.
-    EXPECT_TRUE(hasCode(m.diagnostics(),
-                        DiagnosticCode::S_InvalidTypeSpecifierCombination))
-        << "the ambiguous-head guard in `resolveTypeNodeImpl` did not fire; "
-           "whatever refused this program was not the type-hijack guard";
+    // The DEFINING assertion, unchanged in substance: the decoration inside the
+    // head must not become the head type. What must NEVER happen is a clean
+    // compile typed `int`.
+    expectResolvedLong(m, "v",
+                       "THE SILENT MISCOMPILE IS BACK: an attribute placed inside "
+                       "`typedefHeadFull` re-pointed the head at the typedef named "
+                       "`aligned`");
+    // One type in the head: nothing for the guard to say, and nothing else
+    // refuses the unit.
+    expectNoAmbiguousHead(m, "an attribute specifier is opaque to the head scan");
+    EXPECT_FALSE(m.hasErrors());
+    // And the attribute is READ, as the declaration's own — the answer the
+    // shipped grammar gives for the same text.
+    EXPECT_EQ(aliasAlign(m), shippedAlign)
+        << "the attribute written inside the head was DROPPED: every head reader "
+           "skips it, so `headAttributeRuns` is the one reader it has";
 }
 
-// CONTROL for the pin above: the SAME mutation shape applied where it changes
-// nothing observable (the decoration's name is NOT a typedef). The head is
-// unambiguous, so the guard must stay SILENT — a guard that fires here would be
-// refusing every decorated typedef in the corpus.
+// ★ THE GUARD'S OWN PIN, on a head that really holds TWO types. The mutant above
+// used to be it; an attribute can no longer bring a second type into a head, so
+// this one does it with a shape that names a type by construction: an optional
+// `typeof` specifier appended to the head (FIRST-disjoint from every declarator,
+// so ordinary typedefs still parse). Two children resolving to DIFFERENT types is
+// the case where child order would decide the program, and it is refused; two
+// resolving to the SAME type cannot miscompile and stays quiet.
+TEST(TypeHeadHijackSweep, AHeadHoldingTwoTypesIsRefusedLoudly) {
+    nlohmann::json doc = shippedCJson();
+    ASSERT_TRUE(doc["shapes"].contains("typedefHeadFull"));
+    ASSERT_TRUE(doc["shapes"].contains("typeofSpecifier"));
+    ASSERT_EQ(doc["shapes"]["typedefHeadFull"]["sequence"].size(), 3u)
+        << "typedefHeadFull is no longer {qualifiers, typedefHead, qualifiers}";
+    doc["shapes"]["typedefHeadFull"] = nlohmann::json{
+        {"sequence", {nlohmann::json{{"repeat", "headQualifier"}},
+                      "typedefHead",
+                      nlohmann::json{{"repeat", "headQualifier"}},
+                      nlohmann::json{{"optional", "typeofSpecifier"}}}}};
+    auto schema = GrammarSchema::loadFromText(doc.dump(), "<two-type-head>");
+    ASSERT_TRUE(schema.has_value())
+        << "the two-type-head mutant must LOAD — the refusal has to come from "
+           "the resolver, which is the only place that knows what a child names";
+
+    auto const analyzeMutant = [&](char const* src) {
+        UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
+        builder.addInMemory(src, "<mem>");
+        auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+        return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                       kLayout);
+    };
+
+    {
+        auto m = analyzeMutant("typedef long typeof(int) T;\nT v;\n");
+        EXPECT_TRUE(m.hasErrors());
+        EXPECT_TRUE(hasCode(m.diagnostics(),
+                            DiagnosticCode::S_InvalidTypeSpecifierCombination))
+            << "a head whose two children name DIFFERENT types compiled without "
+               "the ambiguous-head refusal: child order decided the type";
+    }
+    {
+        auto m = analyzeMutant("typedef long typeof(long) T;\nT v;\n");
+        expectNoAmbiguousHead(m, "two children naming the SAME type");
+        expectResolvedLong(m, "v", "two children naming the same type");
+    }
+    {
+        // CONTROL: the mutant grammar still reads an ordinary typedef.
+        auto m = analyzeMutant("typedef long T;\nT v;\n");
+        EXPECT_FALSE(m.hasErrors());
+        expectResolvedLong(m, "v", "the mutant's ordinary typedef");
+    }
+}
+
+// CONTROL for the attribute-in-head mutant (`AnAttributeInsideTheHeadIsThe
+// DeclarationsOwn`): the SAME mutation shape applied where no typedef shares the
+// decoration's name. The head is unambiguous, so the guard must stay SILENT — a
+// guard that fires here would be refusing every decorated typedef in the corpus.
 TEST(TypeHeadHijackSweep, WrongFixMutantWithoutACollisionStaysQuiet) {
     nlohmann::json doc = shippedCJson();
     auto const attrRun = nlohmann::json{

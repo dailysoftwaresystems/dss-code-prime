@@ -18,13 +18,16 @@
 // programs to 42. The guard-page walk of a runtime stack descent (`lir_callconv.cpp`) is the second such pass.
 //
 // THE RULE EVERY REBUILD BETWEEN MIR→LIR AND THE BINDING OBEYS — checked here, per module:
-//   * a pass that inserts blocks PUBLISHES its block ENTRY IMAGE (for every source block, the block of its
-//     output where that block's instructions begin) and lays each source block's pieces out from that entry
-//     up to the next source block's entry: `expandAsmRegions` and `materializeCallingConvention`;
-//   * a pass that publishes none is PROVED block-preserving: the same functions, each with the same block
-//     range, every block with the same successors — `lowerWideCallArgs`, `rewriteWithAllocation`,
-//     `legalizeTwoAddress`, `runLirPeephole`. One that stops preserving is refused here, in every module, by
-//     name, until it publishes its image;
+//   * EVERY rebuild PUBLISHES its block ENTRY IMAGE (for every source block, the block of its output where
+//     that block's instructions begin) and lays each source block's pieces out from that entry up to the
+//     next source block's entry. A pass that inserts blocks publishes where each source block's pieces
+//     start (`expandAsmRegions`, `materializeCallingConvention`); a pass that rebuilds block for block
+//     publishes the identity IT PERFORMED, written down from the very map it rebuilt through
+//     (`lowerWideCallArgs`, `rewriteWithAllocation`, `legalizeTwoAddress`, `runLirPeephole`);
+//   * NOTHING HERE INFERS AN IMAGE. A block id is a position, and two modules with the same block ranges
+//     and the same successor ids do not say which source block's instructions stand at a position — two
+//     blocks no edge tells apart may have changed places. So a rebuild that publishes no image for a module
+//     that has blocks is refused, by name, in every module;
 //   * `assemble()` is not a rebuild: it keys each offset by the id of the block it is laying out, in one walk
 //     in layout order, branch relaxation and islands included. `verifyBlockOffsetsFollowLayout` checks
 //     exactly that — every block of every function has an offset, and they never decrease in layout order.
@@ -55,9 +58,9 @@ struct LirBlockRebuild {
     std::string_view pass;           // the pass, as the diagnostics name it
     Lir const*       in  = nullptr;
     Lir const*       out = nullptr;
-    // EMPTY: the pass publishes no image, so it must be PROVED block-preserving. Otherwise indexed by `in`'s
-    // block arena (`LirBlockId.v`; slot 0, the arena sentinel, holds 0): the `.v` of the `out` block where
-    // that block's instructions begin.
+    // What the PASS wrote down as it rebuilt, never something read back out of the two modules: indexed by
+    // `in`'s block arena (`LirBlockId.v`; slot 0, the arena sentinel, holds 0), the `.v` of the `out` block
+    // where that block's instructions begin. EMPTY is accepted only for a module with no block at all.
     std::span<std::uint32_t const> entryImage;
 };
 
@@ -125,32 +128,15 @@ imagesOf(LirBlockRebuild const& step, DiagnosticReporter& reporter) {
         std::uint32_t const outFirst = out.funcBlockAt(outFn, 0).v;
         std::uint32_t const outLast  = out.funcBlockAt(outFn, m - 1).v;
         if (!published) {
-            // THE PROOF. Ids are positions, so the same range plus the same successors, block by block, is
-            // the identity — and a pass that reordered, merged or split a block fails one of the three.
-            bool same = n == m && in.funcBlockAt(inFn, 0).v == outFirst;
-            std::uint32_t differs = 0;
-            for (std::uint32_t k = 0; same && k < n; ++k) {
-                LirBlockId const b = in.funcBlockAt(inFn, k);
-                auto const si = in.blockSuccessors(b);
-                auto const so = out.blockSuccessors(out.funcBlockAt(outFn, k));
-                same = si.size() == so.size();
-                for (std::size_t s = 0; same && s < si.size(); ++s) same = si[s].v == so[s].v;
-                if (!same) differs = b.v;
-            }
-            if (!same) {
-                refuse(reporter, std::format(
-                    "LIR pass '{}' rebuilt function #{} with a different block structure ({} block(s) from "
-                    "block {}, then {} from block {}{}) and publishes no block image, so a block a jump "
-                    "table, a static label table or a __try names cannot be followed through it",
-                    step.pass, fi, n, in.funcBlockAt(inFn, 0).v, m, outFirst,
-                    differs != 0 ? std::format("; block {}'s successors differ", differs) : std::string{}));
-                return std::nullopt;
-            }
-            for (std::uint32_t k = 0; k < n; ++k) {
-                std::uint32_t const v = in.funcBlockAt(inFn, k).v;
-                images[v] = Image{v, v};
-            }
-            continue;
+            // No inference (the rule above): the pass says where each block went, or its output is not
+            // followed. This function has blocks, so an image was owed.
+            refuse(reporter, std::format(
+                "LIR pass '{}' publishes no block image for a module that has blocks (function #{} has {}, "
+                "and its rebuilt form {}), so a block a jump table, a static label table or a __try names "
+                "cannot be followed through it: every rebuild states where each source block's "
+                "instructions begin",
+                step.pass, fi, n, m));
+            return std::nullopt;
         }
         // A PUBLISHED image must lay the function's blocks out in order, from the output function's first
         // block, each entry inside the output function — then a block's pieces are exactly the run from its

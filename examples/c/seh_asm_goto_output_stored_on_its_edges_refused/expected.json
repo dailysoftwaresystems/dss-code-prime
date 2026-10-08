@@ -1,0 +1,10 @@
+{
+  "$comment": "P69 (lane `cs`, D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES), the NEGATIVE half: an `asm goto` inside a `__try` whose output is a structure the template leaves in a register is stored through the object's address on EACH edge of the statement, in a block the lowering creates for that edge. A scope-table entry guards one byte range — the blocks the guarded body's own statements became — and those edge blocks are laid out after every block of the function, outside it. MEASURED before the refusal existed (pe64, the mingw-gcc build of DSS, debug AND release, the same in both): this program, whose `p` is a no-access page, ended with exit code 3221225477 (0xC0000005) instead of 42; in its image the scope was [0x1064, 0x10c8) and the two stores `mov %r9,(%rcx)` sat at 0x10e1 and 0x10ed, the function's last two blocks. The three controls returned 42 through the handler: the same statement as a plain `asm` (no label), an `asm goto` with a scalar register output, an `asm goto` with a memory output. No reference on these hosts compiles both halves (MSVC has no x64 inline asm, mingw gcc no `__try`), so there is no reference exit code to state: the escaped fault was DSS's own. The capability — a guarded range that covers every block the lowering creates for a guarded body — is the row's open work; until then the statement is refused by name, never compiled into a store its handler cannot see.",
+  "$commentRedOnDisable": "REMOVE direction: make `refusesUserMemoryInACreatedBlock` in src/lir/lowering/mir_to_lir.cpp answer false. This entry then FAILS in both runners — the compile SUCCEEDS and the declared diagnostic set is empty — and the artifact, run by hand, ends with 0xC0000005. The named GREEN control across that mutant is examples/c/seh_after_an_asm_label_function, whose guarded bodies hold a plain template and a C read and are unaffected.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:pe64-x86_64-windows-exec" } ],
+  "expectDiagnostics": [
+    { "code": "L_UnsupportedLoweringForOpcode", "line": 36, "col": 9 }
+  ]
+}

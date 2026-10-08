@@ -2,12 +2,13 @@
  *
  * The IMPLEMENTATION half of C23 7.26.2.7 `strndup` on `pe`. The DECLARATION half is the
  * `strndup` row of `src/dss-config/shippedLibs/string.json`, whose per-symbol `realization`
- * map names THIS file for `pe`; on `elf` the row imports the C library's own.
+ * map names THIS file for `pe`; on `elf` and on `macho` the row imports the C library's own.
  *
  * ★ WHY A BODY. C23 requires the function and the pe C library has none: ✔MEASURED
- * 2026-10-07 (lane `cs`'s probes iso1 / iso2w) — ucrtbase.dll exports no `strndup`
+ * 2026-10-07 (lane `cs`'s probes iso1 / iso2w / mac1) — ucrtbase.dll exports no `strndup`
  * (`GetProcAddress`), mingw-w64 13.2.0 link-fails on it and MSVC 19.51 refuses it, while
- * glibc 2.39 exports one (gcc 13.3.0 and clang 18.1.3 at -std=c2x build and run it to 42).
+ * glibc 2.39 exports one (gcc 13.3.0 and clang 18.1.3 at -std=c2x build and run it to 42)
+ * and so does libSystem (`dlsym` finds it; Apple clang 21.0.0 builds and runs it to 42).
  *
  * ★★ THE SEMANTICS ARE 7.26.2.7's: at most `n` bytes of `s` are read — the copy stops at the
  * first null character before `n` — and the result is always null-terminated, in space

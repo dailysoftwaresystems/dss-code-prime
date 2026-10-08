@@ -372,6 +372,138 @@ runAppertainmentFor(Tree const& tree, DeclaratorConfig const& dc,
                                                       dc));
 }
 
+// ★★ P69 round 4 (lane `cs`) — THE ATTRIBUTE SPECIFIERS WRITTEN INSIDE A DECLARATOR
+// THAT STAND BESIDE WHAT IT DECLARES, in source order. `carrier` is a node from
+// `collectDeclarators` (a per-slot wrapper or the declarator itself).
+//
+// An attribute specifier inside a declarator sits in a pointer layer (`int *
+// __attribute__((X)) p`) or at the start of a parenthesized declarator (`int
+// (__attribute__((X)) arr)[2]`). What it decorates is decided by what FOLLOWS it,
+// reading inwards towards the name:
+//   * a POINTER layer follows  ⇒ it decorates the type formed so far (`int *
+//     __attribute__((X)) *pp`, `int (__attribute__((X)) *pf)(int)`), and it is not
+//     in this list;
+//   * the declared NAME follows, or the place a name would stand in an abstract
+//     declarator, or a FUNCTION or ARRAY declarator (`int * __attribute__((X))
+//     f(void)`, `int * __attribute__((X)) (*pf)(int)`) ⇒ it stands beside the
+//     declared entity, and it is in this list. Parentheses that derive nothing
+//     (`int * __attribute__((X)) (p)`) are looked through.
+//
+// That is gcc's own rule, the one its manual states — "an attribute that only
+// applies to declarations, applied to the type of a declaration, is treated as
+// applying to that declaration" — and its declarator walk implements with exactly
+// these three cases (a name, a function declarator or an array declarator next).
+// clang gives every attribute in a declarator to the declaration. ✔MEASURED, lane
+// `cs`'s probes ta7 and ta8 (gcc 13.3.0, clang 18.1.3, Apple clang): `int *
+// __attribute__((weak)) p3 = 0, q3 = 0;` is `V p3` / `B q3`; `int * *
+// __attribute__((weak)) p6` and `int (__attribute__((weak)) p7) = 0;` are weak on
+// all three; after the INNER star and before the star in a parenthesized declarator
+// gcc says "does not apply to types" and leaves the symbol strong, clang makes it
+// weak — and there this compiler reads as gcc does and says so, as gcc does.
+//
+// WHAT a consumer does with a specifier of this list is its own business (the
+// attribute fold gives it to the declared entity unless the name's row keeps it on
+// the type; the linkage and noreturn folds read it as they read the run after the
+// declarator). This function only answers WHICH specifiers, once, so the three
+// folds cannot come to disagree about the position.
+//
+// Roles only (`pointerLayerRule`, `groupRule`, `directRule` and its abstract twin,
+// the suffix roles, the attribute-specifier predicate) — no rule name, no spelling.
+// An iterative descent with the walk's own depth cap: a corrupted or cyclic node
+// graph is a bounded miss.
+[[nodiscard]] inline std::vector<NodeId>
+nameAdjacentAttributeSpecifiers(Tree const& tree, SemanticConfig const& cfg,
+                                NodeId carrier) {
+    namespace det = declarator_walk_detail;
+    std::vector<NodeId> out;
+    if (!cfg.declarators.has_value()) return out;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    TreeDeclaratorView const v{tree};
+    auto const specifiersOf = [&](NodeId shape, std::vector<NodeId>& into) {
+        for (NodeId c : tree.children(shape)) {
+            if (!v.isVisible(c) || tree.kind(c) != NodeKind::Internal) continue;
+            if (isAttributeSpecifierRule(cfg, tree.rule(c))) into.push_back(c);
+        }
+    };
+    // The specifiers whose follower has not been seen yet: they join `out` when a
+    // name, a function suffix or an array suffix turns out to follow, and are
+    // dropped when a pointer layer does.
+    std::vector<NodeId> pending;
+    NodeId cur = carrier;
+    for (std::size_t step = 0; step < det::kMaxDeclaratorDepth; ++step) {
+        if (!cur.valid() || tree.kind(cur) != NodeKind::Internal) break;
+        RuleId const r = tree.rule(cur);
+        if (isDeclaratorSlotWrapper(r, dc)) {
+            cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
+            continue;
+        }
+        NodeId direct{};
+        if (r == dc.declaratorRule) {
+            NodeId lastLayer{};
+            for (NodeId c : tree.children(cur)) {
+                if (!v.isVisible(c) || tree.kind(c) != NodeKind::Internal) continue;
+                RuleId const cr = tree.rule(c);
+                if (cr == dc.pointerLayerRule) lastLayer = c;
+                else if (cr == dc.directRule
+                         || (dc.directAbstractRule.has_value()
+                             && cr == *dc.directAbstractRule)) {
+                    if (!direct.valid()) direct = c;
+                }
+            }
+            if (lastLayer.valid()) {
+                pending.clear();   // a pointer followed them: they are a type's
+                specifiersOf(lastLayer, pending);
+            }
+        } else if (r == dc.directRule
+                   || (dc.directAbstractRule.has_value()
+                       && r == *dc.directAbstractRule)) {
+            direct = cur;
+        } else {
+            break;   // not a declarator-role shape
+        }
+        if (!direct.valid()) {
+            // A star-only abstract declarator: the place of the name follows.
+            out.insert(out.end(), pending.begin(), pending.end());
+            break;
+        }
+        bool   hasName   = false;
+        bool   hasSuffix = false;
+        NodeId group{};
+        for (NodeId c : tree.children(direct)) {
+            if (!v.isVisible(c)) continue;
+            if (tree.kind(c) == NodeKind::Token) {
+                if (tree.tokenKind(c) == dc.nameToken) hasName = true;
+                continue;
+            }
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            RuleId const cr = tree.rule(c);
+            if (cr == dc.groupRule) {
+                if (!group.valid()) group = c;
+            } else if (cr == dc.fnSuffixRule || cr == dc.arraySuffixRule
+                       || (dc.fnSuffixTailRule.has_value()
+                           && cr == *dc.fnSuffixTailRule)
+                       || (dc.arrayStarSuffixRule.has_value()
+                           && cr == *dc.arrayStarSuffixRule)) {
+                hasSuffix = true;
+            }
+        }
+        if (hasName || !group.valid()) {
+            // The name, or an abstract direct declarator (a suffix with no name).
+            out.insert(out.end(), pending.begin(), pending.end());
+            break;
+        }
+        if (hasSuffix) {
+            // A function or array declarator follows what is pending; the
+            // parenthesized declarator inside it starts a new stretch.
+            out.insert(out.end(), pending.begin(), pending.end());
+            pending.clear();
+        }
+        specifiersOf(group, pending);
+        cur = det::firstChildOfRule(v, group, dc.declaratorRule);
+    }
+    return out;
+}
+
 // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME) — THE shared "this child is a
 // decoration, not the initializer" predicate.
 //

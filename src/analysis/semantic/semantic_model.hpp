@@ -5,6 +5,7 @@
 #include "analysis/semantic/type_rules.hpp"   // arrayToPointerDecay (C 6.3.2.1p3)
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"  // c97: heterogeneous scope-binding lookup
+#include "core/types/aggregate_layout.hpp"   // AggregateLayoutParams (see `aggregateLayout()`)
 #include "core/types/data_model.hpp"
 #include "core/types/declared_qualification.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -641,6 +642,16 @@ struct DSS_EXPORT SymbolRecord {
     // B/C). Orthogonal to binding/visibility (a file-scope thread_local
     // keeps external linkage). Default false.
     bool            isThreadLocal = false;
+    // P69 (lane `cs`): WHERE THIS DECLARATION'S THREAD STORAGE CAME FROM, in the
+    // one respect the redeclaration merge needs: true iff `isThreadLocal` was set
+    // only by specifiers whose linkage entry says the request YIELDS when another
+    // declaration of the object does not make it
+    // (`LinkageSpecifierEffect::threadStorageYieldsOnMismatch`; c:
+    // `__declspec(thread)`). The merge then IGNORES and WARNS the request and the
+    // object is one shared object, instead of refusing the pair as C 6.7.1p3
+    // refuses a `_Thread_local` mismatch. Never true beside the keyword, and
+    // meaningless when `isThreadLocal` is false.
+    bool            threadStorageYieldsOnMismatch = false;
     // P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the machine register
     // a GNU LOCAL REGISTER VARIABLE names — the asm label of a block-scope
     // object whose declaration carries a `{asmLabelNamesRegister: true}`
@@ -1082,6 +1093,7 @@ public:
                   UnitAttribute<ConstantSubobjectFact>   constantSubobjects,
                   UnitAttribute<NanPayload>              nanPayloads,
                   UnitAttribute<TypeId>                  overflowPredicateTargets,
+                  UnitAttribute<bool>                    attributeNamesIgnoredForKind,
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   std::unordered_map<std::string, SuppressedShippedSymbol>
                                                          suppressedShippedLibraries,
@@ -1101,7 +1113,12 @@ public:
                   // accessors below. Defaulted (0/0) for every direct constructor
                   // caller that is not the analyzer.
                   std::uint64_t                          exprTypeQueries = 0,
-                  std::uint64_t                          exprTypeNodeVisits = 0) noexcept
+                  std::uint64_t                          exprTypeNodeVisits = 0,
+                  // See `aggregateLayout()`. Last, and defaulted, for the same
+                  // reason `target` is: every direct constructor caller that is
+                  // not the analyzer has no layout to carry.
+                  std::optional<AggregateLayoutParams>   aggregateLayout =
+                      std::nullopt) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -1119,6 +1136,7 @@ public:
           constantSubobjects_(std::move(constantSubobjects)),
           nanPayloads_(std::move(nanPayloads)),
           overflowPredicateTargets_(std::move(overflowPredicateTargets)),
+          attributeNamesIgnoredForKind_(std::move(attributeNamesIgnoredForKind)),
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
@@ -1126,7 +1144,8 @@ public:
           target_(target),
           charIsUnsigned_(charIsUnsigned),
           exprTypeQueries_(exprTypeQueries),
-          exprTypeNodeVisits_(exprTypeNodeVisits) {}
+          exprTypeNodeVisits_(exprTypeNodeVisits),
+          aggregateLayout_(aggregateLayout) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -1256,6 +1275,24 @@ public:
     [[nodiscard]] ConstantSubobjectFact const* constantSubobjectFor(NodeId id) const {
         return constantSubobjects_.tryGet(id);
     }
+    // P69 (lane `cs`): true iff `nameToken` is the NAME token of an attribute clause
+    // the declaration-kind gate IGNORED — the language declares the attribute
+    // applicable to other kinds of entity than the one this declaration declares,
+    // and said so (`S_AttributeIgnoredForDeclarationKind`: "ignored … and its
+    // effect was discarded"). The gate's verdict is recorded HERE, as a fact, so
+    // that a second reader of the same tokens cannot apply what the first one
+    // discarded: the CST→HIR linkage fold skips such a name, which is what makes
+    // `__attribute__((selectany)) int f(void) { … }` an ordinary strong function
+    // (gcc 13.3.0 on Linux: "'selectany' attribute directive ignored", and the
+    // image runs) instead of a weak one the warning said it was not.
+    //
+    // Per CLAUSE, not per declarator: a clause shared by several declarators of
+    // one declaration is ignored for all of them as soon as one is outside the
+    // kind axis — the reading of the one reference that accepts such a
+    // declaration, which ignores the attribute altogether.
+    [[nodiscard]] bool attributeNameIgnoredForKind(NodeId nameToken) const {
+        return attributeNamesIgnoredForKind_.has(nameToken);
+    }
 
     // The full attributes — convenient for tooling / forEach iteration.
     [[nodiscard]] UnitAttribute<SymbolId> const& nodeToSymbol() const noexcept { return nodeToSymbol_; }
@@ -1365,6 +1402,26 @@ public:
         return charIsUnsigned_;
     }
 
+    // The aggregate-layout parameters this analysis ran under — `analyze()`'s own
+    // parameter: the target's block with the active format's bit-field axes
+    // already overlaid by the driver — or `nullopt` when analysis ran with none
+    // (the LSP, the FFI header parser, every direct-API test, a target that
+    // declares no block).
+    //
+    // The HIR lowering reads THIS rather than taking a second parameter — the
+    // `dataModel()` / `charIsUnsigned()` discipline — because it asks the same
+    // question the semantic tier's constant evaluator asks: what is `sizeof(T)`,
+    // what is `_Alignof(T)`. The lowering asks it of a CONDITION (is this `if`,
+    // this loop, decided before the program runs?) and of an index designator;
+    // answered from any other source, the two tiers could size one type two ways
+    // and one of them would be claiming code unreachable that the other laid out.
+    // `nullopt` makes the lowering's fold REFUSE, never guess: without a layout a
+    // `sizeof` is not a constant there, and the statement it guards may continue.
+    [[nodiscard]] std::optional<AggregateLayoutParams> const&
+    aggregateLayout() const noexcept {
+        return aggregateLayout_;
+    }
+
 private:
     std::shared_ptr<CompilationUnit const> cu_;
     TypeLattice                            lattice_;
@@ -1398,6 +1455,7 @@ private:
     UnitAttribute<ConstantSubobjectFact>                  constantSubobjects_;
     UnitAttribute<NanPayload>                             nanPayloads_;
     UnitAttribute<TypeId>                                 overflowPredicateTargets_;
+    UnitAttribute<bool>                                   attributeNamesIgnoredForKind_;
     // FF11: descriptor externs minted from resolved shipped-lib JSON
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.
@@ -1422,6 +1480,8 @@ private:
     // own work for this analysis (see the two accessors).
     std::uint64_t                                          exprTypeQueries_ = 0;
     std::uint64_t                                          exprTypeNodeVisits_ = 0;
+    // The analysis-time aggregate-layout parameters (see `aggregateLayout()`).
+    std::optional<AggregateLayoutParams>                   aggregateLayout_{};
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

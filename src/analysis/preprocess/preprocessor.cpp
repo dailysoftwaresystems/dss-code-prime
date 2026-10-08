@@ -10307,7 +10307,7 @@ PreprocessResult preprocessRun(
     // ORDINARY directive handler seeds them in stream order (the gcc model:
     // "as if #define appeared before the first source line"). Two origins:
     //   "<built-in>"     — config predefinedMacros WITH `params` (function-like,
-    //                      e.g. the MSVC-profile `__declspec(x)` → empty erase),
+    //                      e.g. the pe-profile `_declspec(x)` → `__declspec(x)`),
     //                      format-filtered exactly like the predefined_ seed.
     //   "<command-line>" — the CLI `--define NAME[=VALUE]` entries (VALUE
     //                      defaults to 1). Because these become ORDINARY

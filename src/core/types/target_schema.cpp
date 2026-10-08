@@ -3397,6 +3397,37 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                      std::format("callingConvention '{}': stackProbePageBytes ({}) must be a power of two",
                                  cc.name, cc.stackProbePageBytes));
             }
+            // D-CSUBSET-VLA-WIN64-STACK-PROBE: a guard page has to HOLD what one
+            // step reaches below the stack pointer, or no touch can keep the stack
+            // on it, whatever the program (the FOOTING note in lir_callconv.cpp).
+            // One step is what one call pushes (`callPushBytes`) or one probe touch
+            // — a word of this convention's own stack pointer, the `widthBytes` of
+            // the register `stackPointer` names, which is the row the
+            // calling-convention pass reads for the width it touches with. A
+            // convention whose page is smaller than either can never be probed, so
+            // it does not load.
+            if (cc.stackProbePageBytes != 0) {
+                if (cc.callPushBytes > cc.stackProbePageBytes) {
+                    fail(std::format("/callingConventions/{}/stackProbePageBytes", i),
+                         std::format("callingConvention '{}': stackProbePageBytes ({}) is smaller "
+                                     "than callPushBytes ({}) — one call would push past the "
+                                     "guard page, which no probe touch can prevent",
+                                     cc.name, cc.stackProbePageBytes, cc.callPushBytes));
+                }
+                if (cc.stackPointer.has_value()) {
+                    if (auto const sp = registerIndex.find(cc.stackPointer->name);
+                        sp != registerIndex.end()
+                        && registers[sp->second].widthBytes > cc.stackProbePageBytes) {
+                        fail(std::format("/callingConventions/{}/stackProbePageBytes", i),
+                             std::format("callingConvention '{}': stackProbePageBytes ({}) is smaller "
+                                         "than one probe touch, a word of its stackPointer '{}' ({} "
+                                         "bytes, /registers/{}/widthBytes) — a page that cannot hold "
+                                         "one touch cannot be probed",
+                                         cc.name, cc.stackProbePageBytes, cc.stackPointer->name,
+                                         registers[sp->second].widthBytes, sp->second));
+                    }
+                }
+            }
             if (!isPow2Nonzero(cc.stackAlignment)) {
                 fail(std::format("/callingConventions/{}/stackAlignment", i),
                      std::format("callingConvention '{}': stackAlignment ({}) must be a non-zero power of two",

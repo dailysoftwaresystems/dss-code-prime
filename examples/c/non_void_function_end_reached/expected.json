@@ -1,0 +1,60 @@
+{
+  "$comment": "P69 (lane `cs`, D-C-A-NON-VOID-FUNCTION-WHOSE-END-IS-REACHABLE-IS-REFUSED): C23 6.9.2p13 makes REACHING the closing brace of a function that returns a value defined — only USING the value nobody returned is undefined. DSS refused every such function (H_VerifierFailure, 'may fall through without returning a value'); it now compiles it, a call that ends at the brace RETURNS to a caller that goes on running, and the function is reported once as a warning at the brace (H_NonVoidFunctionEndReachable). The rule is language config: `nonVoidFunctionEndReached: returnsUnspecifiedValue` on C's `topLevelDecl` row; a document that does not state the key keeps the refusal. Exit 42, or a bitmask of the shapes that went wrong (see main.c): 1 = `if (k) return 5;` reached twice unused then returned and used, 2 = an enumeration switch with a return per case and no default, 4 = no return statement at all, 8 = pointer / double / long double / a two-word structure / a 64-byte structure (the caller's storage), each reached unused then returned and compared, 16 = the same bodies where the release pipeline may inline them. REFERENCES: see `$measuredComment`.",
+  "$measuredComment": "(filled by the probe of THIS file's bytes)",
+  "$releaseComment": "The release arm is the half the ruling asks for by name: under the optimizer a function in which SOME paths return and one reaches the end keeps its returning paths' values (`some_paths(1) == 5`, `inl_some_paths(1) == 5` after inlining), and the reached end is neither deleted as unreachable (the `steps` counter says the statements after each such call ran) nor allowed to change another path. REPORT-ONLY (`mustDifferFromBaseline: false`): its value is that the optimized program agrees.",
+  "$commentRedOnDisable": "MEASURED, each mutant built and read ALONE — see the row's closing cell for the runs. The discriminating failure modes: the completion removed (every function here is refused — the compile fails), the reached end lowered as unreachable (bit 1, 2, 4, 8 or 16: control runs past the function), the completion applied to `main` first (`tests/hir/test_non_void_function_end_reached.cpp`, not this example: `main` here returns explicitly).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectWarnings": [
+    { "code": "H_NonVoidFunctionEndReachable", "line": 45, "col": 1, "$comment": "some_paths" },
+    { "code": "H_NonVoidFunctionEndReachable", "line": 54, "col": 1, "$comment": "per_case" },
+    { "code": "H_NonVoidFunctionEndReachable", "line": 58, "col": 1, "$comment": "no_return" },
+    { "code": "H_NonVoidFunctionEndReachable", "line": 63, "col": 1, "$comment": "as_pointer" },
+    { "code": "H_NonVoidFunctionEndReachable", "line": 68, "col": 1, "$comment": "as_double" },
+    { "code": "H_NonVoidFunctionEndReachable", "line": 73, "col": 1, "$comment": "as_long_double" },
+    { "code": "H_NonVoidFunctionEndReachable", "line": 81, "col": 1, "$comment": "as_pair" },
+    { "code": "H_NonVoidFunctionEndReachable", "line": 89, "col": 1, "$comment": "as_wide" },
+    { "code": "H_NonVoidFunctionEndReachable", "line": 94, "col": 1, "$comment": "inl_some_paths" },
+    { "code": "H_NonVoidFunctionEndReachable", "line": 99, "col": 1, "$comment": "inl_double" }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": false
+    }
+  ]
+}

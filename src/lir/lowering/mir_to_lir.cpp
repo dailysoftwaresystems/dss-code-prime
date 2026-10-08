@@ -1442,6 +1442,46 @@ struct Lowerer {
     std::unordered_map<std::uint32_t, std::uint32_t> sehMirBlockFuncIndex_;
     std::vector<SehScopeDescriptor>                  sehScopeDescriptors_;
 
+    // ── A GUARDED RANGE COVERS THE FUNCTION'S OWN BLOCKS AND NOTHING ELSE ──────
+    // (D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES)
+    //
+    // A scope's range is ONE contiguous run of byte offsets: from the block its
+    // guarded body's first MIR block became to the end of the block its last
+    // one became (`SehScopeDescriptor`). Every MIR block gets its LIR block
+    // BEFORE any body is lowered, so a block this lowering CREATES while
+    // lowering an instruction receives an id after all of them, and a LIR block
+    // id is a position: the created block is laid out at the END of the
+    // function, OUTSIDE every guarded range. An instruction in it that faults
+    // on user memory is therefore not caught by the `__try` it was written in.
+    // ✔MEASURED P69 on pe64, debug and release: an `asm goto` whose output is a
+    // structure left in a register, written in a guarded body over a no-access
+    // page, ended the process with 0xC0000005 — its two edge stores sat in the
+    // function's last two blocks, past the scope's end.
+    //
+    // ⇒ ONE RULE, ASKED BY EVERY CREATOR WHOSE BLOCK WOULD TOUCH USER MEMORY
+    // (`refusesUserMemoryInACreatedBlock`): inside a guarded body that statement
+    // is REFUSED, by name, instead of compiled. The condition is the function's
+    // own scopes — never a format's or an architecture's name. The creators:
+    //   * an `asm goto`'s edge blocks (`createAsmCaptureBlocks`) — ASKS, for a
+    //     BY-ADDRESS output, whose value is stored through the object's address
+    //     on every edge. Its other edge work cannot fault: a register capture,
+    //     and a home-carried output's store into this frame;
+    //   * the LL/SC retry loop of an atomic compare-exchange (`lowerAtomicCas`)
+    //     — ASKS: its exclusive load and store address the program's object;
+    //   * a phi edge's split block (`lowerTerminator`) — does not ask: register
+    //     moves, plus the home-to-home copy of a memory-resident `long double`,
+    //     which only a format whose `long double` is wider than a register has.
+    //     ⚠ A format that gains BOTH a guarded scope and such a `long double`
+    //     must ask here too: that copy's source can be an in-place load's
+    //     address, the program's own object;
+    //   * a dense switch's table-read block (`tryLowerSwitchJumpTable`) and a
+    //     sparse one's compare chain (`lowerSwitch`) — do not ask: a compare, a
+    //     branch and a read of this module's own jump table.
+    // The set is THIS function's guarded MIR blocks, rebuilt per function from
+    // the scopes handed in; empty — and the rule silent — for every function
+    // without one.
+    std::unordered_set<std::uint32_t> guardedMirBlocks_;
+
     // Mint a fresh synthetic SymbolId for a jump table's `.data` item. Draws
     // from the SAME monotone `nextBlockSym_` sequence `mintBlockSymbol` uses, so
     // a table symbol can never collide with a block symbol (or a user / extern
@@ -2907,6 +2947,25 @@ struct Lowerer {
             "MIR inst {} ('{}') cannot be lowered to target '{}': {}",
             at.v, mirOpcodeName(op), target.name(), what);
         reporter.report(std::move(d));
+    }
+
+    // THE ONE REFUSAL OF `guardedMirBlocks_`' RULE, asked by a creator BEFORE it
+    // creates a block that would hold `access`: true (reported) when `at` sits
+    // in a guarded body of this function — the caller then lowers nothing —
+    // false when it does not, and the caller goes on. `access` says what would
+    // touch the program's memory out there; `instead` what compiles today.
+    [[nodiscard]] bool refusesUserMemoryInACreatedBlock(MirInstId at,
+                                                        std::string_view access,
+                                                        std::string_view instead) {
+        if (!guardedMirBlocks_.contains(mir.instBlock(at).v)) return false;
+        reportUnsupported(mir.instOpcode(at), at,
+            std::format("it is written inside a guarded body (`__try`), and {} "
+                        "would be placed in a block laid out after the "
+                        "function's own blocks — outside the byte range the "
+                        "body's scope guards, so a fault it raised would escape "
+                        "the handler. That is not lowered yet: {}",
+                        access, instead));
+        return true;
     }
 
     // An instruction whose SHAPE is not the one its opcode defines — the wrong
@@ -5807,6 +5866,27 @@ struct Lowerer {
             // run on each edge, and a spilled output's store is placed by the
             // rewriter at the head of each edge — which is sound only on a
             // block no other path enters.
+            // ★★ IN A GUARDED BODY THOSE BLOCKS LIE OUTSIDE THE SCOPE'S RANGE
+            // (`guardedMirBlocks_`), and a by-address output is stored through
+            // its object's address on each of them. A frame slot of this
+            // function cannot fault; any other address is the program's, so the
+            // statement is refused HERE — before a block is created — rather
+            // than compiled into a store its `__try` does not guard.
+            for (std::size_t j = 0; j < ins.size(); ++j) {
+                if (!(ins[j].carriedByAddress && ins[j].carriedOut)) continue;
+                if (mir.instOpcode(operands[j]) == MirOpcode::Alloca) continue;
+                if (refusesUserMemoryInACreatedBlock(
+                        id,
+                        "the store of a by-address output (a structure, a "
+                        "complex or a wide integer the template leaves in a "
+                        "register) through its object's address, which is made "
+                        "on every edge of the statement,",
+                        "give the statement a local object of this function "
+                        "as that output and assign it to its destination after "
+                        "the statement")) {
+                    return false;
+                }
+            }
             captureBlocks = createAsmCaptureBlocks(succs, outs, ins);
             // The label half of the operand-spelling rule above: a spelling
             // bound twice is resolved by FIRST match, so a repeat would bind
@@ -7544,8 +7624,8 @@ struct Lowerer {
     // here, so nothing a later store does can reach it, and a `volatile` read
     // happens where the program performs it (C 6.7.3) instead of wherever the
     // value is next consumed. `emitWideFloatHomeCopy` is the one bytes-mover —
-    // exactly the 10 significant bytes of an x87 datum (so a packed member is
-    // never over-read), all 16 of a binary128 — and the home is recorded in
+    // the 10 value bytes of an x87 datum (its six padding bytes are not
+    // copied), all 16 of a binary128 — and the home is recorded in
     // `allocaSlotIndex_`, so every consumer rematerializes its address instead
     // of holding a long-lived register.
     void lowerF80Load(MirInstId id) {
@@ -7582,15 +7662,22 @@ struct Lowerer {
     // format axis and the target's own opcode table decides the rest, so there
     // is no arch/format identity branch here.
     //
-    // ⚠⚠ F80 MOVES THROUGH THE x87 STACK, AND THAT IS NOT AN ACCIDENT OF
-    // HISTORY. An F80 source address can be ANY `long double` lvalue's address —
-    // `lowerF80Load` copies FROM the object itself, and reads a value in place
-    // where nothing can write it first — so the address may point at a 10-byte
-    // object inside a packed struct rather than at one of this lowerer's own
-    // 16-byte scratch slots. `fld_m80`/`fstp_m80` touch exactly the 10
-    // significant bytes; a two-word 16-byte GPR copy (the shape F128 uses, and
-    // the cheaper one) would OVER-READ such a source by six bytes. F128 is a
-    // true 16-byte binary128, so its 16-byte copy is exact.
+    // ⚠⚠ F80 MOVES THROUGH THE x87 STACK: `fld_m80`/`fstp_m80` read and write
+    // exactly the 10 VALUE bytes of the datum and never its six padding bytes,
+    // so the copy carries the value and nothing else, whatever the source
+    // address is (`lowerF80Load` copies FROM the object itself, and reads a
+    // value in place where nothing can write it first). F128 is a true 16-byte
+    // binary128, so its two-word copy is exact.
+    // ⚠ WHAT THIS IS NOT: a guard against over-reading a "10-byte object". This
+    // note used to say a 16-byte copy would over-read a `long double` member of
+    // a packed structure by six bytes; no such object exists. ✔MEASURED (P69,
+    // lane `lm`; gcc 13.3.0, clang 18.1.3 and DSS on x86_64 ELF): `sizeof(long
+    // double)` is 16 and `struct __attribute__((packed)) { char c; long double
+    // v; }` is 17 bytes with `v` at offset 1 — a packed member keeps the type's
+    // 16 bytes — and gcc -O2 itself copies such an object as two 8-byte words.
+    // A two-word copy would therefore read nothing outside the object either;
+    // the x87 pair is the move the target declares for the datum, and it leaves
+    // the destination's padding bytes unwritten.
     //
     // Fail-loud (false, diagnostic already reported) if the target declares no
     // such op, or if `kind` is not a memory-resident wide float — the caller
@@ -13291,6 +13378,17 @@ struct Lowerer {
                                     "MIR AtomicCas (LL/SC loop)");
                 return;
             }
+            // The loop's blocks are created HERE, so in a guarded body they lie
+            // outside the scope's range (`guardedMirBlocks_`) — and its
+            // exclusive load and store address the program's object.
+            if (refusesUserMemoryInACreatedBlock(
+                    id,
+                    "the exclusive load and store of its retry loop, which "
+                    "address the program's object,",
+                    "perform the atomic operation outside the guarded body")) {
+                poisonValue(id);
+                return;
+            }
             LirBlockId const retry = lir.createBlock();
             LirBlockId const store = lir.createBlock();
             LirBlockId const done  = lir.createBlock();
@@ -16320,6 +16418,27 @@ struct Lowerer {
             if (!sehScopesIn_.empty()) {
                 sehMirBlockToLir_[mb.v]     = lb;
                 sehMirBlockFuncIndex_[mb.v] = currentFuncIndex_;
+            }
+        }
+        // Which of THIS function's blocks lie in a guarded body: for each scope
+        // whose first and last block are this function's, every block from the
+        // one to the other in the function's own order (the funclet pass lays a
+        // guarded body out contiguously, which is what makes its range a range).
+        // See `guardedMirBlocks_`.
+        guardedMirBlocks_.clear();
+        if (!sehScopesIn_.empty()) {
+            std::unordered_map<std::uint32_t, std::uint32_t> position;
+            position.reserve(blockCount);
+            for (std::uint32_t i = 0; i < blockCount; ++i) {
+                position.emplace(mir.funcBlockAt(mf, i).v, i);
+            }
+            for (auto const& s : sehScopesIn_) {
+                auto const first = position.find(s.beginBlock.v);
+                auto const last  = position.find(s.endBlock.v);
+                if (first == position.end() || last == position.end()) continue;
+                for (std::uint32_t i = first->second; i <= last->second; ++i) {
+                    guardedMirBlocks_.insert(mir.funcBlockAt(mf, i).v);
+                }
             }
         }
         // Pre-pass 2: allocate vregs for all Phi results so back-edge

@@ -599,6 +599,574 @@ TEST(LirCallconv, MsX64WalksAVlaAndAnAllocaAlikeAndSysVWalksNeither) {
     }
 }
 
+// The same producer contract where the round-up is the IDENTITY. `lowerVlaAlloca` rounds the
+// runtime size up to the stack alignment, which defines a fresh register — except under a
+// convention that aligns its stack to 1, where the round-up hands back its input: the
+// PROGRAM'S OWN size value, which other instructions still read and which the guard-page walk
+// would count down under them. That one case gets a copy of its own. No shipped convention
+// aligns its stack to 1, so the negative is synthesized: cc 0 (the convention
+// `lowerVlaAlloca` reads the alignment from) with `stackAlignment` 1 — and `callPushBytes`
+// 0, which the loader holds below the alignment. The source reads its size again AFTER the
+// allocation, so the value the descent must not consume is provably still wanted.
+TEST(LirCallconv, ADescentUnderAStackAlignedToOneGetsASizeRegisterOfItsOwn) {
+    auto mutated = ::dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            auto& cc0 = doc.at("callingConventions").at(0);
+            cc0["stackAlignment"] = 1;
+            cc0["callPushBytes"]  = 0;
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "a convention that aligns its stack to 1 must still LOAD";
+    TargetSchema const& sch = **mutated;
+    ASSERT_NE(sch.callingConvention(0), nullptr);
+    ASSERT_EQ(static_cast<std::uint32_t>(sch.callingConvention(0)->stackAlignment), 1u);
+    auto const subSpReg = sch.opcodeByMnemonic("sub_sp_reg");
+    auto const mov      = sch.opcodeByMnemonic("mov");
+    ASSERT_TRUE(subSpReg.has_value() && mov.has_value());
+
+    // A VLA of `char`: an element aligned to 1 needs no rounding headroom under a stack aligned
+    // to 1, so nothing but the round-up stands between the program's size and the descent.
+    // (`__builtin_alloca` is NOT this shape: its 16-byte element alignment exceeds 1, and the
+    // headroom `add` already defines a register of its own.)
+    auto lowered = lowerCToLir(
+        "long f(unsigned long n) { volatile char a[n]; a[0] = 1; return a[0] + (long)n; }\n",
+        *mutated, /*mirCcIndex=*/0);
+    ASSERT_TRUE(lowered.lir.ok);
+    Lir const& pre = lowered.lir.lir;
+    LirFuncId const pf = pre.funcAt(0);
+
+    // The function as text, for the failure messages below.
+    std::string text;
+    auto const forEachInst = [&](auto&& visit) {
+        for (std::uint32_t bi = 0; bi < pre.funcBlockCount(pf); ++bi) {
+            LirBlockId const blk = pre.funcBlockAt(pf, bi);
+            for (std::uint32_t k = 0; k < pre.blockInstCount(blk); ++k) {
+                visit(pre.blockInstAt(blk, k));
+            }
+        }
+    };
+    forEachInst([&](LirInstId in) {
+        auto const* info = sch.opcodeInfo(pre.instOpcode(in));
+        auto const name = [](LirReg const reg) {
+            if (!reg.valid()) return std::string{"-"};
+            return std::string{reg.isPhysical != 0 ? "p" : "v"}
+                 + std::to_string(static_cast<std::uint32_t>(reg.id));
+        };
+        text += "  " + name(pre.instResult(in)) + " <- "
+              + (info != nullptr ? std::string{info->mnemonic} : std::string{"?"});
+        for (auto const& o : pre.instOperands(in)) {
+            if (o.kind == LirOperandKind::Reg) text += " " + name(o.reg);
+        }
+        text += "\n";
+    });
+    auto const usesOf = [&](LirReg reg) {
+        std::uint32_t n = 0;
+        forEachInst([&](LirInstId in) {
+            for (auto const& o : pre.instOperands(in)) {
+                if (o.kind == LirOperandKind::Reg && o.reg == reg) ++n;
+            }
+        });
+        return n;
+    };
+
+    std::optional<LirReg> size;
+    std::uint32_t descents = 0;
+    forEachInst([&](LirInstId in) {
+        if (pre.instOpcode(in) != *subSpReg) return;
+        ++descents;
+        auto const o = pre.instOperands(in);
+        if (o.size() == 2 && o[1].kind == LirOperandKind::Reg) size = o[1].reg;
+    });
+    ASSERT_EQ(descents, 1u) << text;
+    ASSERT_TRUE(size.has_value()) << text;
+    ASSERT_EQ(static_cast<std::uint32_t>(size->isPhysical), 0u) << text;
+    EXPECT_EQ(usesOf(*size), 1u)
+        << "the descent's size register has one use, the descent, so the walk may count it "
+           "down\n" << text;
+
+    // It is a COPY of the value the program computed — and that value is read again.
+    std::optional<LirReg> programValue;
+    std::uint32_t defs = 0;
+    forEachInst([&](LirInstId in) {
+        if (!(pre.instResult(in) == *size)) return;
+        ++defs;
+        auto const o = pre.instOperands(in);
+        if (pre.instOpcode(in) == *mov && o.size() == 1 && o[0].kind == LirOperandKind::Reg
+            && o[0].reg.isPhysical == 0) {
+            programValue = o[0].reg;
+        }
+    });
+    ASSERT_EQ(defs, 1u) << text;
+    ASSERT_TRUE(programValue.has_value())
+        << "the descent's size register is defined by a copy of the program's own size "
+           "value, made for the descent alone\n" << text;
+    EXPECT_FALSE(*programValue == *size) << text;
+    EXPECT_GE(usesOf(*programValue), 2u)
+        << "the pin's premise: the program's own size value is read by the copy AND again "
+           "after the allocation, so a descent that consumed it would have destroyed a "
+           "value still wanted\n" << text;
+}
+
+// ── D-CSUBSET-VLA-WIN64-STACK-PROBE: THE FOOTING ──────────────────────────────────
+//
+// What a function may reach below its settled SP before any probe of its own is DERIVED
+// from the convention's own numbers (the FOOTING paragraph of the design note above
+// `DynamicProbeBlocks` in lir_callconv.cpp): it is entered with the page that holds the byte
+// at its SP committed — by the call's push, or, when the call pushes nothing, by its caller.
+// ms_x64 (a call pushes 8 onto a 16-aligned SP) reaches everything it needs from there for
+// EVERY frame, so its code carries no extra touch. The SAME convention with `callPushBytes`
+// 0 — the shipped document mutated into a link-register machine's shape, the negative no
+// shipped target can synthesize — does not: its leaf with a frame of exactly a page would
+// put touch (1) one word PAST the guard page, and its caller owes its callee the page its
+// own SP lands in. Each gets ONE landing touch, `or_mem [SP + 0], 0`, the first thing after
+// the prologue. Every arm runs the shipped convention over the same function as its control.
+
+namespace {
+
+// One block — an optional body-local of `localBytes`, an optional runtime descent, an
+// optional call, `ret` — as regalloc leaves it (every register physical).
+struct FootingShape {
+    std::uint32_t localBytes = 0;
+    bool          descent    = false;
+    bool          call       = false;
+};
+
+[[nodiscard]] DescentModule
+footingModule(TargetSchema const& sch, std::uint16_t ccIndex, std::uint16_t spOrd,
+              std::uint16_t regOrd, FootingShape const& shape) {
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{77});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    LirReg const reg = makePhysicalReg(regOrd, LirRegClass::GPR);
+    if (shape.localBytes > 0) {
+        b.addInst(*sch.opcodeByMnemonic("alloca"), reg, std::span<LirOperand const>{},
+                  /*payload=*/shape.localBytes);
+    }
+    if (shape.descent) {
+        std::array<LirOperand, 2> ops{
+            LirOperand::makeReg(makePhysicalReg(spOrd, LirRegClass::GPR)),
+            LirOperand::makeReg(reg)};
+        b.addInst(*sch.opcodeByMnemonic("sub_sp_reg"), InvalidLirReg, ops);
+    }
+    if (shape.call) {
+        std::array<LirOperand, 1> callOps{LirOperand::makeSymbolRef(13)};
+        b.addInst(*sch.opcodeByMnemonic("call"), InvalidLirReg, callOps);
+    }
+    b.addReturn(*sch.opcodeByMnemonic("ret"), std::span<LirOperand const>{});
+    DescentModule out{std::move(b).finish(), {}};
+    out.alloc.perFunc.emplace_back();
+    out.alloc.perFunc.back().ok                     = true;
+    out.alloc.perFunc.back().originalSymbol         = SymbolId{77};
+    out.alloc.perFunc.back().callingConventionIndex = ccIndex;
+    out.alloc.perFunc.back().numSpillSlots          = 0;
+    return out;
+}
+
+// The shipped x86_64 document with ONE number changed: ms_x64's call pushes nothing.
+[[nodiscard]] auto x8664WhoseMsX64CallPushesNothing() {
+    return ::dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& cc : doc.at("callingConventions")) {
+                if (cc.is_object() && cc.value("name", std::string{}) == "ms_x64") {
+                    cc["callPushBytes"] = 0;
+                }
+            }
+        });
+}
+
+// The index, in `blk`, of the first instruction `pred` accepts.
+template <typename Pred>
+[[nodiscard]] std::optional<std::uint32_t>
+firstInBlock(Lir const& lir, LirBlockId blk, Pred pred) {
+    for (std::uint32_t k = 0; k < lir.blockInstCount(blk); ++k) {
+        if (pred(lir.blockInstAt(blk, k))) return k;
+    }
+    return std::nullopt;
+}
+
+// What the footing pins read off a schema: ms_x64 (cc 1), its stack pointer, a general
+// register for the function's own value, and the opcodes they look for.
+struct FootingTarget {
+    TargetCallingConvention const* cc = nullptr;
+    std::uint16_t spOrd = 0;
+    std::uint16_t rax   = 0;
+    std::uint16_t orMem = 0, probe = 0, lea = 0, call = 0;
+    std::uint32_t page  = 0;
+};
+
+[[nodiscard]] std::optional<FootingTarget> footingTargetOf(TargetSchema const& sch) {
+    FootingTarget t;
+    t.cc = sch.callingConvention(1);
+    auto const raxOrd = sch.registerByName("rax");
+    auto const orMem  = sch.opcodeByMnemonic("or_mem");
+    auto const probe  = sch.opcodeByMnemonic("stack_probe");
+    auto const lea    = sch.opcodeByMnemonic("lea");
+    auto const call   = sch.opcodeByMnemonic("call");
+    if (t.cc == nullptr || t.cc->name != "ms_x64" || !t.cc->stackPointer.has_value()
+        || !raxOrd.has_value() || !orMem.has_value() || !probe.has_value()
+        || !lea.has_value() || !call.has_value()) {
+        return std::nullopt;
+    }
+    t.spOrd = t.cc->stackPointer->ordinal;
+    t.rax   = static_cast<std::uint16_t>(*raxOrd);
+    t.orMem = *orMem;
+    t.probe = *probe;
+    t.lea   = *lea;
+    t.call  = *call;
+    t.page  = t.cc->stackProbePageBytes;
+    return t;
+}
+
+} // namespace
+
+// The reviewer's shape: a LEAF whose frame is exactly one page, with a runtime descent.
+// Entered at a page boundary under a call that pushes nothing, its SP settles on the base of
+// the still-untouched guard page and touch (1), one word lower, would fall past it — so it
+// is landed first. One alignment quantum less (the frame leaves room for that word) it is
+// not; and under the shipped convention, whose call's push keeps the entry SP 8 bytes into
+// its page, the very same frame is not either.
+TEST(LirCallconv, ALeafWhoseFrameIsExactlyAPageIsLandedBeforeItsDescentWhenTheCallPushesNothing) {
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto mutated = x8664WhoseMsX64CallPushesNothing();
+    ASSERT_TRUE(mutated.has_value())
+        << "a convention whose call pushes nothing must still LOAD: the pin is the "
+           "materialization's, not the loader's";
+    for (bool const pushesNothing : {true, false}) {
+        TargetSchema const& sch = pushesNothing ? **mutated : **shipped;
+        auto const t = footingTargetOf(sch);
+        ASSERT_TRUE(t.has_value());
+        ASSERT_EQ(static_cast<std::uint32_t>(t->cc->callPushBytes), pushesNothing ? 0u : 8u);
+        ASSERT_GT(t->page, 0u);
+        ASSERT_EQ(static_cast<std::uint32_t>(t->cc->stackAlignment), 16u)
+            << "the pin's arithmetic: one alignment quantum below a page";
+
+        // The frame the descent alone gives, then the local that makes it what the arm wants.
+        std::uint32_t bare = 0;
+        {
+            auto m = footingModule(sch, 1, t->spOrd, t->rax, {.descent = true});
+            DiagnosticReporter rep;
+            auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+            ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+            bare = result.perFunc[0].totalFrameSize;
+            ASSERT_LT(bare, t->page - 16u);
+        }
+        for (std::uint32_t const frame : {t->page, t->page - 16u}) {
+            SCOPED_TRACE(std::format("callPushBytes {} frame {}",
+                                     static_cast<std::uint32_t>(t->cc->callPushBytes), frame));
+            auto m = footingModule(sch, 1, t->spOrd, t->rax,
+                                   {.localBytes = frame - bare, .descent = true});
+            DiagnosticReporter rep;
+            auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+            ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+            ASSERT_EQ(result.perFunc[0].totalFrameSize, frame)
+                << "the pin's premise: the frame is exactly what the arm names";
+            Lir const& out = result.lir;
+            EXPECT_EQ(countOpcodeInModule(out, t->probe), 0u)
+                << "a frame of at most a page is not walked";
+            LirBlockId const entry = out.funcBlockAt(out.funcAt(0), 0);
+            auto const landing = firstInBlock(out, entry, [&](LirInstId i) {
+                return isProbeTouch(out, i, t->orMem, t->spOrd, 0); });
+            auto const touchOne = firstInBlock(out, entry, [&](LirInstId i) {
+                return isProbeTouch(out, i, t->orMem, t->spOrd, -8); });
+            auto const local = firstInBlock(out, entry, [&](LirInstId i) {
+                return out.instOpcode(i) == t->lea; });
+            ASSERT_TRUE(touchOne.has_value()) << "the descent's own touch (1)";
+            ASSERT_TRUE(local.has_value()) << "the body's first instruction: the local's address";
+            bool const owed = pushesNothing && frame == t->page;
+            EXPECT_EQ(landing.has_value(), owed)
+                << (owed ? "SP settles a full page below a page boundary it may have been "
+                           "entered at, and nothing committed that page: touch (1) would "
+                           "fall past the guard page"
+                         : "touch (1) still lands on the guard page from here: no landing "
+                           "touch, the code is what it was");
+            EXPECT_EQ(countOpcodeInModule(out, t->orMem), owed ? 4u : 3u);
+            if (owed && landing.has_value()) {
+                EXPECT_LT(*landing, *local) << "the first thing after the prologue";
+                EXPECT_LT(*landing, *touchOne) << "and before the descent's first touch";
+            }
+        }
+    }
+}
+
+// A function that CALLS under a convention whose call pushes nothing hands its callee its own
+// SP as the footing, so it touches the page that SP lands in; the shipped convention's call
+// commits it with its push and needs nothing. A function that neither calls nor descends
+// reaches nothing below its SP under either.
+TEST(LirCallconv, ACallerWhoseCallPushesNothingTouchesThePageItsStackPointerLandsIn) {
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto mutated = x8664WhoseMsX64CallPushesNothing();
+    ASSERT_TRUE(mutated.has_value());
+    for (bool const pushesNothing : {true, false}) {
+        TargetSchema const& sch = pushesNothing ? **mutated : **shipped;
+        auto const t = footingTargetOf(sch);
+        ASSERT_TRUE(t.has_value());
+        ASSERT_EQ(static_cast<std::uint32_t>(t->cc->callPushBytes), pushesNothing ? 0u : 8u);
+        SCOPED_TRACE(std::format("callPushBytes {}",
+                                 static_cast<std::uint32_t>(t->cc->callPushBytes)));
+        {
+            auto m = footingModule(sch, 1, t->spOrd, t->rax, {.localBytes = 64, .call = true});
+            DiagnosticReporter rep;
+            auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+            ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+            ASSERT_GT(result.perFunc[0].totalFrameSize, 0u);
+            ASSERT_LE(result.perFunc[0].totalFrameSize, t->page) << "an unwalked frame";
+            Lir const& out = result.lir;
+            LirBlockId const entry = out.funcBlockAt(out.funcAt(0), 0);
+            auto const landing = firstInBlock(out, entry, [&](LirInstId i) {
+                return isProbeTouch(out, i, t->orMem, t->spOrd, 0); });
+            auto const local = firstInBlock(out, entry, [&](LirInstId i) {
+                return out.instOpcode(i) == t->lea; });
+            auto const callAt = firstInBlock(out, entry, [&](LirInstId i) {
+                return out.instOpcode(i) == t->call; });
+            ASSERT_TRUE(local.has_value() && callAt.has_value());
+            EXPECT_EQ(countOpcodeInModule(out, t->orMem), pushesNothing ? 1u : 0u);
+            EXPECT_EQ(landing.has_value(), pushesNothing);
+            if (pushesNothing && landing.has_value()) {
+                EXPECT_LT(*landing, *local) << "the first thing after the prologue";
+                EXPECT_LT(*landing, *callAt) << "before the call that relies on it";
+            }
+        }
+        {
+            auto m = footingModule(sch, 1, t->spOrd, t->rax, {.localBytes = 64});
+            DiagnosticReporter rep;
+            auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+            ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+            EXPECT_EQ(countOpcodeInModule(result.lir, t->orMem), 0u)
+                << "a leaf with no runtime descent reaches nothing below its SP";
+        }
+    }
+}
+
+// A WALKED frame: the walk's last touch is up to a page above the settled SP, so under a
+// call that pushes nothing touch (1) may again fall past the guard page — the landing touch
+// follows the walk and precedes the descent. The shipped convention's walk keeps the entry
+// SP's 8 bytes of offset in every page it touches, and needs none.
+TEST(LirCallconv, AWalkedFrameIsLandedAfterItsWalkWhenTheCallPushesNothing) {
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto mutated = x8664WhoseMsX64CallPushesNothing();
+    ASSERT_TRUE(mutated.has_value());
+    for (bool const pushesNothing : {true, false}) {
+        TargetSchema const& sch = pushesNothing ? **mutated : **shipped;
+        auto const t = footingTargetOf(sch);
+        ASSERT_TRUE(t.has_value());
+        ASSERT_EQ(static_cast<std::uint32_t>(t->cc->callPushBytes), pushesNothing ? 0u : 8u);
+        SCOPED_TRACE(std::format("callPushBytes {}",
+                                 static_cast<std::uint32_t>(t->cc->callPushBytes)));
+        auto m = footingModule(sch, 1, t->spOrd, t->rax,
+                               {.localBytes = 2u * t->page, .descent = true});
+        DiagnosticReporter rep;
+        auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+        ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+        ASSERT_GT(result.perFunc[0].totalFrameSize, t->page) << "the pin's premise: a walked frame";
+        Lir const& out = result.lir;
+        EXPECT_EQ(countOpcodeInModule(out, t->probe), 1u);
+        LirBlockId const entry = out.funcBlockAt(out.funcAt(0), 0);
+        auto const walk = firstInBlock(out, entry, [&](LirInstId i) {
+            return out.instOpcode(i) == t->probe; });
+        auto const landing = firstInBlock(out, entry, [&](LirInstId i) {
+            return isProbeTouch(out, i, t->orMem, t->spOrd, 0); });
+        auto const touchOne = firstInBlock(out, entry, [&](LirInstId i) {
+            return isProbeTouch(out, i, t->orMem, t->spOrd, -8); });
+        ASSERT_TRUE(walk.has_value() && touchOne.has_value());
+        EXPECT_EQ(landing.has_value(), pushesNothing);
+        EXPECT_EQ(countOpcodeInModule(out, t->orMem), pushesNothing ? 4u : 3u);
+        if (pushesNothing && landing.has_value()) {
+            EXPECT_LT(*walk, *landing) << "after the walk: it touches the settled SP";
+            EXPECT_LT(*landing, *touchOne) << "and before the descent's first touch";
+        }
+    }
+}
+
+// A schema that owes a landing touch and declares no verb to make it with refuses by name;
+// the same function under the convention that declares no page needs no verb at all.
+TEST(LirCallconvAbi, ALandingTouchOwedWithoutTheTouchVerbFailsLoud) {
+    auto mutated = ::dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& cc : doc.at("callingConventions")) {
+                if (cc.is_object() && cc.value("name", std::string{}) == "ms_x64") {
+                    cc["callPushBytes"] = 0;
+                }
+            }
+            ::dss::test_support::detail::eraseOpcodeRows(doc, {"or_mem"}, "x86_64");
+        });
+    ASSERT_TRUE(mutated.has_value());
+    TargetSchema const& sch = **mutated;
+    ASSERT_FALSE(sch.opcodeByMnemonic("or_mem").has_value());
+    auto const* ms   = sch.callingConvention(1);
+    auto const* sysv = sch.callingConvention(0);
+    ASSERT_TRUE(ms != nullptr && sysv != nullptr);
+    ASSERT_EQ(static_cast<std::uint32_t>(ms->callPushBytes), 0u);
+    ASSERT_GT(ms->stackProbePageBytes, 0u);
+    ASSERT_EQ(sysv->stackProbePageBytes, 0u);
+    ASSERT_TRUE(ms->stackPointer.has_value() && sysv->stackPointer.has_value());
+    auto const raxOrd = sch.registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+    std::uint16_t const rax = static_cast<std::uint16_t>(*raxOrd);
+
+    auto m = footingModule(sch, 1, ms->stackPointer->ordinal, rax,
+                           {.localBytes = 64, .call = true});
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::L_RequiredLirOpcodeMissing), 1u);
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("'or_mem'") != std::string::npos
+            && d.actual.find("callPushBytes=0") != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named) << "the refusal names the missing verb and the number that owes it";
+
+    auto c = footingModule(sch, 0, sysv->stackPointer->ordinal, rax,
+                           {.localBytes = 64, .call = true});
+    DiagnosticReporter crep;
+    auto control = materializeCallingConvention(c.lir, sch, c.alloc, crep);
+    EXPECT_TRUE(control.ok()) << "no page, no footing to keep, no verb needed";
+}
+
+// ONE TOUCH IS ONE WHOLE GENERAL REGISTER — a word of the stack pointer's own class — and
+// its width is ASKED of the target document (`wholeRegisterAccessFlags`, over the full rows
+// of `registers[]`), written nowhere in the pass. Under the shipped x86_64 that is 8 bytes:
+// an `or_mem` at the default width, touch (1) at [SP - 8]. Declare every general register 4
+// bytes wide instead and every touch of the walk is 4 bytes wide, touch (1) at [SP - 4] — the
+// pass PRODUCES the narrower touch (whether an encoder can emit it is the assembler's
+// question, not asked here). A general register whose width no LIR instruction can state is
+// refused by name — by the owner of that question — in a function that touches the guard
+// page, and only there. (A page too small for one touch never reaches the pass: the LOADER
+// refuses it — tests/core/test_target_schema.cpp.)
+namespace {
+
+// The shipped x86_64 document with every FULL general register declared `bytes` wide. The
+// views that would no longer be strictly narrower than their register go with it (a view
+// asserts containment); nothing else in the document names them.
+[[nodiscard]] auto x8664WhoseGeneralRegistersAreDeclared(std::uint32_t bytes) {
+    return ::dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [bytes](nlohmann::json& doc) {
+            auto const isGpr = [](nlohmann::json const& r) {
+                return r.is_object() && r.value("class", std::string{}) == "gpr";
+            };
+            auto& regs = doc.at("registers");
+            regs.erase(std::remove_if(regs.begin(), regs.end(),
+                                      [&](nlohmann::json const& r) {
+                                          return isGpr(r) && r.contains("subOf")
+                                              && r.value("widthBytes", 0u) >= bytes;
+                                      }),
+                       regs.end());
+            for (auto& r : regs) {
+                if (isGpr(r) && !r.contains("subOf")) r["widthBytes"] = bytes;
+            }
+        });
+}
+
+} // namespace
+
+TEST(LirCallconv, AGuardPageTouchIsOneWholeGeneralRegister) {
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto narrow = x8664WhoseGeneralRegistersAreDeclared(4u);
+    ASSERT_TRUE(narrow.has_value())
+        << "a target whose general registers are 4 bytes wide must still LOAD";
+    struct Arm {
+        TargetSchema const* sch;
+        char const*         what;
+        std::int32_t        wordBytes;
+    };
+    for (Arm const arm : {Arm{shipped->get(), "general registers as shipped", 8},
+                          Arm{narrow->get(), "general registers declared 4 bytes wide", 4}}) {
+        SCOPED_TRACE(arm.what);
+        TargetSchema const& sch = *arm.sch;
+        auto const* cc = sch.callingConvention(1);
+        ASSERT_NE(cc, nullptr);
+        ASSERT_TRUE(cc->stackPointer.has_value());
+        ASSERT_STREQ(cc->stackPointer->name.c_str(), "rsp");
+        std::uint16_t const spOrd = cc->stackPointer->ordinal;
+        auto const natural = sch.registerClassNaturalWidthBits(TargetRegClass::GPR);
+        ASSERT_TRUE(natural.has_value());
+        ASSERT_EQ(static_cast<std::int32_t>(*natural), arm.wordBytes * 8)
+            << "the pin's premise: the document states this width for a whole general "
+               "register";
+        auto const* spInfo = sch.registerInfo(spOrd);
+        ASSERT_NE(spInfo, nullptr);
+        ASSERT_EQ(static_cast<std::int32_t>(spInfo->widthBytes), arm.wordBytes)
+            << "and the stack pointer, a full register of that class, is as wide — the "
+               "row the loader's validator reads";
+        auto const raxOrd = sch.registerByName("rax");
+        auto const orMem  = sch.opcodeByMnemonic("or_mem");
+        ASSERT_TRUE(raxOrd.has_value() && orMem.has_value());
+
+        auto m = descentOnlyModule(sch, /*ccIndex=*/1, spOrd,
+                                   static_cast<std::uint16_t>(*raxOrd));
+        DiagnosticReporter rep;
+        auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+        ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+        Lir const& out = result.lir;
+        LirFuncId const fn = out.funcAt(0);
+        ASSERT_EQ(out.funcBlockCount(fn), 3u);
+        LirBlockId const entry = out.funcBlockAt(fn, 0);
+        LirBlockId const step  = out.funcBlockAt(fn, 1);
+        LirBlockId const tail  = out.funcBlockAt(fn, 2);
+        std::uint32_t const en = out.blockInstCount(entry);
+        ASSERT_GE(en, 3u);
+        LirInstId const one   = out.blockInstAt(entry, en - 3);
+        LirInstId const two   = out.blockInstAt(step, 1);
+        LirInstId const three = out.blockInstAt(tail, 1);
+        EXPECT_TRUE(isProbeTouch(out, one, *orMem, spOrd, -arm.wordBytes))
+            << "touch (1) reaches exactly one stack-pointer word below SP";
+        EXPECT_TRUE(isProbeTouch(out, two, *orMem, spOrd, 0));
+        EXPECT_TRUE(isProbeTouch(out, three, *orMem, spOrd, 0));
+        for (LirInstId const touch : {one, two, three}) {
+            EXPECT_EQ(static_cast<std::int32_t>(lirInstWidthBits(out.instFlags(touch))),
+                      arm.wordBytes * 8)
+                << "every touch is as wide as the stack pointer the document declares";
+        }
+        EXPECT_EQ(countOpcodeInModule(out, *orMem), 3u);
+    }
+}
+
+TEST(LirCallconvAbi, AGeneralRegisterNoInstructionCanStateRefusesTheTouchByName) {
+    auto mutated = x8664WhoseGeneralRegistersAreDeclared(3u);
+    ASSERT_TRUE(mutated.has_value())
+        << "the loader holds a register's width to no instruction vocabulary: that is "
+           "this tier's, so the refusal under test is the pass's";
+    TargetSchema const& sch = **mutated;
+    auto const* ms = sch.callingConvention(1);
+    ASSERT_NE(ms, nullptr);
+    ASSERT_TRUE(ms->stackPointer.has_value());
+    ASSERT_GT(ms->stackProbePageBytes, 0u);
+    auto const natural = sch.registerClassNaturalWidthBits(TargetRegClass::GPR);
+    ASSERT_TRUE(natural.has_value());
+    ASSERT_EQ(*natural, 24u) << "the pin's premise: a whole general register is 3 bytes";
+    auto const raxOrd = sch.registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+    std::uint16_t const rax = static_cast<std::uint16_t>(*raxOrd);
+
+    // The touch is the FIRST thing a function with a runtime descent asks a width for —
+    // before its prologue's own register saves — so the one refusal is the touch's.
+    auto m = footingModule(sch, 1, ms->stackPointer->ordinal, rax, {.descent = true});
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+    EXPECT_FALSE(result.ok());
+    ASSERT_EQ(rep.all().size(), 1u);
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::L_RequiredLirOpcodeMissing), 1u);
+    EXPECT_NE(rep.all()[0].actual.find("guard-page touch"), std::string::npos)
+        << rep.all()[0].actual;
+    EXPECT_NE(rep.all()[0].actual.find("24 bits"), std::string::npos)
+        << rep.all()[0].actual;
+
+    // A function that touches no guard page needs no touch, so no width to state.
+    auto leaf = footingModule(sch, 1, ms->stackPointer->ordinal, rax, {.localBytes = 64});
+    DiagnosticReporter lrep;
+    auto leafResult = materializeCallingConvention(leaf.lir, sch, leaf.alloc, lrep);
+    EXPECT_TRUE(leafResult.ok()) << (lrep.all().empty() ? "" : lrep.all()[0].actual);
+}
+
 TEST(LirCallconv, StraightLineFunctionGetsPrologueEpilogueAndZeroFrameOps) {
     auto bundle = lowerThroughRewrite("int f(int x) { return x + x; }");
     ASSERT_TRUE(bundle.lowered.lir.ok);

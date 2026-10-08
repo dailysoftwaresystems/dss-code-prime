@@ -649,12 +649,23 @@ private:
 // class, which necessarily restarted at 0 because the scalars were no longer
 // there to advance it. Identical rule, identical object, overlapping bytes.
 // ⇒ For ANY ONE CALL exactly one instance places anything. `lowerWideCallArgs`
-// owns it (it is the last tier holding the complete argument list), states every
-// aggregate's offset on its carrier and stamps `kLirInstFlagOutgoingArgsPlaced`
-// on the Call; the call arm then READS those offsets and REFUSES if asked to
-// place anything at all. The pre-scan and the callee's `arg` arm walk different
-// argument lists (the caller's reservation, the callee's own incoming region) and
-// are unaffected.
+// owns it (it is the last tier holding the complete argument list) and stamps
+// `kLirInstFlagOutgoingArgsPlaced` on the Call. ★ Since P69 round 4 that pass
+// also WRITES what it places: a stacked scalar as a `store_outgoing_arg` at its
+// byte offset, and a stacked by-value aggregate as its BYTES, copied chunk by
+// chunk before register allocation — the `(Reg, ByValueStackAgg)` carrier leaves
+// the Call, and no offset is stated on a carrier any more (the trailing
+// `MemOffset` this comment used to describe as "the aggregate's offset stated on
+// its carrier, which the call arm READS" is a form no pass produces now). So on
+// every Call the pipeline lowers the call arm places NOTHING and copies nothing.
+// The call arm's own instance and its copy remain for a module that never went
+// through that pass — a hand-built one (tests/lir, tests/asm): it copies a
+// carrier at a stated offset, places an unplaced one itself on an UNSTAMPED Call,
+// and REFUSES to place anything on a stamped one. Removing that residual arm,
+// together with the carrier form's other consumers, is owned by
+// D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET.
+// The pre-scan and the callee's `arg` arm walk different argument lists (the
+// caller's reservation, the callee's own incoming region) and are unaffected.
 //
 // ★ THE ACCESS WIDTH IS PART OF THE PLACEMENT, NOT A SEPARATE DECISION. Under
 // `Slot` the datum owns the whole pointer-width slot — the caller stored a whole

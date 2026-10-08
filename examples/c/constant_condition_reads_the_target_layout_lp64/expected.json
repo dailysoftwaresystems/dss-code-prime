@@ -1,0 +1,19 @@
+{
+  "$comment": "P69 (lane `cs`, D-C-A-NON-VOID-FUNCTION-WHOSE-END-IS-REACHABLE-IS-REFUSED): THE VALUE OF A LAYOUT CONSTANT IS THE TARGET'S, NOT THE HOST'S — the LP64 half of a pair with `examples/c/constant_condition_reads_the_target_layout_llp64` (IDENTICAL main.c; the two manifests differ in their targets and in which function they expect to be reported). `sizeof(long)` is 8 on these targets, so `when_long_is_eight` ends in an `if` that always returns — its closing brace is never reached and NOTHING may be said about it — while `when_long_is_not_eight` ends in an `if` that never fires: its end is reached on every call and it is reported once, at its brace (line 40). `expectWarnings` is exact over the code it declares, so the one entry asserts BOTH halves: that warning, there, and no other of its code. The CST->HIR lowering decides this with its own constant evaluator, which until P69 was handed no layout at all — `sizeof` was not a constant there, so BOTH functions would have been reported on every target; a fold that used the HOST's sizes instead would get this manifest right and the LLP64 one wrong on a 64-bit Unix host, and the reverse on Windows. The parameters it now reads are the ones the semantic analysis itself ran under (`SemanticModel::aggregateLayout`, `dataModel`), carried by the model. The program exits 42 on every target (40 from the function that returns a value there, plus the two calls counted).",
+  "$measuredComment": "(filled by the probe of THIS file's bytes)",
+  "$commentRedOnDisable": "MEASURED, each mutant built and read ALONE — the runs are in the row's closing cell: the `sizeof` hook removed from the lowering's evaluator, and the model built WITHOUT the layout parameters, each report `when_long_is_eight` too (a second warning of the declared code: red in both runners).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectWarnings": [
+    { "code": "H_NonVoidFunctionEndReachable", "line": 40, "col": 1, "$comment": "when_long_is_not_eight: under LP64 its `if` never fires" }
+  ],
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

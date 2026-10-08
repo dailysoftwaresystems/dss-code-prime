@@ -449,6 +449,32 @@ dss_add_test(NAME analysis/semantic/test_gnu_aligned_three_forms
 target_include_directories(dss_analysis_semantic_test_gnu_aligned_three_forms
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P69 (lane `cs`): an attribute written where a TYPE is written — among a type's
+# specifiers, in a type name, in a pointer layer, at the start of a parenthesized
+# declarator, after a tag that is only referred to. The reference matrix as pins:
+# what each position decorates (the declaration, the whole named type, the base,
+# one pointer level, the declared entity beside its name), what is said of an
+# attribute that decorates a type, and the two verbs judged once per specifier.
+# Leads with the defect that made the family a P0: `struct S __attribute__((aligned
+# (16))) w;` taking the size of a `struct aligned`. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_attribute_type_positions
+             SOURCES test_attribute_type_positions.cpp)
+target_include_directories(dss_analysis_semantic_test_attribute_type_positions
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane `cs`): the SECOND spelling of the attribute specifier, `__declspec(...)`
+# — until this cycle a predefined macro of the pe pairs that erased its argument, so
+# an alignment or a thread-storage request written in it was dropped in silence.
+# The reference matrix (cl and mingw-w64 gcc) as pins: where the spelling exists
+# and how it is refused elsewhere, the modifier list, cl's `align` (raise-only, the
+# last of several, a leading one on a definition aligns the type), `thread` and
+# what it yields to, the inert modifiers, and the two refused by name. Shares
+# `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_attribute_second_spelling
+             SOURCES test_attribute_second_spelling.cpp)
+target_include_directories(dss_analysis_semantic_test_attribute_second_spelling
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # ★★★ P66 (lane `at`) — THE ADVERTISEMENT GUARD, the instrument half of
 # [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]].
 # DSS answered `__has_extension(c_atomic)` = 1 while the GNU `__atomic_*`

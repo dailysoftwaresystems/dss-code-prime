@@ -2609,7 +2609,16 @@ private:
         // round trip that is byte-stable on re-emit and LOSSY in the pool, which
         // is the failure mode hardest to see from the text alone.
         if (auto const* agg = std::get_if<HirAggregateValue>(&v.value)) {
-            out_ += "agg {";
+            // v8 (P69, lane `cs`): a UNION value names the member its one field
+            // initializes, `agg member N {…}` — `.dssir` v5's spelling, token for token
+            // (`mir_text.cpp`, `appendLiteral`). The field's type cannot say which member
+            // (two may share one), `toMirLiteral` copies the member on, and the static-data
+            // encoder refuses a union value that names none: a writer that dropped it lost
+            // the value's meaning without a word.
+            out_ += "agg ";
+            if (agg->unionMember.has_value())
+                out_ += std::format("member {} ", *agg->unionMember);
+            out_ += "{";
             // Reverse execution order: the closing brace, then each field's
             // `: <core>` tail, the field itself, and the separator before it.
             using Kind = LiteralEmitTask::Kind;
@@ -3652,6 +3661,7 @@ private:
                 // `literalCoreFromName` / `literalCoreAccepted` pair.
                 if (auto const k = literalCoreFromName(core); k.has_value()) {
                     done.core = *k;
+                    checkUnionMember(done);   // a nested union value, its core just read
                 } else {
                     malformed(std::format(
                         "unknown aggregate literal field core '{}' — accepted: {}",
@@ -3679,6 +3689,30 @@ private:
             stack.pop_back();
             done       = std::move(lv);
             haveResult = true;
+        }
+    }
+
+    // v8: `member N` is a UNION value's, and a union value with a field names its member —
+    // the two rules `.dssir` v5 reads by (`mir_text.cpp`, `checkUnionMember`). Both are
+    // refused HERE, at the text and in words about the TEXT: the writer never spells either,
+    // and what a member-less union value meets further down is the static-data encoder's
+    // refusal of an upstream DEFECT in DSS, which a malformed input is not. Whether N is a
+    // member the union HAS is the encoder's to answer — it walks the value against its type.
+    // Called where a value's core is known: a field's, once its `: <core>` is read, and the
+    // top-level value's, once `literalCoreFor` recomputed it from the type annotation.
+    void checkUnionMember(HirLiteralValue const& lv) {
+        auto const* a = std::get_if<HirAggregateValue>(&lv.value);
+        if (a == nullptr) return;
+        if (a->unionMember.has_value() && lv.core != TypeKind::Union) {
+            std::string_view const core = literalCoreName(lv.core);
+            malformed(std::format(
+                "`agg member {}` names a union member, but this literal's core is '{}' — only "
+                "a union value names its member", *a->unionMember,
+                core.empty() ? std::string_view{"?"} : core));
+        } else if (lv.core == TypeKind::Union && !a->fields.empty()
+                   && !a->unionMember.has_value()) {
+            malformed("a union aggregate literal with a field must name the member it "
+                      "initializes — `agg member N {…}`; this text names none");
         }
     }
 
@@ -3782,11 +3816,35 @@ private:
         else if (tag == "agg") {
             // D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM: the inverse of
             // `appendLiteralValue`'s aggregate arm, and the SAME syntax
-            // `mir_text.cpp`'s `parseLiteral` reads — `agg { <field>, … }`, each
-            // field a tagged value followed by `: <core>`. The fields are read by
+            // `mir_text.cpp`'s `parseLiteral` reads — `agg [member N] { <field>, … }`,
+            // each field a tagged value followed by `: <core>`. The fields are read by
             // the driver above, one head at a time, into the frame pushed here.
+            //
+            // v8 (P69, lane `cs`): `member N` — the member a UNION value's one field
+            // initializes, as `.dssir` v5 reads it. That the value is a union's, and
+            // that a union value with a field names one, is checked where the value's
+            // core is known (`checkUnionMember`).
+            std::optional<std::uint32_t> member;
+            if (acceptKeyword("member")) {
+                if (!peekIs(Tk::Int)) {
+                    // A punctuation token carries no text: say what stands there only
+                    // when there is a word to quote.
+                    std::string const got = lex_.peek().text;
+                    malformed(got.empty()
+                        ? std::string{"expected a member index after `agg member` — `agg member N {…}`"}
+                        : std::format("expected a member index after `agg member`, got '{}'", got));
+                    // The word that stands where the index belongs is spent with the
+                    // refusal; a `{` is the value's own and is left for it (`agg member {`).
+                    if (!peekIs(Tk::LBrace) && !peekIs(Tk::Eof)) lex_.take();
+                } else {
+                    std::size_t const before = refusals_;
+                    std::uint32_t const idx = takeU32("union member index");
+                    if (refusals_ == before) member = idx;
+                }
+            }
             expect(Tk::LBrace, "'{'");
             stack.push_back(LiteralParseFrame{});
+            stack.back().agg.unionMember = member;
             return false;   // the fields come next
         }
         else if (tag == kHirTextUnspelledAggregateTag) {
@@ -4701,6 +4759,7 @@ private:
                 HirLiteralValue v = parseLiteralValue();
                 TypeId t = parseTypeAnnot();
                 v.core = literalCoreFor(t, v);
+                checkUnionMember(v);   // v8: the top-level value's core is its type's
                 std::uint32_t const pidx = pLiterals_.add(std::move(v));
                 return completeNode(builder_.makeLiteral(t, pidx, flags), idx,
                                     std::move(attrs), done);

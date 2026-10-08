@@ -382,7 +382,8 @@ renderPredefinedMacroDump(PredefinedMacroDumpRequest const& req) {
     //   · a FUNCTION-LIKE config predefine is lowered to a "<built-in>" prologue
     //     `#define`, i.e. an ORDINARY macro, so the `--define` hits C 6.10.3p2
     //     instead → `P0014` ("incompatible redefinition"). Confirmed with
-    //     `--define __declspec=z`.
+    //     `--define __declspec=z` while that name was a function-like predefine
+    //     (the function-like one on pe is `_declspec` since).
     // Reproducing that two-route decision here would be a SECOND owner of it, and
     // the routes differ by a property (`isFunctionLike`) whose consequences live in
     // the directive handler. So the note reports the CONDITION and names the rules;

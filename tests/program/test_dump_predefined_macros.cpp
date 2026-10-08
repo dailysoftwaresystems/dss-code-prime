@@ -546,10 +546,21 @@ TEST(DumpPredefinedMacros, ShippedPeOnlyMacroAppearsOnlyInThePeSection) {
     EXPECT_TRUE(hasLineFor(pe, "_WIN32"));
     EXPECT_FALSE(hasLineFor(elf, "_WIN32"));
     // …and the pe-only function-like predefine reports its params, not a value.
-    EXPECT_NE(lineFor(pe, "__declspec").find("form=function(x)"),
+    // (`_declspec`, cl's single-underscore spelling: `_declspec(x)` is
+    // `__declspec(x)`.)
+    EXPECT_NE(lineFor(pe, "_declspec").find("form=function(x)"),
               std::string::npos);
-    EXPECT_EQ(valueOf(pe, "__declspec"),
+    EXPECT_EQ(valueOf(pe, "_declspec"),
               std::string{kNoSingleValueFunctionLike});
+    // P69: `__declspec` itself is a keyword now, and on pe it is ALSO predefined —
+    // object-like, expanding to itself, so that `defined(__declspec)` stays true
+    // there. It is not a function-like macro any more (as one it erased every
+    // modifier written in it) and it is absent off pe.
+    EXPECT_TRUE(hasLineFor(pe, "__declspec"));
+    EXPECT_EQ(lineFor(pe, "__declspec").find("form=function"), std::string::npos);
+    EXPECT_EQ(valueOf(pe, "__declspec"), "__declspec");
+    EXPECT_FALSE(hasLineFor(elf, "__declspec"));
+    EXPECT_FALSE(hasLineFor(elf, "_declspec"));
 }
 
 // ── ★ THE HIGH-VALUE ASSERTION ─────────────────────────────────────────────

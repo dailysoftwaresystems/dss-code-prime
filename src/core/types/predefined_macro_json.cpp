@@ -1152,8 +1152,8 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
             pm.value = e.at("value").get<std::string>();
         }
         // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): OPTIONAL `params` — a
-        // FUNCTION-LIKE predefine (e.g. the MSVC-profile `__declspec(x)` →
-        // empty erase). Constant-kind — and, P68 round 9, `type-suffix`, whose
+        // FUNCTION-LIKE predefine (e.g. the pe-profile `_declspec(x)` →
+        // `__declspec(x)`). Constant-kind — and, P68 round 9, `type-suffix`, whose
         // function-like form pastes its ONE parameter to the suffix (`__INT64_C(c)`
         // → `c ## L`, C 7.22.4.1); every other derived kind is object-like. Each
         // param must be a non-empty unique string (C 6.10.3p6 duplicate-param

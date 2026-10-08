@@ -4,10 +4,13 @@
 // pipeline binds them against the FINAL module's byte offsets. These tests hold the translation to its
 // rule on synthetic modules whose block layout is chosen exactly:
 //   * through a pass that PUBLISHES its entry image, an entry goes to its block's FIRST piece and a scope's
-//     last block to its LAST piece;
-//   * a pass that publishes none is the identity — and is REFUSED, by name, the moment its blocks differ;
+//     last block to its LAST piece — an inserting pass's image and a block-for-block pass's identity alike;
+//   * a pass that publishes NONE is REFUSED, by name, whatever its blocks look like: nothing is inferred,
+//     because two blocks no edge tells apart may have changed places;
 //   * a descriptor id with no image, an image out of layout order, and an offset table that does not
-//     follow the final layout are each REFUSED, never passed through.
+//     follow the final layout are each REFUSED, never passed through;
+//   * the four REAL block-for-block rebuilds (wide-call arguments, the rewrite, the two-address legalizer,
+//     the peephole) each publish the identity they performed.
 // The runtime half is the three examples `*_after_an_asm_label_function`, which fail without it.
 
 #include "core/types/diagnostic_reporter.hpp"
@@ -15,11 +18,19 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
 #include "lir/lir.hpp"
+#include "lir/lir_2addr_legalize.hpp"
 #include "lir/lir_descriptor_blocks.hpp"
+#include "lir/lir_liveness.hpp"
+#include "lir/lir_peephole.hpp"
+#include "lir/lir_regalloc.hpp"
+#include "lir/lir_rewrite.hpp"
+#include "lir/lir_wide_call_args.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
+#include "lowered_lir_fixture.hpp"
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -89,6 +100,8 @@ std::vector<FuncShape> const kProduced{{{1}, {}}, {{1, 2}, {}, {}}};
 std::vector<FuncShape> const kSplit{{{1}, {2}, {}}, {{1, 2}, {}, {}}};
 // The split's entry image, indexed by the produced module's block ids (slot 0 = the sentinel).
 std::vector<std::uint32_t> const kSplitEntries{0, 1, 3, 4, 5, 6};
+// What a pass that rebuilds the produced module block for block publishes: every block where it was.
+std::vector<std::uint32_t> const kIdentity{0, 1, 2, 3, 4, 5};
 
 struct Descriptors {
     std::vector<JumpTableDescriptor>   jumpTables;
@@ -139,7 +152,7 @@ TEST(LirDescriptorBlocks, AnInsertingPassTakesAnEntryToItsFirstPieceAndALastBloc
     Lir const preserved = moduleOf(kProduced);
     Lir const split     = moduleOf(kSplit);
     std::vector<LirBlockRebuild> const steps{
-        {"rewrite", &produced, &preserved, {}},
+        {"rewrite", &produced, &preserved, kIdentity},
         {"callconv", &preserved, &split, kSplitEntries},
     };
     Descriptors d = oneOfEach();
@@ -165,18 +178,47 @@ TEST(LirDescriptorBlocks, AnInsertingPassTakesAnEntryToItsFirstPieceAndALastBloc
     EXPECT_EQ(d.scopes[0].handlerLirBlockV, 3u);
 }
 
-TEST(LirDescriptorBlocks, APassThatPublishesNoImageIsProvedTheIdentity) {
+TEST(LirDescriptorBlocks, ABlockForBlockPassPublishesTheIdentityAndIsFollowed) {
     Lir const produced  = moduleOf(kProduced);
     Lir const preserved = moduleOf(kProduced);
-    std::vector<LirBlockRebuild> const steps{{"lir-peephole", &produced, &preserved, {}}};
+    std::vector<LirBlockRebuild> const steps{{"lir-peephole", &produced, &preserved, kIdentity}};
     Descriptors d = oneOfEach();
     DiagnosticReporter rep;
     ASSERT_TRUE(translate(steps, d, rep)) << firstMessage(rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(d.jumpTables[0].slotBindings[0].first, 4u);
     EXPECT_EQ(d.jumpTables[0].slotBindings[1].first, 5u);
     EXPECT_EQ(d.labels[0].lirBlockV, 5u);
     EXPECT_EQ(d.scopes[0].endLirBlockV, 1u);
     EXPECT_EQ(d.scopes[0].handlerLirBlockV, 2u);
+}
+
+// The same two modules, and the pass says nothing: refused. That the blocks LOOK unchanged — the same
+// ranges, the same successors — is exactly what is no longer taken for an answer.
+TEST(LirDescriptorBlocks, APassThatPublishesNoImageIsRefusedEvenWhenItsBlocksLookUnchanged) {
+    Lir const produced  = moduleOf(kProduced);
+    Lir const preserved = moduleOf(kProduced);
+    std::vector<LirBlockRebuild> const steps{{"lir-peephole", &produced, &preserved, {}}};
+    Descriptors d = oneOfEach();
+    DiagnosticReporter rep;
+    EXPECT_FALSE(translate(steps, d, rep));
+    ASSERT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(rep.all()[0].code, DiagnosticCode::L_SideStructureIndexDangling);
+    std::string const m = firstMessage(rep);
+    EXPECT_NE(m.find("'lir-peephole'"), std::string::npos) << m;
+    EXPECT_NE(m.find("publishes no block image for a module that has blocks"), std::string::npos) << m;
+}
+
+// A module with no block at all owes no image: a declaration-only translation unit goes through every
+// rebuild empty.
+TEST(LirDescriptorBlocks, AModuleWithNoBlockOwesNoImage) {
+    Lir const produced  = moduleOf({});
+    Lir const preserved = moduleOf({});
+    std::vector<LirBlockRebuild> const steps{{"lir-peephole", &produced, &preserved, {}}};
+    Descriptors d;
+    DiagnosticReporter rep;
+    EXPECT_TRUE(translate(steps, d, rep)) << firstMessage(rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
 }
 
 TEST(LirDescriptorBlocks, APassThatChangedItsBlocksWithoutAnImageIsRefusedByName) {
@@ -193,16 +235,72 @@ TEST(LirDescriptorBlocks, APassThatChangedItsBlocksWithoutAnImageIsRefusedByName
     EXPECT_NE(m.find("publishes no block image"), std::string::npos) << m;
 }
 
-TEST(LirDescriptorBlocks, SameBlockCountsWithDifferentSuccessorsAreNotTheIdentity) {
-    // f0's first block returns instead of branching: the ranges agree and the CFG does not.
-    Lir const produced  = moduleOf(kProduced);
-    Lir const rewired   = moduleOf({{{}, {}}, {{1, 2}, {}, {}}});
-    std::vector<LirBlockRebuild> const steps{{"rewrite", &produced, &rewired, {}}};
+// THE CASE AN INFERENCE CANNOT SEE. Three blocks that only DATA reaches — a static label table's targets —
+// have no edge between them, so a rebuild that moved the second behind the third leaves a module with the
+// same block range and the same successors, block by block. Only the pass knows; so the pass says, and what
+// it says is held to the layout.
+TEST(LirDescriptorBlocks, TwoBlocksNoEdgeTellsApartAreNeverInferredToBeInPlace) {
+    std::vector<FuncShape> const labelTargets{{{}, {}, {}}};
+    Lir const produced = moduleOf(labelTargets);
+    Lir const moved    = moduleOf(labelTargets);
+    auto const lastLabel = [] {
+        Descriptors d;
+        LirBlockSymbolBinding lb;
+        lb.funcIndex = 0;
+        lb.lirBlockV = 3;
+        lb.symbol    = SymbolId{950};
+        d.labels.push_back(lb);
+        return d;
+    };
+    {
+        // Published truthfully, the move is refused: a block's pieces run from its entry to the next
+        // block's, so an image must follow the layout.
+        std::vector<std::uint32_t> const swapped{0, 1, 3, 2};
+        std::vector<LirBlockRebuild> const steps{{"lir-peephole", &produced, &moved, swapped}};
+        Descriptors d = lastLabel();
+        DiagnosticReporter rep;
+        EXPECT_FALSE(translate(steps, d, rep));
+        std::string const m = firstMessage(rep);
+        EXPECT_NE(m.find("'lir-peephole' published entry 2 for block 3 (#2 of function #0)"),
+                  std::string::npos) << m;
+        EXPECT_NE(m.find("the block before it entered at 3"), std::string::npos) << m;
+    }
+    {
+        // Published by nobody, it is not assumed away.
+        std::vector<LirBlockRebuild> const steps{{"lir-peephole", &produced, &moved, {}}};
+        Descriptors d = lastLabel();
+        DiagnosticReporter rep;
+        EXPECT_FALSE(translate(steps, d, rep));
+        ASSERT_EQ(rep.errorCount(), 1u);
+        EXPECT_NE(firstMessage(rep).find("publishes no block image"), std::string::npos)
+            << firstMessage(rep);
+    }
+    {
+        // The control: a pass that kept the three where they were says so, and is followed.
+        std::vector<std::uint32_t> const identity{0, 1, 2, 3};
+        std::vector<LirBlockRebuild> const steps{{"lir-peephole", &produced, &moved, identity}};
+        Descriptors d = lastLabel();
+        DiagnosticReporter rep;
+        ASSERT_TRUE(translate(steps, d, rep)) << firstMessage(rep);
+        EXPECT_EQ(d.labels[0].lirBlockV, 3u);
+    }
+}
+
+// An identity published over an output whose blocks are NOT where the input's were is refused too: the
+// image is checked against the output it claims to describe.
+TEST(LirDescriptorBlocks, AnIdentityImageOverAnOutputWhoseBlocksMovedIsRefused) {
+    Lir const produced = moduleOf(kProduced);
+    Lir const split    = moduleOf(kSplit);   // f1's blocks are 4..6 there, not 3..5
+    std::vector<LirBlockRebuild> const steps{{"rewrite", &produced, &split, kIdentity}};
     Descriptors d = oneOfEach();
     DiagnosticReporter rep;
     EXPECT_FALSE(translate(steps, d, rep));
+    ASSERT_EQ(rep.errorCount(), 1u);
     std::string const m = firstMessage(rep);
-    EXPECT_NE(m.find("block 1's successors differ"), std::string::npos) << m;
+    EXPECT_NE(m.find("'rewrite' published entry 3 for block 3 (#0 of function #1)"), std::string::npos)
+        << m;
+    EXPECT_NE(m.find("occupy 4..6 and its first block must enter at the first of them"),
+              std::string::npos) << m;
 }
 
 TEST(LirDescriptorBlocks, ADescriptorIdWithNoImageIsRefusedNamingTheDescriptorAndTheId) {
@@ -270,13 +368,135 @@ TEST(LirDescriptorBlocks, ABrokenRebuildChainIsRefused) {
     Lir const split     = moduleOf(kSplit);
     // The second step does not take the module the first produced.
     std::vector<LirBlockRebuild> const steps{
-        {"rewrite", &produced, &preserved, {}},
+        {"rewrite", &produced, &preserved, kIdentity},
         {"callconv", &produced, &split, kSplitEntries},
     };
     Descriptors d = oneOfEach();
     DiagnosticReporter rep;
     EXPECT_FALSE(translate(steps, d, rep));
     EXPECT_NE(firstMessage(rep).find("broken at pass 'rewrite'"), std::string::npos) << firstMessage(rep);
+}
+
+// ── the four real block-for-block rebuilds ─────────────────────────────────
+
+// The pipeline's own passes, over a real lowering: each publishes an image of the size of its input's
+// block arena that takes block k of function f to block k of function f of its output — the identity it
+// performed — and the chain of the four carries a block that data names to the same place in the last
+// module. Withhold any ONE image and the chain is refused naming that pass.
+TEST(LirDescriptorBlocks, TheFourBlockForBlockRebuildsPublishTheIdentityTheyPerformed) {
+    auto const lowered = test_support::lowerCToLir(R"(
+        int pick(int a, int b, int c) {
+            int r = 0;
+            for (int i = 0; i < a; ++i) {
+                if (i & 1) r += b; else r -= c;
+            }
+            switch (r & 3) {
+                case 0: return a;
+                case 1: return b;
+                case 2: return c;
+                default: return r;
+            }
+        }
+        int wide(int a, int b, int c, int d, int e, int f, int g, int h) {
+            return a + b + c + d + e + f + g + h;
+        }
+        int main(int argc, char **argv) {
+            (void)argv;
+            if (argc > 3) return wide(1, 2, 3, 4, 5, 6, 7, argc);
+            return pick(argc, 2, 3);
+        }
+    )");
+    ASSERT_TRUE(lowered.lir.ok);
+    TargetSchema const& schema   = *lowered.target;
+    Lir const&          produced = lowered.lir.lir;
+    DiagnosticReporter  rep;
+    auto const wide = lowerWideCallArgs(produced, schema, 0, rep);
+    ASSERT_TRUE(wide.ok) << firstMessage(rep);
+    auto const liveness = analyzeLiveness(wide.lir);
+    auto const alloc    = allocateRegisters(wide.lir, schema, liveness, 0, rep);
+    ASSERT_TRUE(alloc.ok()) << firstMessage(rep);
+    auto const rewritten = rewriteWithAllocation(wide.lir, schema, alloc, rep);
+    ASSERT_TRUE(rewritten.ok) << firstMessage(rep);
+    auto const legal = legalizeTwoAddress(rewritten.lir, schema, rep);
+    ASSERT_TRUE(legal.ok()) << firstMessage(rep);
+    auto const peeped = runLirPeephole(legal.lir, schema, rep);
+    ASSERT_TRUE(peeped.ok()) << firstMessage(rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << firstMessage(rep);
+
+    struct Real {
+        std::string_view                  pass;
+        Lir const*                        in;
+        Lir const*                        out;
+        std::vector<std::uint32_t> const* image;
+    };
+    std::vector<Real> const real{
+        {"wide-call-args", &produced, &wide.lir, &wide.blockEntryImage},
+        {"rewrite", &wide.lir, &rewritten.lir, &rewritten.blockEntryImage},
+        {"two-address-legalize", &rewritten.lir, &legal.lir, &legal.blockEntryImage},
+        {"lir-peephole", &legal.lir, &peeped.lir, &peeped.blockEntryImage},
+    };
+    // Not a vacuous module: three functions, and enough blocks that a slot left at 0 could not hide.
+    ASSERT_EQ(produced.moduleFuncCount(), 3u);
+    std::size_t producedBlocks = 0;
+    for (std::uint32_t fi = 0; fi < produced.moduleFuncCount(); ++fi) {
+        producedBlocks += produced.funcBlockCount(produced.funcAt(fi));
+    }
+    ASSERT_GE(producedBlocks, 10u);
+
+    for (Real const& s : real) {
+        SCOPED_TRACE(std::string(s.pass));
+        ASSERT_EQ(s.image->size(), s.in->blockCount());
+        ASSERT_EQ(s.in->moduleFuncCount(), s.out->moduleFuncCount());
+        for (std::uint32_t fi = 0; fi < s.in->moduleFuncCount(); ++fi) {
+            LirFuncId const inFn  = s.in->funcAt(fi);
+            LirFuncId const outFn = s.out->funcAt(fi);
+            ASSERT_EQ(s.in->funcBlockCount(inFn), s.out->funcBlockCount(outFn)) << "function #" << fi;
+            for (std::uint32_t k = 0; k < s.in->funcBlockCount(inFn); ++k) {
+                EXPECT_EQ((*s.image)[s.in->funcBlockAt(inFn, k).v], s.out->funcBlockAt(outFn, k).v)
+                    << "block #" << k << " of function #" << fi;
+            }
+        }
+    }
+
+    // A label binding to each function's LAST block, through the four real steps.
+    auto const lastBlocks = [&] {
+        Descriptors d;
+        for (std::uint32_t fi = 0; fi < produced.moduleFuncCount(); ++fi) {
+            LirFuncId const fn = produced.funcAt(fi);
+            LirBlockSymbolBinding lb;
+            lb.funcIndex = fi;
+            lb.lirBlockV = produced.funcBlockAt(fn, produced.funcBlockCount(fn) - 1).v;
+            lb.symbol    = SymbolId{700 + fi};
+            d.labels.push_back(lb);
+        }
+        return d;
+    };
+    std::vector<LirBlockRebuild> steps;
+    for (Real const& s : real) steps.push_back({s.pass, s.in, s.out, *s.image});
+    {
+        Descriptors d = lastBlocks();
+        DiagnosticReporter trep;
+        ASSERT_TRUE(translate(steps, d, trep)) << firstMessage(trep);
+        for (std::uint32_t fi = 0; fi < produced.moduleFuncCount(); ++fi) {
+            LirFuncId const fn = peeped.lir.funcAt(fi);
+            EXPECT_EQ(d.labels[fi].lirBlockV,
+                      peeped.lir.funcBlockAt(fn, peeped.lir.funcBlockCount(fn) - 1).v)
+                << "function #" << fi;
+        }
+    }
+    for (std::size_t withheld = 0; withheld < steps.size(); ++withheld) {
+        SCOPED_TRACE(std::string(steps[withheld].pass));
+        auto silent = steps;
+        silent[withheld].entryImage = {};
+        Descriptors d = lastBlocks();
+        DiagnosticReporter trep;
+        EXPECT_FALSE(translate(silent, d, trep));
+        ASSERT_EQ(trep.errorCount(), 1u);
+        std::string const m = firstMessage(trep);
+        EXPECT_NE(m.find(std::string("LIR pass '") + std::string(steps[withheld].pass) + "'"),
+                  std::string::npos) << m;
+        EXPECT_NE(m.find("publishes no block image"), std::string::npos) << m;
+    }
 }
 
 // ── the assembler's offsets ────────────────────────────────────────────────

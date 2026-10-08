@@ -434,8 +434,9 @@ dss_add_test(NAME lir/test_lir_long_double_value_semantics
 # D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS (P69): the blocks a
 # jump table, a static `&&label` and a `__try` scope name, followed from MIR→LIR's
 # ids to the final LIR — the first piece for an entry and the last for a scope's
-# last block, a pass without an image proved the identity or refused by name, a
-# descriptor id with no image refused, and the assembler's offsets held to the
+# last block, a pass that publishes no image refused by name (nothing inferred),
+# the four real block-for-block rebuilds publishing the identity they performed,
+# a descriptor id with no image refused, and the assembler's offsets held to the
 # final layout (`lir/lir_descriptor_blocks.hpp`).
 dss_add_test(NAME lir/test_lir_descriptor_blocks
              SOURCES test_lir_descriptor_blocks.cpp)

@@ -5,14 +5,18 @@
  * `_BitInt` out (H_UnsupportedLoweringForKind). Exit 42 when every object holds its value, otherwise a
  * bitmask of the ones that do not:
  *   1 `{ 42 }`, 2 the empty `{}`, 4 a wide (N > 64) one from `{ 42 }`, 8 a wide empty `{}`,
- *   16 a static one, 32 a `_BitInt` member's own braces. */
+ *   16 a static one, 32 a `_BitInt` member's own braces.
+ * Every object is VOLATILE, so each check reads the object the initializer wrote: an optimizing
+ * pipeline may not replace the read by the constant the object was initialized from (C17 5.1.2.3p6:
+ * accesses to volatile objects are evaluated strictly according to the abstract machine), and the
+ * release arm therefore measures the stored bytes too, not a folded comparison. */
 int main(int argc, char **argv) {
-    _BitInt(8) b = { 42 };
-    _BitInt(8) zb = {};
-    unsigned _BitInt(100) w = { 42 };
-    unsigned _BitInt(100) zw = {};
-    static _BitInt(24) s = { 40 };
-    struct { _BitInt(12) m; int n; } t = { { 2 }, 7 };
+    volatile _BitInt(8) b = { 42 };
+    volatile _BitInt(8) zb = {};
+    volatile unsigned _BitInt(100) w = { 42 };
+    volatile unsigned _BitInt(100) zw = {};
+    static volatile _BitInt(24) s = { 40 };
+    volatile struct { _BitInt(12) m; int n; } t = { { 2 }, 7 };
     int bad = 0;
     (void)argv;
     if (b != 42) bad |= 1;

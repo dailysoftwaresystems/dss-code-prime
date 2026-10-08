@@ -1107,6 +1107,13 @@ private:
                                              std::string_view     name) {
     std::string_view const bare = stripDunder(name);
     for (auto const& row : schema.semantics().attributeEffects) {
+        // A row whose verb exists to REFUSE its names — one the compiler cannot
+        // honour at all, one it honours only for the pair whose convention the name
+        // selects — is vocabulary kept so the refusal can be by name. It is not an
+        // answer of "yes": a header that asks first and is told 1 goes on to USE
+        // the attribute, and the use is then refused where the header's own
+        // fallback arm would have compiled (`attributeEffectAdvertisesItsNames`).
+        if (!attributeEffectAdvertisesItsNames(row.effect)) continue;
         for (auto const& n : row.names) {
             if (n == name || n == bare) return true;
         }

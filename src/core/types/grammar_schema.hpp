@@ -1310,6 +1310,13 @@ public:
     // Sorted by `.v`; empty for every rule that declares none.
     [[nodiscard]] std::span<SchemaTokenId const> notFollowedBy(RuleId rule) const noexcept;
 
+    // P69 round 4 (lane `cs`): the positive twin — the token kinds ONE of which MUST follow a
+    // cleanly-closed speculative probe of `rule` (`followedByFirstOf` on the shape body: the
+    // FIRST set of the shape it names — a PEG and-predicate); when the next token is none of
+    // them, the probe is abandoned and the alt tries its next candidate (or its skip). Sorted
+    // by `.v`; empty for every rule that declares none.
+    [[nodiscard]] std::span<SchemaTokenId const> followedBy(RuleId rule) const noexcept;
+
     // Pratt-walker wrapper rule ids declared by `expr.wrapperRules`
     // for `rule`. The loader auto-interned the declared names and
     // validated all three were present, so for an `isExprRule(rule)`

@@ -13,10 +13,16 @@
 // the `noreturn_function` shape routed through the OTHER declaration rule:
 // `compute` is a NON-void function whose only non-return path calls `die`, so
 // without the noreturn attribute reaching `SymbolRecord.isNoreturn` the
-// fall-through would let `compute` reach its closing `}` without returning and
-// the build would fail H_VerifierFailure with NO binary. A parse-only fix —
-// admit the token to the grammar and let the linkage scan swallow it — produces
-// exactly that failure, which is why the example runs rather than compiles.
+// fall-through lets `compute` reach its closing `}` without returning. A
+// parse-only fix — admit the token to the grammar and let the linkage scan
+// swallow it — produces exactly that. Until P69 it was a build that failed
+// H_VerifierFailure with NO binary. Under C it no longer is: C23 6.9.2p13 accepts
+// a non-void function whose end is reached, so the compile succeeds with the
+// warning H_NonVoidFunctionEndReachable and the program STILL exits 42 (`die`
+// ends the process whatever the compiler believes about it). The manifest
+// therefore FORBIDS that code (`forbidDiagnostics`): a specifier that parses and
+// is not honored is red on the diagnostic, in both runners — the run alone
+// cannot see it.
 //
 // ⓘ `externSpecifiers` is the `externDecl` row's `specifierPrefix` and is always
 // its first child, so `specifierPrefixNamesNoreturn` reads this subtree; the

@@ -150,6 +150,30 @@ round's close; each checkpoint's commit message says what was and was not run on
   the three reds being repository guards reading that worktree's stale copies), and 28 mutants read, each alone.
   ✔MEASURED on the main tree after the fold: the same checks and guards as above pass. Balance unchanged: 622 open
   against 620. Three mutants of an earlier row of that lane need an ELF host and are owed before the round's close.
+  ✔MEASURED after that commit: the merged tree's first full-suite reading, `macos-arm64-debug`, passed — 2694 tests.
+- **Checkpoint 5 (2026-10-08) = the C front end lane's fold, made CODE-FIRST**: 155 paths (25 new). The weak axis
+  (a weak binding states its kind, `selectany`, the tentative mark, four linkage refusals of the verifier);
+  `__declspec` as a second spelling of the attribute specifier; an attribute after a referred tag no longer names
+  ANOTHER tag (a silent wrong type, the base's); a constant's member name is no longer resolved by a scope walk; the
+  reachable end of a non-void function, with a new manifest key `forbidDiagnostics` in both example runners; and a
+  statement whose lowering creates a block that could fault OUTSIDE its `__try`'s guarded range is refused by name
+  instead of compiled. **Of its mutants 145 are NOT READ YET**: three rows (two P0, one P1) are born `disclosed`,
+  "fix folded", and close on read pins; two more are capabilities not built, loud today (the guarded range does not
+  cover the blocks the lowering creates — being built next in that lane; a calling-convention attribute naming
+  another convention). ✔MEASURED by the lane: the full suite BEFORE composing with checkpoint 4 on four legs
+  (`macos-arm64-debug` and `linux-arm64-debug` 2697 of 2697; the two Windows legs 2722 of 2727, the five reds being
+  repository guards on that worktree's stale copies); the COMPOSED tree on a focused set of 243 entries on those two
+  remote legs only. **No MSVC and no MinGW build of the composed tree exists** (the local host admitted no heavy leg
+  that afternoon: its memory was held by other work), and `linux-x86_64-debug` read nothing. Balance on this tree:
+  **627 open against 620** — 24 closed, 31 opened (1 created, 30 disclosed), REAL net +7 until the fix-folded rows'
+  pins are read. Nine NAMED time-budget rows were re-derived from that day's full-suite figures (each had been
+  passed by a passing run).
+- **Silent defects FOUND on 2026-10-08 and NOT YET FIXED in this tree** (each the base's debt, each with its lane
+  at work): on pe64 a value read in an `__except` handler body, or after the region, can be garbage — register
+  allocation does not know the region (✔MEASURED: a parameter, a `double`, a struct returned after the handler ran,
+  in release a global's shared address); nested `__try` regions reach the OUTER handler (✔MEASURED; the scope
+  records are emitted outer first and the dispatch is first-match); and a reference written through a STATIC name
+  follows a losing weak alias of the same body to the winner (ELF references ✔MEASURED 79; DSS 99 by the code).
 - **HOW THIS CYCLE ENDS — operator, 2026-10-08, verbatim:** *"on finishing this cycle I'll turn on the pipes and
   try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and monitor CI until
   green"*. So P69 is this PR's EXIT: its four lanes finish what they are in (no second round opens in this PR — what

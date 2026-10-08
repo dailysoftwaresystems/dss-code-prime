@@ -162,7 +162,16 @@ analyzeForTargetFormat(std::shared_ptr<CompilationUnit const> cu,
         // reference to a local outlives every read of it.
         &roleResolver,
         // P68 round 12 (lane `cs`): the format's enumeration compatible-type rule.
-        effectiveEnumCompatibleTypeRule(format));
+        effectiveEnumCompatibleTypeRule(format),
+        // P69 round 4 (lane `cs`): the NAME of the pair's calling convention — the
+        // row of the target's `callingConventions` the format selects, read off
+        // the SAME resolved convention the `va_list` strategy above is read from.
+        // An attribute that names a convention is judged against it. A pair whose
+        // format declares no convention (`nullptr`) hands `nullopt`, and such an
+        // attribute is then refused by name rather than accepted on a guess.
+        callingConvention != nullptr
+            ? std::optional<std::string_view>{callingConvention->name}
+            : std::nullopt);
     return TargetFormatAnalysis{std::move(model), std::move(analyzeVaLayout)};
 }
 

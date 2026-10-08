@@ -367,7 +367,8 @@ impliedSurfaceKindFromName(std::string_view s) noexcept {
 // extra keystrokes.
 //
 // The first three were enumerated from the real corpus census (rows / distinct
-// names): `erases-to-nothing` 8/8, `arch-property` 52/16, `standard-defined`
+// names, the figures of that day and not a live count): `erases-to-nothing` 8/8,
+// `arch-property` 52/16, `standard-defined`
 // 10/10. `compiler-extension` was added 2026-08-24 with `__COUNTER__`
 // (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED), which none of the three could describe
 // truthfully — see its own note below.
@@ -814,8 +815,8 @@ struct DSS_EXPORT PredefinedMacroDef {
     PredefinedMacroKind kind = PredefinedMacroKind::Constant;
     std::string         value;
     // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): OPTIONAL parameter list. A
-    // params-bearing (`isFunctionLike`) predefine — e.g. the MSVC-profile
-    // `__declspec(x)` → empty erase — is NOT seeded into `predefined_`;
+    // params-bearing (`isFunctionLike`) predefine — e.g. the pe-profile
+    // `_declspec(x)` → `__declspec(x)` — is NOT seeded into `predefined_`;
     // it lowers to a `#define name(params) value` line in the synthetic
     // "<built-in>" PROLOGUE prepended to the synth stream, so the ordinary
     // directive handler owns param parsing, C 6.10.3p6 duplicate-param

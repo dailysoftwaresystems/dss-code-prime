@@ -5364,6 +5364,28 @@ struct DSS_EXPORT TargetSchemaData {
     // as `registers` — ML7 callconv lowering will require ≥1 entry.
     std::vector<TargetCallingConvention> callingConventions;
     substrate::TransparentStringMap<std::uint16_t> callingConventionIndex;
+    // ★ P69 round 4 (lane `cs`) — THE CALLING CONVENTIONS THIS TARGET'S REFERENCE
+    // COMPILERS GIVE A MEANING AND THIS COMPILER DOES NOT IMPLEMENT
+    // (`unimplementedCallingConventions`, an array of convention ids). It is the
+    // fact that separates the two things a source-level convention name can be on a
+    // target that has no row for it: a convention some reference really emits (a
+    // function so declared is CALLED DIFFERENTLY — the name must be refused by
+    // name), or a word this target's toolchains do not know at all (they warn and
+    // ignore; so does this compiler). `callingConventions` cannot say it: a row
+    // there is a convention this compiler EMITS.
+    //
+    // ✔MEASURED (lane `cs`'s probes ta6 / ta8; a function defined with the
+    // attribute, its type compared with the plain one): on x86_64 clang 18.1.3
+    // makes `vectorcall`, `regcall`, `preserve_most` and `preserve_all` distinct
+    // function types where gcc 13.3.0 warns "attribute directive ignored"; on arm64
+    // Apple clang and clang for aarch64 Linux make `ms_abi` a distinct type where
+    // arm64 gcc ignores it, Apple clang does the same for `preserve_most` /
+    // `preserve_all`, and arm64 gcc and Apple clang for `aarch64_vector_pcs`.
+    //
+    // The loader keeps the two sets apart (an id is a row OR an unimplemented id,
+    // never both) and unique. Empty ⇒ this target's references know no convention
+    // beyond the rows.
+    std::vector<std::string> unimplementedCallingConventions;
 
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
     // per-target mapping from abstract `TargetCondCode` (substrate-tier
@@ -6034,6 +6056,35 @@ public:
         auto it = d_.callingConventionIndex.find(name);
         if (it == d_.callingConventionIndex.end()) return nullptr;
         return &d_.callingConventions[it->second];
+    }
+
+    // P69 round 4 (lane `cs`): the convention ids this target's reference
+    // compilers give a meaning and this compiler does not implement — see
+    // `TargetSchemaData::unimplementedCallingConventions`.
+    [[nodiscard]] std::span<std::string const>
+    unimplementedCallingConventions() const noexcept {
+        return d_.unimplementedCallingConventions;
+    }
+    // WHAT A CONVENTION ID IS ON THIS TARGET — the one question a source-level
+    // convention name asks of the target document. `Implemented`: a row of
+    // `callingConventions` (whether it is the ACTIVE one is the caller's
+    // comparison with the pair's resolved convention). `KnownUnimplemented`: a
+    // reference compiler of this target emits it and this compiler cannot.
+    // `Unknown`: no toolchain of this target knows the id.
+    enum class CallingConventionStanding : std::uint8_t {
+        Implemented,
+        KnownUnimplemented,
+        Unknown,
+    };
+    [[nodiscard]] CallingConventionStanding
+    callingConventionStanding(std::string_view id) const noexcept {
+        if (callingConventionByName(id) != nullptr) {
+            return CallingConventionStanding::Implemented;
+        }
+        for (std::string const& known : d_.unimplementedCallingConventions) {
+            if (known == id) return CallingConventionStanding::KnownUnimplemented;
+        }
+        return CallingConventionStanding::Unknown;
     }
 
     // ── Cond-code encoding (D-CSUBSET-WHILE-LOOP-SUBSTRATE) ──────

@@ -1,0 +1,20 @@
+{
+  "$comment": "P69 (lane `cs`, D-C-A-CONSTANTS-MEMBER-NAME-IS-RESOLVED-BY-A-SCOPE-WALK): the member name of a constant — each step of `offsetof(T, a.b)`, the `&((T *)0)->m` spelling, the member operand of `__builtin_object_size` — is resolved by the one member rule every member access uses: a member of T, or of one of T's anonymous struct / union members (C23 6.7.3.2p15), with T's qualifiers set aside. Before P69 those three askers walked the scope chain outwards from T's member scope instead: a member reached through an anonymous member was REFUSED in every constant here ('c' is not a member of that struct/union; or, for the address spelling, 'not an integer constant expression'), a volatile-qualified T was refused as INCOMPLETE, and the object-size builtin answered 'unknown' for a promoted member. Every constant is checked at run time against the address arithmetic on a real object, on four targets, debug and release.",
+  "$commentOtherHalf": "The same walk also ACCEPTED a name that is not a member but is declared in a scope enclosing the struct (a file-scope object, a function, an enumerator — also one declared inside the struct —, a typedef name, a member of the enclosing struct) and answered another member's offset. A program that builds cannot show a refusal; those are pinned by name in tests/analysis/semantic/test_builtin_compile_time_operators.cpp (BuiltinCompileTimeOperators.OffsetofRefusesANameBoundOutsideTheStruct), with the bit-field inside an anonymous member, the ambiguous promoted name, and the sentence offsetof gives for each way there is no offset.",
+  "$commentForbidDiagnostics": "`by_promoted_offset`, `by_promoted_offsetof` and `by_qualified_offset` end in an `if` whose condition is one of these constants and is true: their closing brace is not reached, and the HIR lowering must see that with the SAME member rule the semantic tier folded the `_Static_assert`s with (one function, `anon_member_search::memberByteOffset`, called by both). If its reading failed, each would be reported as reaching its end — a warning no reference gives — and the key below would turn the arm red.",
+  "$measuredComment": "(filled by the probe of THIS file's bytes)",
+  "$commentRedOnDisable": "(filled from the mutant runs)",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "forbidDiagnostics": ["H_NonVoidFunctionEndReachable"],
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

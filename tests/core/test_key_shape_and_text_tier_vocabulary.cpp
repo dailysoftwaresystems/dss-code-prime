@@ -524,22 +524,22 @@ TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
 TEST(TextTierVocabulary, EveryHirAttributeRefusalAdvertisesExactlyWhatItAccepts) {
     constexpr HirAttrVocabulary kVocabularies[] = {
         {"ffi linkage",
-         "dsshir 7\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
+         "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi linkage", 3},
         {"ffi visibility",
-         "dsshir 7\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
+         "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi visibility", 3},
         {"shader stage",
-         "dsshir 7\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
+         "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader stage", 7},
         {"shader builtin",
-         "dsshir 7\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
+         "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader builtin", 12},
         {"transpile idiom",
-         "dsshir 7\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
+         "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
          ")\n  extern_global %1 : i32\n}\n", "unknown transpile idiom", 6},
         {"diag recovery",
-         "dsshir 7\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
+         "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
          ")\n  extern_global %1 : i32\n}\n", "unknown diag recovery", 4},
     };
 
@@ -1184,7 +1184,7 @@ TEST(TextTierVocabulary, MirBitIntAndWideFloatLiteralsRoundTripThroughText) {
 // constant in the reader's translation unit, so the two ends cannot drift.
 TEST(TextTierVocabulary, TheUnspelledAggregateLiteralMarkerIsRefusedByName) {
     auto const text =
-        std::string{"dsshir 7\nproducer \"\"\n"
+        std::string{"dsshir 8\nproducer \"\"\n"
                     "symbols { %1 \"g\" }\n"
                     "module [] \"probe\" {\n"
                     "  global %1 : i32 = lit unspelled_aggregate : i32\n"
@@ -1228,7 +1228,7 @@ namespace {
 
 // A `.dsshir` module whose single function body is `bodyLine`.
 [[nodiscard]] std::string hirBody(std::string_view bodyLine) {
-    return std::string{"dsshir 7\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+    return std::string{"dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                        "  function %1 : fn() -> void {\n    block {\n      "}
          + std::string{bodyLine} + "\n      return void\n    }\n  }\n}\n";
 }

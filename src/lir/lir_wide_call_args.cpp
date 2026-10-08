@@ -115,7 +115,8 @@ constexpr std::uint8_t kOutgoingChunkWidthFlags =
 [[nodiscard]] bool
 lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
              TargetCallingConvention const& cc, std::uint16_t storeOutgoingOp,
-             std::uint16_t gprLoadOp, LirBuilder& b, DiagnosticReporter& reporter) {
+             std::uint16_t gprLoadOp, LirBuilder& b,
+             std::vector<std::uint32_t>& entryImage, DiagnosticReporter& reporter) {
 
     auto const& funcInfo = src.funcArena().at(fn);
     b.addFunction(SymbolId{funcInfo.symbol});
@@ -131,6 +132,9 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
         b.beginBlock(srcToDst.at(srcBlock.v));
+        // The block image this rebuild publishes (`LirWideCallResult::blockEntryImage`): this
+        // source block's instructions begin in the block just begun.
+        entryImage[srcBlock.v] = srcToDst.at(srcBlock.v).v;
 
         std::uint32_t const instN = src.blockInstCount(srcBlock);
         for (std::uint32_t i = 0; i < instN; ++i) {
@@ -500,10 +504,11 @@ lowerWideCallArgs(Lir const& src, TargetSchema const& schema,
     // inside `lowerOneFunc`.
     lir_pass_util::copyModuleSideStructures(src, b);
     std::size_t const funcCount = src.moduleFuncCount();
+    out.blockEntryImage.assign(src.blockCount(), 0u);
     for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
         LirFuncId const fn = src.funcAt(fi);
         if (!lowerOneFunc(src, fn, schema, *cc, *storeOutgoingOp, *gprLoadOp, b,
-                          reporter))
+                          out.blockEntryImage, reporter))
             return out;
     }
     out.lir = std::move(b).finish();

@@ -67,6 +67,14 @@ static_assert(!std::is_constructible_v<HirVerifier, Hir&&>);
 static_assert(!std::is_constructible_v<HirVerifier, Hir&&, dss::HirSourceMap const*>);
 static_assert(!std::is_constructible_v<HirVerifier, Hir&&, dss::HirSourceMap const*,
                                        dss::TypeInterner const*>);
+static_assert(!std::is_constructible_v<HirVerifier, Hir&&, dss::HirSourceMap const*,
+                                       dss::TypeInterner const*,
+                                       dss::HirInlineAsmPool const*,
+                                       dss::HirLinkageMap const*>);
+static_assert(std::is_constructible_v<HirVerifier, Hir const&, dss::HirSourceMap const*,
+                                      dss::TypeInterner const*,
+                                      dss::HirInlineAsmPool const*,
+                                      dss::HirLinkageMap const*>);
 
 namespace {
 
@@ -797,7 +805,7 @@ TEST(HirVerifier, ReturnCompletenessSkippedWithoutInterner) {
 // WHY THE HELPER WALKS THE WHOLE SUBTREE: a `goto` may target a `LabelStmt` nested
 // at ANY depth inside a dead-tail statement, so re-establishing reachability
 // (D-CSUBSET-BLOCK-TERMINATION-LAST-REACHABLE — the soundness that keeps
-// GenuineFallThroughStillFailsLoudIncludingNestedLabel red) requires scanning the
+// GenuineFallThroughIsStillSeenIncludingNestedLabel honest) requires scanning the
 // child's ENTIRE subtree for a label. It was originally recursive (one host frame
 // per HIR level); SQLite emits deeply-nested trees (especially expressions in dead
 // code), where a recursive tree-walk has overflowed the stack before — the same
@@ -1773,4 +1781,102 @@ TEST(HirVerifier, AUnionAggregateNamesTheMemberItsChildInitializes) {
     auto const past = verdict(i32, 2);
     EXPECT_FALSE(past.first) << "member 2 of a two-member union";
     EXPECT_NE(past.second.find("member 2"), std::string::npos) << past.second;
+}
+
+// P69 (lane `cs`): the linkage side-table's own invariants. The table is not part of the
+// tree, so no other rule can see them, and each one is a fact a consumer would otherwise
+// GUESS: which kind of weak definition a weak binding is (the two link differently), and
+// whether a zero-filled global is a tentative definition (two of those are one object).
+//
+// RED-ON-DISABLE: drop any one arm of `checkLinkageAttributes` and the row naming it goes
+// green where it must be red; drop the `linkageMap_ == nullptr` return's twin — the fifth
+// constructor argument — and every refused row passes.
+TEST(HirVerifier, ALinkageAttributeStatesItsWeakKindAndKeepsTheTentativeMarkOnGlobals) {
+    using dss::LinkageAttr;
+    using dss::SymbolBinding;
+    using dss::WeakDefinitionKind;
+    TypeInterner ti = makeInterner();
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const fnTy = intToIntSig(ti);
+
+    struct Row {
+        char const* what;
+        bool        onFunction;      // the attribute sits on the Function, else on the Global
+        LinkageAttr attr;
+        char const* refusedWith;     // nullptr = the module verifies clean
+    };
+    auto const weak = [](WeakDefinitionKind k) {
+        LinkageAttr a;
+        a.binding  = SymbolBinding::Weak;
+        a.weakKind = k;
+        return a;
+    };
+    auto const tentative = [](SymbolBinding b) {
+        LinkageAttr a;
+        a.binding   = b;
+        a.tentative = true;
+        return a;
+    };
+    LinkageAttr kindBesideGlobal;
+    kindBesideGlobal.weakKind = WeakDefinitionKind::SelectAny;
+    LinkageAttr kindBesideLocal;
+    kindBesideLocal.binding  = SymbolBinding::Local;
+    kindBesideLocal.weakKind = WeakDefinitionKind::Overridable;
+    LinkageAttr weakTentative = weak(WeakDefinitionKind::Overridable);
+    weakTentative.tentative = true;
+    LinkageAttr local;
+    local.binding = SymbolBinding::Local;
+
+    for (Row const& row : {
+             Row{"an overridable weak global", false,
+                 weak(WeakDefinitionKind::Overridable), nullptr},
+             Row{"a select-any weak global", false,
+                 weak(WeakDefinitionKind::SelectAny), nullptr},
+             Row{"an overridable weak function", true,
+                 weak(WeakDefinitionKind::Overridable), nullptr},
+             Row{"a weak global that names no kind", false,
+                 weak(WeakDefinitionKind{}), "names no weak-definition kind"},
+             Row{"a weak function that names no kind", true,
+                 weak(WeakDefinitionKind{}), "names no weak-definition kind"},
+             Row{"a kind beside the default binding", false, kindBesideGlobal,
+                 "names a weak-definition kind beside the 'global' binding"},
+             Row{"a kind beside the internal binding", false, kindBesideLocal,
+                 "names a weak-definition kind beside the 'local' binding"},
+             Row{"a tentative global", false, tentative(SymbolBinding::Global), nullptr},
+             Row{"a tentative weak global", false, weakTentative, nullptr},
+             Row{"an internal global, not tentative", false, local, nullptr},
+             Row{"a tentative mark on a function", true,
+                 tentative(SymbolBinding::Global), "the node is not a Global"},
+             Row{"a tentative mark beside the internal binding", false,
+                 tentative(SymbolBinding::Local), "beside the internal binding"}}) {
+        HirBuilder b{"c"};
+        HirNodeId const fn = b.makeFunction(fnTy, 1, std::array{b.makeVarDecl(i32, 10)},
+                                            b.makeBlock({}));
+        HirNodeId const g   = b.makeGlobal(i32, 2);
+        HirNodeId const mod = b.makeModule(std::array{fn, g});
+        Hir h = std::move(b).finish(mod);
+        dss::HirLinkageMap linkage{h};
+        linkage.set(row.onFunction ? fn : g, row.attr);
+
+        DiagnosticReporter reporter;
+        bool const ok =
+            HirVerifier{h, nullptr, nullptr, nullptr, &linkage}.verify(reporter);
+        if (row.refusedWith == nullptr) {
+            EXPECT_TRUE(ok) << row.what << ": "
+                            << (reporter.all().empty() ? std::string{}
+                                                       : reporter.all().front().actual);
+            EXPECT_EQ(reporter.errorCount(), 0u) << row.what;
+        } else {
+            EXPECT_FALSE(ok) << row.what;
+            ASSERT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u)
+                << row.what << " — exactly its own finding, never a second one";
+            EXPECT_NE(reporter.all().front().actual.find(row.refusedWith),
+                      std::string::npos)
+                << row.what << " — got: " << reporter.all().front().actual;
+        }
+        // CONTROL: the same module with NO table handed to the verifier is not judged
+        // on linkage at all — the rule reads the table, not the tree.
+        DiagnosticReporter quiet;
+        EXPECT_TRUE(HirVerifier{h}.verify(quiet)) << row.what;
+    }
 }

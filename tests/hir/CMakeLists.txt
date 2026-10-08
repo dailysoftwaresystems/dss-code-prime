@@ -28,6 +28,15 @@ dss_add_test(NAME hir/test_brace_element_diagnosed_conversion
 # elements warn S_ExcessInitializerElements and are dropped unevaluated (6.7.9p2).
 dss_add_test(NAME hir/test_initializer_list_shapes
              SOURCES test_initializer_list_shapes.cpp)
+# P69 (lane `cs`): a value-returning function whose end is reached is a language
+# rule (`nonVoidFunctionEndReached`); under C's the lowering completes the body
+# and warns once. Separate from test_hir_lowering_c.cpp because half of it runs
+# under the shipped C document with that ONE key rewritten, which needs the JSON
+# document in hand and a fixture of its own.
+dss_add_test(NAME hir/test_non_void_function_end_reached
+             SOURCES test_non_void_function_end_reached.cpp)
+target_link_libraries(dss_hir_test_non_void_function_end_reached
+                      PRIVATE nlohmann_json::nlohmann_json)
 # D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION. Separate from
 # test_hir_lowering_c.cpp because that file's fixture deliberately pins the
 # long-double axis at `None` ("moving it would silently re-point every one of

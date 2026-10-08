@@ -135,7 +135,7 @@ struct DSS_EXPORT SignMaskConstant {
 // lowerer saw (via a `SehTryBegin` marker in the parent function). Like a
 // JumpTableDescriptor it carries only what the assembler-adjacent pipeline needs
 // AFTER `assemble()` resolves each block's byte offset: the LIR block ids of the
-// guarded body's [entry, exit) and the `__except` handler, plus the symbols the
+// guarded body's FIRST and LAST block and of the `__except` handler, plus the symbols the
 // pe writer resolves to image-RVAs (the filter funclet + the __C_specific_handler
 // personality). `compile_pipeline.cpp` translates the LIR block ids to byte
 // offsets against the owning function's `blockByteOffsets` and attaches a
@@ -144,10 +144,24 @@ struct DSS_EXPORT SignMaskConstant {
 // (`SehTryBegin`/`SehTryEnd`/`SehFilterReturn`) emit NO runtime branch — the OS
 // dispatches into the handler via the scope table, so these ids are pure position
 // data (the c114 .pdata + c70 jump-table link-time-RVA pattern).
+//
+// ★ `endLirBlockV` IS THE BODY'S LAST BLOCK, NOT ONE PAST IT. Its comment used to
+// say "one-past the guarded body (the range end)", which no writer or reader of
+// the field ever meant (✔READ P69, every one of them): the lowering writes the
+// LIR block of `MirSehScope::endBlock` — "the guarded body's LAST block" — the
+// descriptor translation (`lir_descriptor_blocks.hpp`) carries it through later
+// passes as a last block (the last piece of whatever that block became), and
+// the binding in `compile_pipeline.cpp` computes the half-open range END itself,
+// as the offset of whichever block is laid out next after it.
+// ⚠ THE RANGE IS ONE CONTIGUOUS RUN OF THE FUNCTION'S OWN (1:1) BLOCKS. A block
+// the lowering CREATES while lowering a guarded block is laid out after all of
+// them, so it lies outside the range: the lowering refuses to place anything
+// that can fault on user memory in one (`refusesUserMemoryInACreatedBlock`,
+// D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES).
 struct DSS_EXPORT SehScopeDescriptor {
     std::size_t   funcIndex        = 0;  // index into lir.funcAt(i) of the owning (parent) function
-    std::uint32_t beginLirBlockV   = 0;  // LIR block .v of the guarded body's entry (try block)
-    std::uint32_t endLirBlockV     = 0;  // LIR block .v marking one-past the guarded body (the range end)
+    std::uint32_t beginLirBlockV   = 0;  // LIR block .v of the guarded body's FIRST block (the try entry)
+    std::uint32_t endLirBlockV     = 0;  // LIR block .v of the guarded body's LAST block (never one past it)
     std::uint32_t handlerLirBlockV = 0;  // LIR block .v of the __except handler body
     SymbolId      filterFuncletSymbol{}; // the synthesized filter-funclet function symbol
     SymbolId      personalitySymbol{};   // __C_specific_handler extern symbol

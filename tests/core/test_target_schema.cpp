@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 #include <ios>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <set>
 #include <span>
 #include <sstream>
@@ -1174,6 +1175,131 @@ TEST(TargetSchema, CallPushBytesShippedAArch64DeclaresZero) {
         << "ARM64 BL writes LR — no stack push, callPushBytes must "
            "be 0 (the non-leaf x30-save lands in savedRegAreaSize "
            "via callee-saved tracking, independent of this bias).";
+}
+
+// ── D-CSUBSET-VLA-WIN64-STACK-PROBE: A GUARD PAGE HOLDS ONE STEP, OR THE CONVENTION
+//    DOES NOT LOAD ────────────────────────────────────────────────────────────────
+//
+// One step below the stack pointer is what one call pushes (`callPushBytes`) or one
+// probe touch — a word of the convention's own stack pointer (`registers[stackPointer]
+// .widthBytes`, the row the calling-convention pass reads for the width it touches
+// with). A `stackProbePageBytes` smaller than either can never be probed, whatever the
+// program, so the LOADER refuses it, naming the keys. Every arm mutates the shipped
+// x86_64 document's ms_x64 (the negative no shipped convention can synthesize); each
+// rule is isolated from the other, and a page that holds one step still loads.
+
+namespace {
+
+struct ProbePageMutation {
+    std::uint32_t                page = 0;
+    std::optional<std::uint32_t> callPushBytes;
+    // Declare the stack pointer `rsp` 4 bytes wide — a 4-byte word, so a 4-byte
+    // touch. Its 4-byte view `esp` goes with it: a view must be strictly narrower
+    // than its register, and a convention may not name a view as its stack pointer.
+    bool                         fourByteStackPointer = false;
+};
+
+[[nodiscard]] auto x8664WithMsX64Probing(ProbePageMutation const& m) {
+    return dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [&m](nlohmann::json& doc) {
+            for (auto& cc : doc.at("callingConventions")) {
+                if (!cc.is_object() || cc.value("name", std::string{}) != "ms_x64") {
+                    continue;
+                }
+                cc["stackProbePageBytes"] = m.page;
+                if (m.callPushBytes.has_value()) cc["callPushBytes"] = *m.callPushBytes;
+            }
+            if (m.fourByteStackPointer) {
+                auto& regs = doc.at("registers");
+                regs.erase(std::remove_if(regs.begin(), regs.end(),
+                                          [](nlohmann::json const& r) {
+                                              return r.is_object()
+                                                  && r.value("name", std::string{}) == "esp";
+                                          }),
+                           regs.end());
+                for (auto& r : regs) {
+                    if (r.is_object() && r.value("name", std::string{}) == "rsp") {
+                        r["widthBytes"] = 4;
+                    }
+                }
+            }
+        });
+}
+
+// The loader's refusals of a `stackProbePageBytes` as too small that name `key`.
+template <typename LoadResultT>
+[[nodiscard]] std::size_t
+probePageTooSmallRefusalsNaming(LoadResultT const& r, std::string_view key) {
+    if (r.has_value()) return 0;
+    std::size_t n = 0;
+    for (auto const& d : r.error()) {
+        if (d.path.ends_with("/stackProbePageBytes")
+            && d.message.find("is smaller than") != std::string::npos
+            && d.message.find(key) != std::string::npos) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+template <typename LoadResultT>
+[[nodiscard]] std::string allRefusals(LoadResultT const& r) {
+    std::string out;
+    if (r.has_value()) return out;
+    for (auto const& d : r.error()) out += d.path + ": " + d.message + "\n";
+    return out;
+}
+
+} // namespace
+
+TEST(TargetSchema, AProbePageSmallerThanOneTouchDoesNotLoad) {
+    // A call that pushes nothing, so only the touch is at stake: rsp is 8 bytes wide.
+    auto r = x8664WithMsX64Probing({.page = 4, .callPushBytes = 0});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(probePageTooSmallRefusalsNaming(r, "stackPointer 'rsp' (8 bytes"), 1u)
+        << allRefusals(r);
+    EXPECT_EQ(probePageTooSmallRefusalsNaming(r, "callPushBytes"), 0u) << allRefusals(r);
+    EXPECT_EQ(r.error().size(), 1u)
+        << "the only thing wrong with this document is its page: " << allRefusals(r);
+}
+
+TEST(TargetSchema, AProbePageSmallerThanWhatACallPushesDoesNotLoad) {
+    // A 4-byte stack pointer, so one touch fits the page and only the push is at
+    // stake: the shipped call pushes 8.
+    auto r = x8664WithMsX64Probing({.page = 4, .fourByteStackPointer = true});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(probePageTooSmallRefusalsNaming(r, "callPushBytes (8)"), 1u) << allRefusals(r);
+    EXPECT_EQ(probePageTooSmallRefusalsNaming(r, "stackPointer"), 0u) << allRefusals(r);
+    EXPECT_EQ(r.error().size(), 1u)
+        << "the only thing wrong with this document is its page: " << allRefusals(r);
+}
+
+TEST(TargetSchema, AProbePageSmallerThanBothIsRefusedForEach) {
+    auto r = x8664WithMsX64Probing({.page = 4});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(probePageTooSmallRefusalsNaming(r, "callPushBytes (8)"), 1u) << allRefusals(r);
+    EXPECT_EQ(probePageTooSmallRefusalsNaming(r, "stackPointer 'rsp' (8 bytes"), 1u)
+        << allRefusals(r);
+    EXPECT_EQ(r.error().size(), 2u) << allRefusals(r);
+}
+
+TEST(TargetSchema, AProbePageThatHoldsOneStepLoads) {
+    // Exactly one step: the page is as wide as the word and as the push.
+    auto eight = x8664WithMsX64Probing({.page = 8});
+    EXPECT_TRUE(eight.has_value()) << allRefusals(eight);
+    // The 4-byte stack pointer under a call that pushes nothing: one 4-byte touch
+    // fits a 4-byte page. (This is also what makes the push arm above the PAGE's
+    // refusal and not the narrowed register's.)
+    auto four = x8664WithMsX64Probing(
+        {.page = 4, .callPushBytes = 0, .fourByteStackPointer = true});
+    EXPECT_TRUE(four.has_value()) << allRefusals(four);
+    // And the shipped convention itself.
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto const* ms = (*shipped)->callingConvention(1);
+    ASSERT_NE(ms, nullptr);
+    EXPECT_STREQ(ms->name.c_str(), "ms_x64");
+    EXPECT_EQ(ms->stackProbePageBytes, 4096u);
 }
 
 TEST(TargetSchema, CallingConventionUnknownRegisterRejected) {
@@ -4895,4 +5021,75 @@ TEST(TargetSchema, ResultEarlyClobberIsABooleanOnAnOpcodeWithAResult) {
     ASSERT_FALSE(noResult.has_value())
         << "an early-clobber claim on an opcode with no result reads nothing";
     EXPECT_TRUE(anyHasCode(noResult.error(), DiagnosticCode::C_ConflictingField));
+}
+
+// P69 round 4 (lane `cs`): `unimplementedCallingConventions` — the convention ids this
+// target's reference compilers give a meaning and this compiler does not implement. It is
+// what makes a source-level convention name three-valued on a target: a ROW (implemented;
+// active or foreign is the caller's comparison), a listed id (refused by name), or neither
+// (an unknown word here). An id that is BOTH a row and listed would be refused by name while
+// the back end emits it, so the loader refuses the document.
+//
+// RED-ON-DISABLE: drop the "is a row of 'callingConventions'" arm of the loader and the
+// both-places document loads; drop the duplicate arm and the repeated id loads; make
+// `callingConventionStanding` read the rows only and the listed id answers Unknown.
+TEST(TargetSchema, AConventionIdIsARowOrListedAsUnimplementedNeverBoth) {
+    auto load = [](char const* extra) {
+        return TargetSchema::loadFromText(
+            std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[
+              {"name":"x0","class":"gpr","widthBytes":8},
+              {"name":"sp","class":"gpr","widthBytes":8}
+            ],
+            "callingConventions":[
+              {"name":"cc","argGprs":["x0"],"stackPointer":"sp","stackAlignment":16}])"}
+                + extra + "}");
+    };
+    using Standing = TargetSchema::CallingConventionStanding;
+    {
+        auto r = load(R"(,"unimplementedCallingConventions":["other_cc","third_cc"])");
+        ASSERT_TRUE(r.has_value()) << "two listed ids beside one row must load";
+        EXPECT_EQ((*r)->unimplementedCallingConventions().size(), 2u);
+        EXPECT_EQ((*r)->callingConventionStanding("cc"), Standing::Implemented);
+        EXPECT_EQ((*r)->callingConventionStanding("other_cc"),
+                  Standing::KnownUnimplemented);
+        EXPECT_EQ((*r)->callingConventionStanding("third_cc"),
+                  Standing::KnownUnimplemented);
+        EXPECT_EQ((*r)->callingConventionStanding("no_such_cc"), Standing::Unknown);
+        EXPECT_EQ((*r)->callingConventionStanding(""), Standing::Unknown);
+    }
+    {
+        auto r = load("");
+        ASSERT_TRUE(r.has_value()) << "CONTROL: the key is optional";
+        EXPECT_TRUE((*r)->unimplementedCallingConventions().empty());
+        EXPECT_EQ((*r)->callingConventionStanding("other_cc"), Standing::Unknown);
+    }
+    struct Refused {
+        char const* what;
+        char const* extra;
+        char const* says;
+    };
+    for (Refused const c : {
+             Refused{"not an array", R"(,"unimplementedCallingConventions":"other_cc")",
+                     "must be an array"},
+             Refused{"an entry that is not a string",
+                     R"(,"unimplementedCallingConventions":[7])", "non-empty"},
+             Refused{"an empty id", R"(,"unimplementedCallingConventions":[""])",
+                     "non-empty"},
+             Refused{"an id that is also a row",
+                     R"(,"unimplementedCallingConventions":["cc"])",
+                     "is a row of 'callingConventions'"},
+             Refused{"an id listed twice",
+                     R"(,"unimplementedCallingConventions":["other_cc","other_cc"])",
+                     "duplicate unimplemented"}}) {
+        auto r = load(c.extra);
+        ASSERT_FALSE(r.has_value()) << c.what << " must fail the load";
+        EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson)) << c.what;
+        bool said = false;
+        for (auto const& d : r.error())
+            if (d.message.find(c.says) != std::string::npos) said = true;
+        EXPECT_TRUE(said) << c.what << " — expected a diagnostic containing \"" << c.says
+                          << "\"";
+    }
 }

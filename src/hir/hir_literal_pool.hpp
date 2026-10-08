@@ -57,7 +57,9 @@ struct HirAggregateValue {
     // members may share one (`union { int a; int b; }`). Set by the evaluator from a union
     // `ConstructAggregate`'s payload; ABSENT on a value whose member is not known (every
     // non-union value, and a union value no producer named), and a member read of such a
-    // value is not a constant. FOLD-TRANSIENT: not serialized with a pooled literal.
+    // value is not a constant. NOT fold-transient: `toMirLiteral` copies it into the MIR
+    // literal, where the static-data encoder reads it, and a pooled literal is serialized
+    // WITH it — `agg member N {…}` in `.dsshir` (v8), the spelling `.dssir` has had since v5.
     std::optional<std::uint32_t> unionMember;
 
     // ★★★ THE TEARDOWN IS PART OF THE WALK, AND IT WAS THE ONE WALK NOBODY

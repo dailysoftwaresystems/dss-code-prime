@@ -12,10 +12,21 @@
 //   __attribute__((__noreturn__)) void die(int);          LEADING           rc=0
 //   extern __attribute__((__noreturn__)) void die(int);   LEADING           rc=0
 //
-// The `rc=1` is `error[H_VerifierFailure]: non-void function may fall through
+// The `rc=1` was `error[H_VerifierFailure]: non-void function may fall through
 // without returning a value` — a SPURIOUS refusal of a correct program, with NO
-// binary. That is why this example RUNS rather than merely compiles: an unhonored
-// noreturn is not a missing optimisation here, it is a build that does not happen.
+// binary: on that day an unhonored noreturn was not a missing optimisation, it
+// was a build that did not happen.
+//
+// ★ SINCE P69 THE SAME DEFECT PRESENTS DIFFERENTLY, and the pin moved with it.
+// C23 6.9.2p13 accepts a non-void function whose end is reached (only USING the
+// value is undefined), and DSS now honors that: an unhonored noreturn leaves
+// `viaTrailing` / `viaSlot` / `viaExternTrailing` with a reached end, the compile
+// SUCCEEDS with the warning H_NonVoidFunctionEndReachable on each, and the
+// program still exits 42 — the decorated callees end the process whatever the
+// compiler believes about them. So the manifest FORBIDS that code
+// (`forbidDiagnostics`): the arm is red on the diagnostic, in both runners. The
+// exit code alone cannot see a dropped noreturn; `viaSibling` — the LEAK
+// direction — is still the part the exit code holds.
 //
 // ★★ THE THREE REFERENCES, EACH PROBED SEPARATELY 2026-09-03, by -Wreturn-type
 // differential against an undecorated control:
@@ -57,7 +68,8 @@
 // RED-ON-DISABLE (REMOVE direction): set `attrSpec`'s `appertainsTo` in
 // `declarators.afterDeclaratorAttrRules` to `type` in
 // `src/dss-config/sources/c.lang.json` and this example FAILS IN BOTH
-// RUNNERS (back to H_VerifierFailure on `viaTrailing`), while
+// RUNNERS (a reached end on `viaTrailing`: H_VerifierFailure when this was
+// exercised in P56, the forbidden H_NonVoidFunctionEndReachable since P69), while
 // `extern_noreturn_specifier` and `noreturn_function` — whose spellings are both
 // in the LEADING position — stay green: the control that says the mutant is
 // targeted at the non-leading positions and not at the noreturn sink itself.

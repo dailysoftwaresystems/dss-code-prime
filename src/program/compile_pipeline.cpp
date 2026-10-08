@@ -1664,16 +1664,19 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // bindings below name blocks by MIR→LIR's ids and read the FINAL module's
     // `blockByteOffsets`; a block id is an arena position, so every block an
     // inserting pass adds renumbers each one after it. Every rebuild in between is
-    // listed, in order: the four that publish no image are PROVED block-preserving
-    // (same blocks, same successors), the two that insert blocks publish their
-    // entry images, `assemble()` is held to its layout — and any descriptor id with
-    // no image in the final LIR is refused by name. See `lir/lir_descriptor_blocks.hpp`.
+    // listed, in order, WITH THE BLOCK IMAGE IT PUBLISHED: the four that rebuild
+    // block for block state the identity they performed, the two that insert blocks
+    // state where each source block's pieces begin, and nothing is inferred — a
+    // rebuild that publishes no image is refused by name. `assemble()` is held to
+    // its layout, and any descriptor id with no image in the final LIR is refused
+    // by name. See `lir/lir_descriptor_blocks.hpp`.
     {
         std::vector<LirBlockRebuild> rebuilds{
-            {"wide-call-args", &lir.lir, &wideLir.lir, {}},
-            {"rewrite", &wideLir.lir, &rewritten.lir, {}},
-            {"two-address-legalize", &rewritten.lir, &legal.lir, {}},
-            {"lir-peephole", &legal.lir, &peeped.lir, {}},
+            {"wide-call-args", &lir.lir, &wideLir.lir, wideLir.blockEntryImage},
+            {"rewrite", &wideLir.lir, &rewritten.lir, rewritten.blockEntryImage},
+            {"two-address-legalize", &rewritten.lir, &legal.lir,
+             legal.blockEntryImage},
+            {"lir-peephole", &legal.lir, &peeped.lir, peeped.blockEntryImage},
         };
         if (expanded.has_value()) {
             rebuilds.push_back({"asm-region-expansion", &peeped.lir, &expanded->lir,

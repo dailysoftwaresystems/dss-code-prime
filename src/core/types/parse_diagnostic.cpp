@@ -175,8 +175,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_LibraryBuiltinUnavailable";
         case DiagnosticCode::S_IntegerLiteralImplicitlyUnsigned:
             return "S_IntegerLiteralImplicitlyUnsigned";
+        case DiagnosticCode::S_AttributeNotHonoured:
+            return "S_AttributeNotHonoured";
         case DiagnosticCode::H_StaticInitializerNotFolded:
             return "H_StaticInitializerNotFolded";
+        case DiagnosticCode::H_NonVoidFunctionEndReachable:
+            return "H_NonVoidFunctionEndReachable";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

@@ -120,10 +120,26 @@ set(_DSS_TB_UNIT_debug 35)
 # "<entry>|<sanitized>|<release>|<debug>" — each the entry's own ceiling in whole
 # seconds, the maximum over every measured run of that class (sources above).
 set(_DSS_TB_NAMED
-    "program/test_emit_hir_round_trips_every_example|1536|218|308"
+    # ★ NINE ROWS RE-DERIVED 2026-10-08 (cycle P69) FROM FULL-SUITE RUNS UNDER A ROUND'S LOAD -- the
+    # population a gate runs on: four lanes' legs on the host at once (the Windows suite took 2391 s
+    # against 1917 s the same morning). Each passed its row in a PASSING run, so the row was the stale
+    # one. ✔MEASURED, the slower of two full-suite runs of that day where two were read (MinGW Debug
+    # / MSVC Release; AppleClang Debug where it was the slower):
+    #   program/test_emit_hir_round_trips_every_example  765.0-773.1 s debug, 429.0-435.2 s release
+    #     (it grows with the corpus: one round trip per example);
+    #   conformance/test_reference_conformance           309.7 s debug, 107.2 s release;
+    #   analysis/semantic/test_fc3_width_semantics_shuffled  357.8 s debug (371.2 s AppleClang Debug);
+    #   program/test_runtime_cache_wiring                81.5-99.1 s debug, 68.9-84.2 s release;
+    #   program/test_compile_pipeline                    84.35-87.02 s debug, 52.42-91.16 s release (nine
+    #     cases added that day compile each layout pair twice; their owner shares the compiles next);
+    #   program/test_ffi_resolve_library                 70.2-89.3 s debug, 58.0-70.0 s release;
+    #   program/test_static_link 38.5 s, program/test_dependency_resolver 42.7 s,
+    #   program/test_project_config 37.8 s -- debug.
+    # No sanitized figure was measured (only CI builds that class): every row keeps its own.
+    "program/test_emit_hir_round_trips_every_example|1536|436|774"
     "hir/test_frontend_deep_nesting_costs_heap|1501|36|200"
     "mir/test_deep_nesting_costs_heap|904|22|146"
-    "conformance/test_reference_conformance|607|75|182"
+    "conformance/test_reference_conformance|607|108|310"
     "analysis/preprocess/test_preprocessor_shuffled|354|163|489"
     "analysis/semantic/test_semantic_analyzer_c_shuffled|441|140|273"
     "analysis/semantic/test_semantic_analyzer_c|435|60|85"
@@ -131,18 +147,18 @@ set(_DSS_TB_NAMED
     "hir/test_hir_lowering_c|359|29|59"
     "analysis/syntactic/test_parser_speculation_ceilings|357|5|55"
     "plan_citations_guard|304|345|107"
-    "analysis/semantic/test_fc3_width_semantics_shuffled|186|97|334"
+    "analysis/semantic/test_fc3_width_semantics_shuffled|186|97|372"
     "core/test_deep_type_layout_costs_heap|280|8|37"
     "mir/test_mir_lowering_c|251|26|49"
-    "program/test_runtime_cache_wiring|244|48|57"
+    "program/test_runtime_cache_wiring|244|85|100"
     "analysis/preprocess/test_preprocessor|214|11|38"
     "core/test_key_shape_and_text_tier_vocabulary|190|10|36"
     "core/test_config_closed_key_vocabulary|177|7|33"
-    "program/test_compile_pipeline|145|23|32"
-    "program/test_ffi_resolve_library|141|25|32"
+    "program/test_compile_pipeline|145|92|88"
+    "program/test_ffi_resolve_library|141|71|90"
     "core/test_grammar_loader_chain_vocabulary_projection|134|5|24"
-    "program/test_static_link|129|17|27"
-    "program/test_dependency_resolver|119|12|24"
+    "program/test_static_link|129|17|39"
+    "program/test_dependency_resolver|119|12|43"
     "analysis/semantic/test_type_identity_vocabulary|112|8|19"
     "link/test_descriptor_library_role_agreement|105|14|20"
     # ⓘ `lane_worktree_guard` AND `lane_fold_selftest_guard` HAD ROWS HERE, GONE WITH THEIR SUBJECTS
@@ -216,7 +232,7 @@ set(_DSS_TB_NAMED
     "core/test_type_kind_vocabulary_projection|103|4|17"
     "analysis/semantic/test_fc3_width_semantics|96|6|19"
     "analysis/preprocess/test_preprocess_no_rework|94|5|18"
-    "program/test_project_config|84|11|15"
+    "program/test_project_config|84|11|38"
     "orphan_tests_guard|7|76|15"
     "lir/test_mir_to_lir|76|8|16"
     # ★ harness/test_sqlite_harness_legs: RE-DERIVED 2026-09-22 (lane mig, part 4), when its pins were

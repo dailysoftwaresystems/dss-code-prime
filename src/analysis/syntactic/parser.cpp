@@ -957,11 +957,21 @@ struct Parser::Impl {
             return node;
         }
         // LastIdentifier — track the latest identifier in source order.
+        // ★ P69 round 4 (lane `cs`): an ATTRIBUTE SPECIFIER names nothing the shape
+        // declares, so the walk does not enter one — the same stop the semantic
+        // tier's `extractNameNode` takes, off the same config role
+        // (`isAttributeSpecifierRule`). Without it `struct S __attribute__((unused))
+        // v;` bound the sketch's tag to `unused`, the attribute's clause name.
         NodeId              found{};
         std::vector<NodeId> stack{node};
         while (!stack.empty()) {
             const NodeId cur = stack.back();
             stack.pop_back();
+            if (builder->nodeKind(cur) == NodeKind::Internal
+                && isAttributeSpecifierRule(schema->semantics(),
+                                            builder->nodeRule(cur))) {
+                continue;
+            }
             if (builder->nodeKind(cur) == NodeKind::Token
                 && builder->nodeTokenKind(cur).v == identifierKind.v) {
                 found = cur;
@@ -1136,8 +1146,17 @@ struct Parser::Impl {
     // every guarded shape the leftmost path hits a token almost immediately
     // (`(a)(x+1+…+1)` at 38812 terms returned rc 0). It is converted anyway — the
     // bound was a property of today's grammars, not of this code.
+    //
+    // ★ P69 round 4 (lane `cs`): `skipAttributeSpecifiers` makes the walk blind to
+    // ATTRIBUTE SPECIFIER subtrees (the language's declared role,
+    // `isAttributeSpecifierRule`). The type-name triage asks for the type child's
+    // BASE leaf, and an attribute run written before the base is not the base:
+    // read as one, `int (__attribute__((unused)) name)` committed as a FUNCTION
+    // suffix — its "parameter list" starts with a keyword, so rule 1 said no value
+    // reading competes — where gcc and clang read a parenthesized declarator.
     void collectLeavesBelow_(NodeId node, std::vector<NodeId>& out,
-                             std::size_t cap) const {
+                             std::size_t cap,
+                             bool skipAttributeSpecifiers = false) const {
         std::vector<NodeId> pending{node};
         while (!pending.empty()) {
             if (out.size() > cap) return;
@@ -1145,6 +1164,11 @@ struct Parser::Impl {
             pending.pop_back();
             if (builder->nodeKind(n) != NodeKind::Internal) {
                 if (!isEmptySpace(builder->nodeFlags(n))) out.push_back(n);
+                continue;
+            }
+            if (skipAttributeSpecifiers
+                && isAttributeSpecifierRule(schema->semantics(),
+                                            builder->nodeRule(n))) {
                 continue;
             }
             const std::span<NodeId const> kids = builder->nodeChildren(n);
@@ -1248,8 +1272,11 @@ struct Parser::Impl {
         // SKIP the follower test, mis-reading the call as a cast to a type
         // named `f(p)` → S_UnknownType. (A genuinely-undeclared callee still
         // errors: the rollback re-reads the call, then checkCall reports it.)
+        // ★ P69 round 4: the BASE leaf is the first leaf that is not inside an
+        // attribute specifier (see `collectLeavesBelow_`).
         std::vector<NodeId> typeLeaves;
-        collectLeavesBelow_(typeChild, typeLeaves, /*cap=*/1);
+        collectLeavesBelow_(typeChild, typeLeaves, /*cap=*/1,
+                            /*skipAttributeSpecifiers=*/true);
         if (typeLeaves.empty()
             || builder->nodeKind(typeLeaves[0]) != NodeKind::Token
             || builder->nodeTokenKind(typeLeaves[0]).v != identifierKind.v) {
@@ -2116,7 +2143,8 @@ struct Parser::Impl {
     //     what keeps the speculation ceilings reachable on a cast chain.
     //   * no facet on it that is decided only when a PROBE closes
     //     (`candidateNeedsProbe_`: the `commitRequiresTypeName` triage, the
-    //     `notFollowedBy` predicate) — each needs a probe to roll back, exactly as
+    //     `notFollowedBy` predicate and its positive twin `followedByFirstOf`) —
+    //     each needs a probe to roll back, exactly as
     //     the unique-production direct descent already requires.
     //   * no nullable tail — an alt that may legitimately SKIP must keep that
     //     option, and committing forecloses it (D-PARSE-SPECULATIVE-OPTIONAL).
@@ -2180,9 +2208,14 @@ struct Parser::Impl {
     // this ONE question, so neither can skip a facet the other honours. (The loader's
     // `validateNotFollowedBy` closes the remaining ways in: a non-candidate reference and
     // the alt's fallback replay.)
+    // ★ P69 round 4: the positive follower predicate (`followedByFirstOf`) is the third such
+    // facet — a rule that reads only when one of a shape's FIRST tokens follows it must be
+    // PROBED even as a unique survivor, or the parse would be committed to it before its
+    // follower was looked at.
     [[nodiscard]] bool candidateNeedsProbe_(RuleId rule) const {
         return schema->typeNameCommitRule(rule).valid()
-            || !schema->notFollowedBy(rule).empty();
+            || !schema->notFollowedBy(rule).empty()
+            || !schema->followedBy(rule).empty();
     }
 
     // The branch frame closed with the probe still clean: the FC2 type-name
@@ -2208,6 +2241,21 @@ struct Parser::Impl {
             SchemaTokenId const next = peekSignificantKind(0);
             if (std::binary_search(notAfter.begin(), notAfter.end(), next,
                                    [](SchemaTokenId a, SchemaTokenId b) { return a.v < b.v; })) {
+                abandonAndAdvance_();
+                return;
+            }
+        }
+        // P69 round 4 (lane `cs`): the POSITIVE twin (`followedByFirstOf`, config-declared) —
+        // a clean close NOT followed by a token that can start the named shape is not this
+        // branch's reading either. C's attribute run among type specifiers is the instance:
+        // `unsigned __attribute__((aligned(16))) int x;` reads the run as part of the specifiers
+        // because a specifier follows it, while in `int __attribute__((unused)) x;` the same
+        // run belongs to the declaration's own slot and the specifier list must end before it.
+        // Trivia is looked through, as above.
+        if (auto const mustFollow = schema->followedBy(site.branch); !mustFollow.empty()) {
+            SchemaTokenId const next = peekSignificantKind(0);
+            if (!std::binary_search(mustFollow.begin(), mustFollow.end(), next,
+                                    [](SchemaTokenId a, SchemaTokenId b) { return a.v < b.v; })) {
                 abandonAndAdvance_();
                 return;
             }

@@ -6,6 +6,9 @@
 #include "lir/lir.hpp"
 #include "lir/lir_regalloc.hpp"
 
+#include <cstdint>
+#include <vector>
+
 // LIR post-regalloc rewrite pass. Consumes an `Lir` module + a
 // matching `LirAllocation` side-table and produces a fresh `Lir`
 // module where every virtual register has been replaced by the
@@ -60,6 +63,13 @@ namespace dss {
 struct DSS_EXPORT LirRewriteResult {
     Lir  lir{};
     bool ok = true;
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: every rebuild publishes its block entry
+    // image. The rewrite keeps every block (the topology invariant above), so what it publishes is the
+    // identity IT PERFORMED — written down where each source block is begun, from the map the rebuild goes
+    // through. Indexed by the SOURCE module's block arena (`LirBlockId.v`; slot 0 holds 0): the `.v` of the
+    // block of `lir` where that block's instructions begin. `lir/lir_descriptor_blocks.hpp` follows the
+    // blocks data names through it, and refuses a rebuild that publishes none.
+    std::vector<std::uint32_t> blockEntryImage;
 };
 
 [[nodiscard]] DSS_EXPORT LirRewriteResult

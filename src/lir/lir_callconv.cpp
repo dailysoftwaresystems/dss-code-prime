@@ -849,6 +849,11 @@ LirInstId emitSpCopy(LirBuilder& b, std::uint16_t op, LirReg dst, LirReg src) {
 // op's result is `none` — like a bare `sub SP,F`, it mutates SP in place
 // and exposes no SSA value; SP is a fixed physical reg the encoder reads
 // from operand 0.
+// ★ THE OP'S CONTRACT, which `probeFootingFor` builds on and every encoder
+// that lowers it owes: the touches step WHOLE pages down from the entry SP
+// (so each keeps the entry SP's offset inside its page), and the LAST one is
+// at most `pageBytes` above the final SP — the remainder below it, up to a
+// page, is not touched by this op.
 LirInstId emitStackProbe(LirBuilder& b, std::uint16_t op, LirReg sp,
                          std::uint32_t frameBytes, std::uint32_t pageBytes) {
     std::array<LirOperand, 3> ops{
@@ -1568,6 +1573,12 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
     // plain `sub SP, F` below — byte-identical to before this feature.
     // Agnostic: the decision reads cc.stackProbePageBytes (a config
     // value), NEVER cc.name / arch / object format.
+    // ⚠ "frame ≤ page needs no WALK" is all this threshold says. Whether what
+    // the function then reaches BELOW its settled SP — a call's push, a
+    // runtime descent's first touch — still lands on the guard page is the
+    // FOOTING's question (`probeFootingFor`, derived from callPushBytes,
+    // stackAlignment and the touch width), answered by the caller with one
+    // landing touch after this prologue where the convention needs it.
     if (cc.stackProbePageBytes > 0
         && layout.totalFrameSize > cc.stackProbePageBytes) {
         if (stackProbeOp == 0) {
@@ -3288,9 +3299,10 @@ functionNeedsBodyFrameScratch(Lir const& src, LirFuncId fn,
 // CRT object, `___chkstk_ms` is libgcc), and an inline walk needs no symbol at all.
 //
 // THE SHAPE is `___chkstk_ms`'s loop with SP itself as the pointer and the size
-// register as the counter — the descent's own two operands and nothing else:
+// register as the counter — the descent's own two operands and nothing else (W is
+// one word of the convention's stack pointer, 8 for rsp — `ProbeTouch` below):
 //
-//         or_mem [SP - 8], 0          (1) the word just below SP
+//         or_mem [SP - W], 0          (1) the word just below SP
 //         cmp    size, page
 //         jcc    ule → tail | step
 //   step: sub    SP, page
@@ -3308,10 +3320,61 @@ functionNeedsBodyFrameScratch(Lir const& src, LirFuncId fn,
 //   (1) is the touch the helper's CALL makes for free (its return-address push at
 //       SP-8), and it is NOT optional: SP may sit inside the still-untouched guard
 //       page — a fixed frame of up to a page below a touched entry SP is never
-//       probed — and from there the first page step would land BELOW the guard.
+//       walked — and from there the first page step would land BELOW the guard.
+//       Whether (1) itself lands on the guard page is THE FOOTING, below.
 //   (3) leaves SP itself touched, so whatever follows — the next descent, a call,
 //       a callee's unprobed frame — starts from a committed page, the footing a
 //       function's entry SP has.
+//
+// ★ THE FOOTING — WHAT A FUNCTION MAY REACH WITH NO PROBE OF ITS OWN, DERIVED FROM
+//   THE CONVENTION'S OWN NUMBERS (`probeFootingFor`). A function is ENTERED WITH
+//   THE PAGE THAT HOLDS THE BYTE AT ITS STACK POINTER COMMITTED. A call that pushes
+//   (`callPushBytes` ≥ 1) wrote that byte itself, whoever made the call. A call
+//   that pushes nothing (a link-register machine) leaves it to the CALLER, which
+//   must therefore have touched the page its own SP is in before it calls.
+//   ⚠ THAT SECOND HALF IS DSS'S OWN RULE FOR SUCH A CONVENTION, DERIVED HERE, AND
+//   NOT ANY PLATFORM ABI'S TEXT: a convention document does not say what a callee
+//   may assume about the page under its entry SP when the call wrote nothing
+//   there, so it is a contract between two functions this pass states and keeps on
+//   BOTH sides — the callee reads its reach off it, and the caller is given the
+//   landing touch below so that it holds. (A link-register Windows prologue that
+//   stores the frame record at its new SP satisfies it with that store; the
+//   explicit touch is the conservative form of the same thing, correct wherever
+//   the saved registers sit in the frame.)
+//   The guard page is then at worst the next page down, so from a committed byte
+//   that sits `o` bytes into its page everything down to `o + page` bytes below it
+//   may be touched. Three numbers decide the rest:
+//     · LEAST — the smallest `o` an entry SP can have. The convention aligns SP to
+//       `stackAlignment` before the call and the call pushes `callPushBytes`, so it
+//       is `(stackAlignment − callPushBytes mod stackAlignment) mod stackAlignment`
+//       (8 under ms_x64; 0 when the call pushes nothing) — known only when a page
+//       is a whole number of alignments, and taken as 0 otherwise.
+//     · GAP — how far the settled SP is below the last byte known committed: the
+//       whole fixed frame when the prologue did not walk it, and at most one page
+//       when it did (`stack_probe` steps whole pages down from the entry SP,
+//       touching each, and leaves its remainder — up to a page — untouched; the
+//       walked touches keep the entry SP's offset inside the page).
+//     · NEED — how far below the settled SP the function reaches before any probe
+//       of its own: touch (1)'s width if it has a runtime descent; what a call
+//       pushes if it calls; and A WHOLE PAGE if it calls under a convention whose
+//       call pushes nothing, because the callee's footing is then this function's
+//       own SP and the page that holds it has to be committed already.
+//   `gap + need > least + page` means the reach leaves the guard page, and the
+//   function then gets a LANDING TOUCH — `or_mem [SP + 0], 0`, the first thing
+//   after its prologue. That touch is always within reach itself (`gap ≤ page`),
+//   and it leaves SP's own page committed: gap 0, after which any `need` of at most
+//   a page is safe. ms_x64 never gets one — its LEAST (8) is what its call pushes
+//   and is touch (1)'s width, so `gap + 8 > 8 + page` is false for every frame —
+//   which is why "the call pushed a word at the entry SP" is a consequence here and
+//   not a premise: its code is byte-identical. A convention whose call pushes
+//   nothing gets one in every function that calls with a frame, and in a leaf with
+//   a runtime descent whose frame is exactly a page (or was walked): there touch (1)
+//   would otherwise fall one word past the guard page.
+//   A `need` LARGER than a page — a page smaller than one touch, or than what one
+//   call pushes — is beyond any touch, whatever the program: such a convention
+//   does not LOAD (`TargetSchemaData::validate` refuses its `stackProbePageBytes`
+//   against `callPushBytes` and against a word of its `stackPointer`), so this
+//   pass never sees one.
 //
 // ★ EVERY TOUCH STORES BACK THE VALUE IT READ (`or` with 0), and every one lands
 //   below the original SP, on bytes this descent is allocating — except the
@@ -3338,14 +3401,36 @@ struct DynamicProbeBlocks {
     LirBlockId tail{};
 };
 
-// The touch's own width: a full general-register word (flags 0 = width 64), which
-// is also how far below SP touch (1) reaches — it covers exactly the bytes
-// [SP - 8, SP) and nothing at or above SP.
-inline constexpr std::uint8_t kProbeTouchWidthFlags = 0;
+// ONE GUARD-PAGE TOUCH IS ONE WHOLE GENERAL REGISTER — a word of the stack
+// pointer's own class, in full. Its width is ASKED, never written here: of
+// `wholeRegisterAccessFlags`, the one owner of "how wide is a register of this
+// class", which derives it from the class's full rows of the target document's
+// `registers[]` (8 bytes on x86_64) and refuses, by name, a class with no single
+// full width and a width no LIR instruction can state. It is also how far below SP
+// touch (1) reaches: exactly the bytes [SP - bytes, SP), nothing at or above SP.
+// The loader's validator reads the stack pointer's own row for the same number when
+// it refuses a convention whose page cannot hold one touch (`TargetSchemaData::
+// validate`, the calling-convention block) — a stack pointer is a FULL register of
+// the general class (the loader holds it to that), so its `widthBytes` is that
+// class's full width wherever the class has one, and the tier that admits a
+// convention and the tier that probes under it cannot disagree about a touch.
+struct ProbeTouch {
+    std::uint32_t bytes      = 0;   // one whole general register
+    std::uint8_t  widthFlags = 0;   // the `kLirInstFlagWidth*` bits that state it
+};
+
+// The touch of this target, or nullopt when the owner refused (reported).
+[[nodiscard]] std::optional<ProbeTouch>
+probeTouchFor(TargetSchema const& schema, DiagnosticReporter& reporter) {
+    auto const flags = wholeRegisterAccessFlags(
+        schema, LirRegClass::GPR, "callconv: guard-page touch", reporter);
+    if (!flags.has_value()) return std::nullopt;
+    return ProbeTouch{lirInstWidthBits(*flags) / 8u, *flags};
+}
 
 // `or_mem [base + offset], 0` — a read-modify-write that stores back what it read.
 LirInstId emitProbeTouch(LirBuilder& b, std::uint16_t orMemOp, LirReg base,
-                         std::int32_t offset) {
+                         std::int32_t offset, ProbeTouch const& touch) {
     std::array<LirOperand, 4> ops{
         LirOperand::makeImmInt32(0),
         LirOperand::makeReg(base),
@@ -3353,7 +3438,38 @@ LirInstId emitProbeTouch(LirBuilder& b, std::uint16_t orMemOp, LirReg base,
         LirOperand::makeMemOffset(offset)
     };
     return b.addInst(orMemOp, InvalidLirReg, ops, /*payload=*/0,
-                     kProbeTouchWidthFlags);
+                     touch.widthFlags);
+}
+
+// THE FOOTING of one function under a convention that declares a guard page (the
+// design note's paragraph of that name): `need` is how far below its settled stack
+// pointer the function reaches before any probe of its own, and `landingTouch` says
+// whether that reach leaves the guard page unless the prologue touches [SP + 0]
+// first. Both are 0/false under a convention that declares no page.
+struct ProbeFooting {
+    std::uint32_t need         = 0;
+    bool          landingTouch = false;
+};
+
+[[nodiscard]] ProbeFooting
+probeFootingFor(TargetCallingConvention const& cc, std::uint32_t touchBytes,
+                std::uint32_t frameBytes, bool hasCalls, bool hasRuntimeDescent) {
+    ProbeFooting f;
+    std::uint32_t const page = cc.stackProbePageBytes;
+    if (page == 0) return f;
+    std::uint32_t const push = cc.callPushBytes;
+    // A call that pushes reaches its push. One that pushes nothing hands the callee
+    // THIS function's stack pointer as its footing: the page holding it has to be
+    // committed already — the reach of a whole page.
+    std::uint32_t const callNeed = !hasCalls ? 0u : (push == 0 ? page : push);
+    f.need = std::max(hasRuntimeDescent ? touchBytes : 0u, callNeed);
+    if (f.need == 0) return f;
+    std::uint32_t const align = cc.stackAlignment > 0 ? cc.stackAlignment : 1u;
+    std::uint32_t const least =
+        page % align == 0 ? (align - push % align) % align : 0u;
+    std::uint32_t const gap = frameBytes > page ? page : frameBytes;
+    f.landingTouch = std::uint64_t{gap} + f.need > std::uint64_t{least} + page;
+    return f;
 }
 
 // `cmp size, page` then `jcc cond → ifTrue | ifFalse` — the walk's one test,
@@ -3375,15 +3491,15 @@ void emitProbeTest(LirBuilder& b, OpcodeHandles const& h, LirReg size,
 // touch's id goes into `touches`, the frame-base verifier's exact escape for them.
 void emitDynamicProbeLoop(LirBuilder& b, OpcodeHandles const& h, LirReg sp,
                           LirReg size, std::int32_t page,
+                          ProbeTouch const& touch,
                           DynamicProbeBlocks const& blocks,
                           std::unordered_set<std::uint32_t>& touches) {
-    std::int32_t const touchBytes =
-        static_cast<std::int32_t>(lirInstWidthBits(kProbeTouchWidthFlags) / 8u);
-    touches.insert(emitProbeTouch(b, h.orMem, sp, -touchBytes).v);
+    touches.insert(emitProbeTouch(b, h.orMem, sp,
+                                  -static_cast<std::int32_t>(touch.bytes), touch).v);
     emitProbeTest(b, h, size, page, TargetCondCode::Ule, blocks.tail, blocks.step);
     b.beginBlock(blocks.step);
     emitSpAdjust(b, h.sub, sp, static_cast<std::uint32_t>(page));
-    touches.insert(emitProbeTouch(b, h.orMem, sp, 0).v);
+    touches.insert(emitProbeTouch(b, h.orMem, sp, 0, touch).v);
     std::array<LirOperand, 2> countOps{LirOperand::makeReg(size),
                                        LirOperand::makeImmInt32(page)};
     b.addInst(h.sub, size, countOps);
@@ -3861,6 +3977,49 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
         return false;
     }
 
+    // D-CSUBSET-VLA-WIN64-STACK-PROBE: this function's FOOTING under a convention
+    // that declares a guard page (the design note above `DynamicProbeBlocks`) — what
+    // it reaches below its settled SP before any probe of its own, and whether its
+    // prologue owes a LANDING TOUCH for that reach to stay on the guard page. Decided
+    // here, from the frame the layout just fixed, before anything is emitted.
+    //
+    // `need` never exceeds a page: a convention whose `stackProbePageBytes` is
+    // smaller than `callPushBytes` or than one word of its stack pointer does not
+    // LOAD (`TargetSchemaData::validate`, the calling-convention block).
+    //
+    // The touch itself (`ProbeTouch`) is asked for only by a function that touches:
+    // one with a runtime descent needs its width to know its reach, so it asks
+    // first; one that only owes a landing touch asks once the footing says so.
+    ProbeTouch probeTouch;
+    if (walkDynamicDescents) {
+        auto const touch = probeTouchFor(schema, reporter);
+        if (!touch.has_value()) return false;
+        probeTouch = *touch;
+    }
+    ProbeFooting const footing = probeFootingFor(
+        cc, probeTouch.bytes, outLayout.totalFrameSize, hasCalls,
+        walkDynamicDescents);
+    if (footing.landingTouch && !walkDynamicDescents) {
+        auto const touch = probeTouchFor(schema, reporter);
+        if (!touch.has_value()) return false;
+        probeTouch = *touch;
+    }
+    if (footing.landingTouch && h.orMem == 0) {
+        // (A function with a runtime descent never gets here without the verb: the
+        // walk's own check above refused it. This is the function that only calls.)
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               std::format("calling convention '{}' declares stackProbePageBytes={} "
+                           "and callPushBytes={}, under which this function's frame of "
+                           "{} bytes must touch the page its stack pointer lands in "
+                           "before anything reaches below it, but the target schema "
+                           "has no 'or_mem' opcode to touch it with: the schema must "
+                           "declare it",
+                           cc.name, cc.stackProbePageBytes, cc.callPushBytes,
+                           outLayout.totalFrameSize));
+        return false;
+    }
+
     auto const& funcInfo = src.funcArena().at(fn);
     b.addFunction(SymbolId{funcInfo.symbol});
 
@@ -4016,6 +4175,17 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // fact is known, rather than reconstructed by a consumer.
             outCfiFn.prologueOpCount =
                 static_cast<std::uint32_t>(outCfiFn.ops.size());
+            // D-CSUBSET-VLA-WIN64-STACK-PROBE: the LANDING TOUCH (the design note's
+            // FOOTING paragraph) — the first BODY instruction, at the settled SP,
+            // which is the fixed-frame bottom here: no runtime descent has run. It
+            // moves nothing and saves nothing, so it is no prologue op and carries
+            // no unwind rule; the flags it writes are dead at a function's entry.
+            // Its id joins the walk's touches, the frame-base verifier's escape by
+            // identity.
+            if (footing.landingTouch) {
+                outProbeTouches.insert(
+                    emitProbeTouch(b, h.orMem, sp, 0, probeTouch).v);
+            }
         }
 
         // ── D-LIR-PER-INST-REG-CONSTRAINTS: where the per-INSTRUCTION side
@@ -4733,6 +4903,30 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // outgoing area at `dstOffset`. Emitted in the stack-store phase
                 // (before any register move) so the source `addr` reg is read while
                 // still intact. `addr` is the carrier's (already-physical) Reg.
+                //
+                // ★ P69 round 4 — NOT REACHED BY THE PIPELINE TODAY, AND KEPT ON
+                // PURPOSE. The wide-call pass (`lir_wide_call_args.cpp`) runs over
+                // EVERY Call before register allocation, copies each stacked
+                // by-value aggregate into its placed outgoing bytes there, and takes
+                // the `(Reg, ByValueStackAgg)` carrier off the Call — so no Call the
+                // pipeline lowers reaches this pass carrying one, and the placed
+                // triple `(Reg, ByValueStackAgg, MemOffset)` is no longer produced by
+                // any pass (the wide-call pass REFUSES an input that states one).
+                // This copy stays because the carrier is still an operand FORM that
+                // four other consumers accept — register allocation, the rewrite, the
+                // text form and the verifier — and hand-built modules reach all of
+                // them (tests/lir/test_lir_callconv.cpp,
+                // tests/lir/test_lir_outgoing_arg_cursor.cpp, tests/asm): one consumer
+                // of five refusing a form the other four take would be the defect.
+                // Its two known limits are loud, by name, never a wrong byte:
+                // `L_VirtualRegInPostRegalloc` (the rewriter's reload scratch
+                // exhausted by spilled carrier addresses at one call) and
+                // `L_CcRegLookupFailed` (no free caller-saved general register to copy
+                // through). Its REMOVAL — the stage invariant "after the wide-call
+                // pass no Call carries the form", stated by the verifier, with every
+                // consumer's arm dropped together and the hand-built tests building
+                // the post-pass form — is owned by
+                // D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET.
                 struct ByValStackCopy {
                     LirReg       addr;
                     std::int32_t dstOffset;  // from THIS fn's SP-post-prologue
@@ -5826,12 +6020,13 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 }
                 emitDynamicProbeLoop(b, h, sp, ops[1].reg,
                                      static_cast<std::int32_t>(cc.stackProbePageBytes),
-                                     pb->second, outProbeTouches);
+                                     probeTouch, pb->second, outProbeTouches);
                 std::array<LirOperand, 2> descentOps{ops[0], ops[1]};
                 LirInstId const descent = b.addInst(op, result, descentOps, payload,
                                                     src.instFlags(inst));
                 lir_pass_util::carryInstSideData(src, inst, b, descent);
-                outProbeTouches.insert(emitProbeTouch(b, h.orMem, sp, 0).v);
+                outProbeTouches.insert(
+                    emitProbeTouch(b, h.orMem, sp, 0, probeTouch).v);
                 continue;
             }
 

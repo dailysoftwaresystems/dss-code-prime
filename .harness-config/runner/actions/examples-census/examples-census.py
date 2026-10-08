@@ -111,10 +111,11 @@ def census(ms):
     # runners read and this census does not is exactly the "plausible zero" this
     # script exists to prevent — it simply would not appear in the report, and a
     # reader counting manifests from here would under-report it silently rather
-    # than crash. `expectWarnings` joined the set in P54 (lane `fw`).
+    # than crash. `expectWarnings` joined the set in P54 (lane `fw`),
+    # `forbidDiagnostics` in P69 (lane `cs`).
     for k in ("language", "source", "sources", "project", "exitCode",
               "expectedStdout", "expectDiagnostics", "expectWarnings",
-              "optimizedPipelines", "targets"):
+              "forbidDiagnostics", "optimizedPipelines", "targets"):
         c["top." + k] = top(k)
 
     # ⚠ DELIBERATELY NOT IN THE TUPLE ABOVE, whose stated invariant is the RUNNERS'

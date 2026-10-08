@@ -1526,3 +1526,68 @@ TEST(ParserSpeculation, NotFollowedByVetoesACleanCloseOnEveryPathToTheCandidate)
     EXPECT_EQ(countNodesByRule(survivorOk, "pair"), 1u);
     EXPECT_EQ(countNodesByRule(survivorOk, "axe"), 1u);
 }
+
+// ── P69 round 4 (lane `cs`): `followedByFirstOf`, THE POSITIVE TWIN ───────────────────────────────
+// A candidate that closes cleanly is the alt's reading only if the next token can START the shape
+// it names. C uses it for an attribute run among a type's specifiers — part of the specifier list
+// when a specifier follows it, the declaration's own otherwise; this grammar names no C construct.
+// `list` is an `X`, then any number of `X` or of a `run`, and a `run` belongs to the list only when
+// an `X` follows. `stmt` has its OWN slot for an `A B` after the list (`tail`), so a parse that
+// IGNORED the predicate would still succeed: only the tree says who took it.
+// `run` is the only candidate of the repeat's alt that starts with `A`, at the trailing repeat of a
+// non-root rule — the shape the loader admits because that alt skips before it could ever replay
+// (`GrammarSchema.AFollowerPredicateIsJudgedAtTheAltTheParserStandsAt`).
+// RED-ON-DISABLE: drop the positive test from `decideClosedCandidate_` → `X A B ;` keeps the run
+// inside the list (`tail` 0, `run` 1).
+namespace {
+
+constexpr std::string_view kFollowedBySchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "FollowedBySpec", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "A":  [{ "kind": "AKind" }],
+    "B":  [{ "kind": "BKind" }],
+    "X":  [{ "kind": "XKind" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root": { "sequence": [{ "repeat": "stmt" }] },
+    "stmt": { "sequence": ["list", { "optional": "tail" }, "Semi"] },
+    "list": { "sequence": ["XKind", { "repeat": { "alt": ["XKind", "run"], "speculative": true, "lookahead": 4 } }] },
+    "run":  { "sequence": ["AKind", "BKind"], "followedByFirstOf": "list" },
+    "tail": { "sequence": ["AKind", "BKind"] }
+  }
+})JSON";
+
+} // namespace
+
+TEST(ParserSpeculation, FollowedByFirstOfKeepsACleanCloseOnlyBeforeTheNamedShape) {
+    // An `X` follows the run: it is part of the list.
+    Tree kept = parseWithSchema(kFollowedBySchema, "X A B X ;");
+    EXPECT_FALSE(kept.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(kept, "run"), 1u) << "`A B` before an `X` is the list's";
+    EXPECT_EQ(countNodesByRule(kept, "tail"), 0u);
+
+    // Nothing that starts a list follows: the list ends BEFORE the run and the statement's own
+    // slot takes it.
+    Tree left = parseWithSchema(kFollowedBySchema, "X A B ;");
+    EXPECT_FALSE(left.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(left, "run"), 0u)
+        << "`A B` before `;` was kept inside the list: the follower predicate was skipped";
+    EXPECT_EQ(countNodesByRule(left, "tail"), 1u);
+
+    // Both in one statement, and the loop goes on after a kept run.
+    Tree both = parseWithSchema(kFollowedBySchema, "X X A B X A B ; X ;");
+    EXPECT_FALSE(both.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(both, "run"), 1u);
+    EXPECT_EQ(countNodesByRule(both, "tail"), 1u);
+    EXPECT_EQ(countNodesByRule(both, "list"), 2u);
+
+    // CONTROL: a list with no run at all is unaffected.
+    Tree plain = parseWithSchema(kFollowedBySchema, "X X X ;");
+    EXPECT_FALSE(plain.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(plain, "run"), 0u);
+    EXPECT_EQ(countNodesByRule(plain, "tail"), 0u);
+}

@@ -810,6 +810,68 @@ TEST(FeatureQueryOperators, TheBuiltinAnswerFollowsTheDeclaredTruthSet) {
            "builtin is added.";
 }
 
+// ── 5b. AN ATTRIBUTE THE COMPILER REFUSES BY NAME IS NOT ADVERTISED ─────────
+//
+// P69 (lane `cs`). The attribute table gained two verbs whose rows exist so that a
+// name can be REFUSED BY NAME: `unsupported` (`vector_size`, `mode`, `naked` — the
+// compiler cannot honour them at all) and `callingConvention` (`ms_abi`, … —
+// honoured only as a statement of the pair's own convention). `__has_attribute`
+// answers from that same table, and it answered 1 for every name in it — so the
+// moment those rows were written, a header that asks first
+//     #if __has_attribute(vector_size)
+//     typedef int v4 __attribute__((vector_size(16)));
+//     #else … the scalar fallback …
+// was answered INTO the refusal, where before the rows existed it was answered 0
+// and its fallback compiled. An advertisement the compiler does not honour is the
+// defect class that kept a whole real-world corpus from building for six cycles
+// (`c_atomic`); this is the same thing, one table over.
+//
+// Table-driven over the SHIPPED rows, never a hand list: a row added tomorrow
+// under either verb is asked here without anyone remembering to. Each name is
+// asked in its reserved spelling (`__name__`), which is an identifier whatever
+// the plain word is; the named cells below ask the plain words real headers use.
+//
+// RED-ON-DISABLE: drop the `attributeEffectAdvertisesItsNames` line of
+// `languageDeclaresAttribute` and every row of the two verbs answers 1.
+TEST(FeatureQueryOperators, AnAttributeThatIsRefusedByNameIsNotAdvertised) {
+    auto const answers = [](std::string const& name) {
+        PreprocessResult const r = pp("#if __has_attribute(" + name
+                                      + ")\nint yes;\n#else\nint no;\n#endif\n");
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << name;
+        bool const yes = sawLexeme(r, "yes");
+        EXPECT_NE(yes, sawLexeme(r, "no")) << name << " — exactly one arm is live";
+        return yes;
+    };
+    std::size_t refusing = 0;
+    std::size_t advertising = 0;
+    for (auto const& row : cSchema()->semantics().attributeEffects) {
+        bool const advertised = attributeEffectAdvertisesItsNames(row.effect);
+        for (auto const& n : row.names) {
+            // A qualified name (`q(name)`) is not an identifier: no program can ask
+            // the operator about it, so it has no answer to pin.
+            if (n.find('(') != std::string::npos) continue;
+            EXPECT_EQ(answers("__" + n + "__"), advertised) << n;
+            ++(advertised ? advertising : refusing);
+        }
+    }
+    EXPECT_GE(refusing, 10u)
+        << "the shipped table carries three `unsupported` words and seven "
+           "calling-convention words; a count below that means the loop above "
+           "asked nothing of one of the two verbs";
+    EXPECT_GT(advertising, 20u);
+
+    for (char const* n : {"vector_size", "mode", "naked", "ms_abi", "sysv_abi",
+                          "vectorcall", "aarch64_vector_pcs"}) {
+        EXPECT_FALSE(answers(n)) << n;
+    }
+    // CONTROLS: a name the compiler honours is still advertised, and a name
+    // nothing declares still answers 0.
+    for (char const* n : {"aligned", "noinline", "deprecated", "selectany"}) {
+        EXPECT_TRUE(answers(n)) << n;
+    }
+    EXPECT_FALSE(answers(std::string{kAbsentAttribute}));
+}
+
 // ── 6. THE SHIM SURVIVES THE INCLUDE PRE-SCAN ORACLE ────────────────────────
 //
 // [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] made the include pre-scan host the

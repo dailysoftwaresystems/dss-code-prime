@@ -1,0 +1,17 @@
+{
+  "$comment": "P69 (lane `cs`, D-C-A-NON-VOID-FUNCTION-WHOSE-END-IS-REACHABLE-IS-REFUSED): THE VALUE OF A LAYOUT CONSTANT IS THE TARGET'S, NOT THE HOST'S — the LLP64 half of a pair with `examples/c/constant_condition_reads_the_target_layout_lp64` (IDENTICAL main.c; the two manifests differ in their targets and in which function they expect to be reported). `sizeof(long)` is 4 on this target, so `when_long_is_not_eight` ends in an `if` that always returns — its closing brace is never reached and NOTHING may be said about it — while `when_long_is_eight` ends in an `if` that never fires: its end is reached on every call and it is reported once, at its brace (line 35). `expectWarnings` is exact over the code it declares, so the one entry asserts BOTH halves. This manifest is compiled on EVERY host by the in-process examples runner (and run where the target runs), which is what makes it the half that catches a fold done with the host's sizes: on a 64-bit Unix host such a fold would report line 40 here instead of line 35. See the LP64 manifest for the mechanism. The program exits 42.",
+  "$measuredComment": "(filled by the probe of THIS file's bytes)",
+  "$commentRedOnDisable": "MEASURED, each mutant built and read ALONE — the runs are in the row's closing cell: the `sizeof` hook removed from the lowering's evaluator, and the model built WITHOUT the layout parameters, each report `when_long_is_not_eight` too (a second warning of the declared code: red).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectWarnings": [
+    { "code": "H_NonVoidFunctionEndReachable", "line": 35, "col": 1, "$comment": "when_long_is_eight: under LLP64 its `if` never fires" }
+  ],
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

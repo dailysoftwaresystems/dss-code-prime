@@ -119,6 +119,7 @@ bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     checkUnnamedObject(reporter);
     checkShaderRestrictions(reporter);
     checkInlineAsm(reporter);
+    checkLinkageAttributes(reporter);
     //
     // A capped reporter (the global maxDiagnostics ceiling hit — here or in a
     // prior phase sharing this reporter) silently drops further report() calls,
@@ -1304,6 +1305,65 @@ void HirVerifier::checkConstructAggregate(DiagnosticReporter& reporter) const {
                                  "TypeKind ordinal {} (must be Struct, "
                                  "Union, or Array)",
                                  id.v, static_cast<unsigned>(kind)),
+                     sourceMap_);
+        }
+    }
+}
+
+void HirVerifier::checkLinkageAttributes(DiagnosticReporter& reporter) const {
+    if (linkageMap_ == nullptr || linkageMap_->empty()) return;
+    // By node index, not by the table's own (unspecified) order: the findings
+    // of one module come out in one order on every run.
+    std::uint32_t const moduleTag = hir_.id().v;
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        LinkageAttr const* const entry = linkageMap_->tryGet(id);
+        if (entry == nullptr) continue;
+        LinkageAttr const& attr = *entry;
+        if (hasError(hir_.flags(id))) continue;   // cascade suppression
+        bool const namesKind = !weakDefinitionKindName(attr.weakKind).empty();
+        if (attr.binding == SymbolBinding::Weak && !namesKind) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("the linkage attribute of node #{} has the weak "
+                                 "binding and names no weak-definition kind — a "
+                                 "weak definition is one any other definition of "
+                                 "the name replaces ('{}') or one of several "
+                                 "interchangeable copies ('{}'), the two link "
+                                 "differently, and nothing downstream may guess "
+                                 "which was meant",
+                                 id.v,
+                                 weakDefinitionKindName(
+                                     WeakDefinitionKind::Overridable),
+                                 weakDefinitionKindName(
+                                     WeakDefinitionKind::SelectAny)),
+                     sourceMap_);
+        }
+        if (attr.binding != SymbolBinding::Weak
+            && attr.weakKind != WeakDefinitionKind{}) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("the linkage attribute of node #{} names a "
+                                 "weak-definition kind beside the '{}' binding — "
+                                 "a kind is read only beside the weak binding, so "
+                                 "the producer meant a binding it did not set",
+                                 id.v, symbolBindingName(attr.binding)),
+                     sourceMap_);
+        }
+        if (attr.tentative && hir_.kind(id) != HirKind::Global) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("the linkage attribute of node #{} carries the "
+                                 "tentative-definition mark, and the node is not a "
+                                 "Global — only an object's definition can be a "
+                                 "tentative one", id.v),
+                     sourceMap_);
+        }
+        if (attr.tentative && attr.binding == SymbolBinding::Local) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("the linkage attribute of node #{} carries the "
+                                 "tentative-definition mark beside the internal "
+                                 "binding — an internal-linkage object takes no "
+                                 "part in the cross-unit fold the mark exists for, "
+                                 "and a consumer reading the mark alone would make "
+                                 "two units' private objects one", id.v),
                      sourceMap_);
         }
     }

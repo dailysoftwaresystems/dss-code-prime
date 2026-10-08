@@ -1,0 +1,15 @@
+{
+  "$comment": "`__declspec(...)` is a spelling of the attribute specifier for the pe object format only (`attributeSemantics.spellings` of the language document). For every other format a specifier written in it is refused by name, once per specifier and before any modifier in it is read: S_AttributeNotHonoured at the specifier's first token, twice here, and nothing else (no unknown-attribute warning beside either refusal, no second verdict on the modifiers). gcc for Linux has no such word (a syntax error) and clang for Linux and macOS refuses it by name. The pe pair, where the same file's specifiers are honoured, is examples/c/declspec_requests_are_honoured_on_pe.",
+  "$commentRedOnDisable": "Drop the refusal from `judgeAttributeSpecifier` (or `availableObjectFormats` from the spelling's row) and this source compiles for all three targets with the alignment and the inlining request applied or not as the plain rows say — which is the silent acceptance the row exists to prevent.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    {"spec": "x86_64:elf64-x86_64-linux-exec"},
+    {"spec": "arm64:elf64-aarch64-linux-exec"},
+    {"spec": "arm64:macho64-arm64-darwin-exec"}
+  ],
+  "expectDiagnostics": [
+    {"code": "S_AttributeNotHonoured", "line": 19, "col": 1},
+    {"code": "S_AttributeNotHonoured", "line": 21, "col": 1}
+  ]
+}

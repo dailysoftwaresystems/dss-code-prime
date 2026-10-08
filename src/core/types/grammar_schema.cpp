@@ -880,6 +880,12 @@ std::span<SchemaTokenId const> GrammarSchema::notFollowedBy(RuleId rule) const n
     return r->notFollowedBy;
 }
 
+std::span<SchemaTokenId const> GrammarSchema::followedBy(RuleId rule) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return {};
+    return r->followedBy;
+}
+
 ExprWrapperRules GrammarSchema::exprWrapperRules(RuleId rule) const noexcept {
     auto it = d_.exprWrapperRules.find(rule.v);
     if (it == d_.exprWrapperRules.end()) return ExprWrapperRules{};
