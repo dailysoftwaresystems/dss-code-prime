@@ -47,9 +47,13 @@
 //                                                  Zero on leaf fns (no
 //                                                  calls means no callee
 //                                                  to home args for).
-//   [SP+outgoingArgAreaSize
-//      .. SP+outgoingArgAreaSize+savedRegAreaSize) saved callee-saved regs
-//   [SP+outgoingArgAreaSize+savedRegAreaSize ..)   spill slots
+//   [SP+savedRegAreaOffset()
+//      .. SP+savedRegAreaOffset()+savedRegAreaSize) saved callee-saved regs
+//                                                  (savedRegAreaOffset() is
+//                                                  outgoingArgAreaSize rounded
+//                                                  up to the widest register
+//                                                  the area saves, if any)
+//   [SP+savedRegAreaOffset()+savedRegAreaSize ..)  spill slots
 //   [SP+totalFrameSize)                            the original pre-prologue SP
 //
 // `outgoingArgAreaSize = hasCalls ? (cc.shadowSpaceBytes +
@@ -62,12 +66,12 @@
 //    ? alignedSizeWithBias(rawPreShadow, cc.stackAlignment,
 //                          cc.callPushBytes)
 //    : alignUp(rawPreShadow, cc.stackAlignment)`
-// where `rawPreShadow = outgoingArgAreaSize + savedRegAreaSize +
+// where `rawPreShadow = savedRegAreaOffset() + savedRegAreaSize +
 // spillAreaSize`. The Win64 shadow-space requirement collapses INTO
 // outgoingArgAreaSize (no separate max() with shadowSpaceBytes —
 // it's already there).
 //
-// Spill slot N is at offset `outgoingArgAreaSize + savedRegAreaSize +
+// Spill slot N is at offset `savedRegAreaOffset() + savedRegAreaSize +
 // N * regWidth`. `regWidth` is the cc's primary integer register
 // width (8 bytes on x86_64/ARM64).
 //
@@ -849,10 +853,12 @@ struct DSS_EXPORT FrameLayout {
     // spill area and the local-alloca area so the local base lands on the
     // max-local-alignment boundary. Nonzero ONLY when a function has an
     // over-aligned local (`alignas`, or a naturally >8-aligned type like
-    // `long double`) AND the raw local base (outgoing+saved+spill) does not
+    // `long double`) AND the raw local base (the spill area's end) does not
     // already satisfy that alignment — i.e. an ODD outgoing-arg count leaves the
-    // base ≡ 8 (mod 16). Every other frame keeps this 0 → its layout is
-    // byte-identical to before this cycle (the zero-blast-radius invariant).
+    // base ≡ 8 (mod 16), in a frame whose saved-register area was not itself
+    // moved onto that boundary by a 16-byte save (`savedRegAreaOffset`). Every
+    // other frame keeps this 0 → its layout is byte-identical to before this
+    // cycle (the zero-blast-radius invariant).
     // Folded into `localAreaOffset()` (so alloca offsets shift with it) AND into
     // `totalFrameSize` (so the prologue grows + RSP stays call-aligned).
     std::uint32_t       localAreaAlignPad = 0;
@@ -889,22 +895,56 @@ struct DSS_EXPORT FrameLayout {
     // CFI emitters) can verify the invariant without re-scanning
     // the source LIR.
     bool                hasCalls          = false;
+    // The saved-register area's OWN alignment, in bytes: the widest save the
+    // prologue makes into it — per saved register, the bytes of it the
+    // convention preserves (`calleeSavedAccessFlags`, the owner the prologue
+    // asks for each store's width). 0 when the function saves no register.
+    // `savedRegAreaOffset()` rounds the area's base up to it. Last among the
+    // data members so that no existing initializer of this struct moves.
+    std::uint32_t       savedRegAreaAlign = 0;
 
-    // Derived: saved-reg area starts immediately after the outgoing-
-    // args area. Updated by D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 closure (2026-06-02) — the
+    // Derived: THE SAVED-REGISTER AREA BEGINS AT A MULTIPLE OF THE WIDEST
+    // REGISTER IT SAVES — the first one at or above the end of the
+    // outgoing-args area. That area is counted in POINTER-width slots
+    // (`outgoingSlotSize`), so an odd count of them ends 8 bytes off a
+    // multiple of 16; a register saved WHOLE at 16 bytes would then sit in an
+    // unaligned slot, and an unwind format may be able to state such a save
+    // only at a multiple of the register's width (D-WIN64-XMM-UNWIND-RESTORE:
+    // both vector save codes of Win64 UNWIND_INFO, by the format's own
+    // documentation). The slots above the base are `slotSize` apart, and
+    // `slotSize` is the widest register of every class that occupies one
+    // (`frameSlotStride`), so a base on the boundary puts every slot on it.
+    //
+    // ★ KEYED ON WHAT THE AREA HOLDS (`savedRegAreaAlign`), NOT ON ITS STRIDE.
+    // The stride is as wide as the target's widest float register whether or
+    // not the function saves one. Rounding to it would move the frame of
+    // EVERY function whose widest call passes an odd count of stack slots —
+    // and grow most of them by a whole stack-alignment unit — to align saves
+    // that are a pointer wide. A function that saves nothing wider than a
+    // pointer keeps the frame it always had: its base IS the outgoing area's
+    // end. This is a rule of the layout — no calling convention and no object
+    // format is named — and the spill area and the locals above inherit the
+    // base. The outgoing area keeps its exact size either way: a callee reads
+    // its stack arguments there, and the VLA watermark is biased by it.
+    //
+    // The outgoing-args area itself: updated by D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 closure (2026-06-02) — the
     // outgoing area is the new SP+0 zone for stack-arg overflow on
     // ANY cc that overflows its argGprs/argFprs pool. Zero when this
     // function makes no calls or every call fits in the register
     // pool — backward-compatible with leaf-fn / register-only-call
     // shapes.
     [[nodiscard]] constexpr std::uint32_t
-    savedRegAreaOffset() const noexcept { return outgoingArgAreaSize; }
+    savedRegAreaOffset() const noexcept {
+        if (savedRegAreaAlign <= 1u) return outgoingArgAreaSize;   // nothing saved
+        return (outgoingArgAreaSize + savedRegAreaAlign - 1u)
+             / savedRegAreaAlign * savedRegAreaAlign;
+    }
 
     // Derived: spill area starts immediately after the saved-reg area
     // (which itself starts after the outgoing-args area).
     [[nodiscard]] constexpr std::uint32_t
     spillAreaOffset() const noexcept {
-        return outgoingArgAreaSize + savedRegAreaSize;
+        return savedRegAreaOffset() + savedRegAreaSize;
     }
 
     // Local-int codegen (plan step 13.3b): local-alloca area
@@ -937,8 +977,7 @@ struct DSS_EXPORT FrameLayout {
         // non-over-aligned frame) shifts the local base up to its required
         // boundary. Both the alloca-offset progression and `vaRegSaveAreaOffset`
         // derive from this, so the whole topmost frame region moves in lockstep.
-        return outgoingArgAreaSize + savedRegAreaSize + spillAreaSize
-             + localAreaAlignPad;
+        return spillAreaOffset() + spillAreaSize + localAreaAlignPad;
     }
 
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the variadic register-save-area sits

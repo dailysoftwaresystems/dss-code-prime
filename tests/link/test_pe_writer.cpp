@@ -3024,19 +3024,25 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     // D-WIN64-PDATA-XDATA-UNWIND host-independent structural pin. A pe64
     // function carrying call-frame information (frame alloc + callee-saves) gets
     // a .pdata RUNTIME_FUNCTION + a .xdata UNWIND_INFO, and the EXCEPTION
-    // data directory (index 3) points at .pdata. Also pins the c114 FPR
-    // decision: a saved FPR (MS-x64 xmm6..15, spilled low-64 via MOVSD) is
-    // OMITTED from the unwind codes (no matching UWOP; RSP-irrelevant) while
-    // its 8-byte store STILL advances the following GPR saves' CodeOffsets.
+    // data directory (index 3) points at .pdata.
     //
-    // Frame 0x20 (ALLOC_SMALL slots=4) + prologue-order saves
-    // [xmm6@0, rbx@8, rbp@16]; the `mov` cursor starts at allocLen=7 (sub
-    // rsp,imm32) then +8 per store: xmm6→15 (omitted), rbx→23, rbp→31.
-    // RED-on-disable: reverting the FPR-omit to the old fail-loud makes
-    // encode() report an error; mis-passing the DSS ordinal (30) for xmm6
-    // instead of its hwEncoding (6) makes its width 9 → rbx CodeOffset 24,
-    // not 23; dropping the emission entirely removes .pdata/.xdata. Runs on
-    // every leg (pure byte inspection, no execution).
+    // ★ IT ALSO PINS D-WIN64-XMM-UNWIND-RESTORE FOR A FUNCTION THAT GUARDS NO
+    // REGION. A saved 16-byte vector register (MS-x64 xmm6..15) has a code of
+    // its own, UWOP_SAVE_XMM128, at the offset the prologue stores it — the
+    // code is what hands a frame further up ITS value of that register when a
+    // fault unwinds through this one, so it is owed by every function that
+    // saves one, guarding or not. (Until 2026-10-10 the save was OMITTED from
+    // the codes and this test required the omission: `CountOfCodes` 5.)
+    //
+    // Frame 0x28 (ALLOC_SMALL slots=5) + prologue-order saves
+    // [xmm6@16, rbx@8, rbp@32], their rules at the PCs the CFI states: 15, 23
+    // and 31. WHAT EACH WRONG ENCODER DOES TO THESE BYTES: one that states no
+    // vector code answers CountOfCodes 5 and moves the ALLOC code up; one that
+    // scales the vector slot by 8, as a general register's is, answers node 2
+    // for xmm6; dropping the emission entirely removes .pdata/.xdata. (The
+    // register field cannot tell the hardware number 6 from the DSS ordinal
+    // 22 here: the field is four bits and the ordinal is the number plus 16.)
+    // Runs on every leg (pure byte inspection, no execution).
     auto loaded = loadShippedExec();
     ASSERT_TRUE(loaded.format);
     ASSERT_TRUE(loaded.target);
@@ -3045,14 +3051,14 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
     fn.symbol = SymbolId{1};
-    // sub rsp, 0x20 (48 81 EC 20 00 00 00) ; ret (C3) — first byte 0x48
+    // sub rsp, 0x28 (48 81 EC 28 00 00 00) ; ret (C3) — first byte 0x48
     // satisfies the prologue-shape guard; the rest is opaque to the builder.
-    fn.bytes = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+    fn.bytes = {0x48, 0x81, 0xEC, 0x28, 0x00, 0x00, 0x00, 0xC3};
     // The CFI states each rule's PC DIRECTLY -- these are the byte offsets the
     // assembler measures for this prologue, not lengths the writer re-derives
-    // from an assumed encoding. Frame 0x20 on a convention whose CALL pushes 8,
-    // so the CFA is 8+0x20 = 40 once the sub retires, and each save's
-    // CFA-relative offset is its RSP slot minus 40. xmm6 is physical ordinal 22
+    // from an assumed encoding. Frame 0x28 on a convention whose CALL pushes 8,
+    // so the CFA is 8+0x28 = 48 once the sub retires, and each save's
+    // CFA-relative offset is its RSP slot minus 48. xmm6 is physical ordinal 22
     // (the FPR file starts at 16); its HARDWARE encoding is 6.
     CfiFunction cfi;
     cfi.codeLength    = 8;
@@ -3061,10 +3067,10 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
                                         /*returnAddressRegister=*/std::nullopt};
     cfi.prologueEndPc = 31;
     cfi.ops = {
-        CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{},  40},
-        CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(22), CfiRegRef{}, -40},
-        CfiOp{23, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(3),  CfiRegRef{}, -32},
-        CfiOp{31, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(5),  CfiRegRef{}, -24},
+        CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{},  48},
+        CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(22), CfiRegRef{}, -32},
+        CfiOp{23, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(3),  CfiRegRef{}, -40},
+        CfiOp{31, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(5),  CfiRegRef{}, -16},
     };
     fn.cfi = std::move(cfi);
     mod.functions.push_back(std::move(fn));
@@ -3072,7 +3078,7 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     DiagnosticReporter rep;
     auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
-    ASSERT_EQ(rep.errorCount(), 0u);   // the FPR save no longer fails loud
+    ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(img.empty());
 
     auto const [textRva, textPtr] =
@@ -3096,29 +3102,36 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     EXPECT_EQ(readU32LE(img, pdataPtr + 8u), xdataRva)     << "UnwindInfoAddress";
 
     // (3) The UNWIND_INFO, byte-for-byte. Header: Ver=1/Flags=0, SizeOfProlog
-    //     = 31, CountOfCodes = 5 (2 GPR saves ×2 nodes + 1 ALLOC_SMALL) — NOT
-    //     7 (the xmm6 save contributes NO code), FrameReg/Off = 0. Codes are
-    //     DESCENDING by CodeOffset: rbp(31), rbx(23), then ALLOC(7).
+    //     = 31, CountOfCodes = 7 (2 general saves x 2 nodes + 1 vector save x
+    //     2 nodes + 1 ALLOC_SMALL) — 5 is an encoder that states no vector
+    //     code — FrameReg/Off = 0. Codes are DESCENDING by CodeOffset: rbp(31),
+    //     rbx(23), xmm6(15), then ALLOC(7).
     std::size_t const u = xdataPtr;
     EXPECT_EQ(img[u + 0], 0x01u) << "Version=1, Flags=0";
     EXPECT_EQ(img[u + 1], 31u)   << "SizeOfProlog";
-    EXPECT_EQ(img[u + 2], 5u)    << "CountOfCodes: xmm6 omitted (else 7)";
+    EXPECT_EQ(img[u + 2], 7u)    << "CountOfCodes: the xmm6 save has its code (5 = omitted)";
     EXPECT_EQ(img[u + 3], 0x00u) << "FrameRegister=0, FrameOffset=0";
-    // rbp: UWOP_SAVE_NONVOL(4) | reg 5<<4 = 0x54, CodeOffset 31, node 16/8=2.
+    // rbp: UWOP_SAVE_NONVOL(4) | reg 5<<4 = 0x54, CodeOffset 31, node 32/8=4.
     EXPECT_EQ(img[u + 4], 31u)   << "rbp CodeOffset";
     EXPECT_EQ(img[u + 5], 0x54u) << "rbp SAVE_NONVOL | reg=5";
-    EXPECT_EQ(readU16LE(img, u + 6), 2u) << "rbp scaled offset 16/8";
+    EXPECT_EQ(readU16LE(img, u + 6), 4u) << "rbp scaled offset 32/8";
     // rbx: 0x34, CodeOffset 23 -- the PC the CFI STATED, carried through
     // untouched. The builder no longer computes it from an assumed store width,
     // which is exactly the defect that left every FPR-saving pe64 function's
     // SizeOfProlog one byte short PER SAVE
     // (D-WIN64-UNWIND-XMM-SPILL-WIDTH-ASSUMED-NINE-MEASURED-TEN).
-    EXPECT_EQ(img[u + 8], 23u)   << "rbx CodeOffset (xmm6 width was 8)";
+    EXPECT_EQ(img[u + 8], 23u)   << "rbx CodeOffset";
     EXPECT_EQ(img[u + 9], 0x34u) << "rbx SAVE_NONVOL | reg=3";
     EXPECT_EQ(readU16LE(img, u + 10), 1u) << "rbx scaled offset 8/8";
-    // ALLOC_SMALL(2) | (slots-1=3)<<4 = 0x32, CodeOffset 7 (end of sub rsp).
-    EXPECT_EQ(img[u + 12], 7u)    << "ALLOC CodeOffset";
-    EXPECT_EQ(img[u + 13], 0x32u) << "ALLOC_SMALL | (slots-1)=3";
+    // xmm6: UWOP_SAVE_XMM128(8) | hardware number 6<<4 = 0x68, CodeOffset 15
+    // (the end of its store), node 16/16 = 1 — a vector slot is scaled by
+    // SIXTEEN, so the same slot read as a general register's would say 2.
+    EXPECT_EQ(img[u + 12], 15u)   << "xmm6 CodeOffset";
+    EXPECT_EQ(img[u + 13], 0x68u) << "xmm6 SAVE_XMM128 | reg=6";
+    EXPECT_EQ(readU16LE(img, u + 14), 1u) << "xmm6 scaled offset 16/16";
+    // ALLOC_SMALL(2) | (slots-1=4)<<4 = 0x42, CodeOffset 7 (end of sub rsp).
+    EXPECT_EQ(img[u + 16], 7u)    << "ALLOC CodeOffset";
+    EXPECT_EQ(img[u + 17], 0x42u) << "ALLOC_SMALL | (slots-1)=4";
 }
 
 TEST(PeExecWriter, VlaFramePointerCaptureEmitsSetFpregSoTheFrameIsDescribable) {
@@ -3393,63 +3406,93 @@ TEST(PeExecWriter, SehScopeTableEmitsEhandlerFlagAndScopeRecord) {
     EXPECT_EQ(readU32LE(img, u + 28), parentRva + 0x18u) << "JumpTarget = parent+0x18";
 }
 
-TEST(PeExecWriter, SehGuardingFunctionSavingNonVolatileXmmFailsLoud) {
-    // c116 (D-WIN64-XMM-UNWIND-RESTORE, the H5 invariant): a __try-guarding
-    // function (non-empty sehScopes) that spills a NON-VOLATILE xmm must FAIL
-    // LOUD, not silently emit an unwind table that omits UWOP_SAVE_XMM128 — the
-    // __except handler resumes in the parent frame and could read an unrestored
-    // xmm. sqlite's WAL SEH functions spill zero non-volatile xmm (the H5 proof),
-    // so this never fires for the shipped corpus; the guard converts that proof
-    // into an ENFORCED invariant. RED-on-disable: drop the guardsSeh arm in
-    // pe.cpp buildFunctionUnwindInfo → the FPR save is silently omitted (as it
-    // legitimately is for a NON-SEH function) → this function encodes cleanly and
-    // ships a broken unwind table. The paired negative (a NON-SEH function with
-    // the same xmm save encodes fine) is the FunctionUnwindInfoEmitsPdata... test
-    // above (xmm6 omitted, no error).
+TEST(PeExecWriter, GuardingFunctionSavingVectorRegistersStatesEachSaveCode) {
+    // D-WIN64-XMM-UNWIND-RESTORE. A `__try`-guarding function that saves a
+    // call-preserved vector register used to be REFUSED here (this test was
+    // `SehGuardingFunctionSavingNonVolatileXmmFailsLoud` and required the
+    // refusal): the unwind information could not say where the register was,
+    // so a handler resuming in that frame could have read an unrestored one.
+    // The format CAN say it, and the reference does (✔MEASURED, cl 19.51 x64
+    // /O2: `movaps [rsp+30h],xmm6` ending at prologue byte 11 is `@11
+    // SAVE_XMM128 xmm6, 3` in a function that guards a region) — so the
+    // refusal was of valid programs: every guarding function with a `double`
+    // live across a call. This pins the capability in its three parts:
+    //
+    //   (A) THE SCALED FORM, in a guarding function: a slot that is a multiple
+    //       of 16 from RSP is `UWOP_SAVE_XMM128`, one node holding slot/16 —
+    //       and the scope table still sits right after the DWORD-aligned
+    //       codes, wherever the longer code array ends.
+    //   (B) THE FAR FORM IS THE FAR REACH: a slot whose quotient by 16 does
+    //       not fit one node is `UWOP_SAVE_XMM128_FAR`, the slot UNSCALED in
+    //       two nodes, low word first.
+    //   (C) WHAT STAYS REFUSED, BY NAME: a saved register that is neither a
+    //       general register nor a whole 16-byte vector register; a vector
+    //       slot below the stack pointer; a vector slot that is NOT A
+    //       MULTIPLE OF 16 — the format's documentation says of both codes
+    //       that the offset is always one, and the frame producer guarantees
+    //       it, so such a rule is a broken frame and neither form may be
+    //       used to state it; and a vector register whose hardware number
+    //       does not fit the code's four bits.
     auto loaded = loadShippedExec();
     ASSERT_TRUE(loaded.format);
     ASSERT_TRUE(loaded.target);
 
     AssembledModule mod;
     mod.expectedFuncCount = 2;
-    // Same parent shape as the scope-table test, but its prologue ALSO saves a
-    // non-volatile xmm (xmm6). sub rsp,0x20 (7B) then movsd [rsp],xmm6 — the
-    // bytes past [0] are opaque to the unwind builder (it reads the CFI).
+    // Function 0: the PARENT, guarding one region. Its prologue is the shape
+    // the frame producer emits — the allocation, then one whole-register store
+    // per saved register:
+    //   sub rsp,0x48 ; movups [rsp+0x20],xmm6 ; movups [rsp+0x30],xmm15
+    // ending at bytes 7, 15 and 24. The builder reads the CFI, not the bytes.
     AssembledFunction parent;
     parent.symbol = SymbolId{1};
-    parent.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00,          // sub rsp,0x20
-                     0xF2, 0x0F, 0x11, 0x34, 0x24,                      // movsd [rsp],xmm6
-                     0x90, 0x90, 0x90, 0xC3};
+    parent.bytes  = {0x48, 0x81, 0xEC, 0x48, 0x00, 0x00, 0x00,              // 0..6
+                     0x0F, 0x11, 0xB4, 0x24, 0x20, 0x00, 0x00, 0x00,        // 7..14
+                     0x44, 0x0F, 0x11, 0xBC, 0x24, 0x30, 0x00, 0x00, 0x00,  // 15..23
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,        // 24..31
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,        // 32..39
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xC3};       // 40..47
     {
         CfiFunction cfi;
-        cfi.codeLength    = 16;
+        cfi.codeLength    = 48;
         cfi.initial       = CfiInitialState{4, 8, -8, std::nullopt};
-        cfi.prologueEndPc = 17;
+        cfi.prologueEndPc = 24;
         cfi.ops = {
-            CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{}, 0x28},
-            // xmm6 = physical ordinal 22 (non-volatile under ms_x64).
-            CfiOp{17, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(22), CfiRegRef{}, -0x28},
+            // CFA = RSP + 0x50 once the allocation retires; a slot at RSP+S is
+            // at CFA + (S - 0x50). xmm6 and xmm15 are physical ordinals 22 and
+            // 31; their hardware numbers are 6 and 15.
+            CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{}, 0x50},
+            CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(22), CfiRegRef{}, 0x20 - 0x50},
+            CfiOp{24, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(31), CfiRegRef{}, 0x30 - 0x50},
         };
         parent.cfi = std::move(cfi);
         SehScopeEntry sc;
-        sc.beginByteOffset      = 0x0C;
-        sc.endByteOffset        = 0x0F;
-        sc.jumpTargetByteOffset = 0x0F;
+        sc.beginByteOffset      = 0x18;
+        sc.endByteOffset        = 0x20;
+        sc.jumpTargetByteOffset = 0x28;
         sc.filterFuncletSymbol  = SymbolId{2};
         sc.personalitySymbol    = SymbolId{3};
         parent.sehScopes.push_back(sc);
     }
     mod.functions.push_back(std::move(parent));
+    // Function 1: the FILTER FUNCLET, which guards nothing. Its one vector
+    // save sits 16 * 0x10000 bytes above RSP — a slot no shipped frame reaches
+    // (the allocation codes stop at 512 KiB), stated here because the rule is
+    // the builder's input and the quotient's bound is the builder's to honour.
     AssembledFunction funclet;
     funclet.symbol = SymbolId{2};
-    funclet.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+    funclet.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00,
+                      0x0F, 0x11, 0xBC, 0x24, 0x00, 0x00, 0x10, 0x00, 0xC3};
     {
         CfiFunction cfi;
-        cfi.codeLength    = 8;
+        cfi.codeLength    = 16;
         cfi.initial       = CfiInitialState{4, 8, -8, std::nullopt};
-        cfi.prologueEndPc = 7;
-        cfi.ops = { CfiOp{7, CfiOpKind::DefCfaOffset, CfiRegRef{},
-                          CfiRegRef{}, 0x28} };
+        cfi.prologueEndPc = 15;
+        cfi.ops = {
+            CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{}, 0x28},
+            // xmm7 = physical ordinal 23.
+            CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(23), CfiRegRef{}, 0x100000 - 0x28},
+        };
         funclet.cfi = std::move(cfi);
     }
     mod.functions.push_back(std::move(funclet));
@@ -3457,11 +3500,168 @@ TEST(PeExecWriter, SehGuardingFunctionSavingNonVolatileXmmFailsLoud) {
         ExternImport{SymbolId{3}, "__C_specific_handler", "msvcrt.dll",
                      /*isData=*/false});
 
-    DiagnosticReporter rep;
-    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_GT(rep.errorCount(), 0u)
-        << "a SEH-guarding function saving a non-volatile xmm must fail loud "
-           "(D-WIN64-XMM-UNWIND-RESTORE), not silently omit its restore";
+    {
+        DiagnosticReporter rep;
+        auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u)
+            << "a guarding function that saves a vector register is describable";
+        ASSERT_FALSE(img.empty());
+
+        auto const [textRva, textPtr] =
+            findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+        auto const [pdataRva, pdataPtr] =
+            findExecSection(img, {'.', 'p', 'd', 'a', 't', 'a', 0, 0});
+        auto const [xdataRva, xdataPtr] =
+            findExecSection(img, {'.', 'x', 'd', 'a', 't', 'a', 0, 0});
+        ASSERT_NE(textRva, 0u);
+        ASSERT_NE(pdataRva, 0u) << ".pdata section must exist";
+        ASSERT_NE(xdataRva, 0u) << ".xdata section must exist";
+        std::uint32_t const parentRva  = textRva;
+        std::uint32_t const funcletRva = textRva + 48u;
+        // Each function's UNWIND_INFO is found the way the system finds it:
+        // through its own RUNTIME_FUNCTION.
+        ASSERT_EQ(readU32LE(img, pdataPtr + 0u), parentRva);
+        ASSERT_EQ(readU32LE(img, pdataPtr + 12u), funcletRva);
+        std::size_t const u =
+            xdataPtr + (readU32LE(img, pdataPtr + 8u) - xdataRva);
+        std::size_t const f =
+            xdataPtr + (readU32LE(img, pdataPtr + 20u) - xdataRva);
+
+        // (A) the parent. Header: Version 1 | EHANDLER, SizeOfProlog 24,
+        // CountOfCodes 5 = xmm15 scaled (2 nodes) + xmm6 scaled (2) +
+        // ALLOC_SMALL (1). Codes DESCENDING by CodeOffset.
+        EXPECT_EQ(img[u + 0], 0x09u) << "Version=1, UNW_FLAG_EHANDLER";
+        EXPECT_EQ(img[u + 1], 24u)   << "SizeOfProlog";
+        EXPECT_EQ(img[u + 2], 5u)    << "CountOfCodes (1 = both vector saves omitted)";
+        EXPECT_EQ(img[u + 3], 0x00u) << "no frame register";
+        // xmm15 at RSP+0x30: UWOP_SAVE_XMM128(8) | 15<<4 = 0xF8, node 0x30/16 = 3.
+        EXPECT_EQ(img[u + 4], 24u)   << "xmm15 CodeOffset";
+        EXPECT_EQ(img[u + 5], 0xF8u) << "xmm15 SAVE_XMM128 | reg=15";
+        EXPECT_EQ(readU16LE(img, u + 6), 3u) << "xmm15 slot / 16 (6 = scaled by 8)";
+        // xmm6 at RSP+0x20: UWOP_SAVE_XMM128(8) | 6<<4 = 0x68, node 0x20/16 = 2.
+        EXPECT_EQ(img[u + 8], 15u)   << "xmm6 CodeOffset";
+        EXPECT_EQ(img[u + 9], 0x68u) << "xmm6 SAVE_XMM128 | reg=6";
+        EXPECT_EQ(readU16LE(img, u + 10), 2u) << "xmm6 slot / 16 (4 = scaled by 8)";
+        // ALLOC_SMALL(2) | (0x48/8 - 1 = 8)<<4 = 0x82.
+        EXPECT_EQ(img[u + 12], 7u)    << "ALLOC CodeOffset";
+        EXPECT_EQ(img[u + 13], 0x82u) << "ALLOC_SMALL | (slots-1)=8";
+        // Header (4) + five nodes (10) = 14; the code array is padded to an
+        // even count of nodes, so the handler routine's RVA and the scope
+        // table follow at 16.
+        EXPECT_GE(readU32LE(img, u + 16), textRva) << "handler field is a .text thunk RVA";
+        EXPECT_EQ(readU32LE(img, u + 20), 1u) << "scope Count = 1";
+        EXPECT_EQ(readU32LE(img, u + 24), parentRva + 0x18u) << "Begin";
+        EXPECT_EQ(readU32LE(img, u + 28), parentRva + 0x20u) << "End";
+        EXPECT_EQ(readU32LE(img, u + 32), funcletRva)        << "Handler = funclet RVA";
+        EXPECT_EQ(readU32LE(img, u + 36), parentRva + 0x28u) << "JumpTarget";
+
+        // (B) the funclet: xmm7 at RSP+0x100000. 0x100000 IS a multiple of 16,
+        // but its quotient (0x10000) does not fit one node, so the FAR form —
+        // 9 | 7<<4 = 0x79 — carries 0x00100000: low word 0, high word 0x10.
+        EXPECT_EQ(img[f + 0], 0x01u) << "Version=1, no handler";
+        EXPECT_EQ(img[f + 1], 15u)   << "SizeOfProlog";
+        EXPECT_EQ(img[f + 2], 4u)    << "CountOfCodes: FAR (3 nodes) + ALLOC_SMALL";
+        EXPECT_EQ(img[f + 4], 15u)   << "xmm7 CodeOffset";
+        EXPECT_EQ(img[f + 5], 0x79u) << "xmm7 SAVE_XMM128_FAR | reg=7";
+        EXPECT_EQ(readU16LE(img, f + 6), 0x0000u) << "xmm7 slot, low word";
+        EXPECT_EQ(readU16LE(img, f + 8), 0x0010u) << "xmm7 slot, high word";
+        EXPECT_EQ(img[f + 10], 7u)    << "ALLOC CodeOffset";
+        EXPECT_EQ(img[f + 11], 0x32u) << "ALLOC_SMALL | (slots-1)=3";
+    }
+
+    // (C) What stays refused. One function, one save rule the format has no
+    // code for; the refusal names the register and says why.
+    auto refusalOn = [&](TargetSchema const& target, std::uint16_t ordinal,
+                         std::int64_t cfaRelative) {
+        AssembledModule m;
+        m.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+        CfiFunction cfi;
+        cfi.codeLength    = 8;
+        cfi.initial       = CfiInitialState{4, 8, -8, std::nullopt};
+        cfi.prologueEndPc = 15;
+        cfi.ops = {
+            CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{}, CfiRegRef{}, 0x28},
+            CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(ordinal),
+                  CfiRegRef{}, cfaRelative},
+        };
+        fn.cfi = std::move(cfi);
+        m.functions.push_back(std::move(fn));
+        DiagnosticReporter r;
+        (void)encodeUntrampolined(m, target, *loaded.format, r);
+        std::string text;
+        for (auto const& d : r.all()) {
+            if (d.code == DiagnosticCode::K_UnwindRuleUnrepresentable) {
+                text += d.actual;
+            }
+        }
+        return text;
+    };
+    auto refusalOf = [&](std::uint16_t ordinal, std::int64_t cfaRelative) {
+        return refusalOn(*loaded.target, ordinal, cfaRelative);
+    };
+    // `rflags` is physical ordinal 32: class `flags`, eight bytes.
+    std::string const notASaveTheFormatHas = refusalOf(32, -0x28);
+    EXPECT_NE(notASaveTheFormatHas.find("save rule names rflags (class 'flags', 8 bytes)"),
+              std::string::npos)
+        << notASaveTheFormatHas;
+    EXPECT_NE(notASaveTheFormatHas.find("and nothing else"), std::string::npos)
+        << notASaveTheFormatHas;
+    // xmm6 eight bytes BELOW the stack pointer (CFA - 0x30 with the CFA at
+    // RSP + 0x28).
+    std::string const belowTheStackPointer = refusalOf(22, -0x30);
+    EXPECT_NE(belowTheStackPointer.find("saved-reg slot -8 for xmm6 is negative"),
+              std::string::npos)
+        << belowTheStackPointer;
+    // xmm6 at RSP+0x18 (CFA - 0x10): eight bytes off a multiple of 16. The
+    // format's documentation says of BOTH vector codes that the offset is
+    // always a multiple of 16, so the unscaled FAR form is not a way to say
+    // this slot — and before the frame producer guaranteed the alignment, a
+    // function whose widest call passed an odd number of stack slots had
+    // exactly this rule.
+    std::string const offTheStride = refusalOf(22, 0x18 - 0x28);
+    EXPECT_NE(offTheStride.find("saved-reg slot 24 for xmm6 is not a multiple of 16"),
+              std::string::npos)
+        << offTheStride;
+    // CONTROL for (C): the same one-function module with a rule the format
+    // DOES have a code for is not refused — the refusals above are of their
+    // rules, not of the fixture.
+    EXPECT_EQ(refusalOf(22, 0x10 - 0x28), std::string{});
+
+    // The two refusals no x86_64 register can reach: a floating-point register
+    // that is NOT sixteen bytes, and a sixteen-byte one whose hardware number
+    // does not fit the code's four bits. The x86_64 document has neither (its
+    // only `fpr` file is xmm0..xmm15, and its loader refuses a seventeenth). The
+    // writer takes its register table and its format as two arguments, and the
+    // format alone (`pe.machine`) selects this builder — so the same format
+    // handed the shipped ARM64 register table is a loadable pairing that has
+    // both: `d7` is the eight-byte reading of a vector register, and `v16` is a
+    // whole one numbered 16. Looked up by NAME: the fixture names an ordinal,
+    // and an ordinal is a position in one document.
+    {
+        auto arm64 = TargetSchema::loadShipped("arm64");
+        ASSERT_TRUE(arm64.has_value());
+        auto const d7  = (*arm64)->registerByName("d7");
+        auto const v16 = (*arm64)->registerByName("v16");
+        auto const v7  = (*arm64)->registerByName("v7");
+        ASSERT_TRUE(d7.has_value() && v16.has_value() && v7.has_value())
+            << "the shipped arm64 target no longer names d7, v16 and v7";
+        std::string const halfARegister = refusalOn(**arm64, *d7, 0x10 - 0x28);
+        EXPECT_NE(halfARegister.find("save rule names d7 (class 'fpr', 8 bytes)"),
+                  std::string::npos)
+            << halfARegister;
+        std::string const pastTheField = refusalOn(**arm64, *v16, 0x10 - 0x28);
+        EXPECT_NE(pastTheField.find("saved vector register v16 has hardware number 16"),
+                  std::string::npos)
+            << pastTheField;
+        // CONTROL: the same rule, the same register table, a whole vector
+        // register the four bits CAN name — not refused, so the two refusals
+        // above are of d7's width and of v16's number, not of the pairing.
+        EXPECT_EQ(refusalOn(**arm64, *v7, 0x10 - 0x28), std::string{});
+    }
 }
 
 namespace {

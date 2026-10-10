@@ -290,6 +290,30 @@ computeFrameLayout(LirFuncAllocation const& alloc,
             + outgoingArgSlots * layout.outgoingSlotSize)
         : 0u;
     layout.savedRegAreaSize    = static_cast<std::uint32_t>(layout.savedRegs.size()) * slotWidth;
+    // THE SAVED-REGISTER AREA'S OWN ALIGNMENT (`FrameLayout::savedRegAreaOffset`):
+    // the widest save the prologue will make into it, asked of the owner the
+    // prologue asks for each store's width — never the stride, which is as wide
+    // as the target's widest register whether or not this function saves one.
+    // Every offset below is read through `savedRegAreaOffset()`, so this is set
+    // before any of them.
+    //
+    // ⓘ ASKED QUIETLY, AND THAT IS NOT A SWALLOWED REFUSAL. Where the owner
+    // cannot state a saved register's width, the prologue's own store of that
+    // register asks it the SAME question (same schema, convention and class)
+    // and reports by its own name — and a function that probes its stack asks
+    // for a width before either. A report from here would put a layout detail
+    // in front of the refusal that names what could not be emitted
+    // (`LirCallconvAbi.AGeneralRegisterNoInstructionCanStateRefusesTheTouchByName`
+    // reads exactly one diagnostic, the touch's). A register whose width nobody
+    // can state contributes no alignment; the function does not survive it.
+    DiagnosticReporter quietWidths;
+    for (auto const& saved : layout.savedRegs) {
+        auto const saveWidth = calleeSavedAccessFlags(
+            schema, cc, saved.regClass(), "", quietWidths);
+        if (!saveWidth.has_value()) continue;
+        layout.savedRegAreaAlign = std::max<std::uint32_t>(
+            layout.savedRegAreaAlign, lirInstWidthBits(*saveWidth) / 8u);
+    }
     layout.spillAreaSize       = alloc.numSpillSlots * slotWidth;
     // Local-int codegen (plan step 13.3b) + FC7 (D-FC7-MEMBER-ACCESS):
     // local allocas sit ABOVE the spill area (positive RSP offset post-
@@ -367,13 +391,14 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     //     same reason `frameSlotPlacementAlign` caps a per-alloca offset: padding an
     //     offset past the base's own guarantee buys nothing. This changes ONLY a
     //     frame with a >stack-slot-multiple-aligned local whose base is off (e.g. an
-    //     odd outgoing-arg count leaves the x86 base ≡ 8 mod 16); every other frame's
-    //     pad is 0 (byte-identical layout — the zero-blast-radius invariant).
+    //     odd outgoing-arg count leaves the x86 base ≡ 8 mod 16, unless a 16-byte
+    //     save already moved the saved-register area onto the boundary —
+    //     `savedRegAreaOffset`); every other frame's pad is 0 (byte-identical
+    //     layout — the zero-blast-radius invariant).
     std::uint32_t localAreaAlignPad = 0;
     if (maxLocalAlign > 0) {
         std::uint32_t const rawLocalBase =
-            layout.outgoingArgAreaSize + layout.savedRegAreaSize
-            + layout.spillAreaSize;
+            layout.spillAreaOffset() + layout.spillAreaSize;
         std::uint32_t const baseAlign =
             frameSlotPlacementAlign(maxLocalAlign, frameAlign);
         if (rawLocalBase % baseAlign != 0u) {
@@ -402,7 +427,7 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     // prologue (local-int codegen, plan step 13.3b); the materialize pass
     // emits `lea result, [sp + offset]` for each `alloca` opcode.
     std::uint32_t const rawPreShadow =
-        layout.outgoingArgAreaSize + layout.savedRegAreaSize
+        layout.spillAreaOffset()
         + layout.spillAreaSize    + layout.localAreaAlignPad
         + layout.localAreaSize    + layout.vaRegSaveAreaSize;
     std::uint32_t const align = frameAlign;  // == (cc.stackAlignment > 0 ? … : 1)

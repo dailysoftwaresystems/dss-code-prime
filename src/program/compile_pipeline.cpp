@@ -44,6 +44,7 @@
 #include "lir/lir_asm_region.hpp"      // expandAsmRegions — the inline-asm bundles
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_descriptor_blocks.hpp"  // translateDescriptorBlockIds — the blocks data names
+#include "lir/lir_guarded_regions.hpp"    // guardedRegionsAt — the runs liveness reads
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_peephole.hpp"
 #include "lir/lir_regalloc.hpp"
@@ -1363,8 +1364,41 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     }
 
     // 5. Liveness analysis (input to regalloc).
+    //
+    // ★★★ D-LIR-NO-EXCEPTIONAL-EDGE-INTO-A-TRY-HANDLER: THE GUARDED RUNS GO IN
+    // WITH THE MODULE. Each `__try` scope MIR→LIR returned is a run of blocks
+    // from any instruction of which the dispatcher may hand control to the
+    // handler block, keeping only what a call keeps. Liveness makes that block
+    // an exceptional successor of every block of the run, and the allocator
+    // then keeps what the handler reads out of the volatile registers (see
+    // `LirGuardedRegion`).
+    // ★ THE SCOPES' BLOCK IDS ARE MIR→LIR's, AND LIVENESS READS `wideLir.lir`. A
+    // block id is a position in one module, so the ids are FOLLOWED here through
+    // the block image `lowerWideCallArgs` published — the first step of the very
+    // chain the scope table's binding follows to the final module, read by the
+    // same owner (`guardedRegionsAt`, lir/lir_guarded_regions.hpp). The run
+    // liveness guards is the run the table will enclose, cut at this module; a
+    // rebuild that later lands between MIR→LIR and liveness joins this list.
+    // ⚠ Calling the region-less overload here would compile every `__try`
+    // without a diagnostic and deliver its handlers garbage:
+    // `DriverArgumentSupply.GuardedRegionReachesLivenessAndTheScopeTable` in
+    // tests/program reads the emitted image for it.
     phase.emplace(substrate::CompilePhase::Regalloc);
-    auto const liveness = analyzeLiveness(wideLir.lir);
+    auto const livenessEntry = reporter.errorCount();
+    std::vector<LirBlockRebuild> const rebuildsBeforeLiveness{
+        {"wide-call-args", &lir.lir, &wideLir.lir, wideLir.blockEntryImage},
+    };
+    auto const guardedRegions = guardedRegionsAt(
+        rebuildsBeforeLiveness, lir.sehScopeDescriptors, reporter);
+    if (!guardedRegions.has_value() || !tierClean(reporter, livenessEntry)) {
+        return std::nullopt;
+    }
+    auto const livenessOrRefusal =
+        analyzeLiveness(wideLir.lir, *guardedRegions, reporter);
+    if (!livenessOrRefusal.has_value() || !tierClean(reporter, livenessEntry)) {
+        return std::nullopt;
+    }
+    LirLiveness const& liveness = *livenessOrRefusal;
 
     // 6. Register allocation.
     auto const allocEntry = reporter.errorCount();

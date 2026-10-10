@@ -1,0 +1,12 @@
+{
+  "$comment": "The EXCEPTION_* status names of <windows.h>, each compared against the SDK header's own value by a _Static_assert, so a wrong value in the shipped header fails the COMPILE on every host. The values were MEASURED 2026-10-08 with the reference compiler (cl 19.51 x64, a program printing each name the header defines), and this same file compiles there. Before this example the shipped header declared two of the family, and a filter naming any other did not compile. At run time the program catches an integer division by zero by its name: exit 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

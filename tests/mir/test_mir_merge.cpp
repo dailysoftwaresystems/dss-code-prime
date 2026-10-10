@@ -3565,6 +3565,683 @@ TEST(SynthSehFunclets, FilterReadingParentLocalEmitsRecoverParentFrameSlot) {
     EXPECT_TRUE(verifier.verify(rep)) << "the H1 SEH-lowered module must verify";
 }
 
+// ═══ D-MIR-NESTED-TRY-REGIONS-REACH-THE-OUTER-HANDLER ═══════════════════════════
+//
+// WHICH HANDLER A FAULT REACHES is decided by two things this pass owns and
+// nothing later re-derives: where each region's blocks are laid out (a scope
+// record is two addresses, and every address between them is guarded) and the
+// ORDER of the records (the handler routine gives the fault to the first record,
+// in table order, whose range holds the address and whose filter accepts).
+//
+// ✔MEASURED 2026-10-08, the base, pe64, baseline and release: two nested regions
+// whose handlers touch only a frame local — a fault in the INNER body ran the
+// OUTER handler (the image's table read `outer [+99,+233)`, `inner [+161,+188)`),
+// and an inner body holding a loop had its range run to the END of the outer one
+// (`outer [+189,+667)`, `inner [+372,+667)`): the outer body's own blocks after
+// the inner region lay inside the inner range.
+// ✔MEASURED the same day, the reference (cl 19.51 x64, /Od and /O2, a program
+// printing its own function's table; every shape answers 42):
+//     two deep                        [+20,+32) [+20,+57)
+//     three deep                      [+20,+32) [+20,+59) [+20,+87)
+//     two siblings inside one parent  [+20,+32) [+40,+59) [+20,+87)
+// — ascending END of the range, a region after every region inside it, siblings
+// by address; the outer range HOLDS the inner handler.
+//
+// The fixtures are hand-built in the order the SOURCE opens the regions (outer
+// region 0 first), which is the order the frontend numbers them and the order the
+// records used to go out in.
+namespace {
+
+// A filter block of region `region`: accepts an access violation.
+void emitAvFilter(MirBuilder& mb, TypeInterner& in, MirBlockId filterBB,
+                  MirBlockId handlerBB, std::uint32_t region) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const u32 = in.primitive(TypeKind::U32);
+    mb.beginBlock(filterBB);
+    MirInstId const code = mb.addInst(MirOpcode::SehExceptionCode, {}, u32);
+    MirLiteralValue av; av.value = std::int64_t{0xC0000005}; av.core = TypeKind::U32;
+    MirInstId const avc = mb.addConst(std::move(av), u32);
+    MirInstId const cmp = mb.addInst(MirOpcode::ICmpEq,
+                                     std::array<MirInstId, 2>{code, avc}, i32);
+    mb.addSehFilterReturn(cmp, handlerBB, region);
+}
+
+// A handler block TAGGED with its region — an otherwise unused `Const i32
+// 1000 + region` — so a scope record can be attributed to its region by what its
+// handler block holds, never by where the record sits in the table.
+void emitTaggedHandler(MirBuilder& mb, TypeInterner& in, MirBlockId handlerBB,
+                       MirBlockId next, std::uint32_t region) {
+    mb.beginBlock(handlerBB);
+    (void)mb.addConst(i32Lit(1000 + static_cast<std::int64_t>(region)),
+                      in.primitive(TypeKind::I32));
+    mb.addBr(next);
+}
+
+// A guarded one-block body: a load that could fault, the region's end marker.
+void emitFaultingBody(MirBuilder& mb, TypeInterner& in, MirBlockId bodyBB,
+                      MirInstId slot, MirBlockId next, std::uint32_t region) {
+    mb.beginBlock(bodyBB);
+    (void)mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot},
+                     in.primitive(TypeKind::I32));
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, region);
+    mb.addBr(next);
+}
+
+// One record of the pass, read off the REBUILT function: its region (the tag in
+// its handler block) and the layout positions of its first, last and handler
+// blocks.
+struct RecordRun {
+    std::uint32_t region  = UINT32_MAX;
+    std::uint32_t first   = UINT32_MAX;
+    std::uint32_t last    = UINT32_MAX;
+    std::uint32_t handler = UINT32_MAX;
+};
+
+[[nodiscard]] std::uint32_t layoutPosition(Mir const& mir, MirFuncId f, MirBlockId b) {
+    std::uint32_t const nb = mir.funcBlockCount(f);
+    for (std::uint32_t i = 0; i < nb; ++i) {
+        if (mir.funcBlockAt(f, i).v == b.v) return i;
+    }
+    return UINT32_MAX;
+}
+
+[[nodiscard]] std::vector<RecordRun>
+recordRuns(Mir const& mir, MirFuncId parent, std::vector<MirSehScope> const& scopes) {
+    std::vector<RecordRun> out;
+    for (MirSehScope const& s : scopes) {
+        RecordRun r;
+        r.first   = layoutPosition(mir, parent, s.beginBlock);
+        r.last    = layoutPosition(mir, parent, s.endBlock);
+        r.handler = layoutPosition(mir, parent, s.handlerBlock);
+        std::uint32_t const n = mir.blockInstCount(s.handlerBlock);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            MirInstId const id = mir.blockInstAt(s.handlerBlock, i);
+            if (mir.instOpcode(id) != MirOpcode::Const) continue;
+            auto const& lit = mir.literalValue(mir.constLiteralIndex(id));
+            if (auto const* v = std::get_if<std::int64_t>(&lit.value);
+                v != nullptr && *v >= 1000) {
+                r.region = static_cast<std::uint32_t>(*v - 1000);
+            }
+        }
+        out.push_back(r);
+    }
+    return out;
+}
+
+// How many blocks of the run `[first, last]` hold a `SehTryEnd` of `region`, and
+// how many hold a `SehFilterReturn` (a filter stub).
+struct RunContents {
+    std::uint32_t endsOfRegion = 0;
+    std::uint32_t filterStubs  = 0;
+};
+
+[[nodiscard]] RunContents runContents(Mir const& mir, MirFuncId parent,
+                                      RecordRun const& run, std::uint32_t region) {
+    RunContents c;
+    for (std::uint32_t p = run.first; p <= run.last; ++p) {
+        MirBlockId const b = mir.funcBlockAt(parent, p);
+        std::uint32_t const n = mir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            MirInstId const id = mir.blockInstAt(b, i);
+            if (mir.instOpcode(id) == MirOpcode::SehTryEnd && mir.instPayload(id) == region) {
+                ++c.endsOfRegion;
+            }
+            if (mir.instOpcode(id) == MirOpcode::SehFilterReturn) ++c.filterStubs;
+        }
+    }
+    return c;
+}
+
+// TWO DEEP, and the inner body holds a LOOP whose block is created LAST — where an
+// optimizer's block order puts a loop body: after the code that follows the loop.
+//
+//   entry      : slot = alloca ; SehTryBegin(0) → [oBody, oFilter]
+//   oBody      : SehTryBegin(1) → [iBody, iFilter]         outer body's entry
+//   iBody      : load ; CondBr → [iLoop, iEnd]             inner body's entry
+//   iEnd       : SehTryEnd(1) ; Br → afterInner
+//   iFilter    : … SehFilterReturn(1) → iHandler
+//   iHandler   : Br → afterInner
+//   afterInner : SehTryEnd(0) ; Br → join                   outer body, after the inner region
+//   oFilter    : … SehFilterReturn(0) → oHandler
+//   oHandler   : Br → join
+//   join       : return 0
+//   iLoop      : Br → iBody                                 INNER body, created last
+//
+// Inner body = {iBody, iLoop, iEnd}; outer body = those three plus oBody, iFilter,
+// iHandler and afterInner (the inner filter stub and the inner handler run inside
+// the outer body: a fault in the inner handler is the outer handler's).
+Mir buildSehNestedInnerLoopCreatedLast(TypeInterner& in, SymbolId sym) {
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const pI32   = in.pointer(i32);
+    TypeId const boolTy = in.primitive(TypeKind::Bool);
+    TypeId const sig    = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.addFunction(sig, sym);
+    MirBlockId const entry      = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const oBody      = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const iBody      = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const iEnd       = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const iFilter    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const iHandler   = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const afterInner = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const oFilter    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const oHandler   = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join       = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const iLoop      = mb.createBlock(StructCfMarker::Linear);
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    mb.addSehTryBegin(oBody, oFilter, 0);
+
+    mb.beginBlock(oBody);
+    mb.addSehTryBegin(iBody, iFilter, 1);
+
+    mb.beginBlock(iBody);
+    MirInstId const v    = mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const cnd  = mb.addInst(MirOpcode::ICmpNe,
+                                      std::array<MirInstId, 2>{v, zero}, boolTy);
+    mb.addCondBr(cnd, iLoop, iEnd);
+
+    mb.beginBlock(iEnd);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 1);
+    mb.addBr(afterInner);
+
+    emitAvFilter(mb, in, iFilter, iHandler, 1);
+    emitTaggedHandler(mb, in, iHandler, afterInner, 1);
+
+    mb.beginBlock(afterInner);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 0);
+    mb.addBr(join);
+
+    emitAvFilter(mb, in, oFilter, oHandler, 0);
+    emitTaggedHandler(mb, in, oHandler, join, 0);
+
+    mb.beginBlock(join);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+
+    mb.beginBlock(iLoop);
+    mb.addBr(iBody);
+    return std::move(mb).finish();
+}
+
+// THREE DEEP (regions 0 ⊃ 1 ⊃ 2), every body one block.
+Mir buildSehThreeDeep(TypeInterner& in, SymbolId sym) {
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const pI32 = in.pointer(i32);
+    TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.addFunction(sig, sym);
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b2 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f2 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h2 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const a2 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const a1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join = mb.createBlock(StructCfMarker::Linear);
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    mb.addSehTryBegin(b0, f0, 0);
+    mb.beginBlock(b0);
+    mb.addSehTryBegin(b1, f1, 1);
+    mb.beginBlock(b1);
+    mb.addSehTryBegin(b2, f2, 2);
+    emitFaultingBody(mb, in, b2, slot, a2, 2);
+    emitAvFilter(mb, in, f2, h2, 2);
+    emitTaggedHandler(mb, in, h2, a2, 2);
+    mb.beginBlock(a2);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 1);
+    mb.addBr(a1);
+    emitAvFilter(mb, in, f1, h1, 1);
+    emitTaggedHandler(mb, in, h1, a1, 1);
+    mb.beginBlock(a1);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 0);
+    mb.addBr(join);
+    emitAvFilter(mb, in, f0, h0, 0);
+    emitTaggedHandler(mb, in, h0, join, 0);
+    mb.beginBlock(join);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+// TWO SIBLINGS (regions 1 and 2) INSIDE ONE PARENT (region 0). The FIRST sibling's
+// body is TWO blocks and the second's ONE: an order by size would put the second
+// sibling first, the measured order (by address) keeps the first one first.
+Mir buildSehTwoSiblingsInOneParent(TypeInterner& in, SymbolId sym) {
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const pI32 = in.pointer(i32);
+    TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.addFunction(sig, sym);
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const b0  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b1  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b1b = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f1  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h1  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const mid = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b2  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f2  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h2  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const aft = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f0  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h0  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join = mb.createBlock(StructCfMarker::Linear);
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    mb.addSehTryBegin(b0, f0, 0);
+    mb.beginBlock(b0);
+    mb.addSehTryBegin(b1, f1, 1);
+    mb.beginBlock(b1);
+    (void)mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    mb.addBr(b1b);
+    mb.beginBlock(b1b);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 1);
+    mb.addBr(mid);
+    emitAvFilter(mb, in, f1, h1, 1);
+    emitTaggedHandler(mb, in, h1, mid, 1);
+    mb.beginBlock(mid);
+    mb.addSehTryBegin(b2, f2, 2);
+    emitFaultingBody(mb, in, b2, slot, aft, 2);
+    emitAvFilter(mb, in, f2, h2, 2);
+    emitTaggedHandler(mb, in, h2, aft, 2);
+    mb.beginBlock(aft);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 0);
+    mb.addBr(join);
+    emitAvFilter(mb, in, f0, h0, 0);
+    emitTaggedHandler(mb, in, h0, join, 0);
+    mb.beginBlock(join);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+// The measured order, as a predicate over two consecutive records of one
+// function: the earlier one ends first, or they end together and it begins later.
+[[nodiscard]] bool inMeasuredOrder(RecordRun const& earlier, RecordRun const& later) {
+    return earlier.last < later.last
+        || (earlier.last == later.last && earlier.first > later.first);
+}
+
+} // namespace
+
+TEST(SynthSehFunclets, NestedRegionEachGetsItsOwnRunAndTheInnerRecordComesFirst) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSehNestedInnerLoopCreatedLast(in, SymbolId{100});
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                      CSymbolDecorationScheme::None,
+                                      "pe64-x86_64-windows-exec", scopes, rep))
+        << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+    ASSERT_EQ(scopes.size(), 2u);
+    auto const parent = findFuncBySymbol(mir, SymbolId{100});
+    ASSERT_TRUE(parent.has_value());
+    std::vector<RecordRun> const runs = recordRuns(mir, *parent, scopes);
+
+    // THE ORDER: the inner region's record, then the outer's.
+    EXPECT_EQ(runs[0].region, 1u) << "the first record must be the INNER region's";
+    EXPECT_EQ(runs[1].region, 0u) << "the second record must be the OUTER region's";
+    EXPECT_TRUE(inMeasuredOrder(runs[0], runs[1]));
+
+    // EACH RUN IS EXACTLY ITS BODY. The inner body is three blocks although its loop
+    // block was created after everything else; the outer body is seven.
+    ASSERT_LE(runs[0].first, runs[0].last);
+    ASSERT_LE(runs[1].first, runs[1].last);
+    EXPECT_EQ(runs[0].last - runs[0].first + 1u, 3u)
+        << "the inner run must hold the inner body and nothing else";
+    EXPECT_EQ(runs[1].last - runs[1].first + 1u, 7u)
+        << "the outer run must hold the outer body, the inner region included";
+    RunContents const inner = runContents(mir, *parent, runs[0], /*region=*/1);
+    EXPECT_EQ(inner.endsOfRegion, 1u) << "the inner run ends in the inner region's end";
+    EXPECT_EQ(inner.filterStubs, 0u)  << "no filter stub lies inside the inner run";
+    EXPECT_EQ(runContents(mir, *parent, runs[0], /*region=*/0).endsOfRegion, 0u)
+        << "the block that ends the OUTER body is not in the inner run: a fault in "
+           "it would otherwise be delivered to the inner handler";
+
+    // THE INNER RUN LIES INSIDE THE OUTER ONE, and so does the inner HANDLER (a
+    // fault in it is the outer handler's) — while no handler lies inside its own run.
+    EXPECT_GT(runs[0].first, runs[1].first);
+    EXPECT_LE(runs[0].last, runs[1].last);
+    EXPECT_TRUE(runs[0].handler < runs[0].first || runs[0].handler > runs[0].last)
+        << "the inner handler must lie outside the inner run";
+    EXPECT_TRUE(runs[0].handler >= runs[1].first && runs[0].handler <= runs[1].last)
+        << "the inner handler must lie inside the OUTER run";
+    EXPECT_TRUE(runs[1].handler < runs[1].first || runs[1].handler > runs[1].last)
+        << "the outer handler must lie outside the outer run";
+
+    rederiveStructCfMarkers(mir);
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << allDiagText(rep);
+}
+
+TEST(SynthSehFunclets, RecordsFollowTheMeasuredOrderForThreeDeepAndForSiblings) {
+    struct Case {
+        char const*                name;
+        Mir                      (*build)(TypeInterner&, SymbolId);
+        std::array<std::uint32_t, 3> regionsInTableOrder;
+    };
+    // Region ids are the order the source OPENS the regions: three deep is
+    // 0 ⊃ 1 ⊃ 2; the siblings are 1 then 2, inside 0.
+    std::array<Case, 2> const cases{{
+        {"three deep", &buildSehThreeDeep, {2u, 1u, 0u}},
+        {"two siblings inside one parent", &buildSehTwoSiblingsInOneParent, {1u, 2u, 0u}},
+    }};
+    for (Case const& c : cases) {
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = c.build(in, SymbolId{100});
+        std::vector<ExternImport> ext;
+        std::vector<MirSehScope>  scopes;
+        DiagnosticReporter        rep;
+        ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                          CSymbolDecorationScheme::None,
+                                          "pe64-x86_64-windows-exec", scopes, rep))
+            << c.name << ": " << allDiagText(rep);
+        ASSERT_EQ(scopes.size(), 3u) << c.name;
+        auto const parent = findFuncBySymbol(mir, SymbolId{100});
+        ASSERT_TRUE(parent.has_value()) << c.name;
+        std::vector<RecordRun> const runs = recordRuns(mir, *parent, scopes);
+        for (std::size_t k = 0; k < 3; ++k) {
+            EXPECT_EQ(runs[k].region, c.regionsInTableOrder[k])
+                << c.name << ": record #" << k;
+        }
+        EXPECT_TRUE(inMeasuredOrder(runs[0], runs[1])) << c.name;
+        EXPECT_TRUE(inMeasuredOrder(runs[1], runs[2])) << c.name;
+        // The last record is the outermost region's and holds both others.
+        EXPECT_LE(runs[2].first, runs[0].first) << c.name;
+        EXPECT_GE(runs[2].last, runs[1].last) << c.name;
+        rederiveStructCfMarkers(mir);
+        MirVerifier verifier{mir, &in};
+        EXPECT_TRUE(verifier.verify(rep)) << c.name << ": " << allDiagText(rep);
+    }
+}
+
+// TWO REGIONS THAT OVERLAP AND DO NOT NEST have no innermost, so no order of their
+// records is right: the pass refuses, naming both. A `__try` is a statement, so
+// no source produces this; a pass that moved a region's end marker would.
+//
+//   entry : SehTryBegin(0) → [a, f0]
+//   a     : SehTryBegin(1) → [b, f1]        region 0's entry; region 1 opens inside it
+//   f1    : … SehFilterReturn(1) → h1
+//   h1    : return                           (region 1's handler leaves the function)
+//   b     : SehTryEnd(0) ; Br → c           region 0 ENDS while region 1 is open
+//   c     : SehTryEnd(1) ; Br → join
+//
+// Region 0 = {a, f1, h1, b}, region 1 = {b, c}: each is one run starting at its
+// entry (positions 1..4 and 4..5), they share `b`, and neither holds the other.
+TEST(SynthSehFunclets, TwoRegionsThatOverlapWithoutNestingAreRefused) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const sig = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.addFunction(sig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const a  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const c  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    mb.addSehTryBegin(a, f0, 0);
+    mb.beginBlock(a);
+    mb.addSehTryBegin(b, f1, 1);
+    emitAvFilter(mb, in, f1, h1, 1);
+    mb.beginBlock(h1);
+    mb.addReturn(mb.addConst(i32Lit(7), i32));
+    mb.beginBlock(b);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 0);
+    mb.addBr(c);
+    mb.beginBlock(c);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 1);
+    mb.addBr(join);
+    emitAvFilter(mb, in, f0, h0, 0);
+    emitTaggedHandler(mb, in, h0, join, 0);
+    mb.beginBlock(join);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    EXPECT_FALSE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                       CSymbolDecorationScheme::None,
+                                       "pe64-x86_64-windows-exec", scopes, rep));
+    std::string const text = allDiagText(rep);
+    EXPECT_NE(text.find("they overlap and neither holds the other"), std::string::npos)
+        << text;
+    EXPECT_NE(text.find("guarded regions 0 and 1"), std::string::npos) << text;
+    EXPECT_TRUE(scopes.empty()) << "a refused module must hand out no record";
+}
+
+// A REGION WHOSE BODY CANNOT BE ONE RUN is refused by the layout's own verifier:
+// two regions that are apart and share a block — the block can follow only one of
+// the two entries. The first region gets its run; the second's body is then in
+// two pieces, and a record over them would guard the first region's entry too.
+//
+//   entry : CondBr → [p0, p1]
+//   p0    : SehTryBegin(0) → [a0, f0]        p1 : SehTryBegin(1) → [a1, f1]
+//   a0    : Br → s                           a1 : Br → s
+//   s     : SehTryEnd(0) ; SehTryEnd(1) ; Br → join
+TEST(SynthSehFunclets, ABodyThatCannotBeLaidOutAsOneRunIsRefused) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const pI32   = in.pointer(i32);
+    TypeId const boolTy = in.primitive(TypeKind::Bool);
+    TypeId const sig    = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.addFunction(sig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const p0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const p1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const a0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const a1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const s  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    MirInstId const v    = mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const cnd  = mb.addInst(MirOpcode::ICmpNe,
+                                      std::array<MirInstId, 2>{v, zero}, boolTy);
+    mb.addCondBr(cnd, p0, p1);
+    mb.beginBlock(p0);
+    mb.addSehTryBegin(a0, f0, 0);
+    mb.beginBlock(p1);
+    mb.addSehTryBegin(a1, f1, 1);
+    mb.beginBlock(a0);
+    mb.addBr(s);
+    mb.beginBlock(a1);
+    mb.addBr(s);
+    mb.beginBlock(s);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 0);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 1);
+    mb.addBr(join);
+    emitAvFilter(mb, in, f0, h0, 0);
+    emitTaggedHandler(mb, in, h0, join, 0);
+    emitAvFilter(mb, in, f1, h1, 1);
+    emitTaggedHandler(mb, in, h1, join, 1);
+    mb.beginBlock(join);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    EXPECT_FALSE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                       CSymbolDecorationScheme::None,
+                                       "pe64-x86_64-windows-exec", scopes, rep));
+    std::string const text = allDiagText(rep);
+    EXPECT_NE(text.find("is not laid out as one run of its function starting at the "
+                        "body's entry"), std::string::npos) << text;
+    EXPECT_TRUE(scopes.empty()) << "a refused module must hand out no record";
+}
+
+// ═══ D-MIR-TRY-FILTER-SHARED-PURE-VALUE-REFUSED-IN-RELEASE ══════════════════════
+//
+// A filter funclet is a function of its own: it keeps none of the parent's
+// registers. A value of the parent reaches it as a parent FRAME SLOT, or as a
+// value it can COMPUTE AGAIN — an instruction that is a function of its operands
+// and of nothing else. The optimizer makes the second kind: CSE hands a filter's
+// `GlobalAddr g` or `3 + 4` the dominating copy computed before the region.
+// ✔MEASURED 2026-10-08 at the base: a filter reading a global the function also
+// wrote before the region compiled at baseline and was REFUSED in release.
+//
+//   entry    : slot = alloca ; g = globaladdr G ; sum = 3 + 4 ; [early = load g] ;
+//              SehTryBegin(0) → [tryBB, filterBB]
+//   filterBB : (code == AV) & (load g == sum)          — reads `g` and `sum`
+//              (code == AV) & (early == sum)           — reads `early`, a LOAD
+namespace {
+
+Mir buildSehFilterReadsValueFromBeforeTheRegion(TypeInterner& in, SymbolId sym,
+                                                bool readsAnEarlierLoad) {
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const u32  = in.primitive(TypeKind::U32);
+    TypeId const pI32 = in.pointer(i32);
+    TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(7)),
+                       MirFuncId{}, SymbolBinding::Global,
+                       SymbolVisibility::Default, /*isConst=*/false,
+                       MirThreadStorage::Shared);
+    mb.addFunction(sig, sym);
+    MirBlockId const entry     = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tryBB     = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const filterBB  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const handlerBB = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const joinBB    = mb.createBlock(StructCfMarker::Linear);
+
+    mb.beginBlock(entry);
+    MirInstId const slot  = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    MirInstId const g     = mb.addGlobalAddr(SymbolId{300}, pI32);
+    MirInstId const k3    = mb.addConst(i32Lit(3), i32);
+    MirInstId const k4    = mb.addConst(i32Lit(4), i32);
+    MirInstId const sum   = mb.addInst(MirOpcode::Add, std::array<MirInstId, 2>{k3, k4}, i32);
+    MirInstId const early = mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{g}, i32);
+    mb.addSehTryBegin(tryBB, filterBB, 0);
+
+    emitFaultingBody(mb, in, tryBB, slot, joinBB, 0);
+
+    mb.beginBlock(filterBB);
+    MirInstId const code = mb.addInst(MirOpcode::SehExceptionCode, {}, u32);
+    MirLiteralValue av; av.value = std::int64_t{0xC0000005}; av.core = TypeKind::U32;
+    MirInstId const avc = mb.addConst(std::move(av), u32);
+    MirInstId const c1  = mb.addInst(MirOpcode::ICmpEq,
+                                     std::array<MirInstId, 2>{code, avc}, i32);
+    MirInstId const read = readsAnEarlierLoad
+        ? early
+        : mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{g}, i32);
+    MirInstId const c2   = mb.addInst(MirOpcode::ICmpEq,
+                                      std::array<MirInstId, 2>{read, sum}, i32);
+    MirInstId const both = mb.addInst(MirOpcode::And,
+                                      std::array<MirInstId, 2>{c1, c2}, i32);
+    mb.addSehFilterReturn(both, handlerBB, 0);
+
+    emitTaggedHandler(mb, in, handlerBB, joinBB, 0);
+    mb.beginBlock(joinBB);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+} // namespace
+
+TEST(SynthSehFunclets, FilterComputesAgainAValueTheParentComputedBeforeTheRegion) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSehFilterReadsValueFromBeforeTheRegion(in, SymbolId{100},
+                                                          /*readsAnEarlierLoad=*/false);
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                      CSymbolDecorationScheme::None,
+                                      "pe64-x86_64-windows-exec", scopes, rep))
+        << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+    ASSERT_EQ(scopes.size(), 1u);
+
+    // The funclet holds its OWN copy of the address and of the sum — operands and
+    // all — and every operand of every instruction in it is an instruction of the
+    // funclet: nothing of the parent's is named across the function boundary.
+    auto const funclet = findFuncBySymbol(mir, scopes[0].filterFuncletSymbol);
+    ASSERT_TRUE(funclet.has_value());
+    std::unordered_map<std::uint32_t, MirOpcode> own;
+    std::uint32_t const nbf = mir.funcBlockCount(*funclet);
+    for (std::uint32_t bi = 0; bi < nbf; ++bi) {
+        MirBlockId const b = mir.funcBlockAt(*funclet, bi);
+        for (std::uint32_t ii = 0; ii < mir.blockInstCount(b); ++ii) {
+            MirInstId const id = mir.blockInstAt(b, ii);
+            own.emplace(id.v, mir.instOpcode(id));
+        }
+    }
+    std::uint32_t addresses = 0, sums = 0, recovered = 0;
+    for (std::uint32_t bi = 0; bi < nbf; ++bi) {
+        MirBlockId const b = mir.funcBlockAt(*funclet, bi);
+        for (std::uint32_t ii = 0; ii < mir.blockInstCount(b); ++ii) {
+            MirInstId const id = mir.blockInstAt(b, ii);
+            for (MirInstId const o : mir.instOperands(id)) {
+                EXPECT_TRUE(own.contains(o.v))
+                    << "a funclet instruction names an instruction of another function";
+            }
+            MirOpcode const op = mir.instOpcode(id);
+            if (op == MirOpcode::RecoverParentFrameSlot) ++recovered;
+            if (op == MirOpcode::GlobalAddr) {
+                ++addresses;
+                EXPECT_EQ(mir.globalAddrSymbol(id).v, 300u);
+            }
+            if (op == MirOpcode::Add) {
+                ++sums;
+                for (MirInstId const o : mir.instOperands(id)) {
+                    auto const it = own.find(o.v);
+                    ASSERT_NE(it, own.end());
+                    EXPECT_EQ(it->second, MirOpcode::Const)
+                        << "the sum's operands are computed again with it";
+                }
+            }
+        }
+    }
+    EXPECT_EQ(addresses, 1u) << "the global's address is computed again in the funclet";
+    EXPECT_EQ(sums, 1u)      << "the sum is computed again in the funclet";
+    EXPECT_EQ(recovered, 0u) << "nothing here is a parent frame slot";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << allDiagText(rep);
+}
+
+TEST(SynthSehFunclets, FilterReadingAnEarlierLoadIsRefusedByName) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSehFilterReadsValueFromBeforeTheRegion(in, SymbolId{100},
+                                                          /*readsAnEarlierLoad=*/true);
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    // A LOAD is memory at an earlier moment: the filter runs at the fault, and the
+    // body may have stored since. It is neither a frame slot nor a function of its
+    // operands, so it stays a refusal — one that names the instruction.
+    EXPECT_FALSE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                       CSymbolDecorationScheme::None,
+                                       "pe64-x86_64-windows-exec", scopes, rep));
+    std::string const text = allDiagText(rep);
+    EXPECT_NE(text.find("the value is a 'load'"), std::string::npos) << text;
+    EXPECT_NE(text.find("can neither read from the parent's frame nor compute again "
+                        "from its operands"), std::string::npos) << text;
+}
+
 // ── FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): synthesizeThreadsShim ──────────────
 // A caller references mtx_lock (pre-minted SymbolId{10}, seeded into functionSymbols by
 // the CST→HIR seam so the reference lowered to a GlobalAddr against a NOT-yet-defined

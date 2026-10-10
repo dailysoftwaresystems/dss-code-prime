@@ -106,7 +106,8 @@
         { "when": { "format": "macho" }, "value": 29, "type": "i32" }
     ] },
     { "name": "_SC_NPROCESSORS_ONLN", "variants": [
-        { "when": { "format": "elf" }, "value": 84, "type": "i32" }
+        { "when": { "format": "elf" },   "value": 84, "type": "i32" },
+        { "when": { "format": "macho" }, "value": 58, "type": "i32" }
     ] }
   ]
 }

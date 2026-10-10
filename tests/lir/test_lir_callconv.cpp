@@ -2184,6 +2184,146 @@ TEST(LirCallconv, MultiFunctionModuleMaterializesEachFunction) {
     EXPECT_EQ(result.perFunc.size(), 2u);
 }
 
+// ── THE SAVED-REGISTER AREA BEGINS AT A MULTIPLE OF THE WIDEST REGISTER IT SAVES ──
+//
+// A rule of the LAYOUT, stated with no convention and no format named
+// (`FrameLayout::savedRegAreaOffset`, `FrameLayout::savedRegAreaAlign`). The
+// area sits above the outgoing-argument area, which is counted in pointer-width
+// slots: an odd count of them ends 8 bytes off a multiple of 16, and a register
+// saved WHOLE at 16 bytes would then sit in an unaligned slot — which an unwind
+// format may be unable to state at all (both vector save codes of Win64
+// UNWIND_INFO say a multiple of 16, by the format's documentation:
+// D-WIN64-XMM-UNWIND-RESTORE).
+//
+// ★ BOTH HALVES ARE THE RULE. (1) Every saved register sits at a multiple of the
+// width its convention saves it at. (2) A frame that saves nothing wider than a
+// pointer IS WHERE IT ALWAYS WAS: its saved-register area begins exactly where
+// the outgoing area ends. Rounding to the area's stride instead — 16 bytes on a
+// target whose widest float register is 16, whatever the function saves — gives
+// (1) and breaks (2): it moves the frame of every function whose widest call
+// passes an odd count of stack slots and grows most of them by 16 bytes.
+//
+// Pinned where it is made, for EVERY shipped convention of EVERY target, with
+// callers whose widest call passes 0, 1, 2 and 3 arguments beyond what the
+// convention passes in registers, each once keeping an INTEGER across that call
+// and once keeping a DOUBLE across it (which a convention that preserves a
+// vector register whole keeps in one, and therefore saves). The widths are asked
+// of the owner the prologue asks (`calleeSavedAccessFlags`), never written here.
+TEST(LirCallconv, SavedRegisterAreaBeginsAtAMultipleOfTheWidestRegisterItSaves) {
+    std::size_t movedOntoABoundary = 0;   // over every convention of every target
+    std::size_t leftWhereItWas     = 0;   // off the stride, nothing wide saved
+    for (char const* targetName : {"x86_64", "arm64"}) {
+        auto target = TargetSchema::loadShipped(targetName);
+        ASSERT_TRUE(target.has_value()) << targetName;
+        std::size_t const conventions = (*target)->callingConventions().size();
+        ASSERT_GE(conventions, 1u) << targetName;
+        for (std::uint16_t ccIndex = 0; ccIndex < conventions; ++ccIndex) {
+            auto const* cc = (*target)->callingConvention(ccIndex);
+            ASSERT_NE(cc, nullptr);
+            SCOPED_TRACE(std::string{targetName} + " / " + cc->name);
+            std::size_t const inRegisters = cc->argGprs.size();
+            ASSERT_GE(inRegisters, 1u);
+            std::string src;
+            for (std::size_t extra = 0; extra <= 3; ++extra) {
+                std::size_t const args = inRegisters + extra;
+                std::string params;
+                std::string values;
+                for (std::size_t a = 0; a < args; ++a) {
+                    params += std::format("{}long long a{}", a == 0 ? "" : ", ", a);
+                    values += std::format("{}{}", a == 0 ? "" : ", ", a + 1);
+                }
+                src += std::format("long long g{}({}) {{ return a0 + a{}; }}\n",
+                                   extra, params, args - 1);
+                src += std::format("long long f{}(long long keep) {{ return g{}({}) + keep; }}\n",
+                                   extra, extra, values);
+                src += std::format("double h{}(double keep) {{ return (double)g{}({}) + keep; }}\n",
+                                   extra, extra, values);
+            }
+            auto bundle = lowerThroughRewrite(src, ccIndex, targetName);
+            ASSERT_TRUE(bundle.lowered.lir.ok);
+            ASSERT_TRUE(bundle.rewritten.ok);
+            DiagnosticReporter ccRep;
+            auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                                       *bundle.lowered.target,
+                                                       bundle.alloc, ccRep);
+            ASSERT_TRUE(result.ok());
+            std::size_t onTheStride  = 0;   // callers whose outgoing area ends on it
+            std::size_t offTheStride = 0;   // … and off it
+            for (std::size_t i = 0; i < result.perFunc.size(); ++i) {
+                FrameLayout const& layout = result.perFunc[i];
+                ASSERT_GT(layout.slotSize, 0u);
+                ASSERT_GT(layout.outgoingSlotSize, 0u);
+                std::uint32_t const base = layout.savedRegAreaOffset();
+                // (1) EVERY SAVED REGISTER AT A MULTIPLE OF ITS OWN SAVE WIDTH.
+                std::uint32_t widest = 0;
+                for (std::size_t r = 0; r < layout.savedRegs.size(); ++r) {
+                    DiagnosticReporter widthRep;
+                    auto const flags = calleeSavedAccessFlags(
+                        *bundle.lowered.target, *cc, layout.savedRegs[r].regClass(),
+                        "t", widthRep);
+                    ASSERT_TRUE(flags.has_value());
+                    std::uint32_t const bytes = lirInstWidthBits(*flags) / 8u;
+                    ASSERT_GT(bytes, 0u);
+                    widest = std::max(widest, bytes);
+                    std::uint32_t const slot =
+                        base + static_cast<std::uint32_t>(r) * layout.slotSize;
+                    EXPECT_EQ(slot % bytes, 0u)
+                        << "function #" << i << ": saved register #" << r << " is "
+                        << bytes << " bytes wide and sits at " << slot
+                        << " (the area begins at " << base
+                        << ", the outgoing area ends at "
+                        << layout.outgoingArgAreaSize << ")";
+                }
+                EXPECT_EQ(layout.savedRegAreaAlign, widest)
+                    << "function #" << i << ": the area's alignment is the widest "
+                       "save it holds";
+                // (2) NOTHING WIDER THAN A POINTER SAVED: THE FRAME IS WHERE IT WAS.
+                if (widest <= layout.outgoingSlotSize) {
+                    EXPECT_EQ(base, layout.outgoingArgAreaSize)
+                        << "function #" << i << " saves nothing wider than "
+                        << layout.outgoingSlotSize << " bytes (widest " << widest
+                        << "), so its saved-register area begins where its outgoing "
+                           "area ends";
+                } else {
+                    EXPECT_GE(base, layout.outgoingArgAreaSize);
+                    EXPECT_LT(base - layout.outgoingArgAreaSize, widest);
+                }
+                // Everything above goes through that base, and the frame holds it.
+                EXPECT_EQ(layout.spillAreaOffset(), base + layout.savedRegAreaSize);
+                EXPECT_GE(layout.localAreaOffset(),
+                          layout.spillAreaOffset() + layout.spillAreaSize);
+                EXPECT_GE(layout.totalFrameSize,
+                          layout.localAreaOffset() + layout.localAreaSize);
+                if (!layout.hasCalls) continue;
+                if (layout.outgoingArgAreaSize % layout.slotSize == 0u) {
+                    ++onTheStride;
+                    continue;
+                }
+                ++offTheStride;
+                if (base > layout.outgoingArgAreaSize) {
+                    ++movedOntoABoundary;
+                } else if (layout.savedRegAreaSize + layout.spillAreaSize > 0u) {
+                    ++leftWhereItWas;
+                }
+            }
+            EXPECT_GE(onTheStride, 1u)
+                << "no caller's outgoing area ended on the stride: the even case was "
+                   "not read";
+            EXPECT_GE(offTheStride, 1u)
+                << "no caller's outgoing area ended off the stride: the odd case, the "
+                   "one the rule exists for, was not read";
+        }
+    }
+    // The premises: both halves of the rule were MET, somewhere in the matrix.
+    EXPECT_GE(movedOntoABoundary, 1u)
+        << "no frame saved a register wider than a pointer above an off-stride "
+           "outgoing area: half (1) of the rule was never exercised";
+    EXPECT_GE(leftWhereItWas, 1u)
+        << "no frame with an off-stride outgoing area and nothing wide saved owned "
+           "a saved register or a spill slot: half (2) of the rule was never "
+           "exercised";
+}
+
 TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
     // Lock the FrameLayout substrate contract: spillAreaOffset ==
     // savedRegAreaSize; savedRegAreaSize == savedRegs.size() * slotSize;
@@ -2210,12 +2350,20 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
     ASSERT_NE(cc, nullptr);
     for (std::size_t i = 0; i < result.perFunc.size(); ++i) {
         auto const& layout = result.perFunc[i];
-        // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 (2026-06-02): spillAreaOffset is now
-        // outgoingArgAreaSize + savedRegAreaSize (outgoing area is
-        // the new SP+0 zone; saved regs sit above it).
+        // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 (2026-06-02): the outgoing area is
+        // the SP+0 zone and the saved regs sit above it — at the first
+        // multiple of the widest register the area saves at or above its
+        // end, which is its end when nothing wider than a pointer is saved
+        // (the rule `SavedRegisterAreaBeginsAtAMultipleOfTheWidestRegisterItSaves`
+        // pins for every convention); the spill area follows the saved regs.
+        ASSERT_GT(layout.slotSize, 0u);
+        std::uint32_t const savedAlign =
+            layout.savedRegAreaAlign <= 1u ? 1u : layout.savedRegAreaAlign;
+        EXPECT_EQ(layout.savedRegAreaOffset(),
+                  (layout.outgoingArgAreaSize + savedAlign - 1u)
+                      / savedAlign * savedAlign);
         EXPECT_EQ(layout.spillAreaOffset(),
-                  layout.outgoingArgAreaSize + layout.savedRegAreaSize);
-        EXPECT_EQ(layout.savedRegAreaOffset(), layout.outgoingArgAreaSize);
+                  layout.savedRegAreaOffset() + layout.savedRegAreaSize);
         EXPECT_EQ(layout.savedRegAreaSize,
                   static_cast<std::uint32_t>(layout.savedRegs.size()) * layout.slotSize);
         EXPECT_EQ(layout.spillAreaSize,
@@ -2227,15 +2375,13 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
         EXPECT_EQ(layout.localAreaSize,
                   layout.numLocalAllocas * layout.slotSize);
         EXPECT_EQ(layout.localAreaOffset(),
-                  layout.outgoingArgAreaSize + layout.savedRegAreaSize
-                      + layout.spillAreaSize);
+                  layout.spillAreaOffset() + layout.spillAreaSize);
         // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02) + D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7
         // (2026-06-02) + the local-alloca area (2026-06-02):
         // expected formula incorporates outgoingArgAreaSize directly
         // (already includes the callee's shadow-space when hasCalls)
         // AND the new localAreaSize above the spill area.
-        std::uint32_t const raw = layout.outgoingArgAreaSize
-                                + layout.savedRegAreaSize
+        std::uint32_t const raw = layout.spillAreaOffset()
                                 + layout.spillAreaSize
                                 + layout.localAreaSize;
         std::uint32_t expected;

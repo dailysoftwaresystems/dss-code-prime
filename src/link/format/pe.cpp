@@ -293,11 +293,19 @@ peThunkSizeFor(std::uint16_t machine) noexcept {
 // `sub rsp, frame` (or, for `frame > stackProbePageBytes`, the inline page-probe
 // loop) then one `mov [rsp + saveOffset], reg` per used callee-save — no push,
 // no frame pointer. So the unwind codes are UWOP_ALLOC_{SMALL,LARGE} for the RSP
-// adjustment + UWOP_SAVE_NONVOL per saved GPR. A saved FPR (MS-x64 xmm6..15) is
-// spilled low-64 via MOVSD, for which there is no matching UWOP (SAVE_XMM128
-// describes a full-16-byte MOVAPS slot); since an xmm save does not move RSP it is
-// OMITTED from the codes — the RSP/return-address walk stays exact. Its handler-
-// case RESTORE is deferred to D-WIN64-XMM-UNWIND-RESTORE (c116).
+// adjustment + UWOP_SAVE_NONVOL per saved general register + UWOP_SAVE_XMM128
+// (or its FAR form) per saved 16-byte vector register (MS-x64 xmm6..15, which
+// the prologue stores WHOLE).
+//
+// ★ A SAVE CODE IS NOT ABOUT THE STACK WALK, AND THAT IS WHY LEAVING ONE OUT
+// LOOKED HARMLESS (D-WIN64-XMM-UNWIND-RESTORE). A vector save never moves RSP,
+// so the return-address walk is exact without it. What the code carries is the
+// CALLER's value of a register this function saved and then reused: when a
+// fault unwinds THROUGH this frame to a handler further up, the code is the
+// only thing that tells the unwinder where that value is. Whether any frame
+// above keeps a `double` in such a register across its call is a fact about
+// this function's callers — a foreign object's included — that no function
+// can know. So the code is stated for EVERY function that saves one.
 //
 // CRITICAL (audit-F1): each UNWIND_CODE's CodeOffset = the byte offset of the END
 // of the instruction that performs that op (NOT the whole-prologue length); the
@@ -322,13 +330,16 @@ peThunkSizeFor(std::uint16_t machine) noexcept {
 // a DWARF-style CFA rule change at PC X is a Win64 UNWIND_CODE with CodeOffset X.
 //   * CFA offset grows by N          -> UWOP_ALLOC_{SMALL,LARGE} of N
 //   * CFA base becomes register R    -> UWOP_SET_FPREG (R, offset 0)
-//   * register R saved at CFA+K      -> UWOP_SAVE_NONVOL (R, (K + cfaOffset)/8)
-// Anything else is REFUSED by name -- see `fail` below. A saved FPR (MS-x64
-// xmm6..15) is spilled low-64 via MOVSD, for which there is no matching UWOP
-// (SAVE_XMM128 describes a full 16-byte MOVAPS slot); since an xmm save does not
-// move RSP it is OMITTED from the codes -- the RSP/return-address walk stays
-// exact -- and a __try-guarding function that saves one fails LOUD
-// (D-WIN64-XMM-UNWIND-RESTORE).
+//   * general register R saved at CFA+K
+//                                    -> UWOP_SAVE_NONVOL (R, (K + cfaOffset)/8)
+//   * 16-byte vector register X saved at CFA+K, a multiple of 16 from RSP
+//                                    -> UWOP_SAVE_XMM128 (X, (K + cfaOffset)/16)
+//                                       while the quotient fits one node, else
+//                                       UWOP_SAVE_XMM128_FAR (X, K + cfaOffset,
+//                                       UNSCALED, in two nodes) -- the far REACH;
+//                                       a slot that is not a multiple of 16 has
+//                                       no code in either form and is refused
+// Anything else is REFUSED by name -- see `fail` below.
 //
 // CRITICAL (audit-F1): each UNWIND_CODE's CodeOffset = the byte offset of the END
 // of the instruction that performs that op (NOT the whole-prologue length), and
@@ -339,6 +350,11 @@ constexpr std::uint8_t kUwopAllocLarge  = 1;  // 2 nodes (opinfo 0, size/8 as u1
 constexpr std::uint8_t kUwopAllocSmall  = 2;  // 1 node, opinfo = size/8 - 1 — frames 8..128 B
 constexpr std::uint8_t kUwopSetFpReg    = 3;  // 1 node, opinfo 0 — CFA base becomes the frame register
 constexpr std::uint8_t kUwopSaveNonvol  = 4;  // 2 nodes (opinfo=reg, offset/8 as u16)
+constexpr std::uint8_t kUwopSaveXmm128    = 8;  // 2 nodes (opinfo=vector register number, offset/16 as u16)
+constexpr std::uint8_t kUwopSaveXmm128Far = 9;  // 3 nodes (opinfo=vector register number, offset UNSCALED as u32, low word first)
+// The width of the one vector save the format can state: UWOP_SAVE_XMM128 and
+// its FAR form each say "all 128 bits of this register are in that slot".
+constexpr std::uint16_t kUwopVectorSaveBytes = 16;
 constexpr std::size_t  kRuntimeFunctionSize = 12;  // BeginAddress + EndAddress + UnwindInfoAddress (3 u32)
 
 // Build one function's UNWIND_INFO blob (aligned to a multiple of 4 bytes so the
@@ -427,19 +443,17 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                     "large-frame probe to __chkstk (D-WIN64-CHKSTK-LARGE-PROLOGUE)");
     }
 
-    struct Code { std::uint8_t codeOffset; std::uint8_t opAndInfo; std::uint16_t node; bool hasNode; };
+    // One UNWIND_CODE: the two-byte code node, then the `extraNodes` operand
+    // nodes its operation carries (none, one or two), each a little-endian u16.
+    struct Code {
+        std::uint8_t                 codeOffset;
+        std::uint8_t                 opAndInfo;
+        std::array<std::uint16_t, 2> nodes;
+        std::uint8_t                 extraNodes;
+    };
     // Codes accumulate in ASCENDING CodeOffset (the order the ops arrive, which
     // the representation guarantees is sorted by PC) and are emitted REVERSED.
     std::vector<Code> codes;
-    // c116b (D-WIN64-XMM-UNWIND-RESTORE): a function that GUARDS a `__try` has an
-    // exception handler that RESUMES in this frame post-unwind and runs parent code.
-    // If that code reads a non-volatile xmm (xmm6-15) that was live before the fault,
-    // the OS must restore it during the unwind — which needs a UWOP_SAVE_XMM128 in
-    // this UNWIND_INFO (backed by a 16-byte movaps spill). DSS spills only the low 64
-    // bits (movsd) and OMITS the FPR unwind codes (fine for NON-SEH functions: an xmm
-    // save never affects RSP/return-address reconstruction). For a SEH function it is
-    // NOT fine — so fail LOUD rather than emit an unwind table that silently fails to
-    // restore a non-volatile xmm on the handler path.
     bool const guardsSeh = !sehScopes.empty();
     std::uint8_t frameRegisterByte = 0x00u;   // FrameRegister nibble | FrameOffset nibble
     std::int64_t cfaOffset = cfi.initial.cfaOffset;
@@ -492,11 +506,11 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                                      static_cast<std::uint8_t>(
                                          kUwopAllocSmall
                                          | ((static_cast<std::uint8_t>(slots) - 1u) << 4)),
-                                     0u, false});
+                                     {}, 0u});
             } else if (slots <= 0xFFFFu) {  // ≤ 512 KiB — opinfo 0, one u16 node
                 codes.push_back(Code{static_cast<std::uint8_t>(op.pcOffset),
                                      static_cast<std::uint8_t>(kUwopAllocLarge | (0u << 4)),
-                                     static_cast<std::uint16_t>(slots), true});
+                                     {static_cast<std::uint16_t>(slots), 0u}, 1u});
             } else {
                 return fail("frame " + std::to_string(delta) + " > 512 KiB needs "
                             "UWOP_ALLOC_LARGE op-info=1 (u32 node) — no shipped "
@@ -526,7 +540,7 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
             }
             frameRegisterByte = static_cast<std::uint8_t>(ri->hwEncoding & 0x0Fu);
             codes.push_back(Code{static_cast<std::uint8_t>(op.pcOffset),
-                                 kUwopSetFpReg, 0u, false});
+                                 kUwopSetFpReg, {}, 0u});
             break;
         }
         case CfiOpKind::RegAtCfaOffset: {
@@ -547,16 +561,85 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
             // CFA + op.offset, so its RSP-relative slot is the sum.
             std::int64_t const slotFromSp = op.offset + cfaOffset;
             if (ri->regClass != TargetRegClass::GPR) {
-                if (guardsSeh) {
-                    return fail("a __try-guarding function saves non-volatile "
-                                + ri->name
-                                + " but DSS omits UWOP_SAVE_XMM128 (spills low-64 via "
-                                  "movsd) — the __except handler could read an unrestored "
-                                  "xmm on resume. D-WIN64-XMM-UNWIND-RESTORE (spill xmm6-"
-                                  "15 with movaps + emit SAVE_XMM128) must land before a "
-                                  "SEH function may use a non-volatile xmm.");
+                // ── A SAVED VECTOR REGISTER — D-WIN64-XMM-UNWIND-RESTORE.
+                //
+                // The format has exactly one vector save, in two spellings
+                // (the x64 unwind-data documentation). UWOP_SAVE_XMM128 says
+                // all 128 bits of a non-volatile XMM register are on the
+                // stack: the operation info is the register's number and the
+                // next node is the slot's offset SCALED BY 16.
+                // UWOP_SAVE_XMM128_FAR says the same with the offset UNSCALED
+                // in the next two nodes. ✔MEASURED against the reference
+                // (cl 19.51 x64, /O2): `movaps [rsp+30h],xmm6` ending at
+                // prologue byte 11 is the code `@11 SAVE_XMM128 xmm6, 3` — in
+                // a function that guards a `__try` and in one that does not.
+                //
+                // ★ BOTH FORMS SAY A MULTIPLE OF 16, AND ONLY THAT. The same
+                // documentation: for these two codes "the offset is always a
+                // multiple of 16", because 128-bit XMM operations occur on
+                // 16-byte aligned memory. The FAR form is the far REACH — a
+                // quotient that does not fit one node — and never a way to
+                // say an unaligned slot: whoever reads the slot back is
+                // entitled to an aligned load. The frame producer guarantees
+                // the alignment (the saved-register area begins at a multiple
+                // of its own slot size, `FrameLayout::savedRegAreaOffset`),
+                // so a slot that is not a multiple of 16 is a broken frame,
+                // refused by name below rather than stated in a form the
+                // format does not have.
+                //
+                // ⚠ BOTH SPELLINGS CLAIM THE WHOLE REGISTER. The rule this arm
+                // translates — "register X is at CFA+K" — is the frame
+                // producer's, whose store is as wide as the convention declares
+                // the register preserved (`calleeSavedPreservedBits`; silence
+                // means all of it, which is what `ms_x64` says). A register of
+                // any other class or width has no code at all, and is refused
+                // by name rather than described as something it is not.
+                if (ri->regClass != TargetRegClass::FPR
+                    || ri->widthBytes != kUwopVectorSaveBytes) {
+                    return fail("save rule names " + ri->name + " (class '"
+                                + std::string(targetRegClassName(ri->regClass))
+                                + "', " + std::to_string(ri->widthBytes)
+                                + " bytes); Win64 UNWIND_INFO can say where a "
+                                  "general register or a whole 16-byte vector "
+                                  "register was saved, and nothing else");
                 }
-                continue;   // non-SEH: low-64 MOVSD save — omitted (RSP-irrelevant)
+                if (ri->hwEncoding > 0x0Fu) {
+                    return fail("saved vector register " + ri->name
+                                + " has hardware number "
+                                + std::to_string(ri->hwEncoding)
+                                + "; an unwind code names its register in four "
+                                  "bits");
+                }
+                if (slotFromSp < 0 || slotFromSp > 0xFFFFFFFFll) {
+                    return fail("saved-reg slot " + std::to_string(slotFromSp)
+                                + " for " + ri->name
+                                + " is negative or past the 32-bit offset "
+                                  "UWOP_SAVE_XMM128_FAR carries");
+                }
+                if (slotFromSp % kUwopVectorSaveBytes != 0) {
+                    return fail("saved-reg slot " + std::to_string(slotFromSp)
+                                + " for " + ri->name
+                                + " is not a multiple of 16; Win64 UNWIND_INFO "
+                                  "states where a vector register was saved only "
+                                  "at a multiple of 16, in either form of the "
+                                  "code");
+                }
+                auto const pc   = static_cast<std::uint8_t>(op.pcOffset);
+                auto const info = static_cast<std::uint8_t>(ri->hwEncoding << 4);
+                if (slotFromSp / kUwopVectorSaveBytes <= 0xFFFF) {
+                    codes.push_back(Code{
+                        pc, static_cast<std::uint8_t>(kUwopSaveXmm128 | info),
+                        {static_cast<std::uint16_t>(
+                             slotFromSp / kUwopVectorSaveBytes), 0u},
+                        1u});
+                } else {
+                    codes.push_back(Code{
+                        pc, static_cast<std::uint8_t>(kUwopSaveXmm128Far | info),
+                        {static_cast<std::uint16_t>(slotFromSp & 0xFFFF),
+                         static_cast<std::uint16_t>((slotFromSp >> 16) & 0xFFFF)},
+                        2u});
+                }
+                break;
             }
             if (slotFromSp < 0 || slotFromSp % 8 != 0) {
                 return fail("saved-reg slot " + std::to_string(slotFromSp)
@@ -572,7 +655,7 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
             codes.push_back(Code{
                 static_cast<std::uint8_t>(op.pcOffset),
                 static_cast<std::uint8_t>(kUwopSaveNonvol | (ri->hwEncoding << 4)),
-                static_cast<std::uint16_t>(slotFromSp / 8), true});
+                {static_cast<std::uint16_t>(slotFromSp / 8), 0u}, 1u});
             break;
         }
         default:
@@ -584,7 +667,7 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
 
     // Emit: header, then codes DESCENDING by CodeOffset.
     std::uint32_t nodeCount = 0;
-    for (auto const& c : codes) nodeCount += c.hasNode ? 2u : 1u;
+    for (auto const& c : codes) nodeCount += 1u + c.extraNodes;
     if (nodeCount > 255u) return fail("unwind-code node count > 255");
 
     // c116 (D-WIN64-SEH-FUNCLETS): a function that guards a `__try` sets
@@ -602,9 +685,9 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
     auto pushCode = [&](Code const& c) {
         out.push_back(c.codeOffset);
         out.push_back(c.opAndInfo);
-        if (c.hasNode) {
-            out.push_back(static_cast<std::uint8_t>(c.node & 0xFFu));
-            out.push_back(static_cast<std::uint8_t>((c.node >> 8) & 0xFFu));
+        for (std::uint8_t i = 0; i < c.extraNodes; ++i) {
+            out.push_back(static_cast<std::uint8_t>(c.nodes[i] & 0xFFu));
+            out.push_back(static_cast<std::uint8_t>((c.nodes[i] >> 8) & 0xFFu));
         }
     };
     for (auto it = codes.rbegin(); it != codes.rend(); ++it) pushCode(*it);

@@ -1163,6 +1163,728 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheSehScopes) {
            "(D-WIN64-SEH-FUNCLETS)";
 }
 
+// ═════════════════════════════════════════════════
+// THE GUARDED REGIONS, END TO END — what a handler reads
+// (D-LIR-NO-EXCEPTIONAL-EDGE-INTO-A-TRY-HANDLER) and which handler a fault
+// reaches (D-MIR-NESTED-TRY-REGIONS-REACH-THE-OUTER-HANDLER).
+// ═════════════════════════════════════════════════
+//
+// ★★★ BOTH DEFECTS WERE SILENT AND BOTH LIVED BETWEEN TIERS. ✔MEASURED
+// 2026-10-08 on pe64 at the base, baseline and release: a handler that read a
+// parameter read whatever the unwinder left in the parameter's volatile
+// register, and a fault in the inner of two nested regions ran the OUTER
+// handler. Each tier that owns a half is pinned on its own (LIR liveness and
+// the allocator; the funclet synthesizer); THIS pin reads the emitted IMAGE, so
+// it also holds the seams between them — in particular the driver handing the
+// scopes to liveness, which nothing else can see: hand it none, and every
+// `__try` still compiles without a diagnostic.
+//
+// ★ IT READS THE UNWIND DATA, NOT THE EXIT CODE, so it discriminates on every
+// host rather than only where a pe64 image runs:
+//   * WHAT A HANDLER READS. A value live into a handler must be where a call
+//     would keep it. A parameter is born in a volatile register, so a function
+//     whose handler reads one has to SAVE a non-volatile register (or spill);
+//     the SAME function with a handler that reads no parameter saves none. The
+//     unwind codes list every saved non-volatile register. The pair is the
+//     assertion: the count differs by the parameter alone.
+//   * WHICH HANDLER. The handler routine gives a fault to the FIRST record, in
+//     table order, whose range holds the address. The table of two nested
+//     regions must therefore list the INNER range first, and — as the reference
+//     compiler's own table does (cl 19.51: `[+20,+32) [+20,+57)`) — the outer
+//     range must hold the inner HANDLER, which lies outside its own range.
+namespace {
+
+struct PeScopeRecord {
+    std::uint32_t begin  = 0;
+    std::uint32_t end    = 0;
+    std::uint32_t filter = 0;
+    std::uint32_t target = 0;
+};
+
+// One function of a pe64 image whose unwind info names a language handler.
+struct PeGuardedFunction {
+    std::uint32_t              begin = 0;
+    std::uint32_t              end   = 0;
+    std::size_t                savedNonVolatile = 0;   // UWOP_PUSH_NONVOL / UWOP_SAVE_NONVOL(_FAR)
+    std::vector<PeScopeRecord> records;                // the scope table, IN TABLE ORDER
+};
+
+[[nodiscard]] std::vector<PeGuardedFunction>
+peGuardedFunctions(std::vector<std::uint8_t> const& img) {
+    constexpr std::uint8_t kHandlerFlags    = 0x03;   // UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER
+    constexpr std::size_t  kRuntimeFunction = 12;
+    std::vector<PeGuardedFunction> out;
+    auto const secs = peSections(img);
+    for (auto const& s : secs) {
+        if (s.name != ".pdata") continue;
+        std::size_t const sz = std::min<std::size_t>(s.vsize, s.rawSize);
+        for (std::size_t e = 0; e + kRuntimeFunction <= sz; e += kRuntimeFunction) {
+            PeGuardedFunction f;
+            f.begin = rdU32(img, s.rawPtr + e);
+            f.end   = rdU32(img, s.rawPtr + e + 4);
+            std::size_t const at = peRvaToOffset(secs, rdU32(img, s.rawPtr + e + 8));
+            if (at == 0 || at + 4 > img.size()) continue;
+            std::uint8_t const flags  = static_cast<std::uint8_t>(img[at] >> 3);
+            std::size_t const  ncodes = img[at + 2];
+            if ((flags & kHandlerFlags) == 0) continue;
+            // The unwind codes: two bytes each, some followed by one or two
+            // slots of operand.
+            for (std::size_t i = 0; i < ncodes;) {
+                std::uint8_t const b    = img[at + 4 + 2 * i + 1];
+                std::uint8_t const op   = static_cast<std::uint8_t>(b & 0x0F);
+                std::uint8_t const info = static_cast<std::uint8_t>(b >> 4);
+                std::size_t slots = 1;
+                if (op == 1) slots = info == 0 ? 2 : 3;        // UWOP_ALLOC_LARGE
+                else if (op == 4 || op == 8) slots = 2;        // SAVE_NONVOL / SAVE_XMM128
+                else if (op == 5 || op == 9) slots = 3;        // …_FAR
+                if (op == 0 || op == 4 || op == 5) ++f.savedNonVolatile;
+                i += slots;
+            }
+            // Past the codes (padded to an even count): the handler routine's
+            // RVA, then its data — a count and that many four-field records.
+            std::size_t const after = at + 4 + 2 * ((ncodes + 1) & ~std::size_t{1});
+            if (after + 8 > img.size()) continue;
+            std::uint32_t const count = rdU32(img, after + 4);
+            if (count > 64 || after + 8 + std::size_t{16} * count > img.size()) continue;
+            for (std::uint32_t k = 0; k < count; ++k) {
+                std::size_t const r = after + 8 + std::size_t{16} * k;
+                f.records.push_back(PeScopeRecord{rdU32(img, r), rdU32(img, r + 4),
+                                                  rdU32(img, r + 8), rdU32(img, r + 12)});
+            }
+            out.push_back(std::move(f));
+        }
+    }
+    return out;
+}
+
+// `int guarded(int *p, int caught)`: one region; `handlerBody` is the statement
+// the handler runs. A filter of 1 accepts every exception, so no header is
+// needed and the two programs differ by the handler's statement alone.
+[[nodiscard]] std::string oneRegionSource(std::string_view handlerBody) {
+    std::string s =
+        "int guarded(int *p, int caught) {\n"
+        "    int rc = 0;\n"
+        "    __try { rc = *p; }\n"
+        "    __except (1) { ";
+    s += handlerBody;
+    s += " }\n"
+         "    return rc;\n"
+         "}\n";
+    return s;
+}
+
+constexpr std::string_view kGuardedMain =
+    "extern int guarded(int *p, int caught);\n"
+    "int main(void) { int x = 5; return guarded(&x, 42) - 5; }\n";
+
+} // namespace
+
+TEST(DriverArgumentSupply, GuardedRegionReachesLivenessAndTheScopeTable) {
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-guarded"};
+    scratch.useAsCwd();
+
+    // ── WHAT A HANDLER READS ────────────────────────────────────────────────
+    auto const saved = [&](std::string_view tag, std::string_view handlerBody,
+                           std::size_t& outSaved) {
+        auto const out = scratch.path() / (std::string{tag} + "_out");
+        DiagnosticReporter rep;
+        ASSERT_EQ(buildMergedPair(scratch, std::string{tag} + "_a.c",
+                                  oneRegionSource(handlerBody),
+                                  std::string{tag} + "_b.c", kGuardedMain,
+                                  kPeExecSpec, out, rep), 0)
+            << tag << ": the pe64 build must succeed\n" << allDiagnosticText(rep);
+        auto const img = readAllBytes(out / (std::string{tag} + "_a.exe"));
+        ASSERT_FALSE(img.empty()) << tag;
+        auto const fns = peGuardedFunctions(img);
+        ASSERT_EQ(fns.size(), 1u)
+            << tag << ": exactly one function of the image names a language handler";
+        ASSERT_EQ(fns[0].records.size(), 1u) << tag;
+        outSaved = fns[0].savedNonVolatile;
+    };
+    std::size_t readsParameter = 0;
+    std::size_t readsNothing   = 0;
+    ASSERT_NO_FATAL_FAILURE(saved("reads_param", "rc = caught;", readsParameter));
+    ASSERT_NO_FATAL_FAILURE(saved("reads_const", "rc = 42;", readsNothing));
+    EXPECT_GT(readsParameter, readsNothing)
+        << "a handler that reads a PARAMETER needs that value where a call would "
+           "keep it: the function must save one more non-volatile register than "
+           "the same function whose handler reads none. Equal counts mean the "
+           "value stayed in the volatile register it was passed in, and the "
+           "handler reads what the unwinder left there";
+    EXPECT_EQ(readsNothing, 0u)
+        << "the control: with nothing live into the handler the function saves no "
+           "non-volatile register — so the count above is the parameter's doing";
+
+    // ── WHICH HANDLER A FAULT REACHES ───────────────────────────────────────
+    auto const out = scratch.path() / "nested_out";
+    DiagnosticReporter rep;
+    ASSERT_EQ(buildMergedPair(
+                  scratch, "nested_a.c",
+                  "int guarded(int *p, int caught) {\n"
+                  "    int rc = 0;\n"
+                  "    __try {\n"
+                  "        __try { rc = *p; }\n"
+                  "        __except (1) { rc += 2; }\n"
+                  "        rc += caught;\n"
+                  "    } __except (1) { rc += 1000; }\n"
+                  "    return rc;\n"
+                  "}\n",
+                  "nested_b.c", kGuardedMain, kPeExecSpec, out, rep), 0)
+        << "the nested pe64 build must succeed\n" << allDiagnosticText(rep);
+    auto const img = readAllBytes(out / "nested_a.exe");
+    ASSERT_FALSE(img.empty());
+    auto const fns = peGuardedFunctions(img);
+    ASSERT_EQ(fns.size(), 1u);
+    ASSERT_EQ(fns[0].records.size(), 2u) << "two regions, two records";
+    PeScopeRecord const& first  = fns[0].records[0];
+    PeScopeRecord const& second = fns[0].records[1];
+    EXPECT_TRUE(second.begin <= first.begin && first.end <= second.end
+                && (second.begin < first.begin || first.end < second.end))
+        << "the FIRST record's range must lie inside the second's: the handler "
+           "routine takes the first record that holds the faulting address, so the "
+           "inner region's must come first. Got [" << first.begin << ", " << first.end
+        << ") then [" << second.begin << ", " << second.end << ")";
+    EXPECT_TRUE(first.target < first.begin || first.target >= first.end)
+        << "the inner handler lies outside its own range";
+    EXPECT_TRUE(first.target >= second.begin && first.target < second.end)
+        << "the inner handler lies INSIDE the outer range: a fault in it is the "
+           "outer handler's";
+    EXPECT_TRUE(second.target < second.begin || second.target >= second.end)
+        << "the outer handler lies outside its own range";
+    EXPECT_GE(fns[0].savedNonVolatile, 1u)
+        << "`caught` is read after the inner region, inside the outer one: it is "
+           "live into the inner handler";
+}
+
+// ═════════════════════════════════════════════════
+// EVERY SAVED VECTOR REGISTER HAS ITS UNWIND CODE, AT ITS STORE
+// (D-WIN64-XMM-UNWIND-RESTORE)
+// ═════════════════════════════════════════════════
+//
+// ★★★ WHAT A SAVE CODE IS FOR. When a fault unwinds THROUGH a frame to a
+// handler further up, the system puts back every call-preserved register that
+// frame saved — from the slot the frame's unwind information names. A register
+// the frame saved and reused, with no code naming its slot, reaches the handler
+// holding the CALLEE's value. For the general registers DSS always stated the
+// code. For the vector registers it stated none: a function that guards a
+// region and saved one was refused at the writer, and every other function
+// shipped without the code — so a handler in any caller, a foreign object's
+// included, that kept a `double` across its call read whatever the DSS callee
+// had left there. ✔MEASURED 2026-10-10 at the base: every `__try` function
+// with a `double` live across a call refused (handler or no handler, baseline
+// and release), and a plain function's three vector saves absent from its
+// codes. The reference states the code in both kinds of function (cl 19.51
+// x64 /O2: `movaps [rsp+30h],xmm6` ending at prologue byte 11 is `@11
+// SAVE_XMM128 xmm6, 3`).
+//
+// ★ THIS PIN READS THE IMAGE, ON EVERY HOST — the composition the writer's own
+// unit pin cannot see, because it hand-builds the frame rules: that the frame
+// producer's rule for a vector register REACHES the writer, names the slot the
+// prologue really stored to and the byte that store really ends at, and that
+// the store is of the WHOLE register, which both spellings of the code claim.
+// For every function of the image:
+//   * each vector save code is the SCALED form exactly when its slot is a
+//     multiple of 16 that fits one node, the FAR form otherwise;
+//   * the bytes that END at the code's offset are a whole-register store
+//     (`[REX] 0F 11 /r` or `0F 29 /r`) of THAT register to THAT slot off RSP;
+//   * that store BEGINS where the previous prologue operation ended — a store
+//     of half the register (`F2 0F 11`, MOVSD) is one byte longer and fails it;
+//   * the prologue holds as many such stores as the function has vector codes
+//     — a store without a code is the old omission.
+// And the image must hold at least one such function that guards a region and
+// one that does not, or the loop above ran over nothing.
+namespace {
+
+struct PeUnwindCode {
+    std::uint8_t  codeOffset = 0;   // the prologue byte the operation ENDS at
+    std::uint8_t  op         = 0;
+    std::uint8_t  info       = 0;
+    std::uint32_t operand    = 0;   // DECODED: a save's slot offset from RSP
+};
+
+struct PeFunctionUnwind {
+    std::uint32_t              begin  = 0;
+    bool                       guards = false;   // names a language handler
+    std::vector<PeUnwindCode>  codes;            // IN TABLE ORDER: descending offset
+    std::vector<std::uint8_t>  prologue;         // its first SizeOfProlog bytes
+};
+
+constexpr std::uint8_t kPeUwopSaveXmm128    = 8;
+constexpr std::uint8_t kPeUwopSaveXmm128Far = 9;
+
+// Every function of a pe64 image, with its unwind codes decoded the way the
+// x64 unwind-data documentation states them: a general save's node is its slot
+// divided by 8, a vector save's by 16, and a FAR form carries the offset
+// unscaled in two nodes, low word first.
+[[nodiscard]] std::vector<PeFunctionUnwind>
+peFunctionUnwinds(std::vector<std::uint8_t> const& img) {
+    constexpr std::uint8_t kHandlerFlags    = 0x03;
+    constexpr std::size_t  kRuntimeFunction = 12;
+    std::vector<PeFunctionUnwind> out;
+    auto const secs = peSections(img);
+    for (auto const& s : secs) {
+        if (s.name != ".pdata") continue;
+        std::size_t const sz = std::min<std::size_t>(s.vsize, s.rawSize);
+        for (std::size_t e = 0; e + kRuntimeFunction <= sz; e += kRuntimeFunction) {
+            PeFunctionUnwind f;
+            f.begin = rdU32(img, s.rawPtr + e);
+            std::size_t const at   = peRvaToOffset(secs, rdU32(img, s.rawPtr + e + 8));
+            std::size_t const code = peRvaToOffset(secs, f.begin);
+            if (at == 0 || code == 0 || at + 4 > img.size()) continue;
+            f.guards = ((img[at] >> 3) & kHandlerFlags) != 0;
+            std::size_t const prolog = img[at + 1];
+            std::size_t const ncodes = img[at + 2];
+            if (code + prolog > img.size() || at + 4 + 2 * ncodes > img.size()) continue;
+            f.prologue.assign(img.begin() + static_cast<std::ptrdiff_t>(code),
+                              img.begin() + static_cast<std::ptrdiff_t>(code + prolog));
+            for (std::size_t i = 0; i < ncodes;) {
+                std::size_t const n = at + 4 + 2 * i;
+                PeUnwindCode c;
+                c.codeOffset = img[n];
+                c.op         = static_cast<std::uint8_t>(img[n + 1] & 0x0F);
+                c.info       = static_cast<std::uint8_t>(img[n + 1] >> 4);
+                std::uint32_t const one = rdU16(img, n + 2);
+                std::uint32_t const two = one | (static_cast<std::uint32_t>(rdU16(img, n + 4)) << 16);
+                std::size_t slots = 1;
+                if (c.op == 1)      { slots = c.info == 0 ? 2 : 3; c.operand = c.info == 0 ? one * 8u : two; }
+                else if (c.op == 2) { c.operand = c.info * 8u + 8u; }
+                else if (c.op == 4) { slots = 2; c.operand = one * 8u; }
+                else if (c.op == kPeUwopSaveXmm128) { slots = 2; c.operand = one * 16u; }
+                else if (c.op == 5 || c.op == kPeUwopSaveXmm128Far) { slots = 3; c.operand = two; }
+                f.codes.push_back(c);
+                i += slots;
+            }
+            out.push_back(std::move(f));
+        }
+    }
+    return out;
+}
+
+// The length of the whole-register store of vector register `reg` to
+// [RSP + slot] whose LAST byte is `p[end - 1]`, or 0 when the bytes ending
+// there are not that instruction: `[REX.R] 0F 11 /r` (MOVUPS) or `0F 29 /r`
+// (MOVAPS), an RSP base with no index, and a 32-bit or an 8-bit displacement.
+[[nodiscard]] std::size_t
+vectorStoreEndingAt(std::vector<std::uint8_t> const& p, std::size_t end,
+                    unsigned reg, std::uint32_t slot) {
+    for (std::size_t const dispBytes : {std::size_t{4}, std::size_t{1}}) {
+        if (dispBytes == 1 && slot > 0x7Fu) continue;
+        std::size_t const len = (reg >= 8 ? 1u : 0u) + 4u + dispBytes;
+        if (end < len || end > p.size()) continue;
+        std::size_t s = end - len;
+        if (reg >= 8 && p[s++] != 0x44u) continue;                  // REX.R alone
+        if (p[s] != 0x0Fu || (p[s + 1] != 0x11u && p[s + 1] != 0x29u)) continue;
+        std::uint8_t const modrm = static_cast<std::uint8_t>(
+            (dispBytes == 4 ? 0x80u : 0x40u) | ((reg & 7u) << 3) | 4u);
+        if (p[s + 2] != modrm || p[s + 3] != 0x24u) continue;       // SIB: base RSP
+        std::uint32_t disp = 0;
+        for (std::size_t k = 0; k < dispBytes; ++k) {
+            disp |= static_cast<std::uint32_t>(p[s + 4 + k]) << (8 * k);
+        }
+        if (disp == slot) return len;
+    }
+    return 0;
+}
+
+// How many stores of a vector register to an RSP-based slot a prologue holds,
+// by the store's own bytes — whatever the unwind codes say.
+[[nodiscard]] std::size_t vectorStoresIn(std::vector<std::uint8_t> const& p) {
+    std::size_t n = 0;
+    for (std::size_t k = 0; k + 4 <= p.size(); ++k) {
+        if (p[k] != 0x0Fu || (p[k + 1] != 0x11u && p[k + 1] != 0x29u)) continue;
+        std::uint8_t const modrm = p[k + 2];
+        if ((modrm >> 6) == 3u || (modrm & 7u) != 4u) continue;     // a memory form with an SIB
+        if (p[k + 3] != 0x24u) continue;                            // base RSP, no index
+        ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+TEST(DriverArgumentSupply, EverySavedVectorRegisterHasItsUnwindCodeAtItsStore) {
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-vector-unwind"};
+    scratch.useAsCwd();
+    auto const out = scratch.path() / "vec_out";
+    DiagnosticReporter rep;
+    // `vec_plain` keeps two `double`s across a call and guards nothing;
+    // `vec_guarded` keeps one across a call inside its region and reads it in
+    // the handler; `vec_odd` keeps one across a call that passes one argument
+    // on the stack — an ODD count of outgoing stack slots, after which the
+    // register-save area must still begin at a multiple of 16.
+    ASSERT_EQ(buildMergedPair(
+                  scratch, "vec_a.c",
+                  "extern double vec_half(double x);\n"
+                  "extern double vec_five(double a, int b, int c, int d, int e);\n"
+                  "int vec_plain(double a, double b) {\n"
+                  "    double h = vec_half(4.0);\n"
+                  "    return (int)(h + a + b);\n"
+                  "}\n"
+                  "int vec_guarded(int *p, double keep) {\n"
+                  "    int rc = 0;\n"
+                  "    __try { rc = (int)vec_half(2.0); rc += *p; }\n"
+                  "    __except (1) { rc = (int)keep; }\n"
+                  "    return rc;\n"
+                  "}\n"
+                  "int vec_odd(double a) {\n"
+                  "    double h = vec_five(1.0, 2, 3, 4, 5);\n"
+                  "    return (int)(h + a);\n"
+                  "}\n",
+                  "vec_b.c",
+                  "extern int vec_plain(double a, double b);\n"
+                  "extern int vec_guarded(int *p, double keep);\n"
+                  "extern int vec_odd(double a);\n"
+                  "double vec_half(double x) { return x * 0.5; }\n"
+                  "double vec_five(double a, int b, int c, int d, int e) {\n"
+                  "    return a + b + c + d + e;\n"
+                  "}\n"
+                  "int main(void) {\n"
+                  "    int x = 5;\n"
+                  "    return vec_plain(1.0, 2.0) + vec_guarded(&x, 42.0) + vec_odd(3.0);\n"
+                  "}\n",
+                  kPeExecSpec, out, rep), 0)
+        << "a function that guards a region and keeps a `double` across a call "
+           "must build: a refusal naming the unwind information means the writer "
+           "again has no code for a saved vector register\n"
+        << allDiagnosticText(rep);
+    auto const img = readAllBytes(out / "vec_a.exe");
+    ASSERT_FALSE(img.empty());
+
+    auto const fns = peFunctionUnwinds(img);
+    ASSERT_GE(fns.size(), 4u) << "the premise: the image's function table was read";
+    std::size_t guardingWithAVectorSave = 0;
+    std::size_t plainWithAVectorSave    = 0;
+    std::size_t vectorSaves             = 0;
+    for (auto const& f : fns) {
+        std::size_t vectorCodes = 0;
+        for (std::size_t i = 0; i < f.codes.size(); ++i) {
+            PeUnwindCode const& c = f.codes[i];
+            if (c.op != kPeUwopSaveXmm128 && c.op != kPeUwopSaveXmm128Far) continue;
+            ++vectorCodes;
+            EXPECT_EQ(c.operand % 16u, 0u)
+                << "function at " << f.begin << ": xmm" << unsigned{c.info} << " at RSP+"
+                << c.operand << " — a vector register's save slot is a multiple of "
+                   "16 from the stack pointer: neither form of the code states "
+                   "another, and the unwinder may load it aligned";
+            EXPECT_EQ(unsigned{c.op},
+                      unsigned{c.operand / 16u <= 0xFFFFu ? kPeUwopSaveXmm128
+                                                          : kPeUwopSaveXmm128Far})
+                << "function at " << f.begin << ": xmm" << unsigned{c.info} << " at RSP+"
+                << c.operand << " — the scaled form while the quotient fits one "
+                   "node, the FAR form only past that reach";
+            ++vectorSaves;
+            std::size_t const len =
+                vectorStoreEndingAt(f.prologue, c.codeOffset, c.info, c.operand);
+            EXPECT_NE(len, 0u)
+                << "function at " << f.begin << ": the code says xmm" << unsigned{c.info}
+                << " is at RSP+" << c.operand << " from prologue byte "
+                << unsigned{c.codeOffset} << ", and the bytes ending there are not a "
+                   "whole-register store of that register to that slot: "
+                << hexWindow(f.prologue, 0, f.prologue.size());
+            std::size_t const previousEnd =
+                i + 1 < f.codes.size() ? f.codes[i + 1].codeOffset : 0u;
+            EXPECT_EQ(c.codeOffset - len, previousEnd)
+                << "function at " << f.begin << ": the store of xmm" << unsigned{c.info}
+                << " must begin where the previous prologue operation ended. One "
+                   "byte earlier is a store with a mandatory prefix — half the "
+                   "register, which the code would describe as all of it: "
+                << hexWindow(f.prologue, 0, f.prologue.size());
+        }
+        EXPECT_EQ(vectorStoresIn(f.prologue), vectorCodes)
+            << "function at " << f.begin << ": every vector register its prologue "
+               "stores has a save code, and nothing else does. A store without a "
+               "code is a register a handler further up reads unrestored: "
+            << hexWindow(f.prologue, 0, f.prologue.size());
+        if (vectorCodes != 0) ++(f.guards ? guardingWithAVectorSave : plainWithAVectorSave);
+    }
+    EXPECT_GE(guardingWithAVectorSave, 1u)
+        << "`vec_guarded` keeps a `double` across a call and into its handler: it "
+           "saves a call-preserved vector register and says where";
+    EXPECT_GE(plainWithAVectorSave, 2u)
+        << "`vec_plain` and `vec_odd` guard nothing and still owe the code — it is "
+           "what restores their CALLER's register";
+    EXPECT_GE(vectorSaves, 3u)
+        << "three functions save a vector register. `vec_odd` is the one whose "
+           "outgoing-argument area ends 8 bytes off a multiple of 16 (one "
+           "stack-passed argument above the 32 bytes every call reserves), which "
+           "is where its save area used to begin (✔MEASURED 2026-10-10 before the "
+           "layout rule: its store was to RSP+0x28) — a frame that puts it there "
+           "again is refused by the writer, and this program does not build";
+}
+
+// ── <windows.h>: THE TYPE AND THE VALUE OF EVERY CONSTANT IT DECLARES ─────────
+//
+// A constant's C type is part of its meaning. The shipped header typed 100 of
+// its 117 constants `unsigned int`; both pe references type 47 of those `int`,
+// 22 `long` and 31 `unsigned long` — and with the signedness wrong, so is the
+// ANSWER of a comparison or a subtraction with a negative operand
+// (`-1 < MEM_COMMIT` was false).
+//
+// ⚠ THE TABLE IS THE REFERENCES' ANSWER, NOT DSS'S OWN: a generated program
+// printed each name's type (by `_Generic`) and its value under MSVC cl
+// 19.51.36260 x64 (reference run 20261010-131314-9af2a35c) and under MinGW-w64
+// gcc 13.2.0 (reference run 20261010-131441-e7515cef), and the two printed the
+// identical 117 lines. Each row is one such line, in the header's order; the
+// value is spelled as a constant of the reference's own type.
+//
+// The claim is made where a type becomes observable — a compile — on every
+// host: each row is a `_Static_assert` over `_Generic` and one over the value.
+// The EXCEPTION_* status family is among the rows, so a wrong status VALUE
+// fails here too. The runnable proof is `examples/c/windows_constant_types`.
+namespace {
+
+struct WindowsConstant {
+    char const* name;
+    char const* type;
+    char const* value;
+};
+
+constexpr WindowsConstant kWindowsConstants[] = {
+    {"TRUE",                               "int",           "1"},
+    {"FALSE",                              "int",           "0"},
+    {"MAX_PATH",                           "int",           "260"},
+    {"INVALID_FILE_ATTRIBUTES",            "unsigned long", "0xFFFFFFFFUL"},
+    {"INVALID_SET_FILE_POINTER",           "unsigned long", "0xFFFFFFFFUL"},
+    {"GENERIC_READ",                       "unsigned long", "0x80000000UL"},
+    {"GENERIC_WRITE",                      "long",          "1073741824L"},
+    {"FILE_SHARE_READ",                    "int",           "1"},
+    {"FILE_SHARE_WRITE",                   "int",           "2"},
+    {"FILE_SHARE_DELETE",                  "int",           "4"},
+    {"CREATE_NEW",                         "int",           "1"},
+    {"CREATE_ALWAYS",                      "int",           "2"},
+    {"OPEN_EXISTING",                      "int",           "3"},
+    {"OPEN_ALWAYS",                        "int",           "4"},
+    {"TRUNCATE_EXISTING",                  "int",           "5"},
+    {"FILE_ATTRIBUTE_READONLY",            "int",           "1"},
+    {"FILE_ATTRIBUTE_HIDDEN",              "int",           "2"},
+    {"FILE_ATTRIBUTE_DIRECTORY",           "int",           "16"},
+    {"FILE_ATTRIBUTE_NORMAL",              "int",           "128"},
+    {"FILE_ATTRIBUTE_TEMPORARY",           "int",           "256"},
+    {"FILE_FLAG_DELETE_ON_CLOSE",          "int",           "67108864"},
+    {"FILE_FLAG_RANDOM_ACCESS",            "int",           "268435456"},
+    {"FILE_FLAG_OVERLAPPED",               "int",           "1073741824"},
+    {"FILE_BEGIN",                         "int",           "0"},
+    {"FILE_CURRENT",                       "int",           "1"},
+    {"FILE_END",                           "int",           "2"},
+    {"FILE_MAP_WRITE",                     "int",           "2"},
+    {"FILE_MAP_READ",                      "int",           "4"},
+    {"PAGE_READONLY",                      "int",           "2"},
+    {"PAGE_READWRITE",                     "int",           "4"},
+    {"PAGE_WRITECOPY",                     "int",           "8"},
+    {"SECTION_MAP_WRITE",                  "int",           "2"},
+    {"SECTION_MAP_READ",                   "int",           "4"},
+    {"LMEM_FIXED",                         "int",           "0"},
+    {"LMEM_ZEROINIT",                      "int",           "64"},
+    {"HEAP_ZERO_MEMORY",                   "int",           "8"},
+    {"HEAP_GENERATE_EXCEPTIONS",           "int",           "4"},
+    {"LOCKFILE_FAIL_IMMEDIATELY",          "int",           "1"},
+    {"LOCKFILE_EXCLUSIVE_LOCK",            "int",           "2"},
+    {"FORMAT_MESSAGE_ALLOCATE_BUFFER",     "int",           "256"},
+    {"FORMAT_MESSAGE_IGNORE_INSERTS",      "int",           "512"},
+    {"FORMAT_MESSAGE_FROM_SYSTEM",         "int",           "4096"},
+    {"GetFileExInfoStandard",              "int",           "0"},
+    {"WAIT_OBJECT_0",                      "unsigned long", "0x00000000UL"},
+    {"WAIT_TIMEOUT",                       "long",          "258L"},
+    {"WAIT_FAILED",                        "unsigned long", "0xFFFFFFFFUL"},
+    {"INFINITE",                           "unsigned int",  "0xFFFFFFFFU"},
+    {"ERROR_FILE_NOT_FOUND",               "long",          "2L"},
+    {"ERROR_ACCESS_DENIED",                "long",          "5L"},
+    {"ERROR_NOT_ENOUGH_MEMORY",            "long",          "8L"},
+    {"ERROR_NO_MORE_FILES",                "long",          "18L"},
+    {"ERROR_HANDLE_DISK_FULL",             "long",          "39L"},
+    {"ERROR_NOT_SUPPORTED",                "long",          "50L"},
+    {"ERROR_LOCK_VIOLATION",               "long",          "33L"},
+    {"ERROR_SHARING_VIOLATION",            "long",          "32L"},
+    {"ERROR_RETRY",                        "long",          "1237L"},
+    {"ERROR_PATH_NOT_FOUND",               "long",          "3L"},
+    {"ERROR_INVALID_HANDLE",               "long",          "6L"},
+    {"ERROR_HANDLE_EOF",                   "long",          "38L"},
+    {"ERROR_DEV_NOT_EXIST",                "long",          "55L"},
+    {"ERROR_NETNAME_DELETED",              "long",          "64L"},
+    {"ERROR_DISK_FULL",                    "long",          "112L"},
+    {"ERROR_SEM_TIMEOUT",                  "long",          "121L"},
+    {"ERROR_NOT_LOCKED",                   "long",          "158L"},
+    {"ERROR_USER_MAPPED_FILE",             "long",          "1224L"},
+    {"ERROR_NETWORK_UNREACHABLE",          "long",          "1231L"},
+    {"NO_ERROR",                           "long",          "0L"},
+    {"WAIT_IO_COMPLETION",                 "unsigned long", "0x000000C0UL"},
+    {"CP_ACP",                             "int",           "0"},
+    {"CP_OEMCP",                           "int",           "1"},
+    {"CP_UTF8",                            "int",           "65001"},
+    {"STD_INPUT_HANDLE",                   "unsigned long", "0xFFFFFFF6UL"},
+    {"STD_OUTPUT_HANDLE",                  "unsigned long", "0xFFFFFFF5UL"},
+    {"STD_ERROR_HANDLE",                   "unsigned long", "0xFFFFFFF4UL"},
+    {"ENABLE_VIRTUAL_TERMINAL_PROCESSING", "int",           "4"},
+    {"FILE_WRITE_ATTRIBUTES",              "int",           "256"},
+    {"FILE_FLAG_BACKUP_SEMANTICS",         "int",           "33554432"},
+    {"CTRL_C_EVENT",                       "int",           "0"},
+    {"EXCEPTION_IN_PAGE_ERROR",            "unsigned long", "0xC0000006UL"},
+    {"EXCEPTION_ACCESS_VIOLATION",         "unsigned long", "0xC0000005UL"},
+    {"EXCEPTION_DATATYPE_MISALIGNMENT",    "unsigned long", "0x80000002UL"},
+    {"EXCEPTION_BREAKPOINT",               "unsigned long", "0x80000003UL"},
+    {"EXCEPTION_SINGLE_STEP",              "unsigned long", "0x80000004UL"},
+    {"EXCEPTION_ARRAY_BOUNDS_EXCEEDED",    "unsigned long", "0xC000008CUL"},
+    {"EXCEPTION_FLT_DENORMAL_OPERAND",     "unsigned long", "0xC000008DUL"},
+    {"EXCEPTION_FLT_DIVIDE_BY_ZERO",       "unsigned long", "0xC000008EUL"},
+    {"EXCEPTION_FLT_INEXACT_RESULT",       "unsigned long", "0xC000008FUL"},
+    {"EXCEPTION_FLT_INVALID_OPERATION",    "unsigned long", "0xC0000090UL"},
+    {"EXCEPTION_FLT_OVERFLOW",             "unsigned long", "0xC0000091UL"},
+    {"EXCEPTION_FLT_STACK_CHECK",          "unsigned long", "0xC0000092UL"},
+    {"EXCEPTION_FLT_UNDERFLOW",            "unsigned long", "0xC0000093UL"},
+    {"EXCEPTION_INT_DIVIDE_BY_ZERO",       "unsigned long", "0xC0000094UL"},
+    {"EXCEPTION_INT_OVERFLOW",             "unsigned long", "0xC0000095UL"},
+    {"EXCEPTION_PRIV_INSTRUCTION",         "unsigned long", "0xC0000096UL"},
+    {"EXCEPTION_ILLEGAL_INSTRUCTION",      "unsigned long", "0xC000001DUL"},
+    {"EXCEPTION_NONCONTINUABLE_EXCEPTION", "unsigned long", "0xC0000025UL"},
+    {"EXCEPTION_STACK_OVERFLOW",           "unsigned long", "0xC00000FDUL"},
+    {"EXCEPTION_INVALID_DISPOSITION",      "unsigned long", "0xC0000026UL"},
+    {"EXCEPTION_GUARD_PAGE",               "unsigned long", "0x80000001UL"},
+    {"EXCEPTION_INVALID_HANDLE",           "unsigned long", "0xC0000008UL"},
+    {"EXCEPTION_NONCONTINUABLE",           "int",           "1"},
+    {"MEM_COMMIT",                         "int",           "4096"},
+    {"MEM_RESERVE",                        "int",           "8192"},
+    {"MEM_RELEASE",                        "int",           "32768"},
+    {"PAGE_NOACCESS",                      "int",           "1"},
+    {"EXCEPTION_EXECUTE_HANDLER",          "int",           "1"},
+    {"EXCEPTION_CONTINUE_SEARCH",          "int",           "0"},
+    {"EXCEPTION_CONTINUE_EXECUTION",       "int",           "(-1)"},
+    {"EXCEPTION_MAXIMUM_PARAMETERS",       "int",           "15"},
+    {"EVENT_MODIFY_STATE",                 "int",           "2"},
+    {"DRIVE_UNKNOWN",                      "int",           "0"},
+    {"DRIVE_NO_ROOT_DIR",                  "int",           "1"},
+    {"DRIVE_REMOVABLE",                    "int",           "2"},
+    {"DRIVE_FIXED",                        "int",           "3"},
+    {"DRIVE_REMOTE",                       "int",           "4"},
+    {"DRIVE_CDROM",                        "int",           "5"},
+    {"DRIVE_RAMDISK",                      "int",           "6"},
+};
+
+// One translation unit holding the two assertions of each row given.
+[[nodiscard]] std::string windowsConstantAssertions(std::span<WindowsConstant const> rows) {
+    std::string src = "#include <windows.h>\n";
+    for (WindowsConstant const& c : rows) {
+        std::string const name{c.name};
+        std::string const type{c.type};
+        std::string const value{c.value};
+        src += "_Static_assert(_Generic((" + name + "), " + type + ": 1, default: 0), \""
+             + name + " is " + type + "\");\n";
+        src += "_Static_assert((" + name + ") == " + value + ", \"" + name + " equals "
+             + value + "\");\n";
+    }
+    src += "int windows_constants_unit(void) { return 0; }\n";
+    return src;
+}
+
+constexpr std::string_view kWindowsConstantsMain =
+    "extern int windows_constants_unit(void);\n"
+    "int main(void) { return windows_constants_unit(); }\n";
+
+} // namespace
+
+TEST(DriverArgumentSupply, WindowsHeaderConstantsHaveTheTypesAndValuesTheReferencesGive) {
+    ASSERT_EQ(std::size(kWindowsConstants), 117u)
+        << "the table is the references' 117 lines; a row added to the header "
+           "arrives with its own measured line";
+    {
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-windows-constants"};
+        scratch.useAsCwd();
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildMergedPair(scratch, "wc_a.c", windowsConstantAssertions(kWindowsConstants),
+                                  "wc_b.c", kWindowsConstantsMain, kPeExecSpec,
+                                  scratch.path() / "wc_out", rep), 0)
+            << "a constant of the shipped <windows.h> has a type or a value other "
+               "than the one both references give it:\n"
+            << allDiagnosticText(rep);
+    }
+    // THE NEGATIVE, one per way a row can be wrong, so that a green above is a
+    // reading and not a build that ignores the assertions: the type the header
+    // USED to give a signed constant, and a value one off.
+    constexpr WindowsConstant kWrongType[]  = {{"MEM_COMMIT", "unsigned int", "0x00001000U"}};
+    constexpr WindowsConstant kWrongValue[] = {{"EXCEPTION_INT_DIVIDE_BY_ZERO", "unsigned long",
+                                                "0xC0000095UL"}};
+    struct Negative {
+        std::span<WindowsConstant const> rows;
+        char const*                      mustSay;
+    };
+    Negative const negatives[] = {
+        {kWrongType, "MEM_COMMIT is unsigned int"},
+        {kWrongValue, "EXCEPTION_INT_DIVIDE_BY_ZERO equals 0xC0000095UL"},
+    };
+    for (Negative const& n : negatives) {
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-windows-constants-negative"};
+        scratch.useAsCwd();
+        DiagnosticReporter rep;
+        EXPECT_NE(buildMergedPair(scratch, "wc_a.c", windowsConstantAssertions(n.rows),
+                                  "wc_b.c", kWindowsConstantsMain, kPeExecSpec,
+                                  scratch.path() / "wc_out", rep), 0)
+            << n.mustSay << " — a false assertion must fail the build";
+        EXPECT_NE(allDiagnosticText(rep).find(n.mustSay), std::string::npos)
+            << "the failure must be THIS assertion's, by its own text: "
+            << allDiagnosticText(rep);
+    }
+}
+
+// ── A `sysconf` NAME IS ITS PLATFORM'S OWN NUMBER ──────────────────────────
+//
+// `_SC_NPROCESSORS_ONLN` is declared by the <unistd.h> of every POSIX platform
+// and is a different number on each: it is an index into that C library's own
+// table, so the only right value is the one the platform's header gives. The
+// shipped header declared it for ELF alone; a program that asked for the
+// processor count did not compile for Mach-O, where the reference's header
+// defines it (✔MEASURED 2026-10-10, the one name of the Mach-O descriptors the
+// SDK has and the shipped headers lacked). The numbers below are the
+// references' — gcc 13.3 and clang 18.1 against glibc on x86_64, gcc 13.3 on
+// arm64, AppleClang 21 against the macOS SDK — never the descriptor's own.
+TEST(DriverArgumentSupply, ProcessorCountNameHasItsPlatformsNumberOnEveryPosixFormat) {
+    struct Row {
+        std::string_view spec;
+        char const*      value;
+    };
+    constexpr std::string_view kMachoArm64ExecSpec = "arm64:macho64-arm64-darwin-exec";
+    Row const rows[] = {
+        {"x86_64:elf64-x86_64-linux-exec", "84"},
+        {kElfArm64ExecSpec, "84"},
+        {kMachoArm64ExecSpec, "58"},
+    };
+    auto const unit = [](char const* value) {
+        std::string const v{value};
+        return "#include <unistd.h>\n"
+               "_Static_assert(_Generic((_SC_NPROCESSORS_ONLN), int: 1, default: 0), "
+               "\"_SC_NPROCESSORS_ONLN is int\");\n"
+               "_Static_assert((_SC_NPROCESSORS_ONLN) == " + v + ", "
+               "\"_SC_NPROCESSORS_ONLN equals " + v + "\");\n"
+               "long processor_count_unit(void) { return sysconf(_SC_NPROCESSORS_ONLN); }\n";
+    };
+    constexpr std::string_view kMain =
+        "extern long processor_count_unit(void);\n"
+        "int main(void) { return processor_count_unit() >= 1 ? 0 : 1; }\n";
+    for (Row const& row : rows) {
+        SCOPED_TRACE(std::string{row.spec});
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-processor-count"};
+        scratch.useAsCwd();
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildMergedPair(scratch, "pc_a.c", unit(row.value), "pc_b.c", kMain,
+                                  row.spec, scratch.path() / "pc_out", rep), 0)
+            << "the shipped <unistd.h> does not give _SC_NPROCESSORS_ONLN the number "
+               "this platform's own header gives it:\n"
+            << allDiagnosticText(rep);
+    }
+    // THE NEGATIVE: the other platform's number must fail, by this assertion's
+    // own text — a build that ignored the assertions would pass every row above.
+    {
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-processor-count-negative"};
+        scratch.useAsCwd();
+        DiagnosticReporter rep;
+        EXPECT_NE(buildMergedPair(scratch, "pc_a.c", unit("84"), "pc_b.c", kMain,
+                                  kMachoArm64ExecSpec, scratch.path() / "pc_out", rep), 0)
+            << "the ELF number must not be accepted for Mach-O";
+        EXPECT_NE(allDiagnosticText(rep).find("_SC_NPROCESSORS_ONLN equals 84"),
+                  std::string::npos)
+            << "the failure must be THIS assertion's, by its own text: "
+            << allDiagnosticText(rep);
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // `wideFloatSoftcallLibrary` — the runtime library each minted F128 softcall
 // binds to (D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH), pre-resolved in the driver

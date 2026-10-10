@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -536,6 +537,38 @@ rangeCrossesCall(LirLiveRange const& r,
                                r.start);
     if (lo == callPositions.end()) return false;
     return *lo + 1u < r.end;
+}
+
+// ── THE ONE QUESTION BEHIND "CALLEE-SAVED OR SPILL" ─────────────────────────
+//
+// ★★★ D-LIR-NO-EXCEPTIONAL-EDGE-INTO-A-TRY-HANDLER. True iff the value in `r`
+// is, at some point of its life, held while a party that keeps only the
+// convention's call-preserved registers has control: it survives a CALL
+// (`rangeCrossesCall`), or it is live INTO A LANDING BLOCK
+// (`lirRangeEntersALanding`) — a block control reaches from anywhere in a
+// guarded run through an unwinder, which hands over the frame and the registers
+// a call keeps and nothing else. Either way the range may take a register
+// outside the convention's `callerSaved`, or a spill slot, and nothing else.
+//
+// ⚠ ONE PREDICATE, NOT A SECOND RULE BESIDE THE CALL RULE. Everything that
+// already obeys "crosses a call" — the partition preference, the eviction
+// candidate's `requireCalleeSaved`, the coalescer's class hull (a hull that
+// covers a landing entry is asked this as one range) — obeys the landing by
+// being asked this instead. The volatile set is the convention's own list; no
+// register is named here.
+//
+// ⚠ THE TWO HALVES DIFFER BY ONE SLOT, AND THE DIFFERENCE IS REAL. A value a
+// call CONSUMES (its range ends at the call's early slot) is safe in a volatile
+// register: the call destroys it after reading it. A value the landing block's
+// first instruction reads has ALREADY been through the transfer, so a range
+// that merely reaches that slot is lost too — `lirRangeEntersALanding` asks
+// "covers the entry", not "extends past it".
+[[nodiscard]] bool
+rangeOutlivesAVolatileRegister(LirLiveRange const&               r,
+                               std::vector<std::uint32_t> const& callPositions,
+                               LirFuncLiveness const&            flow) {
+    return rangeCrossesCall(r, callPositions)
+        || lirRangeEntersALanding(r, flow.landingEntryPositions);
 }
 
 // Per-opcode implicit-clobber consumer (cycle 10q closure of the
@@ -1073,6 +1106,96 @@ findAllocationConflict(LirFuncLiveness const&   flow,
         c.isSpillSlot = prev.isSpill;
         c.sharedResource = prev.isSpill ? prev.resource : (prev.resource >> 8);
         return c;
+    }
+    return std::nullopt;
+}
+
+// ── the independent landing auditor (contract: `lir_regalloc.hpp`) ──────────
+//
+// Like the conflict auditor above, deliberately NOT written in terms of what
+// the allocator asked while it chose: it never calls `lirRangeEntersALanding`
+// or reads a call position. Its inputs are the liveness SETS (what each landing
+// block reads), the ranges, the finished assignment table and the convention's
+// own volatile list — so a transform that asked the wrong question, a liveness
+// that lost the exceptional edge and a table that moved a value mid-run each
+// show here as themselves.
+std::optional<LirLandingViolation>
+findLandingViolation(Lir const& lir, TargetSchema const& schema,
+                     LirFuncLiveness const& flow, LirFuncAllocation const& alloc) {
+    if (flow.guardedRuns.empty() || alloc.assignments.empty()) return std::nullopt;
+    auto const* cc = schema.callingConvention(alloc.callingConventionIndex);
+    if (cc == nullptr) return std::nullopt;   // reported by the allocator itself
+
+    // The registers a call does NOT keep, by ordinal — every class at once: the
+    // list holds names and a name belongs to one register of one class.
+    std::unordered_set<std::string_view> volatileNames;
+    volatileNames.reserve(cc->callerSaved.size());
+    for (auto const& n : cc->callerSaved) volatileNames.insert(n);
+    auto const regs = schema.registers();
+
+    // Each block's position span, [first, end), in the liveness order.
+    std::vector<std::uint32_t> firstPos(flow.blockOrder.size() + 1u, 0u);
+    for (std::size_t bi = 0; bi < flow.blockOrder.size(); ++bi) {
+        firstPos[bi + 1u] = firstPos[bi] + 2u * lir.blockInstCount(flow.blockOrder[bi]);
+    }
+    std::vector<LirLiveRange const*> rangeOf;
+    for (auto const& rng : flow.ranges) {
+        if (rng.vreg.id >= rangeOf.size()) rangeOf.resize(rng.vreg.id + 1u, nullptr);
+        rangeOf[rng.vreg.id] = &rng;
+    }
+
+    for (auto const& run : flow.guardedRuns) {
+        if (run.landingOrderIndex >= flow.liveIn.size()) continue;
+        VRegBitset const& read = flow.liveIn[run.landingOrderIndex];
+        std::uint32_t const landingV = flow.blockOrder[run.landingOrderIndex].v;
+        for (std::size_t w = 0; w < read.bits.size(); ++w) {
+            std::uint64_t bits = read.bits[w];
+            while (bits != 0) {
+                std::uint32_t const id = static_cast<std::uint32_t>(w << 6)
+                    + static_cast<std::uint32_t>(std::countr_zero(bits));
+                bits &= bits - 1u;
+                LirLandingViolation v;
+                v.landingBlockV = landingV;
+                v.blockV        = landingV;
+                LirLiveRange const* const rng =
+                    id < rangeOf.size() ? rangeOf[id] : nullptr;
+                auto const* const a = alloc.forVReg(id);
+                if (rng == nullptr || a == nullptr) {
+                    v.vreg = makeVirtualReg(id, rng != nullptr ? rng->vreg.regClass()
+                                                               : LirRegClass::None);
+                    v.kind = LirLandingViolation::Kind::Unassigned;
+                    return v;
+                }
+                v.vreg = rng->vreg;
+                // (1) WHERE it is kept: a spill slot, or a register a call keeps.
+                if (!a->isSpilled()) {
+                    std::uint32_t const ordinal = a->physReg().id;
+                    if (ordinal >= regs.size()
+                        || volatileNames.contains(regs[ordinal].name)) {
+                        v.kind = LirLandingViolation::Kind::VolatileRegister;
+                        return v;
+                    }
+                }
+                // (2) THAT it is kept there through the whole run and at the
+                // landing's entry. One assignment per register is one location
+                // for the register's whole range, so "the range covers it" is
+                // "the location holds it": defined before each block of the run
+                // and live to its end, defined before the landing's first slot
+                // and read at or after it.
+                for (std::uint32_t const bi : run.blockOrderIndices) {
+                    if (firstPos[bi] == firstPos[bi + 1u]) continue;   // no instruction
+                    if (rng->start < firstPos[bi] && rng->end >= firstPos[bi + 1u]) continue;
+                    v.kind   = LirLandingViolation::Kind::NotHeldThroughRun;
+                    v.blockV = flow.blockOrder[bi].v;
+                    return v;
+                }
+                if (!(rng->start < run.landingEntryPosition
+                      && run.landingEntryPosition < rng->end)) {
+                    v.kind = LirLandingViolation::Kind::NotHeldThroughRun;
+                    return v;
+                }
+            }
+        }
     }
     return std::nullopt;
 }
@@ -2236,7 +2359,11 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
 
         expireActive(active, free, r.start);
 
-        bool const crossesCall = rangeCrossesCall(r, callPositions);
+        // "Crosses a call" in the wide sense every consumer below means by it:
+        // held while a party that keeps only the call-preserved registers has
+        // control — a call, or the transfer into a landing block.
+        bool const crossesCall =
+            rangeOutlivesAVolatileRegister(r, callPositions, flow);
 
         // D-CSUBSET-BINOP-RIGHT-CLOBBER closure (2026-06-02): when
         // this range is the result of a `requires2Address` opcode,
@@ -2623,7 +2750,7 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         assignClassSpill(part.members[spillIt->classRoot],
                          acquireSlot(spillIt->cls, spillIt->range));
         bool const evictedCrossesCall =
-            rangeCrossesCall(spillIt->range, callPositions);
+            rangeOutlivesAVolatileRegister(spillIt->range, callPositions, flow);
         if (evictedCrossesCall) ++spills.crossCallExhaustion;
         else                    ++spills.pressure;
 
@@ -2665,6 +2792,33 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         regallocFatal("interfering live ranges share one resource — the "
                       "coalescer or the linear scan is unsound; refusing to "
                       "emit a silently wrong artifact");
+    }
+
+    // ── THE SECOND SELF-CHECK, same wall, same reason, also unconditional.
+    // A value a landing block reads has no code between the fault and its
+    // first use: where the table says it is, it must have been all along, and
+    // the party that made the transfer must have kept that place. Nothing a
+    // user writes reaches this either — it is the allocator (or the liveness it
+    // was handed) contradicting the exceptional edge — and what it prevents is
+    // a handler that silently reads what a dispatcher left in a register.
+    if (auto const lost = findLandingViolation(lir, schema, flow, out);
+        lost.has_value()) {
+        char const* const what =
+            lost->kind == LirLandingViolation::Kind::VolatileRegister
+                ? "is kept in a register the calling convention does not keep "
+                  "across a call"
+            : lost->kind == LirLandingViolation::Kind::NotHeldThroughRun
+                ? "is not held in one place through that block"
+                : "has no assignment";
+        std::fprintf(stderr,
+                     "dss::LirRegAlloc: in func %u, vreg %u is read by landing "
+                     "block %u and %s (block %u)\n",
+                     flow.fn.v, static_cast<unsigned>(lost->vreg.id),
+                     static_cast<unsigned>(lost->landingBlockV), what,
+                     static_cast<unsigned>(lost->blockV));
+        regallocFatal("a value live into a landing block would not survive the "
+                      "transfer into it; refusing to emit a silently wrong "
+                      "artifact");
     }
 
     out.ok = (reporter.errorCount() == baseline);

@@ -87,6 +87,29 @@ class DiagnosticReporter;
 // reorder guarantees that next block is the FIRST non-region block, so [Begin,End)
 // covers exactly the guarded body). `handlerBlock` = the `__except` body (the scope-
 // table JumpTarget); `filterFuncletSymbol` = the synthesized funclet.
+//
+// ★★★ TWO PROMISES EVERY CONSUMER OF THESE RECORDS RESTS ON
+// (D-MIR-NESTED-TRY-REGIONS-REACH-THE-OUTER-HANDLER), both VERIFIED by the pass on
+// the module it returns, per region, and refused by name when they do not hold:
+//   1. THE RUN IS THE MEMBERSHIP. The blocks laid out from `beginBlock` through
+//      `endBlock` are exactly the blocks of the guarded body — re-derived from the
+//      rebuilt function's own CFG — and the run starts at the body's entry. A
+//      region nested in another has its own run INSIDE the outer one. Neither the
+//      filter stub nor the handler of a region lies inside that region's run.
+//      LIR liveness reads the same three blocks as a guarded run (`LirGuardedRegion`).
+//   2. THE ORDER IS THE DISPATCH ORDER. The handler routine gives a fault to the
+//      first record, in table order, whose range holds the faulting address and
+//      whose filter accepts, and an outer range holds every address of the regions
+//      inside it. So THE RULE, stated once for every tier that orders or adds
+//      records: A FUNCTION'S RECORDS COME OUT REGION BY REGION, EACH REGION AFTER
+//      EVERY REGION INSIDE IT AND SIBLINGS BY THE ADDRESS OF THEIR FIRST BLOCK; A
+//      REGION'S OWN RECORDS STAY TOGETHER, IN ADDRESS ORDER. This pass gives each
+//      region ONE record, and for one-record regions the rule reads "ascending end
+//      of the range, and of two that end together the one that begins later
+//      first" — the reference compiler's table, as measured (the .cpp carries the
+//      three tables). A tier that gives a region further records (a run of blocks
+//      laid out apart from the body) places them right after that region's own.
+//      Whoever carries these records to the image must keep their order.
 struct DSS_EXPORT MirSehScope {
     SymbolId   parentFuncSymbol{};      // the function that guards this region
     MirBlockId beginBlock{};            // guarded body entry (SehTryBegin succ[0])

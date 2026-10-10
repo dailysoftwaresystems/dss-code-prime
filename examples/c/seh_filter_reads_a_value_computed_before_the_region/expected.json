@@ -1,0 +1,12 @@
+{
+  "$comment": "D-MIR-TRY-FILTER-SHARED-PURE-VALUE-REFUSED-IN-RELEASE: a __try FILTER that reads something the function also computed before the region. A filter is a function of its own — it has the exception and the parent's frame, none of the parent's registers — and an optimized build shares one computation (a global's address, the address of one of its elements) between the code before the region and the filter. Before the fix this compiled at baseline and was REFUSED in release; the filter now computes such a value again. Three cases: a global written before the region, an array element written before the region, and a global the guarded body changes before it faults (the filter must see the value at the fault). The exit code names the first case to fail (11..13); 42 = all right; a crash = a filter declined a fault it should have accepted. THE RELEASE ARM IS THE SUBJECT: it is the arm that used to be refused. The reference compiler (cl 19.51 x64, /Od and /O2) runs this file to 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

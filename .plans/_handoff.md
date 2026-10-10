@@ -167,13 +167,37 @@ round's close; each checkpoint's commit message says what was and was not run on
   that afternoon: its memory was held by other work), and `linux-x86_64-debug` read nothing. Balance on this tree:
   **627 open against 620** — 24 closed, 31 opened (1 created, 30 disclosed), REAL net +7 until the fix-folded rows'
   pins are read. Nine NAMED time-budget rows were re-derived from that day's full-suite figures (each had been
-  passed by a passing run).
-- **Silent defects FOUND on 2026-10-08 and NOT YET FIXED in this tree** (each the base's debt, each with its lane
-  at work): on pe64 a value read in an `__except` handler body, or after the region, can be garbage — register
-  allocation does not know the region (✔MEASURED: a parameter, a `double`, a struct returned after the handler ran,
-  in release a global's shared address); nested `__try` regions reach the OUTER handler (✔MEASURED; the scope
-  records are emitted outer first and the dispatch is first-match); and a reference written through a STATIC name
-  follows a losing weak alias of the same body to the winner (ELF references ✔MEASURED 79; DSS 99 by the code).
+  passed by a passing run). ✔MEASURED after that commit, the composed tree's full suite: `macos-arm64-debug` 2717
+  passed (2026-10-08); `windows-x86_64-release` (MSVC 19.51.36260.0) and `windows-x86_64-debug` (MinGW GNU 13.2.0)
+  2747 passed each (2026-10-10) — the first MSVC and MinGW builds of it. NOT read on that commit: the WSL pair, the
+  arm64 Linux pair, `macos-arm64-release`.
+- **Checkpoint 6 (2026-10-10) = the library lane's P0 fold, the Win64 `__try` family, made CODE-FIRST**: 31 paths
+  (7 new). Register allocation and liveness now know a guarded region (a value read in an `__except` handler body
+  or after the region is the value the program computed — it could be garbage); nested regions reach their OWN
+  handler (they reached the outer one); a filter may read a pure value computed before the region in release; every
+  function states where it saved each whole vector register (`UWOP_SAVE_XMM128`, near and far form), so a register
+  is put back when an exception unwinds THROUGH a frame, and the saved-register area begins at a multiple of the
+  widest register it saves (only a Win64 frame that saves a vector register and whose outgoing area ends off 16
+  moves, by 16 bytes); the 117 `<windows.h>` constants carry the real headers' types (100 were mistyped, 69 in
+  signedness); `_SC_NPROCESSORS_ONLN` has its Mach-O number. Six new examples. ✔MEASURED by the lane on the folded
+  bytes, the full suite unfiltered: `macos-arm64-debug`, `linux-arm64-debug`, `linux-x86_64-debug` 2729 of 2729;
+  `windows-x86_64-debug` (MinGW) and `windows-x86_64-release` (MSVC) 2755 of 2759, the four reds on each being
+  repository guards on that worktree (two anchor guards naming this fold's new ids, the emitted-id inventory, the
+  document census) — all four written at the fold and read green on the main tree with the other guards.
+  **None of its 34 mutants is read**: five rows (three P0) are `disclosed`, "fix folded", and close when their
+  mutants pass as arms of `dssharness check-mutations`. THREE rows are born OPEN and unbuilt, each the base's debt
+  and each closing in a later fold of the same lane in this round: a silent wrong answer in the constant evaluator
+  (below), the refusal beside it, and a `__try` filter holding a branch. Balance on this tree: **635 open against
+  620** — 24 closed, 39 opened (the tool counts 4 created, 35 disclosed; three of the four are that found debt),
+  REAL net +15 until the fix-folded rows' pins are read.
+- **Silent defects FOUND in this round and NOT YET FIXED in this tree** (each the base's debt, each with its lane
+  at work): a reference written through a STATIC name follows a losing weak alias of the same body to the winner
+  (ELF references ✔MEASURED 158 on four compilers' objects, DSS 198); and in a STATIC INITIALIZER, an enumerator,
+  an array size or a `_Static_assert`, the unary `~` and `-` of an `unsigned int` constant are not reduced to
+  32 bits, so every widening of the result is wrong (✔MEASURED on pe64, baseline and release:
+  `static const unsigned long long u = ~0U;` holds 0xFFFFFFFFFFFFFFFF; right inside function bodies). The two
+  pe64 `__try` defects found on 2026-10-08 (a value read in a handler could be garbage; nested regions reached
+  the outer handler) are fixed by checkpoint 6.
 - **HOW THIS CYCLE ENDS — operator, 2026-10-08, verbatim:** *"on finishing this cycle I'll turn on the pipes and
   try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and monitor CI until
   green"*. So P69 is this PR's EXIT: its four lanes finish what they are in (no second round opens in this PR — what
