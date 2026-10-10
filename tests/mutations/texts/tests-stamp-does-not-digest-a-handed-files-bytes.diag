@@ -1,0 +1,1 @@
+dss-build-stamp selftest: FAILED  handed: a byte added to a handed dependency's source moves the .deps component, and only it

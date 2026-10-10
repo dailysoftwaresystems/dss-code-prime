@@ -1,0 +1,1 @@
+        list(FILTER _dss_found EXCLUDE REGEX "^\\.git(/|$)")

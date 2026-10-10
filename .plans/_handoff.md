@@ -209,13 +209,31 @@ round's close; each checkpoint's commit message says what was and was not run on
   `windows-x86_64-debug`. Of the stamp's 14 mutants, all are red by hand on copies outside every tree and TWO were
   read through the harness; they become arms in that lane's next fold (a gtest case per self-test arm driving the
   same entry). No Windows-leg arm exists yet (a worker of a lane worktree exceeds 260 characters there; a Windows
-  sweep runs from the main checkout). No row written; balance unchanged, 635 against 620.
+  sweep runs from the main checkout). No row written; balance unchanged, 635 against 620. ✔MEASURED after that
+  commit, the composed tree's full suite on the main checkout: `macos-arm64-debug` 2730 passed,
+  `windows-x86_64-release` (MSVC) and `windows-x86_64-debug` (MinGW) 2760 passed each; the verb's own self-test 7 of
+  7 on both Windows legs and on `linux-x86_64-release` (`linux-x86_64-debug`: 6 passed, 1 unmeasured — the WSL
+  distribution's limit of file watchers was reached while other legs ran there; owed again).
+- **Checkpoint 8 (2026-10-10) = the harness lane's second fold: the build stamp's self-test is a gtest binary and
+  its mutants are arms.** 47 paths (43 new). The `cmake -P` entry `build/build_stamp_identity` is replaced under
+  the same ctest name by a binary that starts the entry's own command line once and holds one case per self-test
+  arm (46 cases; it fails, never skips, when cmake cannot be started); 14 arms of the two stamp modules join the
+  registry (21 arms in all). Two of the original fourteen mutants have NO arm by the tool's design — a mutation the
+  tree's own configure refuses has no red kind — and two others pin what those two alone read. ✔MEASURED by the
+  lane on its final bytes: all 14 `passed` on `macos-arm64-debug`, which is NOT the leg their `S` rows name
+  (`linux-x86_64-debug`, owed from the main checkout); the closing control green on `windows-x86_64-debug` (MinGW)
+  and `windows-x86_64-release` (MSVC) 41 of 41, `linux-x86_64-debug` and `macos-arm64-debug` 11 of 11. No row.
 - **Silent defects FOUND in this round and NOT YET FIXED in this tree** (each the base's debt, each with its lane
   at work): a reference written through a STATIC name follows a losing weak alias of the same body to the winner
   (ELF references ✔MEASURED 158 on four compilers' objects, DSS 198); and in a STATIC INITIALIZER, an enumerator,
   an array size or a `_Static_assert`, the unary `~` and `-` of an `unsigned int` constant are not reduced to
   32 bits, so every widening of the result is wrong (✔MEASURED on pe64, baseline and release:
-  `static const unsigned long long u = ~0U;` holds 0xFFFFFFFFFFFFFFFF; right inside function bodies). The two
+  `static const unsigned long long u = ~0U;` holds 0xFFFFFFFFFFFFFFFF; and where such a widened value is a
+  CONDITION inside a function body the function dies of an illegal instruction). **AND ONE BORN IN THIS PR, a merge
+  blocker:** a member of a constant aggregate whose initializer is a one-operand expression is read WITHOUT its
+  operator (✔MEASURED on pe64: `static const struct S g = {.b = -5}; if (g.b != -5) return 7;` dies of an illegal
+  instruction; a static assertion, an enumerator and an array bound built on such a member are wrong) — the
+  library lane fixes all three in the fold it has open. The two
   pe64 `__try` defects found on 2026-10-08 (a value read in a handler could be garbage; nested regions reached
   the outer handler) are fixed by checkpoint 6.
 - **HOW THIS CYCLE ENDS — operator, 2026-10-08, verbatim:** *"on finishing this cycle I'll turn on the pipes and

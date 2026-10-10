@@ -516,6 +516,126 @@ function(dss_use_build_stamp target)
                  APPEND PROPERTY OBJECT_DEPENDS ${DSS_BUILD_STAMP_RUNTIME_INPUTS})
 endfunction()
 
+# ── THE STAMP'S SELF-TEST: ONE COMMAND LINE, WRITTEN ONCE, HERE ─────────────────
+# `cmake/DssBuildStamp.cmake` proves its own properties when run with
+# `-DDSS_STAMP_MODE=selftest`: in throwaway trees, without git the value is the declared
+# inputs' CONTENT, with git only the inputs' dirt counts; a dependency's sources this
+# configure was HANDED reach the value; a declared input that names nothing is refused;
+# one arm stamps THIS tree under its own declaration, and the `configure:` arms configure
+# fixture projects with this build's generator against `cmake/DssBuildStampDeclaration.cmake`.
+#
+# ★ ITS ctest ENTRY, `build/build_stamp_identity`, IS A TEST BINARY (tests/program/
+# test_build_stamp_identity.cpp) THAT RUNS THIS COMMAND LINE AND HOLDS ONE CASE PER ARM.
+# It was a bare `cmake -P` entry until 2026-10-10: one verdict for every arm, and no test
+# binary — so no mutation of either module could be an arm of the mutation sweep, which
+# runs a test binary whole and judges the EXACT cases that go red. The binary drives the
+# same script; it re-implements no arm. There is ONE entry and ONE command line, composed
+# here from the same variables the stamp itself is wired with, and handed to the binary as
+# a header generated at configure — never as compile definitions, which would give this one
+# test target a macro set of its own and cost it the test targets' shared precompiled header.
+# So a copy of this tree, configured where it stands, runs ITS OWN modules.
+set(DSS_BUILD_STAMP_SELFTEST_COMMAND
+    "${CMAKE_COMMAND}"
+    "-DDSS_STAMP_MODE=selftest"
+    "-DDSS_STAMP_SCRATCH=${CMAKE_BINARY_DIR}/build-stamp-selftest"
+    "-DDSS_STAMP_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+    "-DDSS_STAMP_GIT=${GIT_EXECUTABLE}"
+    "-DDSS_STAMP_INPUTS=${DSS_BUILD_STAMP_INPUTS}"
+    "-DDSS_STAMP_RECORDS=${DSS_BUILD_STAMP_RECORDS}"
+    "-DDSS_STAMP_SCRIPT_DIRS=${DSS_BUILD_STAMP_SCRIPT_DIRS}"
+    "-DDSS_STAMP_GENERATOR=${CMAKE_GENERATOR}"
+    "-DDSS_STAMP_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+    "-P"
+    "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake")
+# Twelve arguments were written above. A value holding a `;` would have been split into
+# more, in silence, and the script would read a truncated one: counted, not assumed.
+list(LENGTH DSS_BUILD_STAMP_SELFTEST_COMMAND _dss_selftest_argc)
+if(NOT _dss_selftest_argc EQUAL 12)
+    message(FATAL_ERROR
+        "dss: the build stamp's self-test command line has ${_dss_selftest_argc} arguments where 12 were "
+        "written — a path, the generator's name or a declared list holds a `;`, which a CMake list "
+        "splits. That argument would reach the script cut.")
+endif()
+set(DSS_BUILD_STAMP_SELFTEST_DIR "${CMAKE_BINARY_DIR}/generated/build-stamp-selftest")
+set(_dss_selftest_header "${DSS_BUILD_STAMP_SELFTEST_DIR}/dss_build_stamp_selftest_command.hpp")
+# The header's text is ONE string, appended to — never a CMake list, which would take every
+# `;` of the C++ it holds for a separator and drop it.
+set(_dss_selftest_text "")
+string(APPEND _dss_selftest_text
+    "// GENERATED at configure by the top-level CMakeLists.txt (THE STAMP'S SELF-TEST). Do not edit.\n"
+    "// The command line of the build stamp's self-test as THIS configure composed it, the directory\n"
+    "// it runs in, and the file its standard output goes to.\n"
+    "#pragma once\n"
+    "namespace dss::build_stamp_selftest {\n"
+    "inline constexpr const char* const kCommand[] = {\n")
+foreach(_dss_selftest_arg IN LISTS DSS_BUILD_STAMP_SELFTEST_COMMAND)
+    # A raw string literal: the argument's own bytes, nothing escaped. The one text it cannot
+    # hold is its own closing delimiter, which is refused rather than hoped absent.
+    if(_dss_selftest_arg MATCHES "\\)dss\"")
+        message(FATAL_ERROR
+            "dss: an argument of the build stamp's self-test holds `)dss\"`, the closing delimiter of the raw "
+            "string literal it is written into: ${_dss_selftest_arg}")
+    endif()
+    string(APPEND _dss_selftest_text "    R\"dss(${_dss_selftest_arg})dss\",\n")
+endforeach()
+string(APPEND _dss_selftest_text
+    "};\n"
+    "inline constexpr const char* const kWorkingDirectory = R\"dss(${CMAKE_BINARY_DIR})dss\";\n"
+    "inline constexpr const char* const kStandardOutput =\n"
+    "    R\"dss(${CMAKE_BINARY_DIR}/build-stamp-selftest.stdout.txt)dss\";\n"
+    "}  // namespace dss::build_stamp_selftest\n")
+# Written only when its bytes differ, so a configure that changes nothing rebuilds nothing.
+set(_dss_selftest_have "")
+if(EXISTS "${_dss_selftest_header}")
+    file(READ "${_dss_selftest_header}" _dss_selftest_have)
+endif()
+if(NOT _dss_selftest_have STREQUAL _dss_selftest_text)
+    file(WRITE "${_dss_selftest_header}" "${_dss_selftest_text}")
+endif()
+
+add_library(dss_build_stamp_selftest_command INTERFACE)
+target_include_directories(dss_build_stamp_selftest_command INTERFACE "${DSS_BUILD_STAMP_SELFTEST_DIR}")
+
+# THE opt-in, for the ONE target that runs the self-test. It gives the target the generated
+# header, and it declares what the build graph did not say: that target's verdict is a
+# function of the two scripts it runs, which no compiler reads, so no object depended on
+# them. Each of its sources that includes the header names both modules as inputs of its
+# object (`OBJECT_DEPENDS`) — found by reading the sources, as the stamp's own opt-in does.
+# An edit of either module then rebuilds that object, which is what a tool asking the graph
+# "was an object that depends on the site rebuilt" needs to witness a mutation of a script.
+function(dss_use_build_stamp_selftest target)
+    target_link_libraries(${target} PRIVATE dss_build_stamp_selftest_command)
+    get_target_property(_dss_sources ${target} SOURCES)
+    get_target_property(_dss_dir ${target} SOURCE_DIR)
+    set(_dss_includers "")
+    foreach(_dss_source IN LISTS _dss_sources)
+        cmake_path(ABSOLUTE_PATH _dss_source BASE_DIRECTORY "${_dss_dir}" NORMALIZE OUTPUT_VARIABLE _dss_abs)
+        if(NOT EXISTS "${_dss_abs}" OR IS_DIRECTORY "${_dss_abs}")
+            continue()   # a generated source, or a generator expression: it cannot hold the include yet
+        endif()
+        file(STRINGS "${_dss_abs}" _dss_hit LIMIT_COUNT 1
+             REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]dss_build_stamp_selftest_command\\.hpp[>\"]")
+        if(_dss_hit)
+            list(APPEND _dss_includers "${_dss_abs}")
+        endif()
+    endforeach()
+    if(NOT _dss_includers)
+        message(FATAL_ERROR
+            "dss_use_build_stamp_selftest(${target}): no source of `${target}` includes "
+            "`dss_build_stamp_selftest_command.hpp`, so there is no object to declare the two stamp modules on. "
+            "Opt a target in only where one of its sources runs the self-test.")
+    endif()
+    foreach(_dss_module IN ITEMS DssBuildStamp.cmake DssBuildStampDeclaration.cmake)
+        if(NOT EXISTS "${CMAKE_SOURCE_DIR}/cmake/${_dss_module}")
+            message(FATAL_ERROR "dss_use_build_stamp_selftest(${target}): cmake/${_dss_module} is not a file.")
+        endif()
+    endforeach()
+    set_property(SOURCE ${_dss_includers} TARGET_DIRECTORY ${target}
+                 APPEND PROPERTY OBJECT_DEPENDS
+                     "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake"
+                     "${CMAKE_SOURCE_DIR}/cmake/DssBuildStampDeclaration.cmake")
+endfunction()
+
 add_subdirectory(src)
 
 if(DSS_BUILD_TESTS)
@@ -1783,26 +1903,10 @@ if(DSS_BUILD_TESTS)
                 "-DDSS_HCS_GENERATOR=${CMAKE_GENERATOR}"
                 "-DDSS_HCS_PCH_DISABLED=${CMAKE_DISABLE_PRECOMPILE_HEADERS}"
                 -P "${CMAKE_SOURCE_DIR}/cmake/DssHostCompilerStamp.cmake")
-    # The compiler's BUILD stamp, proven in throwaway trees by the script that computes it (2026-10-06,
-    # cycle P69, lane `hm`): without git the value is the declared inputs' CONTENT, so an unchanged tree
-    # stamps the same value and leaves the header alone, and a source's bytes, a new file, a rename, a test
-    # tree's CMake script or VERSION moves it while a test's source, a document, a plan or a harness file
-    # does not; with git only the inputs' dirt counts, both ways; a declared input that names nothing is
-    # refused. One arm stamps THIS tree under its own declaration without git, and four configure fixture
-    # projects with this build's generator to prove the configure-time check of the declaration. Every leg
-    # runs it: what git a leg has, and whether its tree is a work tree, are the host's.
-    add_test(
-        NAME build/build_stamp_identity
-        COMMAND ${CMAKE_COMMAND}
-                -DDSS_STAMP_MODE=selftest
-                "-DDSS_STAMP_SCRATCH=${CMAKE_BINARY_DIR}/build-stamp-selftest"
-                "-DDSS_STAMP_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-                "-DDSS_STAMP_GIT=${GIT_EXECUTABLE}"
-                "-DDSS_STAMP_INPUTS=${DSS_BUILD_STAMP_INPUTS}"
-                "-DDSS_STAMP_RECORDS=${DSS_BUILD_STAMP_RECORDS}"
-                "-DDSS_STAMP_SCRIPT_DIRS=${DSS_BUILD_STAMP_SCRIPT_DIRS}"
-                "-DDSS_STAMP_GENERATOR=${CMAKE_GENERATOR}"
-                "-DDSS_STAMP_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
-                -P "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake")
+    # The compiler's BUILD stamp is proven by `build/build_stamp_identity` too, on every leg — what git
+    # a leg has, and whether its tree is a work tree, are the host's. That entry is no longer registered
+    # here: it is the test binary tests/program/CMakeLists.txt registers under the same name, which
+    # runs the stamp script's self-test by the command line composed beside the stamp's wiring above
+    # (THE STAMP'S SELF-TEST) and holds one case per arm of it.
 endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DssTestBudgets.cmake")  # every ctest entry's TIMEOUT — keep this LAST

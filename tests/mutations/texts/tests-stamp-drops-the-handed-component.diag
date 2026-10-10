@@ -1,0 +1,1 @@
+dss-build-stamp selftest: FAILED  handed: a handed dependency adds .deps<16 hex> to the value the tree has without it, the same twice

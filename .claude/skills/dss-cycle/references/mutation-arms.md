@@ -107,7 +107,7 @@ The words are the tool's (`help mutations`, `help verdicts`, `help exit-codes`);
 | `survived` | the mutation built and ran, and no case failed | the pin is vacuous: strengthen the test, and tell the orchestrator at once |
 | `unattributed` | the run failed and nothing ties it to a case: no report, a failing exit with no failing case, a run past its bound or silent too long | contain the crash or hang in a case |
 | `unwitnessed` | the build passed and an object that depends on a site was not rebuilt | find out what actually ran: nothing about the pin is known |
-| `failed` | the build failed at a step that is no object depending on the site (a link, another object) | read the arm's build log; a void reading |
+| `failed` | the build failed at a step that is no object depending on the site (a link, another object, the configure itself) | read the arm's build log, or its `configure.log`; a void reading — and where the mutation itself stopped the configure, the mutant cannot be an arm (the last section) |
 | `stopped` | not driven to a verdict: the sweep was stopped, no worker was left, or the UNMUTATED run of its binary did not pass | read the control's log: a runner red unmutated stops every arm that runs it and fails the leg |
 | `not-admitted` | its machine did not admit it | a wait, not a failure: run again; it measured nothing |
 | `poisoned` | a site could not be put back | the worker is retired; report it |
@@ -266,6 +266,16 @@ taken and put back over each other, so a coupled site is another file"* — that
 hand protocol (the last section). Never one before-text spanning every site: any unrelated edit between the sites
 would break the arm.
 
+**(8) A CMake SCRIPT site, behind the script's own self-test.**
+`tests-stamp-does-not-digest-a-handed-files-bytes`: site `cmake/DssBuildStamp.cmake`, which no compiler reads. Its
+claim is a case of the test binary that DRIVES the script's self-test (the last section says how such a binary is
+built): the binary runs the self-test once, and each case reads ONE self-test arm's own verdict line. So the `C`
+rows are the cases of the self-test arms the mutation fails, and the `diag` is the script's own failure line for
+the claim. Target and runner are BOTH the test's target: its object is the one the build declares as depending on
+the script (✔MEASURED 2026-10-10: 47 to 49 s an arm on a warm worker).
+
+    A | tests-stamp-does-not-digest-a-handed-files-bytes | cmake/DssBuildStamp.cmake | T/….before | T/….after | TEST-RED | dss_build_build_stamp_identity | dss_build_build_stamp_identity | <cases> | T/….diag | CLAIM AT tests/program/test_build_stamp_identity.cpp, TEST <Case>. <why>
+
 ## Finding an arm's claim, target, runner, case count, diagnostic and legs
 
 - **the claim** — the TEST written for the mechanism: `CLAIM AT <its file>, TEST <Case>`. If the only thing that
@@ -337,6 +347,10 @@ match; the leg's own run id is the second `run` line of the sweep's output and t
   (the last section).
 - `stopped`, *"the unmutated <runner> has N red"* — the runner is not self-contained, or is red on these bytes:
   read `controls/<runner>/run.log`. It fails the leg, so fix it or take the arm out before the next sweep.
+- `failed`, *"the mutated build failed, and named no step that failed: configure exited 1"* — the mutation stopped
+  the worker's own configure. Read `configure.log` in the arm's directory (a directory path given to
+  `read-leg-path` lists it): where it holds the mutated mechanism's own refusal of the tree, the mutant cannot be
+  an arm (the last section).
 
 ## The command lines
 
@@ -384,8 +398,10 @@ build, test or sync of the leg — but one harness command at a time on one tree
   260"*). So an arm that names a Windows leg is read by the orchestrator on the main tree after the fold that
   carries it — such a fold is code-first for those arms — while every other leg is swept from the lane's own tree.
 - **A sweep's unmutated control is the one build of this repository that is HANDED its dependencies** (each
-  worker is given the sources its leg's build fetched), so it is where the build stamp's handed-dependency term
-  and the configure guard's hand-over rules are exercised: no leg of the gate builds that way.
+  worker is given the sources its leg's build fetched, inside the worker's own tree), so it is where the build
+  stamp's handed-dependency term and the configure guard's hand-over rules are exercised: no leg of the gate
+  builds that way. It is also why a mutant of the guard's excuse for handed directories stops every worker's
+  configure (the last section).
 - **Room**: the tool places a worker only where its copy and build fit, and says what keeps one out. `dssharness
   clean --legs <leg>` removes a leg's build directory AND its workers; `delete-agent` removes the workers beside a
   lane's worktree and beside each host's copy.
@@ -400,10 +416,29 @@ Each is named with the measurement that shows it. **Such a mutant has NO row in 
   file, a script). The verb reads `violated`, *"no object … depends on '<site>'"*, before it mutates anything.
   The answer is to make the dependency TRUE in the build graph — as the build stamp's includers are declared to
   depend on every file under `src/dss-config/` — never to route around the witness; until it is declared, no arm.
+- **A mutation the tree's own CONFIGURE refuses** — a mutant of a configure-time guard that makes the guard refuse
+  the tree it runs in. The verb reads `failed`, *"the mutated build failed, and named no step that failed:
+  configure exited 1"* (✔MEASURED 2026-10-10 on two mutants of the build stamp's configure guard; each arm's
+  `configure.log` held the guard's own refusal — one because a worker is handed its dependencies inside its tree,
+  one in every tree). No red kind fits: a BUILD-RED arm must stop at an object that depends on its site, and a
+  configure has none. Such a mutant has no row, and no hand reading either — a tree that does not configure builds
+  nothing to read. **Write the mutant a configure SURVIVES instead**: one that switches the same refusal or excuse
+  off where only the script's own fixture meets it, so the real tree still configures and the fixture's case goes
+  red (✔ the guard's refusal of an undeclared directory: its mutant refuses none; the real tree, whose every
+  directory is declared, configures; the fixture cases that expect a refusal go red). Where no such mutant exists
+  — the claim IS that the real tree, or a worker handed its dependencies, configures — the configure of every tree
+  and of every worker is that claim's test, and the report says so in those words.
 - **NOT a class: a claim that only a SCRIPT entry holds** (a `cmake -P` self-test, a runner action's own
   self-test). It gets a gtest case that DRIVES that entry — the entry's own command line, on the tree the binary
   was configured from, one case per claim, failing (never skipping) when the entry cannot be started — and then
-  its mutants are arms like any other.
+  its mutants are arms like any other (class 8 above). ✔ The build stamp's self-test is the worked case, and its
+  four properties are the pattern: (1) the entry's command line is written ONCE in the build and baked into a
+  generated header, so the test starts exactly what the entry was; (2) the test binary is registered under the
+  entry's own ctest name and REPLACES the script entry — one truth, one run per leg; (3) it runs the script once
+  per process and has one case per self-test arm, each reading that arm's own verdict line, plus a case that
+  every arm is a case and every case an arm, so a new self-test arm with no case is red; (4) the build declares
+  the object of the source that includes the header as depending on the script's modules, so a mutated module
+  rebuilds it and the tool witnesses the rebuild.
 - **NOT a class: an example pin.** It is no hand reading either — Rule 1: write the unit-tier claim.
 
 ### The hand protocol, for that one class only

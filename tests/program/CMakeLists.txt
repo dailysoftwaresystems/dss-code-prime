@@ -203,6 +203,30 @@ dss_add_test(NAME program/test_build_stamp
 # rebuilding the world.
 dss_use_build_stamp(dss_program_test_build_stamp)
 
+# THE STAMP SCRIPT'S OWN SELF-TEST, ONE CASE PER ARM — the ctest entry
+# `build/build_stamp_identity`. `cmake/DssBuildStamp.cmake` proves its properties in
+# throwaway trees when run in `selftest` mode (what moves the value with and without
+# git, what a handed dependency adds, what is refused), and configures fixture
+# projects against `cmake/DssBuildStampDeclaration.cmake`. This binary RUNS that
+# self-test — the command line the top-level CMakeLists composes, on the tree it was
+# configured from — and reads each arm's verdict into a case of its own; it
+# re-implements none of them. It keeps the entry's name because it IS that entry:
+# the name says what is proven, and the test trees' other `build/` entries are its
+# neighbours. The source lives here, beside the stamp's other tests.
+#
+# ★ WHY A TEST BINARY AND NOT THE BARE `cmake -P` ENTRY IT REPLACED: a script entry
+# has one verdict and no cases, so a mutation of either module could not be an arm
+# of the mutation sweep, which starts a test binary whole and judges the exact set
+# of cases that go red.
+dss_add_test(NAME build/build_stamp_identity
+             SOURCES test_build_stamp_identity.cpp)
+
+# The opt-in (top-level CMakeLists): the generated header that holds the command
+# line, and the two stamp modules declared as inputs of this target's object — no
+# compiler reads a CMake script, so without that declaration no object depended on
+# either.
+dss_use_build_stamp_selftest(dss_build_build_stamp_identity)
+
 # It REUSES tests/core/native_c_probe.hpp for the reference-compiler probe
 # rather than growing a second copy of host-compiler discovery, shell quoting
 # and output capture — the same reason tests/conformance adds this path.
