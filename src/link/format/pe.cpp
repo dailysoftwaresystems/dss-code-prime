@@ -165,8 +165,9 @@ constexpr std::size_t   kAuxSectionDefUnusedTail = 3;
 //   Characteristics 3 -> link.exe LINKS, and the binary RUNS returning 42
 // ⇒ 3 is the only value under which a cross-object weak alias RESOLVES, and by
 // bar §A.3b one working reference makes the behaviour required. gcc emits 1 for
-// its own `weak, alias(...)`, but gcc has already bound its INTERNAL reference
-// to the renamed `.weak.<n>.<n>` body, so its value never has to make the alias
+// its own `weak, alias(...)`, and under its own linker that record is reached
+// from the SAME unit only — GNU ld's PE backend resolves a weak external from
+// no other object at any value — so gcc's value never has to make the alias
 // reachable from outside; DSS re-emits objects whose alias must be. See
 // `appendAliasEntries` for the ld-vs-link.exe divergence this uncovered.
 constexpr std::uint32_t IMAGE_WEAK_EXTERN_SEARCH_ALIAS = 3;
@@ -1070,11 +1071,11 @@ encode(AssembledModule const&    module,
     // reader's COMDAT gate (coff_object_reader.cpp, "GATE 3: COMDAT selection
     // -> the section's external-symbol binding") lifts ANY / SAME_SIZE /
     // EXACT_MATCH to `SymbolBinding::Weak` and NODUPLICATES to Global.
-    // Emitting WEAK_EXTERNAL here would produce objects DSS READS BACK WITH
-    // THE WRONG SEMANTICS -- the writer/reader round trip is this arm's
-    // acceptance test, and before this change the two disagreed about what a
-    // COFF weak definition even is (the reader had an answer; the writer
-    // emitted no COMDAT at all and refused the symbol).
+    // Emitting WEAK_EXTERNAL for such a definition would produce objects DSS
+    // READS BACK AS THE OTHER KIND -- the writer/reader round trip is this
+    // arm's acceptance test, and before this change the two disagreed about
+    // what a COFF weak definition even is (the reader had an answer; the
+    // writer emitted no COMDAT at all and refused the symbol).
     //
     // ✔MEASURED 2026-08-20, the reference encodings, each probed separately:
     //   * cl.exe 14.51.36231 and clang 17 (--target=x86_64-pc-windows-msvc)
@@ -1083,11 +1084,12 @@ encode(AssembledModule const&    module,
     //     symbol first and the EXTERNAL `gv` second -- the shape emitted here.
     //   * mingw gcc 13.2.0 and that same clang BOTH encode GNU
     //     `__attribute__((weak))` as UNDEF WEAK_EXTERNAL plus a STRONG
-    //     definition under a synthetic `.weak.<name>...` name. That shape is
-    //     a weak reference to a renamed strong body: DSS's reader would see
-    //     the real name undefined and the body under a name nothing refers
-    //     to, so it is NOT the encoding for a symbol DSS models as a weak
-    //     DEFINITION.
+    //     definition under a synthetic `.weak.<name>...` name. That is the
+    //     format's OTHER kind of weak definition, the OVERRIDABLE one, and
+    //     since P69 a dialect of its own (THE WEAK-EXTERNAL ARM, below):
+    //     DSS's reader reads the pair as one body under a weak name of kind
+    //     `Overridable`, and this writer hands the kind on instead of
+    //     re-spelling it as a COMDAT.
     //
     // MECHANICS: the duplicate-resolution policy is a property of the
     // SECTION, so each weak body needs a section OF ITS OWN -- two weak
@@ -1095,7 +1097,118 @@ encode(AssembledModule const&    module,
     // functions are therefore held out of the shared `.text` and weak data
     // items out of their shared data section (`excludedItemIndices`), and each
     // gets a single-body COMDAT section appended after the ordinary ones.
-    link::format::ObjectSymbolNames const objNames{module};
+    //
+    // ── THE WEAK-EXTERNAL ARM (P69) — AN OVERRIDABLE DEFINITION KEEPS ITS KIND ──
+    //    D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER
+    //
+    // PE has TWO kinds of weak definition, and they are two MECHANISMS with two
+    // duplicate rules, not two strengths of one (✔MEASURED 2026-10-10, link.exe
+    // 14.44.35228 and lld-link 19.1.5 on clang 19.1.5 objects):
+    //   * SELECT-ANY, a COMDAT section: two of them coalesce (the first is
+    //     kept); beside a STRONG definition of the name it is a DUPLICATE
+    //     (LNK2005);
+    //   * OVERRIDABLE, a weak external whose default is a body: it yields to a
+    //     strong definition and to a select-any one, in either order; two of
+    //     them for one name CONFLICT (LNK1227 when their defaults differ in
+    //     name, LNK2005 on the default when they do not).
+    // So which one a definition is written as decides what its object's final
+    // linker does with it, and the kind a unit STATED (`ModuleSymbol::weakKind`:
+    // the COFF reader's, off the record's own form) must reach the wire as that
+    // kind. Which kind takes which spelling is the DOCUMENT's (`weakDefinition`:
+    // `dialect`, and `byKind` for a kind that takes the other), asked per
+    // definition; a definition that states no kind takes `dialect`, which is
+    // how every definition was written until P69.
+    //
+    // THE SHAPE, as MinGW gcc and clang write `__attribute__((weak))`: the body
+    // stays in its ordinary section under an EXTERNAL record of its own — the
+    // DEFAULT — and the weak name is a weak external whose auxiliary record
+    // names that default. The default is EXTERNAL because link.exe refuses a
+    // STATIC one (LNK1235, ✔MEASURED 2026-10-08), and is named as clang names
+    // it: `.weak.<name>.default.<the unit's first strong external definition>`,
+    // or `.weak.<name>.default` in a unit that has none (✔MEASURED 2026-10-10;
+    // gcc writes `.weak.<name>.<that definition>`, and its own linker resolves
+    // no weak external from another object at all).
+    //
+    // A body is written this way when the FIRST name a linker can resolve it by
+    // is a weak one whose kind the document spells `weak-external`. (A body
+    // whose first such name is GLOBAL already has its external record, and the
+    // alias pass writes its weak names as weak externals of it — what a unit
+    // read from a compiler's object states.) `ObjectSymbolNames` is told these
+    // bodies take a record of their own, so the weak name becomes the first of
+    // the body's extra names and every "is this a COMDAT definition" below
+    // answers no for them.
+    std::unordered_map<std::uint32_t, ModuleSymbol const*> weakExternalBodies;
+    // The same definitions in the MODULE's order: whatever is refused or
+    // written per definition below walks this, so two runs say the same thing
+    // in the same order.
+    std::vector<ModuleSymbol const*>  weakExternalNames;
+    std::unordered_set<std::uint32_t> bodiesUnderTheirOwnRecord;
+    {
+        std::unordered_set<std::uint32_t> named;   // bodies whose first resolvable name was met
+        for (ModuleSymbol const& ms : module.symbols) {
+            if (!link::format::ObjectSymbolNames::hasExternalLinkage(ms)) continue;
+            if (!named.insert(ms.symbol.v).second) continue;
+            if (ms.binding == SymbolBinding::Weak
+                && fmt.weakDefinitionDialectFor(ms.weakKind)
+                       == WeakDefinitionDialect::WeakExternal) {
+                weakExternalBodies.emplace(ms.symbol.v, &ms);
+                weakExternalNames.push_back(&ms);
+                bodiesUnderTheirOwnRecord.insert(ms.symbol.v);
+            }
+        }
+    }
+    link::format::ObjectSymbolNames const objNames{module,
+                                                   std::move(bodiesUnderTheirOwnRecord)};
+    // The unit's first strong external definition, which a default's name ends
+    // in: functions in module order, then named data items.
+    std::string firstStrongDefinition;
+    if (!weakExternalBodies.empty()) {
+        auto const strongNameOf = [&](SymbolId id) -> std::string {
+            return objNames.definedBinding(id) == SymbolBinding::Global
+                       ? objNames.definedName(id, "sym_")
+                       : std::string{};
+        };
+        for (auto const& fn : module.functions) {
+            firstStrongDefinition = strongNameOf(fn.symbol);
+            if (!firstStrongDefinition.empty()) break;
+        }
+        if (firstStrongDefinition.empty()) {
+            for (auto const& d : module.dataItems) {
+                if (d.symbol == SymbolId{}) continue;
+                firstStrongDefinition = strongNameOf(d.symbol);
+                if (!firstStrongDefinition.empty()) break;
+            }
+        }
+    }
+    // The name of the default record of a body written as a weak external;
+    // nullopt for every other definition.
+    auto const defaultRecordNameOf = [&](SymbolId id) -> std::optional<std::string> {
+        auto const it = weakExternalBodies.find(id.v);
+        if (it == weakExternalBodies.end()) return std::nullopt;
+        std::string name = ".weak." + it->second->name + ".default";
+        if (!firstStrongDefinition.empty()) name += "." + firstStrongDefinition;
+        return name;
+    };
+    // A default's name is this writer's own, so it must be one nothing else in
+    // the object holds: an object that already names a symbol so is refused by
+    // name rather than written with two definitions of one name.
+    if (!weakExternalBodies.empty()) {
+        std::unordered_set<std::string_view> held;
+        for (ModuleSymbol const& ms : module.symbols) held.insert(ms.name);
+        for (ExternImport const& e : module.externImports) held.insert(e.mangledName);
+        for (ModuleSymbol const* weakName : weakExternalNames) {
+            std::string const name = *defaultRecordNameOf(weakName->symbol);
+            if (!held.contains(name)) continue;
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): the overridable weak definition '{}' "
+                             "is written as a weak external whose default is its "
+                             "body under the name '{}', and this object already "
+                             "holds a symbol of that name -- refusing rather than "
+                             "write two definitions of one name.",
+                             weakName->name, name));
+            return {};
+        }
+    }
     auto const isWeakDefinition = [&](SymbolId id) {
         return objNames.definedBinding(id) == SymbolBinding::Weak;
     };
@@ -1122,9 +1235,12 @@ encode(AssembledModule const&    module,
     // UNANSWERED schema and a WRONG-DIALECT schema need different fixes — and
     // adds one this copy lacked: it also sees a WEAK ALIAS of a STRONG
     // definition, which `definedBinding` alone reports as Global.
-    if (!link::format::requireWeakDefinitionDialect(
-            module, fmt, WeakDefinitionDialect::Comdat, "pe::encode (Obj)",
-            reporter)) {
+    static constexpr WeakDefinitionDialect kDialectsWrittenHere[] = {
+        WeakDefinitionDialect::Comdat,
+        WeakDefinitionDialect::WeakExternal,
+    };
+    if (!link::format::requireWeakDefinitionDialects(
+            module, fmt, kDialectsWrittenHere, "pe::encode (Obj)", reporter)) {
         return {};
     }
 
@@ -2006,9 +2122,13 @@ encode(AssembledModule const&    module,
     // ⇒ the ld refusal is a NON-DSS CONFOUND (bar §A.3b: the test is the
     // DISJUNCTION, and link.exe is a reference that works), NOT a defect in
     // what this writer emits. gcc's own `weak, alias(...)` links only when the
-    // reference is in the SAME translation unit, where gcc has already bound it
-    // to the renamed `.weak.<n>.<n>` body and the weak external is never
-    // consulted.
+    // reference is in the SAME translation unit — and even there the reference
+    // is a relocation against the weak external's OWN record, not one gcc
+    // bound to the renamed body: beside another object's definition of the
+    // name it reads that definition (✔MEASURED 2026-10-08, MinGW gcc 13.2.0 +
+    // GNU ld 2.42: `IMAGE_REL_AMD64_REL32 shared` against the class-105
+    // record; 9 through the weak name beside `shared = 9`, 7 through the
+    // body's own name).
     //
     // WHAT STILL FAILS LOUD, and it is a real remaining shape rather than a
     // vestigial arm: an alias that is STRONGER than its canonical (Global alias
@@ -2085,6 +2205,11 @@ encode(AssembledModule const&    module,
     std::unordered_map<SymbolId, std::uint32_t> symIdxBySymbol;
     symIdxBySymbol.reserve(module.functions.size()
                            + module.dataItems.size());
+    // The record of a body's BYTES where a relocation naming the body is
+    // written against another record (THE WEAK-EXTERNAL ARM: the default's
+    // record, while `symIdxBySymbol` holds the weak external's). Asked by what
+    // this writer itself states about a body — its unwind records.
+    std::unordered_map<SymbolId, std::uint32_t> bytesRecordOfBody;
 
     // Defined function symbols (type=FUNCTION, SectionNumber=1 for `.text`).
     // Storage class is coupled to the NAME
@@ -2105,9 +2230,17 @@ encode(AssembledModule const&    module,
                        "for distinct AssembledFunctions)");
             return {};
         }
-        SymbolBinding const binding = objNames.definedBinding(f.symId);
+        // THE WEAK-EXTERNAL ARM: such a body is an EXTERNAL definition under
+        // its default's name, and the alias pass below then writes its weak
+        // name (the first of its extra names) as the weak external of it.
+        auto const defaultName = defaultRecordNameOf(f.symId);
+        SymbolBinding const binding = defaultName.has_value()
+                                          ? SymbolBinding::Global
+                                          : objNames.definedBinding(f.symId);
         CoffSymEntry e;
-        e.name          = objNames.definedName(f.symId, "sym_");
+        e.name          = defaultName.has_value()
+                              ? *defaultName
+                              : objNames.definedName(f.symId, "sym_");
         e.value         = static_cast<std::uint32_t>(f.valueInText);
         e.sectionNumber = kTextSectionNumber;
         e.type          = IMAGE_SYM_DTYPE_FUNCTION;
@@ -2318,10 +2451,15 @@ encode(AssembledModule const&    module,
                          di.symbol.v));
                 return false;
             }
-            SymbolBinding const binding =
-                objNames.definedBinding(di.symbol);
+            // THE WEAK-EXTERNAL ARM, as for a function above.
+            auto const defaultName = defaultRecordNameOf(di.symbol);
+            SymbolBinding const binding = defaultName.has_value()
+                                              ? SymbolBinding::Global
+                                              : objNames.definedBinding(di.symbol);
             CoffSymEntry e;
-            e.name          = objNames.definedName(di.symbol, "sym_");
+            e.name          = defaultName.has_value()
+                                  ? *defaultName
+                                  : objNames.definedName(di.symbol, "sym_");
             e.value         =
                 static_cast<std::uint32_t>(layout.itemOffsets[j]);
             e.sectionNumber = sectionNumber;
@@ -2358,6 +2496,56 @@ encode(AssembledModule const&    module,
                 e.storageClass == IMAGE_SYM_CLASS_WEAK_EXTERNAL
                 || (e.storageClass == IMAGE_SYM_CLASS_EXTERNAL && e.sectionNumber > 0);
             if (namesADefinition) recordOfDefinedName.emplace(e.name, e.tableIndex);
+        }
+        // THE WEAK-EXTERNAL ARM: what a relocation naming such a body is
+        // written against. Its `symIdxBySymbol` entry so far is the DEFAULT's
+        // record — the BYTES. A relocation means the bytes in a unit that
+        // references the name by row (`ModuleSymbol::referencedByName`: one
+        // written through a `static` name of the body, or its section) where
+        // this format's linkers leave a superseded definition's bytes in place
+        // — the document's `supersededDefinition`, asked with the definition's
+        // own kind as the merge asks it. Everywhere else it means the NAME, and
+        // is written against the weak external, so that another object's
+        // definition wins it: the unit references through its definition (what
+        // a unit DSS compiles does), or the format replaces a superseded
+        // definition whole. What this WRITER says about the body itself (its
+        // unwind records) keeps the default: `bytesRecordOfBody`.
+        for (ModuleSymbol const* weakName : weakExternalNames) {
+            auto const body = symIdxBySymbol.find(weakName->symbol);
+            if (body == symIdxBySymbol.end()) continue;   // a name with no body in this object
+            bytesRecordOfBody.emplace(weakName->symbol, body->second);
+            if (weakName->referencedByName) {
+                SupersededDefinitionStatement const& superseded = fmt.supersededDefinition();
+                auto const answer = superseded.answerFor(weakName->weakKind);
+                if (!answer.has_value()) {
+                    emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                         std::format("pe::encode (Obj): '{}' is a weak definition its unit "
+                                     "references by name. Whether a relocation that names the "
+                                     "definition itself stays on its bytes when another "
+                                     "definition wins the name, or goes to the winner with the "
+                                     "name, decides which of its two records such a relocation "
+                                     "is written against, and that is format '{}''s "
+                                     "'supersededDefinition', which {} -- refusing rather than "
+                                     "guess one.",
+                                     weakName->name, fmt.name(),
+                                     superseded.stated()
+                                         ? "it states per kind of weak definition, while this "
+                                           "definition states no kind"
+                                         : "it does not state"));
+                    return {};
+                }
+                if (*answer == SupersededDefinition::KeepsItsBytes) continue;
+            }
+            auto const nameRecord = recordOfDefinedName.find(weakName->name);
+            if (nameRecord == recordOfDefinedName.end()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format("pe::encode (Obj): the weak external '{}' has no record "
+                                 "although its default was written - substrate-invariant "
+                                 "violation.",
+                                 weakName->name));
+                return {};
+            }
+            body->second = nameRecord->second;
         }
         link::format::pointOwnNameReferencesAtTheirRecords(module, recordOfDefinedName,
                                                            symIdxBySymbol);
@@ -2950,8 +3138,18 @@ encode(AssembledModule const&    module,
         for (auto const& f : rec.rvaFields) {
             std::uint32_t symIdx = 0;
             if (f.targetSymbol.has_value()) {
-                auto const it = symIdxBySymbol.find(*f.targetSymbol);
-                if (it == symIdxBySymbol.end()) {
+                // The BYTES of what the field names, never a name another
+                // object may win: a table that describes this body must not
+                // follow its weak name to an override (THE WEAK-EXTERNAL ARM).
+                std::optional<std::uint32_t> named;
+                if (auto const b = bytesRecordOfBody.find(*f.targetSymbol);
+                    b != bytesRecordOfBody.end()) {
+                    named = b->second;
+                } else if (auto const s = symIdxBySymbol.find(*f.targetSymbol);
+                           s != symIdxBySymbol.end()) {
+                    named = s->second;
+                }
+                if (!named.has_value()) {
                     emit(reporter, DiagnosticCode::K_SymbolUndefined,
                          std::format(
                              "pe::encode (Obj): the unwind RVA field at offset "
@@ -2964,7 +3162,7 @@ encode(AssembledModule const&    module,
                              f.offsetInSection, rec.name, f.targetSymbol->v));
                     return {};
                 }
-                symIdx = it->second;
+                symIdx = *named;
             } else {
                 symIdx = unwindSections[f.xdataRecord].sectionSymIdx;
             }
@@ -5351,18 +5549,48 @@ encodeExec(AssembledModule const&    module,
     // handler field is an IMAGE-RVA (the OS calls the personality imageBase-relative
     // — the c112 address-taken-import precedent), so RVA = thunkVA - imageBase. The
     // thunk (FF 25 jmp *[IAT]) is the callable stub, NOT the raw IAT data slot.
+    //
+    // ★ THE PERSONALITY IS A SYMBOL LIKE ANY OTHER, SO IT IS EITHER IMPORTED OR
+    // DEFINED IN THIS IMAGE (P69,
+    // D-LK-MERGE-LEFT-SEH-SCOPE-IDS-AND-UNIT-ENTRY-UNRENUMBERED). The pass that
+    // guards a `__try` states it as an import, and alone that is all it can be.
+    // In a link of several units one of them may DEFINE the name — a personality
+    // carried in an object rather than taken from the runtime's image — and the
+    // merge then resolves the guarding unit's import row to that definition, as
+    // it resolves any import a linked unit defines. The handler field is an
+    // image-relative address of a function either way (the published PE format,
+    // `UNWIND_INFO`: "Address of exception handler"), so a defined personality is
+    // named by its OWN address: there is no thunk, because nothing is imported.
+    // Looking among the thunks alone refused that link, with a sentence that sent
+    // its reader to the guarding pass (✔MEASURED 2026-10-08 the moment the
+    // scope's id followed the merge: "has no import thunk — the SEH pass must
+    // synthesize its ExternImport"). What is still refused is a personality id
+    // that is NEITHER — and the sentence now says that.
     for (auto const& patch : sehHandlerPatches) {
-        auto it = externThunkVaBySym.find(patch.symbol);
-        if (it == externThunkVaBySym.end()) {
+        std::optional<std::uint64_t> handlerVa;
+        if (auto const it = externThunkVaBySym.find(patch.symbol);
+            it != externThunkVaBySym.end()) {
+            handlerVa = it->second;
+        } else {
+            for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+                if (module.functions[fi].symbol != patch.symbol) continue;
+                handlerVa = oh.imageBase + secText.virtualAddress + funcTextStart[fi];
+                break;
+            }
+        }
+        if (!handlerVa.has_value()) {
             emit(reporter, DiagnosticCode::K_SymbolUndefined,
                  std::string{"pe::encodeExec: SEH personality symbol #"}
                      + std::to_string(patch.symbol.v)
-                     + " (__C_specific_handler) has no import thunk — the SEH pass "
-                       "must synthesize its ExternImport (D-WIN64-SEH-FUNCLETS).");
+                     + " has no import thunk and is no function this image defines — "
+                       "the handler field of a guarded function's unwind data has "
+                       "nothing to name. The pass that guards a `__try` states the "
+                       "personality as an import; a link that defines it must define "
+                       "it as a function.");
             return {};
         }
         std::uint32_t const handlerRva =
-            static_cast<std::uint32_t>(it->second - oh.imageBase);
+            static_cast<std::uint32_t>(*handlerVa - oh.imageBase);
         if (patch.xdataOffset + 4u > xdataBytes.size()) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  "pe::encodeExec: SEH handler-field patch offset out of range "

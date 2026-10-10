@@ -542,10 +542,11 @@ struct DefSym {
     // COMDAT Selection byte in (5.5). `Any` for every non-COMDAT symbol and for
     // IMAGE_COMDAT_SELECT_ANY, which is the pre-existing behaviour verbatim.
     DuplicateMatch duplicateMatch = DuplicateMatch::Any;
-    // P69 round 4: set for the name of a WEAK EXTERNAL whose default is a body
-    // here — a definition that yields to a COMMON of its name
-    // (`ModuleSymbol::yieldsToACommon`).
-    bool yieldsToACommon = false;
+    // P69: which KIND of weak definition this is (`ModuleSymbol::weakKind`),
+    // read off the record's own form — `Overridable` for the name of a WEAK
+    // EXTERNAL whose default is a body here, `SelectAny` for a symbol its COMDAT
+    // section's selection makes weak. Empty for everything that is not weak.
+    std::optional<WeakDefinitionKind> weakKind;
 };
 
 // A reconstructed [start, start+len) byte range within one section, plus the
@@ -1341,16 +1342,22 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // which is exactly the reconstruction this shape wants, and it
                 // remaps every relocation naming either index to the owner.
                 //
-                // ★ AND IT YIELDS TO A COMMON (P69 round 4,
-                // D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT): 5.5.3
-                // uses the default only "if sym1 is not present at link time", and
-                // a common of the name makes it present — ✔MEASURED 2026-10-07,
-                // GNU ld 2.42's PE linker runs a MinGW common beside this shape
-                // with the common's 0 — where this format's own weak definition, a
-                // COMDAT select-any, replaces the common (link.exe, lld-link).
+                // ★ AND ITS KIND IS `Overridable` (P69): the default stands only
+                // while nothing else defines the name. 5.5.3 uses it only "if
+                // sym1 is not present at link time", and both a common of the
+                // name and a COMDAT definition of it make it present —
+                // ✔MEASURED 2026-10-07, GNU ld 2.42's PE linker runs a MinGW
+                // common beside this shape with the common's 0
+                // (D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT), and
+                // 2026-10-08, GNU ld, link.exe and lld-link run a select-any
+                // definition beside it with the select-any body in both object
+                // orders
+                // (D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER).
+                // What the kind means to a link is its document's
+                // (`commonYieldsTo`); this states the kind and nothing more.
                 DefSym weak{i, def.value, s.name, SymbolBinding::Weak,
                             directiveVisibility(s.name)};
-                weak.yieldsToACommon = true;
+                weak.weakKind = WeakDefinitionKind::Overridable;
                 defsBySection[def.sectNum].push_back(std::move(weak));
                 continue;
             }
@@ -1580,15 +1587,23 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // arrive Weak with its promise lost on the way.
             SymbolBinding  extBinding = SymbolBinding::Global;
             DuplicateMatch extDuty    = DuplicateMatch::Any;
+            // P69: a symbol its COMDAT section's selection makes WEAK is one of
+            // several copies the link keeps one of — the `SelectAny` kind,
+            // whichever of the weak selections it is (the selection's own
+            // promise is the duty beside it).
+            std::optional<WeakDefinitionKind> extKind;
             if (auto it = comdatBindingBySection.find(s.sectNum);
                 it != comdatBindingBySection.end()) {
                 extBinding = it->second.binding;
                 extDuty    = it->second.duty;
+                if (extBinding == SymbolBinding::Weak) {
+                    extKind = WeakDefinitionKind::SelectAny;
+                }
             }
             defsBySection[s.sectNum].push_back(
                 DefSym{i, s.value, s.name, extBinding,
                        directiveVisibility(s.name),
-                       /*moduleSymbolAlreadyPushed=*/false, extDuty});
+                       /*moduleSymbolAlreadyPushed=*/false, extDuty, extKind});
         } else if (role == CoffSymbolRole::Static && declaresFunction(s)) {
             // A FILE-LOCAL (`static`) FUNCTION -- an atom BOUNDARY, exactly like
             // an external one. D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM:
@@ -1847,19 +1862,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // would never be asked to keep the definition the object asked it to
             // keep (P69 send-back 5, review-xa4 NIT 9).
             auto const& vocab = objectFormatSchema.pe().linkerDirectives;
-            auto const spelled =
+            auto const token =
                 vocab.has_value()
-                    ? coffLinkerDirectiveText(
+                    ? coffDirectiveToken(
                           CoffDirectiveStatements{{}, std::span<std::string const>{&name, 1}, {}, {}}, *vocab)
                     : std::expected<std::string, std::string>{std::unexpected(std::string{
                           "the format declares no directive vocabulary"})};
-            if (!spelled.has_value() || spelled->empty() || spelled->front() != ' ') {
+            if (!token.has_value()) {
                 return fail(DiagnosticCode::K_LinkerDirectiveUnhonourable,
                     "pe::readRelocatableObject: the object's include directive names its own definition '"
-                    + name + "', and it cannot be handed on: "
-                    + (spelled.has_value() ? std::string{"its spelling is empty"} : spelled.error()) + ".");
+                    + name + "', and it cannot be handed on: " + token.error() + ".");
             }
-            mod.linkerRequests.handOn.push_back(spelled->substr(1));
+            mod.linkerRequests.handOn.push_back(*token);
             continue;
         }
         if (includeRow != nullptr) {
@@ -1904,18 +1918,19 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     for (auto const& name : hiddenInOrder) {
         if (directiveNamesDefined.contains(name)) continue;
         auto const& vocab = objectFormatSchema.pe().linkerDirectives;
-        auto const spelled = vocab.has_value()
-                                 ? coffHideDirectiveText(std::span<std::string const>{&name, 1}, *vocab)
-                                 : std::expected<std::string, std::string>{std::unexpected(std::string{
-                                       "the format declares no directive vocabulary"})};
-        if (!spelled.has_value() || spelled->empty() || spelled->front() != ' ') {
+        auto const token =
+            vocab.has_value()
+                ? coffDirectiveToken(
+                      CoffDirectiveStatements{std::span<std::string const>{&name, 1}, {}, {}, {}}, *vocab)
+                : std::expected<std::string, std::string>{std::unexpected(std::string{
+                      "the format declares no directive vocabulary"})};
+        if (!token.has_value()) {
             return fail(DiagnosticCode::K_LinkerDirectiveUnhonourable,
                 "pe::readRelocatableObject: the object's hide directive names '" + name
-                + "', which another unit must define, and it cannot be handed on: "
-                + (spelled.has_value() ? std::string{"its spelling is empty"} : spelled.error()) + ".");
+                + "', which another unit must define, and it cannot be handed on: " + token.error() + ".");
         }
         mod.linkerRequests.hides.push_back(name);
-        mod.linkerRequests.handOn.push_back(spelled->substr(1));
+        mod.linkerRequests.handOn.push_back(*token);
     }
 
     // Per-section interval lists for relocation-site routing.
@@ -1929,7 +1944,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         if (!d.name.empty() && !d.moduleSymbolAlreadyPushed) {
             mod.symbols.push_back(ModuleSymbol{symbolIds.of(d.symIdx), d.name,
                                                d.binding, d.visibility,
-                                               d.duplicateMatch, d.yieldsToACommon});
+                                               d.duplicateMatch, d.weakKind});
         }
     };
 
@@ -2160,7 +2175,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 } else if (!defs[k].name.empty()) {
                     ModuleSymbol alias{symbolIds.of(owner), defs[k].name, defs[k].binding,
                                        defs[k].visibility};
-                    alias.yieldsToACommon = defs[k].yieldsToACommon;
+                    alias.weakKind = defs[k].weakKind;
                     aliasRows.push_back(std::move(alias));
                 }
                 continue;
@@ -2196,12 +2211,17 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // data kind must NEVER be silently dropped to a bodiless
                 // ModuleSymbol (the "never a silent partial reconstruction"
                 // contract) -- fail loud so the shape is recovered (a new
-                // schema row) rather than mis-linked to an empty def.
-                return fail(DiagnosticCode::F_CorruptedBinary,
+                // schema row) rather than mis-linked to an empty def. Under a
+                // code of its own (P69): the object is not corrupt, DSS does
+                // not model the section.
+                return fail(DiagnosticCode::K_ObjectSectionNotModelled,
                     "pe::readRelocatableObject: defined symbol '" + defs[k].name
                     + "' lives in section '" + sec.name + "' which resolves to "
-                    "no known code/data section kind -- refusing to silently "
-                    "drop a body (add the section's kind to the format schema).");
+                    "no known code/data section kind: no row of format '"
+                    + std::string{objectFormatSchema.name()} + "' names that "
+                    "section. The object is well-formed; DSS does not carry a "
+                    "section its format document has no row for, and refuses "
+                    "rather than drop the body.");
             }
             // A data object -> an AssembledData item. File-backed sections
             // slice their bytes; a zero-fill (bss) section reserves the size
@@ -2238,6 +2258,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // Every canonical row is now recorded, so the aliases can follow: several
     // names, one SymbolId, the owning name first (see (6.44)).
     for (auto& ms : aliasRows) mod.symbols.push_back(std::move(ms));
+    // THE WEAK-NAME RULE, stated on the rows: each weak name this object's
+    // relocations are kept on says so (`ModuleSymbol::referencedByName`), which
+    // is what makes a relocation left on its atom a reference to the BYTES.
+    weakNames.stateOn(mod.symbols);
 
     // -- (6.45) SYNTHETIC GAP ATOMS: reconstruct ANONYMOUS data-section bytes
     //
@@ -2608,11 +2632,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
 
             // THE WEAK-NAME RULE (`object_atom_coverage.hpp`): a relocation
-            // written through a WEAK name of a body that has another external
-            // name keeps the NAME -- a plain reference row the link resolves by
-            // name, to an override where one is linked and to this very body
-            // otherwise -- instead of the atom (6.44) chose for it. The addend
-            // is the name's own: the name sits at the atom's start.
+            // written through a WEAK name keeps the NAME, whatever else names
+            // the body -- a plain reference row the link resolves by name, to an
+            // override where one is linked and to this very body otherwise --
+            // instead of the atom (6.44) chose for it. What this pass leaves on
+            // an atom is then a reference to its BYTES: one written through a
+            // static name of the body, or through its section. The addend is
+            // the name's own: the name sits at the atom's start.
             if (auto const weakName = weakNames.referenceFor(symIdx, symbolIds)) {
                 if (weakName->fresh) {
                     mod.externImports.push_back(

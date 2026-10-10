@@ -416,34 +416,51 @@ void dropPulledMemberEntryRequests(UnitLinkerRequests& requests) {
     requests.image = std::move(kept);
 }
 
-void requireEntryReference(AssembledModule& unit) {
-    for (auto const& request : unit.linkerRequests.image) {
-        auto const* entry = std::get_if<UnitEntryRequest>(&request.value);
-        if (entry == nullptr || entry->runtimeStartup || !entry->unsupported.empty()) continue;
-        bool defined = false;
-        for (auto const& ms : unit.symbols) {
-            defined = defined
-                   || (ms.name == entry->symbol && link::format::ObjectSymbolNames::hasExternalLinkage(ms));
+void requireEntryReference(std::span<AssembledModule> namedUnits) {
+    // WHICH request stands, by the precedence each request's own vocabulary row states — the question
+    // `decideUnitLinkerRequests` settles for the image (`settle`: `first` keeps the standing one, `last` and
+    // `inOrder` take the later), asked here of the units named to the link, in their order, before the archive
+    // search runs. Two requests of two precedences have no order between them: that link is refused by name by the
+    // decision, and nothing is required of it here.
+    AssembledModule*        standingUnit = nullptr;
+    UnitImageRequest const* standing     = nullptr;
+    for (auto& unit : namedUnits) {
+        for (auto const& request : unit.linkerRequests.image) {
+            if (std::get_if<UnitEntryRequest>(&request.value) == nullptr) continue;
+            if (standing != nullptr) {
+                if (standing->precedence != request.precedence) return;
+                if (request.precedence == UnitRequestPrecedence::First) continue;
+            }
+            standing     = &request;
+            standingUnit = &unit;
         }
-        if (defined) continue;
-        ExternImport* row = nullptr;
-        for (auto& e : unit.externImports) {
-            if (e.mangledName == entry->symbol) row = &e;
-        }
-        if (row != nullptr) {
-            // A COMMON of the name is the unit's own (tentative) definition — a datum, which the entry refuses by
-            // name; any other row is its reference, now required.
-            if (row->commonSize == 0u) row->requiredByDirective = true;
-            continue;
-        }
-        ExternImport required;
-        required.symbol              = SymbolId{maxExistingSymbolIdV(unit) + 1u};
-        required.mangledName         = entry->symbol;
-        // A directive states no code-vs-data kind; the definition the link finds decides it.
-        required.kindOrigin          = ExternKindOrigin::Pending;
-        required.requiredByDirective = true;
-        unit.externImports.push_back(std::move(required));
     }
+    if (standing == nullptr) return;
+    AssembledModule& unit  = *standingUnit;
+    auto const&      entry = std::get<UnitEntryRequest>(standing->value);
+    if (entry.runtimeStartup || !entry.unsupported.empty()) return;
+    std::string const name = entry.symbol;   // `standing` points into the unit this function is about to grow
+    for (auto const& ms : unit.symbols) {
+        if (ms.name == name && link::format::ObjectSymbolNames::hasExternalLinkage(ms)) return;   // its own definition
+    }
+    for (auto& e : unit.externImports) {
+        if (e.mangledName != name) continue;
+        // A COMMON of the name is the unit's own (tentative) definition — a datum, which the entry refuses by
+        // name; any other row is its reference, now required.
+        if (e.commonSize == 0u) e.requiredByDirective = true;
+        return;
+    }
+    ExternImport required;
+    required.symbol              = SymbolId{maxExistingSymbolIdV(unit) + 1u};
+    required.mangledName         = name;
+    // A directive states no code-vs-data kind; the definition the link finds decides it.
+    required.kindOrigin          = ExternKindOrigin::Pending;
+    required.requiredByDirective = true;
+    unit.externImports.push_back(std::move(required));
+}
+
+void requireEntryReference(AssembledModule& unit) {
+    requireEntryReference(std::span<AssembledModule>{&unit, 1});
 }
 
 }  // namespace dss::linker

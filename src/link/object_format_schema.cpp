@@ -711,6 +711,41 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                          detail::renderAllowedList(
                              allNames(kWeakDefinitionDialectTable), " or ")));
     }
+    // P69: the per-kind entries say which kinds take ANOTHER dialect than the
+    // block's, so without the block they qualify nothing; and each must name a
+    // real kind and a real dialect, once. The loader cannot produce any of
+    // these (its keys are a JSON object's, its values come from the tables);
+    // a hand-built `ObjectFormatData` can.
+    if (!weakDefinitionByKind.empty() && !weakDefinition.has_value()) {
+        fail("/weakDefinition/byKind",
+             "per-kind weak-definition dialects are stated beside NO "
+             "'weakDefinition' block — they say which kinds take another "
+             "dialect than the block's, and there is none to depart from");
+    }
+    for (std::size_t i = 0; i < weakDefinitionByKind.size(); ++i) {
+        auto const& [kind, dialect] = weakDefinitionByKind[i];
+        if (weakDefinitionKindName(kind).empty()
+            || weakDefinitionDialectName(dialect).empty()) {
+            fail("/weakDefinition/byKind",
+                 std::format("per-kind weak-definition entry #{} names no {} — "
+                             "each states a real kind ({}) and a real dialect "
+                             "({})",
+                             i,
+                             weakDefinitionKindName(kind).empty() ? "kind" : "dialect",
+                             detail::renderAllowedList(
+                                 allNames(kWeakDefinitionKindTable), " or "),
+                             detail::renderAllowedList(
+                                 allNames(kWeakDefinitionDialectTable), " or ")));
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (weakDefinitionByKind[j].first == kind) {
+                fail("/weakDefinition/byKind",
+                     std::format("the weak-definition kind '{}' is given a "
+                                 "dialect twice — one kind, one spelling",
+                                 weakDefinitionKindName(kind)));
+            }
+        }
+    }
 
     // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET: a
     //    PRESENT `objectImportSlot` block must name a prefix ──────────────

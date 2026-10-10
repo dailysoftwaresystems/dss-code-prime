@@ -5463,7 +5463,17 @@ enum class DiagnosticCode : std::uint16_t {
     //   it would be allocated once in `.bss` and every thread would share it.
     //   Always an Error, so it needs no row in the unsuppressable table.
     K_CommonSymbolUnallocatable    = 0x802D,
-    // K-NEXT-SLOT: 0x802E — grep this marker before adding a K_* code.
+    // K_ObjectSectionNotModelled (D-LK-COFF-READER-REFUSES-A-CUSTOM-NAMED-SECTION,
+    //   P69) — ERROR, by name. A relocatable object holds a DEFINITION in a
+    //   section no row of its format document names: one the program named
+    //   itself (`#pragma section`, `__attribute__((section(...)))`), or one DSS
+    //   has not been taught. The object is WELL-FORMED and its reference linker
+    //   links it — this is not `F_CorruptedBinary`, the code the three object
+    //   readers used for it until P69, which sent whoever read the message to
+    //   look for a damaged file. Refused rather than read without its body.
+    //   Always an Error, so it needs no row in the unsuppressable table.
+    K_ObjectSectionNotModelled     = 0x802E,
+    // K-NEXT-SLOT: 0x802F — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

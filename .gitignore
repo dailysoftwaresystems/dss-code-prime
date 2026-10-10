@@ -89,13 +89,21 @@
 # on purpose; provenance + md5 in the example's `expected.json`.
 !tests/link/data/*.obj
 
-# ★ ELF, Mach-O and MinGW OBJECT fixtures (P69 send-back 5, D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT),
-# the same negation for the same reason, one more extension on: the `examples/c/common_beside_*` examples link a
-# COMMON object and a WEAK-definition object a reference compiler built, each NAMED to the link -- an archive cannot
-# stand in, because which member an archive search fetches for a common is another key's subject -- and gcc and clang
-# name an object `.o`. Without this line the ten fixtures are un-committable and reach no host's copy. Scoped to this
-# one directory on purpose; their sources, with the rebuild commands, are the `tentative_*.source.c` files beside
-# them, and each md5 is in the example's `expected.json`.
+# ★ ELF, Mach-O and MinGW OBJECT fixtures (P69 send-back 5 and fold 2), the same negation for the same reason, one
+# more extension on: gcc and clang name an object `.o`, and whatever reads what a REFERENCE compiler or linker wrote
+# needs the object itself. Three families ride this line, and without it none is committable and none reaches a
+# host's copy:
+#   * the `tentative_*` objects the `examples/c/common_beside_*` examples link -- a COMMON object and a
+#     WEAK-definition object, each NAMED to the link, which an archive cannot stand in for (which member an archive
+#     search fetches for a common is another key's subject);
+#   * the Mach-O call-frame objects (`compiled_unwind_*`, and `relinked_unwind_*`, the relocatable link's product of
+#     the same source), read by the object reader's suites and linked by two examples;
+#   * the objects the readers' pins read as their compilers and assemblers wrote them: a weak alias of a `static`
+#     body (`weak_local_name_*`), a body in a section no row names (`custom_section_*`), and an ELF section group
+#     with its second copy and a definition in no group (`elf_group_*`).
+# No count is written here on purpose: `git ls-files 'tests/link/data/*.o'` is the count. Scoped to this one
+# directory; each fixture's source, with its rebuild command, is the `*.source.c` or `*.source.s` beside it, and its
+# md5 is recorded where it is read (the example's `expected.json`, or the suite that reads it).
 !tests/link/data/*.o
 
 # Executables

@@ -228,7 +228,12 @@ set(_DSS_TB_NAMED
     # macos-arm64 142 s, linux-x86_64 46 s); MinGW Release 104.29 s with three reference arms on
     # PATH (81.29 s with the leg's own one). It read 20.24 / 14.90 s before those cells. Sanitized
     # is NOT measured -- no run of that class has read it -- and takes the unit ceiling until one does.
-    "link/test_common_symbols|53|105|162"
+    # ★ DEBUG RE-DERIVED 2026-10-10 (cycle P69, lane xa's second fold: 59 cases where there were 41,
+    # and native cells under both of Apple's linkers). ✔MEASURED in full-suite runs that passed:
+    # macos-arm64 Debug 256.5 s, linux-arm64 Debug 163.0 s, MinGW Debug 157.5 s with three reference
+    # arms and 218.39 s with four lanes' finals on the host, linux-x86_64 Debug 51.4 s. Release
+    # stays under its ceiling: MSVC Release 53.7 s, 76 s beside other lanes' builds.
+    "link/test_common_symbols|53|105|257"
     "core/test_type_kind_vocabulary_projection|103|4|17"
     "analysis/semantic/test_fc3_width_semantics|96|6|19"
     "analysis/preprocess/test_preprocess_no_rework|94|5|18"

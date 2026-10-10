@@ -828,4 +828,24 @@ coffHideDirectiveText(std::span<std::string const> names, PeLinkerDirectives con
     return coffLinkerDirectiveText(CoffDirectiveStatements{names, {}, {}, {}}, vocab);
 }
 
+// ONE request as a relocatable artifact hands it on (`UnitLinkerRequests::
+// handOn`): the writer's text for `one` without the separator that begins
+// every token of a list — or WHY it has none, in words that are true of the
+// case. (The COFF reader's two sites that need a token each tested the text
+// themselves and said "its spelling is empty" of any text that was not one
+// token, empty or not.)
+[[nodiscard]] inline std::expected<std::string, std::string>
+coffDirectiveToken(CoffDirectiveStatements const& one, PeLinkerDirectives const& vocab) {
+    auto text = coffLinkerDirectiveText(one, vocab);
+    if (!text.has_value()) return text;
+    if (text->empty()) {
+        return std::unexpected(std::string{"it states no request, so there is no directive to write"});
+    }
+    if (text->front() != ' ' || text->find(' ', 1) != std::string::npos) {
+        return std::unexpected(
+            std::format("the vocabulary spells it '{}', which is not ONE directive token", *text));
+    }
+    return text->substr(1);
+}
+
 }  // namespace dss::pe

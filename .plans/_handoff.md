@@ -270,19 +270,49 @@ round's close; each checkpoint's commit message says what was and was not run on
   ruling (the measured exception, a codec arc): `D-DSSHIR-NATIVE-SIDE-TABLES-HAVE-NO-TEXT-FORM` — twelve of the
   thirteen side tables the C lowering binds have no form in the `.dsshir` text; no shipped route compiles from
   that text. Balance: 636 against 620.
-- **Silent defects FOUND in this round and NOT YET FIXED in this tree** (each the base's debt, each with its lane
-  at work): a reference written through a STATIC name follows a losing weak alias of the same body to the winner
-  (ELF references ✔MEASURED 158 on four compilers' objects, DSS 198); and in a STATIC INITIALIZER, an enumerator,
+- **Checkpoint 12 (2026-10-10) = the link lane's SECOND fold, made CODE-FIRST**: 177 paths (114 new), 2 examples,
+  30 arms (the registry holds 239), 3 new rows. It answers the review of its first fold (2 MAJOR): a reference
+  written THROUGH a weak name follows the name, while a relocation written through a `static` name of the same
+  body, or through its section symbol, stays on that unit's BYTES on ELF and for a PE weak external and follows
+  the atom on Mach-O and for a PE COMDAT — ✔MEASURED on the reference linkers first, then DSS made equal
+  (154 / 158 / 158 where it read 154 / 198 / 198: **the silent wrong value of the static-name bullet below is
+  FIXED in this tree**); what becomes of a superseded definition is the link document's key
+  `supersededDefinition`. Its own items: the weak-definition KIND on the link side and in the PE object writer
+  (an overridable definition is a weak external over a default record; the document says which kind takes which
+  spelling) — **the COMPILED origin of the kind is NOT built** (a DSS-compiled `__attribute__((weak))` is still a
+  COMDAT on PE, and `__declspec(selectany) int v = 1;` beside a strong `int v = 2;` in another DSS-compiled unit
+  links in silence); a guarded function's scope ids, the unit's entry and its null-address symbols carried through
+  the merge of units (✔MEASURED before: of 112 labellings of one guarded unit beside another, 22 linked silently
+  wrong); a section no row names refused under its own code. Found and fixed on the way: a one-unit link that did
+  not place its code units; an ELF section group that LOSES to an earlier unit's while a relocation outside it
+  names one of its non-external labels linked and ran in silence — now refused by name (the discard itself is
+  NOT built). ✔MEASURED by the lane on its final bytes, on checkpoint 7's base: the whole suite on all five legs
+  — `macos-arm64-debug`, `linux-arm64-debug` and `linux-x86_64-debug` 2734 passed each; `windows-x86_64-release`
+  (MSVC) and `windows-x86_64-debug` (MinGW) 2760 of 2764, the four reds being repository guards that read the
+  lane worktree's own registry copies and inventories (all four green on this tree after the fold). 16 of its 30
+  arms `passed` on `macos-arm64-debug`; 14 are owed. Rows: `D-LK-MERGE-LEFT-SEH-SCOPE-IDS-AND-UNIT-ENTRY-UNRENUMBERED`
+  born CLOSED on its thirteen passed arms; two born `disclosed` with the fix folded in part
+  (`D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER`,
+  `D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE`). Balance: 638 against 620. The debug ceiling of
+  `link/test_common_symbols` is re-derived (257 s). **⚠ THIS COMPOSITION WAS NEVER BUILT**: the fold was measured
+  on checkpoint 7's base and lands on checkpoints 8 to 11 (the stated end of a module's symbol ids among them,
+  which touches the same id sources this fold widens) — the first full suite of this tree is its first reading.
+- **Silent defects FOUND in this round and NOT YET FIXED in this tree** (the base's debt unless said, all in the
+  fold the library lane has OPEN — its worktree, not this tree): in a STATIC INITIALIZER, an enumerator,
   an array size or a `_Static_assert`, the unary `~` and `-` of an `unsigned int` constant are not reduced to
   32 bits, so every widening of the result is wrong (✔MEASURED on pe64, baseline and release:
   `static const unsigned long long u = ~0U;` holds 0xFFFFFFFFFFFFFFFF; and where such a widened value is a
-  CONDITION inside a function body the function dies of an illegal instruction). **AND ONE BORN IN THIS PR, a merge
-  blocker:** a member of a constant aggregate whose initializer is a one-operand expression is read WITHOUT its
-  operator (✔MEASURED on pe64: `static const struct S g = {.b = -5}; if (g.b != -5) return 7;` dies of an illegal
-  instruction; a static assertion, an enumerator and an array bound built on such a member are wrong) — the
-  library lane fixes all three in the fold it has open. The two
-  pe64 `__try` defects found on 2026-10-08 (a value read in a handler could be garbage; nested regions reached
-  the outer handler) are fixed by checkpoint 6.
+  CONDITION inside a function body the function dies of an illegal instruction); `_Generic` selects `default` in
+  silence where its controlling expression holds a literal in an enumerator, a file-scope array bound or a
+  bit-field width (✔MEASURED: `enum { EV = _Generic(0, int: 42, default: 9) };` gives 9). **AND ONE BORN IN THIS
+  PR, a merge blocker:** a member of a constant aggregate whose initializer is a one-operand expression is read
+  WITHOUT its operator (✔MEASURED on pe64: `static const struct S g = {.b = -5}; if (g.b != -5) return 7;` dies of
+  an illegal instruction; 134 of 247 measured cells wrong) — its fix is built and read green on
+  `macos-arm64-debug` in that lane's worktree, not handed back. LOUD, the base's debt, in the same open fold: a
+  brace element under an operator (`char first[] = { *"abc" };` at block scope; `struct S arr[] = { src[i] };`)
+  is refused by the HIR lowering where all six references accept it. FIXED since they were listed here: the
+  reference through a STATIC name following a losing weak alias (checkpoint 12); the two pe64 `__try` defects
+  found on 2026-10-08 (checkpoint 6).
 - **HOW THIS CYCLE ENDS — operator, 2026-10-08, verbatim:** *"on finishing this cycle I'll turn on the pipes and
   try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and monitor CI until
   green"*. So P69 is this PR's EXIT: its four lanes finish what they are in (no second round opens in this PR — what

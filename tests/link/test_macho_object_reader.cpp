@@ -2183,6 +2183,8 @@ TEST(MachoUnwindRelocations, TheImageDescribesEachFunctionAsItsObjectDid) {
         auto member = loadShipped(c.target, c.documents[0]);
         auto exec   = loadShipped(c.target, c.image);
         ASSERT_TRUE(member.target && member.format && exec.format);
+        // The image linked from the COMPILER's object, kept for the relocatable link's product to be read against.
+        std::vector<std::uint8_t> compiledImage;
         for (char const* fixture : {c.compiled, c.relinked}) {
             SCOPED_TRACE(std::string{c.target} + " / " + fixture);
             auto const bytes = unwindFixture(fixture);
@@ -2212,6 +2214,17 @@ TEST(MachoUnwindRelocations, TheImageDescribesEachFunctionAsItsObjectDid) {
             auto const linked = linker::link(std::span<AssembledModule const>{units}, *member.target, *exec.format,
                                              lrep, ImageRequest{.artifactFileName = "unwind_image"});
             ASSERT_TRUE(linked.ok()) << saidBy(lrep);
+            // THE TWO OBJECTS LINK TO ONE IMAGE. The relocatable link's product states the same two functions, the
+            // same bytes and the same records as the compiler's object, so the image built from it is that object's
+            // image byte for byte — the sentence the comment above records of `dsscp`'s images, pinned here on the
+            // two this test links.
+            if (fixture == c.compiled) {
+                compiledImage = linked.bytes;
+            } else {
+                EXPECT_TRUE(linked.bytes == compiledImage)
+                    << "the image of the relocatable link's product (" << linked.bytes.size()
+                    << " bytes) is not the image of the compiler's object (" << compiledImage.size() << " bytes)";
+            }
             auto const frames = imageCallFrames(linked.bytes);
             ASSERT_TRUE(frames.has_value()) << "the image carries no `__TEXT,__eh_frame`";
             auto const at = unwindLayoutOf(linked.bytes);

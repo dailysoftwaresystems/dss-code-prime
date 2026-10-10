@@ -535,17 +535,58 @@ struct DSS_EXPORT ModuleSymbol {
     // the COMDAT Selection byte. See `core/types/symbol_attrs.hpp` for why this
     // is a second axis rather than two more `SymbolBinding` enumerators.
     DuplicateMatch   duplicateMatch = DuplicateMatch::Any;
-    // P69 round 4 (D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT): a
-    // WEAK definition whose own spelling YIELDS to a COMMON of its name, even
-    // where its format's weak definitions replace one (`commonYieldsTo`). Set by
-    // the COFF object reader for a WEAK EXTERNAL whose default is a body of its
-    // object (MinGW gcc's `__attribute__((weak))`): PE/COFF 5.5.3 uses the
-    // default only "if sym1 is not present at link time", and a common makes it
-    // present — ✔MEASURED 2026-10-07, GNU ld 2.42's PE linker runs that program
-    // with the common's 0, where link.exe and lld-link let a COMDAT select-any
-    // definition replace the common. Read only when `binding == Weak`, by
-    // `linker::allocateCommonDefinitions` and the archive search.
-    bool             yieldsToACommon = false;
+    // P69 (the weak-definition KIND, `core/types/symbol_attrs.hpp`): which of the
+    // two things a WEAK definition is, where its producer's form states one.
+    // Read only when `binding == Weak`. The COFF object reader states both: a
+    // WEAK EXTERNAL whose default is a body of its object is `Overridable`
+    // (MinGW gcc's and clang's `__attribute__((weak))`), a weak COMDAT symbol
+    // `SelectAny`. EMPTY where the producer's form has one spelling for both
+    // (ELF's `STB_WEAK`, Mach-O's `N_WEAK_DEF`) and on a row nobody stated a
+    // kind for: an absent kind is neither, and nothing reads it as one.
+    //
+    // What a kind MEANS beside a common of the name and beside the other weak
+    // definitions of it is the LINK document's fact (`commonYieldsTo`), asked
+    // through `link/common_yield.hpp` — never decided where the kind is read.
+    // (It replaces round 4's `yieldsToACommon`, a bool that said one
+    // consequence of one kind on one format: ✔MEASURED 2026-10-08, the same
+    // kind also loses to a select-any definition of its name, and that had no
+    // home — D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER.)
+    std::optional<WeakDefinitionKind> weakKind;
+    // P69 (THE WEAK-NAME RULE, `link/format/object_atom_coverage.hpp`): HOW THE
+    // UNIT THAT CARRIES THIS ROW REFERS TO THE NAME. True when every reference
+    // the unit makes through this NAME is a reference row of the name
+    // (`ExternImport`), never a relocation against the definition — which makes
+    // a relocation of the unit that DOES target the definition a reference to
+    // its BYTES (one written through a `static` name of the body, or through
+    // its section). An object reader states it for every weak name it keeps a
+    // reference on. False — the default — where the unit targets the
+    // definition for a reference through the name too: a unit DSS compiles,
+    // whose every reference to its own weak definition means the name.
+    //
+    // Read only when `binding == Weak`, and it is what tells the two meanings
+    // of one relocation apart. What the second meaning DOES is the format's
+    // (`supersededDefinition`, the link's document): where a superseded
+    // definition keeps its bytes the merge keeps such a relocation on them
+    // (`linker.cpp`, `keptBytesId`) and a relocatable artifact gives them a
+    // record of their own (`ObjectSymbolNames`, `object_symbol_names.hpp`);
+    // where it is replaced whole the relocation goes to the winner as the name
+    // does.
+    bool             referencedByName = false;
+    // P69 fold 2: THE SIGNATURE OF THE SECTION GROUP THIS DEFINITION'S STORAGE
+    // BELONGS TO, where its producer's form states one — an ELF `SHT_GROUP`
+    // marked `GRP_COMDAT`, whose signature is a symbol's name. Empty everywhere
+    // else: a unit DSS compiles, and every form that has no such group.
+    //
+    // A group is kept or discarded WHOLE by its format's linkers: the first
+    // unit that carries a signature keeps its group, every later unit's goes,
+    // bytes and all (✔MEASURED 2026-10-10, GNU ld 2.42 and ld.lld 18.1). DSS
+    // does NOT discard section groups yet — a reader carries a group's sections
+    // as ordinary ones — and ONE thing reads this field: the merge's refusal of
+    // a relocation that names the BYTES of a superseded definition whose group
+    // an earlier unit also carries (`linker.cpp`, `supersededInADiscardedGroup`),
+    // which those linkers refuse and "keeps its bytes" would link around a copy
+    // they drop. Not handed on by a relocatable writer (none writes a group).
+    std::string      sectionGroup;
 };
 
 struct DSS_EXPORT AssembledModule {

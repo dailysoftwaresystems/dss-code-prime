@@ -66,6 +66,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -203,11 +204,11 @@ public:
         m_.symbols.push_back(ModuleSymbol{SymbolId{ids_.at(of)}, name, binding, SymbolVisibility::Default});
         return *this;
     }
-    UnitOf& marker(std::string const& fn) {
+    UnitOf& marker(std::string const& fn, SymbolBinding binding = SymbolBinding::Global) {
         AssembledFunction f;
         f.symbol = SymbolId{mint(fn)};
         f.bytes  = {0x31, 0xC0, 0xC3};
-        return function(std::move(f), fn);
+        return function(std::move(f), fn, binding);
     }
     UnitOf& reads(std::string const& fn, std::string const& datumName) {
         std::uint32_t const target = ids_.at(datumName);
@@ -237,8 +238,8 @@ private:
         ids_.emplace(name, id);
         return id;
     }
-    UnitOf& function(AssembledFunction f, std::string const& name) {
-        m_.symbols.push_back(ModuleSymbol{f.symbol, name, SymbolBinding::Global, SymbolVisibility::Default});
+    UnitOf& function(AssembledFunction f, std::string const& name, SymbolBinding binding = SymbolBinding::Global) {
+        m_.symbols.push_back(ModuleSymbol{f.symbol, name, binding, SymbolVisibility::Default});
         m_.functions.push_back(std::move(f));
         return *this;
     }
@@ -448,9 +449,10 @@ TEST(CommonSymbols, ACommonWinsOverAWeakDefinition) {
 // lld-link 19.1.5 on cl 19.44's `__declspec(selectany)`; both link orders), so a relocatable artifact linked from a
 // unit holding `shared` as a 40-byte common and one defining it WEAK (7) carries the weak definition — still weak, its
 // own 7 — and no common. CONTROLS, where the common OUTRANKS the weak definition — the ELF document's answer, the
-// gABI's (the image twin is `ACommonWinsOverAWeakDefinition`), and on PE a weak definition whose own SPELLING yields to
-// a common (`ModuleSymbol::yieldsToACommon`, what the COFF reader reads a weak external's name as — MinGW gcc's weak
-// definition, which GNU ld's PE linker gives the common's 0): the artifact hands the COMMON on, as `ld -r` does
+// gABI's (the image twin is `ACommonWinsOverAWeakDefinition`), and on PE a weak definition of the OVERRIDABLE kind
+// (`ModuleSymbol::weakKind`, what the COFF reader reads a weak external's name as — MinGW gcc's weak definition,
+// which GNU ld's PE linker gives the common's 0; the PE documents' `nonOverridableDefinition` says a common yields
+// to every definition but that kind): the artifact hands the COMMON on, as `ld -r` does
 // (✔MEASURED 2026-10-08, GNU ld 2.42's ELF linker on x86_64 and aarch64, ld.lld 18.1.3, and GNU ld's PE linker on
 // MinGW gcc 13.2.0's weak external, both unit orders: the artifact's symbol is the common, which a later link
 // allocates, replaces by a strong definition without a duplicate, or folds with a larger common) — the 40-byte common
@@ -460,17 +462,21 @@ TEST(CommonSymbols, ACommonWinsOverAWeakDefinition) {
 // where it outranks, strong, so a later link beside a strong definition saw two.
 TEST(CommonSymbols, AWeakDefinitionReplacesTheCommonWhereTheLinksDocumentSaysSo) {
     struct Arm {
-        char const*    format;
-        std::string    shared;          // the name as the format's C decoration spells it
-        CommonYieldsTo yields;          // the document's answer
-        bool           spellingYields;  // the weak definition's own spelling yields to a common
-        bool           weakWins;
+        char const*                       format;
+        std::string                       shared;   // the name as the format's C decoration spells it
+        CommonYieldsTo                    yields;   // the document's answer
+        std::optional<WeakDefinitionKind> kind;     // the kind the weak definition states, if it states one
+        bool                              weakWins;
     };
-    for (auto const& arm : {Arm{"macho64-x86_64-darwin", "_shared", CommonYieldsTo::AnyDefinition, false, true},
-                            Arm{"pe64-x86_64-windows", "shared", CommonYieldsTo::AnyDefinition, false, true},
-                            Arm{"pe64-x86_64-windows", "shared", CommonYieldsTo::AnyDefinition, true, false},
-                            Arm{"elf64-x86_64-linux", "shared", CommonYieldsTo::StrongDefinition, false, false}}) {
-        SCOPED_TRACE(std::string{arm.format} + (arm.spellingYields ? " (a spelling that yields)" : ""));
+    using Kind = WeakDefinitionKind;
+    for (auto const& arm :
+         {Arm{"macho64-x86_64-darwin", "_shared", CommonYieldsTo::AnyDefinition, std::nullopt, true},
+          Arm{"pe64-x86_64-windows", "shared", CommonYieldsTo::NonOverridableDefinition, std::nullopt, true},
+          Arm{"pe64-x86_64-windows", "shared", CommonYieldsTo::NonOverridableDefinition, Kind::SelectAny, true},
+          Arm{"pe64-x86_64-windows", "shared", CommonYieldsTo::NonOverridableDefinition, Kind::Overridable, false},
+          Arm{"elf64-x86_64-linux", "shared", CommonYieldsTo::StrongDefinition, std::nullopt, false}}) {
+        SCOPED_TRACE(std::string{arm.format} + ", a weak definition that states "
+                     + (arm.kind.has_value() ? std::string{weakDefinitionKindName(*arm.kind)} : std::string{"no kind"}));
         auto const L = load("x86_64", arm.format);
         ASSERT_TRUE(L.target && L.format);
         EXPECT_EQ(L.format->commonYieldsTo(), arm.yields) << "the document's own answer";
@@ -479,7 +485,7 @@ TEST(CommonSymbols, AWeakDefinitionReplacesTheCommonWhereTheLinksDocumentSaysSo)
             unitWithCommon(1, "reader_fn", 40, 32, /*entry=*/false),
             UnitOf(2).datum(arm.shared, SymbolBinding::Weak, 7).reads("weak_reader", arm.shared).build()};
         mods[0].externImports[0].mangledName = arm.shared;
-        mods[1].symbols[0].yieldsToACommon   = arm.spellingYields;
+        mods[1].symbols[0].weakKind          = arm.kind;
         DiagnosticReporter rep;
         auto const obj = linker::link(std::span<AssembledModule const>{mods}, *L.target, *L.format, rep);
         ASSERT_TRUE(obj.ok()) << diagnosticsOf(rep);
@@ -495,7 +501,11 @@ TEST(CommonSymbols, AWeakDefinitionReplacesTheCommonWhereTheLinksDocumentSaysSo)
             if (s.name == arm.shared) sym = &s;
         }
         if (arm.weakWins) {
-            EXPECT_EQ(row, nullptr) << "one object cannot carry a common and a definition of a name";
+            // What the two units read through the weak name stays on the NAME (THE WEAK-NAME RULE: since P69 fold 2
+            // whatever else names the body, so also a weak name that is its body's only one) — a PLAIN reference
+            // row beside the definition. The claim this pin owns is that it is never a COMMON.
+            ASSERT_NE(row, nullptr) << "the reads written through the weak name are kept on the name";
+            EXPECT_EQ(row->commonSize, 0u) << "one object cannot carry a common and a definition of a name";
             ASSERT_NE(sym, nullptr) << "the artifact must DEFINE the name";
             AssembledData const* item = nullptr;
             for (auto const& d : back->dataItems) {
@@ -652,22 +662,31 @@ TEST(CommonSymbols, ALinkWhoseDocumentLeavesTheQuestionOpenIsRefusedByName) {
 // The ONE answer to whether a common yields to a definition (`linker::commonYieldsToDefinition`), which the link's
 // allocation and the archive search both ask, so the member the search fetches is the definition the link lets
 // win: a STRONG definition, yes; a LOCAL symbol is no definition the common meets; a WEAK one, as the link's
-// document says (no on ELF, yes on Mach-O and PE), and no on every document when its own spelling yields to a
-// common; and no answer where the document does not say.
+// document says: no on ELF; yes on Mach-O; on PE, where the format has two KINDS of weak definition and the common
+// stands between them, yes unless the definition states the OVERRIDABLE kind; and no answer where the document does
+// not say. The RANK the cross-unit fold is handed (`linker::weakDefinitionRank`) is the same fact read once more: a
+// definition stated overridable yields to every other weak definition of its name on PE, and nothing is ranked
+// anywhere else.
 TEST(CommonSymbols, OneAnswerSaysWhetherACommonYieldsToADefinition) {
     auto const silent = elfExecDocumentWithoutCommonYieldsTo();
     ASSERT_TRUE(silent);
     struct Doc {
-        char const*         name;   // null: the ELF exec document without the key
-        std::optional<bool> weak;   // what a weak definition the document decides gets
+        char const*         name;          // null: the ELF exec document without the key
+        std::optional<bool> unstated;      // a weak definition that states no kind
+        std::optional<bool> selectAny;
+        std::optional<bool> overridable;
+        bool                ranksTheKinds; // an overridable definition yields to the other weak definitions
     };
-    auto const definition = [](SymbolBinding binding, bool spellingYields) {
+    auto const definition = [](SymbolBinding binding, std::optional<WeakDefinitionKind> kind) {
         ModuleSymbol s{SymbolId{1}, "shared", binding, SymbolVisibility::Default};
-        s.yieldsToACommon = spellingYields;
+        s.weakKind = kind;
         return s;
     };
-    for (auto const& doc : {Doc{"elf64-x86_64-linux-exec", false}, Doc{"macho64-x86_64-darwin-exec", true},
-                            Doc{"pe64-x86_64-windows-exec", true}, Doc{nullptr, std::nullopt}}) {
+    using Kind = WeakDefinitionKind;
+    for (auto const& doc : {Doc{"elf64-x86_64-linux-exec", false, false, false, false},
+                            Doc{"macho64-x86_64-darwin-exec", true, true, true, false},
+                            Doc{"pe64-x86_64-windows-exec", true, true, false, true},
+                            Doc{nullptr, std::nullopt, std::nullopt, std::nullopt, false}}) {
         SCOPED_TRACE(doc.name != nullptr ? doc.name : "the ELF exec document without the key");
         std::shared_ptr<ObjectFormatSchema const> format = silent;
         if (doc.name != nullptr) {
@@ -675,15 +694,30 @@ TEST(CommonSymbols, OneAnswerSaysWhetherACommonYieldsToADefinition) {
             ASSERT_TRUE(shipped.has_value());
             format = *shipped;
         }
-        EXPECT_EQ(linker::commonYieldsToDefinition(*format, definition(SymbolBinding::Global, false)),
+        EXPECT_EQ(linker::commonYieldsToDefinition(*format, definition(SymbolBinding::Global, std::nullopt)),
                   std::optional<bool>{true});
-        EXPECT_EQ(linker::commonYieldsToDefinition(*format, definition(SymbolBinding::Local, false)),
+        EXPECT_EQ(linker::commonYieldsToDefinition(*format, definition(SymbolBinding::Local, std::nullopt)),
                   std::optional<bool>{false});
-        EXPECT_EQ(linker::commonYieldsToDefinition(*format, definition(SymbolBinding::Weak, true)),
-                  std::optional<bool>{false})
-            << "a weak definition whose own spelling yields to a common";
-        EXPECT_EQ(linker::commonYieldsToDefinition(*format, definition(SymbolBinding::Weak, false)), doc.weak);
+        EXPECT_EQ(linker::commonYieldsToDefinition(*format, definition(SymbolBinding::Weak, std::nullopt)),
+                  doc.unstated);
+        EXPECT_EQ(linker::commonYieldsToDefinition(*format, definition(SymbolBinding::Weak, Kind::SelectAny)),
+                  doc.selectAny);
+        EXPECT_EQ(linker::commonYieldsToDefinition(*format, definition(SymbolBinding::Weak, Kind::Overridable)),
+                  doc.overridable)
+            << "a weak definition of the overridable kind";
+        // A kind is read only on a WEAK definition: a strong one that carries one is still what a common yields to.
+        EXPECT_EQ(linker::commonYieldsToDefinition(*format, definition(SymbolBinding::Global, Kind::Overridable)),
+                  std::optional<bool>{true});
+
+        EXPECT_EQ(linker::weakDefinitionRank(*format, definition(SymbolBinding::Weak, Kind::Overridable)),
+                  doc.ranksTheKinds ? linker::kYieldingWeakDefinition : linker::kUnrankedWeakDefinition);
+        EXPECT_EQ(linker::weakDefinitionRank(*format, definition(SymbolBinding::Weak, Kind::SelectAny)),
+                  linker::kUnrankedWeakDefinition);
+        EXPECT_EQ(linker::weakDefinitionRank(*format, definition(SymbolBinding::Weak, std::nullopt)),
+                  linker::kUnrankedWeakDefinition);
     }
+    EXPECT_LT(linker::kYieldingWeakDefinition, linker::kUnrankedWeakDefinition)
+        << "the fold replaces a LOWER rank by a higher one: the yielding rank must be the lower";
 }
 
 // Every document a link resolves units for states which definitions a common yields to, as its linkers answer; an
@@ -701,9 +735,12 @@ TEST(CommonSymbols, EachLinkDocumentStatesWhatItsLinkersDo) {
         }
     }
     for (char const* f : {"macho64-x86_64-darwin", "macho64-x86_64-darwin-exec", "macho64-x86_64-darwin-dylib",
-                          "macho64-arm64-darwin", "macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib",
-                          "pe64-x86_64-windows", "pe64-x86_64-windows-exec", "pe64-x86_64-windows-dll"}) {
+                          "macho64-arm64-darwin", "macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib"}) {
         wants.push_back(Want{f, CommonYieldsTo::AnyDefinition});
+    }
+    // PE has two kinds of weak definition and its linkers put the common BETWEEN them.
+    for (char const* f : {"pe64-x86_64-windows", "pe64-x86_64-windows-exec", "pe64-x86_64-windows-dll"}) {
+        wants.push_back(Want{f, CommonYieldsTo::NonOverridableDefinition});
     }
     for (char const* f : {"elf64-x86_64-linux-staticlib", "elf64-aarch64-linux-staticlib",
                           "macho64-x86_64-darwin-staticlib", "macho64-arm64-darwin-staticlib",
@@ -714,6 +751,147 @@ TEST(CommonSymbols, EachLinkDocumentStatesWhatItsLinkersDo) {
         auto const f = ObjectFormatSchema::loadShipped(w.format);
         ASSERT_TRUE(f.has_value()) << w.format;
         EXPECT_EQ((*f)->commonYieldsTo(), w.yields) << w.format;
+    }
+}
+
+// ══ THE TWO KINDS OF WEAK DEFINITION, AT THE LINK ════════════════════════════════════════════════════════════════
+//
+// D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER (P69). One name defined as an OVERRIDABLE
+// weak definition (a COFF weak external whose default is a body: 5) and as a SELECT-ANY one (a COMDAT: 9) is one
+// program whatever the order of its objects: the select-any body. ✔MEASURED 2026-10-08 on PE — GNU ld 2.42 on MinGW
+// gcc 13.2's objects, link.exe 14.44 and lld-link 19.1.5 on clang 19.1.5's weak external beside cl 19.44's and
+// clang's select-any: 99 in both object orders, and beside a common of the name in all six
+// (strong > select-any > common > overridable). DSS folded the two as equals, lowest unit first: 55 whenever the
+// weak-external object came first.
+//
+// The units are hand-built and STATE their kinds, as the COFF reader states them for a foreign object
+// (`tests/link/test_coff_object_reader.cpp` pins that half). Each link is a PE relocatable artifact, read back: which
+// definition the name kept is read off its bytes.
+namespace {
+
+// A unit defining `shared` weak with `value`, stating `kind` (or none).
+[[nodiscard]] AssembledModule weakUnit(std::uint32_t cu, std::uint8_t value, std::optional<WeakDefinitionKind> kind) {
+    AssembledModule m = UnitOf(cu).datum("shared", SymbolBinding::Weak, value).build();
+    m.symbols[0].weakKind = kind;
+    return m;
+}
+
+struct KeptDefinition {
+    bool                        linked = false;
+    std::string                 diagnostics;
+    std::optional<std::uint8_t> value;        // the first byte of the definition the artifact gives the name
+    bool                        common = false;   // the artifact hands a COMMON of the name on instead
+    std::size_t                 definitions = 0;  // rows that define the name
+};
+
+// The PE relocatable artifact of `mods`, read back: what it makes of `shared`.
+void keptOf(std::vector<AssembledModule> const& mods, KeptDefinition& out) {
+    auto const L = load("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(L.target && L.format);
+    DiagnosticReporter rep;
+    auto const obj = linker::link(std::span<AssembledModule const>{mods}, *L.target, *L.format, rep);
+    out.linked      = obj.ok();
+    out.diagnostics = diagnosticsOf(rep);
+    if (!out.linked) return;
+    DiagnosticReporter readRep;
+    auto const back = pe::readRelocatableObject(obj.bytes, *L.target, *L.format, readRep);
+    ASSERT_TRUE(back.has_value()) << diagnosticsOf(readRep);
+    if (auto const* row = rowNamed(*back, "shared"); row != nullptr && row->commonSize != 0u) out.common = true;
+    for (auto const& s : back->symbols) {
+        if (s.name != "shared") continue;
+        ++out.definitions;
+        for (auto const& d : back->dataItems) {
+            if (d.symbol == s.symbol && !d.bytes.empty()) out.value = d.bytes[0];
+        }
+    }
+}
+
+}  // namespace
+
+// The select-any definition is the name's, in both unit orders; so is it with the kinds on the opposite units (the
+// lowest unit is then the select-any one — the order the old fold got right by accident).
+TEST(WeakDefinitionKinds, TheSelectAnyDefinitionReplacesTheOverridableOneInEitherOrder) {
+    using Kind = WeakDefinitionKind;
+    struct Order {
+        char const* what;
+        Kind        first, second;
+    };
+    for (auto const& order : {Order{"the overridable definition's unit first", Kind::Overridable, Kind::SelectAny},
+                              Order{"the select-any definition's unit first", Kind::SelectAny, Kind::Overridable}}) {
+        SCOPED_TRACE(order.what);
+        // 5 is always the overridable body, 9 the select-any one.
+        std::vector<AssembledModule> mods{weakUnit(1, order.first == Kind::Overridable ? 5 : 9, order.first),
+                                          weakUnit(2, order.second == Kind::Overridable ? 5 : 9, order.second)};
+        KeptDefinition kept;
+        ASSERT_NO_FATAL_FAILURE(keptOf(mods, kept));
+        ASSERT_TRUE(kept.linked) << kept.diagnostics;
+        EXPECT_EQ(kept.definitions, 1u) << "one name, one definition";
+        EXPECT_FALSE(kept.common);
+        EXPECT_EQ(kept.value, std::optional<std::uint8_t>{9})
+            << "the select-any body (9) is the name's; 5 is the overridable default, which stands only while nothing "
+               "else defines the name";
+    }
+}
+
+// Beside a COMMON of the name the order is strong > select-any > common > overridable, in all six orders of the
+// three units; and without the select-any definition the common stands over the overridable one (the control that
+// the common is in the link at all).
+TEST(WeakDefinitionKinds, BesideACommonTheSelectAnyDefinitionWinsInAllSixOrders) {
+    using Kind = WeakDefinitionKind;
+    enum class Unit { Overridable, SelectAny, Common };
+    auto const build = [](std::uint32_t cu, Unit which) {
+        switch (which) {
+            case Unit::Overridable: return weakUnit(cu, 5, Kind::Overridable);
+            case Unit::SelectAny: return weakUnit(cu, 9, Kind::SelectAny);
+            case Unit::Common: break;
+        }
+        return UnitOf(cu).common("shared").build();
+    };
+    std::vector<Unit> order{Unit::Overridable, Unit::SelectAny, Unit::Common};
+    std::sort(order.begin(), order.end());
+    std::size_t orders = 0;
+    do {
+        std::string name;
+        std::vector<AssembledModule> mods;
+        for (std::size_t k = 0; k < order.size(); ++k) {
+            mods.push_back(build(static_cast<std::uint32_t>(k + 1), order[k]));
+            name += order[k] == Unit::Overridable ? "overridable " : order[k] == Unit::SelectAny ? "select-any " : "common ";
+        }
+        SCOPED_TRACE("units in the order: " + name);
+        KeptDefinition kept;
+        ASSERT_NO_FATAL_FAILURE(keptOf(mods, kept));
+        ASSERT_TRUE(kept.linked) << kept.diagnostics;
+        EXPECT_FALSE(kept.common) << "the common yields to the select-any definition";
+        EXPECT_EQ(kept.value, std::optional<std::uint8_t>{9});
+        ++orders;
+    } while (std::next_permutation(order.begin(), order.end()));
+    EXPECT_EQ(orders, 6u);
+
+    for (bool const commonFirst : {false, true}) {
+        SCOPED_TRACE(commonFirst ? "CONTROL: the common's unit first" : "CONTROL: the overridable definition's unit first");
+        std::vector<AssembledModule> mods;
+        mods.push_back(commonFirst ? build(1, Unit::Common) : build(1, Unit::Overridable));
+        mods.push_back(commonFirst ? build(2, Unit::Overridable) : build(2, Unit::Common));
+        KeptDefinition kept;
+        ASSERT_NO_FATAL_FAILURE(keptOf(mods, kept));
+        ASSERT_TRUE(kept.linked) << kept.diagnostics;
+        EXPECT_TRUE(kept.common) << "the common outranks the overridable definition and is handed on";
+        EXPECT_EQ(kept.definitions, 0u);
+    }
+}
+
+// CONTROL — definitions that state ONE kind, or none, fold as weak definitions always did: the lowest unit's.
+// Without this the rank could be a tie-break that reorders every weak pair.
+TEST(WeakDefinitionKinds, DefinitionsOfOneKindFoldAsTheyAlwaysDid) {
+    using Kind = WeakDefinitionKind;
+    for (std::optional<Kind> const kind : {std::optional<Kind>{}, std::optional<Kind>{Kind::SelectAny},
+                                           std::optional<Kind>{Kind::Overridable}}) {
+        SCOPED_TRACE(kind.has_value() ? std::string{weakDefinitionKindName(*kind)} : std::string{"no stated kind"});
+        std::vector<AssembledModule> mods{weakUnit(1, 5, kind), weakUnit(2, 9, kind)};
+        KeptDefinition kept;
+        ASSERT_NO_FATAL_FAILURE(keptOf(mods, kept));
+        ASSERT_TRUE(kept.linked) << kept.diagnostics;
+        EXPECT_EQ(kept.value, std::optional<std::uint8_t>{5}) << "the first unit's definition, as before";
     }
 }
 
@@ -889,6 +1067,174 @@ void writeText(fs::path const& p, std::string_view text) { std::ofstream(p, std:
     return {};
 }
 
+// ══ "THE REFERENCE'S ANSWER MOVED" IS ITS OWN FAILURE (P69 fold 2) ═══════════════════════════════════════════════
+//
+// A native cell of this file asserts two different things, and they must never read as the same red:
+//   * the CONTROL: the host's reference toolchain still answers what the table says it answered when the row was
+//     measured — an exit code, a refusal, a refusal's words, a symbol table's layout. When it does not, the
+//     REFERENCE moved (a newer tool on the leg); DSS did nothing. That failure opens with `reference moved:` and
+//     states the live tools' own version lines, what they answered, the versions the table was measured with and
+//     what the table says;
+//   * DSS against the reference: compared with the LIVE answer wherever DSS's expected value is "what the
+//     reference does", so a moved reference reds its control alone and DSS's cell still says whether DSS agrees.
+// The live version is asked only inside a failure's message — which gtest evaluates only when the assertion
+// fails — so a green run pays nothing for it.
+struct ReferenceTool {
+    std::string                  label;          // as the [native-arm] lines name the arm
+    std::string                  measuredWith;   // the versions the table was measured with
+    std::function<std::string()> liveVersion;    // the live tools' own version lines
+};
+
+[[nodiscard]] std::string firstLineOf(fs::path const& p) {
+    std::ifstream in{p};
+    for (std::string line; std::getline(in, line);) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (!line.empty()) return line;
+    }
+    return "(it printed nothing)";
+}
+
+// The first line each of `commands` prints, run as the arm runs its tools.
+[[nodiscard]] std::function<std::string()>
+liveVersionBy(std::function<bool(fs::path const&, std::string const&, std::string const&)> run, fs::path dir,
+              std::vector<std::string> commands) {
+    return [run = std::move(run), dir = std::move(dir), commands = std::move(commands)] {
+        std::string out;
+        for (std::size_t i = 0; i < commands.size(); ++i) {
+            std::string const log = "live-version-" + std::to_string(i) + ".txt";
+            (void)run(dir, commands[i], log);   // a banner's exit status is not the question
+            out += (i == 0 ? "[`" : "; `") + commands[i] + "`: " + firstLineOf(dir / log);
+        }
+        return out + "]";
+    };
+}
+
+[[nodiscard]] std::string referenceMoved(ReferenceTool const& tool, std::string const& answered,
+                                         std::string const& tableSays) {
+    return "reference moved: " + tool.label + " "
+           + (tool.liveVersion ? tool.liveVersion() : std::string{"[version not asked]"}) + " answered " + answered
+           + ", the table (measured with " + tool.measuredWith + ") says " + tableSays
+           + " — the REFERENCE's answer changed under the table, which is NOT DSS differing from the reference: read "
+             "what the live tool does, then restate the table and the row it was measured for";
+}
+
+// An arm of a table as a reference tool (`Arm`: its `label`, `measuredWith`, `versionCommands` and `run`).
+template <typename Arm>
+[[nodiscard]] ReferenceTool referenceToolOf(Arm const& arm, fs::path const& dir) {
+    return ReferenceTool{arm.label, arm.measuredWith, liveVersionBy(arm.run, dir, arm.versionCommands)};
+}
+
+// The CONTROL of a cell whose reference program must exit as the table says: its LIVE exit code, or nullopt when
+// the program did not run.
+[[nodiscard]] std::optional<unsigned> controlExit(ReferenceTool const& tool, test_support::RunResult const& ran,
+                                                  unsigned tableSays) {
+    EXPECT_TRUE(ran.spawned) << tool.label << ": " << ran.diagnostic;
+    EXPECT_FALSE(ran.timedOut) << tool.label;
+    if (!ran.spawned || ran.timedOut) return std::nullopt;
+    EXPECT_EQ(static_cast<unsigned>(ran.exitCode), tableSays)
+        << referenceMoved(tool, std::to_string(ran.exitCode), std::to_string(tableSays));
+    return static_cast<unsigned>(ran.exitCode);
+}
+
+// ONE SHELL RUNS A BATCH OF REFERENCE COMPILES — `(a && b && ...)`, every command's two streams in one log —
+// where each translation unit used to cost a shell of its own (on Windows a `cmd.exe` under the MSVC
+// environment). Chunked, so a cmd.exe command line stays far inside its 8191 characters.
+template <typename Arm>
+[[nodiscard]] ::testing::AssertionResult runBatched(Arm const& arm, fs::path const& d,
+                                                    std::vector<std::string> const& commands,
+                                                    std::string const& logStem) {
+    std::size_t chunk = 0;
+    for (std::size_t i = 0; i < commands.size();) {
+        std::string line = "(" + commands[i++];
+        while (i < commands.size() && line.size() + commands[i].size() < 3000) line += " && " + commands[i++];
+        line += ")";
+        std::string const log = logStem + "-" + std::to_string(chunk++) + ".txt";
+        if (!arm.run(d, line, log)) {
+            return ::testing::AssertionFailure()
+                   << arm.label << ": " << line << test_support::native_probe::tailOf(d / log, 30, arm.label);
+        }
+    }
+    return ::testing::AssertionSuccess();
+}
+
+// WHAT A POSIX LEG's REFERENCE ARMS NEED, AND WHAT THIS HOST LACKS OF IT: `cc` must build a trivial program, and
+// `ld` and `ar` must be on PATH. Asked once per process. A missing tool is the arm NOT RUN, named — a strict run
+// (the gate's) fails on it by that name — never a table that dies inside its first compile, never a silent skip.
+[[nodiscard, maybe_unused]] std::vector<std::string> const& posixReferenceToolsAbsent() {
+    static std::vector<std::string> const absent = [] {
+        std::vector<std::string> out;
+#if !defined(_WIN32)
+        namespace np = test_support::native_probe;
+        test_support::ScratchDir scratch{test_support::Location::Temp, "posix-reference-tools"};
+        auto const probeDir = scratch.path();
+        writeText(probeDir / "check.c", "int main(void){return 0;}\n");
+        auto const asks = [&](std::string const& cmd, char const* log) {
+            return std::system(np::captureCmd("cd \"" + probeDir.string() + "\" && " + cmd, probeDir / log).c_str())
+                   == 0;
+        };
+        if (!asks("cc -o check check.c", "cc.txt")) {
+            out.push_back("`cc` cannot build a trivial program:" + np::tailOf(probeDir / "cc.txt", 5, "cc"));
+        }
+        for (char const* tool : {"ld", "ar"}) {
+            if (!asks(std::string{"command -v "} + tool, "which.txt")) {
+                out.push_back(std::string{"no `"} + tool + "` on PATH");
+            }
+        }
+#endif
+        return out;
+    }();
+    return absent;
+}
+
+// A reference arm OUTSIDE a table (`what` names it): true when this host can run it. Otherwise each missing tool is
+// said under the strict-arm rule — a failure in a strict run, a printed line in any other — and the caller skips.
+[[nodiscard, maybe_unused]] bool posixReferenceArmCanRun(std::string const& what) {
+    auto const& lacking = posixReferenceToolsAbsent();
+    if (lacking.empty()) return true;
+    auto const strict = test_support::readStrictArmVerdicts();
+    for (auto const& tool : lacking) {
+        if (strict.on || strict.malformed) {
+            ADD_FAILURE() << "[native-arm] " << what << ": " << tool << " — the arm cannot run on this host, and "
+                          << test_support::kStrictArmVerdictsEnv << " makes that a failure";
+        } else {
+            std::cout << "[native-arm] " << what << ": not run — " << tool << "\n";
+        }
+    }
+    return false;
+}
+
+// The same for a TABLE's arms: every arm leaves `arms` for `absent`, which each suite reports under the strict-arm
+// rule.
+template <typename Arm>
+void withoutArmsThisPosixHostCannotRun(std::vector<Arm>& arms, std::vector<std::string>& absent) {
+    auto const& lacking = posixReferenceToolsAbsent();
+    if (lacking.empty()) return;
+    for (auto const& a : arms) {
+        for (auto const& tool : lacking) absent.push_back(a.label + ": " + tool);
+    }
+    arms.clear();
+}
+
+// The POSIX legs' `cc` and the linker it drives, for a test that runs them outside an arm table.
+[[nodiscard, maybe_unused]] ReferenceTool posixCc(fs::path const& dir, std::string label, std::string measuredWith) {
+    auto run = [](fs::path const& d, std::string const& cmd, std::string const& log) {
+        return std::system(
+                   test_support::native_probe::captureCmd("cd \"" + d.string() + "\" && LC_ALL=C " + cmd, d / log).c_str())
+               == 0;
+    };
+    return ReferenceTool{std::move(label), std::move(measuredWith),
+                         liveVersionBy(run, dir, {"cc --version", "ld -v"})};
+}
+
+// cl with link.exe, likewise.
+[[nodiscard, maybe_unused]] ReferenceTool clWithLinkExe(test_support::native_probe::MsvcTools const& tools,
+                                                        fs::path const& dir) {
+    auto run = [&tools](fs::path const& d, std::string const& cmd, std::string const& log) {
+        return runCapturing(&tools, d, cmd, log);
+    };
+    return ReferenceTool{"cl (link.exe)", "cl 19.44 with link.exe 14.44", liveVersionBy(run, dir, {"cl", "link"})};
+}
+
 void expect42(fs::path const& exe, char const* who) {
     auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << who << ": " << r.diagnostic;
@@ -916,7 +1262,7 @@ TEST(CommonSymbolsNative, ClTentativeDefinitionsLinkUnderDssAsUnderLinkExe) {
         << test_support::native_probe::tailOf(dir / "cl.txt", 30, "cl");
     ASSERT_TRUE(runCapturing(&tools, dir, "link /nologo /OUT:ref.exe main.obj tu1.obj tu3.obj", "link.txt"))
         << test_support::native_probe::tailOf(dir / "link.txt", 30, "link.exe");
-    expect42(dir / "ref.exe", "link.exe");
+    (void)controlExit(clWithLinkExe(tools, dir), test_support::runBinary(dir / "ref.exe"), 42u);
     DiagnosticReporter rep;
     auto const exe = dssLinks(dir, {"main.obj", "tu1.obj", "tu3.obj"}, rep);
     ASSERT_FALSE(exe.empty()) << "DSS must link cl's tentative definitions:" << diagnosticsOf(rep);
@@ -1768,6 +2114,12 @@ TEST(CommonSymbolsArchive, TheSearchAnswersItsReferencesBeforeItWalksItsCommons)
                     << (fam.commonOutranksAWeakDefinition
                             ? "CONTROL: a weak definition never ends a common's search here, so T is always fetched"
                             : "T is fetched exactly when it precedes U in the archive");
+                // THE IMAGE IS LINKED WHERE THE RULE DISTINGUISHES. Which members are FETCHED is asked above in
+                // every order of the archive and of the commons, in process; what the program then READS follows
+                // from the fetched set — a strong definition beats a weak one whatever their order, the merge's own
+                // pins — so one order per outcome (T before U, U before T), under both orders of the commons, links
+                // an image: 4 of the 12 per family.
+                if (order != "TUX" && order != "UTX") continue;
                 auto const clientObj = fam.encode(clients.front(), *L.target, *L.format, rep);
                 ASSERT_FALSE(clientObj.empty()) << diagnosticsOf(rep);
                 DiagnosticReporter linkRep;
@@ -1896,16 +2248,14 @@ TEST(CommonSymbolsNative, GccCommonsLinkUnderDssAsUnderGnuLd) {
 #if !defined(__linux__) || !(defined(__x86_64__) || defined(__aarch64__))
     GTEST_SKIP() << "not a Linux x86_64 or aarch64 host -- the gcc -fcommon arm runs on the Linux legs";
 #else
+    if (!posixReferenceArmCanRun("gcc -fcommon (GNU ld)")) {
+        if (HasFailure()) return;
+        GTEST_SKIP() << "the reference toolchain is not on this host (see the [native-arm] lines)";
+    }
     test_support::ScratchDir scratch{test_support::Location::Temp, "common-gcc-elf"};
     auto const dir = scratch.path();
     namespace np = test_support::native_probe;
-    writeText(dir / "check.c", "int main(void){return 0;}\n");
-    if (std::system(np::captureCmd("cc -o \"" + (dir / "check").string() + "\" \"" + (dir / "check.c").string() + "\"",
-                                   dir / "check.txt")
-                        .c_str())
-        != 0) {
-        GTEST_SKIP() << "the host's `cc` cannot build a trivial program: " << np::tailOf(dir / "check.txt", 5, "cc");
-    }
+    auto const reference = posixCc(dir, "gcc -fcommon (GNU ld)", "gcc 13.3.0 with GNU ld 2.42");
     writeText(dir / "tu1.c", kTu1);
     writeText(dir / "tu3.c", kTu3);
     writeText(dir / "main.c", kClMain);
@@ -1928,7 +2278,7 @@ TEST(CommonSymbolsNative, GccCommonsLinkUnderDssAsUnderGnuLd) {
     ASSERT_EQ(std::system(np::captureCmd(ref, dir / "ref.txt").c_str()), 0) << ref << np::tailOf(dir / "ref.txt", 20);
     auto const refRun = test_support::runBinary(dir / "ref");
     ASSERT_TRUE(refRun.spawned) << refRun.diagnostic;
-    EXPECT_EQ(refRun.exitCode, 42u) << "GNU ld";
+    EXPECT_EQ(refRun.exitCode, 42u) << referenceMoved(reference, std::to_string(refRun.exitCode), "42");
 #if defined(__x86_64__)
     std::vector<char const*> const specs{"x86_64:elf64-x86_64-linux-exec", "x86_64:elf64-x86_64-linux-pie"};
 #else
@@ -1973,20 +2323,23 @@ TEST(CommonSymbolsNative, ACommonAgainstAThreadLocalMemberIsRefusedByName) {
 #if !defined(__linux__) || !(defined(__x86_64__) || defined(__aarch64__))
     GTEST_SKIP() << "not a Linux x86_64 or aarch64 host -- the gcc thread-local member arm runs on the Linux legs";
 #else
+    if (!posixReferenceArmCanRun("gcc, a thread-local archive member (GNU ld)")) {
+        if (HasFailure()) return;
+        GTEST_SKIP() << "the reference toolchain is not on this host (see the [native-arm] lines)";
+    }
     test_support::ScratchDir scratch{test_support::Location::Temp, "common-tls-member"};
     auto const dir = scratch.path();
     namespace np = test_support::native_probe;
+    auto const reference =
+        posixCc(dir, "gcc, a thread-local archive member (GNU ld)", "gcc 13.3.0 with GNU ld 2.42");
     auto const at = [&](std::string const& name) { return "\"" + (dir / name).string() + "\""; };
-    writeText(dir / "check.c", "int main(void){return 0;}\n");
-    if (std::system(np::captureCmd("cc -o " + at("check") + " " + at("check.c"), dir / "check.txt").c_str()) != 0) {
-        GTEST_SKIP() << "the host's `cc` cannot build a trivial program: " << np::tailOf(dir / "check.txt", 5, "cc");
-    }
     writeText(dir / "tu_common.c", "int shared;\nint read_shared(void) { return shared; }\n");
     writeText(dir / "m_tls.c", "__thread int shared = 7;\n");
     writeText(dir / "m_plain.c", "int shared = 7;\n");
     writeText(dir / "main.c", "int read_shared(void);\nint main(void) { return read_shared(); }\n");
+    // LC_ALL=C: this test READS the reference linker's words, which a leg's locale would otherwise translate.
     auto const sh = [&](std::string const& cmd, std::string const& log) {
-        return std::system(np::captureCmd(cmd, dir / log).c_str()) == 0;
+        return std::system(np::captureCmd("LC_ALL=C " + cmd, dir / log).c_str()) == 0;
     };
     ASSERT_TRUE(sh("cc -c -O2 -fcommon -o " + at("tu_common.o") + " " + at("tu_common.c"), "tu_common.txt"))
         << np::tailOf(dir / "tu_common.txt", 20, "cc");
@@ -2001,18 +2354,24 @@ TEST(CommonSymbolsNative, ACommonAgainstAThreadLocalMemberIsRefusedByName) {
             << np::tailOf(dir / (stem + "-ar.txt"), 20, "ar");
     }
     // The reference: GNU ld refuses the thread-local member, and links the ordinary one to 7.
-    EXPECT_FALSE(sh("cc -O2 -o " + at("ref_tls") + " " + at("main.c") + " " + at("tu_common.o") + " " + at("libtls.a"),
-                    "ref_tls.txt"))
-        << "GNU ld must refuse a thread-local definition for the common";
-    EXPECT_NE(np::tailOf(dir / "ref_tls.txt", 20).find("mismatches non-TLS reference"), std::string::npos)
-        << np::tailOf(dir / "ref_tls.txt", 20);
+    bool const tlsLinked =
+        sh("cc -O2 -o " + at("ref_tls") + " " + at("main.c") + " " + at("tu_common.o") + " " + at("libtls.a"),
+           "ref_tls.txt");
+    EXPECT_FALSE(tlsLinked) << referenceMoved(reference, "LINKS the common against the thread-local member",
+                                              "it refuses the link");
+    if (!tlsLinked) {
+        EXPECT_NE(np::tailOf(dir / "ref_tls.txt", 20).find("mismatches non-TLS reference"), std::string::npos)
+            << referenceMoved(reference, "a refusal in other words:" + np::tailOf(dir / "ref_tls.txt", 20),
+                              "a refusal that says `mismatches non-TLS reference` (read under LC_ALL=C)");
+    }
     ASSERT_TRUE(sh("cc -O2 -o " + at("ref_plain") + " " + at("main.c") + " " + at("tu_common.o") + " "
                        + at("libplain.a"),
                    "ref_plain.txt"))
         << np::tailOf(dir / "ref_plain.txt", 20);
     auto const refRun = test_support::runBinary(dir / "ref_plain");
     ASSERT_TRUE(refRun.spawned) << refRun.diagnostic;
-    EXPECT_EQ(refRun.exitCode, 7u) << "GNU ld, the ordinary member";
+    EXPECT_EQ(refRun.exitCode, 7u) << referenceMoved(reference, std::to_string(refRun.exitCode), "7")
+                                   << " (the ordinary member)";
 #if defined(__x86_64__)
     char const* const spec = "x86_64:elf64-x86_64-linux-exec";
 #else
@@ -2125,6 +2484,8 @@ struct YieldArm {
     char const*                           spec = nullptr; // the DSS image the cells link into
     std::array<unsigned, kYieldCellCount> expected{};     // per cell, in `yieldCells()` order
     bool                                  tlsCell = false;
+    std::string                           measuredWith;      // the versions `expected` was measured with
+    std::vector<std::string>              versionCommands;   // the live tools' banners, read when a control fails
     std::function<std::string(std::string const& stem, bool common)>                         compile;
     std::function<std::string(std::string const& lib, std::vector<std::string> const& members)> archive;
     // The program `out` of the main `mainSource` and `inputs`.
@@ -2176,7 +2537,9 @@ struct YieldArms {
     (void)work;
     auto const posixRun = [](fs::path const& dir, std::string const& cmd, std::string const& log) {
         namespace np = test_support::native_probe;
-        return std::system(np::captureCmd("cd \"" + dir.string() + "\" && " + cmd, dir / log).c_str()) == 0;
+        // LC_ALL=C: a suite that reads a reference tool's words reads them as measured, whatever the leg's locale.
+        return std::system(np::captureCmd("export LC_ALL=C; cd \"" + dir.string() + "\" && " + cmd, dir / log).c_str())
+               == 0;
     };
 #if defined(__APPLE__)
     arms.push_back(gnuStyleArm("Apple clang -arch arm64 (Apple's ld)", "-arch arm64", "arm64:macho64-arm64-darwin-exec",
@@ -2190,7 +2553,16 @@ struct YieldArms {
     arms.push_back(gnuStyleArm("gcc (GNU ld, aarch64)", "", "arm64:elf64-aarch64-linux-exec", {0, 0, 7, 7, 0, 7, 7, 7},
                                "", false));
 #endif
-    for (auto& a : arms) a.run = posixRun;
+    for (auto& a : arms) {
+        a.run = posixRun;
+#if defined(__APPLE__)
+        a.measuredWith = "Apple clang 21.0.0 with ld-1267";
+#else
+        a.measuredWith = "gcc 13.3.0 with GNU ld 2.42";
+#endif
+        a.versionCommands = {"cc --version", "ld -v"};
+    }
+    withoutArmsThisPosixHostCannotRun(arms, found.absent);
 #elif defined(_WIN32)
     namespace np = test_support::native_probe;
     auto const msvc = np::locateMsvcToolchain(work);
@@ -2209,6 +2581,8 @@ struct YieldArms {
         a.exe          = ".exe";
         a.spec         = "x86_64:pe64-x86_64-windows-exec";
         a.expected     = {5, 0, 0, 0, 0, 5, 5, 5};
+        a.measuredWith    = "cl 19.44 with link.exe 14.44";
+        a.versionCommands = {"cl", "link"};
         a.compile      = [](std::string const& stem, bool) { return "cl /nologo /c /O2 /MD " + stem + ".c"; };
         a.archive      = [](std::string const& lib, std::vector<std::string> const& members) {
             std::string c = "lib /nologo /OUT:" + lib + ".lib";
@@ -2231,6 +2605,8 @@ struct YieldArms {
         a.run = [](fs::path const& dir, std::string const& cmd, std::string const& log) {
             return runCapturing(nullptr, dir, cmd, log);
         };
+        a.measuredWith    = "MinGW gcc 13.2.0 with GNU ld 2.42";
+        a.versionCommands = {"gcc --version", "ld -v"};
         arms.push_back(std::move(a));
     } else {
         found.absent.push_back("MinGW gcc (GNU ld, PE): no `gcc` on PATH");
@@ -2289,6 +2665,7 @@ TEST(CommonSymbolsNative, ACommonBesideWeakAndArchivedDefinitionsResolvesAsTheRe
         };
         fs::path const d = dir / ("arm" + std::to_string(k));
         fs::create_directories(d);
+        auto const tool = referenceToolOf(arm, d);
         writeText(d / "main.c", kYieldMain);
         writeText(d / "main_helper.c", kYieldMainHelper);
         writeText(d / "tu_common.c", kYieldCommon);
@@ -2301,12 +2678,12 @@ TEST(CommonSymbolsNative, ACommonBesideWeakAndArchivedDefinitionsResolvesAsTheRe
             writeText(d / "m_tls.c", "__thread int shared = 5;\n");
             stems.push_back("m_tls");
         }
-        ASSERT_TRUE(arm.run(d, arm.compile("tu_common", /*common=*/true), "tu_common.txt"))
-            << np::tailOf(d / "tu_common.txt", 20, arm.label);
-        for (auto const& s : stems) {
-            ASSERT_TRUE(arm.run(d, arm.compile(s, /*common=*/false), s + ".txt"))
-                << np::tailOf(d / (s + ".txt"), 20, arm.label);
-        }
+        // One shell compiles the arm's units — and each reference MAIN once, where every cell's reference link
+        // compiled it again.
+        std::vector<std::string> compiles{arm.compile("tu_common", /*common=*/true)};
+        for (auto const& s : stems) compiles.push_back(arm.compile(s, /*common=*/false));
+        for (char const* m : {"main", "main_helper"}) compiles.push_back(arm.compile(m, /*common=*/false));
+        ASSERT_TRUE(runBatched(arm, d, compiles, "compile"));
         // DSS's link of the main `mainSource`, `tu_common` and `direct`, against `library` when it names one; its
         // image, or nullopt after recording why the link was refused.
         auto const dssLink = [&](std::string const& cell, std::string const& mainSource,
@@ -2345,11 +2722,13 @@ TEST(CommonSymbolsNative, ACommonBesideWeakAndArchivedDefinitionsResolvesAsTheRe
             refInputs.insert(refInputs.end(), direct.begin(), direct.end());
             if (!library.empty()) refInputs.push_back(library);
             std::string const refStem = std::string{"ref_"} + cell.name;
-            ASSERT_TRUE(arm.run(d, arm.link(refStem, mainSource, refInputs), refStem + ".txt"))
+            std::string const mainObject = std::string{cell.callsHelper ? "main_helper" : "main"} + arm.obj;
+            ASSERT_TRUE(arm.run(d, arm.link(refStem, mainObject, refInputs), refStem + ".txt"))
                 << np::tailOf(d / (refStem + ".txt"), 20, arm.label);
             auto const ref = runImage(d / (refStem + arm.exe));
             ASSERT_TRUE(ref.spawned) << ref.diagnostic;
-            EXPECT_EQ(ref.exitCode, arm.expected[c]) << "the reference linker no longer answers what the rows measured";
+            EXPECT_EQ(ref.exitCode, arm.expected[c])
+                << referenceMoved(tool, std::to_string(ref.exitCode), std::to_string(arm.expected[c]));
             DiagnosticReporter rep;
             auto const image = dssLink(cell.name, mainSource, direct, library, rep);
             ASSERT_TRUE(image.has_value()) << "DSS must link the cell:" << diagnosticsOf(rep);
@@ -2984,6 +3363,695 @@ TEST(WeakNameReferences, ARelocatableLinkHandsTheNameOnAndALaterLinkBindsIt) {
     }
 }
 
+// ══ THE RULE'S SECOND HALF: A RELOCATION THAT NAMES THE BODY NAMES ITS BYTES (P69 fold 2, the review of fold 1) ═════
+//
+// D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME. A weak name whose body has NO other external name — a weak
+// alias of a `static` — kept no reference row ("only beside another EXTERNAL name"): the reader bound the reference
+// written through the weak name to the body, and when the name lost to a strong definition the merge folded the body
+// onto the winner and took EVERY relocation naming it along — the unit's own read of its `static` included, which
+// then read the OTHER unit's datum, silently. One object, `static int impl = 7;` under a weak alias `shared`,
+// `direct` reading `impl` and `through` reading `shared`, beside `int shared = 9;` — direct / through:
+//     gcc 13.3 and clang 18.1 under GNU ld 2.42 and ld.lld 18.1 (ELF)                                7 / 9
+//     MinGW gcc 13.2 under GNU ld 2.42; clang 19.1.5 under link.exe 14.44 and lld-link 19.1.5 (PE)   7 / 9
+//     Apple's ld-1267 and ld64-957.1, the pair written by its assembler (Mach-O)                     9 / 9
+//     DSS until fold 2, ELF                                                                          9 / 9
+// (✔MEASURED 2026-10-08; beside a COMMON of the name instead: 7 / 0 on ELF and PE, 7 / 7 on Mach-O.) The split is the
+// format's own fact, not a linker's taste, and the link's DOCUMENT states it (`supersededDefinition`): an ELF weak
+// definition that loses its name keeps its bytes and what names THEM stays on them; Apple's ld replaces the atom
+// with every label it carries; PE answers per KIND of weak definition — a weak external's default keeps its bytes,
+// a COMDAT that loses is replaced whole.
+//
+// Per family the unit is what its own writer writes and its own reader reads. On ELF and Mach-O the body's other name
+// is MODULE-PRIVATE. On PE it is the external default a weak external needs (what MinGW gcc and clang write,
+// `.weak.<name>.<unique>`): a COFF body under a weak external always has an external name, which is why PE never had
+// the hole — its cells are the CONTROL that the two halves are one rule and not an ELF special case.
+//   * THE READER: the weak name states its reference row and says so on its own row
+//     (`ModuleSymbol::referencedByName`); the relocation written through the body's other name is left on the body.
+//   * THE MERGE, read off a RELOCATABLE link of the cell (every family) and off the IMAGE (ELF and Mach-O, whose
+//     images this file can read): what `direct` and `through` each reach.
+//   * THE ARTIFACT: the pair ALONE through a relocatable link, then that artifact beside a strong definition in
+//     both orders — what `ld -r` hands on (✔MEASURED the same day, GNU ld 2.42 and ld.lld 18.1: 7 / 9). On ELF the
+//     artifact has to give the bytes a record of their own beside the weak name (`ObjectSymbolNames`, the ids its
+//     writer hands it), or `direct` would follow the name at the later link.
+
+namespace {
+
+// One body — a datum of `value`, or a function — under `bodyName` (`bodyBinding`) and the WEAK name `weak`; `direct`
+// reaches the BODY, by a relocation that names the definition, and `through` the NAME, by its reference row.
+[[nodiscard]] AssembledModule weakNameOfABody(std::uint32_t cu, bool datum, std::uint8_t value, std::string const& bodyName,
+                                              SymbolBinding bodyBinding, std::string const& weak,
+                                              std::string const& direct, std::string const& through) {
+    UnitOf u(cu);
+    if (datum) {
+        u.datum(bodyName, bodyBinding, value);
+    } else {
+        u.marker(bodyName, bodyBinding);
+    }
+    u.alias(weak, bodyName, SymbolBinding::Weak);
+    if (datum) {
+        u.reads(direct, bodyName);
+    } else {
+        u.calls(direct, bodyName);
+    }
+    u.reference(weak, datum);
+    if (datum) {
+        u.reads(through, weak);
+    } else {
+        u.calls(through, weak);
+    }
+    return u.build();
+}
+
+// The first byte of the datum the ONE relocation of `fn` reaches in the unit `m`: the data item it targets or —
+// through a reference row of a name — the definition of that name `m` itself holds. A common's storage reads zero.
+[[nodiscard]] std::optional<unsigned> byteReachedIn(AssembledModule const& m, std::string const& fn) {
+    auto const targets = targetsOf(m, fn);
+    if (targets.size() != 1u) return std::nullopt;
+    SymbolId at = targets[0];
+    for (auto const& e : m.externImports) {
+        if (e.symbol != at) continue;
+        if (e.commonSize != 0u) return 0u;
+        auto const* def = definitionNamed(m, e.mangledName);
+        if (def == nullptr) return std::nullopt;
+        at = def->symbol;
+        break;
+    }
+    for (auto const& d : m.dataItems) {
+        if (d.symbol == at && !d.bytes.empty()) return static_cast<unsigned>(d.bytes[0]);
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+TEST(WeakNameReferences, ARelocationNamingTheBodyStaysOnItsBytesWhereTheFormatKeepsThem) {
+    enum class U { Pair, Override, Common };
+    struct Cell {
+        char const*    name;
+        std::vector<U> units;   // in link order
+    };
+    std::vector<Cell> const cells{{"the pair alone", {U::Pair}},
+                                  {"the pair, then a strong definition", {U::Pair, U::Override}},
+                                  {"a strong definition, then the pair", {U::Override, U::Pair}},
+                                  {"the pair, then a common", {U::Pair, U::Common}},
+                                  {"a common, then the pair", {U::Common, U::Pair}}};
+    for (auto const& fam : searchFamilies()) {
+        std::string_view const label{fam.label};
+        bool const             pe = label == "PE", macho = label == "Mach-O";
+        auto const L = load("x86_64", fam.relocatable);
+        auto const X = load("x86_64", fam.exec);
+        ASSERT_TRUE(L.target && L.format && X.format);
+        // The format's two facts (the measurements above), each read off the LINK's own document: whether a
+        // definition that lost its name keeps its BYTES (`supersededDefinition`), and whether a common outranks the
+        // pair's weak definition.
+        SupersededDefinitionStatement const& superseded = X.format->supersededDefinition();
+        ASSERT_TRUE(superseded.stated()) << "the link's document must say what becomes of a superseded definition";
+        for (auto const kind : {std::optional<WeakDefinitionKind>{}, std::optional{WeakDefinitionKind::Overridable},
+                                std::optional{WeakDefinitionKind::SelectAny}}) {
+            EXPECT_EQ(L.format->supersededDefinition().answerFor(kind), superseded.answerFor(kind))
+                << "the relocatable document a link's artifact is written with answers as its image document does";
+        }
+        // Whether THIS pair's body keeps its bytes when its weak name is won elsewhere: the document's answer for
+        // the kind the pair's own weak row states — never this test's knowledge of the family. On PE the question
+        // does not arise at all: the body holds an EXTERNAL name of its own (the weak external's default) and is
+        // not superseded, whatever the document says of either kind.
+        auto const keepsItsBytes = [&](AssembledModule const& pair) -> std::optional<bool> {
+            if (pe) return true;
+            auto const* weakRow = definitionNamed(pair, fam.us + "shared");
+            if (weakRow == nullptr) return std::nullopt;
+            auto const answer = superseded.answerFor(weakRow->weakKind);
+            if (!answer.has_value()) return std::nullopt;
+            return *answer == SupersededDefinition::KeepsItsBytes;
+        };
+        bool const commonWins = !macho;
+        std::string const shared = fam.us + "shared", direct = fam.us + "direct", through = fam.us + "through",
+                          viaCommon = fam.us + "via_common";
+        std::string const   body        = pe ? std::string{".weak.shared.default"} : fam.us + "impl";
+        SymbolBinding const bodyBinding = pe ? SymbolBinding::Global : SymbolBinding::Local;
+        for (bool const datum : {true, false}) {
+            for (auto const& cell : cells) {
+                bool const overridden = std::count(cell.units.begin(), cell.units.end(), U::Override) != 0;
+                bool const common     = std::count(cell.units.begin(), cell.units.end(), U::Common) != 0;
+                if (common && !datum) continue;
+                SCOPED_TRACE(std::string{fam.label} + (datum ? ", a datum: " : ", a function: ") + cell.name);
+                std::vector<AssembledModule> mods;
+                std::size_t                  pairAt = 0;
+                for (std::size_t i = 0; i < cell.units.size(); ++i) {
+                    auto const      cu = static_cast<std::uint32_t>(i + 1);
+                    AssembledModule hand;
+                    switch (cell.units[i]) {
+                    case U::Pair:
+                        hand   = weakNameOfABody(cu, datum, 7, body, bodyBinding, shared, direct, through);
+                        pairAt = i;
+                        break;
+                    case U::Override:
+                        hand = definitionOf(cu, datum, 9, shared);
+                        break;
+                    case U::Common:
+                        hand = UnitOf(cu).common(shared).reads(viaCommon, shared).build();
+                        break;
+                    }
+                    auto read = asRead(fam, L, hand, cu);
+                    ASSERT_TRUE(read.has_value());
+                    mods.push_back(std::move(*read));
+                }
+
+                // THE READER.
+                {
+                    AssembledModule const& pair    = mods[pairAt];
+                    auto const*            weakRow = definitionNamed(pair, shared);
+                    ASSERT_NE(weakRow, nullptr);
+                    EXPECT_EQ(weakRow->binding, SymbolBinding::Weak);
+                    EXPECT_TRUE(weakRow->referencedByName)
+                        << "the row of a weak name the reader kept the references of must say so: it is what tells "
+                           "the merge that a relocation left on the body means its BYTES";
+                    auto const* row = rowNamed(pair, shared);
+                    ASSERT_NE(row, nullptr) << "a weak name keeps its reference WHATEVER else names the body — a "
+                                               "module-private name included";
+                    EXPECT_NE(row->symbol, weakRow->symbol) << "the row's id is the NAME's, which no body holds";
+                    EXPECT_EQ(targetsOf(pair, through), std::vector<SymbolId>{row->symbol})
+                        << "the reference written through the weak name keeps the name";
+                    EXPECT_EQ(targetsOf(pair, direct), std::vector<SymbolId>{weakRow->symbol})
+                        << "the relocation written through the body's other name is left on the BODY";
+                    for (auto const& s : pair.symbols) {
+                        if (s.binding != SymbolBinding::Weak) {
+                            EXPECT_FALSE(s.referencedByName) << "'" << s.name << "' is no weak name";
+                        }
+                    }
+                }
+
+                auto const stays = keepsItsBytes(mods[pairAt]);
+                ASSERT_TRUE(stays.has_value()) << "the document must answer for the kind the pair's weak row states";
+                bool const bytesStay = *stays;
+                EXPECT_EQ(bytesStay, !macho) << "what this format's linkers were MEASURED to do with this pair";
+                bool const     nameLost     = overridden || (common && commonWins);
+                unsigned const throughReads = overridden ? 9u : (common && commonWins) ? 0u : 7u;
+                unsigned const directReads  = (nameLost && !bytesStay) ? throughReads : 7u;
+
+                // THE MERGE, off a relocatable link of the cell.
+                {
+                    DiagnosticReporter rep;
+                    auto const obj = linker::link(std::span<AssembledModule const>{mods}, *L.target, *L.format, rep);
+                    ASSERT_TRUE(obj.ok()) << diagnosticsOf(rep);
+                    auto const artifact = readObject(fam, L, obj.bytes, 1, rep);
+                    ASSERT_TRUE(artifact.has_value()) << diagnosticsOf(rep);
+                    if (datum) {
+                        EXPECT_EQ(byteReachedIn(*artifact, direct), std::optional<unsigned>{directReads})
+                            << "what the unit reads through the body's own name"
+                            << (bytesStay ? ": its OWN bytes, whoever won the weak name"
+                                          : ": the name's winner — this format replaces the definition whole");
+                        EXPECT_EQ(byteReachedIn(*artifact, through), std::optional<unsigned>{throughReads})
+                            << "what the unit reads through the weak name: the name's winner";
+                    }
+                    if (overridden) {
+                        auto const* def = definitionNamed(*artifact, shared);
+                        ASSERT_NE(def, nullptr);
+                        EXPECT_EQ(def->binding, SymbolBinding::Global) << "the strong definition won the name";
+                        auto const directTargets = targetsOf(*artifact, direct);
+                        ASSERT_EQ(directTargets.size(), 1u);
+                        EXPECT_EQ(directTargets[0] == def->symbol, !bytesStay)
+                            << "the relocation naming the body must " << (bytesStay ? "NOT " : "")
+                            << "have been sent to the definition that won the weak name";
+                        EXPECT_EQ(targetsOf(*artifact, through), std::vector<SymbolId>{def->symbol})
+                            << "the reference through the weak name reaches the definition that won it";
+                    }
+                }
+
+                // THE MERGE, off the image.
+                {
+                    auto        units = mods;
+                    auto const* entry = definitionNamed(units[pairAt], direct);
+                    ASSERT_NE(entry, nullptr);
+                    units[pairAt].userEntrySymbol = entry->symbol;
+                    DiagnosticReporter rep;
+                    auto const img = linker::link(std::span<AssembledModule const>{units}, *L.target, *X.format, rep,
+                                                  ImageRequest{.artifactFileName = "private_name_image"});
+                    ASSERT_TRUE(img.ok()) << diagnosticsOf(rep);
+                    if (datum && !pe) {
+                        auto const d = valueReadBy(fam, img.bytes, direct);
+                        auto const t = valueReadBy(fam, img.bytes, through);
+                        ASSERT_TRUE(d.has_value() && t.has_value()) << "the image's reads could not be followed";
+                        EXPECT_EQ(*d, directReads) << "the image: what `direct` reads";
+                        EXPECT_EQ(*t, throughReads) << "the image: what `through` reads";
+                    }
+                }
+            }
+
+            // THE ARTIFACT's HALF: the pair alone through a relocatable link, then beside a strong definition.
+            {
+                SCOPED_TRACE(std::string{fam.label} + (datum ? ", a datum" : ", a function")
+                             + ": the pair's artifact, then beside a strong definition");
+                auto pair = asRead(fam, L, weakNameOfABody(1, datum, 7, body, bodyBinding, shared, direct, through), 1);
+                ASSERT_TRUE(pair.has_value());
+                auto const stays = keepsItsBytes(*pair);
+                ASSERT_TRUE(stays.has_value());
+                bool const                         bytesStay = *stays;
+                std::vector<AssembledModule> const one{*pair};
+                DiagnosticReporter                 rep;
+                auto const first = linker::link(std::span<AssembledModule const>{one}, *L.target, *L.format, rep);
+                ASSERT_TRUE(first.ok()) << diagnosticsOf(rep);
+                auto const records = recordsNamed(fam, first.bytes, shared);
+                ASSERT_EQ(records.size(), 1u) << "the artifact spells the weak name ONCE";
+                EXPECT_TRUE(records[0].weak) << "and it is still the WEAK definition";
+                EXPECT_FALSE(records[0].undefined);
+                for (bool const artifactFirst : {true, false}) {
+                    SCOPED_TRACE(artifactFirst ? "the artifact, then the override" : "the override, then the artifact");
+                    std::uint32_t const artifactCu = artifactFirst ? 1u : 2u, strongCu = artifactFirst ? 2u : 1u;
+                    auto artifact = readObject(fam, L, first.bytes, artifactCu, rep);
+                    ASSERT_TRUE(artifact.has_value()) << diagnosticsOf(rep);
+                    auto strong = asRead(fam, L, definitionOf(strongCu, datum, 9, shared), strongCu);
+                    ASSERT_TRUE(strong.has_value());
+                    std::vector<AssembledModule> units;
+                    units.push_back(artifactFirst ? *artifact : *strong);
+                    units.push_back(artifactFirst ? *strong : *artifact);
+                    auto const second = linker::link(std::span<AssembledModule const>{units}, *L.target, *L.format, rep);
+                    ASSERT_TRUE(second.ok()) << diagnosticsOf(rep);
+                    auto const relinked = readObject(fam, L, second.bytes, 1, rep);
+                    ASSERT_TRUE(relinked.has_value()) << diagnosticsOf(rep);
+                    if (datum) {
+                        EXPECT_EQ(byteReachedIn(*relinked, direct), std::optional<unsigned>{bytesStay ? 7u : 9u})
+                            << "through the body's own name, after the artifact met the override";
+                        EXPECT_EQ(byteReachedIn(*relinked, through), std::optional<unsigned>{9u})
+                            << "through the weak name, after the artifact met the override";
+                    }
+                    auto const* def = definitionNamed(*relinked, shared);
+                    ASSERT_NE(def, nullptr);
+                    EXPECT_EQ(def->binding, SymbolBinding::Global);
+                    auto const directTargets = targetsOf(*relinked, direct);
+                    ASSERT_EQ(directTargets.size(), 1u);
+                    EXPECT_EQ(directTargets[0] == def->symbol, !bytesStay)
+                        << "the artifact's relocation naming the body must " << (bytesStay ? "NOT " : "")
+                        << "follow the weak name to the override";
+                    EXPECT_EQ(targetsOf(*relinked, through), std::vector<SymbolId>{def->symbol});
+                }
+            }
+        }
+    }
+}
+
+// ══ THE DOCUMENT IS THE SWITCH (`supersededDefinition`) ═════════════════════════════════════════════════════════════
+//
+// What a relocation naming a superseded definition reaches is not read off the format's NAME, and not off whether
+// the unit's members are kept: a Mach-O object that does not declare MH_SUBSECTIONS_VIA_SYMBOLS is a unit this link
+// keeps whole, and Apple's ld64-957.1 still answers 9 / 9 for it (ld-1267 refuses the pair as a duplicate symbol;
+// ✔MEASURED 2026-10-08). It is the root key of the link's document, and of the document a relocatable object is
+// written with.
+
+namespace {
+
+// The shipped document `format` with its root key `key` set to `value` — or, `value` null, removed with its comment.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const> documentWith(std::string const& format, char const* key,
+                                                                     nlohmann::json value) {
+    auto const    path = dss::test::configRoot() / "object-formats" / (format + ".format.json");
+    std::ifstream in{path};
+    auto          doc = nlohmann::json::parse(in);
+    EXPECT_TRUE(doc.contains(key)) << format << " must state '" << key << "'";
+    if (value.is_null()) {
+        doc.erase(key);
+        doc.erase(std::string{"$"} + key + "Comment");
+    } else {
+        doc[key] = std::move(value);
+    }
+    auto const loaded = ObjectFormatSchema::loadFromText(doc.dump(), format + ", '" + key + "' rewritten");
+    EXPECT_TRUE(loaded.has_value()) << format;
+    if (!loaded.has_value()) return nullptr;
+    return *loaded;
+}
+
+}  // namespace
+
+// Every shipped document that describes relocations says what becomes of a superseded definition, as its format's
+// linkers were measured to answer: the images and the relocatable documents a link resolves units for, and the
+// archive documents too, whose members a relocatable writer writes. ELF and Mach-O state ONE answer for every
+// definition; PE states one PER KIND of weak definition, and so answers nothing for a definition that states no
+// kind. Both vocabularies — the answers, and the kinds a per-kind statement is keyed by — are read by name through
+// their closed tables.
+TEST(WeakNameReferences, EveryDocumentThatDescribesRelocationsSaysWhatBecomesOfASupersededDefinition) {
+    auto const keeps    = std::optional{SupersededDefinition::KeepsItsBytes};
+    auto const replaced = std::optional{SupersededDefinition::ReplacedWhole};
+    std::optional<SupersededDefinition> const noAnswer;
+    auto const overridable = std::optional{WeakDefinitionKind::Overridable};
+    auto const selectAny   = std::optional{WeakDefinitionKind::SelectAny};
+    std::optional<WeakDefinitionKind> const noKind;
+
+    // THE STATEMENT's OWN TABLE (`SupersededDefinitionStatement::answerFor`), which every reader of the key asks.
+    {
+        SupersededDefinitionStatement nothing;
+        EXPECT_FALSE(nothing.stated());
+        EXPECT_FALSE(nothing.perKind());
+        for (auto const kind : {noKind, overridable, selectAny}) EXPECT_EQ(nothing.answerFor(kind), noAnswer);
+
+        SupersededDefinitionStatement every;
+        every.forEveryDefinition = SupersededDefinition::ReplacedWhole;
+        EXPECT_TRUE(every.stated());
+        EXPECT_FALSE(every.perKind());
+        for (auto const kind : {noKind, overridable, selectAny}) {
+            EXPECT_EQ(every.answerFor(kind), replaced) << "one answer, whatever the definition's kind";
+        }
+
+        SupersededDefinitionStatement perKind;
+        perKind.byKind = {{WeakDefinitionKind::Overridable, SupersededDefinition::KeepsItsBytes},
+                          {WeakDefinitionKind::SelectAny, SupersededDefinition::ReplacedWhole}};
+        EXPECT_TRUE(perKind.stated());
+        EXPECT_TRUE(perKind.perKind());
+        EXPECT_EQ(perKind.answerFor(overridable), keeps);
+        EXPECT_EQ(perKind.answerFor(selectAny), replaced);
+        EXPECT_EQ(perKind.answerFor(noKind), noAnswer)
+            << "a definition that states no kind has NO answer under a per-kind statement — never one kind's";
+        // The answer is looked up by the kind, never by position.
+        std::swap(perKind.byKind[0], perKind.byKind[1]);
+        EXPECT_EQ(perKind.answerFor(overridable), keeps);
+        EXPECT_EQ(perKind.answerFor(selectAny), replaced);
+    }
+
+    struct Want {
+        std::string                         format;
+        std::optional<SupersededDefinition> unstatedKind, overridable, selectAny;
+    };
+    std::vector<Want> wants;
+    for (char const* isa : {"x86_64", "aarch64"}) {
+        for (char const* flavor : {"", "-exec", "-pie", "-dyn", "-staticlib"}) {
+            wants.push_back(Want{std::string{"elf64-"} + isa + "-linux" + flavor, keeps, keeps, keeps});
+        }
+    }
+    for (char const* isa : {"x86_64", "arm64"}) {
+        for (char const* flavor : {"", "-exec", "-dylib", "-staticlib"}) {
+            wants.push_back(Want{std::string{"macho64-"} + isa + "-darwin" + flavor, replaced, replaced, replaced});
+        }
+    }
+    for (char const* flavor : {"", "-exec", "-dll", "-staticlib"}) {
+        wants.push_back(Want{std::string{"pe64-x86_64-windows"} + flavor, noAnswer, keeps, replaced});
+    }
+    ASSERT_EQ(wants.size(), 22u);
+    for (auto const& w : wants) {
+        auto const f = ObjectFormatSchema::loadShipped(w.format);
+        ASSERT_TRUE(f.has_value()) << w.format;
+        SupersededDefinitionStatement const& s = (*f)->supersededDefinition();
+        EXPECT_TRUE(s.stated()) << w.format;
+        EXPECT_EQ(s.perKind(), !w.unstatedKind.has_value()) << w.format;
+        EXPECT_EQ(s.answerFor(noKind), w.unstatedKind) << w.format << ": a definition that states no kind";
+        EXPECT_EQ(s.answerFor(overridable), w.overridable) << w.format << ": an overridable definition";
+        EXPECT_EQ(s.answerFor(selectAny), w.selectAny) << w.format << ": a select-any definition";
+    }
+
+    // THE LOADER. A value outside either closed set is refused, naming the key (and, per kind, the kind's own
+    // entry); a per-kind statement must answer for EVERY kind.
+    auto const withValue = [](nlohmann::json value) {
+        auto const    path = dss::test::configRoot() / "object-formats" / "elf64-x86_64-linux-exec.format.json";
+        std::ifstream in{path};
+        auto          doc           = nlohmann::json::parse(in);
+        doc["supersededDefinition"] = std::move(value);
+        return ObjectFormatSchema::loadFromText(doc.dump(), "elf64-x86_64-linux-exec, 'supersededDefinition' rewritten");
+    };
+    auto const refusedAt = [&](nlohmann::json value, std::string_view path) {
+        auto const loaded = withValue(std::move(value));
+        if (loaded.has_value()) return false;
+        bool named = false;
+        for (auto const& d : loaded.error()) named = named || d.path == path;
+        return named;
+    };
+    using J = nlohmann::json;
+    EXPECT_TRUE(refusedAt("keepsTheBytes", "/supersededDefinition")) << "an answer outside the closed set";
+    EXPECT_TRUE(refusedAt("replacedUnlessOverridable", "/supersededDefinition"))
+        << "the retired third value: which kind keeps its bytes is the DOCUMENT's to say, per kind";
+    EXPECT_TRUE(refusedAt(7, "/supersededDefinition")) << "neither one answer nor an answer per kind";
+    EXPECT_TRUE(refusedAt(J::object({{"overridable", "keepsItsBytes"}, {"selectany", "replacedWhole"}}),
+                          "/supersededDefinition/selectany"))
+        << "a key that is no kind of weak definition";
+    EXPECT_TRUE(refusedAt(J::object({{"overridable", "keepsItsBytes"}, {"select-any", "sometimes"}}),
+                          "/supersededDefinition/select-any"))
+        << "a kind's answer outside the closed set";
+    EXPECT_TRUE(refusedAt(J::object({{"overridable", "keepsItsBytes"}}), "/supersededDefinition"))
+        << "a per-kind statement that leaves a kind out";
+    EXPECT_TRUE(refusedAt(J::object(), "/supersededDefinition")) << "a per-kind statement of no kind at all";
+    // CONTROL: either answer loads as the one answer, and a statement per kind loads and answers per kind — on a
+    // document whose shipped statement is another.
+    EXPECT_TRUE(withValue("keepsItsBytes").has_value());
+    auto const one = withValue("replacedWhole");
+    ASSERT_TRUE(one.has_value());
+    EXPECT_EQ((*one)->supersededDefinition().answerFor(noKind), replaced);
+    auto const two = withValue(J::object({{"select-any", "keepsItsBytes"}, {"overridable", "replacedWhole"}}));
+    ASSERT_TRUE(two.has_value());
+    EXPECT_TRUE((*two)->supersededDefinition().perKind());
+    EXPECT_EQ((*two)->supersededDefinition().answerFor(selectAny), keeps);
+    EXPECT_EQ((*two)->supersededDefinition().answerFor(overridable), replaced);
+    EXPECT_EQ((*two)->supersededDefinition().answerFor(noKind), noAnswer);
+}
+
+// One pair of ELF units — the weak alias of a module-private body, and a strong definition of the weak name — under
+// the shipped document and under two copies that differ from it in the ONE key:
+//   * `keepsItsBytes` (shipped): the unit's read through the body's own name reads its own bytes (7);
+//   * `replacedWhole`: it reads the winner's (9) — the same units, the same link, only the document moved;
+//   * unstated: the link is refused, once, naming the key — and only when the question arises (CONTROL: the pair
+//     alone supersedes nothing and links);
+//   * stated PER KIND of weak definition (what a format with two mechanisms says; here PE's own statement, on ELF
+//     units so that the image's reads can be followed): the kind the pair's weak row STATES decides — overridable
+//     keeps its bytes (7), select-any is replaced (9) — and a row that states no kind has no answer: refused, once,
+//     naming the key. Nothing in the link knows which kind keeps what.
+// The reference through the weak name reaches the winner (9) under each: that half is no format's to vary.
+// THE WRITER asks its own document the same question: a relocatable object holding a body under a weak name its unit
+// references by row is refused under a silent document (CONTROL: a module with no such name is written), and under
+// `replacedWhole` the weak name's record is the record of the bytes, so the artifact's relocation follows the name at
+// the next link (9) where the shipped document's artifact stays on its bytes (7, pinned above).
+TEST(WeakNameReferences, TheLinksDocumentDecidesWhatARelocationNamingASupersededDefinitionReaches) {
+    SearchFamily const* elfFamily = nullptr;
+    for (auto const& f : searchFamilies()) {
+        if (std::string_view{f.label} == "ELF") elfFamily = &f;
+    }
+    ASSERT_NE(elfFamily, nullptr);
+    auto const& fam = *elfFamily;
+    auto const  L   = load("x86_64", fam.relocatable);
+    auto const  X   = load("x86_64", fam.exec);
+    ASSERT_TRUE(L.target && L.format && X.format);
+    auto const replaced       = documentWith(fam.exec, "supersededDefinition", "replacedWhole");
+    auto const silent         = documentWith(fam.exec, "supersededDefinition", nullptr);
+    auto const replacedObject = documentWith(fam.relocatable, "supersededDefinition", "replacedWhole");
+    auto const silentObject   = documentWith(fam.relocatable, "supersededDefinition", nullptr);
+    auto const perKind =
+        documentWith(fam.exec, "supersededDefinition",
+                     nlohmann::json::object({{"overridable", "keepsItsBytes"}, {"select-any", "replacedWhole"}}));
+    ASSERT_TRUE(replaced && silent && replacedObject && silentObject && perKind);
+    ASSERT_FALSE(silent->supersededDefinition().stated());
+    ASSERT_FALSE(silentObject->supersededDefinition().stated());
+    ASSERT_TRUE(perKind->supersededDefinition().perKind());
+    auto const refusalsNamingTheKey = [](DiagnosticReporter const& rep) {
+        std::size_t n = 0;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::K_NoMatchingObjectFormat
+                && d.actual.find("'supersededDefinition'") != std::string::npos) {
+                ++n;
+            }
+        }
+        return n;
+    };
+    // The pair as its reader states it (entry: `direct`), alone or beside the strong definition.
+    auto const unitsOf = [&](bool withOverride) -> std::optional<std::vector<AssembledModule>> {
+        std::vector<AssembledModule> units;
+        auto pair = asRead(fam, L,
+                           weakNameOfABody(1, /*datum=*/true, 7, "impl", SymbolBinding::Local, "shared", "direct",
+                                           "through"),
+                           1);
+        if (!pair.has_value()) return std::nullopt;
+        auto const* entry = definitionNamed(*pair, "direct");
+        if (entry == nullptr) return std::nullopt;
+        pair->userEntrySymbol = entry->symbol;
+        units.push_back(std::move(*pair));
+        if (withOverride) {
+            auto strong = asRead(fam, L, definitionOf(2, /*datum=*/true, 9, "shared"), 2);
+            if (!strong.has_value()) return std::nullopt;
+            units.push_back(std::move(*strong));
+        }
+        return units;
+    };
+    auto const overridden = unitsOf(true);
+    auto const alone      = unitsOf(false);
+    ASSERT_TRUE(overridden.has_value() && alone.has_value());
+
+    struct Doc {
+        char const*               what;
+        ObjectFormatSchema const* format;
+        unsigned                  direct;
+    };
+    for (auto const& doc : {Doc{"the shipped document: keepsItsBytes", X.format.get(), 7u},
+                            Doc{"the same document saying replacedWhole", replaced.get(), 9u}}) {
+        SCOPED_TRACE(doc.what);
+        DiagnosticReporter rep;
+        auto const img = linker::link(std::span<AssembledModule const>{*overridden}, *L.target, *doc.format, rep,
+                                      ImageRequest{.artifactFileName = "superseded_image"});
+        ASSERT_TRUE(img.ok()) << diagnosticsOf(rep);
+        auto const d = valueReadBy(fam, img.bytes, "direct");
+        auto const t = valueReadBy(fam, img.bytes, "through");
+        ASSERT_TRUE(d.has_value() && t.has_value()) << "the image's reads could not be followed";
+        EXPECT_EQ(*d, doc.direct) << "what the relocation naming the superseded definition reaches is the DOCUMENT's";
+        EXPECT_EQ(*t, 9u) << "CONTROL: the reference through the weak name reaches the winner under either";
+    }
+    {
+        SCOPED_TRACE("the document without the key");
+        DiagnosticReporter rep;
+        auto const refused = linker::link(std::span<AssembledModule const>{*overridden}, *L.target, *silent, rep,
+                                          ImageRequest{.artifactFileName = "superseded_image"});
+        EXPECT_FALSE(refused.ok()) << "a link whose answer its document does not state must not be written";
+        EXPECT_EQ(refusalsNamingTheKey(rep), 1u) << "refused ONCE, naming the key:" << diagnosticsOf(rep);
+        DiagnosticReporter controlRep;
+        auto const linked = linker::link(std::span<AssembledModule const>{*alone}, *L.target, *silent, controlRep,
+                                         ImageRequest{.artifactFileName = "superseded_image"});
+        EXPECT_TRUE(linked.ok()) << "CONTROL: nothing was superseded, so nothing is asked:" << diagnosticsOf(controlRep);
+        EXPECT_EQ(refusalsNamingTheKey(controlRep), 0u);
+    }
+    {
+        struct Kind {
+            char const*                       what;
+            std::optional<WeakDefinitionKind> kind;
+            std::optional<unsigned>           direct;   // empty: the link is refused
+        };
+        for (auto const& k : {Kind{"a document per kind: the weak row states `overridable`",
+                                   WeakDefinitionKind::Overridable, 7u},
+                              Kind{"a document per kind: the weak row states `select-any`", WeakDefinitionKind::SelectAny,
+                                   9u},
+                              Kind{"a document per kind: the weak row states no kind", std::nullopt, std::nullopt}}) {
+            SCOPED_TRACE(k.what);
+            auto        units = *overridden;
+            std::size_t set   = 0;
+            for (auto& s : units[0].symbols) {
+                if (s.name == "shared" && s.binding == SymbolBinding::Weak) {
+                    s.weakKind = k.kind;
+                    ++set;
+                }
+            }
+            ASSERT_EQ(set, 1u) << "the PREMISE: the pair holds ONE weak row of the name";
+            DiagnosticReporter rep;
+            auto const img = linker::link(std::span<AssembledModule const>{units}, *L.target, *perKind, rep,
+                                          ImageRequest{.artifactFileName = "superseded_image"});
+            if (!k.direct.has_value()) {
+                EXPECT_FALSE(img.ok()) << "a definition the per-kind document says nothing of must not be linked on "
+                                          "one kind's answer";
+                EXPECT_EQ(refusalsNamingTheKey(rep), 1u) << "refused ONCE, naming the key:" << diagnosticsOf(rep);
+                continue;
+            }
+            ASSERT_TRUE(img.ok()) << diagnosticsOf(rep);
+            auto const d = valueReadBy(fam, img.bytes, "direct");
+            auto const t = valueReadBy(fam, img.bytes, "through");
+            ASSERT_TRUE(d.has_value() && t.has_value()) << "the image's reads could not be followed";
+            EXPECT_EQ(*d, *k.direct) << "the document's answer for the kind the row states";
+            EXPECT_EQ(*t, 9u) << "CONTROL: the reference through the weak name reaches the winner under either";
+        }
+    }
+    {
+        SCOPED_TRACE("the relocatable object's writer");
+        std::vector<AssembledModule> one{(*alone)[0]};
+        one[0].userEntrySymbol.reset();
+        DiagnosticReporter rep;
+        auto const refused = linker::link(std::span<AssembledModule const>{one}, *L.target, *silentObject, rep);
+        EXPECT_FALSE(refused.ok()) << "an object whose weak name's record its document cannot place must not be written";
+        EXPECT_GE(refusalsNamingTheKey(rep), 1u) << diagnosticsOf(rep);
+        // CONTROL: a module with no weak name referenced by row asks nothing of the silent document.
+        std::vector<AssembledModule> const plain{definitionOf(1, /*datum=*/true, 9, "shared")};
+        DiagnosticReporter                 controlRep;
+        auto const written = linker::link(std::span<AssembledModule const>{plain}, *L.target, *silentObject, controlRep);
+        EXPECT_TRUE(written.ok()) << diagnosticsOf(controlRep);
+        EXPECT_EQ(refusalsNamingTheKey(controlRep), 0u);
+
+        // Under `replacedWhole` the weak name's record IS the record of the bytes.
+        DiagnosticReporter rep2;
+        auto const first = linker::link(std::span<AssembledModule const>{one}, *L.target, *replacedObject, rep2);
+        ASSERT_TRUE(first.ok()) << diagnosticsOf(rep2);
+        auto artifact = readObject(fam, L, first.bytes, 1, rep2);
+        ASSERT_TRUE(artifact.has_value()) << diagnosticsOf(rep2);
+        auto strong = asRead(fam, L, definitionOf(2, /*datum=*/true, 9, "shared"), 2);
+        ASSERT_TRUE(strong.has_value());
+        std::vector<AssembledModule> const units{*artifact, *strong};
+        auto const second = linker::link(std::span<AssembledModule const>{units}, *L.target, *L.format, rep2);
+        ASSERT_TRUE(second.ok()) << diagnosticsOf(rep2);
+        auto const relinked = readObject(fam, L, second.bytes, 1, rep2);
+        ASSERT_TRUE(relinked.has_value()) << diagnosticsOf(rep2);
+        EXPECT_EQ(byteReachedIn(*relinked, "direct"), std::optional<unsigned>{9u})
+            << "an artifact written under `replacedWhole` hands the body's relocation on by the weak name";
+        EXPECT_EQ(byteReachedIn(*relinked, "through"), std::optional<unsigned>{9u});
+    }
+}
+
+// ══ ONE WEAK NAME, REFERENCED BY ROW IN ONE UNIT AND THROUGH ITS DEFINITION IN ANOTHER ═════════════════════════════
+//
+// A relocatable artifact hands a weak name on by name, and its writer tells a relocation that means the NAME from
+// one that means the BYTES of the definition that won it there by ONE statement on the name's row
+// (`ModuleSymbol::referencedByName`). A unit an object reader read references the name by row; a unit DSS compiled
+// references it through its definition. Merged as they stand, the one row would have to say both: with the reader's
+// statement the compiled unit's reference would be written against the BYTES and miss a later override, with the
+// compiled unit's the reader unit's `static` read would follow the name. `restateWeakNameReferencesByRow`
+// (`link/linker.cpp`) restates the compiled unit before the merge.
+//   A: the weak alias `shared` of a module-private body (7), as its reader states it; `direct` names the body,
+//      `through` the name.
+//   B: a weak `shared` of its own (5) as a compiler states it; `b_reads` names the DEFINITION, meaning the name.
+// The artifact of {A, B} and of {B, A}, then each beside `int shared = 9;`: `direct` still reads A's own bytes (7)
+// and BOTH references through the name — A's and B's — reach the override (9), whichever definition had won the
+// name inside the artifact. The artifact alone: both read the definition that won there (7, or B's 5).
+TEST(WeakNameReferences, AnArtifactOfUnitsThatReferenceOneWeakNameBothWaysHandsTheNameOnForBoth) {
+    SearchFamily const* elfFamily = nullptr;
+    for (auto const& f : searchFamilies()) {
+        if (std::string_view{f.label} == "ELF") elfFamily = &f;
+    }
+    ASSERT_NE(elfFamily, nullptr);
+    auto const& fam = *elfFamily;
+    auto const  L   = load("x86_64", fam.relocatable);
+    ASSERT_TRUE(L.target && L.format);
+    for (bool const readerUnitFirst : {true, false}) {
+        SCOPED_TRACE(readerUnitFirst ? "the reader's unit, then the compiled one" : "the compiled unit, then the reader's");
+        std::uint32_t const cuA = readerUnitFirst ? 1u : 2u, cuB = readerUnitFirst ? 2u : 1u;
+        auto a = asRead(fam, L,
+                        weakNameOfABody(cuA, /*datum=*/true, 7, "impl", SymbolBinding::Local, "shared", "direct", "through"),
+                        cuA);
+        ASSERT_TRUE(a.has_value());
+        AssembledModule const b = UnitOf(cuB).datum("shared", SymbolBinding::Weak, 5).reads("b_reads", "shared").build();
+        // THE PREMISE: the two units say different things of the one name.
+        auto const* aRow = definitionNamed(*a, "shared");
+        auto const* bRow = definitionNamed(b, "shared");
+        ASSERT_TRUE(aRow != nullptr && bRow != nullptr);
+        ASSERT_TRUE(aRow->referencedByName) << "the reader's unit references the name by row";
+        ASSERT_FALSE(bRow->referencedByName) << "the compiled unit references it through its definition";
+        ASSERT_EQ(targetsOf(b, "b_reads"), std::vector<SymbolId>{bRow->symbol});
+
+        std::vector<AssembledModule> units;
+        units.push_back(readerUnitFirst ? *a : b);
+        units.push_back(readerUnitFirst ? b : *a);
+        DiagnosticReporter rep;
+        auto const first = linker::link(std::span<AssembledModule const>{units}, *L.target, *L.format, rep);
+        ASSERT_TRUE(first.ok()) << diagnosticsOf(rep);
+        auto const records = recordsNamed(fam, first.bytes, "shared");
+        ASSERT_EQ(records.size(), 1u) << "the artifact spells the weak name ONCE";
+        EXPECT_TRUE(records[0].weak);
+        auto const alone = readObject(fam, L, first.bytes, 1, rep);
+        ASSERT_TRUE(alone.has_value()) << diagnosticsOf(rep);
+        unsigned const wonInside = readerUnitFirst ? 7u : 5u;   // the first unit's weak definition wins the name
+        EXPECT_EQ(byteReachedIn(*alone, "direct"), std::optional<unsigned>{7u}) << "A's own bytes";
+        EXPECT_EQ(byteReachedIn(*alone, "through"), std::optional<unsigned>{wonInside});
+        EXPECT_EQ(byteReachedIn(*alone, "b_reads"), std::optional<unsigned>{wonInside});
+
+        for (bool const artifactFirst : {true, false}) {
+            SCOPED_TRACE(artifactFirst ? "the artifact, then the override" : "the override, then the artifact");
+            std::uint32_t const artifactCu = artifactFirst ? 1u : 2u, strongCu = artifactFirst ? 2u : 1u;
+            auto artifact = readObject(fam, L, first.bytes, artifactCu, rep);
+            ASSERT_TRUE(artifact.has_value()) << diagnosticsOf(rep);
+            auto strong = asRead(fam, L, definitionOf(strongCu, /*datum=*/true, 9, "shared"), strongCu);
+            ASSERT_TRUE(strong.has_value());
+            std::vector<AssembledModule> later;
+            later.push_back(artifactFirst ? *artifact : *strong);
+            later.push_back(artifactFirst ? *strong : *artifact);
+            auto const second = linker::link(std::span<AssembledModule const>{later}, *L.target, *L.format, rep);
+            ASSERT_TRUE(second.ok()) << diagnosticsOf(rep);
+            auto const relinked = readObject(fam, L, second.bytes, 1, rep);
+            ASSERT_TRUE(relinked.has_value()) << diagnosticsOf(rep);
+            EXPECT_EQ(byteReachedIn(*relinked, "direct"), std::optional<unsigned>{7u})
+                << "the relocation the reader's unit wrote through its static name stays on its own bytes";
+            EXPECT_EQ(byteReachedIn(*relinked, "through"), std::optional<unsigned>{9u})
+                << "the reader unit's reference through the weak name reaches the override";
+            EXPECT_EQ(byteReachedIn(*relinked, "b_reads"), std::optional<unsigned>{9u})
+                << "the compiled unit's reference to its own weak definition MEANS THE NAME, and reaches the override "
+                   "too — written against the bytes it would have stayed on whichever definition won inside the "
+                   "artifact";
+        }
+    }
+}
+
 // ══ Native, every host: a reference written through a weak name, under the host's reference linkers and under DSS ══
 //
 // The host's reference compiler writes each object; a main returns what the object's own function reaches through
@@ -3002,16 +4070,42 @@ TEST(WeakNameReferences, ARelocatableLinkHandsTheNameOnAndALaterLinkBindsIt) {
 //   two weak definitions, 1-2 / 2-1             22 / 44    22 / 44       22 / 44           refused (DSS 22 / 44)
 //   the pair's artifact (DSS-written) alone        7          7             7                 7
 //   the artifact beside the override, either       9          9             9                 9
+//   A WEAK ALIAS OF A STATIC (P69 fold 2): the main returns direct * 10 + through
+//   the pair alone                                77         77            77                77
+//   the pair then the override / reversed         79         99            79                79
+//   the pair beside a common, either order        70         77            70                70
+//   its artifact (DSS-written) alone              77         77            77                77
+//   its artifact beside the override, either      79         99            79                79
+//   A Mac object that does NOT declare its sections divisible (the pair `ln`; Apple arms only):
+//   the pair alone                                 -         77             -                 -
+//   the pair then the override / reversed          -      refused (DSS 99)  -                 -
 // (function and datum pairs alike; ✔MEASURED 2026-10-08: GNU ld 2.42 with gcc 13.3 and with MinGW gcc 13.2, Apple
 // clang 21's ld-1267 and ld64-957.1, clang 19.1.5 with link.exe 14.44 and lld-link 19.1.5.) The artifact cells link
 // the relocatable object DSS writes of the pair's object — under DSS and under the reference final linker.
 // ⓘ Apple clang refuses `__attribute__((alias))`, so on a Mac each pair is ASSEMBLER-written: one address under a
 // strong external name and a `.weak_definition` name, reached by a branch or, for the datum, through its GOT entry
 // (the access a compiler writes for a weak definition).
+// ⓘ THE WEAK ALIAS OF A STATIC (the review of fold 1; the rule's second half, pinned for every host just above): the
+// body's own name is module-private — a C `static`, on a Mac a non-external label — and the object reaches it through
+// BOTH names. ELF and PE keep a unit's bytes, so the read through the static name stays on them (7) while the read
+// through the weak name follows it (9, or a common's 0); Apple's ld replaces the atom, labels included (9 and 9).
+// ✔MEASURED 2026-10-08 with these very sources and commands: gcc 13.3 with GNU ld 2.42, MinGW gcc 13.2 with GNU ld
+// 2.42, clang 19.1.5 with link.exe 14.44 and with lld-link 19.1.5, and Apple's ld-1267 (arm64, x86_64) and
+// ld64-957.1 on the assembler-written pair. A function is reached through its static name BY ADDRESS on the C hosts
+// (a direct call of a `static` in its own section leaves no relocation) and by a branch on a Mac.
+// ⓘ THE MAC OBJECT WHOSE SECTION IS ONE UNIT (`ln`: the same pair assembled WITHOUT `.subsections_via_symbols`).
+// ✔MEASURED 2026-10-08 (Mac run 20261008-215913-6d2d39e3): Apple's ld-1267 — the linker of the arm's `cc` — REFUSES
+// the pair beside the strong definition ("duplicate symbol"), and ld64-957.1 links it and answers 9 and 9 for the
+// datum. So that this link's answer there is the answer of the linker that links it: 99, where it gives 77 alone.
+// It is the cell that says the format's answer is NOT read off whether a unit's members are kept.
 
 namespace {
 
-// A body under a strong name and a WEAK second name, and the function that reaches it through the weak one.
+// A body and a WEAK second name of it, and the function that reaches it through the weak one. The body's own name is
+// `strong`: external — or, where `direct` is named, MODULE-PRIVATE (a C `static`, on a Mac a non-external label), with
+// `direct` the function that reaches the body through THAT name (P69 fold 2: the weak-name rule's second half).
+// `appleUnitSections`: the pair exists on a Mac only, as an object that does NOT declare MH_SUBSECTIONS_VIA_SYMBOLS —
+// one whose section is a unit the link keeps whole.
 struct WnPair {
     char const* stem;
     bool        datum;
@@ -3019,20 +4113,41 @@ struct WnPair {
     char const* weak;
     unsigned    value;
     char const* user;
+    char const* direct            = nullptr;
+    bool        appleUnitSections = false;
 };
 
 [[nodiscard]] std::vector<WnPair> const& wnPairs() {
-    static std::vector<WnPair> const pairs{{"ao", false, "other", "shared", 7, "call_shared"},
-                                           {"ad", true, "other_d", "shared_d", 7, "read_shared_d"},
-                                           {"a1", false, "other_a", "shared", 11, "call_a"},
-                                           {"a2", false, "other_b", "shared", 22, "call_b"},
-                                           {"d1", true, "other_da", "shared_d", 11, "read_a"},
-                                           {"d2", true, "other_db", "shared_d", 22, "read_b"}};
+    static std::vector<WnPair> const pairs{
+        {"ao", false, "other", "shared", 7, "call_shared"},
+        {"ad", true, "other_d", "shared_d", 7, "read_shared_d"},
+        {"a1", false, "other_a", "shared", 11, "call_a"},
+        {"a2", false, "other_b", "shared", 22, "call_b"},
+        {"d1", true, "other_da", "shared_d", 11, "read_a"},
+        {"d2", true, "other_db", "shared_d", 22, "read_b"},
+        {"ld", true, "impl_l", "shared_l", 7, "read_through_l", "read_direct_l"},
+        {"lf", false, "impl_fl", "shared_fl", 7, "call_through_fl", "direct_fl"},
+        {"ln", true, "impl_l", "shared_l", 7, "read_through_l", "read_direct_l", /*appleUnitSections=*/true}};
     return pairs;
 }
 
 [[nodiscard]] std::string cPair(WnPair const& p) {
     std::string const strong{p.strong}, weak{p.weak}, user{p.user}, value = std::to_string(p.value);
+    if (p.direct != nullptr) {
+        // The body is a `static`. A datum is read through each name. A function is reached through the weak name by
+        // a call and through the static one BY ITS ADDRESS: a direct call of a `static` in its own section is
+        // resolved by the assembler and leaves no relocation for a linker to decide.
+        std::string const direct{p.direct};
+        if (p.datum) {
+            return "static int " + strong + " = " + value + ";\nextern int " + weak + " __attribute__((weak, alias(\""
+                   + strong + "\")));\nint " + direct + "(void) { return " + strong + "; }\nint " + user
+                   + "(void) { return " + weak + "; }\n";
+        }
+        return "static int " + strong + "(void) { return " + value + "; }\nextern int " + weak
+               + "(void) __attribute__((weak, alias(\"" + strong + "\")));\nint " + direct
+               + "(void) { int (*volatile p)(void) = " + strong + "; return p(); }\nint " + user + "(void) { return "
+               + weak + "(); }\n";
+    }
     if (p.datum) {
         return "int " + strong + " = " + value + ";\nextern int " + weak + " __attribute__((weak, alias(\"" + strong
                + "\")));\nint " + user + "(void) { return " + weak + "; }\n";
@@ -3045,6 +4160,30 @@ struct WnPair {
     bool const        arm = arch == "arm64";
     std::string const strong{p.strong}, weak{p.weak}, user{p.user}, value = std::to_string(p.value);
     std::string       s;
+    if (p.direct != nullptr) {
+        // The body's own label is NON-EXTERNAL; `direct` reaches the body through that label — a page reference or a
+        // branch the assembler leaves to the linker — and `user` through the weak name.
+        std::string const direct{p.direct};
+        if (p.datum) {
+            s += "\t.data\n\t.globl _" + weak + "\n\t.weak_definition _" + weak + "\n\t.p2align 2\n_" + strong + ":\n_"
+                 + weak + ":\n\t.long " + value + "\n";
+            s += "\t.text\n\t.globl _" + direct + "\n\t.p2align 2\n_" + direct + ":\n";
+            s += arm ? "\tadrp x8, _" + strong + "@PAGE\n\tldr w0, [x8, _" + strong + "@PAGEOFF]\n\tret\n"
+                     : "\tmovl _" + strong + "(%rip), %eax\n\tretq\n";
+            s += "\t.globl _" + user + "\n\t.p2align 2\n_" + user + ":\n";
+            s += arm ? "\tadrp x8, _" + weak + "@GOTPAGE\n\tldr x8, [x8, _" + weak + "@GOTPAGEOFF]\n\tldr w0, [x8]\n\tret\n"
+                     : "\tmovq _" + weak + "@GOTPCREL(%rip), %rax\n\tmovl (%rax), %eax\n\tretq\n";
+        } else {
+            s += "\t.text\n\t.globl _" + weak + "\n\t.weak_definition _" + weak + "\n\t.p2align 2\n_" + strong + ":\n_"
+                 + weak + ":\n";
+            s += arm ? "\tmov w0, #" + value + "\n\tret\n" : "\tmovl $" + value + ", %eax\n\tretq\n";
+            s += "\t.globl _" + direct + "\n\t.p2align 2\n_" + direct + ":\n";
+            s += arm ? "\tb _" + strong + "\n" : "\tjmp _" + strong + "\n";
+            s += "\t.globl _" + user + "\n\t.p2align 2\n_" + user + ":\n";
+            s += arm ? "\tb _" + weak + "\n" : "\tjmp _" + weak + "\n";
+        }
+        return p.appleUnitSections ? s : s + "\t.subsections_via_symbols\n";
+    }
     if (p.datum) {
         s += "\t.data\n\t.globl _" + strong + "\n\t.globl _" + weak + "\n\t.weak_definition _" + weak
              + "\n\t.p2align 2\n_" + strong + ":\n_" + weak + ":\n\t.long " + value + "\n";
@@ -3083,11 +4222,21 @@ struct WnSource {
         {"wo", "__attribute__((weak)) int wf(void) { return 1; }\nint call_wf(void) { return wf(); }\n"},
         {"ws", "int wf(void) { return 2; }\n"},
         {"w1", "__attribute__((weak)) int shared(void) { return 11; }\nint call_a(void) { return shared(); }\n"},
-        {"w2", "__attribute__((weak)) int shared(void) { return 22; }\nint call_b(void) { return shared(); }\n"}};
+        {"w2", "__attribute__((weak)) int shared(void) { return 22; }\nint call_b(void) { return shared(); }\n"},
+        {"main_l", "int read_direct_l(void);\nint read_through_l(void);\n"
+                   "int main(void) { return read_direct_l() * 10 + read_through_l(); }\n"},
+        {"main_fl", "int direct_fl(void);\nint call_through_fl(void);\n"
+                    "int main(void) { return direct_fl() * 10 + call_through_fl(); }\n"},
+        {"sl", "int shared_l = 9;\n"},
+        {"sfl", "int shared_fl(void) { return 9; }\n"},
+        {"cl", "int shared_l;\n", true}};
     return sources;
 }
 
 constexpr int kWnRefuses = -1;
+// A cell this family does not run: one of its inputs exists for another family only (a Mac object that does not
+// declare its sections divisible).
+constexpr int kWnNotThisFamily = -2;
 
 struct WnCell {
     char const*              name;
@@ -3121,7 +4270,23 @@ struct WnCell {
         {"fn_override_then_artifact", "main_fn", {"so", "r_ao"}, 9, 9, 9, 9},
         {"d_artifact_alone", "main_d", {"r_ad"}, 7, 7, 7, 7},
         {"d_artifact_then_override", "main_d", {"r_ad", "sd"}, 9, 9, 9, 9},
-        {"d_override_then_artifact", "main_d", {"sd", "r_ad"}, 9, 9, 9, 9}};
+        {"d_override_then_artifact", "main_d", {"sd", "r_ad"}, 9, 9, 9, 9},
+        {"local_name_d_alone", "main_l", {"ld"}, 77, 77, 77, 77},
+        {"local_name_d_pair_then_override", "main_l", {"ld", "sl"}, 79, 99, 79, 79},
+        {"local_name_d_override_then_pair", "main_l", {"sl", "ld"}, 79, 99, 79, 79},
+        {"local_name_d_pair_then_common", "main_l", {"ld", "cl"}, 70, 77, 70, 70},
+        {"local_name_d_common_then_pair", "main_l", {"cl", "ld"}, 70, 77, 70, 70},
+        {"local_name_fn_alone", "main_fl", {"lf"}, 77, 77, 77, 77},
+        {"local_name_fn_pair_then_override", "main_fl", {"lf", "sfl"}, 79, 99, 79, 79},
+        {"local_name_fn_override_then_pair", "main_fl", {"sfl", "lf"}, 79, 99, 79, 79},
+        {"local_name_d_artifact_alone", "main_l", {"r_ld"}, 77, 77, 77, 77},
+        {"local_name_d_artifact_then_override", "main_l", {"r_ld", "sl"}, 79, 99, 79, 79},
+        {"local_name_d_override_then_artifact", "main_l", {"sl", "r_ld"}, 79, 99, 79, 79},
+        {"unit_sections_d_alone", "main_l", {"ln"}, kWnNotThisFamily, 77, kWnNotThisFamily, kWnNotThisFamily},
+        {"unit_sections_d_pair_then_override", "main_l", {"ln", "sl"}, kWnNotThisFamily, kWnRefuses, kWnNotThisFamily,
+         kWnNotThisFamily, 99},
+        {"unit_sections_d_override_then_pair", "main_l", {"sl", "ln"}, kWnNotThisFamily, kWnRefuses, kWnNotThisFamily,
+         kWnNotThisFamily, 99}};
     return cells;
 }
 
@@ -3135,6 +4300,11 @@ struct WnArm {
     char const* spec         = nullptr;   // the DSS image the cells link into
     char const* artifactSpec = nullptr;   // the DSS relocatable artifact of a pair
     std::string asmArch;                  // Apple: the pairs are assembler-written for this -arch
+    // Arms that state the same non-empty `objectsOf` are ONE compiler's objects handed to different linkers: they
+    // share the directory the first of them compiles into, and DSS answers each cell once for all of them.
+    std::string              objectsOf;
+    std::string              measuredWith;      // the versions the cells' answers were measured with
+    std::vector<std::string> versionCommands;   // the live tools' banners, read when a control fails
     // The arm's own tool rewriting the object file `in` as `out` WITHOUT its local symbols — a relocatable LINK's
     // product, which on PE and Mach-O leaves an object whose FIRST record is an external (the `RecordSymbolIdsNative`
     // cells; an ELF table still opens with the null symbol, and its product is that suite's control). Unset: the arm
@@ -3178,7 +4348,9 @@ struct WnArms {
     (void)work;
     auto const posixRun = [](fs::path const& dir, std::string const& cmd, std::string const& log) {
         namespace np = test_support::native_probe;
-        return std::system(np::captureCmd("cd \"" + dir.string() + "\" && " + cmd, dir / log).c_str()) == 0;
+        // LC_ALL=C: a suite that reads a reference tool's words reads them as measured, whatever the leg's locale.
+        return std::system(np::captureCmd("export LC_ALL=C; cd \"" + dir.string() + "\" && " + cmd, dir / log).c_str())
+               == 0;
     };
 #if defined(__APPLE__)
     {
@@ -3210,7 +4382,16 @@ struct WnArms {
         a.withoutLocals = [](std::string const& out, std::string const& in) { return "ld -r -x -o " + out + " " + in; };
     }
 #endif
-    for (auto& a : arms) a.run = posixRun;
+    for (auto& a : arms) {
+        a.run = posixRun;
+#if defined(__APPLE__)
+        a.measuredWith = "Apple clang 21.0.0 with ld-1267";
+#else
+        a.measuredWith = "gcc 13.3.0 with GNU ld 2.42";
+#endif
+        a.versionCommands = {"cc --version", "ld -v"};
+    }
+    withoutArmsThisPosixHostCannotRun(arms, found.absent);
 #elif defined(_WIN32)
     namespace np = test_support::native_probe;
     if (std::system("where gcc >nul 2>&1") == 0) {
@@ -3219,6 +4400,8 @@ struct WnArms {
         a.run = [](fs::path const& dir, std::string const& cmd, std::string const& log) {
             return runCapturing(nullptr, dir, cmd, log);
         };
+        a.measuredWith    = "MinGW gcc 13.2.0 with GNU ld 2.42";
+        a.versionCommands = {"gcc --version", "ld -v"};
         // GNU ld itself, not the gcc driver: MinGW's driver adds an undefined `_pei386_runtime_relocator` to a
         // relocatable link (✔MEASURED 2026-10-08, gcc 13.2 with binutils 2.42).
         a.withoutLocals = [](std::string const& out, std::string const& in) { return "ld -r -x -o " + out + " " + in; };
@@ -3257,6 +4440,9 @@ struct WnArms {
             a.exe          = ".exe";
             a.spec         = "x86_64:pe64-x86_64-windows-exec";
             a.artifactSpec = "x86_64:pe64-x86_64-windows";
+            a.objectsOf       = "clang --target=x86_64-pc-windows-msvc";
+            a.measuredWith    = lld ? "clang 19.1.5 with lld-link 19.1.5" : "clang 19.1.5 with link.exe 14.44";
+            a.versionCommands = {"clang --version", lld ? "lld-link --version" : "link"};
             a.compile      = [](std::string const& stem, std::string const& sourceExt, bool common) {
                 return std::string{"clang --target=x86_64-pc-windows-msvc -O0"} + (common ? " -fcommon" : "") + " -c -o "
                        + stem + ".obj " + stem + sourceExt;
@@ -3284,6 +4470,11 @@ struct WnArms {
 TEST(WeakNameReferencesNative, AReferenceThroughAWeakNameResolvesAsTheReferenceLinkerDoes) {
     namespace np = test_support::native_probe;
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "weak-name"};
+    // ONE COMPILER's OBJECTS ARE ONE DIRECTORY. Arms that state the same `objectsOf` differ only in the LINKER they
+    // hand the objects to: the first of them compiles, and DSS — which reads the objects, never the reference
+    // linker — answers each cell once for all of them.
+    std::map<std::string, std::size_t>                      objectsOwner;   // `objectsOf` -> the arm that compiled
+    std::map<std::pair<std::size_t, std::string>, unsigned> dssAnswers;     // (that arm, cell) -> DSS's exit code
     auto const dir    = scratch.path();
     auto const found  = wnArms(dir);
     auto const& arms  = found.arms;
@@ -3328,18 +4519,24 @@ TEST(WeakNameReferencesNative, AReferenceThroughAWeakNameResolvesAsTheReferenceL
             return test_support::runBinary(exe, test_support::kRunBudget, /*captureStdout=*/false, launcher,
                                            /*programArgs=*/{}, launcherExecsImage);
         };
-        fs::path const d = dir / ("arm" + std::to_string(k));
+        std::size_t const owner = arm.objectsOf.empty() ? k : objectsOwner.try_emplace(arm.objectsOf, k).first->second;
+        fs::path const    d     = dir / ("arm" + std::to_string(owner));
         fs::create_directories(d);
-        for (auto const& s : wnSources()) {
-            writeText(d / (std::string{s.stem} + ".c"), s.text);
-            ASSERT_TRUE(arm.run(d, arm.compile(s.stem, ".c", s.common), std::string{s.stem} + ".txt"))
-                << np::tailOf(d / (std::string{s.stem} + ".txt"), 20, arm.label);
-        }
-        std::string const pairExt = arm.asmArch.empty() ? ".c" : ".s";
-        for (auto const& p : wnPairs()) {
-            writeText(d / (p.stem + pairExt), arm.asmArch.empty() ? cPair(p) : applePair(arm.asmArch, p));
-            ASSERT_TRUE(arm.run(d, arm.compile(p.stem, pairExt, /*common=*/false), std::string{p.stem} + ".txt"))
-                << np::tailOf(d / (std::string{p.stem} + ".txt"), 20, arm.label);
+        auto const tool = referenceToolOf(arm, d);
+        if (owner == k) {
+            // One shell per batch compiles the arm's units.
+            std::vector<std::string> compiles;
+            for (auto const& s : wnSources()) {
+                writeText(d / (std::string{s.stem} + ".c"), s.text);
+                compiles.push_back(arm.compile(s.stem, ".c", s.common));
+            }
+            std::string const pairExt = arm.asmArch.empty() ? ".c" : ".s";
+            for (auto const& p : wnPairs()) {
+                if (p.appleUnitSections && arm.asmArch.empty()) continue;   // a Mach-O object's own property
+                writeText(d / (p.stem + pairExt), arm.asmArch.empty() ? cPair(p) : applePair(arm.asmArch, p));
+                compiles.push_back(arm.compile(p.stem, pairExt, /*common=*/false));
+            }
+            ASSERT_TRUE(runBatched(arm, d, compiles, "compile"));
         }
         // The relocatable artifact DSS writes of ONE pair's object, as `r_<stem>` beside the others.
         auto const dssArtifactOf = [&](std::string const& stem) {
@@ -3365,8 +4562,11 @@ TEST(WeakNameReferencesNative, AReferenceThroughAWeakNameResolvesAsTheReferenceL
             ADD_FAILURE() << "DSS wrote no relocatable object for " << stem << arm.obj;
             return false;
         };
-        ASSERT_TRUE(dssArtifactOf("ao"));
-        ASSERT_TRUE(dssArtifactOf("ad"));
+        if (owner == k) {
+            ASSERT_TRUE(dssArtifactOf("ao"));
+            ASSERT_TRUE(dssArtifactOf("ad"));
+            ASSERT_TRUE(dssArtifactOf("ld"));
+        }
         // DSS's link of the cell: its own main, the reference compiler's objects (and DSS's artifact) in the cell's order.
         auto const dssLink = [&](WnCell const& cell, DiagnosticReporter& rep) -> std::optional<fs::path> {
             auto const out = d / (std::string{"dss_"} + cell.name);
@@ -3387,38 +4587,47 @@ TEST(WeakNameReferencesNative, AReferenceThroughAWeakNameResolvesAsTheReferenceL
                                  : arm.family == WnFamily::Apple ? cell.apple
                                  : arm.family == WnFamily::GnuPe ? cell.gnuPe
                                                                  : cell.msLink;
+            if (expected == kWnNotThisFamily) continue;
             // CONTROL: the reference linker's program of the same objects.
             std::vector<std::string> objects{std::string{cell.main} + arm.obj};
             for (char const* o : cell.inputs) objects.push_back(std::string{o} + arm.obj);
-            std::string const       refStem = std::string{"ref_"} + cell.name;
+            std::string const       refStem = "ref" + std::to_string(k) + "_" + cell.name;
             bool const              linked  = arm.run(d, arm.link(refStem, objects), refStem + ".txt");
             std::optional<unsigned> reference;
             if (expected == kWnRefuses) {
-                EXPECT_FALSE(linked) << "the reference linker now LINKS a cell it refused when the decision was "
-                                        "recorded: read what its program answers and revisit the decision";
+                EXPECT_FALSE(linked) << referenceMoved(tool, "LINKS the cell", "it refuses it")
+                                     << " — read what its program answers and revisit the decision DSS records for "
+                                        "the cell";
             } else {
                 ASSERT_TRUE(linked) << np::tailOf(d / (refStem + ".txt"), 20, arm.label);
                 auto const ref = runImage(d / (refStem + arm.exe));
                 ASSERT_TRUE(ref.spawned) << ref.diagnostic;
                 EXPECT_EQ(static_cast<unsigned>(ref.exitCode), static_cast<unsigned>(expected))
-                    << "the reference linker no longer answers what the row measured";
+                    << referenceMoved(tool, std::to_string(ref.exitCode), std::to_string(expected));
                 reference = static_cast<unsigned>(ref.exitCode);
             }
-            DiagnosticReporter rep;
-            auto const image = dssLink(cell, rep);
-            ASSERT_TRUE(image.has_value()) << "DSS must link the cell:" << diagnosticsOf(rep);
-            auto const r = runImage(*image);
-            ASSERT_TRUE(r.spawned) << r.diagnostic;
-            EXPECT_FALSE(r.timedOut);
+            // DSS's answer for the cell: linked and run once per directory of objects.
+            auto const answerKey = std::make_pair(owner, std::string{cell.name});
+            auto       answered  = dssAnswers.find(answerKey);
+            if (answered == dssAnswers.end()) {
+                DiagnosticReporter rep;
+                auto const image = dssLink(cell, rep);
+                ASSERT_TRUE(image.has_value()) << "DSS must link the cell:" << diagnosticsOf(rep);
+                auto const r = runImage(*image);
+                ASSERT_TRUE(r.spawned) << r.diagnostic;
+                EXPECT_FALSE(r.timedOut);
+                answered = dssAnswers.emplace(answerKey, static_cast<unsigned>(r.exitCode)).first;
+            }
+            unsigned const dssExit = answered->second;
             if (reference.has_value()) {
-                EXPECT_EQ(static_cast<unsigned>(r.exitCode), *reference) << "DSS must give the reference linker's answer";
+                EXPECT_EQ(dssExit, *reference) << "DSS must give the reference linker's answer";
             } else {
-                EXPECT_EQ(static_cast<unsigned>(r.exitCode), static_cast<unsigned>(cell.dssWhereRefused))
+                EXPECT_EQ(dssExit, static_cast<unsigned>(cell.dssWhereRefused))
                     << "where the reference refuses, DSS gives the recorded decision: the first unit's body";
             }
             std::cout << "[native-arm] " << arm.label << " " << cell.name << ": reference linker "
                       << (reference.has_value() ? std::to_string(*reference) : std::string{"REFUSES"}) << ", DSS "
-                      << r.exitCode << "\n";
+                      << dssExit << (owner == k ? "" : " (answered once, with the first arm of these objects)") << "\n";
         }
         ++ran;
     }
@@ -3924,6 +5133,12 @@ TEST(RecordSymbolIds, TheLinkRefusesANameOrAReferenceUnderTheInvalidId) {
 TEST(RecordSymbolIdsNative, AnObjectWhoseFirstRecordIsADefinitionRelinksWhole) {
     namespace np = test_support::native_probe;
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "record-ids"};
+    // One compiler's objects are one directory, and DSS answers once for it (see `WeakNameReferencesNative`).
+    std::map<std::string, std::size_t> objectsOwner;
+    struct DssAnswers {
+        std::optional<unsigned> underDss, merged;
+    };
+    std::map<std::pair<std::size_t, std::string>, DssAnswers> dssAnswers;   // (the arm that compiled, kind/object)
     auto const dir    = scratch.path();
     auto const found  = wnArms(dir);
     auto const& arms  = found.arms;
@@ -3980,8 +5195,10 @@ TEST(RecordSymbolIdsNative, AnObjectWhoseFirstRecordIsADefinitionRelinksWhole) {
         };
         // DSS builds `inputs` for `spec` under `<d>/<outName>`: the one product with extension `ext` (either of
         // `.o` / `.obj` when `ext` is empty), or nullopt after recording why there is none.
-        fs::path const d = dir / ("arm" + std::to_string(k));
+        std::size_t const owner = arm.objectsOf.empty() ? k : objectsOwner.try_emplace(arm.objectsOf, k).first->second;
+        fs::path const    d     = dir / ("arm" + std::to_string(owner));
         fs::create_directories(d);
+        auto const tool = referenceToolOf(arm, d);
         auto const dssBuilds = [&](std::string const& outName, std::vector<std::string> const& inputs, char const* spec,
                                    std::optional<std::string> const& ext) -> std::optional<fs::path> {
             auto const out = d / outName;
@@ -4004,12 +5221,14 @@ TEST(RecordSymbolIdsNative, AnObjectWhoseFirstRecordIsADefinitionRelinksWhole) {
         for (auto const& kind : kinds) {
             SCOPED_TRACE(kind.stem);
             std::string const def = kind.stem, mainStem = std::string{"main_"} + kind.stem;
-            writeText(d / (def + ".c"), kind.definition);
-            writeText(d / (mainStem + ".c"), kind.main);
-            ASSERT_TRUE(arm.run(d, arm.compile(def, ".c", /*common=*/false), def + ".txt"))
-                << np::tailOf(d / (def + ".txt"), 20, arm.label);
-            ASSERT_TRUE(arm.run(d, arm.compile(mainStem, ".c", /*common=*/false), mainStem + ".txt"))
-                << np::tailOf(d / (mainStem + ".txt"), 20, arm.label);
+            if (owner == k) {
+                writeText(d / (def + ".c"), kind.definition);
+                writeText(d / (mainStem + ".c"), kind.main);
+                ASSERT_TRUE(runBatched(arm, d,
+                                       {arm.compile(def, ".c", /*common=*/false),
+                                        arm.compile(mainStem, ".c", /*common=*/false)},
+                                       "compile_" + def));
+            }
             // The objects of the one definition, each with who wrote it.
             struct Object {
                 std::string stem;
@@ -4018,18 +5237,20 @@ TEST(RecordSymbolIdsNative, AnObjectWhoseFirstRecordIsADefinitionRelinksWhole) {
             std::vector<Object> objects{{def, true}};
             if (arm.withoutLocals) {
                 std::string const stripped = def + "_x";
-                ASSERT_TRUE(arm.run(d, arm.withoutLocals(stripped + arm.obj, def + arm.obj), stripped + ".txt"))
-                    << np::tailOf(d / (stripped + ".txt"), 20, arm.label);
+                if (owner == k) {
+                    ASSERT_TRUE(arm.run(d, arm.withoutLocals(stripped + arm.obj, def + arm.obj), stripped + ".txt"))
+                        << np::tailOf(d / (stripped + ".txt"), 20, arm.label);
+                }
                 objects.push_back({stripped, true});
             }
-            {
+            if (owner == k) {
                 auto const own = dssBuilds("dss_object_" + def, {(d / (def + ".c")).string()}, arm.artifactSpec, std::nullopt);
                 ASSERT_TRUE(own.has_value());
                 std::error_code ec;
                 fs::copy_file(*own, d / ("dss_" + def + arm.obj), fs::copy_options::overwrite_existing, ec);
                 ASSERT_FALSE(ec) << ec.message();
-                objects.push_back({"dss_" + def, false});
             }
+            objects.push_back({"dss_" + def, false});
             bool referenceWroteItFirst = false, dssWroteItFirst = false;
             for (auto const& object : objects) {
                 SCOPED_TRACE(object.stem);
@@ -4037,22 +5258,24 @@ TEST(RecordSymbolIdsNative, AnObjectWhoseFirstRecordIsADefinitionRelinksWhole) {
                 bool const definitionIsFirst = first == "shared" || first == "_shared";
                 if (definitionIsFirst) (object.referenceWritten ? referenceWroteItFirst : dssWroteItFirst) = true;
                 // CONTROL: the reference linker's program of the reference's main and the object.
-                std::string const refStem = "ref_" + object.stem;
+                std::string const refStem = "ref" + std::to_string(k) + "_" + object.stem;
                 ASSERT_TRUE(arm.run(d, arm.link(refStem, {mainStem + arm.obj, object.stem + arm.obj}), refStem + ".txt"))
                     << "CONTROL: " << np::tailOf(d / (refStem + ".txt"), 20, arm.label);
                 auto const reference = exitOf(d / (refStem + arm.exe), "CONTROL: the reference linker's program");
                 ASSERT_TRUE(reference.has_value());
-                EXPECT_EQ(*reference, 42u) << "CONTROL: the reference linker's program of the object";
+                EXPECT_EQ(*reference, 42u) << referenceMoved(tool, std::to_string(*reference), "42");
                 // DSS's relocatable artifact of the object ALONE...
-                auto const artifact = dssBuilds("dss_alone_" + object.stem, {(d / (object.stem + arm.obj)).string()},
-                                                arm.artifactSpec, std::nullopt);
-                ASSERT_TRUE(artifact.has_value());
                 std::string const artifactStem = "r_" + object.stem;
-                std::error_code   ec;
-                fs::copy_file(*artifact, d / (artifactStem + arm.obj), fs::copy_options::overwrite_existing, ec);
-                ASSERT_FALSE(ec) << ec.message();
+                if (owner == k) {
+                    auto const artifact = dssBuilds("dss_alone_" + object.stem, {(d / (object.stem + arm.obj)).string()},
+                                                    arm.artifactSpec, std::nullopt);
+                    ASSERT_TRUE(artifact.has_value());
+                    std::error_code ec;
+                    fs::copy_file(*artifact, d / (artifactStem + arm.obj), fs::copy_options::overwrite_existing, ec);
+                    ASSERT_FALSE(ec) << ec.message();
+                }
                 // ...linked by the REFERENCE linker with the reference's main,
-                std::string const refArtifactStem = "ref_" + artifactStem;
+                std::string const refArtifactStem = "ref" + std::to_string(k) + "_" + artifactStem;
                 bool const        refLinked =
                     arm.run(d, arm.link(refArtifactStem, {mainStem + arm.obj, artifactStem + arm.obj}), refArtifactStem + ".txt");
                 EXPECT_TRUE(refLinked) << "the reference linker must link DSS's artifact of the object ALONE: "
@@ -4060,21 +5283,27 @@ TEST(RecordSymbolIdsNative, AnObjectWhoseFirstRecordIsADefinitionRelinksWhole) {
                 std::optional<unsigned> underReference;
                 if (refLinked) underReference = exitOf(d / (refArtifactStem + arm.exe), "the artifact under the reference linker");
                 if (underReference.has_value()) EXPECT_EQ(*underReference, 42u) << "the artifact under the reference linker";
-                // ...and by DSS with its own main;
-                std::optional<unsigned> underDss;
-                if (auto const exe = dssBuilds("dss_artifact_" + object.stem,
-                                               {(d / (mainStem + ".c")).string(), (d / (artifactStem + arm.obj)).string()},
-                                               arm.spec, arm.exe)) {
-                    underDss = exitOf(*exe, "the artifact under DSS");
+                // ...and by DSS with its own main; and the object itself linked by DSS with its own main. DSS
+                // reads the objects, never the reference linker: answered once per directory of objects.
+                auto const answerKey = std::make_pair(owner, std::string{kind.stem} + "/" + object.stem);
+                auto       answered  = dssAnswers.find(answerKey);
+                if (answered == dssAnswers.end()) {
+                    DssAnswers both;
+                    if (auto const exe = dssBuilds("dss_artifact_" + object.stem,
+                                                   {(d / (mainStem + ".c")).string(), (d / (artifactStem + arm.obj)).string()},
+                                                   arm.spec, arm.exe)) {
+                        both.underDss = exitOf(*exe, "the artifact under DSS");
+                    }
+                    if (auto const exe = dssBuilds("dss_merged_" + object.stem,
+                                                   {(d / (mainStem + ".c")).string(), (d / (object.stem + arm.obj)).string()},
+                                                   arm.spec, arm.exe)) {
+                        both.merged = exitOf(*exe, "the object under DSS");
+                    }
+                    answered = dssAnswers.emplace(answerKey, both).first;
                 }
+                std::optional<unsigned> const underDss = answered->second.underDss;
+                std::optional<unsigned> const merged   = answered->second.merged;
                 EXPECT_TRUE(underDss.has_value() && *underDss == 42u) << "DSS's link of its own artifact of the object";
-                // and the object itself linked by DSS with its own main.
-                std::optional<unsigned> merged;
-                if (auto const exe = dssBuilds("dss_merged_" + object.stem,
-                                               {(d / (mainStem + ".c")).string(), (d / (object.stem + arm.obj)).string()},
-                                               arm.spec, arm.exe)) {
-                    merged = exitOf(*exe, "the object under DSS");
-                }
                 EXPECT_TRUE(merged.has_value() && *merged == 42u) << "DSS's link of the object beside its own main";
                 auto const shown = [](std::optional<unsigned> const& v) {
                     return v.has_value() ? std::to_string(*v) : std::string{"none"};
@@ -4101,8 +5330,11 @@ TEST(RecordSymbolIdsNative, AnObjectWhoseFirstRecordIsADefinitionRelinksWhole) {
                               << (referenceWroteItFirst ? "; TODAY one does, and its cells ran" : "") << "\n";
                 } else if (arm.withoutLocals) {
                     EXPECT_TRUE(referenceWroteItFirst)
-                        << "no reference-written object of this arm has its definition as the FIRST record — not as "
-                           "compiled and not without its local symbols: the cell did not run on a reference's object";
+                        << referenceMoved(tool,
+                                          "with no object — as compiled, or without its local symbols — whose FIRST "
+                                          "record is the definition",
+                                          "one of the arm's objects has it there")
+                        << ": the cell did not run on a reference's object";
                 }
             }
         }
@@ -4128,13 +5360,39 @@ TEST(RecordSymbolIdsNative, AnObjectWhoseFirstRecordIsADefinitionRelinksWhole) {
 //                                               for the reference: a duplicate `c`)
 //     archive [m15] [m0]                        m15 alone
 // and a STRONG reference to `w` answers the same in every cell: Apple's ld answers a reference, weak or strong,
-// before it walks its commons. (ELF and PE: one of the two rounds fetches nothing there — no member is fetched for
-// a weak reference on ELF and PE, none for a common on PE — so the order shows in no program, and none is pinned.)
+// before it walks its commons.
+//
+// ELF. (PE has no cell: no member is fetched there for a weak reference, and none for a common.) No member is
+// fetched for a WEAK reference on ELF, so the weak round against the commons round shows in no ELF program; the
+// WORKLIST against the commons round does, in the strong client's cells.
+// ✔MEASURED 2026-10-08 (gcc 13.3.0 -fcommon with GNU ld 2.42 on x86_64, and the aarch64 cross tools under qemu —
+// the two agree in every cell; clang 18.1.3 with ld.lld 18.1.3). Exit = w * 16 + c; the members that came in are
+// read from the linker's map:
+//                    the WEAK client                 the STRONG client
+//                    GNU ld           ld.lld         GNU ld                    ld.lld
+//     [m1] [m2]      37, m2 alone     0, none        REFUSED, `w` twice        16, m1 alone
+//     [m2] [m1]      37, m2 alone     0, none        37, m2 alone              37, m2 alone
+//     [m0] [m15]     5,  m0 alone     0, none        REFUSED, `c` twice        22, m15 alone
+//     [m15] [m0]     22, m15 alone    0, none        22, m15 alone             22, m15 alone
+// GNU ld walks the archive's index ONCE, fetching for a reference and for a common alike, so it refuses both cells
+// in which the two fetches bring two definers of one name. DSS answers every reference first — Apple's ld's order,
+// and the one `pullStaticArchiveMembers` has for every format — and gives GNU ld's answer in seven of the eight
+// cells. In the eighth, the strong client against [m0] [m15], it links the REFERENCE's member alone (22) where GNU
+// ld refuses for `c`: a link that works, with the value the reference that links it (ld.lld) gives. The mirror
+// cell, [m1] [m2], DSS refuses as GNU ld does and for the same duplicate: an ELF link fetches a definition for a
+// common (`archiveCommonResolution: fetchDefinition`, GNU ld's meaning), and under that meaning the program
+// defines `w` twice. ld.lld's 16 there belongs to the other meaning, in which no member is ever fetched for a
+// common and every cell of the commons table GNU ld links to 7 reads 0; "fetch for a common unless the fetch
+// collides" is a behaviour no linker has. Its cost is recorded: a program ld.lld links is refused.
 //   * `ArchiveSearchRoundOrder.AWeakReferenceIsAnsweredBeforeACommon`: the four archives against the weak and the
 //     strong client, under both Mach-O ISAs' documents, on every leg — which members the search fetches, and what
 //     the link then says or binds.
-//   * `ArchiveSearchRoundOrderNative`: the same cells on a Mac, Apple clang's objects and Apple's archives, under
-//     Apple's ld (the CONTROL) and under DSS.
+//   * `ArchiveSearchRoundOrder.AnElfLinkAnswersAReferenceBeforeACommonAndFetchesNothingForAWeakOne`: the same four
+//     archives and both clients under both ELF ISAs' documents, on every leg.
+//   * `ArchiveSearchRoundOrderNative.AppleLdAnswersAReferenceBeforeACommonAndSoDoesDss`: the Mach-O cells on a Mac,
+//     Apple clang's objects and Apple's archives, under Apple's ld (the CONTROL) and under DSS.
+//   * `ArchiveSearchRoundOrderNative.GnuLdsAnswersOnElfAndTheOneCellWhereDssLinksWhatItRefuses`: the ELF cells on a
+//     Linux leg, gcc's objects and `ar`'s archives, under GNU ld (the CONTROL) and under DSS.
 
 namespace {
 
@@ -4224,15 +5482,31 @@ struct OrderCell {
     std::vector<char const*> archive;   // tags, in archive order
     std::vector<std::string> fetched;   // tags, sorted
     char const*              duplicate; // the name the link refuses twice-defined; nullptr: it links
-    unsigned                 w = 0, c = 0;
+    // The value `w` is bound to; nullopt where it is bound to NOTHING — a weak reference no fetched member defines.
+    std::optional<unsigned>  w = std::nullopt;
+    unsigned                 c = 0;
 };
 
+// The cells of a reference a member IS fetched for: a strong one under every format whose members' document
+// fetches a definition for a common, and a weak one too where it fetches for a weak reference (Mach-O).
 [[nodiscard]] std::vector<OrderCell> const& orderCells() {
     static std::vector<OrderCell> const cells{
         {"[m1: w] [m2: c, w]", {"fetched_m1", "fetched_m2"}, {"fetched_m1", "fetched_m2"}, "w"},
-        {"[m2: c, w] [m1: w]", {"fetched_m2", "fetched_m1"}, {"fetched_m2"}, nullptr, 2, 5},
-        {"[m0: c] [m15: w, c]", {"fetched_m0", "fetched_m15"}, {"fetched_m15"}, nullptr, 1, 6},
-        {"[m15: w, c] [m0: c]", {"fetched_m15", "fetched_m0"}, {"fetched_m15"}, nullptr, 1, 6}};
+        {"[m2: c, w] [m1: w]", {"fetched_m2", "fetched_m1"}, {"fetched_m2"}, nullptr, 2u, 5},
+        {"[m0: c] [m15: w, c]", {"fetched_m0", "fetched_m15"}, {"fetched_m15"}, nullptr, 1u, 6},
+        {"[m15: w, c] [m0: c]", {"fetched_m15", "fetched_m0"}, {"fetched_m15"}, nullptr, 1u, 6}};
+    return cells;
+}
+
+// The cells of a WEAK reference where no member is fetched for one (ELF): the common alone decides which member
+// comes in — the first, in the archive's order, that defines its name — and the weak reference binds to whatever
+// that member defines, or to nothing.
+[[nodiscard]] std::vector<OrderCell> const& orderCellsOfAWeakReferenceNothingIsFetchedFor() {
+    static std::vector<OrderCell> const cells{
+        {"[m1: w] [m2: c, w]", {"fetched_m1", "fetched_m2"}, {"fetched_m2"}, nullptr, 2u, 5},
+        {"[m2: c, w] [m1: w]", {"fetched_m2", "fetched_m1"}, {"fetched_m2"}, nullptr, 2u, 5},
+        {"[m0: c] [m15: w, c]", {"fetched_m0", "fetched_m15"}, {"fetched_m0"}, nullptr, std::nullopt, 5},
+        {"[m15: w, c] [m0: c]", {"fetched_m15", "fetched_m0"}, {"fetched_m15"}, nullptr, 1u, 6}};
     return cells;
 }
 
@@ -4244,15 +5518,15 @@ struct OrderCell {
     return members;
 }
 
-}  // namespace
-
-TEST(ArchiveSearchRoundOrder, AWeakReferenceIsAnsweredBeforeACommon) {
-    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "archive-round-order"};
+// The order cells under every family whose relocatable document's name begins with `format`: the STRONG client
+// against `orderCells()`, the WEAK one against `weakCells`. Adds the families it ran to `families`.
+void runOrderCells(std::string_view format, std::vector<OrderCell> const& weakCells, char const* scratchName,
+                   std::size_t& families) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, scratchName};
     auto const dir = scratch.path();
-    std::size_t families = 0;
     for (auto const& rf : recordFamilies()) {
         auto const& fam = rf.fam;
-        if (!std::string_view{fam.relocatable}.starts_with("macho")) continue;   // where both rounds fetch
+        if (!std::string_view{fam.relocatable}.starts_with(format)) continue;
         ++families;
         auto const L = load(rf.target, fam.relocatable);
         ASSERT_TRUE(L.target && L.format) << fam.label;
@@ -4271,8 +5545,8 @@ TEST(ArchiveSearchRoundOrder, AWeakReferenceIsAnsweredBeforeACommon) {
             archived.emplace(member.tag, link::format::ArMemberInput{member.tag + ".o", bytes, names});
         }
         for (bool const weak : {true, false}) {
-            for (auto const& cell : orderCells()) {
-                SCOPED_TRACE(std::string{fam.label} + (weak ? ", a WEAK reference: " : ", CONTROL, a strong reference: ")
+            for (auto const& cell : weak ? weakCells : orderCells()) {
+                SCOPED_TRACE(std::string{fam.label} + (weak ? ", a WEAK reference: " : ", a STRONG reference: ")
                              + cell.name);
                 std::vector<link::format::ArMemberInput> members;
                 std::string                              tag = weak ? "weak" : "strong";
@@ -4288,8 +5562,8 @@ TEST(ArchiveSearchRoundOrder, AWeakReferenceIsAnsweredBeforeACommon) {
                 auto const pulled = pullStaticArchiveMembers(clients, archives, {}, *L.target, **exec, pullRep);
                 ASSERT_TRUE(pulled.has_value()) << diagnosticsOf(pullRep);
                 EXPECT_EQ(orderMembersIn(*pulled, fam.us), cell.fetched)
-                    << "which members the search fetches is the ORDER of its rounds: a reference, weak or strong, is "
-                       "answered before a common";
+                    << "which members the search fetches is the ORDER of its rounds — a reference is answered before "
+                       "a common — and what the members' document says of a WEAK reference";
                 // What the link of the client with the fetched members then answers.
                 std::vector<AssembledModule> mods{clients.front()};
                 mods.insert(mods.end(), pulled->begin(), pulled->end());
@@ -4318,14 +5592,37 @@ TEST(ArchiveSearchRoundOrder, AWeakReferenceIsAnsweredBeforeACommon) {
                     return std::nullopt;
                 };
                 auto const w = boundValue(1), c = boundValue(2);
-                ASSERT_TRUE(w.has_value()) << "the reference to `w` is bound to no fetched member's definition";
+                if (cell.w.has_value()) {
+                    ASSERT_TRUE(w.has_value()) << "the reference to `w` is bound to no fetched member's definition";
+                    EXPECT_EQ(*w, *cell.w) << "`w`";
+                } else {
+                    EXPECT_FALSE(w.has_value())
+                        << "no fetched member defines `w`: the weak reference is bound to nothing, and reads 0";
+                }
                 ASSERT_TRUE(c.has_value()) << "the common `c` is bound to no fetched member's definition";
-                EXPECT_EQ(*w, cell.w) << "`w`";
                 EXPECT_EQ(*c, cell.c) << "`c`: the fetched member's strong definition replaced the common";
             }
         }
     }
+}
+
+}  // namespace
+
+TEST(ArchiveSearchRoundOrder, AWeakReferenceIsAnsweredBeforeACommon) {
+    // Mach-O: a member is fetched for a weak reference as for a strong one, so both clients get the one table.
+    std::size_t families = 0;
+    runOrderCells("macho", orderCells(), "archive-round-order", families);
+    if (HasFatalFailure()) return;
     EXPECT_EQ(families, 2u) << "both Mach-O ISAs' documents";
+}
+
+TEST(ArchiveSearchRoundOrder, AnElfLinkAnswersAReferenceBeforeACommonAndFetchesNothingForAWeakOne) {
+    // ELF: the strong client gets the same table — the worklist before the commons, on every format — and the
+    // weak one the table of a reference no member is fetched for.
+    std::size_t families = 0;
+    runOrderCells("elf", orderCellsOfAWeakReferenceNothingIsFetchedFor(), "archive-round-order-elf", families);
+    if (HasFatalFailure()) return;
+    EXPECT_EQ(families, 2u) << "both ELF ISAs' documents";
 }
 
 // The same cells on a Mac. Apple clang writes `tu_weak` (the weak reference to `w` and the common `c`, -fcommon, read
@@ -4343,6 +5640,18 @@ TEST(ArchiveSearchRoundOrderNative, AppleLdAnswersAReferenceBeforeACommonAndSoDo
     auto const strict = test_support::readStrictArmVerdicts();
     ASSERT_FALSE(strict.malformed) << test_support::kStrictArmVerdictsEnv << "='" << strict.raw
                                    << "' is not a recognised value";
+#if defined(__APPLE__)
+    // On Apple's own leg an arm this host cannot run is said under the strict-arm rule, like every table's.
+    for (auto const& missing : found.absent) {
+        if (strict.on) {
+            ADD_FAILURE() << "[native-arm] " << missing << " — the arm cannot run on this host, and "
+                          << test_support::kStrictArmVerdictsEnv << " makes that a failure";
+        } else {
+            std::cout << "[native-arm] " << missing << ": not run — no such toolchain on this host\n";
+        }
+    }
+    if (HasFailure()) return;
+#endif
     std::vector<YieldArm const*> arms;
     for (auto const& a : found.arms) {
         if (std::string_view{a.spec}.find("macho") != std::string_view::npos) arms.push_back(&a);
@@ -4392,14 +5701,12 @@ TEST(ArchiveSearchRoundOrderNative, AppleLdAnswersAReferenceBeforeACommonAndSoDo
         writeText(d / "m1.c", "int w = 1;\n");
         writeText(d / "m2.c", "int c = 5;\nint w = 2;\n");
         writeText(d / "m15.c", "int w = 1;\nint c = 6;\n");
-        for (char const* s : {"tu_weak", "tu_strong"}) {
-            ASSERT_TRUE(arm.run(d, arm.compile(s, /*common=*/true), std::string{s} + ".txt"))
-                << np::tailOf(d / (std::string{s} + ".txt"), 20, arm.label);
-        }
-        for (char const* s : {"m0", "m1", "m2", "m15"}) {
-            ASSERT_TRUE(arm.run(d, arm.compile(s, /*common=*/false), std::string{s} + ".txt"))
-                << np::tailOf(d / (std::string{s} + ".txt"), 20, arm.label);
-        }
+        auto const tool = referenceToolOf(arm, d);
+        // One shell compiles the arm's units, and the reference's MAIN once (every cell's link compiled it again).
+        std::vector<std::string> compiles{arm.compile("main", /*common=*/false)};
+        for (char const* s : {"tu_weak", "tu_strong"}) compiles.push_back(arm.compile(s, /*common=*/true));
+        for (char const* s : {"m0", "m1", "m2", "m15"}) compiles.push_back(arm.compile(s, /*common=*/false));
+        ASSERT_TRUE(runBatched(arm, d, compiles, "compile"));
         for (auto const& cell : cells) {
             std::string const lib = std::string{"lib_"} + cell.name;
             ASSERT_TRUE(arm.run(d, arm.archive(lib, cell.members), lib + ".txt"))
@@ -4409,18 +5716,18 @@ TEST(ArchiveSearchRoundOrderNative, AppleLdAnswersAReferenceBeforeACommonAndSoDo
                 SCOPED_TRACE(tag);
                 // CONTROL: Apple's ld.
                 std::string const refStem = "ref_" + tag;
-                bool const linked = arm.run(d, arm.link(refStem, "main.c", {std::string{unit} + arm.obj, lib + arm.lib}),
+                bool const linked = arm.run(d, arm.link(refStem, "main" + arm.obj, {std::string{unit} + arm.obj, lib + arm.lib}),
                                             refStem + ".txt");
                 std::optional<unsigned> reference;
                 if (cell.expected < 0) {
-                    EXPECT_FALSE(linked) << "Apple's ld now LINKS the cell it refused for a duplicate `_w` when the "
-                                            "order was measured: read what its program answers and revisit the order";
+                    EXPECT_FALSE(linked) << referenceMoved(tool, "LINKS the cell", "it refuses it for a duplicate `_w`")
+                                         << " — read what its program answers and revisit the order";
                 } else {
                     ASSERT_TRUE(linked) << np::tailOf(d / (refStem + ".txt"), 20, arm.label);
                     auto const ref = runImage(d / (refStem + arm.exe));
                     ASSERT_TRUE(ref.spawned) << ref.diagnostic;
                     EXPECT_EQ(static_cast<unsigned>(ref.exitCode), static_cast<unsigned>(cell.expected))
-                        << "Apple's ld no longer answers what was measured";
+                        << referenceMoved(tool, std::to_string(ref.exitCode), std::to_string(cell.expected));
                     reference = static_cast<unsigned>(ref.exitCode);
                 }
                 // DSS: its own main, Apple's object, Apple's archive.
@@ -4463,6 +5770,162 @@ TEST(ArchiveSearchRoundOrderNative, AppleLdAnswersAReferenceBeforeACommonAndSoDo
         ++ran;
     }
     if (ran == 0 && !HasFailure()) GTEST_SKIP() << "no arm could run on this host (see the [native-arm] lines)";
+}
+
+// The ELF cells on a Linux leg. gcc writes `tu_weak`, `tu_strong` and the four members, `ar` each archive, and a
+// main returns `read_w() * 16 + read_c()`. GNU ld is the CONTROL and must still answer what was measured; DSS, its
+// own main beside gcc's object and archive, must answer the same in seven cells and LINK the eighth.
+//                         [m1][m2]           [m2][m1]    [m0][m15]           [m15][m0]
+//   GNU ld, weak              37                 37           5                   22
+//   GNU ld, strong        refused, `w`           37       refused, `c`            22
+//   DSS,    weak              37                 37           5                   22
+//   DSS,    strong        refused, `w`           37          22                   22
+TEST(ArchiveSearchRoundOrderNative, GnuLdsAnswersOnElfAndTheOneCellWhereDssLinksWhatItRefuses) {
+    namespace np = test_support::native_probe;
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "archive-round-order-native-elf"};
+    auto const dir   = scratch.path();
+    auto const found = yieldArms(dir);
+#if defined(__linux__)
+    // On a Linux leg an arm this host cannot run is said under the strict-arm rule, like every table's.
+    auto const strict = test_support::readStrictArmVerdicts();
+    ASSERT_FALSE(strict.malformed) << test_support::kStrictArmVerdictsEnv << "='" << strict.raw
+                                   << "' is not a recognised value";
+    for (auto const& missing : found.absent) {
+        if (strict.on) {
+            ADD_FAILURE() << "[native-arm] " << missing << " — the arm cannot run on this host, and "
+                          << test_support::kStrictArmVerdictsEnv << " makes that a failure";
+        } else {
+            std::cout << "[native-arm] " << missing << ": not run — no such toolchain on this host\n";
+        }
+    }
+    if (HasFailure()) return;
+#endif
+    std::vector<YieldArm const*> arms;
+    for (auto const& a : found.arms) {
+        if (std::string_view{a.spec}.find(":elf") != std::string_view::npos) arms.push_back(&a);
+    }
+    if (arms.empty()) {
+        GTEST_SKIP() << "GNU ld's ELF answers are measured on a Linux leg, and this host is not one — the synthetic "
+                        "half (ArchiveSearchRoundOrder) runs the ELF documents on every host";
+    }
+    struct Cell {
+        char const*              name;
+        std::vector<std::string> members;
+        int                      weak;             // the weak client: GNU ld and DSS alike
+        int                      strongGnuLd;      // the strong client under GNU ld; -1: refused
+        char const*              gnuLdDuplicate;   // the name GNU ld calls defined twice, where it refuses
+        int                      strongDss;        // the strong client under DSS; -1: refused, for a duplicate `w`
+    };
+    std::vector<Cell> const cells{{"m1_m2", {"m1", "m2"}, 37, -1, "w", -1},
+                                  {"m2_m1", {"m2", "m1"}, 37, 37, nullptr, 37},
+                                  {"m0_m15", {"m0", "m15"}, 5, -1, "c", 22},
+                                  {"m15_m0", {"m15", "m0"}, 22, 22, nullptr, 22}};
+    // GNU ld's own words for a name defined twice, in either quoting its locale gives the name.
+    auto const saysDefinedTwice = [](std::string const& log, std::string const& name) {
+        return log.find("multiple definition of") != std::string::npos
+               && (log.find("`" + name + "'") != std::string::npos || log.find("'" + name + "'") != std::string::npos
+                   || log.find("\xE2\x80\x98" + name + "\xE2\x80\x99") != std::string::npos);
+    };
+    for (std::size_t k = 0; k < arms.size(); ++k) {
+        auto const& arm = *arms[k];
+        SCOPED_TRACE(arm.label);
+        fs::path const d = dir / ("arm" + std::to_string(k));
+        fs::create_directories(d);
+        writeText(d / "main.c", "int read_w(void);\nint read_c(void);\nint main(void) { return read_w() * 16 + read_c(); }\n");
+        writeText(d / "tu_weak.c", "extern int w __attribute__((weak));\nint c;\n"
+                                   "int read_w(void) { return &w ? w : 0; }\nint read_c(void) { return c; }\n");
+        writeText(d / "tu_strong.c", "extern int w;\nint c;\n"
+                                     "int read_w(void) { return w; }\nint read_c(void) { return c; }\n");
+        writeText(d / "m0.c", "int c = 5;\n");
+        writeText(d / "m1.c", "int w = 1;\n");
+        writeText(d / "m2.c", "int c = 5;\nint w = 2;\n");
+        writeText(d / "m15.c", "int w = 1;\nint c = 6;\n");
+        auto const tool = referenceToolOf(arm, d);
+        // One shell compiles the arm's units, and the reference's MAIN once (every cell's link compiled it again).
+        std::vector<std::string> compiles{arm.compile("main", /*common=*/false)};
+        for (char const* s : {"tu_weak", "tu_strong"}) compiles.push_back(arm.compile(s, /*common=*/true));
+        for (char const* s : {"m0", "m1", "m2", "m15"}) compiles.push_back(arm.compile(s, /*common=*/false));
+        ASSERT_TRUE(runBatched(arm, d, compiles, "compile"));
+        for (auto const& cell : cells) {
+            std::string const lib = std::string{"lib_"} + cell.name;
+            ASSERT_TRUE(arm.run(d, arm.archive(lib, cell.members), lib + ".txt"))
+                << np::tailOf(d / (lib + ".txt"), 20, arm.label);
+            for (bool const weak : {true, false}) {
+                std::string const unit  = weak ? "tu_weak" : "tu_strong";
+                std::string const tag   = unit + "_" + cell.name;
+                int const         gnuLd = weak ? cell.weak : cell.strongGnuLd;
+                int const         dss   = weak ? cell.weak : cell.strongDss;
+                SCOPED_TRACE(tag);
+                // CONTROL: GNU ld.
+                std::string const refStem = "ref_" + tag;
+                bool const linked = arm.run(d, arm.link(refStem, "main" + arm.obj, {unit + arm.obj, lib + arm.lib}),
+                                            refStem + ".txt");
+                std::optional<unsigned> reference;   // GNU ld's LIVE answer, where it links
+                if (gnuLd < 0) {
+                    std::string const twice = std::string{"`"} + cell.gnuLdDuplicate + "` defined twice";
+                    EXPECT_FALSE(linked) << referenceMoved(tool, "LINKS the cell", "it refuses it for " + twice)
+                                         << " — read what its program answers and revisit the table";
+                    std::string const said = np::tailOf(d / (refStem + ".txt"), 40);
+                    if (!linked) {
+                        EXPECT_TRUE(saysDefinedTwice(said, cell.gnuLdDuplicate))
+                            << referenceMoved(tool, "a refusal in other words:" + said,
+                                              "a refusal for " + twice + " (`multiple definition of`, read under LC_ALL=C)");
+                    }
+                } else {
+                    ASSERT_TRUE(linked) << np::tailOf(d / (refStem + ".txt"), 20, arm.label);
+                    auto const ref = test_support::runBinary(d / (refStem + arm.exe));
+                    ASSERT_TRUE(ref.spawned) << ref.diagnostic;
+                    EXPECT_FALSE(ref.timedOut);
+                    EXPECT_EQ(static_cast<unsigned>(ref.exitCode), static_cast<unsigned>(gnuLd))
+                        << referenceMoved(tool, std::to_string(ref.exitCode), std::to_string(gnuLd));
+                    reference = static_cast<unsigned>(ref.exitCode);
+                }
+                // DSS: its own main, gcc's object, `ar`'s archive.
+                auto const out = d / ("dss_" + tag);
+                fs::create_directories(out);
+                Program p;
+                p.setOutputDir(out);
+                p.setResolveLibraries(std::vector<fs::path>{d / (lib + arm.lib)});
+                DiagnosticReporter rep;
+                int const rc = p.compileFiles(std::vector<std::string>{(d / "main.c").string(),
+                                                                       (d / (unit + arm.obj)).string()},
+                                              "c", std::vector<std::string>{arm.spec}, rep);
+                if (dss < 0) {
+                    EXPECT_NE(rc, 0) << "DSS must refuse the cell: the reference's member and the common's both "
+                                        "define `w`";
+                    bool named = false;
+                    for (auto const& diag : rep.all()) {
+                        named = named || (diag.severity == DiagnosticSeverity::Error
+                                          && diag.actual.find("\"w\"") != std::string::npos);
+                    }
+                    EXPECT_TRUE(named) << "the refusal must name the twice-defined `w`:" << diagnosticsOf(rep);
+                    std::cout << "[native-arm] " << arm.label << " " << tag << ": GNU ld REFUSES, DSS "
+                              << (rc != 0 ? "REFUSES" : "links") << "\n";
+                    continue;
+                }
+                ASSERT_EQ(rc, 0) << "DSS must link the cell:" << diagnosticsOf(rep);
+                fs::path image;
+                for (auto const& e : fs::directory_iterator(out)) {
+                    if (e.is_regular_file() && e.path().extension() == arm.exe) image = e.path();
+                }
+                ASSERT_FALSE(image.empty()) << "no image under " << out.string();
+                auto const r = test_support::runBinary(image);
+                ASSERT_TRUE(r.spawned) << r.diagnostic;
+                EXPECT_FALSE(r.timedOut);
+                if (reference.has_value()) {
+                    // Where GNU ld links, DSS's answer is DEFINED as GNU ld's: the LIVE one, not the table's.
+                    EXPECT_EQ(static_cast<unsigned>(r.exitCode), *reference) << "DSS must give GNU ld's answer";
+                } else {
+                    EXPECT_EQ(static_cast<unsigned>(r.exitCode), static_cast<unsigned>(dss))
+                        << "where GNU ld refuses for a second definer of the common's name, DSS links the "
+                           "REFERENCE's member alone — the value ld.lld gives";
+                }
+                std::cout << "[native-arm] " << arm.label << " " << tag << ": GNU ld "
+                          << (gnuLd < 0 ? std::string{"REFUSES"} : std::to_string(gnuLd)) << ", DSS " << r.exitCode
+                          << "\n";
+            }
+        }
+    }
 }
 
 // ══ A COMMON NOTHING READS, BESIDE A THREAD-LOCAL DEFINITION OF ITS NAME ═════════════════════════════════════════
@@ -4593,11 +6056,17 @@ TEST(CommonSymbols, AnUnreadElfCommonKeepsWhatItsRecordStatesThroughARelocatable
 TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRecordStates) {
     namespace np = test_support::native_probe;
 #if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+    if (!posixReferenceArmCanRun("gcc (GNU ld), a common nothing reads beside a thread-local definition")) {
+        if (HasFailure()) return;
+        GTEST_SKIP() << "the reference toolchain is not on this host (see the [native-arm] lines)";
+    }
     test_support::ScratchDir scratch{test_support::Location::Temp, "unread-common-tls"};
     auto const dir = scratch.path();
+    auto const reference = posixCc(dir, "gcc (GNU ld)", "gcc 13.3.0 with GNU ld 2.42");
     auto const at = [&](std::string const& name) { return "\"" + (dir / name).string() + "\""; };
+    // LC_ALL=C: this test READS the reference linker's words, which a leg's locale would otherwise translate.
     auto const sh = [&](std::string const& cmd, std::string const& log) {
-        return std::system(np::captureCmd(cmd, dir / log).c_str()) == 0;
+        return std::system(np::captureCmd("LC_ALL=C " + cmd, dir / log).c_str()) == 0;
     };
     writeText(dir / "main.c", "int main(void) { return 0; }\n");
     writeText(dir / "unread.c", "int c;\n");
@@ -4630,15 +6099,20 @@ TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRec
         for (auto const& o : cell.objects) ref += " " + at(o);
         bool const linked = sh(ref, std::string{"ref_"} + cell.name + ".txt");
         if (cell.refused) {
-            EXPECT_FALSE(linked) << "GNU ld must refuse a common nothing reads against a thread-local definition";
-            EXPECT_NE(np::tailOf(dir / (std::string{"ref_"} + cell.name + ".txt"), 20).find("mismatches non-TLS reference"),
-                      std::string::npos)
-                << np::tailOf(dir / (std::string{"ref_"} + cell.name + ".txt"), 20);
+            std::string const said = np::tailOf(dir / (std::string{"ref_"} + cell.name + ".txt"), 20);
+            EXPECT_FALSE(linked) << referenceMoved(reference, "LINKS the pair",
+                                                   "it refuses a common nothing reads against a thread-local definition");
+            if (!linked) {
+                EXPECT_NE(said.find("mismatches non-TLS reference"), std::string::npos)
+                    << referenceMoved(reference, "a refusal in other words:" + said,
+                                      "a refusal that says `mismatches non-TLS reference` (read under LC_ALL=C)");
+            }
         } else {
             ASSERT_TRUE(linked) << np::tailOf(dir / (std::string{"ref_"} + cell.name + ".txt"), 20);
             auto const r = test_support::runBinary(dir / (std::string{"ref_"} + cell.name));
             ASSERT_TRUE(r.spawned) << r.diagnostic;
-            EXPECT_EQ(r.exitCode, 0u) << "CONTROL: GNU ld, the ordinary definition";
+            EXPECT_EQ(r.exitCode, 0u) << referenceMoved(reference, std::to_string(r.exitCode), "0")
+                                      << " (the ordinary definition)";
         }
         // DSS: its own main, gcc's objects.
         auto const out = dir / (std::string{"dss-"} + cell.name);
@@ -4699,6 +6173,8 @@ TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRec
     writeText(dir / "main5.c", "int get(void);\nint main(void) { return get(); }\n");
     ASSERT_TRUE(runCapturing(&tools, dir, "cl /nologo /c /O2 /MD /GS- unread.c tls.c reader.c main0.c main5.c", "cl.txt"))
         << np::tailOf(dir / "cl.txt", 30, "cl");
+    auto const reference = clWithLinkExe(tools, dir);
+    std::map<std::string, unsigned> liveAnswer;   // link.exe's LIVE answer, by cell
     struct RefCell {
         char const*              name;
         char const*              main;
@@ -4712,12 +6188,15 @@ TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRec
         std::string ref = std::string{"link /nologo /OUT:ref_"} + cell.name + ".exe " + cell.main + ".obj";
         for (auto const& o : cell.objects) ref += " " + o;
         ASSERT_TRUE(runCapturing(&tools, dir, ref, std::string{"ref_"} + cell.name + ".txt"))
-            << "link.exe no longer links the pair: "
-            << np::tailOf(dir / (std::string{"ref_"} + cell.name + ".txt"), 30, "link.exe");
-        auto const refRun = test_support::runBinary(dir / (std::string{"ref_"} + cell.name + ".exe"));
-        ASSERT_TRUE(refRun.spawned) << refRun.diagnostic;
-        EXPECT_EQ(refRun.exitCode, cell.expected) << "link.exe no longer answers what was measured";
-        std::cout << "[native-arm] cl (link.exe) " << cell.name << ": link.exe " << refRun.exitCode << "\n";
+            << referenceMoved(reference,
+                              "REFUSES the pair:"
+                                  + np::tailOf(dir / (std::string{"ref_"} + cell.name + ".txt"), 30, "link.exe"),
+                              "it links it");
+        auto const live = controlExit(reference, test_support::runBinary(dir / (std::string{"ref_"} + cell.name + ".exe")),
+                                      cell.expected);
+        ASSERT_TRUE(live.has_value());
+        liveAnswer[cell.name] = *live;
+        std::cout << "[native-arm] cl (link.exe) " << cell.name << ": link.exe " << *live << "\n";
     }
     // The PREMISE of DSS's cells: cl wrote `int c;` as a COMMON nothing of its unit reads, and its record states no
     // storage duration.
@@ -4747,12 +6226,14 @@ TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRec
         char const* name;
         char const* main;
         bool        besideTheCommon;
-        unsigned    expected;   // link.exe's answer for the same program
+        unsigned    expected;      // what the program is: the table's answer
+        char const* linkExeCell;   // link.exe's cell of the same program, whose LIVE answer DSS must give; null: DSS alone
     };
-    for (DssCell const& cell : {DssCell{"the_common_beside_the_definition", "dmain0", true, 0u},
-                                DssCell{"the_common_beside_the_definition_read", "dmain5", true, 5u},
-                                DssCell{"CONTROL_the_definition_alone", "dmain0", false, 0u},
-                                DssCell{"CONTROL_the_definition_alone_read", "dmain5", false, 5u}}) {
+    for (DssCell const& cell :
+         {DssCell{"the_common_beside_the_definition", "dmain0", true, 0u, "unread_then_tls"},
+          DssCell{"the_common_beside_the_definition_read", "dmain5", true, 5u, "with_a_thread_local_reader"},
+          DssCell{"CONTROL_the_definition_alone", "dmain0", false, 0u, nullptr},
+          DssCell{"CONTROL_the_definition_alone_read", "dmain5", false, 5u, nullptr}}) {
         SCOPED_TRACE(std::string{"DSS, "} + cell.name);
         auto const out = dir / (std::string{"dss_"} + cell.name);
         fs::create_directories(out);
@@ -4771,7 +6252,9 @@ TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRec
         auto const r = test_support::runBinary(image);
         ASSERT_TRUE(r.spawned) << r.diagnostic;
         EXPECT_FALSE(r.timedOut);
-        EXPECT_EQ(r.exitCode, cell.expected) << "DSS must give link.exe's answer";
+        // Beside the common DSS's answer is DEFINED as link.exe's — the LIVE one; alone, as what the program is.
+        unsigned const want = cell.linkExeCell != nullptr ? liveAnswer.at(cell.linkExeCell) : cell.expected;
+        EXPECT_EQ(r.exitCode, want) << "DSS must give link.exe's answer";
         std::cout << "[native-arm] cl's unread common, DSS's thread-local definition, " << cell.name << ": DSS "
                   << r.exitCode << " (link.exe: " << cell.expected << ")\n";
     }
@@ -4781,4 +6264,922 @@ TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRec
                     "a Mach-O record states no storage duration — is pinned on the Mach-O documents by "
                     "ThreadStorageAgreement.AnUnreadReferenceIsJudgedWhereItsRecordStatesItsStorageDuration";
 #endif
+}
+
+// ══ The weak-definition KIND through the PE relocatable writer (P69 fold 2) ══════════════════════════════════════
+//    D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER, the writer half.
+//
+// PE's two kinds of weak definition are two mechanisms with two duplicate rules (✔MEASURED 2026-10-10, link.exe
+// 14.44.35228 and lld-link 19.1.5: an overridable one yields to a strong and to a select-any definition and two of
+// them conflict; two select-any coalesce and one beside a strong definition is a duplicate), so the kind a unit
+// STATED must reach the wire as that kind. The document says which kind takes which spelling
+// (`weakDefinition.byKind`); these pins hold the writer to it on HAND-BUILT units — a unit DSS compiles states no
+// kind yet and is written as before, which the controls pin too.
+
+namespace {
+
+struct CoffRecord {
+    std::uint32_t index              = 0;
+    std::string   name;
+    std::uint32_t value              = 0;
+    std::int16_t  section            = 0;
+    std::uint8_t  storageClass       = 0;
+    bool          weakExternal       = false;   // class 105 with its auxiliary record
+    std::uint32_t defaultIndex       = 0;       // the auxiliary record's TagIndex
+    std::uint32_t auxCharacteristics = 0;
+};
+
+// Every symbol record of the COFF object `b`, auxiliary records folded into the record they follow.
+[[nodiscard]] std::vector<CoffRecord> coffRecords(std::vector<std::uint8_t> const& b) {
+    std::vector<CoffRecord> out;
+    if (b.size() < 20) return out;
+    std::uint64_t const symtab = rdLE(b, 8, 4), nsyms = rdLE(b, 12, 4), strtab = symtab + nsyms * 18;
+    for (std::uint64_t i = 0; i < nsyms; ++i) {
+        std::uint64_t const rec = symtab + i * 18;
+        CoffRecord          r;
+        r.index = static_cast<std::uint32_t>(i);
+        if (rdLE(b, rec, 4) == 0u) {
+            r.name = cstrAt(b, strtab + rdLE(b, rec + 4, 4));
+        } else {
+            for (std::uint64_t k = 0; k < 8 && b[rec + k] != 0; ++k) r.name.push_back(static_cast<char>(b[rec + k]));
+        }
+        r.value        = static_cast<std::uint32_t>(rdLE(b, rec + 8, 4));
+        r.section      = static_cast<std::int16_t>(rdLE(b, rec + 12, 2));
+        r.storageClass = b[rec + 16];
+        std::uint64_t const aux = b[rec + 17];
+        if (r.storageClass == 105u && aux != 0u) {
+            r.weakExternal       = true;
+            r.defaultIndex       = static_cast<std::uint32_t>(rdLE(b, rec + 18, 4));
+            r.auxCharacteristics = static_cast<std::uint32_t>(rdLE(b, rec + 22, 4));
+        }
+        out.push_back(std::move(r));
+        i += aux;
+    }
+    return out;
+}
+
+[[nodiscard]] std::vector<CoffRecord const*> coffRecordsOf(std::vector<CoffRecord> const& records,
+                                                           std::string const&             name) {
+    std::vector<CoffRecord const*> out;
+    for (auto const& r : records) {
+        if (r.name == name) out.push_back(&r);
+    }
+    return out;
+}
+
+// Whether the 1-based section `ordinal` of the COFF object `b` is a COMDAT (IMAGE_SCN_LNK_COMDAT).
+[[nodiscard]] bool coffSectionIsComdat(std::vector<std::uint8_t> const& b, std::int16_t ordinal) {
+    if (ordinal <= 0) return false;
+    std::uint64_t const header = 20 + rdLE(b, 16, 2) + static_cast<std::uint64_t>(ordinal - 1) * 40;
+    return (rdLE(b, header + 36, 4) & 0x00001000u) != 0u;
+}
+
+[[nodiscard]] ModuleSymbol* rowOf(AssembledModule& m, std::string const& name) {
+    for (auto& s : m.symbols) {
+        if (s.name == name) return &s;
+    }
+    return nullptr;
+}
+
+// A unit whose `shared` — a datum of 7, or a function — is a WEAK definition of `kind` under its FIRST name, beside
+// the strong function `anchor` when `withAnchor`; `via` reaches it THROUGH THE DEFINITION, as a unit DSS compiles does.
+[[nodiscard]] AssembledModule firstNameWeak(bool datum, std::optional<WeakDefinitionKind> kind, bool withAnchor) {
+    UnitOf u(1);
+    if (withAnchor) u.marker("anchor");
+    if (datum) {
+        u.datum("shared", SymbolBinding::Weak, 7);
+        u.reads("via", "shared");
+    } else {
+        u.marker("shared");
+        u.calls("via", "shared");
+    }
+    AssembledModule m = u.build();
+    ModuleSymbol*   s = rowOf(m, "shared");
+    s->binding        = SymbolBinding::Weak;
+    s->weakKind       = kind;
+    return m;
+}
+
+struct PeObject {
+    Loaded                         L;
+    std::vector<std::uint8_t>      bytes;
+    std::vector<CoffRecord>        records;
+    std::optional<AssembledModule> back;
+    DiagnosticReporter             rep;
+};
+
+// `hand` through the PE relocatable writer under `format` (the shipped object document when null), and read back.
+void writePe(AssembledModule const& hand, PeObject& out, std::shared_ptr<ObjectFormatSchema const> format = nullptr) {
+    out.L = load("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(out.L.target && out.L.format);
+    if (format) out.L.format = std::move(format);
+    out.bytes = pe::encode(hand, *out.L.target, *out.L.format, out.rep);
+    if (out.bytes.empty()) return;
+    out.records = coffRecords(out.bytes);
+    out.back    = pe::readRelocatableObject(out.bytes, *out.L.target, *out.L.format, out.rep, CompilationUnitId{1});
+}
+
+// The shipped PE object document with `edit` applied to its JSON.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const> peObjectDocument(std::function<void(nlohmann::json&)> const& edit,
+                                                                        char const*                                why) {
+    auto const path = dss::test::configRoot() / "object-formats" / "pe64-x86_64-windows.format.json";
+    std::ifstream in{path};
+    auto          doc = nlohmann::json::parse(in);
+    edit(doc);
+    auto const loaded = ObjectFormatSchema::loadFromText(doc.dump(), why);
+    EXPECT_TRUE(loaded.has_value()) << why;
+    if (!loaded.has_value()) return nullptr;
+    return *loaded;
+}
+
+}  // namespace
+
+// AN OVERRIDABLE DEFINITION IS THE BODY UNDER AN EXTERNAL DEFAULT PLUS ITS NAME AS A WEAK EXTERNAL — never a COMDAT.
+// The default is named as clang names it and lies in an ordinary section; the weak external's auxiliary record names
+// it with the search-alias characteristic; DSS's own reader reads the pair back as ONE body whose weak name is of the
+// kind the unit stated; and the unit's own reference, written through the definition, is a relocation against the
+// weak external — the NAME, which another object may win. CONTROLS, same unit: stated select-any, and stating no
+// kind, the definition is the COMDAT it always was (its name EXTERNAL in a COMDAT section, no weak external, no
+// default) — so the arm is the kind's and not every weak definition's.
+TEST(WeakDefinitionKindsWriter, AnOverridableDefinitionReachesTheWireAsAWeakExternalWithADefaultOfItsOwn) {
+    for (bool const datum : {true, false}) {
+        SCOPED_TRACE(datum ? "a datum" : "a function");
+        {
+            PeObject o;
+            writePe(firstNameWeak(datum, WeakDefinitionKind::Overridable, true), o);
+            ASSERT_FALSE(o.bytes.empty()) << diagnosticsOf(o.rep);
+            EXPECT_EQ(o.rep.errorCount(), 0u) << diagnosticsOf(o.rep);
+            auto const names    = coffRecordsOf(o.records, "shared");
+            auto const defaults = coffRecordsOf(o.records, ".weak.shared.default.anchor");
+            ASSERT_EQ(names.size(), 1u) << "the weak name is spelled once";
+            ASSERT_EQ(defaults.size(), 1u) << "the body's own record, named after the unit's first strong definition";
+            EXPECT_TRUE(names[0]->weakExternal) << "IMAGE_SYM_CLASS_WEAK_EXTERNAL with its auxiliary record";
+            EXPECT_EQ(names[0]->section, 0);
+            EXPECT_EQ(names[0]->value, 0u);
+            EXPECT_EQ(names[0]->defaultIndex, defaults[0]->index) << "the auxiliary record names the default";
+            EXPECT_EQ(names[0]->auxCharacteristics, 3u) << "IMAGE_WEAK_EXTERN_SEARCH_ALIAS";
+            EXPECT_EQ(defaults[0]->storageClass, 2u) << "EXTERNAL: link.exe refuses a STATIC default (LNK1235)";
+            EXPECT_GT(defaults[0]->section, 0);
+            EXPECT_FALSE(coffSectionIsComdat(o.bytes, defaults[0]->section))
+                << "the body stays in its ordinary section: a COMDAT is the OTHER kind";
+
+            ASSERT_TRUE(o.back.has_value()) << diagnosticsOf(o.rep);
+            auto const* weakRow    = definitionNamed(*o.back, "shared");
+            auto const* defaultRow = definitionNamed(*o.back, ".weak.shared.default.anchor");
+            ASSERT_TRUE(weakRow != nullptr && defaultRow != nullptr);
+            EXPECT_EQ(weakRow->symbol, defaultRow->symbol) << "two names of ONE body";
+            EXPECT_EQ(weakRow->binding, SymbolBinding::Weak);
+            EXPECT_EQ(weakRow->weakKind, std::optional{WeakDefinitionKind::Overridable})
+                << "the kind the unit stated is the kind its object states";
+            auto const* row = rowNamed(*o.back, "shared");
+            ASSERT_NE(row, nullptr) << "the unit's reference reads back as a reference row of the NAME";
+            EXPECT_EQ(targetsOf(*o.back, "via"), std::vector<SymbolId>{row->symbol})
+                << "a unit that references through its definition means the name: the relocation is written against "
+                   "the weak external, which another object's definition wins";
+        }
+        for (auto const kind : std::vector<std::optional<WeakDefinitionKind>>{WeakDefinitionKind::SelectAny, std::nullopt}) {
+            SCOPED_TRACE(kind.has_value() ? "CONTROL: stated select-any" : "CONTROL: no kind stated");
+            PeObject o;
+            writePe(firstNameWeak(datum, kind, true), o);
+            ASSERT_FALSE(o.bytes.empty()) << diagnosticsOf(o.rep);
+            auto const names = coffRecordsOf(o.records, "shared");
+            ASSERT_EQ(names.size(), 1u);
+            EXPECT_FALSE(names[0]->weakExternal);
+            EXPECT_EQ(names[0]->storageClass, 2u);
+            EXPECT_TRUE(coffSectionIsComdat(o.bytes, names[0]->section)) << "a COMDAT section of its own";
+            for (auto const& r : o.records) {
+                EXPECT_FALSE(r.name.starts_with(".weak.")) << "no default record: " << r.name;
+            }
+            ASSERT_TRUE(o.back.has_value()) << diagnosticsOf(o.rep);
+            auto const* weakRow = definitionNamed(*o.back, "shared");
+            ASSERT_NE(weakRow, nullptr);
+            EXPECT_EQ(weakRow->weakKind, std::optional{WeakDefinitionKind::SelectAny});
+        }
+    }
+}
+
+// THE DEFAULT'S NAME, clang's scheme: `.weak.<name>.default.<the unit's first strong external definition>`, and
+// `.weak.<name>.default` in a unit that has none (✔MEASURED 2026-10-10, clang 19.1.5, both of its COFF targets); two
+// overridable definitions of one unit take two defaults. The name is the writer's own, so an object that already
+// holds a symbol of that name is REFUSED by name rather than written with two definitions of it.
+TEST(WeakDefinitionKindsWriter, ADefaultIsNamedAfterItsWeakNameAndTheUnitsFirstStrongDefinition) {
+    {
+        PeObject o;
+        writePe(firstNameWeak(true, WeakDefinitionKind::Overridable, /*withAnchor=*/false), o);
+        ASSERT_FALSE(o.bytes.empty()) << diagnosticsOf(o.rep);
+        // `via` is the unit's first strong external definition here.
+        EXPECT_EQ(coffRecordsOf(o.records, ".weak.shared.default.via").size(), 1u);
+    }
+    {
+        // A unit that holds NOTHING strong: the weak datum alone.
+        UnitOf u(1);
+        u.datum("shared", SymbolBinding::Weak, 7);
+        AssembledModule m          = u.build();
+        rowOf(m, "shared")->weakKind = WeakDefinitionKind::Overridable;
+        PeObject o;
+        writePe(m, o);
+        ASSERT_FALSE(o.bytes.empty()) << diagnosticsOf(o.rep);
+        auto const defaults = coffRecordsOf(o.records, ".weak.shared.default");
+        ASSERT_EQ(defaults.size(), 1u);
+        auto const names = coffRecordsOf(o.records, "shared");
+        ASSERT_EQ(names.size(), 1u);
+        EXPECT_TRUE(names[0]->weakExternal);
+        EXPECT_EQ(names[0]->defaultIndex, defaults[0]->index);
+    }
+    {
+        // Two overridable definitions, one strong function between them.
+        UnitOf u(1);
+        u.datum("first", SymbolBinding::Weak, 7).marker("anchor").datum("second", SymbolBinding::Weak, 8);
+        AssembledModule m           = u.build();
+        rowOf(m, "first")->weakKind  = WeakDefinitionKind::Overridable;
+        rowOf(m, "second")->weakKind = WeakDefinitionKind::Overridable;
+        PeObject o;
+        writePe(m, o);
+        ASSERT_FALSE(o.bytes.empty()) << diagnosticsOf(o.rep);
+        auto const d1 = coffRecordsOf(o.records, ".weak.first.default.anchor");
+        auto const d2 = coffRecordsOf(o.records, ".weak.second.default.anchor");
+        ASSERT_EQ(d1.size(), 1u);
+        ASSERT_EQ(d2.size(), 1u);
+        EXPECT_NE(d1[0]->value, d2[0]->value) << "two bodies, two addresses";
+        EXPECT_EQ(coffRecordsOf(o.records, "first")[0]->defaultIndex, d1[0]->index);
+        EXPECT_EQ(coffRecordsOf(o.records, "second")[0]->defaultIndex, d2[0]->index);
+    }
+    {
+        // The object already holds a symbol under the name the default would take.
+        UnitOf u(1);
+        u.marker("anchor").datum("shared", SymbolBinding::Weak, 7).datum(".weak.shared.default.anchor",
+                                                                        SymbolBinding::Global, 9);
+        AssembledModule m           = u.build();
+        rowOf(m, "shared")->weakKind = WeakDefinitionKind::Overridable;
+        PeObject o;
+        writePe(m, o);
+        EXPECT_TRUE(o.bytes.empty()) << "two definitions of one name must not be written";
+        std::size_t refusals = 0;
+        for (auto const& d : o.rep.all()) {
+            if (d.code == DiagnosticCode::K_NoMatchingObjectFormat
+                && d.actual.find("'shared'") != std::string::npos
+                && d.actual.find("'.weak.shared.default.anchor'") != std::string::npos) {
+                ++refusals;
+            }
+        }
+        EXPECT_EQ(refusals, 1u) << diagnosticsOf(o.rep);
+    }
+}
+
+// WHAT A RELOCATION NAMING AN OVERRIDABLE BODY IS WRITTEN AGAINST IS WHAT ITS UNIT MEANS BY IT. A unit that references
+// the weak name BY ROW (`ModuleSymbol::referencedByName`: what an object reader states) means the BYTES by a
+// relocation that names the definition, and this format's linkers leave an overridable definition's bytes in place
+// when another definition wins the name (`supersededDefinition`): the relocation is written against the DEFAULT, the
+// one through the row against the WEAK EXTERNAL. The writer READS that key: under a copy of the document that says an
+// overridable definition is replaced whole both relocations name the weak external, and under one that does not say,
+// the object is refused by name.
+TEST(WeakDefinitionKindsWriter, ARelocationNamingTheBodyIsWrittenAgainstItsBytesWhereItsUnitReferencesByRow) {
+    auto const byRow = [] {
+        UnitOf u(1);
+        u.marker("anchor").datum("shared", SymbolBinding::Weak, 7).reads("via_bytes", "shared");
+        AssembledModule m   = u.build();
+        ModuleSymbol*   s   = rowOf(m, "shared");
+        s->weakKind         = WeakDefinitionKind::Overridable;
+        s->referencedByName = true;
+        ExternImport ref;
+        ref.symbol      = SymbolId{100};
+        ref.mangledName = "shared";
+        ref.isData      = true;
+        m.externImports.push_back(std::move(ref));
+        m.functions.push_back(reader(101, 100));
+        m.symbols.push_back(ModuleSymbol{SymbolId{101}, "via_name", SymbolBinding::Global, SymbolVisibility::Default});
+        m.expectedFuncCount = m.functions.size();
+        return m;
+    };
+    {
+        PeObject o;
+        writePe(byRow(), o);
+        ASSERT_FALSE(o.bytes.empty()) << diagnosticsOf(o.rep);
+        ASSERT_TRUE(o.back.has_value()) << diagnosticsOf(o.rep);
+        auto const* body = definitionNamed(*o.back, ".weak.shared.default.anchor");
+        auto const* row  = rowNamed(*o.back, "shared");
+        ASSERT_TRUE(body != nullptr && row != nullptr);
+        EXPECT_EQ(targetsOf(*o.back, "via_bytes"), std::vector<SymbolId>{body->symbol})
+            << "a relocation naming the definition stays on its bytes: written against the default's record";
+        EXPECT_EQ(targetsOf(*o.back, "via_name"), std::vector<SymbolId>{row->symbol})
+            << "a reference through the row follows the name: written against the weak external";
+    }
+    {
+        SCOPED_TRACE("the document says an overridable definition is replaced whole");
+        auto const doc = peObjectDocument(
+            [](nlohmann::json& d) {
+                d["supersededDefinition"] = nlohmann::json::object({{"overridable", "replacedWhole"},
+                                                                    {"select-any", "replacedWhole"}});
+            },
+            "pe64-x86_64-windows, an overridable definition replaced whole");
+        ASSERT_NE(doc, nullptr);
+        PeObject o;
+        writePe(byRow(), o, doc);
+        ASSERT_FALSE(o.bytes.empty()) << diagnosticsOf(o.rep);
+        ASSERT_TRUE(o.back.has_value()) << diagnosticsOf(o.rep);
+        auto const* row = rowNamed(*o.back, "shared");
+        ASSERT_NE(row, nullptr);
+        EXPECT_EQ(targetsOf(*o.back, "via_bytes"), std::vector<SymbolId>{row->symbol})
+            << "where the definition goes with its name, so does a relocation that names it";
+        EXPECT_EQ(targetsOf(*o.back, "via_name"), std::vector<SymbolId>{row->symbol});
+    }
+    {
+        SCOPED_TRACE("the document does not say");
+        auto const doc = peObjectDocument(
+            [](nlohmann::json& d) {
+                d.erase("supersededDefinition");
+                d.erase("$supersededDefinitionComment");
+            },
+            "pe64-x86_64-windows, supersededDefinition removed");
+        ASSERT_NE(doc, nullptr);
+        PeObject o;
+        writePe(byRow(), o, doc);
+        EXPECT_TRUE(o.bytes.empty());
+        std::size_t refusals = 0;
+        for (auto const& d : o.rep.all()) {
+            if (d.code == DiagnosticCode::K_NoMatchingObjectFormat
+                && d.actual.find("'supersededDefinition'") != std::string::npos
+                && d.actual.find("'shared'") != std::string::npos) {
+                ++refusals;
+            }
+        }
+        EXPECT_EQ(refusals, 1u) << diagnosticsOf(o.rep);
+        // CONTROL: the same silent document writes the unit that references THROUGH its definition — the question
+        // never arises for it.
+        PeObject through;
+        writePe(firstNameWeak(true, WeakDefinitionKind::Overridable, true), through, doc);
+        EXPECT_FALSE(through.bytes.empty()) << diagnosticsOf(through.rep);
+    }
+}
+
+// AN OVERRIDABLE WEAK NAME OF A MODULE-PRIVATE BODY. The body's own name is `static`, so nothing external names its
+// bytes — and a weak external's default must be EXTERNAL (link.exe refuses a STATIC one, LNK1235, ✔MEASURED
+// 2026-10-08). The writer gives the body the default record all the same and names it from the weak external.
+// Until P69 this object was REFUSED ("an alias ... binds weak where ... binds local"). CONTROL: the same pair with no
+// kind stated still is — a COMDAT cannot give one body two policies, and nothing says to write it another way.
+TEST(WeakDefinitionKindsWriter, AnOverridableWeakNameOfAModulePrivateBodyTakesAnExternalDefault) {
+    auto const pair = [](std::optional<WeakDefinitionKind> kind) {
+        UnitOf u(1);
+        u.marker("anchor").datum("impl", SymbolBinding::Local, 7).alias("shared", "impl", SymbolBinding::Weak);
+        AssembledModule m           = u.build();
+        rowOf(m, "shared")->weakKind = kind;
+        return m;
+    };
+    {
+        PeObject o;
+        writePe(pair(WeakDefinitionKind::Overridable), o);
+        ASSERT_FALSE(o.bytes.empty()) << diagnosticsOf(o.rep);
+        EXPECT_EQ(o.rep.errorCount(), 0u) << diagnosticsOf(o.rep);
+        auto const names    = coffRecordsOf(o.records, "shared");
+        auto const defaults = coffRecordsOf(o.records, ".weak.shared.default.anchor");
+        ASSERT_EQ(names.size(), 1u);
+        ASSERT_EQ(defaults.size(), 1u);
+        EXPECT_TRUE(names[0]->weakExternal);
+        EXPECT_EQ(names[0]->defaultIndex, defaults[0]->index);
+        EXPECT_EQ(defaults[0]->storageClass, 2u) << "EXTERNAL, though the body's own name is module-private";
+        EXPECT_GT(defaults[0]->section, 0);
+        ASSERT_TRUE(o.back.has_value()) << diagnosticsOf(o.rep);
+        auto const* weakRow = definitionNamed(*o.back, "shared");
+        ASSERT_NE(weakRow, nullptr);
+        EXPECT_EQ(weakRow->weakKind, std::optional{WeakDefinitionKind::Overridable});
+    }
+    {
+        PeObject o;
+        writePe(pair(std::nullopt), o);
+        EXPECT_TRUE(o.bytes.empty()) << "CONTROL: with no kind stated the pair has no encoding and is refused";
+        bool named = false;
+        for (auto const& d : o.rep.all()) {
+            named = named || (d.code == DiagnosticCode::K_NoMatchingObjectFormat
+                              && d.actual.find("'shared' is an alias of") != std::string::npos);
+        }
+        EXPECT_TRUE(named) << diagnosticsOf(o.rep);
+    }
+}
+
+// ══ P69 fold 2, the pins that read REFERENCE-BUILT objects (`tests/link/data`) ══════════════════════════════════════
+
+namespace {
+
+// A reference-built object committed under `tests/link/data`; empty, and a failure, when it cannot be opened.
+[[nodiscard]] std::vector<std::uint8_t> referenceObject(char const* name) {
+    auto const    path = dss::test::repoRoot() / "tests" / "link" / "data" / name;
+    std::ifstream in{path, std::ios::binary};
+    if (!in.good()) {
+        ADD_FAILURE() << "cannot open " << path.string();
+        return {};
+    }
+    std::string const raw{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+    return std::vector<std::uint8_t>(raw.begin(), raw.end());
+}
+
+[[nodiscard]] RecordFamily const* recordFamilyLabelled(std::string_view label) {
+    for (auto const& rf : recordFamilies()) {
+        if (label == rf.fam.label) return &rf;
+    }
+    ADD_FAILURE() << "no family is labelled '" << label << "'";
+    return nullptr;
+}
+
+// What EVERY relocation of the function `m` defines as `fn` targets: the one id they agree on — nullopt when the
+// function has none or they disagree. (An ISA that reaches a datum with two instructions writes two relocations.)
+[[nodiscard]] std::optional<SymbolId> soleTargetOf(AssembledModule const& m, std::string const& fn) {
+    auto const targets = targetsOf(m, fn);
+    if (targets.empty()) return std::nullopt;
+    for (auto const& t : targets) {
+        if (t != targets[0]) return std::nullopt;
+    }
+    return targets[0];
+}
+
+// The first byte of the datum the relocations of `fn` reach in the unit `m`: the data item they target or — through
+// a reference row of a name — the definition of that name `m` itself holds.
+[[nodiscard]] std::optional<unsigned> byteReachedByEvery(AssembledModule const& m, std::string const& fn) {
+    auto at = soleTargetOf(m, fn);
+    if (!at.has_value()) return std::nullopt;
+    for (auto const& e : m.externImports) {
+        if (e.symbol != *at) continue;
+        auto const* def = definitionNamed(m, e.mangledName);
+        if (def == nullptr) return std::nullopt;
+        at = def->symbol;
+        break;
+    }
+    for (auto const& d : m.dataItems) {
+        if (d.symbol == *at && !d.bytes.empty()) return static_cast<unsigned>(d.bytes[0]);
+    }
+    return std::nullopt;
+}
+
+// A unit that defines `shared_l` (a datum of 9) and `shared_fl` (a function) STRONG, as its family's reader reads it.
+[[nodiscard]] std::optional<AssembledModule> overrideOfBothNames(RecordFamily const& rf, Loaded const& L,
+                                                                 std::uint32_t cu) {
+    AssembledModule m;
+    m.cuId = CompilationUnitId{cu};
+    AssembledData d;
+    d.symbol    = SymbolId{1};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {9, 0, 0, 0};
+    d.alignment = Alignment::of<4>();
+    m.dataItems.push_back(std::move(d));
+    AssembledFunction f;
+    f.symbol = SymbolId{2};
+    f.bytes  = rf.returns;
+    m.functions.push_back(std::move(f));
+    m.symbols.push_back(ModuleSymbol{SymbolId{1}, rf.fam.us + "shared_l", SymbolBinding::Global, SymbolVisibility::Default});
+    m.symbols.push_back(ModuleSymbol{SymbolId{2}, rf.fam.us + "shared_fl", SymbolBinding::Global, SymbolVisibility::Default});
+    m.expectedFuncCount = m.functions.size();
+    return asRead(rf.fam, L, m, cu);
+}
+
+}  // namespace
+
+// ══ THE WEAK-NAME RULE ON WHAT THE REFERENCE COMPILERS WRITE (P69 fold 2, the review of fold 1, MAJOR 1) ════════════
+//
+// D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME. Fold 1 pinned both halves of the rule on units DSS's own
+// writers wrote. These are the objects the rule is about: ONE source (`tests/link/data/weak_local_name.source.c`) —
+// a weak alias of a `static` body, a datum and a function, each referenced by its unit through BOTH names — as six
+// compilers wrote it. ✔MEASURED 2026-10-10, exit = read_direct_l * 10 + read_through_l + direct_fl * 10 +
+// call_through_fl under a `main` of the same compiler:
+//                                                                              alone   beside an override, either order
+//   weak_local_name_x86_64_elf_gcc.o     gcc 13.3.0, GNU ld 2.42                154     158      also through `ld -r`
+//   weak_local_name_x86_64_elf_clang.o   clang 18.1.3, GNU ld 2.42              154     158      also through `ld -r`
+//   weak_local_name_aarch64_elf_gcc.o    aarch64-linux-gnu-gcc 13.3.0           154     158      (qemu-aarch64 8.2.2)
+//   weak_local_name_aarch64_elf_clang.o  clang 18.1.3 --target=aarch64-linux-gnu 154    158      (qemu-aarch64 8.2.2)
+//   weak_local_name_x86_64_pe_mingw.o    MinGW gcc 13.2.0, GNU ld 2.42          154     158
+//   weak_local_name_x86_64_pe_clang.obj  clang 19.1.5; link.exe 14.44, lld-link 19.1.5   154   158
+// 154 is 7 through every name; 158 is 7 through the static names and 9 through the weak ones. DSS, BEFORE fold 2, on
+// the four ELF objects under its own `main` (`dsscp`, the same day): 154 alone and 198 beside the override — 9
+// through the STATIC names too, silently; the two COFF objects 154 / 158, as the references.
+//   md5: 023d1984cd18375397399e0293f2a085, f8722d1cd4887e0d56d4174a9e40f1cc, 684faee4ffe5738687f65f819e36e4fc,
+//        531648029ad53f2408fb4ea9821066d0, a33de4b2124c369d29cc7fb7349b4029, 22f875b98e860b3900105c92eef0820b
+//   (in the table's order; each object is the same bytes from its rebuild command, read twice).
+// No Mach-O object: Apple's clang refuses `alias`; that family's pair is assembler-written and pinned natively
+// (`WeakNameReferencesNative`).
+//   * THE READER: the weak name's row says its references are kept on the name (`referencedByName`), a reference row
+//     of the name exists, what is written through the weak name targets that row, and what is written through the
+//     static name — a relocation against the static symbol, or against its section — targets the BODY.
+//   * THE MERGE, off a relocatable link of each cell read back: through the static name the unit reaches ITS OWN
+//     bytes whoever won the weak name; through the weak name it reaches the name's winner.
+//   * THE IMAGE links in every cell (what it reads is the native suite's, where the program runs).
+TEST(WeakNameReferencesOnReferenceObjects, EachReaderStatesBothReferencesAndTheMergeKeepsThemApart) {
+    struct Fixture {
+        char const* file;
+        char const* family;
+    };
+    std::vector<Fixture> const fixtures{{"weak_local_name_x86_64_elf_gcc.o", "ELF x86_64"},
+                                        {"weak_local_name_x86_64_elf_clang.o", "ELF x86_64"},
+                                        {"weak_local_name_aarch64_elf_gcc.o", "ELF aarch64"},
+                                        {"weak_local_name_aarch64_elf_clang.o", "ELF aarch64"},
+                                        {"weak_local_name_x86_64_pe_mingw.o", "PE x86_64"},
+                                        {"weak_local_name_x86_64_pe_clang.obj", "PE x86_64"}};
+    struct Pair {
+        bool        datum;
+        char const* weak;
+        char const* direct;
+        char const* through;
+    };
+    std::vector<Pair> const pairs{{true, "shared_l", "read_direct_l", "read_through_l"},
+                                  {false, "shared_fl", "direct_fl", "call_through_fl"}};
+    for (auto const& fx : fixtures) {
+        SCOPED_TRACE(fx.file);
+        auto const* rf = recordFamilyLabelled(fx.family);
+        ASSERT_NE(rf, nullptr);
+        auto const L = load(rf->target, rf->fam.relocatable);
+        auto const X = load(rf->target, rf->fam.exec);
+        ASSERT_TRUE(L.target && L.format && X.format);
+        auto const bytes = referenceObject(fx.file);
+        ASSERT_FALSE(bytes.empty());
+
+        // THE READER.
+        {
+            DiagnosticReporter rep;
+            auto const         object = readObject(rf->fam, L, bytes, 1, rep);
+            ASSERT_TRUE(object.has_value()) << diagnosticsOf(rep);
+            for (auto const& p : pairs) {
+                SCOPED_TRACE(p.weak);
+                auto const* weakRow = definitionNamed(*object, p.weak);
+                ASSERT_NE(weakRow, nullptr) << "the weak name is a DEFINITION of the body";
+                EXPECT_EQ(weakRow->binding, SymbolBinding::Weak);
+                EXPECT_TRUE(weakRow->referencedByName)
+                    << "the row of a weak name the reader kept the references of must say so";
+                auto const* row = rowNamed(*object, p.weak);
+                ASSERT_NE(row, nullptr) << "a weak name keeps its reference whatever else names the body — here a "
+                                           "`static` name alone";
+                EXPECT_NE(row->symbol, weakRow->symbol) << "the row's id is the NAME's, which no body holds";
+                EXPECT_EQ(row->isData, p.datum);
+                EXPECT_EQ(soleTargetOf(*object, p.through), std::optional<SymbolId>{row->symbol})
+                    << "what the compiler wrote through the weak name keeps the name";
+                EXPECT_EQ(soleTargetOf(*object, p.direct), std::optional<SymbolId>{weakRow->symbol})
+                    << "what it wrote through the static name (the symbol, or its section) is left on the BODY";
+                // What that second relocation DOES is the link document's answer for the kind this row states: the
+                // measurements above are of formats that keep the bytes.
+                auto const answer = X.format->supersededDefinition().answerFor(weakRow->weakKind);
+                ASSERT_TRUE(answer.has_value()) << "the link's document must answer for the kind the row states";
+                EXPECT_EQ(*answer, SupersededDefinition::KeepsItsBytes);
+            }
+        }
+
+        // THE MERGE and THE IMAGE, cell by cell.
+        struct Cell {
+            char const* name;
+            bool        overridden;
+            bool        objectFirst;
+        };
+        for (auto const& cell : {Cell{"the object alone", false, true}, Cell{"the object, then an override", true, true},
+                                 Cell{"an override, then the object", true, false}}) {
+            SCOPED_TRACE(cell.name);
+            std::uint32_t const objectCu = (cell.overridden && !cell.objectFirst) ? 2u : 1u;
+            std::uint32_t const strongCu = objectCu == 1u ? 2u : 1u;
+            DiagnosticReporter  rep;
+            auto                unit = readObject(rf->fam, L, bytes, objectCu, rep);
+            ASSERT_TRUE(unit.has_value()) << diagnosticsOf(rep);
+            std::vector<AssembledModule> mods;
+            if (cell.overridden) {
+                auto strong = overrideOfBothNames(*rf, L, strongCu);
+                ASSERT_TRUE(strong.has_value());
+                mods.push_back(cell.objectFirst ? *unit : *strong);
+                mods.push_back(cell.objectFirst ? *strong : *unit);
+            } else {
+                mods.push_back(*unit);
+            }
+
+            auto const obj = linker::link(std::span<AssembledModule const>{mods}, *L.target, *L.format, rep);
+            ASSERT_TRUE(obj.ok()) << diagnosticsOf(rep);
+            auto const artifact = readObject(rf->fam, L, obj.bytes, 1, rep);
+            ASSERT_TRUE(artifact.has_value()) << diagnosticsOf(rep);
+            EXPECT_EQ(byteReachedByEvery(*artifact, "read_direct_l"), std::optional<unsigned>{7u})
+                << "through the static name the unit reads ITS OWN bytes, whoever won the weak name";
+            EXPECT_EQ(byteReachedByEvery(*artifact, "read_through_l"),
+                      std::optional<unsigned>{cell.overridden ? 9u : 7u})
+                << "through the weak name it reads the name's winner";
+            auto const directFn = soleTargetOf(*artifact, "direct_fl");
+            ASSERT_TRUE(directFn.has_value());
+            bool reachesAFunction = false;
+            for (auto const& f : artifact->functions) reachesAFunction = reachesAFunction || f.symbol == *directFn;
+            EXPECT_TRUE(reachesAFunction) << "through the static name the unit reaches a function body of the artifact";
+            if (cell.overridden) {
+                auto const* fnDef = definitionNamed(*artifact, "shared_fl");
+                ASSERT_NE(fnDef, nullptr);
+                EXPECT_EQ(fnDef->binding, SymbolBinding::Global) << "the strong definition won the name";
+                EXPECT_EQ(soleTargetOf(*artifact, "call_through_fl"), std::optional<SymbolId>{fnDef->symbol})
+                    << "the call through the weak name reaches the definition that won it";
+                EXPECT_NE(*directFn, fnDef->symbol)
+                    << "the relocation naming the static function must NOT have followed the weak name to the "
+                       "override";
+            }
+
+            auto        units    = mods;
+            auto&       pairUnit = units[cell.overridden && !cell.objectFirst ? 1u : 0u];
+            auto const* entry    = definitionNamed(pairUnit, "read_direct_l");
+            ASSERT_NE(entry, nullptr);
+            pairUnit.userEntrySymbol = entry->symbol;
+            DiagnosticReporter irep;
+            auto const img = linker::link(std::span<AssembledModule const>{units}, *L.target, *X.format, irep,
+                                          ImageRequest{.artifactFileName = "reference_pair_image"});
+            EXPECT_TRUE(img.ok()) << diagnosticsOf(irep);
+        }
+    }
+}
+
+// ══ THE LOSER OF A SECTION GROUP HAS NO BYTES TO KEEP (P69 fold 2, the review of fold 1, MAJOR 1) ═══════════════════
+//
+// D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME. "A superseded definition keeps its bytes" is ELF's answer
+// for a weak definition that loses its NAME. An ELF COMDAT GROUP that loses to another group of its signature is a
+// different thing: it is discarded, bytes and all. ✔MEASURED 2026-10-10 on the four fixtures below (GNU ld 2.42 and
+// ld.lld 18.1; exit = direct_g * 10 + through_g, a `main` built by gcc 13.3; the label object by both assemblers):
+//     the label object alone                              77
+//     the label object, then the copy                     77        (the label object's group is the one kept)
+//     the copy, then the label object                     REFUSED by both linkers ("defined in discarded section";
+//                                                         "relocation refers to a [symbol in a] discarded section")
+//     the label object beside the strong definition       79, either order   (a definition in NO group discards
+//                                                                             nothing: the bytes stay)
+// DSS reads a group's sections as ordinary ones and discards nothing, so the rule's second half alone would keep the
+// loser's bytes in the refused cell and link it (79). It refuses that cell BY NAME, at the relocation that asks for
+// the discarded bytes, and keeps the bytes — as measured — where the group is beside a definition in no group.
+// (DSS before fold 2, `dsscp`, the same day: 77, 77, 99, 99, 99 — the refused cell linked, and both "79" cells read
+// the other object's datum through the label.)
+// Fixtures (x86_64 ELF; each `elf_group_*.source.s` beside them is its source and states its rebuild command; each
+// object is the same bytes from that command):
+//     elf_group_label_x86_64_elf_gas.o    md5 77cd5a97bf25581ffc09103d79096e61   GNU as 2.42: the relocation names
+//                                                                               the label `impl_g`
+//     elf_group_label_x86_64_elf_clang.o  md5 976277dd4ea8f5ebaa2b18ec62e1634c   clang 18.1.3's assembler: it names
+//                                                                               the group's section symbol
+//     elf_group_copy_x86_64_elf_gas.o     md5 aab57c35997c5fb6ef186305d2506b9c   a second copy of the group, holding 9
+//     elf_group_strong_x86_64_elf_gas.o   md5 031d1c68730aa983dd8de1673bcd1c21   a strong `shared_g` in no group, 9
+// The label shape is hand-written: the gABI forbids a reference from outside a group to a local symbol of it, and no
+// compiler writes one. It is the one shape in which keeping and discarding differ in what a link DOES.
+
+namespace {
+
+// Every row of the body `name` names in `m` states the section group `signature`.
+void stateGroupOn(AssembledModule& m, std::string const& name, std::string const& signature) {
+    auto const* def = definitionNamed(m, name);
+    ASSERT_NE(def, nullptr) << name;
+    SymbolId const id = def->symbol;
+    for (auto& s : m.symbols) {
+        if (s.symbol == id) s.sectionGroup = signature;
+    }
+}
+
+[[nodiscard]] bool refusedForADiscardedGroup(DiagnosticReporter const& rep, std::string_view group,
+                                             std::size_t loser, std::size_t keeper) {
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_CrossCuMergeUnsupported
+            && d.actual.find("section group '" + std::string{group} + "'") != std::string::npos
+            && d.actual.find("linked unit #" + std::to_string(loser) + " names the BYTES") != std::string::npos
+            && d.actual.find("linked unit #" + std::to_string(keeper) + " carries too") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST(SectionGroupLosers, TheElfReaderStatesTheSignatureOfEveryGroupMember) {
+    auto const* rf = recordFamilyLabelled("ELF x86_64");
+    ASSERT_NE(rf, nullptr);
+    auto const L = load(rf->target, rf->fam.relocatable);
+    ASSERT_TRUE(L.target && L.format);
+    for (char const* file : {"elf_group_label_x86_64_elf_gas.o", "elf_group_label_x86_64_elf_clang.o"}) {
+        SCOPED_TRACE(file);
+        DiagnosticReporter rep;
+        auto const         object = readObject(rf->fam, L, referenceObject(file), 1, rep);
+        ASSERT_TRUE(object.has_value()) << diagnosticsOf(rep);
+        auto const* weakRow = definitionNamed(*object, "shared_g");
+        ASSERT_NE(weakRow, nullptr);
+        EXPECT_EQ(weakRow->binding, SymbolBinding::Weak);
+        EXPECT_TRUE(weakRow->referencedByName);
+        std::size_t members = 0;
+        for (auto const& s : object->symbols) {
+            if (s.symbol != weakRow->symbol) continue;
+            ++members;
+            EXPECT_EQ(s.sectionGroup, "shared_g") << "'" << s.name << "' is a name of the group's member";
+        }
+        EXPECT_GE(members, 1u);
+        for (char const* outside : {"direct_g", "through_g"}) {
+            auto const* fn = definitionNamed(*object, outside);
+            ASSERT_NE(fn, nullptr) << outside;
+            EXPECT_TRUE(fn->sectionGroup.empty()) << outside << " lies in `.text`, which is in no group";
+        }
+        // Both references, as the weak-name rule reads them: the one through the label is left on the BODY.
+        auto const* row = rowNamed(*object, "shared_g");
+        ASSERT_NE(row, nullptr);
+        EXPECT_EQ(soleTargetOf(*object, "through_g"), std::optional<SymbolId>{row->symbol});
+        EXPECT_EQ(soleTargetOf(*object, "direct_g"), std::optional<SymbolId>{weakRow->symbol});
+    }
+    {
+        DiagnosticReporter rep;
+        auto const copy = readObject(rf->fam, L, referenceObject("elf_group_copy_x86_64_elf_gas.o"), 1, rep);
+        ASSERT_TRUE(copy.has_value()) << diagnosticsOf(rep);
+        auto const* def = definitionNamed(*copy, "shared_g");
+        ASSERT_NE(def, nullptr);
+        EXPECT_EQ(def->sectionGroup, "shared_g");
+        auto const strong = readObject(rf->fam, L, referenceObject("elf_group_strong_x86_64_elf_gas.o"), 1, rep);
+        ASSERT_TRUE(strong.has_value()) << diagnosticsOf(rep);
+        for (auto const& s : strong->symbols) {
+            EXPECT_TRUE(s.sectionGroup.empty()) << "CONTROL: '" << s.name << "' of an object with no group";
+        }
+    }
+    // CONTROL: a unit DSS's own writer wrote states no group on any row — the writer writes none.
+    auto const own = asRead(rf->fam, L,
+                            weakNameOfABody(1, true, 7, "impl", SymbolBinding::Local, "shared", "direct", "through"), 1);
+    ASSERT_TRUE(own.has_value());
+    for (auto const& s : own->symbols) EXPECT_TRUE(s.sectionGroup.empty()) << s.name;
+}
+
+TEST(SectionGroupLosers, ARelocationNamingADiscardedGroupsBytesIsRefusedByNameAndAGroupBesideANonGroupKeepsThem) {
+    auto const* rf = recordFamilyLabelled("ELF x86_64");
+    ASSERT_NE(rf, nullptr);
+    auto const L = load(rf->target, rf->fam.relocatable);
+    auto const X = load(rf->target, rf->fam.exec);
+    ASSERT_TRUE(L.target && L.format && X.format);
+    enum class U { Label, Copy, Strong };
+    struct Cell {
+        char const*    name;
+        std::vector<U> units;     // in link order
+        bool           refused;
+        unsigned       direct, through;
+    };
+    std::vector<Cell> const cells{
+        {"the label object alone", {U::Label}, false, 7, 7},
+        {"the label object, then the copy", {U::Label, U::Copy}, false, 7, 7},
+        {"the copy, then the label object", {U::Copy, U::Label}, true, 0, 0},
+        {"the label object, then a strong definition in no group", {U::Label, U::Strong}, false, 7, 9},
+        {"a strong definition in no group, then the label object", {U::Strong, U::Label}, false, 7, 9}};
+    for (char const* label : {"elf_group_label_x86_64_elf_gas.o", "elf_group_label_x86_64_elf_clang.o"}) {
+        for (auto const& cell : cells) {
+            SCOPED_TRACE(std::string{label} + ": " + cell.name);
+            std::vector<AssembledModule> mods;
+            std::size_t                  labelAt = 0;
+            DiagnosticReporter           rrep;
+            for (std::size_t i = 0; i < cell.units.size(); ++i) {
+                char const* file = cell.units[i] == U::Label  ? label
+                                   : cell.units[i] == U::Copy ? "elf_group_copy_x86_64_elf_gas.o"
+                                                              : "elf_group_strong_x86_64_elf_gas.o";
+                auto read = readObject(rf->fam, L, referenceObject(file), static_cast<std::uint32_t>(i + 1), rrep);
+                ASSERT_TRUE(read.has_value()) << diagnosticsOf(rrep);
+                if (cell.units[i] == U::Label) labelAt = i;
+                mods.push_back(std::move(*read));
+            }
+
+            // The image.
+            {
+                auto        units = mods;
+                auto const* entry = definitionNamed(units[labelAt], "direct_g");
+                ASSERT_NE(entry, nullptr);
+                units[labelAt].userEntrySymbol = entry->symbol;
+                DiagnosticReporter rep;
+                auto const img = linker::link(std::span<AssembledModule const>{units}, *L.target, *X.format, rep,
+                                              ImageRequest{.artifactFileName = "group_loser_image"});
+                if (cell.refused) {
+                    EXPECT_FALSE(img.ok()) << "both reference linkers refuse this cell: the bytes the relocation "
+                                              "names were discarded with their group";
+                    EXPECT_TRUE(refusedForADiscardedGroup(rep, "shared_g", labelAt, 0)) << diagnosticsOf(rep);
+                } else {
+                    ASSERT_TRUE(img.ok()) << diagnosticsOf(rep);
+                    auto const d = valueReadBy(rf->fam, img.bytes, "direct_g");
+                    auto const t = valueReadBy(rf->fam, img.bytes, "through_g");
+                    ASSERT_TRUE(d.has_value() && t.has_value()) << "the image's reads could not be followed";
+                    EXPECT_EQ(*d, cell.direct) << "what `direct_g` reads through the label";
+                    EXPECT_EQ(*t, cell.through) << "what `through_g` reads through the weak name";
+                }
+            }
+            // The relocatable link is the same merge: it refuses the same cell and no other.
+            {
+                DiagnosticReporter rep;
+                auto const obj = linker::link(std::span<AssembledModule const>{mods}, *L.target, *L.format, rep);
+                EXPECT_EQ(obj.ok(), !cell.refused) << diagnosticsOf(rep);
+                EXPECT_EQ(refusedForADiscardedGroup(rep, "shared_g", labelAt, 0), cell.refused) << diagnosticsOf(rep);
+            }
+        }
+    }
+}
+
+// The same rule on hand-built units, a FUNCTION body as well as a datum, and the three ways a member is NOT behind
+// an earlier carrier: it is the first carrier itself, the earlier definition is in no group, the earlier group has
+// another signature.
+TEST(SectionGroupLosers, AMemberIsRefusedOnlyBehindAnEarlierCarrierOfItsOwnSignature) {
+    auto const* rf = recordFamilyLabelled("ELF x86_64");
+    ASSERT_NE(rf, nullptr);
+    auto const L = load(rf->target, rf->fam.relocatable);
+    ASSERT_TRUE(L.target && L.format);
+    for (bool const datum : {true, false}) {
+        auto const pairAt = [&](std::uint32_t cu) {
+            auto pair = asRead(rf->fam, L,
+                               weakNameOfABody(cu, datum, 7, "impl", SymbolBinding::Local, "shared", "direct", "through"),
+                               cu);
+            if (pair.has_value()) stateGroupOn(*pair, "shared", "sig");
+            return pair;
+        };
+        // A WEAK definition of the name alone, in the group `signature` (or in none).
+        auto const otherAt = [&](std::uint32_t cu, char const* signature) {
+            UnitOf u(cu);
+            if (datum) {
+                u.datum("shared", SymbolBinding::Weak, 9);
+            } else {
+                u.marker("shared", SymbolBinding::Weak);
+            }
+            auto other = asRead(rf->fam, L, u.build(), cu);
+            if (other.has_value() && signature != nullptr) stateGroupOn(*other, "shared", signature);
+            return other;
+        };
+        struct Cell {
+            char const* name;
+            bool        pairFirst;
+            char const* otherSignature;   // nullptr: the other definition is in no group
+            bool        refused;
+        };
+        for (auto const& cell :
+             {Cell{"behind a carrier of its signature", false, "sig", true},
+              Cell{"the first carrier of its signature", true, "sig", false},
+              Cell{"behind a definition in no group", false, nullptr, false},
+              Cell{"behind a group of another signature", false, "other-sig", false}}) {
+            SCOPED_TRACE(std::string{datum ? "a datum, " : "a function, "} + cell.name);
+            std::uint32_t const pairCu = cell.pairFirst ? 1u : 2u, otherCu = cell.pairFirst ? 2u : 1u;
+            auto                pair  = pairAt(pairCu);
+            auto                other = otherAt(otherCu, cell.otherSignature);
+            ASSERT_TRUE(pair.has_value() && other.has_value());
+            std::vector<AssembledModule> mods;
+            mods.push_back(cell.pairFirst ? *pair : *other);
+            mods.push_back(cell.pairFirst ? *other : *pair);
+            DiagnosticReporter rep;
+            auto const obj = linker::link(std::span<AssembledModule const>{mods}, *L.target, *L.format, rep);
+            EXPECT_EQ(obj.ok(), !cell.refused) << diagnosticsOf(rep);
+            EXPECT_EQ(refusedForADiscardedGroup(rep, "sig", 1, 0), cell.refused) << diagnosticsOf(rep);
+            if (!cell.refused && !cell.pairFirst && datum) {
+                // Not discarded: the unit still reads its own bytes through the body's own name.
+                DiagnosticReporter arep;
+                auto const artifact = readObject(rf->fam, L, obj.bytes, 1, arep);
+                ASSERT_TRUE(artifact.has_value()) << diagnosticsOf(arep);
+                EXPECT_EQ(byteReachedIn(*artifact, "direct"), std::optional<unsigned>{7u});
+                EXPECT_EQ(byteReachedIn(*artifact, "through"), std::optional<unsigned>{9u});
+            }
+        }
+    }
+}
+
+// ══ A DEFINITION IN A SECTION NO ROW NAMES (P69 fold 2; D-LK-COFF-READER-REFUSES-A-CUSTOM-NAMED-SECTION) ═════════════
+//
+// `__attribute__((section("dssdata"))) int dss_custom_datum = 42;` and a function that reads it, as clang 19.1.5
+// writes it for five targets (`tests/link/data/custom_section.source.c`, which states each rebuild command). Every
+// reference linker keeps such a section as its own. ✔MEASURED 2026-10-10 with `dsscp` under a DSS `main`:
+//     custom_section_x86_64_elf.o    md5 5ff331f54e32dcffee84be53b78c6939   LINKS and runs to 42
+//     custom_section_aarch64_elf.o   md5 49e42f369fa4bf88c63ddf39c942ff20   LINKS and runs to 42 (qemu-aarch64)
+//     custom_section_x86_64_pe.obj   md5 30d7b0c84a1281d7a37795b774953481   refused at read
+//     custom_section_x86_64_macho.o  md5 98a5859ee76f160b6a83dea0fa5a65e3   refused at read
+//     custom_section_arm64_macho.o   md5 b4ae340cee0c09a63d5ebfd60a682f33   refused at read
+// The ELF reader classifies a section no row names by its flags and carries the body. The COFF and Mach-O readers
+// have no row for it and refuse — until P69 as `F_CorruptedBinary`, which says the FILE is damaged; the object is
+// well-formed, and the refusal now has a code of its own that says what is true: DSS does not model the section.
+TEST(ObjectSectionsNoRowNames, EachReaderCarriesTheBodyOrRefusesItUnderACodeThatSaysWhy) {
+    struct Fixture {
+        char const* file;
+        char const* family;
+        char const* section;
+        char const* datum;
+        bool        carried;
+    };
+    std::vector<Fixture> const fixtures{
+        {"custom_section_x86_64_elf.o", "ELF x86_64", "dssdata", "dss_custom_datum", true},
+        {"custom_section_aarch64_elf.o", "ELF aarch64", "dssdata", "dss_custom_datum", true},
+        {"custom_section_x86_64_pe.obj", "PE x86_64", "dssdata", "dss_custom_datum", false},
+        {"custom_section_x86_64_macho.o", "Mach-O x86_64", "__DATA,dssdata", "_dss_custom_datum", false},
+        {"custom_section_arm64_macho.o", "Mach-O arm64", "__DATA,dssdata", "_dss_custom_datum", false}};
+    for (auto const& fx : fixtures) {
+        SCOPED_TRACE(fx.file);
+        auto const* rf = recordFamilyLabelled(fx.family);
+        ASSERT_NE(rf, nullptr);
+        auto const L = load(rf->target, rf->fam.relocatable);
+        ASSERT_TRUE(L.target && L.format);
+        auto const bytes = referenceObject(fx.file);
+        ASSERT_FALSE(bytes.empty());
+        DiagnosticReporter rep;
+        auto const         object = readObject(rf->fam, L, bytes, 1, rep);
+        if (fx.carried) {
+            ASSERT_TRUE(object.has_value()) << diagnosticsOf(rep);
+            auto const* def = definitionNamed(*object, fx.datum);
+            ASSERT_NE(def, nullptr);
+            bool held = false;
+            for (auto const& d : object->dataItems) {
+                held = held || (d.symbol == def->symbol && !d.bytes.empty() && d.bytes[0] == 42u);
+            }
+            EXPECT_TRUE(held) << "the body in the section no row names is carried with its bytes";
+            continue;
+        }
+        EXPECT_FALSE(object.has_value()) << "a body in a section this format's document has no row for is refused, "
+                                            "never read without its bytes";
+        bool said = false;
+        for (auto const& d : rep.all()) {
+            said = said
+                   || (d.code == DiagnosticCode::K_ObjectSectionNotModelled
+                       && d.actual.find(std::string{"'"} + fx.datum + "' lives in section '" + fx.section + "'")
+                              != std::string::npos
+                       && d.actual.find(std::string{"no row of format '"} + rf->fam.relocatable + "'")
+                              != std::string::npos);
+        }
+        EXPECT_TRUE(said) << "the refusal names the definition, its section and the document that has no row for it"
+                          << diagnosticsOf(rep);
+        EXPECT_FALSE(sawCode(rep, DiagnosticCode::F_CorruptedBinary))
+            << "the object is well-formed: it must not be refused as a damaged file" << diagnosticsOf(rep);
+    }
 }

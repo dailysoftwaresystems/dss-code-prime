@@ -3584,13 +3584,23 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     //     it reaches the same programs in every cell measured (✔MEASURED
     //     2026-10-08, GNU ld 2.42, x86_64 and aarch64: the two shapes above read
     //     the STRONG definition in every order, a weak definition never ending a
-    //     common's search there). The two orders part only where an archive holds
-    //     two STRONG definers of one name and a reference fetches the second: GNU
-    //     ld has by then fetched the first for the common and refuses the link
-    //     ("multiple definition"); this search answers the reference first, the
-    //     common yields to that member's definition, and the program links with
-    //     it — a link that works where a reference linker refuses, never a
-    //     different answer where one works.
+    //     common's search there). The two orders part in ONE shape, and it is
+    //     ✔MEASURED too (2026-10-08, the same linkers and ld.lld 18.1.3; a program
+    //     holding `c` as a common and a strong reference to `w`): against an
+    //     archive of m0 (`c`) then m15 (`w` and `c`) GNU ld fetches m0 for the
+    //     common, then m15 for the reference, and REFUSES ("multiple definition
+    //     of `c'"); this search answers the reference first, m15's `c` ends the
+    //     common's search, and the program links with m15 alone — the value
+    //     ld.lld, which links the cell, gives. A link that works where one
+    //     reference refuses, never a different answer where one works: in the
+    //     other member order, and against m1 (`w`) and m2 (`c` and `w`) in both
+    //     orders, the two give one answer — the REFUSAL of m1 then m2 included,
+    //     where the reference's member and the common's both define `w` (ld.lld
+    //     links that one, because it fetches nothing for a common; under this
+    //     format's `fetchDefinition` the program defines `w` twice, and it is
+    //     refused by name). Pinned by `ArchiveSearchRoundOrder` (every leg) and
+    //     `ArchiveSearchRoundOrderNative` (GNU ld on the Linux legs, Apple's ld
+    //     on the Mac), `tests/link/test_common_symbols.cpp`.
     auto const fetchDefinitionsForCommons = [&]() -> std::optional<bool> {
         bool              fetched  = false;
         std::size_t const roundEnd = commonNames.size();
@@ -4163,12 +4173,17 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
             linkFormat, memberFormat, objectPath,
             objectPath.filename().string(), reporter);
         if (!object_mod) return std::nullopt;   // read fail-loud already reported
-        // P69 send-back 5 (review-xa4 MINOR 3): an object NAMED to the link keeps
-        // its `/ENTRY:`, and the entry's name is a reference the archive search
-        // answers (`linker::requireEntryReference`). An image link decides it; a
-        // relocatable artifact hands the directive on and decides nothing.
-        if (linkFormat.isImageFlavor()) linker::requireEntryReference(*object_mod);
         objects.push_back(std::move(*object_mod));
+    }
+    // P69 send-back 5 (review-xa4 MINOR 3): an object NAMED to the link keeps
+    // its `/ENTRY:`, and the entry's name is a reference the archive search
+    // answers (`linker::requireEntryReference`). An image link decides it; a
+    // relocatable artifact hands the directive on and decides nothing. Asked
+    // of the named objects TOGETHER, once all are read (P69 fold 2): only the
+    // entry that stands among them is a reference — a later object's dropped
+    // `/ENTRY:` requires nothing, as under link.exe.
+    if (linkFormat.isImageFlavor()) {
+        linker::requireEntryReference(std::span<AssembledModule>{objects});
     }
     return objects;
 }

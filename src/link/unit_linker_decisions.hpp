@@ -8,6 +8,7 @@
 #include "link/object_format_schema.hpp"
 
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -101,6 +102,22 @@ DSS_EXPORT void dropPulledMemberEntryRequests(UnitLinkerRequests& requests);
 // nothing defines is refused by name as any required reference is. A member the
 // archive search itself pulls names no entry (`dropPulledMemberEntryRequests`)
 // and is never handed here.
+//
+// ONLY THE ENTRY THAT STANDS (the review of fold 1, NIT 6; ✔MEASURED 2026-10-10,
+// link.exe 14.44.35228 on clang 19.1.5 objects and on the committed cl
+// fixtures): of two named objects that each state an `/ENTRY:`, the first
+// stands, the later is dropped with a warning (LNK4258) and requires NOTHING —
+// its symbol, defined only by an archive member, is not fetched, and defined
+// nowhere the link still stands and runs. (lld-link 19.1.5 requires every
+// stated entry and refuses that link; one a reference runs is one DSS links.)
+// So the units named to the link are handed here TOGETHER, in their order, and
+// the request that stands is found by the precedence each request's own
+// vocabulary row states — as `decideUnitLinkerRequests` later finds it for the
+// image — before anything is required. Making each stating unit's entry a
+// required reference as it was read, which this function did until fold 2,
+// refused a link link.exe runs.
+DSS_EXPORT void requireEntryReference(std::span<AssembledModule> namedUnits);
+// One unit named to the link alone: the same rule, among the entries it states.
 DSS_EXPORT void requireEntryReference(AssembledModule& unit);
 
 }  // namespace dss::linker

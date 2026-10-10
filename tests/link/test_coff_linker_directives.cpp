@@ -425,6 +425,39 @@ TEST(CoffLinkerDirectives, TheWriterStatesEveryRequestTheReaderReadsBack) {
     EXPECT_NE(wide.error().find("past the 2^13"), std::string::npos) << wide.error();
 }
 
+// ONE request as a relocatable artifact hands it on (`UnitLinkerRequests::handOn`): the writer's text for it without
+// the separator that begins every token of a list — or WHY there is none, in words that are true of the case. Until
+// P69 fold 2 the COFF reader's two sites that need a token tested the text themselves and said "its spelling is
+// empty" of ANY text that was not one token.
+TEST(CoffLinkerDirectives, OneRequestIsHandedOnAsOneTokenOrRefusedInWordsTrueOfIt) {
+    auto const& v = shippedVocabulary();
+    std::vector<std::string> const one{"helper"};
+    auto const hide = pe::coffDirectiveToken(pe::CoffDirectiveStatements{one, {}, {}, {}}, v);
+    ASSERT_TRUE(hide.has_value()) << hide.error();
+    EXPECT_EQ(*hide, "-exclude-symbols:helper") << "the token, with no separator before it";
+    auto const include = pe::coffDirectiveToken(pe::CoffDirectiveStatements{{}, one, {}, {}}, v);
+    ASSERT_TRUE(include.has_value()) << include.error();
+    EXPECT_EQ(*include, "-include:helper");
+    // Nothing stated: said as that.
+    auto const nothing = pe::coffDirectiveToken(pe::CoffDirectiveStatements{}, v);
+    ASSERT_FALSE(nothing.has_value());
+    EXPECT_NE(nothing.error().find("states no request"), std::string::npos) << nothing.error();
+    // Two requests are not ONE token: said as that, with the text they spell.
+    std::vector<std::string> const two{"a", "b"};
+    auto const pair = pe::coffDirectiveToken(pe::CoffDirectiveStatements{two, {}, {}, {}}, v);
+    ASSERT_FALSE(pair.has_value());
+    EXPECT_NE(pair.error().find("not ONE directive token"), std::string::npos) << pair.error();
+    EXPECT_NE(pair.error().find("-exclude-symbols:a -exclude-symbols:b"), std::string::npos) << pair.error();
+    // A name the grammar cannot spell: the writer's own reason, unchanged.
+    std::vector<std::string> const bad{"a,b"};
+    auto const refused = pe::coffDirectiveToken(pe::CoffDirectiveStatements{bad, {}, {}, {}}, v);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_NE(refused.error().find("cannot be spelled"), std::string::npos) << refused.error();
+    for (std::string const* said : {&nothing.error(), &pair.error(), &refused.error()}) {
+        EXPECT_EQ(said->find("its spelling is empty"), std::string::npos) << *said;
+    }
+}
+
 // link.exe's alignment for a common no `-aligncomm:` names (✔MEASURED 2026-10-06, run 20261006-225314-2e577758).
 TEST(CoffLinkerDirectives, ACommonsNaturalAlignmentIsLinkExes) {
     std::pair<std::uint64_t, std::uint64_t> const kMeasured[] = {

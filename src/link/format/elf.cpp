@@ -4540,7 +4540,44 @@ encode(AssembledModule const&    module,
     // (D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS) — an image's
     // `.symtab` resolves nothing and is read by debuggers. Built once from
     // `module` for O(1) per-symbol lookup below.
-    link::format::ObjectSymbolNames const objNames{module};
+    // WHERE THE RECORD OF A WEAK NAME STANDS (THE WEAK-NAME RULE's second half,
+    // `ObjectSymbolNames`). A RELOCATABLE object that holds a body under a weak
+    // name its unit references by row has to say which of the two a relocation
+    // naming that body means, and that follows from what this format's linkers
+    // do with a superseded definition — the document's `supersededDefinition`,
+    // never this writer's opinion: where the bytes are kept they get a record
+    // of their own, so that the object's final linker keeps a relocation
+    // against it on these bytes whoever wins the name. An image re-links
+    // nothing and keeps the one record.
+    std::unordered_set<std::uint32_t> bytesUnderTheirOwnRecord;
+    if (!isExec) {
+        SupersededDefinitionStatement const& superseded = fmt.supersededDefinition();
+        for (ModuleSymbol const* weakName :
+             link::format::ObjectSymbolNames::bodiesUnderAWeakNameReferencedByRow(module)) {
+            auto const answer = superseded.answerFor(weakName->weakKind);
+            if (!answer.has_value()) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("elf::encode (ET_REL): '{}' is a weak definition its unit "
+                                 "references by name. Whether a relocation that names the "
+                                 "definition itself stays on its bytes when another "
+                                 "definition wins the name, or goes to the winner with the "
+                                 "name, decides whether those bytes need a record of their "
+                                 "own, and that is format '{}''s 'supersededDefinition', "
+                                 "which {} -- refusing rather than guess one.",
+                                 weakName->name, fmt.name(),
+                                 superseded.stated()
+                                     ? "it states per kind of weak definition, while this "
+                                       "definition states no kind"
+                                     : "it does not state"));
+                return {};
+            }
+            if (*answer == SupersededDefinition::KeepsItsBytes) {
+                bytesUnderTheirOwnRecord.insert(weakName->symbol.v);
+            }
+        }
+    }
+    link::format::ObjectSymbolNames const objNames{module,
+                                                   std::move(bytesUnderTheirOwnRecord)};
 
     // Helper: emit one Elf64_Sym record (24 bytes).
     auto appendSym = [&](std::uint32_t nameOff, std::uint8_t info,

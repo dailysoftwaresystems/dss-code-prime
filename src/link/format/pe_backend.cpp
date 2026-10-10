@@ -86,8 +86,14 @@ constexpr StackReserveVehicle kPeVehicles[] = {
 // BACKEND'S FORMATS: `pe64-x86_64-windows` and `-staticlib` declare the
 // dialect, `-exec` and `-dll` declare none, because the image arm emits no
 // COMDAT. This span answers only "can this walker spell it".
+//
+// P69: AND `weak-external`, the format's other mechanism — the body under an
+// external default record plus the weak name as a weak external naming it
+// (`pe.cpp`, THE WEAK-EXTERNAL ARM). Which kind of weak definition takes which
+// is the document's (`weakDefinition.byKind`).
 constexpr WeakDefinitionDialect kPeWeakDialects[] = {
     WeakDefinitionDialect::Comdat,
+    WeakDefinitionDialect::WeakExternal,
 };
 
 // ── `pe.linkerDirectives` — the COFF linker-directive vocabulary (P69) ───────

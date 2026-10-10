@@ -386,14 +386,20 @@ DSS_CHECK_ENUM_NAME_TABLE(kArchiveCommonResolutionTable);
 //     both link orders);
 //   * `anyDefinition` — a weak definition replaces it as a strong one does:
 //     Mach-O, a weak definition being an `N_WEAK_DEF` (✔MEASURED 2026-10-07, Apple
-//     clang 21's ld-1267 and ld64-957.1, arm64 and x86_64, both link orders), and
-//     PE, a weak definition being a COMDAT select-any (✔MEASURED 2026-10-07,
-//     link.exe 14.44 and lld-link 19.1.5 on cl 19.44's objects, both orders).
-// The answer is for the weak definitions a format SPELLS as its own
-// (`weakDefinition`) and for DSS's own; a definition whose spelling yields to a
-// common regardless — a COFF weak external's body, MinGW gcc's
-// `__attribute__((weak))`, which GNU ld's PE linker gives the common's value
-// (✔MEASURED 2026-10-07) — says so on its symbol (`ModuleSymbol::yieldsToACommon`).
+//     clang 21's ld-1267 and ld64-957.1, arm64 and x86_64, both link orders);
+//   * `nonOverridableDefinition` — the format has TWO kinds of weak definition
+//     (`WeakDefinitionKind`) and the common stands BETWEEN them: PE. A SELECT-ANY
+//     one, a COMDAT section, replaces the common as a strong definition does
+//     (✔MEASURED 2026-10-07, link.exe 14.44 and lld-link 19.1.5 on cl 19.44's
+//     objects, both orders); an OVERRIDABLE one, a weak external whose default is
+//     a body — MinGW gcc's and clang's `__attribute__((weak))` — yields to it,
+//     the common being a definition that is present (✔MEASURED 2026-10-07, GNU ld
+//     2.42's PE linker: the common's value). And because the common stands
+//     between them, the select-any kind outranks the overridable one as well,
+//     whatever the link order (✔MEASURED 2026-10-08, the three linkers; the
+//     cross-unit fold's rank, `linker::weakDefinitionRank`). A definition that
+//     states no kind (`ModuleSymbol::weakKind` empty: DSS's own until its units
+//     state one) is not overridable.
 // The archive search asks the same question of a member
 // (`ArchiveCommonResolution::FetchDefinition`), so the member it fetches is one
 // whose definition the link then lets win. A document that states neither
@@ -404,13 +410,145 @@ DSS_CHECK_ENUM_NAME_TABLE(kArchiveCommonResolutionTable);
 enum class CommonYieldsTo : std::uint8_t {
     StrongDefinition,
     AnyDefinition,
+    NonOverridableDefinition,
 };
 
-inline constexpr EnumNameTable<CommonYieldsTo, 2> kCommonYieldsToTable{{{
-    { CommonYieldsTo::StrongDefinition, "strongDefinition" },
-    { CommonYieldsTo::AnyDefinition,    "anyDefinition"    },
+inline constexpr EnumNameTable<CommonYieldsTo, 3> kCommonYieldsToTable{{{
+    { CommonYieldsTo::StrongDefinition,         "strongDefinition"         },
+    { CommonYieldsTo::AnyDefinition,            "anyDefinition"            },
+    { CommonYieldsTo::NonOverridableDefinition, "nonOverridableDefinition" },
 }}};
 DSS_CHECK_ENUM_NAME_TABLE(kCommonYieldsToTable);
+
+// ★★★ WHAT BECOMES OF A DEFINITION WHOSE NAME ANOTHER DEFINITION WINS — a FORMAT
+// fact, the root key `supersededDefinition` (P69 fold 2, the review of fold 1;
+// D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME), stated by every
+// document that describes relocations: the ones a link resolves units for (an
+// image, a relocatable artifact) and the ones a relocatable object is written
+// with.
+// A weak definition that is overridden — or outranked by a common, or the later
+// of two — is SUPERSEDED: every reference written through its NAME goes to the
+// winner, under every linker measured (THE WEAK-NAME RULE,
+// `link/format/object_atom_coverage.hpp`). The linkers split on what the
+// definition's own BYTES are afterwards, and with it on what a relocation means
+// that its object wrote through a module-private name of the definition, or
+// through its section. TWO ANSWERS:
+//   * `keepsItsBytes` — the name moves and nothing else does. The bytes stay in
+//     their input section, and a relocation that names them stays on them.
+//   * `replacedWhole` — the definition is replaced with every label it carries,
+//     so such a relocation reaches the winner as the name does.
+// A DOCUMENT STATES ONE FOR EVERY DEFINITION, OR ONE PER KIND OF WEAK DEFINITION
+// (`WeakDefinitionKind`, `core/types/symbol_attrs.hpp`):
+//     "supersededDefinition": "replacedWhole"
+//     "supersededDefinition": { "overridable": "keepsItsBytes",
+//                               "select-any":  "replacedWhole" }
+// The second form is keyed by the kinds' own names, every one of them, and it is
+// for a format that spells the two kinds differently and whose linkers treat
+// them differently. Nothing in shared code knows which kind keeps what: a reader
+// of the key hands the statement the definition's own kind
+// (`ModuleSymbol::weakKind`) and takes the document's answer
+// (`SupersededDefinitionStatement::answerFor`). Under a per-kind statement a
+// definition that states NO kind has no answer, and is refused by name like an
+// unstated key — the document was asked about a definition it says nothing of.
+// (Until the takeover of 2026-10-10 the staged form had a THIRD value,
+// `replacedUnlessOverridable`, whose meaning lived here as knowledge of which
+// kind keeps its bytes. The answer is a fact of the format AND the kind — Mach-O
+// replaces an overridable weak definition whole where ELF and PE keep its bytes
+// — so the document says it per kind, and the engine reads.)
+// ✔MEASURED, each answer on its format's reference linkers:
+//   * ELF, `keepsItsBytes`. 2026-10-08 — `static int impl = 7;` under a weak
+//     alias `shared`, beside `int shared = 9;`: the object's own read of `impl`
+//     gives 7 and its read of `shared` 9, under GNU ld 2.42 and ld.lld 18.1 (gcc
+//     13.3 and clang 18.1 objects, both orders, through `ld -r`); beside a
+//     common of the name instead, 7 and 0. That is ELF's `STB_WEAK`, the only
+//     weak definition this link's ELF reader reads. ELF's OTHER mechanism is the
+//     COMDAT GROUP, whose loser is DISCARDED with every section of the group
+//     (✔MEASURED 2026-10-10, GNU ld 2.42 and ld.lld 18.1.3 on gas's and clang's
+//     objects: a relocation from outside the group against a non-external
+//     symbol of the losing copy is REFUSED by both — "defined in discarded
+//     section", "relocation refers to a discarded section" — and a group that
+//     is the only copy keeps its bytes beside a strong definition of its name,
+//     7 and 9, exactly as a plain weak definition does).
+//   * Mach-O, `replacedWhole`. 2026-10-08 — a pair Apple's assembler wrote
+//     (`_impl` non-external and `_shared` a `.weak_definition` at one address):
+//     9 and 9 under ld-1267 (arm64 and x86_64) and ld64-957.1, both orders and
+//     through `ld -r`. It is NOT a consequence of the object's sections being
+//     divisible: an object that does not declare MH_SUBSECTIONS_VIA_SYMBOLS —
+//     whose section is a unit this link keeps whole (`InputSectionPlacement`) —
+//     still answers 9 and 9 for a datum under ld64-957.1, and ld-1267 refuses
+//     that pair as a duplicate symbol. Which is why this is a key of its own and
+//     not read off whether a unit's members are kept.
+//   * PE/COFF, PER KIND. 2026-10-08.
+//       - `overridable`: `keepsItsBytes`. The definition is the default of a
+//         WEAK EXTERNAL: the name defers to another and the default's section is
+//         nobody's to discard. With the external default name gcc and clang
+//         write (`.weak.<name>.<unique>`) the body is not superseded at all — it
+//         holds a name of its own — and the same source as above reads 7 and 9
+//         under GNU ld 2.42 (MinGW gcc 13.2), link.exe 14.44 and lld-link 19.1.5
+//         (clang 19.1.5). With that default's record made STATIC (no compiler
+//         writes it; clang's object, one byte changed) lld-link reads 7 and 9 in
+//         every cell, link.exe reads 7 and 9 where the override comes first and
+//         refuses the object otherwise (LNK1235), and GNU ld reads 7 and 9
+//         beside the override.
+//       - `select-any`: `replacedWhole`. The definition is a COMDAT, one of
+//         several copies, and the loser's SECTION is discarded with every label
+//         in it. What a relocation from a kept section against a non-external
+//         label of the discarded one, or against its section symbol, then
+//         reaches: under GNU ld 2.42 the kept copy for a function (9 and 9) and
+//         garbage for a datum; under link.exe 14.44 garbage for a datum and a
+//         crashing program for a function; lld-link 19.1.5 refuses the link
+//         ("relocation against symbol in discarded section"). The one cell that
+//         WORKS answers the winner, and so does this link, for a function and a
+//         datum alike — which is also what it did before the key existed.
+// A document that does not state it leaves a link to REFUSE the moment the
+// question arises — a relocation naming a superseded definition whose unit
+// references the lost name by row (`ModuleSymbol::referencedByName`) — and a
+// relocatable object's writer the moment it holds a body under such a weak name,
+// each naming this key, rather than guess a meaning the families disagree on.
+// Read by `linker::mergeModules` (`link/linker.cpp`) and by the ELF relocatable
+// writer (`link/format/elf.cpp`, `ObjectSymbolNames`).
+enum class SupersededDefinition : std::uint8_t {
+    KeepsItsBytes,
+    ReplacedWhole,
+};
+
+inline constexpr EnumNameTable<SupersededDefinition, 2> kSupersededDefinitionTable{{{
+    { SupersededDefinition::KeepsItsBytes, "keepsItsBytes" },
+    { SupersededDefinition::ReplacedWhole, "replacedWhole" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kSupersededDefinitionTable);
+
+// WHAT ONE DOCUMENT STATES OF IT: nothing, one answer for every definition, or
+// one answer per kind of weak definition. The ONE place a reader of the key
+// gets its answer from, so that no reader spells the per-kind lookup — or a
+// default for a kind the document left out — for itself.
+struct SupersededDefinitionStatement {
+    // The string form: the answer whatever the definition's kind.
+    std::optional<SupersededDefinition> forEveryDefinition;
+    // The object form: an answer per kind, in the document's order. The loader
+    // requires every kind of `kWeakDefinitionKindTable` exactly once.
+    std::vector<std::pair<WeakDefinitionKind, SupersededDefinition>> byKind;
+
+    [[nodiscard]] bool stated() const noexcept {
+        return forEveryDefinition.has_value() || !byKind.empty();
+    }
+    [[nodiscard]] bool perKind() const noexcept { return !byKind.empty(); }
+
+    // The document's answer for a superseded definition of `kind` — what the
+    // definition's own row states (`ModuleSymbol::weakKind`), empty where its
+    // producer's form has one spelling for every weak definition. nullopt: the
+    // document does not say — it states nothing, or it states an answer per
+    // kind and this definition states none.
+    [[nodiscard]] std::optional<SupersededDefinition>
+    answerFor(std::optional<WeakDefinitionKind> kind) const noexcept {
+        if (forEveryDefinition.has_value()) return forEveryDefinition;
+        if (!kind.has_value()) return std::nullopt;
+        for (auto const& [of, answer] : byKind) {
+            if (of == *kind) return answer;
+        }
+        return std::nullopt;
+    }
+};
 
 // ★★★ WHAT A PC-RELATIVE, NON-BRANCH REFERENCE TO AN IMPORT MEANS IN AN IMAGE —
 // a FORMAT fact, the root key `pcRelativeImportAddress` (P69 review M1 case (c)
@@ -2260,6 +2398,12 @@ struct DSS_EXPORT ObjectFormatData {
     // weak definition of its name; refused on an ARCHIVE document (`validate()`),
     // whose members are each linked alone.
     std::optional<CommonYieldsTo> commonYieldsTo;
+    // What becomes of a definition whose name another definition wins (the
+    // `supersededDefinition` root key — see `SupersededDefinition`). OPTIONAL:
+    // unstated, a link refuses when a relocation names such a definition, and a
+    // relocatable object's writer when it holds a body under a weak name its
+    // unit references by row.
+    SupersededDefinitionStatement supersededDefinition;
 
     // Sections row (D-LK4-2). The walker reads sections by
     // SectionKind; `name`/`type`/`flags`/`addrAlign`/`entrySize`
@@ -2901,6 +3045,20 @@ struct DSS_EXPORT ObjectFormatData {
     // definition rather than state part of what an image needs; it states all
     // of it now, so they moved to the first.
     std::optional<WeakDefinition> weakDefinition;
+    // P69 (`weakDefinition.byKind` in the JSON): the dialect of each KIND of
+    // weak definition that does NOT take the block's `dialect`, keyed by the
+    // kinds' own names (`kWeakDefinitionKindTable`). Empty for a format with
+    // one spelling. PE's relocatable documents state `overridable:
+    // weak-external` — what MinGW gcc and clang write for
+    // `__attribute__((weak))`, the format's second mechanism, with a duplicate
+    // rule of its own (`WeakDefinitionDialect::WeakExternal`). `dialect` stays
+    // the answer for a kind with no entry AND for a definition that states no
+    // kind (`ModuleSymbol::weakKind` empty: DSS's own until its units state
+    // one), so nothing a document said before P69 changes meaning. Held beside
+    // the block rather than in it because `WeakDefinition` is one field by
+    // design (one property per field); meaningless without the block, and
+    // `validate()` refuses entries beside an absent one.
+    std::vector<std::pair<WeakDefinitionKind, WeakDefinitionDialect>> weakDefinitionByKind;
 
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
     //
@@ -3217,6 +3375,17 @@ public:
     // the archive search, so the two cannot disagree.
     [[nodiscard]] std::optional<CommonYieldsTo> commonYieldsTo() const noexcept {
         return d_.commonYieldsTo;
+    }
+
+    // What this document states of a definition whose name another definition
+    // wins (`supersededDefinition`): nothing, one answer, or one per kind of
+    // weak definition — asked through `SupersededDefinitionStatement::answerFor`.
+    // Read from the document of the LINK by the merge, and from the document a
+    // relocatable object is written with by its writer, so a relocation that
+    // names a superseded definition's bytes means one thing in both.
+    [[nodiscard]] SupersededDefinitionStatement const&
+    supersededDefinition() const noexcept {
+        return d_.supersededDefinition;
     }
 
     [[nodiscard]] ObjectFormatRelocationInfo const*
@@ -3800,6 +3969,35 @@ public:
     [[nodiscard]] std::optional<WeakDefinition>
     weakDefinition() const noexcept {
         return d_.weakDefinition;
+    }
+    // The dialect a weak definition of this KIND is spelled in: the kind's own
+    // entry of `weakDefinition.byKind`, else the block's `dialect`; nullopt
+    // when the format has not answered at all. What a walker asks PER
+    // DEFINITION, with the kind the definition's unit stated — a declared
+    // spelling, never a format identity.
+    [[nodiscard]] std::optional<WeakDefinitionDialect>
+    weakDefinitionDialectFor(std::optional<WeakDefinitionKind> kind) const noexcept {
+        if (!d_.weakDefinition.has_value()) return std::nullopt;
+        if (kind.has_value()) {
+            for (auto const& [of, dialect] : d_.weakDefinitionByKind) {
+                if (of == *kind) return dialect;
+            }
+        }
+        return d_.weakDefinition->dialect;
+    }
+    // Every dialect this format can answer with, the block's own first, each
+    // once. Empty when it has not answered.
+    [[nodiscard]] std::vector<WeakDefinitionDialect>
+    weakDefinitionDialectsStated() const {
+        std::vector<WeakDefinitionDialect> out;
+        if (!d_.weakDefinition.has_value()) return out;
+        out.push_back(d_.weakDefinition->dialect);
+        for (auto const& [of, dialect] : d_.weakDefinitionByKind) {
+            bool seen = false;
+            for (WeakDefinitionDialect const d : out) seen = seen || d == dialect;
+            if (!seen) out.push_back(dialect);
+        }
+        return out;
     }
 
     // ── D-LK2-RODATA producer-data-section capability gate ─────

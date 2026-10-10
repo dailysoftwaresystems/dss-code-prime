@@ -37,7 +37,11 @@
 // holds (a gap or padding atom, the reference row of a weak name, a directive's
 // row) come after it, from ONE counter. Every reader states its ids through
 // this class; the ELF reader too, whose record 0 names nothing, so that
-// nothing of an ELF object moves.
+// nothing of an ELF object moves. A pass that mints on the unit AFTER the read
+// (the link's, for an entry a directive names or a name handed to a common)
+// continues that counter: it asks the taken-id scan
+// (`link/fresh_symbol_ids.hpp`), which reads every id this class gave — a
+// record that became a symbol ROW and nothing else included.
 //
 // ★ WHY NOT `index + 1` FOR EVERY RECORD. A site that forgot that rule would
 // mint the NEIGHBOUR record's id: a reference bound to the wrong symbol, which

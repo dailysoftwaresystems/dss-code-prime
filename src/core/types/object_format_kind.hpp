@@ -1553,22 +1553,35 @@ struct DSS_EXPORT StackReserveControl {
 //     IMAGE_SCN_LNK_COMDAT whose Selection byte is IMAGE_COMDAT_SELECT_ANY
 //     ("any section that defines the same COMDAT symbol can be linked; the
 //     rest are removed"). ✔The published PE/COFF format, "COMDAT Sections
-//     (Object Only)". NOT `IMAGE_SYM_CLASS_WEAK_EXTERNAL`, which is a weak
-//     REFERENCE with a fallback alias and serves the separate ALIAS path —
-//     see `pe.cpp`'s weak-definition block for the measured reference
-//     encodings that fix this choice.
+//     (Object Only)". `IMAGE_SYM_CLASS_WEAK_EXTERNAL`, a name with a
+//     fallback, is the format's OTHER spelling (`weak-external`, below) and
+//     a different mechanism — see `pe.cpp`'s weak-definition block for the
+//     measured reference encodings.
 //   * `symbol-binding` (ELF): the weakness lives in the symbol's BINDING
 //     field — `STB_WEAK` in the high nibble of `st_info`. No section flag is
 //     involved (`elf.cpp`, `stbForBinding`).
 //   * `symbol-flag` (Mach-O): the weakness lives in a per-symbol FLAG bit
 //     ALONGSIDE an ordinary binding — `N_WEAK_DEF` (0x0080) in the nlist's
 //     `n_desc`, on a symbol that is otherwise `N_SECT|N_EXT` (`macho.cpp`).
+//   * `weak-external` (PE/COFF, P69): the weakness lives in a SECOND RECORD.
+//     The body is an ordinary external definition under a default name of its
+//     own, and the weak name is an `IMAGE_SYM_CLASS_WEAK_EXTERNAL` record
+//     whose Auxiliary Format 3 names that default: "use this unless another
+//     definition of the name is linked". It is how MinGW gcc and clang spell
+//     `__attribute__((weak))` on COFF, and a different MECHANISM from
+//     `comdat`, with a different duplicate rule (✔MEASURED 2026-10-10,
+//     link.exe 14.44 and lld-link 19.1.5: it yields to a strong definition
+//     and to a select-any one, where a COMDAT beside a strong definition is a
+//     duplicate; two of them for one name conflict, where two COMDATs
+//     coalesce). WHICH KIND of weak definition takes which dialect is the
+//     document's (`weakDefinition.byKind`, read through
+//     `ObjectFormatSchema::weakDefinitionDialectFor`), never this enum's.
 //
-// ★ WHY ALL THREE SHIP AS VOCABULARY. Each names an encoder that EXISTS in
+// ★ WHY EVERY ONE SHIPS AS VOCABULARY. Each names an encoder that EXISTS in
 // this tree today, so none is a verb shipped ahead of its walker arm (the
 // `StackReserveVehicle` discipline).
 //
-// ★★ ALL THREE ARE NOW CONSULTED BY THE WALKER THAT WRITES THEM
+// ★★ EACH IS CONSULTED BY THE WALKER THAT WRITES IT
 // ([[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]],
 // cycle P28). The shared gate is `link/format/weak_definition_gate.hpp`, called
 // once by `pe::encode`'s Obj arm, once by `elf::encode`, and once by
@@ -1601,13 +1614,15 @@ enum class WeakDefinitionDialect : std::uint8_t {
     Comdat        = 1,  // COFF: IMAGE_SCN_LNK_COMDAT + IMAGE_COMDAT_SELECT_ANY
     SymbolBinding = 2,  // ELF: STB_WEAK in st_info
     SymbolFlag    = 3,  // Mach-O: N_WEAK_DEF (0x0080) in n_desc
+    WeakExternal  = 4,  // COFF: IMAGE_SYM_CLASS_WEAK_EXTERNAL naming a default
 };
 
-inline constexpr EnumNameTable<WeakDefinitionDialect, 3>
+inline constexpr EnumNameTable<WeakDefinitionDialect, 4>
 kWeakDefinitionDialectTable{{{
     { WeakDefinitionDialect::Comdat,        "comdat"         },
     { WeakDefinitionDialect::SymbolBinding, "symbol-binding" },
     { WeakDefinitionDialect::SymbolFlag,    "symbol-flag"    },
+    { WeakDefinitionDialect::WeakExternal,  "weak-external"  },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -1626,6 +1641,7 @@ weakDefinitionDialectName(WeakDefinitionDialect d) noexcept {
         case WeakDefinitionDialect::Comdat:
         case WeakDefinitionDialect::SymbolBinding:
         case WeakDefinitionDialect::SymbolFlag:
+        case WeakDefinitionDialect::WeakExternal:
             break;
     }
     return kWeakDefinitionDialectTable.nameOrEmpty(d);   // NOT .name()

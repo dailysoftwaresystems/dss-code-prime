@@ -1170,46 +1170,107 @@ TEST(ObjectAtomCoverage, SharedAliasRuleRefusesEqualOffsetWithConflictingExtents
 // D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME. The QUESTION on its
 // own, and the readers' half of the bookkeeping, in the neutral coordinates the
 // three readers and the merge ask it in. What the answer does to a link -- an
-// override reached, a common, an artifact's record -- is pinned where links are
-// made (`test_common_symbols.cpp`, the `WeakNameReferences` suites).
+// override reached, a common, an artifact's record, the bytes a unit's own
+// relocation stays on -- is pinned where links are made
+// (`test_common_symbols.cpp`, the `WeakNameReferences` suites).
 
-TEST(ObjectAtomCoverage, AWeakNameKeepsItsNameOnlyBesideAnotherExternalName) {
-    using dss::link::format::AtomName;
-    using dss::link::format::weakNamesBesideAnotherExternalName;
+TEST(ObjectAtomCoverage, AReferenceThroughAWeakNameFollowsTheNameWhateverElseNamesTheBody) {
+    using namespace dss::link::format;
 
-    std::vector<AtomName> const names = {
-        {1, SymbolBinding::Global, "other"},        //  0 a strong name is never the kept one
-        {1, SymbolBinding::Weak, "shared"},         //  1 KEPT: weak, beside a strong name
-        {2, SymbolBinding::Weak, "alone"},          //  2 a body's only name: the atom folds whole
-        {3, SymbolBinding::Local, "ltmp0"},         //  3
-        {3, SymbolBinding::Weak, "beside_local"},   //  4 a Local name is no external name
-        {4, SymbolBinding::Weak, "a"},              //  5 KEPT: two weak names of one body,
-        {4, SymbolBinding::Weak, "b"},              //  6 KEPT: each beside the other
-        {5, SymbolBinding::Weak, "twice"},          //  7 one name described twice is one name
-        {5, SymbolBinding::Weak, "twice"},          //  8
-        {6, SymbolBinding::Weak, ""},               //  9 no name recorded
-        {6, SymbolBinding::Global, "named"},        // 10
-        {7, SymbolBinding::Global, "g1"},           // 11 two strong names: neither is weak
-        {7, SymbolBinding::Global, "g2"},           // 12
-        {8, SymbolBinding::Weak, "beside_unnamed"}, // 13 an unnamed row is no other name
-        {8, SymbolBinding::Global, ""},             // 14
+    // THE QUESTION: for every WEAK name that has a spelling, and for no other.
+    EXPECT_TRUE(referenceFollowsTheName(SymbolBinding::Weak, "shared"));
+    EXPECT_FALSE(referenceFollowsTheName(SymbolBinding::Global, "other"))
+        << "a strong name can only ever denote its own body";
+    EXPECT_FALSE(referenceFollowsTheName(SymbolBinding::Local, "ltmp0")) << "a module-private name is no link name";
+    EXPECT_FALSE(referenceFollowsTheName(SymbolBinding::Weak, "")) << "no name recorded: nothing to keep";
+    static_assert(referenceFollowsTheName(SymbolBinding::Weak, "w"), "the question is a constant expression");
+
+    // ASKED OF AN OBJECT'S SYMBOLS, the answer never depends on what ELSE names
+    // the body. Until the review of cycle P69's first fold it did: a weak name
+    // kept its references only "beside another EXTERNAL name", so `alone` and
+    // `beside_local` below were bound to the body at read time -- and a
+    // relocation written through a static name of that body then had no way to
+    // mean the BYTES apart from the name (the measurements at THE WEAK-NAME RULE).
+    struct Named {
+        std::uint64_t offset;
+        std::uint32_t record;
+        char const*   name;
+        SymbolBinding binding;
+        bool          kept;
     };
-    std::vector<bool> const expected = {false, true,  false, false, false, true,  true, false,
-                                        false, false, false, false, false, false, false};
-    EXPECT_EQ(weakNamesBesideAnotherExternalName(names), expected);
+    std::vector<Named> const names = {
+        {0, 1, "other", SymbolBinding::Global, false},        // a strong name is never the kept one
+        {0, 2, "shared", SymbolBinding::Weak, true},          // weak, beside a strong name
+        {16, 3, "alone", SymbolBinding::Weak, true},          // a body's ONLY name
+        {32, 4, "ltmp0", SymbolBinding::Local, false},        // a module-private name is never kept ...
+        {32, 5, "beside_local", SymbolBinding::Weak, true},   // ... and the weak name beside it is
+        {48, 6, "a", SymbolBinding::Weak, true},              // two weak names of one body:
+        {48, 7, "b", SymbolBinding::Weak, true},              // each keeps its own
+        {64, 8, "g1", SymbolBinding::Global, false},          // two strong names: neither is weak
+        {64, 9, "g2", SymbolBinding::Global, false},
+    };
+    for (bool const reversed : {false, true}) {
+        SCOPED_TRACE(reversed ? "staged in reverse" : "staged in order");
+        std::vector<AtomStartCandidate> c;
+        for (auto const& n : names) c.push_back(cand(1, n.offset, n.record, n.name, n.binding));
+        // The answer is a property of each symbol, never of the order the
+        // symbols were staged in.
+        if (reversed) std::reverse(c.begin(), c.end());
+        std::vector<std::uint32_t> owner;
+        DiagnosticReporter         rep;
+        ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
+        RecordSymbolIds    ids{100};
+        WeakNameReferences refs;
+        refs.decideFrom(c, owner, ids);
+        for (auto const& n : names) {
+            EXPECT_EQ(refs.referenceFor(n.record, ids).has_value(), n.kept) << "'" << n.name << "'";
+        }
 
-    // The answer is a property of the SET of names an atom carries, never of
-    // the order they were staged in: the same names reversed.
-    std::vector<AtomName> const reversed(names.rbegin(), names.rend());
-    std::vector<bool> const expectedReversed(expected.rbegin(), expected.rend());
-    EXPECT_EQ(weakNamesBesideAnotherExternalName(reversed), expectedReversed);
+        // THE ROWS SAY SO (`ModuleSymbol::referencedByName`). Filed as a reader
+        // files them -- every name of a body under the id of the symbol that
+        // owns it -- each row of a kept name is stated, and no other: not a
+        // strong or a module-private name of the same body, and not a weak row
+        // the class decided nothing for (a symbol that starts no atom, here
+        // `sizeless`), whose references it left where they were.
+        std::vector<ModuleSymbol> rows;
+        for (std::size_t i = 0; i < c.size(); ++i) {
+            rows.push_back(ModuleSymbol{ids.of(owner[i]), std::string{c[i].name}, c[i].binding,
+                                        SymbolVisibility::Default});
+        }
+        rows.push_back(ModuleSymbol{SymbolId{50}, "sizeless", SymbolBinding::Weak, SymbolVisibility::Default});
+        for (auto const& row : rows) ASSERT_FALSE(row.referencedByName) << "the PREMISE: a row is born unstated";
+        refs.stateOn(rows);
+        for (auto const& row : rows) {
+            bool kept = false;
+            for (auto const& n : names) kept = kept || (n.kept && row.name == n.name);
+            EXPECT_EQ(row.referencedByName, kept) << "the row '" << row.name << "'";
+        }
+    }
 
-    // Atoms are told apart by identity alone: the same two names on two
-    // DIFFERENT atoms are two single-named bodies.
-    std::vector<AtomName> const apart = {{1, SymbolBinding::Global, "other"},
-                                         {2, SymbolBinding::Weak, "shared"}};
-    EXPECT_EQ(weakNamesBesideAnotherExternalName(apart), (std::vector<bool>{false, false}));
-    EXPECT_TRUE(weakNamesBesideAnotherExternalName({}).empty());
+    // A weak name with no spelling keeps nothing, and says nothing.
+    {
+        std::vector<AtomStartCandidate> const c = {cand(1, 0, 1, "", SymbolBinding::Weak),
+                                                   cand(1, 0, 2, "named", SymbolBinding::Global)};
+        std::vector<std::uint32_t> owner;
+        DiagnosticReporter         rep;
+        ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
+        RecordSymbolIds    ids{100};
+        WeakNameReferences refs;
+        refs.decideFrom(c, owner, ids);
+        EXPECT_FALSE(refs.referenceFor(1, ids).has_value());
+        EXPECT_FALSE(refs.referenceFor(2, ids).has_value());
+    }
+
+    // An object with no symbol at all: nothing kept, and nothing to state.
+    {
+        RecordSymbolIds           ids{0};
+        WeakNameReferences        refs;
+        std::vector<ModuleSymbol> rows;
+        refs.decideFrom({}, {}, ids);
+        refs.stateOn(rows);
+        EXPECT_FALSE(refs.referenceFor(0, ids).has_value());
+        EXPECT_TRUE(rows.empty());
+    }
 }
 
 TEST(ObjectAtomCoverage, AKeptWeakNameGetsOneReferenceRowUnderAnIdNoBodyHolds) {
@@ -1241,7 +1302,6 @@ TEST(ObjectAtomCoverage, AKeptWeakNameGetsOneReferenceRowUnderAnIdNoBodyHolds) {
         return peek.fresh();
     };
     EXPECT_FALSE(refs.referenceFor(5, ids).has_value()) << "a strong name keeps the alias remap";
-    EXPECT_FALSE(refs.referenceFor(7, ids).has_value()) << "a body's only name needs no row";
     EXPECT_FALSE(refs.referenceFor(44, ids).has_value()) << "a symbol that starts no atom";
 
     // A weak name the alias rule took the atom FROM: its own id is free, so the
@@ -1274,6 +1334,24 @@ TEST(ObjectAtomCoverage, AKeptWeakNameGetsOneReferenceRowUnderAnIdNoBodyHolds) {
     EXPECT_EQ(w2->id, SymbolId{3});
     EXPECT_EQ(w2->atom, SymbolId{2});
     EXPECT_EQ(nextFresh(), SymbolId{102});
+
+    // A weak name that is its body's ONLY name owns the atom as `w1` does: its
+    // row takes the next id no symbol holds, and the body keeps the symbol's own
+    // -- so a relocation the object wrote through the section, or through a
+    // static name of that body, can name the BYTES apart from the name (P69
+    // fold 2: until then such a name stated no row, and nothing could).
+    auto const lone = refs.referenceFor(7, ids);
+    ASSERT_TRUE(lone.has_value());
+    EXPECT_TRUE(lone->fresh);
+    EXPECT_EQ(lone->id, SymbolId{102});
+    EXPECT_EQ(lone->atom, SymbolId{7});
+    EXPECT_EQ(lone->name, "lone");
+    EXPECT_EQ(nextFresh(), SymbolId{103});
+    auto const loneAgain = refs.referenceFor(7, ids);
+    ASSERT_TRUE(loneAgain.has_value());
+    EXPECT_FALSE(loneAgain->fresh) << "ONE row per name";
+    EXPECT_EQ(loneAgain->id, SymbolId{102});
+    EXPECT_EQ(nextFresh(), SymbolId{103});
 
     // The row states the name and what its body IS, read off the sliced atoms:
     // a data item of that id is a datum (thread-local by its section), anything

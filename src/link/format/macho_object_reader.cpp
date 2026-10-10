@@ -1184,13 +1184,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // data kind must NEVER be silently dropped to a bodiless
                 // ModuleSymbol (the "never a silent partial reconstruction"
                 // contract) -- fail loud so the shape is recovered (a new
-                // schema row) rather than mis-linked to an empty def.
-                return fail(DiagnosticCode::F_CorruptedBinary,
+                // schema row) rather than mis-linked to an empty def. Under a
+                // code of its own (P69): the object is not corrupt, DSS does
+                // not model the section.
+                return fail(DiagnosticCode::K_ObjectSectionNotModelled,
                     "macho::readRelocatableObject: defined symbol '"
                     + defs[k].name + "' lives in section '" + sec.segName + ","
                     + sec.sectName + "' which resolves to no known code/data "
-                    "section kind -- refusing to silently drop a body (add the "
-                    "section's kind to the format schema).");
+                    "section kind: no row of format '"
+                    + std::string{objectFormatSchema.name()} + "' names that "
+                    "section. The object is well-formed; DSS does not carry a "
+                    "section its format document has no row for, and refuses "
+                    "rather than drop the body.");
             }
 
             // A data object -> an AssembledData item. File-backed sections
@@ -1230,6 +1235,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // Every canonical row is now recorded, so the aliases can follow: several
     // names, one SymbolId, the owning name first (see (6.44)).
     for (auto& ms : aliasRows) mod.symbols.push_back(std::move(ms));
+    // THE WEAK-NAME RULE, stated on the rows: each weak name this object's
+    // relocations are kept on says so (`ModuleSymbol::referencedByName`), which
+    // is what makes a relocation left on its atom a reference to the BYTES.
+    weakNames.stateOn(mod.symbols);
 
     // -- (6.5) Coverage guard: no defined symbol's body was dropped -------
     //
@@ -1521,11 +1530,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
 
             // THE WEAK-NAME RULE (`object_atom_coverage.hpp`): a relocation
-            // written through a WEAK name of a body that has another external
-            // name keeps the NAME -- a plain reference row the link resolves by
-            // name, to an override where one is linked and to this very body
-            // otherwise -- instead of the atom (6.44) chose for it. The addend
-            // is the name's own: the name sits at the atom's start.
+            // written through a WEAK name keeps the NAME, whatever else names
+            // the body -- a plain reference row the link resolves by name, to an
+            // override where one is linked and to this very body otherwise --
+            // instead of the atom (6.44) chose for it. What this pass leaves on
+            // an atom is then a reference to its BYTES: one written through a
+            // static name of the body, or through its section. The addend is
+            // the name's own: the name sits at the atom's start.
             if (auto const weakName = weakNames.referenceFor(rSymNum, symbolIds)) {
                 if (weakName->fresh) {
                     mod.externImports.push_back(

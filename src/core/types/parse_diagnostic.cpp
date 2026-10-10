@@ -628,6 +628,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_LinkerDirectiveIgnored";
         case DiagnosticCode::K_CommonSymbolUnallocatable:
             return "K_CommonSymbolUnallocatable";
+        case DiagnosticCode::K_ObjectSectionNotModelled:
+            return "K_ObjectSectionNotModelled";
         case DiagnosticCode::K_ExternImportAttributeConflict:
             return "K_ExternImportAttributeConflict";
         case DiagnosticCode::K_FormatLacksProcessExit:

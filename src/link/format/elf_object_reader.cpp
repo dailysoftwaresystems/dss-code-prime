@@ -55,6 +55,8 @@ constexpr std::uint32_t kShtSymtab = 2;
 constexpr std::uint32_t kShtStrtab = 3;
 constexpr std::uint32_t kShtRela   = 4;
 constexpr std::uint32_t kShtNobits = 8;
+constexpr std::uint32_t kShtGroup  = 17;   // SHT_GROUP: a flag word, then its member sections' indices
+constexpr std::uint32_t kGrpComdat = 0x1;  // GRP_COMDAT: one of several groups of a signature is kept
 
 // Elf64 sh_flags bits (gABI 4.8) -- the FALLBACK section-kind signal for a
 // section NAME the format schema does not declare (the -ffunction-sections /
@@ -972,14 +974,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             allocated && sy.size > 0
             && (type == kSttObject || type == kSttNoType);
         if (isRuntimeBody) {
-            return fail(DiagnosticCode::F_CorruptedBinary,
+            // Under a code of its own (P69): the object is not corrupt, DSS
+            // does not model the section.
+            return fail(DiagnosticCode::K_ObjectSectionNotModelled,
                 "elf::readRelocatableObject: defined symbol '" + sy.name
                 + "' (an allocated " + std::to_string(sy.size)
                 + "-byte body in section '" + sec.name + "', sh_flags="
                 + std::to_string(sec.flags)
-                + ") resolves to no known code/data section kind -- refusing to "
-                  "silently drop a code/data body. Add the section's kind (a "
-                  "format schema row or a resolveSectionKind arm).");
+                + ") resolves to no known code/data section kind: no row of "
+                  "format '" + std::string{objectFormatSchema.name()}
+                + "' names that section. The object is well-formed; DSS does "
+                  "not carry a section its format document has no row for, "
+                  "and refuses rather than drop the body.");
         }
         stageBodiless();   // self-gates on a RESOLVED kind (see above)
         pushModuleSym();
@@ -1009,6 +1015,75 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
     for (auto& ms : aliasRows) mod.symbols.push_back(std::move(ms));
+    // THE WEAK-NAME RULE, stated on the rows: each weak name this object's
+    // relocations are kept on says so (`ModuleSymbol::referencedByName`), which
+    // is what makes a relocation left on its atom a reference to the BYTES.
+    weakNames.stateOn(mod.symbols);
+
+    // SECTION GROUPS (P69 fold 2): every definition whose section is a member of
+    // a COMDAT group says under which SIGNATURE (`ModuleSymbol::sectionGroup`).
+    // This reader still carries a group's sections as ordinary ones and discards
+    // nothing; the signature is stated so that the link can refuse the one thing
+    // it would otherwise answer wrongly — keeping bytes a group's loser does not
+    // have (`linker.cpp`, `supersededInADiscardedGroup`). `SHT_GROUP` is a flag
+    // word followed by the member sections' indices, and `sh_info` is the
+    // signature's symbol-table index; only a `GRP_COMDAT` group is one of
+    // several that a link keeps one of. A signature that is a section symbol is
+    // named by its section; one with no name at all can match no other group
+    // and states nothing.
+    {
+        std::unordered_map<std::uint16_t, std::string> signatureOfSection;
+        for (std::uint16_t g = 0; g < eShnum; ++g) {
+            Shdr const& group = secs[g];
+            if (group.type != kShtGroup) continue;
+            if (group.size < 4u || group.size % 4u != 0u) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: section group #" + std::to_string(g)
+                    + " is " + std::to_string(group.size)
+                    + " bytes, which is not a flag word followed by 4-byte section indices.");
+            }
+            std::size_t const at = static_cast<std::size_t>(group.offset);
+            if ((rdU32(bytes, at) & kGrpComdat) == 0u) continue;
+            if (group.info >= numSyms) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: section group #" + std::to_string(g)
+                    + " names symbol #" + std::to_string(group.info)
+                    + " as its signature, and the symbol table has "
+                    + std::to_string(numSyms) + " records.");
+            }
+            Sym const&  signatureSym = syms[group.info];
+            std::string signature    = signatureSym.name;
+            if (signature.empty() && signatureSym.shndx != kShnUndef
+                && signatureSym.shndx < eShnum) {
+                signature = secs[signatureSym.shndx].name;
+            }
+            for (std::uint64_t k = 4; k < group.size; k += 4) {
+                std::uint32_t const member = rdU32(bytes, at + static_cast<std::size_t>(k));
+                if (member == 0u || member >= eShnum) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "elf::readRelocatableObject: section group #" + std::to_string(g)
+                        + " lists section #" + std::to_string(member)
+                        + " as a member, and the object has "
+                        + std::to_string(eShnum) + " sections.");
+                }
+                if (!signature.empty()) {
+                    signatureOfSection.emplace(static_cast<std::uint16_t>(member), signature);
+                }
+            }
+        }
+        if (!signatureOfSection.empty()) {
+            std::unordered_map<std::uint32_t, std::string const*> signatureOfId;
+            for (std::size_t i = 0; i < numSyms; ++i) {
+                auto const it = signatureOfSection.find(syms[i].shndx);
+                if (it == signatureOfSection.end()) continue;
+                signatureOfId.emplace(symbolIds.of(static_cast<std::uint32_t>(i)).v, &it->second);
+            }
+            for (ModuleSymbol& ms : mod.symbols) {
+                auto const it = signatureOfId.find(ms.symbol.v);
+                if (it != signatureOfId.end()) ms.sectionGroup = *it->second;
+            }
+        }
+    }
 
     // MEDIUM guard: overlapping STT_FUNC (st_value,st_size) ranges within one
     // section -- a relocation site inside the overlap would mis-route to
@@ -1470,11 +1545,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 }
             }
             // THE WEAK-NAME RULE (`object_atom_coverage.hpp`): a relocation
-            // written through a WEAK name of a body that has another external
-            // name keeps the NAME -- a plain reference row the link resolves by
-            // name, to an override where one is linked and to this very body
-            // otherwise -- instead of the atom (6.44) chose for it. The addend
-            // is the name's own: the name sits at the atom's start.
+            // written through a WEAK name keeps the NAME, whatever else names
+            // the body -- a plain reference row the link resolves by name, to an
+            // override where one is linked and to this very body otherwise --
+            // instead of the atom (6.44) chose for it. What this pass leaves on
+            // an atom is then a reference to its BYTES: one written through a
+            // static name of the body, or through its section. The addend is
+            // the name's own: the name sits at the atom's start.
             if (auto const weakName = weakNames.referenceFor(symIdx, symbolIds)) {
                 if (weakName->fresh) {
                     mod.externImports.push_back(

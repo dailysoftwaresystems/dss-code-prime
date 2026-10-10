@@ -10,6 +10,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // Shared symbol-NAMING substrate for the object/image writers — the ONE owner of
@@ -91,11 +92,83 @@ namespace dss::link::format {
 
 class ObjectSymbolNames {
 public:
-    explicit ObjectSymbolNames(AssembledModule const& module) {
+    // ── WHERE THE RECORD OF A WEAK NAME STANDS (P69 fold 2) ───────────────────
+    //    D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME
+    //
+    // A definition whose FIRST name is WEAK and referenced by name
+    // (`ModuleSymbol::referencedByName`: every weak name an object reader read)
+    // is two things a relocation can mean: the NAME, which a later link may give
+    // to another definition, and the BYTES, which a relocation written through a
+    // `static` name of the body or through its section names. Whether a linker
+    // tells the two apart is the FORMAT's (`supersededDefinition`), and the
+    // writer of a RELOCATABLE object asks its own document of each such
+    // definition (`bodiesUnderAWeakNameReferencedByRow` lists them; the
+    // document answers for the definition's own kind,
+    // `SupersededDefinitionStatement::answerFor`):
+    //   * the weak name's record IS the record of the bytes — a relocation
+    //     naming the definition is written against the weak name. Every image
+    //     (nothing re-links one); a definition its format's linkers replace
+    //     whole when it is superseded, for which the two meanings are one; and
+    //     every writer until P69.
+    //   * the bytes take a RECORD OF THEIR OWN — the ids a writer hands this
+    //     class (`bytesUnderTheirOwnRecord`): a module-private record
+    //     (`<prefix><id>`, Local), with the weak name an extra name at the same
+    //     address. A relocation naming the definition is then written against
+    //     the private record, one naming the weak name's reference row against
+    //     the weak record. What gcc and clang write for a weak alias of a
+    //     `static`, and what `ld -r` hands on (✔MEASURED 2026-10-08, GNU ld 2.42
+    //     and ld.lld 18.1: the artifact of such an object, linked beside an
+    //     override, still reads its own bytes through the static name — 7 — and
+    //     the override through the weak one — 9). A definition its format's
+    //     linkers leave in place when it is superseded: the ELF relocatable
+    //     writer asks for it.
+    // A weak first name the unit references THROUGH THE DEFINITION (a unit DSS
+    // compiled: `referencedByName` false) is never listed: there the relocation
+    // means the name, and the weak name's record is the record of the bytes.
+
+    // The first row of every definition of `module` whose FIRST name is a weak
+    // name its unit references by row, in table order — the definitions for
+    // which a relocatable object's writer has to know where the weak name's
+    // record stands, and so the moment its document must say what its format's
+    // linkers do with a superseded definition.
+    [[nodiscard]] static std::vector<ModuleSymbol const*>
+    bodiesUnderAWeakNameReferencedByRow(AssembledModule const& module) {
+        std::vector<ModuleSymbol const*>  found;
+        std::unordered_set<std::uint32_t> seen;
+        seen.reserve(module.symbols.size());
+        for (ModuleSymbol const& ms : module.symbols) {
+            if (!seen.insert(ms.symbol.v).second) continue;   // a later name of the body
+            if (ms.referencedByName && ms.binding == SymbolBinding::Weak && !ms.name.empty()) {
+                found.push_back(&ms);
+            }
+        }
+        return found;
+    }
+
+    // `bytesUnderTheirOwnRecord`: the ids (of `bodiesUnderAWeakNameReferencedByRow`)
+    // whose bytes take a record of their own, the weak name beside it. Empty —
+    // the default — for every writer that has no such definition to place.
+    explicit ObjectSymbolNames(AssembledModule const&            module,
+                               std::unordered_set<std::uint32_t> bytesUnderTheirOwnRecord = {})
+        : bytesUnderTheirOwnRecord_(std::move(bytesUnderTheirOwnRecord)) {
         definedBySym_.reserve(module.symbols.size());
         for (ModuleSymbol const& ms : module.symbols) {
             auto const [it, fresh] = definedBySym_.emplace(ms.symbol.v, &ms);
-            if (fresh) continue;
+            if (fresh) {
+                if (bytesUnderTheirOwnRecord_.contains(ms.symbol.v)) {
+                    if (hasExternalLinkage(ms)) {
+                        // The bytes take the fallback record (`definedName` and
+                        // its two companions below); this name is the first of
+                        // the extra names at that address.
+                        aliasesBySym_[ms.symbol.v].push_back(&ms);
+                    } else {
+                        // No name to put beside the bytes: the fallback record
+                        // is all such a definition ever had.
+                        bytesUnderTheirOwnRecord_.erase(ms.symbol.v);
+                    }
+                }
+                continue;
+            }
             // A SECOND (third, …) row for one SymbolId is an ALIAS: one atom,
             // several names. See `definedAliases` for what qualifies and why
             // the canonical row is the first one.
@@ -177,7 +250,9 @@ public:
     [[nodiscard]] std::string
     definedName(SymbolId id, std::string_view internalPrefix) const {
         if (auto const it = definedBySym_.find(id.v); it != definedBySym_.end()) {
-            if (hasExternalLinkage(*it->second)) return it->second->name;
+            if (hasExternalLinkage(*it->second) && !bytesUnderTheirOwnRecord_.contains(id.v)) {
+                return it->second->name;
+            }
         }
         return std::string{internalPrefix} + std::to_string(id.v);
     }
@@ -246,7 +321,7 @@ public:
     [[nodiscard]] SymbolBinding
     definedBinding(SymbolId id) const {
         if (auto const it = definedBySym_.find(id.v); it != definedBySym_.end()) {
-            if (hasExternalLinkage(*it->second)) {
+            if (hasExternalLinkage(*it->second) && !bytesUnderTheirOwnRecord_.contains(id.v)) {
                 return it->second->binding;  // Global or Weak
             }
         }
@@ -292,7 +367,7 @@ public:
     [[nodiscard]] SymbolVisibility
     definedVisibility(SymbolId id) const {
         if (auto const it = definedBySym_.find(id.v); it != definedBySym_.end()) {
-            if (hasExternalLinkage(*it->second)) {
+            if (hasExternalLinkage(*it->second) && !bytesUnderTheirOwnRecord_.contains(id.v)) {
                 return it->second->visibility;
             }
         }
@@ -433,15 +508,18 @@ private:
     std::unordered_map<std::uint32_t, std::vector<ModuleSymbol const*>>
         aliasesBySym_;
     std::unordered_map<std::uint32_t, ExternImport const*> externBySym_;
+    // The ids whose bytes take the fallback record while their weak first name
+    // is an extra name beside it (the constructor's `bytesUnderTheirOwnRecord`).
+    std::unordered_set<std::uint32_t> bytesUnderTheirOwnRecord_;
 };
 
 // ── A REFERENCE TO A NAME ITS OWN MODULE DEFINES ───────────────────────────
 //    D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME
 //
 // An object reader states a plain reference row for a relocation its object
-// writes through a WEAK name of a body that has another external name (THE
-// WEAK-NAME RULE, `object_atom_coverage.hpp`), so such a row names a definition
-// of the SAME module. An image resolves it by name like any other reference;
+// writes through a WEAK name (THE WEAK-NAME RULE, `object_atom_coverage.hpp`),
+// so such a row names a definition of the SAME module. An image resolves it by
+// name like any other reference;
 // the three predicates below are what the link and the object writers read of
 // that shape.
 

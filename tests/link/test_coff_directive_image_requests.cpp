@@ -31,6 +31,7 @@
 #include "link/format/coff_linker_directives.hpp"
 #include "link/format/coff_object_reader.hpp"
 #include "link/format/pe.hpp"
+#include "link/fresh_symbol_ids.hpp"
 #include "link/image_request.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
@@ -1287,6 +1288,169 @@ TEST(CoffDirectiveImageRequests, AnEntryANamedObjectDoesNotDefineIsARequiredRefe
     EXPECT_TRUE(sawText(none->rep, "undefined symbol 'dss_far_entry'")) << diagnosticsOf(none->rep);
     EXPECT_TRUE(sawText(none->rep, "linker directive (`/INCLUDE:`, `/EXPORT:` or `/ENTRY:`) requires"))
         << "in words that point at the directive, not at a prototype" << diagnosticsOf(none->rep);
+}
+
+// THE ID A PASS MINTS ON A UNIT AFTER THE READ IS PAST EVERY ID OF THE UNIT — ITS SYMBOL ROWS' TOO (P69 fold 2, the
+// review of fold 1). A unit an object reader produced numbers by record, and a record that is neither a body nor an
+// import (a section's own symbol) is a row only. The taken-id scan read no row, so the id `requireEntryReference`
+// minted could be one a row already held: on the fixture read below it EQUALLED the Local row of the object's
+// `.chks64` section symbol (found by the reviewer).
+TEST(CoffDirectiveImageRequests, TheEntrysReferenceTakesAnIdNoRowOfTheUnitHolds) {
+    // Synthetic: the unit's largest id is held by a ROW ALONE, the very next number past its bodies and imports.
+    AssembledModule stating = requestingUnit(2, requestsOf(" /ENTRY:dss_far_entry"));
+    std::uint32_t largest = 0;
+    for (auto const& fn : stating.functions) largest = std::max(largest, fn.symbol.v);
+    for (auto const& d : stating.dataItems) largest = std::max(largest, d.symbol.v);
+    for (auto const& e : stating.externImports) largest = std::max(largest, e.symbol.v);
+    for (auto const& ms : stating.symbols) ASSERT_LE(ms.symbol.v, largest) << "the PREMISE: no row past the bodies yet";
+    stating.symbols.push_back(
+        ModuleSymbol{SymbolId{largest + 1u}, ".only_a_row", SymbolBinding::Local, SymbolVisibility::Default});
+    EXPECT_EQ(linker::maxExistingSymbolIdV(stating), largest + 1u) << "an id only a symbol row holds is TAKEN";
+    linker::requireEntryReference(stating);
+    ASSERT_EQ(stating.externImports.size(), 1u);
+    EXPECT_GT(stating.externImports.back().symbol.v, largest + 1u)
+        << "the entry's reference took the id of the row `.only_a_row`: one id, two symbols";
+
+    // The object the defect was found on, through the pipeline that reads it for an image link: the id of the
+    // reference its `/ENTRY:` requires is the id of nothing else in the unit.
+    auto const exe = load("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(exe.target && exe.format);
+    std::vector<std::filesystem::path> const objects{
+        ::dss::test::repoRoot() / "tests" / "link" / "data" / "pe_directive_entry_reference_x86_64_pe.obj"};
+    DiagnosticReporter rep;
+    auto const units = readObjectInputModules(objects, *exe.target, *exe.format, rep);
+    ASSERT_TRUE(units.has_value()) << diagnosticsOf(rep);
+    ASSERT_EQ(units->size(), 1u);
+    AssembledModule const& unit = units->front();
+    ExternImport const* reference = nullptr;
+    for (auto const& e : unit.externImports) {
+        if (e.mangledName == "dss_archived_entry") reference = &e;
+    }
+    ASSERT_NE(reference, nullptr) << "the PREMISE: the read made the entry's name a reference of the unit";
+    ASSERT_TRUE(reference->requiredByDirective);
+    std::size_t rowsOnly = 0;
+    for (auto const& ms : unit.symbols) {
+        EXPECT_NE(ms.symbol.v, reference->symbol.v)
+            << "the reference shares its id with the symbol row '" << ms.name << "'";
+        bool body = false;
+        for (auto const& fn : unit.functions) body = body || fn.symbol == ms.symbol;
+        for (auto const& d : unit.dataItems) body = body || d.symbol == ms.symbol;
+        rowsOnly += body ? 0u : 1u;
+    }
+    EXPECT_GT(rowsOnly, 0u) << "the PREMISE: this object has a record that is a symbol row and nothing else — the "
+                               "shape the scan missed";
+    for (auto const& fn : unit.functions) EXPECT_NE(fn.symbol.v, reference->symbol.v);
+    for (auto const& d : unit.dataItems) EXPECT_NE(d.symbol.v, reference->symbol.v);
+    for (auto const& e : unit.externImports) {
+        if (&e != reference) EXPECT_NE(e.symbol.v, reference->symbol.v) << "import '" << e.mangledName << "'";
+    }
+}
+
+// ONLY THE ENTRY THAT STANDS IS A REQUIRED REFERENCE (P69 fold 2; the review of fold 1, NIT 6). ✔MEASURED 2026-10-10,
+// link.exe 14.44.35228 on clang 19.1.5 objects and on the committed cl fixtures: of two objects that each state an
+// `/ENTRY:` the FIRST stands and the later is dropped with a warning (LNK4258) — and the dropped one requires nothing:
+// its symbol, defined only by an archive member, is not fetched, and defined NOWHERE the link still stands and runs.
+// (lld-link 19.1.5 requires every stated entry and refuses that link.) Until fold 2 every stating unit's entry was
+// required as the unit was read, and the link below was refused for `dss_dropped_entry`.
+TEST(CoffDirectiveImageRequests, OnlyTheEntryThatStandsIsARequiredReference) {
+    auto const required = [](AssembledModule const& m) {
+        std::vector<std::string> out;
+        for (auto const& e : m.externImports) {
+            if (e.requiredByDirective) out.push_back(e.mangledName);
+        }
+        return out;
+    };
+    auto const stamped = requestsOf(" /ENTRY:dss_entry");
+    ASSERT_EQ(stamped.image.size(), 1u);
+    ASSERT_TRUE(stamped.image[0].precedence == UnitRequestPrecedence::First)
+        << "the PREMISE: the shipped vocabulary gives the entry link.exe's precedence, the first";
+    {
+        // The first unit defines the entry it states; the second states one NOTHING defines.
+        std::vector<AssembledModule> units{requestingUnit(2, requestsOf(" /ENTRY:dss_entry")),
+                                           extraUnit(3, requestsOf(" /ENTRY:dss_dropped_entry"))};
+        linker::requireEntryReference(std::span<AssembledModule>{units});
+        EXPECT_TRUE(required(units[0]).empty()) << "it defines its entry";
+        EXPECT_TRUE(required(units[1]).empty()) << "the DROPPED entry requires nothing";
+        auto const l = linkExe({programUnit(), units[0], units[1]});
+        ASSERT_TRUE(l->pe.has_value()) << "link.exe links this program and it runs" << diagnosticsOf(l->rep);
+        EXPECT_EQ(l->pe->bytesAt(l->pe->entry(), std::size(kEntryBody)),
+                  (std::vector<std::uint8_t>{std::begin(kEntryBody), std::end(kEntryBody)}))
+            << "the image starts at the entry that stands";
+        EXPECT_EQ(countCode(l->rep, DiagnosticCode::K_LinkerDirectiveIgnored), 1u)
+            << "and the dropped one is said, as link.exe says it (LNK4258)" << diagnosticsOf(l->rep);
+    }
+    {
+        // The other order: the entry nothing defines is the one that STANDS — required, and refused by name, as
+        // link.exe refuses it (LNK2001).
+        std::vector<AssembledModule> units{extraUnit(3, requestsOf(" /ENTRY:dss_dropped_entry")),
+                                           requestingUnit(2, requestsOf(" /ENTRY:dss_entry"))};
+        linker::requireEntryReference(std::span<AssembledModule>{units});
+        EXPECT_EQ(required(units[0]), std::vector<std::string>{"dss_dropped_entry"});
+        EXPECT_TRUE(required(units[1]).empty());
+        auto const l = linkExe({programUnit(), units[0], units[1]});
+        EXPECT_TRUE(l->image.bytes.empty());
+        EXPECT_TRUE(sawText(l->rep, "undefined symbol 'dss_dropped_entry'")) << diagnosticsOf(l->rep);
+    }
+    {
+        // The precedence is the REQUEST's own — its vocabulary row's — never this function's: under `last` the later
+        // request stands, so the later unit's entry is the reference.
+        std::vector<AssembledModule> units{
+            requestingUnit(2, withPrecedence(requestsOf(" /ENTRY:dss_entry"), UnitRequestPrecedence::Last)),
+            extraUnit(3, withPrecedence(requestsOf(" /ENTRY:dss_dropped_entry"), UnitRequestPrecedence::Last))};
+        linker::requireEntryReference(std::span<AssembledModule>{units});
+        EXPECT_TRUE(required(units[0]).empty());
+        EXPECT_EQ(required(units[1]), std::vector<std::string>{"dss_dropped_entry"});
+    }
+    {
+        // Two precedences have no order between them: nothing is required, and the decision refuses the link by name.
+        std::vector<AssembledModule> units{
+            requestingUnit(2, withPrecedence(requestsOf(" /ENTRY:dss_entry"), UnitRequestPrecedence::First)),
+            extraUnit(3, withPrecedence(requestsOf(" /ENTRY:dss_dropped_entry"), UnitRequestPrecedence::Last))};
+        linker::requireEntryReference(std::span<AssembledModule>{units});
+        EXPECT_TRUE(required(units[0]).empty());
+        EXPECT_TRUE(required(units[1]).empty());
+        auto const l = linkExe({programUnit(), units[0], units[1]});
+        EXPECT_TRUE(l->image.bytes.empty());
+        EXPECT_TRUE(sawText(l->rep, "under two precedences")) << diagnosticsOf(l->rep);
+    }
+}
+
+// THE PIPELINE'S HALF OF THE SAME RULE, on the committed cl fixtures: the object that states `/ENTRY:dss_member_entry`
+// and defines it, then the object that states `/ENTRY:dss_archived_entry` and does not. Read for an image link, in that
+// order, the second states NO reference (its entry is dropped); in the other order it states the required one (its
+// entry stands). The corpus example `pe_foreign_directive_entry_dropped_requires_nothing` runs the first link.
+TEST(CoffDirectivePipeline, ALaterObjectsDroppedEntryRequiresNothing) {
+    auto const exe = load("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(exe.target && exe.format);
+    auto const data = ::dss::test::repoRoot() / "tests" / "link" / "data";
+    auto const member    = data / "pe_directive_entry_member_x86_64_pe.obj";
+    auto const reference = data / "pe_directive_entry_reference_x86_64_pe.obj";
+    auto const referenceOf = [](AssembledModule const& unit) -> ExternImport const* {
+        for (auto const& x : unit.externImports) {
+            if (x.mangledName == "dss_archived_entry") return &x;
+        }
+        return nullptr;
+    };
+    {
+        std::vector<std::filesystem::path> const objects{member, reference};
+        DiagnosticReporter rep;
+        auto const units = readObjectInputModules(objects, *exe.target, *exe.format, rep);
+        ASSERT_TRUE(units.has_value()) << diagnosticsOf(rep);
+        ASSERT_EQ(units->size(), 2u);
+        EXPECT_EQ(referenceOf((*units)[1]), nullptr)
+            << "the later object's entry is dropped: its name is no reference of the object";
+        for (auto const& x : (*units)[0].externImports) EXPECT_FALSE(x.requiredByDirective) << x.mangledName;
+    }
+    {
+        std::vector<std::filesystem::path> const objects{reference, member};
+        DiagnosticReporter rep;
+        auto const units = readObjectInputModules(objects, *exe.target, *exe.format, rep);
+        ASSERT_TRUE(units.has_value()) << diagnosticsOf(rep);
+        ASSERT_EQ(units->size(), 2u);
+        auto const* row = referenceOf((*units)[0]);
+        ASSERT_NE(row, nullptr) << "CONTROL: named first, the same object's entry stands and is a reference";
+        EXPECT_TRUE(row->requiredByDirective);
+    }
 }
 
 // ══ THE PIPELINE'S OWN CALL SITES (P69 send-back 5, review-xa4 MINOR 3, NIT 11, NIT 13 (ii)) ═════════════════════

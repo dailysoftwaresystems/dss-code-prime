@@ -1237,12 +1237,14 @@ bindingOf(AssembledModule const& m, std::string const& name) {
     for (auto const& s : m.symbols) if (s.name == name) return s.binding;
     return std::nullopt;
 }
-// Whether a defined symbol's own spelling yields to a COMMON of its name (`ModuleSymbol::yieldsToACommon`); nullopt
-// if unknown.
-[[nodiscard]] std::optional<bool>
-yieldsToACommonOf(AssembledModule const& m, std::string const& name) {
-    for (auto const& s : m.symbols) if (s.name == name) return s.yieldsToACommon;
-    return std::nullopt;
+// The KIND of weak definition a defined symbol's own record states (`ModuleSymbol::weakKind`), in the kind's own
+// spelling: "none" for a symbol that states no kind, "no such symbol" when the module holds no row of the name.
+[[nodiscard]] std::string weakKindOf(AssembledModule const& m, std::string const& name) {
+    for (auto const& s : m.symbols) {
+        if (s.name != name) continue;
+        return s.weakKind.has_value() ? std::string{weakDefinitionKindName(*s.weakKind)} : std::string{"none"};
+    }
+    return "no such symbol";
 }
 [[nodiscard]] bool sawCode(DiagnosticReporter const& rep, DiagnosticCode code) {
     for (auto const& d : rep.all()) if (d.code == code) return true;
@@ -1304,10 +1306,11 @@ TEST(CoffForeignObject, DataComdatAnyLiftsWeak) {
     EXPECT_EQ(*b, SymbolBinding::Weak)
         << "ANY(2)/SAME_SIZE(3)/EXACT_MATCH(4) lift to Weak so the all-weak merge "
            "dedups duplicates -- red-on-disable vs the pre-TF-C53 hardcoded Global";
-    // P69 round 4: a COMDAT select-any is this format's own weak definition, which REPLACES a common of its name
-    // (link.exe, lld-link; `commonYieldsTo`), so its spelling does not yield to one — unlike a weak external's body
-    // (`CoffWeakExternal.SectionBackedDefaultBindsTheWeakNameToThatBody`).
-    EXPECT_EQ(yieldsToACommonOf(*got, "W"), std::optional<bool>{false});
+    // P69: a symbol its COMDAT section's selection makes weak is ONE OF SEVERAL EQUAL COPIES the link keeps one of —
+    // the SELECT-ANY kind, this format's own weak definition, which replaces a common of its name and a weak
+    // external's body alike (link.exe, lld-link, GNU ld; `commonYieldsTo`). The other kind is pinned by
+    // `CoffWeakExternal.SectionBackedDefaultBindsTheWeakNameToThatBody`.
+    EXPECT_EQ(weakKindOf(*got, "W"), "select-any");
 }
 
 // -- Gate 3: LARGEST / ASSOCIATIVE on a kind-resolved COMDAT -> FAIL LOUD ----
@@ -2753,12 +2756,14 @@ TEST(CoffWeakExternal, SectionBackedDefaultBindsTheWeakNameToThatBody) {
     EXPECT_EQ(bindingOf(*got, "wfn"), SymbolBinding::Weak);
     EXPECT_EQ(bindingOf(*got, "Wbody"), SymbolBinding::Global)
         << "the renamed body keeps the STRONG linkage the object gave it";
-    // P69 round 4 (D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT): the weak name yields to a COMMON of it,
-    // as PE/COFF 5.5.3 makes it yield to any definition ("if sym1 is not present at link time"; GNU ld's PE linker
-    // gives a MinGW common beside this shape its own 0, ✔MEASURED 2026-10-07) — where this format's own weak
-    // definition, a COMDAT select-any, replaces one. The renamed body is an ordinary strong definition.
-    EXPECT_EQ(yieldsToACommonOf(*got, "wfn"), std::optional<bool>{true});
-    EXPECT_EQ(yieldsToACommonOf(*got, "Wbody"), std::optional<bool>{false});
+    // P69 (D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT, and
+    // D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER): the weak name is the OVERRIDABLE kind
+    // — a default, which PE/COFF 5.5.3 uses only "if sym1 is not present at link time". A common of the name makes it
+    // present (GNU ld's PE linker gives a MinGW common beside this shape its own 0, ✔MEASURED 2026-10-07) and so
+    // does a COMDAT select-any definition of it (GNU ld, link.exe and lld-link run the select-any body in both object
+    // orders, ✔MEASURED 2026-10-08). The renamed body is an ordinary strong definition and states no kind.
+    EXPECT_EQ(weakKindOf(*got, "wfn"), "overridable");
+    EXPECT_EQ(weakKindOf(*got, "Wbody"), "none");
 
     // One atom, two names -- the equal-offset alias rule, not two twin atoms.
     auto const wfnId  = symIdOfName(*got, "wfn");
