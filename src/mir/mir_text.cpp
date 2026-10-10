@@ -2328,6 +2328,10 @@ private:
             if (!symbolNames_.emplace(v, name.text).second) {
                 emitMalformed(std::format("symbol slot %{} is declared twice", v));
             }
+            // A declared slot is an id of the module's space whether or not a
+            // function or a global of the module is given it: the text's table
+            // is the name table this module is made from (stated in `finalize`).
+            builder_.keepSymbolIdsClearOf(SymbolId{v});
         }
         (void)expect(TokKind::RBrace);
     }
@@ -4371,6 +4375,22 @@ private:
             return std::make_unique<MirParseResult>(
                 Mir{}, std::move(interner_), std::move(symbolNames_));
         }
+        // ★ THE TEXT IS THE NAME TABLE THIS MODULE IS MADE FROM, AND IT IS STATED
+        // HERE — the one place every module this reader hands out passes
+        // (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE). The reader
+        // stated nothing, and the scan that holds every module builder to a
+        // statement excused it in so many words — "a parsed module is made from
+        // no table". ✔MEASURED 2026-10-08: a text declaring `%1 "f"` and `%2 "g"`
+        // and defining `f` alone read back with its id space ending at 2, so the
+        // lowering — handed the module and no import row, which a text never
+        // holds — named a block `%2`: `g`'s id, in silence. A call in the text may
+        // name an entry that is no function or global of the module; the entry is
+        // the table's all the same. The end stated is the one the declared slots
+        // (`parseSymbolsPreamble`) and the symbols the text defines have raised,
+        // by the door's own rule (the top id saturates there). A text with NO
+        // `symbols` section states it too: its table is empty, and nothing stands
+        // beside a text — so no input reaches the door's refusal of a counted end.
+        builder_.stateSymbolIdEnd(builder_.symbolIdEnd());
         Mir module = std::move(builder_).finish();
         auto result = std::make_unique<MirParseResult>(
             std::move(module), std::move(interner_), std::move(symbolNames_));

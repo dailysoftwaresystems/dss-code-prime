@@ -150,10 +150,12 @@ Mir::Mir(Mir&& other) noexcept
       asmDescriptorPool_(std::move(other.asmDescriptorPool_)),
       aliasingMode_(other.aliasingMode_),
       charTypesAliasAll_(other.charTypesAliasAll_),
-      symbolIdEnd_(other.symbolIdEnd_) {
+      symbolIdEnd_(other.symbolIdEnd_),
+      symbolIdEndStated_(other.symbolIdEndStated_) {
     other.aliasingMode_ = MirAliasingMode::Permissive;
     other.charTypesAliasAll_ = true;
     other.symbolIdEnd_ = 1;
+    other.symbolIdEndStated_ = false;   // the emptied module is nobody's table
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
                     other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_,
@@ -178,6 +180,8 @@ Mir& Mir::operator=(Mir&& other) noexcept {
     other.charTypesAliasAll_ = true;
     symbolIdEnd_ = other.symbolIdEnd_;
     other.symbolIdEnd_ = 1;
+    symbolIdEndStated_ = other.symbolIdEndStated_;
+    other.symbolIdEndStated_ = false;
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
                     other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_,
@@ -570,6 +574,29 @@ namespace {
     std::abort();
 }
 
+// THE REFUSAL OF A COUNTED END. A module's end is STATED when whoever made the
+// module said where its id space ends — a name table's end, "this module is its own
+// table", or the statement of the module it replaces, copied. An end nobody stated
+// is only COUNTED from the symbols the module defines, and a count is exactly what
+// a name table outgrows: an id minted past it can be a name the table already
+// holds (✔MEASURED P69: a synthesized symbol minted INSIDE the name table, which a
+// later rename then bound to a user's function). Nothing downstream can tell such
+// an id from a fresh one, so the mint itself refuses — loudly, at the first id,
+// which is what makes a module builder nobody has written yet state its end on the
+// day it first reaches a pass that mints.
+[[noreturn]] void symbolIdEndNeverStated(char const* leaf) {
+    std::fprintf(stderr,
+                 "dss::%s fatal: this module's symbol-id space was never stated — its end is "
+                 "only COUNTED from the symbols it defines. A module made from a name table "
+                 "states the table's end (MirBuilder::stateSymbolIdEnd); a module made from "
+                 "nothing but itself says so (MirBuilder::stateSelfContainedSymbolIds); a "
+                 "module that replaces another continues its ids, and carries whether they "
+                 "were stated (MirBuilder::continueSymbolIdsOf). Minting past a counted end "
+                 "could hand out an id a name table beside the module already holds.\n",
+                 leaf);
+    std::abort();
+}
+
 } // namespace
 
 void MirBuilder::stateSymbolIdEnd(std::uint32_t end) noexcept {
@@ -577,8 +604,15 @@ void MirBuilder::stateSymbolIdEnd(std::uint32_t end) noexcept {
     raiseSymbolIdEndTo_(end);
 }
 
+void MirBuilder::stateSelfContainedSymbolIds() noexcept {
+    symbolIdEndStated_ = true;   // the counted end, STATED: nothing stands beside it
+}
+
 void MirBuilder::continueSymbolIdsOf(Mir const& rebuilt) noexcept {
-    symbolIdEndStated_ = true;
+    // COPIED, never made: a module whose end was only counted is continued by a
+    // builder whose end is only counted, through every rebuild, until a leaf
+    // refuses it. (A statement this builder already made stands.)
+    if (rebuilt.symbolIdEndIsStated()) symbolIdEndStated_ = true;
     raiseSymbolIdEndTo_(rebuilt.symbolIdEnd());
 }
 
@@ -587,16 +621,7 @@ void MirBuilder::keepSymbolIdsClearOf(SymbolId taken) noexcept {
 }
 
 SymbolId MirBuilder::mintSymbol() {
-    if (!symbolIdEndStated_) {
-        std::fputs("dss::MirBuilder fatal: mintSymbol: this module's symbol-id space was "
-                   "never stated. A module made from a name table states the table's end "
-                   "(stateSymbolIdEnd); a module that replaces another continues its ids "
-                   "(continueSymbolIdsOf). An id counted from the symbols a builder happens "
-                   "to hold can land inside the name table, on a declaration the module "
-                   "never sees.\n",
-                   stderr);
-        std::abort();
-    }
+    if (!symbolIdEndStated_) symbolIdEndNeverStated("MirBuilder::mintSymbol");
     return takeSymbolIdAt(symbolIdEnd_);
 }
 
@@ -612,11 +637,19 @@ void MirBuilder::carryModuleFactsOf(Mir const& rebuilt) noexcept {
     continueSymbolIdsOf(rebuilt);
 }
 
+// The module's own end and the module's own word on it — never a count of the
+// symbols it holds (that count is exactly what a name table outgrows).
+MirSymbolIdContinuation::MirSymbolIdContinuation(Mir const& mir) noexcept
+    : end_{mir.symbolIdEnd()}, stated_{mir.symbolIdEndIsStated()} {}
+
 void MirSymbolIdContinuation::keepClearOf(SymbolId taken) noexcept {
     if (onePastSymbolId(taken) > end_) end_ = onePastSymbolId(taken);
 }
 
-SymbolId MirSymbolIdContinuation::mint() noexcept { return takeSymbolIdAt(end_); }
+SymbolId MirSymbolIdContinuation::mint() noexcept {
+    if (!stated_) symbolIdEndNeverStated("MirSymbolIdContinuation::mint");
+    return takeSymbolIdAt(end_);
+}
 
 SymbolId MirSymbolIdContinuation::mintOrAbort(char const* who) {
     SymbolId const minted = mint();
@@ -1732,8 +1765,11 @@ Mir MirBuilder::finish() && {
               aliasingMode_,
               charTypesAliasAll_};
     // The module's id space is the builder's: the table end it was told, and
-    // every id minted since (the constructor counted the defined symbols alone).
+    // every id minted since (the constructor counted the defined symbols alone) —
+    // and with the end, whether anyone ever STATED it. The frozen module once
+    // dropped that fact, so the first rebuild made a counted end a stated one.
     if (symbolIdEnd_ > built.symbolIdEnd_) built.symbolIdEnd_ = symbolIdEnd_;
+    built.symbolIdEndStated_ = symbolIdEndStated_;
     return built;
 }
 

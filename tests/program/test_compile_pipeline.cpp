@@ -1198,7 +1198,7 @@ TEST(Program_CompileFiles, AConstantConditionReadsTheTargetsOwnLayout) {
 //
 //   * the semantic tier FIXES it — `_Static_assert(E == N)` with the pair's own N
 //     compiles, and the control arm (the OTHER data model's N) is refused with
-//     `S_StaticAssertFailed`, so the assertion is not vacuous;
+//     `S_StaticAssertFailed`, assertion by assertion, so none is vacuous;
 //   * the lowering READS it — `if (E == N) return x;` is silent and
 //     `if (E != N) return x;` is reported, by name, and nothing else is.
 //
@@ -1207,6 +1207,18 @@ TEST(Program_CompileFiles, AConstantConditionReadsTheTargetsOwnLayout) {
 // semantic tier that disagreed would fail the assertion the lowering agrees with.
 // The pair's N is what each platform's own reference compiles (LP64: gcc 13.3.0,
 // clang 18.1.3, Apple clang 21.0.0; LLP64: cl 14.51, mingw-w64 gcc 13.2.0).
+//
+// ONE PROGRAM, COMPILED ONCE PER PAIR AND ARM — EIGHT COMPILES, NOT FORTY. The
+// five hooks used to compile a program each, twice per pair. They are five PARTS
+// of one program now, each part's names its own behind the hook's prefix (`sz_`,
+// `al_`, `mo_`, `ro_`, `sel_`: a function, a tag, an object, an assertion's
+// message), and a case reads ITS OWN names in the pair's two compiles — the
+// functions the lowering reported, the assertions the semantic tier refused —
+// never another hook's. What the sharing costs, said here once: the lowering
+// does not run on a program with an error, so a hook whose SEMANTIC tier loses
+// the pair's value stops the agreed compile for all five, and all five cases go
+// red, each printing the assertion that failed. A hook whose LOWERING disagrees
+// reddens its own case alone.
 namespace {
 
 struct LayoutPair {
@@ -1238,9 +1250,9 @@ withValues(std::string text,
 struct CompiledForPair {
     int                      rc = 0;
     std::size_t              errors = 0;
-    std::size_t              staticAssertsFailed = 0;
     std::string              firstError;
-    std::vector<std::string> endReported;   // the texts of H_NonVoidFunctionEndReachable
+    std::vector<std::string> assertsRefused;   // the texts of S_StaticAssertFailed
+    std::vector<std::string> endReported;      // the texts of H_NonVoidFunctionEndReachable
 };
 
 [[nodiscard]] CompiledForPair compileForPair(std::string_view spec, std::string const& text) {
@@ -1255,40 +1267,179 @@ struct CompiledForPair {
     for (auto const& d : rep.all()) {
         if (d.severity == DiagnosticSeverity::Error && out.firstError.empty())
             out.firstError = std::string{diagnosticCodeName(d.code)} + ": " + d.actual;
-        if (d.code == DiagnosticCode::S_StaticAssertFailed) ++out.staticAssertsFailed;
+        if (d.code == DiagnosticCode::S_StaticAssertFailed) out.assertsRefused.push_back(d.actual);
         if (d.code == DiagnosticCode::H_NonVoidFunctionEndReachable)
             out.endReported.push_back(d.actual);
     }
     return out;
 }
 
-// `agreed`: the program with the pair's own values. `refuted`: the same program with
-// the other data model's. `mustReport`: the functions whose end IS reached.
-void expectTheTiersAgree(LayoutPair const& pair, std::string const& agreed,
-                         std::string const& refuted,
-                         std::initializer_list<std::string_view> mustReport) {
-    SCOPED_TRACE(std::string{pair.spec});
-    CompiledForPair const got = compileForPair(pair.spec, agreed);
-    EXPECT_EQ(got.rc, 0) << got.firstError;
-    EXPECT_EQ(got.errors, 0u) << "the semantic tier does not hold the pair's value: "
-                              << got.firstError;
-    EXPECT_EQ(got.endReported.size(), mustReport.size())
-        << "the lowering reports a different set than the one the values imply"
-        << (got.endReported.empty() ? std::string{} : " — first: " + got.endReported[0]);
-    for (std::string_view const name : mustReport) {
-        std::string const quoted = "'" + std::string{name} + "'";
-        EXPECT_EQ(std::count_if(got.endReported.begin(), got.endReported.end(),
+// THE PROGRAM. `@LONG@` is `sizeof(long)`, `@PAD@` the size of `{ char; long; }`,
+// `@L@` and `@F@` the offsets of `l` and of the promoted `f` in
+// `{ char c; long l; struct { char e; long f; }; }`, `@WHICH@` the `_Generic` arm
+// the target's `size_t` selects.
+[[nodiscard]] std::string const& tierProgram() {
+    static std::string const which =
+        "_Generic(sizeof 0, unsigned long: 1, unsigned long long: 2, default: 0)";
+    static std::string const width = "_Generic((long)0, long: sizeof(long), default: 0)";
+    static std::string const text =
+        // sizeof — `sz_`
+        "struct sz_Pad { char c; long l; };\n"
+        "static char sz_bound[sizeof(struct sz_Pad)];\n"
+        "_Static_assert(sizeof(long) == @LONG@, \"sz_long\");\n"
+        "_Static_assert(sizeof(struct sz_Pad) == @PAD@, \"sz_pad\");\n"
+        "_Static_assert(sizeof(void *) == 8, \"sz_pointer\");\n"
+        "_Static_assert(sizeof sz_bound == @PAD@, \"sz_bound\");\n"
+        "int sz_long_agrees(int x) { if (sizeof(long) == @LONG@) return x; }\n"
+        "int sz_long_disagrees(int x) { if (sizeof(long) != @LONG@) return x; }\n"
+        "int sz_pad_agrees(int x) { if (sizeof(struct sz_Pad) == @PAD@) return x; }\n"
+        "int sz_pad_disagrees(int x) { if (sizeof(struct sz_Pad) != @PAD@) return x; }\n"
+        "int sz_pointer_agrees(int x) { if (sizeof(void *) == 8) return x; }\n"
+        "int sz_pointer_disagrees(int x) { if (sizeof(void *) != 8) return x; }\n"
+        "int sz_value_agrees(int x) { if (sizeof sz_bound == @PAD@) return x; }\n"
+        "int sz_value_disagrees(int x) { if (sizeof sz_bound != @PAD@) return x; }\n"
+        // _Alignof — `al_`
+        "struct al_Over { char c; _Alignas(16) int v; };\n"
+        "struct al_Pad { char c; long l; };\n"
+        "static struct al_Pad al_object;\n"
+        "_Static_assert(_Alignof(long) == @LONG@, \"al_long\");\n"
+        "_Static_assert(_Alignof(struct al_Pad) == @LONG@, \"al_pad\");\n"
+        "_Static_assert(_Alignof(struct al_Over) == 16, \"al_over\");\n"
+        "_Static_assert(__alignof__(al_object) == @LONG@, \"al_value\");\n"
+        "int al_long_agrees(int x) { if (_Alignof(long) == @LONG@) return x; }\n"
+        "int al_long_disagrees(int x) { if (_Alignof(long) != @LONG@) return x; }\n"
+        "int al_pad_agrees(int x) { if (_Alignof(struct al_Pad) == @LONG@) return x; }\n"
+        "int al_pad_disagrees(int x) { if (_Alignof(struct al_Pad) != @LONG@) return x; }\n"
+        "int al_over_agrees(int x) { if (_Alignof(struct al_Over) == 16) return x; }\n"
+        "int al_over_disagrees(int x) { if (_Alignof(struct al_Over) != 16) return x; }\n"
+        "int al_value_agrees(int x) { if (__alignof__(al_object) == @LONG@) return x; }\n"
+        "int al_value_disagrees(int x) { if (__alignof__(al_object) != @LONG@) return x; }\n"
+        // a member's offset, `&((T *)0)->m` — `mo_`
+        "struct mo_Pad { char c; long l; struct { char e; long f; }; };\n"
+        "_Static_assert((unsigned long long)&((struct mo_Pad *)0)->l == @L@, \"mo_l\");\n"
+        "_Static_assert((unsigned long long)&((struct mo_Pad *)0)->f == @F@, \"mo_f\");\n"
+        "_Static_assert((unsigned long long)&((volatile struct mo_Pad *)0)->f == @F@, \"mo_vf\");\n"
+        "static char mo_bound[(unsigned long long)&((struct mo_Pad *)0)->f];\n"
+        "int mo_direct_agrees(int x) { if ((unsigned long long)&((struct mo_Pad *)0)->l == @L@) return x; }\n"
+        "int mo_direct_disagrees(int x) { if ((unsigned long long)&((struct mo_Pad *)0)->l != @L@) return x; }\n"
+        "int mo_promoted_agrees(int x) { if ((unsigned long long)&((struct mo_Pad *)0)->f == @F@) return x; }\n"
+        "int mo_promoted_disagrees(int x) { if ((unsigned long long)&((struct mo_Pad *)0)->f != @F@) return x; }\n"
+        "int mo_qualified_agrees(int x) { if ((unsigned long long)&((volatile struct mo_Pad *)0)->f == @F@) return x; }\n"
+        "int mo_qualified_disagrees(int x) { if ((unsigned long long)&((volatile struct mo_Pad *)0)->f != @F@) return x; }\n"
+        // a recorded offset, `__builtin_offsetof` — `ro_`
+        "struct ro_Pad { char c; long l; struct { char e; long f; }; };\n"
+        "_Static_assert(__builtin_offsetof(struct ro_Pad, l) == @L@, \"ro_l\");\n"
+        "_Static_assert(__builtin_offsetof(struct ro_Pad, f) == @F@, \"ro_f\");\n"
+        "static char ro_bound[__builtin_offsetof(struct ro_Pad, f)];\n"
+        "int ro_direct_agrees(int x) { if (__builtin_offsetof(struct ro_Pad, l) == @L@) return x; }\n"
+        "int ro_direct_disagrees(int x) { if (__builtin_offsetof(struct ro_Pad, l) != @L@) return x; }\n"
+        "int ro_promoted_agrees(int x) { if (__builtin_offsetof(struct ro_Pad, f) == @F@) return x; }\n"
+        "int ro_promoted_disagrees(int x) { if (__builtin_offsetof(struct ro_Pad, f) != @F@) return x; }\n"
+        // a recorded selection, `_Generic` — `sel_`
+        "_Static_assert(" + which + " == @WHICH@, \"sel_which\");\n"
+        "_Static_assert(" + width + " == @LONG@, \"sel_width\");\n"
+        "int sel_which_agrees(int x) { if (" + which + " == @WHICH@) return x; }\n"
+        "int sel_which_disagrees(int x) { if (" + which + " != @WHICH@) return x; }\n"
+        "int sel_width_agrees(int x) { if (" + width + " == @LONG@) return x; }\n"
+        "int sel_width_disagrees(int x) { if (" + width + " != @LONG@) return x; }\n"
+        "int main(void) {\n"
+        "    return (int)sizeof sz_bound + (int)sizeof al_object + (int)sizeof mo_bound\n"
+        "         + (int)sizeof ro_bound;\n"
+        "}\n";
+    return text;
+}
+
+// A pair's two compiles: `agreed` holds the pair's own values, `refuted` the other
+// data model's. Made the first time a case asks, kept for the cases after it.
+struct TierArms {
+    CompiledForPair agreed;
+    CompiledForPair refuted;
+};
+
+[[nodiscard]] TierArms const& tierArmsFor(std::size_t pairIndex) {
+    static std::array<std::optional<TierArms>, kLayoutPairs.size()> compiled;
+    std::optional<TierArms>& slot = compiled[pairIndex];
+    if (!slot.has_value()) {
+        LayoutPair const& pair = kLayoutPairs[pairIndex];
+        std::uint64_t const longBytes = pair.lp64 ? 8 : 4;
+        std::uint64_t const other     = 12 - longBytes;
+        std::uint64_t const which     = pair.lp64 ? 1 : 2;
+        slot = TierArms{
+            compileForPair(pair.spec,
+                           withValues(tierProgram(), {{"LONG", longBytes},
+                                                      {"PAD", 2 * longBytes},
+                                                      {"L", longBytes},
+                                                      {"F", 3 * longBytes},
+                                                      {"WHICH", which}})),
+            compileForPair(pair.spec,
+                           withValues(tierProgram(), {{"LONG", other},
+                                                      {"PAD", 2 * other},
+                                                      {"L", other},
+                                                      {"F", 3 * other},
+                                                      {"WHICH", 3 - which}}))};
+    }
+    return *slot;
+}
+
+// The texts that name something of ONE hook: `opener` is what stands before a
+// name in that kind of text (`'` before a function's, `"` before a message's).
+[[nodiscard]] std::vector<std::string> ownOf(std::vector<std::string> const& texts,
+                                             std::string_view opener, std::string_view prefix) {
+    std::string const key = std::string{opener} + std::string{prefix};
+    std::vector<std::string> own;
+    for (std::string const& t : texts) {
+        if (t.find(key) != std::string::npos) own.push_back(t);
+    }
+    return own;
+}
+
+void expectEachOnce(std::vector<std::string> const& texts, char quote,
+                    std::initializer_list<std::string_view> names, char const* what) {
+    for (std::string_view const name : names) {
+        std::string const quoted = quote + std::string{name} + quote;
+        EXPECT_EQ(std::count_if(texts.begin(), texts.end(),
                                 [&](std::string const& t) {
                                     return t.find(quoted) != std::string::npos;
                                 }),
                   1)
-            << quoted << " must be reported exactly once";
+            << quoted << " " << what;
     }
-    // THE CONTROL: the assertion really fixes the value — the other model's is refused.
-    CompiledForPair const control = compileForPair(pair.spec, refuted);
-    EXPECT_NE(control.rc, 0) << "the other data model's values compiled too";
-    EXPECT_GE(control.staticAssertsFailed, 1u) << control.firstError;
 }
+
+// `prefix`: the hook's. `mustReport`: its functions whose end IS reached.
+// `mustRefute`: the messages of its assertions the other data model's values break.
+void expectTheTiersAgree(std::string_view prefix,
+                         std::initializer_list<std::string_view> mustReport,
+                         std::initializer_list<std::string_view> mustRefute) {
+    for (std::size_t i = 0; i < kLayoutPairs.size(); ++i) {
+        SCOPED_TRACE(std::string{kLayoutPairs[i].spec});
+        TierArms const& arms = tierArmsFor(i);
+        CompiledForPair const& got = arms.agreed;
+        std::vector<std::string> const refusedHere = ownOf(got.assertsRefused, "\"", prefix);
+        EXPECT_TRUE(refusedHere.empty())
+            << "the semantic tier does not hold the pair's value: "
+            << (refusedHere.empty() ? std::string{} : refusedHere[0]);
+        EXPECT_EQ(got.rc, 0) << "the program did not compile, so the lowering was never asked — "
+                             << got.firstError;
+        EXPECT_EQ(got.errors, 0u) << got.firstError;
+        std::vector<std::string> const reported = ownOf(got.endReported, "'", prefix);
+        EXPECT_EQ(reported.size(), mustReport.size())
+            << "the lowering reports a different set than the one the values imply"
+            << (reported.empty() ? std::string{} : " — first: " + reported[0]);
+        expectEachOnce(reported, '\'', mustReport, "must be reported exactly once");
+        // THE CONTROL: each assertion really fixes its value — the other model's is
+        // refused, by its own message.
+        CompiledForPair const& control = arms.refuted;
+        EXPECT_NE(control.rc, 0) << "the other data model's values compiled too";
+        std::vector<std::string> const refuted = ownOf(control.assertsRefused, "\"", prefix);
+        EXPECT_EQ(refuted.size(), mustRefute.size())
+            << "the semantic tier refuses a different set of this hook's assertions"
+            << (refuted.empty() ? std::string{} : " — first: " + refuted[0]);
+        expectEachOnce(refuted, '"', mustRefute, "must be refused exactly once");
+    }
+}
+
+constexpr std::array<std::string_view, 5> kTierHooks{"sz_", "al_", "mo_", "ro_", "sel_"};
 
 }  // namespace
 
@@ -1298,59 +1449,19 @@ void expectTheTiersAgree(LayoutPair const& pair, std::string const& agreed,
 // declaration time, the lowering reads the type that tier STAMPED), ONE layout
 // query (`operandLayout`) over ONE set of parameters.
 TEST(Program_CompileFiles, BothTiersAgreeOnSizeofPerTarget) {
-    std::string const text =
-        "struct Pad { char c; long l; };\n"
-        "static char bound[sizeof(struct Pad)];\n"
-        "_Static_assert(sizeof(long) == @LONG@, \"long\");\n"
-        "_Static_assert(sizeof(struct Pad) == @PAD@, \"pad\");\n"
-        "_Static_assert(sizeof(void *) == 8, \"pointer\");\n"
-        "_Static_assert(sizeof bound == @PAD@, \"bound\");\n"
-        "int long_agrees(int x) { if (sizeof(long) == @LONG@) return x; }\n"
-        "int long_disagrees(int x) { if (sizeof(long) != @LONG@) return x; }\n"
-        "int pad_agrees(int x) { if (sizeof(struct Pad) == @PAD@) return x; }\n"
-        "int pad_disagrees(int x) { if (sizeof(struct Pad) != @PAD@) return x; }\n"
-        "int pointer_agrees(int x) { if (sizeof(void *) == 8) return x; }\n"
-        "int pointer_disagrees(int x) { if (sizeof(void *) != 8) return x; }\n"
-        "int value_agrees(int x) { if (sizeof bound == @PAD@) return x; }\n"
-        "int value_disagrees(int x) { if (sizeof bound != @PAD@) return x; }\n"
-        "int main(void) { return (int)sizeof bound; }\n";
-    for (LayoutPair const& pair : kLayoutPairs) {
-        std::uint64_t const longBytes = pair.lp64 ? 8 : 4;
-        expectTheTiersAgree(
-            pair,
-            withValues(text, {{"LONG", longBytes}, {"PAD", 2 * longBytes}}),
-            withValues(text, {{"LONG", 12 - longBytes}, {"PAD", 2 * (12 - longBytes)}}),
-            {"long_disagrees", "pad_disagrees", "pointer_disagrees", "value_disagrees"});
-    }
+    expectTheTiersAgree(
+        "sz_",
+        {"sz_long_disagrees", "sz_pad_disagrees", "sz_pointer_disagrees", "sz_value_disagrees"},
+        {"sz_long", "sz_pad", "sz_bound"});
 }
 
 // `_Alignof` — the hook `resolveAlignof`: `long`, an over-aligned member's struct,
 // and the GNU value form. Two evaluators and one layout query, as `sizeof`.
 TEST(Program_CompileFiles, BothTiersAgreeOnAlignofPerTarget) {
-    std::string const text =
-        "struct Over { char c; _Alignas(16) int v; };\n"
-        "struct Pad { char c; long l; };\n"
-        "static struct Pad object;\n"
-        "_Static_assert(_Alignof(long) == @LONG@, \"long\");\n"
-        "_Static_assert(_Alignof(struct Pad) == @LONG@, \"pad\");\n"
-        "_Static_assert(_Alignof(struct Over) == 16, \"over\");\n"
-        "_Static_assert(__alignof__(object) == @LONG@, \"value\");\n"
-        "int long_agrees(int x) { if (_Alignof(long) == @LONG@) return x; }\n"
-        "int long_disagrees(int x) { if (_Alignof(long) != @LONG@) return x; }\n"
-        "int pad_agrees(int x) { if (_Alignof(struct Pad) == @LONG@) return x; }\n"
-        "int pad_disagrees(int x) { if (_Alignof(struct Pad) != @LONG@) return x; }\n"
-        "int over_agrees(int x) { if (_Alignof(struct Over) == 16) return x; }\n"
-        "int over_disagrees(int x) { if (_Alignof(struct Over) != 16) return x; }\n"
-        "int value_agrees(int x) { if (__alignof__(object) == @LONG@) return x; }\n"
-        "int value_disagrees(int x) { if (__alignof__(object) != @LONG@) return x; }\n"
-        "int main(void) { return (int)sizeof object; }\n";
-    for (LayoutPair const& pair : kLayoutPairs) {
-        std::uint64_t const longBytes = pair.lp64 ? 8 : 4;
-        expectTheTiersAgree(
-            pair, withValues(text, {{"LONG", longBytes}}),
-            withValues(text, {{"LONG", 12 - longBytes}}),
-            {"long_disagrees", "pad_disagrees", "over_disagrees", "value_disagrees"});
-    }
+    expectTheTiersAgree(
+        "al_",
+        {"al_long_disagrees", "al_pad_disagrees", "al_over_disagrees", "al_value_disagrees"},
+        {"al_long", "al_pad", "al_value"});
 }
 
 // A MEMBER'S OFFSET through the `&((T *)0)->m` spelling — the hook
@@ -1358,27 +1469,9 @@ TEST(Program_CompileFiles, BothTiersAgreeOnAlignofPerTarget) {
 // (`anon_member_search::memberByteOffset`): a direct member behind padding, a
 // member promoted through an anonymous struct, and one behind a qualified pointee.
 TEST(Program_CompileFiles, BothTiersAgreeOnAMemberOffsetPerTarget) {
-    std::string const text =
-        "struct Pad { char c; long l; struct { char e; long f; }; };\n"
-        "_Static_assert((unsigned long long)&((struct Pad *)0)->l == @L@, \"l\");\n"
-        "_Static_assert((unsigned long long)&((struct Pad *)0)->f == @F@, \"f\");\n"
-        "_Static_assert((unsigned long long)&((volatile struct Pad *)0)->f == @F@, \"vf\");\n"
-        "static char bound[(unsigned long long)&((struct Pad *)0)->f];\n"
-        "int direct_agrees(int x) { if ((unsigned long long)&((struct Pad *)0)->l == @L@) return x; }\n"
-        "int direct_disagrees(int x) { if ((unsigned long long)&((struct Pad *)0)->l != @L@) return x; }\n"
-        "int promoted_agrees(int x) { if ((unsigned long long)&((struct Pad *)0)->f == @F@) return x; }\n"
-        "int promoted_disagrees(int x) { if ((unsigned long long)&((struct Pad *)0)->f != @F@) return x; }\n"
-        "int qualified_agrees(int x) { if ((unsigned long long)&((volatile struct Pad *)0)->f == @F@) return x; }\n"
-        "int qualified_disagrees(int x) { if ((unsigned long long)&((volatile struct Pad *)0)->f != @F@) return x; }\n"
-        "int main(void) { return (int)sizeof bound; }\n";
-    for (LayoutPair const& pair : kLayoutPairs) {
-        std::uint64_t const longBytes = pair.lp64 ? 8 : 4;
-        std::uint64_t const other = 12 - longBytes;
-        expectTheTiersAgree(
-            pair, withValues(text, {{"L", longBytes}, {"F", 3 * longBytes}}),
-            withValues(text, {{"L", other}, {"F", 3 * other}}),
-            {"direct_disagrees", "promoted_disagrees", "qualified_disagrees"});
-    }
+    expectTheTiersAgree(
+        "mo_", {"mo_direct_disagrees", "mo_promoted_disagrees", "mo_qualified_disagrees"},
+        {"mo_l", "mo_f", "mo_vf"});
 }
 
 // A RECORDED ANSWER — the hook `resolveFoldedConstant`: `__builtin_offsetof` (what
@@ -1386,24 +1479,8 @@ TEST(Program_CompileFiles, BothTiersAgreeOnAMemberOffsetPerTarget) {
 // all: it reads the value the semantic tier recorded for it, so there is one
 // evaluation and nothing to agree with but itself — pinned so that stays true.
 TEST(Program_CompileFiles, BothTiersAgreeOnARecordedOffsetPerTarget) {
-    std::string const text =
-        "struct Pad { char c; long l; struct { char e; long f; }; };\n"
-        "_Static_assert(__builtin_offsetof(struct Pad, l) == @L@, \"l\");\n"
-        "_Static_assert(__builtin_offsetof(struct Pad, f) == @F@, \"f\");\n"
-        "static char bound[__builtin_offsetof(struct Pad, f)];\n"
-        "int direct_agrees(int x) { if (__builtin_offsetof(struct Pad, l) == @L@) return x; }\n"
-        "int direct_disagrees(int x) { if (__builtin_offsetof(struct Pad, l) != @L@) return x; }\n"
-        "int promoted_agrees(int x) { if (__builtin_offsetof(struct Pad, f) == @F@) return x; }\n"
-        "int promoted_disagrees(int x) { if (__builtin_offsetof(struct Pad, f) != @F@) return x; }\n"
-        "int main(void) { return (int)sizeof bound; }\n";
-    for (LayoutPair const& pair : kLayoutPairs) {
-        std::uint64_t const longBytes = pair.lp64 ? 8 : 4;
-        std::uint64_t const other = 12 - longBytes;
-        expectTheTiersAgree(
-            pair, withValues(text, {{"L", longBytes}, {"F", 3 * longBytes}}),
-            withValues(text, {{"L", other}, {"F", 3 * other}}),
-            {"direct_disagrees", "promoted_disagrees"});
-    }
+    expectTheTiersAgree("ro_", {"ro_direct_disagrees", "ro_promoted_disagrees"},
+                        {"ro_l", "ro_f"});
 }
 
 // A RECORDED SELECTION — the hook `resolveSelectedArm`: a `_Generic` whose
@@ -1412,71 +1489,175 @@ TEST(Program_CompileFiles, BothTiersAgreeOnARecordedOffsetPerTarget) {
 // arm is itself a layout constant. The lowering reads WHICH arm the semantic tier
 // selected and folds that arm; it never selects.
 TEST(Program_CompileFiles, BothTiersAgreeOnASelectionPerTarget) {
-    std::string const which =
-        "_Generic(sizeof 0, unsigned long: 1, unsigned long long: 2, default: 0)";
-    std::string const width = "_Generic((long)0, long: sizeof(long), default: 0)";
-    std::string const text =
-        "_Static_assert(" + which + " == @WHICH@, \"which\");\n"
-        "_Static_assert(" + width + " == @LONG@, \"width\");\n"
-        "int which_agrees(int x) { if (" + which + " == @WHICH@) return x; }\n"
-        "int which_disagrees(int x) { if (" + which + " != @WHICH@) return x; }\n"
-        "int width_agrees(int x) { if (" + width + " == @LONG@) return x; }\n"
-        "int width_disagrees(int x) { if (" + width + " != @LONG@) return x; }\n"
-        "int main(void) { return 0; }\n";
-    for (LayoutPair const& pair : kLayoutPairs) {
-        std::uint64_t const longBytes = pair.lp64 ? 8 : 4;
-        std::uint64_t const which = pair.lp64 ? 1 : 2;
-        expectTheTiersAgree(
-            pair, withValues(text, {{"WHICH", which}, {"LONG", longBytes}}),
-            withValues(text, {{"WHICH", 3 - which}, {"LONG", 12 - longBytes}}),
-            {"which_disagrees", "width_disagrees"});
+    expectTheTiersAgree("sel_", {"sel_which_disagrees", "sel_width_disagrees"},
+                        {"sel_which", "sel_width"});
+}
+
+// WHAT THE SHARING MUST NOT HIDE: a case reads only the lines that name its own
+// hook, so a line that names NO hook — a function reported outside the five
+// parts, an assertion refused with a message of nobody's — would be read by no
+// case. Every line of both compiles of every pair belongs to exactly one hook.
+TEST(Program_CompileFiles, TheSharedTierProgramSaysNothingOutsideItsFiveHooks) {
+    for (std::size_t i = 0; i < kLayoutPairs.size(); ++i) {
+        SCOPED_TRACE(std::string{kLayoutPairs[i].spec});
+        TierArms const& arms = tierArmsFor(i);
+        auto const hooksNaming = [](std::string const& text, std::string_view opener) {
+            return std::count_if(kTierHooks.begin(), kTierHooks.end(), [&](std::string_view hook) {
+                return text.find(std::string{opener} + std::string{hook}) != std::string::npos;
+            });
+        };
+        for (std::string const& t : arms.agreed.endReported) {
+            EXPECT_EQ(hooksNaming(t, "'"), 1) << "a function's end is reported outside every hook: " << t;
+        }
+        EXPECT_EQ(arms.agreed.endReported.size(), 15u) << "4 + 4 + 3 + 2 + 2 functions reach their end";
+        for (std::string const& t : arms.refuted.assertsRefused) {
+            EXPECT_EQ(hooksNaming(t, "\""), 1) << "an assertion is refused outside every hook: " << t;
+        }
+        EXPECT_EQ(arms.refuted.assertsRefused.size(), 13u) << "3 + 3 + 3 + 2 + 2 assertions name a layout value";
+        EXPECT_EQ(arms.refuted.errors, arms.refuted.assertsRefused.size())
+            << "the control arm is refused for a reason that is not an assertion: "
+            << arms.refuted.firstError;
     }
 }
 
-// ── A GUARDED RANGE COVERS THE FUNCTION'S OWN BLOCKS AND NOTHING ELSE ────────
+// ── A GUARDED REGION IS A SET OF CONTIGUOUS RUNS: AN `asm goto`'s EDGE BLOCKS ──
 // (D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES)
 //
 // An `asm goto` whose output is a structure the template leaves in a register is
 // stored through the object's address on EACH EDGE of the statement, in a block
 // the lowering creates for that edge — laid out after every block of the
-// function, so outside the byte range a `__try` around the statement guards.
-// ✔MEASURED P69 on pe64, debug and release: over a no-access page the process
-// ended with 0xC0000005 instead of reaching its handler. DSS now refuses that
-// one statement by name. Every arm but the first is a CONTROL that must keep
-// compiling, each removing exactly one of the facts the refusal reads.
-TEST(Program_CompileFiles, AGuardedAsmGotoStoringItsOutputOnItsEdgesIsRefusedByName) {
+// function. A `__try` around the statement used to guard the body's own blocks
+// alone. ✔MEASURED P69 on pe64, debug and release: over a no-access page the
+// process ended with 0xC0000005 instead of reaching its handler; DSS then
+// refused the statement by name. It COMPILES now: the edge blocks are a run of
+// the region, under a scope record of their own.
+//
+// The pin reads the PRODUCED IMAGE on every host — `.pdata`'s RUNTIME_FUNCTION
+// array, each entry's UNWIND_INFO, and the scope table behind it — never an exit
+// code (the runnable witness is
+// examples/c/seh_asm_goto_output_stored_on_its_edges_is_guarded, on the legs
+// that run a pe64 image). Each arm states how many records its function's table
+// holds, and the arms differ in exactly the facts that decide it.
+namespace {
+
+struct GuardedPeScope {
+    std::uint32_t begin = 0, end = 0, filter = 0, target = 0;   // RVAs, as the table holds them
+};
+struct GuardedPeFunction {
+    std::uint32_t               begin = 0, end = 0;             // RVAs, from RUNTIME_FUNCTION
+    std::vector<GuardedPeScope> scopes;
+};
+
+// Every function of a pe64 image whose unwind information claims an exception
+// handler, with its scope table. `resolved` receives the number of RUNTIME_FUNCTION
+// entries whose UNWIND_INFO was found at all, so a pin can guard its own premise
+// (an image with no unwind information would otherwise read as "no handler").
+[[nodiscard]] std::vector<GuardedPeFunction>
+guardedPeFunctions(std::vector<std::uint8_t> const& img, std::size_t& resolved) {
+    resolved = 0;
+    std::vector<GuardedPeFunction> out;
+    auto const u16 = [&](std::size_t at) -> std::uint32_t {
+        return at + 2 <= img.size() ? std::uint32_t{img[at]} | (std::uint32_t{img[at + 1]} << 8) : 0u;
+    };
+    auto const u32 = [&](std::size_t at) -> std::uint32_t {
+        return at + 4 <= img.size() ? u16(at) | (u16(at + 2) << 16) : 0u;
+    };
+    if (img.size() < 0x40) return out;
+    std::size_t const pe = u32(0x3C);
+    if (pe + 24 > img.size() || img[pe] != 'P' || img[pe + 1] != 'E') return out;
+    struct Section { std::string name; std::uint32_t vaddr, vsize, rawPtr, rawSize; };
+    std::vector<Section> sections;
+    std::size_t const sectionTable = pe + 24 + u16(pe + 20);
+    for (std::uint32_t i = 0; i < u16(pe + 6); ++i) {
+        std::size_t const o = sectionTable + std::size_t{i} * 40;
+        if (o + 40 > img.size()) break;
+        Section s;
+        for (std::size_t k = 0; k < 8 && img[o + k] != 0; ++k) s.name.push_back(static_cast<char>(img[o + k]));
+        s.vsize = u32(o + 8); s.vaddr = u32(o + 12); s.rawSize = u32(o + 16); s.rawPtr = u32(o + 20);
+        sections.push_back(std::move(s));
+    }
+    auto const fileOffsetOf = [&](std::uint32_t rva) -> std::size_t {
+        for (auto const& s : sections) {
+            if (rva >= s.vaddr && rva < s.vaddr + std::max(s.vsize, s.rawSize)) {
+                return std::size_t{rva - s.vaddr} + s.rawPtr;
+            }
+        }
+        return 0;
+    };
+    for (auto const& s : sections) {
+        if (s.name != ".pdata") continue;
+        std::size_t const bytes = std::min<std::size_t>(s.vsize, s.rawSize);
+        for (std::size_t e = 0; e + 12 <= bytes; e += 12) {
+            std::uint32_t const begin = u32(s.rawPtr + e);
+            std::uint32_t const end   = u32(s.rawPtr + e + 4);
+            std::size_t const   info  = fileOffsetOf(u32(s.rawPtr + e + 8));
+            if (begin == 0 && end == 0) continue;            // the array's padding
+            if (info == 0 || info + 4 > img.size()) continue;
+            ++resolved;
+            // UNWIND_INFO: Version:3 | Flags:5, SizeOfProlog, CountOfCodes, frame;
+            // then the codes (two bytes each, an even number of them); then, when
+            // the flags claim a handler, its RVA and the language-specific data —
+            // here the scope table: Count, then Count × {Begin, End, Handler, Target}.
+            constexpr std::uint8_t kEHandler = 0x08;         // UNW_FLAG_EHANDLER << 3
+            if ((img[info] & kEHandler) == 0) continue;
+            std::size_t const codes = (std::size_t{img[info + 2]} + 1u) & ~std::size_t{1};
+            std::size_t const table = info + 4 + codes * 2 + 4;   // past the handler's RVA
+            GuardedPeFunction fn;
+            fn.begin = begin;
+            fn.end   = end;
+            std::uint32_t const count = u32(table);
+            for (std::uint32_t k = 0; k < count && table + 4 + (std::size_t{k} + 1) * 16 <= img.size(); ++k) {
+                std::size_t const r = table + 4 + std::size_t{k} * 16;
+                fn.scopes.push_back(GuardedPeScope{u32(r), u32(r + 4), u32(r + 8), u32(r + 12)});
+            }
+            out.push_back(std::move(fn));
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] std::vector<std::uint8_t> guardedPeImage(fs::path const& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::vector<std::uint8_t>{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+}  // namespace
+
+TEST(Program_CompileFiles, AGuardedAsmGotosEdgeBlocksAreUnderAScopeRecordOfTheirOwn) {
     constexpr std::string_view kPe = "x86_64:pe64-x86_64-windows-exec";
     struct Arm {
         char const* stem;
-        bool        refused;
+        std::size_t records;  // the scope records of `use` (0: its unwind information claims no handler)
         char const* body;     // the statements of `use(struct pair *p, int *q)`
     };
     std::array<Arm, 5> const arms{{
-        // THE SHAPE: guarded, `asm goto`, a by-address output through `p`.
-        {"guarded_goto_by_address", true,
+        // THE SHAPE: guarded, `asm goto`, a by-address output through `p` — the
+        // body's own blocks, then the edge blocks that store through `p`.
+        {"guarded_goto_by_address", 2,
          "  __try {\n"
          "    __asm__ goto (\"movq $7, %0\" : \"=r\"(*p) : : \"cc\" : other);\n"
          "    rc += 1;\n"
          "  other:\n"
          "    rc += 2;\n"
          "  } __except (1) { rc = 42; }\n"},
-        // not `asm goto`: the store follows the template in the guarded block.
-        {"guarded_plain_by_address", false,
+        // not `asm goto`: one way out, the store follows the template in the
+        // guarded block itself, and nothing is created.
+        {"guarded_plain_by_address", 1,
          "  __try {\n"
          "    __asm__ (\"movq $7, %0\" : \"=r\"(*p) : : \"cc\");\n"
          "    rc += 1;\n"
          "  } __except (1) { rc = 42; }\n"},
-        // not by-address: a scalar's edge store is a block of the function's own.
-        {"guarded_goto_scalar", false,
+        // a scalar output: every edge still gets its block (the capture).
+        {"guarded_goto_scalar", 2,
          "  __try {\n"
          "    __asm__ goto (\"movl $7, %0\" : \"=r\"(*q) : : \"cc\" : other);\n"
          "    rc += 1;\n"
          "  other:\n"
          "    rc += 2;\n"
          "  } __except (1) { rc = 42; }\n"},
-        // not the program's memory: the output is this function's own object
-        // (the remedy the refusal names), assigned through `p` afterwards.
-        {"guarded_goto_local", false,
+        // the output is this function's own object, assigned through `p`
+        // afterwards (what the refusal used to tell the programmer to write).
+        {"guarded_goto_local", 2,
          "  __try {\n"
          "    struct pair local;\n"
          "    __asm__ goto (\"movq $7, %0\" : \"=r\"(local) : : \"cc\" : other);\n"
@@ -1485,7 +1666,7 @@ TEST(Program_CompileFiles, AGuardedAsmGotoStoringItsOutputOnItsEdgesIsRefusedByN
          "    *p = local;\n"
          "  } __except (1) { rc = 42; }\n"},
         // not guarded: the same statement with no `__try` around it.
-        {"unguarded_goto_by_address", false,
+        {"unguarded_goto_by_address", 0,
          "  __asm__ goto (\"movq $7, %0\" : \"=r\"(*p) : : \"cc\" : other);\n"
          "  rc += 1;\n"
          "other:\n"
@@ -1511,25 +1692,42 @@ TEST(Program_CompileFiles, AGuardedAsmGotoStoringItsOutputOnItsEdgesIsRefusedByN
         DiagnosticReporter rep;
         int const rc = prog.compileFiles({src.generic_string()}, "c",
                                          {std::string{kPe}}, rep);
-        std::size_t errors = 0, named = 0;
-        for (auto const& d : rep.all()) {
-            if (d.severity != DiagnosticSeverity::Error) continue;
-            ++errors;
-            if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
-                && d.actual.find("inside a guarded body") != std::string::npos
-                && d.actual.find("by-address output") != std::string::npos) {
-                ++named;
-            }
+        // Every arm is read: a red one does not hide the next.
+        EXPECT_EQ(rc, 0) << (rep.all().empty() ? std::string{} : rep.all()[0].actual);
+        EXPECT_EQ(rep.errorCount(), 0u)
+            << (rep.all().empty() ? std::string{} : rep.all()[0].actual);
+        if (rc != 0) continue;
+
+        auto const img = guardedPeImage(scratch.path() / "target" / "pe64-x86_64-windows-exec"
+                                        / (std::string{arm.stem} + ".exe"));
+        EXPECT_FALSE(img.empty()) << "the compile must produce the image";
+        std::size_t resolved = 0;
+        std::vector<GuardedPeFunction> const guarded = guardedPeFunctions(img, resolved);
+        EXPECT_GE(resolved, 1u)
+            << "the premise: `.pdata` must resolve a function's unwind information";
+        if (arm.records == 0) {
+            EXPECT_TRUE(guarded.empty()) << "a function with no `__try` claims a handler";
+            continue;
         }
-        if (arm.refused) {
-            EXPECT_NE(rc, 0)
-                << "RED-ON-DISABLE: compiled, this statement's edge stores lie "
-                   "outside the range its `__try` guards";
-            EXPECT_EQ(named, 1u) << "the refusal names the guarded body and the output";
-        } else {
-            EXPECT_EQ(rc, 0) << "a control must keep compiling";
-            EXPECT_EQ(errors, 0u)
-                << (rep.all().empty() ? std::string{} : rep.all()[0].actual);
+        EXPECT_EQ(guarded.size(), 1u) << "`use` alone guards a region";
+        if (guarded.size() != 1u) continue;
+        GuardedPeFunction const& fn = guarded[0];
+        EXPECT_EQ(fn.scopes.size(), arm.records)
+            << "RED-ON-DISABLE: with the run's record gone, the blocks this "
+               "statement's edges became lie outside every range its `__try` guards";
+        if (fn.scopes.empty()) continue;
+        for (GuardedPeScope const& sc : fn.scopes) {
+            EXPECT_LT(sc.begin, sc.end) << "an empty record guards nothing";
+            EXPECT_GE(sc.begin, fn.begin);
+            EXPECT_LE(sc.end, fn.end);
+            EXPECT_EQ(sc.filter, fn.scopes[0].filter) << "every record of a region names its one filter";
+            EXPECT_EQ(sc.target, fn.scopes[0].target) << "and enters its one handler";
+            EXPECT_FALSE(sc.target >= sc.begin && sc.target < sc.end)
+                << "a record's range holds its own handler";
+        }
+        if (fn.scopes.size() == 2) {
+            EXPECT_GE(fn.scopes[1].begin, fn.scopes[0].end)
+                << "the run lies after the body's own blocks, apart from them";
         }
     }
 }

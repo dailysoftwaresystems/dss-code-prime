@@ -17932,6 +17932,135 @@ TEST(MirLoweringC, AVaListReachedThroughItsDecayedPointerIsReadThroughThePointer
     EXPECT_TRUE(C.mir.ok) << (C.mirReporter.all().empty() ? "" : C.mirReporter.all()[0].actual);
 }
 
+// `va_copy` INTO a list reached through its decayed pointer copies the TAG the pointer points
+// at — the pointee step of `lowerVaCopy`, which reads WHAT is copied off the destination's
+// type: a `Ptr<__va_list_tag>` destination names the 24-byte tag, not eight bytes of pointer.
+// Beside the direct copy (`va_copy(b, a)`), the decayed one (`p = b; va_copy(p, a)`) READS THE
+// SAME 24 BYTES out of the source's tag, and p's value — the destination's address — besides.
+// The pin counts BYTES, not instructions, because the two copies are cut differently and both
+// are right: the array-typed destination is copied as three 8-byte chunks, the tag reached
+// through the pointer member by member (two `unsigned int` cursors, two area pointers).
+// ✔MEASURED 2026-10-10 on the four build compilers: the decayed function holds no 8-byte integer
+// load at all and three pointer loads, the direct one three 8-byte integer loads and no
+// pointer load. The run-time half is examples/c/va_list_through_its_decayed_pointer
+// (`copy_into_ptr`).
+//
+// RED-ON-DISABLE: skip the pointee step and the copy is ONE pointer-sized load out of the
+// source's tag, stored over the destination's first eight bytes: sixteen bytes fewer are read.
+namespace {
+// Every byte the function's Loads read, on the LP64 pair `lowerC` lowers for by default. A
+// load of a type with no scalar size is a failure of its own, never a silent zero.
+[[nodiscard]] std::uint64_t bytesLoaded(Mir const& m, TypeInterner const& in, std::uint32_t fi) {
+    std::uint64_t n = 0;
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Load) continue;
+            auto const size = scalarByteSize(in.kind(m.instType(ix)), DataModel::Lp64);
+            if (!size.has_value()) {
+                ADD_FAILURE() << "a Load of a type with no scalar size";
+                continue;
+            }
+            n += *size;
+        }
+    }
+    return n;
+}
+}  // namespace
+
+TEST(MirLoweringC, VaCopyIntoADecayedListCopiesTheTagItPointsAt) {
+    char const* direct =
+        "int f(int n, ...) { va_list a, b; va_start(a, n); va_copy(b, a);\n"
+        "  va_end(b); va_end(a); return n; }\n";
+    char const* decayed =
+        "int f(int n, ...) { va_list a, b; va_start(a, n); __typeof__(&b[0]) p = b;\n"
+        "  va_copy(p, a); va_end(b); va_end(a); return n; }\n";
+    auto D = lowerC(direct);   // x86_64 SysV
+    auto P = lowerC(decayed);
+    for (char const* src : {direct, decayed}) {
+        auto const& L = src == direct ? D : P;
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        ASSERT_TRUE(L.mir.ok) << src
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        ASSERT_EQ(L.mir.mir.moduleFuncCount(), 1u) << src;
+    }
+    std::uint64_t const directBytes  = bytesLoaded(D.mir.mir, D.model.lattice().interner(), 0);
+    std::uint64_t const decayedBytes = bytesLoaded(P.mir.mir, P.model.lattice().interner(), 0);
+    // CONTROL: the direct copy does read the tag — three 8-byte chunks — so the sum below is
+    // a comparison with a copy, not with nothing.
+    EXPECT_EQ(countLoadsOfKind(D.mir.mir, D.model.lattice().interner(), 0, TypeKind::I64), 3u)
+        << direct;
+    EXPECT_GE(directBytes, 24u) << direct;
+    EXPECT_EQ(decayedBytes, directBytes + 8u)
+        << "the decayed copy reads the 24 bytes of the source's tag, as the direct one does, and "
+           "the 8 bytes of p's value besides\n" << decayed;
+}
+
+// A PARAMETER declared as the list DECAYED — a `Ptr<__va_list_tag>` — is an ordinary pointer
+// parameter: its incoming VALUE is the tag's address. It is NOT the array-typed `va_list`
+// parameter, whose incoming pointer is registered as the parameter's ADDRESS (the array IS
+// the caller's tag). Registered that way too, the pointer variable would be conflated with
+// the tag it points at: the walk would load "p's value" out of the tag's first eight bytes
+// and index from there. Pinned by what no correct lowering does: load a POINTER through the
+// incoming argument itself. THE CONTROL is the array-typed spelling of the same function,
+// which reads the same fields and holds no such load either.
+// The run-time half is examples/c/va_list_through_its_decayed_pointer (`walk`).
+//
+// RED-ON-DISABLE: let the va_list-parameter arm take a `Ptr<__va_list_tag>` parameter too.
+namespace {
+// Loads of a pointer whose ADDRESS operand is one of the function's incoming arguments.
+[[nodiscard]] std::size_t countPointerLoadsThroughAnArgument(Mir const& m, TypeInterner const& in,
+                                                             std::uint32_t fi) {
+    std::size_t n = 0;
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Load) continue;
+            if (in.kind(m.instType(ix)) != TypeKind::Ptr) continue;
+            auto const ops = m.instOperands(ix);
+            if (!ops.empty() && m.instOpcode(ops[0]) == MirOpcode::Arg) ++n;
+        }
+    }
+    return n;
+}
+}  // namespace
+
+TEST(MirLoweringC, ADecayedListParameterIsAnOrdinaryPointerNeverTheTagsOwnAddress) {
+    char const* decayedParam =
+        "int walk(__typeof__(&((va_list *)0)[0][0]) p, int n) {\n"
+        "  int s = 0;\n"
+        "  for (int i = 0; i < n; ++i) s += va_arg(p, int);\n"
+        "  return s;\n"
+        "}\n";
+    char const* arrayParam =
+        "int walk(va_list p, int n) {\n"
+        "  int s = 0;\n"
+        "  for (int i = 0; i < n; ++i) s += va_arg(p, int);\n"
+        "  return s;\n"
+        "}\n";
+    for (char const* src : {decayedParam, arrayParam}) {
+        auto L = lowerC(src);   // x86_64 SysV
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        ASSERT_TRUE(L.mir.ok) << src
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        ASSERT_EQ(L.mir.mir.moduleFuncCount(), 1u) << src;
+        EXPECT_EQ(countPointerLoadsThroughAnArgument(L.mir.mir, L.model.lattice().interner(), 0),
+                  0u)
+            << "a pointer is loaded THROUGH the incoming argument: the parameter's value was "
+               "taken for the address of the pointer variable\n" << src;
+        // The walk really reads the tag: the register-save area's pointer is loaded
+        // (so the zero above is not the silence of a function that reads nothing).
+        EXPECT_GE(countLoadsOfKind(L.mir.mir, L.model.lattice().interner(), 0, TypeKind::Ptr), 1u)
+            << src;
+    }
+}
+
 // The semantic tier types `va_copy` `void` and refuses an operand that is not a va_list,
 // at either position — the check va_start's and va_end's operands get.
 TEST(MirLoweringC, VaCopyRefusesAnOperandThatIsNotAVaList) {

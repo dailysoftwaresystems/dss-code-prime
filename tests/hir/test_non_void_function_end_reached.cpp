@@ -820,3 +820,271 @@ TEST(NonVoidFunctionEndReached, ADocumentThatDoesNotStateTheRuleKeepsTheRefusal)
     EXPECT_TRUE(l->result->ok) << dump(l->reporter);
     EXPECT_EQ(countCode(l->reporter, kReached), 1u) << dump(l->reporter);
 }
+
+// ── THE OTHER TWO ROUTES ─────────────────────────────────────────────────────
+//
+// The end of a body is completed once per way a language document can say "this
+// is a function", and every pin above is on ONE of the three — the declarator
+// route (C). The other two:
+//
+//   * a row that STATES its kind and is mapped to `Function`
+//     (`lowerFunctionDecl`) — the shipped toy document's `funcDef`;
+//   * a positional row whose kind a CHILD decides (`kindByChild`,
+//     `lowerFunction`) — the route of NO shipped document: the one document with
+//     such a row (c) is declarator-mode.
+//
+// Each is pinned on a document made in memory from the shipped TOY one: the two
+// end-of-body keys set on its function row (the toy language states neither — the
+// fixture throws if it ever does, because the "key absent" arm below is that
+// document as shipped), and for the positional route its function rule and row
+// rewritten into the child-kind shape:
+//     func f(x : int) -> int { … }      the shipped shape
+//     func f -> int (x : int) { … }     the positional one — `funcTail` is the
+//                                       parameters and the body, and decides the kind
+// Nothing else of the language moves, so the two routes are measured on the same
+// statements. WHICH route a document takes is proven by the mutants, not asserted:
+// taking the completion out of one route reddens that route's cases and leaves
+// the other two routes' green.
+namespace {
+
+enum class ToyRoute { StatesItsKind, KindByChild };
+
+struct ToyKeys {
+    std::optional<std::string_view> endRule;                   // nonVoidFunctionEndReached
+    bool                            mainReturnsZero = false;   // implicitReturnZeroForFunctionNames
+};
+
+[[nodiscard]] std::shared_ptr<GrammarSchema const> toyDocument(ToyRoute route, ToyKeys keys) {
+    std::filesystem::path const path =
+        dss::test::configRoot() / "sources" / "toy.lang.json";
+    std::ifstream in{path, std::ios::binary};
+    if (!in.good()) {
+        throw std::runtime_error("cannot open the shipped toy document: " + path.string());
+    }
+    nlohmann::json doc = nlohmann::json::parse(in);
+    nlohmann::json* fn = nullptr;
+    std::size_t functionRows = 0;
+    for (auto& row : doc.at("semantics").at("declarations")) {
+        if (row.value("kind", std::string{}) != "function") continue;
+        ++functionRows;
+        fn = &row;
+    }
+    if (functionRows != 1 || fn->at("rule") != "funcDef") {
+        throw std::runtime_error(
+            "expected the shipped toy document to hold exactly one function row, "
+            "`funcDef`; found " + std::to_string(functionRows));
+    }
+    if (fn->contains("nonVoidFunctionEndReached")
+        || fn->contains("implicitReturnZeroForFunctionNames")) {
+        throw std::runtime_error(
+            "the shipped toy document now states an end-of-body key: the `key "
+            "absent` arm of this file is no longer that document as shipped");
+    }
+    if (route == ToyRoute::KindByChild) {
+        // The rewrite is of THIS shape; a toy document that moved must be read
+        // again before it is rewritten.
+        nlohmann::json const shipped = nlohmann::json::parse(
+            R"({ "sequence": [ "FuncKeyword", "Identifier", "funcParams", "Arrow", "typeRef", "block" ] })");
+        if (doc.at("shapes").at("funcDef") != shipped) {
+            throw std::runtime_error("the shipped toy document's `funcDef` shape moved");
+        }
+        doc["shapes"]["funcDef"] = nlohmann::json::parse(
+            R"({ "sequence": [ "FuncKeyword", "Identifier", "Arrow", "typeRef", "funcTail" ] })");
+        doc["shapes"]["funcTail"] = nlohmann::json::parse(
+            R"({ "sequence": [ "funcParams", "block" ] })");
+        *fn = nlohmann::json::parse(
+            R"({ "rule": "funcDef", "name": 1, "type": 3, "kind": "variable",
+                 "kindByChild": { "childPath": [4], "whenRule": "funcTail",
+                                  "whenKind": "function",
+                                  "paramsPath": [0], "bodyPath": [1] } })");
+        std::size_t remapped = 0;
+        for (auto& mapping : doc.at("hirLowering").at("ruleMappings")) {
+            if (mapping.at("rule") != "funcDef") continue;
+            mapping["hirKind"] = "Decl";
+            ++remapped;
+        }
+        if (remapped != 1) {
+            throw std::runtime_error("the toy document maps `funcDef` "
+                                     + std::to_string(remapped) + " time(s), not once");
+        }
+    }
+    if (keys.endRule.has_value()) {
+        (*fn)["nonVoidFunctionEndReached"] = std::string{*keys.endRule};
+    }
+    if (keys.mainReturnsZero) {
+        (*fn)["implicitReturnZeroForFunctionNames"] = nlohmann::json::array({"main"});
+    }
+    auto loaded = GrammarSchema::loadFromText(doc.dump(), "<toy-rewritten>");
+    if (!loaded) {
+        std::string message = "the rewritten toy document did not load";
+        for (auto const& d : loaded.error()) {
+            message += "\n    ";
+            message += d.path;
+            message += ": ";
+            message += d.message;
+        }
+        throw std::runtime_error(std::move(message));
+    }
+    return *loaded;
+}
+
+// One function definition in the route's own spelling.
+[[nodiscard]] std::string toyFunction(ToyRoute route, std::string_view name,
+                                      std::string_view params, std::string_view result,
+                                      std::string_view body) {
+    std::string text = "func ";
+    text += name;
+    if (route == ToyRoute::StatesItsKind) {
+        text += "(";
+        text += params;
+        text += ") -> ";
+        text += result;
+    } else {
+        text += " -> ";
+        text += result;
+        text += " (";
+        text += params;
+        text += ")";
+    }
+    text += " ";
+    text += body;
+    text += "\n";
+    return text;
+}
+
+constexpr std::string_view kRelaxed = "returnsUnspecifiedValue";
+
+// The completion's shape, the one warning per function at its own closing brace,
+// nothing else reported — and the refusal kept by the same document without the
+// rule (absent: the document as shipped, or as rewritten for the route; and
+// spelled `refused`).
+void expectTheRouteCompletesAReachedEnd(ToyRoute route) {
+    auto const fn = [route](std::string_view name, std::string_view params,
+                            std::string_view result, std::string_view body) {
+        return toyFunction(route, name, params, result, body);
+    };
+    std::string const reached = fn("f", "x : int", "int", "{ if (0 < x) { return 5; } }");
+    std::string const returns =
+        fn("g", "x : int", "int", "{ if (0 < x) { return 1; } else { return 2; } }");
+    {
+        std::string const src = reached + returns + fn("h", "", "bool", "{ }")
+                              + fn("v", "x : int", "void", "{ if (0 < x) { return; } }");
+        auto const l = lowerUnder(toyDocument(route, ToyKeys{kRelaxed, false}), src);
+        ASSERT_TRUE(l->result->ok) << dump(l->reporter);
+        ASSERT_EQ(l->reporter.all().size(), 2u)
+            << "exactly the two warnings — `f` and `h`:" << dump(l->reporter);
+        std::size_t const fEnd = lastCharOf(*l, "{ if (0 < x) { return 5; } }");
+        std::size_t const hEnd = lastCharOf(*l, "{ }");
+        bool sawF = false;
+        bool sawH = false;
+        for (auto const& d : l->reporter.all()) {
+            EXPECT_EQ(d.code, kReached);
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
+            if (d.actual.find("'f'") != std::string::npos) {
+                sawF = true;
+                EXPECT_EQ(d.span.start(), fEnd) << d.actual;
+            } else if (d.actual.find("'h'") != std::string::npos) {
+                sawH = true;
+                EXPECT_EQ(d.span.start(), hEnd) << d.actual;
+            }
+        }
+        EXPECT_TRUE(sawF) << dump(l->reporter);
+        EXPECT_TRUE(sawH) << dump(l->reporter);
+        auto const& interner = l->model.lattice().interner();
+        for (std::string_view const name : {"f", "h"}) {
+            HirNodeId const node = l->function(name);
+            ASSERT_TRUE(node.valid()) << name;
+            TypeId const local = completionLocalType(*l, node);
+            ASSERT_TRUE(local.valid())
+                << name << "'s body must be { <body>  T t;  return t; }";
+            EXPECT_EQ(local, interner.fnResult(l->hir().functionSignature(node))) << name;
+        }
+        // A body that returns on every path, and a function that returns nothing:
+        // neither completed.
+        for (std::string_view const name : {"g", "v"}) {
+            HirNodeId const node = l->function(name);
+            ASSERT_TRUE(node.valid()) << name;
+            EXPECT_FALSE(completionLocalType(*l, node).valid()) << name;
+        }
+    }
+    struct Arm {
+        char const*                     what;
+        std::optional<std::string_view> spelling;
+    };
+    for (Arm const& arm : {Arm{"key absent", std::nullopt},
+                           Arm{"key spelled refused", std::string_view{"refused"}}}) {
+        auto const l = lowerUnder(toyDocument(route, ToyKeys{arm.spelling, false}),
+                                  reached + returns);
+        EXPECT_FALSE(l->result->ok) << arm.what;
+        EXPECT_EQ(countCode(l->reporter, kRefused), 1u) << arm.what << dump(l->reporter);
+        EXPECT_EQ(countCode(l->reporter, kReached), 0u) << arm.what << dump(l->reporter);
+    }
+}
+
+// The list of names that return zero is read FIRST on this route too: `main` gets
+// `return 0`, not the unspecified value, and is not reported. THE CONTROL is the
+// same program under the same document without the list — there `main` is
+// completed and reported like any other function, so the list is what answered.
+void expectMainKeepsItsReturnZero(ToyRoute route) {
+    std::string const src = toyFunction(route, "helper", "", "int", "{ }")
+                          + toyFunction(route, "main", "", "int", "{ var x : int = 1; }");
+    {
+        auto const l = lowerUnder(toyDocument(route, ToyKeys{kRelaxed, true}), src);
+        ASSERT_TRUE(l->result->ok) << dump(l->reporter);
+        ASSERT_EQ(l->reporter.all().size(), 1u) << dump(l->reporter);
+        EXPECT_EQ(l->reporter.all()[0].code, kReached);
+        EXPECT_NE(l->reporter.all()[0].actual.find("'helper'"), std::string::npos)
+            << l->reporter.all()[0].actual;
+        Hir const& hir = l->hir();
+        HirNodeId const m = l->function("main");
+        ASSERT_TRUE(m.valid());
+        HirNodeId const outer = hir.functionBody(m);
+        ASSERT_EQ(hir.kind(outer), HirKind::Block);
+        auto const kids = hir.children(outer);
+        ASSERT_EQ(kids.size(), 2u) << "main is { <body>  return 0; } — two children, not three";
+        ASSERT_EQ(hir.kind(kids[1]), HirKind::ReturnStmt);
+        auto const value = hir.returnValue(kids[1]);
+        ASSERT_TRUE(value.has_value());
+        EXPECT_EQ(hir.kind(*value), HirKind::Literal) << "main returns the literal zero";
+        EXPECT_FALSE(completionLocalType(*l, m).valid());
+    }
+    {
+        auto const l = lowerUnder(toyDocument(route, ToyKeys{kRelaxed, false}), src);
+        ASSERT_TRUE(l->result->ok) << dump(l->reporter);
+        EXPECT_EQ(countCode(l->reporter, kReached), 2u)
+            << "CONTROL: without the list `main` is one more function whose end is reached"
+            << dump(l->reporter);
+        HirNodeId const m = l->function("main");
+        ASSERT_TRUE(m.valid());
+        EXPECT_TRUE(completionLocalType(*l, m).valid());
+    }
+}
+
+}  // namespace
+
+// RED-ON-DISABLE: take the completion out of `lowerFunctionDecl` and `f` and `h`
+// are refused by the verifier under the relaxed rule; the declarator route's
+// cases and the positional route's stay green.
+TEST(NonVoidFunctionEndReached, ARowThatStatesItsKindIsCompletedOnItsOwnRoute) {
+    expectTheRouteCompletesAReachedEnd(ToyRoute::StatesItsKind);
+}
+
+// RED-ON-DISABLE: call the completion BEFORE the list in `lowerFunctionDecl` and
+// `main` is completed with the local and warned about.
+TEST(NonVoidFunctionEndReached, MainKeepsItsReturnZeroOnTheRouteOfARowThatStatesItsKind) {
+    expectMainKeepsItsReturnZero(ToyRoute::StatesItsKind);
+}
+
+// The positional child-kind route — reached by no shipped document, so this
+// in-memory rewrite of the toy one is the only thing that lowers a function there.
+//
+// RED-ON-DISABLE: take the completion out of `lowerFunction`; the other two
+// routes' cases stay green.
+TEST(NonVoidFunctionEndReached, APositionalChildKindRowIsCompletedOnItsOwnRoute) {
+    expectTheRouteCompletesAReachedEnd(ToyRoute::KindByChild);
+}
+
+// RED-ON-DISABLE: call the completion BEFORE the list in `lowerFunction`.
+TEST(NonVoidFunctionEndReached, MainKeepsItsReturnZeroOnThePositionalChildKindRoute) {
+    expectMainKeepsItsReturnZero(ToyRoute::KindByChild);
+}

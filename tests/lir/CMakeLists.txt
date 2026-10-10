@@ -446,3 +446,12 @@ dss_add_test(NAME lir/test_lir_descriptor_blocks
 # format that lowers a thread-local access and under an indirect-slot dispatch.
 dss_add_test(NAME lir/test_thread_local_import_lowering
              SOURCES test_thread_local_import_lowering.cpp)
+
+# D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES (P69): a guarded
+# region is a set of contiguous runs with one scope record per run — the records
+# of a nested pair in table order (inner body, inner runs, outer body, outer
+# runs), a run made only of blocks created for the region's own blocks in its own
+# function, and why no run writes a value its handler reads: a source function
+# that guards a region holds no phi at all.
+dss_add_test(NAME lir/test_guarded_region_runs
+             SOURCES test_guarded_region_runs.cpp)

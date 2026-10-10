@@ -940,6 +940,109 @@ TEST(LirCallconv, ACallerWhoseCallPushesNothingTouchesThePageItsStackPointerLand
     }
 }
 
+// ── THE MATERIALIZATION PUBLISHES WHERE EACH SOURCE BLOCK LANDED ──────────────────
+//
+// The guard-page walk INSERTS blocks: its step and its tail are created right after the
+// block that descends, so every source block laid out AFTER that one has another id in the
+// output. The pass says where each landed — `LirCallconvResult::blockEntryImage`, indexed
+// by the SOURCE block's id — and everything that names a block as data follows it (a
+// label's address, a switch table, a guarded region, the unwind rows:
+// `lir/lir_descriptor_blocks.hpp`). Until this case the image of THIS pass was read only
+// by programs that had to RUN on a pe host (examples/c/c99_vla_win64_unwind_walk and the
+// three "…_after_an_asm_label_function" examples): on a leg that cannot run pe, nothing
+// looked at it.
+//
+// Three source blocks — one before the descent, the block that descends, the block that
+// returns — so there is a block on each side of the insertion. The witness is not the
+// image: the output block that holds `ret` is found BY ITS OPCODE, and the source block
+// that returns must be published as that block. A pass that published its SOURCE ids
+// would be right about the first two blocks and wrong about the third, which is why the
+// function has a block after the descent.
+TEST(LirCallconv, TheMaterializationPublishesWhereEachSourceBlockLanded) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const t = footingTargetOf(sch);
+    ASSERT_TRUE(t.has_value());
+    ASSERT_GT(t->page, 0u) << "the premise: ms_x64 walks a runtime descent";
+    auto const jmp      = sch.opcodeByMnemonic("jmp");
+    auto const subSpReg = sch.opcodeByMnemonic("sub_sp_reg");
+    auto const ret      = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(jmp.has_value() && subSpReg.has_value() && ret.has_value());
+
+    LirBuilder b{sch};
+    (void)b.addFunction(SymbolId{77});
+    LirBlockId const first    = b.createBlock();
+    LirBlockId const descends = b.createBlock();
+    LirBlockId const returns  = b.createBlock();
+    b.beginBlock(first);
+    (void)b.addBr(*jmp, descends);
+    b.beginBlock(descends);
+    {
+        std::array<LirOperand, 2> ops{
+            LirOperand::makeReg(makePhysicalReg(t->spOrd, LirRegClass::GPR)),
+            LirOperand::makeReg(makePhysicalReg(t->rax, LirRegClass::GPR))};
+        (void)b.addInst(*subSpReg, InvalidLirReg, ops);
+        (void)b.addBr(*jmp, returns);
+    }
+    b.beginBlock(returns);
+    (void)b.addReturn(*ret, std::span<LirOperand const>{});
+    Lir const src = std::move(b).finish();
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{77};
+    alloc.perFunc.back().callingConventionIndex = 1;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(src, sch, alloc, rep);
+    ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& out = result.lir;
+    LirFuncId const srcFn = src.funcAt(0);
+    LirFuncId const outFn = out.funcAt(0);
+    ASSERT_EQ(src.funcBlockCount(srcFn), 3u);
+    ASSERT_EQ(result.blockEntryImage.size(), src.blockCount())
+        << "the image is indexed by the SOURCE module's block arena";
+    // CONTROL: the walk did insert blocks — otherwise the identity would be the right
+    // answer and the case would prove nothing.
+    std::uint32_t const outBlocks = out.funcBlockCount(outFn);
+    ASSERT_EQ(outBlocks, 5u) << "three source blocks and the walk's step and tail";
+
+    // Where, in the output function's layout, a block holds a given opcode.
+    auto const positionsHolding = [&](std::uint16_t opcode) {
+        std::vector<std::uint32_t> at;
+        for (std::uint32_t k = 0; k < outBlocks; ++k) {
+            LirBlockId const blk = out.funcBlockAt(outFn, k);
+            for (std::uint32_t i = 0; i < out.blockInstCount(blk); ++i) {
+                if (out.instOpcode(out.blockInstAt(blk, i)) == opcode) {
+                    at.push_back(k);
+                    break;
+                }
+            }
+        }
+        return at;
+    };
+    auto const retAt   = positionsHolding(*ret);
+    auto const touchAt = positionsHolding(t->orMem);
+    ASSERT_EQ(retAt.size(), 1u) << "the function returns in one place";
+    ASSERT_FALSE(touchAt.empty()) << "the walk's first touch closes the block that descends";
+
+    // The block that returns: the last of the layout, two blocks later than it was.
+    EXPECT_EQ(retAt.front(), 4u);
+    EXPECT_EQ(result.blockEntryImage[returns.v], out.funcBlockAt(outFn, retAt.front()).v)
+        << "the source block that returns was published somewhere else than the block "
+           "that returns in the materialized function";
+    EXPECT_NE(out.funcBlockAt(outFn, retAt.front()).v, out.funcBlockAt(outFn, 2).v)
+        << "CONTROL: the block that returns is not the block that sits at the returning "
+           "block's old place in the layout (the walk's step)";
+
+    // The two blocks up to the insertion keep their places.
+    EXPECT_EQ(result.blockEntryImage[first.v], out.funcBlockAt(outFn, 0).v);
+    EXPECT_EQ(touchAt.front(), 1u) << "touch (1) is in the first piece of the descending block";
+    EXPECT_EQ(result.blockEntryImage[descends.v], out.funcBlockAt(outFn, 1).v);
+}
+
 // A WALKED frame: the walk's last touch is up to a page above the settled SP, so under a
 // call that pushes nothing touch (1) may again fall past the guard page — the landing touch
 // follows the walk and precedes the descent. The shipped convention's walk keeps the entry

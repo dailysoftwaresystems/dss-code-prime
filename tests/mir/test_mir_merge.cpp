@@ -182,6 +182,7 @@ std::size_t countOp(Mir const& mir, MirOpcode want) {
 Mir buildEntryOnly(TypeInterner& in, TypeId sig) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -2881,6 +2882,7 @@ Mir buildSehParent(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
@@ -3022,6 +3024,7 @@ TEST(SynthSehFunclets, LabelAddressInAFilterExpressionIsRefusedNotCloned) {
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
 
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
@@ -3159,6 +3162,7 @@ Mir buildSehParentMultiBlockBody(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
@@ -3313,6 +3317,7 @@ Mir buildSehParentOrderSensitiveMarkers(TypeInterner& in, SymbolId sym) {
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     // ⚠ CREATION ORDER IS THE EXPERIMENT. `h2BB` is deliberately created BETWEEN
     // the region's two body blocks — which is not perversity but the state the
@@ -3481,6 +3486,7 @@ Mir buildSehParentFilterReadsLocal(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
@@ -3716,6 +3722,7 @@ Mir buildSehNestedInnerLoopCreatedLast(TypeInterner& in, SymbolId sym) {
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const sig    = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry      = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const oBody      = mb.createBlock(StructCfMarker::Linear);
@@ -3771,6 +3778,7 @@ Mir buildSehThreeDeep(TypeInterner& in, SymbolId sym) {
     TypeId const pI32 = in.pointer(i32);
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const b0 = mb.createBlock(StructCfMarker::Linear);
@@ -3819,6 +3827,7 @@ Mir buildSehTwoSiblingsInOneParent(TypeInterner& in, SymbolId sym) {
     TypeId const pI32 = in.pointer(i32);
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const b0  = mb.createBlock(StructCfMarker::Linear);
@@ -3984,6 +3993,7 @@ TEST(SynthSehFunclets, TwoRegionsThatOverlapWithoutNestingAreRefused) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     TypeId const sig = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const a  = mb.createBlock(StructCfMarker::Linear);
@@ -4042,6 +4052,7 @@ TEST(SynthSehFunclets, ABodyThatCannotBeLaidOutAsOneRunIsRefused) {
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const sig    = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const p0 = mb.createBlock(StructCfMarker::Linear);
@@ -4116,6 +4127,7 @@ Mir buildSehFilterReadsValueFromBeforeTheRegion(TypeInterner& in, SymbolId sym,
     TypeId const pI32 = in.pointer(i32);
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(7)),
                        MirFuncId{}, SymbolBinding::Global,
                        SymbolVisibility::Default, /*isConst=*/false,
@@ -4258,6 +4270,7 @@ TEST(SynthThreadsShim, SynthesizesDefinitionAndHelperImportNotTheShimName) {
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcSysV);  // the descriptor sig
 
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});   // main
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -4341,6 +4354,7 @@ TEST(SynthThreadsShim, ThrdCreateDirectPassesStartRoutineNoTrampoline) {
     TypeId const createSig = in.fnSig(cp, i32, CallConv::CcMS64);   // (thr, func, arg)->int
 
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -4479,6 +4493,7 @@ TEST(SynthThreadsShim, ThrdExitConvertsExplicitlyToEachVehiclesExitParameterType
         std::array<TypeId, 1> const ep{i32};
         TypeId const exitSig = in.fnSig(ep, voidTy, CallConv::CcMS64);
         MirBuilder mb;
+        mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
         mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -4591,6 +4606,7 @@ TEST(SynthThreadsShim, OnlyReferencedRecipesAreSynthesized) {
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcMS64);
 
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -4737,6 +4753,7 @@ TEST(SynthThreadsShim, ThrdJoinIsMultiBlockAndVerifies) {
     TypeId const joinSig = in.fnSig(jp, i32, CallConv::CcMS64);   // (thrd_t, int*)->int
 
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -4972,6 +4989,7 @@ TEST(SynthThreadsShim, PthreadVehicleSynthesizesDefinitionAndPthreadHelperImport
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcAAPCS64);
 
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -5079,6 +5097,7 @@ TEST(SynthThreadsShim, PthreadEveryRecipeEmitsAndVerifies) {
         TypeId const i32 = in.primitive(TypeKind::I32);
         TypeId const pV  = in.pointer(in.primitive(TypeKind::Void));
         MirBuilder mb;
+        mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
         mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);

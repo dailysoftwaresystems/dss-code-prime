@@ -25,6 +25,11 @@
 //     space answers the invalid id; that a mint from a builder told nothing dies, and so
 //     does a minter that cannot refuse at exhaustion; and the continuation a tier
 //     lowering the frozen module mints from;
+//   * a STATED end against a COUNTED one (P69, lane cs): the module carries whether its
+//     end was ever stated — by the table it was made from, by its maker's word that it
+//     is made from nothing but itself, or by the module it replaces — a rebuild copies
+//     that fact and never makes it, a move carries it, and both leaves die rather than
+//     mint past an end that was only counted, through a real pass too;
 //   * a unit lowered with NO table stated still ends past its imports;
 //   * each synthesis pass mints past an end the module's own symbols do not reach;
 //   * the single-CU pipeline, at BOTH shipped configurations: an artifact publishes no
@@ -128,11 +133,13 @@ std::unordered_set<std::uint32_t> funcIds(Mir const& mir) {
 }
 
 // What a fixture's module is made from: `kNoTable` builds it as a hand-built module is
-// built (its end is one past the symbols it defines); any other value is the end of the
-// name table HIR→MIR would state for it.
+// built — from nothing but itself, which it SAYS (its end is one past the symbols it
+// defines; the door mints for no module that never said where its ids end); any other
+// value is the end of the name table HIR→MIR would state for it.
 constexpr std::uint32_t kNoTable = 0;
 void stateTable(MirBuilder& mb, std::uint32_t tableEnd) {
     if (tableEnd != kNoTable) mb.stateSymbolIdEnd(tableEnd);
+    else                      mb.stateSelfContainedSymbolIds();
 }
 
 // A one-function module: the entry `sig` bound to SymbolId{100}, body `return 0;`.
@@ -492,7 +499,15 @@ TEST(SynthSymbolFloor, AModuleMadeWithoutABuilderEndsPastTheSymbolsItDefines) {
                   std::move(instBlock), {}, {}, {}, MirLiteralPool{}, MirAsmDescriptorPool{},
                   MirAliasingMode::Permissive, /*charTypesAliasAll=*/true);
     EXPECT_EQ(mir.symbolIdEnd(), 58u) << "one past the highest symbol either arena defines";
-    EXPECT_EQ(MirSymbolIdContinuation{mir}.mint().v, 58u);
+    EXPECT_EQ(MirSymbolIdContinuation{mir}.end(), 58u) << "and a continuation starts there";
+    // …but that end is COUNTED — nobody stated it — so nothing is minted past it until
+    // a rebuild that knows what the module was made from says so
+    // (`SymbolIdEndIsStatedDeath.AMintPastAnEndThatWasOnlyCountedDies`).
+    EXPECT_FALSE(mir.symbolIdEndIsStated());
+    MirBuilder rebuilt;
+    rebuilt.continueSymbolIdsOf(mir);
+    rebuilt.stateSelfContainedSymbolIds();
+    EXPECT_EQ(rebuilt.mintSymbol().v, 58u) << "the first id past it, once its maker's word is given";
 }
 
 // A caller that states NO table — a fixture that lowers hand-built HIR with the default
@@ -560,6 +575,15 @@ TEST(SynthSymbolFloorDeath, AnExhaustedSpaceKillsTheMinterThatCannotRefuse) {
         (void)past.mintOrAbort("theLoweringThatMints");
     }, "theLoweringThatMints fatal: the module's SymbolId space is exhausted");
 }
+
+// ── A STATED END AGAINST A COUNTED ONE ────────────────────────────────────────
+//
+// Whether a module's end was ever STATED travels with the module — through `finish`,
+// a move, every rebuild, the frozen module's continuation and the `.dssir` reader —
+// and both leaves refuse to mint past an end that was only counted. Those pins are
+// mir/test_symbol_id_end_is_stated, a binary of their own for the reason its header
+// gives: the refusal is an abort, so a case that observes the FACT must never mint
+// before it has asserted it, and this file's cases mint freely.
 
 // ── Each pass mints past the module's end ────────────────────────────────────
 
@@ -916,8 +940,11 @@ TEST(SynthSymbolFloor, NoMirOrOptimizerSourceCountsASymbolIdOfItsOwn) {
 // a module; unless it says where that module's ids end — it states a table's end, or it
 // continues the ids of the module it rebuilds (directly, or through a clone-globals
 // helper, each of which does) — the module it finishes is numbered from the symbols it
-// happens to define, and the next minter counts inside the table again. `mir_text.cpp`
-// is the one exception: a parsed module is made from no table.
+// happens to define, and the next minter counts inside the table again. NO FILE IS
+// EXCUSED. `mir_text.cpp` was, on the sentence "a parsed module is made from no table";
+// ✔MEASURED 2026-10-08 it is made from the text's own `symbols` table, and a name that
+// table declared and the module did not define lost its id to a block symbol
+// (tests/mir/test_mir_text_reader_never_aborts.cpp holds that text).
 TEST(SynthSymbolFloor, EveryFileThatBuildsAModuleStatesOrContinuesItsSymbolIds) {
     auto const root = dss::test::findRepoRoot();
     ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
@@ -948,11 +975,31 @@ TEST(SynthSymbolFloor, EveryFileThatBuildsAModuleStatesOrContinuesItsSymbolIds) 
         ++builders;
         std::string const rel =
             std::filesystem::relative(entry.path(), *root / "src").generic_string();
-        if (rel == "mir/mir_text.cpp") continue;
         bool carries = false;
         for (std::string_view const c : carriers) carries = carries || text.find(c) != std::string::npos;
         EXPECT_TRUE(carries) << rel << " builds a module and neither states nor continues its "
                                        "symbol-id space";
     }
     EXPECT_GE(builders, 15u) << "the scan must have found the module builders";
+
+    // AND NO PRODUCT FILE SAYS ITS MODULE IS MADE FROM NOTHING BUT ITSELF. That
+    // sentence (`stateSelfContainedSymbolIds`) is a hand-built fixture's: every module
+    // the product makes is made from a name table, or replaces a module and carries
+    // whatever that one said. A product entrance that reached for it would be stating
+    // a counted end — the defect, with a signature. SCOPE: every .cpp and .hpp under
+    // src/, read as text for a call or a declaration of that name; the door's own two
+    // files declare and define it and are the only ones allowed to.
+    std::size_t doorFiles = 0;
+    for (auto const& entry : std::filesystem::recursive_directory_iterator(*root / "src")) {
+        if (!entry.is_regular_file()) continue;
+        auto const ext = entry.path().extension();
+        if (ext != ".cpp" && ext != ".hpp") continue;
+        if (readWhole(entry.path()).find("stateSelfContainedSymbolIds(") == std::string::npos) continue;
+        std::string const rel =
+            std::filesystem::relative(entry.path(), *root / "src").generic_string();
+        if (rel == "mir/mir.hpp" || rel == "mir/mir.cpp") { ++doorFiles; continue; }
+        ADD_FAILURE() << rel << " says a module is made from nothing but itself: state the "
+                                "table it is made from, or continue the module it replaces";
+    }
+    EXPECT_EQ(doorFiles, 2u) << "the scan must have found the door's declaration and its definition";
 }

@@ -15270,6 +15270,13 @@ struct Lowerer {
         nextLabelOrdinal_ = savedNextOrd;
         currentFunctionSymbol_ = savedFnSym;
         currentReturnType_ = savedReturn;
+        // THE END OF THE BODY, ON THE ROUTE OF A ROW THAT STATES ITS KIND (a
+        // declaration row mapped to `Function` directly — the shipped toy
+        // document's `funcDef`). The same two calls as the declarator route, in
+        // the same order, and the order is the rule: the list of names that return
+        // zero is read FIRST. Pinned on THIS route by
+        // hir/test_non_void_function_end_reached, with the two keys set in memory
+        // on the toy document's row (that document states neither).
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
         body = maybeCompleteReachableNonVoidEnd(
@@ -15809,6 +15816,14 @@ struct Lowerer {
         nextLabelOrdinal_ = savedNextOrd;
         currentFunctionSymbol_ = savedFnSym;
         currentReturnType_ = savedReturn;
+        // THE END OF THE BODY, ON THE POSITIONAL CHILD-KIND ROUTE. No SHIPPED
+        // document is lowered here: this route is entered only for a `Decl` row
+        // that is not declarator-mode, and the one shipped document with a `Decl`
+        // row (c) is declarator-mode. The two calls are wired, in the other routes'
+        // order, because the rule is the ENGINE's and not one grammar shape's — and
+        // they are pinned all the same, by hir/test_non_void_function_end_reached
+        // on the toy document rewritten in memory into this shape (a `funcTail`
+        // child decides the kind), with the two keys set on its row.
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
         body = maybeCompleteReachableNonVoidEnd(

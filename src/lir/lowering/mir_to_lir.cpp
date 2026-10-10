@@ -1287,105 +1287,77 @@ struct Lowerer {
 
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbol minting for `&&label`
     // block-address materialization. A block whose address is taken gets ONE local
-    // symbol (deduped by MIR block id within the module). `nextBlockSym_` is seeded
-    // lazily to 1 + max(existing function/global SymbolId) on first use so a minted
-    // id can't collide with a user symbol (same discipline as hir_to_mir's
-    // string-literal synthetic minter). `blockToSym_` keys the dedup off the MIR
-    // block id (stable for the duration of THIS lowering — the LIR-pass block
-    // renumbering happens AFTER, and the BlockRef operand carried on the emitted
-    // `lea` is what survives those passes via remapBlockRef).
+    // symbol (deduped by MIR block id within the module), drawn from `symbolIds_`.
+    // `blockToSym_` keys the dedup off the MIR block id (stable for the duration
+    // of THIS lowering — the LIR-pass block renumbering happens AFTER, and the
+    // BlockRef operand carried on the emitted `lea` is what survives those passes
+    // via remapBlockRef).
     //
     // TLS C1 (D-CSUBSET-THREAD-LOCAL, audit M-5 survey): every symbol this
-    // minter produces (block-address `lea`s via lowerBlockAddress, jump-table
+    // lowering mints (block-address `lea`s via lowerBlockAddress, jump-table
     // symbols via mintJumpTableSymbol, fneg sign-mask symbols via
-    // mintSignMaskSymbol) is minted PAST the module's function/global/extern
-    // high-water mark, so it can NEVER collide with a `threadLocalSymbols_`
-    // entry — those riprel/symbol-relative emissions need no TLS exclusion
-    // (unreachable for a TLS symbol by construction).
-    std::optional<std::uint32_t>                  nextBlockSym_;
+    // mintSignMaskSymbol, the imports it serves itself) is minted PAST the
+    // module's whole id space, so it can NEVER collide with a
+    // `threadLocalSymbols_` entry — those riprel/symbol-relative emissions need
+    // no TLS exclusion (unreachable for a TLS symbol by construction).
     std::unordered_map<std::uint32_t, SymbolId>   blockToSym_;
-    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the highest block symbol
-    // PRE-MINTED at HIR→MIR (a label whose address a static initializer took). Such
-    // a symbol is neither a function, a global, nor an extern, so the high-water
-    // scan below would step right over it and this minter would hand the SAME id to
-    // a different block — two definitions of one symbol, which the linker reports
-    // as "declared more than once". Folded into the seed of BOTH minters.
-    std::uint32_t preMintedBlockSymCeiling_ = 0;
-    // The seed's high-water mark (for the refusal's sentence) and whether the
-    // refusal was already made — it is made ONCE per lowering, not per mint.
-    std::uint32_t symbolHighWater_               = 0;
+    // ★ THE LOWERING'S IDS CONTINUE THE MODULE'S
+    // (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE, the sixth minter).
+    // ONE continuation per lowering: its first id is `mir.symbolIdEnd()` — past
+    // the name table the module was made from, every symbol the module defines
+    // and every id minted for it since — and it is kept clear of the two kinds
+    // of id that can sit BESIDE a module, outside its end: an import row handed
+    // in (the constructor), and a block symbol an export already publishes
+    // (`run()`, D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: a module built
+    // by hand states no id for its exports).
+    // The seed used to be a SCAN — the highest function, global and handed-in
+    // import id, plus one. ✔MEASURED 2026-10-08 on a module made from a table of
+    // nine names and holding one: block symbols 2 and 3, a jump table 2 and its
+    // blocks 3..9 — ids of the table, each some other name's, and no diagnostic.
+    // A scan sees what a module HOLDS; a table owns far more (a declaration
+    // defined elsewhere, an import nobody handed in, a local, a tag).
+    MirSymbolIdContinuation symbolIds_{mir};
+    // The refusal of an exhausted id space is made ONCE per lowering, not per mint.
     bool          symbolSpaceExhaustedReported_  = false;
 
     // ★ THE ONE MINTER OF LOWERING-SYNTHESIZED SYMBOLS (P68 round 8, lane `ht`,
-    // part 1c). Block, jump-table and sign-mask symbols draw from ONE monotone
-    // sequence seeded once, past the module's highest function / global / extern
-    // SymbolId and the pre-minted block-symbol ceiling, so none can collide with
-    // an id the module owns. The seed used to be written out TWICE — here and in
-    // `mintJumpTableSymbol` — as `maxV + 1u` then `(*nextBlockSym_)++`, and both
-    // WRAPPED: a module holding the top of the 32-bit space minted 0, the invalid
-    // sentinel, then walked up through ids the module already owns; and on the
-    // way it could hand out 0xFFFFFF01, the writer-reserved PE `_tls_index`
-    // singleton, aliasing a block address onto the TLS index. Now the reserved
-    // values are stepped over by the owner's own predicate
-    // (`isWriterReservedSymbolIdValue`), and exhaustion is refused ONCE, by name
+    // part 1c; its seed replaced in P69). Block, jump-table and sign-mask
+    // symbols, and the imports this lowering serves itself, draw from ONE
+    // sequence — `symbolIds_`, which continues the module's id space through the
+    // module's own door. So a value a format writer reserves is stepped over by
+    // its owner's predicate (it used to be handed out: 0xFFFFFF01, the PE
+    // `_tls_index` singleton, aliased a block address onto the TLS index), the
+    // last value of the space is never handed out, and nothing wraps (a module
+    // holding the top id used to mint 0, the invalid sentinel, then walk up
+    // through ids it owns). Exhaustion is refused ONCE, by name
     // (`L_SymbolIdSpaceExhausted`, unsuppressable): the lowering's error gate
     // then withholds the module, so the invalid `SymbolId{}` returned meanwhile
     // is never emitted — the discipline `hir_to_mir`'s synthetic minters keep.
-    // `nextBlockSym_ == 0` means "exhausted": 0 is never a minted id.
-    [[nodiscard]] SymbolId mintPastHighWater(std::string_view what) {
-        constexpr std::uint32_t kTop = std::numeric_limits<std::uint32_t>::max();
-        if (!nextBlockSym_.has_value()) {
-            std::uint32_t maxV = preMintedBlockSymCeiling_;
-            for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
-                if (std::uint32_t const v = mir.funcSymbol(mir.funcAt(fi)).v; v > maxV) {
-                    maxV = v;
-                }
-            }
-            for (std::uint32_t gi = 0; gi < mir.moduleGlobalCount(); ++gi) {
-                if (std::uint32_t const v = mir.globalSymbol(mir.globalAt(gi)).v; v > maxV) {
-                    maxV = v;
-                }
-            }
-            // EXTERN imports occupy SymbolIds too (the exec entry/_start/exit
-            // trampoline externs are minted past the function/global high-water at
-            // HIR→MIR time). A block symbol minted into their range would collide
-            // at link (K_SymbolUndefined "declared more than once"), so clear them.
-            for (std::uint32_t const ev : externSymbols) {
-                if (ev > maxV) maxV = ev;
-            }
-            symbolHighWater_ = maxV;
-            nextBlockSym_    = maxV == kTop ? 0u : maxV + 1u;
+    [[nodiscard]] SymbolId mintPastTheModulesIds(std::string_view what) {
+        SymbolId const minted = symbolIds_.mint();
+        if (minted.valid()) return minted;
+        if (!symbolSpaceExhaustedReported_) {
+            symbolSpaceExhaustedReported_ = true;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_SymbolIdSpaceExhausted;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "cannot mint a {}: the SymbolId space is exhausted — this module's "
+                "ids end at {} (its name table, every symbol it defines and every "
+                "id already minted for it), and the lowering's own symbols continue "
+                "from there; wrapping would land on the invalid sentinel and on ids "
+                "the module already owns",
+                what, symbolIds_.end());
+            reporter.report(std::move(d));
         }
-        std::uint32_t next = *nextBlockSym_;
-        while (next != 0 && isWriterReservedSymbolIdValue(next)) {
-            next = next == kTop ? 0u : next + 1u;
-        }
-        if (next == 0) {
-            nextBlockSym_ = 0u;
-            if (!symbolSpaceExhaustedReported_) {
-                symbolSpaceExhaustedReported_ = true;
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::L_SymbolIdSpaceExhausted;
-                d.severity = DiagnosticSeverity::Error;
-                d.actual   = std::format(
-                    "cannot mint a {}: the SymbolId space is exhausted — this module's "
-                    "highest function / global / extern id is {}, and the lowering "
-                    "mints its own symbols past that mark; wrapping would land on the "
-                    "invalid sentinel and on ids the module already owns",
-                    what, symbolHighWater_);
-                reporter.report(std::move(d));
-            }
-            return SymbolId{};
-        }
-        nextBlockSym_ = next == kTop ? 0u : next + 1u;
-        return SymbolId{next};
+        return SymbolId{};
     }
 
     [[nodiscard]] SymbolId mintBlockSymbol(MirBlockId block) {
         if (auto it = blockToSym_.find(block.v); it != blockToSym_.end()) {
             return it->second;
         }
-        SymbolId const sym = mintPastHighWater("block symbol");
+        SymbolId const sym = mintPastTheModulesIds("block symbol");
         if (!sym.valid()) return sym;   // refused by name above; nothing is recorded
         blockToSym_.emplace(block.v, sym);
         return sym;
@@ -1436,66 +1408,83 @@ struct Lowerer {
     // translate them to LIR. `sehScopesIn_` is the input; as each function lowers,
     // its blocks' MIR→LIR ids + owning func index are recorded persistently (the
     // per-function `mirBlockToLirBlock` is cleared each function, so it can't be
-    // read after the fact). `run()` then builds one `SehScopeDescriptor` per scope.
+    // read after the fact). `run()` then builds each scope's `SehScopeDescriptor`s
+    // (`buildSehScopeDescriptors`).
     std::span<MirSehScope const>                     sehScopesIn_;
     std::unordered_map<std::uint32_t, LirBlockId>    sehMirBlockToLir_;
     std::unordered_map<std::uint32_t, std::uint32_t> sehMirBlockFuncIndex_;
     std::vector<SehScopeDescriptor>                  sehScopeDescriptors_;
 
-    // ── A GUARDED RANGE COVERS THE FUNCTION'S OWN BLOCKS AND NOTHING ELSE ──────
+    // ── A GUARDED REGION IS A SET OF CONTIGUOUS RUNS, ONE RECORD PER RUN ────────
     // (D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES)
     //
-    // A scope's range is ONE contiguous run of byte offsets: from the block its
-    // guarded body's first MIR block became to the end of the block its last
-    // one became (`SehScopeDescriptor`). Every MIR block gets its LIR block
-    // BEFORE any body is lowered, so a block this lowering CREATES while
-    // lowering an instruction receives an id after all of them, and a LIR block
-    // id is a position: the created block is laid out at the END of the
-    // function, OUTSIDE every guarded range. An instruction in it that faults
-    // on user memory is therefore not caught by the `__try` it was written in.
+    // Every MIR block gets its LIR block BEFORE any body is lowered, so a block
+    // this lowering CREATES while lowering an instruction receives an id after
+    // all of them, and a LIR block id is a position: the created block is laid
+    // out at the END of the function, after the one contiguous run the region's
+    // own blocks make. A scope record used to name that run alone, so whatever
+    // sat in a created block was outside the `__try` it was written in.
     // ✔MEASURED P69 on pe64, debug and release: an `asm goto` whose output is a
     // structure left in a register, written in a guarded body over a no-access
     // page, ended the process with 0xC0000005 — its two edge stores sat in the
     // function's last two blocks, past the scope's end.
     //
-    // ⇒ ONE RULE, ASKED BY EVERY CREATOR WHOSE BLOCK WOULD TOUCH USER MEMORY
-    // (`refusesUserMemoryInACreatedBlock`): inside a guarded body that statement
-    // is REFUSED, by name, instead of compiled. The condition is the function's
-    // own scopes — never a format's or an architecture's name. The creators:
-    //   * an `asm goto`'s edge blocks (`createAsmCaptureBlocks`) — ASKS, for a
-    //     BY-ADDRESS output, whose value is stored through the object's address
-    //     on every edge. Its other edge work cannot fault: a register capture,
-    //     and a home-carried output's store into this frame;
-    //   * the LL/SC retry loop of an atomic compare-exchange (`lowerAtomicCas`)
-    //     — ASKS: its exclusive load and store address the program's object;
-    //   * a phi edge's split block (`lowerTerminator`) — does not ask: register
-    //     moves, plus the home-to-home copy of a memory-resident `long double`,
-    //     which only a format whose `long double` is wider than a register has.
-    //     ⚠ A format that gains BOTH a guarded scope and such a `long double`
-    //     must ask here too: that copy's source can be an in-place load's
-    //     address, the program's own object;
-    //   * a dense switch's table-read block (`tryLowerSwitchJumpTable`) and a
-    //     sparse one's compare chain (`lowerSwitch`) — do not ask: a compare, a
-    //     branch and a read of this module's own jump table.
-    // The set is THIS function's guarded MIR blocks, rebuilt per function from
-    // the scopes handed in; empty — and the rule silent — for every function
-    // without one.
-    std::unordered_set<std::uint32_t> guardedMirBlocks_;
+    // ⇒ A CREATED BLOCK BELONGS TO THE MIR BLOCK BEING LOWERED WHEN IT IS
+    // CREATED, AND TO EVERY REGION THAT BLOCK IS IN. Every creator goes through
+    // ONE place (`createLateBlock`), which writes the pair down; for each scope
+    // `buildSehScopeDescriptors` then emits, after the record of the region's
+    // own blocks, one more record per MAXIMAL RUN of contiguous created blocks
+    // of that region — same handler, same funclet, same personality. No creator
+    // asks anything and none can forget to: the creators today are an
+    // `asm goto`'s edge blocks (`createAsmCaptureBlocks`), the LL/SC retry loop
+    // of an atomic compare-exchange (`lowerAtomicCas`, whose `done` block also
+    // receives THE REST of the guarded MIR block), a phi edge's split block
+    // (`lowerTerminator`), a dense switch's table-read block and a sparse one's
+    // compare chain. `run()` holds the lowering to it on the finished module:
+    // a function that has a scope and a block nobody wrote down is refused.
+    //
+    // What this tier knows of the table is only that a record is a RANGE. That
+    // is the whole capability: a format that hands scopes in declared a scope
+    // table of such records (`sehPersonality`), and a format with none never
+    // reaches here — its `__try` is refused where the region resolves
+    // (`synthesizeSehFunclets`). The ORDER of the records is the one sentence of
+    // mir/merge/synth_seh_funclets.hpp, which owns the order of REGIONS: the
+    // scopes arrive in table order, and each region's own records stay together
+    // — its body's record, then its runs in address order. Nothing here sorts
+    // across regions, and nothing after this tier sorts at all.
+    struct LateBlock {
+        LirBlockId    block;       // created while lowering…
+        MirBlockId    owner;       // …this MIR block,
+        std::uint32_t funcIndex;   // of this function
+    };
+    std::vector<LateBlock>                           lateBlocks_;   // creation order = layout order
+    std::unordered_map<std::uint32_t, std::uint32_t> sehMirBlockPosition_;   // MIR block .v → its place in its function
+    MirBlockId                                       loweringMirBlock_{};
+
+    // THE ONE PLACE A BLOCK IS CREATED AFTER THE 1:1 PRE-PASS. Only a module
+    // that carries scopes pays for the record.
+    [[nodiscard]] LirBlockId createLateBlock() {
+        LirBlockId const created = lir.createBlock();
+        if (!sehScopesIn_.empty()) {
+            lateBlocks_.push_back(LateBlock{created, loweringMirBlock_, currentFuncIndex_});
+        }
+        return created;
+    }
 
     // Mint a fresh synthetic SymbolId for a jump table's `.data` item. Draws
-    // from the SAME monotone `nextBlockSym_` sequence `mintBlockSymbol` uses, so
-    // a table symbol can never collide with a block symbol (or a user / extern
-    // symbol — the shared lazy seed sits past every function/global/extern id).
-    // Not deduped (each dense switch gets its own table).
+    // from the SAME sequence `mintBlockSymbol` uses (`symbolIds_`), so a table
+    // symbol can never collide with a block symbol, nor with any id of the
+    // module's own space or beside it. Not deduped (each dense switch gets its
+    // own table).
     [[nodiscard]] SymbolId mintJumpTableSymbol() {
-        // The SAME sequence and seed as `mintBlockSymbol` — through the one minter,
-        // so the two cannot disagree about the seed or about exhaustion.
-        return mintPastHighWater("jump-table or sign-mask symbol");
+        // The SAME sequence as `mintBlockSymbol` — through the one minter, so the
+        // two cannot disagree about where the ids start or about exhaustion.
+        return mintPastTheModulesIds("jump-table or sign-mask symbol");
     }
 
     // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): a fresh synthetic SymbolId for a float-
-    // negate sign-mask `.rodata` item. Draws from the SAME monotone
-    // `nextBlockSym_` sequence (via `mintJumpTableSymbol`), so a mask symbol
+    // negate sign-mask `.rodata` item. Draws from the SAME sequence (via
+    // `mintJumpTableSymbol`), so a mask symbol
     // can never collide with a block/table/user/extern symbol. Per-occurrence.
     [[nodiscard]] SymbolId mintSignMaskSymbol() { return mintJumpTableSymbol(); }
 
@@ -1538,6 +1527,9 @@ struct Lowerer {
         externSymbols.reserve(externImports.size());
         for (auto const& e : externImports) {
             externSymbols.insert(e.symbol.v);
+            // An import row sits BESIDE the module: a module built by hand has
+            // no table whose end covers the row's id (see `symbolIds_`).
+            symbolIds_.keepClearOf(e.symbol);
             // LD-2: index by mangled name so a minted F128 softcall reuses a
             // user import of the same helper (dedup at the link boundary).
             suppliedExternByName_.emplace(e.mangledName, e.symbol);
@@ -2947,25 +2939,6 @@ struct Lowerer {
             "MIR inst {} ('{}') cannot be lowered to target '{}': {}",
             at.v, mirOpcodeName(op), target.name(), what);
         reporter.report(std::move(d));
-    }
-
-    // THE ONE REFUSAL OF `guardedMirBlocks_`' RULE, asked by a creator BEFORE it
-    // creates a block that would hold `access`: true (reported) when `at` sits
-    // in a guarded body of this function — the caller then lowers nothing —
-    // false when it does not, and the caller goes on. `access` says what would
-    // touch the program's memory out there; `instead` what compiles today.
-    [[nodiscard]] bool refusesUserMemoryInACreatedBlock(MirInstId at,
-                                                        std::string_view access,
-                                                        std::string_view instead) {
-        if (!guardedMirBlocks_.contains(mir.instBlock(at).v)) return false;
-        reportUnsupported(mir.instOpcode(at), at,
-            std::format("it is written inside a guarded body (`__try`), and {} "
-                        "would be placed in a block laid out after the "
-                        "function's own blocks — outside the byte range the "
-                        "body's scope guards, so a fault it raised would escape "
-                        "the handler. That is not lowered yet: {}",
-                        access, instead));
-        return true;
     }
 
     // An instruction whose SHAPE is not the one its opcode defines — the wrong
@@ -5866,27 +5839,11 @@ struct Lowerer {
             // run on each edge, and a spilled output's store is placed by the
             // rewriter at the head of each edge — which is sound only on a
             // block no other path enters.
-            // ★★ IN A GUARDED BODY THOSE BLOCKS LIE OUTSIDE THE SCOPE'S RANGE
-            // (`guardedMirBlocks_`), and a by-address output is stored through
-            // its object's address on each of them. A frame slot of this
-            // function cannot fault; any other address is the program's, so the
-            // statement is refused HERE — before a block is created — rather
-            // than compiled into a store its `__try` does not guard.
-            for (std::size_t j = 0; j < ins.size(); ++j) {
-                if (!(ins[j].carriedByAddress && ins[j].carriedOut)) continue;
-                if (mir.instOpcode(operands[j]) == MirOpcode::Alloca) continue;
-                if (refusesUserMemoryInACreatedBlock(
-                        id,
-                        "the store of a by-address output (a structure, a "
-                        "complex or a wide integer the template leaves in a "
-                        "register) through its object's address, which is made "
-                        "on every edge of the statement,",
-                        "give the statement a local object of this function "
-                        "as that output and assign it to its destination after "
-                        "the statement")) {
-                    return false;
-                }
-            }
+            // ★★ IN A GUARDED BODY THOSE BLOCKS ARE A RUN OF THE BODY'S REGION
+            // (`createLateBlock`): a by-address output is stored through its
+            // object's address on each of them, that address is the program's,
+            // and the store's fault reaches the handler of the `__try` the
+            // statement is written in — the run has a scope record of its own.
             captureBlocks = createAsmCaptureBlocks(succs, outs, ins);
             // The label half of the operand-spelling rule above: a spelling
             // bound twice is resolved by FIRST match, so a repeat would bind
@@ -6103,7 +6060,7 @@ struct Lowerer {
         std::vector<LirBlockId> blocks;
         blocks.reserve(succs.size());           // every edge; see above
         for (std::size_t j = 0; j < succs.size(); ++j) {
-            blocks.push_back(lir.createBlock());
+            blocks.push_back(createLateBlock());
         }
         return blocks;
     }
@@ -9101,9 +9058,9 @@ struct Lowerer {
                                 "MIR F128 softcall (extern-call dispatch)");
             return std::nullopt;
         }
-        // 4. Mint. Draw the SymbolId from the shared monotone `nextBlockSym_`
-        //    sequence (collision-free: seeded past every func/global/extern id)
-        //    and record it in `externSymbols` so any downstream extern-aware
+        // 4. Mint. Draw the SymbolId from the lowering's one sequence
+        //    (`symbolIds_`: past the module's whole id space and every id beside
+        //    it) and record it in `externSymbols` so any downstream extern-aware
         //    site treats it correctly.
         SymbolId const sym = mintJumpTableSymbol();
         ExternImport imp;
@@ -13378,20 +13335,13 @@ struct Lowerer {
                                     "MIR AtomicCas (LL/SC loop)");
                 return;
             }
-            // The loop's blocks are created HERE, so in a guarded body they lie
-            // outside the scope's range (`guardedMirBlocks_`) — and its
-            // exclusive load and store address the program's object.
-            if (refusesUserMemoryInACreatedBlock(
-                    id,
-                    "the exclusive load and store of its retry loop, which "
-                    "address the program's object,",
-                    "perform the atomic operation outside the guarded body")) {
-                poisonValue(id);
-                return;
-            }
-            LirBlockId const retry = lir.createBlock();
-            LirBlockId const store = lir.createBlock();
-            LirBlockId const done  = lir.createBlock();
+            // The loop's blocks are created HERE. Its exclusive load and store
+            // address the program's object, and `done` receives the REST of the
+            // MIR block: in a guarded body the three are a run of the body's
+            // region, under a scope record of their own (`createLateBlock`).
+            LirBlockId const retry = createLateBlock();
+            LirBlockId const store = createLateBlock();
+            LirBlockId const done  = createLateBlock();
             // The loop-carried result + the exclusive-store status vregs are
             // created ONCE; the retry back-edge re-executes the same
             // instructions into the same vregs (loop-spanning live ranges).
@@ -14946,7 +14896,7 @@ struct Lowerer {
                 // arms must land on the same split, or the second arm would skip
                 // them.
                 if (edgeWasSplit(s)) continue;
-                LirBlockId const split = lir.createBlock();
+                LirBlockId const split = createLateBlock();
                 edgeSplitTarget_.emplace(s.v, split);
                 edgeSplits_.emplace_back(s, split);
             }
@@ -15638,7 +15588,7 @@ struct Lowerer {
                 LirOperand::makeReg(idxReg), *spanOperand};
             emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);  // 64-bit
         }
-        LirBlockId const body        = lir.createBlock();
+        LirBlockId const body        = createLateBlock();
         LirBlockId const defaultLir  = lirSucc(defaultMir);
         {
             std::uint32_t const ugtCond =
@@ -15942,7 +15892,7 @@ struct Lowerer {
             if (isLastCase) {
                 // Final compare: jcc-eq to case target, else jcc fallthrough
                 // to a tiny "jmp default" block.
-                LirBlockId const defaultJump = lir.createBlock();
+                LirBlockId const defaultJump = createLateBlock();
                 std::array<LirOperand, 2> jccOps{
                     LirOperand::makeBlockRef(caseTarget.v),
                     LirOperand::makeBlockRef(defaultJump.v)};
@@ -15952,7 +15902,7 @@ struct Lowerer {
                 emitBr(*opcode(MnemonicSlot::Jmp), lirSucc(defaultMir));
                 return true;
             }
-            nextBlock = lir.createBlock();
+            nextBlock = createLateBlock();
             std::array<LirOperand, 2> jccOps{
                 LirOperand::makeBlockRef(caseTarget.v),
                 LirOperand::makeBlockRef(nextBlock.v)};
@@ -16418,38 +16368,27 @@ struct Lowerer {
             if (!sehScopesIn_.empty()) {
                 sehMirBlockToLir_[mb.v]     = lb;
                 sehMirBlockFuncIndex_[mb.v] = currentFuncIndex_;
-            }
-        }
-        // Which of THIS function's blocks lie in a guarded body: for each scope
-        // whose first and last block are this function's, every block from the
-        // one to the other in the function's own order (the funclet pass lays a
-        // guarded body out contiguously, which is what makes its range a range).
-        // See `guardedMirBlocks_`.
-        guardedMirBlocks_.clear();
-        if (!sehScopesIn_.empty()) {
-            std::unordered_map<std::uint32_t, std::uint32_t> position;
-            position.reserve(blockCount);
-            for (std::uint32_t i = 0; i < blockCount; ++i) {
-                position.emplace(mir.funcBlockAt(mf, i).v, i);
-            }
-            for (auto const& s : sehScopesIn_) {
-                auto const first = position.find(s.beginBlock.v);
-                auto const last  = position.find(s.endBlock.v);
-                if (first == position.end() || last == position.end()) continue;
-                for (std::uint32_t i = first->second; i <= last->second; ++i) {
-                    guardedMirBlocks_.insert(mir.funcBlockAt(mf, i).v);
-                }
+                // Its place in the function's own order: a region is every
+                // block from its first to its last in that order (the funclet
+                // pass lays a guarded body out contiguously), which is how a
+                // created block's owner is found in or out of a region
+                // (`buildSehScopeDescriptors`).
+                sehMirBlockPosition_[mb.v]  = i;
             }
         }
         // Pre-pass 2: allocate vregs for all Phi results so back-edge
         // predecessor moves resolve cleanly.
         prepassAllocatePhis(mf);
 
-        // Pass 3: lower bodies block-by-block in MIR's declared order.
+        // Pass 3: lower bodies block-by-block in MIR's declared order. Whatever
+        // block is created meanwhile is the block being lowered's
+        // (`createLateBlock`).
         for (std::uint32_t i = 0; i < blockCount; ++i) {
             MirBlockId const mb = mir.funcBlockAt(mf, i);
+            loweringMirBlock_ = mb;
             lowerBlock(mb);
         }
+        loweringMirBlock_ = MirBlockId{};
         // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: hand this function's
         // reservation-order alignment record to the post-lowering harvest, which
         // cross-checks it against its own frozen-LIR walk and fails loud on any
@@ -16581,8 +16520,9 @@ struct Lowerer {
                     SymbolId const sym = mir.blockAddressExportSymbol(inst);
                     MirBlockId const target = mir.blockAddressTarget(ops[0]);
                     blockToSym_[target.v] = sym;
-                    if (sym.v > preMintedBlockSymCeiling_)
-                        preMintedBlockSymCeiling_ = sym.v;
+                    // The export already publishes `sym`: no block the lowering
+                    // names itself may be given it (see `symbolIds_`).
+                    symbolIds_.keepClearOf(sym);
                     // The census `lowerFunction` builds is per-function and is not
                     // available yet; the export-only decision is made there.
                 }
@@ -16621,7 +16561,8 @@ struct Lowerer {
             lowerFunction(mir.funcAt(i));
         }
         // c116 (D-WIN64-SEH-FUNCLETS): translate each SEH scope (parent MIR block
-        // ids) to LIR block ids + emit one SehScopeDescriptor. All three blocks of
+        // ids) to LIR block ids + emit its SehScopeDescriptors — the record of
+        // its own blocks, then one per run of created blocks. All three blocks of
         // a scope live in ONE parent function, so their funcIndex agrees; we key on
         // the begin block's owning function.
         buildSehScopeDescriptors();
@@ -16629,6 +16570,7 @@ struct Lowerer {
         // BELOW from the FROZEN LIR (not MIR), see the harvest comment there.
         std::vector<FuncLocalAlignment> funcLocalAlignments;
         Lir frozen = std::move(lir).finish();
+        verifyEveryLateBlockIsWrittenDown(frozen);
         // Ensure lirToMir spans every LIR inst slot (any trailing
         // slots without recorded sources default to InvalidMirInst).
         if (lirToMir.size() < frozen.nodeCount()) {
@@ -16749,18 +16691,30 @@ struct Lowerer {
         };
     }
 
-    // c116 (D-WIN64-SEH-FUNCLETS): build one SehScopeDescriptor per MirSehScope by
-    // translating its (rebuilt-module) parent MIR block ids to LIR block ids via the
-    // persistent map. Fails loud (never a silent drop) if a scope block was not
-    // lowered — that would mean a region referenced a nonexistent block.
+    // c116 (D-WIN64-SEH-FUNCLETS): build the SehScopeDescriptors of every
+    // MirSehScope, IN TABLE ORDER — for each scope in the order it is handed in,
+    // the record of the region's own blocks (its parent MIR block ids translated
+    // to LIR block ids via the persistent map), then one record per maximal run
+    // of contiguous created blocks whose owner is a block of the region
+    // (`createLateBlock`), in address order. A created block of an inner body is
+    // a block of every region around it, so it is in a run of each — the inner
+    // region's record first, because the inner scope arrives first. Fails loud
+    // (never a silent drop) if a scope block was not lowered — that would mean a
+    // region referenced a nonexistent block.
     void buildSehScopeDescriptors() {
         for (auto const& s : sehScopesIn_) {
             auto beginIt = sehMirBlockToLir_.find(s.beginBlock.v);
             auto endIt   = sehMirBlockToLir_.find(s.endBlock.v);
             auto handIt  = sehMirBlockToLir_.find(s.handlerBlock.v);
             auto fiIt    = sehMirBlockFuncIndex_.find(s.beginBlock.v);
+            // Where the region's first and last block stand in their function's
+            // own order — filled beside the two maps above, for the same blocks.
+            auto const firstPos = sehMirBlockPosition_.find(s.beginBlock.v);
+            auto const lastPos  = sehMirBlockPosition_.find(s.endBlock.v);
             if (beginIt == sehMirBlockToLir_.end() || endIt == sehMirBlockToLir_.end()
-                || handIt == sehMirBlockToLir_.end() || fiIt == sehMirBlockFuncIndex_.end()) {
+                || handIt == sehMirBlockToLir_.end() || fiIt == sehMirBlockFuncIndex_.end()
+                || firstPos == sehMirBlockPosition_.end()
+                || lastPos == sehMirBlockPosition_.end()) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
                 d.severity = DiagnosticSeverity::Error;
@@ -16777,6 +16731,77 @@ struct Lowerer {
             desc.filterFuncletSymbol = s.filterFuncletSymbol;
             desc.personalitySymbol   = s.personalitySymbol;
             sehScopeDescriptors_.push_back(desc);
+
+            // The region's RUNS. A region is every block of its function from
+            // its first to its last, in the function's own order; a created
+            // block is in it when its owner is. `lateBlocks_` is in creation
+            // order, which is layout order, so a run is a stretch of it whose
+            // ids follow one another and whose owners are all of the region.
+            auto const inRegion = [&](LateBlock const& late) {
+                // A block's place is counted per function, so the function is
+                // asked first: another function's blocks stand at the same places.
+                if (late.funcIndex != fiIt->second) return false;
+                auto const owner = sehMirBlockPosition_.find(late.owner.v);
+                return owner != sehMirBlockPosition_.end()
+                    && owner->second >= firstPos->second
+                    && owner->second <= lastPos->second;
+            };
+            bool open = false;
+            SehScopeDescriptor run = desc;   // same function, handler, funclet, personality
+            for (LateBlock const& late : lateBlocks_) {
+                bool const member = inRegion(late);
+                if (open && member && late.block.v == run.endLirBlockV + 1u) {
+                    run.endLirBlockV = late.block.v;
+                    continue;
+                }
+                if (open) sehScopeDescriptors_.push_back(run);
+                open = member;
+                if (member) {
+                    run.beginLirBlockV = late.block.v;
+                    run.endLirBlockV   = late.block.v;
+                }
+            }
+            if (open) sehScopeDescriptors_.push_back(run);
+        }
+    }
+
+    // THE OTHER HALF OF `createLateBlock`, held on the FINISHED module: every
+    // block of a function is one of its MIR blocks' (the 1:1 pre-pass) or is
+    // written down with its owner. A creator that went around the one place
+    // would leave a block no region's record can cover — an unguarded piece of
+    // a `__try`, in silence — so it is refused by name instead. Asked only of a
+    // module that carries scopes.
+    void verifyEveryLateBlockIsWrittenDown(Lir const& frozen) {
+        if (sehScopesIn_.empty()) return;
+        std::vector<std::uint32_t> lateCount(frozen.moduleFuncCount(), 0u);
+        for (LateBlock const& late : lateBlocks_) {
+            // Written down = its owner is a MIR block of the function it was
+            // created in (a block created outside the lowering of any block has
+            // none, and counts as missing).
+            auto const ownerFunc = sehMirBlockFuncIndex_.find(late.owner.v);
+            if (ownerFunc == sehMirBlockFuncIndex_.end()
+                || ownerFunc->second != late.funcIndex) {
+                continue;
+            }
+            if (late.funcIndex < lateCount.size()) ++lateCount[late.funcIndex];
+        }
+        std::uint32_t const fnCount =
+            static_cast<std::uint32_t>(frozen.moduleFuncCount());
+        for (std::uint32_t fi = 0; fi < fnCount && fi < mir.moduleFuncCount(); ++fi) {
+            std::uint32_t const have  = frozen.funcBlockCount(frozen.funcAt(fi));
+            std::uint32_t const owned = mir.funcBlockCount(mir.funcAt(fi)) + lateCount[fi];
+            if (have == owned) continue;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_SideStructureIndexDangling;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "mir_to_lir: function #{} was lowered to {} block(s), of which {} "
+                "are its MIR blocks' and {} were created with their owner written "
+                "down — a block was created around the one place that records "
+                "which guarded region it belongs to, so no scope record could "
+                "cover it",
+                fi, have, mir.funcBlockCount(mir.funcAt(fi)), lateCount[fi]);
+            reporter.report(std::move(d));
         }
     }
 };

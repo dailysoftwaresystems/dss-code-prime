@@ -90,6 +90,10 @@ struct Callee {
 Mir buildCaller(TypeInterner& in, CallConv cc, std::vector<Callee> const& callees) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    // This hand-built module is its own table: nothing beside it names an id it
+    // does not define, so its end is the counted one, STATED (the symbol-id door
+    // refuses to mint past an end nobody stated).
+    mb.stateSelfContainedSymbolIds();
     mb.addFunction(in.fnSig({}, i32, cc), SymbolId{kMainSym});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);

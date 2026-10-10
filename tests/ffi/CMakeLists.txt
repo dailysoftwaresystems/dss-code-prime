@@ -385,3 +385,36 @@ dss_add_test(NAME ffi/test_variant_arms_co_match
 # Writes its descriptors as text and reads them through the shipped reader: no json link.
 dss_add_test(NAME ffi/test_shipped_alias_row_gates
              SOURCES test_shipped_alias_row_gates.cpp)
+
+# P69 (lane cs): <string.h>'s C23 7.26 surface per executable pair, through the real reader with each
+# pair's own facts — every function the clause names is declared; `strdup` and `memccpy` bind the
+# leading-underscore export on pe and the plain name elsewhere; `strndup` is DSS's own unit on pe and
+# `memset_explicit` on every format. A pe fact was visible only on a leg that can start a pe image.
+dss_add_test(NAME ffi/test_string_h_iso_surface
+             SOURCES test_string_h_iso_surface.cpp)
+
+# P69 (lane cs): the BODIES DSS ships for <string.h> (runtime/platform/src/strndup.c and
+# memset_explicit.c), RUN. Both are plain ISO C, so each is compiled HERE by the leg's own C compiler —
+# through a wrapper unit that includes the shipped file as it is, under a test-only name — and called
+# from the C++ cases, which state C23 7.26.2.7 and 7.26.6.2 case by case. Until this binary a body's
+# behaviour was seen only by a program DSS compiled and a leg of that body's format ran.
+#
+# C IS ENABLED IN THIS DIRECTORY, the highest one common to the targets that compile it (the project
+# itself is C++ only). Every leg already names its C compiler beside its C++ one (the toolchain's `CC`
+# in .harness-config/config.json, `matrix.cc` in the workflows), and the googletest project has always
+# made CMake find it; this is the first target of the repository's own that compiles with it.
+#
+# The two C units are compiled as ISO C11 with no extensions: the bodies need nothing later, and a
+# body that began to lean on an extension would be refused here. They take no precompiled header —
+# the shared one is C++.
+enable_language(C)
+dss_add_test(NAME ffi/test_shipped_string_bodies
+             SOURCES test_shipped_string_bodies.cpp
+                     shipped_body_strndup.c
+                     shipped_body_memset_explicit.c)
+set_source_files_properties(shipped_body_strndup.c shipped_body_memset_explicit.c
+                            PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+set_target_properties(dss_ffi_test_shipped_string_bodies PROPERTIES
+                      C_STANDARD 11
+                      C_STANDARD_REQUIRED ON
+                      C_EXTENSIONS OFF)

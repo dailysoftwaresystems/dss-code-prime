@@ -162,6 +162,14 @@ struct DSS_EXPORT SyntheticBlockSymbol {
 // `[beginByteOffset, endByteOffset)`; a fault in it dispatches to the filter
 // funclet (`filterFuncletSymbol`), and on EXECUTE_HANDLER the OS resumes at
 // `jumpTargetByteOffset` (the `__except` body, in the parent frame).
+//
+// AN ENTRY IS ONE RECORD, NOT ONE `__try`. A guarded region is a set of
+// contiguous byte runs — the blocks its body's statements became, and each run
+// of blocks the lowering created for them and laid out elsewhere in the
+// function — and it has one entry per run, all with the region's filter and
+// handler. The entries of a function are in TABLE ORDER (the dispatcher takes
+// the first record whose range holds the faulting PC): a region's records
+// together, an inner region's before those of a region around it.
 struct DSS_EXPORT SehScopeEntry {
     std::uint32_t beginByteOffset      = 0;  // start of the guarded body (within parent bytes)
     std::uint32_t endByteOffset        = 0;  // one-past the guarded body (half-open range)

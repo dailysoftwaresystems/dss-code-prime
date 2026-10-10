@@ -223,6 +223,22 @@ round's close; each checkpoint's commit message says what was and was not run on
   lane on its final bytes: all 14 `passed` on `macos-arm64-debug`, which is NOT the leg their `S` rows name
   (`linux-x86_64-debug`, owed from the main checkout); the closing control green on `windows-x86_64-debug` (MinGW)
   and `windows-x86_64-release` (MSVC) 41 of 41, `linux-x86_64-debug` and `macos-arm64-debug` 11 of 11. No row.
+- **Checkpoint 9 (2026-10-10) = the C front end lane's fold A2, made CODE-FIRST**: 48 paths (9 new, 2 removed).
+  The end of a module's symbol ids is a STATED fact carried on the module: the MIR-to-LIR lowering mints through
+  one continuation over the frozen module (the sixth minter), the `.dssir` reader keeps clear of every slot its
+  text declares, and a mint past an end that was only counted is refused by name. A guarded region is a SET OF
+  RUNS — one scope record per run of blocks the lowering creates for a guarded body — so the refusal checkpoint 5
+  put there is gone and its program is a positive example that runs on both Windows legs. The reachable end's two
+  other routes are pinned; `program/test_compile_pipeline` shares its compiles; eleven mutants that only an
+  example read got unit-tier claims, among them the repository's first own C units (two shipped runtime bodies
+  compiled by each leg's own C compiler and called from a test). It answers the review of checkpoint 5's fold
+  (SEND BACK, 14 findings, 2 major: three rows whose cells contradicted the tree — restated here, nine rows
+  amended, none new — and four example manifests that claimed a red-on-disable nobody had read — now "WRITTEN,
+  NOT READ"). ✔MEASURED by the lane on its final bytes: the whole suite 2734 of 2734 on `macos-arm64-debug` and
+  `linux-arm64-debug`; every unit entry and the fold's examples, 671 of 671, on `windows-x86_64-debug` (MinGW) and
+  `windows-x86_64-release` (MSVC). NOT read: `linux-x86_64-debug`, the examples tier on Windows beyond the fold's
+  own, a sanitizer. **No arm of it is written or read**: 313 mutants of this lane are owed as arms. Balance
+  unchanged: 635 against 620.
 - **Silent defects FOUND in this round and NOT YET FIXED in this tree** (each the base's debt, each with its lane
   at work): a reference written through a STATIC name follows a losing weak alias of the same body to the winner
   (ELF references ✔MEASURED 158 on four compilers' objects, DSS 198); and in a STATIC INITIALIZER, an enumerator,

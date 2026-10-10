@@ -3700,6 +3700,7 @@ TEST(MirToLir, SwitchCharDiscriminantJumpTableWidenIsTargetKeyed) {
         auto const fnSig =
             interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
         ::dss::MirBuilder mb;
+        mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
         mb.addFunction(fnSig, ::dss::SymbolId{1});
         ::dss::MirBlockId const entry =
             mb.createBlock(::dss::StructCfMarker::SwitchHead);
@@ -6556,6 +6557,7 @@ buildF128BinaryArith(::dss::TypeInterner& interner, ::dss::MirOpcode op) {
     std::array<::dss::TypeId, 3> params{ptrT, ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const pa = mb.addArg(0, ptrT);
@@ -6676,6 +6678,7 @@ TEST(MirToLir, F128FixTfsiLowersToSoftcallSequence) {
     std::array<::dss::TypeId, 1> params{ptrT};
     auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const p = mb.addArg(0, ptrT);
@@ -6738,6 +6741,7 @@ TEST(MirToLir, F128ExtendFromDoubleLowersToSoftcallSequence) {
     std::array<::dss::TypeId, 2> params{f64, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const d  = mb.addArg(0, f64);
@@ -6804,6 +6808,7 @@ TEST(MirToLir, F128SoftcallInjectsExternImportOnce) {
     std::array<::dss::TypeId, 3> params{ptrT, ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const pa = mb.addArg(0, ptrT);
@@ -7264,6 +7269,7 @@ TEST(MirToLir, LongDoubleUserCallComposesWithSoftcall) {
     std::array<::dss::TypeId, 4> params{ptrT, ptrT, ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const pa = mb.addArg(0, ptrT);
@@ -7325,6 +7331,7 @@ TEST(MirToLir, F128PhiControlMergeLowersToMemoryHomeCopy) {
     std::array<::dss::TypeId, 3> params{boolT, ptrF128, ptrF128};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const entry = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     ::dss::MirBlockId const thenB = mb.createBlock(::dss::StructCfMarker::IfThen);
@@ -7498,6 +7505,7 @@ TEST(MirToLir, F128SoftcallDoesNotClobberDoubleLiveAcrossCall) {
     std::array<::dss::TypeId, 4> params{ptrT, ptrT, ptrT, f64};
     auto const sig = interner.fnSig(params, f64, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const pa = mb.addArg(0, ptrT);
@@ -8945,6 +8953,7 @@ namespace {
     TypeId const params[] = {i32p};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -8964,6 +8973,7 @@ namespace {
     TypeId const params[] = {i32p, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -9360,6 +9370,7 @@ buildWideFloatCompare(::dss::TypeInterner& interner, ::dss::TypeKind kind,
     std::array<::dss::TypeId, 2> params{ptrT, ptrT};
     auto const sig = interner.fnSig(params, boolT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const pa = mb.addArg(0, ptrT);
@@ -9386,6 +9397,7 @@ buildWideFloatCompareBranch(::dss::TypeInterner& interner, ::dss::TypeKind kind,
     std::array<::dss::TypeId, 2> params{ptrT, ptrT};
     auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     ::dss::MirBlockId const entry =
         mb.createBlock(::dss::StructCfMarker::EntryBlock);
@@ -9837,6 +9849,7 @@ buildWideFloatNeg(::dss::TypeInterner& interner, ::dss::TypeKind kind) {
     std::array<::dss::TypeId, 2> params{ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const pa = mb.addArg(0, ptrT);
@@ -9865,6 +9878,7 @@ buildWideFloatConvert(::dss::TypeInterner& interner, ::dss::TypeKind srcK,
     std::array<::dss::TypeId, 2> params{pSrcT, pDstT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const pa = mb.addArg(0, pSrcT);

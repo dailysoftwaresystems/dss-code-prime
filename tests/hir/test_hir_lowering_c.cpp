@@ -1199,6 +1199,129 @@ TEST(HirLoweringC, ScalarEmptyAndSingleBraceInitLower) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 }
 
+// A `_Complex` AND A `_BitInt` ARE SCALAR BRACE-INIT TARGETS, EACH ITS OWN MEMBER
+// OF THE CLOSED ALLOWLIST. Both are scalar types (C23 6.2.5: the arithmetic types
+// and the pointer types), so `T v = { e };`, the empty `T v = {};`, a member inside
+// an aggregate's list and a compound literal initialize them as they do an `int`.
+// The runnable halves — the values read back through memory, debug and release —
+// are examples/c/complex_scalar_braced_initializer and
+// examples/c/bit_int_scalar_braced_initializer; these are the unit-tier claims, one
+// case per member, so taking ONE member out of the allowlist reddens its own case
+// and leaves the other green.
+//
+// RED-ON-DISABLE: remove `TypeKind::Complex` (first case) or `TypeKind::BitInt`
+// (second case) from the scalar brace-init allowlist — the initializer then falls
+// to the aggregate gate, which refuses it.
+TEST(HirLoweringC, AComplexIsAScalarBraceInitTarget) {
+    SemanticModel model = analyzeC(
+        "int main(void) {\n"
+        "    double _Complex z = { 42.0 };\n"
+        "    double _Complex e = {};\n"
+        "    float _Complex f = { 2.0f };\n"
+        "    static double _Complex s = { 1.5 };\n"
+        "    struct { double _Complex m; int n; } t = { { 3.0 }, 7 };\n"
+        "    double _Complex c = (double _Complex){ 5.0 };\n"
+        "    (void)z; (void)e; (void)f; (void)s; (void)c;\n"
+        "    return t.n;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok)
+        << "a `_Complex` is a scalar: its brace initializer must lower — "
+        << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_InvalidScalarInitializer), 0u);
+}
+
+TEST(HirLoweringC, ABitIntIsAScalarBraceInitTarget) {
+    SemanticModel model = analyzeC(
+        "int main(void) {\n"
+        "    _BitInt(8) b = { 42 };\n"
+        "    _BitInt(8) zb = {};\n"
+        "    unsigned _BitInt(100) w = { 42 };\n"
+        "    unsigned _BitInt(100) zw = {};\n"
+        "    static _BitInt(24) s = { 40 };\n"
+        "    struct { _BitInt(12) m; int n; } t = { { 2 }, 7 };\n"
+        "    (void)b; (void)zb; (void)w; (void)zw; (void)s;\n"
+        "    return t.n;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok)
+        << "a `_BitInt` is a scalar: its brace initializer must lower — "
+        << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_InvalidScalarInitializer), 0u);
+}
+
+// CHECKED ARITHMETIC IS COMPUTED IN A TYPE WIDE ENOUGH TO HOLD THE EXACT RESULT.
+// `__builtin_add_overflow(a, b, &r)` answers "did the mathematical sum fit `r`", so
+// the sum is formed in a type W that cannot itself wrap: over two signed N-bit
+// operands, N + 1 bits. The lowering binds both operands and the exact result to
+// synthetic temporaries of type W — three of them — and W is the first of `long
+// long`'s 64 bits, the 128-bit type, and a bit-precise type of exactly the bits
+// needed. The run-time half is examples/c/gnu_overflow_predicates and
+// examples/c/gnu_builtins_overflow_alloca; this is the unit-tier claim: W, by type.
+//
+// RED-ON-DISABLE: cap the signed W at 64 bits — the `long long` and `__int128`
+// rows then compute in a type the sum wraps in (and the `int` row, whose 33 bits
+// fit 64 either way, stays green: the control inside the case).
+TEST(HirLoweringC, CheckedArithmeticOverSignedOperandsIsComputedWideEnoughForTheExactResult) {
+    struct Row {
+        char const*  type;
+        TypeKind     wide;
+        std::int64_t bitIntWidth;   // when `wide` is a bit-precise type
+    };
+    for (Row const& row : {Row{"int", TypeKind::I64, 0},
+                           Row{"long long", TypeKind::I128, 0},
+                           Row{"__int128", TypeKind::BitInt, 129}}) {
+        std::string src = "int f(";
+        src += row.type;
+        src += " a, ";
+        src += row.type;
+        src += " b) {\n    ";
+        src += row.type;
+        src += " r;\n    return __builtin_add_overflow(a, b, &r);\n}\n"
+               "int main(void) { return 0; }\n";
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors())
+            << row.type << ": "
+            << (model.diagnostics().all().empty()
+                  ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << row.type << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& ti = model.lattice().interner();
+        Hir const& hir = res->hir;
+        std::size_t wideTemporaries = 0;
+        std::vector<HirNodeId> pending;
+        for (HirNodeId d : hir.moduleDecls(hir.root())) {
+            if (hir.kind(d) == HirKind::Function) pending.push_back(hir.functionBody(d));
+        }
+        while (!pending.empty()) {
+            HirNodeId const id = pending.back();
+            pending.pop_back();
+            if (hir.kind(id) == HirKind::VarDecl && has(hir.flags(id), HirFlags::Synthetic)) {
+                TypeId const t = hir.varDeclType(id);
+                bool const isWide =
+                    ti.kind(t) == row.wide
+                    && (row.wide != TypeKind::BitInt
+                        || (ti.bitIntWidth(t) == row.bitIntWidth && ti.bitIntIsSigned(t)));
+                if (isWide) ++wideTemporaries;
+            }
+            for (HirNodeId c : hir.children(id)) pending.push_back(c);
+        }
+        EXPECT_EQ(wideTemporaries, 3u)
+            << row.type << ": the two operands and the exact sum are each bound to a "
+                           "temporary of the type the sum cannot wrap in";
+    }
+}
+
 // FC17.5 (S_InvalidScalarInitializer 0xE03F): the three malformed scalar
 // brace shapes stay LOUD — excess elements (`{1,2}`), a designator on a
 // scalar (`{.x=1}`), and the audit-N2 nested brace list (`{{42}}` — C23

@@ -467,3 +467,108 @@ TEST(LirAsmRegion, TheTextCodecRoundTripsABundleByteForByte) {
                   asmRegionBundles(L.lir.lir).size());
     }
 }
+
+// ── (H) THE EXPANSION PUBLISHES WHERE EACH SOURCE BLOCK LANDED ───────────────
+//
+// A template with a label of its own becomes several blocks of the function, so every
+// source block AFTER the statement's has a new id. The pass says where each landed —
+// `LirAsmRegionExpansionResult::blockEntryImage`, indexed by the SOURCE block's id — and
+// everything that names a block as data follows it (a label's address, a switch table, a
+// guarded region, the unwind rows: `lir/lir_descriptor_blocks.hpp`). Until this case the
+// image of THIS pass was read only by programs that had to run
+// (examples/c/switch_after_an_asm_label_function and its two neighbours): on a leg that
+// cannot run the pair, nothing looked at it.
+//
+// Two witnesses, neither of them the image:
+//   * the function's `ret` is found in the expanded module BY ITS OPCODE, and the source
+//     block that held it must be published as that block;
+//   * a source block the template did not touch is one block of the output, and the
+//     statement's own block is followed by every block the expansion added — so the
+//     blocks before the statement keep their place and the blocks after it move by
+//     exactly the number of blocks added.
+// A pass that published its SOURCE ids would be right about every block up to the
+// statement and wrong about every block after it — which is why the function has blocks
+// on both sides.
+TEST(LirAsmRegion, TheExpansionPublishesWhereEachSourceBlockLanded) {
+    struct Probe {
+        char const* target;
+        char const* loop;   // a template with a label of its own: a counted loop
+    };
+    for (Probe const& p :
+         {Probe{"x86_64", "1:\\n\\taddl $2, %0\\n\\tsubl $1, %1\\n\\tjnz 1b"},
+          Probe{"arm64", "1:\\n\\tadd %w0, %w0, #2\\n\\tsub %w1, %w1, #1\\n\\tcbnz %w1, 1b"}}) {
+        SCOPED_TRACE(p.target);
+        std::string const src =
+            std::string{"int f(int n, int k) {\n"
+                        "  int acc = 0;\n"
+                        "  if (k) acc = 1;\n"
+                        "  __asm__(\""} + p.loop + "\" : \"+r\"(acc), \"+r\"(n) : : \"cc\");\n"
+            "  if (k > 1) acc += 3;\n"
+            "  return acc;\n"
+            "}\n";
+        auto L = lowerCToLir(src, p.target);
+        ASSERT_TRUE(L.lir.ok) << summarize(L);
+        auto const ready = lirReadyForAsmExpansion(L.lir.lir, *L.target);
+        ASSERT_TRUE(ready.has_value());
+        Lir const& in = *ready;
+        DiagnosticReporter rep;
+        auto const expanded = expandAsmRegions(in, *L.target, rep);
+        ASSERT_TRUE(expanded.ok) << (rep.all().empty() ? std::string{} : rep.all().back().actual);
+        Lir const& out = expanded.lir;
+
+        ASSERT_EQ(in.moduleFuncCount(), 1u);
+        ASSERT_EQ(out.moduleFuncCount(), 1u);
+        LirFuncId const inFn  = in.funcAt(0);
+        LirFuncId const outFn = out.funcAt(0);
+        std::uint32_t const inBlocks  = in.funcBlockCount(inFn);
+        std::uint32_t const outBlocks = out.funcBlockCount(outFn);
+        ASSERT_EQ(expanded.blockEntryImage.size(), in.blockCount());
+        // CONTROL: the template's label did become blocks — otherwise the identity would be
+        // the right answer and the case would prove nothing.
+        ASSERT_GT(outBlocks, inBlocks) << "the template's label added no block";
+        std::uint32_t const added = outBlocks - inBlocks;
+
+        // Where a module's blocks hold a given opcode, and where the statement is.
+        std::uint16_t const ret = opOf(*L.target, "ret");
+        auto const positionsHolding = [&](Lir const& m, LirFuncId fn, auto const& wanted) {
+            std::vector<std::uint32_t> at;
+            for (std::uint32_t k = 0; k < m.funcBlockCount(fn); ++k) {
+                LirBlockId const b = m.funcBlockAt(fn, k);
+                for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                    if (wanted(m, m.blockInstAt(b, i))) { at.push_back(k); break; }
+                }
+            }
+            return at;
+        };
+        auto const isRet = [&](Lir const& m, LirInstId i) { return m.instOpcode(i) == ret; };
+        auto const isBundle = [](Lir const& m, LirInstId i) { return m.instAsmRegion(i) != nullptr; };
+        auto const retIn    = positionsHolding(in, inFn, isRet);
+        auto const retOut   = positionsHolding(out, outFn, isRet);
+        auto const bundleIn = positionsHolding(in, inFn, isBundle);
+        ASSERT_EQ(retIn.size(), 1u) << "the probe returns in one place";
+        ASSERT_EQ(retOut.size(), 1u);
+        ASSERT_EQ(bundleIn.size(), 1u) << "one statement, one bundle";
+        ASSERT_TRUE(positionsHolding(out, outFn, isBundle).empty()) << "the expansion left a bundle";
+        std::uint32_t const statementAt = bundleIn.front();
+        // CONTROL: blocks on both sides of the statement.
+        ASSERT_GT(statementAt, 0u);
+        ASSERT_GT(retIn.front(), statementAt) << "the return must come after the statement";
+
+        // Witness one: the block that returns.
+        EXPECT_EQ(expanded.blockEntryImage[in.funcBlockAt(inFn, retIn.front()).v],
+                  out.funcBlockAt(outFn, retOut.front()).v)
+            << "the source block that returns was published somewhere else than the block that "
+               "returns in the expanded function";
+        EXPECT_EQ(retOut.front(), retIn.front() + added)
+            << "CONTROL: the returning block did move, by the blocks the expansion added";
+
+        // Witness two: every block, by its place.
+        for (std::uint32_t k = 0; k < inBlocks; ++k) {
+            std::uint32_t const place = k <= statementAt ? k : k + added;
+            EXPECT_EQ(expanded.blockEntryImage[in.funcBlockAt(inFn, k).v],
+                      out.funcBlockAt(outFn, place).v)
+                << "source block #" << k << (k <= statementAt ? " (up to the statement)"
+                                                              : " (after the statement)");
+        }
+    }
+}
