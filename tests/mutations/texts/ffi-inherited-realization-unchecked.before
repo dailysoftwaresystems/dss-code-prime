@@ -1,0 +1,3 @@
+                if (std::string const declared =
+                        declaredImport(sym.library, sym.libraryRoles, fmt);
+                    !declared.empty()) {

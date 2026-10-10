@@ -1,0 +1,2 @@
+    if (!d.has_value()) return unknown;
+    bool const sub = (type & 1) != 0;

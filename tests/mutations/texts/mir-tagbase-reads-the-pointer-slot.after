@@ -1,0 +1,1 @@
+            if (false && t.valid() && interner.kind(t) == TypeKind::Ptr) return lowerExpr(apChild);

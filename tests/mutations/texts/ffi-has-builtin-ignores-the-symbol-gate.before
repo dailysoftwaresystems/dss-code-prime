@@ -1,0 +1,3 @@
+        if (objectFormatInAvailabilitySet(row.documentGate, fmt)
+            && objectFormatInAvailabilitySet(row.symbolGate, fmt))
+            return !row.isObject;

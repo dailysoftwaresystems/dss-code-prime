@@ -1,0 +1,3 @@
+            std::optional<SymbolId> const s =
+                env.resolveUnnamedObject ? env.resolveUnnamedObject(n) : std::nullopt;
+            if (n.valid() || !s.has_value() || !s->valid()) {

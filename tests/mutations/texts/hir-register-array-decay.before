@@ -1,0 +1,2 @@
+        TypeId const t = arrayExpr.valid() ? builder.typeId(arrayExpr) : InvalidType;
+        if (!t.valid() || interner.kind(t) != TypeKind::Array) return false;

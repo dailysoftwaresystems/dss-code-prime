@@ -1,0 +1,2 @@
+void validateNotFollowedBy(GrammarSchemaData& data, Collector& coll) {
+    std::unordered_set<std::uint32_t> vetoing;

@@ -1,0 +1,4 @@
+        } else if (lv.core == TypeKind::Union && !a->fields.empty()
+                   && !a->unionMember.has_value() && /*S2c*/ a->fields.size() > a->fields.size()) {
+            malformed("a union aggregate literal with a field must name the member it "
+                      "initializes

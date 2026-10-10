@@ -1,0 +1,1 @@
+    std::uint32_t const gap = frameBytes > page ? 0u : frameBytes;   /*S6f*/

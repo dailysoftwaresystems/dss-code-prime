@@ -1,0 +1,2 @@
+        auto& s = sehScopes[k];
+        std::string const what

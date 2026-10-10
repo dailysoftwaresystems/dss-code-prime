@@ -1,0 +1,2 @@
+                LirOperand::makeReg(sp), LirOperand::makeReg(*sizeRaw)};
+            emitInst(*subOp, InvalidLirReg, ops, /*payload=*/0, /*flags=*/0);

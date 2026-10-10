@@ -1,0 +1,6 @@
+            for (std::uint32_t k = 0; k < n; ++k) {   /*M52f2*/
+                std::uint32_t const v = in.funcBlockAt(inFn, k).v;
+                images[v] = Image{v, v};
+            }
+            continue;
+        }

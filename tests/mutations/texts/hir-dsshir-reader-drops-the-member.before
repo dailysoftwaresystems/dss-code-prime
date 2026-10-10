@@ -1,0 +1,2 @@
+            stack.back().agg.unionMember = member;
+            return false;   // the fields come next

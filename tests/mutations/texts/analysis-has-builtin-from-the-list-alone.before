@@ -1,0 +1,1 @@
+        return libraryFunctionProvided && libraryFunctionProvided(lib);

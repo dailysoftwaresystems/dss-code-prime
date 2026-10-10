@@ -1,0 +1,1 @@
+"name": "strndup", "signature": "fn(ptr<const<char>>, u64) -> ptr<char>", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "pe"], "realization": {

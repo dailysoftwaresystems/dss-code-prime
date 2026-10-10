@@ -1,0 +1,2 @@
+            == MirOpcode::SehTryBegin) {
+            return;   // promoted_ stays empty

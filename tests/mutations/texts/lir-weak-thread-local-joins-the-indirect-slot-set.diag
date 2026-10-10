@@ -1,0 +1,1 @@
+a weak thread-local's access is the `pe-indexed` sequence, not a `.refptr` read

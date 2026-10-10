@@ -1,0 +1,1 @@
+int main(void) { return _Generic(&f_plain, FC *: 1, default: 42); }

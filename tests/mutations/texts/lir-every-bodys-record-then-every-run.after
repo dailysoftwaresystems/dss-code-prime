@@ -1,0 +1,6 @@
+            sehScopeDescriptors_.insert(
+                sehScopeDescriptors_.begin()
+                    + static_cast<std::ptrdiff_t>(&s - sehScopesIn_.data()),
+                desc);
+
+            // The region's RUNS.

@@ -1,0 +1,1 @@
+                            queried = subtreeType(s, tree, opnd, fromScope);

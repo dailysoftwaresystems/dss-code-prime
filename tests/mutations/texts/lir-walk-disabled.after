@@ -1,0 +1,1 @@
+    bool const walkDynamicDescents = false && hasVla && cc.stackProbePageBytes > 0;

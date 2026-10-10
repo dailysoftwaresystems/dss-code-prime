@@ -1,0 +1,8 @@
+            refuse(reporter, std::format(
+                "LIR pass '{}' publishes no block image for a module that has blocks (function #{} has {}, "
+                "and its rebuilt form {}), so a block a jump table, a static label table or a __try names "
+                "cannot be followed through it: every rebuild states where each source block's "
+                "instructions begin",
+                step.pass, fi, n, m));
+            return std::nullopt;
+        }

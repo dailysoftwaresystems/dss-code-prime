@@ -1,0 +1,1 @@
+        outBlockEntryImage[srcBlock.v] = srcToDst[srcBlock.v].v;

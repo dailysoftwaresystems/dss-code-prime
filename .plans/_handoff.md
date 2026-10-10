@@ -258,6 +258,18 @@ round's close; each checkpoint's commit message says what was and was not run on
   freshness entry on the MSVC tree: 799 objects, 2 excused, each for having no `#include`; all 11 arms `passed` on
   `macos-arm64-debug`, which is NOT the leg their `S` rows name (`linux-x86_64-debug`, owed from the main
   checkout). NOT read: the two arm64 Linux legs, the release legs of WSL and the Mac. No row; balance unchanged.
+- **Checkpoint 11 (2026-10-10) = the C front end lane's FIRST ARM BATCH: 177 arms written, NONE swept.** Registry
+  and texts only (493 new texts; the registry holds 209 arms), no path under `src/`, nothing built. The 177 are
+  158 mutants (a mutant red in N binaries is N arms): 129 whose red set was measured by hand before the arm
+  existed — 105 of them on a leg OTHER than the one their `S` row names — and 48 whose unit-tier claim was written
+  after their reading and has never been read red (fold A2's 30 mutants among them). Their `diag`: 126 a text the
+  hand reading's red run said, 51 DECLARED from the claim's assertion and marked so in the `C` row. By leg:
+  `linux-x86_64-debug` 94, `macos-arm64-debug` 82, `windows-x86_64-release` 1. **Every one of the 177 is owed its
+  first sweep from the main checkout; an arm not `passed` goes back to the lane with its text.** NOT written: fold
+  A1's 140 first-sweep mutants and seven several-site mutants. One row, born `disclosed` on the orchestrator's
+  ruling (the measured exception, a codec arc): `D-DSSHIR-NATIVE-SIDE-TABLES-HAVE-NO-TEXT-FORM` — twelve of the
+  thirteen side tables the C lowering binds have no form in the `.dsshir` text; no shipped route compiles from
+  that text. Balance: 636 against 620.
 - **Silent defects FOUND in this round and NOT YET FIXED in this tree** (each the base's debt, each with its lane
   at work): a reference written through a STATIC name follows a losing weak alias of the same body to the winner
   (ELF references ✔MEASURED 158 on four compilers' objects, DSS 198); and in a STATIC INITIALIZER, an enumerator,
