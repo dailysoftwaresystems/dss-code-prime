@@ -140,6 +140,18 @@ own private `build-warn/` reddened by 23 errors in files it did not own; and one
 scratchpad script overwritten mid-run by a sibling. **Ownership partitions WRITES; it does not
 partition the COMPILER, the build dir, or the scratchpad.**
 
+★★★★ **A BRIEF THAT ASKS FOR A PIN ASKS FOR ITS ARM** (operator, 2026-10-10 — `dssharness check-mutations`
+is mandatory). The brief says, in these words or its own: the claim is a gtest TEST of a self-contained test
+binary, never an example entry alone; the lane DECLARES the arm in `tests/mutations/arms.registry` (its
+section, its block, one `S` row naming one leg by the stated rule), validates the registry, sweeps ITS OWN
+arms from its own tree on the legs they name, and reports each arm's verdict with the run id; an arm that
+names a Windows leg is reported as owed, for the orchestrator to sweep on the main tree after the fold; a
+row that rests on a pin does not close before its arm passed on the bytes it closes on. Paste the
+command lines from `mutation-arms.md`; a brief states an interface only if its author ran it.
+ⓘ An arm puts no wrong byte in any tree — the tool mutates a worker copy beside it — so the paragraph and
+the window below now concern only a mutant of the one class read by hand, and every byte-changing
+measurement that is not a pin.
+
 ★★ **A BYTE-CHANGING MEASUREMENT GOES IN A WORKTREE — THE LANE'S OWN AGENT WORKTREE, OR A PLAIN PROBE
 ONE — PASTE `worktrees.md` §H.0 INTO THE BRIEF, DO NOT CITE IT.** §H.0 already names *"red-on-disable mutants"* explicitly and predates
 the incidents above, so the gap is not knowledge — it is that a brief which says *"prove

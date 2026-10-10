@@ -3,7 +3,7 @@
 ## Contents
 - Step 6 — Fail-loud gate: the build is verifiable (`check-ninja-deps`) · a ctest run that overlapped a
   build is void · any shared input moving under a run · a wrapper cannot report its verdict if a command
-  follows it · no new `abort()` in test code · the anchor-registry and script-index guards · §A.7
+  follows it · the mutation arms · no new `abort()` in test code · the anchor-registry and script-index guards · §A.7
   nothing worked around · the anchor balance gate · four rows that are the same row · the
   diagnostic-code allocation gate
 - Step 8 — Cross-plan update
@@ -53,6 +53,12 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   ran" look identical from outside, and this project has been burned by that ambiguity before.
 - `dssharness test --legs windows-x86_64-debug --json --time` 100%, including the new tests — the round
   gate is `dssharness test --legs gate`, the eight legs; `--filter <regex>` iterates but never concludes.
+- ★★★★ **THE MUTATION ARMS — `dssharness check-mutations`, every selected arm `passed`** (2026-10-10). A
+  green suite says every pin's test passes; only the sweep says each can FAIL. Per fold, the fold's own arms
+  (`--arms <ids>`) on the fold's bytes; at the round's close, in the main tree, one `--legs <leg>` per leg an
+  arm's `S` row names. Read each leg by its own line, never by the exit code alone; a leg that did not reach
+  its arms is STATED with the tool's reason. A pin with no arm is unproven, and a row that rests on it does
+  not close (`mutation-arms.md`, `round-gate-and-ci.md`).
 - ★★★ **A CTEST RUN THAT OVERLAPPED A BUILD IS VOID IN BOTH DIRECTIONS — AND IT CAN STILL LOOK
   GREEN.** ✔MEASURED 2026-08-17: a lane ran `ninja` while its own gate was executing (the documented
   *mid-run DLL relink is never OK* hazard), and the run **reported 875/875** while emitting ~400

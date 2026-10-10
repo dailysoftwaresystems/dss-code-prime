@@ -50,7 +50,9 @@ Four clauses, and each is measured rather than asserted — detail in §H.0b:
    depth (`**/.secrets`, which covers the root one too) — once, for every host. `dssharness sync --dry-run`
    lists every path it would write, which is how to CHECK this rather than trust it.
 2. ⚠ **The MAX_PATH budget is SPENT, not slack.** `create-worktree` and `create-agent` refuse up front a
-   name whose longest build path would pass `worktrees.pathLimit`, every term read from
+   name whose longest build path would pass the path limit — the PLATFORM's own: this repository declares
+   no `worktrees.pathLimit`, on purpose, because a declared one replaces the platform's limit on every host
+   (dss-harness.md) —, the reserve and the margin read from
    `.harness-config/config.json` and the longest name that still fits named in the refusal — the defect it
    prevents fails as a per-TU compile error in files the lane never touched. An agent's orchestrator and
    agent names share the one budget. ⇒ **Keep names SHORT**; a descriptive name spends the margin.
@@ -149,6 +151,13 @@ is the same class as a red-on-disable whose mutant never compiled in.
   mutants, "what does the corpus look like if…" — runs in a worktree, never in the shared tree: a lane's own
   agent worktree, or a plain probe worktree. What lands in the main tree lands through the fold, or as a
   verified patch the main loop decides on.
+  ★ **A red-on-disable ARM changes no tree at all**: `dssharness check-mutations` applies the mutation in a
+  WORKER COPY it keeps beside the tree (`<tree>.mutation-<key>w-<n>`, a whole copy with a whole build, synced
+  by content before every sweep), so a sweep may be run on a lane's worktree and on the main checkout alike.
+  A worker's path is twenty characters longer than its tree's; the workers go with their tree —
+  `delete-agent` and `delete-worktree` remove those kept beside it, `clean` a leg's with its build directory.
+  The hand-applied mutant, which does change a tree, remains only for the one class of mutant the installed
+  tool refuses as an arm (mutation-arms.md).
 - ⚠ **A revert is not a safe undo once a concurrent lane has edited the same file.** Copying a
   pristine copy back destroys the other lane's interleaved work. Reverse-apply the specific patch
   (`git apply -R`), or leave it and report.

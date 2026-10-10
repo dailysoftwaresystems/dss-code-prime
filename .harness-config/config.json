@@ -728,6 +728,31 @@
       "action": "probe-reference-cc/probe-reference-cc.yml",
       "stallSeconds": 420
     },
+    // ★ HOW AN IMAGE IS BUILT WHERE IT CAN BE AND RUN WHERE IT MUST BE (2026-10-08, cycle P69, lane hm, to lane
+    // lm's specification). DSS builds any target on any host, so a leg whose build is free makes the images a
+    // machine whose build is not will run -- and until this runner nothing KEPT one: every runner that compiles an
+    // image it cannot run judges it in a directory it then removes. The request's sources travel as base64 (the
+    // probe's reason: `sync` keeps ONE copy of the repository per host), are compiled with the leg's own product for
+    // a stated target under each stated pipeline, and every image is kept beside a report; `sync --pull` brings the
+    // kept files back, each named (it carries no directory), and the report ends with that command. Every leg,
+    // because any of them can be the one whose build is free.
+    // No `requireBuild`: the compile step names the leg's product, so DssHarness builds each leg first, whichever
+    // runner starts it (`help runners`); the manual `self-test` step names none and needs no build.
+    "compile-and-keep": {
+      "description": "Compiles the sources carried in the request (base64) with the leg's own built dsscp for a stated target, once per stated pipeline, and keeps every image beside a redacted report: per source and pipeline the compile's exit code, its diagnostics, and each image's name, size and md5. A compile that fails is reported as a measurement; a request the built compiler refuses is refused in its words.",
+      "legs": [
+        "windows-x86_64-debug",
+        "windows-x86_64-release",
+        "linux-x86_64-debug",
+        "linux-x86_64-release",
+        "macos-arm64-debug",
+        "macos-arm64-release",
+        "linux-arm64-debug",
+        "linux-arm64-release"
+      ],
+      "action": "compile-and-keep/compile-and-keep.yml",
+      "stallSeconds": 420
+    },
     // THE PROTOTYPE CENSUS (P68 round 12, lane lm; its values step and derived pair P69; cl's dialect P69, lane hm):
     // every shipped prototype, and every integer value, judged against the leg's own platform header, as the
     // action's file says. ITS REFERENCE, on every leg, is the action's `cc` input, `cc` by default, whose dialect the
@@ -1440,10 +1465,11 @@
     ],
     // Printed in the warning as "it shares <this>". ✔READ in `src/program/runtime_object_cache.cpp`
     // (`kPlatformRootCandidates`, `resolveArtifactCacheRoots`) and `dss_build_stamp.hpp`: the stamp is
-    // version + commit + a digest of uncommitted changes, so another tree's dsscp shares the cache
-    // ROOT but never an entry. It contends for disk and CPU, not for a result.
+    // version + commit + a digest of uncommitted changes (+ a digest of the dependency sources a build
+    // was handed instead of fetching), so another tree's dsscp shares the cache ROOT but never an
+    // entry. It contends for disk and CPU, not for a result.
     "sharedState": {
-      "dsscp": "the per-user runtime object cache (%LOCALAPPDATA%/dsscp/runtime-cache on Windows, $XDG_CACHE_HOME or ~/.cache/dsscp/runtime-cache elsewhere, DSS_RUNTIME_CACHE_DIR overriding both), one subdirectory per build stamp (version + commit + a digest of uncommitted changes), so a dsscp from another tree shares the directory but no entry; and the system temp directory"
+      "dsscp": "the per-user runtime object cache (%LOCALAPPDATA%/dsscp/runtime-cache on Windows, $XDG_CACHE_HOME or ~/.cache/dsscp/runtime-cache elsewhere, DSS_RUNTIME_CACHE_DIR overriding both), one subdirectory per build stamp (version + commit + a digest of uncommitted changes, and of any dependency sources the build was handed), so a dsscp from another tree shares the directory but no entry; and the system temp directory"
     }
   },
   "worktrees": {
@@ -1455,14 +1481,20 @@
     "maxNameLength": 10,
     // Reserve = the longest file below `build/<variant>/`: 166, a test object, + 2 for its transient
     // `.obj.d` depfile (✔MEASURED 2026-09-21 in every Windows build directory). The harness adds
-    // `build/<longest variant>/` and every separator itself, and holds a path UNDER `pathLimit` (the
-    // NUL counts), so the margin is only headroom: 1. At this checkout's root that is
-    // 50 + name + 30 + 168 + 1 < 260, admitting a `maxNameLength` name with one character to spare;
-    // physically 248 + name <= 259 (a 260-character path fails to write). A build warns when it
-    // writes deeper than the reserve: re-derive it then, since the longest test name drives it.
+    // `build/<longest variant>/` and every separator itself, and holds a path UNDER the platform's own
+    // limit (260 on Windows; the NUL counts), so the margin is only headroom: 1. At this checkout's
+    // root that is 50 + name + 30 + 168 + 1 < 260, admitting a `maxNameLength` name with one character
+    // to spare; physically 248 + name <= 259 (a 260-character path fails to write). A build warns when
+    // it writes deeper than the reserve: re-derive it then, since the longest test name drives it.
+    // ★ `pathLimit` IS NOT DECLARED, ON PURPOSE. It REPLACES the platform's limit on every host, so a
+    // declared 260 held the Mac, WSL and the VPS to Windows' limit, and no mutation worker of a lane
+    // worktree could be placed on any of them (✔MEASURED 2026-10-10: `skipped-unavailable`, "every
+    // path must stay under 260", on the Mac leg; placed at once with the line gone). Windows keeps its
+    // own 260 without being told (✔MEASURED the same day, from a lane worktree: the same refusal on
+    // the Windows leg, with nothing declared). Declare it only when every tool the build runs takes
+    // longer paths on every host that has a limit.
     "pathBudgetReserve": 168,
     "pathBudgetMargin": 1,
-    "pathLimit": 260,
     "detach": true
   },
   "anchors": {
@@ -1495,6 +1527,24 @@
       "packaging",
       "integrated_tests",
       "tests"
+    ]
+  },
+  // RED-ON-DISABLE IS `dssharness check-mutations`: every pin is an ARM of the registry below, driven in worker
+  // copies of a leg's tree and judged by its exact red set (`dssharness help mutations`; the skill's
+  // `references/mutation-arms.md` is this repository's how-to).
+  // `reportArgs`: every test target links GoogleTest's own `main` (`dss_add_test`, tests/CMakeLists.txt), so each
+  // writes its report with `--gtest_output=xml:<file>`; a case is named `Suite.Case`. A runner is such a target and
+  // nothing else: the tool starts its binary whole, with these arguments alone, so an examples runner (one example
+  // per invocation) and a guard or script entry (no test binary) are never an arm's runner.
+  // `workers` and `runTimeFactor` are NOT declared: by the tool's own rule a leg gets no more workers than it has
+  // arms to drive or its host has room for, and ONE in a WSL distribution, and a sweep that runs fewer says what
+  // keeps the rest out (`dssharness help mutations`; ✔MEASURED 2026-10-10: two on the Mac, one on WSL, each a
+  // whole build of the tree).
+  "mutations": {
+    "registry": "tests/mutations/arms.registry",
+    "textDirectory": "tests/mutations/texts",
+    "reportArgs": [
+      "--gtest_output=xml:{report}"
     ]
   },
   "sshItems": [

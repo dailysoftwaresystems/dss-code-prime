@@ -59,10 +59,35 @@
 #                          which a script COULD reach a product target, while
 #                          their sources build only tests
 # All three are comma-separated paths relative to DSS_STAMP_SOURCE_DIR (the
-# records may be empty). Nothing else names the compiler: a test's source, a
-# plan, a skill, a harness program or a document is never compiled into it, and
-# the runtime cache's key carries the config documents it loads as a term of its
-# own.
+# records may be empty). Nothing else of the TREE names the compiler: a test's
+# source, a plan, a skill, a harness program or a document is never compiled
+# into it, and the runtime cache's key carries the config documents it loads as
+# a term of its own.
+#
+# ── AND WHAT IT IS BUILT AGAINST: A DEPENDENCY, FETCHED OR HANDED ────────────
+# A dependency the build FETCHES needs no term: the top-level CMakeLists pins
+# its version, and that file is an input. A dependency the configure is HANDED
+# (CMake's `FETCHCONTENT_SOURCE_DIR_<NAME>`: use these sources, fetch nothing)
+# is held by no pin — its bytes are whatever stands in the directory — so the
+# stamp names it by them:
+#   DSS_STAMP_HANDED_DEPENDENCIES   comma-separated `<NAME>=<absolute directory>`,
+#                          as `dss_build_stamp_handed_dependencies` reads CMake's
+#                          own record of the hand-overs; EMPTY where the configure
+#                          was handed none, and the value is then exactly what it
+#                          is without this term
+# Every file under each directory enters one sorted list as its dependency's
+# name, its path below that directory and the SHA-256 of its bytes; the list's
+# digest is the `.deps` component. The directory's own location is NOT in it —
+# the same bytes handed from another path stamp the same value — and a clone's
+# own `.git` there is not read: git's bookkeeping moves when no source does.
+# Read on every build, as the inputs are: a handed directory can change between
+# two builds with no configure between them.
+# ✔MEASURED 2026-10-10 why the term exists: DssHarness builds each mutation
+# worker with the dependency sources the leg's own build fetched, HANDED to the
+# worker's configure from inside the worker. Until then the stamp named no
+# dependency at all on the strength of the pin, which a hand-over steps around:
+# a compiler built against other bytes of a dependency carried the pinned
+# build's stamp, and the runtime object cache could not tell the two apart.
 # ✔MEASURED 2026-10-06 (cycle P69, lane `hm`) why the inputs are declared, in
 # two directions. On a work tree the dirt was the WHOLE tree's, so an edit to
 # any file — a registry row, a skill, a harness program — moved the stamp and
@@ -84,6 +109,8 @@
 #   DSS_STAMP_OUTPUT      the generated header to write
 #   DSS_STAMP_INPUTS, DSS_STAMP_RECORDS, DSS_STAMP_SCRIPT_DIRS   the
 #                         declaration (above)
+#   DSS_STAMP_HANDED_DEPENDENCIES   the dependencies the configure was handed
+#                         (above); must be passed, EMPTY where there is none
 #   DSS_STAMP_GIT         path to git, or EMPTY when configure found none
 #   DSS_STAMP_MODE        `stamp` (the default) or `selftest`
 #   DSS_STAMP_SCRATCH     the self-test's scratch directory (selftest only)
@@ -96,6 +123,8 @@
 #   <VERSION>+g<12 hex>.dirty<16 hex>       …plus a digest of the inputs' DIRT
 #   <VERSION>+src<16 hex>                   no git, or no work tree: a digest of
 #                                           the inputs' CONTENT
+#   <any of the three>.deps<16 hex>         …plus a digest of the CONTENT of the
+#                                           dependencies the configure was handed
 #
 # No component ever contains whitespace, so the whole stamp is a single token —
 # the property `tests/program/test_build_stamp.cpp` pins, because this string
@@ -147,6 +176,14 @@ foreach(_dss_required IN ITEMS DSS_STAMP_VERSION DSS_STAMP_SOURCE_DIR DSS_STAMP_
 endforeach()
 # DSS_STAMP_GIT is deliberately NOT in that loop: "configure found no git" is a
 # legitimate state with a defined behaviour below, not a caller error.
+# DSS_STAMP_HANDED_DEPENDENCIES must be PASSED and may be empty: "handed none"
+# is a statement, and a run that was told nothing would name no dependency.
+if(NOT DEFINED DSS_STAMP_HANDED_DEPENDENCIES)
+    message(FATAL_ERROR
+        "DssBuildStamp: DSS_STAMP_HANDED_DEPENDENCIES was not passed — the top-level CMakeLists says which "
+        "dependencies its configure was handed (empty when it was handed none), and a stamp computed without "
+        "being told would name none of them.")
+endif()
 _dss_stamp_read_inputs(_dss_inputs _dss_records _dss_script_dirs)
 # Every declared input must EXIST: a missing one is a declaration that names
 # nothing, and a stamp computed without it would stop moving with it.
@@ -313,6 +350,46 @@ else()
     string(APPEND _dss_stamp "+src${_dss_content}")
 endif()
 
+# ── THE HANDED DEPENDENCIES' CONTENT ────────────────────────────────────────
+# One sorted list over every dependency the configure was handed: the
+# dependency's NAME alone on a line (so one handed with no file still differs
+# from none handed, and the same bytes under another name are another
+# dependency), then each of its files as a tab, its path below the directory,
+# a tab and the SHA-256 of its bytes. Never the directory's own path: where a
+# dependency was handed FROM is no part of what the compiler was built against.
+string(REPLACE "," ";" _dss_handed "${DSS_STAMP_HANDED_DEPENDENCIES}")
+if(_dss_handed)
+    list(SORT _dss_handed)
+    set(_dss_manifest "")
+    foreach(_dss_pair IN LISTS _dss_handed)
+        if(NOT _dss_pair MATCHES "^([^=]+)=(.+)$")
+            message(FATAL_ERROR
+                "DssBuildStamp: the handed dependency '${_dss_pair}' is not `<NAME>=<directory>`. "
+                "DSS_STAMP_HANDED_DEPENDENCIES is what `dss_build_stamp_handed_dependencies` answers in the "
+                "top-level CMakeLists; pass that, unchanged.")
+        endif()
+        set(_dss_dep_name "${CMAKE_MATCH_1}")
+        set(_dss_dep_dir "${CMAKE_MATCH_2}")
+        if(NOT IS_DIRECTORY "${_dss_dep_dir}")
+            message(FATAL_ERROR
+                "DssBuildStamp: the dependency '${_dss_dep_name}' was handed from '${_dss_dep_dir}', which is no "
+                "directory: a hand-over that names nothing, and a stamp computed without it would not move with "
+                "the bytes the compiler is built against. Configure again with the directory that holds them.")
+        endif()
+        file(GLOB_RECURSE _dss_found LIST_DIRECTORIES false RELATIVE "${_dss_dep_dir}" "${_dss_dep_dir}/*")
+        list(FILTER _dss_found EXCLUDE REGEX "^\\.git(/|$)")   # a clone's own bookkeeping, never a source
+        list(SORT _dss_found)
+        string(APPEND _dss_manifest "${_dss_dep_name}\n")
+        foreach(_dss_f IN LISTS _dss_found)
+            file(SHA256 "${_dss_dep_dir}/${_dss_f}" _dss_h)
+            string(APPEND _dss_manifest "\t${_dss_f}\t${_dss_h}\n")
+        endforeach()
+    endforeach()
+    string(SHA256 _dss_deps "${_dss_manifest}")
+    string(SUBSTRING "${_dss_deps}" 0 16 _dss_deps)
+    string(APPEND _dss_stamp ".deps${_dss_deps}")
+endif()
+
 # ── WRITE ONLY ON CHANGE ─────────────────────────────────────────────────────
 # `dss_build_stamp_generate` is an always-out-of-date target, so this script
 # runs on EVERY build. Writing unconditionally would touch the header every
@@ -354,14 +431,16 @@ endif()
 # CMake scripts): those arms prove the MECHANISM. One more arm stamps the REAL
 # tree (DSS_STAMP_SOURCE_DIR) without git, under the tree's own declaration
 # (DSS_STAMP_INPUTS, DSS_STAMP_RECORDS, DSS_STAMP_SCRIPT_DIRS), and prints how
-# long that took. Four more configure fixture PROJECTS against
+# long that took. Eleven hand the fixtures a dependency's sources and read the
+# `.deps` component. Eleven more configure fixture PROJECTS against
 # `cmake/DssBuildStampDeclaration.cmake`, the configure-time check that every
-# directory a configure processes is declared. Every git command it runs,
+# directory a configure processes is declared -- seven of them over a
+# dependency's sources the configure is handed. Every git command it runs,
 # and every stamp run, has git's repository variables removed, so an exported
 # GIT_DIR cannot point either at another repository. Each arm prints its
 # verdict; the run fails on any red arm and on an arm count other than
 # _DSS_SELFTEST_ARMS.
-set(_DSS_SELFTEST_ARMS 26)
+set(_DSS_SELFTEST_ARMS 44)
 foreach(_dss_required IN ITEMS DSS_STAMP_SCRATCH DSS_STAMP_SOURCE_DIR)
     if(NOT DEFINED ${_dss_required} OR "${${_dss_required}}" STREQUAL "")
         message(FATAL_ERROR "DssBuildStamp selftest: ${_dss_required} was not passed.")
@@ -400,13 +479,15 @@ endfunction()
 # Runs THIS file in stamp mode over `tree`, writing `header` -> the stamp it
 # wrote (or ""), the exit code, and what it printed. `git` is a git path, or ""
 # for no git; `inputs`, `records` and `scripts` are the declaration it is handed.
+# ONE argument after `out_text` is the handed dependencies (`<NAME>=<directory>`,
+# comma-separated); without it the run is handed none, which it is still TOLD.
 function(_dss_t_stamp_into tree header git inputs records scripts out_value out_rc out_text)
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env ${_dss_t_unset}
                 "${CMAKE_COMMAND}" -DDSS_STAMP_MODE=stamp -DDSS_STAMP_VERSION=9.9.9
                 "-DDSS_STAMP_SOURCE_DIR=${tree}" "-DDSS_STAMP_OUTPUT=${header}"
                 "-DDSS_STAMP_GIT=${git}" "-DDSS_STAMP_INPUTS=${inputs}" "-DDSS_STAMP_RECORDS=${records}"
-                "-DDSS_STAMP_SCRIPT_DIRS=${scripts}"
+                "-DDSS_STAMP_SCRIPT_DIRS=${scripts}" "-DDSS_STAMP_HANDED_DEPENDENCIES=${ARGN}"
                 -P "${CMAKE_CURRENT_FUNCTION_LIST_FILE}"
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
     set(_value "")
@@ -424,7 +505,7 @@ endfunction()
 # The fixture form: the header beside the tree, the fixtures' own declaration.
 function(_dss_t_stamp tree git inputs out_value out_rc out_text)
     _dss_t_stamp_into("${tree}" "${tree}-out/stamp.hpp" "${git}" "${inputs}" "${_dss_t_records}" "${_dss_t_scripts}"
-                      _v _rc _t)
+                      _v _rc _t ${ARGN})
     set(${out_value} "${_v}" PARENT_SCOPE)
     set(${out_rc} "${_rc}" PARENT_SCOPE)
     set(${out_text} "${_t}" PARENT_SCOPE)
@@ -610,6 +691,118 @@ if(_rc EQUAL 0 AND _g5 MATCHES "^9\\.9\\.9\\+g${_head}\\.dirty${_dss_hex16}$")
 endif()
 _dss_t_arm("git: a CMake script under a test directory makes it dirty" ${_ok} "'${_g5}'")
 
+# ── the dependencies a configure was handed ──
+# Two directories of the SAME bytes at different paths (`dep-a`, `dep-b`) and the fixtures above: `nogit` as it
+# stands after its arms (value `_v8`) and `git` (value `_g5`, dirty).
+set(_dep "${DSS_STAMP_SCRATCH}/dep-a")
+set(_dep_b "${DSS_STAMP_SCRATCH}/elsewhere/dep-b")
+file(REMOVE_RECURSE "${_dep}" "${_dep_b}")
+foreach(_d IN ITEMS "${_dep}" "${_dep_b}")
+    _dss_t_write("${_d}/include/dep.hpp" "#pragma once\n")
+    _dss_t_write("${_d}/CMakeLists.txt" "# the dependency's own script\n")
+endforeach()
+_dss_t_stamp("${DSS_STAMP_SCRATCH}/nogit" "" "${_dss_t_inputs}" _h1 _rc1 _o "DEPX=${_dep}")
+_dss_t_stamp("${DSS_STAMP_SCRATCH}/nogit" "" "${_dss_t_inputs}" _h2 _rc2 _o2 "DEPX=${_dep}")
+set(_ok FALSE)
+if(_rc1 EQUAL 0 AND _rc2 EQUAL 0 AND _h1 STREQUAL _h2 AND NOT _o2 MATCHES "build stamp ->"
+   AND _h1 MATCHES "^9\\.9\\.9\\+src${_dss_hex16}\\.deps${_dss_hex16}$")
+    string(REGEX REPLACE "\\.deps${_dss_hex16}$" "" _h1_head "${_h1}")
+    if(_h1_head STREQUAL _v8)
+        set(_ok TRUE)
+    endif()
+endif()
+_dss_t_arm("handed: a handed dependency adds .deps<16 hex> to the value the tree has without it, the same twice"
+           ${_ok} "'${_v8}' -> '${_h1}' then '${_h2}' (rc ${_rc1}/${_rc2})")
+_dss_t_stamp("${DSS_STAMP_SCRATCH}/nogit" "" "${_dss_t_inputs}" _h3 _rc _o "")
+set(_ok FALSE)
+if(_rc EQUAL 0 AND _h3 STREQUAL _v8)
+    set(_ok TRUE)
+endif()
+_dss_t_arm("handed: a configure handed nothing stamps the value with no .deps component" ${_ok}
+           "'${_h3}', expected '${_v8}' (rc ${_rc})")
+_dss_t_stamp("${DSS_STAMP_SCRATCH}/nogit" "" "${_dss_t_inputs}" _h4 _rc _o "DEPX=${_dep_b}")
+set(_ok FALSE)
+if(_rc EQUAL 0 AND _h4 STREQUAL _h1)
+    set(_ok TRUE)
+endif()
+_dss_t_arm("handed: the same bytes handed from another directory stamp the same value" ${_ok}
+           "'${_h1}' from dep-a, '${_h4}' from elsewhere/dep-b (rc ${_rc})")
+_dss_t_write("${_dep}/.git/HEAD" "ref: refs/heads/main\n")
+_dss_t_write("${_dep}/.git/objects/aa/bb" "an object\n")
+_dss_t_stamp("${DSS_STAMP_SCRATCH}/nogit" "" "${_dss_t_inputs}" _h5 _rc _o "DEPX=${_dep}")
+set(_ok FALSE)
+if(_rc EQUAL 0 AND _h5 STREQUAL _h1)
+    set(_ok TRUE)
+endif()
+_dss_t_arm("handed: a clone's own .git under the handed directory leaves it" ${_ok} "'${_h1}' -> '${_h5}' (rc ${_rc})")
+file(APPEND "${_dep}/include/dep.hpp" "#define DEP 2\n")
+_dss_t_stamp("${DSS_STAMP_SCRATCH}/nogit" "" "${_dss_t_inputs}" _h6 _rc _o "DEPX=${_dep}")
+set(_ok FALSE)
+if(_rc EQUAL 0 AND NOT _h6 STREQUAL _h1 AND _h6 MATCHES "^9\\.9\\.9\\+src${_dss_hex16}\\.deps${_dss_hex16}$")
+    string(REGEX REPLACE "\\.deps${_dss_hex16}$" "" _h6_head "${_h6}")
+    if(_h6_head STREQUAL _v8)
+        set(_ok TRUE)
+    endif()
+endif()
+_dss_t_arm("handed: a byte added to a handed dependency's source moves the .deps component, and only it" ${_ok}
+           "'${_h1}' -> '${_h6}' (rc ${_rc})")
+file(RENAME "${_dep}/include/dep.hpp" "${_dep}/include/dep_renamed.hpp")
+_dss_t_stamp("${DSS_STAMP_SCRATCH}/nogit" "" "${_dss_t_inputs}" _h10 _rc _o "DEPX=${_dep}")
+set(_ok FALSE)
+if(_rc EQUAL 0 AND NOT _h10 STREQUAL _h6 AND _h10 MATCHES "\\.deps${_dss_hex16}$")
+    set(_ok TRUE)
+endif()
+_dss_t_arm("handed: the same bytes under another file name stamp another value" ${_ok}
+           "'${_h6}' -> '${_h10}' (rc ${_rc})")
+_dss_t_stamp("${DSS_STAMP_SCRATCH}/nogit" "" "${_dss_t_inputs}" _h7 _rc _o "DEPY=${_dep_b}")
+set(_ok FALSE)
+if(_rc EQUAL 0 AND NOT _h7 STREQUAL _h4 AND _h7 MATCHES "\\.deps${_dss_hex16}$")
+    set(_ok TRUE)
+endif()
+_dss_t_arm("handed: the same bytes handed as ANOTHER dependency stamp another value" ${_ok}
+           "'${_h4}' as DEPX, '${_h7}' as DEPY (rc ${_rc})")
+_dss_t_stamp("${DSS_STAMP_SCRATCH}/git" "${DSS_STAMP_GIT}" "${_dss_t_inputs}" _h8 _rc _o "DEPX=${_dep_b}")
+set(_ok FALSE)
+if(_rc EQUAL 0 AND _h8 MATCHES "^9\\.9\\.9\\+g${_head}\\.dirty${_dss_hex16}\\.deps${_dss_hex16}$")
+    string(REGEX REPLACE "\\.deps${_dss_hex16}$" "" _h8_head "${_h8}")
+    string(REGEX REPLACE "^.*\\.deps" "" _h8_tail "${_h8}")
+    string(REGEX REPLACE "^.*\\.deps" "" _h4_tail "${_h4}")
+    if(_h8_head STREQUAL _g5 AND _h8_tail STREQUAL _h4_tail)
+        set(_ok TRUE)
+    endif()
+endif()
+_dss_t_arm("handed: a work tree carries the same .deps component after its own commit and dirt" ${_ok}
+           "'${_g5}' -> '${_h8}'; without git the component is '${_h4}' (rc ${_rc})")
+_dss_t_stamp("${DSS_STAMP_SCRATCH}/nogit" "" "${_dss_t_inputs}" _h9 _rc _o "DEPX=${DSS_STAMP_SCRATCH}/no-such-dep")
+string(REGEX REPLACE "[ \t\r\n]+" " " _o "${_o}")
+set(_ok FALSE)
+if(NOT _rc EQUAL 0 AND _o MATCHES "the dependency 'DEPX' was handed from '[^']*no-such-dep', which is no directory")
+    set(_ok TRUE)
+endif()
+_dss_t_arm("handed: a hand-over that names no directory is refused, by the dependency's name" ${_ok} "rc ${_rc}: ${_o}")
+_dss_t_stamp("${DSS_STAMP_SCRATCH}/nogit" "" "${_dss_t_inputs}" _h11 _rc _o "${_dep_b}")
+string(REGEX REPLACE "[ \t\r\n]+" " " _o "${_o}")
+set(_ok FALSE)
+if(NOT _rc EQUAL 0 AND _o MATCHES "the handed dependency '[^']*dep-b' is not `<NAME>=<directory>`")
+    set(_ok TRUE)
+endif()
+_dss_t_arm("handed: a hand-over that is no NAME=directory pair is refused as written" ${_ok} "rc ${_rc}: ${_o}")
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E env ${_dss_t_unset}
+            "${CMAKE_COMMAND}" -DDSS_STAMP_MODE=stamp -DDSS_STAMP_VERSION=9.9.9
+            "-DDSS_STAMP_SOURCE_DIR=${DSS_STAMP_SCRATCH}/nogit" "-DDSS_STAMP_OUTPUT=${DSS_STAMP_SCRATCH}/nogit-out/untold.hpp"
+            "-DDSS_STAMP_GIT=" "-DDSS_STAMP_INPUTS=${_dss_t_inputs}" "-DDSS_STAMP_RECORDS=${_dss_t_records}"
+            "-DDSS_STAMP_SCRIPT_DIRS=${_dss_t_scripts}" -P "${CMAKE_CURRENT_LIST_FILE}"
+    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+string(REGEX REPLACE "[ \t\r\n]+" " " _o "${_out}${_err}")
+set(_ok FALSE)
+if(NOT _rc EQUAL 0 AND _o MATCHES "DSS_STAMP_HANDED_DEPENDENCIES was not passed"
+   AND NOT EXISTS "${DSS_STAMP_SCRATCH}/nogit-out/untold.hpp")
+    set(_ok TRUE)
+endif()
+_dss_t_arm("handed: a run not told what its configure was handed is refused, and writes no header" ${_ok}
+           "rc ${_rc}: ${_o}")
+
 # ── the real tree, under its own declaration, without git ──
 file(REMOVE_RECURSE "${DSS_STAMP_SCRATCH}/real-out")
 string(TIMESTAMP _dss_t0 "%s%f" UTC)
@@ -633,6 +826,10 @@ if(NOT DEFINED DSS_STAMP_GENERATOR OR DSS_STAMP_GENERATOR STREQUAL "")
     message(FATAL_ERROR "DssBuildStamp selftest: DSS_STAMP_GENERATOR was not passed, so the declaration arms cannot "
                         "configure their fixtures -- a named failure, never a skip.")
 endif()
+# Arguments after `out_text` are handed to the fixture's configure as they are (a `-D` cache entry). The
+# fixture asks which dependencies it was handed into `HD`, as the top-level CMakeLists does, and hands the check
+# the variable `_dss_t_handed_var` names (`HD` unless an arm says otherwise).
+set(_dss_t_handed_var "HD")
 function(_dss_t_configure case top_extra src_extra out_rc out_text)
     set(_root "${DSS_STAMP_SCRATCH}/decl-${case}")
     file(REMOVE_RECURSE "${_root}")
@@ -640,7 +837,8 @@ function(_dss_t_configure case top_extra src_extra out_rc out_text)
         "cmake_minimum_required(VERSION 4.0)\nproject(declfixture NONE)\n"
         "include(\"${CMAKE_CURRENT_FUNCTION_LIST_DIR}/DssBuildStampDeclaration.cmake\")\n"
         "set(IN \"src,cmake,CMakeLists.txt\")\nset(SD \"tests\")\n"
-        "cmake_language(DEFER CALL dss_build_stamp_check_declaration IN SD)\n"
+        "dss_build_stamp_handed_dependencies(HD)\n"
+        "cmake_language(DEFER CALL dss_build_stamp_check_declaration IN SD ${_dss_t_handed_var})\n"
         "add_subdirectory(src)\nadd_subdirectory(tests)\n${top_extra}")
     _dss_t_write("${_root}/tree/CMakeLists.txt" "${_top}")
     _dss_t_write("${_root}/tree/src/CMakeLists.txt" "add_subdirectory(sub)\n${src_extra}")
@@ -648,12 +846,15 @@ function(_dss_t_configure case top_extra src_extra out_rc out_text)
     _dss_t_write("${_root}/tree/tests/CMakeLists.txt" "# a declared script directory\n")
     _dss_t_write("${_root}/tree/tools/CMakeLists.txt" "# under no declaration\n")
     _dss_t_write("${_root}/dep/CMakeLists.txt" "# outside the source tree, as a fetched dependency is\n")
+    # a dependency's sources held INSIDE the tree, as a copy built from handed sources holds them
+    _dss_t_write("${_root}/tree/vendor/depx/CMakeLists.txt" "add_subdirectory(inner)\n")
+    _dss_t_write("${_root}/tree/vendor/depx/inner/CMakeLists.txt" "# a directory of the dependency's own\n")
     set(_gen -G "${DSS_STAMP_GENERATOR}")
     if(DSS_STAMP_MAKE_PROGRAM)
         list(APPEND _gen "-DCMAKE_MAKE_PROGRAM=${DSS_STAMP_MAKE_PROGRAM}")
     endif()
     execute_process(
-        COMMAND "${CMAKE_COMMAND}" -S "${_root}/tree" -B "${_root}/build" ${_gen}
+        COMMAND "${CMAKE_COMMAND}" -S "${_root}/tree" -B "${_root}/build" ${_gen} ${ARGN}
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
     # CMake wraps an error message at ~80 columns, so a refusal is matched on its
     # text with every run of whitespace folded to one space.
@@ -687,6 +888,69 @@ if(_rc EQUAL 0)
     set(_ok TRUE)
 endif()
 _dss_t_arm("configure: a directory outside the source tree, where a fetched dependency lives, is not judged" ${_ok}
+           "rc ${_rc}: ${_o}")
+# A dependency the configure is HANDED (CMake's own `FETCHCONTENT_SOURCE_DIR_<NAME>`), held inside the source tree:
+# FetchContent itself adds the directory, and never fetches -- the repository it declares answers nowhere.
+set(_dss_t_fetch
+    "include(FetchContent)\nFetchContent_Declare(depx GIT_REPOSITORY \"https://invalid.invalid/depx.git\" GIT_TAG 0)\n")
+string(APPEND _dss_t_fetch "FetchContent_MakeAvailable(depx)\n")
+set(_dss_t_handed "-DFETCHCONTENT_SOURCE_DIR_DEPX=${DSS_STAMP_SCRATCH}/decl-handed/tree/vendor/depx")
+_dss_t_configure(handed "${_dss_t_fetch}" "" _rc _o "${_dss_t_handed}")
+set(_ok FALSE)
+if(_rc EQUAL 0)
+    set(_ok TRUE)
+endif()
+_dss_t_arm("configure: a dependency's sources it was handed, held inside the source tree, are not judged" ${_ok}
+           "rc ${_rc}: ${_o}")
+_dss_t_configure(nothanded "add_subdirectory(vendor/depx)\n" "" _rc _o)
+set(_ok FALSE)
+if(NOT _rc EQUAL 0 AND _o MATCHES "configure processed vendor/depx, vendor/depx/inner, which lies under no declared input")
+    set(_ok TRUE)
+endif()
+_dss_t_arm("configure: the same directories with no hand-over are refused, each by its name" ${_ok} "rc ${_rc}: ${_o}")
+_dss_t_configure(emptyhandover "add_subdirectory(tools)\n" "" _rc _o "-DFETCHCONTENT_SOURCE_DIR_DEPX=")
+set(_ok FALSE)
+if(NOT _rc EQUAL 0 AND _o MATCHES "configure processed tools, which lies under no declared input")
+    set(_ok TRUE)
+endif()
+_dss_t_arm("configure: an EMPTY hand-over entry hands nothing over, so an undeclared directory is still refused" ${_ok}
+           "rc ${_rc}: ${_o}")
+set(_dss_t_handed "-DFETCHCONTENT_SOURCE_DIR_DEPX=${DSS_STAMP_SCRATCH}/decl-handedbeside/tree/vendor/depx")
+_dss_t_configure(handedbeside "${_dss_t_fetch}add_subdirectory(tools)\n" "" _rc _o "${_dss_t_handed}")
+set(_ok FALSE)
+if(NOT _rc EQUAL 0 AND _o MATCHES "configure processed tools, which lies under no declared input")
+    set(_ok TRUE)
+endif()
+_dss_t_arm("configure: a handed dependency excuses its own directories only -- one beside it is refused, alone" ${_ok}
+           "rc ${_rc}: ${_o}")
+# A script that records a hand-over ITSELF, after the stamp's wiring read them: the walk would excuse the
+# directory and the stamp would not carry its bytes.
+string(CONCAT _dss_t_late
+    "set(FETCHCONTENT_SOURCE_DIR_DEPX \"\${CMAKE_SOURCE_DIR}/vendor/depx\" CACHE PATH \"\" FORCE)\n"
+    "add_subdirectory(vendor/depx)\n")
+_dss_t_configure(latehandover "${_dss_t_late}" "" _rc _o)
+set(_ok FALSE)
+if(NOT _rc EQUAL 0 AND _o MATCHES "ends with the handed dependencies 'DEPX=[^']*/vendor/depx'"
+   AND _o MATCHES "the build stamp was wired with ''")
+    set(_ok TRUE)
+endif()
+_dss_t_arm("configure: a hand-over recorded after the stamp was wired is refused, by the dependency's name" ${_ok}
+           "rc ${_rc}: ${_o}")
+set(_dss_t_handed_var "NEVER_ASKED")
+_dss_t_configure(neverasked "" "" _rc _o)
+set(_dss_t_handed_var "HD")
+set(_ok FALSE)
+if(NOT _rc EQUAL 0 AND _o MATCHES "`NEVER_ASKED` is not set")
+    set(_ok TRUE)
+endif()
+_dss_t_arm("configure: a check not told what the stamp was wired with is refused, naming the variable" ${_ok}
+           "rc ${_rc}: ${_o}")
+_dss_t_configure(separator "" "" _rc _o "-DFETCHCONTENT_SOURCE_DIR_DEPX=${DSS_STAMP_SCRATCH}/decl-separator/de,px")
+set(_ok FALSE)
+if(NOT _rc EQUAL 0 AND _o MATCHES "the dependency 'DEPX' was handed from '[^']*de,px', and that holds a")
+    set(_ok TRUE)
+endif()
+_dss_t_arm("configure: a hand-over whose path holds a separator of the stamp's list is refused, by name" ${_ok}
            "rc ${_rc}: ${_o}")
 
 # ── refusals ──

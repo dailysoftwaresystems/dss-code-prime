@@ -190,6 +190,26 @@ round's close; each checkpoint's commit message says what was and was not run on
   (below), the refusal beside it, and a `__try` filter holding a branch. Balance on this tree: **635 open against
   620** — 24 closed, 39 opened (the tool counts 4 created, 35 disclosed; three of the four are that found debt),
   REAL net +15 until the fix-folded rows' pins are read.
+- **Checkpoint 7 (2026-10-10) = the harness lane's fold: mutants are ARMS of `dssharness check-mutations`**
+  (operator, 2026-10-10: mandatory). 49 paths (28 new): the `mutations` block of `.harness-config/config.json`; the
+  registry `tests/mutations/arms.registry` with its texts (7 arms, one per class the tool drives — a `.cpp` site, a
+  header, a config document, a build-red arm with its control, a leg-scoped arm, a two-file arm, one new arm), pinned
+  to LF in `.gitattributes`; the skill's reference `mutation-arms.md` and eleven changed skill files — an arm's
+  claim is a gtest TEST of a self-contained test binary, an example entry is never a pin, one leg per arm in its
+  `S` row; the hand mutant queue and its measurement worktrees are retired. OURS, fixed in passing: the configure
+  guard refused the dependency directories a worker copy is handed, and the build stamp now digests handed
+  dependency sources (a `.deps` term; its self-test has 44 arms); `dss_use_build_stamp` declares every file under
+  `src/dss-config/` as an input of each includer of the stamp header, the edge the verb's witness reads (the stamp
+  was never stale: ✔MEASURED, one byte of a document recomputes it and rebuilds its three includers); the declared
+  `worktrees.pathLimit` is gone. The fold also carries the runner action `compile-and-keep` as it stood on
+  2026-10-08 (complete; one designed patch is a later fold). ✔MEASURED by the lane on its final bytes: every arm
+  `passed` on the leg its `S` row names (`macos-arm64-debug` 4 arms, `linux-x86_64-debug` 3); the closing control
+  of ten entries green on `macos-arm64-debug`, `linux-x86_64-debug`, `windows-x86_64-debug` (MinGW) and
+  `windows-x86_64-release` (MSVC) — the first MinGW and MSVC configure of the new CMake code; 36 of 36 guards on
+  `windows-x86_64-debug`. Of the stamp's 14 mutants, all are red by hand on copies outside every tree and TWO were
+  read through the harness; they become arms in that lane's next fold (a gtest case per self-test arm driving the
+  same entry). No Windows-leg arm exists yet (a worker of a lane worktree exceeds 260 characters there; a Windows
+  sweep runs from the main checkout). No row written; balance unchanged, 635 against 620.
 - **Silent defects FOUND in this round and NOT YET FIXED in this tree** (each the base's debt, each with its lane
   at work): a reference written through a STATIC name follows a losing weak alias of the same body to the winner
   (ELF references ✔MEASURED 158 on four compilers' objects, DSS 198); and in a STATIC INITIALIZER, an enumerator,

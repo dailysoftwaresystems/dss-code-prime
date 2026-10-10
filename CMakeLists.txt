@@ -422,7 +422,17 @@ set(DSS_BUILD_STAMP_SCRIPT_DIRS "tests,integrated_tests")
 # silent direction. Its scope (directories, not every file a script reads) is stated
 # in the module.
 include("${CMAKE_SOURCE_DIR}/cmake/DssBuildStampDeclaration.cmake")
-cmake_language(DEFER CALL dss_build_stamp_check_declaration DSS_BUILD_STAMP_INPUTS DSS_BUILD_STAMP_SCRIPT_DIRS)
+# ★★ AND WHAT IT IS BUILT AGAINST. A dependency this configure FETCHES is named by its
+# pin in the FetchContent block above, and this file is an input. One it is HANDED
+# instead (`FETCHCONTENT_SOURCE_DIR_<NAME>`: a copy of this tree built from the sources
+# its original fetched, a developer's own checkout of a dependency) is whatever bytes
+# stand in that directory, and no pin holds them — so the stamp carries their digest.
+# Read here, ONCE, from CMake's own record of the hand-overs; handed to the stamp below;
+# and compared again when the configure ends, where a hand-over recorded after this line
+# is refused by name rather than excused and left out of the stamp.
+dss_build_stamp_handed_dependencies(DSS_BUILD_STAMP_HANDED_DEPENDENCIES)
+cmake_language(DEFER CALL dss_build_stamp_check_declaration
+               DSS_BUILD_STAMP_INPUTS DSS_BUILD_STAMP_SCRIPT_DIRS DSS_BUILD_STAMP_HANDED_DEPENDENCIES)
 
 add_custom_target(dss_build_stamp_generate
     COMMAND ${CMAKE_COMMAND}
@@ -433,6 +443,7 @@ add_custom_target(dss_build_stamp_generate
             "-DDSS_STAMP_INPUTS=${DSS_BUILD_STAMP_INPUTS}"
             "-DDSS_STAMP_RECORDS=${DSS_BUILD_STAMP_RECORDS}"
             "-DDSS_STAMP_SCRIPT_DIRS=${DSS_BUILD_STAMP_SCRIPT_DIRS}"
+            "-DDSS_STAMP_HANDED_DEPENDENCIES=${DSS_BUILD_STAMP_HANDED_DEPENDENCIES}"
             -P "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake"
     BYPRODUCTS "${DSS_BUILD_STAMP_HEADER}"
     COMMENT "dss: computing DSS_BUILD_STAMP"
@@ -455,9 +466,54 @@ target_include_directories(dss_build_stamp INTERFACE
 # The dependency is ORDER-ONLY in Ninja, so an always-out-of-date generator does
 # NOT drag its consumers into a rebuild — only a changed header does that, via
 # the compiler's own depfile.
+#
+# ★★ AND IT DECLARES WHAT THE BUILD GRAPH DID NOT SAY: the object that carries the
+# stamp is a function of the files the compiler reads at RUN time. Everything under
+# `src/dss-config/` — the language, target and format documents, the shipped-library
+# descriptors, the runtime's own sources — is compiled into no object, so no object
+# depended on it. The stamp digests those bytes and moves when one changes
+# (✔MEASURED 2026-10-10 on the macOS leg: one byte of one document changed and
+# nothing else, and the build recomputed the stamp and rebuilt its three includers),
+# but only through the always-out-of-date target above: asked which objects a
+# document reaches, the graph answered NONE. Each includer of the stamp header now
+# names every such file as an input of its object (`OBJECT_DEPENDS`), found by
+# reading the target's own sources for the include, so the call sites stay as they
+# are. It rebuilds nothing that was not rebuilt already — the includers recompile
+# on every stamp change — and it is what lets a tool that asks the graph (the
+# mutation sweep's "an object that depends on the site was rebuilt") witness an
+# edit of a document. A new file there re-runs CMake (`CONFIGURE_DEPENDS`), as a
+# new example does.
+file(GLOB_RECURSE DSS_BUILD_STAMP_RUNTIME_INPUTS CONFIGURE_DEPENDS LIST_DIRECTORIES false
+     "${CMAKE_SOURCE_DIR}/src/dss-config/*")
+if(NOT DSS_BUILD_STAMP_RUNTIME_INPUTS)
+    message(FATAL_ERROR "dss: no file under src/dss-config/ — the build stamp's run-time inputs cannot be "
+                        "declared to the build graph. A collapsed glob is not a pass.")
+endif()
 function(dss_use_build_stamp target)
     target_link_libraries(${target} PRIVATE dss_build_stamp)
     add_dependencies(${target} dss_build_stamp_generate)
+    get_target_property(_dss_sources ${target} SOURCES)
+    get_target_property(_dss_dir ${target} SOURCE_DIR)
+    set(_dss_includers "")
+    foreach(_dss_source IN LISTS _dss_sources)
+        cmake_path(ABSOLUTE_PATH _dss_source BASE_DIRECTORY "${_dss_dir}" NORMALIZE OUTPUT_VARIABLE _dss_abs)
+        if(NOT EXISTS "${_dss_abs}" OR IS_DIRECTORY "${_dss_abs}")
+            continue()   # a generated source, or a generator expression: it cannot hold the include yet
+        endif()
+        file(STRINGS "${_dss_abs}" _dss_hit LIMIT_COUNT 1
+             REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]program/dss_build_stamp\\.hpp[>\"]")
+        if(_dss_hit)
+            list(APPEND _dss_includers "${_dss_abs}")
+        endif()
+    endforeach()
+    if(NOT _dss_includers)
+        message(FATAL_ERROR
+            "dss_use_build_stamp(${target}): no source of `${target}` includes `program/dss_build_stamp.hpp`, so "
+            "there is no object to declare the stamp's run-time inputs on. Opt a target in only where one of "
+            "its sources includes the stamp.")
+    endif()
+    set_property(SOURCE ${_dss_includers} TARGET_DIRECTORY ${target}
+                 APPEND PROPERTY OBJECT_DEPENDS ${DSS_BUILD_STAMP_RUNTIME_INPUTS})
 endfunction()
 
 add_subdirectory(src)
@@ -772,6 +828,27 @@ if(DSS_BUILD_TESTS)
                 --selftest "--tree=${CMAKE_SOURCE_DIR}" "--processor=${_dss_census_processor}"
                 "--dsscp=$<TARGET_FILE:dsscp>" "--cc=${_dss_census_reference}"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/prototype-census")
+    # ── The image carriage's own arms (2026-10-08, cycle P69, lane hm) ──
+    # `compile-and-keep` compiles a request's sources on the leg whose build is free and keeps the images
+    # (`dssharness run compile-and-keep`); it runs there, never here. These arms hold it on every leg. The fixed
+    # ones need no compiler: every refusal (sources that do not decode, a name that would leave the step's directory,
+    # no built dsscp, a request the compiler refuses, a kind the target's format does not serve) and every counted
+    # outcome, against a stand-in the program writes itself. THE LIVE ONES are why this entry is handed THIS BUILD'S
+    # dsscp: they compile a corpus example for a stated target under the baseline and every shipped pipeline its
+    # own manifest names, and put an unknown target and an unknown pipeline to the real compiler -- so the day the
+    # compiler's command line, or its answer to a source that does not exist, stops being what the action reads, the
+    # gate says so on every leg rather than the next lane that needs an image.
+    # ★ THE EXAMPLE AND THE TARGET ARE THIS ENTRY'S DATA, not the program's: the language, the source, the artifact's
+    # name and the pipelines are read from the example's own `expected.json`, keyed by the target spec given here,
+    # and an example that stops declaring that target fails the first live arm by name.
+    add_test(
+        NAME harness/compile_and_keep_selftest
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/compile-and-keep/compile-and-keep.py"
+                --selftest "--tree=${CMAKE_SOURCE_DIR}" "--dsscp=$<TARGET_FILE:dsscp>"
+                "--live-example=examples/c/line_comment_on_the_last_line"
+                "--live-target=x86_64:pe64-x86_64-windows-exec"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     # ── The anchor CITATION question, asked by the tool ───────────────────────
     # ⛔⛔ THIS IS AN ADDITION, NOT A REPLACEMENT, AND THAT IS A MEASURED DECISION

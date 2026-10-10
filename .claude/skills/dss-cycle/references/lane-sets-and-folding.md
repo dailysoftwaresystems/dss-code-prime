@@ -21,7 +21,11 @@ most the main tree may ever hold uncommitted.
 
 1. **The order is fold → checks → refresh the siblings → write the inventories → commit → push.** The
    checks are the fold's own: the anchor balance against the cycle's start commit, the registry lint,
-   `check-anchor-citations`, `check-anchor-registry`. The siblings are refreshed BEFORE the commit:
+   `check-anchor-citations`, `check-anchor-registry`, and — where the fold changed
+   `tests/mutations/arms.registry` — the registry's validation and the state of every arm the fold added:
+   `passed` on the fold's bytes with its run id, or named as owed and on which leg (an arm that names a
+   Windows leg is swept here, on the main tree: a worker does not fit beside a lane's worktree there —
+   mutation-arms.md). The siblings are refreshed BEFORE the commit:
    ✔MEASURED 2026-10-08, `refresh-agent` sees only the main tree's UNCOMMITTED changes — after the
    commit it answers "holds the main tree's copy" for a path whose lane copy is older (reported to the
    tool's own repository). A sibling in the middle of a run is refreshed when the run ends; the commit
@@ -40,11 +44,11 @@ most the main tree may ever hold uncommitted.
    main tree's HEAD" as a lane's base — the base is the lane worktree's own HEAD, and the balance is
    always taken with `--base <the cycle's start commit>`. Lanes read registry rows from the MAIN tree;
    their worktree's copy of the registry is not refreshed.
-5. **Lanes hand back at each natural fold point** — a coherent item set that is pinned, mutated and
-   green on five legs, the P0 work first so it is pushed first — instead of accumulating one large
+5. **Lanes hand back at each natural fold point** — a coherent item set that is pinned, its arms
+   declared and `passed`, and green on five legs, the P0 work first so it is pushed first — instead of accumulating one large
    wave. The independent re-review follows the commit; its findings lead the lane's next fold.
-6. **The round's close is unchanged**: every lane re-reviewed clean, the eight runs, the sqlite
-   recompile, the final review, the agents deleted, the handoff rewritten — one more commit and push.
+6. **The round's close is unchanged**: every lane re-reviewed clean, the eight runs, the sweep of every
+   mutation arm on the leg it names, the sqlite recompile, the final review, the agents deleted, the handoff rewritten — one more commit and push.
 
 ## ★★★ A COMPLETED SET OF LANES IS A COMMIT POINT — operator ruling 2026-08-28
 

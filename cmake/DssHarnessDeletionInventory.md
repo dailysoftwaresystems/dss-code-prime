@@ -824,6 +824,12 @@ it. Reported to the operator.
 ★ The path-budget and evidence gates DID port cleanly and are visible in `.harness-config/config.json`
 as `worktrees.pathBudgetReserve` / `pathLimit` / `pathBudgetMargin` / `evidenceRoots` — ✔MEASURED,
 `create-worktree` with a 20-character name refuses with the same 260-character reasoning.
+ⓘ 2026-10-10: `pathLimit` is NO LONGER DECLARED there, on purpose — a declared limit replaces the
+platform's own on EVERY host, so Windows' 260 was imposed on the Mac, WSL and the VPS too, and no mutation
+worker of a lane worktree could be placed on any of them. Undeclared, each host keeps its own (✔MEASURED
+the same day: a worker placed on the Mac at once; the same 260 refusal on a Windows leg from a lane
+worktree). The reserve, the margin and the evidence roots stay; the reasons are in the configuration's
+own `worktrees` comment.
 
 ### 17.4 `owning-tree` CANNOT RETIRE — §10's 🧠INFERRED consequence is now ✔MEASURED
 Twelve directories that SURVIVE every wave import it: `check-anchor-balance`,

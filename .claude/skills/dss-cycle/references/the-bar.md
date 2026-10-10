@@ -6,8 +6,8 @@ A. The bar — non-negotiable, re-read every cycle:
 - §A.2 Best long-term solution, no workarounds
 - §A.3 No follow-ups for the hard part — §A.3b the goal is to WORK
 - §A.4 Fail loud
-- §A.5 Strict-assertion tests — aggregate op-count pins · the red-on-disable demonstration needs its
-  own guard · a green red-on-disable is unproven until the mutant was READ · the restored bytes too · a
+- §A.5 Strict-assertion tests — a red-on-disable is an ARM read by `dssharness check-mutations` ·
+  aggregate op-count pins · the red-on-disable demonstration needs its own guard · a green red-on-disable is unproven until the mutant was READ · the restored bytes too · a
   vacuous asm pin can survive both arms · drive the subject's real input path · multi-site contracts ·
   the real-execution corpus example · cross-target runtime closure
 - §A.6 The full commit gate
@@ -116,6 +116,22 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    (exact counts, full-sequence/byte equality, `static_assert`, death-test message match).
    See the `dss-code-prime` skill §7. A test that still passes when the implementation is
    silently broken is not strict enough.
+   - **★★★★ A RED-ON-DISABLE IS AN ARM, READ BY `dssharness check-mutations` — MANDATORY** (operator,
+     2026-10-10: *"migrate the mutations to the new verb from dss-harness: check-mutations (in dss-cycle
+     skill as mandatory)"*). The pin's claim is a gtest TEST of a self-contained test binary; its mutation,
+     the EXACT set of cases that must go red, the diagnostic the run must say and the leg are declared in
+     `tests/mutations/arms.registry`; and **the pin is proven when its arm reads `passed`, and by nothing
+     else.** Every clause below this bullet was learned by hand, one worthless demonstration at a time, and
+     each is now a check the tool makes itself on every arm and refuses to pass without: the before-text
+     stands in its site exactly once and is never replaced by itself (the fail-closed clauses); every object
+     that depends on the site is witnessed REBUILT from the build's own records (never compiled in; compiled
+     into the wrong binary; the link that failed); the binary runs whole, in a worker copy that holds the
+     mutant and nothing else, never in a tree (never loaded; the moving tree); the reds are an exact set and
+     a named neighbour must have run and stayed green (the wrong test red); the diagnostic must be SAID (the
+     mutant was read); the site is put back and checked by its hash (the restored bytes). **So the clauses
+     below are no longer a checklist a person runs — they are why the verb is mandatory, and what a hand
+     reading owes in the one class of mutant the installed tool refuses as an arm.** How to declare an arm,
+     the verdicts, the sweeps the gate owes and that one class: [mutation-arms.md](mutation-arms.md).
    - **Aggregate op-count pins go INERT when a shared helper emits the same op elsewhere.** An
      `EXPECT_GE(And, N)` / op-count assertion is a worthless guard if a branchless-select (or any
      composition helper) already emits that op — deleting the guarded instance leaves the count
@@ -174,7 +190,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
        test `.exe` **directly** takes the cwd-walk and silently reads whichever tree the shell stands
        in, so a worktree binary run from the shared tree's cwd read the *shared* config and never saw
        the mutant. ⇒ **a config-level
-       red-on-disable MUST run through `ctest`, never a bare `.exe`.** [→ today that is `dssharness test --filter <regex>`, which runs ctest — one mutant per call](dss-harness.md)
+       red-on-disable MUST run through `ctest`, never a bare `.exe`.** [→ today an arm's test binary is started by `dssharness check-mutations` in a worker copy's own root, and reads THAT copy's documents — the tree that holds the mutant and no other; a document's mutation is witnessed through the objects the build declares as depending on it](mutation-arms.md)
      - **The mutant was COMPILED IN — TO THE WRONG BINARY.** ✔MEASURED 2026-08-20 (cycle P23): the
        mutated predicate was a **header inline**. A narrow build rebuilt the shared library and its
        mtime advanced — the instrument the clause above prescribes, behaving exactly as written

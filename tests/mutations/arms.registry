@@ -1,0 +1,174 @@
+# DSS Code Prime - THE MUTATION ARMS REGISTRY: every declared demonstration that a mechanism, switched off, makes
+# a test go RED. One arm, one block of rows. `dssharness check-mutations` reads this file and its grammar is the
+# tool's (`dssharness help mutations`); the how-to, with a worked arm per class, is
+# `.claude/skills/dss-cycle/references/mutation-arms.md`. This header states what is this file's own.
+#
+# ==============================================================================================================
+# WHAT AN ARM IS HERE
+# ==============================================================================================================
+#
+# AN ARM'S CLAIM IS A gtest TEST IN A SELF-CONTAINED TEST BINARY, and that binary's target is the arm's runner.
+# The tool starts the runner's binary WHOLE, with its report arguments and nothing else, in a worker copy's root.
+# An `examples/` or `integrated_tests/` entry is a corpus check the gate runs and never an arm's pin: a mutation
+# only an example notices has no arm until a unit-tier TEST claims its mechanism.
+#
+# ==============================================================================================================
+# THE STANDING CONDITIONS - each enforced, by the tool or by this layout, rather than restated in a row
+# ==============================================================================================================
+#
+#   (a) EVERY TEST-RED ARM NAMES THE DIAGNOSTIC IT MUST PRODUCE - a `diag` file, written from an OBSERVED run -
+#       and a red that does not say it is a violation, not a pass. A BUILD-RED arm matches NO compiler text:
+#       its proof is the PAIRED POSITIVE CONTROL (`B`), the same construct with one value substituted, which
+#       must build.
+#   (b) AN ARM THAT PRODUCES NO RED IS `survived`. THERE IS NO ROW, FIELD OR TOKEN IN THIS GRAMMAR THAT CAN
+#       DECLARE AN ARM INERT, and none is ever added: it would be an escape built into the mechanism whose
+#       whole purpose is to close one.
+#   (c) AN UNREGISTERED MUTATION IS DRIVEN BY NOBODY. Nothing is swept but an `A` row; a row naming an arm no
+#       `A` row declares is refused; a text file under texts/ that no row cites is refused.
+#   (d) A COUNT IS DERIVED, NEVER TYPED. How many arms: `grep -c '^A | ' tests/mutations/arms.registry`. No
+#       figure is written into these comments.
+#   (e) EVERY ARM HERE MUST READ `passed`. One arm that does not fails the sweep of its leg, and a runner that
+#       is red UNMUTATED fails every arm that runs it. A mutation the verb cannot drive (the how-to names each
+#       class, with its measurement) has NO row here - never a failing one.
+#   (f) EVERY `C` ROW SAYS HOW ITS RED WAS MEASURED: the sweep that read it, and the hand reading before it
+#       where one exists. A red predicted from the code and never observed is not a `C` row.
+#   (g) EVERY MUTATION TEXT AND EVERY DIAGNOSTIC IS A FILE under tests/mutations/texts/. The grammar has no
+#       escape, and the text a field would hold is the kind that holds a pipe.
+#
+# ==============================================================================================================
+# LAYOUT - one file many hands append to, so it is laid out for clean merges
+# ==============================================================================================================
+#
+#   * ONE SECTION PER AREA of the compiler - the first directory of the arm's site under `src/` (a site outside
+#     `src/` goes to `tests`) - in alphabetical order, each opened by its own comment block. Never a section per
+#     author, lane or cycle: none of those is a fact of the tree.
+#   * AN ARM'S ID is `<area>-<what the mutation makes the code do>`, lowercase words joined by hyphens, at most
+#     80 characters. Where several test binaries read ONE mutation, each is an arm of its own, `<that id>_<pin>`.
+#   * AN ARM IS A BLOCK: its A row, then its M, B, C, G and S rows, then ONE blank line. Inside a section the
+#     blocks are sorted by arm id, so two additions meet only where they sort together.
+#   * THE A ROW'S WHY OPENS `CLAIM AT <test file>, TEST <Case>.` - the test that is the claim - and then says
+#     what the mutation switches off and what would be true if nothing noticed. A BUILD-RED arm's opens
+#     `CLAIM AT <file>, <the construct that refuses to compile>.` Never a line number.
+#   * EVERY ARM CARRIES ONE `S` ROW NAMING ONE LEG, and its why says which rule chose it: (1) a claim about a
+#     platform, a format or a toolchain names a leg of THAT platform - a second leg only where the claim is
+#     about two; (2) any other claim names its AREA'S DEFAULT LEG, stated in the section's comment block. An
+#     arm with no `S` row is refused by this convention though the tool would run it on every leg: the gate's
+#     own runs prove a claim GREEN on every leg, and that it can go RED is shown once.
+#   * A TEXT FILE is `texts/<the arm's id, up to its `_`>.<role>`: `before`, `after`, `control-before`,
+#     `control-after`, and `2.before` / `2.after` for an M row's site (`3.` for the next); a `diag` that belongs
+#     to one arm of several takes that arm's whole id. One flat directory, every file cited by its path from
+#     the repository root. A text holds exactly the text and one line ending (UTF-8, LF). This file is ASCII.
+#   * A HAND MERGE of this file (a tree's copy, the main tree's, their common base) is `git merge-file --union`
+#     on copies, the blocks sorted again, and the result VALIDATED before anything else reads it.
+#
+# A | arm | site | before | after | red kind | target | runner | cases | diag | why
+# C | arm | case | why          G | arm | case | why          S | arm | leg | why
+# M | arm | site | before | after | why                       B | arm | control before | control after | why
+
+# ==============================================================================================================
+# analysis -- sites under src/analysis/ -- default leg: linux-x86_64-debug
+# ==============================================================================================================
+
+A | analysis-not-predicate-entered-without-a-probe | src/analysis/syntactic/parser.cpp | tests/mutations/texts/analysis-not-predicate-entered-without-a-probe.before | tests/mutations/texts/analysis-not-predicate-entered-without-a-probe.after | TEST-RED | dsscp-lib | dss_analysis_syntactic_test_parser_speculation | 27 | tests/mutations/texts/analysis-not-predicate-entered-without-a-probe.diag | CLAIM AT tests/analysis/syntactic/test_parser_speculation.cpp, TEST NotFollowedByVetoesACleanCloseOnEveryPathToTheCandidate. A candidate that carries `notFollowedBy` must be PROBED before it is entered, on every path that reaches it; the arm lets one be entered directly where it is the lone survivor of the pruning, so a rule's own predicate is consulted on some paths and silently skipped on another.
+C | analysis-not-predicate-entered-without-a-probe | ParserSpeculation.NotFollowedByVetoesACleanCloseOnEveryPathToTheCandidate | MEASURED by hand before the arm existed (macos-arm64-debug, run 20261008-222627-1eed6e18) by the arm's first sweep (macos-arm64-debug, run 20261010-131159-bbd6e459), and on the leg its S row names (linux-x86_64-debug, run 20261010-144510-312c5e04): the lone pruned survivor reads `A B` and leaves the `C` its own predicate forbids, and the case's message says the predicate must hold on the unique-survivor path too.
+G | analysis-not-predicate-entered-without-a-probe | ParserSpeculation.SpeculativeAltAcceptsTokenLeafBranches | EXCLUSIVITY: an alternative with no predicate speculates as before; this neighbour must RUN and stay green.
+S | analysis-not-predicate-entered-without-a-probe | linux-x86_64-debug | rule 2: the claim is about no platform; the area's default leg
+
+# ==============================================================================================================
+# asm -- sites under src/asm/ -- default leg: linux-x86_64-debug
+# ==============================================================================================================
+
+# ==============================================================================================================
+# core -- sites under src/core/ -- default leg: linux-x86_64-debug
+# ==============================================================================================================
+
+A | core-x87-extended-loses-a-significand-digit | src/core/types/float_format.hpp | tests/mutations/texts/core-x87-extended-loses-a-significand-digit.before | tests/mutations/texts/core-x87-extended-loses-a-significand-digit.after | TEST-RED | dsscp-lib | dss_core_test_float_format | 5 | tests/mutations/texts/core-x87-extended-loses-a-significand-digit.diag | CLAIM AT tests/core/test_float_format.cpp, TEST EveryCharacteristicIsComputedFromThePrimaryFacts. Every `<float.h>` characteristic is computed from a format's primary facts, never typed beside them; the arm states 63 significand digits for the x87 extended format, and if nothing noticed, `LDBL_MANT_DIG` and everything derived from it would follow a typo in one table row.
+C | core-x87-extended-loses-a-significand-digit | FloatFormat.EveryCharacteristicIsComputedFromThePrimaryFacts | MEASURED by hand before the arm existed (macos-arm64-debug, run 20261006-193034-b1626072) by the arm's first sweep (macos-arm64-debug, run 20261010-131159-bbd6e459), and on the leg its S row names (linux-x86_64-debug, run 20261010-144510-312c5e04): the F80 row's precision no longer equals the expectation's, which the case prints as `f->precision`.
+G | core-x87-extended-loses-a-significand-digit | FloatFormat.Binary32AndBinary64AgreeWithTheHostsNumericLimits | EXCLUSIVITY: the binary32 and binary64 rows are untouched; this neighbour must RUN and stay green.
+S | core-x87-extended-loses-a-significand-digit | linux-x86_64-debug | rule 2: the table is read alike on every host, whatever its own long double is; the area's default leg
+
+# ==============================================================================================================
+# dss-config -- sites under src/dss-config/ -- default leg: linux-x86_64-debug
+# ==============================================================================================================
+
+A | dss-config-inferred-type-row-ignores-attribute-specifiers | src/dss-config/sources/c.lang.json | tests/mutations/texts/dss-config-inferred-type-row-ignores-attribute-specifiers.before | tests/mutations/texts/dss-config-inferred-type-row-ignores-attribute-specifiers.after | TEST-RED | dsscp-lib | dss_hir_test_hir_lowering_c | 365 | tests/mutations/texts/dss-config-inferred-type-row-ignores-attribute-specifiers.diag | CLAIM AT tests/hir/test_hir_lowering_c.cpp, TEST AWeakDefinitionStatesItsKindInEverySpellingAndPosition. Which specifiers a declaration row lets pass unread is the language document's statement; the arm makes the inferred-type row ignore an attribute specifier again, so `auto g __attribute__((weak)) = 9;` would lose its weak binding in silence. The site is a document the compiler reads at RUN time: the object that witnesses its mutation is an includer of the build stamp, which the build declares as depending on every file under src/dss-config/.
+C | dss-config-inferred-type-row-ignores-attribute-specifiers | HirLoweringC.AWeakDefinitionStatesItsKindInEverySpellingAndPosition | MEASURED by hand before the arm existed (macos-arm64-debug, run 20261008-221859-d26bacfb) by the arm's first passing sweep (macos-arm64-debug, run 20261010-143154-9581632b), and on the leg its S row names (linux-x86_64-debug, run 20261010-144510-312c5e04): the inferred-type spellings no longer state a weak kind, and the case says `weak after an inferred-type declarator`.
+G | dss-config-inferred-type-row-ignores-attribute-specifiers | HirLoweringC.EmptyVoidFunction | EXCLUSIVITY: lowering with no attribute is untouched; this neighbour must RUN and stay green.
+S | dss-config-inferred-type-row-ignores-attribute-specifiers | linux-x86_64-debug | rule 2: the claim is about no platform; the area's default leg
+
+# ==============================================================================================================
+# ffi -- sites under src/ffi/ -- default leg: macos-arm64-debug
+# ==============================================================================================================
+
+A | ffi-symbol-linkage-table-repeats-a-spelling | src/ffi/shipped_lib_descriptor.cpp | tests/mutations/texts/ffi-symbol-linkage-table-repeats-a-spelling.before | tests/mutations/texts/ffi-symbol-linkage-table-repeats-a-spelling.after | BUILD-RED | dsscp-lib | - | 0 | PAIRED-CONTROL | CLAIM AT src/ffi/shipped_lib_descriptor.cpp, the well-formedness check of the descriptor's symbol-linkage spelling table. A descriptor spells a symbol's linkage with one word per enumerator; the arm makes two enumerators share a spelling, which would let a descriptor's `weak` be read as `external` in silence if the table did not refuse to compile. MEASURED by the arm's first sweep (macos-arm64-debug, run 20261010-131159-bbd6e459): the build stops at the object of this file, and the control builds.
+B | ffi-symbol-linkage-table-repeats-a-spelling | tests/mutations/texts/ffi-symbol-linkage-table-repeats-a-spelling.control-before | tests/mutations/texts/ffi-symbol-linkage-table-repeats-a-spelling.control-after | THE PAIRED POSITIVE CONTROL: the same row respelt with a spelling no other row has MUST build - the check refuses the repeat, not the edit.
+S | ffi-symbol-linkage-table-repeats-a-spelling | macos-arm64-debug | rule 2: the claim is about no platform; the area's default leg
+
+# ==============================================================================================================
+# hir -- sites under src/hir/ -- default leg: linux-x86_64-debug
+# ==============================================================================================================
+
+# ==============================================================================================================
+# link -- sites under src/link/ -- default leg: macos-arm64-debug
+# ==============================================================================================================
+
+A | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | src/link/linker.cpp | tests/mutations/texts/link-only-a-strong-definition-replaces-a-common-in-allocation-and-search.before | tests/mutations/texts/link-only-a-strong-definition-replaces-a-common-in-allocation-and-search.after | TEST-RED | dsscp-lib | dss_link_test_common_symbols | 41 | tests/mutations/texts/link-only-a-strong-definition-replaces-a-common-in-allocation-and-search.diag | CLAIM AT tests/link/test_common_symbols.cpp, TEST AMachOLinkFetchesTheFirstMemberWhoseDatumTheCommonYieldsTo. Whether a common yields to a WEAK definition is the format document's answer, and BOTH users of it must apply it: the link's allocation and the archive search. The arm makes both let only a STRONG definition replace a common - one reference linker's rule on every format, applied consistently - so the two users still agree with each other; if nothing noticed, a test that only compared them would pass while every Mach-O link resolved as GNU ld does.
+M | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | src/program/compile_pipeline.cpp | tests/mutations/texts/link-only-a-strong-definition-replaces-a-common-in-allocation-and-search.2.before | tests/mutations/texts/link-only-a-strong-definition-replaces-a-common-in-allocation-and-search.2.after | THE COUPLED SITE, in another file: the archive search's predicate admits a global datum only, as the allocation now does. Each edit alone is a mutant lane-read by hand (the allocation's on windows-x86_64-debug, run 20261008-013648-6b0b140a; the search's, run 20261008-014507-26921e05); only the pair is the rule applied consistently.
+C | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | CommonSymbols.AWeakDefinitionReplacesTheCommonWhereTheLinksDocumentSaysSo | MEASURED by the arm's first sweep (macos-arm64-debug, run 20261010-134043-baf96d1c) and red under the allocation's edit alone by hand (run 20261008-013648-6b0b140a): the allocation keeps the common beside the weak definition the document says it yields to.
+C | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | CommonSymbolsNative.ACommonBesideWeakAndArchivedDefinitionsResolvesAsTheReferenceLinkerDoes | MEASURED by the arm's first sweep (run 20261010-134043-baf96d1c): native cells read 0 or 7 where Apple's ld gives 5.
+C | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | CommonSymbolsArchive.AMachOLinkFetchesTheFirstMemberWhoseDatumTheCommonYieldsTo | THE CLAIM. MEASURED by the arm's first sweep (run 20261010-134043-baf96d1c) and red under each edit alone by hand: the weak member is passed over and the strong one fetched - the case says `_m_weak: the member fetched for the common` and reads 7 where 3.
+C | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | CommonSymbolsArchive.ADefinitionTheCommonOutranksDoesNotEndItsSearch | MEASURED by the arm's first sweep (run 20261010-134043-baf96d1c), named by neither hand reading - the case is younger than both: the common keeps its place beside the fetched definition, section `__bss` and value 0 where 3.
+C | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | CommonSymbolsArchive.TheSearchAnswersItsReferencesBeforeItWalksItsCommons | MEASURED by the arm's first sweep (run 20261010-134043-baf96d1c), named by neither hand reading: the commons round fetches `_m_t` for a name a weak definition had already replaced, and the value reads 7 where 5.
+C | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | WeakNameReferences.AnImageBindsAReferenceThroughAWeakNameToTheNamesWinner | MEASURED by the arm's first sweep (run 20261010-134043-baf96d1c), named by neither hand reading: the name's winner is the common again, so the reference binds elsewhere and reads 0 where 7.
+C | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | WeakNameReferences.ARelocatableLinkHandsTheNameOnAndALaterLinkBindsIt | MEASURED by the arm's first sweep (run 20261010-134043-baf96d1c), named by neither hand reading: the relocatable link's first record is no longer weak and its weak row is missing.
+C | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | WeakNameReferencesNative.AReferenceThroughAWeakNameResolvesAsTheReferenceLinkerDoes | MEASURED by the arm's first sweep (run 20261010-134043-baf96d1c), named by neither hand reading: four native cells read 0 where Apple's ld gives 77.
+G | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | CommonSymbolsArchive.AnElfLinkFetchesTheFirstMemberThatDefinesTheNameAsAGlobalDatum | EXCLUSIVITY: on ELF the document's answer IS the global datum, so this pin must RUN and stay green - it is what tells this arm from one that broke every archive search.
+S | link-only-a-strong-definition-replaces-a-common-in-allocation-and-search | macos-arm64-debug | rule 1: a Mach-O-native claim - its native cells run where Apple's ld is, and another platform's are another set
+
+# ==============================================================================================================
+# lir -- sites under src/lir/ -- default leg: macos-arm64-debug
+# ==============================================================================================================
+
+# ==============================================================================================================
+# lsp -- sites under src/lsp/ -- default leg: linux-x86_64-debug
+# ==============================================================================================================
+
+# ==============================================================================================================
+# mir -- sites under src/mir/ -- default leg: macos-arm64-debug
+# ==============================================================================================================
+
+# ==============================================================================================================
+# opt -- sites under src/opt/ -- default leg: macos-arm64-debug
+# ==============================================================================================================
+
+# ==============================================================================================================
+# program -- sites under src/program/ -- default leg: macos-arm64-debug
+# ==============================================================================================================
+
+A | program-commons-round-fetches-for-a-replaced-name | src/program/compile_pipeline.cpp | tests/mutations/texts/program-commons-round-fetches-for-a-replaced-name.before | tests/mutations/texts/program-commons-round-fetches-for-a-replaced-name.after | TEST-RED | dsscp-lib | dss_link_test_common_symbols | 41 | tests/mutations/texts/program-commons-round-fetches-for-a-replaced-name.diag | CLAIM AT tests/link/test_common_symbols.cpp, TEST TheSearchAnswersItsReferencesBeforeItWalksItsCommons. The archive search's commons round skips a name a linked definition has already replaced; the arm makes it fetch for such a name too, so a link pulls a member - and that member's other definitions - for a question that was already answered.
+C | program-commons-round-fetches-for-a-replaced-name | CommonSymbolsNative.ACommonBesideWeakAndArchivedDefinitionsResolvesAsTheReferenceLinkerDoes | MEASURED by hand before the arm existed (macos-arm64-debug, run 20261008-165111-5b6b82da) and by the arm's first sweep (macos-arm64-debug, run 20261010-131159-bbd6e459): a native cell no longer equals the reference linker's answer.
+C | program-commons-round-fetches-for-a-replaced-name | CommonSymbolsArchive.AMachOLinkFetchesTheFirstMemberWhoseDatumTheCommonYieldsTo | MEASURED by the same hand reading and the same sweep: a further member is fetched for the name the first fetched member already replaced.
+C | program-commons-round-fetches-for-a-replaced-name | CommonSymbolsArchive.ADefinitionTheCommonOutranksDoesNotEndItsSearch | MEASURED by the same hand reading and the same sweep: `_m_strong` is fetched too and the value reads 7 where 3.
+C | program-commons-round-fetches-for-a-replaced-name | CommonSymbolsArchive.TheSearchAnswersItsReferencesBeforeItWalksItsCommons | THE CLAIM. MEASURED by the same hand reading and the same sweep: `_m_t` is fetched for a common the references round's member replaced - the fetched set the case prints holds it - and the value reads 7 where 5.
+C | program-commons-round-fetches-for-a-replaced-name | CommonSymbolsArchive.ASearchBesideALinkedWeakDefinitionUnderASilentDocumentIsRefusedByName | MEASURED by the same hand reading and the same sweep: the set the case requires empty no longer is.
+C | program-commons-round-fetches-for-a-replaced-name | ArchiveSearchRoundOrder.AWeakReferenceIsAnsweredBeforeACommon | MEASURED by the same hand reading and the same sweep: `fetched_m0` is fetched beside `fetched_m15`, and the link no longer succeeds.
+C | program-commons-round-fetches-for-a-replaced-name | ArchiveSearchRoundOrderNative.AppleLdAnswersAReferenceBeforeACommonAndSoDoesDss | MEASURED by the same hand reading and the same sweep: DSS's answer no longer equals Apple ld's.
+G | program-commons-round-fetches-for-a-replaced-name | CommonSymbols.AStrongDefinitionWinsAndKeepsItsBytes | EXCLUSIVITY: a link with no archive search is untouched; this neighbour must RUN and stay green.
+S | program-commons-round-fetches-for-a-replaced-name | macos-arm64-debug | rule 1: a Mach-O-native claim - its native cases run where Apple's ld is and are skipped elsewhere, where the set is another
+
+A | program-stamp-path-segment-keeps-a-plus | src/program/runtime_object_cache.cpp | tests/mutations/texts/program-stamp-path-segment-keeps-a-plus.before | tests/mutations/texts/program-stamp-path-segment-keeps-a-plus.after | TEST-RED | dsscp-lib | dss_program_test_runtime_object_cache | 41 | tests/mutations/texts/program-stamp-path-segment-keeps-a-plus.diag | CLAIM AT tests/program/test_runtime_object_cache.cpp, TEST DifferentBuildStampsRenderDifferentRootSegments. A build stamp is rendered as ONE filesystem-safe path component of the runtime object cache, its keep-set decided in one place; the arm lets a `+` through, the character every stamp carries, so the cache's directory would be named by text the keep-set exists to exclude. Its unmutated control is also where this binary's Windows path-budget case meets the stamp of a build that was HANDED its dependencies.
+C | program-stamp-path-segment-keeps-a-plus | RuntimeObjectCacheRoots.DifferentBuildStampsRenderDifferentRootSegments | MEASURED by the arm's first sweep (macos-arm64-debug, run 20261010-143154-9581632b): the path-hostile stamp keeps its `+`, which the case prints as the segment it got.
+G | program-stamp-path-segment-keeps-a-plus | RuntimeObjectCachePathBudget.TheLongestComposedNameFitsWindowsMaxPath | EXCLUSIVITY: the budget is arithmetic over lengths, which a kept character does not move; this neighbour must RUN and stay green - in a worker, with a stamp that carries the handed-dependency component.
+S | program-stamp-path-segment-keeps-a-plus | macos-arm64-debug | rule 2: the claim is about no platform; the area's default leg
+
+# ==============================================================================================================
+# source-factory -- sites under src/source-factory/ -- default leg: linux-x86_64-debug
+# ==============================================================================================================
+
+# ==============================================================================================================
+# tests -- sites outside src/ -- default leg: linux-x86_64-debug
+# ==============================================================================================================
+
+# ==============================================================================================================
+# tokenizer -- sites under src/tokenizer/ -- default leg: linux-x86_64-debug
+# ==============================================================================================================

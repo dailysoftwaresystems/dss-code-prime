@@ -35,7 +35,9 @@ This is where the auditor earns its keep. Each entry: the **class**, its **tell*
 4. **Asserted-not-proven guard (the missing red-on-disable).** A correctness mechanism exists in
    `src/` but no test forces it to matter. *Tell:* the mechanism is present and the schema/constraint
    is tested, but no *behavior* test exercises the failure it prevents. *Disproof:* a pin that goes
-   **red when the guard is disabled** — watched, not asserted. (The regalloc implicit-clobber exclusion
+   **red when the guard is disabled** — watched, not asserted: an ARM of `tests/mutations/arms.registry`
+   that `dssharness check-mutations` reads `passed` on the bytes under audit. A pin with no arm, or one
+   whose arm was read on other bytes, is still asserted-not-proven. (The regalloc implicit-clobber exclusion
    had the mechanism + a schema test but no behavior pin until a vreg-live-across-the-op test with a
    demonstrated red-on-disable.)
 

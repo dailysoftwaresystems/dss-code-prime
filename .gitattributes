@@ -224,3 +224,16 @@ src/dss-config/runtime/platform/dist/** binary
 # check-attr`: `unspecified` for both attributes, stored `i/lf`). A CR in an expected file is a
 # census that differs from its own expectation on the one host whose checkout rewrote it.
 .harness-config/**/*.expected text eol=lf
+
+# ⓘ 2026-10-10: THE MUTATION ARMS ARE PINNED THE DAY THEY ARE BORN. `tests/mutations/arms.registry`
+# is what `dssharness check-mutations` reads, and every file under `tests/mutations/texts/` is the
+# exact text a mutation takes out of a pinned source, or puts into it, or that its run must say.
+# None of their names matches a rule above (✔MEASURED `git check-attr` before this line:
+# `unspecified` for both attributes, on the registry and on a text of every role). The sweep itself
+# is safe either way -- the tool reads a text by its SITE's line endings -- but the line-endings
+# guard convicts an unpinned tracked text that a checkout rewrote CRLF, and a text whose bytes
+# depend on the machine that cloned it is the defect every rule in this file exists to prevent.
+# Named by DIRECTORY, as `tests/corpus/**` is: a role is a file extension here and a new role
+# needs no new rule, and nothing binary lives there -- a mutation text is text by construction, and
+# the tool refuses a file in that directory that no row cites.
+tests/mutations/** text eol=lf

@@ -6,6 +6,7 @@ a hard stop is in `triggers-and-hard-stops.md`.
 
 ## Contents
 - The end-of-round gate is `{Debug, Release} × four legs` — eight runs (operator ruling 2026-09-14)
+- The sweep of the mutation arms is a step of the same gate (2026-10-10)
 - CI is expensive to RUN and free to READ — and the two rules are opposite
 - The measurement that produced the ruling — and the three corrections it took
 
@@ -30,6 +31,26 @@ line is now an incomplete gate that reads as complete.
 leg NAME now, and `dssharness legs` lists every one that can run.
 ★ **The whole gate is ONE invocation: `dssharness test --legs gate`** — `legSets.gate` in
 `.harness-config/config.json` names the eight legs, and each leg's ledger carries its run's count.
+
+### ★★★★ THE SWEEP OF THE MUTATION ARMS IS A STEP OF THE SAME GATE — 2026-10-10
+
+The eight runs prove that every pin's test is GREEN on every leg. They do not prove that any of them can go
+RED — that is the sweep's half, and a round owes both:
+
+- **At the round's close, in the main tree, beside the eight runs: every arm of
+  `tests/mutations/arms.registry`, on the ONE leg its `S` row names** — one `dssharness check-mutations --legs
+  <leg> --json` per leg that an `S` row names. Each is a leg command like any other: in the background, its
+  whole output through the redactor, never killed once a unit of it was admitted.
+- **Per fold, the fold's own arms** (`--arms <ids>`), on the fold's bytes, before the fold is called green.
+- **Every arm must read `passed`.** A leg is read by its own line — its arms counted by verdict — never by the
+  command's exit code alone; `21` is never a pass, and `7` measured nothing.
+- **A leg that did not reach its arms is STATED with the tool's reason, never skipped** — the same rule a
+  declined leg of the eight has.
+- **A row that rests on a pin closes only on arms that passed on the bytes it closes on.** A fold handed back
+  before its arms passed names them as owed, and closes nothing that rests on one.
+
+The declaration of an arm, the verdicts, the command lines, what a sweep costs and which trees a leg can be
+swept from are in `mutation-arms.md`.
 
 ### ⚠⚠ CI IS EXPENSIVE TO **RUN** AND FREE TO **READ** — AND THE TWO RULES ARE OPPOSITE
 

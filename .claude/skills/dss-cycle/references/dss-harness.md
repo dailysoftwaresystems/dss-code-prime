@@ -124,6 +124,8 @@ releases never happened — all four landed in 0.5.3 instead. A document still q
 | `check-ci-legs` | the `check-ci-legs` program — **DELETED** |
 | `build` | the `local-build` program — **DELETED**. ⓘ It also reads `ninja -t deps` since 0.5.7; the `check-ninja-deps` action stays because CI runs `ctest` with no DssHarness installed |
 | `test` | the `run-gate` program — **DELETED** |
+| `check-mutations` | the red-on-disable read made by hand, one mutant per `test --filter` call. It reads the arms `tests/mutations/arms.registry` declares, mutates each in a WORKER COPY of the leg's tree — never in a tree —, builds, witnesses every object that depends on the site rebuilt, runs the arm's test binary whole and judges the EXACT set of red cases, then puts the site back by its hash (mutation-arms.md). `--self-test` proves the judge itself with a leg's toolchain and needs no registry |
+| `clean` | removing a leg's build directory by hand: it removes each selected leg's build directory AND the mutation workers its sweeps keep beside its tree, wherever the leg runs; `--dry-run` says what each holds and the room left, and removes nothing |
 | `sync` | the leg drivers, the carriages and the exclude derivation — **DELETED**. The `owning-tree` action is the one owner of *which tree am I standing in*; the `.sh` and PowerShell owners it stood beside were folded into it |
 | `run` | EVERY program this repository ships: each is an action under `.harness-config/runner/actions/` with a `predefinedRunners` entry, started by `dssharness run <name>` |
 
@@ -158,13 +160,16 @@ already does is USED, never re-built around and never requested upstream. Read i
 ⛔ **Forbidden through a script, for main, every lane and the orchestrator alike:**
 - **BUILD**: `dssharness build --legs <leg>` (or `test`, which builds first). Never `cmake --build` or `ninja` from a
   shell or a wrapper.
-- **TEST**: `dssharness test --legs <leg>`, with `--filter <regex>` for a focused set, a re-run or a red-on-disable
-  read. Never `ctest` from a shell or a wrapper. MSVC is the `windows-x86_64-release` leg, where the harness enters
-  the Visual Studio environment itself, once, for `build`, `test` and `run` alike. WSL, the VPS and the Mac are legs
-  too. A red-on-disable read is one mutant per call: the Edit tool applies the mutant, one `dssharness test --filter`
-  call builds and reads it, and the Edit tool restores it, with the source md5 checked moved and returned. No loop
-  script drives the mutants. One did not rebuild after restoring a code mutant, and six of its nine reads came from a
-  stale binary (P68, 2026-09-24); `test` always builds the tree as it stands first.
+- **TEST**: `dssharness test --legs <leg>`, with `--filter <regex>` for a focused set or a re-run. Never `ctest`
+  from a shell or a wrapper. MSVC is the `windows-x86_64-release` leg, where the harness enters the Visual Studio
+  environment itself, once, for `build`, `test` and `run` alike. WSL, the VPS and the Mac are legs too. `test`
+  always builds the tree as it stands first.
+- **RED-ON-DISABLE**: `dssharness check-mutations --legs <leg>` (`--arms <ids>` for a fold's own arms) — MANDATORY
+  (operator, 2026-10-10). A pin is an ARM of `tests/mutations/arms.registry`; the tool mutates a worker copy,
+  never a tree, and a pin is proven only when its arm reads `passed` (mutation-arms.md). Never a mutant applied
+  by hand where an arm can be declared, and never a loop script: one did not rebuild after restoring a code
+  mutant, and six of its nine reads came from a stale binary (P68, 2026-09-24). The one class of mutant the
+  installed tool refuses as an arm is read by the hand protocol that file gives, and reported as that class.
 - **SYNC**: `dssharness sync` (with `--pull` and `--artifact`). Never a hand copy of a host's tree.
 - **WORKTREE AND LANE MANAGEMENT**: a lane is an AGENT — `dssharness create-orchestrator` / `create-agent` /
   `seed-agent` / `refresh-agent` / `fold-agent` / `delete-agent` / `list-orchestrator` / `delete-orchestrator`, MANDATORY
@@ -237,7 +242,14 @@ correctly.
   pe64-under-wine arm is cross-OS, so that launcher stays in `.harness-config/runner/actions/real-examples/c/sqlite/legs.json` with
   the rest of the corpus's own leg catalogue;
 - **every remote leg's repository directory**, because `sync` creates it when it is not there;
+- **the `mutations` block** — the arms registry, its text directory, and the arguments that make a test binary
+  write the report `check-mutations` judges by (mutation-arms.md). Its worker count and run-time factor are left
+  to the tool's defaults;
 - the never-transfer floor, the contention tools, the worktree budget, and both registry paths.
+  ⚠ **`worktrees.pathLimit` is NOT declared, on purpose**: a declared limit replaces the platform's own on EVERY
+  host, so Windows' 260 held the Mac, WSL and the VPS to it and no worker of a lane's tree could be placed
+  anywhere (✔MEASURED 2026-10-10); undeclared, each host keeps its own, Windows included (✔MEASURED the same
+  day: the same refusal on a Windows leg from a lane's tree).
 
 ### What under `.harness-config/` is tracked, and what is ignored
 
@@ -385,7 +397,15 @@ is not a way to silence the gate: a disclosed row stays in the pending registry 
 `14` a tool is missing · `15` a host is unavailable · `20` the command failed · `21` incomplete — it ran
 with nothing failing, but a leg reached no verdict, or a deletion, a fold or a hand-over stopped part way:
 run the same command again once what it names is dealt with, and never read it as a pass · `70` internal ·
-`130` cancelled. Codes 1–9 are reserved per command.
+`130` cancelled. Codes 1–9 are reserved per command (`dssharness help exit-codes` lists each command's own).
+
+**`check-mutations`' own**: `1` an arm `violated` — fix its declaration, or the code it guards · `2` `survived` —
+strengthen the test that should have failed · `8` `unattributed` — contain the crash or hang in a case · `5`
+`unwitnessed` · `7` `not-admitted`, which measured nothing · `21` where nothing failed and not every arm reached
+a verdict, or no selected leg can run. ⚠ **Two of the shared codes are ANSWERS here, not failures of the
+tool**: `10` naming an arm no `A` row declares is how a registry is VALIDATED on no host (`12` is the registry
+or a text refused, by line), and `20` is also what a leg reads when the UNMUTATED run of one arm's test binary
+is red — every arm of that binary is `stopped`, and the leg fails.
 
 ⚠ **`host-exec` returns the wrapped command's exit code unchanged**, so a remote 20 and a local 20 are
 the same number for two different reasons unless you know which leg was asked.

@@ -231,7 +231,9 @@ are in `delegation.md`; the lane lifecycle — its agent, seed, fold, rows and d
 ### 9. The deliverable travels in the report, never as a path — except the registry rows, which go to the agent's rows directory
 
    ★★ **THE DELIVERABLE TRAVELS IN THE REPORT, NEVER AS A PATH — AND THE BRIEF SAYS SO.** A lane's
-   red-on-disable transcript, its md5s and any number the fold will quote come back INLINE in the reply;
+   mutation arms — each arm's id, its verdict, its red set and the run id of the sweep that read it on the
+   fold's bytes, or that it is owed and on which leg — the transcript and md5s of a mutant of the one class
+   read by hand (mutation-arms.md), and any number the fold will quote come back INLINE in the reply;
    its registry rows are the one exception, and go to its agent's rows directory (rule 4). Its work directory
    keeps its P23 job — a private place for harnesses and intermediates — and is not a place a RESULT is left.
    ★★★ **THE SCOPE SPLIT, stated once (the P31 / P44 resolution, 2026-09-25):** REGISTRY ROWS are written

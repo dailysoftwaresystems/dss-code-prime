@@ -37,10 +37,17 @@
 //     0.0.2+g4095c13b2f1a                      a work tree whose inputs match HEAD
 //     0.0.2+g4095c13b2f1a.dirty9f2c1b0d7e4a3d56 …plus a digest of the inputs' DIRT
 //     0.0.2+src5d1e07c3a9b24f68                no git, or no work tree: the inputs' CONTENT
+//     <any of the three>.deps3c0a9e6b1f2d4a57  …plus a digest of the dependency SOURCES
+//                                              the build was HANDED instead of fetching
 //
 // "The inputs" are what the top-level CMakeLists declares the compiler is built
 // from (`DSS_BUILD_STAMP_INPUTS`, `DSS_BUILD_STAMP_SCRIPT_DIRS`), less the
-// harness records `DSS_BUILD_STAMP_RECORDS` names.
+// harness records `DSS_BUILD_STAMP_RECORDS` names. A dependency the build FETCHES
+// is named by its pin in that same file; one it is handed
+// (`FETCHCONTENT_SOURCE_DIR_<NAME>`) is whatever bytes stood in the directory, and
+// the `.deps` component is their digest. So the longest stamp is the second shape
+// with that component: 62 characters, which the runtime object cache's Windows
+// path budget is measured against (`RuntimeObjectCachePathBudget`).
 //
 // ── WHO ASKS, AND WHY IT MATTERS THAT NOBODY ELSE DOES ──────────────────────
 // The runtime object cache (`runtime_object_cache.hpp`) keys a compiled

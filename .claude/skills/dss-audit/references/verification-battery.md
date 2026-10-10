@@ -39,7 +39,8 @@ the regex). Always pair the scan with §E.
   here, and the instrument is what supplies today's examples.
 - **Correctness-critical anchors need a demonstrated negative pin.** Any silent-miscompile-class
   closure (a trap-safe LICM hoist, say) must ship a program that **breaks iff** the transform
-  mis-fires, and the pin must be shown **red-on-disable** — not merely present (§E #4). No pin →
+  mis-fires, and the pin must be shown **red-on-disable** — not merely present (§E #4): its arm reads
+  `passed` under `dssharness check-mutations`, on the bytes being judged. No pin, or no passed arm →
   not closed, regardless of review.
 - **No red pushes.** The full gate (§A.6) holds at every commit. A pushed red — even one fixed in a
   follow-up — is a finding; note whether the implementer's *local* gate has a blind spot (§E #7) that

@@ -45,7 +45,7 @@ Cycle <id>:
 - [ ] 4  Design-audit the plan before lock — an INDEPENDENT subagent applies the dss-audit bar
 - [ ] 5  Implement — lanes by disjoint FILE sets, at most four reasoning agents live
 - [ ] 6  Review and fold — re-review to a fixed point; passes that never converge → pause, do not grind
-- [ ] 7  Fail-loud gate — full battery + anchor balance; a red you cannot self-repair → STOP, never push
+- [ ] 7  Fail-loud gate — full battery + the mutation sweep + anchor balance; a red you cannot self-repair → STOP, never push
 - [ ] 8  Pin every deferral — a row closes by MOVING (`set-anchor`)
 - [ ] 9  Cross-plan update — including the rewrite of `.plans/_handoff.md`, same commit as the code
 - [ ] 10 Self-audit before lock — INDEPENDENT; a finding → back to 5 and re-flow; a design choice → decided, reported
@@ -65,7 +65,7 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
 | 4 | independence is the point; a new engine mechanism also gets a decision brief to the user, veto-able | `workflow-steps.md`, `full-procedure.md` |
 | 5 | each lane's owned and forbidden PATHS named; each lane its own agent (`dssharness create-agent`: its worktree, the build tree going inside it, and its work, plans and rows directories), its subagent aimed at that worktree (`-C`, absolute paths); a new `D-*` cited in `src/` registered in the same commit | `orchestration.md`, `delegation.md`, `lane-discipline.md`, `build-layout.md` |
 | 6 | `/pr-review-toolkit:review-pr`, the agnosticism pass and the CI-hazard screen | `workflow-steps.md`, `full-procedure.md` |
-| 7 | net OPEN ≤ 0 against the cycle's start commit, and `check-anchor-registry` run too; a round of lanes owes EIGHT runs | `gate-and-cross-plan.md`, `round-gate-and-ci.md`, `no-follow-ups.md` |
+| 7 | net OPEN ≤ 0 against the cycle's start commit, and `check-anchor-registry` run too; a round of lanes owes EIGHT runs AND the sweep of every mutation arm on the leg it names (`dssharness check-mutations`), every arm `passed` | `gate-and-cross-plan.md`, `round-gate-and-ci.md`, `mutation-arms.md`, `no-follow-ups.md` |
 | 8 | `dssharness set-anchor <ANCHOR> --status closed --closing '...'`; a new row is `dssharness write-anchor`; both WRITE unless given `--anchor-dry-run` | `anchors-and-deferrals.md`, `registry-and-priority.md` |
 | 9 | plans updated in the SAME commit as the code; the handoff answers its five questions | `gate-and-cross-plan.md` |
 | 10 | the `dss-audit` rule-lens and guardrails on the complete, gate-passed cycle | `workflow-steps.md`, `full-procedure.md` |
@@ -78,6 +78,12 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
 - Non-negotiable, re-read every cycle: agnostic (no language/arch/format identity branch; reuse the
   pipeline's verbs), best long-term with no workaround, the hard part lands this cycle, fail loud,
   strict red-on-disable tests, every issue anchored AND handled → `references/the-bar.md`.
+- ★★★★ **A red-on-disable pin is an ARM, read by `dssharness check-mutations` — MANDATORY** (2026-10-10):
+  its claim is a gtest TEST of a self-contained test binary (an example entry is a corpus check the gate
+  runs, never an arm's pin); the mutation, the EXACT red set, the diagnostic and ONE leg are declared in
+  `tests/mutations/arms.registry`; a pin is proven only when its arm reads `passed`, and a row closes only
+  on arms that passed on the bytes it closes on; the tool mutates a worker copy, never a tree →
+  `references/mutation-arms.md`.
 - ★★★ **The goal is to WORK** (2026-08-19): if ANY reference (gcc, clang, MSVC) compiles and runs a
   correct construct, DSS must too; a reference's failure is never evidence against DSS; probe each
   reference separately → `references/reference-compilers.md`.
@@ -164,6 +170,10 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
 **Gate, CI and hosts**
 - ★★★★ **The end-of-round gate is `{Debug, Release} × four legs` — EIGHT runs** (2026-09-14), reported
   with the build type beside each number → `references/round-gate-and-ci.md`.
+- ★★★★ **The sweep of the mutation arms is a step of that gate** (2026-10-10): at the round's close, in the
+  main tree, one `dssharness check-mutations --legs <leg>` per leg an arm names; per fold, the fold's own
+  arms on the fold's bytes; a leg that did not reach its arms is STATED with the tool's reason, never
+  skipped, and a sweep is read by its leg line, never by its exit code alone → `references/mutation-arms.md`.
 - ⛔ **Never make CI run** — no label, no re-run, no push to re-trigger; ✅ always READ it
   (`dssharness check-ci-legs`): a red leg is a HARD STOP on proceeding, never on fixing → same file.
   ★ The one exception is a PR exit the operator ORDERS to end with the pipes (2026-10-08): then the
@@ -292,6 +302,10 @@ next: <one line, matching the top NEXT entry in .plans/_handoff.md>
 - Read `references/orchestration.md` **before creating, folding or deleting a lane** — the one statement
   of the lane lifecycle under DssHarness's orchestrator and agent verbs: layout, names, seeding, the fold and
   its rows, evidence, transcripts, host copies, and when the orchestrator itself is deleted.
+- Read `references/mutation-arms.md` **before proving a pin, declaring an arm, merging the arms registry, or
+  closing a row on a red-on-disable** — what an arm's claim is, the registry's standing conditions and layout,
+  one worked arm per class, the verdicts and what each obliges, the command lines of the per-fold and
+  per-leg sweeps, what a sweep costs and from which trees it can run, and the one class that has no arm.
 - Read `references/worktrees.md` before any byte-changing measurement or plain worktree operation.
 - Read `references/build-layout.md` before creating ANY build tree (step 5) and before reporting a
   cycle complete (step 11) — **one root `build/`, subdirectories for distinct builds, and a lane's build

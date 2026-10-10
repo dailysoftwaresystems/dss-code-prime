@@ -83,6 +83,7 @@ dssharness run check-scripts-index-write
 | **`check-wrapped-anchor-ids`** | `check-wrapped-anchor-ids.py` | refuse a NEW anchor id split across a line break, which no grep can ever return. |
 | **`clock-step-probe`** | `clock-step-probe.py` | count the intervals in which this host's CLOCK_REALTIME diverged from CLOCK_MONOTONIC beyond the tolerance, so a failure blamed on a clock step has something that can refuse to confirm it. |
 | **`cmake-import`** | `cmake-import.py` | convert a CMake project into a DSS `.dss-project.json` manifest. |
+| **`compile-and-keep`** | `compile-and-keep.py` | compile sources carried in the request with the dsscp a leg itself BUILT, for a stated target and each stated pipeline, and KEEP the images beside a report of every compile (exit code, diagnostics, the image's name, size and md5), so an image one machine cannot build is built on a leg that can and pulled back. |
 | **`compile-bench`** | `compile-bench.py` | time dsscp against gcc/clang/MSVC/tcc on ONE host over a subject size ladder, naming every reference it could not find. |
 | **`corpus-census`** | `corpus-census.py`, `test-corpus-census.py` | census the real-example corpus into a run-identified report instead of one overwritten log. |
 | **`examples-census`** | `examples-census.py` | re-derive every corpus-manifest figure examples/README.md states, by parsing the manifests. |
