@@ -238,7 +238,26 @@ round's close; each checkpoint's commit message says what was and was not run on
   `linux-arm64-debug`; every unit entry and the fold's examples, 671 of 671, on `windows-x86_64-debug` (MinGW) and
   `windows-x86_64-release` (MSVC). NOT read: `linux-x86_64-debug`, the examples tier on Windows beyond the fold's
   own, a sanitizer. **No arm of it is written or read**: 313 mutants of this lane are owed as arms. Balance
-  unchanged: 635 against 620.
+  unchanged: 635 against 620. ✔MEASURED after that commit, from the main checkout: ALL 21 arms the registry then
+  held `passed`, each on the leg its `S` row names (17 on `linux-x86_64-debug`, 4 on `macos-arm64-debug`), and the
+  verb's own self-test 7 of 7 on `linux-x86_64-debug` (the reading checkpoint 7 owed).
+- **Checkpoint 10 (2026-10-10) = the harness lane's third fold: `check-ninja-deps` no longer fails a correct
+  `deps = msvc` tree, and any script entry's pins become arms.** 46 paths (35 new). On a `deps = msvc` tree a zero
+  dependency record is correct exactly when every `#include` of the source is answered — by the precompiled header
+  its edge names (read from that header's own record) or by no directory of the edge's command line (the
+  toolchain's own header, an excuse read off the tree twice: the compiler `CMakeCache.txt` names lives under a
+  path ninja's reader drops, and no record of the tree names such a path); everything else is LOST and says why.
+  A new runner `check-ninja-deps-record` prints what ninja holds for an object and builds nothing. The self-test
+  is a test binary under its old ctest name (`ninja_deps_selftest_guard`, 36 cases, now on every leg); the driver
+  both script self-tests share is `tests/test_support/script_selftest.hpp` with `dss_declare_script_selftest` /
+  `dss_use_script_selftest`, and the stamp's test is rewritten onto it with the same 46 case names. 11 arms join
+  the registry (32 in all). A defect of OURS the Mac leg found and this fold fixes: a manifest written on Windows
+  states an include directory with a backslash, which on a POSIX host named nothing, so a LOST record was excused.
+  ✔MEASURED by the lane on its final bytes: the closing control green on four legs (`windows-x86_64-debug` MinGW
+  and `windows-x86_64-release` MSVC 42 of 42, `macos-arm64-debug` and `linux-x86_64-debug` 13 of 13); the real
+  freshness entry on the MSVC tree: 799 objects, 2 excused, each for having no `#include`; all 11 arms `passed` on
+  `macos-arm64-debug`, which is NOT the leg their `S` rows name (`linux-x86_64-debug`, owed from the main
+  checkout). NOT read: the two arm64 Linux legs, the release legs of WSL and the Mac. No row; balance unchanged.
 - **Silent defects FOUND in this round and NOT YET FIXED in this tree** (each the base's debt, each with its lane
   at work): a reference written through a STATIC name follows a losing weak alias of the same body to the winner
   (ELF references ✔MEASURED 158 on four compilers' objects, DSS 198); and in a STATIC INITIALIZER, an enumerator,

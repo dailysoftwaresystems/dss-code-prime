@@ -221,11 +221,11 @@ dss_use_build_stamp(dss_program_test_build_stamp)
 dss_add_test(NAME build/build_stamp_identity
              SOURCES test_build_stamp_identity.cpp)
 
-# The opt-in (top-level CMakeLists): the generated header that holds the command
-# line, and the two stamp modules declared as inputs of this target's object — no
-# compiler reads a CMake script, so without that declaration no object depended on
-# either.
-dss_use_build_stamp_selftest(dss_build_build_stamp_identity)
+# The opt-in (top-level CMakeLists, `dss_use_script_selftest`): the generated header
+# that holds the command line, and the two stamp modules declared as inputs of this
+# target's object — no compiler reads a CMake script, so without that declaration no
+# object depended on either.
+dss_use_script_selftest(dss_build_build_stamp_identity build_stamp)
 
 # It REUSES tests/core/native_c_probe.hpp for the reference-compiler probe
 # rather than growing a second copy of host-compiler discovery, shell quoting

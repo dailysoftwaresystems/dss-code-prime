@@ -37,9 +37,33 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   ⓘ The no-argument form auto-picks `build/dbg`, else the pre-migration `build-dbg`, else fails loud
   on `build/dbg`. ⏳ SCRIPT-ERA (superseded 2026-09-24: the runner's freshness step is handed THIS leg's {buildDir}, so a lane's own tree is the one read; see actions.md) **Name your own tree when you are a lane** — the whole point is to verify the tree
   the ctest result came from.
-  ⓘ Its `--self-test` (7 parser cases + 5 target-verdict cases) now rides ctest as
-  `ninja_deps_selftest_guard`. The PROBE form still cannot be a ctest entry: it needs a build
-  directory, and a source checkout has none. SUPERSEDED 2026-09-14 by the build/ninja-deps-freshness ctest entry, which runs the probe over the build directory ctest itself runs in (see round-gate-and-ci.md)
+  ⓘ Its `--self-test` rides ctest as `ninja_deps_selftest_guard` — a test binary that runs it and
+  holds one case per arm of it, on every leg — and the probe itself as `build/ninja-deps-freshness`,
+  over the build directory ctest runs in (see round-gate-and-ci.md).
+
+  **WHAT A ZERO RECORD MEANS DEPENDS ON THE TREE'S `deps =` FLAVOUR.** On a `deps = gcc` tree it is
+  always a lost record: gcc lists the source itself. On a `deps = msvc` tree — the MSVC leg — a
+  record holds only the headers the compiler listed AND ninja's reader kept. The reader keeps no
+  path of the toolchain's own installation, and the compiler does not list again what a precompiled
+  header already read. ✔MEASURED 2026-10-10 on the MSVC leg, each record read with the command
+  below: the object that makes the tests' precompiled header — its source names every standard
+  header of the precompiled list and `<gtest/gtest.h>`, with no precompiled state to hide any —
+  recorded googletest's headers, the build tree's compiler stamp and its own header, and NOT ONE
+  standard header; and a unit given five includes of its own (one the precompiled header had read,
+  four standard ones, two of them in no precompiled header) recorded NOTHING, exactly as it did
+  with no include at all.
+  So there a zero record is the CORRECT record of a unit whose every `#include` is answered by the
+  precompiled header its edge names (that header's own record names the file) or by the toolchain,
+  and the check says so per object: `excused: <object> <- <what answers each include>`. A header
+  of the project that neither record names is still a FAIL, said with the header. The check reads
+  all of it off the tree itself, the reader's rule included: one record that names a path of the
+  toolchain's installation, and no toolchain header is excused there.
+  To read what ninja holds for an object on a leg's own tree, as it stands and with nothing built
+  first:
+
+  ```bash
+  dssharness run check-ninja-deps-record --legs <leg> --input build=build/<processor>-<toolchain>-<config> --input object=<the end of the object's path> -v
+  ```
 
   A green ctest proves nothing about the current source if the objects it linked were never
   rebuilt, and that is not hypothetical here: `ninja -t deps` has twice reported `#deps 0` on

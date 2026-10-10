@@ -516,95 +516,131 @@ function(dss_use_build_stamp target)
                  APPEND PROPERTY OBJECT_DEPENDS ${DSS_BUILD_STAMP_RUNTIME_INPUTS})
 endfunction()
 
-# ── THE STAMP'S SELF-TEST: ONE COMMAND LINE, WRITTEN ONCE, HERE ─────────────────
-# `cmake/DssBuildStamp.cmake` proves its own properties when run with
-# `-DDSS_STAMP_MODE=selftest`: in throwaway trees, without git the value is the declared
-# inputs' CONTENT, with git only the inputs' dirt counts; a dependency's sources this
-# configure was HANDED reach the value; a declared input that names nothing is refused;
-# one arm stamps THIS tree under its own declaration, and the `configure:` arms configure
-# fixture projects with this build's generator against `cmake/DssBuildStampDeclaration.cmake`.
+# ── A SCRIPT ENTRY'S SELF-TEST AS A TEST BINARY: ITS COMMAND LINE, WRITTEN ONCE ──
+# A script that proves its own properties -- a `cmake -P` module run in its self-test mode,
+# a runner action's program run with `--self-test` -- is, started bare by ctest, ONE verdict
+# and no cases: no mutation of it can be an arm of the mutation sweep, which runs a test
+# binary whole and judges the EXACT cases that go red. So such an entry is a TEST BINARY
+# that drives the script and holds one case per arm of it (the driving code and the whole
+# pattern: tests/test_support/script_selftest.hpp). The build's part is these two functions.
 #
-# ★ ITS ctest ENTRY, `build/build_stamp_identity`, IS A TEST BINARY (tests/program/
-# test_build_stamp_identity.cpp) THAT RUNS THIS COMMAND LINE AND HOLDS ONE CASE PER ARM.
-# It was a bare `cmake -P` entry until 2026-10-10: one verdict for every arm, and no test
-# binary — so no mutation of either module could be an arm of the mutation sweep, which
-# runs a test binary whole and judges the EXACT cases that go red. The binary drives the
-# same script; it re-implements no arm. There is ONE entry and ONE command line, composed
-# here from the same variables the stamp itself is wired with, and handed to the binary as
-# a header generated at configure — never as compile definitions, which would give this one
-# test target a macro set of its own and cost it the test targets' shared precompiled header.
-# So a copy of this tree, configured where it stands, runs ITS OWN modules.
-set(DSS_BUILD_STAMP_SELFTEST_COMMAND
-    "${CMAKE_COMMAND}"
-    "-DDSS_STAMP_MODE=selftest"
-    "-DDSS_STAMP_SCRATCH=${CMAKE_BINARY_DIR}/build-stamp-selftest"
-    "-DDSS_STAMP_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-    "-DDSS_STAMP_GIT=${GIT_EXECUTABLE}"
-    "-DDSS_STAMP_INPUTS=${DSS_BUILD_STAMP_INPUTS}"
-    "-DDSS_STAMP_RECORDS=${DSS_BUILD_STAMP_RECORDS}"
-    "-DDSS_STAMP_SCRIPT_DIRS=${DSS_BUILD_STAMP_SCRIPT_DIRS}"
-    "-DDSS_STAMP_GENERATOR=${CMAKE_GENERATOR}"
-    "-DDSS_STAMP_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
-    "-P"
-    "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake")
-# Twelve arguments were written above. A value holding a `;` would have been split into
-# more, in silence, and the script would read a truncated one: counted, not assumed.
-list(LENGTH DSS_BUILD_STAMP_SELFTEST_COMMAND _dss_selftest_argc)
-if(NOT _dss_selftest_argc EQUAL 12)
-    message(FATAL_ERROR
-        "dss: the build stamp's self-test command line has ${_dss_selftest_argc} arguments where 12 were "
-        "written — a path, the generator's name or a declared list holds a `;`, which a CMake list "
-        "splits. That argument would reach the script cut.")
-endif()
-set(DSS_BUILD_STAMP_SELFTEST_DIR "${CMAKE_BINARY_DIR}/generated/build-stamp-selftest")
-set(_dss_selftest_header "${DSS_BUILD_STAMP_SELFTEST_DIR}/dss_build_stamp_selftest_command.hpp")
-# The header's text is ONE string, appended to — never a CMake list, which would take every
-# `;` of the C++ it holds for a separator and drop it.
-set(_dss_selftest_text "")
-string(APPEND _dss_selftest_text
-    "// GENERATED at configure by the top-level CMakeLists.txt (THE STAMP'S SELF-TEST). Do not edit.\n"
-    "// The command line of the build stamp's self-test as THIS configure composed it, the directory\n"
-    "// it runs in, and the file its standard output goes to.\n"
-    "#pragma once\n"
-    "namespace dss::build_stamp_selftest {\n"
-    "inline constexpr const char* const kCommand[] = {\n")
-foreach(_dss_selftest_arg IN LISTS DSS_BUILD_STAMP_SELFTEST_COMMAND)
-    # A raw string literal: the argument's own bytes, nothing escaped. The one text it cannot
-    # hold is its own closing delimiter, which is refused rather than hoped absent.
-    if(_dss_selftest_arg MATCHES "\\)dss\"")
+#   dss_declare_script_selftest(<id> ARGC <n> COMMAND <argument>... SCRIPTS <file>...
+#                               [WORKING_DIRECTORY <dir>])
+#       <id>      a lower-case identifier. The entry's command line, the directory it runs in
+#                 (the build directory unless WORKING_DIRECTORY names another) and the file
+#                 its standard output goes to become `dss_<id>_selftest_command.hpp`,
+#                 namespace `dss::<id>_selftest` -- a header GENERATED at configure, never
+#                 compile definitions, which would give one test target a macro set of its
+#                 own and cost it the test targets' shared precompiled header. A copy of
+#                 this tree, configured where it stands, therefore runs ITS OWN script.
+#       ARGC      how many arguments COMMAND was written with. A QUOTED argument arrives
+#                 whole whatever it holds; one written unquoted that holds a `;` is split
+#                 into more, in silence, and the script would read a truncated one
+#                 (✔MEASURED 2026-10-10, cmake 4.3.2: three arguments written, five read).
+#                 Counted, not assumed.
+#       SCRIPTS   the files the entry runs: what its verdict is a function of.
+#   dss_use_script_selftest(<target> <id>)
+#       THE opt-in, for the ONE target that runs the entry. It gives the target the header,
+#       and it declares what the build graph did not say: no compiler reads a script, so no
+#       object depended on one. Each source of the target that includes the header names
+#       every SCRIPTS file as an input of its object (`OBJECT_DEPENDS`) -- found by reading
+#       the sources, as the stamp's own opt-in does. An edit of a script then rebuilds that
+#       object, which is what a tool asking the graph "was an object that depends on the
+#       site rebuilt" needs to witness a mutation of a script.
+# A second script entry costs one call of each and a table of its arms in its test.
+function(dss_declare_script_selftest id)
+    cmake_parse_arguments(PARSE_ARGV 1 _dss_ss "" "ARGC;WORKING_DIRECTORY" "COMMAND;SCRIPTS")
+    if(NOT id MATCHES "^[a-z][a-z0-9_]*$")
         message(FATAL_ERROR
-            "dss: an argument of the build stamp's self-test holds `)dss\"`, the closing delimiter of the raw "
-            "string literal it is written into: ${_dss_selftest_arg}")
+            "dss_declare_script_selftest(${id}): the id names a header and a C++ namespace, so it is "
+            "a lower-case identifier.")
     endif()
-    string(APPEND _dss_selftest_text "    R\"dss(${_dss_selftest_arg})dss\",\n")
-endforeach()
-string(APPEND _dss_selftest_text
-    "};\n"
-    "inline constexpr const char* const kWorkingDirectory = R\"dss(${CMAKE_BINARY_DIR})dss\";\n"
-    "inline constexpr const char* const kStandardOutput =\n"
-    "    R\"dss(${CMAKE_BINARY_DIR}/build-stamp-selftest.stdout.txt)dss\";\n"
-    "}  // namespace dss::build_stamp_selftest\n")
-# Written only when its bytes differ, so a configure that changes nothing rebuilds nothing.
-set(_dss_selftest_have "")
-if(EXISTS "${_dss_selftest_header}")
-    file(READ "${_dss_selftest_header}" _dss_selftest_have)
-endif()
-if(NOT _dss_selftest_have STREQUAL _dss_selftest_text)
-    file(WRITE "${_dss_selftest_header}" "${_dss_selftest_text}")
-endif()
+    if(DEFINED _dss_ss_UNPARSED_ARGUMENTS OR DEFINED _dss_ss_KEYWORDS_MISSING_VALUES
+       OR NOT DEFINED _dss_ss_ARGC OR NOT DEFINED _dss_ss_COMMAND OR NOT DEFINED _dss_ss_SCRIPTS)
+        message(FATAL_ERROR
+            "dss_declare_script_selftest(${id}): ARGC, COMMAND and SCRIPTS are each required, each with "
+            "a value, and nothing else but WORKING_DIRECTORY is read (unread: "
+            "[${_dss_ss_UNPARSED_ARGUMENTS}], given no value: [${_dss_ss_KEYWORDS_MISSING_VALUES}]).")
+    endif()
+    if(NOT _dss_ss_ARGC MATCHES "^[1-9][0-9]*$")
+        message(FATAL_ERROR "dss_declare_script_selftest(${id}): ARGC is a count, and `${_dss_ss_ARGC}` is none.")
+    endif()
+    get_property(_dss_declared GLOBAL PROPERTY "DSS_SCRIPT_SELFTEST_SCRIPTS_${id}" SET)
+    if(_dss_declared)
+        message(FATAL_ERROR "dss_declare_script_selftest(${id}): declared twice.")
+    endif()
+    list(LENGTH _dss_ss_COMMAND _dss_argc)
+    if(NOT _dss_argc EQUAL _dss_ss_ARGC)
+        message(FATAL_ERROR
+            "dss_declare_script_selftest(${id}): the command line has ${_dss_argc} arguments where "
+            "${_dss_ss_ARGC} were written -- an argument written UNQUOTED holds a `;` (a path, a "
+            "generator's name, a declared list), which splits it, or ARGC was not moved with the "
+            "command line. A split argument would reach the script cut.")
+    endif()
+    foreach(_dss_script IN LISTS _dss_ss_SCRIPTS)
+        if(NOT EXISTS "${_dss_script}" OR IS_DIRECTORY "${_dss_script}")
+            message(FATAL_ERROR "dss_declare_script_selftest(${id}): ${_dss_script} is not a file.")
+        endif()
+    endforeach()
+    if(NOT DEFINED _dss_ss_WORKING_DIRECTORY)
+        set(_dss_ss_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    endif()
+    set(_dss_dir "${CMAKE_BINARY_DIR}/generated/script-selftest/${id}")
+    set(_dss_header "${_dss_dir}/dss_${id}_selftest_command.hpp")
+    set(_dss_literals "${_dss_ss_COMMAND}")
+    list(APPEND _dss_literals "${_dss_ss_WORKING_DIRECTORY}")
+    foreach(_dss_literal IN LISTS _dss_literals)
+        # Each is written as a raw string literal: its own bytes, nothing escaped. The one
+        # text such a literal cannot hold is its own closing delimiter, which is refused
+        # rather than hoped absent.
+        if(_dss_literal MATCHES "\\)dss\"")
+            message(FATAL_ERROR
+                "dss_declare_script_selftest(${id}): an argument holds `)dss\"`, the closing delimiter of "
+                "the raw string literal it is written into: ${_dss_literal}")
+        endif()
+    endforeach()
+    # The header's text is ONE string, appended to -- never a CMake list, which would take
+    # every `;` of the C++ it holds for a separator and drop it.
+    set(_dss_text "")
+    string(APPEND _dss_text
+        "// GENERATED at configure by the top-level CMakeLists.txt (dss_declare_script_selftest). Do not edit.\n"
+        "// The command line of the self-test `${id}` as THIS configure composed it, the directory it\n"
+        "// runs in, and the file its standard output goes to.\n"
+        "#pragma once\n"
+        "namespace dss::${id}_selftest {\n"
+        "inline constexpr const char* const kCommand[] = {\n")
+    foreach(_dss_arg IN LISTS _dss_ss_COMMAND)
+        string(APPEND _dss_text "    R\"dss(${_dss_arg})dss\",\n")
+    endforeach()
+    string(APPEND _dss_text
+        "};\n"
+        "inline constexpr const char* const kWorkingDirectory = R\"dss(${_dss_ss_WORKING_DIRECTORY})dss\";\n"
+        "inline constexpr const char* const kStandardOutput =\n"
+        "    R\"dss(${CMAKE_BINARY_DIR}/${id}-selftest.stdout.txt)dss\";\n"
+        "}  // namespace dss::${id}_selftest\n")
+    # Written only when its bytes differ, so a configure that changes nothing rebuilds nothing.
+    set(_dss_have "")
+    if(EXISTS "${_dss_header}")
+        file(READ "${_dss_header}" _dss_have)
+    endif()
+    if(NOT _dss_have STREQUAL _dss_text)
+        file(WRITE "${_dss_header}" "${_dss_text}")
+    endif()
+    add_library(dss_${id}_selftest_command INTERFACE)
+    target_include_directories(dss_${id}_selftest_command INTERFACE "${_dss_dir}")
+    set_property(GLOBAL PROPERTY "DSS_SCRIPT_SELFTEST_SCRIPTS_${id}" "${_dss_ss_SCRIPTS}")
+endfunction()
 
-add_library(dss_build_stamp_selftest_command INTERFACE)
-target_include_directories(dss_build_stamp_selftest_command INTERFACE "${DSS_BUILD_STAMP_SELFTEST_DIR}")
-
-# THE opt-in, for the ONE target that runs the self-test. It gives the target the generated
-# header, and it declares what the build graph did not say: that target's verdict is a
-# function of the two scripts it runs, which no compiler reads, so no object depended on
-# them. Each of its sources that includes the header names both modules as inputs of its
-# object (`OBJECT_DEPENDS`) — found by reading the sources, as the stamp's own opt-in does.
-# An edit of either module then rebuilds that object, which is what a tool asking the graph
-# "was an object that depends on the site rebuilt" needs to witness a mutation of a script.
-function(dss_use_build_stamp_selftest target)
-    target_link_libraries(${target} PRIVATE dss_build_stamp_selftest_command)
+function(dss_use_script_selftest target id)
+    get_property(_dss_declared GLOBAL PROPERTY "DSS_SCRIPT_SELFTEST_SCRIPTS_${id}" SET)
+    if(NOT _dss_declared)
+        message(FATAL_ERROR
+            "dss_use_script_selftest(${target} ${id}): no script self-test `${id}` is declared "
+            "(dss_declare_script_selftest, in the top-level CMakeLists, before the directory that "
+            "holds this target is added).")
+    endif()
+    get_property(_dss_scripts GLOBAL PROPERTY "DSS_SCRIPT_SELFTEST_SCRIPTS_${id}")
+    target_link_libraries(${target} PRIVATE dss_${id}_selftest_command)
     get_target_property(_dss_sources ${target} SOURCES)
     get_target_property(_dss_dir ${target} SOURCE_DIR)
     set(_dss_includers "")
@@ -614,27 +650,50 @@ function(dss_use_build_stamp_selftest target)
             continue()   # a generated source, or a generator expression: it cannot hold the include yet
         endif()
         file(STRINGS "${_dss_abs}" _dss_hit LIMIT_COUNT 1
-             REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]dss_build_stamp_selftest_command\\.hpp[>\"]")
+             REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]dss_${id}_selftest_command\\.hpp[>\"]")
         if(_dss_hit)
             list(APPEND _dss_includers "${_dss_abs}")
         endif()
     endforeach()
     if(NOT _dss_includers)
         message(FATAL_ERROR
-            "dss_use_build_stamp_selftest(${target}): no source of `${target}` includes "
-            "`dss_build_stamp_selftest_command.hpp`, so there is no object to declare the two stamp modules on. "
+            "dss_use_script_selftest(${target} ${id}): no source of `${target}` includes "
+            "`dss_${id}_selftest_command.hpp`, so there is no object to declare the entry's scripts on. "
             "Opt a target in only where one of its sources runs the self-test.")
     endif()
-    foreach(_dss_module IN ITEMS DssBuildStamp.cmake DssBuildStampDeclaration.cmake)
-        if(NOT EXISTS "${CMAKE_SOURCE_DIR}/cmake/${_dss_module}")
-            message(FATAL_ERROR "dss_use_build_stamp_selftest(${target}): cmake/${_dss_module} is not a file.")
-        endif()
-    endforeach()
     set_property(SOURCE ${_dss_includers} TARGET_DIRECTORY ${target}
-                 APPEND PROPERTY OBJECT_DEPENDS
-                     "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake"
-                     "${CMAKE_SOURCE_DIR}/cmake/DssBuildStampDeclaration.cmake")
+                 APPEND PROPERTY OBJECT_DEPENDS ${_dss_scripts})
 endfunction()
+
+# ── THE STAMP'S SELF-TEST ───────────────────────────────────────────────────────
+# `cmake/DssBuildStamp.cmake` proves its own properties when run with
+# `-DDSS_STAMP_MODE=selftest`: in throwaway trees, without git the value is the declared
+# inputs' CONTENT, with git only the inputs' dirt counts; a dependency's sources this
+# configure was HANDED reach the value; a declared input that names nothing is refused;
+# one arm stamps THIS tree under its own declaration, and the `configure:` arms configure
+# fixture projects with this build's generator against `cmake/DssBuildStampDeclaration.cmake`.
+#
+# ★ ITS ctest ENTRY, `build/build_stamp_identity`, IS A TEST BINARY (tests/program/
+# test_build_stamp_identity.cpp) THAT RUNS THIS COMMAND LINE AND HOLDS ONE CASE PER ARM.
+# It was a bare `cmake -P` entry until 2026-10-10. There is ONE entry and ONE command
+# line, composed here from the same variables the stamp itself is wired with.
+dss_declare_script_selftest(build_stamp ARGC 12
+    COMMAND
+        "${CMAKE_COMMAND}"
+        "-DDSS_STAMP_MODE=selftest"
+        "-DDSS_STAMP_SCRATCH=${CMAKE_BINARY_DIR}/build-stamp-selftest"
+        "-DDSS_STAMP_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DDSS_STAMP_GIT=${GIT_EXECUTABLE}"
+        "-DDSS_STAMP_INPUTS=${DSS_BUILD_STAMP_INPUTS}"
+        "-DDSS_STAMP_RECORDS=${DSS_BUILD_STAMP_RECORDS}"
+        "-DDSS_STAMP_SCRIPT_DIRS=${DSS_BUILD_STAMP_SCRIPT_DIRS}"
+        "-DDSS_STAMP_GENERATOR=${CMAKE_GENERATOR}"
+        "-DDSS_STAMP_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-P"
+        "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake"
+    SCRIPTS
+        "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake"
+        "${CMAKE_SOURCE_DIR}/cmake/DssBuildStampDeclaration.cmake")
 
 add_subdirectory(src)
 
@@ -764,6 +823,28 @@ if(DSS_BUILD_TESTS)
     # set a property on a test that already exists.
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DssConfigSnapshot.cmake")
     dss_config_snapshot_init()
+
+    # ── THE NINJA DEPENDENCY-RECORD CHECK'S SELF-TEST: ITS COMMAND LINE ──────────
+    # `.harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py --self-test` proves
+    # the check's own rules on text and on throwaway trees, and prints one verdict line per
+    # arm. Its ctest entry, `ninja_deps_selftest_guard`, is the TEST BINARY
+    # tests/harness/CMakeLists.txt registers under that name (test_ninja_deps_selftest.cpp):
+    # one case per arm, so a mutation of the program can be an arm of the mutation sweep
+    # (`dss_declare_script_selftest`, above, says why and how).
+    # ⚠ DECLARED HERE, BEFORE THE TWO add_subdirectory() CALLS BELOW: the opt-in in that
+    # directory names this declaration, and a declaration precedes its use.
+    # ⓘ `owning-tree.py` is a script of the entry too: the program loads it by path, and the
+    # arms that prove which tree the default build directory belongs to are that file's.
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    dss_declare_script_selftest(ninja_deps ARGC 3
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py"
+            "--self-test"
+        SCRIPTS
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/owning-tree/owning-tree.py")
 
     add_subdirectory(integrated_tests)
     add_subdirectory(tests)
@@ -1467,12 +1548,13 @@ if(DSS_BUILD_TESTS)
     # `${CMAKE_BINARY_DIR}` at configure time. The probe form IS registrable, it is
     # registered immediately below, and the eleven-day gap between writing that
     # sentence and testing it cost cycle P62 a phantom regression — see there. ~~
-    add_test(
-        NAME ninja_deps_selftest_guard
-        COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py"
-                --self-test
-        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ★ THE ENTRY `ninja_deps_selftest_guard` IS NO LONGER REGISTERED HERE (2026-10-10). It is
+    # the test binary tests/harness/CMakeLists.txt registers under the same name, which runs
+    # the program's `--self-test` by the command line declared beside the test directories
+    # above (THE NINJA DEPENDENCY-RECORD CHECK'S SELF-TEST) and holds one case per arm of it.
+    # ⓘ Registered in a test directory it is not among the entries the label scan near the
+    # end of this file reads, so it carries no `repo-guard` label and runs on EVERY leg: it
+    # proves a program's rules on the host's own paths, which every leg has its own of.
 
     # ── THE PROBE FORM, ENFORCED: IS THIS BUILD DIRECTORY FRESH ENOUGH TO BE
     #    BELIEVED? (P62 lane `ax` — ninja recorded ZERO header deps under

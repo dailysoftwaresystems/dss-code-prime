@@ -15,3 +15,23 @@ dss_add_test(NAME harness/test_sqlite_harness_legs
 # two corpus runners take for the same reason.
 target_link_libraries(dss_harness_test_sqlite_harness_legs
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# THE NINJA DEPENDENCY-RECORD CHECK'S OWN SELF-TEST, ONE CASE PER ARM — the ctest entry
+# `ninja_deps_selftest_guard`. `.harness-config/runner/actions/check-ninja-deps/
+# check-ninja-deps.py --self-test` proves the check's rules on text and on throwaway
+# trees and prints one verdict line per arm; this binary RUNS it — by the command line
+# the top-level CMakeLists declares — and reads each arm's verdict into a case of its
+# own. It re-implements none of them. It keeps the entry's name because it IS that
+# entry: until 2026-10-10 the program was started bare by ctest, one verdict for every
+# arm and no test binary, so no mutation of the program could be an arm of the mutation
+# sweep, which starts a test binary whole and judges the exact set of cases that go red.
+# ⓘ The name ends in `guard` and the entry carries NO `repo-guard` label: that label is
+# given to the top directory's entries. This one proves a program's rules on the host's
+# own paths, which every leg has its own of, so it runs on every leg.
+dss_add_test(NAME ninja_deps_selftest_guard
+             SOURCES test_ninja_deps_selftest.cpp)
+# The opt-in (top-level CMakeLists, `dss_use_script_selftest`): the generated header that
+# holds the command line, and the program's files declared as inputs of this target's
+# object — no compiler reads a Python program, so without that declaration no object
+# depended on either.
+dss_use_script_selftest(dss_ninja_deps_selftest_guard ninja_deps)

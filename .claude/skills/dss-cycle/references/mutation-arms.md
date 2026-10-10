@@ -266,13 +266,19 @@ taken and put back over each other, so a coupled site is another file"* — that
 hand protocol (the last section). Never one before-text spanning every site: any unrelated edit between the sites
 would break the arm.
 
-**(8) A CMake SCRIPT site, behind the script's own self-test.**
+**(8) A SCRIPT site — a CMake module, a runner action's program — behind the script's own self-test.**
 `tests-stamp-does-not-digest-a-handed-files-bytes`: site `cmake/DssBuildStamp.cmake`, which no compiler reads. Its
 claim is a case of the test binary that DRIVES the script's self-test (the last section says how such a binary is
 built): the binary runs the self-test once, and each case reads ONE self-test arm's own verdict line. So the `C`
 rows are the cases of the self-test arms the mutation fails, and the `diag` is the script's own failure line for
 the claim. Target and runner are BOTH the test's target: its object is the one the build declares as depending on
-the script (✔MEASURED 2026-10-10: 47 to 49 s an arm on a warm worker).
+the script (✔MEASURED 2026-10-10: 47 to 49 s an arm on a warm worker). A runner action's program is the same
+class: the arms whose site is `.harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py` name the
+target `dss_ninja_deps_selftest_guard`.
+⚠ A script's fixture can read differently per HOST — a path's separator, a file system's case — and then a
+mutation's red exists on one kind of host only. Such an arm's `S` row names a leg of that kind (rule 1), and its
+`C` rows say on which host the red was read; a hand pre-reading on the other kind of host shows it `survived`,
+which is the fact and not a defect of the arm.
 
     A | tests-stamp-does-not-digest-a-handed-files-bytes | cmake/DssBuildStamp.cmake | T/….before | T/….after | TEST-RED | dss_build_build_stamp_identity | dss_build_build_stamp_identity | <cases> | T/….diag | CLAIM AT tests/program/test_build_stamp_identity.cpp, TEST <Case>. <why>
 
@@ -431,14 +437,27 @@ Each is named with the measurement that shows it. **Such a mutant has NO row in 
 - **NOT a class: a claim that only a SCRIPT entry holds** (a `cmake -P` self-test, a runner action's own
   self-test). It gets a gtest case that DRIVES that entry — the entry's own command line, on the tree the binary
   was configured from, one case per claim, failing (never skipping) when the entry cannot be started — and then
-  its mutants are arms like any other (class 8 above). ✔ The build stamp's self-test is the worked case, and its
-  four properties are the pattern: (1) the entry's command line is written ONCE in the build and baked into a
-  generated header, so the test starts exactly what the entry was; (2) the test binary is registered under the
-  entry's own ctest name and REPLACES the script entry — one truth, one run per leg; (3) it runs the script once
-  per process and has one case per self-test arm, each reading that arm's own verdict line, plus a case that
-  every arm is a case and every case an arm, so a new self-test arm with no case is red; (4) the build declares
-  the object of the source that includes the header as depending on the script's modules, so a mutated module
-  rebuilds it and the tool witnesses the rebuild.
+  its mutants are arms like any other (class 8 above). The pattern has four properties: (1) the entry's command
+  line is written ONCE in the build and baked into a generated header, so the test starts exactly what the entry
+  was; (2) the test binary is registered under the entry's own ctest name and REPLACES the script entry — one
+  truth, one run per leg; (3) it runs the script once per process and has one case per self-test arm, each
+  reading that arm's own verdict line, plus a case that every arm is a case and every case an arm, so a new
+  self-test arm with no case is red; (4) the build declares the object of the source that includes the header as
+  depending on the script's files, so a mutated script rebuilds it and the tool witnesses the rebuild.
+  **THE PATTERN IS IN THE TREE ONCE, AND THIS IS HOW ANY SCRIPT ENTRY'S PINS BECOME ARMS.** The driving code —
+  run once, read each verdict line, the three assertions — is `tests/test_support/script_selftest.hpp`; the
+  build's part is two functions of the top-level CMakeLists, `dss_declare_script_selftest(<id> ARGC <n> COMMAND …
+  SCRIPTS …)` (the command line into the generated header) and `dss_use_script_selftest(<target> <id>)` (the
+  header, and the object's dependency on the scripts, for the one target that runs the entry). A further script
+  entry costs four things and no copy of either: the script prints ONE VERDICT LINE PER ARM (`<marker>ok <name>`,
+  `<marker>FAILED <name> -- <what failed>`); one declaration; a test source that is a TABLE of the arms' names
+  with the three shared cases, registered under the entry's own ctest name in the test directory nearest its
+  subject; one opt-in. ✔ Built so: the build stamp's entry, `build/build_stamp_identity`, and the
+  dependency-record check's, `ninja_deps_selftest_guard`.
+  ⚠ An entry that leaves the top-level CMakeLists for a test directory leaves the `repo-guard` label behind — the
+  label is given to the TOP directory's entries whose name ends in `guard` — so it runs on every leg. Decide
+  that, and say it where the entry is registered: a self-test of a program's own rules belongs on every leg (a
+  host's paths are its own); a check of the source tree does not.
 - **NOT a class: an example pin.** It is no hand reading either — Rule 1: write the unit-tier claim.
 
 ### The hand protocol, for that one class only

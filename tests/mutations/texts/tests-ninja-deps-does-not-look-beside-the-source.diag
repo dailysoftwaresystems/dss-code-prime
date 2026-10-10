@@ -1,0 +1,1 @@
+ninja-deps self-test: FAILED  msvc: a header beside the source is found there, and LOST

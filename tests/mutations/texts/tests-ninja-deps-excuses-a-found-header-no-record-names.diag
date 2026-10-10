@@ -1,0 +1,1 @@
+ninja-deps self-test: FAILED  msvc: a header of the project the precompiled header did not read is a LOST record

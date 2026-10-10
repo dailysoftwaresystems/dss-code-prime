@@ -427,6 +427,11 @@ The 20: `anchor_balance_selftest_guard`, `anchors_selftest_guard`,
 `scripts_index_guard`, `shell_portability_guard`, `stale_refusal_citations_guard`,
 `wrapped_anchor_ids_guard`.
 
+ⓘ 2026-10-10: `ninja_deps_selftest_guard` is still one of the twenty, and the instrument above no longer
+counts it. The entry is now a test binary that starts its importer by a command line the top-level
+CMakeLists declares (`dss_declare_script_selftest`), so no `add_test` body names the program for it;
+`build/ninja-deps-freshness` still does.
+
 ⚠ `owning-tree` therefore cannot leave until `scripts/check-scripts-index`,
 `check-shell-portability`, `check-guard-output-encoding`, `check-plan-citations`,
 `check-stale-refusal-citations`, `check-wrapped-anchor-ids`, `check-diagnostic-codes`,

@@ -1020,6 +1020,29 @@
       "action": "check-ninja-deps/check-ninja-deps.yml",
       "requireBuild": true
     },
+    // THE RECORD OF AN OBJECT, READ WHERE IT STANDS: `check-ninja-deps`'s `record` step, alone. No `requireBuild`,
+    // and the step asks the harness for no build directory, so no leg is built first and none takes a heavy-leg
+    // slot: a rebuild could replace the very record a red `build/ninja-deps-freshness` is judged from. The
+    // directory is an input, relative to the leg tree (`build/<processor>-<toolchain>-<config>`); the program
+    // refuses one that does not exist. Every leg: a record is read on the host that holds it.
+    "check-ninja-deps-record": {
+      "description": "Print what ninja holds for an object of a leg's build directory as it stands, path by path - check-ninja-deps's record step, with nothing built first.",
+      "legs": [
+        "windows-x86_64-debug",
+        "windows-x86_64-release",
+        "linux-x86_64-debug",
+        "linux-x86_64-release",
+        "macos-arm64-debug",
+        "macos-arm64-release",
+        "linux-arm64-debug",
+        "linux-arm64-release"
+      ],
+      "steps": [
+        "record"
+      ],
+      "action": "check-ninja-deps/check-ninja-deps.yml",
+      "stallSeconds": 120
+    },
     "check-no-abort-in-tests": {
       "description": "Refuse a new live `abort()` call site in test or test-support code.",
       "legs": [

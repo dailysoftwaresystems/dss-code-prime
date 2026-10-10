@@ -39,20 +39,11 @@
 
 #include "dss_build_stamp_selftest_command.hpp"
 
-#include "core/substrate/process_spawn.hpp"
+#include "script_selftest.hpp"
 
 #include <gtest/gtest.h>
 
-#include <cstddef>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iterator>
-#include <map>
-#include <sstream>
-#include <string>
 #include <string_view>
-#include <vector>
 
 namespace {
 
@@ -152,203 +143,40 @@ namespace {
 constexpr std::string_view kArmNames[] = {DSS_BUILD_STAMP_SELFTEST_ARMS(DSS_BUILD_STAMP_SELFTEST_ARM_NAME)};
 #undef DSS_BUILD_STAMP_SELFTEST_ARM_NAME
 
-// What the script prints before each verdict: `message(STATUS ...)` puts `-- ` in
-// front of it, which is not matched, so the line is found wherever the marker stands.
-constexpr std::string_view kMarker       = "dss-build-stamp selftest: ";
-constexpr std::string_view kDetailOpener = " -- ";
-
-struct ArmVerdict {
-    int         verdicts = 0;      // how many verdict lines named this arm
-    bool        ok       = false;  // what the last of them said
-    std::string detail;            // what a FAILED line said after the arm's name
+// The entry, as the shared driver reads it (tests/test_support/script_selftest.hpp). The
+// marker is what the script prints before each verdict: `message(STATUS ...)` puts `-- `
+// in front of it, which is not matched, so the line is found wherever the marker stands.
+constexpr dss::test_support::ScriptSelfTest kEntry{
+    .command          = dss::build_stamp_selftest::kCommand,
+    .workingDirectory = dss::build_stamp_selftest::kWorkingDirectory,
+    .standardOutput   = dss::build_stamp_selftest::kStandardOutput,
+    .marker           = "dss-build-stamp selftest: ",
+    .armNames         = kArmNames,
+    .tableName        = "DSS_BUILD_STAMP_SELFTEST_ARMS",
 };
-
-struct SelfTestRun {
-    bool        started  = false;  // the command line ran to an exit code AND its output was read
-    int         exitCode = 0;
-    std::string whyNot;            // non-empty exactly when `started` is false
-    std::map<std::string, ArmVerdict, std::less<>> arms;     // every name of kArmNames is a key
-    std::vector<std::string>                       unnamed;  // verdict lines that name no arm of the table
-    int         verdictLines = 0;  // ok and FAILED lines, named or not
-    int         failedLines  = 0;  // FAILED lines, named or not
-};
-
-[[nodiscard]] std::string commandLineForMessages() {
-    std::string out;
-    for (char const* argument : dss::build_stamp_selftest::kCommand) {
-        if (!out.empty()) {
-            out += ' ';
-        }
-        out += argument;
-    }
-    return out;
-}
-
-// The arm of the table that `text` names: `text` IS the name (an `ok` line), or opens
-// with it followed by the detail opener (a FAILED line). Two names hold ` -- `
-// themselves, so the split is never guessed from the text: the LONGEST name that fits
-// is the arm.
-[[nodiscard]] std::string_view armNamedBy(std::string_view text) {
-    std::string_view best;
-    for (std::string_view const name : kArmNames) {
-        bool const fits =
-            text == name
-            || (text.size() >= name.size() + kDetailOpener.size() && text.substr(0, name.size()) == name
-                && text.substr(name.size(), kDetailOpener.size()) == kDetailOpener);
-        if (fits && name.size() > best.size()) {
-            best = name;
-        }
-    }
-    return best;
-}
-
-void readVerdictLine(std::string_view line, SelfTestRun& run) {
-    std::size_t const at = line.find(kMarker);
-    if (at == std::string_view::npos) {
-        return;
-    }
-    std::string_view rest = line.substr(at + kMarker.size());
-    bool             ok   = false;
-    if (rest.substr(0, 3) == "ok ") {
-        ok   = true;
-        rest = rest.substr(3);
-    } else if (rest.substr(0, 7) == "FAILED ") {
-        rest = rest.substr(7);
-    } else {
-        return;  // the timing line, the closing count: no arm's verdict
-    }
-    while (!rest.empty() && rest.front() == ' ') {
-        rest.remove_prefix(1);
-    }
-    ++run.verdictLines;
-    if (!ok) {
-        ++run.failedLines;
-    }
-    std::string_view const name = armNamedBy(rest);
-    if (name.empty()) {
-        run.unnamed.emplace_back(rest);
-        return;
-    }
-    ArmVerdict& verdict = run.arms[std::string(name)];
-    ++verdict.verdicts;
-    verdict.ok = ok;
-    verdict.detail =
-        rest.size() > name.size() ? std::string(rest.substr(name.size() + kDetailOpener.size())) : std::string();
-}
-
-[[nodiscard]] SelfTestRun runTheSelfTest() {
-    SelfTestRun run;
-    for (std::string_view const name : kArmNames) {
-        run.arms.emplace(std::string(name), ArmVerdict{});
-    }
-    std::vector<std::string> argv;
-    for (char const* argument : dss::build_stamp_selftest::kCommand) {
-        argv.emplace_back(argument);
-    }
-    std::filesystem::path const output = dss::build_stamp_selftest::kStandardOutput;
-    // Standard output goes to a file, which the script's verdict lines are read from;
-    // standard error — a refusal's own text, the closing count of a red run — stays
-    // this process's, so it is in the log beside the cases it explains.
-    dss::substrate::SpawnResult const spawned = dss::substrate::spawnAndWaitRedirectStdout(
-        argv, std::filesystem::path(dss::build_stamp_selftest::kWorkingDirectory), output);
-    if (!spawned.spawned) {
-        run.whyNot = "the self-test's command line could not be started: " + spawned.diagnostic;
-        return run;
-    }
-    run.exitCode = spawned.exitCode;
-    std::ifstream in(output, std::ios::binary);
-    if (!in) {
-        run.whyNot = "the self-test ran (exit " + std::to_string(spawned.exitCode)
-                     + ") and its standard output could not be read back from " + output.string();
-        return run;
-    }
-    std::string const text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    std::size_t       from = 0;
-    while (from <= text.size()) {
-        std::size_t const end  = text.find('\n', from);
-        std::size_t const stop = end == std::string::npos ? text.size() : end;
-        std::string_view  line(text.data() + from, stop - from);
-        if (!line.empty() && line.back() == '\r') {
-            line.remove_suffix(1);
-        }
-        readVerdictLine(line, run);
-        if (end == std::string::npos) {
-            break;
-        }
-        from = end + 1;
-    }
-    run.started = true;
-    return run;
-}
 
 // ONE run for the whole binary: the self-test builds its fixtures once, and every case
 // reads the same output.
-[[nodiscard]] SelfTestRun const& theRun() {
-    static SelfTestRun const run = runTheSelfTest();
+[[nodiscard]] dss::test_support::ScriptSelfTestRun const& theRun() {
+    static dss::test_support::ScriptSelfTestRun const run = dss::test_support::runScriptSelfTest(kEntry);
     return run;
-}
-
-// The one assertion every arm's case makes. A red says what the SCRIPT said: the arm's
-// name and its own detail, in the words of the script's own FAILED line.
-void expectTheArmPassed(std::string_view armName) {
-    SelfTestRun const& run = theRun();
-    ASSERT_TRUE(run.started) << run.whyNot << "\n  command line: " << commandLineForMessages();
-    auto const found = run.arms.find(armName);
-    ASSERT_TRUE(found != run.arms.end()) << "no arm of this name in the table: " << armName;
-    ArmVerdict const& verdict = found->second;
-    ASSERT_EQ(verdict.verdicts, 1)
-        << "the self-test gave this arm " << verdict.verdicts << " verdict(s), not one (it exited " << run.exitCode
-        << " after " << run.verdictLines << " verdict line(s)): " << armName;
-    EXPECT_TRUE(verdict.ok) << kMarker << "FAILED  " << armName << kDetailOpener << verdict.detail;
 }
 
 }  // namespace
 
 #define DSS_BUILD_STAMP_SELFTEST_CASE(caseName, armName) \
-    TEST(BuildStampIdentity, caseName) { expectTheArmPassed(armName); }
+    TEST(BuildStampIdentity, caseName) { dss::test_support::expectTheScriptArmPassed(kEntry, theRun(), armName); }
 DSS_BUILD_STAMP_SELFTEST_ARMS(DSS_BUILD_STAMP_SELFTEST_CASE)
 #undef DSS_BUILD_STAMP_SELFTEST_CASE
 
-// The script's arms and this file's cases are the same set. Read from the script's
-// OWN output, so an arm added there and not here is refused by its name — the one way
-// a self-test arm could run on every leg and be a case of nothing.
+// The script's arms and this file's cases are the same set: an arm added to the script
+// without a case here is a red, by the arm's name.
 TEST(BuildStampIdentity, EveryArmTheSelfTestRanIsACaseAndEveryCaseAnArm) {
-    SelfTestRun const& run = theRun();
-    ASSERT_TRUE(run.started) << run.whyNot << "\n  command line: " << commandLineForMessages();
-    std::ostringstream unnamed;
-    for (std::string const& line : run.unnamed) {
-        unnamed << "\n  " << line;
-    }
-    EXPECT_TRUE(run.unnamed.empty())
-        << "the self-test gave a verdict for " << run.unnamed.size()
-        << " arm(s) no case of this file names — add each to DSS_BUILD_STAMP_SELFTEST_ARMS:" << unnamed.str();
-    std::ostringstream wrong;
-    int                wrongCount = 0;
-    for (std::string_view const name : kArmNames) {
-        auto const found = run.arms.find(name);
-        int const  seen  = found == run.arms.end() ? 0 : found->second.verdicts;
-        if (seen != 1) {
-            ++wrongCount;
-            wrong << "\n  " << seen << " verdict(s): " << name;
-        }
-    }
-    EXPECT_EQ(wrongCount, 0) << "the self-test did not give exactly one verdict to " << wrongCount
-                             << " arm(s) this file holds a case for (it exited " << run.exitCode
-                             << "):" << wrong.str();
-    EXPECT_EQ(static_cast<std::size_t>(run.verdictLines), std::size(kArmNames))
-        << "the self-test printed " << run.verdictLines << " verdict line(s) for " << std::size(kArmNames)
-        << " case(s)";
+    dss::test_support::expectEveryScriptArmIsACaseAndEveryCaseAnArm(kEntry, theRun());
 }
 
-// The script's own exit code says what its arms said: zero exactly when none failed.
-// It also fails on an arm COUNT other than its own ratchet, with every arm green —
-// which no arm's case could notice, and this one does.
+// The script also fails on an arm COUNT other than its own ratchet, with every arm green
+// — which no arm's case could notice, and this one does.
 TEST(BuildStampIdentity, TheSelfTestsExitCodeAgreesWithItsArms) {
-    SelfTestRun const& run = theRun();
-    ASSERT_TRUE(run.started) << run.whyNot << "\n  command line: " << commandLineForMessages();
-    EXPECT_EQ(run.exitCode == 0, run.failedLines == 0)
-        << "the self-test exited " << run.exitCode << " with " << run.failedLines << " FAILED verdict line(s) of "
-        << run.verdictLines << ": an exit code that disagrees with the arms is the script refusing something no "
-        << "arm reports (its own arm-count ratchet, a fatal error between two arms) — its standard error, above, "
-        << "says what.";
+    dss::test_support::expectTheScriptsExitCodeAgreesWithItsArms(kEntry, theRun());
 }

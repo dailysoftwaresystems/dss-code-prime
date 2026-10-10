@@ -1,0 +1,4 @@
+        m = _INCLUDE_NAMED.match(line)
+        if not m:
+            return (False, f"{src} holds an `#include` whose text names no file "
+                           f"({line.strip()[:60]})")

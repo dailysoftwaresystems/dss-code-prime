@@ -1,0 +1,1 @@
+ninja-deps self-test: FAILED  msvc: on a tree that also declares deps = gcc, no zero record is excused
