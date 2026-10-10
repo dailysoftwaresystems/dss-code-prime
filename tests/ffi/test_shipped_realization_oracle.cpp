@@ -580,8 +580,9 @@ TEST(ShippedRealizationOracle, RemovingOneLibraryKeyIsCaughtOnTheHandDeclaredPat
 // decided by corpus relPath order, on rows the user never wrote.
 //
 // ✔MEASURED on the shipped corpus: no choice is made there today (only
-// `stdio.json` and `threads.json` carry `synthesize` rows and nothing on either
-// surface is declared twice), which is exactly why the pin BUILDS the second
+// `threads.json` carries `synthesize` rows — stdio.json's went when P69 made the pe
+// printf family DSS's runtime source — and nothing on its surface is declared
+// twice), which is exactly why the pin BUILDS the second
 // declaring descriptor instead of waiting for the corpus to grow one — a latent
 // order-dependence is still an order-dependence.
 //
@@ -592,8 +593,9 @@ TEST(ShippedRealizationOracle, RemovingOneLibraryKeyIsCaughtOnTheHandDeclaredPat
 
 namespace {
 
-// TWO rows: a pe `synthesize` recipe (`printf` — a real id from the closed recipe
-// vocabulary, since the reader refuses an unknown one at read time) and ONE
+// TWO rows: a pe `synthesize` recipe (`thrd_yield` — a real id from the closed recipe
+// vocabulary, since the reader refuses an unknown one at read time; it was `printf`
+// until P69 retired the stdio recipes) and ONE
 // ordinary COMPANION row whose pe image is the caller's. The recipe rows are
 // IDENTICAL across both descriptors on purpose: step (2b) must stay silent, so
 // anything the run reports comes from the companion surface alone.
@@ -601,8 +603,8 @@ namespace {
                                        char const* companionImage) {
     return std::string{R"({ "header": ")"} + header
          + R"(", "library": { "pe": "shared.dll" }, "symbols": [ )"
-         + R"({ "name": "printf", "signature": "fn(ptr<char>, ...) -> i32", )"
-         + R"("availableObjectFormats": ["pe"], "synthesize": "printf" }, )"
+         + R"({ "name": "thrd_yield", "signature": "fn() -> void", )"
+         + R"("availableObjectFormats": ["pe"], "synthesize": "thrd_yield" }, )"
          + R"({ "name": "dupcore", "signature": "fn(i32) -> i32", )"
          + R"("availableObjectFormats": ["pe"], "library": { "pe": ")"
          + companionImage + R"(" } } ] })";
@@ -611,7 +613,7 @@ namespace {
 } // namespace
 
 TEST(ShippedRealizationOracle, ShimCompanionSurfaceDivergenceIsRefused) {
-    // Both arms: `printf` resolves to the SAME recipe with the SAME image, so the
+    // Both arms: `thrd_yield` resolves to the SAME recipe with the SAME image, so the
     // requested-name rule (2b) has nothing to say. Only `dupcore` — a row the
     // caller never asked about and would import anyway — diverges.
     for (bool alphaFirst : {true, false}) {
@@ -627,17 +629,17 @@ TEST(ShippedRealizationOracle, ShimCompanionSurfaceDivergenceIsRefused) {
         if (::testing::Test::HasFatalFailure()) return;
 
         DiagnosticReporter rep;
-        OracleRun const r = ask(dir.path(), {"printf"}, ObjectFormatKind::Pe,
+        OracleRun const r = ask(dir.path(), {"thrd_yield"}, ObjectFormatKind::Pe,
                                 DataModel::Llp64, rep);
         ASSERT_TRUE(r.located) << "the synthetic corpus was not located at all";
-        ASSERT_TRUE(r.row.has_value()) << "'printf' vanished from the answer";
+        ASSERT_TRUE(r.row.has_value()) << "'thrd_yield' vanished from the answer";
         ASSERT_EQ(r.row->status, ShippedRealizationStatus::Realized);
         ASSERT_FALSE(r.row->recipeId.empty())
-            << "'printf' did not resolve to a SHIM row, so the companion-surface "
+            << "'thrd_yield' did not resolve to a SHIM row, so the companion-surface "
                "path this test is about was never reached — re-point the fixture, "
                "do not delete the test";
         EXPECT_GT(r.conflicts, 0u)
-            << "two descriptors both realize the `printf` recipe and name two "
+            << "two descriptors both realize the `thrd_yield` recipe and name two "
                "different pe images for the companion `dupcore` the shim body "
                "would call — whichever descriptor the surface fetch picked would "
                "have decided that import silently, by relPath sort";
@@ -663,7 +665,7 @@ TEST(ShippedRealizationOracle, AgreeingShimCompanionSurfacesAreAccepted) {
 
     DiagnosticReporter rep;
     OracleRun const r =
-        ask(dir.path(), {"printf"}, ObjectFormatKind::Pe, DataModel::Llp64, rep);
+        ask(dir.path(), {"thrd_yield"}, ObjectFormatKind::Pe, DataModel::Llp64, rep);
     ASSERT_TRUE(r.located);
     EXPECT_EQ(r.conflicts, 0u)
         << "two descriptors mirroring one shim surface byte-identically were "

@@ -378,6 +378,7 @@ loadChainedFixupsWeakExecFormat() {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -1405,6 +1406,7 @@ TEST(MachoDylibFormatJsonValidate, MinimalDylibShapeAccepted) {
 TEST(MachoDylibFormatJsonValidate, EntryClusterRejected) {
     auto r = ObjectFormatSchema::loadFromText(dylibJsonWith(R"(
       "entryCallingConvention": "apple_arm64",
+      "entryTransition": "called",
       "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
     )"));

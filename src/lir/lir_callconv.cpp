@@ -290,6 +290,30 @@ computeFrameLayout(LirFuncAllocation const& alloc,
             + outgoingArgSlots * layout.outgoingSlotSize)
         : 0u;
     layout.savedRegAreaSize    = static_cast<std::uint32_t>(layout.savedRegs.size()) * slotWidth;
+    // THE SAVED-REGISTER AREA'S OWN ALIGNMENT (`FrameLayout::savedRegAreaOffset`):
+    // the widest save the prologue will make into it, asked of the owner the
+    // prologue asks for each store's width — never the stride, which is as wide
+    // as the target's widest register whether or not this function saves one.
+    // Every offset below is read through `savedRegAreaOffset()`, so this is set
+    // before any of them.
+    //
+    // ⓘ ASKED QUIETLY, AND THAT IS NOT A SWALLOWED REFUSAL. Where the owner
+    // cannot state a saved register's width, the prologue's own store of that
+    // register asks it the SAME question (same schema, convention and class)
+    // and reports by its own name — and a function that probes its stack asks
+    // for a width before either. A report from here would put a layout detail
+    // in front of the refusal that names what could not be emitted
+    // (`LirCallconvAbi.AGeneralRegisterNoInstructionCanStateRefusesTheTouchByName`
+    // reads exactly one diagnostic, the touch's). A register whose width nobody
+    // can state contributes no alignment; the function does not survive it.
+    DiagnosticReporter quietWidths;
+    for (auto const& saved : layout.savedRegs) {
+        auto const saveWidth = calleeSavedAccessFlags(
+            schema, cc, saved.regClass(), "", quietWidths);
+        if (!saveWidth.has_value()) continue;
+        layout.savedRegAreaAlign = std::max<std::uint32_t>(
+            layout.savedRegAreaAlign, lirInstWidthBits(*saveWidth) / 8u);
+    }
     layout.spillAreaSize       = alloc.numSpillSlots * slotWidth;
     // Local-int codegen (plan step 13.3b) + FC7 (D-FC7-MEMBER-ACCESS):
     // local allocas sit ABOVE the spill area (positive RSP offset post-
@@ -367,13 +391,14 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     //     same reason `frameSlotPlacementAlign` caps a per-alloca offset: padding an
     //     offset past the base's own guarantee buys nothing. This changes ONLY a
     //     frame with a >stack-slot-multiple-aligned local whose base is off (e.g. an
-    //     odd outgoing-arg count leaves the x86 base ≡ 8 mod 16); every other frame's
-    //     pad is 0 (byte-identical layout — the zero-blast-radius invariant).
+    //     odd outgoing-arg count leaves the x86 base ≡ 8 mod 16, unless a 16-byte
+    //     save already moved the saved-register area onto the boundary —
+    //     `savedRegAreaOffset`); every other frame's pad is 0 (byte-identical
+    //     layout — the zero-blast-radius invariant).
     std::uint32_t localAreaAlignPad = 0;
     if (maxLocalAlign > 0) {
         std::uint32_t const rawLocalBase =
-            layout.outgoingArgAreaSize + layout.savedRegAreaSize
-            + layout.spillAreaSize;
+            layout.spillAreaOffset() + layout.spillAreaSize;
         std::uint32_t const baseAlign =
             frameSlotPlacementAlign(maxLocalAlign, frameAlign);
         if (rawLocalBase % baseAlign != 0u) {
@@ -402,7 +427,7 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     // prologue (local-int codegen, plan step 13.3b); the materialize pass
     // emits `lea result, [sp + offset]` for each `alloca` opcode.
     std::uint32_t const rawPreShadow =
-        layout.outgoingArgAreaSize + layout.savedRegAreaSize
+        layout.spillAreaOffset()
         + layout.spillAreaSize    + layout.localAreaAlignPad
         + layout.localAreaSize    + layout.vaRegSaveAreaSize;
     std::uint32_t const align = frameAlign;  // == (cc.stackAlignment > 0 ? … : 1)
@@ -849,6 +874,11 @@ LirInstId emitSpCopy(LirBuilder& b, std::uint16_t op, LirReg dst, LirReg src) {
 // op's result is `none` — like a bare `sub SP,F`, it mutates SP in place
 // and exposes no SSA value; SP is a fixed physical reg the encoder reads
 // from operand 0.
+// ★ THE OP'S CONTRACT, which `probeFootingFor` builds on and every encoder
+// that lowers it owes: the touches step WHOLE pages down from the entry SP
+// (so each keeps the entry SP's offset inside its page), and the LAST one is
+// at most `pageBytes` above the final SP — the remainder below it, up to a
+// page, is not touched by this op.
 LirInstId emitStackProbe(LirBuilder& b, std::uint16_t op, LirReg sp,
                          std::uint32_t frameBytes, std::uint32_t pageBytes) {
     std::array<LirOperand, 3> ops{
@@ -1467,6 +1497,17 @@ struct OpcodeHandles {
     // prologue's emit site fails loud if a CC declares stackProbePageBytes
     // but the schema lacks the opcode (a config mismatch).
     std::uint16_t stackProbe;
+    // D-CSUBSET-VLA-WIN64-STACK-PROBE: the three verbs of the DYNAMIC guard-page
+    // walk this pass emits around every runtime `sub_sp_reg` when the cc declares a
+    // nonzero `stackProbePageBytes` — a page compare (`cmp size, page`), the
+    // conditional branch that closes the loop (`jcc`), and the value-preserving page
+    // touch (`or_mem [SP+off], 0`). Ordinary schema verbs, not a dedicated op: the
+    // walk's shape is plain LIR, so no encoder needs a hand-written arm for it.
+    // Optional — absent ⇒ 0; `emitDynamicStackProbeWalk`'s caller fails loud when a
+    // probe-requiring function reaches a descent with any of them missing.
+    std::uint16_t cmp;
+    std::uint16_t jcc;
+    std::uint16_t orMem;
     // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the `lea_frame_slot` virtual op
     // — a RE-REFERENCE of a body-local alloca's address that the MIR→LIR lowering
     // emits at EACH use (instead of holding one entry-spanning address vreg, which
@@ -1557,6 +1598,12 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
     // plain `sub SP, F` below — byte-identical to before this feature.
     // Agnostic: the decision reads cc.stackProbePageBytes (a config
     // value), NEVER cc.name / arch / object format.
+    // ⚠ "frame ≤ page needs no WALK" is all this threshold says. Whether what
+    // the function then reaches BELOW its settled SP — a call's push, a
+    // runtime descent's first touch — still lands on the guard page is the
+    // FOOTING's question (`probeFootingFor`, derived from callPushBytes,
+    // stackAlignment and the touch width), answered by the caller with one
+    // landing touch after this prologue where the convention needs it.
     if (cc.stackProbePageBytes > 0
         && layout.totalFrameSize > cc.stackProbePageBytes) {
         if (stackProbeOp == 0) {
@@ -2977,6 +3024,13 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // Absent ⇒ field 0; the prologue emit site fails loud if a CC
         // declares stackProbePageBytes but the schema omits the opcode.
         {&OpcodeHandles::stackProbe,        "stack_probe",          true},
+        // D-CSUBSET-VLA-WIN64-STACK-PROBE: optional — the dynamic guard-page walk's
+        // three verbs. Absent ⇒ field 0; a function that needs the walk (a runtime
+        // `sub_sp_reg` under a cc with stackProbePageBytes > 0) fails loud naming
+        // the missing one, and no other function ever reads them.
+        {&OpcodeHandles::cmp,               "cmp",                  true},
+        {&OpcodeHandles::jcc,               "jcc",                  true},
+        {&OpcodeHandles::orMem,             "or_mem",               true},
         // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT: optional — a target declares
         // it to enable the pre-regalloc wide-call materialization. Absent ⇒
         // field 0; `op == h.storeOutgoingArg` never matches (the pass would
@@ -3245,6 +3299,239 @@ functionNeedsBodyFrameScratch(Lir const& src, LirFuncId fn,
     return false;
 }
 
+// ── D-CSUBSET-VLA-WIN64-STACK-PROBE: THE DYNAMIC GUARD-PAGE WALK ─────────────
+//
+// ★ THE ONE SENTENCE: under a calling convention that declares a guard-page size
+//   (`stackProbePageBytes`; ms_x64 = 4096), EVERY runtime descent of the stack
+//   pointer touches each page it crosses, top-down, before anything below it is
+//   used — a variable-length array and `__builtin_alloca` alike, because MIR→LIR
+//   lowers both to the one `sub_sp_reg SP, size` this pass rewrites.
+//
+// WHY. Windows commits a thread's stack lazily. Below the committed region sits ONE
+// guard page, and only a touch OF THAT PAGE grows the stack (the page is committed
+// and the next one down becomes the guard); a touch anywhere lower is a plain
+// access violation. A bare `sub rsp, size` past a page leaves SP below the guard
+// page, and the first access to the far end of the object faults with 0xC0000005.
+// The prologue's FIXED frame has been walked since D-WIN64-LARGE-FRAME-STACK-PROBE
+// (`stack_probe`); a runtime descent was not.
+//
+// ✔MEASURED, the references at -O0 and -O2 alike (mingw-w64 gcc 13.2.0; MSVC 19.51
+// at /Od and /O2): mingw calls `___chkstk_ms` with the aligned size in rax and then
+// subtracts it from rsp, for a VLA and `__builtin_alloca` both; MSVC calls
+// `__chkstk` for `_alloca` (it has no VLA). Both helpers walk the pages below SP one
+// page at a time and touch the final address. DSS emits that walk INLINE, as the
+// fixed-frame probe already does — a DSS image links neither helper (`__chkstk` is a
+// CRT object, `___chkstk_ms` is libgcc), and an inline walk needs no symbol at all.
+//
+// THE SHAPE is `___chkstk_ms`'s loop with SP itself as the pointer and the size
+// register as the counter — the descent's own two operands and nothing else (W is
+// one word of the convention's stack pointer, 8 for rsp — `ProbeTouch` below):
+//
+//         or_mem [SP - W], 0          (1) the word just below SP
+//         cmp    size, page
+//         jcc    ule → tail | step
+//   step: sub    SP, page
+//         or_mem [SP + 0], 0          (2) one touch per page crossed
+//         sub    size, page
+//         cmp    size, page
+//         jcc    ugt → step | tail
+//   tail: sub_sp_reg SP, size         the original descent, by the remainder
+//         or_mem [SP + 0], 0          (3) the new bottom
+//         …the rest of the source block
+//
+// Every step keeps `SP - size` equal to the descent's target, so the original
+// instruction, re-emitted at the tail with the remainder, lands SP exactly where the
+// unwalked descent would have put it.
+//   (1) is the touch the helper's CALL makes for free (its return-address push at
+//       SP-8), and it is NOT optional: SP may sit inside the still-untouched guard
+//       page — a fixed frame of up to a page below a touched entry SP is never
+//       walked — and from there the first page step would land BELOW the guard.
+//       Whether (1) itself lands on the guard page is THE FOOTING, below.
+//   (3) leaves SP itself touched, so whatever follows — the next descent, a call,
+//       a callee's unprobed frame — starts from a committed page, the footing a
+//       function's entry SP has.
+//
+// ★ THE FOOTING — WHAT A FUNCTION MAY REACH WITH NO PROBE OF ITS OWN, DERIVED FROM
+//   THE CONVENTION'S OWN NUMBERS (`probeFootingFor`). A function is ENTERED WITH
+//   THE PAGE THAT HOLDS THE BYTE AT ITS STACK POINTER COMMITTED. A call that pushes
+//   (`callPushBytes` ≥ 1) wrote that byte itself, whoever made the call. A call
+//   that pushes nothing (a link-register machine) leaves it to the CALLER, which
+//   must therefore have touched the page its own SP is in before it calls.
+//   ⚠ THAT SECOND HALF IS DSS'S OWN RULE FOR SUCH A CONVENTION, DERIVED HERE, AND
+//   NOT ANY PLATFORM ABI'S TEXT: a convention document does not say what a callee
+//   may assume about the page under its entry SP when the call wrote nothing
+//   there, so it is a contract between two functions this pass states and keeps on
+//   BOTH sides — the callee reads its reach off it, and the caller is given the
+//   landing touch below so that it holds. (A link-register Windows prologue that
+//   stores the frame record at its new SP satisfies it with that store; the
+//   explicit touch is the conservative form of the same thing, correct wherever
+//   the saved registers sit in the frame.)
+//   The guard page is then at worst the next page down, so from a committed byte
+//   that sits `o` bytes into its page everything down to `o + page` bytes below it
+//   may be touched. Three numbers decide the rest:
+//     · LEAST — the smallest `o` an entry SP can have. The convention aligns SP to
+//       `stackAlignment` before the call and the call pushes `callPushBytes`, so it
+//       is `(stackAlignment − callPushBytes mod stackAlignment) mod stackAlignment`
+//       (8 under ms_x64; 0 when the call pushes nothing) — known only when a page
+//       is a whole number of alignments, and taken as 0 otherwise.
+//     · GAP — how far the settled SP is below the last byte known committed: the
+//       whole fixed frame when the prologue did not walk it, and at most one page
+//       when it did (`stack_probe` steps whole pages down from the entry SP,
+//       touching each, and leaves its remainder — up to a page — untouched; the
+//       walked touches keep the entry SP's offset inside the page).
+//     · NEED — how far below the settled SP the function reaches before any probe
+//       of its own: touch (1)'s width if it has a runtime descent; what a call
+//       pushes if it calls; and A WHOLE PAGE if it calls under a convention whose
+//       call pushes nothing, because the callee's footing is then this function's
+//       own SP and the page that holds it has to be committed already.
+//   `gap + need > least + page` means the reach leaves the guard page, and the
+//   function then gets a LANDING TOUCH — `or_mem [SP + 0], 0`, the first thing
+//   after its prologue. That touch is always within reach itself (`gap ≤ page`),
+//   and it leaves SP's own page committed: gap 0, after which any `need` of at most
+//   a page is safe. ms_x64 never gets one — its LEAST (8) is what its call pushes
+//   and is touch (1)'s width, so `gap + 8 > 8 + page` is false for every frame —
+//   which is why "the call pushed a word at the entry SP" is a consequence here and
+//   not a premise: its code is byte-identical. A convention whose call pushes
+//   nothing gets one in every function that calls with a frame, and in a leaf with
+//   a runtime descent whose frame is exactly a page (or was walked): there touch (1)
+//   would otherwise fall one word past the guard page.
+//   A `need` LARGER than a page — a page smaller than one touch, or than what one
+//   call pushes — is beyond any touch, whatever the program: such a convention
+//   does not LOAD (`TargetSchemaData::validate` refuses its `stackProbePageBytes`
+//   against `callPushBytes` and against a word of its `stackPointer`), so this
+//   pass never sees one.
+//
+// ★ EVERY TOUCH STORES BACK THE VALUE IT READ (`or` with 0), and every one lands
+//   below the original SP, on bytes this descent is allocating — except the
+//   zero-size descent, whose touch (3) reads and rewrites [SP] itself, exactly as
+//   `___chkstk_ms` does for rax = 0.
+//
+// ⚠ THE SIZE REGISTER IS CONSUMED: the walk counts it down. That is sound because
+//   the descent is that value's LAST use, which `lowerVlaAlloca` guarantees by
+//   construction (its operand is a register defined for this instruction alone —
+//   see the note there), and a register shared through coalescing holds only values
+//   whose live ranges are disjoint from it, so nothing live past the descent can
+//   be in it.
+//
+// AGNOSTIC: the decision reads `cc.stackProbePageBytes` (a config value) and the
+// verbs are resolved from the target schema by name; a cc that declares no page
+// (sysv_amd64, aapcs64, apple_arm64) keeps the plain descent, byte-identical. The
+// two blocks are created by `materializeOneFunc` IN LAYOUT POSITION — right after the
+// source block that holds the descent — so a fallthrough the peephole elided on
+// that block's terminator still falls into the block laid out next.
+
+// The two blocks one descent's walk owns.
+struct DynamicProbeBlocks {
+    LirBlockId step{};
+    LirBlockId tail{};
+};
+
+// ONE GUARD-PAGE TOUCH IS ONE WHOLE GENERAL REGISTER — a word of the stack
+// pointer's own class, in full. Its width is ASKED, never written here: of
+// `wholeRegisterAccessFlags`, the one owner of "how wide is a register of this
+// class", which derives it from the class's full rows of the target document's
+// `registers[]` (8 bytes on x86_64) and refuses, by name, a class with no single
+// full width and a width no LIR instruction can state. It is also how far below SP
+// touch (1) reaches: exactly the bytes [SP - bytes, SP), nothing at or above SP.
+// The loader's validator reads the stack pointer's own row for the same number when
+// it refuses a convention whose page cannot hold one touch (`TargetSchemaData::
+// validate`, the calling-convention block) — a stack pointer is a FULL register of
+// the general class (the loader holds it to that), so its `widthBytes` is that
+// class's full width wherever the class has one, and the tier that admits a
+// convention and the tier that probes under it cannot disagree about a touch.
+struct ProbeTouch {
+    std::uint32_t bytes      = 0;   // one whole general register
+    std::uint8_t  widthFlags = 0;   // the `kLirInstFlagWidth*` bits that state it
+};
+
+// The touch of this target, or nullopt when the owner refused (reported).
+[[nodiscard]] std::optional<ProbeTouch>
+probeTouchFor(TargetSchema const& schema, DiagnosticReporter& reporter) {
+    auto const flags = wholeRegisterAccessFlags(
+        schema, LirRegClass::GPR, "callconv: guard-page touch", reporter);
+    if (!flags.has_value()) return std::nullopt;
+    return ProbeTouch{lirInstWidthBits(*flags) / 8u, *flags};
+}
+
+// `or_mem [base + offset], 0` — a read-modify-write that stores back what it read.
+LirInstId emitProbeTouch(LirBuilder& b, std::uint16_t orMemOp, LirReg base,
+                         std::int32_t offset, ProbeTouch const& touch) {
+    std::array<LirOperand, 4> ops{
+        LirOperand::makeImmInt32(0),
+        LirOperand::makeReg(base),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(offset)
+    };
+    return b.addInst(orMemOp, InvalidLirReg, ops, /*payload=*/0,
+                     touch.widthFlags);
+}
+
+// THE FOOTING of one function under a convention that declares a guard page (the
+// design note's paragraph of that name): `need` is how far below its settled stack
+// pointer the function reaches before any probe of its own, and `landingTouch` says
+// whether that reach leaves the guard page unless the prologue touches [SP + 0]
+// first. Both are 0/false under a convention that declares no page.
+struct ProbeFooting {
+    std::uint32_t need         = 0;
+    bool          landingTouch = false;
+};
+
+[[nodiscard]] ProbeFooting
+probeFootingFor(TargetCallingConvention const& cc, std::uint32_t touchBytes,
+                std::uint32_t frameBytes, bool hasCalls, bool hasRuntimeDescent) {
+    ProbeFooting f;
+    std::uint32_t const page = cc.stackProbePageBytes;
+    if (page == 0) return f;
+    std::uint32_t const push = cc.callPushBytes;
+    // A call that pushes reaches its push. One that pushes nothing hands the callee
+    // THIS function's stack pointer as its footing: the page holding it has to be
+    // committed already — the reach of a whole page.
+    std::uint32_t const callNeed = !hasCalls ? 0u : (push == 0 ? page : push);
+    f.need = std::max(hasRuntimeDescent ? touchBytes : 0u, callNeed);
+    if (f.need == 0) return f;
+    std::uint32_t const align = cc.stackAlignment > 0 ? cc.stackAlignment : 1u;
+    std::uint32_t const least =
+        page % align == 0 ? (align - push % align) % align : 0u;
+    std::uint32_t const gap = frameBytes > page ? page : frameBytes;
+    f.landingTouch = std::uint64_t{gap} + f.need > std::uint64_t{least} + page;
+    return f;
+}
+
+// `cmp size, page` then `jcc cond → ifTrue | ifFalse` — the walk's one test,
+// sealing the open block.
+void emitProbeTest(LirBuilder& b, OpcodeHandles const& h, LirReg size,
+                   std::int32_t page, TargetCondCode cond,
+                   LirBlockId ifTrue, LirBlockId ifFalse) {
+    std::array<LirOperand, 2> cmpOps{LirOperand::makeReg(size),
+                                     LirOperand::makeImmInt32(page)};
+    b.addInst(h.cmp, InvalidLirReg, cmpOps);
+    std::array<LirOperand, 2> jccOps{LirOperand::makeBlockRef(ifTrue.v),
+                                     LirOperand::makeBlockRef(ifFalse.v)};
+    b.addCondBr(h.jcc, jccOps, ifTrue, ifFalse,
+                static_cast<std::uint32_t>(cond));
+}
+
+// Emit touch (1), the test, and the whole `step` block into the open block, then
+// open `blocks.tail` — where the caller re-emits the descent and touch (3). Every
+// touch's id goes into `touches`, the frame-base verifier's exact escape for them.
+void emitDynamicProbeLoop(LirBuilder& b, OpcodeHandles const& h, LirReg sp,
+                          LirReg size, std::int32_t page,
+                          ProbeTouch const& touch,
+                          DynamicProbeBlocks const& blocks,
+                          std::unordered_set<std::uint32_t>& touches) {
+    touches.insert(emitProbeTouch(b, h.orMem, sp,
+                                  -static_cast<std::int32_t>(touch.bytes), touch).v);
+    emitProbeTest(b, h, size, page, TargetCondCode::Ule, blocks.tail, blocks.step);
+    b.beginBlock(blocks.step);
+    emitSpAdjust(b, h.sub, sp, static_cast<std::uint32_t>(page));
+    touches.insert(emitProbeTouch(b, h.orMem, sp, 0, touch).v);
+    std::array<LirOperand, 2> countOps{LirOperand::makeReg(size),
+                                       LirOperand::makeImmInt32(page)};
+    b.addInst(h.sub, size, countOps);
+    emitProbeTest(b, h, size, page, TargetCondCode::Ugt, blocks.step, blocks.tail);
+    b.beginBlock(blocks.tail);
+}
+
 [[nodiscard]] bool
 materializeOneFunc(Lir const& src, LirFuncId fn,
                    TargetSchema const& schema,
@@ -3284,6 +3571,16 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                    // unwind info, so a VLA + SEH function fails loud (never mis-unwind).
                    // Only ever true on PE (SEH is Windows-only), so no format branch.
                    bool isSehParent,
+                   // D-CSUBSET-VLA-WIN64-STACK-PROBE: receives the id of every
+                   // page touch this function's guard-page walks emit — the
+                   // frame-base verifier's exact escape for those SP-based
+                   // accesses (module-wide: instruction ids are).
+                   std::unordered_set<std::uint32_t>& outProbeTouches,
+                   // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS:
+                   // the module-wide block entry image (`LirCallconvResult::
+                   // blockEntryImage`, sized to the source block arena) — this
+                   // function writes the entry of each of its source blocks.
+                   std::vector<std::uint32_t>& outBlockEntryImage,
                    DiagnosticReporter& reporter) {
     if (!cc.stackPointer.has_value()) {
         report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
@@ -3326,6 +3623,25 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     LirReg const fp = (hasVla && cc.framePointer.has_value())
         ? makePhysicalReg(cc.framePointer->ordinal, LirRegClass::GPR)
         : InvalidLirReg;
+    // D-CSUBSET-VLA-WIN64-STACK-PROBE: does every runtime descent of THIS function
+    // walk the guard pages? Exactly when it has one and its cc declares a page — the
+    // same config value the prologue's fixed-frame probe reads, so both halves of
+    // the stack's growth answer to one number (the design note is above
+    // `DynamicProbeBlocks`). Checked here, before anything is emitted, so a schema
+    // missing one of the walk's verbs refuses by name instead of mid-function.
+    bool const walkDynamicDescents = hasVla && cc.stackProbePageBytes > 0;
+    if (walkDynamicDescents && (h.cmp == 0 || h.jcc == 0 || h.orMem == 0)) {
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               std::format("calling convention '{}' declares stackProbePageBytes={} "
+                           "and this function moves its stack pointer at run time (a "
+                           "variable-length array or `__builtin_alloca`), but the "
+                           "target schema has no '{}' opcode to walk the guard pages "
+                           "with: the schema must declare it",
+                           cc.name, cc.stackProbePageBytes,
+                           h.cmp == 0 ? "cmp" : (h.jcc == 0 ? "jcc" : "or_mem")));
+        return false;
+    }
     // The base every FIXED-FRAME reference (spill reload/store, fixed-local `lea`,
     // incoming stack-arg read) addresses off. In a VLA function this is the frame
     // pointer (captured == SP-at-fixed-frame-bottom, so the OFFSET is UNCHANGED:
@@ -3686,15 +4002,80 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
         return false;
     }
 
+    // D-CSUBSET-VLA-WIN64-STACK-PROBE: this function's FOOTING under a convention
+    // that declares a guard page (the design note above `DynamicProbeBlocks`) — what
+    // it reaches below its settled SP before any probe of its own, and whether its
+    // prologue owes a LANDING TOUCH for that reach to stay on the guard page. Decided
+    // here, from the frame the layout just fixed, before anything is emitted.
+    //
+    // `need` never exceeds a page: a convention whose `stackProbePageBytes` is
+    // smaller than `callPushBytes` or than one word of its stack pointer does not
+    // LOAD (`TargetSchemaData::validate`, the calling-convention block).
+    //
+    // The touch itself (`ProbeTouch`) is asked for only by a function that touches:
+    // one with a runtime descent needs its width to know its reach, so it asks
+    // first; one that only owes a landing touch asks once the footing says so.
+    ProbeTouch probeTouch;
+    if (walkDynamicDescents) {
+        auto const touch = probeTouchFor(schema, reporter);
+        if (!touch.has_value()) return false;
+        probeTouch = *touch;
+    }
+    ProbeFooting const footing = probeFootingFor(
+        cc, probeTouch.bytes, outLayout.totalFrameSize, hasCalls,
+        walkDynamicDescents);
+    if (footing.landingTouch && !walkDynamicDescents) {
+        auto const touch = probeTouchFor(schema, reporter);
+        if (!touch.has_value()) return false;
+        probeTouch = *touch;
+    }
+    if (footing.landingTouch && h.orMem == 0) {
+        // (A function with a runtime descent never gets here without the verb: the
+        // walk's own check above refused it. This is the function that only calls.)
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               std::format("calling convention '{}' declares stackProbePageBytes={} "
+                           "and callPushBytes={}, under which this function's frame of "
+                           "{} bytes must touch the page its stack pointer lands in "
+                           "before anything reaches below it, but the target schema "
+                           "has no 'or_mem' opcode to touch it with: the schema must "
+                           "declare it",
+                           cc.name, cc.stackProbePageBytes, cc.callPushBytes,
+                           outLayout.totalFrameSize));
+        return false;
+    }
+
     auto const& funcInfo = src.funcArena().at(fn);
     b.addFunction(SymbolId{funcInfo.symbol});
 
     std::uint32_t const blockCount = src.funcBlockCount(fn);
     std::unordered_map<std::uint32_t, LirBlockId> srcToDst;
     srcToDst.reserve(blockCount);
+    // D-CSUBSET-VLA-WIN64-STACK-PROBE: each walked descent's two blocks, keyed by the
+    // descent's SOURCE instruction id and created in this same loop, immediately
+    // after the block that holds it and in the order its descents appear. Blocks
+    // are laid out in creation order, so the layout is [B, step₁, tail₁, …, B+1]: B's
+    // terminator ends up in its last tail, and the block after THAT is still B+1.
+    // ★ AND THAT IS WHY THE PASS PUBLISHES ITS ENTRY IMAGE: every block created after
+    // a step₁ has a new id, so a block that DATA names (a jump-table slot, a static
+    // `&&label`, a `__try` scope) is followed through here by B's entry, and B's
+    // pieces are the run up to B+1's —
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS.
+    std::unordered_map<std::uint32_t, DynamicProbeBlocks> probeBlocks;
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
         srcToDst[srcBlock.v] = b.createBlock();
+        outBlockEntryImage[srcBlock.v] = srcToDst[srcBlock.v].v;
+        if (!walkDynamicDescents) continue;
+        std::uint32_t const n = src.blockInstCount(srcBlock);
+        for (std::uint32_t k = 0; k < n; ++k) {
+            LirInstId const descent = src.blockInstAt(srcBlock, k);
+            if (src.instOpcode(descent) != h.subSpReg) continue;
+            DynamicProbeBlocks pb;
+            pb.step = b.createBlock();
+            pb.tail = b.createBlock();
+            probeBlocks.emplace(descent.v, pb);
+        }
     }
 
     std::uint32_t const slotSize = outLayout.slotSize;
@@ -3819,6 +4200,17 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // fact is known, rather than reconstructed by a consumer.
             outCfiFn.prologueOpCount =
                 static_cast<std::uint32_t>(outCfiFn.ops.size());
+            // D-CSUBSET-VLA-WIN64-STACK-PROBE: the LANDING TOUCH (the design note's
+            // FOOTING paragraph) — the first BODY instruction, at the settled SP,
+            // which is the fixed-frame bottom here: no runtime descent has run. It
+            // moves nothing and saves nothing, so it is no prologue op and carries
+            // no unwind rule; the flags it writes are dead at a function's entry.
+            // Its id joins the walk's touches, the frame-base verifier's escape by
+            // identity.
+            if (footing.landingTouch) {
+                outProbeTouches.insert(
+                    emitProbeTouch(b, h.orMem, sp, 0, probeTouch).v);
+            }
         }
 
         // ── D-LIR-PER-INST-REG-CONSTRAINTS: where the per-INSTRUCTION side
@@ -4536,6 +4928,30 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // outgoing area at `dstOffset`. Emitted in the stack-store phase
                 // (before any register move) so the source `addr` reg is read while
                 // still intact. `addr` is the carrier's (already-physical) Reg.
+                //
+                // ★ P69 round 4 — NOT REACHED BY THE PIPELINE TODAY, AND KEPT ON
+                // PURPOSE. The wide-call pass (`lir_wide_call_args.cpp`) runs over
+                // EVERY Call before register allocation, copies each stacked
+                // by-value aggregate into its placed outgoing bytes there, and takes
+                // the `(Reg, ByValueStackAgg)` carrier off the Call — so no Call the
+                // pipeline lowers reaches this pass carrying one, and the placed
+                // triple `(Reg, ByValueStackAgg, MemOffset)` is no longer produced by
+                // any pass (the wide-call pass REFUSES an input that states one).
+                // This copy stays because the carrier is still an operand FORM that
+                // four other consumers accept — register allocation, the rewrite, the
+                // text form and the verifier — and hand-built modules reach all of
+                // them (tests/lir/test_lir_callconv.cpp,
+                // tests/lir/test_lir_outgoing_arg_cursor.cpp, tests/asm): one consumer
+                // of five refusing a form the other four take would be the defect.
+                // Its two known limits are loud, by name, never a wrong byte:
+                // `L_VirtualRegInPostRegalloc` (the rewriter's reload scratch
+                // exhausted by spilled carrier addresses at one call) and
+                // `L_CcRegLookupFailed` (no free caller-saved general register to copy
+                // through). Its REMOVAL — the stage invariant "after the wide-call
+                // pass no Call carries the form", stated by the verifier, with every
+                // consumer's arm dropped together and the hand-built tests building
+                // the post-pass form — is owned by
+                // D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET.
                 struct ByValStackCopy {
                     LirReg       addr;
                     std::int32_t dstOffset;  // from THIS fn's SP-post-prologue
@@ -5593,6 +6009,52 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 continue;
             }
 
+            // ── D-CSUBSET-VLA-WIN64-STACK-PROBE: walk the guard pages ───────────
+            //
+            // A runtime descent under a cc that declares a guard page: touch (1),
+            // the loop, then the descent itself at the tail by the remainder, then
+            // touch (3) (the design note is above `DynamicProbeBlocks`). The
+            // rest of the source block follows in the tail. Its operands are
+            // checked rather than assumed, because the walk WRITES the size
+            // register: a descent by SP or by the frame base would be counted down
+            // into a broken frame, so either refuses by name
+            // (D-CSUBSET-VLA-WIN64-STACK-PROBE).
+            if (walkDynamicDescents && op == h.subSpReg) {
+                auto const pb = probeBlocks.find(inst.v);
+                bool const shaped =
+                    ops.size() == 2
+                    && ops[0].kind == LirOperandKind::Reg
+                    && ops[0].reg.isPhysical != 0 && ops[0].reg.id == sp.id
+                    && ops[1].kind == LirOperandKind::Reg
+                    && ops[1].reg.isPhysical != 0
+                    && ops[1].reg.regClass() == LirRegClass::GPR
+                    && ops[1].reg.id != sp.id && ops[1].reg.id != fp.id;
+                if (pb == probeBlocks.end() || !shaped) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: the runtime stack descent at inst "
+                                       "{} is not `sub_sp_reg SP, <size register>` "
+                                       "with the size in a general register other "
+                                       "than the stack and frame pointers, so its "
+                                       "guard-page walk has no counter to count "
+                                       "down: the lowering must define the "
+                                       "descent's size in a general register of "
+                                       "its own",
+                                       inst.v));
+                    return false;
+                }
+                emitDynamicProbeLoop(b, h, sp, ops[1].reg,
+                                     static_cast<std::int32_t>(cc.stackProbePageBytes),
+                                     probeTouch, pb->second, outProbeTouches);
+                std::array<LirOperand, 2> descentOps{ops[0], ops[1]};
+                LirInstId const descent = b.addInst(op, result, descentOps, payload,
+                                                    src.instFlags(inst));
+                lir_pass_util::carryInstSideData(src, inst, b, descent);
+                outProbeTouches.insert(
+                    emitProbeTouch(b, h.orMem, sp, 0, probeTouch).v);
+                continue;
+            }
+
             std::vector<LirOperand> newOps;
             newOps.reserve(ops.size());
             for (auto const& o : ops) newOps.push_back(lir_pass_util::remapBlockRef(o, srcToDst));
@@ -5697,7 +6159,11 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                             remember);
                         LirCfiOp restore{};
                         restore.kind       = CfiOpKind::RestoreState;
-                        restore.block      = dstBlock;
+                        // The block the `ret` is emitted INTO — the open one, which
+                        // is `dstBlock` unless a guard-page walk earlier in this
+                        // source block moved the rest of it into a tail
+                        // (D-CSUBSET-VLA-WIN64-STACK-PROBE).
+                        restore.block      = b.openBlock();
                         restore.atBlockEnd = true;
                         outCfiFn.ops.push_back(restore);
                     }
@@ -5754,6 +6220,13 @@ materializeCallingConvention(Lir const&           src,
     if (!opcodes.has_value()) {
         return out;  // empty Lir + empty perFunc — `ok()` returns false
     }
+    // D-CSUBSET-VLA-WIN64-STACK-PROBE: every guard-page touch the walks emit, by
+    // OUTPUT instruction id — filled by `materializeOneFunc`, read by the frame-base
+    // verifier below as its one exact escape.
+    std::unordered_set<std::uint32_t> probeTouches;
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: every source
+    // block's entry in the output, one slot per source block id (0 = the sentinel).
+    out.blockEntryImage.assign(src.blockCount(), 0u);
 
     // c116 H1 (D-WIN64-SEH-FUNCLETS): resolve each funclet's parent to a FUNCTION
     // INDEX (position in `src.funcAt(i)` == position in `out.perFunc`). The synth
@@ -5885,7 +6358,7 @@ materializeCallingConvention(Lir const&           src,
         if (!materializeOneFunc(src, fn, schema, *cc, funcAlloc, b, *opcodes,
                                 layout, funcCfi, out.perFunc, parentLayoutIndex,
                                 maxLocalAlign, perAllocaAligns, isSehParent,
-                                reporter)) {
+                                probeTouches, out.blockEntryImage, reporter)) {
             return LirCallconvResult{};
         }
         out.perFunc.push_back(std::move(layout));
@@ -5920,6 +6393,15 @@ materializeCallingConvention(Lir const&           src,
     // swallow a single one of the references it is meant to see. ✔The mutation that
     // proves it: reverting the frame-base switch on the spill store makes those refs
     // land at `spillAreaOffset()+`, outside both escapes, and this still fires.
+    //
+    // ⚠ AND ONE ESCAPE THAT IS NOT A ZONE AT ALL (D-CSUBSET-VLA-WIN64-STACK-PROBE):
+    // the guard-page walk's own touches. They are SP-based by definition — they
+    // touch the pages SP is descending through — and they address bytes no frame
+    // zone describes: below SP for touch (1), at the MOVING SP for the others, so
+    // whichever zone their offset happens to coincide with says nothing about them.
+    // They are excused by IDENTITY, not by offset: `probeTouches` holds exactly the
+    // instruction ids the walk emitted, so the escape cannot cover a single
+    // reference any other emit site produced.
     if (opcodes->subSpReg != 0) {
         std::size_t const outFnCount = out.lir.moduleFuncCount();
         for (std::uint32_t i = 0;
@@ -5942,6 +6424,7 @@ materializeCallingConvention(Lir const&           src,
                 std::uint32_t const n = out.lir.blockInstCount(blk);
                 for (std::uint32_t k = 0; k < n; ++k) {
                     LirInstId const inst = out.lir.blockInstAt(blk, k);
+                    if (probeTouches.contains(inst.v)) continue;  // the walk's own
                     auto const ops = out.lir.instOperands(inst);
                     for (std::size_t oi = 1; oi < ops.size(); ++oi) {
                         if (ops[oi].kind != LirOperandKind::MemBase) continue;

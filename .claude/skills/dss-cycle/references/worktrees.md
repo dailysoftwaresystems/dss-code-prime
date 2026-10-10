@@ -1,17 +1,16 @@
-# Worktree & agent operations
+# Worktree operations
 
 ## Contents
-- A lane worktree lives inside the repo, at `.worktrees/<short-name>` (operator ruling 2026-08-26) —
-  the rule in brief, as the cycle's root file stated it
-- H. Worktree & agent operations
+- Worktrees live inside the repo, under `.worktrees/` (operator ruling 2026-08-26) — the rule in brief;
+  a LANE's worktree is a DssHarness agent's (`references/orchestration.md`)
+- H. Worktree operations
   - H.0 A byte-changing measurement belongs in a worktree, not the shared tree
   - H.0a …and never under the session scratch directory
-  - H.0b …and inside the repo, at `<repo>/.worktrees/<short-name>` — one owner; `remove` and `land`;
-    the lane verbs resolve their tree from their own location; the MAX_PATH budget; `.gitignore`
+  - H.0b …and inside the repo, under `<repo>/.worktrees/` — one owner; the MAX_PATH budget; the ignore rules
   - Every new worktree inherits root permissions — the allowlist and the sandbox; prefer the root for
     fast, sequential cycles
 
-## ★★★ A LANE WORKTREE LIVES INSIDE THE REPO, AT `.worktrees/<short-name>` — operator ruling 2026-08-26
+## ★★★ WORKTREES LIVE INSIDE THE REPO, UNDER `.worktrees/` — operator ruling 2026-08-26
 
 > *"I want the worktrees implementation to be inside the project root, .worktrees directory (where
 > 100% of it's internal content ignored by .gitignore). This way we stop contaminating builds
@@ -23,49 +22,42 @@ guard can see. ✔MEASURED 2026-08-26: the tree was already carrying **9,661 fil
 orphaned checkouts under `.claude/worktrees/`, three full copies, one of them 287 MB, and
 **`git worktree list` knew about none of them**.
 
-**★ ONE OWNER: DssHarness — `dssharness create-worktree` / `delete-worktree` / `list-worktree`** (operator,
-2026-09-24): **never hand-roll `git worktree add` in a lane.** Seeding, folding and landing run through the
-lane-fold action's own program — `lane-fold.py seed` and `land` — as a NAMED INTERIM until the action
-declares them as manual steps, the only route besides a reported DssHarness bug; `seed` is MANDATORY right
-after `create-worktree`, before any work. `land` keeps a lane's evidence through the `lane-worktree` action's
-VERIFIED copy and re-reads it, then has `dssharness delete-worktree` remove the worktree and the copies
-DssHarness recorded of it on hosts -- and only after the lane's LAST review (the operator, 2026-09-28: "only
-removes copies after last review is fine: while modifications are needed the files can't be removed"). A
-landing whose removal does not finish says LANDING INCOMPLETE (exit 4), and `land` again folds nothing and
-finishes it, or names the command that does. Every directory they use is read from configuration
-(`references/worktrees.md`).
+**★ ONE OWNER: DssHarness** (operator, 2026-09-24): **never hand-roll `git worktree add`.**
+- **A LANE's worktree is an AGENT's** — `dssharness create-agent <o> <a>` makes it at
+  `<repo>/.worktrees/<o>/<a>` and seeds it, `fold-agent` folds it, `delete-agent` removes it with its host
+  copies after the lane's LAST review. That lifecycle is `references/orchestration.md`, MANDATORY since
+  2026-09-29; this file never restates it.
+- **A worktree that is NOT a lane** — a probe, a byte-changing measurement (H.0) — is a plain one:
 
 ```bash
-dssharness create-worktree k      # -> <repo>/.worktrees/k (worktrees.root); a name is at most 10 characters
-python3 .harness-config/runner/actions/lane-fold/lane-fold.py seed k   # MANDATORY, before any work: resets the seed manifest (P57)
-python3 .harness-config/runner/actions/lane-fold/lane-fold.py land k production --apply   # after its LAST review: the worktree and its recorded host copies
-dssharness delete-worktree k --discard-uncommitted --delete-evidence   # a lane NOT landed (abandoned), once what it holds is kept elsewhere
+dssharness create-worktree k                  # -> <repo>/.worktrees/k (worktrees.root); never an orchestrator's name
+dssharness delete-worktree k                  # add --discard-uncommitted / --delete-evidence only once what it holds is kept elsewhere
+dssharness list-worktree [--hosts] [--json]   # every worktree (an agent's as o/a), its host copies, and the copies gone worktrees left
 ```
 
-⚠ **`seed` is MANDATORY, right after `create-worktree` and before any work** — `seed k --empty` for a lane
-created at HEAD and given nothing. It resets the lane's seed manifest and records its base. ✔MEASURED P57: a
-stale manifest left by an earlier lane of the same name makes the fold SILENTLY DROP the lane's work, and
-`create-worktree` does not reset it.
+ⓘ Without its two flags `delete-worktree` refuses a worktree holding uncommitted work or evidence, and on
+Windows it refuses, whole and before anything is removed, one something holds -- a shell standing in it, a file
+open without delete sharing, a program running from it -- naming what holds it.
 
-Four clauses, and each is measured rather than asserted — detail in `references/worktrees.md` §H.0b:
+Four clauses, and each is measured rather than asserted — detail in §H.0b:
 
-1. **`.gitignore`'s `/.worktrees/` rule is what satisfies the "ALL host copies" clause.** The
-   transport derives what it carries from git, so that one line is what stops four full repo copies
-   riding to macOS and the arm64 VPS on every push. ★ It is ALSO declared independently of git:
+1. **The ignore rules are what satisfy the "ALL host copies" clause.** `dssharness init` writes them —
+   `/<worktrees.root>/*`, here `/.worktrees/*`, and the fixed `/.orchestrators/*`, each beside its tracked
+   `.gitkeep` — and `sync` withholds both directories by name, independently of git. ★ `.worktrees` is ALSO
+   declared in configuration; `.orchestrators` rests on the tool's own withholding:
    ✔MEASURED 2026-09-23, `.harness-config/config.json`'s `sync.neverTransfer` names `.worktrees`,
    `.claude/worktrees`, `.temp`, `build`, `scratchpad` and `test-scratch`, and `.secrets` at any
-   depth (`**/.secrets`, which covers the root one too) — once, for every host. `dssharness sync --dry-run` lists every path it would write, which is how to CHECK
-   this rather than trust it.
-2. ⚠ **The MAX_PATH budget is now SPENT, not slack.** The move costs **46 characters** on every
-   build path: longest build-relative suffix **163**, so `C:/dssp40k` had **87 spare** and
-   `.worktrees/k` has **46**. `lane-worktree.py` refuses by arithmetic (exit 3) a name whose longest
-   build path would not stay under `worktrees.pathLimit`, every term read from
-   `.harness-config/config.json` and named in the refusal — the defect it prevents fails as a per-TU
-   compile error in files the lane never touched. ⏳ SCRIPT-ERA (superseded 2026-09-24: `dssharness create-worktree` holds each worktree's longest build path under worktrees.pathLimit, and a name within worktrees.maxNameLength, 10 characters; see dss-harness.md)
-   ⇒ **Keep lane names SHORT** (`k`, `l`, `rod`); a descriptive name spends that margin.
-3. **The lane that takes a worktree owns removing it** — `lane-fold.py land` for a finished lane, after its
-   last review (it removes the host copies DssHarness recorded too); `dssharness delete-worktree` alone
-   otherwise — and the registration must go with it, because a stale
+   depth (`**/.secrets`, which covers the root one too) — once, for every host. `dssharness sync --dry-run`
+   lists every path it would write, which is how to CHECK this rather than trust it.
+2. ⚠ **The MAX_PATH budget is SPENT, not slack.** `create-worktree` and `create-agent` refuse up front a
+   name whose longest build path would pass the path limit — the PLATFORM's own: this repository declares
+   no `worktrees.pathLimit`, on purpose, because a declared one replaces the platform's limit on every host
+   (dss-harness.md) —, the reserve and the margin read from
+   `.harness-config/config.json` and the longest name that still fits named in the refusal — the defect it
+   prevents fails as a per-TU compile error in files the lane never touched. An agent's orchestrator and
+   agent names share the one budget. ⇒ **Keep names SHORT**; a descriptive name spends the margin.
+3. **Whoever creates a worktree removes it** — the orchestrator an agent's with `delete-agent`, after its
+   last review; a probe's creator with `delete-worktree` — and the registration goes with it, because a stale
    registration lives in `.git/worktrees/` and **never appears in `git status`**.
 4. ⚠ **`-fd`, never `-fdx`.** `git clean -fd` does not delete ignored paths, so a live worktree
    survives a leg restore; `-fdx` would destroy it mid-build.
@@ -74,7 +66,7 @@ Four clauses, and each is measured rather than asserted — detail in `reference
 **zero** of the 16 runnable registered guards — identical verdicts and output volume — and
 `git status` reported 0 lines for it.
 
-## H. Worktree & agent operations — every new worktree inherits root permissions
+## H. Worktree operations — every new worktree inherits root permissions
 
 ### ★★ H.0 — A BYTE-CHANGING MEASUREMENT BELONGS IN A WORKTREE, NOT THE SHARED TREE
 ✔MEASURED 2026-08-13, and it cost real confusion. A lane needed to measure the corpus-wide byte
@@ -107,7 +99,7 @@ so it reads as **somebody else's breakage** and sends the lane to investigate an
 governs a lane's *files*; it was never meant to govern a *build root*, and on this host the two
 cannot both be satisfied.
 
-### ★★★ H.0b — AND IT GOES INSIDE THE REPO, AT `<repo>/.worktrees/<short-name>` — operator ruling 2026-08-26
+### ★★★ H.0b — AND IT GOES INSIDE THE REPO, UNDER `<repo>/.worktrees/` — operator ruling 2026-08-26
 
 > *"I want the worktrees implementation to be inside the project root, .worktrees directory (where
 > 100% of it's internal content ignored by .gitignore). This way we stop contaminating builds
@@ -122,125 +114,50 @@ was ALREADY carrying **9,661 files / 410 MB** of orphaned checkouts under `.clau
 (three full copies, one 287 MB with its own `build/perf-lane/`), and **`git worktree list` knew
 about none of them**.
 
-**★ ONE OWNER: DssHarness** — `dssharness create-worktree <name>`, `delete-worktree <name>`,
-`list-worktree` (operator, 2026-09-24). **Never hand-roll `git worktree add` in
-a lane.** A location rule is only as good as the last person who remembered it, and this skill
-already records what happens to a rule that lives only in a document.
+**★ ONE OWNER: DssHarness** — the agent verbs for a lane (`references/orchestration.md`),
+`create-worktree` / `delete-worktree` / `list-worktree` for anything else (operator, 2026-09-24). A
+location rule is only as good as the last person who remembered it, and this skill already records what
+happens to a rule that lives only in a document.
 
-```bash
-dssharness create-worktree k                                                            # -> <repo>/.worktrees/k
-python3 .harness-config/runner/actions/lane-fold/lane-fold.py seed k                    # MANDATORY, before any work: resets the seed manifest (P57)
-python3 .harness-config/runner/actions/lane-fold/lane-fold.py land k production --apply  # the way a FINISHED lane leaves, after its LAST review
-dssharness delete-worktree k --discard-uncommitted --delete-evidence                    # a lane NOT landed (abandoned), once what it holds is kept elsewhere
-dssharness list-worktree                                                                # each worktree's host copies, and the copies gone worktrees left, from DssHarness's record; --hosts asks each host
-```
+⚠ **THE MAX_PATH BUDGET IS SPENT, NOT SLACK — AND THIS IS THE ONE THING TO CARRY FROM H.0a.**
+Moving from a 10-char root into the repository root costs every build path the characters of
+`<repo>/.worktrees/` — and an agent's worktree adds its orchestrator's directory. ✔MEASURED 2026-08-26
+in a live lane worktree: the move more than halved the margin, and this repository's test names are what
+dominate the build-relative suffix and keep growing. The tool holds the line by arithmetic: the root and the
+name, `build/<longest variant>/`, then `worktrees.pathBudgetReserve` and `pathBudgetMargin`, every term read
+from `.harness-config/config.json` and the longest name that still fits named in the refusal — read the
+refusal, never a remembered figure; every character of an orchestrator's name is one its agents' cannot have
+(orchestration.md).
+⇒ **Keep names SHORT.** A descriptive name spends the margin that protects the next long test name.
 
-ⓘ Without its two flags `delete-worktree` refuses a worktree holding uncommitted work or evidence, and on
-Windows it refuses, whole and before anything is removed, one something holds -- a shell standing in it, a file
-open without delete sharing, a program running from it -- naming what holds it.
-
-⚠ **`seed` is MANDATORY, right after `create-worktree` and before any work** — `seed k --empty` for a lane
-created at HEAD and given nothing. It carries the main tree's uncommitted state in, RESETS the lane's seed
-manifest and records its base. ✔MEASURED P57: a stale manifest left by an earlier lane of the same name makes
-the fold SILENTLY DROP the lane's work, and `create-worktree` does not reset it — it knows nothing of
-lane-fold's manifests, and lane-fold keeps a landed lane's manifest on purpose. `land` marks the manifest
-LANDED while it removes a lane and drops the mark once the removal is complete; `seed` resets a mark for a
-NEW worktree of the name (git gives it an administrative directory of its own), and for the landed one only
-while it lists no change — never over what a removal that stopped part way left, `--force` included. A lane
-directory left with no `.git` at all is never force-removed by `land`: it keeps the evidence and names the
-`dssharness delete-worktree <lane> --force` for a person to run once they have looked, since a directory made
-at that path since reads the same.
-
-⚠ `dssharness run lane-fold` runs that action's self-test and nothing else — its `.yml` declares no other step
-(✔MEASURED 2026-09-25, DssHarness 0.5.12) — so seeding, folding and landing run as its program's verbs, as
-above: a NAMED INTERIM, and the only route besides a reported DssHarness bug, which ends when the action
-declares them as manual steps (scheduled: the harness lane's next-PR item).
-
-★ **Every directory both tools use is READ, never spelled in them:** the lanes' root and the
-evidence roots from `.harness-config/config.json` (`worktrees.root`, `worktrees.evidenceRoots`), and
-lane-fold's two bookkeeping directories beside the lanes — the seed manifests `add` writes and `fold`
-reads, and the evidence `land` keeps — from `lane-fold/lane-fold-config.json` (`manifests`,
-`evidence`). Both programs read that one file, so a change there moves both. ⏳ SCRIPT-ERA (superseded 2026-09-24: with `dssharness create-worktree`, lane-fold's `seed` writes the manifest that `add` used to, which is why `seed` is MANDATORY right after creation; see the block above)
-
-⚠ **`remove` REFUSES (exit 8) a worktree that still carries the lane's work** — by its own
-`git status`, a tracked modification or an untracked file that is not ignored (seeded paths
-included); or a commit its HEAD holds that no ref of the repository reaches, asked at the repository
-root as `git rev-list <HEAD> --not --glob=refs/*` (removing the worktree would orphan that commit,
-and gc would delete it) — until it is told `--discard-work`, which names every path
-and commit it discards. It cannot tell folded work from unfolded work; `lane-fold.py land` can,
-builds that flag only from its own "nothing left to fold" measurement, and refuses a lane whose HEAD
-left its base: past the recorded base, or, for a format-1 manifest that records none, holding such a
-commit.
-
-⚠ **`remove` REFUSES (exit 7) a worktree whose evidence roots (`worktrees.evidenceRoots`:
-`scratchpad/` AND `.temp/`) hold any file**, until it is told `--preserve-to <dir>` or
-`--discard-evidence`. ✔MEASURED P66: the gate used to count `scratchpad/` only, while
-every live lane kept its evidence under `.temp/<lane>-scratch/`, so it counted zero for all of them.
-A preserve refuses a destination inside the worktree or one already holding a same-named file with
-other bytes, and re-reads every file at the destination. `--discard-scratchpad` is retired and refused. [→ plain removal is `dssharness delete-worktree <name>`: without `--force` it refuses work that would be lost, a locked worktree, and a worktree whose evidence directories hold anything — `--discard-uncommitted` waives the uncommitted changes (never a commit no ref reaches), `--delete-evidence` the evidence, `--force` every check — on Windows it refuses, whole, a worktree something holds, and it removes the copies of it DssHarness recorded on hosts; `land` keeps the evidence through the action's own verified copy, then calls it](dss-harness.md)
-
-★ **A finished lane is LANDED, never removed by hand:** `lane-fold.py land <lane> production`
-folds it, applies its `row/` cells through the row writer all-or-nothing and re-reads each row, checks
-nothing is left to fold, keeps the whole evidence set under `.worktrees/.evidence/<lane>-<stamp>/`
-(the lanes' root and lane-fold's `evidence`, both read),
-and only then has DssHarness remove the worktree and the copies it recorded on hosts. Without `--apply` it is a dry run; a stopped landing can be re-run. SUPERSEDED 2026-09-25 by the one row format, anchor-rows' rows directory — until `land` switches to it in the next PR, it reads only `<ANCHOR>.<cell>` files under the lane's `.temp/<lane>-scratch/row/` and refuses, loudly, a lane without them; a lane's rows directory is applied by the anchor-rows action (see lane-discipline.md) [→ since 2026-09-29 `land` removes the worktree and its recorded host copies through `dssharness delete-worktree`, and only `land` removes: a fold never does, so a lane a review sends back keeps them. Before it asks, it re-reads the kept evidence (over the evidence roots named before the fold and after it) and marks the lane's seed manifest LANDED; after, it checks the directory, git's registration and DssHarness's record (`list-worktree --json`). Anything left is LANDING INCOMPLETE, exit 4; `land` again folds nothing, compares the lane with its own record in the mark, and finishes the removal or names the command that does. No verb folds or applies rows to a lane marked landed, `seed` resets the mark only as the paragraph on `seed` above says, and every verb refuses a lane directory that is not its own registered git worktree](dss-harness.md)
-
-⚠ **THE LANE VERBS RESOLVE THEIR TREE FROM THE PROGRAM'S OWN LOCATION, NOT FROM YOUR
-`cwd` — SINCE P53.** The lane-worktree shell and PowerShell programs of the time and
-`lane-fold.py` each carried a bare `git rev-parse --show-toplevel`, so
-every path they derived was rooted at whichever repository the CALLER happened to be standing
-in. ✔MEASURED in P52 it silently redirected a whole guard run at another repository, and
-✔MEASURED again in P53 it hit the ORCHESTRATOR live: a shell that had drifted into
-`.worktrees/io` made `lane-fold fold io --apply` resolve `…/.worktrees/io/.worktrees/io`.
-⇒ **Closed: the lane verbs' repo root is no longer `cwd`-keyed.** Each verb anchors on its own
-file through the one owner, `.harness-config/runner/actions/owning-tree/owning-tree.py`, and every
-one accepts an explicit **`--repo <path>`** for a caller that genuinely means another tree.
-
-⚠ **DO NOT "IMPROVE" THIS INTO "the tree that owns `.worktrees/`".** The orchestrator proposed
-exactly that in P53 and the lane REFUTED it by measurement: from inside `.worktrees/lw`, the
-main-checkout answer resolves `remove io` onto a LIVE SIBLING LANE'S uncommitted work, where the
-script-anchored answer resolves to a path that does not exist and refuses. It is also wrong for a
-submodule, where `--git-common-dir` names `<super>/.git/modules/<child>` — rooting a removal
-*inside* `.git`. The blast radius inverts; the original predicate was right.
-
-⚠ **THE MAX_PATH BUDGET IS NOW SPENT, NOT SLACK — AND THIS IS THE ONE THING TO CARRY FROM H.0a.**
-Moving from a 10-char root into the repository root costs **46 characters** of the MAX_PATH budget
-on every build path. ✔MEASURED 2026-08-26 in a live lane worktree: the longest build-relative
-suffix is **163 chars**, so `C:/dssp40k` totalled 173 (**87 spare**) and `<repo>/.worktrees/k`
-totals 214 (**46 spare**). It fits — but the margin more than halved, and this repository's test
-names are what dominate that suffix and keep growing.
-⇒ `lane-worktree.py` **refuses by arithmetic** (exit 3) a name whose longest build path would not
-stay under `worktrees.pathLimit`: the lanes' root and the name, `/build/<longest variant>/`, then
-`pathBudgetReserve` and `pathBudgetMargin` — every term read from `.harness-config/config.json`, and
-every term, with how long a name would still fit, named in the refusal. ✔ Its self-test exercises
-both sides: a name ONE character over the exact budget is refused, one character shorter is admitted. ⏳ SCRIPT-ERA (superseded 2026-09-24: `dssharness create-worktree` applies the same budget from .harness-config/config.json and caps a name at worktrees.maxNameLength, 10 characters; see dss-harness.md)
-⇒ **Keep lane names SHORT** — `k`, `l`, `rod`. A descriptive name spends the margin that protects
-the next long test name.
-
-⚠ **`.gitignore`'s `/.worktrees/` rule is what keeps lane checkouts off every gate host**, and it
-is a REQUIREMENT, not tidiness. Since 2026-08-26 the carriages derive their exclude list from git
-(and `sync.neverTransfer` in `.harness-config/config.json` names it a second time), so that one
-line is what stops four full repo copies riding to
-macOS and the arm64 VPS on every push — and a gate host holding one runs somebody's uncommitted
-`examples/` corpus and reports it as the cycle's. It is therefore ALSO pinned in that script's
-`MUST_NEVER_TRAVEL` floor, which re-asks git and **refuses the carriage** if the rule is edited
-away. ✔The floor's refusal arm is exercised: removing the one line makes it exit 3, naming
-`.worktrees/`. ⏳ SCRIPT-ERA (superseded 2026-09-24: the carriage is `dssharness sync`, whose floor is sync.neverTransfer in .harness-config/config.json; see dss-harness.md)
-⚠ The anchoring (`/.worktrees/`, not `worktrees/`) is deliberate — a bare glob would match a
-future `examples/**/worktrees/` fixture, and this repo has already paid for an unanchored rule.
+⚠ **The ignore rules are what keep checkouts off every gate host**, and they are a REQUIREMENT, not
+tidiness. `dssharness init` writes them in the CONTENTS shape — `/.worktrees/*` from `worktrees.root` and
+the fixed `/.orchestrators/*`, each beside a tracked `.gitkeep` — and names either directory it finds as a
+link, writing nothing through it; the carriage, `dssharness sync`, withholds both directories by NAME
+(DOCUMENTED, `dssharness help layout`). ✔MEASURED 2026-09-29: a `sync --dry-run` from the main checkout, with
+an agent's worktree open, listed no path below either directory — one host, WSL. A gate host holding a checkout runs somebody's
+uncommitted `examples/` corpus and reports it as the cycle's.
 
 ✔**MEASURED, so the move is not a hope:** a real 2,792-file worktree at `.worktrees/probe` moved
 **zero** of the 16 runnable registered guards — identical verdict and output volume before and
 after — and `git status` reported **0 lines** for it.
 
-⚠ **And read a build's exit code from the PROCESS, not from the tail of a pipeline.** The same run
-reported `EXIT=0` over that failure because `$LASTEXITCODE` after a PowerShell pipeline is the LAST
+⚠ **And read a build's exit code from the PROCESS, not from the tail of a pipeline.** A run once
+reported `EXIT=0` over a failed build because `$LASTEXITCODE` after a PowerShell pipeline is the LAST
 command's — `Select-String`'s — not `cmake`'s. An instrument that reports success over a failed build
 is the same class as a red-on-disable whose mutant never compiled in.
 
 - **Any experiment whose whole point is that bytes change** — byte-neutrality probes, red-on-disable
-  mutants, "what does the corpus look like if…" — runs in a `git worktree`, never in the shared tree.
-  The lane hands back a `git apply --check`-verified **patch**; the main loop decides whether it lands.
+  mutants, "what does the corpus look like if…" — runs in a worktree, never in the shared tree: a lane's own
+  agent worktree, or a plain probe worktree. What lands in the main tree lands through the fold, or as a
+  verified patch the main loop decides on.
+  ★ **A red-on-disable ARM changes no tree at all**: `dssharness check-mutations` applies the mutation in a
+  WORKER COPY it keeps beside the tree (`<tree>.mutation-<key>w-<n>`, a whole copy with a whole build, synced
+  by content before every sweep), so a sweep may be run on a lane's worktree and on the main checkout alike.
+  A worker's path is twenty characters longer than its tree's; the workers go with their tree —
+  `delete-agent` and `delete-worktree` remove those kept beside it, `clean` a leg's with its build directory.
+  The hand-applied mutant, which does change a tree, remains only for the one class of mutant the installed
+  tool refuses as an arm (mutation-arms.md).
 - ⚠ **A revert is not a safe undo once a concurrent lane has edited the same file.** Copying a
   pristine copy back destroys the other lane's interleaved work. Reverse-apply the specific patch
   (`git apply -R`), or leave it and report.
@@ -250,7 +167,7 @@ is the same class as a red-on-disable whose mutant never compiled in.
   that lane could not see, **tell the lane**. An unexplained tree mutation is otherwise indistinguishable
   from a defect, and a careful lane will spend real effort investigating it.
 
-A worktree spawned for a cycle (an implementation agent, an independent audit, a probe) is
+A worktree spawned for a cycle (a lane's agent, an independent audit, a probe) is
 the **same repo on the same machine** as root. It must therefore run with the **same
 permissions root already has** and **never re-prompt** for what root trusts. This is
 non-negotiable: a worktree that stalls or spams permission prompts is an operational defect,
@@ -261,13 +178,15 @@ not the user's job to click through. Enforce it on both layers:
    **`Bash(*)` AND `PowerShell(*)`** (on Windows, cmake/ctest builds run through PowerShell —
    `Bash(*)` alone leaves every worktree *build* command prompting and being approved one at a
    time). If a tool starts prompting inside a worktree, add its `(*)` blanket entry to root's
-   settings rather than approving individual commands; the worktree inherits it immediately.
-2. **Sandbox — agents disable it for trusted build/VCS commands.** Any worktree/agent prompt
-   that is *not* an allowlist miss is the **sandbox** flagging a write outside the Windows
-   workspace root (typically the agent's WSL `/home`/`/tmp` build dirs). Spawn **every**
-   worktree agent with a standing instruction to pass `dangerouslyDisableSandbox: true` on its
+   settings rather than approving individual commands; the worktree inherits it immediately. A lane
+   also WRITES OUTSIDE its worktree — its work, plans and rows directories under the main checkout's
+   `.orchestrators/` — so the grant must cover that path too.
+2. **Sandbox — subagents disable it for trusted build/VCS commands.** Any permission prompt from a
+   lane's subagent that is *not* an allowlist miss is the **sandbox** flagging a write outside the Windows
+   workspace root (typically the subagent's WSL `/home`/`/tmp` build dirs). Spawn **every**
+   lane subagent with a standing instruction to pass `dangerouslyDisableSandbox: true` on its
    build / compile / `git` / `wsl` commands (trusted repo operations). Bake that line into the
-   agent prompt verbatim — do not rely on the agent inferring it.
+   brief verbatim — do not rely on the subagent inferring it.
 
 **Corollary — prefer the root for fast, sequential, low-risk cycles.** A worktree buys
 parallel isolation; it costs permission friction and (if spawned at a stale base) a slow
@@ -275,5 +194,4 @@ build. When a cycle is *sequential* and *config-shaped* (e.g. a shipped-descript
 re-probe compiles SQLite), run it in the **root**: it inherits root permissions automatically
 and gets the current HEAD's compile-time wins (post the c97 resolver fix, the SQLite re-probe
 is ~seconds, not ~15 minutes). Reserve worktrees for genuinely parallel or higher-risk *code*
-changes — and when you use one, **reset it to the current HEAD** first (worktrees can spawn at
-a stale base like p18), so it too builds fast.
+changes — and a lane's agent is made at the current HEAD by `create-agent`, so it builds fast.

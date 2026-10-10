@@ -318,14 +318,14 @@ struct DSS_EXPORT HirLoweringConfig {
     // to their slot type via the shared `coerce` helper (the same path
     // ordinary VarDecl init / coerce uses). Compound literal `(T){...}`
     // lowers via the same `lowerBraceInit` with the type taken from
-    // the parenthesized prefix — declared via a separate operand-alt
-    // rule (`compoundLiteralRule`) so its lookup is positional and the
-    // engine never branches on language.
+    // the parenthesized prefix. WHICH rules are compound literals is
+    // `semantics.compoundLiterals`' alone (P69: C23 adds a second form,
+    // the storage-class one) — this block used to repeat the one rule as
+    // `compoundLiteralRule`, a second owner of the same fact.
     RuleId      braceInitListRule{};   std::string braceInitListRuleName;
     RuleId      initElementRule{};     std::string initElementRuleName;
     RuleId      designatedFieldRule{}; std::string designatedFieldRuleName;
     RuleId      designatedIndexRule{}; std::string designatedIndexRuleName;
-    RuleId      compoundLiteralRule{}; std::string compoundLiteralRuleName;
 
     // FC2: explicit cast `(T)expr` — the operand-alt rule whose subtree
     // lowers to a core `HirKind::Cast` (explicit flags, NOT Synthetic).
@@ -358,6 +358,9 @@ struct DSS_EXPORT HirLoweringConfig {
     RuleId      vaStartRule{};         std::string vaStartRuleName;
     RuleId      vaArgRule{};           std::string vaArgRuleName;
     RuleId      vaEndRule{};           std::string vaEndRuleName;
+    // P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): `va_copy(dest, src)` → core
+    // `HirKind::VaCopy` [dest, src]. Invalid ⇒ the language has no copy surface.
+    RuleId      vaCopyRule{};          std::string vaCopyRuleName;
 
     // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): the `_Generic` generic
     // selection operand rule (`genericExpr`). A dedicated operand alt (the SizeOf

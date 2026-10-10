@@ -56,7 +56,7 @@ experiment pins the wiring.
 WRITTEN HERE: the tool exited ZERO on a directory that does not exist.
 ✔MEASURED 2026-08-23 at 6dc63be0, from the repo root:
 
-    $ python .harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py build-dbg
+    $ python <this program> build-dbg        (started by hand, as every program was then)
     ninja-deps: SKIP build-dbg -- no build.ninja (not a ninja build dir)
     rc=0
     $ ls -d build-dbg
@@ -88,10 +88,18 @@ described `check()`, which skipped. One code path, one fix, and it is in
 ⇒ the illegitimate case (a stale path silently returning 0) is now unreachable,
 and the legitimate one is visible in the command line that requested it.
 
-Usage:
-    python .harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py [build-dir ...]     # default: build/dbg, else build-dbg, in THIS script's tree
-    python .harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py --allow-non-ninja <dir>
-    python .harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py --self-test
+Usage: `dssharness run check-ninja-deps` -- its steps run `--self-test`, then the leg's own build directory
+(`{buildDir}`, which the runner's `requireBuild` just built). The program's forms:
+    [build-dir ...]                 # default: build/dbg, else build-dbg, in THIS script's tree
+    --allow-non-ninja <dir>         # a directory that is not a ninja build, named on purpose
+    <build-dir> --record=<object>[,<object>...]   # print the record of each object whose path ends so
+    --self-test
+`--record` is the action's step `record`, which has a runner of its own: what ninja holds for an
+object, path by path, in a build directory of the leg's own tree AS IT STANDS -- the reading a red
+entry is judged from. It builds nothing first (a rebuild could replace the very record asked
+for), so the directory is named by hand, relative to the tree. Each `<object>` is the END of one
+object's path and names exactly ONE record, or nothing is printed for any.
+    dssharness run check-ninja-deps-record --legs <leg> --input build=build/<processor>-<toolchain>-<config> --input object=<the end of an object's path> -v
 
 The default is TRANSITION-SAFE by design. The repo is moving to a single build
 root (`build/<name>`; see .claude/skills/dss-cycle/references/build-layout.md), and
@@ -194,22 +202,67 @@ def allowed(obj):
 # leg stayed green, because the premise only ever held for them.
 #
 # ★★ THE REPAIR IS A CHECKED PROPERTY, NOT A PATH ALLOWLIST, and the allowlist
-# above stays EMPTY. On a `deps = msvc` tree a zero record is excused ONLY for an
-# object whose own source carries no `#include` directive at all — read out of the
-# source, per object, every run. An msvc object whose source DOES include
-# something and records zero is still a hard FAIL: that is the lost record this
-# tool exists to catch, and it is still caught.
+# above stays EMPTY. On a `deps = msvc` tree a zero record is the CORRECT record of
+# an object exactly when the compiler listed no header ninja's reader keeps — and
+# that is read out of the tree, per object, every run (`msvc_zero_record`):
+#   * the unit's own `#include` lines are read from its source;
+#   * each is looked up where the unit's own command line looks — beside the source
+#     for the quoted form, then every include directory the edge states;
+#   * a header found there is a header the record MUST name, unless the precompiled
+#     header the edge names already read it (its own record names it): the compiler
+#     does not list again what the precompiled state already holds;
+#   * a header found in none of them is the toolchain's own, which ninja's reader of
+#     `/showIncludes` does not keep: it drops a path that holds `program files` or
+#     `microsoft visual studio`. That is read off the tree too, twice — the compiler
+#     its `CMakeCache.txt` names must live under such a path, and NO record of the tree
+#     may name a path under one (a single such path and the reader does not drop them
+#     here, whatever any ninja's source says).
+# Anything else — a header of the project the record does not name, an `#include`
+# whose text names no file, a source or a cache that cannot be read, a compiler
+# outside those paths — is the LOST record this tool exists to catch, and still is.
+# ⚠ A HEADER OF THE PROJECT UNDER SUCH A PATH IS NOT EXCUSED, and that is the point:
+# a tree built below `Program Files` has every header dropped, ninja rebuilds nothing
+# on a header's change there, and "all records are empty" is then the defect itself.
+# The toolchain is excused because it is not the project's source; a compiler that
+# moves is caught by the host-compiler stamp every precompiled header includes.
+# ★ THE FIRST RULE WRITTEN HERE EXCUSED ONLY A SOURCE WITH NO `#include` AT ALL, AND
+# THAT WAS A FALSE FAIL. ✔MEASURED 2026-10-10 on an MSVC Release tree of this repo:
+# `1 of 803 objects have ZERO recorded header deps` for a unit whose includes were
+# one header of the shared precompiled header and four standard headers — every one
+# of them answered as above, so its empty record was the correct one, and the entry
+# reddened a leg on a tree that had lost nothing.
+# ✔MEASURED THE SAME DAY, ON THE MSVC LEG, WITH THIS RULE (the action's `record` step
+# for the records, the freshness entry's own line for the verdict):
+#   * the object that makes the tests' precompiled header compiles a source naming
+#     every standard header of the precompiled list and `<gtest/gtest.h>`, with no
+#     precompiled state to hide any of them, and its record is 23 paths: googletest's
+#     21, the build tree's compiler stamp, its own header. Not one standard header.
+#   * `pch_stub.cpp`, which has no include, recorded 0 paths; given five (one the
+#     precompiled header had read, `<vector>` and `<string>` of its list, `<csetjmp>`
+#     and `<clocale>` of no precompiled header) it recorded 0 paths again, and the
+#     entry said `excused: ... of its 5 include(s), 1 the precompiled header its edge
+#     names already read, 4 the toolchain's own` — the convicted shape, on a real tree.
+#   * a test unit with project headers recorded those five and no toolchain path.
+#   On the macOS leg, `deps = gcc`, one unit's record named 896 paths, 869 of them the
+#   toolchain's: the flavours differ exactly as the rule says.
 # ★ AND THE ESCAPE IS DIRECTIONAL: on a `deps = gcc` tree this arm is UNREACHABLE,
 # because `#deps 0` cannot occur there — so nothing is weakened on four of the five
 # CI legs, and the fifth stops reporting a defect its tree does not contain.
-# ⓘ THE PCH IS NOT A HOLE. `rule_id.cpp.obj`'s ninja edge carries
+# ⓘ THE PCH IS NOT A HOLE. An object's ninja edge carries
 # `| …/cmake_pch.hxx …/cmake_pch.cxx.pch` as EXPLICIT implicit inputs, so ninja
 # rebuilds it when the PCH moves from the BUILD GRAPH, never from `.ninja_deps`.
 # A zero deps record cannot cost that rebuild. ✔Read out of the generated
-# `build.ninja` at the same commit.
+# `build.ninja`.
 _NINJA_INCLUDE = re.compile(r"^\s*(?:include|subninja)\s+(.+?)\s*$")
 _NINJA_DEPS_MODE = re.compile(r"^\s*deps\s*=\s*(\w+)\s*$")
 _INCLUDE_DIRECTIVE = re.compile(r"^\s*#\s*include\b")
+_INCLUDE_NAMED = re.compile(r'^\s*#\s*include\s*(?:<([^>\n]+)>|"([^"\n]+)")')
+_CACHE_COMPILER = re.compile(r"^CMAKE_(?:C|CXX)_COMPILER:[A-Z]+=(.+)$")
+_COMMAND_WORD = re.compile(r'(?:[^\s"]|"[^"]*")+')
+# What ninja's `deps = msvc` reader calls a system header and does not record.
+_NINJA_DROPS = ("program files", "microsoft visual studio")
+# The spellings a command line states an include directory with, longest first.
+_INCLUDE_DIR_FLAGS = ("-external:I", "/external:I", "-imsvc", "/imsvc", "-isystem", "-I", "/I")
 
 
 def _ninja_unescape(tok):
@@ -271,47 +324,297 @@ def _sep(p):
     return p.replace("\\", "/")
 
 
-def object_sources(manifest_text):
-    """object path -> first explicit input of its `build` edge (the source).
+def _key(build_dir, p):
+    """One spelling for a path of the build: absolute, with this host's separators and case.
 
-    Keyed on the separator-normalised spelling, so the `ninja -t deps` side and
-    the `build.ninja` side cannot disagree — see `_sep`.
+    Three writers spell one file three ways — `build.ninja` relative with backslashes
+    (and a `.\\\\` before a precompiled header's product), `ninja -t deps` relative with
+    forward slashes, a command line absolute — and every lookup below is between two of
+    them. A path that is not absolute is the build directory's.
     """
-    sources = {}
+    p = _sep(p)
+    if not os.path.isabs(p):
+        p = os.path.join(build_dir, p)
+    return os.path.normcase(os.path.normpath(p))
+
+
+def _ninja_words(text):
+    """The words of a manifest line: split at spaces, a `$`-escaped character taken as itself."""
+    out, cur, i = [], [], 0
+    while i < len(text):
+        c = text[i]
+        if c == "$" and i + 1 < len(text):
+            cur.append(text[i + 1])
+            i += 2
+            continue
+        if c == " ":
+            if cur:
+                out.append("".join(cur))
+                cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def edges(manifest_text, build_dir):
+    """output (as `_key` spells it) -> its `build` edge.
+
+    An edge is `{"rule", "outputs", "inputs", "implicit", "vars"}`: its explicit inputs
+    (the first is a compile edge's source), the implicit ones after `|` (where CMake
+    states a precompiled header), and the variables bound under it (`INCLUDES`, `FLAGS`).
+    Order-only inputs and validations are no input of the question asked here.
+    """
+    table, current = {}, None
     for line in manifest_text.splitlines():
-        if not line.startswith("build "):
-            continue
-        head, sep, rest = line[len("build "):].partition(": ")
-        if not sep:
-            continue
-        # outputs before ": ", then `RULE input input… | implicit… || order…`
-        outs = [_ninja_unescape(t) for t in head.split(" ") if t]
-        tail = rest.split(" ")
-        ins = []
-        for tok in tail[1:]:
-            if tok in ("|", "||"):
-                break
-            if tok:
-                ins.append(_ninja_unescape(tok))
-        if not ins:
-            continue
-        for o in outs:
-            sources.setdefault(_sep(o), ins[0])
-    return sources
+        if line.startswith("build "):
+            current = None
+            head, sep, rest = line[len("build "):].partition(": ")
+            if not sep:
+                continue
+            outs = [w for w in _ninja_words(head) if w != "|"]
+            tail = _ninja_words(rest)
+            if not tail:
+                continue
+            explicit, implicit, where = [], [], 0
+            for word in tail[1:]:
+                if word == "|":
+                    where = 1
+                elif word in ("||", "|@"):
+                    where = 2
+                elif where == 0:
+                    explicit.append(word)
+                elif where == 1:
+                    implicit.append(word)
+            current = {"rule": tail[0], "outputs": outs, "inputs": explicit,
+                       "implicit": implicit, "vars": {}}
+            for o in outs:
+                table.setdefault(_key(build_dir, o), current)
+        elif current is not None and line[:1] in (" ", "\t") and "=" in line:
+            name, _, value = line.strip().partition("=")
+            current["vars"][name.strip()] = value.strip()
+        else:
+            current = None
+    return table
 
 
-def source_has_include(path):
-    """True when the file carries a `#include` directive — or cannot be read.
+def parse_records(text):
+    """object (as `ninja -t deps` spells it) -> the paths its record names.
 
-    ⚠ UNREADABLE READS AS *HAS INCLUDES*, deliberately: the caller uses this only
-    to EXCUSE a zero record, so the direction of any doubt must be to refuse the
-    excuse and fail loud.
+    The same header line `parse` counts by; the indented lines under it are the record.
     """
+    records, current = {}, None
+    for line in text.splitlines():
+        m = _HEADER.match(line)
+        if m:
+            current = records.setdefault(m.group("obj"), [])
+        elif current is not None and line[:1] in (" ", "\t") and line.strip():
+            current.append(line.strip())
+        else:
+            current = None
+    return records
+
+
+def include_directories(edge):
+    """The directories an edge's own command line searches, in the order it states them,
+    each in `_sep`'s spelling.
+
+    ⚠ THE SPELLING IS NOT COSMETIC. A manifest written on Windows states a directory with
+    backslashes, and read on a host where a backslash is an ordinary character the
+    directory names nothing: every header it holds is then "found in no directory of the
+    command line" and counted as the toolchain's own -- a LOST record excused. ✔MEASURED
+    2026-10-10 on the macOS leg, the self-test's own MSVC-shaped tree: three cases red,
+    each saying `0 the precompiled header ..., 3 the toolchain's own`.
+    """
+    dirs = []
+    for name in ("INCLUDES", "FLAGS"):
+        words = [w.replace('"', "") for w in _COMMAND_WORD.findall(edge["vars"].get(name, ""))]
+        i = 0
+        while i < len(words):
+            for flag in _INCLUDE_DIR_FLAGS:
+                if words[i].startswith(flag):
+                    d = words[i][len(flag):]
+                    if not d and i + 1 < len(words):
+                        i += 1
+                        d = words[i]
+                    if d:
+                        dirs.append(_sep(d))
+                    break
+            i += 1
+    return dirs
+
+
+def toolchain_headers_are_dropped(build_dir, records):
+    """-> (True, "") when ninja's `deps = msvc` reader records none of this tree's
+    toolchain headers, else (False, why not). `records` is every record of the tree.
+
+    Two facts, both read on the tree. The toolchain's headers live under the compiler's
+    own installation, and the tree's `CMakeCache.txt` names the compiler: it must lie
+    under a path the reader drops. And the reader must in fact drop such paths HERE: one
+    record of this tree that names a path under them refutes it, whatever any ninja's
+    source says. ⚠ ANY DOUBT REFUSES: no cache, no compiler line, one compiler outside
+    those paths, or one such recorded path, and a header found in no directory of the
+    command line is NOT excused — on such a tree its path would have been recorded, so
+    an empty record lost it.
+    """
+    kept = sorted({d for deps in records.values() for d in deps
+                   if any(word in d.lower() for word in _NINJA_DROPS)})
+    if kept:
+        return (False, f"{len(kept)} path(s) the records of this tree name lie under a path "
+                       f"ninja's reader of `/showIncludes` is taken to drop (the first: "
+                       f"{kept[0]}), so on this tree a toolchain header IS recorded")
+    try:
+        text = (Path(build_dir) / "CMakeCache.txt").read_text(encoding="utf-8",
+                                                              errors="replace")
+    except OSError:
+        return (False, "the tree has no readable CMakeCache.txt to name its compiler")
+    compilers = [m.group(1).strip()
+                 for m in (_CACHE_COMPILER.match(line) for line in text.splitlines()) if m]
+    if not compilers:
+        return (False, "the tree's CMakeCache.txt names no compiler")
+    for c in compilers:
+        if not any(word in c.lower() for word in _NINJA_DROPS):
+            return (False, f"the tree's compiler is {c}, under no path ninja's reader of "
+                           f"`/showIncludes` drops, so its headers are recorded")
+    return (True, "")
+
+
+def msvc_zero_record(obj, build_dir, table, records, toolchain):
+    """Is `#deps 0` the CORRECT record of this object of a `deps = msvc` tree?
+
+    -> (True, what answers every include) | (False, what the record lost). The rule is
+    the block above `_NINJA_INCLUDE`; every doubt is a refusal. `table` is `edges()`'s,
+    `records` is `parse_records()`'s keyed by `_key`, `toolchain` is
+    `toolchain_headers_are_dropped()`'s answer.
+    """
+    edge = table.get(_key(build_dir, obj))
+    if edge is None or not edge["inputs"]:
+        return (False, "the manifest names no source for it")
+    src = _sep(edge["inputs"][0])
+    path = src if os.path.isabs(src) else os.path.join(build_dir, src)
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return any(_INCLUDE_DIRECTIVE.match(line) for line in fh)
+            lines = fh.readlines()
     except OSError:
-        return True
+        return (False, f"its source {src} cannot be read")
+    named = []
+    for line in lines:
+        if not _INCLUDE_DIRECTIVE.match(line):
+            continue
+        m = _INCLUDE_NAMED.match(line)
+        if not m:
+            return (False, f"{src} holds an `#include` whose text names no file "
+                           f"({line.strip()[:60]})")
+        named.append((m.group(1) or m.group(2), m.group(2) is not None))
+    if not named:
+        return (True, f"{src} carries no `#include` directive")
+    # What the precompiled header(s) this edge names already read: the record of the
+    # object that makes each one (CMake states the product as a phony name of it).
+    in_pch = set()
+    for implicit in edge["implicit"]:
+        if not _sep(implicit).lower().endswith(".pch"):
+            continue
+        maker = table.get(_key(build_dir, implicit))
+        if maker is None:
+            continue
+        for made in (maker["inputs"] if maker["rule"] == "phony" else maker["outputs"]):
+            in_pch.update(_key(build_dir, d) for d in records.get(_key(build_dir, made), ()))
+    dirs = [d if os.path.isabs(d) else os.path.join(build_dir, d)
+            for d in include_directories(edge)]
+    from_pch = from_toolchain = 0
+    for name, quoted in named:
+        places = ([os.path.dirname(path)] if quoted else []) + dirs
+        found = next((os.path.join(d, name) for d in places
+                      if os.path.isfile(os.path.join(d, name))), None)
+        if found is None:
+            if not toolchain[0]:
+                return (False, f"{src} includes {name}, which no directory of its command "
+                               f"line holds, and {toolchain[1]}")
+            from_toolchain += 1
+        elif _key(build_dir, found) in in_pch:
+            from_pch += 1
+        else:
+            return (False, f"{src} includes {name}, which is {_sep(found)}: a header the "
+                           f"record must name, and neither it nor the record of a "
+                           f"precompiled header the edge names does")
+    return (True, f"{src}: of its {len(named)} include(s), {from_pch} the precompiled "
+                  f"header its edge names already read, {from_toolchain} the toolchain's own")
+
+
+def zero_records(build_dir, manifest_text, deps_text, objs):
+    """-> ([(object, what excuses it)], [(object, what its record lost)]) for the
+    zero-record objects `objs` of one build directory.
+
+    ★ ONE FUNCTION FOR THE REAL PATH AND THE SELF-TEST: `check()` hands it what
+    `ninja -t deps` printed, the self-test a text of the same shape, and both read the
+    same manifest, sources and cache from a directory.
+    ★ THE ESCAPE IS DIRECTIONAL, AND DECIDED HERE: only a tree whose every `deps =` rule is
+    `msvc` can hold a correct zero record. With one `deps = gcc` rule in the manifest no
+    object is judged at all -- each stays lost, nothing said for it -- so a gcc tree pays
+    nothing and can never be excused.
+    """
+    modes = deps_modes(manifest_text)
+    if "msvc" not in modes or "gcc" in modes:
+        return [], [(o, "") for o in objs]
+    table = edges(manifest_text, build_dir)
+    records = {_key(build_dir, o): deps for o, deps in parse_records(deps_text).items()}
+    toolchain = toolchain_headers_are_dropped(build_dir, records)
+    excused, lost = [], []
+    for o in objs:
+        ok, why = msvc_zero_record(o, build_dir, table, records, toolchain)
+        (excused if ok else lost).append((o, why))
+    return excused, lost
+
+
+def select_record(records, wanted):
+    """-> the objects of `records` whose path ends with `wanted`, in either separator's spelling."""
+    want = _sep(wanted)
+    return [o for o in records if want and _sep(o).endswith(want)]
+
+
+def record(build_dir, wanted):
+    """Print what ninja recorded for each object asked for; returns an exit code.
+
+    `wanted` is one or more ENDS of an object's path as `ninja -t deps` spells it, separated
+    by commas. An end that matches no record, or more than one, is FATAL with what matched,
+    and then NOTHING is printed for any of them: a record printed for the wrong object reads
+    exactly like the right one. Each path is printed as recorded, and the count says how
+    many lie under a path ninja's `deps = msvc` reader drops -- on a tree where the rule
+    holds that figure is zero for every object, however many toolchain headers it includes.
+    """
+    verdict, message = target_verdict(build_dir, False)
+    if verdict != "run":
+        print(message)
+        return 2
+    try:
+        r = subprocess.run(["ninja", "-C", str(build_dir), "-t", "deps"],
+                           capture_output=True, text=True, timeout=600)
+    except FileNotFoundError:
+        print("ninja-deps: FATAL -- `ninja` is not on PATH; nothing was read")
+        return 2
+    except subprocess.TimeoutExpired:
+        print(f"ninja-deps: FATAL -- `ninja -t deps` timed out in {build_dir}")
+        return 2
+    records = parse_records(r.stdout)
+    chosen = []
+    for end in wanted.split(","):
+        hits = select_record(records, end)
+        if len(hits) != 1:
+            print(f"ninja-deps: FATAL -- {len(hits)} of the {len(records)} object(s) ninja holds a "
+                  f"record for in {build_dir} end with {end!r}, and each end asked for names ONE "
+                  f"record" + (": " + ", ".join(hits[:8]) if hits else "") + ". Nothing was printed.")
+            return 2
+        chosen.append(hits[0])
+    for obj in chosen:
+        deps = records[obj]
+        dropped = [d for d in deps if any(word in d.lower() for word in _NINJA_DROPS)]
+        print(f"ninja-deps: RECORD {obj} -- {len(deps)} path(s), {len(dropped)} of them under "
+              f"a path ninja's reader of `/showIncludes` drops")
+        for d in deps:
+            print(f"    {d}")
+    return 0
 
 
 def target_verdict(build_dir, allow_non_ninja):
@@ -377,26 +680,14 @@ def check(build_dir, allow_non_ninja=False):
     flagged = [o for o in empty if not allowed(o)]
 
     # ── the `deps = msvc` arm (see the block above `_NINJA_INCLUDE`) ──────────
-    # Reached ONLY when the manifest declares `deps = msvc` AND something was
-    # flagged, so a gcc tree pays nothing and can never enter it.
-    msvc_excused = []
+    # Asked ONLY when something was flagged; `zero_records` itself judges nothing
+    # unless every `deps =` rule of the manifest is `msvc`.
+    msvc_excused, why_lost = [], {}
     if flagged:
-        manifest = _ninja_manifest_text(build_dir)
-        modes = deps_modes(manifest)
-        if "msvc" in modes and "gcc" not in modes:
-            srcs = object_sources(manifest)
-            still = []
-            for o in flagged:
-                src = srcs.get(_sep(o))
-                if src is None:
-                    still.append(o)          # cannot name its source -> fail loud
-                    continue
-                p = src if os.path.isabs(src) else os.path.join(build_dir, src)
-                if source_has_include(p):
-                    still.append(o)
-                else:
-                    msvc_excused.append((o, src))
-            flagged = still
+        msvc_excused, lost = zero_records(build_dir, _ninja_manifest_text(build_dir),
+                                          r.stdout, flagged)
+        flagged = [o for o, _why in lost]
+        why_lost = {o: why for o, why in lost if why}
 
     if flagged:
         print(f"ninja-deps: FAIL {build_dir} -- {len(flagged)} of {total} objects "
@@ -404,7 +695,9 @@ def check(build_dir, allow_non_ninja=False):
               f"header they include changes, so any gate run here proves nothing "
               f"about the current source.")
         for o in flagged[:40]:
-            print(f"    {o}")
+            # On a `deps = msvc` tree each is said with what its record lost: an
+            # object refused there was judged, not merely counted.
+            print(f"    {o}" + (f"  -- {why_lost[o]}" if o in why_lost else ""))
         if len(flagged) > 40:
             print(f"    … and {len(flagged) - 40} more")
         print("  FIX: delete the listed objects and rebuild, e.g.\n"
@@ -420,24 +713,39 @@ def check(build_dir, allow_non_ninja=False):
     # was read from. An excusal nobody can see is the silent skip this file refuses
     # everywhere else.
     if msvc_excused:
-        note += (f" ({len(msvc_excused)} excused: `deps = msvc` records HEADERS ONLY, "
-                 "and these sources carry no `#include` directive, so a zero record is "
-                 "the correct record)")
+        note += (f" ({len(msvc_excused)} excused: `deps = msvc` records only the headers "
+                 "the compiler lists and ninja's reader keeps, and every `#include` of "
+                 "these sources is answered by the precompiled header its edge names or "
+                 "by the toolchain's own directories, so a zero record is the correct "
+                 "record)")
     print(f"ninja-deps: OK {build_dir} -- {total} objects, all carry header deps{note}")
-    for o, src in msvc_excused[:40]:
-        print(f"    excused: {o}  <- {src}")
+    for o, why in msvc_excused[:40]:
+        print(f"    excused: {o}  <- {why}")
     return 0
 
 
-# ── self-tests: the parser and the verdict rule, pinned ──────────────────────
+# ── self-tests: the parser and the verdict rules, pinned — ONE VERDICT LINE PER ARM ──
+# ★ THE OUTPUT IS A CONTRACT, read by tests/harness/test_ninja_deps_selftest.cpp:
+#     ninja-deps self-test: ok      <the arm's name>
+#     ninja-deps self-test: FAILED  <the arm's name> -- <what failed>
+# and one closing line, `ninja-deps self-test: OK (<n> arm(s))` or `... FAIL (...)`.
+# That test holds a case per arm and refuses an arm it has no case for, so an arm added
+# here is added there. It is what lets a mutation of THIS program be an arm of the
+# mutation sweep, which judges the exact cases a mutation reddens: a self-test with one
+# verdict for everything has no cases to judge.
 def self_test():
-    fails = []
+    arms = {}          # arm name -> what failed in it, in the order the arms ran
+
+    def arm(name):
+        """The problems of the arm `name`. Naming an arm is what gives it a verdict line."""
+        return arms.setdefault(name, [])
 
     def case(name, text, want_total, want_empty):
+        problems = arm(name)
         got_total, got_empty = parse(text)
         if (got_total, got_empty) != (want_total, want_empty):
-            fails.append(f"{name}: got ({got_total}, {got_empty}), "
-                         f"want ({want_total}, {want_empty})")
+            problems.append(f"got ({got_total}, {got_empty}), "
+                            f"want ({want_total}, {want_empty})")
 
     case("a healthy record is counted and not flagged",
          "src/a.cpp.obj: #deps 42, deps mtime 1 (VALID)\n    x.hpp\n", 1, [])
@@ -462,6 +770,24 @@ def self_test():
     case("empty input parses as zero objects, which the caller treats as FATAL",
          "", 0, [])
 
+    # The record reader is the same header line, with what stands under it.
+    problems = arm("a record's own lines are read under its object, and under no other")
+    got = parse_records("a.obj: #deps 2, deps mtime 1 (VALID)\n    x.hpp\n    y.hpp\n\n"
+                        "b.obj: #deps 0, deps mtime 1 (VALID)\n\n"
+                        "c.obj: #deps 1, deps mtime 1 (VALID)\n    z.hpp\n")
+    want = {"a.obj": ["x.hpp", "y.hpp"], "b.obj": [], "c.obj": ["z.hpp"]}
+    if got != want:
+        problems.append(f"got {got!r}, want {want!r}")
+
+    # ... and ONE record is asked for by the end of its object's path.
+    problems = arm("one record is named by the end of its object's path, in either "
+                   "separator's spelling")
+    for wanted, want in (("b.obj", ["t/b.obj"]), ("t\\b.obj", ["t/b.obj"]), (".obj", ["t/a.obj", "t/b.obj"]),
+                         ("c.obj", []), ("", [])):
+        got = select_record({"t/a.obj": [], "t/b.obj": ["x.hpp"]}, wanted)
+        if got != want:
+            problems.append(f"{wanted!r} selected {got!r}, want {want!r}")
+
     # ── the TARGET-RESOLUTION verdict, which had no pin at all until 2026-08-23
     # and was WRONG in the one direction that matters.
     # ★ Driven through `check()` as well as `target_verdict`, because the defect
@@ -480,10 +806,10 @@ def self_test():
         (Path(ninja) / "build.ninja").write_text("# marker\n", encoding="utf-8")
 
         def verdict_case(name, path, allow, want_kind, want_rc, says):
+            problems = arm(name)
             kind, msg = target_verdict(path, allow)
             if kind != want_kind or says not in msg:
-                fails.append(f"{name}: got ({kind!r}, {msg!r}), want {want_kind!r} "
-                             f"saying {says!r}")
+                problems.append(f"got ({kind!r}, {msg!r}), want {want_kind!r} saying {says!r}")
             if kind != "run":
                 # ⚠ `check()`'s own print is CAPTURED here. A self-test that emits
                 # the word FATAL five times on its way to OK teaches the reader to
@@ -494,10 +820,10 @@ def self_test():
                 with _ctx.redirect_stdout(_buf):
                     rc = check(path, allow)
                 if rc != want_rc:
-                    fails.append(f"{name}: check() returned {rc}, want {want_rc}")
+                    problems.append(f"check() returned {rc}, want {want_rc}")
                 if says not in _buf.getvalue():
-                    fails.append(f"{name}: check() printed {_buf.getvalue()!r}, "
-                                 f"which does not say {says!r}")
+                    problems.append(f"check() printed {_buf.getvalue()!r}, "
+                                    f"which does not say {says!r}")
 
         verdict_case("a MISSING directory is FATAL, never a skip", missing, False,
                      "fatal", 2, "does not exist")
@@ -505,72 +831,156 @@ def self_test():
                      missing, True, "fatal", 2, "does not exist")
         verdict_case("a directory with no build.ninja is FATAL by default",
                      empty, False, "fatal", 2, "no build.ninja")
-        verdict_case("... and a reported SKIP only when it was ASKED for",
-                     empty, True, "skip", 0, "--allow-non-ninja was passed")
+        verdict_case("a directory with no build.ninja is a reported SKIP only when it "
+                     "was ASKED for", empty, True, "skip", 0, "--allow-non-ninja was passed")
         verdict_case("a real ninja tree is RUN", ninja, False, "run", 0, "")
 
         # ── the `deps = msvc` excusal, pinned in BOTH directions ─────────────
         # ★ Written as a REMOVE-direction fixture: the manifest below is the one a
-        # real MSVC tree emits, and each case removes the property that earns the
-        # excusal rather than adding one that grants it
-        # ([[feedback-a-fixture-must-synthesize-the-negative]]).
+        # real MSVC tree emits, and each LOST case removes one property the excused
+        # unit had rather than adding one that would grant the excuse.
+        # ★ THE TREE IS THE SHAPE CMake's Ninja generator WRITES FOR MSVC, read off a
+        # real one: objects and the precompiled header's products relative with
+        # backslashes, the product a phony name of the object that makes it (spelt
+        # with a `.\\` the edges that use it do not have), the header and the product
+        # as implicit inputs, include directories as `-I` and `-external:I`.
         msvc_dir = Path(_tmp) / "msvctree"
-        (msvc_dir / "src").mkdir(parents=True)
-        (msvc_dir / "src" / "no_includes.cpp").write_text(
-            '// a comment that merely SAYS #include, which is not a directive\n'
-            'static_assert(true, "x");\n', encoding="utf-8")
-        (msvc_dir / "src" / "has_includes.cpp").write_text(
-            "#include <vector>\nint f();\n", encoding="utf-8")
+        for sub in ("src", "inc/core", "ext/include/gtest", "pch"):
+            (msvc_dir / sub).mkdir(parents=True)
+        (msvc_dir / "inc" / "core" / "mine.hpp").write_text("int mine();\n", encoding="utf-8")
+        (msvc_dir / "ext" / "include" / "gtest" / "gtest.h").write_text(
+            "int gtest();\n", encoding="utf-8")
+        (msvc_dir / "src" / "beside.hpp").write_text("int beside();\n", encoding="utf-8")
+        sources = {
+            "no_includes.cpp": '// a comment that merely SAYS #include, which is not a directive\n'
+                               'static_assert(true, "x");\n',
+            # THE UNIT THE FIRST RULE FAILED: one header of the precompiled header and
+            # the toolchain's own, in both spellings of the directive.
+            "all_answered.cpp": "#include <gtest/gtest.h>\n#include <vector>\n# include <string>\n",
+            "toolchain_only.cpp": "#include <vector>\nint f();\n",
+            "own_header.cpp": '#include <gtest/gtest.h>\n#include "core/mine.hpp"\n',
+            "beside.cpp": '#include <gtest/gtest.h>\n#include "beside.hpp"\n',
+            "unnamed.cpp": "#include <gtest/gtest.h>\n#include DSS_SOME_HEADER\n",
+        }
+        for name, text in sources.items():
+            (msvc_dir / "src" / name).write_text(text, encoding="utf-8")
+        uses_pch = r" | pch\cmake_pch.hxx pch\cmake_pch.cxx.pch || order" + "\n"
+        searches = r"  INCLUDES = -Iinc -external:Iext\include -external:W0" + "\n"
         (msvc_dir / "build.ninja").write_text(
             "include rules.ninja\n"
-            "build a.obj: CXX src/no_includes.cpp | pch.hxx || order\n"
-            "build b.obj: CXX src/has_includes.cpp\n", encoding="utf-8")
+            + r"build pch\.\\cmake_pch.cxx.pch: phony pch\cmake_pch.cxx.obj" + "\n"
+            + r"build pch\cmake_pch.cxx.obj: CXX pch\cmake_pch.cxx" + "\n" + searches
+            + "build a.obj: CXX src/no_includes.cpp" + uses_pch
+            + r"build t\all_answered.obj: CXX src/all_answered.cpp" + uses_pch + searches
+            + r"build t\no_pch.obj: CXX src/all_answered.cpp || order" + "\n" + searches
+            + r"build t\toolchain_only.obj: CXX src/toolchain_only.cpp" + "\n"
+            + r"build t\own_header.obj: CXX src/own_header.cpp" + uses_pch + searches
+            + r"build t\beside.obj: CXX src/beside.cpp" + uses_pch + searches
+            + r"build t\unnamed.obj: CXX src/unnamed.cpp" + uses_pch + searches,
+            encoding="utf-8")
         (msvc_dir / "rules.ninja").write_text(
             "rule CXX\n  command = cl\n  deps = msvc\n", encoding="utf-8")
+        cache = msvc_dir / "CMakeCache.txt"
+        in_program_files = ("CMAKE_CXX_COMPILER:FILEPATH=C:/Program Files/Microsoft Visual "
+                            "Studio/18/x/VC/Tools/MSVC/14/bin/Hostx64/x64/cl.exe\n")
+        cache.write_text(in_program_files, encoding="utf-8")
+        # What `ninja -t deps` prints: the precompiled header's own record names the
+        # header it read; every object under test carries a zero record.
+        pch_reads = ("pch/cmake_pch.cxx.obj: #deps 2, deps mtime 1 (VALID)\n"
+                     "    ext/include/gtest/gtest.h\n    pch/cmake_pch.hxx\n\n")
+        pch_reads_nothing = ("pch/cmake_pch.cxx.obj: #deps 1, deps mtime 1 (VALID)\n"
+                             "    pch/cmake_pch.hxx\n\n")
 
-        def msvc_case(name, objs, want_flagged, want_excused):
+        def msvc_case(name, obj, deps_text, want_excused, says):
+            problems = arm(name)
             m = _ninja_manifest_text(str(msvc_dir))
             if deps_modes(m) != {"msvc"}:
-                fails.append(f"{name}: deps_modes read {deps_modes(m)!r}, want {{'msvc'}}")
-            srcs = object_sources(m)
-            flagged, excused = [], []
-            for o in objs:
-                s = srcs.get(_sep(o))
-                if s is None or source_has_include(str(msvc_dir / s)):
-                    flagged.append(o)
-                else:
-                    excused.append(o)
-            if flagged != want_flagged or excused != want_excused:
-                fails.append(f"{name}: flagged={flagged!r} excused={excused!r}, "
-                             f"want flagged={want_flagged!r} excused={want_excused!r}")
+                problems.append(f"deps_modes read {deps_modes(m)!r}, want {{'msvc'}}")
+            excused, lost = zero_records(
+                str(msvc_dir), m, deps_text + f"{obj}: #deps 0, deps mtime 1 (VALID)\n", [obj])
+            got = excused if want_excused else lost
+            other = lost if want_excused else excused
+            if [o for o, _w in got] != [obj] or other or says not in got[0][1]:
+                problems.append(f"excused={excused!r} lost={lost!r}, want it "
+                                f"{'excused' if want_excused else 'lost'} saying {says!r}")
 
-        msvc_case("an msvc zero-dep TU with NO #include is excused",
-                  ["a.obj"], [], ["a.obj"])
-        msvc_case("an msvc zero-dep TU that DOES #include still FAILS",
-                  ["b.obj"], ["b.obj"], [])
-        msvc_case("an object the manifest cannot name a source for still FAILS",
-                  ["ghost.obj"], ["ghost.obj"], [])
-        # THE DIRECTIONAL HALF: a gcc manifest must not reach the arm at all.
+        # THE EXCUSED SIDE.
+        msvc_case("msvc: a zero record of a unit with NO #include is excused",
+                  "a.obj", pch_reads, True, "carries no `#include` directive")
+        msvc_case("msvc: a zero record is excused when the precompiled header and the "
+                  "toolchain answer every include", "t/all_answered.obj", pch_reads, True,
+                  "of its 3 include(s), 1 the precompiled header its edge names already "
+                  "read, 2 the toolchain's own")
+        msvc_case("msvc: a zero record is excused for the toolchain's headers alone, on an "
+                  "edge with no precompiled header", "t/toolchain_only.obj", pch_reads,
+                  True, "of its 1 include(s), 0 the precompiled header")
+        # THE LOST SIDE — each case REMOVES one property the excused unit had.
+        msvc_case("msvc: a header of the project the precompiled header did not read is a "
+                  "LOST record", "t/own_header.obj", pch_reads, False,
+                  "includes core/mine.hpp")
+        msvc_case("msvc: a header beside the source is found there, and LOST",
+                  "t/beside.obj", pch_reads, False, "includes beside.hpp")
+        msvc_case("msvc: an #include whose text names no file is refused, not guessed",
+                  "t/unnamed.obj", pch_reads, False, "names no file")
+        msvc_case("msvc: the same source on an edge that names NO precompiled header is "
+                  "LOST", "t/no_pch.obj", pch_reads, False, "includes gtest/gtest.h")
+        msvc_case("msvc: a header the precompiled header's own record does not name is "
+                  "LOST", "t/all_answered.obj", pch_reads_nothing, False,
+                  "includes gtest/gtest.h")
+        cache.write_text("CMAKE_CXX_COMPILER:FILEPATH=C:/BuildTools/VC/bin/cl.exe\n",
+                         encoding="utf-8")
+        msvc_case("msvc: a compiler outside the paths ninja's reader drops excuses no "
+                  "toolchain header", "t/toolchain_only.obj", pch_reads, False,
+                  "under no path ninja's reader")
+        cache.unlink()
+        msvc_case("msvc: a tree whose cache cannot name its compiler excuses no toolchain "
+                  "header", "t/toolchain_only.obj", pch_reads, False,
+                  "no readable CMakeCache.txt")
+        cache.write_text(in_program_files, encoding="utf-8")
+        # The reader's own rule is read off the tree, never trusted: ONE record that names a
+        # path under the compiler's installation, and no toolchain header is excused.
+        kept = ("t/elsewhere.obj: #deps 1, deps mtime 1 (VALID)\n"
+                "    C:/Program Files/Microsoft Visual Studio/18/x/VC/Tools/MSVC/14/include/vector\n\n")
+        msvc_case("msvc: a tree whose records name a path the reader is taken to drop excuses "
+                  "no toolchain header", "t/toolchain_only.obj", pch_reads + kept, False,
+                  "a toolchain header IS recorded")
+        msvc_case("msvc: an object the manifest cannot name a source for still FAILS",
+                  "ghost.obj", pch_reads, False, "names no source")
+        # THE DIRECTIONAL HALF, ON THE SAME TREE: one `deps = gcc` rule beside the msvc
+        # one, and the unit the first case excused is excused no longer -- nor judged.
+        (msvc_dir / "rules.ninja").write_text(
+            "rule CXX\n  command = cl\n  deps = msvc\n"
+            "rule CC\n  command = gcc\n  deps = gcc\n", encoding="utf-8")
+        problems = arm("msvc: on a tree that also declares deps = gcc, no zero record is excused")
+        excused, lost = zero_records(
+            str(msvc_dir), _ninja_manifest_text(str(msvc_dir)),
+            pch_reads + "a.obj: #deps 0, deps mtime 1 (VALID)\n", ["a.obj"])
+        if excused or lost != [("a.obj", "")]:
+            problems.append(f"excused={excused!r} lost={lost!r}, want a.obj lost and unjudged")
+        # ... and a gcc manifest is not read as an msvc one in the first place.
+        problems = arm("a gcc manifest is not read as declaring deps = msvc")
         gcc_dir = Path(_tmp) / "gcctree"
         gcc_dir.mkdir()
         (gcc_dir / "build.ninja").write_text(
             "rule CXX\n  command = g++\n  deps = gcc\n"
             "build a.o: CXX src/no_includes.cpp\n", encoding="utf-8")
         if "msvc" in deps_modes(_ninja_manifest_text(str(gcc_dir))):
-            fails.append("a gcc manifest was read as declaring deps = msvc")
+            problems.append("it was read as declaring deps = msvc")
         # AND A MIXED TREE IS NOT AN MSVC TREE: the guard keeps its full strength
         # wherever any gcc-flavoured rule is present.
+        problems = arm("a manifest of both flavours is read as both")
         (gcc_dir / "build.ninja").write_text(
             "rule CXX\n  command = g++\n  deps = gcc\n"
             "rule RC\n  command = rc\n  deps = msvc\n", encoding="utf-8")
         _mixed = deps_modes(_ninja_manifest_text(str(gcc_dir)))
         if not ("msvc" in _mixed and "gcc" in _mixed):
-            fails.append(f"a mixed manifest read as {_mixed!r}, want both flavours")
+            problems.append(f"read as {_mixed!r}, want both flavours")
     finally:
         import shutil as _shutil
         _shutil.rmtree(_tmp, ignore_errors=True)
+        problems = arm("the self-test's temporary tree is removed")
         if Path(_tmp).exists():
-            fails.append("self-test temp tree was not removed")
+            problems.append("it is still there")
 
     # ── THE DEFAULT TREE IS THE ONE THIS FILE LIVES IN; AN EXPLICIT ONE STILL WINS ──
     # Arms, oracle and synthesized negatives are owned by .harness-config/runner/actions/owning-tree/owning-tree.py.
@@ -584,18 +994,26 @@ def self_test():
         return d
     for ok, why, detail in _owning_tree().root_arms(_default_tree, (SystemExit,), False,
                                                     __file__):
+        problems = arm(f"default build tree: {why}")
         if not ok:
-            fails.append(f"default build tree: {why} [{detail}]")
+            problems.append(detail)
+    problems = arm("an EXPLICIT build-tree argument wins over the default")
     if build_dirs(["x/explicit-tree", "--allow-non-ninja"]) != ["x/explicit-tree"]:
-        fails.append("an EXPLICIT build-tree argument did not win over the default")
+        problems.append("the default was taken")
 
-    if fails:
-        print("ninja-deps self-test: FAIL")
-        for f in fails:
-            print("   ", f)
+    failed = 0
+    for name, problems in arms.items():
+        if problems:
+            failed += 1
+            # ONE line per arm whatever a problem holds: the reader of these lines is a program.
+            said = "; ".join(problems).replace("\r", " ").replace("\n", " ")
+            print(f"ninja-deps self-test: FAILED  {name} -- {said}")
+        else:
+            print(f"ninja-deps self-test: ok      {name}")
+    if failed:
+        print(f"ninja-deps self-test: FAIL ({len(arms)} arm(s), {failed} failed)")
         return 1
-    print("ninja-deps self-test: OK (7 parser cases, 5 target-verdict cases, "
-          "5 deps=msvc excusal cases, 3 default-tree cases, 1 explicit-tree case)")
+    print(f"ninja-deps self-test: OK ({len(arms)} arm(s))")
     return 0
 
 
@@ -669,8 +1087,10 @@ def build_dirs(argv):
 def main(argv):
     if "--self-test" in argv:
         return self_test()
+    wanted = [a[len("--record="):] for a in argv if a.startswith("--record=")]
     unknown = [a for a in argv
-               if a.startswith("-") and a not in ("--self-test", "--allow-non-ninja")]
+               if a.startswith("-") and not a.startswith("--record=")
+               and a not in ("--self-test", "--allow-non-ninja")]
     if unknown:
         print("ninja-deps: FATAL -- unknown argument(s): %s. Refusing to run rather "
               "than silently ignoring a flag the caller believed in."
@@ -678,6 +1098,14 @@ def main(argv):
         return 2
     allow_non_ninja = "--allow-non-ninja" in argv
     dirs = build_dirs(argv)
+    if wanted:
+        # The objects of ONE named directory: the default tree is never guessed for a reading.
+        named = [a for a in argv if not a.startswith("-")]
+        if len(wanted) != 1 or len(named) != 1 or allow_non_ninja:
+            print("ninja-deps: FATAL -- `--record=<object>[,<object>...]` is written once, reads "
+                  "ONE build directory named on the command line, and takes no other option.")
+            return 2
+        return record(named[0], wanted[0])
     worst = 0
     for d in dirs:
         worst = max(worst, check(d, allow_non_ninja))

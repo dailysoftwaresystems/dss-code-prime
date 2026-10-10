@@ -1,0 +1,2 @@
+        if (activeFormat_.has_value()) {
+            cb.libraryFunctionProvided =

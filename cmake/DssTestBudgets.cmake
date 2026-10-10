@@ -47,8 +47,8 @@
 #   the arm64 VPS's Debug and Release trees. linux-clang-asan is `sanitized`; the
 #   four CI release legs and every local or VPS Release tree are `release`; every
 #   Debug tree is `debug`.
-#   ⚠ TWO BLIND SPOTS IN THAT POPULATION, both ✔MEASURED since (the rows re-derived below,
-#   from lane_worktree_guard on). A cost-data AVERAGE is not a ceiling: it is a running mean
+#   ⚠ TWO BLIND SPOTS IN THAT POPULATION, both ✔MEASURED since (the rows re-derived below the
+#   note on two retired lane rows). A cost-data AVERAGE is not a ceiling: it is a running mean
 #   over every run a tree ever made, so it lags a suite that grew and sits below every loaded
 #   run. And no source above was a run under this workstation's everyday load, several lanes
 #   building and testing at once, where an entry that starts processes runs several times
@@ -120,10 +120,26 @@ set(_DSS_TB_UNIT_debug 35)
 # "<entry>|<sanitized>|<release>|<debug>" — each the entry's own ceiling in whole
 # seconds, the maximum over every measured run of that class (sources above).
 set(_DSS_TB_NAMED
-    "program/test_emit_hir_round_trips_every_example|1536|218|308"
+    # ★ NINE ROWS RE-DERIVED 2026-10-08 (cycle P69) FROM FULL-SUITE RUNS UNDER A ROUND'S LOAD -- the
+    # population a gate runs on: four lanes' legs on the host at once (the Windows suite took 2391 s
+    # against 1917 s the same morning). Each passed its row in a PASSING run, so the row was the stale
+    # one. ✔MEASURED, the slower of two full-suite runs of that day where two were read (MinGW Debug
+    # / MSVC Release; AppleClang Debug where it was the slower):
+    #   program/test_emit_hir_round_trips_every_example  765.0-773.1 s debug, 429.0-435.2 s release
+    #     (it grows with the corpus: one round trip per example);
+    #   conformance/test_reference_conformance           309.7 s debug, 107.2 s release;
+    #   analysis/semantic/test_fc3_width_semantics_shuffled  357.8 s debug (371.2 s AppleClang Debug);
+    #   program/test_runtime_cache_wiring                81.5-99.1 s debug, 68.9-84.2 s release;
+    #   program/test_compile_pipeline                    84.35-87.02 s debug, 52.42-91.16 s release (nine
+    #     cases added that day compile each layout pair twice; their owner shares the compiles next);
+    #   program/test_ffi_resolve_library                 70.2-89.3 s debug, 58.0-70.0 s release;
+    #   program/test_static_link 38.5 s, program/test_dependency_resolver 42.7 s,
+    #   program/test_project_config 37.8 s -- debug.
+    # No sanitized figure was measured (only CI builds that class): every row keeps its own.
+    "program/test_emit_hir_round_trips_every_example|1536|436|774"
     "hir/test_frontend_deep_nesting_costs_heap|1501|36|200"
     "mir/test_deep_nesting_costs_heap|904|22|146"
-    "conformance/test_reference_conformance|607|75|182"
+    "conformance/test_reference_conformance|607|108|310"
     "analysis/preprocess/test_preprocessor_shuffled|354|163|489"
     "analysis/semantic/test_semantic_analyzer_c_shuffled|441|140|273"
     "analysis/semantic/test_semantic_analyzer_c|435|60|85"
@@ -131,54 +147,28 @@ set(_DSS_TB_NAMED
     "hir/test_hir_lowering_c|359|29|59"
     "analysis/syntactic/test_parser_speculation_ceilings|357|5|55"
     "plan_citations_guard|304|345|107"
-    "analysis/semantic/test_fc3_width_semantics_shuffled|186|97|334"
+    "analysis/semantic/test_fc3_width_semantics_shuffled|186|97|372"
     "core/test_deep_type_layout_costs_heap|280|8|37"
     "mir/test_mir_lowering_c|251|26|49"
-    "program/test_runtime_cache_wiring|244|48|57"
+    "program/test_runtime_cache_wiring|244|85|100"
     "analysis/preprocess/test_preprocessor|214|11|38"
     "core/test_key_shape_and_text_tier_vocabulary|190|10|36"
     "core/test_config_closed_key_vocabulary|177|7|33"
-    "program/test_compile_pipeline|145|23|32"
-    "program/test_ffi_resolve_library|141|25|32"
+    "program/test_compile_pipeline|145|92|88"
+    "program/test_ffi_resolve_library|141|71|90"
     "core/test_grammar_loader_chain_vocabulary_projection|134|5|24"
-    "program/test_static_link|129|17|27"
-    "program/test_dependency_resolver|119|12|24"
+    "program/test_static_link|129|17|39"
+    "program/test_dependency_resolver|119|12|43"
     "analysis/semantic/test_type_identity_vocabulary|112|8|19"
     "link/test_descriptor_library_role_agreement|105|14|20"
-    # ★★ lane_worktree_guard: THE ROW WAS MEASURED ON THE WRONG POPULATION, AND THE SUITE DID
-    # NOT GET SLOWER. It read `|37|104|33`, and the entry was green only on a quiet machine
-    # (✔MEASURED: 315.40 s Timeout in a -j8 repo-guard run, 314.64 s in the round-6 gate).
-    #   · The suite is UNCHANGED since the row was derived: `test-lane-worktree.sh` differs by
-    #     2 lines between e8dbc3c5 (2026-09-15) and 7df54cc1, its subject only by a printed hint.
-    #   · It GREW EIGHTFOLD before that: 113 lines, 2 assertions and no PowerShell on
-    #     2026-09-02; 932 lines, 133 assertions and 46 `pwsh` starts from 2026-09-15.
-    #   · The debug 33 came from ctest's cost data, a RUNNING AVERAGE over every run the tree
-    #     ever made -- the main tree's MinGW Debug average is 24.78 s over 68 runs, most of them
-    #     the 113-line predecessor. An average over two programs is a measurement of neither.
-    #   · The release 104 sat BELOW that class's own average: 117.68 s over 8 MSVC Release runs.
-    # ⇒ RE-DERIVED from healthy runs of the CURRENT suite, Windows being the slowest host in
-    #   both classes (each of its ~50 arm groups is a real `git worktree add` + guarded
-    #   `remove`; one `pwsh` start costs 0.99 s through the .NET-tool shim, ✔MEASURED):
-    #   debug  -- 114.99 s (lane il), 139.66 s (round-6, alone), 192.44 s (the main tree's
-    #             MinGW Debug gate, 2026-09-17), 243.87 s (lane mig, under a -j12 build): 244;
-    #   release -- the 117.68 s average bounds the slowest run from below, last run 110.87 s: 118.
-    #   sanitized 37 (CI linux-clang-asan) is unaffected: Linux starts processes cheaply.
-    "lane_worktree_guard|37|118|244"
-    # ★ AND A NEIGHBOUR OF THE SAME SHAPE, NAMED BY THIS MODULE'S OWN TIER RULE ("every
-    # non-corpus entry whose ceiling passed 60 s on some class"), never named because no
-    # Windows gate log was read for it. ✔MEASURED 2026-09-18, Windows MinGW Debug, a -j8
-    # repo-guard run, PASSING: lane_fold_selftest_guard 220.45 s (37 s standalone). Unmeasured
-    # classes take the unit ceilings, below which no named row is ever budgeted.
-    # ⓘ Its 2026-09-18 neighbour `leg_tree_guard` (179.38 s) retired with its subject on
-    # 2026-09-21 (lane mig, part 4: the bash tree helper became part of `owning-tree.py`,
-    # proved by `owning_tree_selftest_guard`), and its row left with it.
-    # ✔MEASURED 2026-09-29 (P68's PR exit, lane `lf`: the self-test went from 93 to 135 pins, its
-    # landing arms driving the real `dssharness delete-worktree` and `list-worktree`), repo-guard
-    # runs of both Windows legs at once, PASSING: 81.44 then 86.04 s MinGW Debug, 82.31 then
-    # 87.08 s MSVC Release (134, then 135 pins) -- 87.08 s the slowest release run measured
-    # (2026-09-28's took 44.59-54.62 s), above its unit ceiling: 88. Debug stays
-    # 221 (the loaded 2026-09-18 run is still the slowest); sanitized stays unmeasured.
-    "lane_fold_selftest_guard|53|88|221"
+    # ⓘ `lane_worktree_guard` AND `lane_fold_selftest_guard` HAD ROWS HERE, GONE WITH THEIR SUBJECTS
+    # (2026-09-29: DssHarness's orchestrator verbs replaced both lane programs). The lesson each
+    # taught stays in the header's population note: the first's debug 33 was ctest's cost-data
+    # AVERAGE, and it timed out at 315 s in a loaded repo-guard run -- a ROW MEASURED ON THE WRONG
+    # POPULATION; the second went without a row although this module's own tier rule names every
+    # non-corpus entry whose ceiling passed 60 s on some class, and a passing Windows MinGW Debug
+    # repo-guard run took 220.45 s, because no Windows gate log had been read for it. The entries
+    # below are that class.
     # ★★ THE SAME CLASS AGAIN, THREE MORE ENTRIES. link/test_coff_object_reader,
     # link/test_pe_object_data_import_slot and core/test_include_path_rooted_resolution each
     # hit (Timeout) at 315 s in one -j10 full run on 2026-09-18, beside another lane's build,
@@ -232,10 +222,22 @@ set(_DSS_TB_NAMED
     #   ceilings, like every entry that never needed its own.
     "link/test_coff_object_reader|18|89|34"
     "link/test_pe_object_data_import_slot|14|71|33"
+    # ★ link/test_common_symbols: NAMED 2026-10-08 (cycle P69, lane xa), when the suite gained its
+    # weak-name cells, each of which asks the leg's reference linkers the same question. ✔MEASURED
+    # in full-suite runs: MinGW Debug 161.45 s with one reference arm (linux-arm64 146 s,
+    # macos-arm64 142 s, linux-x86_64 46 s); MinGW Release 104.29 s with three reference arms on
+    # PATH (81.29 s with the leg's own one). It read 20.24 / 14.90 s before those cells. Sanitized
+    # is NOT measured -- no run of that class has read it -- and takes the unit ceiling until one does.
+    # ★ DEBUG RE-DERIVED 2026-10-10 (cycle P69, lane xa's second fold: 59 cases where there were 41,
+    # and native cells under both of Apple's linkers). ✔MEASURED in full-suite runs that passed:
+    # macos-arm64 Debug 256.5 s, linux-arm64 Debug 163.0 s, MinGW Debug 157.5 s with three reference
+    # arms and 218.39 s with four lanes' finals on the host, linux-x86_64 Debug 51.4 s. Release
+    # stays under its ceiling: MSVC Release 53.7 s, 76 s beside other lanes' builds.
+    "link/test_common_symbols|53|105|257"
     "core/test_type_kind_vocabulary_projection|103|4|17"
     "analysis/semantic/test_fc3_width_semantics|96|6|19"
     "analysis/preprocess/test_preprocess_no_rework|94|5|18"
-    "program/test_project_config|84|11|15"
+    "program/test_project_config|84|11|38"
     "orphan_tests_guard|7|76|15"
     "lir/test_mir_to_lir|76|8|16"
     # ★ harness/test_sqlite_harness_legs: RE-DERIVED 2026-09-22 (lane mig, part 4), when its pins were

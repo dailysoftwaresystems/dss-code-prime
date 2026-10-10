@@ -161,6 +161,7 @@ TEST(MachOCodeSignPlaceholder, NonMultipleOfEightRejectedAtLoad) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -202,6 +203,7 @@ TEST(MachOCodeSignPlaceholder, ZeroAcceptedAsDisabled) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -263,6 +265,7 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsNonZeroCodeSigSize) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -330,6 +333,7 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsTakesPrecedenceOverBindNow) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -386,6 +390,7 @@ TEST(MachOCodeSignPlaceholder, DynamicPathEmitsLcCodeSignatureWithZeroReservatio
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -505,6 +510,7 @@ TEST(MachOCodeSignPlaceholder, ZeroSizeOmitsLcCodeSignature) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -831,6 +837,7 @@ TEST(MachOCodeSignPlaceholder, AdHocBlockAlongsideHandTypedSizeRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -864,6 +871,7 @@ TEST(MachOCodeSignPlaceholder, AdHocBlockAlongsideHandTypedSizeRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -899,6 +907,7 @@ TEST(PeCertPlaceholder, NonMultipleOfEightRejectedAtLoad) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": {
         "magic": 523, "imageBase": 5368709120,
@@ -976,6 +985,7 @@ TEST(PeCertPlaceholder, WalkerEmitsSecurityDirAndZeroReservation) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "entryPoint": "",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": {
@@ -1048,6 +1058,7 @@ TEST(PeExecFormatJsonValidate,
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 0, "type": "exec" },
       "optionalHeader": {
         "magic": 523, "imageBase": 5368709120,
@@ -1081,6 +1092,9 @@ TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {
     // cert table with the IAT — the Windows loader would still
     // load the image, but the imports would silently corrupt at
     // first call (or Authenticode signing would corrupt the IAT).
+    // P69: the document declares the `dynamic` row, because `.idata`'s name
+    // and Characteristics come from it (design c2 made it read-only —
+    // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB).
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
@@ -1096,6 +1110,7 @@ TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "entryPoint": "",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": {
@@ -1109,7 +1124,8 @@ TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {
         "attributeCertReserveSize": 2048
       },
       "sections":[
-        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
+        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096},
+        {"kind":"dynamic","name":".idata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}
       ],
       "relocationAddends": "inPlace",
       "inputSectionPlacement": "unit",

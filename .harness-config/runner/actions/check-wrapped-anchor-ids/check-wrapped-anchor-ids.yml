@@ -12,3 +12,36 @@ steps:
       python3 ./check-wrapped-anchor-ids.py
     successPattern: 'wrapped-anchor-ids selftest: OK'
     requireInputsUnmoved: true
+
+  # The self-test ALONE, without verifying the tree -- `dssharness run check-wrapped-anchor-ids --manual-step self-test`:
+  # the instrument's arms read while the tree itself is red, or while a mutant is being read.
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-wrapped-anchor-ids.py --selftest
+    successPattern: '^wrapped-anchor-ids selftest: OK \(\d+ arm\(s\), 0 failure\(s\)\)'
+    requireInputsUnmoved: true
+
+  # The BURN-DOWN verb: it may only LOWER a ceiling -- a TREE WRITER, run only where a run names it: `dssharness run check-wrapped-anchor-ids-write`, the runner that runs it on
+  # ONE leg, this machine's own tree (config.json). It moves a tracked file by design, so it cannot carry
+  # requireInputsUnmoved; a plain run afterwards verifies.
+
+  - name: write
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-wrapped-anchor-ids.py --write
+    successPattern: '^wrapped-anchor-ids: re-baselined \d+ file\(s\)'
+
+  # The verb that establishes NEW ground: it CAN RAISE a ceiling, and says so -- a TREE WRITER, run only where a run names it: `dssharness run check-wrapped-anchor-ids-baseline`, the runner that runs it on
+  # ONE leg, this machine's own tree (config.json). It moves a tracked file by design, so it cannot carry
+  # requireInputsUnmoved; a plain run afterwards verifies.
+
+  - name: baseline
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-wrapped-anchor-ids.py --baseline
+    successPattern: '^wrapped-anchor-ids: BASELINED \d+ file\(s\)'

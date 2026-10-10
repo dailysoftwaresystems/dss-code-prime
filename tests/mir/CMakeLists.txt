@@ -62,13 +62,6 @@ dss_add_test(NAME mir/test_thin_lto_artifact_identity
 dss_add_test(NAME mir/test_overlap_struct_zero_init
              SOURCES test_overlap_struct_zero_init.cpp)
 
-# D-FFI-PE-CRT-UCRT-MIGRATION Phase 3 — synthesizeStdioShim's va_list ARM
-# SELECTION, pinned at the operand the synthesized call forwards. Separate from
-# test_mir_merge (which pins the shim's SHAPE) because the two HomogeneousPointer
-# arms produce structurally identical bodies: only the leaf differs, and picking
-# the wrong one is a silent wrong-ABI forward on apple_arm64.
-dss_add_test(NAME mir/test_synth_stdio_shim_valist SOURCES test_synth_stdio_shim_valist.cpp)
-
 # D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS — the three
 # operand/payload-carrying `.dssir` forms whose writer out-ran its reader, plus
 # the class guard for the next one. Its own binary because the pre-fix behaviour
@@ -152,8 +145,9 @@ dss_add_test(NAME mir/test_synth_threads_mtx_type
              SOURCES test_synth_threads_mtx_type.cpp)
 
 # P68 round 11 (D-LK-SYNTHESIZED-LIBRARY-BODY-DEFINED-STRONG-IN-EVERY-UNIT) — the synthesis-once
-# rule: every body `synthesizeStdioShim` / `synthesizeThreadsShim` defines is Weak + Hidden, so
-# the copies separately compiled units carry collapse to one per image.
+# rule: every body `synthesizeThreadsShim` defines is Weak + Hidden, so the copies separately
+# compiled units carry collapse to one per image. (P69 retired the stdio pass it also covered:
+# the pe printf family is DSS's runtime source, one archive member per image.)
 dss_add_test(NAME mir/test_synth_shim_collapse_linkage
              SOURCES test_synth_shim_collapse_linkage.cpp)
 
@@ -188,3 +182,27 @@ dss_add_test(NAME mir/test_mir_try_accessors
 # real (target, format) pair, through the driver's own `buildCuMir`/`assembleUnit`.
 dss_add_test(NAME mir/test_static_pointer_cast_chain
              SOURCES test_static_pointer_cast_chain.cpp)
+
+# P69 rounds 4 and 5 lane `lm` — THE MODULE'S SYMBOL-ID SPACE AND ITS ONE DOOR
+# (`Mir::symbolIdEnd`, `MirBuilder::mintSymbol`, mir/merge/synth_symbol_floor.hpp):
+# HIR→MIR's literal objects, the optimizer's zero constant, the entry-shape init, the
+# SEH funclets and the threads helper imports are all minted by the module, past every
+# id the name table it was made from holds, so no synthesized symbol is published
+# under a name the table gives to something else or shares an id with an import (an
+# x86_64 Linux image published its init as `__func__`; a release build minted its
+# zero constant on an import's id). The door, a unit lowered with no table, pass
+# arms, single-CU pipeline arms at both configurations, and two source scans (no
+# counted SymbolId under src/mir or src/opt; every module builder states or continues
+# its ids). The merged route's statement is pinned in test_mir_merge.cpp.
+dss_add_test(NAME mir/test_synth_symbol_floor
+             SOURCES test_synth_symbol_floor.cpp)
+
+# D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE, the door's CARRIER (P69):
+# whether a module's symbol-id end was ever STATED or is only counted — what states
+# it and what does not, `finish`, a move, every rebuild, the frozen module's
+# continuation and the `.dssir` reader each carrying the fact, and both leaves dying
+# by name past a counted end. A binary of its own because the refusal is an abort:
+# no case here mints from a module before asserting its fact, so a mutation of the
+# carrier reddens named cases instead of killing the process.
+dss_add_test(NAME mir/test_symbol_id_end_is_stated
+             SOURCES test_symbol_id_end_is_stated.cpp)

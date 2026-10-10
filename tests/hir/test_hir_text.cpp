@@ -115,7 +115,7 @@ TEST(HirText, EmitMinimalModule) {
     HirTextContext ctx;  // no interner/symbols needed for an empty module
     DiagnosticReporter r;
     std::string const text = emitHir(hir, ctx, r);
-    EXPECT_NE(text.find("dsshir 6\nproducer \"\"\n"), std::string::npos);
+    EXPECT_NE(text.find("dsshir 8\nproducer \"\"\n"), std::string::npos);
     EXPECT_NE(text.find("module \"toy\" {"), std::string::npos);
     expectRoundTrip(hir, ctx);
 }
@@ -248,7 +248,7 @@ TEST(HirText, MalformedLiteralValuesFailLoud) {
     // never silently default. Pins the bool/overflow/unknown-tag guards.
     auto parseFails = [](std::string_view body) {
         std::string const text =
-            std::string("dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+            std::string("dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                         "  function %1 : fn() -> void {\n    block {\n      expr ")
             + std::string(body) + "\n      return void\n    }\n  }\n}\n";
         DiagnosticReporter r;
@@ -317,6 +317,115 @@ TEST(HirText, RoundTripReadModifyWrite) {
     EXPECT_NE(text.find("rmw %"), std::string::npos) << text;
     EXPECT_NE(text.find("\"old\""), std::string::npos)
         << "the read-modify-write's binding must be in the symbol table\n" << text;
+}
+
+// P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): `unnamed <storage> :
+// <type> (<init>)` round-trips with each of the three storage durations BY NAME, and a
+// storage spelling outside the set is refused naming the set — an unnamed object read
+// back as the wrong storage would be placed on the wrong side of the stack/static line.
+// RED-ON-DISABLE: drop the reader's `Unnamed` arm → it refuses its own writer's keyword.
+TEST(HirText, RoundTripUnnamedObjectEveryStorage) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId i32   = in.primitive(TypeKind::I32);
+    TypeId voidT = in.primitive(TypeKind::Void);
+    TypeId sig   = in.fnSig({}, voidT, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    std::vector<HirNodeId> stmts;
+    for (HirObjectStorage st : {HirObjectStorage::Automatic, HirObjectStorage::Static,
+                                HirObjectStorage::Thread}) {
+        HirNodeId init = b.makeLiteral(i32, 0);
+        stmts.push_back(b.makeExprStmt(b.makeUnnamedObject(init, i32, st)));
+    }
+    stmts.push_back(b.makeReturn());
+    HirNodeId body = b.makeBlock(stmts);
+    HirNodeId fn   = b.makeFunction(sig, 1, {}, body);
+    HirNodeId root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    std::string const text = expectRoundTrip(hir, ctx);
+    for (std::string_view spelled : {"unnamed automatic : i32", "unnamed static : i32",
+                                     "unnamed thread : i32"}) {
+        EXPECT_NE(text.find(spelled), std::string::npos) << spelled << "\n" << text;
+    }
+    std::string bad = text;
+    auto const at = bad.find("unnamed static");
+    ASSERT_NE(at, std::string::npos);
+    bad.replace(at, std::string_view{"unnamed static"}.size(), "unnamed stack");
+    DiagnosticReporter r;
+    auto const res = parseHir(bad, CompilationUnitId{1}, r);
+    EXPECT_FALSE(res->ok);
+    bool named = false;
+    for (auto const& d : r.all())
+        if (d.actual.find("unknown unnamed-object storage 'stack'") != std::string::npos
+            && d.actual.find("automatic") != std::string::npos
+            && d.actual.find("thread") != std::string::npos) named = true;
+    EXPECT_TRUE(named) << "an unknown storage spelling must be refused naming the accepted set";
+}
+
+// P69 (D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED): a union aggregate's
+// member index round-trips — `construct #1 :` — and member 0 writes no index at all, so every
+// aggregate written before the member existed reads back byte-identically.
+TEST(HirText, RoundTripUnionAggregateKeepsItsMember) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId i32   = in.primitive(TypeKind::I32);
+    TypeId f32   = in.primitive(TypeKind::F32);
+    TypeId voidT = in.primitive(TypeKind::Void);
+    std::array<TypeId, 2> const variants{i32, f32};
+    TypeId u     = in.unionType("U", variants);
+    TypeId sig   = in.fnSig({}, voidT, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    std::vector<HirNodeId> stmts;
+    stmts.push_back(b.makeExprStmt(
+        b.makeConstructAggregate(std::array{b.makeLiteral(f32, 0)}, u, HirFlags::None, 1)));
+    stmts.push_back(b.makeExprStmt(
+        b.makeConstructAggregate(std::array{b.makeLiteral(i32, 1)}, u, HirFlags::None, 0)));
+    stmts.push_back(b.makeReturn());
+    HirNodeId body = b.makeBlock(stmts);
+    HirNodeId fn   = b.makeFunction(sig, 1, {}, body);
+    HirNodeId root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find("construct #1 :"), std::string::npos) << text;
+    EXPECT_EQ(text.find("construct #0"), std::string::npos)
+        << "member 0 is the default and is not spelled\n" << text;
+}
+
+// P69 (D-C-STDARG-VA-COPY-MISSING): `va_copy` round-trips with both of its operands, in
+// order — a reader that dropped or swapped one would copy the wrong way.
+TEST(HirText, RoundTripVaCopyKeepsItsTwoOperandsInOrder) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId i32   = in.primitive(TypeKind::I32);
+    TypeId voidT = in.primitive(TypeKind::Void);
+    TypeId sig   = in.fnSig({}, voidT, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId dest = b.makeLiteral(i32, 1);
+    HirNodeId src  = b.makeLiteral(i32, 2);
+    std::vector<HirNodeId> stmts;
+    stmts.push_back(b.makeExprStmt(b.makeVaCopy(dest, src, voidT)));
+    stmts.push_back(b.makeReturn());
+    HirNodeId body = b.makeBlock(stmts);
+    HirNodeId fn   = b.makeFunction(sig, 1, {}, body);
+    HirNodeId root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    std::string const text = expectRoundTrip(hir, ctx);
+    auto const at = text.find("va_copy");
+    ASSERT_NE(at, std::string::npos) << text;
+    auto const one = text.find("1", at);
+    auto const two = text.find("2", at);
+    ASSERT_NE(one, std::string::npos) << text;
+    ASSERT_NE(two, std::string::npos) << text;
+    EXPECT_LT(one, two) << "the destination is written first\n" << text;
 }
 
 TEST(HirText, RoundTripTypesAndFlags) {
@@ -554,7 +663,7 @@ TEST(HirText, ParseMalformedEnumReports) {
     // An unrecognized enum name must report, not silently coerce to a default.
     DiagnosticReporter r;
     auto res = parseHir(
-        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  @ffi(link bogus)\n  extern_global %1 : i32\n}\n",
         CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
@@ -566,7 +675,7 @@ TEST(HirText, ParseStuckTokenDoesNotHang) {
     // never spin (regression: the progress guard was dead). Reaching the assert
     // at all proves termination.
     DiagnosticReporter r;
-    auto res = parseHir("dsshir 6\nproducer \"\"\nmodule \"toy\" {\n  $ % :\n}\n", CompilationUnitId{1}, r);
+    auto res = parseHir("dsshir 8\nproducer \"\"\nmodule \"toy\" {\n  $ % :\n}\n", CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextMalformed), 0u);
 }
@@ -580,7 +689,7 @@ TEST(HirText, ParseVersionMismatch) {
 
 TEST(HirText, ParseMalformedReports) {
     DiagnosticReporter r;
-    auto res = parseHir("dsshir 6\nproducer \"\"\nmodule \"x\" {\n  @@@ garbage\n}\n", CompilationUnitId{1}, r);
+    auto res = parseHir("dsshir 8\nproducer \"\"\nmodule \"x\" {\n  @@@ garbage\n}\n", CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextMalformed), 0u);
 }
@@ -589,7 +698,7 @@ TEST(HirText, ParseUnknownSymbolReports) {
     // %9 referenced but only %1 declared.
     DiagnosticReporter r;
     auto res = parseHir(
-        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"a\"\n}\nmodule \"toy\" {\n"
+        "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"a\"\n}\nmodule \"toy\" {\n"
         "  global %9 : i32\n}\n",
         CompilationUnitId{1}, r);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextUnknownName), 0u);
@@ -634,7 +743,7 @@ TEST(HirText, VerifyOnLoadCatchesUntypedExpr) {
 namespace {
 
 std::string moduleWithDecls(std::string_view decls) {
-    return std::string{"dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"}
+    return std::string{"dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"}
          + std::string{decls} + "}\n";
 }
 
@@ -2227,7 +2336,7 @@ TEST(HirText, InlineAsmTemplateWithANewlineStillRoundTripsByteIdentically) {
 // exactly the reason that row exists.
 TEST(HirText, InlineAsmOperandKindThatNamesNoFormIsRefusedWithTheAcceptedSet) {
     std::string const text =
-        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"m\" "
         "operand_kind not_a_form -> lit int 0 : i32 ) }\n"
@@ -2251,7 +2360,7 @@ TEST(HirText, InlineAsmOperandKindThatNamesNoFormIsRefusedWithTheAcceptedSet) {
 // indistinguishable from one analyzed with no target in scope.
 TEST(HirText, InlineAsmImmediateFormOperandSurvivesTheTextTier) {
     std::string const text =
-        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"i\" "
         "operand_kind imm32 -> lit int 7 : i32 ) }\n"
@@ -2281,7 +2390,7 @@ TEST(HirText, InlineAsmImmediateFormOperandSurvivesTheTextTier) {
 // emits and what stored goldens carry. Only the acceptance changed.
 TEST(HirText, InlineAsmRegisterClassOrdinalOutsideTheEnumIsRefused) {
     std::string const text =
-        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"r\" "
         "class 200 -> lit int 0 : i32 ) }\n"
@@ -2301,7 +2410,7 @@ TEST(HirText, InlineAsmRegisterClassOrdinalOutsideTheEnumIsRefused) {
 // and still round-trips its value.
 TEST(HirText, InlineAsmRegisterClassOrdinalInsideTheEnumStillLoads) {
     std::string const text =
-        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"r\" "
         "class 1 -> lit int 0 : i32 ) }\n"
@@ -2405,7 +2514,7 @@ TEST(HirText, ASelfReferentialStructIsOneTableEntryThatNamesItself) {
     // THE WHOLE ARTIFACT, byte for byte: one definition, the self-reference a
     // plain `type 1`, and the signature naming the same handle.
     EXPECT_EQ(text,
-              "dsshir 6\n"
+              "dsshir 8\n"
               "producer \"\"\n"
               "types {\n"
               "  type 1 = struct \"S\" {i32, ptr<type 1>}\n"
@@ -2761,7 +2870,7 @@ TEST(HirText, ATypesEntryOrReferenceTheWriterCannotProduceIsRefusedByName) {
          "  type 1 = struct \"S\" {i32, ptr<rec 1>}\n", "type 1", "DEFINED ONCE"},
     }};
     auto const wrap = [](char const* types, char const* ty) {
-        std::string s{"dsshir 6\nproducer \"\"\n"};
+        std::string s{"dsshir 8\nproducer \"\"\n"};
         if (*types != '\0') s += std::string{"types {\n"} + types + "}\n";
         s += "symbols {\n  %1 \"S\"\n}\nmodule \"toy\" {\n  type_decl %1 : ";
         return s + ty + "\n}\n";
@@ -3071,7 +3180,7 @@ TEST(HirText, AValueLessReturnFollowedByAStatementRoundTripsWithEverySpan) {
 // as the statement it is.
 TEST(HirText, ABareReturnIsRefusedByNameAndNeverTakesTheNextNodeAsItsValue) {
     std::string const head =
-        "dsshir 6\nproducer \"\"\nbuffers {\n  buf 1 \"t.c\"\n}\n"
+        "dsshir 8\nproducer \"\"\nbuffers {\n  buf 1 \"t.c\"\n}\n"
         "symbols {\n  %1 \"g\"\n  %2 \"f\"\n}\nmodule \"toy\" {\n"
         "  extern_function %1 : fn() -> void {\n  }\n"
         "  function %2 : fn() -> void {\n    block {\n";
@@ -3139,7 +3248,7 @@ TEST(HirText, AStatementInAnExpressionSlotIsRefusedByName) {
     for (Arm const& arm : arms) {
         SCOPED_TRACE(arm.what);
         std::string const text =
-            std::string{"dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\n"
+            std::string{"dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\n"
                         "module \"toy\" {\n  function %1 : fn() -> void {\n    block {\n      "}
             + arm.line + "\n      return void\n    }\n  }\n}\n";
         DiagnosticReporter r;
@@ -3374,7 +3483,7 @@ TEST(HirTextDeepNesting, PastTheFormatDepthLimitTheWriterRefusesByNameAndPoisons
 // treatment of `?`, and it does not need the depth to be exercised.
 TEST(HirTextDeepNesting, ThePoisonTokenTheDepthRefusalWritesIsRefusedOnTheWayBackIn) {
     std::string const text =
-        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
+        "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
         "module \"toy\" {\n  ?\n}\n";
     DiagnosticReporter r;
     auto res = parseHir(text, CompilationUnitId{91}, r);
@@ -3382,7 +3491,7 @@ TEST(HirTextDeepNesting, ThePoisonTokenTheDepthRefusalWritesIsRefusedOnTheWayBac
 
     // CONTROL: the identical artifact with a real statement in that slot loads.
     std::string const ok =
-        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
+        "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
         "module \"toy\" {\n  unreachable\n}\n";
     DiagnosticReporter cr;
     auto good = parseHir(ok, CompilationUnitId{92}, cr);
@@ -3413,7 +3522,7 @@ namespace {
 [[nodiscard]] std::string deepChainArtifact(std::size_t depth) {
     std::string s;
     s.reserve(depth * 32 + 256);
-    s += "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
+    s += "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
          "module \"toy\" {\n  function %1 : fn() -> i32 {\n    block {\n      return ";
     for (std::size_t i = 0; i < depth; ++i) s += "binop Add : i32 (";
     s += "lit #0 : i32";

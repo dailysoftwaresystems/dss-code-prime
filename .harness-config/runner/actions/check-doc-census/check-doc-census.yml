@@ -17,7 +17,7 @@ steps:
     workingDirectoryRoot: action
     run: |
       python3 ./check-doc-census.py --selftest
-    successPattern: 'check-doc-census --selftest: PASS'
+    successPattern: '^check-doc-census --selftest: PASS \(\d+ arm\(s\)\)$'
     requireInputsUnmoved: true
   # The REPAIR verb, run only where a run names it -- `dssharness run check-doc-census-write`, the runner that runs
   # it on ONE leg, this machine's own tree (config.json):

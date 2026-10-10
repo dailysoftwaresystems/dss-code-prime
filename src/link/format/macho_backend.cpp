@@ -32,11 +32,14 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/macho.hpp"
 #include "link/format/macho_object_reader.hpp"
+#include "link/format/macho_relocation_info.hpp"
 #include "link/object_format_schema.hpp"
 
 #include "link/object_format_identity_doc.hpp"
 
 #include <algorithm>
+#include <array>     // the closed key sets of the identity blocks
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <limits>
@@ -50,6 +53,23 @@ namespace dss::link::format {
 namespace {
 
 char const* const kMachOBlocks[] = { "macho", "image" };
+
+// P69 (D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY): every block this
+// backend reads has a CLOSED key set — the shared check
+// (`dss::detail::rejectUnknownKeys`, which lets `$` prose through) bound to this
+// loader's sink and `path/key` convention, once for the six blocks below.
+template <std::size_t N>
+void closeBlock(nlohmann::json const&                    block,
+                std::array<std::string_view, N> const&   keys,
+                std::string_view                         path,
+                std::string_view                         label,
+                substrate::DiagnosticCollector&          coll) {
+    ::dss::detail::rejectUnknownKeys(block, keys, label,
+        [&](std::string_view key, std::string message) {
+            coll.emit(DiagnosticCode::C_MalformedJson, std::format("{}/{}", path, key),
+                      std::move(message));
+        });
+}
 
 // D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS. The weak-
 // definition spellings THIS backend's walker writes. One row: `macho.cpp`
@@ -312,6 +332,16 @@ public:
                 coll.emit(DiagnosticCode::C_MalformedJson, "/macho",
                           "'macho' must be an object when format.kind == 'macho'");
             } else {
+                // CLOSED (P69, D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY),
+                // like every block below: a misspelled key loaded clean and
+                // left the field it names at its default.
+                // 4 -> 5 (P69): `differenceRelocations`, the relocation pairs a
+                // reader of this format applies (`MachODifferenceRelocation`).
+                static constexpr std::array<std::string_view, 5> kMachoBlockKeys{
+                    "cputype", "cpusubtype", "flags", "filetype",
+                    "differenceRelocations"};
+                DSS_CHECK_KEY_VOCABULARY(kMachoBlockKeys);
+                closeBlock(m, kMachoBlockKeys, "/macho", "the 'macho' block", coll);
                 auto readU32 = [&](char const* field, std::uint32_t& out) {
                     if (!m.contains(field) || !m.at(field).is_number_integer())
                         return;
@@ -329,6 +359,62 @@ public:
                 readU32("cputype",    data.macho.cputype);
                 readU32("cpusubtype", data.macho.cpusubtype);
                 readU32("flags",      data.macho.flags);
+                // `differenceRelocations` (P69,
+                // D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ): the
+                // (subtrahend, minuend) relocation pairs a reader of this
+                // format applies. This reads the SHAPE; what the rows must BE
+                // is `validateIdentity`'s, so a table built in memory is held
+                // to the same rule.
+                if (m.contains("differenceRelocations")) {
+                    auto const& pairs = m.at("differenceRelocations");
+                    if (!pairs.is_array()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/macho/differenceRelocations",
+                                  "'differenceRelocations' must be an array of "
+                                  "{ subtrahendNativeId, minuendNativeId }");
+                    } else {
+                        static constexpr std::array<std::string_view, 2>
+                            kDifferenceRelocationKeys{
+                                "subtrahendNativeId", "minuendNativeId"};
+                        DSS_CHECK_KEY_VOCABULARY(kDifferenceRelocationKeys);
+                        for (std::size_t i = 0; i < pairs.size(); ++i) {
+                            auto const& e = pairs[i];
+                            auto const path = std::format(
+                                "/macho/differenceRelocations/{}", i);
+                            bool shaped = e.is_object();
+                            for (std::string_view const key : kDifferenceRelocationKeys) {
+                                shaped = shaped && e.contains(key)
+                                      && e.at(key).is_number_integer();
+                            }
+                            if (!shaped) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                          "each entry is { \"subtrahendNativeId\": "
+                                          "<wire id>, \"minuendNativeId\": <wire "
+                                          "id> }");
+                                continue;
+                            }
+                            closeBlock(e, kDifferenceRelocationKeys, path,
+                                       "a differenceRelocations entry", coll);
+                            std::int64_t const sub =
+                                e.at("subtrahendNativeId").get<std::int64_t>();
+                            std::int64_t const min =
+                                e.at("minuendNativeId").get<std::int64_t>();
+                            if (sub < 0 || sub > 0xFFFFFFFFLL || min < 0
+                                || min > 0xFFFFFFFFLL) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                          std::format(
+                                              "subtrahendNativeId ({}) and "
+                                              "minuendNativeId ({}) must each be "
+                                              "in [0, 2^32)", sub, min));
+                                continue;
+                            }
+                            data.macho.differenceRelocations.push_back(
+                                MachODifferenceRelocation{
+                                    static_cast<std::uint32_t>(sub),
+                                    static_cast<std::uint32_t>(min)});
+                        }
+                    }
+                }
                 // `filetype`: closed enum MachOObjectType. Accepts the
                 // string form ("object"/"execute"/"dylib") OR the
                 // integer wire value (1/2/6) for back-compat with
@@ -402,6 +488,11 @@ public:
                 coll.emit(DiagnosticCode::C_MalformedJson, "/image",
                           "'image' must be an object");
             } else {
+                static constexpr std::array<std::string_view, 11> kImageBlockKeys{
+                    "pageZeroSize", "segmentPageSize", "dylinkerPath", "installName",
+                    "loadDylibs", "bindNow", "codeSignatureSize", "useChainedFixups",
+                    "uuid", "codeSignature", "buildVersion"};
+                closeBlock(im, kImageBlockKeys, "/image", "the 'image' block", coll);
                 if (im.contains("pageZeroSize")) {
                     if (!im.at("pageZeroSize").is_number_integer()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
@@ -486,6 +577,11 @@ public:
                             } else if (arr[i].is_object()
                                     && arr[i].contains("path")
                                     && arr[i].at("path").is_string()) {
+                                static constexpr std::array<std::string_view, 1> kDylibRowKeys{
+                                    "path"};
+                                closeBlock(arr[i], kDylibRowKeys,
+                                           std::format("/image/loadDylibs/{}", i),
+                                           "a loadDylibs entry", coll);
                                 data.machoImage.loadDylibs.push_back(
                                     MachODylibRef{arr[i].at("path")
                                                       .get<std::string>()});
@@ -581,6 +677,8 @@ public:
                                   "/image/uuid",
                                   "'uuid' must be an object {derivation}");
                     } else {
+                        static constexpr std::array<std::string_view, 1> kUuidKeys{"derivation"};
+                        closeBlock(uu, kUuidKeys, "/image/uuid", "the 'uuid' block", coll);
                         MachOUuid uid;
                         bool ok = true;
                         // derivation (closed enum; default "content-hash").
@@ -640,6 +738,10 @@ public:
                                   "{kind, hashAlgorithm, pageSize, "
                                   "identifier}");
                     } else {
+                        static constexpr std::array<std::string_view, 4> kSignatureKeys{
+                            "kind", "hashAlgorithm", "pageSize", "identifier"};
+                        closeBlock(cs, kSignatureKeys, "/image/codeSignature",
+                                   "the 'codeSignature' block", coll);
                         MachOCodeSignature sig;
                         bool ok = true;
                         // kind (closed enum; default "adhoc").
@@ -819,6 +921,10 @@ public:
                                   "'buildVersion' must be an object "
                                   "{platform, minOs, sdk}");
                     } else {
+                        static constexpr std::array<std::string_view, 3> kBuildVersionKeys{
+                            "platform", "minOs", "sdk"};
+                        closeBlock(bv, kBuildVersionKeys, "/image/buildVersion",
+                                   "the 'buildVersion' block", coll);
                         // "X.Y" / "X.Y.Z" → (major<<16)|(minor<<8)|patch.
                         // major 16-bit, minor/patch 8-bit each (the
                         // build_version_command field layout).
@@ -977,6 +1083,102 @@ public:
                  "value, e.g. 0x01000007 for x86_64, 0x0100000C for "
                  "arm64)");
         }
+        // `differenceRelocations` (P69,
+        // D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ). A pair names
+        // two WIRE ids. Each is held to the wire as a relocation row's id is
+        // (only r_type, r_length and r_pcrel), is not pc-relative — the reader
+        // applies `minuend - subtrahend + addend` and nothing else — and the
+        // two state ONE width, since they patch one field. The subtrahend's id
+        // decodes to no kind, so no relocation row may claim it — the reverse
+        // map would then read half of a reference as a whole one — and it
+        // names ONE minuend, or the reader's choice would be a
+        // declaration-order coin flip. And only a document a READER is handed
+        // states any: on an image document nothing reads the table, and config
+        // that is parsed and never read reads as authority while it drifts.
+        for (std::size_t i = 0; i < macho.differenceRelocations.size(); ++i) {
+            auto const& p = macho.differenceRelocations[i];
+            auto const path = std::format("/macho/differenceRelocations/{}", i);
+            if (macho.filetype != MachOObjectType::Object) {
+                fail(path,
+                     std::format(
+                         "'differenceRelocations' is read by the object READER, "
+                         "which is handed '{}' documents only; this document's "
+                         "filetype is '{}', so nothing would read the table",
+                         machoObjectTypeName(MachOObjectType::Object),
+                         machoObjectTypeName(macho.filetype)));
+            }
+            auto holdToTheWire = [&](std::uint32_t id, std::string_view key) {
+                if ((id & (dss::macho::kRInfoExternBit
+                           | dss::macho::kRInfoSymbolnumMask)) != 0u) {
+                    fail(std::format("{}/{}", path, key),
+                         std::format(
+                             "'{}' 0x{:08X} sets bits that belong to ONE "
+                             "relocation entry (bit 27 = r_extern, bits 0..23 = "
+                             "r_symbolnum); a wire id packs only r_type, "
+                             "r_length and r_pcrel",
+                             key, id));
+                }
+                if ((id & dss::macho::kRInfoPcrelBit) != 0u) {
+                    fail(std::format("{}/{}", path, key),
+                         std::format(
+                             "'{}' 0x{:08X} is pc-relative (r_pcrel = 1): the "
+                             "difference of two addresses does not depend on "
+                             "where its field is, and the reader applies "
+                             "`minuend - subtrahend + addend` and nothing else",
+                             key, id));
+                }
+            };
+            holdToTheWire(p.subtrahendNativeId, "subtrahendNativeId");
+            holdToTheWire(p.minuendNativeId, "minuendNativeId");
+            if (dss::macho::relocationFieldBytes(p.subtrahendNativeId)
+                != dss::macho::relocationFieldBytes(p.minuendNativeId)) {
+                fail(std::format("{}/minuendNativeId", path),
+                     std::format(
+                         "the two entries of a difference pair patch ONE field, "
+                         "but their wire ids state different widths "
+                         "(subtrahendNativeId {}: {} byte(s); minuendNativeId "
+                         "{}: {} byte(s))",
+                         p.subtrahendNativeId,
+                         dss::macho::relocationFieldBytes(p.subtrahendNativeId),
+                         p.minuendNativeId,
+                         dss::macho::relocationFieldBytes(p.minuendNativeId)));
+            }
+            for (auto const& r : relocations) {
+                bool claims = r.nativeId == p.subtrahendNativeId;
+                for (auto const& e : r.nativeIdByBytesAfterField) {
+                    claims = claims || e.nativeId == p.subtrahendNativeId;
+                }
+                if (claims) {
+                    fail(std::format("{}/subtrahendNativeId", path),
+                         std::format(
+                             "wire id {} is also relocation '{}''s: a "
+                             "subtrahend entry is half of a reference and "
+                             "decodes to no RelocationKind, so no relocation "
+                             "row may claim its wire id",
+                             p.subtrahendNativeId, r.name));
+                }
+            }
+            for (std::size_t j = 0; j < macho.differenceRelocations.size(); ++j) {
+                auto const& q = macho.differenceRelocations[j];
+                if (j < i && q.subtrahendNativeId == p.subtrahendNativeId) {
+                    fail(std::format("{}/subtrahendNativeId", path),
+                         std::format(
+                             "wire id {} is already the subtrahend of "
+                             "/macho/differenceRelocations/{}: one subtrahend "
+                             "names one minuend",
+                             p.subtrahendNativeId, j));
+                }
+                if (q.minuendNativeId == p.subtrahendNativeId) {
+                    fail(std::format("{}/subtrahendNativeId", path),
+                         std::format(
+                             "wire id {} is the minuend of "
+                             "/macho/differenceRelocations/{}: an entry of that "
+                             "type would be both the start of a pair and the "
+                             "end of one",
+                             p.subtrahendNativeId, j));
+                }
+            }
+        }
         // All three MachOObjectType members have walker arms: MH_OBJECT
         // (LK3 cycle 1), MH_EXECUTE (LK3 cycle 2), MH_DYLIB (c153,
         // D-LK3-3 — the Mach-O mirror of ELF ET_DYN c150 + PE Dll
@@ -1056,7 +1258,7 @@ public:
         // type-design Q4 convergence). Validate the packing mask
         // here so JSON typos fail loud at load time.
         constexpr std::uint32_t kMachOReservedBits =
-            (1u << 27) | 0x00FFFFFFu;
+            dss::macho::kRInfoExternBit | dss::macho::kRInfoSymbolnumMask;
         for (std::size_t i = 0; i < relocations.size(); ++i) {
             auto const& r = relocations[i];
             if ((r.nativeId & kMachOReservedBits) != 0) {

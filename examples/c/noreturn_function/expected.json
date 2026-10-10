@@ -1,8 +1,9 @@
 {
-  "$comment": "FC16 (D-CSUBSET-NORETURN): a non-void function (compute) whose only non-return path is a call to a noreturn function (die — noreturn via the proto/def OR-merge) that tail-calls the shipped noreturn `exit`. The synthesized Unreachable makes the path structurally terminate; main -> compute(0) -> die(42) -> exit(42) exits 42. The `release` arm loads the shipped release.pipeline.json (shippedPipeline) so the reachable Unreachable is routed through the real optimizer composition — the required safety net.",
+  "$comment": "FC16 (D-CSUBSET-NORETURN): a non-void function (compute) whose only non-return path is a call to a noreturn function (die — noreturn via the proto/def OR-merge) that tail-calls the shipped noreturn `exit`. The synthesized Unreachable makes the path structurally terminate; main -> compute(0) -> die(42) -> exit(42) exits 42. The `release` arm loads the shipped release.pipeline.json (shippedPipeline) so the reachable Unreachable is routed through the real optimizer composition — the required safety net. `forbidDiagnostics` carries the RED since P69: with noreturn unhonored `compute`'s end is called reached, which refused the compile until P69 and is now, under C (C23 6.9.2p13), accepted with the warning H_NonVoidFunctionEndReachable — and the program still exits 42, because `die` ends the process either way. Only the forbidden code can see that regression; the arm is red on it in both runners.",
   "language": "c",
   "source": "main.c",
   "exitCode": 42,
+  "forbidDiagnostics": ["H_NonVoidFunctionEndReachable"],
   "targets": [
     {
       "spec": "x86_64:pe64-x86_64-windows-exec",

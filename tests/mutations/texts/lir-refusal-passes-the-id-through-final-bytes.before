@@ -1,0 +1,6 @@
+        if (!isBlockOf(produced, funcIndex, v)) {
+            refuse(reporter, std::format(
+                "{} names block {} of function #{}, which is not a block of that function in the module "
+                "MIR→LIR produced, so it has no image in the final LIR", what, v, funcIndex));
+            return std::nullopt;
+        }

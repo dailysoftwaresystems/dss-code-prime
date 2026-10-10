@@ -1,0 +1,1 @@
+            if (vlaScopeStack_[k].pinnedByAlloca) target = k + 1;

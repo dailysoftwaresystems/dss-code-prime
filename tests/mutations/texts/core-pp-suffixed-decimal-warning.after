@@ -1,0 +1,1 @@
+    return {PhaseFourLiteralStatus::Operand, magnitude, false, suffix.empty()};

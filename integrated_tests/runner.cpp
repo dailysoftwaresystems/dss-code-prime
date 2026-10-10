@@ -678,6 +678,15 @@ struct ExampleManifest {
     // boundary — `expectDiagnostics` can only say REFUSED and `exitCode` can
     // only say RAN, and until this key no single entry could say both.
     std::vector<ExpectedDiagnostic> expectWarnings;
+    // P69 (lane `cs`): NON-EMPTY ⇒ the CLI must print NO diagnostic header
+    // carrying any of these code NAMES, at any severity, in any arm. The
+    // absence assertion `expectWarnings` cannot make (it is exact over the codes
+    // it declares and silent about every other): the red-on-disable of an
+    // example whose point is that a construct is seen to terminate, to be
+    // constant, to be declared — when that regresses the program still builds
+    // and runs, and what changes is that the compiler starts saying something.
+    // Mirrors the in-process sibling's field of the same name.
+    std::vector<std::string> forbidDiagnostics;
 };
 
 // Parse ONE array of diagnostic expectations. `expectDiagnostics` (the refusal
@@ -1101,6 +1110,63 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                   << path.generic_string() << "\n";
         return false;
     }
+    // `forbidDiagnostics` — the absence assertion: a non-empty array of
+    // diagnostic-code NAMES, none twice. (An absence has no position, so there
+    // is no {code, line, col} form.) The key literal stays at the accessor
+    // sites for the cross-runner vocabulary pin, like its two siblings.
+    //
+    // ⚠ WHETHER A NAME IS A CODE THE COMPILER KNOWS IS NOT DECIDED HERE, and
+    // cannot be: this runner links no compiler, and a second table of code
+    // names kept in a test would drift from the first. The CLI is asked, at the
+    // arm, through the one parser of code names it has (`cliKnowsDiagnosticCode`)
+    // — and an unknown name poisons the arm BY NAME, because an absence
+    // assertion on a misspelt code passes forever while asserting nothing.
+    if (j.contains("forbidDiagnostics")) {
+        auto const& arr = j.at("forbidDiagnostics");
+        if (!arr.is_array() || arr.empty()) {
+            std::cerr << "  'forbidDiagnostics' must be a non-empty array of"
+                         " diagnostic-code names in " << path.generic_string() << "\n";
+            return false;
+        }
+        for (auto const& e : arr) {
+            if (!e.is_string() || e.get<std::string>().empty()) {
+                std::cerr << "  each 'forbidDiagnostics' entry must be a string —"
+                             " a diagnostic-code NAME (an absence has no"
+                             " position, so there is no {code, line, col} form) in "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+            std::string name = e.get<std::string>();
+            if (std::find(out.forbidDiagnostics.begin(), out.forbidDiagnostics.end(),
+                          name) != out.forbidDiagnostics.end()) {
+                std::cerr << "  'forbidDiagnostics' names '" << name
+                          << "' twice in " << path.generic_string() << "\n";
+                return false;
+            }
+            out.forbidDiagnostics.push_back(std::move(name));
+        }
+    }
+    // INERT beside `expectDiagnostics`, and an inert declaration is refused: a
+    // refusal entry's diagnostic set is already asserted, so the key could only
+    // ever say nothing there.
+    if (!out.forbidDiagnostics.empty() && !out.expectDiagnostics.empty()) {
+        std::cerr << "  manifest declares BOTH 'expectDiagnostics' and"
+                     " 'forbidDiagnostics'. The first already asserts the"
+                     " refused compile's diagnostics; the second could assert"
+                     " nothing there: " << path.generic_string() << "\n";
+        return false;
+    }
+    // A code cannot be both REQUIRED and FORBIDDEN.
+    for (auto const& e : out.expectWarnings) {
+        if (std::find(out.forbidDiagnostics.begin(), out.forbidDiagnostics.end(),
+                      e.code) != out.forbidDiagnostics.end()) {
+            std::cerr << "  manifest names '" << e.code << "' in BOTH"
+                         " 'expectWarnings' (it must be emitted) and"
+                         " 'forbidDiagnostics' (it must not): "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+    }
     // PROJECT MODE has no expect-error branch, and saying so LOUDLY is the
     // point: `runErrorExampleViaCli` builds a `--compile <sources>` command line
     // a project manifest never populates. Rejected in the PARSER, in BOTH
@@ -1503,7 +1569,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             || k == "project" || k == "exitCode" || k == "expectedStdout"
             || k == "targets" || k == "optimizedPipelines"
             || k == "optimizationObservable" || k == "expectDiagnostics"
-            || k == "expectWarnings"
+            || k == "expectWarnings" || k == "forbidDiagnostics"
             || k.starts_with("$")) {
             continue;
         }
@@ -1511,7 +1577,8 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                   << "' — the runner reads language / source / sources /"
                      " project / exitCode / expectedStdout / targets /"
                      " optimizedPipelines / optimizationObservable /"
-                     " expectDiagnostics / expectWarnings (plus $comment keys)."
+                     " expectDiagnostics / expectWarnings / forbidDiagnostics"
+                     " (plus $comment keys)."
                      " An expectation the runner does not read is an assertion"
                      " that never fires: " << path.generic_string() << "\n";
         return false;
@@ -1802,6 +1869,110 @@ resolvePrebuiltLibraryCli(PrebuiltLibrary const& lib,
     return resolved;
 }
 
+// ── `forbidDiagnostics` — THE THREE PIECES, CLI SIDE ────────────────────────
+//
+// (1) what the CLI's log shows was reported, (2) the judgement over it, (3) the
+// question only the CLI can answer: is this a code name at all? Each is its own
+// function so the corpus arm, the prerequisite build and `runForbidDiagnosticsPin`
+// ask the SAME thing.
+
+// Every diagnostic CODE NAME the log shows, at ANY severity, in log order with
+// repeats: the `<severity>[<CodeName>]:` header `DiagnosticReporter::format`
+// opens every diagnostic with, at column 0. A header quoted mid-line or indented
+// (a source excerpt, a note that mentions one) is not a report and is not read.
+[[nodiscard]] std::vector<std::string> diagnosticCodesInCliLog(std::string const& body) {
+    std::vector<std::string> codes;
+    std::size_t lineStart = 0;
+    while (lineStart < body.size()) {
+        std::size_t lineEnd = body.find('\n', lineStart);
+        if (lineEnd == std::string::npos) lineEnd = body.size();
+        std::string_view const line{body.data() + lineStart, lineEnd - lineStart};
+        std::size_t i = 0;
+        while (i < line.size() && line[i] >= 'a' && line[i] <= 'z') ++i;
+        if (i > 0 && i < line.size() && line[i] == '[') {
+            std::size_t const close = line.find("]:", i);
+            if (close != std::string_view::npos && close > i + 1) {
+                std::string_view const code = line.substr(i + 1, close - i - 1);
+                bool identifier = true;
+                for (char const c : code) {
+                    identifier = identifier
+                        && (std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_');
+                }
+                if (identifier) codes.emplace_back(code);
+            }
+        }
+        lineStart = lineEnd + 1;
+    }
+    return codes;
+}
+
+// THE JUDGEMENT, pure: which of the `forbidden` codes does the log show? In
+// declaration order, each named once however many times it was reported.
+[[nodiscard]] std::vector<std::string>
+forbiddenDiagnosticsInCliLog(std::vector<std::string> const& forbidden,
+                             std::string const& body) {
+    auto const reported = diagnosticCodesInCliLog(body);
+    std::vector<std::string> hit;
+    for (auto const& name : forbidden) {
+        if (std::find(reported.begin(), reported.end(), name) != reported.end()) {
+            hit.push_back(name);
+        }
+    }
+    return hit;
+}
+
+// Is `name` a diagnostic code the CLI knows? ASKED OF THE CLI, through the one
+// parser of code names it has — `--suppress=<name>`, which refuses a name its
+// table does not hold before it looks at anything else on the line. This runner
+// links no compiler and keeps no table of its own: a second list of code names
+// in a test would be a second owner of the first, and it would drift.
+//
+// Three answers, because "the CLI could not be asked" must never read as either
+// of the other two — an absence assertion on a name nobody vouched for passes
+// forever while asserting nothing.
+//   Unknown     — the CLI said the name is not a recognized diagnostic code;
+//   Known       — the CLI accepted the name and went on to its next complaint
+//                 (no mode was selected: the line holds nothing but the flag);
+//   CouldNotAsk — neither sentence came back.
+// A name that is not a plain identifier is Unknown without being asked: no code
+// is spelled otherwise, and nothing else may reach a command line.
+enum class CodeNameAnswer : std::uint8_t { Known, Unknown, CouldNotAsk };
+
+[[nodiscard]] CodeNameAnswer cliKnowsDiagnosticCode(std::string const& compiler,
+                                                    std::string const& name,
+                                                    fs::path const& scratchDir) {
+    if (name.empty()) return CodeNameAnswer::Unknown;
+    for (char const c : name) {
+        if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '_') {
+            return CodeNameAnswer::Unknown;
+        }
+    }
+    static std::map<std::string, CodeNameAnswer> answered;
+    if (auto const it = answered.find(name); it != answered.end()) return it->second;
+
+    auto const log = scratchDir / "forbid-diagnostics-code-name.log";
+    std::string const cmd = quote(compiler) + " --suppress=" + name + " > "
+                          + quote(log.string()) + " 2>&1";
+    (void)std::system(shellWrap(cmd).c_str());
+    std::ifstream in(log.string());
+    std::string const said((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    CodeNameAnswer answer = CodeNameAnswer::CouldNotAsk;
+    if (said.find("--suppress: '" + name + "' is not a recognized diagnostic-code name")
+        != std::string::npos) {
+        answer = CodeNameAnswer::Unknown;
+    } else if (said.find("no mode flag was selected") != std::string::npos) {
+        answer = CodeNameAnswer::Known;
+    }
+    // Only a real answer is remembered: a CLI that could not be asked once may
+    // be askable the next time, and remembering the failure would hide that.
+    if (answer != CodeNameAnswer::CouldNotAsk) answered.emplace(name, answer);
+    return answer;
+}
+
+// `forbidDiagnostics` is the manifest's own list (empty when the key is absent):
+// a prerequisite this arm BUILDS FROM SOURCE is part of the example's compile,
+// so its build log is judged by the same list — see the ★ note where it is read.
 [[nodiscard]] std::optional<fs::path>
 buildDependsOnArtifactCli(std::string const&       compiler,
                           DependsOnArtifact const& dep,
@@ -1810,6 +1981,7 @@ buildDependsOnArtifactCli(std::string const&       compiler,
                           std::string const&       language,
                           std::string const&       exampleName,
                           std::string const&       configName,
+                          std::vector<std::string> const& forbidDiagnostics,
                           std::map<std::string, fs::path>* builtImages) {
     // Nested prerequisites FIRST (order-correct): each must exist on disk
     // before this dep's own build resolves against it.
@@ -1817,7 +1989,7 @@ buildDependsOnArtifactCli(std::string const&       compiler,
     for (auto const& nested : dep.dependsOn) {
         auto nestedPath = buildDependsOnArtifactCli(
             compiler, nested, exampleDir, outDir, language, exampleName,
-            configName, builtImages);
+            configName, forbidDiagnostics, builtImages);
         if (!nestedPath.has_value()) return std::nullopt;  // check already fired
         resolveArgs += " --resolve-library " + quote(nestedPath->string());
     }
@@ -1861,6 +2033,29 @@ buildDependsOnArtifactCli(std::string const&       compiler,
           + depArtifact.generic_string() + ", buildlog: "
           + depLog.generic_string() + ")", depOk, depWhy);
     if (!depOk) return std::nullopt;
+    // ★ `forbidDiagnostics` REACHES THE PREREQUISITE. The key says what the
+    // example's compile must not report, and a library this arm builds from the
+    // example's own sources is that compile — a function in `lib.c` is as much the
+    // example's as one in `main.c`. Its build has its own log, so it is judged
+    // here, by the same pure judgement the arm applies to `cli.log`. Whether each
+    // name IS a code is asked once, at the arm. A `check` only on the failure: a
+    // healthy run emits exactly the checks it always did.
+    if (!forbidDiagnostics.empty()) {
+        std::ifstream depLogIn(depLog.string());
+        std::string const depBody((std::istreambuf_iterator<char>(depLogIn)),
+                                  std::istreambuf_iterator<char>());
+        auto const emitted = forbiddenDiagnosticsInCliLog(forbidDiagnostics, depBody);
+        if (!emitted.empty()) {
+            std::string names;
+            for (auto const& n : emitted) { names += names.empty() ? "" : ", "; names += n; }
+            check(exampleName + ": dependsOn library " + dep.spec
+                      + " emits none of the forbidden diagnostics",
+                  false,
+                  "FORBIDDEN DIAGNOSTIC: emitted " + names + "\n  buildlog: "
+                      + depLog.generic_string());
+            return std::nullopt;
+        }
+    }
     // RECORD THE PREREQUISITE'S PATH for the optimized-vs-baseline dependency
     // comparison. The `check` above has already established the file exists and
     // is non-empty, so what is recorded here is always a readable image.
@@ -2113,10 +2308,11 @@ std::size_t dependencyImagesDiffered  = 0;
     for (auto const& dep : target->dependsOn) {
         auto depArtifact = buildDependsOnArtifactCli(
             compiler, dep, exampleDir, outDir, m.language, armName, configName,
-            &builtDependencyImages);
+            m.forbidDiagnostics, &builtDependencyImages);
         if (!depArtifact.has_value()) {  // check already fired
             return {ArmVerdict::Poisoned,
-                    "dependsOn library " + dep.spec + " did not build"};
+                    "dependsOn library " + dep.spec
+                        + " did not build, or reported a forbidden diagnostic"};
         }
         resolveArgs += " --resolve-library " + quote(depArtifact->string());
         resolvedLibraries.push_back(*depArtifact);
@@ -2333,6 +2529,45 @@ std::size_t dependencyImagesDiffered  = 0;
                 "compile rc=" + std::to_string(sysRc)};
     }
     check(armName + ": compile exits 0", true);
+
+    // ★★★ `forbidDiagnostics` — THE ABSENCE ASSERTION, CLI SIDE, ON EVERY ARM.
+    //
+    // The compile succeeded; this asks what it did NOT say. `cli.log` holds
+    // every diagnostic the CLI printed for this arm, so the judgement is over
+    // that file — at ANY severity, in the baseline and in each optimized arm
+    // alike (a warning only the release pipeline draws is still a warning the
+    // entry forbade). Two refusals come first, both BY NAME, because either one
+    // would otherwise turn the assertion into one that cannot fail: a name the
+    // CLI does not know as a diagnostic code, and a CLI that could not be asked.
+    if (!m.forbidDiagnostics.empty()) {
+        for (auto const& name : m.forbidDiagnostics) {
+            auto const answer = cliKnowsDiagnosticCode(compiler, name, outDir);
+            if (answer == CodeNameAnswer::Known) continue;
+            std::string const why = answer == CodeNameAnswer::Unknown
+                ? "'" + name + "' is not a diagnostic code the CLI knows — a"
+                  " misspelt code is absent from every compile, so the entry"
+                  " would pass asserting nothing"
+                : "the CLI could not be asked whether '" + name + "' is a"
+                  " diagnostic code (neither of its two answers to `--suppress="
+                  + name + "` came back)";
+            check(armName + ": `forbidDiagnostics` names diagnostic codes the CLI knows",
+                  false, why);
+            return {ArmVerdict::Poisoned, "forbidDiagnostics: " + why};
+        }
+        std::ifstream logIn(cliLog.string());
+        std::string const body((std::istreambuf_iterator<char>(logIn)),
+                               std::istreambuf_iterator<char>());
+        auto const emitted = forbiddenDiagnosticsInCliLog(m.forbidDiagnostics, body);
+        std::string names;
+        for (auto const& n : emitted) { names += names.empty() ? "" : ", "; names += n; }
+        check(armName + ": CLI emits none of the forbidden diagnostics",
+              emitted.empty(),
+              "FORBIDDEN DIAGNOSTIC: emitted " + names + "\n  cli log: "
+                  + cliLog.generic_string());
+        if (!emitted.empty()) {
+            return {ArmVerdict::Poisoned, "forbidDiagnostics: emitted " + names};
+        }
+    }
 
     // ★★★ `expectWarnings` — THE ACCEPT-AND-REPORT ASSERTION, CLI SIDE.
     //
@@ -4550,6 +4785,300 @@ void runManifestClosedKeySetPin(fs::path const& scratch) {
     std::cout << "\n";
 }
 
+// ── Harness self-test: `forbidDiagnostics` — parse, question, judgement, RED ──
+//
+// The key that lets an entry assert a diagnostic's ABSENCE (P69), pinned at the
+// five places it can break alone (the fifth, below the arm cases: a `dependsOn`
+// artifact the arm builds from source is judged by the same list, from its own
+// build log):
+//   1. the PARSE refuses every shape that could only pass by saying nothing;
+//   2. the QUESTION "is this a code name?" is answered by the real CLI, both
+//      ways — the sentence it is read from is the CLI's, so a reworded refusal
+//      turns up HERE as a red pin instead of in the corpus as an arm that
+//      "could not ask";
+//   3. the JUDGEMENT reads only real report headers out of a log;
+//   4. the ARM goes RED end to end: `compileAndRunArmViaCli` on a fixture whose
+//      compile prints the code its manifest forbids is POISONED, saying which;
+//      the same fixture forbidding a code the compile does not print RUNS and
+//      exits 42; and a misspelt code poisons the arm BY NAME. The red halves are
+//      PROVOKED on purpose, so their `[FAIL]` lines and the counters they move
+//      are captured and put back — they are this pin's subject, not its result.
+//      Remove the arm's check and the first half stops being poisoned: that is
+//      the red-on-disable of the key itself.
+void runForbidDiagnosticsPin(std::string const& compiler, fs::path const& scratch) {
+    std::cout << "[Harness self-test] forbidDiagnostics: PARSED, the code name"
+                 " ASKED of the CLI, the log JUDGED, and the arm POISONED\n";
+    std::error_code ec;
+    fs::create_directories(scratch, ec);
+    if (ec) {
+        check("create the forbid-diagnostics pin's scratch dir", false, ec.message());
+        std::cout << "\n";
+        return;
+    }
+    constexpr char const* kWarned  = "H_NonVoidFunctionEndReachable";
+    constexpr char const* kNotSaid = "H_UnreachableCode";
+    auto const writeText = [](fs::path const& p, std::string const& text) {
+        std::ofstream f(p.string(), std::ios::binary);
+        f << text;
+        f.close();
+        return f.good();
+    };
+    // Straight-line capture with no early return inside the window: a stolen
+    // stream that was never given back would silence every later line.
+    auto const parseCapturingStderr = [](fs::path const& p) {
+        ExampleManifest    mm;
+        std::ostringstream captured;
+        auto* const        saved = std::cerr.rdbuf(captured.rdbuf());
+        bool const         ok    = readManifest(p, mm);
+        std::cerr.rdbuf(saved);
+        return std::tuple<bool, std::string, ExampleManifest>{
+            ok, captured.str(), std::move(mm)};
+    };
+    auto const        native  = ::dss::test_support::hostNativeTarget();
+    std::string const exeFile = ::dss::test_support::hostExeArtifact("main");
+    std::string const host    = currentHostOs();
+    // `extra` splices in beside the required keys (empty, or ending in a comma).
+    auto const manifestText = [&](std::string const& extra) {
+        return std::string{R"({
+  "language": "c",
+  "source": "main.c",
+  )"} + extra + R"(
+  "targets": [{"spec": ")" + std::string{native.execTarget} + R"(",
+               "artifact": ")" + exeFile + R"(", "runOn": [")" + host + R"("]}]
+})";
+    };
+    auto const forbid = [](std::string const& names) {
+        return std::string{R"("exitCode": 42, "forbidDiagnostics": [)"} + names + "],";
+    };
+    auto const q = [](char const* name) { return std::string{"\""} + name + "\""; };
+
+    // ── 1. THE PARSE ────────────────────────────────────────────────────────
+    auto const parseDir = scratch / "parse";
+    fs::create_directories(parseDir, ec);
+    auto const parsed = [&](std::string const& extra) {
+        (void)writeText(parseDir / "expected.json", manifestText(extra));
+        return parseCapturingStderr(parseDir / "expected.json");
+    };
+    {
+        auto const [ok, msg, mm] = parsed(forbid(q(kWarned) + ", " + q(kNotSaid)));
+        check("a well-formed `forbidDiagnostics` PARSES, names in order",
+              ok && mm.forbidDiagnostics
+                        == std::vector<std::string>{kWarned, kNotSaid},
+              "stderr: " + msg);
+    }
+    struct Refusal {
+        char const* what;
+        std::string extra;
+        char const* says;
+    };
+    for (Refusal const& r : {
+             Refusal{"an EMPTY array", forbid(""), "non-empty array"},
+             Refusal{"a bare string", R"("exitCode": 42, "forbidDiagnostics": "H_UnreachableCode",)",
+                     "non-empty array"},
+             Refusal{"an {code, line, col} entry",
+                     forbid(R"({"code": "H_UnreachableCode", "line": 1, "col": 1})"),
+                     "must be a string"},
+             Refusal{"the same name twice", forbid(q(kWarned) + ", " + q(kWarned)), "twice"},
+             Refusal{"the key beside `expectDiagnostics`",
+                     std::string{R"("expectDiagnostics": [{"code": "S_TypeMismatch", "line": 1, "col": 1}],)"}
+                         + R"( "forbidDiagnostics": [)" + q(kWarned) + "],",
+                     "BOTH 'expectDiagnostics' and 'forbidDiagnostics'"},
+             Refusal{"a code both required and forbidden",
+                     std::string{R"("exitCode": 42, "expectWarnings": [{"code": ")"} + kWarned
+                         + R"(", "line": 1, "col": 20}], "forbidDiagnostics": [)" + q(kWarned) + "],",
+                     "BOTH 'expectWarnings'"}}) {
+        auto const [ok, msg, mm] = parsed(r.extra);
+        (void)mm;
+        check(std::string{"`forbidDiagnostics`: "} + r.what + " is REFUSED, saying \""
+                  + r.says + "\"",
+              !ok && msg.find(r.says) != std::string::npos, "stderr: " + msg);
+    }
+
+    // ── 2. THE QUESTION, asked of the real CLI ──────────────────────────────
+    check("the CLI KNOWS a real diagnostic code",
+          cliKnowsDiagnosticCode(compiler, kNotSaid, scratch) == CodeNameAnswer::Known,
+          std::string{"`--suppress="} + kNotSaid + "` did not answer as a known name —"
+              " the sentence this runner reads the answer from may have been reworded");
+    for (char const* const bad :
+         {"H_NonVoidFunctionEndReachble", "Unknown", "None", "H_Unreachable Code",
+          "H_UnreachableCode\" --help \"", ""}) {
+        check(std::string{"the CLI does NOT know '"} + bad + "' as a diagnostic code",
+              cliKnowsDiagnosticCode(compiler, bad, scratch) == CodeNameAnswer::Unknown,
+              "a name that is not a code must be Unknown — never Known, and never"
+              " `could not ask`");
+    }
+
+    // ── 3. THE JUDGEMENT, over a planted log ────────────────────────────────
+    {
+        std::string const log =
+            "warning[H_NonVoidFunctionEndReachable]: [target=t] control can reach …\n"
+            // (planted DATA in two adjacent literals, one compiled string: spelled as one
+            //  piece it reads to the positional-citation guard as a citation of a source line)
+            "  --> main.c" ":1:20\n"
+            "   |\n"
+            " 1 | int helper(void) { } /* warning[H_UnreachableCode]: quoted, not reported */\n"
+            "  warning[S_UnknownAttribute]: indented, so not a header\n"
+            "info[X_OptFixpointTruncated]: an advisory at another severity\r\n"
+            "error[S_TypeMismatch]: and an error\n"
+            "warning[H_NonVoidFunctionEndReachable]: a second report of the first\n"
+            "warning[not a code]: prose in brackets\n";
+        check("the log's REPORT HEADERS are read, at every severity, and nothing else",
+              diagnosticCodesInCliLog(log)
+                  == std::vector<std::string>{"H_NonVoidFunctionEndReachable",
+                                              "X_OptFixpointTruncated", "S_TypeMismatch",
+                                              "H_NonVoidFunctionEndReachable"});
+        check("a forbidden code the log reports is NAMED, once, in declaration order",
+              forbiddenDiagnosticsInCliLog({kNotSaid, "S_TypeMismatch", kWarned}, log)
+                  == std::vector<std::string>{"S_TypeMismatch", kWarned});
+        check("a code the log only QUOTES is not reported as emitted",
+              forbiddenDiagnosticsInCliLog({kNotSaid, "S_UnknownAttribute"}, log).empty());
+    }
+
+    // ── 4. THE ARM ──────────────────────────────────────────────────────────
+    //
+    // `helper` reaches its closing brace: one warning, and the program is
+    // conforming — the value is not used. Exit 42.
+    struct ArmCase {
+        char const* dir;
+        std::string names;       // the forbidden list
+        bool        poisoned;
+        char const* says;        // what a poisoned arm's detail must name
+    };
+    for (ArmCase const& c : {
+             ArmCase{"forbidden-and-emitted", q(kWarned), true, kWarned},
+             ArmCase{"misspelt-code", q("H_NonVoidFunctionEndReachble"), true,
+                     "H_NonVoidFunctionEndReachble"},
+             ArmCase{"forbidden-and-absent", q(kNotSaid), false, ""}}) {
+        auto const caseDir = scratch / c.dir;
+        auto const outDir  = scratch / (std::string{c.dir} + "-out");
+        std::string const name = std::string{"forbidDiagnostics arm ("} + c.dir + ")";
+        fs::create_directories(caseDir, ec);
+        bool const written =
+            writeText(caseDir / "main.c",
+                      "int helper(void) { }\nint main(void) { helper(); return 42; }\n")
+            && writeText(caseDir / "expected.json", manifestText(forbid(c.names)));
+        check(name + ": fixture written", written, caseDir.generic_string());
+        if (!written) continue;
+        auto const [ok, msg, mm] = parseCapturingStderr(caseDir / "expected.json");
+        check(name + ": fixture manifest parses", ok && mm.targets.size() == 1u,
+              "stderr: " + msg);
+        if (!ok || mm.targets.size() != 1u) continue;
+
+        if (!c.poisoned) {
+            // THE CONTROL — counted normally: every check inside must pass.
+            auto const out = compileAndRunArmViaCli(
+                compiler, caseDir, outDir, mm, &mm.targets[0], name, "baseline",
+                /*configName*/ "", /*captureStdout*/ false);
+            check(name + ": an arm whose compile does NOT print the forbidden code RUNS",
+                  out.verdict == ArmVerdict::Ran,
+                  "verdict=" + std::string{armVerdictName(out.verdict)} + " — " + out.detail);
+            check(name + ": exits 42", out.verdict == ArmVerdict::Ran && out.exitCode == 42,
+                  "got " + std::to_string(out.exitCode));
+            continue;
+        }
+        // THE PROVOKED RED — captured, and the counters it moved put back.
+        std::ostringstream captured;
+        int const          passesBefore   = passes;
+        int const          failuresBefore = failures;
+        auto* const        saved          = std::cout.rdbuf(captured.rdbuf());
+        auto const out = compileAndRunArmViaCli(
+            compiler, caseDir, outDir, mm, &mm.targets[0], name, "baseline",
+            /*configName*/ "", /*captureStdout*/ false);
+        std::cout.rdbuf(saved);
+        int const provoked = failures - failuresBefore;
+        passes   = passesBefore;
+        failures = failuresBefore;
+        std::string const said = captured.str();
+        check(name + ": the arm is POISONED",
+              out.verdict == ArmVerdict::Poisoned,
+              "verdict=" + std::string{armVerdictName(out.verdict)} + " — " + out.detail);
+        check(name + ": exactly ONE failed check, and it is this key's",
+              provoked == 1 && said.find("forbid") != std::string::npos,
+              std::to_string(provoked) + " failed check(s). The arm said: " + said);
+        check(name + ": the verdict NAMES the code",
+              out.detail.find(c.says) != std::string::npos
+                  && said.find(c.says) != std::string::npos,
+              "detail: " + out.detail + " | said: " + said);
+    }
+
+    // ── 5. THE PREREQUISITE — a `dependsOn` artifact is the example's compile ─
+    //
+    // The function that reaches its end is in the LIBRARY the arm builds from the
+    // example's own `forbid_lib.c`; `main.c` is clean, so `cli.log` is silent and
+    // only the prerequisite's build log holds the report. The key must see it.
+    // Red (captured, counters put back), then the same fixture forbidding a code
+    // nothing prints — built, linked, run, exit 42.
+    std::string const libFile = ::dss::test_support::hostLibArtifact("forbid_lib");
+    struct DepCase {
+        char const* dir;
+        char const* forbidden;
+        bool        poisoned;
+    };
+    for (DepCase const& c : {DepCase{"dep-forbidden-and-emitted", kWarned, true},
+                             DepCase{"dep-forbidden-and-absent", kNotSaid, false}}) {
+        auto const caseDir = scratch / c.dir;
+        auto const outDir  = scratch / (std::string{c.dir} + "-out");
+        std::string const name = std::string{"forbidDiagnostics prerequisite ("} + c.dir + ")";
+        fs::create_directories(caseDir, ec);
+        std::string const manifest = std::string{R"({
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "forbidDiagnostics": [)"} + q(c.forbidden) + R"(],
+  "targets": [{"spec": ")" + std::string{native.execTarget} + R"(",
+               "artifact": ")" + exeFile + R"(", "runOn": [")" + host + R"("],
+               "dependsOn": [{"sources": ["forbid_lib.c"],
+                              "spec": ")" + std::string{native.libTarget} + R"(",
+                              "artifact": ")" + libFile + R"("}]}]
+})";
+        bool const written =
+            writeText(caseDir / "forbid_lib.c", "int dss_forbid_lib_reaches_its_end(void) { }\n")
+            && writeText(caseDir / "main.c", "int main(void) { return 42; }\n")
+            && writeText(caseDir / "expected.json", manifest);
+        check(name + ": fixture written", written, caseDir.generic_string());
+        if (!written) continue;
+        auto const [ok, msg, mm] = parseCapturingStderr(caseDir / "expected.json");
+        check(name + ": fixture manifest parses",
+              ok && mm.targets.size() == 1u && mm.targets[0].dependsOn.size() == 1u,
+              "stderr: " + msg);
+        if (!ok || mm.targets.size() != 1u) continue;
+
+        if (!c.poisoned) {
+            auto const out = compileAndRunArmViaCli(
+                compiler, caseDir, outDir, mm, &mm.targets[0], name, "baseline",
+                /*configName*/ "", /*captureStdout*/ false);
+            check(name + ": a prerequisite that does NOT print the forbidden code is"
+                         " built, linked and RUN",
+                  out.verdict == ArmVerdict::Ran && out.exitCode == 42,
+                  "verdict=" + std::string{armVerdictName(out.verdict)} + " exit="
+                      + std::to_string(out.exitCode) + " — " + out.detail);
+            continue;
+        }
+        std::ostringstream captured;
+        int const          passesBefore   = passes;
+        int const          failuresBefore = failures;
+        auto* const        saved          = std::cout.rdbuf(captured.rdbuf());
+        auto const out = compileAndRunArmViaCli(
+            compiler, caseDir, outDir, mm, &mm.targets[0], name, "baseline",
+            /*configName*/ "", /*captureStdout*/ false);
+        std::cout.rdbuf(saved);
+        int const provoked = failures - failuresBefore;
+        passes   = passesBefore;
+        failures = failuresBefore;
+        std::string const said = captured.str();
+        check(name + ": the arm is POISONED by its prerequisite's report",
+              out.verdict == ArmVerdict::Poisoned
+                  && out.detail.find("forbidden diagnostic") != std::string::npos,
+              "verdict=" + std::string{armVerdictName(out.verdict)} + " — " + out.detail);
+        check(name + ": exactly ONE failed check, the prerequisite's, NAMING the code",
+              provoked == 1 && said.find("dependsOn library") != std::string::npos
+                  && said.find("FORBIDDEN DIAGNOSTIC") != std::string::npos
+                  && said.find(c.forbidden) != std::string::npos,
+              std::to_string(provoked) + " failed check(s). The arm said: " + said);
+    }
+    std::cout << "\n";
+}
+
 // ── Harness self-test: `loaderSearchPathVariable` — the parse and the spawn ──
 //
 // The CLI half of the loader-search-path capability (`loader_search_path.hpp`),
@@ -6756,6 +7285,10 @@ int main(int argc, char* argv[]) {
     // example binds (a Windows host binds neither the ELF nor the Mach-O one).
     runPrebuiltLibraryParserPin(outputBase / "harness-prebuilt-library-parser");
     runManifestClosedKeySetPin(outputBase / "harness-manifest-keys");
+    // UNNUMBERED like its neighbours. With the CLI surface because every half of
+    // it is host-independent: the fixture is compiled for THIS host's native
+    // target, so the provoked red and its control run on every leg.
+    runForbidDiagnosticsPin(compiler, outputBase / "harness-forbid-diagnostics");
     // UNNUMBERED for the same reason as its neighbours. It runs with the CLI
     // surface because its spawn half is a host-independent claim about THIS
     // runner's spawn site, witnessed on every leg — including the ones where no

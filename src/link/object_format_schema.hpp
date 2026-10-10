@@ -12,6 +12,7 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/symbol_attrs.hpp"        // SymbolBinding / SymbolVisibility (lifted to core/types for MIR-tier producers)
 #include "core/types/target_schema.hpp"       // EnumNameTable<E,N>
+#include "core/types/unit_linker_requests.hpp" // VersionPair (a directive row's minimum subsystem version)
 #include "link/object_format_backend.hpp"     // D-LINK-…-KIND-IDENTITY-BRANCHES: the format-identity SEAM
 #include "link/runpath.hpp"                   // RunpathDeclaration (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH)
 
@@ -129,15 +130,15 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     std::uint32_t  nativeId = 0;    // ELF r_info type / PE Type /
                                     // Mach-O r_type / WASM reloc type
                                     // — format-specific wire value
-    // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: the "may go through a PLT" variant
-    // of this reloc type (e.g. R_X86_64_PLT32=4 for the R_X86_64_PC32=2 rel32
-    // call). Emitted INSTEAD of `nativeId` when this reloc targets an UNDEFINED
-    // extern in a relocatable object, so a foreign PIE linker resolves the
-    // extern through a linker-built PLT — a bare PC32 against an undefined
-    // symbol errors under -pie. 0 (default) = no PLT variant (the reloc never
-    // names an extern call — e.g. abs64/abs32 data relocs), and the emitter
-    // uses `nativeId` unchanged.
-    std::uint32_t  pltNativeId = 0;
+    // ⓘ `pltNativeId` — a SECOND wire id on a row, emitted instead of `nativeId`
+    // when the row reached an undefined extern FUNCTION (x86_64's PC32 → PLT32)
+    // — is RETIRED (P69, D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB). It is
+    // how one DSS kind came to stand for both a call and an address on ELF
+    // x86_64: the row was PC32 and the call signal hid in its variant. Since
+    // P69 a call is a ROW of its own (`rel32` → R_X86_64_PLT32, `isCall`) and
+    // an address another (`riprel32` → R_X86_64_PC32), so no document needs a
+    // variant, and the loader REFUSES the key as inert config rather than
+    // keeping a field nothing reads.
     // ── DECLARED CALL/BRANCH ROLE (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL) ──
     //
     // True iff this format's NATIVE relocation can only ever target executable
@@ -158,18 +159,21 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     //   arm64 sibling read the same source cleanly.
     //
     // ★ WHY THE FORMAT ROW AND NOT THE TARGET ROW. A target document is
-    //   PER-CPU and shared across formats. `x86_64.target.json`'s `rel32` is
-    //   also ELF's R_X86_64_PC32, which genuinely serves data references too --
-    //   declaring a call role there would be a lie about ELF. The FORMAT is
-    //   where the ambiguity resolves, because the format is what picks the
-    //   native wire relocation: mach-o maps `rel32` to X86_64_RELOC_BRANCH,
-    //   which is branch-only, while ELF maps it to a wire type that is not.
-    //   ELF x86_64's own call signal is likewise format-side (`pltNativeId`).
+    //   PER-CPU and shared across formats, and the ROLE is the format's to
+    //   state, because the format is what picks the native wire relocation:
+    //   Mach-O maps `rel32` to X86_64_RELOC_BRANCH, which is branch-only, and
+    //   since P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB) ELF maps it
+    //   to R_X86_64_PLT32, the call type — x86_64's `rel32` is CALL-ONLY now,
+    //   every address and memory operand having moved to `riprel32`. Until
+    //   P69 the same `rel32` also served ELF data references, as
+    //   R_X86_64_PC32, and declaring a call role on it would have been a lie;
+    //   on PE it still would be — COFF's REL32 is one wire type for calls and
+    //   data, so no PE row is `isCall`.
     //
     // ⚠ FALSE on a row whose wire type is SHARED with a data use -- ELF
-    //   R_X86_64_PC32 is the shipped case (kind 5 `R_X86_64_PC32_UNBIASED`
-    //   shares its nativeId). Setting it there would re-commit the same
-    //   conflation in a new field.
+    //   R_X86_64_PC32 is the shipped case (the kind-8 `riprel32` row and the
+    //   kind-5 `R_X86_64_PC32_UNBIASED` FDE row share its nativeId). Setting it
+    //   there would re-commit the same conflation in a new field.
     //
     // Declared on EVERY document that carries the relocation, including ones
     // no reader consults, because it states what the relocation IS rather than
@@ -181,8 +185,9 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     // True iff this row shares its `nativeId` with another row and exists
     // only so the EMITTER can reach that wire type through a different DSS
     // `kind`. x86_64 is the shipped case: `R_X86_64_PC32` = 2 is BOTH the
-    // call-site `rel32` (implicit addend bias -4, because a call's
-    // displacement is relative to the instruction END) and the DWARF FDE
+    // instruction-operand `riprel32` (implicit addend bias -4, because the
+    // displacement is relative to the instruction END; until P69 it was the
+    // call-site `rel32`, which is R_X86_64_PLT32 since) and the DWARF FDE
     // `initial_location` pointer (bias 0, because it is a DATA word). One
     // ELF wire type, two DSS patch-site semantics.
     //
@@ -209,18 +214,43 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     // `movl $5, counter(%rip)` is SIGNED_4, `addl $1, counter(%rip)` SIGNED_1).
     // The emitter writes the entry matching `Relocation::bytesAfterField`, and
     // `nativeId` when none does; a reader decodes every entry back to this
-    // row's kind. The ADDEND is the same in every case (the x86 walker has
-    // already lowered it by those bytes), so the entries differ in the type
-    // alone — the same shape `pltNativeId` has. Empty on every other row.
+    // row's kind. Unless `bytesAfterFieldLowersTheAddend` says otherwise, the
+    // ADDEND is the same in every case (the x86 walker has already lowered it
+    // by those bytes), so the entries differ in the type alone. Empty on every
+    // other row.
     struct BytesAfterFieldNativeId {
         std::uint8_t  bytesAfterField = 0;
         std::uint32_t nativeId        = 0;
     };
     std::vector<BytesAfterFieldNativeId> nativeIdByBytesAfterField;
 
+    // ── WHETHER THOSE TYPES ALSO LOWER THE ADDEND ───────────────────────────
+    // (P69, D-LK-COFF-READER-REFUSED-CL-REL32-BYTES-AFTER-FIELD-TYPES) — the
+    // JSON key `bytesAfterFieldLowersTheAddend`, a boolean, absent = false.
+    //
+    // false: the field of a bytes-after-field type holds DSS's addend, already
+    //   lowered by the bytes after it, exactly as `nativeId`'s field does —
+    //   Mach-O x86_64's SIGNED_1/_2/_4 (ld64 adds the count back to the field
+    //   and measures from the instruction's end, which comes to the same
+    //   address).
+    // true: the TYPE lowers the addend by its byte count and the field does
+    //   not, so the field holds the offset from the symbol measured from the
+    //   instruction's END — COFF's IMAGE_REL_AMD64_REL32_1.._5, which the PE
+    //   format defines as relative to the byte 1..5 bytes past the field
+    //   (lld-link: S + field - (P + 4 + N)). ✔MEASURED 2026-10-07, cl 19.51
+    //   /O2: REL32_1 on `cmp dword ptr [x],2` and `mov byte ptr [x],11h`,
+    //   REL32_4 on `mov dword ptr [x+24h],9`, the field holding 0 or 0x24, and
+    //   link.exe's programs exit 42. A READER lowers the addend it recovers by
+    //   the type's count (`RelocationDecodeTable::addendLoweringOf`). A WRITER
+    //   never picks such a type: `nativeIdFor` answers the row's own `nativeId`,
+    //   whose field holds the lowered addend and means the same — what clang
+    //   and GNU as write for every one of these sites.
+    bool bytesAfterFieldLowersTheAddend = false;
+
     // The wire type for a site with `bytesAfterField` bytes after its field.
     [[nodiscard]] std::uint32_t
     nativeIdFor(std::uint8_t bytesAfterField) const noexcept {
+        if (bytesAfterFieldLowersTheAddend) return nativeId;
         for (auto const& e : nativeIdByBytesAfterField) {
             if (e.bytesAfterField == bytesAfterField) return e.nativeId;
         }
@@ -306,6 +336,346 @@ inline constexpr EnumNameTable<InputSectionPlacement, 2>
     }}};
 DSS_CHECK_ENUM_NAME_TABLE(kInputSectionPlacementTable);
 
+// ★★★ WHAT AN ARCHIVE SEARCH DOES FOR A NAME THE LINK HOLDS AS A COMMON — a
+// FORMAT fact, the root key `archiveCommonResolution` (P69 round 3,
+// D-LK-ARCHIVE-SEARCH-FETCHED-A-DEFINITION-FOR-A-COMMON), stated by the document
+// that describes an archive's MEMBERS (the format a static link reads them with).
+// A common (`ExternImport::commonSize`) DEFINES its name; the question is whether
+// an archive member that defines the name too is fetched to replace it:
+//   * `fetchDefinition` — of the members the archive's index lists for the name,
+//     in its order, the FIRST whose own symbol table defines it as a DATUM the
+//     common YIELDS to (`commonYieldsTo`, the LINK's document) is fetched, and its
+//     definition wins over the common (`linker::allocateCommonDefinitions`); a
+//     function, another common and a definition the common outranks are passed
+//     over, and with none the common stays the definition. GNU ld's ELF linker,
+//     the default linker of gcc and of clang on Linux, where the common outranks a
+//     WEAK definition, so only a global datum is fetched (✔MEASURED 2026-10-07,
+//     GNU ld 2.42 on x86_64 and on aarch64); Apple's ld, where a weak definition
+//     replaces a common, so a weak datum is fetched too (✔MEASURED 2026-10-07,
+//     Apple clang 21's ld-1267, arm64 and x86_64 — P69 round 4,
+//     D-LK-MACHO-ARCHIVE-COMMON-RESOLUTION-UNMEASURED);
+//   * `keepCommon` — the common satisfies the name and nothing is fetched for it:
+//     link.exe 14.51, lld-link 19.1.5 and GNU ld 2.42's PE linker (✔MEASURED
+//     2026-10-07), and ld.lld 18 unless `--fortran-common` asks for the fetch.
+// A document that states neither leaves a static link to REFUSE the moment the
+// question arises — a common whose name an archive member defines — naming this
+// key, rather than guess a meaning the families disagree on.
+enum class ArchiveCommonResolution : std::uint8_t {
+    FetchDefinition,
+    KeepCommon,
+};
+
+inline constexpr EnumNameTable<ArchiveCommonResolution, 2>
+    kArchiveCommonResolutionTable{{{
+        { ArchiveCommonResolution::FetchDefinition, "fetchDefinition" },
+        { ArchiveCommonResolution::KeepCommon,      "keepCommon"      },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kArchiveCommonResolutionTable);
+
+// ★★★ WHICH DEFINITIONS A COMMON YIELDS TO — a FORMAT fact, the root key
+// `commonYieldsTo` (P69 round 4, lane `xa`,
+// D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT), stated by the documents
+// a link resolves units for: an image, or a relocatable artifact of several units.
+// A common (`ExternImport::commonSize`) DEFINES its name, and a STRONG definition
+// of the name replaces it under every linker measured. The formats split on a WEAK
+// definition of the name:
+//   * `strongDefinition` — only a strong definition replaces the common; it
+//     outranks a weak one, which the link ignores: ELF, the System V gABI's rule
+//     ("the link editor honors the common definition and ignores the weak ones";
+//     ✔MEASURED 2026-10-07, GNU ld 2.42 on x86_64 and aarch64 and ld.lld 18.1.3,
+//     both link orders);
+//   * `anyDefinition` — a weak definition replaces it as a strong one does:
+//     Mach-O, a weak definition being an `N_WEAK_DEF` (✔MEASURED 2026-10-07, Apple
+//     clang 21's ld-1267 and ld64-957.1, arm64 and x86_64, both link orders);
+//   * `nonOverridableDefinition` — the format has TWO kinds of weak definition
+//     (`WeakDefinitionKind`) and the common stands BETWEEN them: PE. A SELECT-ANY
+//     one, a COMDAT section, replaces the common as a strong definition does
+//     (✔MEASURED 2026-10-07, link.exe 14.44 and lld-link 19.1.5 on cl 19.44's
+//     objects, both orders); an OVERRIDABLE one, a weak external whose default is
+//     a body — MinGW gcc's and clang's `__attribute__((weak))` — yields to it,
+//     the common being a definition that is present (✔MEASURED 2026-10-07, GNU ld
+//     2.42's PE linker: the common's value). And because the common stands
+//     between them, the select-any kind outranks the overridable one as well,
+//     whatever the link order (✔MEASURED 2026-10-08, the three linkers; the
+//     cross-unit fold's rank, `linker::weakDefinitionRank`). A definition that
+//     states no kind (`ModuleSymbol::weakKind` empty: DSS's own until its units
+//     state one) is not overridable.
+// The archive search asks the same question of a member
+// (`ArchiveCommonResolution::FetchDefinition`), so the member it fetches is one
+// whose definition the link then lets win. A document that states neither
+// refuses a link the moment a common meets a weak definition of its name, naming
+// this key, rather than guess a meaning the families disagree on. Read by
+// `linker::allocateCommonDefinitions` (`link/linker.cpp`) and by the archive
+// search (`pullStaticArchiveMembers`, `program/compile_pipeline.cpp`).
+enum class CommonYieldsTo : std::uint8_t {
+    StrongDefinition,
+    AnyDefinition,
+    NonOverridableDefinition,
+};
+
+inline constexpr EnumNameTable<CommonYieldsTo, 3> kCommonYieldsToTable{{{
+    { CommonYieldsTo::StrongDefinition,         "strongDefinition"         },
+    { CommonYieldsTo::AnyDefinition,            "anyDefinition"            },
+    { CommonYieldsTo::NonOverridableDefinition, "nonOverridableDefinition" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kCommonYieldsToTable);
+
+// ★★★ WHAT BECOMES OF A DEFINITION WHOSE NAME ANOTHER DEFINITION WINS — a FORMAT
+// fact, the root key `supersededDefinition` (P69 fold 2, the review of fold 1;
+// D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME), stated by every
+// document that describes relocations: the ones a link resolves units for (an
+// image, a relocatable artifact) and the ones a relocatable object is written
+// with.
+// A weak definition that is overridden — or outranked by a common, or the later
+// of two — is SUPERSEDED: every reference written through its NAME goes to the
+// winner, under every linker measured (THE WEAK-NAME RULE,
+// `link/format/object_atom_coverage.hpp`). The linkers split on what the
+// definition's own BYTES are afterwards, and with it on what a relocation means
+// that its object wrote through a module-private name of the definition, or
+// through its section. TWO ANSWERS:
+//   * `keepsItsBytes` — the name moves and nothing else does. The bytes stay in
+//     their input section, and a relocation that names them stays on them.
+//   * `replacedWhole` — the definition is replaced with every label it carries,
+//     so such a relocation reaches the winner as the name does.
+// A DOCUMENT STATES ONE FOR EVERY DEFINITION, OR ONE PER KIND OF WEAK DEFINITION
+// (`WeakDefinitionKind`, `core/types/symbol_attrs.hpp`):
+//     "supersededDefinition": "replacedWhole"
+//     "supersededDefinition": { "overridable": "keepsItsBytes",
+//                               "select-any":  "replacedWhole" }
+// The second form is keyed by the kinds' own names, every one of them, and it is
+// for a format that spells the two kinds differently and whose linkers treat
+// them differently. Nothing in shared code knows which kind keeps what: a reader
+// of the key hands the statement the definition's own kind
+// (`ModuleSymbol::weakKind`) and takes the document's answer
+// (`SupersededDefinitionStatement::answerFor`). Under a per-kind statement a
+// definition that states NO kind has no answer, and is refused by name like an
+// unstated key — the document was asked about a definition it says nothing of.
+// (Until the takeover of 2026-10-10 the staged form had a THIRD value,
+// `replacedUnlessOverridable`, whose meaning lived here as knowledge of which
+// kind keeps its bytes. The answer is a fact of the format AND the kind — Mach-O
+// replaces an overridable weak definition whole where ELF and PE keep its bytes
+// — so the document says it per kind, and the engine reads.)
+// ✔MEASURED, each answer on its format's reference linkers:
+//   * ELF, `keepsItsBytes`. 2026-10-08 — `static int impl = 7;` under a weak
+//     alias `shared`, beside `int shared = 9;`: the object's own read of `impl`
+//     gives 7 and its read of `shared` 9, under GNU ld 2.42 and ld.lld 18.1 (gcc
+//     13.3 and clang 18.1 objects, both orders, through `ld -r`); beside a
+//     common of the name instead, 7 and 0. That is ELF's `STB_WEAK`, the only
+//     weak definition this link's ELF reader reads. ELF's OTHER mechanism is the
+//     COMDAT GROUP, whose loser is DISCARDED with every section of the group
+//     (✔MEASURED 2026-10-10, GNU ld 2.42 and ld.lld 18.1.3 on gas's and clang's
+//     objects: a relocation from outside the group against a non-external
+//     symbol of the losing copy is REFUSED by both — "defined in discarded
+//     section", "relocation refers to a discarded section" — and a group that
+//     is the only copy keeps its bytes beside a strong definition of its name,
+//     7 and 9, exactly as a plain weak definition does).
+//   * Mach-O, `replacedWhole`. 2026-10-08 — a pair Apple's assembler wrote
+//     (`_impl` non-external and `_shared` a `.weak_definition` at one address):
+//     9 and 9 under ld-1267 (arm64 and x86_64) and ld64-957.1, both orders and
+//     through `ld -r`. It is NOT a consequence of the object's sections being
+//     divisible: an object that does not declare MH_SUBSECTIONS_VIA_SYMBOLS —
+//     whose section is a unit this link keeps whole (`InputSectionPlacement`) —
+//     still answers 9 and 9 for a datum under ld64-957.1, and ld-1267 refuses
+//     that pair as a duplicate symbol. Which is why this is a key of its own and
+//     not read off whether a unit's members are kept.
+//   * PE/COFF, PER KIND. 2026-10-08.
+//       - `overridable`: `keepsItsBytes`. The definition is the default of a
+//         WEAK EXTERNAL: the name defers to another and the default's section is
+//         nobody's to discard. With the external default name gcc and clang
+//         write (`.weak.<name>.<unique>`) the body is not superseded at all — it
+//         holds a name of its own — and the same source as above reads 7 and 9
+//         under GNU ld 2.42 (MinGW gcc 13.2), link.exe 14.44 and lld-link 19.1.5
+//         (clang 19.1.5). With that default's record made STATIC (no compiler
+//         writes it; clang's object, one byte changed) lld-link reads 7 and 9 in
+//         every cell, link.exe reads 7 and 9 where the override comes first and
+//         refuses the object otherwise (LNK1235), and GNU ld reads 7 and 9
+//         beside the override.
+//       - `select-any`: `replacedWhole`. The definition is a COMDAT, one of
+//         several copies, and the loser's SECTION is discarded with every label
+//         in it. What a relocation from a kept section against a non-external
+//         label of the discarded one, or against its section symbol, then
+//         reaches: under GNU ld 2.42 the kept copy for a function (9 and 9) and
+//         garbage for a datum; under link.exe 14.44 garbage for a datum and a
+//         crashing program for a function; lld-link 19.1.5 refuses the link
+//         ("relocation against symbol in discarded section"). The one cell that
+//         WORKS answers the winner, and so does this link, for a function and a
+//         datum alike — which is also what it did before the key existed.
+// A document that does not state it leaves a link to REFUSE the moment the
+// question arises — a relocation naming a superseded definition whose unit
+// references the lost name by row (`ModuleSymbol::referencedByName`) — and a
+// relocatable object's writer the moment it holds a body under such a weak name,
+// each naming this key, rather than guess a meaning the families disagree on.
+// Read by `linker::mergeModules` (`link/linker.cpp`) and by the ELF relocatable
+// writer (`link/format/elf.cpp`, `ObjectSymbolNames`).
+enum class SupersededDefinition : std::uint8_t {
+    KeepsItsBytes,
+    ReplacedWhole,
+};
+
+inline constexpr EnumNameTable<SupersededDefinition, 2> kSupersededDefinitionTable{{{
+    { SupersededDefinition::KeepsItsBytes, "keepsItsBytes" },
+    { SupersededDefinition::ReplacedWhole, "replacedWhole" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kSupersededDefinitionTable);
+
+// WHAT ONE DOCUMENT STATES OF IT: nothing, one answer for every definition, or
+// one answer per kind of weak definition. The ONE place a reader of the key
+// gets its answer from, so that no reader spells the per-kind lookup — or a
+// default for a kind the document left out — for itself.
+struct SupersededDefinitionStatement {
+    // The string form: the answer whatever the definition's kind.
+    std::optional<SupersededDefinition> forEveryDefinition;
+    // The object form: an answer per kind, in the document's order. The loader
+    // requires every kind of `kWeakDefinitionKindTable` exactly once.
+    std::vector<std::pair<WeakDefinitionKind, SupersededDefinition>> byKind;
+
+    [[nodiscard]] bool stated() const noexcept {
+        return forEveryDefinition.has_value() || !byKind.empty();
+    }
+    [[nodiscard]] bool perKind() const noexcept { return !byKind.empty(); }
+
+    // The document's answer for a superseded definition of `kind` — what the
+    // definition's own row states (`ModuleSymbol::weakKind`), empty where its
+    // producer's form has one spelling for every weak definition. nullopt: the
+    // document does not say — it states nothing, or it states an answer per
+    // kind and this definition states none.
+    [[nodiscard]] std::optional<SupersededDefinition>
+    answerFor(std::optional<WeakDefinitionKind> kind) const noexcept {
+        if (forEveryDefinition.has_value()) return forEveryDefinition;
+        if (!kind.has_value()) return std::nullopt;
+        for (auto const& [of, answer] : byKind) {
+            if (of == *kind) return answer;
+        }
+        return std::nullopt;
+    }
+};
+
+// ★★★ WHAT A PC-RELATIVE, NON-BRANCH REFERENCE TO AN IMPORT MEANS IN AN IMAGE —
+// a FORMAT fact, the root key `pcRelativeImportAddress` (P69 review M1 case (c)
+// and MINOR 8, D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE).
+//
+// A displacement reaches nothing outside the image, so a unit's
+// `leaq puts(%rip)` can only compute the import's CALL ENTRY — the PE import
+// thunk, the ELF PLT stub, the Mach-O stub. Where that entry is the function's
+// canonical address (an ELF executable or PIE: the image makes its stub
+// canonical) nothing is left to decide and the key is ABSENT. Where it is not —
+// exactly the images that declare `externAddrBinding` — the references decide,
+// and the loader enforces that the two keys come together on an image:
+//   * `callEntry` — the unit's address of the import IS its call entry, and so
+//     is every other address reference that unit makes to it, so the unit
+//     agrees with itself (C 6.5.9). ✔MEASURED 2026-09-30 (PE): link.exe,
+//     lld-link and GNU ld bind such a MinGW object's `leaq` AND its
+//     `.quad puts` to the import thunk alike.
+//   * `refused` — no linker of this format gives the reference a meaning:
+//     ELF shared objects (GNU ld and lld: "recompile with -fPIC"), and Mach-O
+//     images (✔MEASURED 2026-10-01, Apple clang 21's ld, executable AND dylib,
+//     both ISAs: "fixup error (kind=x86_64_rip) ... target '_puts' does not
+//     have address", and `kind=arm64_adrp_lo12` for `adrp`/`add`).
+// Read by `linker::bindPcRelativeImportAddressUnits`
+// (link/pc_relative_import_address.hpp), which recognizes the branch by the
+// TARGET's own declared branch encodings (`link/branch_sites.hpp`).
+enum class PcRelativeImportAddress : std::uint8_t {
+    CallEntry,
+    Refused,
+};
+
+inline constexpr EnumNameTable<PcRelativeImportAddress, 2>
+    kPcRelativeImportAddressTable{{{
+        { PcRelativeImportAddress::CallEntry, "callEntry" },
+        { PcRelativeImportAddress::Refused,   "refused"   },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kPcRelativeImportAddressTable);
+
+// ★★★ WHAT A REFERENCE NAMING A WEAK SYMBOL RESOLVED TO NOTHING COMPUTES IN AN
+// IMAGE — a FORMAT fact, the root block `weakResolvedToNothing` (P69, lane `lm`,
+// D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO).
+//
+// An image binds a WEAK symbol that no linked unit defines and no library binds
+// to NOTHING, and the value of nothing is 0 (the gABI's "an undefined weak symbol
+// has a zero value"; AAELF64 "Weak References": zero for an absolute
+// relocation). A reference READ THROUGH A SLOT — DSS's own data references, a
+// foreign object's GOT load — reads a slot holding 0 and needs nothing from this
+// block. A reference that names the symbol DIRECTLY computes its field from the
+// value, and whether the field can hold the answer depends on the image and on
+// its target's ABI, by the field's CLASS:
+//   * `absolute`   — `S + A`: a link-time constant in EVERY image, and not an
+//                    address the loader moves, so the link writes it and leaves
+//                    no load-time fix-up (a `.quad w`, `int *p = &w;`, `movl $w`);
+//   * `pcRelative` — `S + A - P` that is not a branch (`leaq w(%rip)`, `adrp`):
+//                    a constant only where the loader places the image at its
+//                    link address;
+//   * `branch`     — a call or a jump to the symbol.
+// Each class answers one of:
+//   * `zero`            — the field computes from S = 0;
+//   * `nextInstruction` — a BRANCH only: it reaches the instruction after it, as
+//                         AAELF64 gives an R_AARCH64_CALL26 to an unresolved weak
+//                         reference "for systems without dynamic pre-emption" —
+//                         and an image that binds the symbol to nothing at link
+//                         time is one;
+//   * `refused`         — refused by name.
+// The references keep such a symbol DYNAMIC instead (`.dynsym` WEAK UND, a PLT
+// entry or GOT slot ld.so leaves 0 — ✔MEASURED 2026-10-07, GNU ld 2.42 and ld.lld
+// 18), so where their answer differs from a constant the documents record why.
+// A document that declares NO block refuses every direct reference: nothing
+// silent is the default. Read by `rejectOrDropUnreferencedExterns`
+// (`link/linker.cpp`) through `link/weak_resolved_to_nothing.hpp`.
+enum class WeakNullReference : std::uint8_t {
+    Zero,
+    NextInstruction,
+    Refused,
+};
+
+inline constexpr EnumNameTable<WeakNullReference, 3> kWeakNullReferenceTable{{{
+    { WeakNullReference::Zero,            "zero"            },
+    { WeakNullReference::NextInstruction, "nextInstruction" },
+    { WeakNullReference::Refused,         "refused"         },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kWeakNullReferenceTable);
+
+// The three answers one image document declares (`weakResolvedToNothing`); the
+// default-constructed value — every class refused — is what a document that
+// declares no block answers.
+struct WeakResolvedToNothing {
+    WeakNullReference absolute   = WeakNullReference::Refused;
+    WeakNullReference pcRelative = WeakNullReference::Refused;
+    WeakNullReference branch     = WeakNullReference::Refused;
+};
+
+// ★★★ WHETHER AN ARCHIVE SEARCH FETCHES A MEMBER FOR AN UNDEFINED WEAK REFERENCE
+// — a FORMAT fact, the root key `archiveWeakReferenceSearch` (P69 round 4, lane
+// `lm`, D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE), stated, like
+// `archiveCommonResolution`, by the document that describes an archive's
+// MEMBERS. A static link holds a WEAK reference that nothing it has linked
+// defines, and an archive member defines the name:
+//   * `doNotFetch` — nothing is fetched for it; the reference stays unresolved
+//     (the image binds it to nothing, `weakResolvedToNothing`) unless a member
+//     fetched for another reason defines the name. The ELF gABI's own rule ("The
+//     link editor does not extract archive members to resolve undefined weak
+//     symbols") — GNU ld 2.42 and ld.lld 18, x86_64 and aarch64, -no-pie and
+//     -pie — and COFF's for a weak external whose search policy is NOLIBRARY or
+//     ALIAS: link.exe 14.51, lld-link 18 and GNU ld 2.42's PE linker (✔MEASURED
+//     2026-10-07);
+//   * `fetchMember` — the member is fetched as for a strong reference: ld64
+//     (Apple clang 21's linker, arm64 and x86_64, with or without `-U`;
+//     ✔MEASURED 2026-10-07, the object's reference read back as a weak external).
+// A row that asks for the search itself (`ExternImport::searchesArchives`, a COFF
+// weak external stating SEARCH_LIBRARY) joins it under either answer, and the
+// rows `linker::weakReferenceAwaitsTheArchiveRule` excludes — a fallback, a
+// common, a required name — never read this. A document that states neither
+// answer leaves a static link to REFUSE when the question arises — a weak
+// reference whose name an archive member defines — naming this key.
+enum class ArchiveWeakReferenceSearch : std::uint8_t {
+    FetchMember,
+    DoNotFetch,
+};
+
+inline constexpr EnumNameTable<ArchiveWeakReferenceSearch, 2>
+    kArchiveWeakReferenceSearchTable{{{
+        { ArchiveWeakReferenceSearch::FetchMember, "fetchMember" },
+        { ArchiveWeakReferenceSearch::DoNotFetch,  "doNotFetch"  },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kArchiveWeakReferenceSearchTable);
+
 // ── THE DECODE SIDE OF `relocations[]`, BUILT ONCE ────────────────
 //
 // The two lookups every object READER needs, derived from the rows above by
@@ -373,12 +743,21 @@ struct DSS_EXPORT RelocationDecodeTable {
         return std::unexpected(Miss::NoInstruction);
     }
     // The wire types whose presence PROVES the extern they reach is a
-    // FUNCTION: every row the format declares `"isCall": true` on, plus every
-    // declared `pltNativeId` (a call-through-stub variant can only be a call).
-    // DECLARED by the schema, never inferred from the target's arithmetic
-    // formula — D-LK-MACHO-ISDATA-NO-CALL-SIGNAL. Legitimately EMPTY for a
-    // format that declares neither (every shipped PE document).
+    // FUNCTION: every row the format declares `"isCall": true` on (and that
+    // row's bytes-after-field types). DECLARED by the schema, never inferred
+    // from the target's arithmetic formula — D-LK-MACHO-ISDATA-NO-CALL-SIGNAL.
+    // Legitimately EMPTY for a format that declares none (every shipped PE
+    // document: COFF's REL32 is one wire type for calls and data).
     std::unordered_set<std::uint32_t> callSignalNativeIds;
+    // Wire type → the bytes after the field that its TYPE states and its field
+    // does not (`ObjectFormatRelocationInfo::bytesAfterFieldLowersTheAddend`):
+    // COFF's REL32_1.._5. Every reader passes `addendLoweringOf` to
+    // `recoverRelocationAddend`, the one owner, which lowers the addend by it.
+    std::unordered_map<std::uint32_t, std::uint8_t> addendLoweredByType;
+    [[nodiscard]] std::uint8_t addendLoweringOf(std::uint32_t nativeId) const noexcept {
+        auto const it = addendLoweredByType.find(nativeId);
+        return it == addendLoweredByType.end() ? std::uint8_t{0} : it->second;
+    }
 };
 
 // ── Per-section row (plan 14 D-LK4-2) ───────────────────────────
@@ -482,6 +861,38 @@ elfObjectTypeFromName(std::string_view s) noexcept {
     return kElfObjectTypeTable.fromName(s);
 }
 
+// ★ P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): the psABI numbers
+// of the three DYNAMIC relocations an ELF image's loader applies, stated BY
+// ROLE where every other psABI number of the format already lives — so the
+// writer names no machine (they replace the `e_machine` switches
+// `globDatTypeFor` / `relativeRelocTypeFor`). The roles differ in the ONE way
+// that matters to an image that makes a library function's stub CANONICAL:
+//   * `globDat`  — fill a slot with the symbol's address through a lookup
+//                  an undefined-WITH-VALUE definition in the executable
+//                  SATISFIES (the non-PLT class): a datum's slot, and the
+//                  address of a function whose stub is not canonical;
+//   * `jumpSlot` — fill a slot through the PLT-class lookup, which SKIPS
+//                  such a definition — the only relocation that lets a
+//                  canonical stub's OWN slot bind to the library rather than
+//                  to the stub itself (glibc `elf_machine_type_class`, musl
+//                  `need_def`); written to `.rela.dyn` under the image's
+//                  eager binding (DT_FLAGS_1 = DF_1_NOW);
+//   * `relative` — base + addend, no symbol.
+// All zero = not declared. validate() requires all three on an image that
+// can carry dynamic relocations (ET_DYN, or an executable naming an
+// interpreter) and refuses them anywhere else as inert config.
+struct DSS_EXPORT ElfDynamicRelocationTypes {
+    std::uint32_t globDat  = 0;
+    std::uint32_t jumpSlot = 0;
+    std::uint32_t relative = 0;
+    [[nodiscard]] bool anyDeclared() const noexcept {
+        return globDat != 0 || jumpSlot != 0 || relative != 0;
+    }
+    [[nodiscard]] bool complete() const noexcept {
+        return globDat != 0 && jumpSlot != 0 && relative != 0;
+    }
+};
+
 struct DSS_EXPORT ElfIdentity {
     std::uint8_t   fileClass = 0;    // ELFCLASS64=2 / ELFCLASS32=1
     std::uint8_t   dataEncoding = 0; // ELFDATA2LSB=1 / ELFDATA2MSB=2
@@ -543,6 +954,8 @@ struct DSS_EXPORT ElfIdentity {
     // preserves cycle 2b.2's emitted image for schemas that omit
     // the field.
     bool           bindNow = true;
+    // The dynamic relocation types by role — see `ElfDynamicRelocationTypes`.
+    ElfDynamicRelocationTypes dynamicRelocationTypes;
 };
 
 // ── PE/COFF-specific identity block (loaded only when kind == Pe) ──
@@ -591,12 +1004,266 @@ peObjectTypeFromName(std::string_view s) noexcept {
     return kPeObjectTypeTable.fromName(s);
 }
 
+// ★★★ A COFF OBJECT'S LINKER DIRECTIVES — the requests a relocatable COFF
+// object hands its final linker as TEXT in a section of its own (`.drectve`,
+// IMAGE_SCN_LNK_INFO), and what each one MEANS for a DSS link. P69 (the PE half
+// of D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS, and
+// D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE), the `pe.linkerDirectives`
+// block of a relocatable PE document.
+//
+// COFF has no visibility field: a definition is EXTERNAL or it is not. So the
+// ecosystem says "defined here, never exported from the image" with a
+// directive. ✔MEASURED 2026-10-01 (lane lm, probe run 20261001-152320-120ebcb3):
+// clang 18.1.3 `--target=x86_64-w64-windows-gnu -c` writes a
+// `visibility("hidden")` definition as an ordinary EXTERNAL symbol plus
+// ` -exclude-symbols:<name>`; mingw-w64 gcc 13.2.0 ignores the attribute with a
+// warning (run 20261001-152413-a2378443). And every object the references
+// write carries directives of its own — ✔MEASURED 2026-10-06 (probe runs
+// 20261006-212638-3ab25596, -212648-2547f2f2, -212645-25ddf9c5): cl 19.51 C
+// `/DEFAULTLIB:MSVCRT /DEFAULTLIB:OLDNAMES`, `/EXPORT:<name>[,DATA]`,
+// `/EDITANDCONTINUE` (/ZI), `/InferAsanLibs /INCLUDE:...` (/fsanitize=address),
+// `/FAILIFMISMATCH:` and `/alternatename:` (C++); mingw-w64 gcc 13.2.0
+// ` -export:"<name>"[,data]` and ` -aligncomm:"<common>",<log2>` for every
+// `-fcommon` common; `#pragma comment(linker, ...)` passes any option through.
+//
+// The VOCABULARY is the document's: the characters an option may begin with,
+// and each option the reader recognizes with its meaning here — every option
+// one of the reference linkers takes in a directive is HONOURED, REFUSED by name
+// with the reason (and the row that carries the work), or IGNORED with the
+// reason that is right for a DSS link. An option the document does not list is
+// one no reference honours in a directive: the reader WARNS
+// (`K_LinkerDirectiveIgnored`) and links, as link.exe does (LNK4229) and GNU ld
+// does ("unrecognized") — ✔MEASURED 2026-10-07, link.exe 14.44 over 45 such
+// options; lld-link refuses them. The writer states each request with the first
+// option the document declares for its meaning, after the first declared prefix
+// (`pe::coffLinkerDirectiveText`): every external definition its visibility keeps
+// out of the image's exports, and the `includeSymbol`, `alternateName` and
+// `commonAlignment` requests a re-emitted foreign object hands on to its final
+// linker; every other directive a relocatable artifact holds is handed on
+// verbatim (`UnitLinkerRequests::handOn`).
+//
+// ★ THE IMAGE REQUESTS (P69 round 4) and the precedence link.exe gives each,
+// ✔MEASURED 2026-10-07 with link.exe 14.44.35228 and lld-link 19.1.5 on cl 19.44
+// objects: a unit's request against another unit's — `/STACK:`, `/HEAP:`,
+// `/BASE:` and `/ENTRY:` the FIRST wins (link.exe warns LNK4258 on a later,
+// different `/ENTRY:`), `/SUBSYSTEM:`, `/VERSION:` and `/ALIGN:` the LAST,
+// `/SECTION:` applies in order; against the program's own request (DSS's
+// `--stack-reserve`) the program's wins, reserve and commit alike. lld-link
+// takes the LAST `/STACK:` (its reserve alone), `/SUBSYSTEM:` and `/ENTRY:`,
+// lets a directive's `/STACK:` beat its command line, and refuses `/HEAP:`,
+// `/BASE:`, `/ALIGN:` and `/VERSION:` in a directive; where the two split, the
+// vendor of the directive format decides.
+enum class LinkerDirectiveMeaning : std::uint8_t {
+    // The comma-separated names are definitions the image must not export: a
+    // definition of THIS object is read back as `SymbolVisibility::Hidden`, and
+    // a name another unit defines is hidden there (LINK-WIDE, ✔MEASURED
+    // 2026-10-07: lld-link -lldmingw honours another object's
+    // `-exclude-symbols:`, and one naming nothing is silent).
+    HideSymbols,
+    // `[exported=]internal[,DATA][,PRIVATE]` — the image exports the definition
+    // `internal`, wherever in the link it is, under `exported` (LINK-WIDE). An
+    // EXE gets an export table for it; a DLL already exports every visible
+    // definition and adds the renamed name. An explicit export wins over a hide
+    // (✔MEASURED 2026-10-07, lld-link -lldmingw and GNU ld). A name only a
+    // library defines is exported at the image's import thunk, as both linkers
+    // export `/EXPORT:puts` (✔MEASURED 2026-10-07); a name nothing defines is
+    // refused (LNK2001). An ordinal, NONAME and a forwarder are refused by name.
+    ExportSymbol,
+    // The named symbol must be DEFINED by the link — `/INCLUDE:`. A name this
+    // object does not define becomes a REQUIRED reference of the object
+    // (`ExternImport::requiredByDirective`): an archive member defining it is
+    // pulled, a library binds it, and one nothing defines is refused by name, as
+    // link.exe (LNK2001) and lld-link ("undefined symbol") refuse it.
+    // ✔MEASURED 2026-10-06 (run 20261006-222410-df088936): link.exe imports an
+    // otherwise unreferenced `puts` for `/INCLUDE:puts`.
+    IncludeSymbol,
+    // `name=fallback` — a reference to `name` that NOTHING in the link defines
+    // resolves to `fallback` (`/alternatename:`). ✔MEASURED 2026-10-06:
+    // link.exe resolves it to a fallback this object defines AND to one an
+    // import library's member defines (run 20261006-222410-df088936); lld-link
+    // 18 honours it and lets a defined `name` win (run
+    // 20261006-213542-7ff2ade8). The meaning is LINK-WIDE — any object's
+    // reference to `name` takes the fallback, wherever the fallback is defined
+    // — so the reader states it on the reference (`ExternImport::fallbackName`)
+    // and the link decides it once it knows what it defines (`linker::link`).
+    AlternateName,
+    // `name,log2` — the COMMON symbol `name` aligned to 2^log2 bytes
+    // (`-aligncomm:`, written by gcc and clang's windows-gnu target for every
+    // `-fcommon` common of alignment 2 or more). ✔MEASURED 2026-10-06 (GNU ld
+    // 2.42, run 20261006-222413-52787563; lld-link 18, run
+    // 20261006-222558-072ac1f9): it aligns a common and has NO effect on any
+    // other name, a definition or nothing at all.
+    CommonAlignment,
+    // `reserve[,commit]` — the initial thread's stack (`/STACK:`; both linkers
+    // honour it: 200 frames of 64 KiB run to 42 under 0x10000000 and overflow
+    // under the 1 MiB default, ✔MEASURED 2026-10-07). The image writer realizes
+    // the values as link.exe does (rounded up to 4; a reserve below the default
+    // commit, the commit unstated, becomes that commit); a commit above the
+    // reserve is lld-link's (link.exe refuses it with LNK1229, lld-link writes
+    // it and the image runs). Honoured by a link that makes a PROGRAM; the
+    // loader reads a DLL's copy of the field from nowhere, so a DLL link warns.
+    StackSize,
+    // `reserve[,commit]` — the default process heap (`/HEAP:`; link.exe honours
+    // it with the stack's rounding, lld-link refuses it in a directive,
+    // ✔MEASURED 2026-10-07). A commit above the reserve is refused: link.exe
+    // refuses it (LNK1229) and lld-link takes no heap directive at all.
+    HeapSize,
+    // `name[,major[.minor]]` — the image's subsystem, the row's `subsystems`
+    // table naming the IMAGE_SUBSYSTEM value of each name the option takes, and
+    // the subsystem AND operating-system versions when stated (link.exe sets
+    // both from `CONSOLE,6.1`, ✔MEASURED 2026-10-07). A version below the row's
+    // `minimumVersion` is warned and the format's default kept, as link.exe does
+    // (LNK4010 on 5.01; it takes 5.02 for x64, ✔MEASURED 2026-10-07). A DSS
+    // image starts in the language's entry whatever the subsystem: link.exe and
+    // lld-link REFUSE `/SUBSYSTEM:WINDOWS` with only `main` (their GUI default
+    // startup calls WinMain), and run `/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup`
+    // as a GUI image of `main` — the meaning DSS gives both.
+    Subsystem,
+    // `symbol` — the image's entry (`/ENTRY:`). A name in the row's
+    // `runtimeStartups` is the C runtime's startup, which in a DSS image is the
+    // target's own (it calls the language's entry); any other must be a
+    // function the link defines, and the image starts THERE, with no runtime
+    // startup, its return value the exit status (✔MEASURED 2026-10-07, both
+    // linkers: 42). A name in `unsupportedStartups` is refused by name, and so
+    // is a DATUM (both linkers take one, and both images fault at start,
+    // 0xC0000005, ✔MEASURED 2026-10-07).
+    EntryPoint,
+    // `name,attributes` — an output section's Characteristics, read as link.exe
+    // reads the letters E R W S D K P (case-insensitive; `!` toggles negation
+    // for the letters after it; an un-negated E, R or W REPLACES the E/R/W bits;
+    // K and P mean cacheable / pageable). ✔MEASURED 2026-10-07 over 28 arms. A
+    // section the image does not have is warned about (LNK4039); `ALIGN=` is
+    // refused (LNK1137 without /DRIVER). lld-link forks (it replaces every bit
+    // and reads K / P inverted); the vendor's rule is DSS's.
+    SectionAttributes,
+    // no value — the image's CheckSum is computed (`/RELEASE`: lld-link honours
+    // it, link.exe ignores it in a directive with LNK4229, ✔MEASURED 2026-10-07;
+    // lld-link's value is the PE algorithm's over its file).
+    ImageChecksum,
+    // `major[.minor]` — the image's version fields (`/VERSION:`; link.exe
+    // honours it up to 65535.65535 and refuses 65536 and `1.2.3`, lld-link
+    // refuses it in a directive, ✔MEASURED 2026-10-07).
+    ImageVersion,
+    // `address` — the image's preferred base (`/BASE:`; link.exe honours a
+    // multiple of 64 KiB and refuses any other, LNK1224, ✔MEASURED 2026-10-07).
+    ImageBase,
+    // `bytes` — the image's section alignment (`/ALIGN:`; link.exe honours a
+    // power of two and warns on any other, LNK4043, keeping its default,
+    // ✔MEASURED 2026-10-07). One below the format's own section alignment (its
+    // page) is a layout DSS's image writer does not make, refused by name.
+    SectionAlignment,
+    // `key=value` — a consistency check across the link's objects
+    // (`/FAILIFMISMATCH:`): link.exe and lld-link refuse a mismatch, GNU ld
+    // links it (✔MEASURED 2026-10-06), so a DSS link WARNS and links.
+    MismatchCheck,
+    // no value — the image is a DLL (`/DLL`; link.exe makes one, ✔MEASURED
+    // 2026-10-07). Satisfied by a link that makes a shared library; a link
+    // that makes a program refuses it by name, the build's target being the
+    // program the user asked for.
+    DllImage,
+    // A request a reference honours and a DSS image cannot honour yet — REFUSED
+    // by name by a link that makes an image; `reason` says why and names the row
+    // that carries the work. A relocatable artifact hands it on to its final
+    // linker, which can (`UnitUnhonourableRequest`).
+    Refused,
+    // A request a DSS link satisfies another way, or one that changes no
+    // program's meaning — the row states which, and why (`reason`).
+    Ignored,
+};
+
+inline constexpr EnumNameTable<LinkerDirectiveMeaning, 18> kLinkerDirectiveMeaningTable{{{
+    { LinkerDirectiveMeaning::HideSymbols,       "hideSymbols"       },
+    { LinkerDirectiveMeaning::ExportSymbol,      "exportSymbol"      },
+    { LinkerDirectiveMeaning::IncludeSymbol,     "includeSymbol"     },
+    { LinkerDirectiveMeaning::AlternateName,     "alternateName"     },
+    { LinkerDirectiveMeaning::CommonAlignment,   "commonAlignment"   },
+    { LinkerDirectiveMeaning::StackSize,         "stackSize"         },
+    { LinkerDirectiveMeaning::HeapSize,          "heapSize"          },
+    { LinkerDirectiveMeaning::Subsystem,         "subsystem"         },
+    { LinkerDirectiveMeaning::EntryPoint,        "entryPoint"        },
+    { LinkerDirectiveMeaning::SectionAttributes, "sectionAttributes" },
+    { LinkerDirectiveMeaning::ImageChecksum,     "imageChecksum"     },
+    { LinkerDirectiveMeaning::ImageVersion,      "imageVersion"      },
+    { LinkerDirectiveMeaning::ImageBase,         "imageBase"         },
+    { LinkerDirectiveMeaning::SectionAlignment,  "sectionAlignment"  },
+    { LinkerDirectiveMeaning::MismatchCheck,     "mismatchCheck"     },
+    { LinkerDirectiveMeaning::DllImage,          "dllImage"          },
+    { LinkerDirectiveMeaning::Refused,           "refused"           },
+    { LinkerDirectiveMeaning::Ignored,           "ignored"           },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kLinkerDirectiveMeaningTable);
+
+// A name a directive's value may take, with what the row says of it — an
+// IMAGE_SUBSYSTEM value, or the reason a name is refused.
+struct DSS_EXPORT PeDirectiveNamedValue {
+    std::string   name;      // compared without regard to case
+    std::uint16_t value = 0;
+    std::string   reason;
+    friend bool operator==(PeDirectiveNamedValue const&, PeDirectiveNamedValue const&) = default;
+};
+
+struct DSS_EXPORT PeLinkerDirectiveRow {
+    std::string            option;   // compared without regard to case
+    LinkerDirectiveMeaning meaning = LinkerDirectiveMeaning::Ignored;
+    // WHY dropping or refusing the request is right — required on an `ignored`
+    // or `refused` row, and refused on any other (a meaning the reader applies
+    // needs no excuse).
+    std::string            reason;
+    // `subsystem` rows only (required there): each name the option takes and its
+    // IMAGE_SUBSYSTEM value. A name the table lacks is refused by name.
+    std::vector<PeDirectiveNamedValue> subsystems;
+    // `subsystem` rows only: subsystems a reference names that no DSS image
+    // starts under, each refused by name with its `reason`.
+    std::vector<PeDirectiveNamedValue> unsupportedSubsystems;
+    // `subsystem` rows only: the lowest subsystem version the vendor's linker
+    // takes for this machine; a lower one is warned and the format's default
+    // version kept.
+    std::optional<VersionPair>         minimumVersion;
+    // `entryPoint` rows only (required there): the names that mean the C
+    // runtime's own startup — the target's startup in a DSS image.
+    std::vector<std::string>           runtimeStartups;
+    // `entryPoint` rows only: runtime startups a DSS image does not provide,
+    // each refused by name with its `reason`.
+    std::vector<PeDirectiveNamedValue> unsupportedStartups;
+    // `includeSymbol` rows only: names the platform's C runtime defines that no
+    // DSS link does, each refused by name with its `reason` when an object asks
+    // for one it does not define.
+    std::vector<PeDirectiveNamedValue> runtimeSymbols;
+    // Rows whose request ONE LINK DECIDES ACROSS ITS UNITS only -- the nine
+    // image settings and `exportSymbol` (`pe::isDecidedAcrossUnits`) -- where the
+    // loader REQUIRES both and refuses either on any other row (P69 send-back 5,
+    // review-xa4 MINOR 6): which unit's request stands when two units of one
+    // link state the option, and what a link that makes a shared library does
+    // with it. Both are this format's vendor linker's facts (✔MEASURED
+    // 2026-10-07, link.exe 14.44.35228: the first `/STACK:`, `/HEAP:`, `/BASE:`,
+    // `/ENTRY:` and `/EXPORT:`, the last `/SUBSYSTEM:`, `/VERSION:` and
+    // `/ALIGN:`, `/SECTION:` in order; lld-link takes the last `/STACK:` and
+    // `/ENTRY:`), carried on each request and read there by
+    // `linker::decideUnitLinkerRequests`: no option's precedence is code.
+    // `inSharedLibraryReason` is required when the answer is `ignored` or
+    // `refused`, and refused otherwise.
+    std::optional<UnitRequestPrecedence>    unitPrecedence;
+    std::optional<SharedLibraryDisposition> inSharedLibrary;
+    std::string                             inSharedLibraryReason;
+};
+
+struct DSS_EXPORT PeLinkerDirectives {
+    std::string                       section;               // the directive section's name
+    std::uint32_t                     characteristics = 0;   // the header the writer stamps
+    std::string                       optionPrefixes;        // each char a prefix; the writer uses the first
+    std::vector<PeLinkerDirectiveRow> directives;
+};
+
 struct DSS_EXPORT PeIdentity {
     std::uint16_t machine = 0;          // IMAGE_FILE_MACHINE_AMD64=0x8664
                                         // / I386=0x014C / ARM64=0xAA64
     std::uint16_t characteristics = 0;  // file-level flags; conventionally
                                         // 0 for relocatable .obj
     PeObjectType  objectType = PeObjectType::Obj;
+    // The relocatable document's linker-directive vocabulary (above); absent on
+    // an image, which neither writes nor reads a member through its own document
+    // (a member is read through its archive's relocatable sibling).
+    std::optional<PeLinkerDirectives> linkerDirectives;
 };
 
 // ── PE32+ Optional Header (loaded when PE objectType != Obj) ──
@@ -687,6 +1354,40 @@ machoObjectTypeFromName(std::string_view s) noexcept {
     return kMachOObjectTypeTable.fromName(s);
 }
 
+// ── A DIFFERENCE written as TWO relocation entries (P69,
+//    D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ) ──
+//
+// Mach-O states `A - B + addend` in a data field as a PAIR of `relocation_info`
+// entries at ONE `r_address`: first the SUBTRAHEND (the symbol to subtract —
+// X86_64_RELOC_SUBTRACTOR, ARM64_RELOC_SUBTRACTOR), then the MINUEND (the symbol
+// it is subtracted from — the UNSIGNED type), with the addend stored in the
+// field. One row declares one such pair by its two wire ids, packed as a
+// `relocations` row's `nativeId` is: type, length and pc-relative bit. The
+// WIDTH of the field the pair patches is not restated: each id carries it
+// (`r_length`, `macho::relocationFieldBytes`), and the loader refuses a pair
+// whose two ids state different widths.
+//
+// ★ WHY A TABLE OF ITS OWN and not a key on a `relocations` row. A relocation
+//   row maps a wire id to a universal `RelocationKind`, which the target
+//   document gives its arithmetic and its width; a subtrahend entry has no kind
+//   (it is half of a reference), and a format uses a pair on a field no row of
+//   it describes — arm64 declares no 4-byte absolute kind at all, and the CIE
+//   pointer of a call-frame record is four bytes on both ISAs. So a pair names
+//   both of its ids itself.
+//
+// ⚠ WHO READS IT: the Mach-O object READER, for a DWARF call-frame section
+//   (✔MEASURED 2026-10-08, Apple clang 21.0.0 with ld-1267). A relocatable
+//   LINK's product (`ld -r`) keeps EVERY reference of that section as such a
+//   pair, on both ISAs; an arm64 COMPILER's own object already keeps each
+//   record's function address as one, where a compiler's x86_64 object stores
+//   the resolved value and carries no relocation. So it is declared by the
+//   documents a reader is handed (`filetype: object`) and REFUSED on an image
+//   document, where nothing would read it.
+struct DSS_EXPORT MachODifferenceRelocation {
+    std::uint32_t subtrahendNativeId = 0;  // the entry naming the symbol to subtract
+    std::uint32_t minuendNativeId    = 0;  // the entry that follows it at the same address
+};
+
 struct DSS_EXPORT MachOIdentity {
     std::uint32_t cputype = 0;       // CPU_TYPE_X86_64=0x01000007
                                      // / CPU_TYPE_ARM64=0x0100000C
@@ -712,6 +1413,11 @@ struct DSS_EXPORT MachOIdentity {
                                      //   D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM and
                                      //   the rationale in each object
                                      //   format's `macho.$comment`.
+    // The (subtrahend, minuend) relocation pairs a READER of this format
+    // applies — the JSON key `macho.differenceRelocations`; see
+    // `MachODifferenceRelocation`. Empty = the document declares none, and a
+    // reader then refuses a call-frame section that carries a relocation.
+    std::vector<MachODifferenceRelocation> differenceRelocations;
 };
 
 // ── Mach-O image block (loaded when filetype is MH_EXECUTE or
@@ -1318,6 +2024,44 @@ objectFormatContainerFromName(std::string_view s) noexcept {
     return kObjectFormatContainerTable.fromName(s);
 }
 
+// ── HOW THE PLATFORM ENTERS A PROCESS: `entryTransition` ────────────
+// (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION)
+//
+// Whether the loader CALLS the image's entry point — a return address
+// pushed, so the stack holds the ISA's function-entry state at the
+// entry's first instruction — or JUMPS to it, the stack exactly
+// ABI-aligned and nothing pushed. A fact of the platform's ENTRY
+// MECHANISM, so of the exec FORMAT, never of a calling convention: the
+// SAME `sysv_amd64` convention enters ELF by a jump (the kernel, or
+// ld.so's `jmp`) and Mach-O by a call (dyld calls LC_MAIN's entry).
+// The entry trampoline DERIVES its process-entry stack bias from it —
+// the convention's `callPushBytes` when `called`, 0 when `jumped` —
+// which is why the convention carries no entry bias of its own.
+// ✔MEASURED per format (probes/entryref.c, P69 lane lm: a C function
+// made the entry point, its 16-aligned locals' address mod 16): ELF
+// x86_64 jumped; Mach-O x86_64 and pe64 called; on arm64 the stack
+// cannot tell (BL pushes nothing), so the derived bias is 0 either way.
+enum class EntryTransition : std::uint8_t {
+    Called = 0,  // the loader CALLS the entry (dyld LC_MAIN, BaseThreadInitThunk)
+    Jumped = 1,  // the loader JUMPS to it (the ELF kernel / ld.so hand-off)
+};
+
+inline constexpr EnumNameTable<EntryTransition, 2> kEntryTransitionTable{{{
+    { EntryTransition::Called, "called" },
+    { EntryTransition::Jumped, "jumped" },
+}}};
+
+DSS_CHECK_ENUM_NAME_TABLE(kEntryTransitionTable);
+
+[[nodiscard]] constexpr std::string_view
+entryTransitionName(EntryTransition t) noexcept {
+    return kEntryTransitionTable.name(t);
+}
+[[nodiscard]] constexpr std::optional<EntryTransition>
+entryTransitionFromName(std::string_view s) noexcept {
+    return kEntryTransitionTable.fromName(s);
+}
+
 namespace detail {
 
 struct DSS_EXPORT ObjectFormatData {
@@ -1644,6 +2388,22 @@ struct DSS_EXPORT ObjectFormatData {
     // `InputSectionPlacement`). REQUIRED whenever `relocations` is non-empty
     // (`validate()`): a format whose objects the link reads must say it.
     std::optional<InputSectionPlacement> inputSectionPlacement;
+    // What a static link's archive search does for a name it holds as a COMMON
+    // (the `archiveCommonResolution` root key — see `ArchiveCommonResolution`).
+    // OPTIONAL: absent, a static link refuses when the question arises; refused
+    // on an IMAGE document (`validate()`), which describes no archive member.
+    std::optional<ArchiveCommonResolution> archiveCommonResolution;
+    // Which definitions a COMMON yields to (the `commonYieldsTo` root key — see
+    // `CommonYieldsTo`). OPTIONAL: absent, a link refuses when a common meets a
+    // weak definition of its name; refused on an ARCHIVE document (`validate()`),
+    // whose members are each linked alone.
+    std::optional<CommonYieldsTo> commonYieldsTo;
+    // What becomes of a definition whose name another definition wins (the
+    // `supersededDefinition` root key — see `SupersededDefinition`). OPTIONAL:
+    // unstated, a link refuses when a relocation names such a definition, and a
+    // relocatable object's writer when it holds a body under a weak name its
+    // unit references by row.
+    SupersededDefinitionStatement supersededDefinition;
 
     // Sections row (D-LK4-2). The walker reads sections by
     // SectionKind; `name`/`type`/`flags`/`addrAlign`/`entrySize`
@@ -1877,6 +2637,14 @@ struct DSS_EXPORT ObjectFormatData {
     // together).
     std::string entryCallingConvention;
 
+    // `entryTransition`: how the platform's loader enters this exec
+    // image (`EntryTransition` above). Paired with `processExit` exactly
+    // as `entryCallingConvention` is — required on every format that
+    // declares one, illegal on every other — because the trampoline
+    // cannot place its first call without knowing where the stack
+    // stands. nullopt on a format without `processExit`.
+    std::optional<EntryTransition> entryTransition;
+
     // ── D-FFI-EXTERN-CALL-DISPATCH: extern-call shape ────────────
     //
     // How a call to an extern import is reached at the CALL SITE for
@@ -2038,15 +2806,71 @@ struct DSS_EXPORT ObjectFormatData {
     //
     // `std::nullopt` = the format declared no binding — NOT a silent
     // default: an `&extern` value then materializes via the ordinary lea
-    // (a PC-relative rel32 on x86_64 — already foreign-PIE-safe; an
-    // absolute page-pair on arm64 — foreign-PIE-safe ONLY for a
-    // DSS-linked exec). Only the arm64 relocatable + static-archive
-    // formats declare `got`; the DSS-linked exec/pie/dyn formats omit it
-    // (they use the c117 DSS-local got-indirect slot path). Consumed by
-    // MIR→LIR `lowerGlobalAddr`'s value-form arm. An unknown VALUE fails
+    // (a PC-relative `riprel32` on x86_64; an absolute page-pair on arm64 —
+    // foreign-PIE-safe ONLY for a DSS-linked exec). WHO DECLARES `got`
+    // (★ P69, D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB — the list
+    // this comment used to give, "only the arm64 relocatable + static-archive
+    // formats", went stale when the reason became the ADDRESS'S IDENTITY and
+    // not only foreign-PIE safety): every relocatable document — the ELF and
+    // Mach-O ones write a GOT relocation the final linker makes the slot for,
+    // and the PE ones, whose COFF has no GOT relocation, load every extern's
+    // address from a pointer the object carries (one absolute relocation, the
+    // one its statics use: P69 re-review MAJOR 2) — every image that CANNOT carry a canonical
+    // stub — the two ELF `-dyn` documents and every Mach-O image — and the two
+    // PE images, whose slot is loader-bound through an import descriptor of
+    // its own (design c2). The ELF exec and PIE documents omit it: there a
+    // non-call reference makes the import's PLT stub CANONICAL, which is the
+    // same address everywhere in the process. Consumed by MIR→LIR
+    // `lowerGlobalAddr`'s value-form arm; the link then mints the slot — for
+    // an image, and for a relocatable format that cannot spell the GOT
+    // relocation (`lowerGotSlotReferences`). An unknown VALUE fails
     // loud at load (the closed-enum check — the externCallDispatch /
     // dataImportBinding discipline).
     std::optional<ExternAddrBinding> externAddrBinding;
+
+    // ── D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED (P69): the NAME an
+    //     object gives an import's ADDRESS SLOT ───────────────────────────
+    //
+    // COFF gives every import two names: `X`, the function a call reaches
+    // through the linker's thunk, and `<prefix>X` — `__imp_X` — the IAT entry
+    // the loader fills with X's address. Code compiled against a `dllimport`
+    // declaration names ONLY the second (every MSVC `/MD` object: the UCRT
+    // headers declare the C library dllimport). A format that states the
+    // prefix lets the link read `<prefix>X` as X's address slot
+    // (`linker::foldImportAddressReferences`, link/import_address_references.hpp);
+    // a format that states none has no such spelling, and a name that merely
+    // begins with those characters is an ordinary name there. Only an IMAGE
+    // reads it — an image link is where a member's imports are bound — so the
+    // PE image documents state it and validate() refuses it on any other
+    // flavor. DSS's own objects never WRITE `<prefix>X` (P69 re-review MAJOR 2:
+    // a load from the IAT entry is MSVC `/MD`'s code shape, whose statics keep
+    // the import thunk, so it gave one function two addresses under every
+    // foreign PE linker). An empty string is refused at load: every name would
+    // become a slot.
+    std::optional<std::string> importAddressSymbolPrefix;
+
+    // ── P69 review M1 (c) + MINOR 8: what an image makes of a unit's
+    //     PC-relative, non-branch reference to an import (`PcRelativeImportAddress`
+    //     above). Declared on exactly the images that declare `externAddrBinding`
+    //     — validate() refuses either without the other on an image, and this
+    //     one on any other flavor.
+    std::optional<PcRelativeImportAddress> pcRelativeImportAddress;
+
+    // ── P69, lane `lm`:
+    //     D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO — what a
+    //     reference naming a weak symbol this image resolves to nothing computes,
+    //     per field class (`WeakResolvedToNothing` above). Declared on the images
+    //     that bind such a symbol to nothing — those that refuse an undefined
+    //     import — and refused elsewhere by validate(), which also refuses `zero`
+    //     for a displacement on a writer that cannot make one reach address 0.
+    std::optional<WeakResolvedToNothing> weakResolvedToNothing;
+
+    // ── P69 round 4, lane `lm`:
+    //     D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE — whether a
+    //     static link's archive search fetches a member for a weak reference
+    //     nothing it linked defines (`ArchiveWeakReferenceSearch` above). Stated
+    //     by the archive documents alone; refused on every other by validate().
+    std::optional<ArchiveWeakReferenceSearch> archiveWeakReferenceSearch;
 
     // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET:
     //     the OBJECT-CARRIED realization of `dataImportBinding` ───────
@@ -2221,6 +3045,20 @@ struct DSS_EXPORT ObjectFormatData {
     // definition rather than state part of what an image needs; it states all
     // of it now, so they moved to the first.
     std::optional<WeakDefinition> weakDefinition;
+    // P69 (`weakDefinition.byKind` in the JSON): the dialect of each KIND of
+    // weak definition that does NOT take the block's `dialect`, keyed by the
+    // kinds' own names (`kWeakDefinitionKindTable`). Empty for a format with
+    // one spelling. PE's relocatable documents state `overridable:
+    // weak-external` — what MinGW gcc and clang write for
+    // `__attribute__((weak))`, the format's second mechanism, with a duplicate
+    // rule of its own (`WeakDefinitionDialect::WeakExternal`). `dialect` stays
+    // the answer for a kind with no entry AND for a definition that states no
+    // kind (`ModuleSymbol::weakKind` empty: DSS's own until its units state
+    // one), so nothing a document said before P69 changes meaning. Held beside
+    // the block rather than in it because `WeakDefinition` is one field by
+    // design (one property per field); meaningless without the block, and
+    // `validate()` refuses entries beside an absent one.
+    std::vector<std::pair<WeakDefinitionKind, WeakDefinitionDialect>> weakDefinitionByKind;
 
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
     //
@@ -2523,6 +3361,33 @@ public:
         return d_.inputSectionPlacement;
     }
 
+    // What a static link's archive search does for a name it holds as a COMMON
+    // (`archiveCommonResolution`), or nullopt where this document does not state
+    // it. Read by the archive pull, from the document of the archive's members.
+    [[nodiscard]] std::optional<ArchiveCommonResolution>
+    archiveCommonResolution() const noexcept {
+        return d_.archiveCommonResolution;
+    }
+
+    // Which definitions a COMMON yields to (`commonYieldsTo`), or nullopt where
+    // this document does not state it. Read from the document of the LINK — the
+    // image or relocatable artifact it writes — by the commons' allocation and by
+    // the archive search, so the two cannot disagree.
+    [[nodiscard]] std::optional<CommonYieldsTo> commonYieldsTo() const noexcept {
+        return d_.commonYieldsTo;
+    }
+
+    // What this document states of a definition whose name another definition
+    // wins (`supersededDefinition`): nothing, one answer, or one per kind of
+    // weak definition — asked through `SupersededDefinitionStatement::answerFor`.
+    // Read from the document of the LINK by the merge, and from the document a
+    // relocatable object is written with by its writer, so a relocation that
+    // names a superseded definition's bytes means one thing in both.
+    [[nodiscard]] SupersededDefinitionStatement const&
+    supersededDefinition() const noexcept {
+        return d_.supersededDefinition;
+    }
+
     [[nodiscard]] ObjectFormatRelocationInfo const*
     relocationByName(std::string_view name) const noexcept {
         auto it = d_.relocationNameIndex.find(name);
@@ -2774,6 +3639,12 @@ public:
     [[nodiscard]] std::string_view entryCallingConvention() const noexcept {
         return d_.entryCallingConvention;
     }
+    // D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION: whether the
+    // loader calls or jumps to the entry — the fact the trampoline derives its
+    // process-entry stack bias from.
+    [[nodiscard]] std::optional<EntryTransition> entryTransition() const noexcept {
+        return d_.entryTransition;
+    }
 
     // ── D-RUNTIME-MAIN-ARGC-ARGV accessor ────────────────────────
     // The format's program-entry argument mechanism (StackVector),
@@ -2974,12 +3845,44 @@ public:
     // ── D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT accessor (TF-C52) ────
     // The format's extern-ADDRESS materialization binding (`got`), or
     // nullopt if the format declared none. MIR→LIR reads this to route
-    // an `&extern` VALUE through the arm64 GOT-address macro (adrp:got:
-    // + ldr:got_lo12:) instead of an absolute page-pair lea; nullopt =
-    // the ordinary lea (foreign-PIE-safe only on x86_64 / a DSS exec).
+    // an `&extern` VALUE through the target's GOT-load row (`lea_extern_got`:
+    // arm64 adrp:got: + ldr:got_lo12:, x86_64 `mov reg, [rip + slot]`)
+    // instead of the ordinary lea; see the field for who declares it.
     [[nodiscard]] std::optional<ExternAddrBinding>
     externAddrBinding() const noexcept {
         return d_.externAddrBinding;
+    }
+
+    // ── P69 review M1 (c) + MINOR 8 accessor ──
+    // What this image makes of a unit's PC-relative, non-branch reference to
+    // an import (`PcRelativeImportAddress`), or nullopt on a format that is
+    // not an image declaring `externAddrBinding`.
+    [[nodiscard]] std::optional<PcRelativeImportAddress>
+    pcRelativeImportAddress() const noexcept {
+        return d_.pcRelativeImportAddress;
+    }
+    // ── P69 (lane `lm`) accessor ──
+    // What this image makes of a reference naming a weak symbol it resolves to
+    // nothing (`WeakResolvedToNothing`). A format that declares no block answers
+    // the default value: every class refused.
+    [[nodiscard]] WeakResolvedToNothing weakResolvedToNothing() const noexcept {
+        return d_.weakResolvedToNothing.value_or(WeakResolvedToNothing{});
+    }
+    // ── P69 round 4 (lane `lm`) accessor ──
+    // Whether an archive search fetches a member for an undefined weak reference
+    // (`ArchiveWeakReferenceSearch`), or nullopt where this document does not
+    // state it — which a static link refuses only when the question arises.
+    [[nodiscard]] std::optional<ArchiveWeakReferenceSearch>
+    archiveWeakReferenceSearch() const noexcept {
+        return d_.archiveWeakReferenceSearch;
+    }
+    // ── D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED accessor (P69) ──
+    // The spelling an object gives an import's address slot (`__imp_` on
+    // the PE images), or empty when the format states none.
+    [[nodiscard]] std::string_view importAddressSymbolPrefix() const noexcept {
+        return d_.importAddressSymbolPrefix.has_value()
+                   ? std::string_view{*d_.importAddressSymbolPrefix}
+                   : std::string_view{};
     }
 
     // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET
@@ -3066,6 +3969,35 @@ public:
     [[nodiscard]] std::optional<WeakDefinition>
     weakDefinition() const noexcept {
         return d_.weakDefinition;
+    }
+    // The dialect a weak definition of this KIND is spelled in: the kind's own
+    // entry of `weakDefinition.byKind`, else the block's `dialect`; nullopt
+    // when the format has not answered at all. What a walker asks PER
+    // DEFINITION, with the kind the definition's unit stated — a declared
+    // spelling, never a format identity.
+    [[nodiscard]] std::optional<WeakDefinitionDialect>
+    weakDefinitionDialectFor(std::optional<WeakDefinitionKind> kind) const noexcept {
+        if (!d_.weakDefinition.has_value()) return std::nullopt;
+        if (kind.has_value()) {
+            for (auto const& [of, dialect] : d_.weakDefinitionByKind) {
+                if (of == *kind) return dialect;
+            }
+        }
+        return d_.weakDefinition->dialect;
+    }
+    // Every dialect this format can answer with, the block's own first, each
+    // once. Empty when it has not answered.
+    [[nodiscard]] std::vector<WeakDefinitionDialect>
+    weakDefinitionDialectsStated() const {
+        std::vector<WeakDefinitionDialect> out;
+        if (!d_.weakDefinition.has_value()) return out;
+        out.push_back(d_.weakDefinition->dialect);
+        for (auto const& [of, dialect] : d_.weakDefinitionByKind) {
+            bool seen = false;
+            for (WeakDefinitionDialect const d : out) seen = seen || d == dialect;
+            if (!seen) out.push_back(dialect);
+        }
+        return out;
     }
 
     // ── D-LK2-RODATA producer-data-section capability gate ─────

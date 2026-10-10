@@ -377,6 +377,38 @@ public:
     [[nodiscard]] virtual bool
     realizesCoalescingScopeReferences() const noexcept { return false; }
 
+    // ── D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69) ─
+    //
+    // Does THIS backend's WRITER resolve a PC-relative or branch field naming a
+    // symbol whose ADDRESS is 0 (`AssembledModule::nullAddressSymbols`: a weak
+    // symbol the link resolved to nothing) in an image of this schema — that is,
+    // does it place the image at its link address, so `0 - P` is a constant the
+    // field can hold?
+    //
+    // ★ A WALKER CAPABILITY, like the one above: a document DECLARES `zero` for
+    // such a field (`weakResolvedToNothing`), and whether the bytes can then be
+    // written is a property of the code that writes them, so the loader refuses
+    // a document that declares `zero` for a PC-relative class on a backend that
+    // answers false here.
+    // ★ DEFAULT FALSE. A writer that never gives the symbol an address would fail
+    // the reference loud ("not defined") — the refusal at load says why.
+    [[nodiscard]] virtual bool
+    writesNullAddressReferences(detail::ObjectFormatData const& /*d*/) const noexcept {
+        return false;
+    }
+
+    // ── D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE (P69 round 4) ──
+    //
+    // Does THIS backend's image writer realize the image requests a link's units
+    // state (`DirectiveImageSettings`: a stack or heap size, a subsystem, a
+    // version, a base, a section alignment, a checksum, section attributes, the
+    // exports)? A WALKER CAPABILITY, for the reason the ones above are: only the
+    // code that writes the header can answer it. DEFAULT FALSE: a link whose
+    // units ask any of them of a backend that does not realize them is refused
+    // by name (`decideUnitLinkerRequests`) rather than written without them.
+    [[nodiscard]] virtual bool
+    realizesDirectiveImageSettings() const noexcept { return false; }
+
     // ── [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] ──
     //
     // Where THIS backend's writer will put the call stub of each import that

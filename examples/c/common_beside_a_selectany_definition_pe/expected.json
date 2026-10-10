@@ -1,0 +1,28 @@
+{
+  "$comment": "★★ A COMMON BESIDE cl's SELECT-ANY DEFINITION OF ITS NAME: THE DEFINITION REPLACES THE COMMON (P69 send-back 5, review-xa4 MINOR 4; D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT) -- the PE documents' `commonYieldsTo: nonOverridableDefinition` (a select-any definition is not an overridable one), on the reference compiler's own objects. The two objects named to the link are cl's builds of `int dss_tentative; int dss_read_tentative(void) { return dss_tentative; }` -- cl writes every C tentative definition as a COMMON, an undefined external whose value is its size -- and of `__declspec(selectany) int dss_tentative = 5;`, a COMDAT select-any DEFINITION, cl's spelling of a definition that may be stated more than once. ✔MEASURED 2026-10-08 (the same main.c built by cl; link.exe 14.44.35228 and lld-link 19.1.5): in both object orders the definition replaces the common and the program reads 5, exit 42; the common object alone reads 0, exit 37. GNU ld answers the opposite for the GNU spelling of such a definition -- a weak one never replaces a common (`examples/c/common_beside_a_weak_definition_elf`, and on this very format `examples/c/common_beside_a_weak_definition_pe_mingw`) -- which is why the answer is a key of the format document rather than a rule of the link, and, for a definition whose own spelling yields, a fact its object states. main.c is DSS's; the 37 it adds keeps either answer apart from the exit code of a program that did nothing. The `release` arm pins that optimizing the DSS half changes nothing about which of the two the program reads.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "The COMMON, and the function that reads it. Source and rebuild commands: `tests/link/data/tentative_common.source.c` (cl 19.44.35228 `/c /O2 /MD /GS- /experimental:deterministic /pathmap:`; md5 fca2b27ff4c3b56e0f57964055923dd2). A relocatable object named to the link is an OBJECT INPUT, linked eagerly. The witness is the reader's name.",
+          "path": "tests/link/data/tentative_common_x86_64_pe_msvc.obj",
+          "containerWitness": "dss_read_tentative"
+        },
+        {
+          "$comment": "The select-any DEFINITION. Source and rebuild commands: `tests/link/data/tentative_selectany.source.c` (the same cl build; md5 9b666893aff6054333dc2bf6004d6edf). The witness is the name both objects state.",
+          "path": "tests/link/data/tentative_selectany_x86_64_pe_msvc.obj",
+          "containerWitness": "dss_tentative"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

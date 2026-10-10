@@ -131,11 +131,12 @@ struct DSS_EXPORT SignMaskConstant {
     bool     isF64 = true;    // true → F64 mask (bit 63); false → F32 mask (bit 31)
 };
 
-// c116 (D-WIN64-SEH-FUNCLETS): one descriptor per MSVC-x64 `__try` region the
-// lowerer saw (via a `SehTryBegin` marker in the parent function). Like a
+// c116 (D-WIN64-SEH-FUNCLETS): the descriptors of each MSVC-x64 `__try` region
+// the lowerer was handed (one per contiguous run of the region's blocks — see
+// below; a region none of whose blocks made the lowering create one has one). Like a
 // JumpTableDescriptor it carries only what the assembler-adjacent pipeline needs
 // AFTER `assemble()` resolves each block's byte offset: the LIR block ids of the
-// guarded body's [entry, exit) and the `__except` handler, plus the symbols the
+// guarded body's FIRST and LAST block and of the `__except` handler, plus the symbols the
 // pe writer resolves to image-RVAs (the filter funclet + the __C_specific_handler
 // personality). `compile_pipeline.cpp` translates the LIR block ids to byte
 // offsets against the owning function's `blockByteOffsets` and attaches a
@@ -144,10 +145,33 @@ struct DSS_EXPORT SignMaskConstant {
 // (`SehTryBegin`/`SehTryEnd`/`SehFilterReturn`) emit NO runtime branch — the OS
 // dispatches into the handler via the scope table, so these ids are pure position
 // data (the c114 .pdata + c70 jump-table link-time-RVA pattern).
+//
+// ★ `endLirBlockV` IS THE BODY'S LAST BLOCK, NOT ONE PAST IT. Its comment used to
+// say "one-past the guarded body (the range end)", which no writer or reader of
+// the field ever meant (✔READ P69, every one of them): the lowering writes the
+// LIR block of `MirSehScope::endBlock` — "the guarded body's LAST block" — the
+// descriptor translation (`lir_descriptor_blocks.hpp`) carries it through later
+// passes as a last block (the last piece of whatever that block became), and
+// the binding in `compile_pipeline.cpp` computes the half-open range END itself,
+// as the offset of whichever block is laid out next after it.
+// ★ A REGION IS A SET OF CONTIGUOUS RUNS, AND A DESCRIPTOR IS ONE RUN
+// (D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES). The region's
+// own (1:1) blocks are one run, and its first descriptor. A block the lowering
+// CREATES while lowering a guarded block is laid out after every 1:1 block of
+// the function, outside that run — it used to be outside the `__try` altogether
+// — so each maximal run of contiguous created blocks whose owner is a block of
+// the region is one more descriptor, with the region's handler, funclet and
+// personality. A created block of an inner body is in a run of every region
+// around it.
+// ★ THE DESCRIPTORS ARE IN TABLE ORDER, and nothing after MIR→LIR sorts them:
+// the dispatch gives a fault to the FIRST record whose range holds it. The order
+// of regions is the scopes' as handed in (mir/merge/synth_seh_funclets.hpp owns
+// that sentence: each region after every region inside it); a region's own
+// descriptors stay together — its body's, then its runs in address order.
 struct DSS_EXPORT SehScopeDescriptor {
     std::size_t   funcIndex        = 0;  // index into lir.funcAt(i) of the owning (parent) function
-    std::uint32_t beginLirBlockV   = 0;  // LIR block .v of the guarded body's entry (try block)
-    std::uint32_t endLirBlockV     = 0;  // LIR block .v marking one-past the guarded body (the range end)
+    std::uint32_t beginLirBlockV   = 0;  // LIR block .v of the guarded body's FIRST block (the try entry)
+    std::uint32_t endLirBlockV     = 0;  // LIR block .v of the guarded body's LAST block (never one past it)
     std::uint32_t handlerLirBlockV = 0;  // LIR block .v of the __except handler body
     SymbolId      filterFuncletSymbol{}; // the synthesized filter-funclet function symbol
     SymbolId      personalitySymbol{};   // __C_specific_handler extern symbol
@@ -202,7 +226,8 @@ struct DSS_EXPORT MirToLirResult {
     // to the owning function. Empty for every module with no `&&label` in a
     // static-storage initializer.
     std::vector<LirBlockSymbolBinding> blockSymbolBindings;
-    // c116 (D-WIN64-SEH-FUNCLETS): one descriptor per `__try` region. Consumed by
+    // c116 (D-WIN64-SEH-FUNCLETS): the descriptors of every `__try` region, IN
+    // TABLE ORDER (one per run of the region's blocks). Consumed by
     // `compile_pipeline.cpp` AFTER `assemble()` to attach a `SehScopeEntry` to the
     // owning function's `FrameUnwindInfo.sehScopes` (byte offsets from that
     // function's `blockByteOffsets`). Empty for every module without a `__try`.
@@ -339,9 +364,10 @@ lowerToLir(Mir const&          mir,
            std::optional<TlsAccessInfo> tlsAccess = std::nullopt,
            // c116 (D-WIN64-SEH-FUNCLETS): the SEH scope records produced by
            // `synthesizeSehFunclets` (keyed by the REBUILT module's parent MIR
-           // block ids). Each is translated to LIR block ids + emitted as a
-           // `SehScopeDescriptor` on the result. Empty for every module without a
-           // `__try`; a non-SEH module never reaches the translation.
+           // block ids), IN TABLE ORDER. Each is translated to LIR block ids +
+           // emitted as its `SehScopeDescriptor`s on the result, in that order
+           // (one per run of the region's blocks). Empty for every module
+           // without a `__try`; a non-SEH module never reaches the translation.
            std::span<MirSehScope const> sehScopes = {},
            // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the ACTIVE object
            // format's F128 softfloat-helper runtime library (`libgcc_s.so.1`

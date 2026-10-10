@@ -1,0 +1,2 @@
+    (void)n.kind;
+    return n.tokenKind;

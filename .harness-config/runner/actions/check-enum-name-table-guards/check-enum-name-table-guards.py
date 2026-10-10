@@ -28,8 +28,8 @@ sweep without this gate would decay to exactly the state it repaired.
 That is the same correction `check-diagnostic-codes.py` records: a hand-maintained
 pin can only check rows somebody remembered to add to it.
 
-  python .harness-config/runner/actions/check-enum-name-table-guards/check-enum-name-table-guards.py
-  python .harness-config/runner/actions/check-enum-name-table-guards/check-enum-name-table-guards.py --self-test
+  dssharness run check-enum-name-table-guards                           # verify, then the self-test
+  dssharness run check-enum-name-table-guards --manual-step self-test   # --self-test alone
 
 ⚠ NO `.ps1` TWIN, DELIBERATELY: this is Python and therefore already runs on both
 hosts. A twin would be a second implementation of something that was never split.

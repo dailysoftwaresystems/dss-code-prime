@@ -107,8 +107,9 @@
    pe64-x86_64-windows-exec.format.json -> the linker's pre-walker gate rejects
    loud (K_FormatLacksImportSupport) at compile time; un-ship ctype.json's
    `_mbcasemap` row -> honest K_SymbolUndefined at link (✔MEASURED by exercising
-   it: on this example AND on extern_data_addr_reject_pe, which is what proves
-   that example's CODE pin is load-bearing); retype the SOURCE DECLARATOR to an
+   it: on this example AND on extern_data_addr_plus_offset_pe, then named
+   extern_data_addr_reject_pe, which is what proves that example's CODE pin is
+   load-bearing); retype the SOURCE DECLARATOR to an
    array -> exit 4 (a RUN failure with no diagnostic, which is why this witness
    runs). ⚠ Retyping the ctype.json ROW instead does NOT red — ✔MEASURED
    (`ptr<u8>` -> `arr<u8,256>`: compile rc=0, exit 42 at debug AND release, still

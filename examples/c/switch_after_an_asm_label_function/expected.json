@@ -1,0 +1,46 @@
+{
+  "$comment": "★★★ A DENSE SWITCH LAID OUT AFTER A BLOCK-INSERTING PASS (P69, D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS). A jump table names its case blocks from DATA, by MIR→LIR's block ids, and the pipeline binds them after assembly to the FINAL module's offsets; a block id is an arena position, so every block a later pass inserts renumbers every block after it. Two passes insert: the inline-asm expansion (a template's label becomes a block) and, under a calling convention that walks the guard page, the calling convention itself (each runtime stack descent gets the walk's loop blocks). Shapes, each its own exit bit: a switch BEFORE both (the control, 1), the template's loop (2), a switch in a function after the template's (4), a template and a switch in one function (8), a VLA frame (16), a switch in a function after the VLA's (64), a VLA and a switch in one function (128). ✔MEASURED 2026-10-07 on the build at 71648598 (the probe shapes of bits 4 and 8): DSS ran them to 2 — the switch dispatched to the wrong cases — on pe and elf, while gcc and clang (c2x and -O2) and mingw gcc ran them to 42 (gnu run 20261007-110129-0d8ce32e, mingw run 20261007-110212-2f16adc9), and the BEFORE control was 42 everywhere. The bits 64 and 128 shapes exist only on a target whose calling convention walks the guard page (pe64); elsewhere they are controls.",
+  "language": "c",
+  "$commentForbidDiagnostics": "P69: this example holds a value-returning function whose last statement is not a plain `return` (found by a mechanical scan of the corpus for exactly that shape), so the function is complete only because DSS SEES that control never arrives at its closing brace. Until P69 losing that sight REFUSED the compile. Under C it no longer does: C23 6.9.2p13 accepts a non-void function whose end is reached, so the compile succeeds with the warning H_NonVoidFunctionEndReachable and the program may run unchanged. This key keeps the red: the arm fails when that code is reported, in both runners, where the exit code could not see the regression.",
+  "forbidDiagnostics": ["H_NonVoidFunctionEndReachable"],
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

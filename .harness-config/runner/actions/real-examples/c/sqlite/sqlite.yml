@@ -21,7 +21,17 @@ description: >-
   twins into one Python driver carrying the union of both drivers' checks, so the step
   needs no selector: on a Windows host the driver runs its POSIX half (the sqlite
   configure, the recipe derivation, the reference oracles) inside WSL through
-  `wsl.exe -e`, which is the only host switch it has.
+  `wsl.exe -d <distribution> -e`, which is the only host switch it has -- the
+  distribution the tree's WSL legs declare (config.json `legs.<leg>.wsl`), read,
+  never the machine's default (2026-09-30).
+
+  ★ ONE CHECKOUT PER CONSUMER (2026-09-30). Each run stages sqlite from its OWN
+  checkout, put on the pin: a POSIX host's inside its output tree
+  (build/real-examples/c/sqlite/checkout), a Windows host's inside WSL's user cache,
+  keyed by its output tree. Until then every run on a host shared one clone in WSL's
+  home, and the four-leg run below refused one of its own legs at that clone's lock
+  whenever the stage had to refresh (`sqlite_stage.consumer_checkout` says why a
+  wait could not fix it).
 
   ★ THREE MANUAL STEPS (P68 round 12: the first two 2026-09-25, the self-test 2026-09-26):
   the round-close RECOMPILE, the speedtest1 BENCHMARK, and the action's own SELF-TEST.
@@ -61,9 +71,13 @@ steps:
         description: "ONE .test file run alone instead of the tier, a path on the leg's own host; empty runs the tier"
         default: ''
     # Every option is `--name=value`: a test file is a path, and nothing a step splices in may be
-    # read as a flag of its own.
+    # read as a flag of its own. `--step=build-and-test` FIRST (2026-09-30): it tells the driver it
+    # runs as this step, so the flags after it must be exactly this step's inputs (the driver's
+    # STEP_FLAGS, which its self-test holds this line to) and any other steering variable set in the
+    # environment is refused by name -- a step is steered by its inputs alone -- and a step is strict:
+    # an environmental leg skip fails it.
     run: |
-      python3 ./build_and_test.py --tier="{tier}" --dss-config="{dssConfig}" --test-file="{testFile}" --dss="{product}"
+      python3 ./build_and_test.py --step=build-and-test --tier="{tier}" --dss-config="{dssConfig}" --test-file="{testFile}" --dss="{product}"
     # ★ THE STEP'S STALL BOUND, AND WHY IT SITS ABOVE THE DRIVER'S OWN (2026-09-26, the PR exit). DssHarness
     # ends a step whose output is silent this long. The driver reports a running corpus on its output as the
     # segment log grows -- a line at most every DSS_PROGRESS_INTERVAL (60 s), and none while the fixture is
@@ -87,6 +101,9 @@ steps:
   # (`sqlite_recompile.py`).
   - name: recompile
     manual: true
+    # HEAVY wherever it runs (DssHarness 0.6.6: a step's own `heavy` makes ANY run of it heavy, through whichever
+    # runner -- before it, `--manual-step recompile` through the light sqlite-self-test runner ran unadmitted).
+    heavy: true
     workingDirectoryRoot: action
     inputs:
       recompileLeg:
@@ -96,12 +113,13 @@ steps:
         description: "the dsscp configuration the manifest is compiled with (dsscp --config=<it>)"
         default: 'release'
     run: |
-      python3 ./build_and_test.py --recompile="{recompileLeg}" --dss="{product}" --dss-config="{dssConfig}"
-    # ONE summary line, printed LAST, naming the sqlite commit it compiled -- the pin, legs.json
-    # `stageBuild.sqliteCommit`, which a stage of any other revision is re-staged to -- and only a
-    # clean census (every TU seen, no blocker) says `blockers=0`: a census that could not see a TU
-    # prints INCOMPLETE and exits 1 first. `\b`, not `$`: the pattern is matched per line, and a
-    # Windows console line may end in a carriage return.
+      python3 ./build_and_test.py --step=recompile --recompile="{recompileLeg}" --dss="{product}" --dss-config="{dssConfig}"
+    # ONE summary line, printed LAST, naming the sqlite commit its stage RECORDS (2026-09-30: until
+    # then it restated the catalogue's pin whatever the stage held) -- which must be the pin, legs.json
+    # `stageBuild.sqliteCommit`: a stage of any other revision is re-staged, and a census whose stage
+    # is not the pin is INCOMPLETE -- and only a clean census (every TU seen, no blocker) says
+    # `blockers=0`: a census that could not see a TU prints INCOMPLETE and exits 1 first. `\b`, not
+    # `$`: the pattern is matched per line, and a Windows console line may end in a carriage return.
     successPattern: '^recompile: \S+ sqlite=[0-9a-f]{12} tus=[0-9]+ reference_ok=[0-9]+ dss_ok=[0-9]+ blockers=0\b'
     requireInputsUnmoved: true
 
@@ -111,15 +129,19 @@ steps:
   # recompile compile -- read from the harness's OWN checkout inside this tree
   # (build/real-examples/c/sqlite[/windows]/speedtest1/sqlite), put on the pin under the tree's run
   # lock, the one the corpus run and the recompile take, so two runs of one tree serialize on every
-  # host. What the benchmark writes stays in the tree: the checkout, the lock, this step's output and
-  # the measurement core's own temporaries (the vcvars script, the pre-flight probe, the timed
-  # databases), which go in `speedtest1/scratch` beside the checkout and are removed when the run
-  # ends. The compilers it times, and the POSIX build that derives the subject, write their own
+  # host. What the benchmark writes stays in the tree BY DEFAULT: the checkout, the lock, its default
+  # output and the measurement core's own temporaries (the vcvars script, the pre-flight probe, the
+  # timed databases), which go in `speedtest1/scratch` beside the checkout and are removed when the
+  # run ends. The exceptions, as the program's own header states them: an `--out` or OUT_DIR naming a
+  # directory outside the tree is written where it names -- this step's `--out` is `{stepBuild}`, the
+  # action's own build directory, which DssHarness keeps inside the tree and carries out as the kept
+  # report -- and the compilers it times, and the POSIX build that derives the subject, write their own
   # temporary files where their environment says -- theirs, not moved. The report is KEPT: the raw
   # measurement and its README-ready markdown, each naming the sqlite head measured and whether it IS
   # the pin.
   - name: benchmark-speedtest1
     manual: true
+    heavy: true    # it builds speedtest1 with dsscp and every reference compiler, then times them
     workingDirectoryRoot: action
     inputs:
       size:
@@ -134,16 +156,30 @@ steps:
       jobsArms:
         description: 'the worker counts measured, space-separated'
         default: '1 4'
+      testset:
+        description: 'the speedtest1 --testset; empty runs its own default set'
+        default: ''
+      cc:
+        description: 'the ONE reference compiler measured beside dsscp, a name on PATH or a path; empty finds the default'
+        default: ''
+      plan:
+        description: 'a benchmark plan file to measure, absolute or relative to this action directory; empty writes the plan here'
+        default: ''
+    # `--step=benchmark-speedtest1` (2026-09-30): the program runs as this step, so a steering variable
+    # set in the environment (OUT_DIR, SRC_DIR, CC, ... -- `BENCH_STEERING`) is refused by name. Every knob
+    # is an input here, and the tree measured is the one the step runs in (`--dss-src`).
     run: |
-      python3 ./benchmark_speedtest1.py --dss="{product}" --out="{stepBuild}" --size="{size}" --build-repeats="{buildRepeats}" --run-repeats="{runRepeats}" --jobs-arms="{jobsArms}"
+      python3 ./benchmark_speedtest1.py --step=benchmark-speedtest1 --dss="{product}" --dss-src="{treeDir}" --out="{stepBuild}" --size="{size}" --build-repeats="{buildRepeats}" --run-repeats="{runRepeats}" --jobs-arms="{jobsArms}" --testset="{testset}" --cc="{cc}" --plan="{plan}"
     outputs: [benchmark-speedtest1.json, benchmark-speedtest1.md]
     persist: true
-    # The measurement core's verdict line (speedtest1_bench.py, R9), printed LAST, after both kept
-    # files were written, and only when every REQUIRED arm -- the dss arm the plan writer marks --
-    # built at every worker count and ran. A run in which dsscp failed while a reference compiler
-    # did not exits 4 instead, its report still printed: a benchmark without its subject is not
-    # a benchmark of it. The line also names the sqlite head measured and whether it is the pin.
-    successPattern: '^speedtest1_bench: every required arm measured \('
+    # The measurement core's verdict line (speedtest1_bench.py, R9 and R11), printed LAST, after both
+    # kept files were written, and only when every REQUIRED arm -- the dss arm the plan writer marks --
+    # built at every worker count and ran, OF THE PINNED sqlite. A run in which dsscp failed while a
+    # reference compiler did not exits 4 instead, and one that measured another sqlite than the pin
+    # exits 6 (2026-09-30: until then it exited 0 with a line ending `NOT the pinned <pin>`, which this
+    # pattern's first half accepted), each report still printed: a benchmark without its subject is
+    # not a benchmark of it. The pattern requires the head measured AND `, the pin`; `\b`, not `$`.
+    successPattern: '^speedtest1_bench: every required arm measured \([^)]*\); sqlite [0-9a-f]{7,40}, the pin\b'
     requireInputsUnmoved: true
 
   # The action's OWN CHECKS, with no build: the benchmark's self-test, then the driver's Step 0 alone
@@ -161,4 +197,116 @@ steps:
     # answers with its exit code. `\(`, not `$`: the pattern is matched per line, and a Windows console
     # line may end in a carriage return.
     successPattern: '^build_and_test\.py --self-test: OK \('
+    requireInputsUnmoved: true
+
+  # ── THE LEG RESOLVER'S OPERATOR VERBS ────────────────────────────────────────────────────────────────────────
+  # harness_legs.py answers the driver through its verb CLI; these steps ask it the questions a person asks, on
+  # the leg a run names (`dssharness run sqlite-self-test --legs <leg> --manual-step legs-...`). None writes the
+  # tree; `legs-acquire` fills the library cache, which lives OUTSIDE the repository.
+  # ★ EACH PATTERN IS THE LINE ITS VERB PRINTS ON SUCCESS ALONE (2026-10-01, the P69 review's NIT 6): `^\{` matched
+  # any JSON object -- an error record included -- and `=[01]` any `=0` in any line.
+  - name: legs-header-stages
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./harness_legs.py --header-stages
+    # `<header key><TAB><guard>=0|1 ...`, a line per staged header
+    successPattern: '^\S+\t\S+=[01](?: \S+=[01])*\s*$'
+    requireInputsUnmoved: true
+
+  - name: legs-path-translations
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./harness_legs.py --path-translations
+    # `<verb><TAB><translator argv>`, a line per declared translation
+    successPattern: '^[A-Za-z][A-Za-z0-9-]*\t\S'
+    requireInputsUnmoved: true
+
+  # What --plan concluded about THIS host's environment, measured again -- the instrument once run as
+  # `wsl.exe -e python3 harness_legs.py --probe-environment`; and the budget such a run may take.
+  - name: legs-probe-environment
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./harness_legs.py --probe-environment
+    # a measured probe's verdict in the `{name: {verdict, why, verb, evidence}}` map
+    successPattern: '^\s*"verdict": "'
+    requireInputsUnmoved: true
+
+  - name: legs-probe-budget
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./harness_legs.py --print-probe-budget
+    successPattern: '^\s*"probeEnvironmentSeconds": \d'
+    requireInputsUnmoved: true
+
+  # A leg's plan resolved from probe verdicts a caller already holds, instead of measuring them here.
+  - name: legs-plan
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      verdicts:
+        description: 'a probe-verdicts file ({kernel: verdicts}), absolute or relative to this action directory'
+        required: true
+    run: |
+      python3 ./harness_legs.py --plan --format json --probe-verdicts="{verdicts}"
+    # the plan document's leg list (`plan_json`)
+    successPattern: '^\s*"legs": \['
+    requireInputsUnmoved: true
+
+  # What acquiring a leg's pinned libraries WOULD do (archives, digests, cache paths), touching nothing.
+  - name: legs-acquire-plan
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      label:
+        description: 'the leg whose libraries are planned, by its legs.json label'
+        required: true
+      cacheRoot:
+        description: 'where acquired libraries are cached; empty is DSS_HARNESS_CACHE_ROOT, else ~/.cache/dsscp'
+        default: ''
+    run: |
+      python3 ./harness_legs.py --acquire-plan="{label}" --cache-root="{cacheRoot}"
+    # the plan's own field: the acquisition RECORD (`--acquire`'s, failures included) carries no `archives`
+    successPattern: '^\s*"archives": '
+    requireInputsUnmoved: true
+
+  # ACQUIRE a leg's pinned libraries into the cache (outside the repository); offline=true completes from the
+  # cache or fails naming what is missing, never falling back to what else is on the machine.
+  - name: legs-acquire
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      label:
+        description: 'the leg whose libraries are acquired, by its legs.json label'
+        required: true
+      offline:
+        description: 'true refuses to reach the network'
+        default: 'false'
+      cacheRoot:
+        description: 'where acquired libraries are cached; empty is DSS_HARNESS_CACHE_ROOT, else ~/.cache/dsscp'
+        default: ''
+    run: |
+      python3 ./harness_legs.py --acquire="{label}" --offline="{offline}" --cache-root="{cacheRoot}"
+    # the ONE record shape prints on both outcomes; only a success's `error` is empty (`acquisition_record`)
+    successPattern: '^\s*"error": ""'
+    requireInputsUnmoved: true
+
+  # Is a leg's declared launcher usable on this host -- and, with `artifact`, do the built binary's own
+  # PT_INTERP and DT_NEEDED stay inside the declared rows?
+  - name: legs-check-launcher
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      label:
+        description: 'the leg whose launcher is checked, by its legs.json label'
+        required: true
+      artifact:
+        description: 'a built binary to cross-check, absolute or relative to this action directory; empty checks the declaration alone'
+        default: ''
+    run: |
+      python3 ./harness_legs.py --check-launcher="{label}" --artifact="{artifact}"
+    successPattern: '"ok": true'
     requireInputsUnmoved: true

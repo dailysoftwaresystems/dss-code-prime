@@ -5,6 +5,8 @@
 #include "ffi/mangling/c_mangle.hpp"   // applyCMangling (per-format C helper import names)
 #include "core/types/type_lattice/core_type.hpp"       // TypeKind, CallConv
 #include "core/types/type_lattice/type_interner.hpp"
+#include "link/extern_reference_gate.hpp"   // mirReferenceTargetIds (the referenced-only rule, MIR tier)
+#include "mir/merge/synth_symbol_floor.hpp"  // continueSymbolIdsPastImports (the rebuild continues the module's ids)
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"   // rederiveStructCfMarkers (Cycle-2 thrd_join multi-block)
@@ -13,10 +15,11 @@
 #include <algorithm>   // std::max, std::sort
 #include <array>
 #include <cstdint>
-#include <optional>    // std::optional (the once-adapter symbol, minted iff call_once present)
+#include <optional>    // std::optional (the format's synthesis vehicle)
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>   // the module's referenced symbols
 #include <utility>     // std::move, std::pair
 #include <vector>
 
@@ -56,23 +59,6 @@ void emitErr(DiagnosticReporter& rep, std::string msg) {
     rep.report(std::move(d));
 }
 
-// Max SymbolId.v across every defined function, module global, and extern import — the
-// floor for minting fresh kernel32-helper symbols (mirrors synthesizePeStartup's
-// maxSymbolIdV; the globals scan is load-bearing — synthetic string-literal globals
-// hold the highest ids).
-[[nodiscard]] std::uint32_t
-maxSymbolIdV(Mir const& mir, std::vector<ExternImport> const& externs) {
-    std::uint32_t maxV = 0;
-    std::size_t const nf = mir.moduleFuncCount();
-    for (std::uint32_t i = 0; i < nf; ++i)
-        maxV = std::max(maxV, mir.funcSymbol(mir.funcAt(i)).v);
-    std::size_t const ng = mir.moduleGlobalCount();
-    for (std::uint32_t i = 0; i < ng; ++i)
-        maxV = std::max(maxV, mir.globalSymbol(mir.globalAt(i)).v);
-    for (auto const& e : externs) maxV = std::max(maxV, e.symbol.v);
-    return maxV;
-}
-
 } // namespace
 
 bool synthesizeThreadsShim(
@@ -87,11 +73,35 @@ bool synthesizeThreadsShim(
     // pe/macho TU). Keys on the map (a data property), never a format check.
     if (recipeBySymbol.empty()) return true;
 
-    // D-CSUBSET-C11-THREADS-MACHO: a non-empty recipe map means the active format carries
-    // synthesize-tagged <threads.h> symbols — so it MUST declare which primitive family to
-    // synthesize over. A missing `librarySynthesis` block is a format/descriptor mismatch:
-    // fail LOUD, never silently assume a vehicle (a disguised `if (format != known) →
-    // win32` default is exactly the identity branch the bar forbids).
+    // ★★ ONLY THE RECIPES THE MODULE REFERENCES ARE SYNTHESIZED — the referenced-only rule
+    // of link/extern_reference_gate.hpp, read at the tier before relocations exist.
+    // D-MIR-THREADS-SHIM-SYNTHESIZES-UNREFERENCED-RECIPES: the map holds a recipe for EVERY
+    // synthesize-tagged row the TU's headers injected, used or not, and this pass used to
+    // synthesize them all — and the single-CU seam then ran it AFTER the optimizer, so no
+    // DCE ever saw those bodies. ✔MEASURED P69 (lane lm's dsscp): `#include <threads.h>` and
+    // an empty main took a pe64 image from `.text` 0x23 and one import to 0x81c and 26 (every
+    // recipe's kernel32 helper), a Mach-O arm64 one from 0x18 and one import to 0x508 and 29,
+    // and on Mach-O x86_64 — whose format declares no vehicle — refused to compile at all. A
+    // body nothing names is library code an unused declaration must not bring in, exactly as
+    // an archive member is. ⓘ A recipe body calls only its vehicle's primitives, never
+    // another recipe, so one read of the module decides every recipe.
+    // ★ THE MODULE READ HERE is the one the UNIT-stage optimize left, before the PROGRAM
+    // stage (`synthesizeLibraryShims` is called before every route's final optimize): a
+    // recipe named only by code the Program stage deletes is synthesized, and its WEAK body
+    // stays. The reference gate's `mirReferenceTargetIds` carries the measurement and the
+    // reason the rule reads this module rather than predicting the later one.
+    std::unordered_set<std::uint32_t> const referenced = linker::mirReferenceTargetIds(mir);
+    std::vector<std::pair<std::uint32_t, std::string>> recipes;
+    for (auto const& [symV, recipe] : recipeBySymbol)
+        if (referenced.contains(symV)) recipes.emplace_back(symV, recipe);
+    if (recipes.empty()) return true;
+
+    // D-CSUBSET-C11-THREADS-MACHO: a REFERENCED recipe means the program calls a
+    // synthesize-tagged <threads.h> function on the active format — so the format MUST
+    // declare which primitive family to synthesize over. A missing `librarySynthesis` block
+    // is a format/descriptor mismatch: fail LOUD, never silently assume a vehicle (a
+    // disguised `if (format != known) → win32` default is exactly the identity branch the
+    // bar forbids).
     // ⚠ NO DEFERRAL ROW IS NAMED IN THE EMITTED TEXT, AND THAT IS DELIBERATE.
     // This message used to carry `(D-CSUBSET-C11-THREADS-MACHO)`. That row is
     // CLOSED — closing it is how `macho64-arm64` GOT its `librarySynthesis`
@@ -104,10 +114,10 @@ bool synthesizeThreadsShim(
     // here, where closing a row cannot turn a comment into compiler output.
     if (!librarySynthesis.has_value()) {
         emitErr(reporter,
-                "synthesizeThreadsShim: <threads.h> synth recipes are present but the target "
-                "object format declares no `librarySynthesis` vehicle — refusing to assume "
-                "a primitive family. Declare one in the format descriptor, or drop the "
-                "synthesize-tagged <threads.h> symbols for this format");
+                "synthesizeThreadsShim: the program uses <threads.h> functions the target "
+                "object format synthesizes, but the format declares no `librarySynthesis` "
+                "vehicle — refusing to assume a primitive family. Declare one in the format "
+                "descriptor, or drop the synthesize-tagged <threads.h> symbols for this format");
         return false;
     }
     LibrarySynthVehicle const vehicle       = librarySynthesis->vehicle;
@@ -116,8 +126,6 @@ bool synthesizeThreadsShim(
     // A DETERMINISTIC emission order (unordered_map iteration is not stable — a shifting
     // function order would make the binary non-reproducible). Sort by pre-minted
     // SymbolId.v.
-    std::vector<std::pair<std::uint32_t, std::string>> recipes(
-        recipeBySymbol.begin(), recipeBySymbol.end());
     std::sort(recipes.begin(), recipes.end(),
               [](auto const& a, auto const& b) { return a.first < b.first; });
 
@@ -149,9 +157,16 @@ bool synthesizeThreadsShim(
     // D-MIR-SYNTH-SHIM-HELPER-SIGNATURES-DUPLICATE-THE-DESCRIPTOR.
     // Every `hSig_*` / `phSig_*` below re-declares a shape that a shipped
     // descriptor ALSO declares (e.g. `hSig_v_u32` here vs windows.json's
-    // `ExitThread: fn(u32) -> void`). They agree today and nothing enforces it — and the
-    // post-synthesis MirVerifier CANNOT enforce it, because it reads the callee FnSig off the
-    // GlobalAddr this pass itself minted, so the rule is self-consistent within the pass. It
+    // `ExitThread: fn(u32 "unsigned long") -> void`). They agree in REPRESENTATION — arity,
+    // kind and width of every position — and nothing enforces it. They do NOT agree in
+    // vocabulary IDENTITY, and where the descriptor names more than a width they never did:
+    // it spells a DWORD `u32 "unsigned long"` (ExitThread and Sleep since P69 round 4,
+    // GetExitCodeThread's LPDWORD before that) and a `CRITICAL_SECTION *` by its struct,
+    // where every shape here is the anonymous core or `ptr<void>`. A call below is typed by
+    // the GlobalAddr this pass mints for it, so the shape written HERE is the one the call
+    // carries, whatever the descriptor's row says — which is also why the
+    // post-synthesis MirVerifier CANNOT enforce the agreement: it reads the callee FnSig off
+    // that same GlobalAddr, so the rule is self-consistent within the pass. It
     // catches the INTRA-shim class only (the `thrd_exit` i32→u32 pun below was exactly that).
     TypeId const hSig_v_pV        = sig({pVoid}, voidTy);                 // Init/Enter/Leave/Delete CS; cond-var Init/Wake/WakeAll
     TypeId const hSig_i32_pV      = sig({pVoid}, i32Ty);                  // TryEnterCriticalSection / CloseHandle
@@ -165,12 +180,12 @@ bool synthesizeThreadsShim(
     TypeId const hSig_pV_void     = sig({}, pVoid);                      // GetCurrentThread
     // Cycle 2 (D-CSUBSET-C11-THREADS-TRAMPOLINES) kernel32 helper signatures (match
     // windows.json exactly). CreateThread/WaitForSingleObject/GetExitCodeThread/
-    // CloseHandle(=hSig_i32_pV) drive thrd_create/thrd_join; InitOnceExecuteOnce drives
-    // call_once.
+    // CloseHandle(=hSig_i32_pV) drive thrd_create/thrd_join. (call_once left this pass in
+    // P69: it is DSS's runtime source over InitOnceExecuteOnce on pe,
+    // runtime/platform/src/threads_once.c, and libSystem's pthread_once on Mach-O.)
     TypeId const hSig_CreateThread = sig({pVoid, u64Ty, pVoid, pVoid, u32Ty, pVoid}, pVoid);
     TypeId const hSig_u32_pVu32    = sig({pVoid, u32Ty}, u32Ty);         // WaitForSingleObject
     TypeId const hSig_i32_pVpU32   = sig({pVoid, pU32}, i32Ty);          // GetExitCodeThread(HANDLE,LPDWORD)
-    TypeId const hSig_i32_4pV      = sig({pVoid, pVoid, pVoid, pVoid}, i32Ty); // InitOnceExecuteOnce
     // Cycle 3 (D-CSUBSET-C11-THREADS-TIMED) kernel32 helper signatures. `Sleep` reuses
     // `hSig_v_u32` and `GetSystemTimeAsFileTime` reuses `hSig_v_pV` (identical shapes, and
     // windows.json declares them so); `GetThreadId` reuses `hSig_u32_pV`. Only
@@ -192,9 +207,6 @@ bool synthesizeThreadsShim(
     // Cycle 2 recipe signatures (the pe thrd_t is ptr<void>=HANDLE).
     TypeId const rSig_thrd_create = sig({pVoid, pVoid, pVoid}, i32Ty);  // (thrd_t*, start, arg)->int
     TypeId const rSig_thrd_join   = sig({pVoid, pI32}, i32Ty);          // (thrd_t, int*)->int
-    TypeId const rSig_call_once   = sig({pVoid, pVoid}, voidTy);        // (once_flag*, void(*)(void))->void
-    // The module-scoped InitOnceExecuteOnce adapter (PINIT_ONCE_FN shape, BOOL return).
-    TypeId const onceTrampSig     = sig({pVoid, pVoid, pVoid}, i32Ty);  // (InitOnce*, param, ctx*)->BOOL
     // Cycle 3 win32 recipe signatures. thrd_sleep(const timespec*, timespec*),
     // mtx_timedlock(mtx_t*, const timespec*) and thrd_equal(thrd_t, thrd_t) all land on
     // `fn(ptr, ptr) -> i32` — thrd_equal only because the pe thrd_t IS a HANDLE
@@ -239,7 +251,6 @@ bool synthesizeThreadsShim(
     TypeId const rSigP_v_i32      = sig({i32Ty}, voidTy);      // thrd_exit
     TypeId const rSigP_i32_u64    = sig({u64Ty}, i32Ty);       // thrd_detach
     TypeId const rSigP_thrd_create= sig({pVoid, pVoid, pVoid}, i32Ty);  // (thrd_t*, start, arg)->int
-    TypeId const rSigP_call_once  = sig({pVoid, pVoid}, voidTy);        // (once_flag*, void(*)(void))->void
     TypeId const rSigP_thrd_join  = sig({u64Ty, pI32}, i32Ty);         // (thrd_t, int*)->int
     // Cycle 3 pthread recipe signatures. thrd_sleep(const timespec*, timespec*) and
     // mtx_timedlock(mtx_t*, const timespec*) share the two-pointer shape; thrd_equal takes
@@ -251,28 +262,24 @@ bool synthesizeThreadsShim(
     // ── Rebuild the module (Mir is frozen): clone every existing function verbatim,
     //    then APPEND each shim function, then clone globals — the shared rebuild idiom. ──
     MirBuilder builder;
+    // The fresh helper imports are minted from the module (the one door —
+    // synth_symbol_floor.hpp): the rebuilt module continues the source's symbol ids, so
+    // a helper's id is past every id the module holds and every id the NAME TABLE it was
+    // made from holds (a shipped constant such as `thrd_success` is named there and is
+    // never a function, global or extern). AND past every pre-minted shim symbol: one is
+    // NOT yet a defined function / global / extern, so in a module made from no table (a
+    // unit test's) the module's end does not cover it and a fresh helper could take a
+    // shim id. Over the WHOLE recipe map, not only the referenced recipes: an
+    // unreferenced recipe's symbol is still minted and still named, so a helper sharing
+    // its id would share its name.
+    continueSymbolIdsPastImports(builder, mir, externImports);
+    for (auto const& [symV, _] : recipeBySymbol) builder.keepSymbolIdsClearOf(SymbolId{symV});
     IdentityClonePolicy policy;
     std::size_t const nf = mir.moduleFuncCount();
     for (std::uint32_t i = 0; i < nf; ++i) {
         opt::passes::MirFunctionRebuilder rb{mir, builder, policy};
         rb.rebuildFunction(mir.funcAt(i));
     }
-
-    // Floor for fresh kernel32-helper symbols: above every existing symbol AND every
-    // pre-minted shim symbol (which is NOT yet a defined function / global / extern, so
-    // maxSymbolIdV would miss it → a fresh helper could collide with a shim id).
-    std::uint32_t nextSymV = maxSymbolIdV(mir, externImports);
-    for (auto const& [symV, _] : recipes) nextSymV = std::max(nextSymV, symV);
-
-    // Cycle 2 (D-CSUBSET-C11-THREADS-TRAMPOLINES): call_once passes InitOnceExecuteOnce a
-    // PINIT_ONCE_FN(InitOnce*, param, ctx*)->BOOL, but C11's callback is a bare
-    // void(*)(void) with a DIFFERENT arg shape + no return, so we synthesize ONE
-    // module-scoped adapter and address-take it. Mint its symbol here (above every
-    // existing + recipe id) iff a call_once recipe is present; the kernel32-helper
-    // importOf draws from the SAME monotonic `nextSymV` afterward, so no id collides.
-    std::optional<SymbolId> onceTrampSym;
-    for (auto const& [symV, recipe] : recipes)
-        if (recipe == "call_once") { onceTrampSym = SymbolId{++nextSymV}; break; }
 
     // On-demand kernel32 import, deduped by mangledName. Seed from the existing imports
     // so a TU that ALSO `#include`s <windows.h> (which eagerly imports the cond-var / CS
@@ -293,7 +300,7 @@ bool synthesizeThreadsShim(
         if (auto it = helperSyms.find(mangled); it != helperSyms.end()) {
             hs = it->second;
         } else {
-            hs = SymbolId{++nextSymV};
+            hs = builder.mintSymbolOrAbort("synthesizeThreadsShim");
             helperSyms.emplace(mangled, hs);
             ExternImport imp;
             imp.symbol      = hs;
@@ -437,8 +444,8 @@ bool synthesizeThreadsShim(
     // Returns nothing; the caller emits the body then a terminator.
     //
     // ★★ THE LINKAGE IS THE SYNTHESIS-ONCE RULE (P68 round 11,
-    // D-LK-SYNTHESIZED-LIBRARY-BODY-DEFINED-STRONG-IN-EVERY-UNIT) — the same rule, for the
-    // same reason, as `synthesizeStdioShim`'s: a synthesized library body exists ONCE per
+    // D-LK-SYNTHESIZED-LIBRARY-BODY-DEFINED-STRONG-IN-EVERY-UNIT) — the rule the retired
+    // <stdio.h> shim family shared until P69: a synthesized library body exists ONCE per
     // linked image however many separately compiled units carry it. `Weak` is the linkage
     // every writer expresses and the linker's all-weak arm collapses (ELF STB_WEAK, Mach-O
     // N_WEAK_DEF, COFF COMDAT SELECT_ANY); `Hidden` keeps the body internal to its image —
@@ -454,26 +461,20 @@ bool synthesizeThreadsShim(
         builder.beginBlock(entry);
     };
 
-    // Cycle 2: emit the once-adapter ONCE, before the recipe loop (on the win32 vehicle
-    // every call_once GlobalAddr-references it). It is a synthesized body like any other, so
-    // it takes the same Weak + Hidden linkage from `begin`. On the win32 vehicle DCE keeps
-    // it through call_once's `GlobalAddr` (a live function naming it), which is also what
-    // kept it before — an OS-invoked callback is never a direct-call target. The pthread
-    // vehicle hands pthread_once the C11 function as is, so nothing names the adapter there
-    // and DCE drops it, as it did before the linkage changed (✔MEASURED 2026-09-24: no
-    // `___dss_once_tramp` in a Mach-O arm64 image, before or after). Its 3 params match
-    // PINIT_ONCE_FN; only `param` (the C11 fn) is used, but
-    // all 3 Args are emitted so their ordinals stay contiguous (0,1,2) — DCE keeps every
-    // Arg as a root (D-OPT-VARIADIC-RELEASE-ARGINDEX), so the unused io/ctx survive.
-    if (onceTrampSym.has_value()) {
-        begin(*onceTrampSym, onceTrampSig);
-        (void)builder.addArg(0, pVoid);                  // InitOnce* (ignored)
-        MirInstId const fn = builder.addArg(1, pVoid);   // the C11 void(*)(void)
-        (void)builder.addArg(2, pVoid);                  // Context* (ignored)
-        std::array<MirInstId, 1> ind{fn};                // fn() — indirect (D-CSUBSET-FNPTR-INDIRECT-CALL)
-        builder.addInst(MirOpcode::Call, ind, InvalidType);
-        builder.addReturn(i32c(1));   // TRUE — else InitOnceExecuteOnce treats init as FAILED
-    }
+    // ⓘ THIS PASS DEFINES ONLY RECIPE SYMBOLS — each pre-minted, and named, by the semantic
+    // phase. Until P69 it also minted the call_once adapter it handed InitOnceExecuteOnce,
+    // from the same floor as the helper imports; that floor (the module scan + the recipe
+    // map) did not see every SymbolId the semantic phase minted — a shipped CONSTANT's
+    // (`thrd_success`) is never a function, global or extern — and the adapter's id
+    // collided with one: ✔MEASURED P69 (lane lm), a Mach-O arm64 image of `#include
+    // <threads.h>` carried the 0x20-byte adapter between `main` and `mtx_init` under the
+    // name `_thrd_success`. (So the 2026-09-24 note that DCE dropped it on the pthread
+    // vehicle — "no `___dss_once_tramp` in a Mach-O arm64 image" — searched for a name the
+    // body did not have.) call_once is DSS's runtime source on pe and libSystem's
+    // pthread_once on Mach-O since P69, so nothing minted here is DEFINED any more — and
+    // the module's own end (`Mir::symbolIdEnd`, which every helper import is minted from)
+    // clears every id the name table holds, so a minted helper import's id is no name the
+    // table gives to anything else either.
 
     for (auto const& [symV, recipe] : recipes) {
         SymbolId const sym{symV};
@@ -603,7 +604,9 @@ bool synthesizeThreadsShim(
                 // MirVerifier was wired into the single-CU synth seam). C11 declares
                 // `_Noreturn void thrd_exit(int res)` — SIGNED — and Win32 declares
                 // `VOID ExitThread(DWORD dwExitCode)` — UNSIGNED; windows.json states the
-                // latter faithfully (`fn(u32) -> void`). BOTH declarations are right, so the
+                // latter faithfully (`fn(u32 "unsigned long") -> void`: DWORD is `unsigned
+                // long`, whose 32-bit unsigned representation is the `u32` this call is
+                // minted over). BOTH declarations are right, so the
                 // conversion between them belongs HERE, exactly as the pthread arm below
                 // spells its own `thrd_exit` widening with an EXPLICIT SExt+IntToPtr instead
                 // of punning an i32 into a `ptr<void>` parameter. Handing the raw `i32` Arg
@@ -651,23 +654,6 @@ bool synthesizeThreadsShim(
                 MirInstId const z    = builder.addInst(MirOpcode::ZExt, ze, i32Ty);      // 0/1
                 std::array<MirInstId, 2> mul{z, i32c(2)};
                 builder.addReturn(builder.addInst(MirOpcode::Mul, mul, i32Ty));          // 0 or thrd_error(2)
-
-            } else if (recipe == "call_once") {
-                // InitOnceExecuteOnce(f, &__dss_once_tramp, fn, NULL) — the adapter (minted +
-                // emitted above) invokes the C11 void(*)(void) `fn` exactly once.
-                if (!onceTrampSym.has_value()) {   // never fires: the pre-loop scan minted it
-                    emitErr(reporter, "synthesizeThreadsShim: call_once recipe without a "
-                                      "synthesized __dss_once_tramp adapter (internal breach)");
-                    return false;
-                }
-                begin(sym, rSig_call_once);
-                MirInstId const flag  = builder.addArg(0, pVoid);   // once_flag* (INIT_ONCE*)
-                MirInstId const fn    = builder.addArg(1, pVoid);   // void(*)(void)
-                MirInstId const tramp = builder.addGlobalAddr(*onceTrampSym,
-                                                              interner.pointer(onceTrampSig));
-                MirInstId const nul   = konst(0, TypeKind::Ptr, pVoid);   // Context = NULL
-                call4("InitOnceExecuteOnce", hSig_i32_4pV, i32Ty, flag, tramp, fn, nul);
-                builder.addReturn();   // void
 
             } else if (recipe == "thrd_join") {
                 // MULTI-block: WaitForSingleObject(t, INFINITE); if (res) GetExitCodeThread(t,
@@ -1107,17 +1093,6 @@ bool synthesizeThreadsShim(
                                              thr, nullPtr(), func, arg);
                 std::array<MirInstId, 2> mul{isNonZeroI32(r), i32c(2)};
                 builder.addReturn(builder.addInst(MirOpcode::Mul, mul, i32Ty));         // r!=0 → thrd_error(2)
-
-            } else if (recipe == "call_once") {
-                // pthread_once(flag, func) — the SAME shape as C11 call_once (once_flag* +
-                // void(*)(void)), so a DIRECT pass; NO adapter (unlike pe's InitOnceExecuteOnce
-                // via __dss_once_tramp). The macho once_flag is seeded with the macOS
-                // PTHREAD_ONCE_INIT magic sig via the ONCE_FLAG_INIT variant (threads.json).
-                begin(sym, rSigP_call_once);
-                MirInstId const flag = builder.addArg(0, pVoid);
-                MirInstId const func = builder.addArg(1, pVoid);
-                call2("pthread_once", phSig_i32_pVpV, i32Ty, flag, func);   // int ret discarded (call_once is void)
-                builder.addReturn();
 
             } else if (recipe == "thrd_join") {
                 // MULTI-block: pthread_join wants a void** out-slot (8 bytes) but the C11 `res`

@@ -1,0 +1,4 @@
+std::optional<RuleId> Tree::ruleIfInternal(NodeId id) const {
+    auto const& n = node_(id);
+    if (n.kind != NodeKind::Internal) return std::nullopt;
+    return n.rule;

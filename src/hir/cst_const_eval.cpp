@@ -18,6 +18,7 @@
 #include "hir/const_eval_operators.hpp"   // shared opFromName / opEntryFor seams
 #include "hir/hir_op.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <limits>
 #include <optional>
@@ -357,7 +358,13 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
         // P31: `__builtin_offsetof` / `__builtin_types_compatible_p` — each has a
         // castTypeRef child the peel would descend into and then reject as
         // non-constant, exactly the sizeof hazard one row up.
-        || isFoldedConstantRule(cfg, rule);
+        || isFoldedConstantRule(cfg, rule)
+        // P69: a compound literal — a constant only through evalNode's constant-
+        // subobject arm (C23 6.6p6), never by descending into its type name or list.
+        || std::ranges::any_of(tree.schema().semantics().compoundLiteralRules,
+                               [&](CompoundLiteralRule const& row) {
+                                   return row.rule.valid() && row.rule.v == rule.v;
+                               });
     if (isDispatched) return NodeId{};
     NodeId onlyInternal{};
     int    internalCount = 0;
@@ -374,6 +381,387 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
         if (tokCount == 1) return onlyTok;
     }
     return NodeId{};
+}
+
+// ── A FOLDED VALUE CONVERTED TO A CLASSIFIED TARGET ──────────────────────────────
+// The cast arm's whole meaning, lifted out VERBATIM (P69, lane `cs`) so a second reader
+// applies the one conversion rather than a copy of it: a CONSTANT SUBOBJECT — a compound
+// literal constant, or the `.member` of a structure or union constant (C23 6.6p6-p7) — is
+// read AT ITS DECLARED TYPE, as `(T)v` converts its initializer's value (an object's
+// value is its initializer converted to the object's type, C 6.7.9p11). `inner` holds a
+// value; `expr` is the node a failure blames.
+[[nodiscard]] ConstEvalResult
+convertToCastTarget(ConstEvalResult const& inner, CstCastTarget const& target,
+                    EvalOptions const& options, NodeId expr) {
+    CstCastTarget const* const tgt = &target;
+    // ── `(_Bool)x` IS A COMPARISON, NOT A ONE-BIT TRUNCATION ────────────────
+    // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]], C 6.3.1.2:
+    // "the result is 0 if the value compares equal to 0; otherwise 1". This
+    // arm is FIRST because a `_Bool` target used to be carried as a width-1
+    // INTEGER and folded through `narrowIntToBits(v, 1, false)`, which keeps
+    // the low bit — the two rules disagree on every even value. ✔MEASURED,
+    // `int a[(_Bool)2 + 41];` built a 41-element array here and a 42-element
+    // one on all four references; the same expression at the HIR tier was
+    // already correct, so ONE value had TWO transforms and only one of them
+    // was C. The truth question is `detail::asBool`, the same verb the HIR
+    // cast arm and `asBoolBridge` ask.
+    if (tgt->isBool) {
+        // An ADDRESS keeps the capability the width-1 integer path had, and
+        // the same boundary the integer arm below draws: a NULL-base address
+        // is a pure compile-time offset with a defined truth value, while a
+        // SYMBOL-based one is a relocation and is not a constant here.
+        // ✔MEASURED, all four references accept `(_Bool)(void *)0 == 0`.
+        if (auto const* a = asAddress(*inner.value)) {
+            if (a->base != HirAddressValue::kNullBase) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }
+            return ok(makeBoolLiteral(a->byteOffset != 0 ? 1 : 0));
+        }
+        auto const b = asBool(*inner.value, options.allowFloat);
+        if (!b.has_value()) {
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        }
+        return ok(makeBoolLiteral(*b ? 1 : 0));
+    }
+    // ── A FLOAT TARGET ──────────────────────────────────────────────────────
+    // `(double)3` / `(float)0.1` in a constant expression. The descriptor had
+    // no float classification at all before this row, so the resolver returned
+    // nullopt and the whole cast was non-constant.
+    //
+    // ⚠ THIS DOES NOT LET A FLOAT VALUE INTO AN INTEGER-REQUIRED CONSUMER. The
+    // wall is `asInt64Bridge`, which answers only for integer arms, so a
+    // float-armed RESULT comes back nullopt and the consumer fails loud —
+    // ✔MEASURED, gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51
+    // all reject `int a[(double)3];`, `enum E { A = (double)3 };` and
+    // `struct S { int x : (double)3; };`, while all four accept
+    // `_Static_assert((double)3 == 3.0, "")` and `(int)(double)3`. That wall was
+    // put at the bridge — rather than at the leaf, which cannot see the result
+    // type — by the CLOSED row
+    // [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]].
+    if (tgt->floatKind.has_value()) {
+        TypeKind const toK = *tgt->floatKind;
+        if (!options.allowFloat) {
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        }
+        // F80/F128 target: carry the value at TRUE target precision in the
+        // wide arm, never a binary64-rounded stand-in (LD-3's rule, and the
+        // reason `floatKindInfo(F80).hostBacked` is false).
+        if (WideFloatValue::isSupportedKind(toK)) {
+            auto w = detail::toWideFloatOperand(*inner.value, toK);
+            if (!w.has_value()) {
+                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+            }
+            HirLiteralValue v;
+            v.core  = toK;
+            v.value = *w;
+            return ok(std::move(v));
+        }
+        auto const info = floatKindInfo(toK);
+        if (!info.has_value() || !info->hostBacked) {
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        }
+        double src = 0.0;
+        if (auto const* wf = std::get_if<WideFloatValue>(&inner.value->value)) {
+            src = wf->toDouble();          // F80/F128 → binary64, round-to-nearest
+        } else if (isFloatValue(*inner.value)) {
+            src = *detail::asDouble(*inner.value);
+        } else {
+            // Int → Float, through the SHARED widening verb, which reads the
+            // source's signedness off its CORE. Neither obvious bridge works
+            // here: `asIntBits` is an int64 REINTERPRETATION and would fold
+            // `(double)18446744073709551615ULL` to -1.0, while `asInt64`
+            // refuses the value outright — and all four references fold it to
+            // 2^64 (✔MEASURED).
+            auto const iv = detail::integerConstantAsDouble(*inner.value, options.charIsUnsigned);
+            if (!iv.has_value()) {
+                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+            }
+            src = *iv;
+        }
+        HirLiteralValue v;
+        v.core = toK;
+        // ★ NARROW TO THE TARGET'S OWN WIDTH. An F32 target must round through
+        // binary32 — the identical call the float LEAF gained when `0.1f` was
+        // found carrying 53 significant bits under an F32 core; a cast that
+        // merely relabelled the host double would reintroduce that same wrong
+        // answer through a second door.
+        v.value = narrowToFloatWidth(src, info->bits);
+        return ok(std::move(v));
+    }
+    // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a `(_BitInt(N))expr` cast folds via
+    // the wrap-aware bignum `convertTo(N, signed)` (mod-2^N) — narrow AND wide.
+    // Any integer / bit-precise operand converts; a non-integer operand fails loud.
+    if (tgt->isBitPrecise) {
+        // A FLOAT operand truncates per C 6.3.1.4p1 first (clang 18.1.3 folds
+        // `(_BitInt(16))300.5`; gcc 13.3.0 and MSVC 19.51 have no `_BitInt`).
+        if (auto const fv = detail::floatToWideIntTarget(*inner.value, tgt->bitWidth,
+                                              tgt->bitSigned, options)) {
+            if (!fv->value.has_value()) return fail(ConstEvalFailure::Overflow, expr);
+            HirLiteralValue v;
+            v.core  = TypeKind::BitInt;
+            v.value = *fv->value;
+            return ok(std::move(v));
+        }
+        auto bv = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
+        if (!bv.has_value()) {
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        }
+        bv->convertTo(tgt->bitWidth, tgt->bitSigned);
+        HirLiteralValue v;
+        v.core  = TypeKind::BitInt;
+        v.value = std::move(*bv);
+        return ok(std::move(v));
+    }
+    if (tgt->isPointer) {
+        if (auto const* a = asAddress(*inner.value)) {
+            HirAddressValue out = *a;           // ptr→ptr: identity, retype pointee
+            out.pointeeType = tgt->pointeeType;
+            return ok(makeAddress(out));
+        }
+        auto const iv = asInt64(*inner.value);
+        if (iv.has_value() && *iv == 0) {       // (T*)0 → a NULL-base address
+            return ok(makeAddress(HirAddressValue{HirAddressValue::kNullBase, 0,
+                                                  tgt->pointeeType}));
+        }
+        return fail(ConstEvalFailure::NotAConstantExpression, expr);  // (T*)<nonzero>
+    }
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): a cast to a 128-bit integer routes
+    // through the bignum, exactly like the `_BitInt` arm above — checked
+    // BEFORE the generic `isInteger` arm, which would otherwise narrow the
+    // value through `narrowIntToBits` into an int64 and tag it I64/U64. That
+    // is the silent 64-bit wrap: `(__uint128_t)x` would claim a 128-bit type
+    // while carrying 64 bits of value. The result keeps a STANDARD I128/U128
+    // core — a `__int128` is not bit-precise, so tagging it `TypeKind::BitInt`
+    // here would silently change the expression's type mid-fold.
+    //
+    // ★ PROVENANCE — this arm shipped DEAD and was revived by a self-audit.
+    // As first written it could never fire: `semantic_analyzer.cpp`'s
+    // `resolveCastTarget` had no I128/U128 row, so a 128-bit cast target fell to
+    // its `default: return nullopt` and the whole cast was non-foldable. The
+    // MEASURED symptom was that EVERY 128-bit integer constant expression
+    // refused — `_Static_assert((__uint128_t)5 == 5, "")` included — while the
+    // `_BitInt(128)` twin was clean. The resolver rows are now present and this
+    // is the reachable 128-bit shape; the descriptor's own `intBits` is the
+    // width because this engine is interner-free.
+    //
+    // ★ WHY THE WIDE RESULT CANNOT TRUNCATE DOWNSTREAM (measured, and the reason
+    // reviving this arm is safe): the value it produces rides a 128-bit
+    // `BitIntValue`, and `asInt64` admits one only when its VALUE is
+    // representable in an int64 — never merely because the low limb looks
+    // small (D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE). So the two 64-bit ICE
+    // slots — `asInt64Bridge` (array dimension / static-assert / enumerator) and
+    // the `isInteger` narrowing arm just below — REFUSE a value that does not
+    // fit instead of narrowing it. `int a[(__uint128_t)1 << 100];` fails loud
+    // with S_NonConstantArrayLength, and so does the sharper
+    // `int a[((__int128)1 << 100) + 3];`, whose low 64 bits are exactly 3;
+    // neither ever becomes a truncated bound.
+    //   ⓘ WHAT CHANGED, AND WHAT DID NOT: the rule used to be the declared
+    // WIDTH (`width() > 64` ⇒ always nullopt), which ALSO refused
+    // `int a[(__int128)2 + 1];` — a value both gcc 13.3.0 (`-std=c2x`) and
+    // clang 18.1.3 (`-std=c23`) accept. Those now fold. The refusal of values
+    // that genuinely exceed int64 is unchanged, and is what this note is about.
+    if (tgt->isInteger && tgt->intBits == 128) {
+        // A FLOAT operand truncates per C 6.3.1.4p1 through the SAME shared
+        // verb the `_BitInt` arm and the HIR walker use — and this is the only
+        // exact route for it: `(__int128)1e30` has no int64 rendering, so the
+        // `asBitIntValue` bridge below refused a conversion gcc 13.3.0 and
+        // clang 18.1.3 both fold (✔MEASURED; MSVC 19.51 has no `__int128`).
+        if (auto const fv = detail::floatToWideIntTarget(*inner.value, 128u,
+                                                         tgt->intSigned, options)) {
+            if (!fv->value.has_value()) return fail(ConstEvalFailure::Overflow, expr);
+            HirLiteralValue v;
+            v.core  = tgt->intSigned ? TypeKind::I128 : TypeKind::U128;
+            v.value = *fv->value;
+            return ok(std::move(v));
+        }
+        auto bv = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
+        if (!bv.has_value()) {
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        }
+        bv->convertTo(128u, tgt->intSigned);
+        HirLiteralValue v;
+        v.core  = tgt->intSigned ? TypeKind::I128 : TypeKind::U128;
+        v.value = std::move(*bv);
+        return ok(std::move(v));
+    }
+    if (tgt->isInteger) {
+        // ── THE CAST'S CORE IS ITS DECLARED WIDTH, NOT A GENERIC 64 ─────
+        // D-HIR-CONSTEVAL-UNSIGNED-WRAPAROUND-NOT-MODULAR. Both arms below
+        // used to stamp `I64`/`U64` on EVERY integer cast result whatever
+        // `intBits` said, while `narrowIntToBits` correctly reduced the
+        // VALUE to the declared width. Value and label disagreed, and once
+        // the usual arithmetic conversions started reading the label, the
+        // disagreement became a wrong answer: `(unsigned int)0 - 1u` would
+        // compute its common type as 64-bit and wrap to
+        // 0xffffffffffffffff instead of 0xffffffff.
+        //
+        // ★ THIS IS ROW D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE'S
+        // DEFECT CLASS EXACTLY, one tier up: a result typed from a generic
+        // KIND instead of from the DECLARED type. It stayed invisible for
+        // the same reason -- the widths whose kind and declared type
+        // coincide (I64/U64) worked, so every 64-bit probe passed.
+        // `intKindFromWidth` is the interner-free spelling of the declared
+        // width, and is the same verb `packBitIntResult` already uses.
+        auto const castCore = [&] {
+            return detail::intKindFromWidth(
+                static_cast<std::uint32_t>(tgt->intBits), tgt->intSigned);
+        };
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: a plain-`char` target
+        // whose signedness was never supplied is answerable ONLY while the
+        // two readings agree — i.e. while the truncated byte's high bit is
+        // clear. `(char)300` is 44 either way and folds; `(char)200` is -56
+        // or 200 depending on the target and must NOT be guessed. VALUE-
+        // scoped, not type-scoped, so a target-less const-expr (the LSP, the
+        // FFI header parser) keeps every answer that is not in doubt — the
+        // identical rule `narrowCharConstantSignednessMatters` applies to a
+        // character constant. Called from BOTH cast arms below; a guard on
+        // one arm only is the partial fix that reads as a complete one.
+        auto const charSignUnknownAndObservable =
+            [&](std::int64_t truncated) {
+                return tgt->intSignednessUnknown
+                    && (static_cast<std::uint64_t>(truncated) & 0x80u) != 0u;
+            };
+        // ── FLOAT → INTEGER, C 6.3.1.4p1 ────────────────────────────────────
+        // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]], and the
+        // shape the row is named for. `(int)1.5` reached the `asIntBits`
+        // bridge below, which answers only for integer arms, then the
+        // `asBitIntValue` fallback, which does the same — so the fold ended in
+        // `UnsupportedTypeKind` and every ICE position refused a cast all four
+        // references accept (✔MEASURED: array bound, enumerator, bit-field
+        // width, `_Alignas`, static assertion, index designator).
+        //
+        // ⚠ THE TARGET'S OWN WIDTH DECIDES, NOT int64's, and the predicates are
+        // the ones `combineCast` calls — the SAME arithmetic, so the CST fold of
+        // `(unsigned long long)1.8446744e19` cannot disagree with the HIR fold
+        // of the same text.
+        //
+        // ★ OUT OF RANGE IS A LOUD REFUSAL, DELIBERATELY, AND THIS IS THE ONE
+        // PLACE THE FOUR REFERENCES DO NOT AGREE. 6.3.1.4p1 makes the value
+        // UNDEFINED when the truncated integral part does not fit, and
+        // ✔MEASURED separately: `(int)1e30` folds to INT_MAX on gcc 13.3.0,
+        // clang 18.1.3 and mingw-w64 gcc 13.2.0 but to 0 on MSVC 19.51;
+        // `(char)300.5` is 127 on the first three and 44 on MSVC;
+        // `(unsigned)-3.5` is 0 on the first three and 4294967293 on MSVC. There
+        // is no union answer to bake — and none of the four DIAGNOSES the
+        // saturation (measured with `-Wall -Wextra`), so a silently wrong array
+        // bound is exactly what they ship. DSS refuses instead, which is a
+        // diagnostic C 6.6 already contemplates for a constant expression
+        // outside its type's range, and which cannot become a wrong program.
+        if (auto const fv = detail::floatToWideIntTarget(
+                *inner.value, static_cast<std::uint32_t>(tgt->intBits),
+                tgt->intSigned, options)) {
+            if (!fv->value.has_value()) return fail(ConstEvalFailure::Overflow, expr);
+            if (charSignUnknownAndObservable(fv->value->asI64())) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }
+            HirLiteralValue v;
+            v.core = castCore();
+            // Width ≤ 64 here (the 128-bit target was handled above), so the
+            // bignum's own extraction is the exact value: `asI64` for a signed
+            // target, `low64` for an unsigned one — the same split
+            // `packBitIntResult` makes for a standard-width result.
+            if (tgt->intSigned) v.value = fv->value->asI64();
+            else                v.value = fv->value->low64();
+            return ok(std::move(v));
+        }
+        if (auto const* a = asAddress(*inner.value)) {
+            // address → integer: legal ONLY for a NULL-base address (a pure
+            // compile-time offset). A symbol-based address is a relocation,
+            // not an integer constant — fail loud.
+            if (a->base != HirAddressValue::kNullBase) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }
+            HirLiteralValue v;
+            v.core  = castCore();
+            std::int64_t const nv = narrowIntToBits(a->byteOffset, tgt->intBits,
+                                                    tgt->intSigned);
+            if (tgt->intSigned) v.value = nv;
+            else                v.value = static_cast<std::uint64_t>(nv);
+            return ok(std::move(v));
+        }
+        // `asIntBits`: a cast READS its operand's bits and re-labels
+        // them at the declared width -- `(unsigned long long)-1` and
+        // `(long long)0xffffffffffffffffull` are both well-defined C
+        // (6.3.1.3p2), so refusing the operand for not fitting a SIGNED
+        // int64 refused legal conversions.
+        auto iv = detail::asIntBits(*inner.value);
+        if (!iv.has_value()) {
+            // ── A WIDE OPERAND NARROWED BY AN EXPLICIT CAST IS NOT A REFUSAL ──
+            // D-CSUBSET-INT128-ICE-CONTEXT-REFUSED / D-CSUBSET-INT128-CONSTFOLD-WIDE.
+            //
+            // `asIntBits` nullopts for a `BitIntValue` wider than 64 bits — the
+            // right answer to ITS question ("what is this value as an int64?").
+            // It is the wrong answer HERE, because the programmer WROTE a
+            // narrowing cast, and C 6.3.1.3p2 defines exactly what that yields:
+            // the value reduced modulo 2^N for an unsigned target, and the
+            // implementation-defined two's-complement answer for a signed one —
+            // which is the very rule `narrowIntToBits` below already implements
+            // for a 64-bit source.
+            //
+            // ✔MEASURED at `301e2a63`, DSS vs clang 18.1.3 (`-std=c23`) and gcc
+            // 13.3.0 (`-std=c2x`), probed SEPARATELY — both references fold all
+            // four, DSS refused all four:
+            //     _Static_assert((int)((__uint128_t)5) == 5, "");        S0029
+            //     _Static_assert((unsigned long long)((__uint128_t)5) == 5, "");
+            //     enum Q { QA = (int)(__int128)7 };                      S0029
+            //     int b[(int)(__uint128_t)4];                            S000B
+            // ★ THE ARM DIRECTLY ABOVE ALREADY DID THIS. A `(_BitInt(8))` target
+            // routes a wide operand through the bignum's own wrap-aware
+            // `convertTo`, so `_Static_assert((_BitInt(8))((__uint128_t)5) == 5)`
+            // was CLEAN while the `int` twin was refused — one law, two arms, and
+            // only one of them knew it. This reuses the SAME verb rather than
+            // adding a second narrowing rule.
+            //
+            // ⚠ THE ROW'S INVARIANT IS UNTOUCHED: "a value exceeding int64 can
+            // never SILENTLY truncate into an ICE". Nothing here is silent — this
+            // path is reached only through a cast the programmer wrote, whose
+            // whole meaning is the narrowing. A BARE wide value used as an array
+            // bound or enumerator still goes through `asInt64`, which admits it
+            // only when its VALUE fits an int64
+            // (D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE), so
+            // `int a[(__uint128_t)1 << 100];` keeps failing loud rather than
+            // becoming a truncated bound.
+            auto wide = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
+            if (!wide.has_value()) {
+                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+            }
+            // Reduce to the low 64 bits FIRST (mod 2^64, exact and total), then
+            // let `narrowIntToBits` apply the declared width exactly as it does
+            // for every other source. Composing the two is the same modular
+            // reduction as converting straight to `intBits`, because `intBits`
+            // here is ≤ 64 (the 128-bit target was handled above).
+            wide->convertTo(64u, /*isSigned=*/false);
+            iv = static_cast<std::int64_t>(wide->low64());
+        }
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: a plain-`char` target
+        // whose signedness was never supplied is answerable ONLY while the
+        // two readings agree — i.e. while the truncated byte's high bit is
+        // clear. `(char)300` is 44 either way and folds; `(char)200` is -56
+        // or 200 depending on the target and must NOT be guessed. Scoped to
+        // the VALUE rather than to the type so a target-less const-expr keeps
+        // every answer that is not actually in doubt.
+        if (charSignUnknownAndObservable(*iv)) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        HirLiteralValue v;
+        v.core  = castCore();
+        std::int64_t const nv = narrowIntToBits(*iv, tgt->intBits, tgt->intSigned);
+        if (tgt->intSigned) v.value = nv;
+        else                v.value = static_cast<std::uint64_t>(nv);
+        return ok(std::move(v));
+    }
+    // What is left is a target the classifier admitted but no arm above folds.
+    // ⚠ THE OLD SENTENCE HERE SAID "a float / aggregate cast target", AND HALF
+    // OF IT WENT FALSE ABOVE: since
+    // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]] a FLOAT target
+    // folds in its own arm, and `classifyCstCastTarget` refuses an AGGREGATE
+    // before the fold is ever entered — so neither of the two shapes that
+    // sentence named still arrives here. It is kept in the past tense because
+    // one live consumer's comment still cites this arm by that name:
+    // `SemanticAnalyzerC.ComplexConstexprInitializerRefusesToFold` relies on a
+    // `_Complex` cast target being non-foldable, and it is — through the
+    // classifier's `default`, not through here.
+    return fail(ConstEvalFailure::NotAConstantExpression, expr);
 }
 
 // Internal per-node fold body. `visitedInitNodes` carries the per-call
@@ -481,7 +869,7 @@ evalNode(NodeId                              expr,
                     // phase 4 perform; a `char`-typed literal above 0x7F with no
                     // target answer is not a constant this fold can decide.
                     auto const reduced = reducedIntegerLiteralBits(
-                        r.kind, *iv, options.charIsUnsigned);
+                        r.kind, *iv, options.charIsUnsigned, r.outOfRange);
                     if (!reduced.has_value()) {
                         return fail(ConstEvalFailure::NotAConstantExpression, expr);
                     }
@@ -757,374 +1145,121 @@ evalNode(NodeId                              expr,
         ConstEvalResult inner =
             evalImpl(operandN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
         if (!inner.value.has_value()) return inner;
-        // ── `(_Bool)x` IS A COMPARISON, NOT A ONE-BIT TRUNCATION ────────────────
-        // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]], C 6.3.1.2:
-        // "the result is 0 if the value compares equal to 0; otherwise 1". This
-        // arm is FIRST because a `_Bool` target used to be carried as a width-1
-        // INTEGER and folded through `narrowIntToBits(v, 1, false)`, which keeps
-        // the low bit — the two rules disagree on every even value. ✔MEASURED,
-        // `int a[(_Bool)2 + 41];` built a 41-element array here and a 42-element
-        // one on all four references; the same expression at the HIR tier was
-        // already correct, so ONE value had TWO transforms and only one of them
-        // was C. The truth question is `detail::asBool`, the same verb the HIR
-        // cast arm and `asBoolBridge` ask.
-        if (tgt->isBool) {
-            // An ADDRESS keeps the capability the width-1 integer path had, and
-            // the same boundary the integer arm below draws: a NULL-base address
-            // is a pure compile-time offset with a defined truth value, while a
-            // SYMBOL-based one is a relocation and is not a constant here.
-            // ✔MEASURED, all four references accept `(_Bool)(void *)0 == 0`.
-            if (auto const* a = asAddress(*inner.value)) {
-                if (a->base != HirAddressValue::kNullBase) {
-                    return fail(ConstEvalFailure::NotAConstantExpression, expr);
-                }
-                return ok(makeBoolLiteral(a->byteOffset != 0 ? 1 : 0));
+        return convertToCastTarget(inner, *tgt, options, expr);
+    }
+
+    // ★ P69 (lane `cs`, C23 6.6p6-p7): a CONSTANT SUBOBJECT — a compound literal constant
+    // `(constexpr T){ v }`, or the `.` member of a structure or union named constant /
+    // compound literal constant, even recursively. The resolver hands back the initializer
+    // VALUE that initializes it (or says it is zero-initialized) and its declared type; this
+    // arm folds that value in the value's own scope — the `resolveSymbolInit` path, cycle
+    // guard included — and reads it AT the declared type through the cast arm's own
+    // conversion. ✔MEASURED 2026-09-30 (probe-reference-cc runs 20260930-185149-8dd835aa,
+    // -185219-ff240d50, -215342-bd6f89d0, -215414-bc6d1ef1, -215506-23709b5b): gcc 13.3.0
+    // -std=c2x folds every such constant in an array bound, a `case` label, an enumerator and
+    // a static assertion, a zero-initialized member and an unsigned member at its own type
+    // included, and refuses an INACTIVE union member and an array member's element; clang
+    // 18.1.3 -std=c2x folds a CONST (not constexpr) compound literal and a const structure's
+    // member in all four as a GNU extension. A member access the resolver does not claim
+    // falls through to the offsetof arm below; a compound literal it does not claim is not a
+    // constant.
+    bool const isCompoundLiteral = [&] {
+        for (auto const& row : ctx.schema.semantics().compoundLiteralRules)
+            if (row.rule.valid() && row.rule.v == rule.v) return true;
+        return false;
+    }();
+    if (isCompoundLiteral
+        || (cfg.postfixExprRule.valid() && rule.v == cfg.postfixExprRule.v)) {
+        std::optional<CstConstantSubobject> const sub =
+            env.resolveConstantSubobject
+                ? env.resolveConstantSubobject(expr, currentScopeOpaque)
+                : std::nullopt;
+        if (sub.has_value()) {
+            if (sub->zeroValue) {
+                HirLiteralValue zero;
+                zero.core  = TypeKind::I32;
+                zero.value = std::int64_t{0};
+                return convertToCastTarget(ok(std::move(zero)), sub->type, options, expr);
             }
-            auto const b = asBool(*inner.value, options.allowFloat);
-            if (!b.has_value()) {
-                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-            }
-            return ok(makeBoolLiteral(*b ? 1 : 0));
-        }
-        // ── A FLOAT TARGET ──────────────────────────────────────────────────────
-        // `(double)3` / `(float)0.1` in a constant expression. The descriptor had
-        // no float classification at all before this row, so the resolver returned
-        // nullopt and the whole cast was non-constant.
-        //
-        // ⚠ THIS DOES NOT LET A FLOAT VALUE INTO AN INTEGER-REQUIRED CONSUMER. The
-        // wall is `asInt64Bridge`, which answers only for integer arms, so a
-        // float-armed RESULT comes back nullopt and the consumer fails loud —
-        // ✔MEASURED, gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51
-        // all reject `int a[(double)3];`, `enum E { A = (double)3 };` and
-        // `struct S { int x : (double)3; };`, while all four accept
-        // `_Static_assert((double)3 == 3.0, "")` and `(int)(double)3`. That wall was
-        // put at the bridge — rather than at the leaf, which cannot see the result
-        // type — by the CLOSED row
-        // [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]].
-        if (tgt->floatKind.has_value()) {
-            TypeKind const toK = *tgt->floatKind;
-            if (!options.allowFloat) {
-                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-            }
-            // F80/F128 target: carry the value at TRUE target precision in the
-            // wide arm, never a binary64-rounded stand-in (LD-3's rule, and the
-            // reason `floatKindInfo(F80).hostBacked` is false).
-            if (WideFloatValue::isSupportedKind(toK)) {
-                auto w = detail::toWideFloatOperand(*inner.value, toK);
-                if (!w.has_value()) {
-                    return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-                }
-                HirLiteralValue v;
-                v.core  = toK;
-                v.value = *w;
-                return ok(std::move(v));
-            }
-            auto const info = floatKindInfo(toK);
-            if (!info.has_value() || !info->hostBacked) {
-                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-            }
-            double src = 0.0;
-            if (auto const* wf = std::get_if<WideFloatValue>(&inner.value->value)) {
-                src = wf->toDouble();          // F80/F128 → binary64, round-to-nearest
-            } else if (isFloatValue(*inner.value)) {
-                src = *detail::asDouble(*inner.value);
-            } else {
-                // Int → Float, through the SHARED widening verb, which reads the
-                // source's signedness off its CORE. Neither obvious bridge works
-                // here: `asIntBits` is an int64 REINTERPRETATION and would fold
-                // `(double)18446744073709551615ULL` to -1.0, while `asInt64`
-                // refuses the value outright — and all four references fold it to
-                // 2^64 (✔MEASURED).
-                auto const iv = detail::integerConstantAsDouble(*inner.value, options.charIsUnsigned);
-                if (!iv.has_value()) {
-                    return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-                }
-                src = *iv;
-            }
-            HirLiteralValue v;
-            v.core = toK;
-            // ★ NARROW TO THE TARGET'S OWN WIDTH. An F32 target must round through
-            // binary32 — the identical call the float LEAF gained when `0.1f` was
-            // found carrying 53 significant bits under an F32 core; a cast that
-            // merely relabelled the host double would reintroduce that same wrong
-            // answer through a second door.
-            v.value = narrowToFloatWidth(src, info->bits);
-            return ok(std::move(v));
-        }
-        // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a `(_BitInt(N))expr` cast folds via
-        // the wrap-aware bignum `convertTo(N, signed)` (mod-2^N) — narrow AND wide.
-        // Any integer / bit-precise operand converts; a non-integer operand fails loud.
-        if (tgt->isBitPrecise) {
-            // A FLOAT operand truncates per C 6.3.1.4p1 first (clang 18.1.3 folds
-            // `(_BitInt(16))300.5`; gcc 13.3.0 and MSVC 19.51 have no `_BitInt`).
-            if (auto const fv = detail::floatToWideIntTarget(*inner.value, tgt->bitWidth,
-                                                  tgt->bitSigned, options)) {
-                if (!fv->value.has_value()) return fail(ConstEvalFailure::Overflow, expr);
-                HirLiteralValue v;
-                v.core  = TypeKind::BitInt;
-                v.value = *fv->value;
-                return ok(std::move(v));
-            }
-            auto bv = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
-            if (!bv.has_value()) {
-                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-            }
-            bv->convertTo(tgt->bitWidth, tgt->bitSigned);
-            HirLiteralValue v;
-            v.core  = TypeKind::BitInt;
-            v.value = std::move(*bv);
-            return ok(std::move(v));
-        }
-        if (tgt->isPointer) {
-            if (auto const* a = asAddress(*inner.value)) {
-                HirAddressValue out = *a;           // ptr→ptr: identity, retype pointee
-                out.pointeeType = tgt->pointeeType;
-                return ok(makeAddress(out));
-            }
-            auto const iv = asInt64(*inner.value);
-            if (iv.has_value() && *iv == 0) {       // (T*)0 → a NULL-base address
-                return ok(makeAddress(HirAddressValue{HirAddressValue::kNullBase, 0,
-                                                      tgt->pointeeType}));
-            }
-            return fail(ConstEvalFailure::NotAConstantExpression, expr);  // (T*)<nonzero>
-        }
-        // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): a cast to a 128-bit integer routes
-        // through the bignum, exactly like the `_BitInt` arm above — checked
-        // BEFORE the generic `isInteger` arm, which would otherwise narrow the
-        // value through `narrowIntToBits` into an int64 and tag it I64/U64. That
-        // is the silent 64-bit wrap: `(__uint128_t)x` would claim a 128-bit type
-        // while carrying 64 bits of value. The result keeps a STANDARD I128/U128
-        // core — a `__int128` is not bit-precise, so tagging it `TypeKind::BitInt`
-        // here would silently change the expression's type mid-fold.
-        //
-        // ★ PROVENANCE — this arm shipped DEAD and was revived by a self-audit.
-        // As first written it could never fire: `semantic_analyzer.cpp`'s
-        // `resolveCastTarget` had no I128/U128 row, so a 128-bit cast target fell to
-        // its `default: return nullopt` and the whole cast was non-foldable. The
-        // MEASURED symptom was that EVERY 128-bit integer constant expression
-        // refused — `_Static_assert((__uint128_t)5 == 5, "")` included — while the
-        // `_BitInt(128)` twin was clean. The resolver rows are now present and this
-        // is the reachable 128-bit shape; the descriptor's own `intBits` is the
-        // width because this engine is interner-free.
-        //
-        // ★ WHY THE WIDE RESULT CANNOT TRUNCATE DOWNSTREAM (measured, and the reason
-        // reviving this arm is safe): the value it produces rides a 128-bit
-        // `BitIntValue`, and `asInt64` admits one only when its VALUE is
-        // representable in an int64 — never merely because the low limb looks
-        // small (D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE). So the two 64-bit ICE
-        // slots — `asInt64Bridge` (array dimension / static-assert / enumerator) and
-        // the `isInteger` narrowing arm just below — REFUSE a value that does not
-        // fit instead of narrowing it. `int a[(__uint128_t)1 << 100];` fails loud
-        // with S_NonConstantArrayLength, and so does the sharper
-        // `int a[((__int128)1 << 100) + 3];`, whose low 64 bits are exactly 3;
-        // neither ever becomes a truncated bound.
-        //   ⓘ WHAT CHANGED, AND WHAT DID NOT: the rule used to be the declared
-        // WIDTH (`width() > 64` ⇒ always nullopt), which ALSO refused
-        // `int a[(__int128)2 + 1];` — a value both gcc 13.3.0 (`-std=c2x`) and
-        // clang 18.1.3 (`-std=c23`) accept. Those now fold. The refusal of values
-        // that genuinely exceed int64 is unchanged, and is what this note is about.
-        if (tgt->isInteger && tgt->intBits == 128) {
-            // A FLOAT operand truncates per C 6.3.1.4p1 through the SAME shared
-            // verb the `_BitInt` arm and the HIR walker use — and this is the only
-            // exact route for it: `(__int128)1e30` has no int64 rendering, so the
-            // `asBitIntValue` bridge below refused a conversion gcc 13.3.0 and
-            // clang 18.1.3 both fold (✔MEASURED; MSVC 19.51 has no `__int128`).
-            if (auto const fv = detail::floatToWideIntTarget(*inner.value, 128u,
-                                                             tgt->intSigned, options)) {
-                if (!fv->value.has_value()) return fail(ConstEvalFailure::Overflow, expr);
-                HirLiteralValue v;
-                v.core  = tgt->intSigned ? TypeKind::I128 : TypeKind::U128;
-                v.value = *fv->value;
-                return ok(std::move(v));
-            }
-            auto bv = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
-            if (!bv.has_value()) {
-                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-            }
-            bv->convertTo(128u, tgt->intSigned);
-            HirLiteralValue v;
-            v.core  = tgt->intSigned ? TypeKind::I128 : TypeKind::U128;
-            v.value = std::move(*bv);
-            return ok(std::move(v));
-        }
-        if (tgt->isInteger) {
-            // ── THE CAST'S CORE IS ITS DECLARED WIDTH, NOT A GENERIC 64 ─────
-            // D-HIR-CONSTEVAL-UNSIGNED-WRAPAROUND-NOT-MODULAR. Both arms below
-            // used to stamp `I64`/`U64` on EVERY integer cast result whatever
-            // `intBits` said, while `narrowIntToBits` correctly reduced the
-            // VALUE to the declared width. Value and label disagreed, and once
-            // the usual arithmetic conversions started reading the label, the
-            // disagreement became a wrong answer: `(unsigned int)0 - 1u` would
-            // compute its common type as 64-bit and wrap to
-            // 0xffffffffffffffff instead of 0xffffffff.
-            //
-            // ★ THIS IS ROW D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE'S
-            // DEFECT CLASS EXACTLY, one tier up: a result typed from a generic
-            // KIND instead of from the DECLARED type. It stayed invisible for
-            // the same reason -- the widths whose kind and declared type
-            // coincide (I64/U64) worked, so every 64-bit probe passed.
-            // `intKindFromWidth` is the interner-free spelling of the declared
-            // width, and is the same verb `packBitIntResult` already uses.
-            auto const castCore = [&] {
-                return detail::intKindFromWidth(
-                    static_cast<std::uint32_t>(tgt->intBits), tgt->intSigned);
-            };
-            // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: a plain-`char` target
-            // whose signedness was never supplied is answerable ONLY while the
-            // two readings agree — i.e. while the truncated byte's high bit is
-            // clear. `(char)300` is 44 either way and folds; `(char)200` is -56
-            // or 200 depending on the target and must NOT be guessed. VALUE-
-            // scoped, not type-scoped, so a target-less const-expr (the LSP, the
-            // FFI header parser) keeps every answer that is not in doubt — the
-            // identical rule `narrowCharConstantSignednessMatters` applies to a
-            // character constant. Called from BOTH cast arms below; a guard on
-            // one arm only is the partial fix that reads as a complete one.
-            auto const charSignUnknownAndObservable =
-                [&](std::int64_t truncated) {
-                    return tgt->intSignednessUnknown
-                        && (static_cast<std::uint64_t>(truncated) & 0x80u) != 0u;
-                };
-            // ── FLOAT → INTEGER, C 6.3.1.4p1 ────────────────────────────────────
-            // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]], and the
-            // shape the row is named for. `(int)1.5` reached the `asIntBits`
-            // bridge below, which answers only for integer arms, then the
-            // `asBitIntValue` fallback, which does the same — so the fold ended in
-            // `UnsupportedTypeKind` and every ICE position refused a cast all four
-            // references accept (✔MEASURED: array bound, enumerator, bit-field
-            // width, `_Alignas`, static assertion, index designator).
-            //
-            // ⚠ THE TARGET'S OWN WIDTH DECIDES, NOT int64's, and the predicates are
-            // the ones `combineCast` calls — the SAME arithmetic, so the CST fold of
-            // `(unsigned long long)1.8446744e19` cannot disagree with the HIR fold
-            // of the same text.
-            //
-            // ★ OUT OF RANGE IS A LOUD REFUSAL, DELIBERATELY, AND THIS IS THE ONE
-            // PLACE THE FOUR REFERENCES DO NOT AGREE. 6.3.1.4p1 makes the value
-            // UNDEFINED when the truncated integral part does not fit, and
-            // ✔MEASURED separately: `(int)1e30` folds to INT_MAX on gcc 13.3.0,
-            // clang 18.1.3 and mingw-w64 gcc 13.2.0 but to 0 on MSVC 19.51;
-            // `(char)300.5` is 127 on the first three and 44 on MSVC;
-            // `(unsigned)-3.5` is 0 on the first three and 4294967293 on MSVC. There
-            // is no union answer to bake — and none of the four DIAGNOSES the
-            // saturation (measured with `-Wall -Wextra`), so a silently wrong array
-            // bound is exactly what they ship. DSS refuses instead, which is a
-            // diagnostic C 6.6 already contemplates for a constant expression
-            // outside its type's range, and which cannot become a wrong program.
-            if (auto const fv = detail::floatToWideIntTarget(
-                    *inner.value, static_cast<std::uint32_t>(tgt->intBits),
-                    tgt->intSigned, options)) {
-                if (!fv->value.has_value()) return fail(ConstEvalFailure::Overflow, expr);
-                if (charSignUnknownAndObservable(fv->value->asI64())) {
-                    return fail(ConstEvalFailure::NotAConstantExpression, expr);
-                }
-                HirLiteralValue v;
-                v.core = castCore();
-                // Width ≤ 64 here (the 128-bit target was handled above), so the
-                // bignum's own extraction is the exact value: `asI64` for a signed
-                // target, `low64` for an unsigned one — the same split
-                // `packBitIntResult` makes for a standard-width result.
-                if (tgt->intSigned) v.value = fv->value->asI64();
-                else                v.value = fv->value->low64();
-                return ok(std::move(v));
-            }
-            if (auto const* a = asAddress(*inner.value)) {
-                // address → integer: legal ONLY for a NULL-base address (a pure
-                // compile-time offset). A symbol-based address is a relocation,
-                // not an integer constant — fail loud.
-                if (a->base != HirAddressValue::kNullBase) {
-                    return fail(ConstEvalFailure::NotAConstantExpression, expr);
-                }
-                HirLiteralValue v;
-                v.core  = castCore();
-                std::int64_t const nv = narrowIntToBits(a->byteOffset, tgt->intBits,
-                                                        tgt->intSigned);
-                if (tgt->intSigned) v.value = nv;
-                else                v.value = static_cast<std::uint64_t>(nv);
-                return ok(std::move(v));
-            }
-            // `asIntBits`: a cast READS its operand's bits and re-labels
-            // them at the declared width -- `(unsigned long long)-1` and
-            // `(long long)0xffffffffffffffffull` are both well-defined C
-            // (6.3.1.3p2), so refusing the operand for not fitting a SIGNED
-            // int64 refused legal conversions.
-            auto iv = detail::asIntBits(*inner.value);
-            if (!iv.has_value()) {
-                // ── A WIDE OPERAND NARROWED BY AN EXPLICIT CAST IS NOT A REFUSAL ──
-                // D-CSUBSET-INT128-ICE-CONTEXT-REFUSED / D-CSUBSET-INT128-CONSTFOLD-WIDE.
-                //
-                // `asIntBits` nullopts for a `BitIntValue` wider than 64 bits — the
-                // right answer to ITS question ("what is this value as an int64?").
-                // It is the wrong answer HERE, because the programmer WROTE a
-                // narrowing cast, and C 6.3.1.3p2 defines exactly what that yields:
-                // the value reduced modulo 2^N for an unsigned target, and the
-                // implementation-defined two's-complement answer for a signed one —
-                // which is the very rule `narrowIntToBits` below already implements
-                // for a 64-bit source.
-                //
-                // ✔MEASURED at `301e2a63`, DSS vs clang 18.1.3 (`-std=c23`) and gcc
-                // 13.3.0 (`-std=c2x`), probed SEPARATELY — both references fold all
-                // four, DSS refused all four:
-                //     _Static_assert((int)((__uint128_t)5) == 5, "");        S0029
-                //     _Static_assert((unsigned long long)((__uint128_t)5) == 5, "");
-                //     enum Q { QA = (int)(__int128)7 };                      S0029
-                //     int b[(int)(__uint128_t)4];                            S000B
-                // ★ THE ARM DIRECTLY ABOVE ALREADY DID THIS. A `(_BitInt(8))` target
-                // routes a wide operand through the bignum's own wrap-aware
-                // `convertTo`, so `_Static_assert((_BitInt(8))((__uint128_t)5) == 5)`
-                // was CLEAN while the `int` twin was refused — one law, two arms, and
-                // only one of them knew it. This reuses the SAME verb rather than
-                // adding a second narrowing rule.
-                //
-                // ⚠ THE ROW'S INVARIANT IS UNTOUCHED: "a value exceeding int64 can
-                // never SILENTLY truncate into an ICE". Nothing here is silent — this
-                // path is reached only through a cast the programmer wrote, whose
-                // whole meaning is the narrowing. A BARE wide value used as an array
-                // bound or enumerator still goes through `asInt64`, which admits it
-                // only when its VALUE fits an int64
-                // (D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE), so
-                // `int a[(__uint128_t)1 << 100];` keeps failing loud rather than
-                // becoming a truncated bound.
-                auto wide = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
-                if (!wide.has_value()) {
-                    return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-                }
-                // Reduce to the low 64 bits FIRST (mod 2^64, exact and total), then
-                // let `narrowIntToBits` apply the declared width exactly as it does
-                // for every other source. Composing the two is the same modular
-                // reduction as converting straight to `intBits`, because `intBits`
-                // here is ≤ 64 (the 128-bit target was handled above).
-                wide->convertTo(64u, /*isSigned=*/false);
-                iv = static_cast<std::int64_t>(wide->low64());
-            }
-            // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: a plain-`char` target
-            // whose signedness was never supplied is answerable ONLY while the
-            // two readings agree — i.e. while the truncated byte's high bit is
-            // clear. `(char)300` is 44 either way and folds; `(char)200` is -56
-            // or 200 depending on the target and must NOT be guessed. Scoped to
-            // the VALUE rather than to the type so a target-less const-expr keeps
-            // every answer that is not actually in doubt.
-            if (charSignUnknownAndObservable(*iv)) {
+            NodeId const init = sub->init.initExpr;
+            if (!init.valid() || visitedInitNodes.contains(init.v)) {
                 return fail(ConstEvalFailure::NotAConstantExpression, expr);
             }
-            HirLiteralValue v;
-            v.core  = castCore();
-            std::int64_t const nv = narrowIntToBits(*iv, tgt->intBits, tgt->intSigned);
-            if (tgt->intSigned) v.value = nv;
-            else                v.value = static_cast<std::uint64_t>(nv);
-            return ok(std::move(v));
+            visitedInitNodes.insert(init.v);
+            ConstEvalResult inner = evalImpl(init, ctx, env, options,
+                                             sub->init.initScopeOpaque, visitedInitNodes);
+            visitedInitNodes.erase(init.v);
+            if (!inner.value.has_value()) {
+                inner.blamedNode = HirNodeId{expr.v};
+                return inner;
+            }
+            return convertToCastTarget(inner, sub->type, options, expr);
         }
-        // What is left is a target the classifier admitted but no arm above folds.
-        // ⚠ THE OLD SENTENCE HERE SAID "a float / aggregate cast target", AND HALF
-        // OF IT WENT FALSE ABOVE: since
-        // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]] a FLOAT target
-        // folds in its own arm, and `classifyCstCastTarget` refuses an AGGREGATE
-        // before the fold is ever entered — so neither of the two shapes that
-        // sentence named still arrives here. It is kept in the past tense because
-        // one live consumer's comment still cites this arm by that name:
-        // `SemanticAnalyzerC.ComplexConstexprInitializerRefusesToFold` relies on a
-        // `_Complex` cast target being non-foldable, and it is — through the
-        // classifier's `default`, not through here.
-        return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        if (isCompoundLiteral) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+    }
+
+    // ★ P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): a CALL of a
+    // builtin whose verb has a constant form. ✔MEASURED 2026-10-01 (lane `cs`'s probes r5s
+    // s01-s04 + s08, t06-t07): gcc 13.3.0 and clang 18.1.3, both modes, take
+    // `__builtin_expect(1, 1)`, `__builtin_ffs(8)`, `__builtin_parity(7)` and
+    // `__builtin_popcountl(7)` as integer constant expressions in `_Static_assert`, an
+    // enumerator, an array bound and a `case` label, and clang `__builtin_object_size(g, 0)`
+    // as well (gcc refuses that one; the union accepts it). The resolver names the callee
+    // and its parameters; every operand folds and converts as the call converts it, and
+    // `foldBuiltinVerb` — the HIR evaluator's arithmetic too — computes the value. Not a
+    // builtin call (an ordinary call): the resolver answers nullopt and the call falls to
+    // the member-access arm below, which refuses it as before.
+    if (cfg.postfixExprRule.valid() && rule.v == cfg.postfixExprRule.v
+        && env.resolveBuiltinCall) {
+        if (std::optional<CstBuiltinCall> const bc = env.resolveBuiltinCall(expr)) {
+            auto const coreOf = [](CstCastTarget const& t) -> TypeKind {
+                if (t.isBool) return TypeKind::Bool;
+                if (t.isInteger && t.intBits >= 8)
+                    return detail::intKindFromWidth(static_cast<std::uint32_t>(t.intBits),
+                                                    t.intSigned);
+                if (t.isPointer) return TypeKind::Ptr;
+                if (t.floatKind.has_value()) return *t.floatKind;
+                return TypeKind::Void;
+            };
+            TypeKind const resultCore = coreOf(bc->resultType);
+            if (bc->answer.has_value()) {
+                // A compile-time answer the tier computed (its operands are unevaluated):
+                // an integer, or a `_Bool` (the `_p` overflow predicates' result) — held in
+                // the int64 arm as 0 / 1, the HirLiteralValue contract for a Bool core.
+                if (!bc->resultType.isInteger && !bc->resultType.isBool) {
+                    return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                }
+                HirLiteralValue lit;
+                lit.core = resultCore;
+                if (bc->resultType.isBool)
+                    lit.value = static_cast<std::int64_t>(*bc->answer != 0 ? 1 : 0);
+                else if (bc->resultType.intSigned)
+                    lit.value = static_cast<std::int64_t>(*bc->answer);
+                else
+                    lit.value = *bc->answer;
+                return convertToCastTarget(ok(std::move(lit)), bc->resultType, options, expr);
+            }
+            std::vector<HirLiteralValue> values;
+            std::vector<TypeKind>        cores;
+            values.reserve(bc->args.size());
+            cores.reserve(bc->args.size());
+            for (std::size_t i = 0; i < bc->args.size(); ++i) {
+                ConstEvalResult inner = evalImpl(bc->args[i], ctx, env, options,
+                                                 currentScopeOpaque, visitedInitNodes);
+                if (!inner.value.has_value()) return inner;
+                if (i < bc->argTypes.size() && bc->argTypes[i].has_value()) {
+                    inner = convertToCastTarget(inner, *bc->argTypes[i], options, bc->args[i]);
+                    if (!inner.value.has_value()) return inner;
+                    cores.push_back(coreOf(*bc->argTypes[i]));
+                } else {
+                    cores.push_back(inner.value->core);
+                }
+                values.push_back(std::move(*inner.value));
+            }
+            auto folded = foldBuiltinVerb(bc->verb, values, cores, resultCore);
+            if (!folded.has_value()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            return convertToCastTarget(ok(std::move(*folded)), bc->resultType, options, expr);
+        }
     }
 
     // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): a POSTFIX member access in

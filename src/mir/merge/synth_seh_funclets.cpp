@@ -5,6 +5,7 @@
 #include "core/types/type_lattice/core_type.hpp"       // TypeKind, CallConv
 #include "core/types/type_lattice/type_interner.hpp"
 #include "ffi/mangling/c_mangle.hpp"   // applyCMangling (per-format personality name)
+#include "mir/merge/synth_symbol_floor.hpp"  // continueSymbolIdsPastImports (the rebuild continues the module's ids)
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"  // rederiveStructCfMarkers (the relayout's duty)
@@ -41,40 +42,28 @@ void emitErr(DiagnosticReporter& rep, std::string msg) {
     rep.report(std::move(d));
 }
 
-// Max SymbolId.v across every function, module global, and extern import — the
-// floor for minting fresh synthetic funclet/personality symbols (mirrors
-// synthesizePeStartup's maxSymbolIdV; the globals scan is load-bearing for the
-// same reason — synthetic string-literal globals hold the highest ids).
-[[nodiscard]] std::uint32_t
-maxSymbolIdV(Mir const& mir, std::vector<ExternImport> const& externs) {
-    std::uint32_t maxV = 0;
-    std::size_t const nf = mir.moduleFuncCount();
-    for (std::uint32_t i = 0; i < nf; ++i) {
-        maxV = std::max(maxV, mir.funcSymbol(mir.funcAt(i)).v);
-    }
-    std::size_t const ng = mir.moduleGlobalCount();
-    for (std::uint32_t i = 0; i < ng; ++i) {
-        maxV = std::max(maxV, mir.globalSymbol(mir.globalAt(i)).v);
-    }
-    for (auto const& e : externs) maxV = std::max(maxV, e.symbol.v);
-    return maxV;
-}
+// ⓘ THE FUNCLET AND PERSONALITY SYMBOLS COME FROM THE MODULE (`MirBuilder::mintSymbolOrAbort`,
+// the one door — see mir/merge/synth_symbol_floor.hpp), as the entry-shape and
+// threads-shim passes' do: past every id the module holds (its globals load-bearing —
+// synthetic string-literal globals hold the highest ids) AND every id the name table the
+// module was made from holds, which names whatever symbol a funclet's id lands on.
 
 // One collected `__try` region, resolved to concrete blocks + the minted funclet
 // symbol. `filterBB` is the single block ending in SehFilterReturn (c115 lowers the
-// filter EXPRESSION to one block). `bodyBlocks` is the guarded region's block set in
-// the CONTIGUOUS layout order the parent rebuild imposes (entry first); `endBB` is
-// its LAST block (the scope [Begin,End) end resolves to one-past it at link time).
+// filter EXPRESSION to one block). `bodyBlocks` is the guarded region's MEMBERSHIP —
+// every block of the guarded body, in the source function's block order. Where the
+// body's run ENDS is not a fact about this list: it is read off the rebuilt
+// function's layout, after the relayout, by `verifyRegionLayout`.
 struct Region {
     MirFuncId  parentFn{};
+    std::uint32_t parentIndex = 0;   // `parentFn`'s position in the module's function list
     SymbolId   parentSym{};
     std::uint32_t regionId = 0;
     MirBlockId tryBB{};        // SehTryBegin succ[0] — the guarded body's entry
     MirBlockId filterBB{};     // SehTryBegin succ[1] (== the SehFilterReturn block)
     MirBlockId handlerBB{};    // SehFilterReturn succ[0]
-    MirBlockId endBB{};        // the guarded body's LAST block in the contiguous layout
     SymbolId   funcletSym{};
-    std::vector<MirBlockId> bodyBlocks;  // the guarded region's blocks, layout order
+    std::vector<MirBlockId> bodyBlocks;  // the guarded body's blocks, source order
 };
 
 // Compute a `__try` region's GUARDED-BODY block set: every block reachable from
@@ -123,6 +112,80 @@ computeGuardedBodyBlocks(Mir const& mir, MirFuncId fn, MirBlockId tryBB,
         if (inRegion.contains(b.v)) ordered.push_back(b);
     }
     return ordered;
+}
+
+// ── THE VERIFIER OF THE LAYOUT (D-MIR-NESTED-TRY-REGIONS-REACH-THE-OUTER-HANDLER) ──
+//
+// ★★★ A SCOPE RECORD IS TWO ADDRESSES, AND EVERYTHING BETWEEN THEM IS GUARDED.
+// The dispatcher never asks which blocks the source put in the `__try`: it asks
+// whether the faulting address lies in [Begin, End). So the record is right only
+// if the region's MEMBERSHIP — every block of the guarded body — is laid out as
+// exactly ONE RUN of the function, and that run STARTS at the body's entry
+// (whose address is Begin). A member outside the run faults unguarded; a
+// non-member inside it has its faults delivered to a handler that is not its
+// own; a handler inside its own run is re-entered by its own fault.
+//
+// This reads the REBUILT function — the layout the relayout actually produced —
+// and re-derives the membership from that function's own CFG rather than from
+// the list the relayout was handed, so a relayout that misplaced a block and a
+// rebuild that re-keyed one wrongly both show here. It answers the run — its
+// LAST block (the scope's End is the address of whatever is laid out after it)
+// and the layout positions of its first and last block — or nothing, after
+// reporting which block is out of place.
+//
+// The filter stub and the handler are never members (the walk does not enter
+// them), so "exactly one run of members" is also "neither lies inside the run".
+struct LaidRun {
+    MirBlockId    last{};
+    std::uint32_t firstPos = 0;   // the body's entry, as a position in the function's block list
+    std::uint32_t lastPos  = 0;   // the run's last block, likewise (inclusive)
+};
+
+[[nodiscard]] std::optional<LaidRun>
+verifyRegionLayout(Mir const& mir, MirFuncId fn, MirBlockId tryBB,
+                   MirBlockId filterBB, MirBlockId handlerBB,
+                   std::uint32_t regionId, DiagnosticReporter& reporter) {
+    std::vector<MirBlockId> const members =
+        computeGuardedBodyBlocks(mir, fn, tryBB, filterBB, handlerBB, regionId);
+    std::uint32_t const nb = mir.funcBlockCount(fn);
+    std::uint32_t begin = nb;
+    for (std::uint32_t i = 0; i < nb; ++i) {
+        if (mir.funcBlockAt(fn, i).v == tryBB.v) {
+            begin = i;
+            break;
+        }
+    }
+    // `members` comes back in the function's block order, so the run is exact iff
+    // its k-th member is the block laid out k places after the body's entry.
+    for (std::size_t k = 0; k < members.size(); ++k) {
+        std::uint32_t const want = begin + static_cast<std::uint32_t>(k);
+        if (want < nb && mir.funcBlockAt(fn, want).v == members[k].v) continue;
+        std::uint32_t at = nb;
+        for (std::uint32_t i = 0; i < nb; ++i) {
+            if (mir.funcBlockAt(fn, i).v == members[k].v) {
+                at = i;
+                break;
+            }
+        }
+        emitErr(reporter, std::format(
+            "synthesizeSehFunclets: guarded region {} is not laid out as one run of "
+            "its function starting at the body's entry — the body has {} block(s), "
+            "its entry is laid out at position {}, and block #{} of the body (in "
+            "layout order) sits at position {} where the run needs position {}. A "
+            "scope record guards every address between two blocks, so a fault in a "
+            "misplaced block would reach another region's handler or none. This is "
+            "the relayout disagreeing with the region's membership, not a property "
+            "of the program", regionId, members.size(), begin, k, at, want));
+        return std::nullopt;
+    }
+    if (members.empty() || begin == nb) {
+        emitErr(reporter, std::format(
+            "synthesizeSehFunclets: guarded region {} has no body in the rebuilt "
+            "function (internal invariant violation)", regionId));
+        return std::nullopt;
+    }
+    return LaidRun{members.back(), begin,
+                   begin + static_cast<std::uint32_t>(members.size()) - 1u};
 }
 
 // A verbatim clone policy (synthesizePeStartup's IdentityClonePolicy) — every
@@ -179,7 +242,7 @@ public:
             filterBlocks_.insert(r.filterBB.v);
             handlerByFilter_.emplace(r.filterBB.v, r.handlerBB);
             regionByFilter_.emplace(r.filterBB.v, r.regionId);
-            regionBodies_.push_back(&r.bodyBlocks);
+            regions_.push_back(&r);
         }
     }
 
@@ -188,36 +251,90 @@ public:
     // its scope-table [Begin,End) covers exactly the region (no non-region block
     // interleaved). The optimizer's RPO block order can interleave the join/handler
     // between body blocks (empirically observed), so we relay out: walk the source
-    // block order, and the FIRST time a region's entry (tryBB) is reached, emit that
-    // region's whole body contiguously (in its precomputed order); every already-
-    // emitted region body block is then skipped. The entry block stays index 0 (it
+    // block order, and the first time a block of a region's body is reached, emit
+    // that region's whole body as ONE run. The entry block stays index 0 (it
     // is never inside a guarded body — a __try cannot start at function entry in C:
     // the CRT/setup precedes it), so alloca scan-order (entry-only, c69) is preserved
     // ⇒ H1 slot-ids stay stable. Non-region blocks keep their relative order.
+    //
+    // ★★★ D-MIR-NESTED-TRY-REGIONS-REACH-THE-OUTER-HANDLER: THE RUN IS BUILT PER
+    // NESTING LEVEL, ENTRY FIRST. A region inside another region's body is itself a
+    // body that needs its own run INSIDE the outer one, and the predecessor of this
+    // function did not give it one: it emitted the OUTERMOST body in source order
+    // and skipped everything already emitted, so an inner body with a loop (whose
+    // blocks the optimizer's order puts after the code that follows the loop) was
+    // left in pieces, and its range — entry to last piece — then held blocks of the
+    // outer body. A fault in those blocks belongs to the outer handler alone.
+    //   * a run STARTS at its body's entry (`tryBB`): the scope's Begin is that
+    //     block's address, so a body block laid out before it would be unguarded;
+    //   * the rest of the body follows in source order, except that the first block
+    //     met of a DIRECTLY nested region opens that region's own run right there;
+    //   * the walk keeps its own stack — nesting depth is the source's to choose,
+    //     and this pass must not spend a host frame per level of it.
+    // `verifyRegionLayout` re-derives every region's membership from the REBUILT
+    // function and refuses a layout in which any run and its membership disagree.
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
-        // Map each region-body block to its owning region's ordered body list.
-        std::unordered_map<std::uint32_t, std::vector<MirBlockId> const*> bodyOf;
-        for (auto const* body : regionBodies_) {
-            for (MirBlockId const b : *body) bodyOf[b.v] = body;
+        constexpr std::size_t kNone = static_cast<std::size_t>(-1);
+        std::vector<std::unordered_set<std::uint32_t>> bodySet(regions_.size());
+        for (std::size_t i = 0; i < regions_.size(); ++i) {
+            for (MirBlockId const b : regions_[i]->bodyBlocks) bodySet[i].insert(b.v);
         }
+        // The region whose run opens when block `b` is met while laying out region
+        // `within` (kNone: at function level): the LARGEST body that holds `b` and
+        // lies strictly inside `within` — bodies nest, so a region strictly inside
+        // another has its entry among that one's blocks and fewer blocks than it.
+        auto const outermostHolding = [&](std::uint32_t b, std::size_t within) {
+            std::size_t best = kNone;
+            for (std::size_t i = 0; i < regions_.size(); ++i) {
+                if (i == within || !bodySet[i].contains(b)) continue;
+                if (within != kNone
+                    && (!bodySet[within].contains(regions_[i]->tryBB.v)
+                        || bodySet[i].size() >= bodySet[within].size())) {
+                    continue;
+                }
+                if (best == kNone || bodySet[i].size() > bodySet[best].size()) best = i;
+            }
+            return best;
+        };
+
         std::vector<MirBlockId> order;
         std::unordered_set<std::uint32_t> emitted;
         std::uint32_t const n = src.funcBlockCount(fn);
         order.reserve(n);
+        auto const emit = [&](MirBlockId b) {
+            if (emitted.insert(b.v).second) order.push_back(b);
+        };
+        struct Frame {
+            std::size_t region;
+            std::size_t next;   // into that region's `bodyBlocks`
+        };
+        std::vector<Frame> open;
+        auto const openRun = [&](std::size_t region) {
+            emit(regions_[region]->tryBB);   // the run starts at the body's entry
+            open.push_back(Frame{region, 0});
+        };
         for (std::uint32_t i = 0; i < n; ++i) {
             MirBlockId const b = src.funcBlockAt(fn, i);
-            if (emitted.contains(b.v)) continue;   // already emitted as part of a body
-            auto it = bodyOf.find(b.v);
-            if (it == bodyOf.end()) {
-                order.push_back(b);
-                emitted.insert(b.v);
+            if (emitted.contains(b.v)) continue;   // already emitted as part of a run
+            std::size_t const top = outermostHolding(b.v, kNone);
+            if (top == kNone) {
+                emit(b);
                 continue;
             }
-            // First block of a region body reached — emit the WHOLE body contiguously
-            // in its precomputed (deterministic) order.
-            for (MirBlockId const rb : *it->second) {
-                if (emitted.insert(rb.v).second) order.push_back(rb);
+            openRun(top);
+            while (!open.empty()) {
+                std::size_t const region = open.back().region;
+                auto const& body = regions_[region]->bodyBlocks;
+                if (open.back().next == body.size()) {
+                    open.pop_back();
+                    continue;
+                }
+                MirBlockId const rb = body[open.back().next++];
+                if (emitted.contains(rb.v)) continue;
+                std::size_t const child = outermostHolding(rb.v, region);
+                if (child == kNone) emit(rb);
+                else                openRun(child);
             }
         }
         return order;
@@ -288,9 +405,9 @@ private:
     std::unordered_map<std::uint32_t, std::uint32_t> regionByFilter_;
     std::unordered_map<std::uint32_t, MirInstId>  stubConstByFilter_;
     MirBlockId                        curFilterBB_{};
-    // c116b: each guarded region's ordered body-block list (borrowed from the
-    // Region vector, which outlives this policy) — drives the contiguity relayout.
-    std::vector<std::vector<MirBlockId> const*> regionBodies_;
+    // c116b: this parent's regions (borrowed from the Region vector, which
+    // outlives this policy) — their memberships drive the contiguity relayout.
+    std::vector<Region const*>        regions_;
 };
 
 // Build a parent function's ALLOCA scan-order slot-id map: each Alloca inst id → its
@@ -320,6 +437,65 @@ parentAllocaSlotIds(Mir const& mir, MirFuncId fn) {
     return slotIds;
 }
 
+// The opcodes whose result is a function of THEIR OPERANDS AND OF NOTHING ELSE:
+// not of memory at the moment they run, not of the frame, the arguments or the
+// blocks of the function they sit in, and with no effect of their own. Such an
+// instruction computes the same value wherever it is placed, which is what lets
+// a filter funclet clone one the optimizer moved out of the filter block (see
+// `resolveOperand` in `emitFilterFuncletBody`).
+//
+// ⚠ AN ALLOW-LIST, DELIBERATELY. The complement — "everything without side
+// effects that is not a load" — is shorter and rots the wrong way: a new opcode
+// that reads the frame (the three `va_start` area addresses, a by-value stack
+// parameter, an indirect-result read all exist already) would be cloned into the
+// funclet without a word and read the FUNCLET's frame. Here a new opcode is
+// refused by name until someone decides it belongs.
+[[nodiscard]] constexpr bool isOperandOnlyValue(MirOpcode op) noexcept {
+    switch (op) {
+        case MirOpcode::Const:
+        case MirOpcode::GlobalAddr:
+        // integer arithmetic
+        case MirOpcode::Add:  case MirOpcode::Sub:  case MirOpcode::Mul:
+        case MirOpcode::SDiv: case MirOpcode::UDiv: case MirOpcode::SMod:
+        case MirOpcode::UMod: case MirOpcode::Neg:  case MirOpcode::UMulH:
+        // floating arithmetic
+        case MirOpcode::FAdd: case MirOpcode::FSub: case MirOpcode::FMul:
+        case MirOpcode::FDiv: case MirOpcode::FNeg:
+        // bitwise
+        case MirOpcode::And:  case MirOpcode::Or:   case MirOpcode::Xor:
+        case MirOpcode::Shl:  case MirOpcode::LShr: case MirOpcode::AShr:
+        case MirOpcode::Not:  case MirOpcode::Popcount: case MirOpcode::Clz:
+        case MirOpcode::Ctz:  case MirOpcode::Bswap:
+        // comparisons
+        case MirOpcode::ICmpEq:  case MirOpcode::ICmpNe:
+        case MirOpcode::ICmpSlt: case MirOpcode::ICmpSle:
+        case MirOpcode::ICmpSgt: case MirOpcode::ICmpSge:
+        case MirOpcode::ICmpUlt: case MirOpcode::ICmpUle:
+        case MirOpcode::ICmpUgt: case MirOpcode::ICmpUge:
+        case MirOpcode::FCmpOeq: case MirOpcode::FCmpOne:
+        case MirOpcode::FCmpOlt: case MirOpcode::FCmpOle:
+        case MirOpcode::FCmpOgt: case MirOpcode::FCmpOge:
+        case MirOpcode::FCmpUeq: case MirOpcode::FCmpUne:
+        case MirOpcode::FCmpUlt: case MirOpcode::FCmpUle:
+        case MirOpcode::FCmpUgt: case MirOpcode::FCmpUge:
+        // address and aggregate arithmetic
+        case MirOpcode::Gep:
+        case MirOpcode::ExtractValue: case MirOpcode::InsertValue:
+        // conversions
+        case MirOpcode::Trunc:   case MirOpcode::SExt:    case MirOpcode::ZExt:
+        case MirOpcode::FPTrunc: case MirOpcode::FPExt:   case MirOpcode::Bitcast:
+        case MirOpcode::IntToPtr: case MirOpcode::PtrToInt:
+        case MirOpcode::FPToSI:  case MirOpcode::FPToUI:
+        case MirOpcode::SIToFP:  case MirOpcode::UIToFP:
+        // vectors
+        case MirOpcode::VAdd: case MirOpcode::VSub: case MirOpcode::VMul:
+        case MirOpcode::VShuffle: case MirOpcode::VExtract: case MirOpcode::VInsert:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Emit the filter FUNCLET body directly into `builder` (the current open function),
 // cloning `filterBB`'s non-terminator insts with the SEH rewrites. Returns false
 // (reported) on an unsupported inst. `exPtrArg` is the funclet's arg0
@@ -345,34 +521,96 @@ parentAllocaSlotIds(Mir const& mir, MirFuncId fn) {
     // old value id → new value id, within the funclet.
     std::unordered_map<std::uint32_t, MirInstId> map;
 
-    // Resolve an operand: if already mapped, return it; if it is a PARENT ALLOCA
-    // (defined outside filterBB, op == Alloca), materialize a RecoverParentFrameSlot
-    // for it (once) and return that; otherwise fail loud (unrecoverable out-of-block
-    // reference). Returns nullopt (reported) on failure.
+    // Resolve an operand: if already mapped, return it; otherwise it is defined
+    // OUTSIDE filterBB and the funclet has to obtain it some other way. Returns
+    // nullopt (reported) when it cannot.
+    //
+    // ★★★ D-MIR-TRY-FILTER-SHARED-PURE-VALUE-REFUSED-IN-RELEASE: WHAT A FILTER
+    // FUNCLET CAN REACH. It is a function of its own, entered by the dispatcher
+    // DURING THE SEARCH — on top of the faulting frame, before anything is
+    // unwound — with two arguments: the exception pointers and the parent's
+    // frame. It keeps none of the parent's registers. So a value of the parent
+    // reaches it in exactly two ways:
+    //   * a PARENT FRAME SLOT (`Alloca`), read through the establisher frame
+    //     (`RecoverParentFrameSlot`) — which is why HIR→MIR forces every symbol a
+    //     filter names into the frame;
+    //   * a value the funclet can COMPUTE AGAIN: an instruction whose result is a
+    //     function of its operands and of nothing else (`isOperandOnlyValue`),
+    //     its operands reached the same two ways. The optimizer creates these:
+    //     CSE gives a filter's `GlobalAddr g` or `a + 4` the dominating copy
+    //     computed before the region, and LICM hoists one out of a loop the
+    //     region sits in. ✔MEASURED 2026-10-08: a filter reading a global the
+    //     function also wrote before the region compiled at baseline and was
+    //     REFUSED in release — this lambda copied `Const` and `GlobalAddr` when
+    //     they were defined inside the filter block and refused the same
+    //     instruction defined outside it. Cloning the cone puts the expression
+    //     back where the source wrote it.
+    // Everything else — an argument, a load, a call's result, a block's address —
+    // belongs to the parent's registers, memory at an earlier moment, or blocks,
+    // and stays a refusal.
+    // The cone is walked with a work stack: its depth is the expression's.
     auto resolveOperand = [&](MirInstId o) -> std::optional<MirInstId> {
         if (auto it = map.find(o.v); it != map.end()) return it->second;
-        // Not defined in filterBB — is it a parent alloca we can recover?
-        if (mir.instOpcode(o) == MirOpcode::Alloca) {
-            auto slotIt = allocaSlotId.find(o.v);
-            if (slotIt == allocaSlotId.end()) {
-                emitErr(reporter, "synthesizeSehFunclets: the SEH filter references a "
-                        "parent local whose frame slot could not be resolved "
-                        "(D-WIN64-SEH-FUNCLETS)");
+        std::vector<MirInstId> pending{o};
+        while (!pending.empty()) {
+            MirInstId const cur = pending.back();
+            if (map.contains(cur.v)) {
+                pending.pop_back();
+                continue;
+            }
+            MirOpcode const op = mir.instOpcode(cur);
+            if (op == MirOpcode::Alloca) {
+                auto slotIt = allocaSlotId.find(cur.v);
+                if (slotIt == allocaSlotId.end()) {
+                    emitErr(reporter, "synthesizeSehFunclets: the SEH filter references a "
+                            "parent local whose frame slot could not be resolved "
+                            "(D-WIN64-SEH-FUNCLETS)");
+                    return std::nullopt;
+                }
+                // The recovered address has the alloca's own pointer result type.
+                map[cur.v] = builder.addInst(
+                    MirOpcode::RecoverParentFrameSlot,
+                    std::array<MirInstId, 1>{establisherArg}, mir.instType(cur),
+                    /*payload=*/slotIt->second);
+                pending.pop_back();
+                continue;
+            }
+            if (!isOperandOnlyValue(op)) {
+                emitErr(reporter, std::format(
+                        "synthesizeSehFunclets: the SEH filter expression "
+                        "references a value defined outside the filter block that is not a "
+                        "recoverable parent local (only exception code/info + parent locals "
+                        "are supported) (D-WIN64-SEH-FUNCLETS) — the value is a '{}', which a "
+                        "filter funclet can neither read from the parent's frame nor "
+                        "compute again from its operands", opcodeInfo(op).mnemonic));
                 return std::nullopt;
             }
-            // The recovered address has the alloca's own pointer result type.
-            MirInstId const recovered = builder.addInst(
-                MirOpcode::RecoverParentFrameSlot,
-                std::array<MirInstId, 1>{establisherArg}, mir.instType(o),
-                /*payload=*/slotIt->second);
-            map[o.v] = recovered;
-            return recovered;
+            // Operands first; a non-phi value's operands are defined before it,
+            // so the cone is a DAG and this terminates.
+            bool waiting = false;
+            for (MirInstId const x : mir.instOperands(cur)) {
+                if (!map.contains(x.v)) {
+                    pending.push_back(x);
+                    waiting = true;
+                }
+            }
+            if (waiting) continue;
+            if (op == MirOpcode::Const) {
+                map[cur.v] = builder.addConst(
+                    mir.literalValue(mir.constLiteralIndex(cur)), mir.instType(cur));
+            } else if (op == MirOpcode::GlobalAddr) {
+                map[cur.v] = builder.addGlobalAddr(mir.globalAddrSymbol(cur),
+                                                   mir.instType(cur));
+            } else {
+                std::vector<MirInstId> newOps;
+                for (MirInstId const x : mir.instOperands(cur)) newOps.push_back(map.at(x.v));
+                map[cur.v] = builder.addInst(op, newOps, mir.instType(cur),
+                                             mir.instPayload(cur), mir.instFlags(cur),
+                                             mir.instPayload2(cur));
+            }
+            pending.pop_back();
         }
-        emitErr(reporter, "synthesizeSehFunclets: the SEH filter expression "
-                "references a value defined outside the filter block that is not a "
-                "recoverable parent local (only exception code/info + parent locals "
-                "are supported) (D-WIN64-SEH-FUNCLETS)");
-        return std::nullopt;
+        return map.at(o.v);
     };
 
     std::uint32_t const n = mir.blockInstCount(filterBB);
@@ -516,10 +754,14 @@ bool synthesizeSehFunclets(Mir&                                  mir,
     if (!anySeh) return true;
 
     // (1) Collect every region + mint funclet symbols. One personality import is
-    //     shared across all regions.
-    std::uint32_t maxV = maxSymbolIdV(mir, externImports);
-    SymbolId const personalitySym{maxV + 1};
-    std::uint32_t nextSymV = maxV + 1;
+    //     shared across all regions. The symbols are minted from the module the
+    //     rebuild in (2) fills, so its builder opens here: it continues the
+    //     source's symbol ids. (A return before (2) drops the builder and the ids
+    //     it minted with it; `mir` is untouched.)
+    constexpr char const* kMinter = "synthesizeSehFunclets";
+    MirBuilder builder;
+    continueSymbolIdsPastImports(builder, mir, externImports);
+    SymbolId const personalitySym = builder.mintSymbolOrAbort(kMinter);
 
     std::vector<Region> regions;
     for (std::uint32_t fi = 0; fi < nf0; ++fi) {
@@ -539,6 +781,7 @@ bool synthesizeSehFunclets(Mir&                                  mir,
             }
             Region r;
             r.parentFn  = f;
+            r.parentIndex = fi;
             r.parentSym = mir.funcSymbol(f);
             r.regionId  = mir.instPayload(term);
             r.tryBB     = succs[0];
@@ -589,13 +832,11 @@ bool synthesizeSehFunclets(Mir&                                  mir,
                 return false;
             }
             // The scope PC range is [begin, end). SehParentPolicy lays the body out
-            // contiguously in `bodyBlocks` order, so `endBB` = the LAST body block;
-            // the pipeline computes `end` as the offset of whatever block is laid out
-            // immediately after it (the first non-region block after the contiguous
-            // run). `beginBlock` = tryBB (bodyBlocks[0] by construction — the entry).
-            r.endBB = r.bodyBlocks.back();
+            // as one run that starts at `tryBB`; the pipeline computes `end` as the
+            // offset of whatever block is laid out immediately after the run's last
+            // block, which `verifyRegionLayout` reads off the rebuilt function.
 
-            r.funcletSym = SymbolId{++nextSymV};
+            r.funcletSym = builder.mintSymbolOrAbort(kMinter);
             regions.push_back(r);
         }
     }
@@ -688,7 +929,7 @@ bool synthesizeSehFunclets(Mir&                                  mir,
     //     the stub policy), then append one funclet per region, then globals.
     //     The rebuild mints FRESH block ids in a new arena, so capture each SEH
     //     parent's old→new block map to re-key the scope records afterward.
-    MirBuilder builder;
+    //     (`builder` was opened in (1), where the symbols were minted from it.)
     IdentityClonePolicy identity;
     std::unordered_map<std::uint32_t, MirBlockId> oldToNewBlock;  // old.v → new block
     for (std::uint32_t fi = 0; fi < nf0; ++fi) {
@@ -788,24 +1029,116 @@ bool synthesizeSehFunclets(Mir&                                  mir,
     // (3) Emit the scope records, re-keyed to the REBUILT module's block ids (the
     //     rebuild minted fresh ids in a new arena). The LIR lowering then maps each
     //     new MIR block to its LIR block; the pipeline binds byte offsets.
-    outScopes.reserve(regions.size());
-    for (auto const& r : regions) {
-        auto beginIt = oldToNewBlock.find(r.tryBB.v);
-        auto endIt   = oldToNewBlock.find(r.endBB.v);
-        auto handIt  = oldToNewBlock.find(r.handlerBB.v);
-        if (beginIt == oldToNewBlock.end() || endIt == oldToNewBlock.end()
+    //
+    // ★ EVERY RUN IS VERIFIED ON THE REBUILT FUNCTION BEFORE A RECORD NAMES IT
+    //   (`verifyRegionLayout`): a record is a pair of addresses, and what the
+    //   dispatcher will treat as guarded is whatever lies between them.
+    struct Laid {
+        Region const* region = nullptr;
+        MirBlockId    begin{};
+        MirBlockId    last{};
+        MirBlockId    handler{};
+        std::uint32_t firstPos = 0;
+        std::uint32_t lastPos  = 0;
+    };
+    std::vector<Laid> laid;
+    laid.reserve(regions.size());
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+        Region const& r = regions[i];
+        auto beginIt  = oldToNewBlock.find(r.tryBB.v);
+        auto filterIt = oldToNewBlock.find(r.filterBB.v);
+        auto handIt   = oldToNewBlock.find(r.handlerBB.v);
+        if (beginIt == oldToNewBlock.end() || filterIt == oldToNewBlock.end()
             || handIt == oldToNewBlock.end()) {
             emitErr(reporter, "synthesizeSehFunclets: a SEH region's block was "
                     "dropped by the rebuild (internal invariant violation, "
                     "D-WIN64-SEH-FUNCLETS)");
             return false;
         }
+        auto const run = verifyRegionLayout(
+            mir, mir.funcAt(r.parentIndex), beginIt->second, filterIt->second,
+            handIt->second, r.regionId, reporter);
+        if (!run.has_value()) return false;   // reported
+        laid.push_back(Laid{&r, beginIt->second, run->last, handIt->second,
+                            run->firstPos, run->lastPos});
+    }
+
+    // ★★★ D-MIR-NESTED-TRY-REGIONS-REACH-THE-OUTER-HANDLER: THE RECORDS OF ONE
+    // FUNCTION GO OUT REGION BY REGION, EACH REGION AFTER EVERY REGION INSIDE IT,
+    // SIBLINGS BY ADDRESS (the header states the rule for every tier). Here a
+    // region is one run, so that is: IN ASCENDING ORDER OF THE END OF THEIR RUN,
+    // and of two runs that end together the one that BEGINS LATER first. The handler routine walks
+    // a function's records in table order and gives the fault to the FIRST record
+    // whose range holds the faulting address and whose filter accepts it — and an
+    // outer region's range holds every address of the regions inside it.
+    // ✔MEASURED 2026-10-08 on pe64, with the records in the order they were
+    // collected (region-id order — the order the source OPENS the regions,
+    // outermost first): the image's table read `outer, inner`, and a fault in the
+    // inner body ran the OUTER handler. Two regions whose handlers touch only a
+    // frame local, no loop: the simplest nesting there is.
+    // ✔MEASURED the same day, the reference (cl 19.51 x64, /Od and /O2, a program
+    // printing its own table): two deep `[+20,+32) [+20,+57)`; three deep
+    // `[+20,+32) [+20,+59) [+20,+87)`; two siblings inside one parent
+    // `[+20,+32) [+40,+59) [+20,+87)`. That is this order exactly: a region after
+    // every region inside it, siblings by address.
+    //
+    // The order is a property of RUNS THAT NEST. Two runs of one function are
+    // either apart or one inside the other — a `__try` is a statement, so bodies
+    // nest as statements do — and the sweep below REFUSES the pair that is neither
+    // (it would have no innermost) and the pair that is the same run twice.
+    std::stable_sort(laid.begin(), laid.end(), [](Laid const& a, Laid const& b) {
+        if (a.region->parentIndex != b.region->parentIndex) {
+            return a.region->parentIndex < b.region->parentIndex;
+        }
+        if (a.firstPos != b.firstPos) return a.firstPos < b.firstPos;
+        return a.lastPos > b.lastPos;
+    });
+    {
+        // `laid` is, per function, in order of each run's FIRST block, the longer
+        // run first: every run that holds the current one is still on `open`.
+        std::vector<Laid const*> open;
+        for (Laid const& cur : laid) {
+            while (!open.empty()
+                   && (open.back()->region->parentIndex != cur.region->parentIndex
+                       || open.back()->lastPos < cur.firstPos)) {
+                open.pop_back();
+            }
+            if (!open.empty()) {
+                Laid const& outer = *open.back();
+                bool const sameRun = outer.firstPos == cur.firstPos
+                                  && outer.lastPos == cur.lastPos;
+                if (sameRun || cur.lastPos > outer.lastPos) {
+                    emitErr(reporter, std::format(
+                        "synthesizeSehFunclets: guarded regions {} and {} of one function "
+                        "are laid out at positions {}..{} and {}..{} — {}. Which handler a "
+                        "fault reaches is decided by the order of the records whose ranges "
+                        "hold its address, and that order exists only when, of any two "
+                        "ranges that share an address, one lies inside the other",
+                        outer.region->regionId, cur.region->regionId, outer.firstPos,
+                        outer.lastPos, cur.firstPos, cur.lastPos,
+                        sameRun ? "the same run twice"
+                                : "they overlap and neither holds the other"));
+                    return false;
+                }
+            }
+            open.push_back(&cur);
+        }
+    }
+    std::stable_sort(laid.begin(), laid.end(), [](Laid const& a, Laid const& b) {
+        if (a.region->parentIndex != b.region->parentIndex) {
+            return a.region->parentIndex < b.region->parentIndex;
+        }
+        if (a.lastPos != b.lastPos) return a.lastPos < b.lastPos;
+        return a.firstPos > b.firstPos;
+    });
+    outScopes.reserve(laid.size());
+    for (Laid const& l : laid) {
         MirSehScope s;
-        s.parentFuncSymbol    = r.parentSym;
-        s.beginBlock          = beginIt->second;
-        s.endBlock            = endIt->second;
-        s.handlerBlock        = handIt->second;
-        s.filterFuncletSymbol = r.funcletSym;
+        s.parentFuncSymbol    = l.region->parentSym;
+        s.beginBlock          = l.begin;
+        s.endBlock            = l.last;
+        s.handlerBlock        = l.handler;
+        s.filterFuncletSymbol = l.region->funcletSym;
         s.personalitySymbol   = personalitySym;
         outScopes.push_back(s);
     }

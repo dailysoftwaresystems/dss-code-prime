@@ -2,11 +2,13 @@
 
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/arg_payload.hpp"
+#include "core/types/object_format_kind.hpp"   // isWriterReservedSymbolIdValue (a value no module may mint)
 #include "core/types/target_schema.hpp"   // TargetRegClass (the piece's result-register pool)
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -67,6 +69,14 @@ void resetMovedFrom_(Mir::InstArena& inst, Mir::BlockArena& block, Mir::FuncAren
     asmDescriptorPool = MirAsmDescriptorPool{};
 }
 
+// One past `s` in a module's symbol-id space. The LAST value has no "one past":
+// an end saturates on it, and the door then refuses to mint rather than wrap onto
+// 0, the invalid id.
+[[nodiscard]] std::uint32_t onePastSymbolId(SymbolId s) noexcept {
+    constexpr std::uint32_t kLast = std::numeric_limits<std::uint32_t>::max();
+    return s.v == kLast ? kLast : s.v + 1u;
+}
+
 } // namespace
 
 // ── Mir ───────────────────────────────────────────────────────────────────────
@@ -115,6 +125,16 @@ Mir::Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
                      instBlock_.size(), instArena_.nodeCount());
         std::abort();
     }
+    // The symbol-id space is past every symbol the module defines, whoever built
+    // it (see `symbolIdEnd()`) — an invariant of the class, so it is established
+    // here and holds for a module assembled from raw arenas as for a builder's.
+    auto const pastSymbol = [&](SymbolId s) {
+        if (onePastSymbolId(s) > symbolIdEnd_) symbolIdEnd_ = onePastSymbolId(s);
+    };
+    std::size_t const nf = moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) pastSymbol(funcSymbol(funcAt(i)));
+    std::size_t const ng = moduleGlobalCount();
+    for (std::uint32_t i = 0; i < ng; ++i) pastSymbol(globalSymbol(globalAt(i)));
 }
 
 Mir::Mir(Mir&& other) noexcept
@@ -129,9 +149,13 @@ Mir::Mir(Mir&& other) noexcept
       literalPool_(std::move(other.literalPool_)),
       asmDescriptorPool_(std::move(other.asmDescriptorPool_)),
       aliasingMode_(other.aliasingMode_),
-      charTypesAliasAll_(other.charTypesAliasAll_) {
+      charTypesAliasAll_(other.charTypesAliasAll_),
+      symbolIdEnd_(other.symbolIdEnd_),
+      symbolIdEndStated_(other.symbolIdEndStated_) {
     other.aliasingMode_ = MirAliasingMode::Permissive;
     other.charTypesAliasAll_ = true;
+    other.symbolIdEnd_ = 1;
+    other.symbolIdEndStated_ = false;   // the emptied module is nobody's table
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
                     other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_,
@@ -154,6 +178,10 @@ Mir& Mir::operator=(Mir&& other) noexcept {
     other.aliasingMode_ = MirAliasingMode::Permissive;
     charTypesAliasAll_ = other.charTypesAliasAll_;
     other.charTypesAliasAll_ = true;
+    symbolIdEnd_ = other.symbolIdEnd_;
+    other.symbolIdEnd_ = 1;
+    symbolIdEndStated_ = other.symbolIdEndStated_;
+    other.symbolIdEndStated_ = false;
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
                     other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_,
@@ -519,6 +547,116 @@ MirBuilder::MirBuilder(MirModuleId tag)
     instBlock_.push_back(InvalidMirBlock);
 }
 
+// ── the symbol-id space: the one door (the contract is on the declarations) ──
+
+namespace {
+
+// THE ONE PLACE a fresh SymbolId of a module's id space is made: the id at `end`,
+// and the end moves past it. A value a format WRITER defines for itself is never a
+// module's and is stepped over (`isWriterReservedSymbolIdValue`, the owner's own
+// predicate — today the PE `_tls_index` singleton; a module that minted it would
+// alias a constant or a block onto the writer's slot). The invalid `SymbolId{}`
+// when the space is exhausted — minting the last value would leave the end nowhere
+// to go, and a wrapped id would be 0, the invalid sentinel.
+[[nodiscard]] SymbolId takeSymbolIdAt(std::uint32_t& end) noexcept {
+    constexpr std::uint32_t kLast = std::numeric_limits<std::uint32_t>::max();
+    while (end != kLast && isWriterReservedSymbolIdValue(end)) ++end;
+    if (end == kLast) return SymbolId{};
+    return SymbolId{end++};
+}
+
+[[noreturn]] void symbolIdSpaceExhausted(char const* who, std::uint32_t end) {
+    // Nothing downstream could tell a wrapped id from a real symbol.
+    std::fprintf(stderr,
+                 "dss::%s fatal: the module's SymbolId space is exhausted (its end is %u) — "
+                 "no fresh symbol can be minted.\n",
+                 who, end);
+    std::abort();
+}
+
+// THE REFUSAL OF A COUNTED END. A module's end is STATED when whoever made the
+// module said where its id space ends — a name table's end, "this module is its own
+// table", or the statement of the module it replaces, copied. An end nobody stated
+// is only COUNTED from the symbols the module defines, and a count is exactly what
+// a name table outgrows: an id minted past it can be a name the table already
+// holds (✔MEASURED P69: a synthesized symbol minted INSIDE the name table, which a
+// later rename then bound to a user's function). Nothing downstream can tell such
+// an id from a fresh one, so the mint itself refuses — loudly, at the first id,
+// which is what makes a module builder nobody has written yet state its end on the
+// day it first reaches a pass that mints.
+[[noreturn]] void symbolIdEndNeverStated(char const* leaf) {
+    std::fprintf(stderr,
+                 "dss::%s fatal: this module's symbol-id space was never stated — its end is "
+                 "only COUNTED from the symbols it defines. A module made from a name table "
+                 "states the table's end (MirBuilder::stateSymbolIdEnd); a module made from "
+                 "nothing but itself says so (MirBuilder::stateSelfContainedSymbolIds); a "
+                 "module that replaces another continues its ids, and carries whether they "
+                 "were stated (MirBuilder::continueSymbolIdsOf). Minting past a counted end "
+                 "could hand out an id a name table beside the module already holds.\n",
+                 leaf);
+    std::abort();
+}
+
+} // namespace
+
+void MirBuilder::stateSymbolIdEnd(std::uint32_t end) noexcept {
+    symbolIdEndStated_ = true;
+    raiseSymbolIdEndTo_(end);
+}
+
+void MirBuilder::stateSelfContainedSymbolIds() noexcept {
+    symbolIdEndStated_ = true;   // the counted end, STATED: nothing stands beside it
+}
+
+void MirBuilder::continueSymbolIdsOf(Mir const& rebuilt) noexcept {
+    // COPIED, never made: a module whose end was only counted is continued by a
+    // builder whose end is only counted, through every rebuild, until a leaf
+    // refuses it. (A statement this builder already made stands.)
+    if (rebuilt.symbolIdEndIsStated()) symbolIdEndStated_ = true;
+    raiseSymbolIdEndTo_(rebuilt.symbolIdEnd());
+}
+
+void MirBuilder::keepSymbolIdsClearOf(SymbolId taken) noexcept {
+    raiseSymbolIdEndTo_(onePastSymbolId(taken));
+}
+
+SymbolId MirBuilder::mintSymbol() {
+    if (!symbolIdEndStated_) symbolIdEndNeverStated("MirBuilder::mintSymbol");
+    return takeSymbolIdAt(symbolIdEnd_);
+}
+
+SymbolId MirBuilder::mintSymbolOrAbort(char const* who) {
+    SymbolId const minted = mintSymbol();
+    if (!minted.valid()) symbolIdSpaceExhausted(who, symbolIdEnd_);
+    return minted;
+}
+
+void MirBuilder::carryModuleFactsOf(Mir const& rebuilt) noexcept {
+    aliasingMode_      = rebuilt.aliasingMode();
+    charTypesAliasAll_ = rebuilt.charTypesAliasAll();
+    continueSymbolIdsOf(rebuilt);
+}
+
+// The module's own end and the module's own word on it — never a count of the
+// symbols it holds (that count is exactly what a name table outgrows).
+MirSymbolIdContinuation::MirSymbolIdContinuation(Mir const& mir) noexcept
+    : end_{mir.symbolIdEnd()}, stated_{mir.symbolIdEndIsStated()} {}
+
+void MirSymbolIdContinuation::keepClearOf(SymbolId taken) noexcept {
+    if (onePastSymbolId(taken) > end_) end_ = onePastSymbolId(taken);
+}
+
+SymbolId MirSymbolIdContinuation::mint() noexcept {
+    if (!stated_) symbolIdEndNeverStated("MirSymbolIdContinuation::mint");
+    return takeSymbolIdAt(end_);
+}
+
+SymbolId MirSymbolIdContinuation::mintOrAbort(char const* who) {
+    SymbolId const minted = mint();
+    if (!minted.valid()) symbolIdSpaceExhausted(who, end_);
+    return minted;
+}
+
 void MirBuilder::checkSameModule_(std::uint32_t arenaTag, char const* what) const {
     // Untagged ids (arenaTag == 0) pass — literal-id test ergonomics, mirroring
     // the substrate cross-arena guard.
@@ -596,6 +734,7 @@ MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol,
     f.staticInit       = staticInit;
     MirFuncId const id = funcArena_.addNode(f);
     openFunc_ = id;
+    keepSymbolIdsClearOf(symbol);   // the id space is past every symbol the module defines
     return id;
 }
 
@@ -641,6 +780,7 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
     g.isConst          = isConst;
     g.isThreadLocal    = (threadStorage == MirThreadStorage::PerThread);
     g.alignment        = alignmentBytes;
+    keepSymbolIdsClearOf(symbol);   // the id space is past every symbol the module defines
     return globalArena_.addNode(g);
 }
 
@@ -1484,9 +1624,10 @@ MirInstId MirBuilder::addReturnMulti(std::span<MirInstId const> values) {
     return id;
 }
 
-MirInstId MirBuilder::addUnreachable() {
+MirInstId MirBuilder::addUnreachable(MirUnreachableKind kind) {
     detail::MirInst pod;
     pod.opcode = MirOpcode::Unreachable;
+    pod.payload = static_cast<std::uint32_t>(kind);   // P69: what it asserts
     MirInstId const id = appendInst_(pod, {}, /*terminates=*/true);
     recordSuccessors_(MirOpcode::Unreachable, {});  // same symmetry as addReturn
     return id;
@@ -1615,14 +1756,21 @@ Mir MirBuilder::finish() && {
         }
     }
 
-    return Mir{std::move(instArena_).finish(), std::move(blockArena_).finish(),
-               std::move(funcArena_).finish(), std::move(globalArena_).finish(),
-               std::move(instBlock_),
-               std::move(operandPool_), std::move(phiPool_), std::move(succPool_),
-               std::move(literalPool_),
-               std::move(asmDescriptorPool_),
-               aliasingMode_,
-               charTypesAliasAll_};
+    Mir built{std::move(instArena_).finish(), std::move(blockArena_).finish(),
+              std::move(funcArena_).finish(), std::move(globalArena_).finish(),
+              std::move(instBlock_),
+              std::move(operandPool_), std::move(phiPool_), std::move(succPool_),
+              std::move(literalPool_),
+              std::move(asmDescriptorPool_),
+              aliasingMode_,
+              charTypesAliasAll_};
+    // The module's id space is the builder's: the table end it was told, and
+    // every id minted since (the constructor counted the defined symbols alone) —
+    // and with the end, whether anyone ever STATED it. The frozen module once
+    // dropped that fact, so the first rebuild made a counted end a stated one.
+    if (symbolIdEnd_ > built.symbolIdEnd_) built.symbolIdEnd_ = symbolIdEnd_;
+    built.symbolIdEndStated_ = symbolIdEndStated_;
+    return built;
 }
 
 } // namespace dss

@@ -5,6 +5,12 @@ description: >-
   The program documents itself in its own header; this file declares only how a
   runner starts it and what witnesses that it ran.
   Gated by ctest as `ninja_deps_selftest_guard + build/ninja-deps-freshness`.
+  The step `record` prints what ninja holds for an object, path by path, in a build directory of
+  the leg's tree AS IT STANDS -- the reading a red entry is judged from, and the one way to see a
+  record on a leg whose host is not this one. It does not ask the harness for the leg's build
+  directory, so nothing is built first: a rebuild could replace the very record asked for. It is
+  manual here and has a runner of its own, which no build is required of:
+  `dssharness run check-ninja-deps-record --legs <leg> --input build=build/<processor>-<toolchain>-<config> --input object=<the end of an object's path> -v`.
 steps:
   - name: self-test
     workingDirectoryRoot: action
@@ -18,3 +24,14 @@ steps:
       python3 ./check-ninja-deps.py {buildDir}
     successPattern: 'ninja-deps: OK '
     requireInputsUnmoved: true
+  - name: record
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      build:
+        description: 'the build directory to read, RELATIVE to the leg tree: build/<processor>-<toolchain>-<config>, e.g. build/x86_64-msvc-release'
+      object:
+        description: 'the END of an object path as `ninja -t deps` spells it, e.g. dss_test_pch.dir/cmake_pch.cxx.obj; several are separated by commas, and each names exactly one record'
+    run: |
+      python3 ./check-ninja-deps.py "{treeDir}/{build}" --record="{object}"
+    successPattern: 'ninja-deps: RECORD '

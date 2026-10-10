@@ -1,0 +1,2 @@
+                    == static_cast<std::uint32_t>(MirUnreachableKind::Trap) + 7u)
+                    out_ += " trap";

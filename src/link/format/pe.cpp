@@ -5,6 +5,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"   // isExternallyVisible (dll .edata exports)
 #include "link/format/byte_emit.hpp"
+#include "link/format/coff_linker_directives.hpp"   // coffLinkerDirectiveText — what an object hands its final linker
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
@@ -16,6 +17,9 @@
 // (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO).
 #include "link/format/unwind_pointer_reloc.hpp"
 #include "link/format/weak_definition_gate.hpp"
+#include "link/fresh_symbol_ids.hpp" // maxExistingSymbolIdV — the residue runner's symbols
+#include "link/load_time_fixups.hpp" // synthesizeLoadTimeFixupRunner — the import-slot residue runner
+#include "link/pointer_reloc.hpp"   // absolutePointerRelocKind — a loader-bound slot's fixup
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -24,7 +28,9 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <iterator>   // std::back_inserter — the moved read-only items
 #include <limits>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -159,11 +165,16 @@ constexpr std::size_t   kAuxSectionDefUnusedTail = 3;
 //   Characteristics 3 -> link.exe LINKS, and the binary RUNS returning 42
 // ⇒ 3 is the only value under which a cross-object weak alias RESOLVES, and by
 // bar §A.3b one working reference makes the behaviour required. gcc emits 1 for
-// its own `weak, alias(...)`, but gcc has already bound its INTERNAL reference
-// to the renamed `.weak.<n>.<n>` body, so its value never has to make the alias
+// its own `weak, alias(...)`, and under its own linker that record is reached
+// from the SAME unit only — GNU ld's PE backend resolves a weak external from
+// no other object at any value — so gcc's value never has to make the alias
 // reachable from outside; DSS re-emits objects whose alias must be. See
 // `appendAliasEntries` for the ld-vs-link.exe divergence this uncovered.
 constexpr std::uint32_t IMAGE_WEAK_EXTERN_SEARCH_ALIAS = 3;
+// P69 round 4 (D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE): the
+// policy a weak REFERENCE (an absolute-0 default, not an alias) writes when its
+// row asks the archive search for its name (`ExternImport::searchesArchives`).
+constexpr std::uint32_t IMAGE_WEAK_EXTERN_SEARCH_LIBRARY = 2;
 constexpr std::size_t   kAuxWeakExternUnusedTail = 10;
 
 constexpr std::uint16_t kFileHeaderSize    = 20;
@@ -283,11 +294,19 @@ peThunkSizeFor(std::uint16_t machine) noexcept {
 // `sub rsp, frame` (or, for `frame > stackProbePageBytes`, the inline page-probe
 // loop) then one `mov [rsp + saveOffset], reg` per used callee-save — no push,
 // no frame pointer. So the unwind codes are UWOP_ALLOC_{SMALL,LARGE} for the RSP
-// adjustment + UWOP_SAVE_NONVOL per saved GPR. A saved FPR (MS-x64 xmm6..15) is
-// spilled low-64 via MOVSD, for which there is no matching UWOP (SAVE_XMM128
-// describes a full-16-byte MOVAPS slot); since an xmm save does not move RSP it is
-// OMITTED from the codes — the RSP/return-address walk stays exact. Its handler-
-// case RESTORE is deferred to D-WIN64-XMM-UNWIND-RESTORE (c116).
+// adjustment + UWOP_SAVE_NONVOL per saved general register + UWOP_SAVE_XMM128
+// (or its FAR form) per saved 16-byte vector register (MS-x64 xmm6..15, which
+// the prologue stores WHOLE).
+//
+// ★ A SAVE CODE IS NOT ABOUT THE STACK WALK, AND THAT IS WHY LEAVING ONE OUT
+// LOOKED HARMLESS (D-WIN64-XMM-UNWIND-RESTORE). A vector save never moves RSP,
+// so the return-address walk is exact without it. What the code carries is the
+// CALLER's value of a register this function saved and then reused: when a
+// fault unwinds THROUGH this frame to a handler further up, the code is the
+// only thing that tells the unwinder where that value is. Whether any frame
+// above keeps a `double` in such a register across its call is a fact about
+// this function's callers — a foreign object's included — that no function
+// can know. So the code is stated for EVERY function that saves one.
 //
 // CRITICAL (audit-F1): each UNWIND_CODE's CodeOffset = the byte offset of the END
 // of the instruction that performs that op (NOT the whole-prologue length); the
@@ -312,13 +331,16 @@ peThunkSizeFor(std::uint16_t machine) noexcept {
 // a DWARF-style CFA rule change at PC X is a Win64 UNWIND_CODE with CodeOffset X.
 //   * CFA offset grows by N          -> UWOP_ALLOC_{SMALL,LARGE} of N
 //   * CFA base becomes register R    -> UWOP_SET_FPREG (R, offset 0)
-//   * register R saved at CFA+K      -> UWOP_SAVE_NONVOL (R, (K + cfaOffset)/8)
-// Anything else is REFUSED by name -- see `fail` below. A saved FPR (MS-x64
-// xmm6..15) is spilled low-64 via MOVSD, for which there is no matching UWOP
-// (SAVE_XMM128 describes a full 16-byte MOVAPS slot); since an xmm save does not
-// move RSP it is OMITTED from the codes -- the RSP/return-address walk stays
-// exact -- and a __try-guarding function that saves one fails LOUD
-// (D-WIN64-XMM-UNWIND-RESTORE).
+//   * general register R saved at CFA+K
+//                                    -> UWOP_SAVE_NONVOL (R, (K + cfaOffset)/8)
+//   * 16-byte vector register X saved at CFA+K, a multiple of 16 from RSP
+//                                    -> UWOP_SAVE_XMM128 (X, (K + cfaOffset)/16)
+//                                       while the quotient fits one node, else
+//                                       UWOP_SAVE_XMM128_FAR (X, K + cfaOffset,
+//                                       UNSCALED, in two nodes) -- the far REACH;
+//                                       a slot that is not a multiple of 16 has
+//                                       no code in either form and is refused
+// Anything else is REFUSED by name -- see `fail` below.
 //
 // CRITICAL (audit-F1): each UNWIND_CODE's CodeOffset = the byte offset of the END
 // of the instruction that performs that op (NOT the whole-prologue length), and
@@ -329,6 +351,11 @@ constexpr std::uint8_t kUwopAllocLarge  = 1;  // 2 nodes (opinfo 0, size/8 as u1
 constexpr std::uint8_t kUwopAllocSmall  = 2;  // 1 node, opinfo = size/8 - 1 — frames 8..128 B
 constexpr std::uint8_t kUwopSetFpReg    = 3;  // 1 node, opinfo 0 — CFA base becomes the frame register
 constexpr std::uint8_t kUwopSaveNonvol  = 4;  // 2 nodes (opinfo=reg, offset/8 as u16)
+constexpr std::uint8_t kUwopSaveXmm128    = 8;  // 2 nodes (opinfo=vector register number, offset/16 as u16)
+constexpr std::uint8_t kUwopSaveXmm128Far = 9;  // 3 nodes (opinfo=vector register number, offset UNSCALED as u32, low word first)
+// The width of the one vector save the format can state: UWOP_SAVE_XMM128 and
+// its FAR form each say "all 128 bits of this register are in that slot".
+constexpr std::uint16_t kUwopVectorSaveBytes = 16;
 constexpr std::size_t  kRuntimeFunctionSize = 12;  // BeginAddress + EndAddress + UnwindInfoAddress (3 u32)
 
 // Build one function's UNWIND_INFO blob (aligned to a multiple of 4 bytes so the
@@ -417,19 +444,17 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                     "large-frame probe to __chkstk (D-WIN64-CHKSTK-LARGE-PROLOGUE)");
     }
 
-    struct Code { std::uint8_t codeOffset; std::uint8_t opAndInfo; std::uint16_t node; bool hasNode; };
+    // One UNWIND_CODE: the two-byte code node, then the `extraNodes` operand
+    // nodes its operation carries (none, one or two), each a little-endian u16.
+    struct Code {
+        std::uint8_t                 codeOffset;
+        std::uint8_t                 opAndInfo;
+        std::array<std::uint16_t, 2> nodes;
+        std::uint8_t                 extraNodes;
+    };
     // Codes accumulate in ASCENDING CodeOffset (the order the ops arrive, which
     // the representation guarantees is sorted by PC) and are emitted REVERSED.
     std::vector<Code> codes;
-    // c116b (D-WIN64-XMM-UNWIND-RESTORE): a function that GUARDS a `__try` has an
-    // exception handler that RESUMES in this frame post-unwind and runs parent code.
-    // If that code reads a non-volatile xmm (xmm6-15) that was live before the fault,
-    // the OS must restore it during the unwind — which needs a UWOP_SAVE_XMM128 in
-    // this UNWIND_INFO (backed by a 16-byte movaps spill). DSS spills only the low 64
-    // bits (movsd) and OMITS the FPR unwind codes (fine for NON-SEH functions: an xmm
-    // save never affects RSP/return-address reconstruction). For a SEH function it is
-    // NOT fine — so fail LOUD rather than emit an unwind table that silently fails to
-    // restore a non-volatile xmm on the handler path.
     bool const guardsSeh = !sehScopes.empty();
     std::uint8_t frameRegisterByte = 0x00u;   // FrameRegister nibble | FrameOffset nibble
     std::int64_t cfaOffset = cfi.initial.cfaOffset;
@@ -482,11 +507,11 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                                      static_cast<std::uint8_t>(
                                          kUwopAllocSmall
                                          | ((static_cast<std::uint8_t>(slots) - 1u) << 4)),
-                                     0u, false});
+                                     {}, 0u});
             } else if (slots <= 0xFFFFu) {  // ≤ 512 KiB — opinfo 0, one u16 node
                 codes.push_back(Code{static_cast<std::uint8_t>(op.pcOffset),
                                      static_cast<std::uint8_t>(kUwopAllocLarge | (0u << 4)),
-                                     static_cast<std::uint16_t>(slots), true});
+                                     {static_cast<std::uint16_t>(slots), 0u}, 1u});
             } else {
                 return fail("frame " + std::to_string(delta) + " > 512 KiB needs "
                             "UWOP_ALLOC_LARGE op-info=1 (u32 node) — no shipped "
@@ -516,7 +541,7 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
             }
             frameRegisterByte = static_cast<std::uint8_t>(ri->hwEncoding & 0x0Fu);
             codes.push_back(Code{static_cast<std::uint8_t>(op.pcOffset),
-                                 kUwopSetFpReg, 0u, false});
+                                 kUwopSetFpReg, {}, 0u});
             break;
         }
         case CfiOpKind::RegAtCfaOffset: {
@@ -537,16 +562,85 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
             // CFA + op.offset, so its RSP-relative slot is the sum.
             std::int64_t const slotFromSp = op.offset + cfaOffset;
             if (ri->regClass != TargetRegClass::GPR) {
-                if (guardsSeh) {
-                    return fail("a __try-guarding function saves non-volatile "
-                                + ri->name
-                                + " but DSS omits UWOP_SAVE_XMM128 (spills low-64 via "
-                                  "movsd) — the __except handler could read an unrestored "
-                                  "xmm on resume. D-WIN64-XMM-UNWIND-RESTORE (spill xmm6-"
-                                  "15 with movaps + emit SAVE_XMM128) must land before a "
-                                  "SEH function may use a non-volatile xmm.");
+                // ── A SAVED VECTOR REGISTER — D-WIN64-XMM-UNWIND-RESTORE.
+                //
+                // The format has exactly one vector save, in two spellings
+                // (the x64 unwind-data documentation). UWOP_SAVE_XMM128 says
+                // all 128 bits of a non-volatile XMM register are on the
+                // stack: the operation info is the register's number and the
+                // next node is the slot's offset SCALED BY 16.
+                // UWOP_SAVE_XMM128_FAR says the same with the offset UNSCALED
+                // in the next two nodes. ✔MEASURED against the reference
+                // (cl 19.51 x64, /O2): `movaps [rsp+30h],xmm6` ending at
+                // prologue byte 11 is the code `@11 SAVE_XMM128 xmm6, 3` — in
+                // a function that guards a `__try` and in one that does not.
+                //
+                // ★ BOTH FORMS SAY A MULTIPLE OF 16, AND ONLY THAT. The same
+                // documentation: for these two codes "the offset is always a
+                // multiple of 16", because 128-bit XMM operations occur on
+                // 16-byte aligned memory. The FAR form is the far REACH — a
+                // quotient that does not fit one node — and never a way to
+                // say an unaligned slot: whoever reads the slot back is
+                // entitled to an aligned load. The frame producer guarantees
+                // the alignment (the saved-register area begins at a multiple
+                // of its own slot size, `FrameLayout::savedRegAreaOffset`),
+                // so a slot that is not a multiple of 16 is a broken frame,
+                // refused by name below rather than stated in a form the
+                // format does not have.
+                //
+                // ⚠ BOTH SPELLINGS CLAIM THE WHOLE REGISTER. The rule this arm
+                // translates — "register X is at CFA+K" — is the frame
+                // producer's, whose store is as wide as the convention declares
+                // the register preserved (`calleeSavedPreservedBits`; silence
+                // means all of it, which is what `ms_x64` says). A register of
+                // any other class or width has no code at all, and is refused
+                // by name rather than described as something it is not.
+                if (ri->regClass != TargetRegClass::FPR
+                    || ri->widthBytes != kUwopVectorSaveBytes) {
+                    return fail("save rule names " + ri->name + " (class '"
+                                + std::string(targetRegClassName(ri->regClass))
+                                + "', " + std::to_string(ri->widthBytes)
+                                + " bytes); Win64 UNWIND_INFO can say where a "
+                                  "general register or a whole 16-byte vector "
+                                  "register was saved, and nothing else");
                 }
-                continue;   // non-SEH: low-64 MOVSD save — omitted (RSP-irrelevant)
+                if (ri->hwEncoding > 0x0Fu) {
+                    return fail("saved vector register " + ri->name
+                                + " has hardware number "
+                                + std::to_string(ri->hwEncoding)
+                                + "; an unwind code names its register in four "
+                                  "bits");
+                }
+                if (slotFromSp < 0 || slotFromSp > 0xFFFFFFFFll) {
+                    return fail("saved-reg slot " + std::to_string(slotFromSp)
+                                + " for " + ri->name
+                                + " is negative or past the 32-bit offset "
+                                  "UWOP_SAVE_XMM128_FAR carries");
+                }
+                if (slotFromSp % kUwopVectorSaveBytes != 0) {
+                    return fail("saved-reg slot " + std::to_string(slotFromSp)
+                                + " for " + ri->name
+                                + " is not a multiple of 16; Win64 UNWIND_INFO "
+                                  "states where a vector register was saved only "
+                                  "at a multiple of 16, in either form of the "
+                                  "code");
+                }
+                auto const pc   = static_cast<std::uint8_t>(op.pcOffset);
+                auto const info = static_cast<std::uint8_t>(ri->hwEncoding << 4);
+                if (slotFromSp / kUwopVectorSaveBytes <= 0xFFFF) {
+                    codes.push_back(Code{
+                        pc, static_cast<std::uint8_t>(kUwopSaveXmm128 | info),
+                        {static_cast<std::uint16_t>(
+                             slotFromSp / kUwopVectorSaveBytes), 0u},
+                        1u});
+                } else {
+                    codes.push_back(Code{
+                        pc, static_cast<std::uint8_t>(kUwopSaveXmm128Far | info),
+                        {static_cast<std::uint16_t>(slotFromSp & 0xFFFF),
+                         static_cast<std::uint16_t>((slotFromSp >> 16) & 0xFFFF)},
+                        2u});
+                }
+                break;
             }
             if (slotFromSp < 0 || slotFromSp % 8 != 0) {
                 return fail("saved-reg slot " + std::to_string(slotFromSp)
@@ -562,7 +656,7 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
             codes.push_back(Code{
                 static_cast<std::uint8_t>(op.pcOffset),
                 static_cast<std::uint8_t>(kUwopSaveNonvol | (ri->hwEncoding << 4)),
-                static_cast<std::uint16_t>(slotFromSp / 8), true});
+                {static_cast<std::uint16_t>(slotFromSp / 8), 0u}, 1u});
             break;
         }
         default:
@@ -574,7 +668,7 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
 
     // Emit: header, then codes DESCENDING by CodeOffset.
     std::uint32_t nodeCount = 0;
-    for (auto const& c : codes) nodeCount += c.hasNode ? 2u : 1u;
+    for (auto const& c : codes) nodeCount += 1u + c.extraNodes;
     if (nodeCount > 255u) return fail("unwind-code node count > 255");
 
     // c116 (D-WIN64-SEH-FUNCLETS): a function that guards a `__try` sets
@@ -592,9 +686,9 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
     auto pushCode = [&](Code const& c) {
         out.push_back(c.codeOffset);
         out.push_back(c.opAndInfo);
-        if (c.hasNode) {
-            out.push_back(static_cast<std::uint8_t>(c.node & 0xFFu));
-            out.push_back(static_cast<std::uint8_t>((c.node >> 8) & 0xFFu));
+        for (std::uint8_t i = 0; i < c.extraNodes; ++i) {
+            out.push_back(static_cast<std::uint8_t>(c.nodes[i] & 0xFFu));
+            out.push_back(static_cast<std::uint8_t>((c.nodes[i] >> 8) & 0xFFu));
         }
     };
     for (auto it = codes.rbegin(); it != codes.rend(); ++it) pushCode(*it);
@@ -730,12 +824,12 @@ void writeSectionHeader(std::vector<std::uint8_t>& out,
 // .obj path (LK2 cycle 1) keeps its top-of-file position.
 namespace {
 [[nodiscard]] std::vector<std::uint8_t>
-encodeExec(AssembledModule const&    module,
-           TargetSchema const&       targetSchema,
-           ObjectFormatSchema const& fmt,
-           ObjectFormatSectionInfo const& secText,
-           DiagnosticReporter&       reporter,
-           ImageRequest const&       request);
+encodeExecWithImportSlotResidue(AssembledModule const&    module,
+                                TargetSchema const&       targetSchema,
+                                ObjectFormatSchema const& fmt,
+                                ObjectFormatSectionInfo const& secText,
+                                DiagnosticReporter&       reporter,
+                                ImageRequest const&       request);
 } // namespace
 
 std::vector<std::uint8_t>
@@ -857,8 +951,8 @@ encode(AssembledModule const&    module,
     // data-directory[0], and the extern-address / text-abs-reloc
     // fail-loud belts.
     if (fmt.pe().objectType != PeObjectType::Obj) {
-        return encodeExec(module, targetSchema, fmt, *secText, reporter,
-                          request);
+        return encodeExecWithImportSlotResidue(module, targetSchema, fmt, *secText,
+                                               reporter, request);
     }
     // ── THE UNWIND GATE — D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO ──────
     //
@@ -977,11 +1071,11 @@ encode(AssembledModule const&    module,
     // reader's COMDAT gate (coff_object_reader.cpp, "GATE 3: COMDAT selection
     // -> the section's external-symbol binding") lifts ANY / SAME_SIZE /
     // EXACT_MATCH to `SymbolBinding::Weak` and NODUPLICATES to Global.
-    // Emitting WEAK_EXTERNAL here would produce objects DSS READS BACK WITH
-    // THE WRONG SEMANTICS -- the writer/reader round trip is this arm's
-    // acceptance test, and before this change the two disagreed about what a
-    // COFF weak definition even is (the reader had an answer; the writer
-    // emitted no COMDAT at all and refused the symbol).
+    // Emitting WEAK_EXTERNAL for such a definition would produce objects DSS
+    // READS BACK AS THE OTHER KIND -- the writer/reader round trip is this
+    // arm's acceptance test, and before this change the two disagreed about
+    // what a COFF weak definition even is (the reader had an answer; the
+    // writer emitted no COMDAT at all and refused the symbol).
     //
     // ✔MEASURED 2026-08-20, the reference encodings, each probed separately:
     //   * cl.exe 14.51.36231 and clang 17 (--target=x86_64-pc-windows-msvc)
@@ -990,11 +1084,12 @@ encode(AssembledModule const&    module,
     //     symbol first and the EXTERNAL `gv` second -- the shape emitted here.
     //   * mingw gcc 13.2.0 and that same clang BOTH encode GNU
     //     `__attribute__((weak))` as UNDEF WEAK_EXTERNAL plus a STRONG
-    //     definition under a synthetic `.weak.<name>...` name. That shape is
-    //     a weak reference to a renamed strong body: DSS's reader would see
-    //     the real name undefined and the body under a name nothing refers
-    //     to, so it is NOT the encoding for a symbol DSS models as a weak
-    //     DEFINITION.
+    //     definition under a synthetic `.weak.<name>...` name. That is the
+    //     format's OTHER kind of weak definition, the OVERRIDABLE one, and
+    //     since P69 a dialect of its own (THE WEAK-EXTERNAL ARM, below):
+    //     DSS's reader reads the pair as one body under a weak name of kind
+    //     `Overridable`, and this writer hands the kind on instead of
+    //     re-spelling it as a COMDAT.
     //
     // MECHANICS: the duplicate-resolution policy is a property of the
     // SECTION, so each weak body needs a section OF ITS OWN -- two weak
@@ -1002,7 +1097,118 @@ encode(AssembledModule const&    module,
     // functions are therefore held out of the shared `.text` and weak data
     // items out of their shared data section (`excludedItemIndices`), and each
     // gets a single-body COMDAT section appended after the ordinary ones.
-    link::format::ObjectSymbolNames const objNames{module};
+    //
+    // ── THE WEAK-EXTERNAL ARM (P69) — AN OVERRIDABLE DEFINITION KEEPS ITS KIND ──
+    //    D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER
+    //
+    // PE has TWO kinds of weak definition, and they are two MECHANISMS with two
+    // duplicate rules, not two strengths of one (✔MEASURED 2026-10-10, link.exe
+    // 14.44.35228 and lld-link 19.1.5 on clang 19.1.5 objects):
+    //   * SELECT-ANY, a COMDAT section: two of them coalesce (the first is
+    //     kept); beside a STRONG definition of the name it is a DUPLICATE
+    //     (LNK2005);
+    //   * OVERRIDABLE, a weak external whose default is a body: it yields to a
+    //     strong definition and to a select-any one, in either order; two of
+    //     them for one name CONFLICT (LNK1227 when their defaults differ in
+    //     name, LNK2005 on the default when they do not).
+    // So which one a definition is written as decides what its object's final
+    // linker does with it, and the kind a unit STATED (`ModuleSymbol::weakKind`:
+    // the COFF reader's, off the record's own form) must reach the wire as that
+    // kind. Which kind takes which spelling is the DOCUMENT's (`weakDefinition`:
+    // `dialect`, and `byKind` for a kind that takes the other), asked per
+    // definition; a definition that states no kind takes `dialect`, which is
+    // how every definition was written until P69.
+    //
+    // THE SHAPE, as MinGW gcc and clang write `__attribute__((weak))`: the body
+    // stays in its ordinary section under an EXTERNAL record of its own — the
+    // DEFAULT — and the weak name is a weak external whose auxiliary record
+    // names that default. The default is EXTERNAL because link.exe refuses a
+    // STATIC one (LNK1235, ✔MEASURED 2026-10-08), and is named as clang names
+    // it: `.weak.<name>.default.<the unit's first strong external definition>`,
+    // or `.weak.<name>.default` in a unit that has none (✔MEASURED 2026-10-10;
+    // gcc writes `.weak.<name>.<that definition>`, and its own linker resolves
+    // no weak external from another object at all).
+    //
+    // A body is written this way when the FIRST name a linker can resolve it by
+    // is a weak one whose kind the document spells `weak-external`. (A body
+    // whose first such name is GLOBAL already has its external record, and the
+    // alias pass writes its weak names as weak externals of it — what a unit
+    // read from a compiler's object states.) `ObjectSymbolNames` is told these
+    // bodies take a record of their own, so the weak name becomes the first of
+    // the body's extra names and every "is this a COMDAT definition" below
+    // answers no for them.
+    std::unordered_map<std::uint32_t, ModuleSymbol const*> weakExternalBodies;
+    // The same definitions in the MODULE's order: whatever is refused or
+    // written per definition below walks this, so two runs say the same thing
+    // in the same order.
+    std::vector<ModuleSymbol const*>  weakExternalNames;
+    std::unordered_set<std::uint32_t> bodiesUnderTheirOwnRecord;
+    {
+        std::unordered_set<std::uint32_t> named;   // bodies whose first resolvable name was met
+        for (ModuleSymbol const& ms : module.symbols) {
+            if (!link::format::ObjectSymbolNames::hasExternalLinkage(ms)) continue;
+            if (!named.insert(ms.symbol.v).second) continue;
+            if (ms.binding == SymbolBinding::Weak
+                && fmt.weakDefinitionDialectFor(ms.weakKind)
+                       == WeakDefinitionDialect::WeakExternal) {
+                weakExternalBodies.emplace(ms.symbol.v, &ms);
+                weakExternalNames.push_back(&ms);
+                bodiesUnderTheirOwnRecord.insert(ms.symbol.v);
+            }
+        }
+    }
+    link::format::ObjectSymbolNames const objNames{module,
+                                                   std::move(bodiesUnderTheirOwnRecord)};
+    // The unit's first strong external definition, which a default's name ends
+    // in: functions in module order, then named data items.
+    std::string firstStrongDefinition;
+    if (!weakExternalBodies.empty()) {
+        auto const strongNameOf = [&](SymbolId id) -> std::string {
+            return objNames.definedBinding(id) == SymbolBinding::Global
+                       ? objNames.definedName(id, "sym_")
+                       : std::string{};
+        };
+        for (auto const& fn : module.functions) {
+            firstStrongDefinition = strongNameOf(fn.symbol);
+            if (!firstStrongDefinition.empty()) break;
+        }
+        if (firstStrongDefinition.empty()) {
+            for (auto const& d : module.dataItems) {
+                if (d.symbol == SymbolId{}) continue;
+                firstStrongDefinition = strongNameOf(d.symbol);
+                if (!firstStrongDefinition.empty()) break;
+            }
+        }
+    }
+    // The name of the default record of a body written as a weak external;
+    // nullopt for every other definition.
+    auto const defaultRecordNameOf = [&](SymbolId id) -> std::optional<std::string> {
+        auto const it = weakExternalBodies.find(id.v);
+        if (it == weakExternalBodies.end()) return std::nullopt;
+        std::string name = ".weak." + it->second->name + ".default";
+        if (!firstStrongDefinition.empty()) name += "." + firstStrongDefinition;
+        return name;
+    };
+    // A default's name is this writer's own, so it must be one nothing else in
+    // the object holds: an object that already names a symbol so is refused by
+    // name rather than written with two definitions of one name.
+    if (!weakExternalBodies.empty()) {
+        std::unordered_set<std::string_view> held;
+        for (ModuleSymbol const& ms : module.symbols) held.insert(ms.name);
+        for (ExternImport const& e : module.externImports) held.insert(e.mangledName);
+        for (ModuleSymbol const* weakName : weakExternalNames) {
+            std::string const name = *defaultRecordNameOf(weakName->symbol);
+            if (!held.contains(name)) continue;
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): the overridable weak definition '{}' "
+                             "is written as a weak external whose default is its "
+                             "body under the name '{}', and this object already "
+                             "holds a symbol of that name -- refusing rather than "
+                             "write two definitions of one name.",
+                             weakName->name, name));
+            return {};
+        }
+    }
     auto const isWeakDefinition = [&](SymbolId id) {
         return objNames.definedBinding(id) == SymbolBinding::Weak;
     };
@@ -1029,9 +1235,12 @@ encode(AssembledModule const&    module,
     // UNANSWERED schema and a WRONG-DIALECT schema need different fixes — and
     // adds one this copy lacked: it also sees a WEAK ALIAS of a STRONG
     // definition, which `definedBinding` alone reports as Global.
-    if (!link::format::requireWeakDefinitionDialect(
-            module, fmt, WeakDefinitionDialect::Comdat, "pe::encode (Obj)",
-            reporter)) {
+    static constexpr WeakDefinitionDialect kDialectsWrittenHere[] = {
+        WeakDefinitionDialect::Comdat,
+        WeakDefinitionDialect::WeakExternal,
+    };
+    if (!link::format::requireWeakDefinitionDialects(
+            module, fmt, kDialectsWrittenHere, "pe::encode (Obj)", reporter)) {
         return {};
     }
 
@@ -1401,6 +1610,18 @@ encode(AssembledModule const&    module,
         //             that section's STATIC section symbol.
         std::optional<SymbolId> targetSymbol;
         std::size_t             xdataRecord = 0;
+        // ★★ THE ADDEND IS AN OFFSET FROM WHAT THE RELOCATION NAMES, AND
+        // `addUnwindField` BELOW IS THE ONE PLACE IT REACHES THE BYTES.
+        // COFF has no addend column: a linker reads the field and adds the
+        // named symbol's RVA (S + A — ✔MEASURED 2026-09-30, `lld-link` 18 and
+        // GNU ld 2.42 alike, and MSVC's own `.pdata` states `$LN4 + 0` /
+        // `$LN4 + <length>`). So an addend stated in any OTHER coordinate is
+        // counted twice or not at all, and both happened here
+        // (D-LK-PE-OBJ-PDATA-FIELDS-COUNT-THE-FUNCTION-OFFSET-TWICE): the
+        // RUNTIME_FUNCTION fields stamped the function's offset IN `.text`
+        // against the FUNCTION symbol (2 x the offset for every function but
+        // the first), and the scope-table fields kept the builder's
+        // placeholder 0 because this member was written and never read.
         std::uint32_t           addend      = 0;
     };
     struct UnwindSectionRecord {
@@ -1472,6 +1693,34 @@ encode(AssembledModule const&    module,
             };
             std::optional<std::size_t> sharedGroup;
 
+            // THE ONE WRITER OF AN UNWIND FIELD'S ADDEND. It stamps `f.addend`
+            // — an offset from what `f` names — into the 4 bytes the
+            // relocation patches, and records the relocation, so the two can
+            // never be stated in different coordinates again. The field must
+            // already exist in the section: a field past the end is a
+            // substrate-invariant violation, refused rather than written.
+            auto addUnwindField = [&](UnwindSectionRecord& rec,
+                                      UnwindFieldReloc     f) -> bool {
+                if (static_cast<std::size_t>(f.offsetInSection) + 4u
+                    > rec.bytes.size()) {
+                    // D-LK-PE-OBJ-PDATA-FIELDS-COUNT-THE-FUNCTION-OFFSET-TWICE:
+                    // the one writer of an unwind field's addend refuses a
+                    // field its section cannot hold.
+                    emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
+                         std::format(
+                             "pe::encode (Obj): an unwind field at offset {} "
+                             "overruns the {}-byte '{}' section it patches - "
+                             "substrate-invariant violation: the unwind "
+                             "builder laid out fewer bytes than it described.",
+                             f.offsetInSection, rec.bytes.size(), rec.name));
+                    return false;
+                }
+                link::format::detail::writeU32LEAt(rec.bytes, f.offsetInSection,
+                                                   f.addend);
+                rec.rvaFields.push_back(f);
+                return true;
+            };
+
             for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
                 auto const& fn = module.functions[fi];
                 if (!fn.cfi.has_value()) continue;
@@ -1527,36 +1776,44 @@ encode(AssembledModule const&    module,
                 // builder states them as requests. The handler's symbol is an
                 // EXTERN here, which an object expresses perfectly well; only
                 // an IMAGE has to defer it to an import thunk.
+                // The scope table's Begin/End/JumpTarget are INTERIOR offsets
+                // of this function and its HandlerAddress the funclet's start:
+                // the builder states each as `{symbol, offset into it}`, which
+                // is exactly the coordinate `addUnwindField` writes.
                 for (auto const& p : rvaPatches) {
-                    unwindSections[groupBase].rvaFields.push_back(
-                        {p.xdataOffset, p.symbol, 0, p.addend});
+                    if (!addUnwindField(unwindSections[groupBase],
+                                        {p.xdataOffset, p.symbol, 0, p.addend})) {
+                        return {};
+                    }
                 }
                 for (auto const& p : handlerPatches) {
-                    unwindSections[groupBase].rvaFields.push_back(
-                        {p.xdataOffset, p.symbol, 0, 0u});
+                    if (!addUnwindField(unwindSections[groupBase],
+                                        {p.xdataOffset, p.symbol, 0, 0u})) {
+                        return {};
+                    }
                 }
 
                 UnwindSectionRecord& prec = unwindSections[groupBase + 1];
                 std::uint32_t const pdataOff =
                     static_cast<std::uint32_t>(prec.bytes.size());
-                // A weak function's `funcTextStart` is 0 (its COMDAT holds one
-                // body); an ordinary one's is its offset within `.text`. Both
-                // are the addend for a relocation against the FUNCTION symbol
-                // — this writer mints no `.text` section symbol, so the
-                // function symbol is the only handle, and it is also the one
-                // that survives COMDAT selection.
-                std::uint32_t const beginOff =
-                    static_cast<std::uint32_t>(funcTextStart[fi]);
-                std::uint32_t const endOff =
-                    beginOff + static_cast<std::uint32_t>(fn.bytes.size());
-                appendU32LE(prec.bytes, beginOff);
-                appendU32LE(prec.bytes, endOff);
-                appendU32LE(prec.bytes, xdataOff);
-                prec.rvaFields.push_back({pdataOff, fn.symbol, 0, beginOff});
-                prec.rvaFields.push_back(
-                    {pdataOff + 4u, fn.symbol, 0, endOff});
-                prec.rvaFields.push_back(
-                    {pdataOff + 8u, std::nullopt, groupBase, xdataOff});
+                // Begin and End relocate against the FUNCTION symbol — this
+                // writer mints no `.text` section symbol, so the function
+                // symbol is the only handle, and it is also the one that
+                // survives COMDAT selection — so their addends are offsets
+                // FROM THE FUNCTION: 0 and its length, whatever the function's
+                // offset in `.text` (MSVC's own `$LN4 + 0` / `$LN4 + len`).
+                // UnwindInfo relocates against the group's `.xdata` section
+                // symbol, whose value is 0, so its addend is the blob's offset.
+                prec.bytes.resize(prec.bytes.size() + 12u, 0u);
+                if (!addUnwindField(prec, {pdataOff, fn.symbol, 0, 0u})
+                    || !addUnwindField(
+                           prec, {pdataOff + 4u, fn.symbol, 0,
+                                  static_cast<std::uint32_t>(fn.bytes.size())})
+                    || !addUnwindField(
+                           prec, {pdataOff + 8u, std::nullopt, groupBase,
+                                  xdataOff})) {
+                    return {};
+                }
             }
             // A group is created only when a function feeds it, so an empty
             // `.xdata` here would mean the encoder returned a zero-length
@@ -1575,11 +1832,130 @@ encode(AssembledModule const&    module,
             }
         }
     }
-    // Unwind ordinals come BEFORE the COMDAT ones so the weak-definition
-    // ordinal arithmetic below (and the tripwire that reads it) is untouched.
+    // The SHARED unwind pair's ordinals come before the COMDAT ones; an
+    // ASSOCIATIVE pair's come AFTER them (assigned below the COMDAT loop).
+    // ★ AN ASSOCIATIVE COMDAT MUST FOLLOW THE SECTION IT IS ASSOCIATED WITH
+    //   (D-LK-PE-OBJ-ASSOCIATIVE-UNWIND-SECTION-PRECEDES-ITS-COMDAT). ✔MEASURED
+    //   2026-10-06 (run 20261006-215740-5f83e38e): with every unwind ordinal
+    //   below the COMDATs, link.exe 14.51 refused a DSS object holding one weak
+    //   function — `fatal error LNK1243: invalid or corrupt file: COMDAT section
+    //   0x6 associated with following section 0x12` — while lld-link and GNU ld
+    //   linked it. MSVC's own `/Gy` objects place each `.xdata`/`.pdata` after
+    //   its function's `.text$mn`.
     for (auto& rec : unwindSections) {
-        rec.sectionNumber = ++sectOrdinalCursor;
+        if (!rec.associatedComdat.has_value()) rec.sectionNumber = ++sectOrdinalCursor;
     }
+
+    // ── THE LINKER DIRECTIVES: a definition this object HIDES (P69, the PE half
+    //    of D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS) ────────────────
+    // COFF has no visibility field, so a `visibility("hidden")` (or internal)
+    // external definition is stated the way clang's windows-gnu target states
+    // it: an ordinary EXTERNAL symbol plus a hide directive in the format's
+    // directive section (`pe.linkerDirectives`, spelled by
+    // `pe::coffLinkerDirectiveText`), which the COFF reader lifts back to Hidden
+    // and the final linker's export gate honours. Every name of the definition
+    // is listed — the canonical and each alias whose own visibility hides it —
+    // in function-then-data order, so the text is a function of the module.
+    // The section comes LAST in ordinal order (after the COMDATs): it carries no
+    // symbol and no relocation, so nothing before it moves.
+    std::vector<std::string> hiddenDefinitions;
+    {
+        auto const noteHidden = [&](SymbolId id) {
+            SymbolBinding const binding = objNames.definedBinding(id);
+            if (binding != SymbolBinding::Local
+                && !isExternallyVisible(binding, objNames.definedVisibility(id))) {
+                hiddenDefinitions.push_back(objNames.definedName(id, "sym_"));
+            }
+            for (ModuleSymbol const* alias : objNames.definedAliases(id)) {
+                if (alias->binding != SymbolBinding::Local
+                    && !isExternallyVisible(alias->binding, alias->visibility)) {
+                    hiddenDefinitions.push_back(alias->name);
+                }
+            }
+        };
+        for (auto const& fn : module.functions) noteHidden(fn.symbol);
+        for (auto const& di : module.dataItems) {
+            if (di.symbol != SymbolId{}) noteHidden(di.symbol);
+        }
+    }
+    // ...and the requests a FOREIGN object's directives made of its final linker,
+    // which a re-emitted member (the static-archive repack) must hand on rather
+    // than drop (P69, D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE): an import
+    // row an `/INCLUDE:` made required, and one that states a fallback
+    // (`/alternatename:`). DSS's own front end makes neither.
+    std::vector<std::string>            requiredImports;
+    std::vector<pe::CoffAlternateName>  fallbackImports;
+    // ...and of each COMMON the object hands on (P69,
+    // D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS): a hidden one is a hidden
+    // definition like any other, and an alignment wider than the one link.exe
+    // gives a common of its size (`naturalCoffCommonAlignment`) is stated, as
+    // gcc states it, or the final linker would align it less.
+    std::vector<pe::CoffCommonAlignment> commonAlignments;
+    // An export's internal name the unit does not define is a REQUIRED row too
+    // (an export is a reference, the COFF reader's rule): the `/EXPORT:` handed
+    // on below restates that reference itself, and an `/INCLUDE:` beside it would
+    // be a request the object never made.
+    std::unordered_set<std::string_view> exportedInternalNames;
+    for (auto const& e : module.linkerRequests.exports) exportedInternalNames.insert(e.internalName);
+    for (auto const& ext : module.externImports) {
+        if (ext.requiredByDirective && !exportedInternalNames.contains(ext.mangledName)) {
+            requiredImports.push_back(ext.mangledName);
+        }
+        if (!ext.fallbackName.empty()) {
+            fallbackImports.push_back(pe::CoffAlternateName{ext.mangledName, ext.fallbackName});
+        }
+        if (ext.commonSize == 0u) continue;
+        if (!isExternallyVisible(SymbolBinding::Global, ext.commonVisibility)) {
+            hiddenDefinitions.push_back(ext.mangledName);
+        }
+        if (ext.commonAlignment > pe::naturalCoffCommonAlignment(ext.commonSize)) {
+            commonAlignments.push_back(pe::CoffCommonAlignment{
+                ext.mangledName, static_cast<std::uint8_t>(std::countr_zero(ext.commonAlignment))});
+        }
+    }
+    // ...and, VERBATIM, every other directive of a foreign unit the object holds
+    // (P69 round 4, `UnitLinkerRequests::handOn`: an export, an image request, a
+    // refused or an ignored option, a hide of another unit's definition), so its
+    // final linker is asked what the unit asked.
+    std::vector<std::string> const& handedOn = module.linkerRequests.handOn;
+    std::string directiveText;
+    if (!hiddenDefinitions.empty() || !requiredImports.empty() || !fallbackImports.empty()
+        || !commonAlignments.empty() || !handedOn.empty()) {
+        auto const& vocab = fmt.pe().linkerDirectives;
+        if (!vocab.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 hiddenDefinitions.empty()
+                     ? std::format("pe::encode (Obj): '{}' carries a linker directive of the "
+                                   "object it was read from (an `/INCLUDE:`, an "
+                                   "`/alternatename:`, a common's `-aligncomm:` or a request "
+                                   "handed on verbatim), and format '{}' declares no "
+                                   "'pe.linkerDirectives' to state it with — writing the object "
+                                   "without it would drop the request.",
+                                   !requiredImports.empty()    ? requiredImports.front()
+                                   : !fallbackImports.empty()  ? fallbackImports.front().name
+                                   : !commonAlignments.empty() ? commonAlignments.front().name
+                                                               : handedOn.front(),
+                                   fmt.name())
+                     : std::format("pe::encode (Obj): '{}' is an external definition its "
+                                   "visibility keeps out of the image's exports, and format '{}' "
+                                   "declares no 'pe.linkerDirectives' to state that with — COFF "
+                                   "has no visibility field, so writing it as a plain EXTERNAL "
+                                   "symbol would export it from every image that links it.",
+                                   hiddenDefinitions.front(), fmt.name()));
+            return {};
+        }
+        auto text = pe::coffLinkerDirectiveText(
+            pe::CoffDirectiveStatements{hiddenDefinitions, requiredImports, fallbackImports,
+                                        commonAlignments, handedOn},
+            *vocab);
+        if (!text.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 "pe::encode (Obj): " + text.error() + ".");
+            return {};
+        }
+        directiveText = std::move(*text);
+    }
+    std::size_t const directiveSections = directiveText.empty() ? 0u : 1u;
 
     // COFF's IMAGE_SYMBOL.SectionNumber is a SIGNED 16-bit field whose negative
     // values are reserved specials (UNDEF is 0, ABSOLUTE is -1, DEBUG is -2),
@@ -1589,19 +1965,32 @@ encode(AssembledModule const&    module,
     // cursor wrap into a reserved value and bind every later symbol to a
     // section that does not exist.
     constexpr std::size_t kMaxCoffSections = 0x7FFF;
+    std::size_t associativeUnwindSections = 0;
+    for (auto const& rec : unwindSections) {
+        if (rec.associatedComdat.has_value()) ++associativeUnwindSections;
+    }
     if (static_cast<std::size_t>(sectOrdinalCursor) + comdats.size()
+            + associativeUnwindSections + directiveSections
         > kMaxCoffSections) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
              std::format("pe::encode (Obj): {} ordinary sections plus {} weak "
                          "definitions (each of which needs a COMDAT section of "
-                         "its own) exceed COFF's {} section limit - "
+                         "its own, and a weak function two more for its unwind "
+                         "tables: {}) exceed COFF's {} section limit - "
                          "IMAGE_SYMBOL.SectionNumber is a signed 16-bit field "
                          "whose negative values are reserved specials.",
                          static_cast<std::size_t>(sectOrdinalCursor),
-                         comdats.size(), kMaxCoffSections));
+                         comdats.size(), associativeUnwindSections,
+                         kMaxCoffSections));
         return {};
     }
     for (auto& rec : comdats) rec.sectionNumber = ++sectOrdinalCursor;
+    // Every associative unwind section after every COMDAT, so each names a
+    // section that PRECEDES it (see the shared pair's ordinals above).
+    for (auto& rec : unwindSections) {
+        if (rec.associatedComdat.has_value()) rec.sectionNumber = ++sectOrdinalCursor;
+    }
+    if (directiveSections != 0) ++sectOrdinalCursor;   // the directive section, last
 
     std::size_t const numSections =
         static_cast<std::size_t>(sectOrdinalCursor);
@@ -1670,6 +2059,8 @@ encode(AssembledModule const&    module,
         bool          hasWeakExternAux     = false;
         std::uint32_t auxWeakTagIndex      = 0;  // symtab index of the DEFAULT
         std::uint32_t auxWeakCharacteristics = 0;
+        // The record's own SymbolTableIndex, stamped by `appendEntry`.
+        std::uint32_t tableIndex = 0;
     };
     std::vector<CoffSymEntry> symEntries;
     std::uint32_t slotsMinted = 0;
@@ -1681,6 +2072,7 @@ encode(AssembledModule const&    module,
     auto appendEntry = [&](CoffSymEntry e) -> std::uint32_t {
         std::uint32_t const idx = slotsMinted;
         slotsMinted += (e.hasSectionDefAux || e.hasWeakExternAux) ? 2u : 1u;
+        e.tableIndex = idx;
         symEntries.push_back(std::move(e));
         return idx;
     };
@@ -1730,9 +2122,13 @@ encode(AssembledModule const&    module,
     // ⇒ the ld refusal is a NON-DSS CONFOUND (bar §A.3b: the test is the
     // DISJUNCTION, and link.exe is a reference that works), NOT a defect in
     // what this writer emits. gcc's own `weak, alias(...)` links only when the
-    // reference is in the SAME translation unit, where gcc has already bound it
-    // to the renamed `.weak.<n>.<n>` body and the weak external is never
-    // consulted.
+    // reference is in the SAME translation unit — and even there the reference
+    // is a relocation against the weak external's OWN record, not one gcc
+    // bound to the renamed body: beside another object's definition of the
+    // name it reads that definition (✔MEASURED 2026-10-08, MinGW gcc 13.2.0 +
+    // GNU ld 2.42: `IMAGE_REL_AMD64_REL32 shared` against the class-105
+    // record; 9 through the weak name beside `shared = 9`, 7 through the
+    // body's own name).
     //
     // WHAT STILL FAILS LOUD, and it is a real remaining shape rather than a
     // vestigial arm: an alias that is STRONGER than its canonical (Global alias
@@ -1809,6 +2205,11 @@ encode(AssembledModule const&    module,
     std::unordered_map<SymbolId, std::uint32_t> symIdxBySymbol;
     symIdxBySymbol.reserve(module.functions.size()
                            + module.dataItems.size());
+    // The record of a body's BYTES where a relocation naming the body is
+    // written against another record (THE WEAK-EXTERNAL ARM: the default's
+    // record, while `symIdxBySymbol` holds the weak external's). Asked by what
+    // this writer itself states about a body — its unwind records.
+    std::unordered_map<SymbolId, std::uint32_t> bytesRecordOfBody;
 
     // Defined function symbols (type=FUNCTION, SectionNumber=1 for `.text`).
     // Storage class is coupled to the NAME
@@ -1829,9 +2230,17 @@ encode(AssembledModule const&    module,
                        "for distinct AssembledFunctions)");
             return {};
         }
-        SymbolBinding const binding = objNames.definedBinding(f.symId);
+        // THE WEAK-EXTERNAL ARM: such a body is an EXTERNAL definition under
+        // its default's name, and the alias pass below then writes its weak
+        // name (the first of its extra names) as the weak external of it.
+        auto const defaultName = defaultRecordNameOf(f.symId);
+        SymbolBinding const binding = defaultName.has_value()
+                                          ? SymbolBinding::Global
+                                          : objNames.definedBinding(f.symId);
         CoffSymEntry e;
-        e.name          = objNames.definedName(f.symId, "sym_");
+        e.name          = defaultName.has_value()
+                              ? *defaultName
+                              : objNames.definedName(f.symId, "sym_");
         e.value         = static_cast<std::uint32_t>(f.valueInText);
         e.sectionNumber = kTextSectionNumber;
         e.type          = IMAGE_SYM_DTYPE_FUNCTION;
@@ -1942,9 +2351,22 @@ encode(AssembledModule const&    module,
         secDef.hasSectionDefAux = true;
         secDef.auxLength = static_cast<std::uint32_t>(rec.bytes.size());
         if (rec.associatedComdat.has_value()) {
+            std::int16_t const parent = comdats[*rec.associatedComdat].sectionNumber;
+            // ⚠ NOTHING INSIDE DSS CAN WITNESS THIS ORDER: the COFF reader skips
+            // associative metadata whatever its ordinal. link.exe refuses a
+            // forward association outright (LNK1243, see the ordinal assignment).
+            if (parent >= rec.sectionNumber) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("pe::encode (Obj): the associative '{}' (section {}) "
+                                 "describes COMDAT section {}, which does not precede "
+                                 "it — link.exe refuses such an object (LNK1243, "
+                                 "'COMDAT section associated with following section'). "
+                                 "Substrate-invariant violation.",
+                                 rec.name, rec.sectionNumber, parent));
+                return {};
+            }
             secDef.auxSelection = IMAGE_COMDAT_SELECT_ASSOCIATIVE;
-            secDef.auxNumber    = static_cast<std::uint16_t>(
-                comdats[*rec.associatedComdat].sectionNumber);
+            secDef.auxNumber    = static_cast<std::uint16_t>(parent);
         }
         rec.sectionDefEntry = symEntries.size();
         rec.sectionSymIdx   = appendEntry(std::move(secDef));
@@ -2029,10 +2451,15 @@ encode(AssembledModule const&    module,
                          di.symbol.v));
                 return false;
             }
-            SymbolBinding const binding =
-                objNames.definedBinding(di.symbol);
+            // THE WEAK-EXTERNAL ARM, as for a function above.
+            auto const defaultName = defaultRecordNameOf(di.symbol);
+            SymbolBinding const binding = defaultName.has_value()
+                                              ? SymbolBinding::Global
+                                              : objNames.definedBinding(di.symbol);
             CoffSymEntry e;
-            e.name          = objNames.definedName(di.symbol, "sym_");
+            e.name          = defaultName.has_value()
+                                  ? *defaultName
+                                  : objNames.definedName(di.symbol, "sym_");
             e.value         =
                 static_cast<std::uint32_t>(layout.itemOffsets[j]);
             e.sectionNumber = sectionNumber;
@@ -2053,6 +2480,76 @@ encode(AssembledModule const&    module,
     if (hasData && !appendDataSyms(dataLayout, IDX_DATA)) return {};
     if (hasRelRo && !appendDataSyms(relroLayout, IDX_RELRO)) return {};
     if (hasBss && !appendDataSyms(bssLayout, IDX_BSS)) return {};
+
+    // THE WEAK-NAME RULE, this writer's arm (`object_symbol_names.hpp`): a
+    // plain reference row naming one of this object's own external-linkage names
+    // gets no UNDEF record. Its id is the record of the NAME, so a relocation
+    // written through a weak name names the weak external itself, as MinGW gcc
+    // and clang write it (✔MEASURED 2026-10-08: `IMAGE_REL_AMD64_REL32 shared`
+    // against the class-105 record). Every record appended so far is a
+    // DEFINITION's: an EXTERNAL one in a section, or the weak external an alias
+    // is written as.
+    {
+        std::unordered_map<std::string, std::uint32_t> recordOfDefinedName;
+        for (auto const& e : symEntries) {
+            bool const namesADefinition =
+                e.storageClass == IMAGE_SYM_CLASS_WEAK_EXTERNAL
+                || (e.storageClass == IMAGE_SYM_CLASS_EXTERNAL && e.sectionNumber > 0);
+            if (namesADefinition) recordOfDefinedName.emplace(e.name, e.tableIndex);
+        }
+        // THE WEAK-EXTERNAL ARM: what a relocation naming such a body is
+        // written against. Its `symIdxBySymbol` entry so far is the DEFAULT's
+        // record — the BYTES. A relocation means the bytes in a unit that
+        // references the name by row (`ModuleSymbol::referencedByName`: one
+        // written through a `static` name of the body, or its section) where
+        // this format's linkers leave a superseded definition's bytes in place
+        // — the document's `supersededDefinition`, asked with the definition's
+        // own kind as the merge asks it. Everywhere else it means the NAME, and
+        // is written against the weak external, so that another object's
+        // definition wins it: the unit references through its definition (what
+        // a unit DSS compiles does), or the format replaces a superseded
+        // definition whole. What this WRITER says about the body itself (its
+        // unwind records) keeps the default: `bytesRecordOfBody`.
+        for (ModuleSymbol const* weakName : weakExternalNames) {
+            auto const body = symIdxBySymbol.find(weakName->symbol);
+            if (body == symIdxBySymbol.end()) continue;   // a name with no body in this object
+            bytesRecordOfBody.emplace(weakName->symbol, body->second);
+            if (weakName->referencedByName) {
+                SupersededDefinitionStatement const& superseded = fmt.supersededDefinition();
+                auto const answer = superseded.answerFor(weakName->weakKind);
+                if (!answer.has_value()) {
+                    emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                         std::format("pe::encode (Obj): '{}' is a weak definition its unit "
+                                     "references by name. Whether a relocation that names the "
+                                     "definition itself stays on its bytes when another "
+                                     "definition wins the name, or goes to the winner with the "
+                                     "name, decides which of its two records such a relocation "
+                                     "is written against, and that is format '{}''s "
+                                     "'supersededDefinition', which {} -- refusing rather than "
+                                     "guess one.",
+                                     weakName->name, fmt.name(),
+                                     superseded.stated()
+                                         ? "it states per kind of weak definition, while this "
+                                           "definition states no kind"
+                                         : "it does not state"));
+                    return {};
+                }
+                if (*answer == SupersededDefinition::KeepsItsBytes) continue;
+            }
+            auto const nameRecord = recordOfDefinedName.find(weakName->name);
+            if (nameRecord == recordOfDefinedName.end()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format("pe::encode (Obj): the weak external '{}' has no record "
+                                 "although its default was written - substrate-invariant "
+                                 "violation.",
+                                 weakName->name));
+                return {};
+            }
+            body->second = nameRecord->second;
+        }
+        link::format::pointOwnNameReferencesAtTheirRecords(module, recordOfDefinedName,
+                                                           symIdxBySymbol);
+    }
 
     // Undefined externs: any reloc target that is neither a defined
     // function / block / data / weak symbol. Scans DATA-ITEM relocations too
@@ -2131,9 +2628,23 @@ encode(AssembledModule const&    module,
             if (f.targetSymbol.has_value()) noteExternTarget(*f.targetSymbol);
         }
     }
+    // A COMMON row (P69, D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS) is a
+    // DEFINITION the object hands on to its final linker: it gets its record
+    // whether or not a relocation names it.
+    std::unordered_map<SymbolId, ExternImport const*> commonRowOf;
+    for (auto const& imp : module.externImports) {
+        if (imp.commonSize == 0u) continue;
+        commonRowOf.emplace(imp.symbol, &imp);
+        noteExternTarget(imp.symbol);
+    }
     std::unordered_map<SymbolId, bool> externIsData;
     for (auto const& imp : module.externImports)
         externIsData.emplace(imp.symbol, imp.isData);
+    // P69 round 4: the weak references whose rows ask the archive search for
+    // their name (`ExternImport::searchesArchives`), written back as SEARCH_LIBRARY.
+    std::unordered_map<SymbolId, bool> externSearchesArchives;
+    for (auto const& imp : module.externImports)
+        if (imp.searchesArchives) externSearchesArchives.emplace(imp.symbol, true);
     // ── D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE (the PE arm) ─────
     //
     // A WEAK reference — `extern int ea __attribute__((weak));` — is a name that
@@ -2199,6 +2710,28 @@ encode(AssembledModule const&    module,
                                 ? static_cast<std::uint16_t>(
                                       IMAGE_SYM_DTYPE_FUNCTION)
                                 : std::uint16_t{0};
+        if (auto const common = commonRowOf.find(e); common != commonRowOf.end()) {
+            // PE/COFF 5.4.2's common: an EXTERNAL record of section UNDEF whose
+            // Value is the SIZE (its alignment, when it must be stated, rides
+            // the directive section above).
+            std::uint64_t const size = common->second->commonSize;
+            if (size > std::numeric_limits<std::uint32_t>::max()) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("pe::encode (Obj): the common symbol '{}' is {} bytes, and "
+                                 "the COFF symbol Value that states a common's size holds "
+                                 "32 bits.",
+                                 name, size));
+                return {};
+            }
+            CoffSymEntry ent;
+            ent.name          = std::move(name);
+            ent.value         = static_cast<std::uint32_t>(size);
+            ent.sectionNumber = IMAGE_SYM_UNDEFINED;
+            ent.type          = 0;
+            ent.storageClass  = IMAGE_SYM_CLASS_EXTERNAL;
+            symIdxBySymbol.emplace(e, appendEntry(std::move(ent)));
+            continue;
+        }
         if (binding == SymbolBinding::Weak) {
             // The fallback first, so its index is known when the weak external
             // that names it is built — no back-patching, and no window in which
@@ -2223,10 +2756,20 @@ encode(AssembledModule const&    module,
             ent.storageClass           = IMAGE_SYM_CLASS_WEAK_EXTERNAL;
             ent.hasWeakExternAux       = true;
             ent.auxWeakTagIndex        = defIdx;
-            // The same Characteristics the alias arm uses, and for the same
-            // MEASURED reason recorded at the constant: 3 is the only value
-            // under which link.exe resolves a weak external at all.
-            ent.auxWeakCharacteristics = IMAGE_WEAK_EXTERN_SEARCH_ALIAS;
+            // ALIAS(3), the alias arm's value — but NOT for the alias arm's
+            // reason: that measurement (only 3 lets a cross-object ALIAS
+            // resolve) is about a section-backed default. For this ABSOLUTE-0
+            // default every policy links under link.exe — NOLIBRARY(1) and
+            // ALIAS(3) fetch no archive member for the name and SEARCH_LIBRARY(2)
+            // fetches one (✔MEASURED P69 round 4, run 20261007-172031-276901ca;
+            // lld-link 18 fetches for none, run 20261007-172119-27ef8f92). A C
+            // weak reference asks no library search — the ELF gABI's meaning,
+            // and the PE members' `archiveWeakReferenceSearch` — so ALIAS; a row
+            // read from an object whose weak external asked for the search
+            // (`searchesArchives`) is written back as it came.
+            ent.auxWeakCharacteristics = externSearchesArchives.contains(e)
+                                             ? IMAGE_WEAK_EXTERN_SEARCH_LIBRARY
+                                             : IMAGE_WEAK_EXTERN_SEARCH_ALIAS;
             symIdxBySymbol.emplace(e, appendEntry(std::move(ent)));
             continue;
         }
@@ -2258,9 +2801,13 @@ encode(AssembledModule const&    module,
     // linker will not accept, and a comment coupling the two walks would be the
     // only thing holding the invariant. This is the same belt, and the same
     // reasoning, as the `slotsMinted == numberOfSymbols` tripwire further down.
+    // The COMDAT range is read off the records (consecutive ordinals, assigned
+    // in order), never derived from the section COUNT: a section placed after
+    // the COMDATs (the linker-directive section, P69) would shift a count-based
+    // range by one and misname every COMDAT's first symbol.
     std::int32_t const firstComdatOrdinal =
-        static_cast<std::int32_t>(numSections)
-        - static_cast<std::int32_t>(comdats.size()) + 1;
+        comdats.empty() ? std::numeric_limits<std::int32_t>::max()
+                        : static_cast<std::int32_t>(comdats.front().sectionNumber);
     std::vector<std::size_t> namingComdat(comdats.size(), 0);
     for (std::size_t i = 0; i < symEntries.size(); ++i) {
         std::int32_t const sn =
@@ -2268,6 +2815,7 @@ encode(AssembledModule const&    module,
         if (sn < firstComdatOrdinal) continue;   // not a COMDAT ordinal
         std::size_t const ci =
             static_cast<std::size_t>(sn - firstComdatOrdinal);
+        if (ci >= comdats.size()) continue;      // past the COMDATs: names none
         std::size_t const rank = namingComdat[ci]++;
         if (rank > 1) continue;   // ordinary members of the section
         // The group appends the section symbol at `sectionDefEntry` and the
@@ -2293,8 +2841,9 @@ encode(AssembledModule const&    module,
         return {};
     }
     // The same rule for the unwind sections (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO),
-    // which the arithmetic above cannot reach because their ordinals sit BELOW
-    // the COMDAT range. Their form is stricter and so is the check: an unwind
+    // which the arithmetic above cannot reach because their ordinals sit
+    // outside the COMDAT range — the shared pair's below it, each associative
+    // pair's past it. Their form is stricter and so is the check: an unwind
     // section's own section symbol must be the ONLY record naming its ordinal —
     // there is no COMDAT symbol, because a table that describes other code
     // defines no program symbol of its own.
@@ -2589,8 +3138,18 @@ encode(AssembledModule const&    module,
         for (auto const& f : rec.rvaFields) {
             std::uint32_t symIdx = 0;
             if (f.targetSymbol.has_value()) {
-                auto const it = symIdxBySymbol.find(*f.targetSymbol);
-                if (it == symIdxBySymbol.end()) {
+                // The BYTES of what the field names, never a name another
+                // object may win: a table that describes this body must not
+                // follow its weak name to an override (THE WEAK-EXTERNAL ARM).
+                std::optional<std::uint32_t> named;
+                if (auto const b = bytesRecordOfBody.find(*f.targetSymbol);
+                    b != bytesRecordOfBody.end()) {
+                    named = b->second;
+                } else if (auto const s = symIdxBySymbol.find(*f.targetSymbol);
+                           s != symIdxBySymbol.end()) {
+                    named = s->second;
+                }
+                if (!named.has_value()) {
                     emit(reporter, DiagnosticCode::K_SymbolUndefined,
                          std::format(
                              "pe::encode (Obj): the unwind RVA field at offset "
@@ -2603,7 +3162,7 @@ encode(AssembledModule const&    module,
                              f.offsetInSection, rec.name, f.targetSymbol->v));
                     return {};
                 }
-                symIdx = it->second;
+                symIdx = *named;
             } else {
                 symIdx = unwindSections[f.xdataRecord].sectionSymIdx;
             }
@@ -2782,14 +3341,22 @@ encode(AssembledModule const&    module,
     if (hasRelRo) {
         rawCursor += static_cast<std::uint32_t>(relroLayout.spanSize);
     }
-    // The unwind sections' bytes, in the ordinal order assigned above (they
-    // sit between the ordinary data sections and the COMDATs) —
-    // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO. Every one is file-backed: an
-    // unwind table with no bytes describes nothing.
-    for (auto& rec : unwindSections) {
+    // Every walk below visits the sections in ORDINAL order: the shared unwind
+    // pair, the COMDATs, then each associative unwind pair (see the ordinal
+    // assignment) — `associative` picks which unwind sections a walk visits.
+    auto const forEachUnwindSection = [&](bool associative, auto&& visit) {
+        for (auto& rec : unwindSections) {
+            if (rec.associatedComdat.has_value() == associative) visit(rec);
+        }
+    };
+    // The shared unwind sections' bytes (between the ordinary data sections
+    // and the COMDATs) — D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO. Every one is
+    // file-backed: an unwind table with no bytes describes nothing.
+    auto const placeUnwindBytes = [&](UnwindSectionRecord& rec) {
         rec.rawPointer = rawCursor;
         rawCursor += static_cast<std::uint32_t>(rec.bytes.size());
-    }
+    };
+    forEachUnwindSection(/*associative=*/false, placeUnwindBytes);
     // Each COMDAT section's bytes follow, in the ordinal order assigned above
     // — a zero-fill one (a weak `bss` item) stores none, exactly like `.bss`.
     for (auto& rec : comdats) {
@@ -2797,6 +3364,11 @@ encode(AssembledModule const&    module,
         rec.rawPointer = rawCursor;
         rawCursor += static_cast<std::uint32_t>(rec.spanSize);
     }
+    // Then each associative unwind section's, after the COMDAT it describes.
+    forEachUnwindSection(/*associative=*/true, placeUnwindBytes);
+    // The directive section's text follows, last as its ordinal is.
+    std::uint32_t const directiveRawPointer = directiveSections != 0 ? rawCursor : 0u;
+    rawCursor += static_cast<std::uint32_t>(directiveText.size());
     // Relocation tables follow ALL file-backed section bytes (.text's
     // first, then each reloc-bearing data section's — the same order the
     // section headers are emitted). A no-reloc table keeps pointer = 0.
@@ -2810,14 +3382,16 @@ encode(AssembledModule const&    module,
     std::uint32_t const relroRelocPointer =
         relroRelocCount > 0 ? relocCursor : 0u;
     relocCursor += static_cast<std::uint32_t>(relroRelocs.size());
-    for (auto& rec : unwindSections) {
+    auto const placeUnwindRelocs = [&](UnwindSectionRecord& rec) {
         rec.relocPointer = rec.relocCount > 0 ? relocCursor : 0u;
         relocCursor += static_cast<std::uint32_t>(rec.relocs.size());
-    }
+    };
+    forEachUnwindSection(/*associative=*/false, placeUnwindRelocs);
     for (auto& rec : comdats) {
         rec.relocPointer = rec.relocCount > 0 ? relocCursor : 0u;
         relocCursor += static_cast<std::uint32_t>(rec.relocs.size());
     }
+    forEachUnwindSection(/*associative=*/true, placeUnwindRelocs);
 
     std::uint32_t const symtabPointer = relocCursor;
     std::uint32_t const symtabSizeBytes =
@@ -2964,11 +3538,12 @@ encode(AssembledModule const&    module,
                               /*relocCount=*/0, bssAlignBits);
     }
     // Unwind section headers (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO), in the
-    // ordinal order assigned above — after the ordinary data sections, before
-    // the COMDATs. Characteristics are the gcc-witnessed 0x40300040
-    // (initialized data, 4-byte align class, read-only), plus
-    // IMAGE_SCN_LNK_COMDAT for the pair that describes a weak function.
-    for (auto const& rec : unwindSections) {
+    // ordinal order assigned above — the shared pair after the ordinary data
+    // sections, before the COMDATs; each associative pair after the COMDATs.
+    // Characteristics are the gcc-witnessed 0x40300040 (initialized data,
+    // 4-byte align class, read-only), plus IMAGE_SCN_LNK_COMDAT for the pair
+    // that describes a weak function.
+    auto const pushUnwindSectionHeader = [&](UnwindSectionRecord const& rec) {
         PeSectionHeader h{};
         h.name                 = encodeSectionName(rec.name, 0);
         h.virtualSize          = 0;
@@ -2984,7 +3559,8 @@ encode(AssembledModule const&    module,
             kUnwindObjCharacteristics
             | (rec.associatedComdat.has_value() ? kScnLnkComdat : 0u);
         sectionHeaders.push_back(h);
-    }
+    };
+    forEachUnwindSection(/*associative=*/false, pushUnwindSectionHeader);
     // COMDAT section headers, in the ordinal order assigned above. The name is
     // the ordinary section's name (a COMDAT does NOT need a distinct one —
     // ✔MEASURED: cl.exe and clang both emit a second plain `.data` for a
@@ -3003,6 +3579,24 @@ encode(AssembledModule const&    module,
             static_cast<std::uint16_t>(rec.relocCount);
         h.numberOfLinenumbers  = 0;
         h.characteristics      = rec.characteristics;
+        sectionHeaders.push_back(h);
+    }
+    forEachUnwindSection(/*associative=*/true, pushUnwindSectionHeader);
+    // The directive section's header, last (see the hidden-definition block):
+    // its name and Characteristics are the format's (`pe.linkerDirectives`).
+    if (directiveSections != 0) {
+        auto const& vocab = *fmt.pe().linkerDirectives;
+        PeSectionHeader h{};
+        h.name                 = encodeSectionName(vocab.section, 0);
+        h.virtualSize          = 0;
+        h.virtualAddress       = 0;
+        h.sizeOfRawData        = static_cast<std::uint32_t>(directiveText.size());
+        h.pointerToRawData     = directiveRawPointer;
+        h.pointerToRelocations = 0;
+        h.pointerToLinenumbers = 0;
+        h.numberOfRelocations  = 0;
+        h.numberOfLinenumbers  = 0;
+        h.characteristics      = vocab.characteristics;
         sectionHeaders.push_back(h);
     }
     // Belt: the header vector must match the ordinal cursor the symbol
@@ -3049,12 +3643,14 @@ encode(AssembledModule const&    module,
         bytes.insert(bytes.end(), relroLayout.bytes.begin(),
                      relroLayout.bytes.end());
     }
-    // The unwind sections' bytes, then each COMDAT section's single body —
-    // both in the ordinal order assigned above, which is the order the raw
-    // cursor walked when it handed out PointerToRawData.
-    for (auto const& rec : unwindSections) {
+    // The shared unwind sections' bytes, each COMDAT section's single body,
+    // then each associative unwind section's — the ordinal order assigned
+    // above, which is the order the raw cursor walked when it handed out
+    // PointerToRawData.
+    auto const emitUnwindBytes = [&](UnwindSectionRecord const& rec) {
         bytes.insert(bytes.end(), rec.bytes.begin(), rec.bytes.end());
-    }
+    };
+    forEachUnwindSection(/*associative=*/false, emitUnwindBytes);
     for (auto const& rec : comdats) {
         if (rec.zeroFill) continue;   // reserves span, stores no bytes
         if (rec.fnIndex.has_value()) {
@@ -3064,15 +3660,19 @@ encode(AssembledModule const&    module,
                          rec.dataLayout->bytes.end());
         }
     }
+    forEachUnwindSection(/*associative=*/true, emitUnwindBytes);
+    bytes.insert(bytes.end(), directiveText.begin(), directiveText.end());
     bytes.insert(bytes.end(), textRelocs.begin(), textRelocs.end());
     bytes.insert(bytes.end(), dataRelocs.begin(), dataRelocs.end());
     bytes.insert(bytes.end(), relroRelocs.begin(), relroRelocs.end());
-    for (auto const& rec : unwindSections) {
+    auto const emitUnwindRelocs = [&](UnwindSectionRecord const& rec) {
         bytes.insert(bytes.end(), rec.relocs.begin(), rec.relocs.end());
-    }
+    };
+    forEachUnwindSection(/*associative=*/false, emitUnwindRelocs);
     for (auto const& rec : comdats) {
         bytes.insert(bytes.end(), rec.relocs.begin(), rec.relocs.end());
     }
+    forEachUnwindSection(/*associative=*/true, emitUnwindRelocs);
 
     // The emitted byte cursor must equal the symtab pointer stamped into
     // the file header — a file-backed layout whose bytes diverge from
@@ -3144,47 +3744,299 @@ encode(AssembledModule const&    module,
 
 namespace {
 
+// PE/COFF §6.4: an import descriptor is 20 bytes; a PE32+ lookup / IAT entry —
+// and so a loader-bound slot, which IS one — is one 8-byte pointer.
+constexpr std::size_t kPeImportDescriptorSize = 20;
+constexpr std::size_t kPeLookupEntrySize      = 8;
+
+// The TLS callback's calling contract (PE/COFF §6.7, `PIMAGE_TLS_CALLBACK`:
+// `(PVOID DllHandle, DWORD Reason, PVOID Reserved)`): the reason is the second
+// argument, and DLL_PROCESS_ATTACH is 1 — the call the loader makes once, after
+// it has bound every import and before any other code of the image runs (for
+// an executable before its entry point, for a DLL before DllMain, and for a DLL
+// with no entry point at all).
+constexpr std::size_t  kTlsCallbackReasonArgument = 1;
+constexpr std::int32_t kDllProcessAttach          = 1;
+
+// ── WHICH POINTER SLOTS HOLDING AN IMPORT'S ADDRESS THE LOADER BINDS, AND
+//    WHICH IT CANNOT — the ONE classification (design c2 and its residue) ──
+// A slot is a data item's pointer-width absolute relocation against an
+// IMPORT's own symbol (`importSlotKind` is the target's absolute pointer
+// relocation of an IAT entry's width). `LoaderBound`: a slot the loader fills
+// exactly as it fills the IAT — the import's address and nothing else, in data
+// the loader binds before any code runs. `Residue`
+// (D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE, P69 review M1 (a)/(b)): the address
+// PLUS an offset (`&arr[3]` of a DLL datum — the loader writes S, never S+A),
+// or any such slot in a thread-local TEMPLATE (the loader copies the starting
+// thread's block before it binds; measured, research variant T1) — filled at
+// load by the image's residue runner instead. A slot naming an import's CALL
+// ENTRY (`callEntrySymbol`) or its address slot is no import's own symbol:
+// neither.
+enum class ImportSlotUse : std::uint8_t { None, LoaderBound, Residue };
+struct ImportSlotClass {
+    ImportSlotUse use         = ImportSlotUse::None;
+    std::size_t   externIndex = 0;   // into module.externImports
+};
+[[nodiscard]] ImportSlotClass
+classifyImportSlot(AssembledData const& di, Relocation const& rel,
+                   std::unordered_map<SymbolId, std::size_t> const& externIdxBySymbol,
+                   std::optional<RelocationKind> const& importSlotKind) {
+    auto const ext = externIdxBySymbol.find(rel.target);
+    if (ext == externIdxBySymbol.end()) return {};
+    if (!importSlotKind.has_value() || rel.kind != *importSlotKind) return {};
+    switch (di.section) {
+        case DataSectionKind::Rodata:
+        case DataSectionKind::RelRoConst:
+        case DataSectionKind::Data:
+            return {rel.addend == 0 ? ImportSlotUse::LoaderBound : ImportSlotUse::Residue,
+                    ext->second};
+        case DataSectionKind::Tdata:
+            return {ImportSlotUse::Residue, ext->second};
+        default:
+            return {};
+    }
+}
+
+// ── THE OPTIONAL HEADER THIS IMAGE IS WRITTEN WITH (P69 round 4,
+//    D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE) ─────────────────────────
+// The format document's header, with the program's own request
+// (`ImageRequest::stackReserveBytes`) and its units' decided directives
+// (`ImageRequest::directives`) applied field by field, the way link.exe
+// realizes each (✔MEASURED 2026-10-07, link.exe 14.44.35228 and lld-link 19.1.5):
+//   * stack / heap: reserve and commit rounded UP to a multiple of 4; a reserve
+//     below the commit with the commit unstated becomes the commit (link.exe
+//     writes 0x1000 for 0, 0x10 and 0x800); a stated stack commit above its
+//     reserve is written as stated — lld-link's answer, and the image runs (the
+//     loader takes what it needs; link.exe refuses it, LNK1229). The program's
+//     own `--stack-reserve` wins whole: its reserve and the format's commit;
+//   * subsystem: the value, and a stated version as BOTH the subsystem and the
+//     operating-system version (`CONSOLE,6.1` -> 6.01 / 6.01, both linkers);
+//   * image version, preferred base, section alignment: as stated (the reader
+//     has refused what link.exe refuses and warned on what it replaces); a
+//     section alignment BELOW the document's own, its page, asks for the layout
+//     whose file offsets equal its addresses, which this writer does not make;
+//   * checksum: the PE algorithm over the finished file (the field itself read
+//     as 0), as lld-link writes it for `/RELEASE`.
+struct EffectivePeHeader {
+    PeOptionalHeader oh;                     // the document's, overridden field by field
+    std::uint16_t    majorImageVersion = 0;
+    std::uint16_t    minorImageVersion = 0;
+    bool             checksum          = false;
+};
+
+[[nodiscard]] std::optional<std::uint64_t> roundUpTo4(std::uint64_t v) noexcept {
+    if (v > std::numeric_limits<std::uint64_t>::max() - 3u) return std::nullopt;
+    return (v + 3u) & ~std::uint64_t{3};
+}
+
+[[nodiscard]] std::optional<EffectivePeHeader>
+effectivePeHeader(ObjectFormatSchema const& fmt, ImageRequest const& request, DiagnosticReporter& reporter) {
+    EffectivePeHeader out;
+    out.oh = fmt.peOptionalHeader();
+    auto const& d = request.directives;
+    // Reserve and commit as link.exe realizes a directive's (see above). nullopt when a value cannot be rounded.
+    auto const realize = [&](ReserveCommit const& rc, std::uint64_t defaultCommit, char const* what)
+        -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
+        auto const reserve = roundUpTo4(rc.reserve);
+        auto const commit  = rc.commit.has_value() ? roundUpTo4(*rc.commit) : std::optional{defaultCommit};
+        if (!reserve.has_value() || !commit.has_value()) {
+            emit(reporter, DiagnosticCode::K_LinkerDirectiveUnhonourable,
+                 std::format("pe::encodeExec: a linked object's {} request ({}{}) is past the largest value an "
+                             "optional-header field holds once rounded to a multiple of 4.",
+                             what, rc.reserve, rc.commit.has_value() ? std::format(",{}", *rc.commit) : ""));
+            return std::nullopt;
+        }
+        std::uint64_t r = *reserve;
+        if (!rc.commit.has_value() && r < *commit) r = *commit;
+        return std::pair{r, *commit};
+    };
+    if (request.stackReserveBytes.has_value()) {
+        out.oh.sizeOfStackReserve = *request.stackReserveBytes;   // the program's own request, whole
+    } else if (d.stack.has_value()) {
+        auto const s = realize(*d.stack, out.oh.sizeOfStackCommit, "stack");
+        if (!s.has_value()) return std::nullopt;
+        out.oh.sizeOfStackReserve = s->first;
+        out.oh.sizeOfStackCommit  = s->second;
+    }
+    if (d.heap.has_value()) {
+        auto const h = realize(*d.heap, out.oh.sizeOfHeapCommit, "heap");
+        if (!h.has_value()) return std::nullopt;
+        out.oh.sizeOfHeapReserve = h->first;
+        out.oh.sizeOfHeapCommit  = h->second;
+    }
+    if (d.subsystem.has_value()) {
+        out.oh.subsystem = d.subsystem->value;
+        if (d.subsystem->version.has_value()) {
+            out.oh.majorSubsystemVersion       = d.subsystem->version->major;
+            out.oh.minorSubsystemVersion       = d.subsystem->version->minor;
+            out.oh.majorOperatingSystemVersion = d.subsystem->version->major;
+            out.oh.minorOperatingSystemVersion = d.subsystem->version->minor;
+        }
+    }
+    if (d.imageVersion.has_value()) {
+        out.majorImageVersion = d.imageVersion->major;
+        out.minorImageVersion = d.imageVersion->minor;
+    }
+    if (d.imageBase.has_value()) out.oh.imageBase = *d.imageBase;
+    if (d.sectionAlignment.has_value()) {
+        // D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE: the sub-page layout (file offset == address,
+        // link.exe's `/ALIGN:0x800` image runs) is the half this writer does not make.
+        if (*d.sectionAlignment < out.oh.sectionAlignment) {
+            emit(reporter, DiagnosticCode::K_LinkerDirectiveUnhonourable,
+                 std::format("pe::encodeExec: a linked object's directive asks for a section alignment of {} bytes, "
+                             "below format '{}''s own {} (its page). Such an image lays every section out at the "
+                             "file offset equal to its address, which this writer does not do: drop the directive, "
+                             "or ask for {} or more.",
+                             *d.sectionAlignment, fmt.name(), out.oh.sectionAlignment, out.oh.sectionAlignment));
+            return std::nullopt;
+        }
+        out.oh.sectionAlignment = *d.sectionAlignment;
+    }
+    out.checksum = d.checksum;
+    return out;
+}
+
+// The PE image checksum (the `CheckSum` field, PE/COFF §3.4.2): the file's 16-bit little-endian words summed with the
+// carry folded back in, the 4-byte field itself read as zero, plus the file's length. ✔MEASURED 2026-10-07: this
+// algorithm, written independently, gives lld-link's own `/RELEASE` value over its file (0x6A9A).
+[[nodiscard]] std::uint32_t peImageChecksum(std::span<std::uint8_t const> file, std::size_t checksumOffset) noexcept {
+    std::uint64_t sum = 0;
+    for (std::size_t i = 0; i < file.size(); i += 2) {
+        std::uint32_t word = file[i];
+        if (i + 1 < file.size()) word |= static_cast<std::uint32_t>(file[i + 1]) << 8;
+        if (i >= checksumOffset && i < checksumOffset + 4) word = 0;
+        sum += word;
+        sum = (sum & 0xFFFFu) + (sum >> 16);
+    }
+    sum = (sum & 0xFFFFu) + (sum >> 16);
+    return static_cast<std::uint32_t>(sum + file.size());
+}
+
+[[nodiscard]] std::unordered_map<SymbolId, std::size_t>
+externIndexBySymbol(AssembledModule const& module) {
+    std::unordered_map<SymbolId, std::size_t> out;
+    out.reserve(module.externImports.size());
+    for (std::size_t i = 0; i < module.externImports.size(); ++i) {
+        out.emplace(module.externImports[i].symbol, i);
+    }
+    return out;
+}
+
 [[nodiscard]] std::vector<std::uint8_t>
 encodeExec(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
            ObjectFormatSchema const& fmt,
            ObjectFormatSectionInfo const& secText,
            DiagnosticReporter&       reporter,
-           ImageRequest const&       request) {
+           ImageRequest const&       request,
+           std::optional<SymbolId>   residueRunner,
+           SymbolId                  threadTemplateBase);
+
+// ── THE IMPORT-SLOT RESIDUE RUNNER (P69 review M1 (a)/(b),
+//    D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE) ─────────────────────────────────
+// When the image holds residue slots, it carries ONE synthesized function the
+// loader calls as the FIRST TLS callback: on DLL_PROCESS_ATTACH it reads each
+// import's bound address from its IAT entry, adds the slot's offset, and stores
+// it into the slot — into a thread-local TEMPLATE and into the running thread's
+// copy alike (`linker::synthesizeLoadTimeFixupRunner`). Emitted only when the
+// residue is non-empty, so every other image is byte-identical. The residue
+// items it writes are laid out in writable storage (`.data`; a template is
+// already in the writable `.tls`), and an image with no thread-local data
+// gains a `.tls` section holding only the directory, the index and the
+// callback array — the TLS directory is the only place a PE image can name a
+// function the loader runs before every other.
+[[nodiscard]] std::vector<std::uint8_t>
+encodeExecWithImportSlotResidue(AssembledModule const&    module,
+                                TargetSchema const&       targetSchema,
+                                ObjectFormatSchema const& fmt,
+                                ObjectFormatSectionInfo const& secText,
+                                DiagnosticReporter&       reporter,
+                                ImageRequest const&       request) {
+    std::optional<RelocationKind> const slotKind = linker::absolutePointerRelocKind(
+        targetSchema, static_cast<std::uint8_t>(kPeLookupEntrySize));
+    auto const externIdx = externIndexBySymbol(module);
+    std::vector<linker::LoadTimeFixup> fixups;
+    std::vector<std::size_t>           fixupExtern;
+    for (auto const& di : module.dataItems) {
+        for (auto const& rel : di.relocations) {
+            auto const c = classifyImportSlot(di, rel, externIdx, slotKind);
+            if (c.use != ImportSlotUse::Residue) continue;
+            linker::LoadTimeFixup f;
+            f.addend         = rel.addend;
+            f.item           = di.symbol;
+            f.offsetInItem   = rel.offset;
+            f.threadTemplate = di.section == DataSectionKind::Tdata;
+            fixups.push_back(f);
+            fixupExtern.push_back(c.externIndex);
+        }
+    }
+    if (fixups.empty()) {
+        return encodeExec(module, targetSchema, fmt, secText, reporter, request,
+                          std::nullopt, SymbolId{});
+    }
+    AssembledModule augmented = module;
+    std::uint32_t maxV = linker::maxExistingSymbolIdV(augmented);
+    if (maxV > std::numeric_limits<std::uint32_t>::max() - 2u - fixups.size()) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "pe::encodeExec: SymbolId space exhausted naming the import-slot residue runner.");
+        return {};
+    }
+    // Each import a fix-up reads is read from its IAT entry — its ADDRESS SLOT,
+    // a symbol the walker binds there.
+    for (std::size_t k = 0; k < fixups.size(); ++k) {
+        ExternImport& ext = augmented.externImports[fixupExtern[k]];
+        if (!ext.addressSlotSymbol.valid()) ext.addressSlotSymbol = SymbolId{++maxV};
+        fixups[k].sourceSlot = ext.addressSlotSymbol;
+    }
+    SymbolId const runner{++maxV};
+    SymbolId const templateBase{++maxV};
+    auto fn = linker::synthesizeLoadTimeFixupRunner(fixups, runner, templateBase,
+                                                    kTlsCallbackReasonArgument,
+                                                    kDllProcessAttach, targetSchema, fmt,
+                                                    reporter);
+    if (!fn.has_value()) return {};
+    augmented.functions.push_back(std::move(*fn));
+    ++augmented.expectedFuncCount;
+    return encodeExec(augmented, targetSchema, fmt, secText, reporter, request, runner,
+                      templateBase);
+}
+
+[[nodiscard]] std::vector<std::uint8_t>
+encodeExec(AssembledModule const&    module,
+           TargetSchema const&       targetSchema,
+           ObjectFormatSchema const& fmt,
+           ObjectFormatSectionInfo const& secTextDeclared,
+           DiagnosticReporter&       reporter,
+           ImageRequest const&       request,
+           std::optional<SymbolId>   residueRunner,
+           SymbolId                  threadTemplateBase) {
     auto const& id = fmt.pe();
-    auto const& oh = fmt.peOptionalHeader();
     // c152 (D-LK2-4): the dll-arm discriminator — schema-declared
     // objectType, mirroring elf.cpp's `isDyn`.
     bool const isDll = id.objectType == PeObjectType::Dll;
 
-    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the EFFECTIVE SizeOfStackReserve.
-    // The per-PROGRAM request OVERRIDES the schema's declared default; absent
-    // a request the shipped default (1 MiB, the MSVC/Windows convention)
-    // stands, so every existing build is byte-identical. `pe::encode` has
-    // already proved the schema declares the `pe-optional-header` vehicle,
-    // and `linker::link` has already range-checked the value against the
-    // bounds that capability declares — what remains is the IMAGE invariant
-    // only this walker owns.
-    std::uint64_t const stackReserve =
-        request.stackReserveBytes.value_or(oh.sizeOfStackReserve);
-    // PE/COFF §3.4: the initial thread's stack is COMMITTED out of the
-    // RESERVED range, so a commit exceeding the reserve is an image the
-    // loader cannot honour. The schema's own pair is already validated at
-    // load; an OVERRIDE can newly violate it, so re-check with the effective
-    // value and fail loud rather than emit a header the loader rejects with
-    // an opaque STATUS_INVALID_IMAGE_FORMAT.
-    if (oh.sizeOfStackCommit > stackReserve) {
-        emit(reporter, DiagnosticCode::K_InvalidStackReserveRequest,
-             std::format(
-                 "pe::encodeExec: requested stack reserve of {} bytes is "
-                 "smaller than this format's SizeOfStackCommit ({} bytes) -- "
-                 "PE/COFF §3.4 commits the initial thread's stack out of the "
-                 "RESERVED range, so the Windows loader cannot honour "
-                 "commit > reserve. Request at least {} bytes. "
-                 "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH.",
-                 stackReserve, oh.sizeOfStackCommit, oh.sizeOfStackCommit));
-        return {};
-    }
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH + P69 round 4: the EFFECTIVE optional
+    // header (`effectivePeHeader`). The per-PROGRAM request OVERRIDES the
+    // schema's declared stack reserve; the units' decided directives override
+    // the fields they name; absent both the shipped defaults stand, so every
+    // existing build is byte-identical. `pe::encode` has already proved the
+    // schema declares the `pe-optional-header` vehicle, and `linker::link` has
+    // already range-checked the program's value against the bounds that
+    // capability declares.
+    // ⓘ A commit above the reserve is NOT refused: lld-link writes a stack
+    // commit of 0x200000 over a reserve of 0x100000 and the image runs to 42
+    // (✔MEASURED 2026-10-07) — the loader takes what it needs. The refusal this
+    // walker held here claimed the loader rejects such a header; measured, it
+    // does not.
+    auto const effective = effectivePeHeader(fmt, request, reporter);
+    if (!effective.has_value()) return {};
+    PeOptionalHeader const& oh = effective->oh;
+    std::uint64_t const stackReserve = oh.sizeOfStackReserve;
+    // `.text` begins at the first address its section alignment allows past the
+    // document's own (the same address under the document's alignment, so every
+    // image without a larger `/ALIGN:` is byte-identical).
+    ObjectFormatSectionInfo secText = secTextDeclared;
+    secText.virtualAddress = link::format::detail::alignUp(secTextDeclared.virtualAddress, oh.sectionAlignment);
 
     // ── (a) Build .text body + per-function start map ─────────
     std::vector<std::uint8_t> text;
@@ -3340,6 +4192,12 @@ encodeExec(AssembledModule const&    module,
         } else {
             it->second.push_back(i);
         }
+    }
+    // extern index → its library's position in `libraryOrder` (a loader-bound
+    // slot's descriptor names its import's library, design c2 below).
+    std::vector<std::size_t> libIndexByExtern(module.externImports.size(), 0);
+    for (std::size_t li = 0; li < libraryOrder.size(); ++li) {
+        for (auto const extIdx : externsByLib[libraryOrder[li]]) libIndexByExtern[extIdx] = li;
     }
 
     bool const hasImports = !module.externImports.empty();
@@ -3540,13 +4398,143 @@ encodeExec(AssembledModule const&    module,
     std::uint64_t const tlsZeroFill = tlsBlockMemsz - tdataSpan;
     // The u32-wire-limit guard for these spans rides the SAME `checkU32Span`
     // call the rdata/data/bss spans use (below, once the lambda is defined).
+    // ── D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB, THE PE HALF: A SLOT
+    //    HOLDING AN IMPORT'S ADDRESS IS BOUND BY THE LOADER (design c2) ──
+    //
+    // One value per function or datum across the process, equal to what
+    // GetProcAddress answers: code reads it from a slot the loader fills (the
+    // GOT slot the link mints under `externAddrBinding: got`), and a static
+    // initializer IS such a slot. So a pointer-sized DATA SLOT holding an
+    // import's address — `static fn p = puts;`, a struct member, an array
+    // element, that minted GOT slot, a foreign object's `.refptr.X` or `.quad X`
+    // — becomes the FirstThunk of an import descriptor of ITS OWN, and the
+    // loader writes the import's address into it exactly as it fills the IAT.
+    // Before this, every such slot held the image's own `FF 25` thunk: a
+    // callable address, but not the function's, so `&puts` differed from the
+    // library's answer (and, across two images, from each other).
+    //
+    // ✔MEASURED 2026-09-30 on hand-built images (the coordinator's research, runs
+    // 20260930-175603-7d991312, -175606-67ca1cb7, -180123-e3ee3909,
+    // -180536-ccaa8c2b); each fact is a byte of the layout below:
+    //   * the descriptor needs an OriginalFirstThunk array (without one the load
+    //     fails 0xC0000139);
+    //   * the slot's own word must be NON-ZERO before binding: it holds the
+    //     lookup entry (hint/name RVA), the word the IAT holds at file time — a
+    //     zero word is left unbound;
+    //   * no FirstThunk terminator, and no base relocation on the slot (the
+    //     loader writes an absolute address, after rebasing);
+    //   * a READ-ONLY slot must lie inside the IAT directory, the range the
+    //     loader unprotects while it binds (outside it: 0xC0000005), and is
+    //     read-only again afterwards; a writable slot needs no cover;
+    //   * the loader binds before any code of the image runs — TLS callbacks and
+    //     DllMain see the bound value — and binds a DLL with no entry point too;
+    //     a slot naming a user DLL's function or datum answers that DLL's own
+    //     address.
+    // Hence: a read-only item holding such a slot is laid out INSIDE `.idata`,
+    // after the IAT, with the IAT directory extended over it (a whole input-
+    // section unit moves with it — a unit is never cut); a writable one stays in
+    // `.data`.
+    //
+    // ⚠ NOT A c2 SLOT: THE RESIDUE (D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE, P69
+    // review M1 (a)/(b)). A slot holding an import's address PLUS a nonzero
+    // addend (`&arr[3]` of a DLL datum) — the loader writes S, never S+A — and a
+    // slot in a thread-local TEMPLATE — the loader copies the main thread's
+    // block BEFORE it binds (measured: variant T1). Both are written at load by
+    // the image's residue runner (`encodeExecWithImportSlotResidue`, the first
+    // TLS callback), so a read-only item holding one is laid out in WRITABLE
+    // `.data` — the runner writes after the loader has sealed `.rdata` and
+    // `.idata` — with its whole input-section unit, and a template item stays in
+    // the writable `.tls`. ONE classification (`classifyImportSlot`) decides
+    // every slot, here and in the relocation loop below, and in the runner's
+    // synthesis, so the three can never disagree.
+    constexpr std::size_t kImportDescriptorSize = kPeImportDescriptorSize;
+    constexpr std::size_t kThunkSize            = kPeLookupEntrySize;   // PE32+
+    std::unordered_map<SymbolId, std::size_t> const externIdxBySymbol =
+        externIndexBySymbol(module);
+    // The target's absolute POINTER relocation of an IAT entry's width — the
+    // linker's own predicate (`link/pointer_reloc.hpp`), not a re-spelling.
+    std::optional<RelocationKind> const importSlotRelocKind =
+        linker::absolutePointerRelocKind(targetSchema, static_cast<std::uint8_t>(kThunkSize));
+    auto const slotClassOf = [&](AssembledData const& di, Relocation const& rel) {
+        return classifyImportSlot(di, rel, externIdxBySymbol, importSlotRelocKind);
+    };
+    struct ImportBoundSlot {
+        std::size_t   itemIndex    = 0;   // into module.dataItems
+        std::uint64_t offsetInItem = 0;   // the relocation's offset in the item
+        std::size_t   externIndex  = 0;   // into module.externImports
+        std::uint32_t rva          = 0;   // set once the item is placed
+    };
+    std::vector<ImportBoundSlot> importBoundSlots;
+    // (item, offset) → index into importBoundSlots.
+    std::map<std::pair<std::size_t, std::uint64_t>, std::size_t> importBoundSlotAt;
+    std::vector<std::size_t> importBoundRoItems;   // ascending; see the unit closure below
+    std::vector<std::size_t> residueRoItems;       // ascending: read-only items laid out in `.data`
+    {
+        std::unordered_set<std::uint32_t> boundUnits;
+        std::unordered_set<std::uint32_t> residueUnits;
+        std::vector<bool> roBound(module.dataItems.size(), false);
+        std::vector<bool> roResidue(module.dataItems.size(), false);
+        auto const readOnly = [](AssembledData const& di) {
+            return di.section == DataSectionKind::Rodata
+                || di.section == DataSectionKind::RelRoConst;
+        };
+        for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+            auto const& di = module.dataItems[i];
+            for (auto const& rel : di.relocations) {
+                auto const c = slotClassOf(di, rel);
+                if (c.use == ImportSlotUse::LoaderBound) {
+                    importBoundSlotAt.emplace(std::pair{i, rel.offset}, importBoundSlots.size());
+                    importBoundSlots.push_back(ImportBoundSlot{i, rel.offset, c.externIndex, 0u});
+                    if (readOnly(di)) {
+                        roBound[i] = true;
+                        if (di.inputSection.has_value()) boundUnits.insert(di.inputSection->section);
+                    }
+                } else if (c.use == ImportSlotUse::Residue && readOnly(di)) {
+                    roResidue[i] = true;
+                    if (di.inputSection.has_value()) residueUnits.insert(di.inputSection->section);
+                }
+            }
+        }
+        for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+            auto const& di = module.dataItems[i];
+            if (di.inputSection.has_value() && readOnly(di)) {
+                if (residueUnits.contains(di.inputSection->section)) roResidue[i] = true;
+                if (boundUnits.contains(di.inputSection->section)) roBound[i] = true;
+            }
+            // Written at load: `.data`, where a loader-bound slot needs no cover.
+            if (roResidue[i]) roBound[i] = false;
+            if (roBound[i]) importBoundRoItems.push_back(i);
+            if (roResidue[i]) residueRoItems.push_back(i);
+        }
+    }
+    // The complement of an ascending index set, for the layouts of the moved
+    // items themselves.
+    auto const everyItemBut = [&](std::vector<std::size_t> const& kept) {
+        std::vector<std::size_t> out;
+        out.reserve(module.dataItems.size() - kept.size());
+        for (std::size_t i = 0, k = 0; i < module.dataItems.size(); ++i) {
+            if (k < kept.size() && kept[k] == i) { ++k; continue; }
+            out.push_back(i);
+        }
+        return out;
+    };
+    std::vector<std::size_t> const notImportBoundRoItems =
+        importBoundRoItems.empty() ? std::vector<std::size_t>{} : everyItemBut(importBoundRoItems);
+    std::vector<std::size_t> const notResidueRoItems =
+        residueRoItems.empty() ? std::vector<std::size_t>{} : everyItemBut(residueRoItems);
+    // `.rdata` keeps every read-only item that moved neither into `.idata` nor
+    // into `.data`.
+    std::vector<std::size_t> movedRoItems;
+    std::merge(importBoundRoItems.begin(), importBoundRoItems.end(), residueRoItems.begin(),
+               residueRoItems.end(), std::back_inserter(movedRoItems));
+
     // `allowItemRelocations=true`: PE patches data-item (data→data) relocations
     // (F5 symbol-address pointers, folded relro tables) into the laid-out
     // bytes below + emits their `.reloc` DIR64 base relocations.
     auto rdataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Rodata,
         /*alignFloor=*/1, "pe::encodeExec", reporter,
-        /*allowItemRelocations=*/true);
+        /*allowItemRelocations=*/true, movedRoItems);
     if (!rdataLayoutOpt.has_value()) return {};
     auto& rdataDataLayout = *rdataLayoutOpt;
     auto dataLayoutOpt = link::format::buildExecDataSection(
@@ -3555,6 +4543,22 @@ encodeExec(AssembledModule const&    module,
         /*allowItemRelocations=*/true);
     if (!dataLayoutOpt.has_value()) return {};
     auto& dataDataLayout = *dataLayoutOpt;
+    // The read-only items the residue runner writes (P69 review M1 (a)), laid
+    // out by the same helper and appended to `.data`.
+    if (!residueRoItems.empty()) {
+        auto roOpt = link::format::buildExecDataSection(
+            module.dataItems, DataSectionKind::Rodata,
+            /*alignFloor=*/1, "pe::encodeExec", reporter,
+            /*allowItemRelocations=*/true, notResidueRoItems);
+        if (!roOpt.has_value()) return {};
+        auto relroOpt = link::format::buildExecDataSection(
+            module.dataItems, DataSectionKind::RelRoConst,
+            /*alignFloor=*/1, "pe::encodeExec", reporter,
+            /*allowItemRelocations=*/true, notResidueRoItems);
+        if (!relroOpt.has_value()) return {};
+        link::format::mergeFileBackedDataSection(dataDataLayout, *roOpt);
+        link::format::mergeFileBackedDataSection(dataDataLayout, *relroOpt);
+    }
     auto bssLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Bss,
         /*alignFloor=*/1, "pe::encodeExec", reporter,
@@ -3573,9 +4577,27 @@ encodeExec(AssembledModule const&    module,
     auto relroLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::RelRoConst,
         /*alignFloor=*/1, "pe::encodeExec", reporter,
-        /*allowItemRelocations=*/true);
+        /*allowItemRelocations=*/true, movedRoItems);
     if (!relroLayoutOpt.has_value()) return {};
     link::format::mergeFileBackedDataSection(rdataDataLayout, *relroLayoutOpt);
+    // The read-only items holding a loader-bound slot, laid out by the SAME
+    // helper (so alignment and input-section units behave exactly as in
+    // `.rdata`) and placed inside `.idata` below.
+    link::format::ExecDataSectionLayout importBoundRoLayout;
+    if (!importBoundRoItems.empty()) {
+        auto roOpt = link::format::buildExecDataSection(
+            module.dataItems, DataSectionKind::Rodata,
+            /*alignFloor=*/1, "pe::encodeExec", reporter,
+            /*allowItemRelocations=*/true, notImportBoundRoItems);
+        if (!roOpt.has_value()) return {};
+        auto relroOpt = link::format::buildExecDataSection(
+            module.dataItems, DataSectionKind::RelRoConst,
+            /*alignFloor=*/1, "pe::encodeExec", reporter,
+            /*allowItemRelocations=*/true, notImportBoundRoItems);
+        if (!relroOpt.has_value()) return {};
+        importBoundRoLayout = std::move(*roOpt);
+        link::format::mergeFileBackedDataSection(importBoundRoLayout, *relroOpt);
+    }
     bool const hasRdata = !rdataDataLayout.empty();
     bool const hasData  = !dataDataLayout.empty();
     bool const hasBss   = !bssDataLayout.empty();
@@ -3765,6 +4787,14 @@ encodeExec(AssembledModule const&    module,
         dataOffsetByIndex.emplace(dataDataLayout.itemIndices[j],
                                   dataDataLayout.itemOffsets[j]);
     }
+    // Design c2: the same map for the read-only items moved into `.idata`,
+    // whose bytes are patched here and copied into `.idata` at emission.
+    std::vector<std::uint8_t> importBoundRoBytes = importBoundRoLayout.bytes;
+    std::unordered_map<std::size_t, std::uint64_t> importBoundRoOffsetByIndex;
+    for (std::size_t j = 0; j < importBoundRoLayout.itemIndices.size(); ++j) {
+        importBoundRoOffsetByIndex.emplace(importBoundRoLayout.itemIndices[j],
+                                           importBoundRoLayout.itemOffsets[j]);
+    }
     // TLS C3 (D-CSUBSET-THREAD-LOCAL): the SAME index→section-offset map for
     // `.tls` TEMPLATE (tdata) items, so a reloc-bearing template item
     // (`thread_local char *msg = "hi";`) is patched into `tlsBytes` by the
@@ -3853,9 +4883,25 @@ encodeExec(AssembledModule const&    module,
     std::vector<std::uint8_t> tlsBytes;
     std::uint64_t const tlsDirOffset = alignUp(tlsBlockMemsz, 8);  // dir past block
     std::uint64_t const tlsIndexOffset = tlsDirOffset + 40;     // dir is 40 B
-    std::uint64_t const tlsFileSize = tlsIndexOffset + 4;       // + 4-byte index
+    // P69 review M1 (a)/(b): the TLS CALLBACK array — the residue runner, then
+    // the null that ends the array — after the index, pointer-aligned. Only an
+    // image with a runner has one; every other image is byte-identical.
+    std::uint64_t const tlsCallbacksOffset = alignUp(tlsIndexOffset + 4, 8);
+    std::uint64_t const tlsFileSize =
+        residueRunner.has_value() ? tlsCallbacksOffset + 2 * kThunkSize
+                                  : tlsIndexOffset + 4;     // + 4-byte index
     std::uint32_t tlsRva = 0;
-    if (hasTls) {
+    // An image with a residue runner carries a TLS directory even with no
+    // thread-local data: the directory is where a PE image names the functions
+    // its loader calls before any other code of it.
+    if (residueRunner.has_value() && secTls == nullptr) {
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             "pe::encodeExec: the image needs a TLS callback (its import-slot residue "
+             "runner), and the format declares no ThreadData ('.tls') section row to "
+             "carry the TLS directory.");
+        return {};
+    }
+    if (hasTls || residueRunner.has_value()) {
         DataSectionLayout layout;
         layout.rva = dataChainRva;
         layout.virtualSize = static_cast<std::uint32_t>(
@@ -4106,9 +5152,18 @@ encodeExec(AssembledModule const&    module,
     struct PeExportRec {
         std::string   name;   // real (already-mangled) source name
         std::uint32_t rva = 0;
+        // A read-only item holding a loader-bound import slot lives inside
+        // `.idata` (design c2), which is laid out AFTER `.edata`: its EAT entry
+        // is written once `.idata` is placed, from this offset in that region.
+        std::optional<std::uint64_t> importBoundRoOffset;
     };
     std::vector<PeExportRec> dllExports;
-    if (isDll) {
+    // P69 round 4: the exports the link's units REQUESTED (`/EXPORT:`, decided
+    // link-wide by the linker) join the table in either kind of image — an EXE
+    // gets one for them, as link.exe and lld-link give it (✔MEASURED
+    // 2026-10-07: GetProcAddress on the EXE finds each).
+    auto const& requestedExports = request.directives.exports;
+    if (isDll || !requestedExports.empty()) {
         std::unordered_map<std::uint32_t, std::size_t> funcIdxBySym;
         funcIdxBySym.reserve(module.functions.size());
         for (std::size_t i = 0; i < module.functions.size(); ++i) {
@@ -4135,10 +5190,17 @@ encodeExec(AssembledModule const&    module,
         if (hasRdata) addDataRvas(rdataDataLayout, rdata->rva);
         if (hasData)  addDataRvas(dataDataLayout, data->rva);
         if (hasBss)   addDataRvas(bssDataLayout, bss->rva);
+        std::unordered_map<std::uint32_t, std::uint64_t> importBoundRoOffsetBySym;
+        for (std::size_t j = 0; j < importBoundRoLayout.itemIndices.size(); ++j) {
+            auto const& item = module.dataItems[importBoundRoLayout.itemIndices[j]];
+            if (item.symbol == SymbolId{}) continue;  // anonymous
+            importBoundRoOffsetBySym.emplace(item.symbol.v, importBoundRoLayout.itemOffsets[j]);
+        }
         std::uint32_t const textRva0 =
             static_cast<std::uint32_t>(secText.virtualAddress);
         std::unordered_set<std::string_view> seenExportNames;
         for (auto const& ms : module.symbols) {
+            if (!isDll) break;   // an EXE exports what its units requested, alone (below)
             if (ms.name.empty()) continue;
             if (!isExternallyVisible(ms.binding, ms.visibility)) continue;
             if (!seenExportNames.insert(ms.name).second) {
@@ -4161,7 +5223,10 @@ encodeExec(AssembledModule const&    module,
                                    funcTextStart[fit->second])});
             } else if (auto const dit = dataRvaBySym.find(ms.symbol.v);
                        dit != dataRvaBySym.end()) {
-                dllExports.push_back(PeExportRec{ms.name, dit->second});
+                dllExports.push_back(PeExportRec{ms.name, dit->second, std::nullopt});
+            } else if (auto const bit = importBoundRoOffsetBySym.find(ms.symbol.v);
+                       bit != importBoundRoOffsetBySym.end()) {
+                dllExports.push_back(PeExportRec{ms.name, 0u, bit->second});
             } else {
                 emit(reporter, DiagnosticCode::K_SymbolUndefined,
                      std::format(
@@ -4173,6 +5238,73 @@ encodeExec(AssembledModule const&    module,
                          "function/global). D-LK2-4.",
                          ms.name, ms.symbol.v));
                 return {};
+            }
+        }
+        // P69 round 4: the REQUESTED exports, each under its exported name, at
+        // the definition its internal name names wherever in the link it is —
+        // whatever its visibility, an explicit export winning over a hide
+        // (✔MEASURED 2026-10-07) — or, for a name only a library defines, at
+        // this image's import thunk for it, as both linkers export
+        // `/EXPORT:puts` (✔MEASURED 2026-10-07). A request takes its name from a
+        // DLL's automatic export of a same-named definition (an explicit export
+        // is the program's statement; GNU ld stops exporting automatically
+        // once one exists), and the first of two requests of one name stands
+        // (the linker has already warned, as link.exe warns LNK4197).
+        if (!requestedExports.empty()) {
+            std::unordered_map<std::string_view, SymbolId> definitionByName;
+            for (auto const& ms : module.symbols) {
+                if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
+                    definitionByName.emplace(ms.name, ms.symbol);
+                }
+            }
+            std::unordered_map<std::string_view, std::size_t> thunkByImport;   // import name -> thunk index
+            for (std::size_t j = 0; j < funcExternIdxs.size(); ++j) {
+                thunkByImport.emplace(module.externImports[funcExternIdxs[j]].mangledName, j);
+            }
+            std::unordered_map<std::string, std::size_t> recordByName;
+            for (std::size_t k = 0; k < dllExports.size(); ++k) recordByName.emplace(dllExports[k].name, k);
+            std::unordered_set<std::string> requestedNames;
+            for (auto const& want : requestedExports) {
+                if (!requestedNames.insert(want.exportedName).second) continue;   // the first stands
+                PeExportRec rec{want.exportedName, 0u, std::nullopt};
+                bool placed = false;
+                if (auto const def = definitionByName.find(want.internalName);
+                    def != definitionByName.end()) {
+                    if (auto const fit = funcIdxBySym.find(def->second.v); fit != funcIdxBySym.end()) {
+                        rec.rva = textRva0 + static_cast<std::uint32_t>(funcTextStart[fit->second]);
+                        placed  = true;
+                    } else if (auto const dit = dataRvaBySym.find(def->second.v); dit != dataRvaBySym.end()) {
+                        rec.rva = dit->second;
+                        placed  = true;
+                    } else if (auto const bit = importBoundRoOffsetBySym.find(def->second.v);
+                               bit != importBoundRoOffsetBySym.end()) {
+                        rec.importBoundRoOffset = bit->second;
+                        placed                  = true;
+                    }
+                } else if (auto const th = thunkByImport.find(want.internalName); th != thunkByImport.end()) {
+                    rec.rva = textRva0 + static_cast<std::uint32_t>(thunkBlockOffset + th->second * peThunkSize);
+                    placed  = true;
+                }
+                if (!placed) {
+                    bool const libraryDatum = std::any_of(
+                        module.externImports.begin(), module.externImports.end(),
+                        [&](ExternImport const& e) { return e.isData && e.mangledName == want.internalName; });
+                    emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                         std::format("pe::encodeExec: a linked object's directive '{}' exports '{}', which {}: "
+                                     "define it in a linked unit, or drop the directive (link.exe and lld-link "
+                                     "refuse an export of nothing, LNK2001).",
+                                     want.spelled, want.internalName,
+                                     libraryDatum ? "is a library DATUM -- this image holds no definition of it "
+                                                    "and no thunk to export"
+                                                  : "no unit of the link defines"));
+                    return {};
+                }
+                if (auto const prior = recordByName.find(rec.name); prior != recordByName.end()) {
+                    dllExports[prior->second] = std::move(rec);
+                } else {
+                    recordByName.emplace(rec.name, dllExports.size());
+                    dllExports.push_back(std::move(rec));
+                }
             }
         }
         // The binary-search invariant: memcmp order (std::string's
@@ -4282,11 +5414,15 @@ encodeExec(AssembledModule const&    module,
     //
     // Compute offsets first so we know each IAT slot's RVA before
     // building bytes (the symbol-VA map needs it for reloc apply).
-    constexpr std::size_t kImportDescriptorSize = 20;
-    constexpr std::size_t kThunkSize            = 8;   // PE32+
+    // `kImportDescriptorSize` / `kThunkSize`: declared with the loader-bound
+    // slot pass above, which needs the IAT entry's width first.
     std::size_t const numLibs        = libraryOrder.size();
+    // One descriptor per library, then one per loader-bound slot (design c2,
+    // above: the slot is that descriptor's whole FirstThunk array), then the
+    // all-zero terminator.
+    std::size_t const numBoundSlots  = importBoundSlots.size();
     std::size_t const descriptorBlockSize =
-        (numLibs + 1) * kImportDescriptorSize;
+        (numLibs + numBoundSlots + 1) * kImportDescriptorSize;
     // Pad to kThunkSize so u64 ILT/IAT slots stay naturally aligned.
     // (numLibs+1)*20 is 8-aligned only when (numLibs+1) is even —
     // breaks at numLibs≥2 (code-reviewer #1 convergence). The pad
@@ -4310,6 +5446,13 @@ encodeExec(AssembledModule const&    module,
         std::size_t const slots = externsByLib[libraryOrder[li]].size() + 1;
         thunkCursor += slots * kThunkSize;
     }
+    // Each loader-bound slot's OriginalFirstThunk: its lookup entry and a zero
+    // terminator (the loader walks THIS array; the slot itself needs none).
+    std::vector<std::size_t> boundIltOffsets(numBoundSlots);
+    for (std::size_t k = 0; k < numBoundSlots; ++k) {
+        boundIltOffsets[k] = thunkCursor;
+        thunkCursor += 2 * kThunkSize;
+    }
     for (std::size_t li = 0; li < numLibs; ++li) {
         iatOffsets[li] = thunkCursor;
         auto const& externs = externsByLib[libraryOrder[li]];
@@ -4321,6 +5464,35 @@ encodeExec(AssembledModule const&    module,
                 oh.imageBase + idataRva + iatSlotOff);
         }
         thunkCursor += (externs.size() + 1) * kThunkSize;  // +1 terminator
+    }
+    // The read-only items holding loader-bound slots (design c2), right after
+    // the IATs so ONE IAT directory covers both: its start is aligned as an
+    // ADDRESS (the section RVA is only section-aligned), so every item keeps
+    // the alignment `buildExecDataSection` gave it.
+    std::size_t const iatBlockEnd = thunkCursor;
+    std::size_t importBoundRoStart = thunkCursor;
+    if (!importBoundRoLayout.empty()) {
+        std::uint64_t const a = std::max<std::uint64_t>(1, importBoundRoLayout.maxAlign);
+        importBoundRoStart = static_cast<std::size_t>(
+            alignUp(static_cast<std::uint64_t>(idataRva) + thunkCursor, a) - idataRva);
+        thunkCursor = importBoundRoStart + static_cast<std::size_t>(importBoundRoLayout.spanSize);
+        thunkCursor = (thunkCursor + kThunkSize - 1) & ~(kThunkSize - 1);
+    }
+    std::size_t const iatDirectoryEnd =
+        importBoundRoLayout.empty()
+            ? iatBlockEnd
+            : importBoundRoStart + static_cast<std::size_t>(importBoundRoLayout.spanSize);
+    // An exported item among them gets its EAT entry now that `.idata` is
+    // placed — `.edata` was laid out before it.
+    for (std::size_t i = 0; i < dllExports.size(); ++i) {
+        if (!dllExports[i].importBoundRoOffset.has_value()) continue;
+        std::uint32_t const rva = idataRva + static_cast<std::uint32_t>(
+            importBoundRoStart + *dllExports[i].importBoundRoOffset);
+        std::size_t const at = kExportDirectorySize + 4u * i;
+        for (int b = 0; b < 4; ++b) {
+            edataBytes[at + static_cast<std::size_t>(b)] =
+                static_cast<std::uint8_t>((rva >> (b * 8)) & 0xFFu);
+        }
     }
 
     // ── (c2) Fill the import-thunk block reserved in step (a2) ──
@@ -4377,18 +5549,48 @@ encodeExec(AssembledModule const&    module,
     // handler field is an IMAGE-RVA (the OS calls the personality imageBase-relative
     // — the c112 address-taken-import precedent), so RVA = thunkVA - imageBase. The
     // thunk (FF 25 jmp *[IAT]) is the callable stub, NOT the raw IAT data slot.
+    //
+    // ★ THE PERSONALITY IS A SYMBOL LIKE ANY OTHER, SO IT IS EITHER IMPORTED OR
+    // DEFINED IN THIS IMAGE (P69,
+    // D-LK-MERGE-LEFT-SEH-SCOPE-IDS-AND-UNIT-ENTRY-UNRENUMBERED). The pass that
+    // guards a `__try` states it as an import, and alone that is all it can be.
+    // In a link of several units one of them may DEFINE the name — a personality
+    // carried in an object rather than taken from the runtime's image — and the
+    // merge then resolves the guarding unit's import row to that definition, as
+    // it resolves any import a linked unit defines. The handler field is an
+    // image-relative address of a function either way (the published PE format,
+    // `UNWIND_INFO`: "Address of exception handler"), so a defined personality is
+    // named by its OWN address: there is no thunk, because nothing is imported.
+    // Looking among the thunks alone refused that link, with a sentence that sent
+    // its reader to the guarding pass (✔MEASURED 2026-10-08 the moment the
+    // scope's id followed the merge: "has no import thunk — the SEH pass must
+    // synthesize its ExternImport"). What is still refused is a personality id
+    // that is NEITHER — and the sentence now says that.
     for (auto const& patch : sehHandlerPatches) {
-        auto it = externThunkVaBySym.find(patch.symbol);
-        if (it == externThunkVaBySym.end()) {
+        std::optional<std::uint64_t> handlerVa;
+        if (auto const it = externThunkVaBySym.find(patch.symbol);
+            it != externThunkVaBySym.end()) {
+            handlerVa = it->second;
+        } else {
+            for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+                if (module.functions[fi].symbol != patch.symbol) continue;
+                handlerVa = oh.imageBase + secText.virtualAddress + funcTextStart[fi];
+                break;
+            }
+        }
+        if (!handlerVa.has_value()) {
             emit(reporter, DiagnosticCode::K_SymbolUndefined,
                  std::string{"pe::encodeExec: SEH personality symbol #"}
                      + std::to_string(patch.symbol.v)
-                     + " (__C_specific_handler) has no import thunk — the SEH pass "
-                       "must synthesize its ExternImport (D-WIN64-SEH-FUNCLETS).");
+                     + " has no import thunk and is no function this image defines — "
+                       "the handler field of a guarded function's unwind data has "
+                       "nothing to name. The pass that guards a `__try` states the "
+                       "personality as an import; a link that defines it must define "
+                       "it as a function.");
             return {};
         }
         std::uint32_t const handlerRva =
-            static_cast<std::uint32_t>(it->second - oh.imageBase);
+            static_cast<std::uint32_t>(*handlerVa - oh.imageBase);
         if (patch.xdataOffset + 4u > xdataBytes.size()) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  "pe::encodeExec: SEH handler-field patch offset out of range "
@@ -4588,6 +5790,42 @@ encodeExec(AssembledModule const&    module,
             return {};
         }
     }
+    // `ExternImport::addressSlotSymbol`: the symbol naming the slot that holds
+    // an import's loader-resolved ADDRESS. On PE that slot is the import's IAT
+    // entry — the one the loader fills — so the symbol is bound there, for a
+    // function import and a data import alike. (A walker that leaves it
+    // unbound fails the reference loudly at relocation time.)
+    for (auto const& ext : module.externImports) {
+        if (!ext.addressSlotSymbol.valid()) continue;
+        auto const iatIt = externIatVaBySym.find(ext.symbol);
+        if (iatIt == externIatVaBySym.end()
+            || !symbolVa.emplace(ext.addressSlotSymbol, iatIt->second).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::format("pe::encodeExec: the address slot #{} of import '{}' has no "
+                             "IAT entry, or its SymbolId collides with another symbol.",
+                             ext.addressSlotSymbol.v, ext.mangledName));
+            return {};
+        }
+    }
+    // `ExternImport::callEntrySymbol` (P69 review M1 (c)): the import's CALL
+    // ENTRY taken as an address — on PE, the import thunk — for the units that
+    // take the import's address by a displacement
+    // (`pcRelativeImportAddress: callEntry`). Not an import's own symbol, so
+    // design c2 never makes a slot holding it loader-bound: it holds the
+    // thunk, rebased like any pointer into the image.
+    for (auto const& ext : module.externImports) {
+        if (!ext.callEntrySymbol.valid()) continue;
+        auto const thunkIt = externThunkVaBySym.find(ext.symbol);
+        if (thunkIt == externThunkVaBySym.end()
+            || !symbolVa.emplace(ext.callEntrySymbol, thunkIt->second).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::format("pe::encodeExec: the call entry #{} of import '{}' has no "
+                             "import thunk (a DATA import has none), or its SymbolId "
+                             "collides with another symbol.",
+                             ext.callEntrySymbol.v, ext.mangledName));
+            return {};
+        }
+    }
     // D-LK4-RODATA-WALKER-RELOC-BASE-OFFSET + D-LK4-DATA-PRODUCER: each NAMED
     // data item (rdata / data / bss) joins the symbolVa map at its section's
     // absolute VA (`imageBase + section RVA` + the item's section-relative
@@ -4610,6 +5848,15 @@ encodeExec(AssembledModule const&    module,
     if (hasBss
         && !link::format::addDataSymbolVas(
                module.dataItems, bssDataLayout, oh.imageBase + bss->rva,
+               symbolVa, "pe::encodeExec", reporter)) {
+        return {};
+    }
+    // The read-only items holding loader-bound slots live inside `.idata`
+    // (design c2, above).
+    if (!importBoundRoLayout.empty()
+        && !link::format::addDataSymbolVas(
+               module.dataItems, importBoundRoLayout,
+               oh.imageBase + idataRva + importBoundRoStart,
                symbolVa, "pe::encodeExec", reporter)) {
         return {};
     }
@@ -4639,7 +5886,7 @@ encodeExec(AssembledModule const&    module,
     // already holds the reserved id — the collision-safety assertion the
     // sentinel design requires (a dense id equal to it would be a
     // catastrophic overlap; the sentinel is chosen so this can never fire).
-    if (hasTls) {
+    if (tls.has_value()) {
         SymbolId const reservedIdxId{kTlsIndexReservedSymbolIdValue};
         std::uint64_t const idxSlotVa =
             oh.imageBase + tlsRva + tlsIndexOffset;
@@ -4651,6 +5898,17 @@ encodeExec(AssembledModule const&    module,
                  + " collides with a real module symbol — the high "
                    "sentinel invariant (dense ids never reach it) was "
                    "breached (D-CSUBSET-THREAD-LOCAL).");
+            return {};
+        }
+        // P69 review M1 (b): the residue runner reaches a thread-local
+        // TEMPLATE item as the template's first byte plus the item's offset
+        // in a block — this symbol is that first byte (`.tls` opens with it).
+        if (threadTemplateBase.valid()
+            && !symbolVa.emplace(threadTemplateBase, oh.imageBase + tlsRva).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::format("pe::encodeExec: the thread-local template's base symbol #{} "
+                             "collides with another symbol.",
+                             threadTemplateBase.v));
             return {};
         }
     }
@@ -4817,6 +6075,13 @@ encodeExec(AssembledModule const&    module,
             patchBuf    = &dataBytes;
             itemBaseOff = static_cast<std::size_t>(it->second);
             itemSecRva  = data->rva;
+        } else if (auto it = importBoundRoOffsetByIndex.find(i);
+                   it != importBoundRoOffsetByIndex.end()) {
+            // Design c2: a read-only item holding a loader-bound slot, laid out
+            // inside `.idata` under the IAT directory's cover.
+            patchBuf    = &importBoundRoBytes;
+            itemBaseOff = static_cast<std::size_t>(it->second);
+            itemSecRva  = idataRva + static_cast<std::uint32_t>(importBoundRoStart);
         } else if (auto it = tlsOffsetByIndex.find(i);
                    it != tlsOffsetByIndex.end()) {
             // TLS C3 (D-CSUBSET-THREAD-LOCAL, seam-ii): a reloc-bearing `.tls`
@@ -4838,60 +6103,84 @@ encodeExec(AssembledModule const&    module,
             return {};
         }
         for (auto const& rel : di.relocations) {
-            // ── D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR (c152, the PE half of
-            // the c150 CRITICAL): a data slot whose relocation targets
-            // an extern DATA import would bake the image-local IAT
-            // SLOT address — `symbolVa[dataExtern]` is the
-            // loader-filled `.idata` pointer cell, NOT the imported
-            // object — into the pointer bytes: one indirection off at
-            // runtime (`FILE **pp = &stdout;` would hold &IAT_slot;
-            // `*pp` reads the slot's content — the object's ADDRESS —
-            // where C semantics require the object's VALUE). On a
-            // relocatable-at-load artifact the slot also gets a DIR64
-            // row, faithfully rebasing the wrong value. MSVC itself
-            // REJECTS `&dllimport_obj` as a C static initializer
-            // (C2099 "initializer is not a constant"), so the honest
-            // arm is FAIL LOUD naming the extern. (The symbol-based
-            // fix — the ELF dyn arm's R_X86_64_64-against-dynsym
-            // shape — has no PE image analog short of a CRT-style
-            // runtime pseudo-reloc scheme, deliberately NOT
-            // attempted.)
-            //
-            // A FUNCTION extern is the OTHER half of the registered
-            // anchor and stays LEGAL by design: its symbolVa is the
-            // FF 25 import THUNK — a CALLABLE code address — so the
-            // baked pointer is call-correct (the c112 shipped,
-            // run-proven `addr_import` witness: `static putfn t[] =
-            // {puts};` — sqlite's aSyscall[] shape) and its DIR64 row
-            // rebases it correctly. Cross-image pointer IDENTITY for
-            // an imported function is not guaranteed on Windows
-            // (MSVC's own `&puts` binds each module's local thunk —
-            // the platform norm), exactly as the anchor row records.
-            if (auto const extIt = externIatVaBySym.find(rel.target);
-                extIt != externIatVaBySym.end()) {
-                ExternImport const* ext = nullptr;
-                for (auto const& e : module.externImports) {
-                    if (e.symbol == rel.target) { ext = &e; break; }
-                }
-                if (ext != nullptr && ext->isData) {
-                    emit(reporter,
-                         DiagnosticCode::K_RelocationKindMismatch,
-                         std::format(
-                             "pe::encodeExec: data-item SymbolId #{} "
-                             "carries a relocation targeting extern "
-                             "DATA import '{}' (symbol #{}) -- taking "
-                             "an imported OBJECT's address in a static "
-                             "initializer would bake the image-local "
-                             "IAT-slot address into the data slot (one "
-                             "indirection off at runtime; MSVC rejects "
-                             "the same shape as a non-constant C "
-                             "initializer, C2099). Initialize the "
-                             "pointer at runtime instead "
-                             "(D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR).",
-                             di.symbol.v, ext->mangledName,
-                             rel.target.v));
+            // Design c2 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB,
+            // above): a loader-bound slot holds its descriptor's LOOKUP ENTRY —
+            // the hint/name RVA, the word the IAT itself holds at file time —
+            // and carries NO base relocation: the loader overwrites it with the
+            // import's absolute address after it rebases.
+            if (auto const b = importBoundSlotAt.find(std::pair{i, rel.offset});
+                b != importBoundSlotAt.end()) {
+                ImportBoundSlot& slot = importBoundSlots[b->second];
+                std::size_t const patchOff = itemBaseOff + rel.offset;
+                if (patchOff + kThunkSize > itemBaseOff + di.bytes.size()) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("pe::encodeExec: data-item SymbolId #{} holds the "
+                                     "address of import '{}' at offset {}, which overruns "
+                                     "the item's {} bytes.",
+                                     di.symbol.v,
+                                     module.externImports[slot.externIndex].mangledName,
+                                     rel.offset, di.bytes.size()));
                     return {};
                 }
+                std::uint64_t const lookupEntry = hintNameRvaBySym[slot.externIndex];
+                for (std::size_t b8 = 0; b8 < kThunkSize; ++b8) {
+                    (*patchBuf)[patchOff + b8] =
+                        static_cast<std::uint8_t>((lookupEntry >> (8u * b8)) & 0xFFu);
+                }
+                slot.rva = itemSecRva + static_cast<std::uint32_t>(patchOff);
+                continue;
+            }
+            // ── THE RESIDUE (D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE, P69 review M1
+            // (a)/(b)): an import's address PLUS an offset (`&arr[3]`,
+            // `&s.member` of a DLL datum), or an import's address in a thread-
+            // local TEMPLATE. The loader writes an import's address and nothing
+            // else, so the image's residue runner (the first TLS callback)
+            // writes these at load, after the loader has bound the IAT and
+            // before any other code of the image runs. The word the FILE holds:
+            // a FUNCTION import's call entry (+A, rebased like any pointer into
+            // the image — callable, so a thread that copied a template before
+            // the runner ran can still call through it), and 0 for a DATUM,
+            // whose address only the load knows. (This arm used to refuse a
+            // datum's residue by name and keep a function's thunk; that was
+            // D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR's PE arm, and the runner is what
+            // replaced both.)
+            ImportSlotClass const slotClass = slotClassOf(di, rel);
+            if (slotClass.use == ImportSlotUse::Residue) {
+                if (!residueRunner.has_value()) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("pe::encodeExec: data-item SymbolId #{} holds a slot "
+                                     "only the residue runner can fill, and no runner was "
+                                     "synthesized for this image.",
+                                     di.symbol.v));
+                    return {};
+                }
+                if (module.externImports[slotClass.externIndex].isData) {
+                    std::size_t const patchOff = itemBaseOff + rel.offset;
+                    if (patchOff + kThunkSize > itemBaseOff + di.bytes.size()) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             std::format("pe::encodeExec: data-item SymbolId #{} holds an "
+                                         "import's address at offset {}, which overruns the "
+                                         "item's {} bytes.",
+                                         di.symbol.v, rel.offset, di.bytes.size()));
+                        return {};
+                    }
+                    for (std::size_t b8 = 0; b8 < kThunkSize; ++b8) (*patchBuf)[patchOff + b8] = 0;
+                    continue;
+                }
+                // A function import: its call entry, through the generic arm.
+            } else if (auto const extIt = externIdxBySymbol.find(rel.target);
+                       extIt != externIdxBySymbol.end()
+                       && module.externImports[extIt->second].isData) {
+                // A DATUM's address in any form but a pointer-width absolute
+                // slot: the import's own VA here is its IAT entry, so a generic
+                // patch would be one indirection off. Refused by name.
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("pe::encodeExec: data-item SymbolId #{} holds the address of "
+                                 "DATA import '{}' through a relocation that is not the "
+                                 "target's pointer-width absolute relocation — the only form "
+                                 "in which a datum's address can be bound at load.",
+                                 di.symbol.v, module.externImports[extIt->second].mangledName));
+                return {};
             }
             auto const sIt = symbolVa.find(rel.target);
             if (sIt == symbolVa.end()) {
@@ -4972,7 +6261,11 @@ encodeExec(AssembledModule const&    module,
     // so the CRIT-2 backstop never false-rejects them. AddressOfCallBacks
     // stays 0 and gets NO base-reloc entry (EXACTLY 3 DIR64 entries): a reloc
     // on 0 → the loader adds the slide → a non-null garbage callback pointer.
-    if (hasTls) {
+    // P69 review M1 (a)/(b): EXCEPT in an image with an import-slot residue
+    // runner, whose AddressOfCallBacks names the callback array at the tail of
+    // `.tls` — [runner, 0] — and so carries a DIR64 row, as does the array's
+    // one non-null entry (5 rows); the terminating null gets none.
+    if (tls.has_value()) {
         auto putTlsU64 = [&](std::size_t off, std::uint64_t v) {
             for (int b = 0; b < 8; ++b)
                 tlsBytes[off + b] =
@@ -5031,6 +6324,22 @@ encodeExec(AssembledModule const&    module,
         baseRelocSiteRvas.push_back(dirRvaBase +  0u);
         baseRelocSiteRvas.push_back(dirRvaBase +  8u);
         baseRelocSiteRvas.push_back(dirRvaBase + 16u);
+        if (residueRunner.has_value()) {
+            auto const runnerIt = symbolVa.find(*residueRunner);
+            if (runnerIt == symbolVa.end()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format("pe::encodeExec: the import-slot residue runner #{} was "
+                                 "not laid out in .text.",
+                                 residueRunner->v));
+                return {};
+            }
+            std::size_t const cbOff = static_cast<std::size_t>(tlsCallbacksOffset);
+            putTlsU64(dirOff + 24, oh.imageBase + tlsRva + cbOff);   // AddressOfCallBacks
+            putTlsU64(cbOff, runnerIt->second);                      // callbacks[0] = runner
+            putTlsU64(cbOff + kThunkSize, 0);                        // the array's end
+            baseRelocSiteRvas.push_back(dirRvaBase + 24u);
+            baseRelocSiteRvas.push_back(tlsRva + static_cast<std::uint32_t>(cbOff));
+        }
     }
 
     // ── Build the .reloc (base relocation) section bytes ──────────
@@ -5268,17 +6577,22 @@ encodeExec(AssembledModule const&    module,
         edata->headerIndex = sectionHeaders.size();
         sectionHeaders.push_back(hEData);
     }
-    // .idata section header (when externImports non-empty).
-    // Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) |
-    //                   IMAGE_SCN_MEM_READ (0x40000000) |
-    //                   IMAGE_SCN_MEM_WRITE (0x80000000)
-    //                 = 0xC0000040. PE32+ images keep the import
-    // table writable so the loader can patch IAT slots in-place.
-    constexpr std::uint32_t kIDataCharacteristics = 0xC0000040u;
+    // .idata section header (when externImports non-empty). Its name and
+    // Characteristics are the document's `dynamic` row — ✔ read-only
+    // (0x40000040) on the shipped documents since design c2
+    // (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): the loader needs no
+    // MEM_WRITE here, because it unprotects exactly the IAT DIRECTORY's range
+    // while it binds and restores the section's protection afterwards —
+    // which is also what keeps a `const` table holding an import's address
+    // read-only after the load. (It was a hardcoded 0xC0000040, and the IAT
+    // stayed writable for the life of the process.)
     std::optional<DataSectionLayout> idata;
     if (hasImports) {
+        ObjectFormatSectionInfo const* secIData = link::format::detail::requireSection(
+            fmt, SectionKind::Dynamic, "pe::encodeExec", reporter);
+        if (secIData == nullptr) return {};
         PeSectionHeader hIData{};
-        hIData.name                  = encodeSectionName(".idata", 0);
+        hIData.name                  = encodeSectionName(secIData->name, 0);
         hIData.virtualSize           = static_cast<std::uint32_t>(idataSize);
         hIData.virtualAddress        = idataRva;
         // sizeOfRawData / pointerToRawData filled below.
@@ -5286,7 +6600,7 @@ encodeExec(AssembledModule const&    module,
         hIData.pointerToLinenumbers  = 0;
         hIData.numberOfRelocations   = 0;
         hIData.numberOfLinenumbers   = 0;
-        hIData.characteristics       = kIDataCharacteristics;
+        hIData.characteristics       = secIData->type;
         DataSectionLayout iLayout;
         iLayout.rva         = idataRva;
         iLayout.virtualSize = static_cast<std::uint32_t>(
@@ -5328,6 +6642,30 @@ encodeExec(AssembledModule const&    module,
         rLayout.headerIndex = sectionHeaders.size();
         sectionHeaders.push_back(hReloc);
         reloc = rLayout;
+    }
+
+    // P69 round 4: the units' `/SECTION:name,attributes`, in order, onto the
+    // image's section of that exact name (link.exe matches the name
+    // case-sensitively: `.DATA` misses `.data`, ✔MEASURED 2026-10-07): its
+    // Characteristics become `(c & ~clear) | set`, the masks the reader took
+    // from link.exe's letter rule. A name the image has no section of is warned
+    // and changes nothing, as link.exe warns LNK4039.
+    for (auto const& want : request.directives.sections) {
+        bool found = false;
+        if (want.section.size() <= 8u) {
+            auto const encoded = encodeSectionName(want.section, 0);
+            for (auto& h : sectionHeaders) {
+                if (h.name.bytes != encoded.bytes) continue;
+                h.characteristics = (h.characteristics & ~want.clearMask) | want.setMask;
+                found = true;
+            }
+        }
+        if (!found) {
+            report(reporter, DiagnosticCode::K_LinkerDirectiveIgnored, DiagnosticSeverity::Warning,
+                   std::format("pe::encodeExec: a linked object's directive '{}' names section '{}', which this "
+                               "image does not have: it changes nothing (link.exe LNK4039)",
+                               want.spelled, want.section));
+        }
     }
 
     std::uint32_t const numSections =
@@ -5544,19 +6882,22 @@ encodeExec(AssembledModule const&    module,
     appendU32LE(bytes, fileAlign);
     appendU16LE(bytes, oh.majorOperatingSystemVersion);
     appendU16LE(bytes, oh.minorOperatingSystemVersion);
-    appendU16LE(bytes, 0);                     // MajorImageVersion
-    appendU16LE(bytes, 0);                     // MinorImageVersion
+    appendU16LE(bytes, effective->majorImageVersion);   // MajorImageVersion (0 unless `/VERSION:`)
+    appendU16LE(bytes, effective->minorImageVersion);   // MinorImageVersion
     appendU16LE(bytes, oh.majorSubsystemVersion);
     appendU16LE(bytes, oh.minorSubsystemVersion);
     appendU32LE(bytes, 0);                     // Win32VersionValue (reserved)
     appendU32LE(bytes, sizeOfImage);
     appendU32LE(bytes, sizeOfHeaders);
-    appendU32LE(bytes, 0);                     // CheckSum (loader allows 0)
+    // CheckSum: 0 (the loader allows it) unless a unit asked for one
+    // (`/RELEASE`), which is computed over the finished file below.
+    std::size_t const checksumFieldOffset = bytes.size();
+    appendU32LE(bytes, 0);
     appendU16LE(bytes, oh.subsystem);
     appendU16LE(bytes, oh.dllCharacteristics);
     // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the EFFECTIVE reserve (the
-    // per-program request when one was made, else the schema default) —
-    // computed + invariant-checked at the top of this function.
+    // per-program request when one was made, else a unit's decided `/STACK:`,
+    // else the schema default) — computed at the top of this function.
     appendU64LE(bytes, stackReserve);
     appendU64LE(bytes, oh.sizeOfStackCommit);
     appendU64LE(bytes, oh.sizeOfHeapReserve);
@@ -5588,8 +6929,20 @@ encodeExec(AssembledModule const&    module,
         iatTotal +=
             (externsByLib[libName].size() + 1) * kThunkSize;
     }
+    // Design c2 DOES insert data between the IATs and the HINT/NAME block, on
+    // purpose: the read-only items holding loader-bound slots, which the
+    // loader writes only inside this directory's range. So the directory runs
+    // to the end of THOSE, and the explicit sum above stays the check that the
+    // IATs themselves are where the layout put them.
+    if (hasImports && iatOffsets[0] + iatTotal != iatBlockEnd) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encodeExec: the IAT block spans {} bytes by the "
+                         "per-library sum but {} by the layout (import layout bug).",
+                         iatTotal, iatBlockEnd - iatOffsets[0]));
+        return {};
+    }
     std::uint32_t const iatDirSize = hasImports
-        ? static_cast<std::uint32_t>(iatTotal)
+        ? static_cast<std::uint32_t>(iatDirectoryEnd - iatOffsets[0])
         : 0u;
     // LK7: Authenticode attribute-cert placeholder reservation.
     // PE COFF §5.7 directory index 4 (IMAGE_DIRECTORY_ENTRY_SECURITY)
@@ -5841,6 +7194,33 @@ encodeExec(AssembledModule const&    module,
             putU32(dOff + 12, dllNameRvaByLib[li]);     // Name (DLL path RVA)
             putU32(dOff + 16, iatRva);                  // FirstThunk (IAT RVA)
         }
+        // Design c2: one descriptor per loader-bound slot, after the libraries'
+        // and before the terminator. Its FirstThunk IS the slot; its lookup
+        // array names the one import; its Name is the library's own string.
+        for (std::size_t k = 0; k < numBoundSlots; ++k) {
+            ImportBoundSlot const& slot = importBoundSlots[k];
+            if (slot.rva == 0u) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("pe::encodeExec: the loader-bound slot of import "
+                                 "'{}' in data item #{} was never placed (import "
+                                 "layout bug).",
+                                 module.externImports[slot.externIndex].mangledName,
+                                 slot.itemIndex));
+                return {};
+            }
+            std::size_t const dOff = (numLibs + k) * kImportDescriptorSize;
+            putU32(dOff +  0, idataRva + static_cast<std::uint32_t>(boundIltOffsets[k]));
+            putU32(dOff +  4, 0);
+            putU32(dOff +  8, 0);
+            putU32(dOff + 12, dllNameRvaByLib[libIndexByExtern[slot.externIndex]]);
+            putU32(dOff + 16, slot.rva);
+            putU64(boundIltOffsets[k],
+                   static_cast<std::uint64_t>(hintNameRvaBySym[slot.externIndex]));
+            // The terminator entry after it is already zero.
+        }
+        // The read-only items holding those slots, relocated above.
+        std::copy(importBoundRoBytes.begin(), importBoundRoBytes.end(),
+                  idataBytes.begin() + static_cast<std::ptrdiff_t>(importBoundRoStart));
         // ILT + IAT thunks (PE32+: u64 each; bit 63 = ordinal flag,
         // we use by-name imports only — set RVA to HINT/NAME entry).
         for (std::size_t li = 0; li < numLibs; ++li) {
@@ -5910,6 +7290,17 @@ encodeExec(AssembledModule const&    module,
         bytes.insert(bytes.end(),
                      oh.attributeCertReserveSize,
                      std::uint8_t{0});
+    }
+
+    // P69 round 4: a unit's `/RELEASE` — the CheckSum over the finished file
+    // (`peImageChecksum`; a signer that fills the reservation recomputes it, as
+    // signtool does).
+    if (effective->checksum) {
+        std::uint32_t const sum = peImageChecksum(bytes, checksumFieldOffset);
+        for (int b = 0; b < 4; ++b) {
+            bytes[checksumFieldOffset + static_cast<std::size_t>(b)] =
+                static_cast<std::uint8_t>((sum >> (b * 8)) & 0xFFu);
+        }
     }
 
     return bytes;

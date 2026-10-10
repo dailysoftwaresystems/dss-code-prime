@@ -10,6 +10,7 @@
 #include "core/types/include_path_resolve.hpp"
 #include "core/types/integer_literal_ladder.hpp"  // preprocessorLiteralSignedness (the ONE phase-4 signedness rule the shipped-constant spelling is verified against)
 #include "core/types/literal_close_token.hpp"   // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN
+#include "core/types/number_decode.hpp"   // decodeFloatLiteralAtKind (a spliced float constant read back, P69 round 4)
 #include "core/substrate/phase_timers.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "tokenizer/tokenizer.hpp"
@@ -17,6 +18,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
+#include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -539,8 +543,11 @@ verifiedLiteralSuffix(GrammarSchema const& schema, std::uint64_t magnitude,
             for (DataModel const m : models) {
                 IntegerLadderResult const t =
                     typeIntegerLiteral(text, ns, rules, m, magnitude);
-                if (t.status != IntegerLadderStatus::Typed || t.kind != core
-                    || t.vocabularyName != vocabularyName) {
+                // P69 (lane `cs`): a spelling the ladder only READS AS unsigned past its
+                // signed list (`decimalPastRange`) is diagnosed at every use, so it is
+                // never the spelling a shipped constant is spliced as.
+                if (t.status != IntegerLadderStatus::Typed || t.reinterpretedUnsigned
+                    || t.kind != core || t.vocabularyName != vocabularyName) {
                     typed = false;
                     break;
                 }
@@ -606,6 +613,123 @@ spellIntegerConstant(GrammarSchema const& schema, ffi::ShippedPpConstant const& 
     std::string body = "-" + std::to_string(spelled) + *sfx;
     if (mostNegative) body += " - 1";
     return {SpellOutcome::Spelled, "(" + body + ")"};
+}
+
+// ══ THE TYPED SPLICE — A FLOAT CONSTANT AS THE LANGUAGE'S OWN CONSTANT OF ITS TYPE ══
+// (P69 round 4, D-FFI-DESCRIPTOR-FLOAT-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR.) The
+// float sibling of `spellIntegerConstant`: a descriptor `floatConstants` row becomes a
+// `#define` whose body IS a constant of the row's declared type, so `#ifdef INFINITY`
+// holds after `#include <math.h>` (C 7.12p3-5 make `INFINITY`, `NAN` and `HUGE_VAL`
+// MACROS, and every reference defines them) while `sizeof INFINITY` and
+// `_Generic(INFINITY, …)` see the declared `float`. Before this splice the rows
+// reached the semantic tier only, so the macro was missing on every pair and a
+// program's own `#ifndef INFINITY` fallback silently took over.
+//
+// THREE FORMS, each SEARCHED in the language's own configuration and VERIFIED, never
+// tabulated (the integer splice's rule):
+//   * a FINITE value — a hexadecimal floating constant, exact by construction, with
+//     the suffix whose `semantics.floatLiteralTyping` rule types it to the declared
+//     core, read back through the front end's own decoder (`decodeFloatLiteralAtKind`)
+//     to the same bits; a negative value is `(-<constant>)`;
+//   * ±INFINITY — a call of the FIRST builtin (config order) whose `lowering` is
+//     `infinity`, taking no operand and returning the declared core:
+//     `(__builtin_inff())`, `(__builtin_inf())` — the shape gcc's, clang's and
+//     Apple's own headers use (`(__builtin_inff ())`, `(__builtin_huge_val ())`;
+//     there is no literal for an infinity in C);
+//   * a QUIET NaN with the empty payload — the `quiet_nan` builtin of the declared
+//     core, whose one operand is the empty string: `(__builtin_nanf(""))`, glibc's and
+//     Apple's own `NAN`. Negated for a negative one.
+// The builtin's result core is read from its declared signature through the ONE
+// type-text codec (`ffi::readFunctionTypeShape`), so the builtin spelled here and the
+// one the semantic tier binds cannot disagree on a type. A float constant's type
+// depends on no data model, so there is no `Unrealized`: `Unspellable` when no form
+// verifies, and the caller refuses the descriptor on a live include. (The result is
+// the integer splice's own {outcome, text} shape.)
+[[nodiscard]] IntegerConstantSpelling
+spellFloatConstant(GrammarSchema const& schema, ffi::ShippedPpFloatConstant const& k,
+                   std::optional<LongDoubleFormat> longDoubleFormat) {
+    IntegerConstantSpelling const none{SpellOutcome::Unspellable, {}};
+    double const v = k.value;
+    bool const negative = std::signbit(v);
+    auto const negated = [&](std::string body) {
+        return IntegerConstantSpelling{SpellOutcome::Spelled,
+                                       negative ? "(-" + body + ")" : "(" + body + ")"};
+    };
+    if (std::isinf(v) || std::isnan(v)) {
+        // A NaN with a payload, or a signaling one, has no spelling here: the
+        // `quiet_nan` builtin's empty operand is the empty payload. The double carrier
+        // of an F32 constant keeps neither the payload nor the quiet bit across
+        // narrowing, so the descriptor cannot state one today (see its value decode).
+        std::uint64_t const bits = std::bit_cast<std::uint64_t>(v);
+        if (std::isnan(v)
+            && ((bits & 0x0008000000000000ull) == 0          // signaling: the quiet bit clear
+                || (bits & 0x0007FFFFFFFFFFFFull) != 0)) {   // or a payload below it
+            return none;
+        }
+        BuiltinLowering const verb =
+            std::isinf(v) ? BuiltinLowering::Infinity : BuiltinLowering::QuietNan;
+        std::size_t const operands = std::isinf(v) ? 0u : 1u;
+        for (BuiltinFunctionMapping const& b : schema.semantics().builtinFunctions) {
+            if (b.lowering != verb || b.signatureIsPerPair || b.genericPointee.has_value()) {
+                continue;
+            }
+            TypeKind result = b.resultCore;
+            std::size_t arity = b.paramCores.size();
+            bool variadic = b.variadic;
+            if (!b.signatureText.empty()) {
+                auto const shape = ffi::readFunctionTypeShape(b.signatureText);
+                if (!shape.has_value()) continue;
+                result   = shape->result;
+                arity    = shape->operandCores.size();
+                variadic = shape->variadic;
+            }
+            if (result != k.core || arity != operands || variadic) continue;
+            return negated(b.name + (operands == 0u ? std::string{"()"} : std::string{"(\"\")"}));
+        }
+        return none;
+    }
+    // A finite value: the suffix of the first `floatLiteralTyping` rule (config order:
+    // the least-decorated spelling that works wins) whose type is the declared core
+    // under the pair's long-double format, then the literal read back exactly.
+    auto const& rules = schema.semantics().floatLiteralTyping;
+    NumberStyle const* const ns = schema.numberStyle();
+    LongDoubleFormat const ldf = longDoubleFormat.value_or(LongDoubleFormat::None);
+    // The magnitude, narrowed to the declared core's own width first so the digits
+    // spelled are that type's value (an F32 constant's `0.1` is the float nearest 0.1).
+    double magnitude = std::fabs(v);
+    if (k.core == TypeKind::F32) magnitude = static_cast<double>(static_cast<float>(magnitude));
+    else if (k.core != TypeKind::F64) return none;   // a wider carrier than a double states
+    std::array<char, 64> buf{};
+    auto const [end, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), magnitude,
+                                         std::chars_format::hex);
+    if (ec != std::errc{}) return none;
+    std::string const digits = "0x" + std::string{buf.data(), end};
+    // A floating type's width is no data model's to decide, and the rule's type must
+    // say so: it is verified under EVERY model of the closed table, the integer
+    // splice's no-pair rule, rather than under one assumed model.
+    std::vector<DataModel> const models = spellingModels(std::nullopt);
+    for (FloatLiteralTypingRule const& r : rules) {
+        std::vector<std::string> spellings;
+        if (r.suffixes.empty()) spellings.emplace_back();
+        else for (auto const& s : r.suffixes) spellings.push_back(s);
+        bool const typed = std::ranges::all_of(models, [&](DataModel m) {
+            auto const core = r.type.resolveCore(m, ldf);
+            return core.has_value() && *core == k.core;
+        });
+        if (!typed) continue;
+        for (auto const& sfx : spellings) {
+            std::string const text = digits + sfx;
+            FloatLiteralDecode const back = decodeFloatLiteralAtKind(text, ns, k.core);
+            if (!back.ok || back.wide.has_value()
+                || std::bit_cast<std::uint64_t>(back.narrow)
+                       != std::bit_cast<std::uint64_t>(magnitude)) {
+                continue;
+            }
+            return negative ? IntegerConstantSpelling{SpellOutcome::Spelled, "(-" + text + ")"}
+                            : IntegerConstantSpelling{SpellOutcome::Spelled, text};
+        }
+    }
+    return none;
 }
 
 // ══ THE TYPE-DERIVED PREDEFINED MACROS — (LANGUAGE × PAIR) REALIZATION ═════════
@@ -804,6 +928,21 @@ realizeTypeDerivedPredefine(PredefinedMacroDef const&                 pm,
             // `name(c)` → `c ## sfx` (C 7.22.4.1's `INTN_C`); with no suffix, `c`.
             std::string const& param = pm.params.front();
             return {Outcome::Realized, sfx->empty() ? param : param + " ## " + *sfx};
+        }
+        case PredefinedMacroKind::TypeFormat: {
+            // P69 (M4): the format string a conversion of this type is written
+            // with — the language's length modifier for the type the pair realizes,
+            // then the row's conversion letter, as a C string literal (`"ld"`), the
+            // shape every reference's `__INT64_FMTd__` has.
+            auto const mod = formatModifierFor(language.preprocess().typeFormatModifiers,
+                                               *id, facts.dataModel);
+            if (!mod.has_value()) {
+                return refused("'preprocess.typeFormatModifiers' names no length "
+                               "modifier for that type — add the type to the entry "
+                               "C's formatted I/O gives it");
+            }
+            return {Outcome::Realized,
+                    "\"" + std::string{*mod} + pm.formatConversion + "\""};
         }
         default:
             return {};   // not a type-derived kind: nothing to realize here
@@ -1643,6 +1782,13 @@ struct SynthBuilder {
     // the semantic `#include` gate use — an unavailable-on-this-format header is
     // treated like "no descriptor on the path" (left verbatim), all three agreeing.
     std::optional<ObjectFormatKind>      activeFormat;
+    // The active pair's TARGET name (the `when.arch` vocabulary), when known —
+    // what a descriptor `constants` arm keyed on `arch` is selected by in the
+    // splice below, so `#if O_NOFOLLOW` sees the value the semantic tier injects
+    // (D-FFI-FCNTL-AARCH64-OPEN-FLAGS-TAKE-X86-64-VALUES). Placed here, not after
+    // `pairFacts`, so a construction site that forgets it fails to compile
+    // instead of silently selecting no arch.
+    std::optional<std::string_view>      activeTarget;
     // D-PP-HEADER-CASE-INSENSITIVE-PE: the ACTIVE FORMAT's header-NAME case
     // rule, applied by EVERY include search this builder performs. A SEPARATE
     // input from `activeFormat` (a KIND): deriving the rule from the kind would
@@ -2076,12 +2222,14 @@ struct SynthBuilder {
                 // above, so the two surfaces of one descriptor can never reach
                 // the TU under different conditions.
                 //
-                // ⓘ NO ACTIVE TARGET IS THREADED, and the loader makes that
-                // safe rather than lucky: a `preprocessorVisible` constant may
-                // key its `variants` on `format` ONLY (refused at load
-                // otherwise), and the format IS threaded. That refusal is what
-                // stops an arch-keyed constant from being silently absent from
-                // `#if` on every target.
+                // ★ THE WHOLE PAIR IS THREADED — target, format and the pair
+                // facts (data model, long-double format) — so a visible
+                // constant selects here exactly the arm the semantic tier
+                // injects. It used to be the format alone, with a load refusal
+                // of every other axis to keep that safe; that refusal made a
+                // per-ARCH value inexpressible, and Linux aarch64's O_DIRECTORY
+                // and O_NOFOLLOW (which override x86_64's) shipped with
+                // x86_64's bits (D-FFI-FCNTL-AARCH64-OPEN-FLAGS-TAKE-X86-64-VALUES).
                 // ⓘ REUSES `macroRep` rather than constructing a second
                 // throwaway. Not merely tidy: the reporter-enumeration pin
                 // (anchor
@@ -2093,7 +2241,7 @@ struct SynthBuilder {
                 // correct answer anyway: they share the same discard discipline
                 // and the same owner downstream.
                 auto consts = ffi::readShippedLibConstants(
-                    p, macroRep, std::nullopt, activeFormat, &pairFacts);
+                    p, macroRep, activeTarget, activeFormat, &pairFacts);
                 if (!consts) {
                     // The macros read above already decides Malformed for the
                     // parent; a constants-only defect is surfaced by the
@@ -2133,6 +2281,35 @@ struct SynthBuilder {
                         continue;
                     }
                     out.append("#define " + k.name + " " + spelled.text + "\n");
+                }
+
+                // P69 round 4, D-FFI-DESCRIPTOR-FLOAT-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR:
+                // the THIRD surface — every float constant is a C MACRO (7.12p3-5),
+                // spelled as the language's own constant of its declared type
+                // (`spellFloatConstant`). The same walk, gate and throwaway reporter
+                // as the integer constants above, and the same refusal on a live
+                // include when no spelling verifies.
+                auto fconsts = ffi::readShippedLibFloatConstants(p, macroRep);
+                if (!fconsts) return;   // surfaced by the semantic read, like a constants defect
+                for (auto const& fk : *fconsts) {
+                    IntegerConstantSpelling const spelled =
+                        spellFloatConstant(*schema, fk, pairFacts.longDoubleFormat);
+                    if (spelled.outcome != SpellOutcome::Spelled) {
+                        if (reportMalformed) {
+                            emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                                   BufferId{}, SourceSpan::empty(0),
+                                   std::string{"shipped-header descriptor float constant '"}
+                                       + fk.name + "' has no spelling this language "
+                                         "verifies as its declared type ("
+                                       + std::string{typeKindNameOrEmpty(fk.core)}
+                                       + "): no 'floatLiteralTyping' suffix for a finite "
+                                         "value, or no 'infinity' / 'quiet_nan' builtin of "
+                                         "that type (descriptor "
+                                       + core::genericSpelling(p) + ")");
+                        }
+                        continue;
+                    }
+                    out.append("#define " + fk.name + " " + spelled.text + "\n");
                 }
             },
             [&](std::string const&, HeaderSearchResult const&) {
@@ -3349,7 +3526,7 @@ struct SynthBuilder {
                     copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
                     includeStack.push_back(canon);
                     SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
-                                       headerNameMatching, headerSearch,
+                                       activeTarget, headerNameMatching, headerSearch,
                                        rep, depth + 1, includeStack,
                                        includeOnce, fatal,
                                        preScanDefinePrefix, oracle,
@@ -3594,7 +3771,7 @@ struct SynthBuilder {
 
             includeStack.push_back(canon);
             SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
-                               headerNameMatching, headerSearch, rep,
+                               activeTarget, headerNameMatching, headerSearch, rep,
                                depth + 1, includeStack, includeOnce, fatal,
                                preScanDefinePrefix, oracle,
                                resolvedDescriptorsOut, pairFacts};
@@ -5723,10 +5900,23 @@ private:
         PpProductText     product;
         PpHasEmbed        hasEmbed;
         PpOperatorRevoked revoked;
+        PpLibraryFunctionProvided libraryFunctionProvided;   // P69 review M3
     };
     [[nodiscard]] IfCallbacks makeIfCallbacks() {
         IfCallbacks cb;
         cb.defined = [this](std::string_view n) { return isDefined(n); };
+        // ★ P69 (lane `cs`, review M3): the platform half of `__has_builtin` for a LIBRARY
+        // builtin — the active object format's shipped corpus, through the predicate that
+        // reads the realization oracle's own rows, so the operator answers 1 exactly where
+        // the semantic tier's binder binds the call. No active format: unset, so 0 — the
+        // binder provides no library function without one either.
+        if (activeFormat_.has_value()) {
+            cb.libraryFunctionProvided =
+                [fmt = *activeFormat_](std::string_view lib) {
+                    return ffi::shippedLibraryFunctionProvidedOnFormat(lib, fmt)
+                        .value_or(false);
+                };
+        }
         // FC15c + D-INCLUDE-ANGLE-SOURCE-FALLBACK: `__has_include` resolves a
         // header EXACTLY as the include machinery would. This is the AUTHORITATIVE
         // pass's callback (it decides the FINAL `#if` branch); it MUST agree with
@@ -5852,7 +6042,8 @@ private:
         IfCallbacks const cb = makeIfCallbacks();
         auto v = evaluateIfExpression(operand, *schema_, expandCb, cb.defined,
                                       cb.hasInclude, *synth_, cb.product, rep_,
-                                      cb.hasEmbed, cb.revoked, charFacts_);
+                                      cb.hasEmbed, cb.revoked, charFacts_,
+                                      cb.libraryFunctionProvided);
         return v.has_value() && *v;
     }
 
@@ -6308,7 +6499,7 @@ private:
                 lineSpan.subspan(lim->clauseBegin, lim->clauseEnd - lim->clauseBegin),
                 line[lim->nameIndex], *schema_, expandCb, cb.defined,
                 cb.hasInclude, *synth_, cb.product, rep_, cb.hasEmbed, cb.revoked,
-                charFacts_, textOf, failParam);
+                charFacts_, cb.libraryFunctionProvided, textOf, failParam);
             if (!limit.has_value()) return;   // reported through failParam
         }
 
@@ -8681,13 +8872,15 @@ private:
             return materializeSignificant(def.value);
         case PredefinedMacroKind::TypeName:
         case PredefinedMacroKind::TypeLimit:
-            // P68 round 9: a spelling or a spelled limit, written by
-            // `mergePredefinedMacros` — never empty when realized, so an empty
-            // one bypassed the merge: the same fatal as above.
+        case PredefinedMacroKind::TypeFormat:
+            // P68 round 9: a spelling or a spelled limit — and, P69, a format
+            // string literal — written by `mergePredefinedMacros`: never empty
+            // when realized, so an empty one bypassed the merge: the same fatal.
             if (def.value.empty()) {
-                ppFatal("materializePredefined: a 'type-name' or 'type-limit' "
-                        "predefined macro reached expansion unrealized — only "
-                        "mergePredefinedMacros may produce the effective list");
+                ppFatal("materializePredefined: a 'type-name', 'type-limit' or "
+                        "'type-format' predefined macro reached expansion "
+                        "unrealized — only mergePredefinedMacros may produce the "
+                        "effective list");
             }
             return materializeSignificant(def.value);
         case PredefinedMacroKind::TypeSuffix:
@@ -10114,7 +10307,7 @@ PreprocessResult preprocessRun(
     // ORDINARY directive handler seeds them in stream order (the gcc model:
     // "as if #define appeared before the first source line"). Two origins:
     //   "<built-in>"     — config predefinedMacros WITH `params` (function-like,
-    //                      e.g. the MSVC-profile `__declspec(x)` → empty erase),
+    //                      e.g. the pe-profile `_declspec(x)` → `__declspec(x)`),
     //                      format-filtered exactly like the predefined_ seed.
     //   "<command-line>" — the CLI `--define NAME[=VALUE]` entries (VALUE
     //                      defaults to 1). Because these become ORDINARY
@@ -10383,8 +10576,16 @@ PreprocessResult preprocessRun(
         // `when: { "longDoubleFormat": … }` arm is selected by.
         typeFacts != nullptr ? std::optional<LongDoubleFormat>{typeFacts->longDoubleFormat}
                              : std::optional<LongDoubleFormat>{}};
+    // The pair's target name, the `when.arch` fact — the SAME name the typedef
+    // read in `shippedTypedefsForPredefines` selects by. No pair ⇒ no arch, so an
+    // arch-keyed arm then matches nothing, exactly as a format-keyed one does
+    // without a format.
+    std::optional<std::string_view> const activeTarget =
+        typeFacts != nullptr && !typeFacts->targetName.empty()
+            ? std::optional<std::string_view>{typeFacts->targetName}
+            : std::optional<std::string_view>{};
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
-                         headerNameMatching, headerSearch,
+                         activeTarget, headerNameMatching, headerSearch,
                          *result.diagnostics, 0, includeStack, includeOnce,
                          result.fatal,
                          preScanDefinePrefix, preScanOracle,

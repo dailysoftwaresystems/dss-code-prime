@@ -74,8 +74,9 @@ WHAT IS AND IS NOT COMPARABLE
 Stated in the OUTPUT as well as here, because a caveat that lives only in a
 source comment is a caveat the reader of the number never saw. See CAVEATS.
 
-Usage:
-    python .harness-config/runner/actions/compile-bench/compile-bench.py --dsscp <path-to-dsscp> [options]
+Usage -- the `bench` step (`dssharness run compile-bench`, an input for each knob below, e.g.
+`--input runs=20`); the step spells every option `--name=value`, and an empty value is the default:
+    compile-bench.py --dsscp <path-to-dsscp> [options]
 
     --dsscp PATH        the compiler under test. REQUIRED; refused if absent.
     --target SPEC       <target>:<format>; default derived from this host and PRINTED.
@@ -85,10 +86,10 @@ Usage:
     --jobs N            dsscp --jobs for the parallel multi-TU arm (default: 6).
     --subjects LIST     comma-separated subject ids (default: every built-in).
     --multi-tus LIST    TU counts for the generated multi-TU ladder (default: 1,4,17).
-    --extra-subject ID=PATH[,PATH...]   add a real subject of your own (repeatable).
+    --extra-subject ID=PATH[,PATH...]   add real subjects of your own (items separated by ';').
     --out DIR           scratch for generated sources, artifacts and logs.
     --label NAME        names this leg in the report (default: derived from the host).
-    --cc NAME=PATH      override where a reference compiler lives (repeatable).
+    --cc NAME=PATH      override where reference compilers live (items separated by ';').
     --require-build-type NAME   refuse unless dsscp was built this way (default: Release).
     --json PATH         also write the whole reading as JSON, for a before/after diff.
     --help
@@ -867,8 +868,16 @@ def parse_args(argv):
     i = 0
     while i < len(argv):
         t = argv[i]
+        inline = None
+        # ★ `--name=value` too (2026-09-30): the bench step spells every option that way, so a value that is
+        # EMPTY -- the step's default -- or begins with `-` is still that option's value, never the next option.
+        if t.startswith("--") and "=" in t:
+            t, inline = t.split("=", 1)
+        adv = 1 if inline is not None else 2
 
         def val():
+            if inline is not None:
+                return inline
             if i + 1 >= len(argv):
                 die("%s wants a value" % t)
             return argv[i + 1]
@@ -877,43 +886,45 @@ def parse_args(argv):
             sys.stdout.write(__doc__)
             raise SystemExit(0)
         elif t == "--dsscp":
-            a["dsscp"] = val(); i += 2
+            a["dsscp"] = val(); i += adv
         elif t == "--target":
-            a["target"] = val(); i += 2
+            a["target"] = val(); i += adv
         elif t == "--language":
-            a["language"] = val(); i += 2
+            a["language"] = val(); i += adv
         elif t == "--runs":
-            a["runs"] = int(val()); i += 2
+            a["runs"] = int(val()); i += adv
         elif t == "--warmup":
-            a["warmup"] = int(val()); i += 2
+            a["warmup"] = int(val()); i += adv
         elif t == "--jobs":
-            a["jobs"] = int(val()); i += 2
+            a["jobs"] = int(val()); i += adv
         elif t == "--subjects":
-            a["subjects"] = [x.strip() for x in val().split(",") if x.strip()]; i += 2
+            a["subjects"] = [x.strip() for x in val().split(",") if x.strip()] or None; i += adv
         elif t == "--multi-tus":
-            a["multi_tus"] = [int(x) for x in val().replace(" ", "").split(",") if x]; i += 2
+            a["multi_tus"] = [int(x) for x in val().replace(" ", "").split(",") if x]; i += adv
         elif t == "--extra-subject":
-            spec = val()
-            if "=" not in spec:
-                die("--extra-subject wants ID=PATH[,PATH...], got %r" % spec)
-            sid, paths = spec.split("=", 1)
-            a["extra"].append((sid, [native(p) for p in paths.split(",") if p]))
-            i += 2
+            # `ID=PATH[,PATH...]` items separated by `;` (repeatable too); an EMPTY value adds none.
+            for spec in [s.strip() for s in val().split(";") if s.strip()]:
+                if "=" not in spec:
+                    die("--extra-subject wants ID=PATH[,PATH...] items separated by ';', got %r" % spec)
+                sid, paths = spec.split("=", 1)
+                a["extra"].append((sid, [native(p) for p in paths.split(",") if p]))
+            i += adv
         elif t == "--out":
-            a["out"] = val(); i += 2
+            a["out"] = val(); i += adv
         elif t == "--label":
-            a["label"] = val(); i += 2
+            a["label"] = val(); i += adv
         elif t == "--cc":
-            spec = val()
-            if "=" not in spec:
-                die("--cc wants NAME=PATH, got %r" % spec)
-            k, v = spec.split("=", 1)
-            a["cc"][k] = v
-            i += 2
+            # `NAME=PATH` items separated by `;` (repeatable too); an EMPTY value overrides none.
+            for spec in [s.strip() for s in val().split(";") if s.strip()]:
+                if "=" not in spec:
+                    die("--cc wants NAME=PATH items separated by ';', got %r" % spec)
+                k, v = spec.split("=", 1)
+                a["cc"][k] = v
+            i += adv
         elif t == "--require-build-type":
-            a["require_build_type"] = val(); i += 2
+            a["require_build_type"] = val(); i += adv
         elif t == "--json":
-            a["json"] = val(); i += 2
+            a["json"] = val(); i += adv
         else:
             # ★★★ NEVER A SHRUG. Ignoring an unknown flag is how a run ends up
             # not measuring what its command line said it measured.

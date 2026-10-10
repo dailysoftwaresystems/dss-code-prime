@@ -1,0 +1,12 @@
+{
+  "$comment": "D-MIR-NESTED-TRY-REGIONS-REACH-THE-OUTER-HANDLER: which handler a fault reaches when __try regions nest. The system's handler routine gives a fault to the FIRST record of the function's scope table whose range holds the faulting address and whose filter accepts it, and an outer range holds every address of the regions inside it — so the table lists a region after every region inside it, and each range holds exactly its own body. Seven cases: a fault in the inner body, a fault in the outer body after the inner region, three deep, two siblings inside one parent, an inner filter that declines (the outer handler then reads a parameter born before both regions), an inner body holding a loop, a fault raised by the inner handler. The exit code names the first case to fail (11..17); 42 = all right. The reference compiler (cl 19.51 x64, /Od and /O2) runs this file to 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

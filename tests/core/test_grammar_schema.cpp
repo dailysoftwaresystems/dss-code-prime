@@ -13,6 +13,7 @@
 // (D-HIR-RESOLVE-ELEMENT-CORE-UNKNOWN-AS-KEY).
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/object_format_kind.hpp"
+#include "core/types/symbol_attrs.hpp"   // SymbolBinding, WeakDefinitionKind (the VALUES)
 #include "repo_root.hpp"
 // The ONE load-or-fail-this-test helper for a shipped grammar.
 #include "shipped_schema_or_throw.hpp"
@@ -290,6 +291,42 @@ TEST(GrammarSchema, CommitAfterPrefixRejectsNonBoolean) {
     EXPECT_TRUE(std::ranges::any_of(diags, [](auto const& d) {
         return d.code == DiagnosticCode::C_UnknownShape;
     }));
+}
+
+// P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): the `notFollowedBy`
+// not-predicate is a non-empty array of TOKEN kind names. A rule name, an unknown kind, an
+// empty array or a bare string is refused loud at load (C_UnknownShape) — never read as a
+// predicate that can never fire.
+TEST(GrammarSchema, NotFollowedByNamesTokenKindsOnly) {
+    auto const load = [](std::string_view nf) {
+        std::string const doc =
+            std::string{R"({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "shapes": {
+        "root": { "sequence": ["Identifier"], "notFollowedBy": )"}
+            + std::string{nf} + R"( }
+      }
+    })";
+        return GrammarSchema::loadFromText(doc);
+    };
+    {
+        auto ok = load(R"(["Identifier"])");
+        ASSERT_TRUE(ok.has_value()) << ok.error()[0].message;
+        GrammarSchema const& s = **ok;
+        EXPECT_EQ(s.notFollowedBy(s.rules().find("root")).size(), 1u)
+            << "the predicate's one token kind reached the compiled rule";
+    }
+    for (std::string_view bad : {std::string_view{R"(["root"])"},
+                                 std::string_view{R"(["NoSuchToken"])"},
+                                 std::string_view{R"([])"},
+                                 std::string_view{R"("Identifier")"}}) {
+        auto r = load(bad);
+        ASSERT_FALSE(r.has_value()) << bad;
+        EXPECT_TRUE(std::ranges::any_of(r.error(), [](auto const& d) {
+            return d.code == DiagnosticCode::C_UnknownShape;
+        })) << bad;
+    }
 }
 
 // ─── loadShipped + the on-disk toy.lang.json ─────────────────────────────
@@ -2598,6 +2635,14 @@ TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
                                            // exactly the drift the count guard below
                                            // exists to find.
                                            "packField",
+                                           // P69 round 4 (lane `cs`): the two verbs
+                                           // judged once per attribute SPECIFIER —
+                                           // a calling convention answered by the
+                                           // target's own facts, and a known
+                                           // attribute refused by name. The roster
+                                           // caught them the same way (13 listed,
+                                           // 11 here).
+                                           "callingConvention", "unsupported",
                                            "none"};
     // The message under test.
     auto const bad = attrVocabSchema(
@@ -2625,13 +2670,26 @@ TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
         // the key, `none` REFUSES it. Writing one shape for both would make the
         // loop fail for a reason that has nothing to do with the verb vocabulary
         // it is here to check.
+        // ★ P69 round 4: a THIRD shape. The two per-specifier verbs carry no kind
+        // axis either — `appliesTo` is REFUSED on them — and each requires its own
+        // key (`conventions`, `reason`).
+        std::string probeRow;
+        if (verb == "none") {
+            probeRow = R"([ { "names": ["aligned"], "effect": "none" } ])";
+        } else if (verb == "callingConvention") {
+            probeRow = R"([ { "names": ["aligned"], "effect": "callingConvention",
+                              "conventions": ["some_convention"] } ])";
+        } else if (verb == "unsupported") {
+            probeRow = R"([ { "names": ["aligned"], "effect": "unsupported",
+                              "reason": "this language cannot honour it" } ])";
+        } else {
+            probeRow = std::format(R"([ {{ "names": ["aligned"],
+                                           "appliesTo": ["variable"],
+                                           "effect": "{}" }} ])",
+                                   verb);
+        }
         auto const good = attrVocabSchema(
-            verb == "none"
-                ? std::string{R"([ { "names": ["aligned"], "effect": "none" } ])"}
-                : std::format(R"([ {{ "names": ["aligned"],
-                                      "appliesTo": ["variable"],
-                                      "effect": "{}" }} ])",
-                              verb),
+            probeRow,
             R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
         auto const ok = GrammarSchema::loadFromText(good);
         ASSERT_TRUE(ok.has_value())
@@ -3098,7 +3156,22 @@ TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedC) {
         << "the shipped c config must satisfy its own `appliesTo` rule";
     std::size_t declAttached = 0;
     std::size_t inertWithKinds = 0;
+    std::size_t judgedPerSpecifier = 0;
     for (auto const& row : (*r)->semantics().attributeEffects) {
+        // ★ P69 round 4 (lane `cs`): the two verbs judged once per attribute
+        // SPECIFIER name no effect on a declared entity, so they carry NO kind axis
+        // — the loader refuses `appliesTo` on them — and the shipped rows must hold
+        // to that. Asserted positively, like the inert half below: a kind set that
+        // reached such a row would make the decl-kind gate warn "ignored" beside
+        // the verb's own refusal.
+        if (row.effect == AttributeEffect::CallingConvention
+            || row.effect == AttributeEffect::Unsupported) {
+            ++judgedPerSpecifier;
+            EXPECT_TRUE(row.appliesTo.empty())
+                << "a per-specifier verb's row carries no kind axis; row naming '"
+                << (row.names.empty() ? "<none>" : row.names[0]) << "' does";
+            continue;
+        }
         if (row.effect == AttributeEffect::None) {
             // ★★ P42 — THE ASSERTION HERE IS **FLIPPED**, NOT DROPPED. It used
             // to demand that an inert row carry NO kind set, on the reading that
@@ -3136,6 +3209,12 @@ TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedC) {
         << "the shipped inert vocabulary must stay SPLIT by applicable kind — a "
            "single bundled 'none' row cannot carry a correct kind set, which is "
            "what made the decl-kind silence structural rather than chosen";
+    // ★ P69 round 4: c ships at least EIGHT per-specifier rows — the refusal by
+    // name of `vector_size` and seven calling-convention names. A lower count
+    // means one was demoted to `none`, which is how a refusal goes silent.
+    EXPECT_GE(judgedPerSpecifier, 8u)
+        << "the shipped per-specifier rows (the refusals by name and the calling "
+           "conventions) were lost or demoted";
 }
 
 // ── the drift cross-check ─────────────────────────────────────────────────
@@ -3626,6 +3705,728 @@ TEST(GrammarSchema, LinkageSpecifierEffectDollarPrefixedKeyIsExempt) {
     ASSERT_TRUE(r.has_value())
         << "a '$'-prefixed documentation key inside a linkage effect must not "
            "trip the typo discriminator: " << errorDiags(r.error());
+}
+
+// P69 (lane `cs`): `weakKind` — WHICH kind of weak definition a weak binding is.
+// REQUIRED beside every `"binding": "weak"` (an entry that forgot it would load
+// as "weak, of whichever kind the consumer defaults to", and the two kinds link
+// differently), REFUSED beside any other binding or none (it would be read by
+// nothing), and a CLOSED set of two spellings.
+//
+// RED-ON-DISABLE: drop the `!eff.contains("weakKind")` arm of the loader and the
+// "weak without a kind" row loads; drop the "read only beside" arm and the three
+// misplaced rows load; drop `"weakKind"` from the effect's key set and both
+// accepted rows fail as an unknown key.
+TEST(GrammarSchema, AWeakBindingStatesItsKindAndNothingElseMay) {
+    constexpr std::string_view kNeedle = R"({ "binding": "local" })";
+    struct Row {
+        char const* what;
+        char const* effect;
+        char const* refusedWith;   // nullptr = loads
+    };
+    for (Row const row : {
+             Row{"overridable", R"({ "binding": "weak", "weakKind": "overridable" })",
+                 nullptr},
+             Row{"select-any", R"({ "binding": "weak", "weakKind": "select-any" })",
+                 nullptr},
+             Row{"weak without a kind", R"({ "binding": "weak" })",
+                 "'weakKind' is REQUIRED beside"},
+             Row{"a kind that is not a string",
+                 R"({ "binding": "weak", "weakKind": true })", "must be a string"},
+             Row{"a kind outside the closed set",
+                 R"({ "binding": "weak", "weakKind": "selectany" })",
+                 "overridable"},
+             Row{"an empty kind", R"({ "binding": "weak", "weakKind": "" })",
+                 "overridable"},
+             Row{"a kind beside the internal binding",
+                 R"({ "binding": "local", "weakKind": "overridable" })",
+                 "'weakKind' is read only beside"},
+             Row{"a kind beside no binding at all",
+                 R"({ "visibility": "hidden", "weakKind": "select-any" })",
+                 "'weakKind' is read only beside"},
+             Row{"a kind alone", R"({ "weakKind": "select-any" })",
+                 "'weakKind' is read only beside"}}) {
+        auto cfg = attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, "");
+        auto const pos = cfg.find(kNeedle);
+        ASSERT_NE(pos, std::string::npos);
+        cfg.replace(pos, kNeedle.size(), row.effect);
+        auto r = GrammarSchema::loadFromText(cfg);
+        if (row.refusedWith == nullptr) {
+            ASSERT_TRUE(r.has_value()) << row.what << ": " << errorDiags(r.error());
+            auto const& specs = (*r)->semantics().declarations[0].linkageSpecifiers;
+            ASSERT_EQ(specs.size(), 1u) << row.what;
+            auto const& effect = specs.begin()->second;
+            ASSERT_TRUE(effect.binding.has_value()) << row.what;
+            EXPECT_EQ(*effect.binding, SymbolBinding::Weak) << row.what;
+            ASSERT_TRUE(effect.weakKind.has_value()) << row.what;
+            EXPECT_EQ(weakDefinitionKindName(*effect.weakKind),
+                      std::string_view{row.what})
+                << "the kind the entry spells is the kind the effect holds";
+            continue;
+        }
+        ASSERT_FALSE(r.has_value()) << row.what << " must fail the load";
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics))
+            << row.what;
+        bool said = false;
+        for (auto const& d : r.error())
+            if (d.message.find(row.refusedWith) != std::string::npos) said = true;
+        EXPECT_TRUE(said) << row.what << " — expected a diagnostic containing \""
+                          << row.refusedWith << "\"; got: " << errorDiags(r.error());
+    }
+    // CONTROL: the untouched fixture (an internal binding, no kind) loads and its
+    // effect holds no kind.
+    auto r = GrammarSchema::loadFromText(
+        attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, ""));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    auto const& specs = (*r)->semantics().declarations[0].linkageSpecifiers;
+    ASSERT_EQ(specs.size(), 1u);
+    EXPECT_FALSE(specs.begin()->second.weakKind.has_value());
+}
+
+// P69 round 4 (lane `cs`): the keys of an `effects` row that belong to ONE verb or
+// say whose the attribute is inside a declarator — `conventions`
+// (`callingConvention`), `reason` (`unsupported`), `withinDeclarator` (every verb
+// that names an effect on the declared entity). Each is required where its verb
+// needs it, refused where nothing would read it, and closed in what it holds.
+//
+// RED-ON-DISABLE, one arm of the loader each: drop the "REQUIRED" arm of
+// `conventions` or of `reason` and the row without the key loads; drop the
+// "belongs to" arm and the key loads on another verb's row; drop the duplicate-id
+// arm and the repeated id loads; drop `appliesTo`'s refusal on a per-specifier
+// verb and that row loads; accept any `withinDeclarator` string and "entity"
+// loads as the type's.
+TEST(GrammarSchema, AnEffectsRowsVerbKeysAreRequiredWhereReadAndRefusedElsewhere) {
+    struct Row {
+        char const* what;
+        char const* effects;
+        char const* refusedWith;   // nullptr = loads
+    };
+    for (Row const row : {
+             Row{"a calling-convention row with two ids",
+                 R"([ { "names": ["cc_a"], "effect": "callingConvention",
+                        "conventions": ["first", "second"] } ])",
+                 nullptr},
+             Row{"an unsupported row with its reason",
+                 R"([ { "names": ["wide"], "effect": "unsupported",
+                        "reason": "it changes the type" } ])",
+                 nullptr},
+             Row{"an entity verb whose attribute stays with the type in a declarator",
+                 R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+                        "effect": "warnOnUse", "withinDeclarator": "type" } ])",
+                 nullptr},
+             Row{"a calling-convention row with no conventions",
+                 R"([ { "names": ["cc_a"], "effect": "callingConvention" } ])",
+                 "'conventions' is REQUIRED"},
+             Row{"conventions that is not an array",
+                 R"([ { "names": ["cc_a"], "effect": "callingConvention",
+                        "conventions": "first" } ])",
+                 "'conventions' must be a non-empty ARRAY"},
+             Row{"an empty conventions list",
+                 R"([ { "names": ["cc_a"], "effect": "callingConvention",
+                        "conventions": [] } ])",
+                 "'conventions' must be a non-empty ARRAY"},
+             Row{"a convention id that is not a string",
+                 R"([ { "names": ["cc_a"], "effect": "callingConvention",
+                        "conventions": [3] } ])",
+                 "each 'conventions' entry"},
+             Row{"a convention id listed twice",
+                 R"([ { "names": ["cc_a"], "effect": "callingConvention",
+                        "conventions": ["first", "first"] } ])",
+                 "duplicate calling-convention id 'first'"},
+             Row{"conventions on another verb's row",
+                 R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+                        "effect": "warnOnUse", "conventions": ["first"] } ])",
+                 "'conventions' belongs to the 'callingConvention' verb's row"},
+             Row{"an unsupported row with no reason",
+                 R"([ { "names": ["wide"], "effect": "unsupported" } ])",
+                 "'reason' is REQUIRED"},
+             Row{"an empty reason",
+                 R"([ { "names": ["wide"], "effect": "unsupported", "reason": "" } ])",
+                 "'reason' must be a non-empty string"},
+             Row{"a reason on another verb's row",
+                 R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+                        "effect": "warnOnUse", "reason": "because" } ])",
+                 "'reason' belongs to another verb's row"},
+             Row{"a kind axis on a calling-convention row",
+                 R"([ { "names": ["cc_a"], "effect": "callingConvention",
+                        "conventions": ["first"], "appliesTo": ["function"] } ])",
+                 "'appliesTo' is refused"},
+             Row{"a kind axis on an unsupported row",
+                 R"([ { "names": ["wide"], "effect": "unsupported",
+                        "reason": "it changes the type", "appliesTo": ["variable"] } ])",
+                 "'appliesTo' is refused"},
+             Row{"withinDeclarator on a calling-convention row",
+                 R"([ { "names": ["cc_a"], "effect": "callingConvention",
+                        "conventions": ["first"], "withinDeclarator": "type" } ])",
+                 "'withinDeclarator' is refused"},
+             Row{"withinDeclarator naming the other answer",
+                 R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+                        "effect": "warnOnUse", "withinDeclarator": "entity" } ])",
+                 "'withinDeclarator' takes the one value"},
+             Row{"withinDeclarator that is not a string",
+                 R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+                        "effect": "warnOnUse", "withinDeclarator": true } ])",
+                 "'withinDeclarator' takes the one value"}}) {
+        bool const namesDeprecated =
+            std::string_view{row.effects}.find("deprecated") != std::string_view::npos;
+        auto const cfg = attrVocabSchema(
+            row.effects,
+            namesDeprecated ? R"("linkageSpecifierIgnoredNames": ["deprecated"],)" : "",
+            "");
+        auto r = GrammarSchema::loadFromText(cfg);
+        if (row.refusedWith == nullptr) {
+            ASSERT_TRUE(r.has_value()) << row.what << ": " << errorDiags(r.error());
+            auto const& effects = (*r)->semantics().attributeEffects;
+            ASSERT_EQ(effects.size(), 1u) << row.what;
+            if (effects[0].effect == AttributeEffect::CallingConvention) {
+                ASSERT_EQ(effects[0].conventions.size(), 2u) << row.what;
+                EXPECT_EQ(effects[0].conventions[0], "first");
+                EXPECT_EQ(effects[0].conventions[1], "second");
+                EXPECT_TRUE(effects[0].appliesTo.empty());
+            } else if (effects[0].effect == AttributeEffect::Unsupported) {
+                EXPECT_EQ(effects[0].reason, "it changes the type");
+                EXPECT_TRUE(effects[0].appliesTo.empty());
+            } else {
+                EXPECT_TRUE(effects[0].staysWithTypeInDeclarator) << row.what;
+            }
+            continue;
+        }
+        ASSERT_FALSE(r.has_value()) << row.what << " must fail the load";
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics))
+            << row.what;
+        bool said = false;
+        for (auto const& d : r.error())
+            if (d.message.find(row.refusedWith) != std::string::npos) said = true;
+        EXPECT_TRUE(said) << row.what << " — expected a diagnostic containing \""
+                          << row.refusedWith << "\"; got: " << errorDiags(r.error());
+    }
+    // CONTROL: a row of an entity verb that omits `withinDeclarator` is the declared
+    // entity's inside a declarator.
+    auto r = GrammarSchema::loadFromText(
+        attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, ""));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    for (auto const& e : (*r)->semantics().attributeEffects)
+        EXPECT_FALSE(e.staysWithTypeInDeclarator);
+}
+
+// ── P69 (lane `cs`): `attributeSemantics.spellings`, the QUALIFIED attribute name,
+//    the four keys of an `align` row, and the `yieldsOnMismatch` linkage axis ──────
+//
+// A language whose attribute specifier has more than one spelling says so in rows,
+// one per frame of `attrSpecRule`, and a name that means something else in one
+// spelling is written `<qualifier>(<name>)` in the tables. Every piece of that is
+// config no engine code names, so every piece that could load clean and then match
+// NOTHING is refused at load — which is what these pins hold. Each refusal row
+// names the diagnostic it expects, so a row that fails for another reason is red.
+
+namespace {
+// A language whose attribute specifier has TWO frames (`( name )` and `ds name )`),
+// a tag specifier that defines when its body is present, and one variable row that
+// runs the strict linkage scan.
+//   %SPELLINGS%  the whole `"spellings": …,` member (with its trailing comma), or "";
+//   %EFFECTS%    the `effects` array;
+//   %LINKEXTRA%  extra `linkageSpecifiers` entries (trailing comma), or "".
+[[nodiscard]] std::string attrSpellingsSchema(std::string_view spellings,
+                                              std::string_view effects,
+                                              std::string_view linkageExtra = "") {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "AttrSpellings", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        "(": [{ "kind": "ParenOpen" }],
+        ")": [{ "kind": "ParenClose" }],
+        "[": [{ "kind": "BracketOpen" }],
+        "]": [{ "kind": "BracketClose" }],
+        "{": [{ "kind": "BlockOpen" }],
+        "}": [{ "kind": "BlockClose" }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "keywords": [ { "word": "st",  "kind": "StKw"  },
+                    { "word": "ds",  "kind": "DsKw"  },
+                    { "word": "agg", "kind": "AggKw" } ],
+      "shapes": {
+        "root":     { "sequence": [ { "repeat": { "alt": [ "sdecl", "vdecl" ] } } ] },
+        "vdecl":    { "sequence": [ "vprefix", "Identifier", "Semi" ] },
+        "sdecl":    { "sequence": [ "spec", "Semi" ] },
+        "spec":     { "sequence": [ "AggKw", "Identifier", { "optional": "body" } ] },
+        "body":     { "sequence": [ "BlockOpen", "BlockClose" ] },
+        "vprefix":  { "sequence": [ { "repeat": { "alt": [ "StKw", "attrSpec", "stdAttr" ] } } ] },
+        "attrSpec": { "alt": [
+                        { "sequence": [ "ParenOpen", "Identifier", "ParenClose" ] },
+                        { "sequence": [ "DsKw", "Identifier", "ParenClose" ] } ] },
+        "stdAttr":  { "sequence": [ "BracketOpen", "Identifier", "BracketClose" ] },
+        "bare":     { "sequence": [ "Semi" ] }
+      },
+      "semantics": {
+        "identifierToken": "Identifier",
+        "declarations": [
+          { "rule": "vdecl", "name": 0, "kind": "variable",
+            "specifierPrefix": "vprefix",
+            "linkageSpecifiers": { %LINKEXTRA%"st": { "binding": "local" } } },
+          { "rule": "spec", "name": 0, "kind": "type", "definesWhenChild": "body" }
+        ],
+        "references": [ { "rule": "spec" } ],
+        "attributeSemantics": {
+          %SPELLINGS%
+          "attrSpecRule":      "attrSpec",
+          "stdAttrRule":       "stdAttr",
+          "bareStatementRule": "bare",
+          "effects": %EFFECTS%
+        }
+      }
+    })JSON";
+    cfg.replace(cfg.find("%LINKEXTRA%"), 11, linkageExtra);
+    cfg.replace(cfg.find("%SPELLINGS%"), 11, spellings);
+    cfg.replace(cfg.find("%EFFECTS%"),    9, effects);
+    return cfg;
+}
+
+// The two spellings every positive arm uses: the plain frame, and the qualified one
+// that exists on two object formats and whose after-body specifier is the
+// declaration's.
+constexpr std::string_view kTwoSpellings =
+    R"("spellings": [ { "introducer": "ParenOpen" },
+                      { "introducer": "DsKw", "qualifier": "ds",
+                        "availableObjectFormats": ["pe", "elf"],
+                        "afterCompositeBody": "declaration" } ],)";
+constexpr std::string_view kInertEffects =
+    R"([ { "names": ["fallthrough"], "effect": "none" } ])";
+
+struct LoadRefusal {
+    char const*    what;
+    std::string    cfg;
+    DiagnosticCode code;
+    char const*    refusedWith;
+};
+
+void expectEachRefused(std::vector<LoadRefusal> const& rows) {
+    for (LoadRefusal const& row : rows) {
+        auto r = GrammarSchema::loadFromText(row.cfg);
+        ASSERT_FALSE(r.has_value()) << row.what << " must fail the load";
+        bool said = false;
+        for (auto const& d : r.error())
+            if (d.code == row.code
+                && d.message.find(row.refusedWith) != std::string::npos)
+                said = true;
+        EXPECT_TRUE(said) << row.what << " — expected a diagnostic containing \""
+                          << row.refusedWith << "\"; got: " << errorDiags(r.error());
+    }
+}
+} // namespace
+
+// THE POSITIVE HALF: every key reaches `SemanticConfig`, and the three questions
+// the engine asks of a spelling row answer as configured. `availableFor` is pinned
+// in all three states — a listed format, an unlisted one, and NO format in scope,
+// which must read as "not available" (an unknown must never read as a yes).
+//
+// RED-ON-DISABLE: drop the loader's `spellings` block and `attributeSpellings` is
+// empty (and the qualified names below are refused); drop any one key's arm and
+// its field keeps its default.
+TEST(GrammarSchema, AttributeSpellingsAndTheirQualifiedRowsReachConfig) {
+    auto const cfg = attrSpellingsSchema(
+        kTwoSpellings,
+        // (A named delimiter: a qualified name ends in `)"`, which would close a
+        // plain raw string in the middle of the document.)
+        R"J([ { "names": ["ds(aligned)"], "appliesTo": ["variable", "type"],
+               "effect": "align", "withoutOperand": "ignored",
+               "onTypeAlias": "raises", "repeated": "last",
+               "leadingDecoratesDefinitionOf": ["spec"] },
+             { "names": ["aligned"], "appliesTo": ["variable", "type"],
+               "effect": "align", "withoutOperand": "largestUseful",
+               "onTypeAlias": "exact", "repeated": "largest" },
+             { "names": ["ds(thread)"], "appliesTo": ["variable"],
+               "effect": "none" } ])J",
+        R"J("ds(thread)": { "threadStorage": true, "yieldsOnMismatch": true },)J");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    auto const& sem = (*r)->semantics();
+
+    ASSERT_EQ(sem.attributeSpellings.size(), 2u);
+    AttributeSpelling const& plain = sem.attributeSpellings[0];
+    EXPECT_EQ(plain.introducerName, "ParenOpen");
+    EXPECT_TRUE(plain.qualifier.empty());
+    EXPECT_TRUE(plain.availableObjectFormats.empty());
+    EXPECT_FALSE(plain.afterCompositeBodyIsTheDeclarations);
+    EXPECT_TRUE(plain.availableFor(ObjectFormatKind::MachO));
+    EXPECT_TRUE(plain.availableFor(std::nullopt))
+        << "a spelling that names no format exists everywhere, with or without a "
+           "format in scope";
+    EXPECT_TRUE(plain.qualified("aligned").empty());
+
+    AttributeSpelling const& ds = sem.attributeSpellings[1];
+    EXPECT_EQ(ds.introducerName, "DsKw");
+    EXPECT_EQ(ds.qualifier, "ds");
+    ASSERT_EQ(ds.availableObjectFormats.size(), 2u);
+    EXPECT_EQ(ds.availableObjectFormats[0], ObjectFormatKind::Elf)
+        << "the list is kept sorted whatever order the document wrote it in";
+    EXPECT_EQ(ds.availableObjectFormats[1], ObjectFormatKind::Pe);
+    EXPECT_TRUE(ds.afterCompositeBodyIsTheDeclarations);
+    EXPECT_TRUE(ds.availableFor(ObjectFormatKind::Pe));
+    EXPECT_TRUE(ds.availableFor(ObjectFormatKind::Elf));
+    EXPECT_FALSE(ds.availableFor(ObjectFormatKind::MachO));
+    EXPECT_FALSE(ds.availableFor(std::nullopt))
+        << "with no object format in scope the question cannot be answered, and "
+           "'unknown' must not read as 'available'";
+    EXPECT_EQ(ds.qualified("aligned"), "ds(aligned)");
+
+    ASSERT_EQ(sem.attributeEffects.size(), 3u);
+    AttributeSemanticsRow const& qualified = sem.attributeEffects[0];
+    ASSERT_EQ(qualified.names.size(), 1u);
+    EXPECT_EQ(qualified.names[0], "ds(aligned)");
+    EXPECT_TRUE(qualified.alignWithoutOperandIsIgnored);
+    EXPECT_TRUE(qualified.alignOnTypeAliasOnlyRaises);
+    EXPECT_TRUE(qualified.alignRepeatTakesLast);
+    ASSERT_EQ(qualified.leadingDecoratesDefinitionOf.size(), 1u);
+    ASSERT_EQ(qualified.leadingDecoratesDefinitionOfNames.size(), 1u);
+    EXPECT_EQ(qualified.leadingDecoratesDefinitionOfNames[0], "spec");
+    // CONTROL: the plain row spells every default out, and each stays the default.
+    AttributeSemanticsRow const& plainRow = sem.attributeEffects[1];
+    EXPECT_FALSE(plainRow.alignWithoutOperandIsIgnored);
+    EXPECT_FALSE(plainRow.alignOnTypeAliasOnlyRaises);
+    EXPECT_FALSE(plainRow.alignRepeatTakesLast);
+    EXPECT_TRUE(plainRow.leadingDecoratesDefinitionOf.empty());
+
+    DeclarationRule const* vdecl = nullptr;
+    for (auto const& d : sem.declarations)
+        if (d.ruleName == "vdecl") vdecl = &d;
+    ASSERT_NE(vdecl, nullptr);
+    auto const key = vdecl->linkageSpecifiers.find("ds(thread)");
+    ASSERT_NE(key, vdecl->linkageSpecifiers.end());
+    EXPECT_TRUE(key->second.threadStorage);
+    EXPECT_TRUE(key->second.threadStorageYieldsOnMismatch);
+    // A qualified name the row models as its OWN linkage specifier is never in the
+    // derived ignore list of that row — it must reach the linkage lookup.
+    EXPECT_FALSE(ignoresName(*vdecl, "ds(thread)"));
+    EXPECT_TRUE(ignoresName(*vdecl, "ds(aligned)"))
+        << "…while a qualified name of the effects table that the row does not "
+           "model is derived into it like any plain one";
+
+    // CONTROL: a language that declares no spellings loads as before, with none.
+    auto bare = GrammarSchema::loadFromText(attrSpellingsSchema("", kInertEffects));
+    ASSERT_TRUE(bare.has_value()) << errorDiags(bare.error());
+    EXPECT_TRUE((*bare)->semantics().attributeSpellings.empty());
+    // CONTROL: a thread-storage effect that does not say it yields does not yield.
+    auto firm = GrammarSchema::loadFromText(attrSpellingsSchema(
+        kTwoSpellings, kInertEffects,
+        R"J("ds(thread)": { "threadStorage": true },)J"));
+    ASSERT_TRUE(firm.has_value()) << errorDiags(firm.error());
+    for (auto const& d : (*firm)->semantics().declarations) {
+        if (d.ruleName != "vdecl") continue;
+        auto const it = d.linkageSpecifiers.find("ds(thread)");
+        ASSERT_NE(it, d.linkageSpecifiers.end());
+        EXPECT_TRUE(it->second.threadStorage);
+        EXPECT_FALSE(it->second.threadStorageYieldsOnMismatch);
+    }
+}
+
+// THE `spellings` BLOCK IS CLOSED: its shape, its four keys and each key's values.
+// The last three rows are the ones a looser loader would let through in silence —
+// a second row opened by the same token (which row a specifier gets would then be
+// decided by document order), a qualifier shared by two rows, and an introducer
+// the specifier shape does not hold (the row could identify no specifier at all).
+//
+// RED-ON-DISABLE: each row dies with its own guard in the loader's `spellings`
+// block; the last with the late check over `attrSpecRule`'s compiled positions.
+TEST(GrammarSchema, AttributeSpellingsBlockIsClosedAndEveryRowCanIdentifyASpecifier) {
+    auto const with = [](std::string_view spellings) {
+        return attrSpellingsSchema(spellings, kInertEffects);
+    };
+    expectEachRefused({
+        {"spellings that is not an array",
+         with(R"("spellings": { "introducer": "ParenOpen" },)"),
+         DiagnosticCode::C_InvalidSemantics, "'spellings' must be a non-empty ARRAY"},
+        {"an empty spellings array", with(R"("spellings": [],)"),
+         DiagnosticCode::C_InvalidSemantics, "'spellings' must be a non-empty ARRAY"},
+        {"a row that is not an object", with(R"("spellings": [ "ParenOpen" ],)"),
+         DiagnosticCode::C_InvalidSemantics, "each 'spellings' row must be an object"},
+        {"a misspelled row key",
+         with(R"("spellings": [ { "introducer": "ParenOpen", "qualifer": "q" } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "qualifer"},
+        {"a row with no introducer", with(R"("spellings": [ { "qualifier": "q" } ],)"),
+         DiagnosticCode::C_MissingField, "'introducer' is required"},
+        {"an introducer that is not a string",
+         with(R"("spellings": [ { "introducer": 3 } ],)"),
+         DiagnosticCode::C_MissingField, "'introducer' is required"},
+        {"an introducer no token declares",
+         with(R"("spellings": [ { "introducer": "NoSuchKw" } ],)"),
+         DiagnosticCode::C_UnknownToken, "which this language does not declare"},
+        {"an empty qualifier",
+         with(R"("spellings": [ { "introducer": "DsKw", "qualifier": "" } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'qualifier' must be a non-empty string"},
+        {"a qualifier that is not a string",
+         with(R"("spellings": [ { "introducer": "DsKw", "qualifier": 7 } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'qualifier' must be a non-empty string"},
+        {"a qualifier holding a parenthesis",
+         with(R"("spellings": [ { "introducer": "DsKw", "qualifier": "ds(" } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'qualifier' must be a non-empty string"},
+        {"formats that is not an array",
+         with(R"("spellings": [ { "introducer": "DsKw",
+                                  "availableObjectFormats": "pe" } ],)"),
+         DiagnosticCode::C_InvalidSemantics,
+         "'availableObjectFormats' must be a non-empty ARRAY"},
+        {"an empty formats list",
+         with(R"("spellings": [ { "introducer": "DsKw",
+                                  "availableObjectFormats": [] } ],)"),
+         DiagnosticCode::C_InvalidSemantics,
+         "'availableObjectFormats' must be a non-empty ARRAY"},
+        {"a format no build can have",
+         with(R"("spellings": [ { "introducer": "DsKw",
+                                  "availableObjectFormats": ["coff"] } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'coff' is not an object format"},
+        {"the sentinel format",
+         with(R"("spellings": [ { "introducer": "DsKw",
+                                  "availableObjectFormats": ["unknown"] } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'unknown' is not an object format"},
+        {"a format that is not a string",
+         with(R"("spellings": [ { "introducer": "DsKw",
+                                  "availableObjectFormats": [2] } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "is not an object format"},
+        {"a format listed twice",
+         with(R"("spellings": [ { "introducer": "DsKw",
+                                  "availableObjectFormats": ["pe", "pe"] } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "object format 'pe' is listed twice"},
+        {"an after-body answer outside the two",
+         with(R"("spellings": [ { "introducer": "DsKw",
+                                  "afterCompositeBody": "object" } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'afterCompositeBody' is \"type\""},
+        {"an after-body answer that is not a string",
+         with(R"("spellings": [ { "introducer": "DsKw",
+                                  "afterCompositeBody": true } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'afterCompositeBody' is \"type\""},
+        {"two rows opened by one token",
+         with(R"("spellings": [ { "introducer": "DsKw" },
+                                { "introducer": "DsKw", "qualifier": "ds" } ],)"),
+         DiagnosticCode::C_InvalidSemantics,
+         "the introducer 'DsKw' already opens an earlier 'spellings' row"},
+        {"two rows sharing one qualifier",
+         with(R"("spellings": [ { "introducer": "ParenOpen", "qualifier": "ds" },
+                                { "introducer": "DsKw", "qualifier": "ds" } ],)"),
+         DiagnosticCode::C_InvalidSemantics,
+         "the qualifier 'ds' is already an earlier 'spellings' row's"},
+        {"an introducer the specifier shape does not hold",
+         with(R"("spellings": [ { "introducer": "ParenOpen" },
+                                { "introducer": "BracketOpen", "qualifier": "b" } ],)"),
+         DiagnosticCode::C_InvalidSemantics,
+         "the 'spellings' row opened by 'BracketOpen' can identify no attribute "
+         "specifier"},
+    });
+    // CONTROL: the well-formed pair loads, with the explicit default of the last key.
+    auto ok = GrammarSchema::loadFromText(with(
+        R"("spellings": [ { "introducer": "ParenOpen", "afterCompositeBody": "type" },
+                          { "introducer": "DsKw", "qualifier": "ds" } ],)"));
+    ASSERT_TRUE(ok.has_value()) << errorDiags(ok.error());
+    ASSERT_EQ((*ok)->semantics().attributeSpellings.size(), 2u);
+    EXPECT_FALSE((*ok)->semantics().attributeSpellings[0]
+                     .afterCompositeBodyIsTheDeclarations);
+}
+
+// A TABLE KEY WITH A PARENTHESIS IS A QUALIFIED NAME OR IT IS REFUSED — in the
+// effects table and in a declaration row's linkage map alike. No clause can spell a
+// parenthesis inside its name, so a key of any other shape, or one qualified by
+// something no spelling declares, would match nothing ever written.
+//
+// RED-ON-DISABLE: drop the effects loop's check and the first six rows load; drop
+// the late check over the linkage maps and the last three load.
+TEST(GrammarSchema, AParenthesizedTableKeyMustBeQualifiedByADeclaredSpelling) {
+    auto const effectsNamed = [](std::string_view name) {
+        return attrSpellingsSchema(
+            kTwoSpellings,
+            std::format(R"([ {{ "names": ["{}"], "effect": "none" }} ])", name));
+    };
+    auto const linkageKeyed = [](std::string_view spellings, std::string_view key) {
+        return attrSpellingsSchema(
+            spellings, kInertEffects,
+            std::format(R"("{}": {{ "threadStorage": true }},)", key));
+    };
+    constexpr char const* kEffects = "is not an attribute name any clause can be "
+                                     "looked up under";
+    constexpr char const* kLinkage = "is not a key any source text can be looked "
+                                     "up under";
+    expectEachRefused({
+        {"an effects name with an unclosed parenthesis", effectsNamed("ds(thread"),
+         DiagnosticCode::C_InvalidSemantics, kEffects},
+        {"an effects name with no qualifier", effectsNamed("(thread)"),
+         DiagnosticCode::C_InvalidSemantics, kEffects},
+        {"an effects name with nothing qualified", effectsNamed("ds()"),
+         DiagnosticCode::C_InvalidSemantics, kEffects},
+        {"an effects name with two groups", effectsNamed("ds(a)(b)"),
+         DiagnosticCode::C_InvalidSemantics, kEffects},
+        {"an effects name with text after the group", effectsNamed("ds(thread)x"),
+         DiagnosticCode::C_InvalidSemantics, kEffects},
+        {"an effects name qualified by an undeclared qualifier",
+         effectsNamed("zz(thread)"), DiagnosticCode::C_InvalidSemantics, kEffects},
+        {"a linkage key qualified by an undeclared qualifier",
+         linkageKeyed(kTwoSpellings, "zz(thread)"),
+         DiagnosticCode::C_InvalidSemantics, kLinkage},
+        {"a linkage key with an unclosed parenthesis",
+         linkageKeyed(kTwoSpellings, "ds(thread"),
+         DiagnosticCode::C_InvalidSemantics, kLinkage},
+        {"a qualified linkage key in a language that declares no spellings",
+         linkageKeyed("", "ds(thread)"),
+         DiagnosticCode::C_InvalidSemantics, kLinkage},
+    });
+    // A qualified effects name in a language that declares no spellings is the same
+    // refusal (its own schema, since the helper above always declares the pair).
+    expectEachRefused({
+        {"a qualified effects name in a language that declares no spellings",
+         attrSpellingsSchema(
+             "", R"J([ { "names": ["ds(thread)"], "effect": "none" } ])J"),
+         DiagnosticCode::C_InvalidSemantics, kEffects},
+    });
+    // CONTROLS: the well-formed qualified name loads in both tables.
+    auto e = GrammarSchema::loadFromText(effectsNamed("ds(thread)"));
+    ASSERT_TRUE(e.has_value()) << errorDiags(e.error());
+    auto l = GrammarSchema::loadFromText(linkageKeyed(kTwoSpellings, "ds(thread)"));
+    ASSERT_TRUE(l.has_value()) << errorDiags(l.error());
+}
+
+// THE FOUR KEYS OF AN `align` ROW belong to that verb, each takes a closed value
+// set, and `leadingDecoratesDefinitionOf` names shapes that can DEFINE — a
+// declaration row with `definesWhenChild`. A shape that is not one would load
+// clean and the alignment would silently go to the declared objects instead of
+// the type.
+//
+// RED-ON-DISABLE: each row dies with its own arm; the non-defining-shape row with
+// the late cross-check against the declarations table.
+TEST(GrammarSchema, AnAlignRowsOwnKeysAreClosedAndNameDefiningShapes) {
+    auto const alignWith = [](std::string_view extra) {
+        return attrSpellingsSchema(
+            kTwoSpellings,
+            std::format(R"([ {{ "names": ["aligned"], "appliesTo": ["variable"],
+                               "effect": "align", {} }} ])", extra));
+    };
+    auto const otherVerbWith = [](std::string_view extra) {
+        return attrSpellingsSchema(
+            kTwoSpellings,
+            std::format(R"([ {{ "names": ["deprecated"], "appliesTo": ["variable"],
+                               "effect": "warnOnUse", {} }} ])", extra));
+    };
+    constexpr char const* kNotAlign = "belongs to the 'align' verb's row";
+    expectEachRefused({
+        {"withoutOperand on another verb's row",
+         otherVerbWith(R"("withoutOperand": "ignored")"),
+         DiagnosticCode::C_InvalidSemantics, kNotAlign},
+        {"onTypeAlias on another verb's row",
+         otherVerbWith(R"("onTypeAlias": "raises")"),
+         DiagnosticCode::C_InvalidSemantics, kNotAlign},
+        {"repeated on another verb's row", otherVerbWith(R"("repeated": "last")"),
+         DiagnosticCode::C_InvalidSemantics, kNotAlign},
+        {"leadingDecoratesDefinitionOf on another verb's row",
+         otherVerbWith(R"("leadingDecoratesDefinitionOf": ["spec"])"),
+         DiagnosticCode::C_InvalidSemantics, kNotAlign},
+        {"a withoutOperand answer outside the two",
+         alignWith(R"("withoutOperand": "zero")"),
+         DiagnosticCode::C_InvalidSemantics, "'withoutOperand' is \"largestUseful\""},
+        {"a withoutOperand answer that is not a string",
+         alignWith(R"("withoutOperand": true)"),
+         DiagnosticCode::C_InvalidSemantics, "'withoutOperand' is \"largestUseful\""},
+        {"an onTypeAlias answer outside the two", alignWith(R"("onTypeAlias": "max")"),
+         DiagnosticCode::C_InvalidSemantics, "'onTypeAlias' is \"exact\""},
+        {"a repeated answer outside the two", alignWith(R"("repeated": "first")"),
+         DiagnosticCode::C_InvalidSemantics, "'repeated' is \"largest\""},
+        {"leadingDecoratesDefinitionOf that is not an array",
+         alignWith(R"("leadingDecoratesDefinitionOf": "spec")"),
+         DiagnosticCode::C_InvalidSemantics,
+         "'leadingDecoratesDefinitionOf' must be a non-empty ARRAY"},
+        {"an empty leadingDecoratesDefinitionOf",
+         alignWith(R"("leadingDecoratesDefinitionOf": [])"),
+         DiagnosticCode::C_InvalidSemantics,
+         "'leadingDecoratesDefinitionOf' must be a non-empty ARRAY"},
+        {"a leading shape no rule declares",
+         alignWith(R"("leadingDecoratesDefinitionOf": ["ghost"])"),
+         DiagnosticCode::C_UnknownShape, "references unknown shape 'ghost'"},
+        {"a leading shape listed twice",
+         alignWith(R"("leadingDecoratesDefinitionOf": ["spec", "spec"])"),
+         DiagnosticCode::C_InvalidSemantics, "shape 'spec' is listed twice"},
+        {"a leading shape that is a declaration row but never defines",
+         alignWith(R"("leadingDecoratesDefinitionOf": ["vdecl"])"),
+         DiagnosticCode::C_InvalidSemantics,
+         "lists 'vdecl' in 'leadingDecoratesDefinitionOf', and that shape is not a "
+         "'declarations' row that says when it DEFINES"},
+        {"a leading shape that is no declaration row at all",
+         alignWith(R"("leadingDecoratesDefinitionOf": ["body"])"),
+         DiagnosticCode::C_InvalidSemantics,
+         "lists 'body' in 'leadingDecoratesDefinitionOf', and that shape is not a "
+         "'declarations' row that says when it DEFINES"},
+    });
+    // CONTROL: the defining shape loads.
+    auto ok = GrammarSchema::loadFromText(
+        alignWith(R"("leadingDecoratesDefinitionOf": ["spec"])"));
+    ASSERT_TRUE(ok.has_value()) << errorDiags(ok.error());
+    ASSERT_EQ((*ok)->semantics().attributeEffects.size(), 1u);
+    EXPECT_EQ((*ok)->semantics().attributeEffects[0].leadingDecoratesDefinitionOf.size(),
+              1u);
+}
+
+// `yieldsOnMismatch` says what a THREAD-STORAGE request does when another
+// declaration of the object does not make it; it is a boolean, and on an effect
+// that sets no thread storage it would be read by nothing.
+//
+// RED-ON-DISABLE: drop the arm's two guards and both rows load.
+TEST(GrammarSchema, YieldsOnMismatchIsABooleanBesideAThreadStorageRequest) {
+    auto const linkage = [](std::string_view effect) {
+        return attrSpellingsSchema(kTwoSpellings, kInertEffects,
+                                   std::format(R"J("ds(thread)": {},)J", effect));
+    };
+    expectEachRefused({
+        {"yieldsOnMismatch that is not a boolean",
+         linkage(R"({ "threadStorage": true, "yieldsOnMismatch": "yes" })"),
+         DiagnosticCode::C_InvalidSemantics, "'yieldsOnMismatch' must be a boolean"},
+        {"yieldsOnMismatch beside another axis only",
+         linkage(R"({ "binding": "local", "yieldsOnMismatch": true })"),
+         DiagnosticCode::C_InvalidSemantics,
+         "'yieldsOnMismatch' says what a THREAD-STORAGE request does"},
+    });
+}
+
+// P69 round 4 (lane `cs`): the two rules that tell the attribute machinery where a
+// TYPE is being named — `specifierRunRule` (a run written among a type's own
+// specifiers) and `typeNameRule` (a type name: a cast, `sizeof`, `_Alignof`, a
+// generic association). Optional, and a name that is written must be a real shape:
+// a typo that merely left the id invalid would put every attribute of a type name
+// back on "the declared entity", which there is none of.
+//
+// RED-ON-DISABLE: drop either `readRule` call of the loader and the accepted row
+// leaves that id invalid; make `readRule` accept an unknown name and the two typo
+// rows load.
+TEST(GrammarSchema, TheSpecifierRunAndTypeNameRulesAreOptionalAndNameRealShapes) {
+    {
+        auto r = GrammarSchema::loadFromText(attributeSemanticsSchemaWith(""));
+        ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+        EXPECT_FALSE((*r)->semantics().attrSpecifierRunRule.valid());
+        EXPECT_FALSE((*r)->semantics().attrTypeNameRule.valid());
+    }
+    {
+        auto r = GrammarSchema::loadFromText(attributeSemanticsSchemaWith(
+            R"("specifierRunRule": "attrSpec", "typeNameRule": "stdAttr",)"));
+        ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+        auto const& sem = (*r)->semantics();
+        ASSERT_TRUE(sem.attrSpecifierRunRule.valid());
+        ASSERT_TRUE(sem.attrTypeNameRule.valid());
+        EXPECT_EQ(sem.attrSpecifierRunRule.v, sem.attrSpecRule.v);
+        EXPECT_EQ(sem.attrTypeNameRule.v, sem.stdAttrRule.v);
+        EXPECT_EQ(sem.attrSpecifierRunRuleName, "attrSpec");
+        EXPECT_EQ(sem.attrTypeNameRuleName, "stdAttr");
+    }
+    for (char const* key : {"specifierRunRule", "typeNameRule"}) {
+        auto typo = GrammarSchema::loadFromText(attributeSemanticsSchemaWith(
+            std::format(R"("{}": "noSuchShape",)", key)));
+        ASSERT_FALSE(typo.has_value()) << key << " naming no shape must fail the load";
+        EXPECT_TRUE(hasDiagCode(typo.error(), DiagnosticCode::C_UnknownShape)) << key;
+        bool named = false;
+        for (auto const& d : typo.error())
+            if (d.message.find(key) != std::string::npos
+                && d.message.find("noSuchShape") != std::string::npos)
+                named = true;
+        EXPECT_TRUE(named) << key << ": " << errorDiags(typo.error());
+
+        auto notString = GrammarSchema::loadFromText(attributeSemanticsSchemaWith(
+            std::format(R"("{}": 7,)", key)));
+        ASSERT_FALSE(notString.has_value()) << key << " that is not a string";
+        EXPECT_TRUE(hasDiagCode(notString.error(), DiagnosticCode::C_MissingField))
+            << key;
+    }
 }
 
 // Missing required `rule` field on a declaration entry → C_MissingField.
@@ -5236,6 +6037,155 @@ TEST(GrammarSchema, SemanticsImplicitReturnZeroDuplicateElementReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// ── D-C-A-NON-VOID-FUNCTION-WHOSE-END-IS-REACHABLE-IS-REFUSED loader pins ─────
+//
+// `nonVoidFunctionEndReached` on a declaration row: what a value-returning
+// function of that form does when control reaches the end of its body. A closed
+// pair of spellings, and the answer of a document that does not state the key is
+// the STRICT one.
+//
+// ★ THE EXPECTATIONS ARE WRITTEN OUT, never read back from
+// `kNonVoidFunctionEndRuleTable`: a pin whose expected spelling comes off the
+// table the loader projects moves both halves of the comparison together, so a
+// renamed row would stay green while every language document writing the old
+// spelling stopped loading.
+
+namespace {
+// A minimal language with one function declaration row; `extra` is spliced in
+// as further keys of that row (empty, or beginning with a comma).
+[[nodiscard]] std::string nonVoidEndRuleDoc(std::string_view extra) {
+    std::string doc = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "function")JSON";
+    doc += extra;
+    doc += R"JSON( } ]
+      }
+    })JSON";
+    return doc;
+}
+
+constexpr std::string_view kNonVoidEndRulePointer =
+    "/semantics/declarations/0/nonVoidFunctionEndReached";
+}  // namespace
+
+// (v) of the ruling that approved the design: a language document that does not
+// state the key gets the strict refusal. RED-ON-DISABLE: flip the field's
+// default in `DeclarationRule` and every language that never asked for the
+// relaxed rule silently acquires it.
+TEST(GrammarSchema, SemanticsNonVoidFunctionEndRuleIsRefusedWhenTheKeyIsAbsent) {
+    auto r = GrammarSchema::loadFromText(nonVoidEndRuleDoc(""));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    auto const& decls = (*r)->semantics().declarations;
+    ASSERT_EQ(decls.size(), 1u);
+    EXPECT_EQ(decls[0].nonVoidFunctionEndReached, NonVoidFunctionEndRule::Refused)
+        << "an unstated rule is the strict one";
+}
+
+TEST(GrammarSchema, SemanticsNonVoidFunctionEndRuleLoadsBothSpellings) {
+    struct Case {
+        std::string_view       spelling;
+        NonVoidFunctionEndRule rule;
+    };
+    constexpr std::array<Case, 2> kCases{{
+        {"refused",                 NonVoidFunctionEndRule::Refused},
+        {"returnsUnspecifiedValue", NonVoidFunctionEndRule::ReturnsUnspecifiedValue},
+    }};
+    for (auto const& c : kCases) {
+        auto r = GrammarSchema::loadFromText(nonVoidEndRuleDoc(
+            std::format(R"(, "nonVoidFunctionEndReached": "{}")", c.spelling)));
+        ASSERT_TRUE(r.has_value()) << c.spelling << ": " << errorDiags(r.error());
+        auto const& decls = (*r)->semantics().declarations;
+        ASSERT_EQ(decls.size(), 1u);
+        EXPECT_EQ(decls[0].nonVoidFunctionEndReached, c.rule) << c.spelling;
+        // The table is what this file says it is — the arm a renamed row reds.
+        EXPECT_EQ(nonVoidFunctionEndRuleName(c.rule), c.spelling);
+    }
+    EXPECT_EQ(allNames(kNonVoidFunctionEndRuleTable).size(), kCases.size())
+        << "a third spelling needs a third case here, and a reader in the lowering";
+}
+
+// A spelling outside the pair is refused AT THE KEY'S OWN POINTER, and the
+// sentence names both spellings the check accepts and nothing else.
+TEST(GrammarSchema, SemanticsNonVoidFunctionEndRuleRefusesAnUnknownSpelling) {
+    auto r = GrammarSchema::loadFromText(nonVoidEndRuleDoc(
+        R"(, "nonVoidFunctionEndReached": "returnsZero")"));
+    ASSERT_FALSE(r.has_value());
+    std::size_t at = 0;
+    for (auto const& d : r.error()) {
+        if (d.path != kNonVoidEndRulePointer) continue;
+        ++at;
+        EXPECT_EQ(d.code, DiagnosticCode::C_InvalidSemantics);
+        EXPECT_NE(d.message.find("'returnsZero'"), std::string::npos) << d.message;
+        EXPECT_NE(d.message.find("'refused' or 'returnsUnspecifiedValue'"),
+                  std::string::npos)
+            << "the refusal must name the accepted pair: " << d.message;
+    }
+    EXPECT_EQ(at, 1u) << "exactly one refusal at " << kNonVoidEndRulePointer
+                      << errorDiags(r.error());
+}
+
+TEST(GrammarSchema, SemanticsNonVoidFunctionEndRuleRefusesANonString) {
+    for (std::string_view const value : {"true", "1", "[\"refused\"]", "null"}) {
+        auto r = GrammarSchema::loadFromText(nonVoidEndRuleDoc(
+            std::format(R"(, "nonVoidFunctionEndReached": {})", value)));
+        ASSERT_FALSE(r.has_value()) << value;
+        std::size_t at = 0;
+        for (auto const& d : r.error()) {
+            if (d.path != kNonVoidEndRulePointer) continue;
+            ++at;
+            EXPECT_EQ(d.code, DiagnosticCode::C_InvalidSemantics) << value;
+            EXPECT_NE(d.message.find("must be a string"), std::string::npos)
+                << value << ": " << d.message;
+            EXPECT_NE(d.message.find("'refused' or 'returnsUnspecifiedValue'"),
+                      std::string::npos)
+                << value << ": " << d.message;
+        }
+        EXPECT_EQ(at, 1u) << value << errorDiags(r.error());
+    }
+}
+
+// A near-miss spelling of the KEY is refused as an unknown key of the row — it
+// must not load as "the rule was not stated", which would be the strict rule by
+// accident in a document that asked for the other one.
+TEST(GrammarSchema, SemanticsNonVoidFunctionEndRuleKeyTypoIsRefused) {
+    auto r = GrammarSchema::loadFromText(nonVoidEndRuleDoc(
+        R"(, "nonVoidFunctionEndReach": "returnsUnspecifiedValue")"));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics))
+        << errorDiags(r.error());
+}
+
+// THE SHIPPED DOCUMENTS: C states the relaxed rule on the one declaration form
+// that defines functions, and the four other shipped languages that load on
+// their own (the list below, written out) keep the strict one on every row.
+TEST(GrammarSchema, ShippedCStatesTheNonVoidFunctionEndRuleAndNoOtherLanguageDoes) {
+    {
+        auto const c = dss::test_support::shippedSchemaOrThrow("c");
+        std::vector<std::string> relaxed;
+        for (auto const& d : c->semantics().declarations) {
+            if (d.nonVoidFunctionEndReached
+                == NonVoidFunctionEndRule::ReturnsUnspecifiedValue) {
+                relaxed.push_back(d.ruleName);
+            }
+        }
+        EXPECT_EQ(relaxed, (std::vector<std::string>{"topLevelDecl"}))
+            << "C23 6.9.2p13 is a rule about function DEFINITIONS, and C defines "
+               "functions through one declaration form";
+    }
+    for (std::string_view const other :
+         {"toy", "tsql-subset", "asm-x86_64-att", "asm-arm64-gas"}) {
+        auto const s = dss::test_support::shippedSchemaOrThrow(other);
+        for (auto const& d : s->semantics().declarations) {
+            EXPECT_EQ(d.nonVoidFunctionEndReached, NonVoidFunctionEndRule::Refused)
+                << other << " row '" << d.ruleName << "'";
+        }
+    }
+}
+
 // FC5 (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN) + D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE — the
 // de-conflation pin. `entryFunctions` (the program-entry MAPPING, read by entry
 // resolution) and `implicitReturnZeroForFunctionNames` (the C main-style return-0
@@ -5941,6 +6891,117 @@ TEST(GrammarSchema, SemanticsBuiltinFunctionsVariadicNotBool) {
     auto r = GrammarSchema::loadFromText(kCfg);
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ── libraryBuiltins + a builtin's libraryFallback (P69, lane `cs`, review m10) ──────────
+// ONE test per refusal the loader states, each pinning its own MESSAGE (several share a
+// code), each over a config whose one defect is that refusal's — and a CONTROL that the
+// same config without it loads. RED-ON-DISABLE: drop any one refusal and its test loads.
+namespace {
+[[nodiscard]] std::string librarySemantics(std::string_view semanticsBody) {
+    return std::string{R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { )JSON"} + std::string{semanticsBody} + " }\n}";
+}
+void expectRefused(std::string_view semanticsBody, DiagnosticCode code,
+                   std::string_view message) {
+    auto r = GrammarSchema::loadFromText(librarySemantics(semanticsBody));
+    ASSERT_FALSE(r.has_value()) << semanticsBody;
+    EXPECT_TRUE(hasDiagCode(r.error(), code)) << semanticsBody << errorDiags(r.error());
+    EXPECT_TRUE(hasDiagMessage(r.error(), message))
+        << semanticsBody << " — expected \"" << message << "\"" << errorDiags(r.error());
+}
+}  // namespace
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsLoadAndNameTheirLibraryFunction) {
+    auto r = GrammarSchema::loadFromText(librarySemantics(
+        R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs", "strlen" ] })"));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    LibraryBuiltins const& lb = (*r)->semantics().libraryBuiltins;
+    EXPECT_EQ(lb.libraryFunctionOf("__builtin_strlen"), "strlen");
+    EXPECT_EQ(lb.libraryFunctionOf("__builtin_abs"), "abs");
+    EXPECT_TRUE(lb.libraryFunctionOf("__builtin_memcpy").empty()) << "not listed";
+    EXPECT_TRUE(lb.libraryFunctionOf("strlen").empty()) << "the bare name is no builtin";
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsNotAnObjectIsRefused) {
+    expectRefused(R"("libraryBuiltins": [ "abs" ])", DiagnosticCode::C_InvalidSemantics,
+                  "'semantics.libraryBuiltins' must be an object");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsUnknownKeyIsRefused) {
+    expectRefused(
+        R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs" ], "functons": [] })",
+        DiagnosticCode::C_InvalidSemantics, "unknown key 'functons'");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsPrefixMissingOrEmptyIsRefused) {
+    expectRefused(R"("libraryBuiltins": { "functions": [ "abs" ] })",
+                  DiagnosticCode::C_MissingField, "'prefix' is required");
+    expectRefused(R"("libraryBuiltins": { "prefix": "", "functions": [ "abs" ] })",
+                  DiagnosticCode::C_MissingField, "'prefix' is required");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsFunctionsMissingOrEmptyIsRefused) {
+    expectRefused(R"("libraryBuiltins": { "prefix": "__builtin_" })",
+                  DiagnosticCode::C_MissingField, "'functions' is required");
+    expectRefused(R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [] })",
+                  DiagnosticCode::C_MissingField, "'functions' is required");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsFunctionEntryThatIsNoNameIsRefused) {
+    expectRefused(R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ 42 ] })",
+                  DiagnosticCode::C_InvalidSemantics,
+                  "each 'functions' entry must be a non-empty string");
+    expectRefused(R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs", "" ] })",
+                  DiagnosticCode::C_InvalidSemantics,
+                  "each 'functions' entry must be a non-empty string");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinsFunctionsUnsortedOrDuplicatedAreRefused) {
+    expectRefused(
+        R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ "strlen", "abs" ] })",
+        DiagnosticCode::C_InvalidSemantics, "'functions' must be sorted and unique");
+    expectRefused(
+        R"("libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs", "abs" ] })",
+        DiagnosticCode::C_InvalidSemantics, "'functions' must be sorted and unique");
+}
+
+TEST(GrammarSchema, SemanticsLibraryBuiltinThatIsAlsoABuiltinFunctionsRowIsRefused) {
+    expectRefused(
+        R"("builtinFunctions": [ { "name": "__builtin_abs", "result": "I32", "params": [ "I32" ] } ],
+           "libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs" ] })",
+        DiagnosticCode::C_InvalidSemantics, "one name, two meanings");
+    auto ok = GrammarSchema::loadFromText(librarySemantics(
+        R"("builtinFunctions": [ { "name": "__builtin_labs", "result": "I32", "params": [ "I32" ] } ],
+           "libraryBuiltins": { "prefix": "__builtin_", "functions": [ "abs" ] })"));
+    EXPECT_TRUE(ok.has_value()) << "CONTROL: disjoint names load" << errorDiags(ok.error());
+}
+
+TEST(GrammarSchema, SemanticsBuiltinLibraryFallbackThatIsNoNameIsRefused) {
+    expectRefused(R"("builtinFunctions": [ { "name": "B", "result": "F64",
+                                             "lowering": "quiet_nan", "libraryFallback": 7 } ])",
+                  DiagnosticCode::C_InvalidSemantics,
+                  "'libraryFallback' must be a non-empty string");
+    expectRefused(R"("builtinFunctions": [ { "name": "B", "result": "F64",
+                                             "lowering": "quiet_nan", "libraryFallback": "" } ])",
+                  DiagnosticCode::C_InvalidSemantics,
+                  "'libraryFallback' must be a non-empty string");
+    auto ok = GrammarSchema::loadFromText(librarySemantics(
+        R"("builtinFunctions": [ { "name": "B", "result": "F64",
+                                   "lowering": "quiet_nan", "libraryFallback": "nan" } ])"));
+    EXPECT_TRUE(ok.has_value()) << "CONTROL: a named fallback on `quiet_nan` loads"
+                                << errorDiags(ok.error());
+}
+
+TEST(GrammarSchema, SemanticsBuiltinLibraryFallbackOnAVerbWithoutAConstantFormIsRefused) {
+    expectRefused(R"("builtinFunctions": [ { "name": "B", "result": "I32", "params": [ "I32" ],
+                                             "lowering": "first_argument",
+                                             "libraryFallback": "abs" } ])",
+                  DiagnosticCode::C_InvalidSemantics, "has no such form");
 }
 
 // ── constMarker (the language's qualifier vocabulary, `semantics` level) ──
@@ -7278,6 +8339,120 @@ TEST(GrammarSchema, DerivedIgnoredNamesLoseANameRemovedFromShippedCsEffects) {
            "of the same claim";
 }
 
+// P69 (lane `cs`): WHAT SHIPPED C SAYS ABOUT ITS SECOND ATTRIBUTE SPELLING. The
+// `__declspec` frame is a spelling of pe only, qualified by its own keyword, and
+// its after-body specifier is the declaration's; `align` and `thread` mean
+// something else there than under the plain spelling and so have qualified rows;
+// the two requests this compiler cannot honour are refused by name, with a reason.
+// The engine reads all of it from these rows and names none of it — so a row that
+// goes missing or changes its answer changes what C means, and this is where that
+// is seen.
+//
+// RED-ON-DISABLE (each on the shipped document): drop the second `spellings` row
+// and the load itself fails (the qualified rows lose their qualifier); drop
+// `availableObjectFormats` and the spelling reads as available on ELF; flip
+// `afterCompositeBody`; drop any of the four keys of the `__declspec(align)` row;
+// drop `yieldsOnMismatch` from one of the five linkage maps.
+TEST(GrammarSchema, ShippedCDeclaresTheDeclspecSpellingAndItsQualifiedRows) {
+    std::string const text = shippedCTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    auto r = GrammarSchema::loadFromText(text);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    auto const& sem = (*r)->semantics();
+
+    ASSERT_EQ(sem.attributeSpellings.size(), 2u);
+    EXPECT_EQ(sem.attributeSpellings[0].introducerName, "AttributeKeyword");
+    EXPECT_TRUE(sem.attributeSpellings[0].qualifier.empty());
+    EXPECT_TRUE(sem.attributeSpellings[0].availableFor(std::nullopt));
+    EXPECT_FALSE(sem.attributeSpellings[0].afterCompositeBodyIsTheDeclarations);
+    AttributeSpelling const& ds = sem.attributeSpellings[1];
+    EXPECT_EQ(ds.introducerName, "DeclspecKeyword");
+    EXPECT_EQ(ds.qualifier, "__declspec");
+    EXPECT_TRUE(ds.availableFor(ObjectFormatKind::Pe));
+    EXPECT_FALSE(ds.availableFor(ObjectFormatKind::Elf));
+    EXPECT_FALSE(ds.availableFor(ObjectFormatKind::MachO));
+    EXPECT_FALSE(ds.availableFor(std::nullopt));
+    EXPECT_TRUE(ds.afterCompositeBodyIsTheDeclarations);
+
+    auto const rowNamed = [&](std::string_view name) -> AttributeSemanticsRow const* {
+        for (auto const& row : sem.attributeEffects)
+            for (auto const& n : row.names)
+                if (n == name) return &row;
+        return nullptr;
+    };
+    AttributeSemanticsRow const* const align = rowNamed("__declspec(align)");
+    ASSERT_NE(align, nullptr);
+    EXPECT_EQ(align->effect, AttributeEffect::Align);
+    EXPECT_TRUE(align->staysWithTypeInDeclarator);
+    EXPECT_TRUE(align->alignWithoutOperandIsIgnored);
+    EXPECT_TRUE(align->alignOnTypeAliasOnlyRaises);
+    EXPECT_TRUE(align->alignRepeatTakesLast);
+    ASSERT_EQ(align->leadingDecoratesDefinitionOfNames.size(), 2u);
+    EXPECT_EQ(align->leadingDecoratesDefinitionOfNames[0], "structSpec");
+    EXPECT_EQ(align->leadingDecoratesDefinitionOfNames[1], "unionSpec");
+    // CONTROL: the plain spelling's `aligned` keeps every default — the four keys
+    // are what makes the two spellings differ, and only the qualified row has them.
+    AttributeSemanticsRow const* const aligned = rowNamed("aligned");
+    ASSERT_NE(aligned, nullptr);
+    EXPECT_EQ(aligned->effect, AttributeEffect::Align);
+    EXPECT_FALSE(aligned->alignWithoutOperandIsIgnored);
+    EXPECT_FALSE(aligned->alignOnTypeAliasOnlyRaises);
+    EXPECT_FALSE(aligned->alignRepeatTakesLast);
+    EXPECT_TRUE(aligned->leadingDecoratesDefinitionOf.empty());
+
+    for (char const* name : {"naked", "__declspec(allocate)"}) {
+        AttributeSemanticsRow const* const row = rowNamed(name);
+        ASSERT_NE(row, nullptr) << name;
+        EXPECT_EQ(row->effect, AttributeEffect::Unsupported) << name;
+        EXPECT_FALSE(row->reason.empty()) << name;
+    }
+    for (char const* name : {"__declspec(dllimport)", "__declspec(dllexport)",
+                             "__declspec(restrict)", "__declspec(noalias)",
+                             "__declspec(thread)"}) {
+        AttributeSemanticsRow const* const row = rowNamed(name);
+        ASSERT_NE(row, nullptr) << name;
+        EXPECT_EQ(row->effect, AttributeEffect::None) << name;
+        EXPECT_FALSE(row->appliesTo.empty())
+            << name << " — an inert row still says which kinds of declaration it "
+                       "may sit on, so the others are warned";
+    }
+    // The import/export words are attributes of the QUALIFIED spelling only: under
+    // the plain one every reference for a non-Windows target warns and ignores them
+    // (gcc 13.3.0, clang 18.1.3, Apple clang), so a plain row would make the word an
+    // attribute — silent, and advertised — on pairs where it is none.
+    EXPECT_EQ(rowNamed("dllimport"), nullptr);
+    EXPECT_EQ(rowNamed("dllexport"), nullptr);
+
+    // The thread-storage request of the qualified spelling: every row that can
+    // declare an object carries it, and on each it yields to a declaration of the
+    // same object that does not make it.
+    std::vector<std::string> carriers;
+    for (auto const& d : sem.declarations) {
+        auto const it = d.linkageSpecifiers.find("__declspec(thread)");
+        if (it == d.linkageSpecifiers.end()) continue;
+        carriers.push_back(d.ruleName);
+        EXPECT_TRUE(it->second.threadStorage) << d.ruleName;
+        EXPECT_TRUE(it->second.threadStorageYieldsOnMismatch) << d.ruleName;
+        EXPECT_FALSE(ignoresName(d, "__declspec(thread)")) << d.ruleName;
+    }
+    std::ranges::sort(carriers);
+    EXPECT_EQ(carriers,
+              (std::vector<std::string>{"autoInferredTopLevelDecl",
+                                        "autoInferredVarDecl", "externDecl",
+                                        "topLevelDecl", "varDecl"}));
+    // CONTROL: the keyword forms of thread storage do NOT yield — two declarations
+    // that disagree through them stay the constraint violation they are.
+    std::size_t firm = 0;
+    for (auto const& d : sem.declarations)
+        for (auto const& [key, effect] : d.linkageSpecifiers)
+            if (effect.threadStorage && key != "__declspec(thread)") {
+                ++firm;
+                EXPECT_FALSE(effect.threadStorageYieldsOnMismatch)
+                    << d.ruleName << " / " << key;
+            }
+    EXPECT_GT(firm, 0u) << "the control must have read at least one keyword form";
+}
+
 // (4) THE LIVE PROOF THAT THE CHECK IS NOT OVER-STRICT. `varDecl` ignores
 //     `attrSpec` and `stdAttr` WHOLESALE BY RULE, so no attribute identifier
 //     can reach its name lookup and it names nothing. Adding one unrelated
@@ -8336,4 +9511,170 @@ TEST(GrammarSchema, StaticInitializerFormsLoadAndEveryMalformedShapeFailsLoud) {
     // An UNDECLARED block is no rule at all: the producer is told nothing (its static
     // objects may be initialized at run time).
     EXPECT_FALSE(otherConstantFormsOf(std::nullopt).has_value());
+}
+
+// P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): WHERE the predicate is
+// admitted — only on a SPECULATIVE alt's candidate that is never the alt's fallback reading for one
+// of its FIRST tokens and never commits after its prefix. Each other way into the rule enters it
+// without a probe, where the predicate cannot be tested; such a grammar is refused at load
+// (C_UnknownShape) rather than skipping the predicate in silence. RED-ON-DISABLE: drop
+// `validateNotFollowedBy` → every refusal below loads.
+TEST(GrammarSchema, NotFollowedByIsAdmittedOnlyWhereAProbeEvaluatesIt) {
+    auto const load = [](std::string const& shapes) {
+        std::string const doc = std::string{R"({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        "A": [{ "kind": "AKind" }],
+        "B": [{ "kind": "BKind" }],
+        "C": [{ "kind": "CKind" }],
+        "X": [{ "kind": "XKind" }]
+      },
+      "shapes": )"} + shapes + "\n    }";
+        return GrammarSchema::loadFromText(doc);
+    };
+    std::string const pair =
+        R"("pair": { "sequence": ["AKind", "BKind"], "notFollowedBy": ["CKind"] })";
+    std::string const triple = R"("triple": { "sequence": ["AKind", "BKind", "CKind"] })";
+    std::string const spec = R"("speculative": true, "lookahead": 3)";
+    {
+        auto ok = load("{ \"root\": { \"alt\": [\"pair\", \"triple\"], " + spec + " }, " + pair
+                       + ", " + triple + " }");
+        ASSERT_TRUE(ok.has_value()) << ok.error()[0].message;
+    }
+    struct Bad { char const* why; std::string shapes; char const* needle; };
+    Bad const bads[] = {
+        {"the declared-last candidate",
+         "{ \"root\": { \"alt\": [\"triple\", \"pair\"], " + spec + " }, " + pair + ", " + triple
+             + " }",
+         "FALLBACK reading"},
+        {"no later candidate starts with its first token",
+         "{ \"root\": { \"alt\": [\"pair\", \"other\"], " + spec + " }, " + pair
+             + R"(, "other": { "sequence": ["XKind"] } })",
+         "FALLBACK reading"},
+        {"a sequence element", "{ \"root\": { \"sequence\": [\"pair\", \"CKind\"] }, " + pair + " }",
+         "outside a speculative alt's candidate list"},
+        {"a candidate of a NON-speculative alt",
+         "{ \"root\": { \"alt\": [\"pair\", \"triple\"] }, " + pair + ", " + triple + " }",
+         "outside a speculative alt's candidate list"},
+        {"beside commitAfterPrefix",
+         "{ \"root\": { \"alt\": [\"pair\", \"triple\"], " + spec + " }, "
+             + R"("pair": { "sequence": ["AKind", "BKind"], "notFollowedBy": ["CKind"], )"
+             + R"("commitAfterPrefix": true }, )" + triple + " }",
+         "mutually exclusive"},
+    };
+    for (Bad const& b : bads) {
+        auto r = load(b.shapes);
+        ASSERT_FALSE(r.has_value()) << b.why;
+        EXPECT_TRUE(std::ranges::any_of(r.error(), [&](auto const& d) {
+            return d.code == DiagnosticCode::C_UnknownShape
+                && d.message.find(b.needle) != std::string::npos;
+        })) << b.why;
+    }
+}
+
+// P69 round 4 (lane `cs`): the POSITIVE twin, `followedByFirstOf`, is held to the same three rules
+// — and BOTH are judged at the alt the PARSER STANDS AT, not at the alt the document wrote. A
+// `repeat` (or `optional`) of an inline alt compiles to two alt positions: the loop entry, which
+// takes the alt's `speculative` and is where the parser dispatches, and the inner alt, which it
+// only ever looks THROUGH. The loader used to walk every speculative alt position as a dispatch
+// site, and both of its answers were wrong at the inner one:
+//   * it called the trailing repeat's only `A`-led candidate a fallback reading — it never is:
+//     that alt skips (its tail is nullable, in a rule that is not the root) before it could replay
+//     — so C's attribute run among type specifiers could not be declared at all;
+//   * it called a speculative alt inside a NON-speculative optional "probed", though the optional
+//     enters its rules directly — a predicate there would have been skipped in silence.
+// RED-ON-DISABLE: judge every speculative alt position again (drop the cursor filter) → the first
+// accepted shape is refused and the nested one loads.
+TEST(GrammarSchema, AFollowerPredicateIsJudgedAtTheAltTheParserStandsAt) {
+    auto const load = [](std::string const& shapes) {
+        std::string const doc = std::string{R"({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        "A": [{ "kind": "AKind" }],
+        "B": [{ "kind": "BKind" }],
+        "C": [{ "kind": "CKind" }],
+        "X": [{ "kind": "XKind" }]
+      },
+      "shapes": )"} + shapes + "\n    }";
+        return GrammarSchema::loadFromText(doc);
+    };
+    std::string const run =
+        R"("run": { "sequence": ["AKind", "BKind"], "followedByFirstOf": "list" })";
+    std::string const triple = R"("triple": { "sequence": ["AKind", "BKind", "CKind"] })";
+    std::string const loop =
+        R"({ "repeat": { "alt": ["XKind", "run"], "speculative": true, "lookahead": 4 } })";
+
+    // ACCEPTED: the trailing repeat of a NON-root rule, `run` its only `A`-led candidate.
+    {
+        auto ok = load(R"({ "root": { "sequence": ["list", "CKind"] }, )"
+                       R"("list": { "sequence": ["XKind", )" + loop + "] }, " + run + " }");
+        ASSERT_TRUE(ok.has_value()) << ok.error()[0].message;
+        auto const& s = **ok;
+        // The token set is the FIRST set of the shape named, resolved at load.
+        ASSERT_EQ(s.followedBy(s.rules().find("run")).size(), 1u);
+        EXPECT_EQ(s.followedBy(s.rules().find("run"))[0].v, s.schemaTokens().find("XKind").v);
+        EXPECT_TRUE(s.notFollowedBy(s.rules().find("run")).empty());
+    }
+    // ACCEPTED: a speculative OPTIONAL (the flag on the optional itself) of the rule — the
+    // optional's position is where the parser stands, it probes, and it skips on failure.
+    {
+        auto ok = load(R"({ "root": { "sequence": ["list", "CKind"] }, )"
+                       R"("list": { "sequence": ["XKind", { "optional": "run", )"
+                       R"("speculative": true, "lookahead": 4 }] }, )" + run + " }");
+        ASSERT_TRUE(ok.has_value()) << ok.error()[0].message;
+    }
+    struct Bad { char const* why; std::string shapes; char const* needle; };
+    Bad const bads[] = {
+        // The SAME trailing repeat in the ROOT rule: a root position that skips could abandon a
+        // token at end-of-source, so the parser does not skip there and the replay is reachable.
+        {"the trailing repeat of the root rule",
+         R"({ "root": { "sequence": ["XKind", )" + loop + "] }, "
+             + R"("run": { "sequence": ["AKind", "BKind"], "followedByFirstOf": "root" } })",
+         "FALLBACK reading"},
+        // A speculative alt INSIDE a non-speculative optional: the optional is where the parser
+        // stands, and it enters `run` directly.
+        {"a speculative alt inside a NON-speculative optional",
+         R"({ "root": { "sequence": ["list", "CKind"] }, )"
+             R"("list": { "sequence": ["XKind", { "optional": { "alt": ["run", "triple"], )"
+             R"("speculative": true, "lookahead": 4 } }] }, )" + run + ", " + triple + " }",
+         "outside a speculative alt's candidate list"},
+        // …and inside a non-speculative alt.
+        {"a speculative alt inside a NON-speculative alt",
+         R"({ "root": { "sequence": ["list", "CKind"] }, )"
+             R"("list": { "alt": ["XKind", { "alt": ["run", "triple"], "speculative": true, )"
+             R"("lookahead": 4 }] }, )" + run + ", " + triple + " }",
+         "outside a speculative alt's candidate list"},
+        // A shape with no FIRST set can never follow anything.
+        {"a named shape that does not exist",
+         R"({ "root": { "sequence": ["list", "CKind"] }, )"
+             R"("list": { "sequence": ["XKind", )" + loop + "] }, "
+             + R"("run": { "sequence": ["AKind", "BKind"], "followedByFirstOf": "nowhere" } })",
+         "followedByFirstOf"},
+        // One follower predicate per shape.
+        {"both predicates on one shape",
+         R"({ "root": { "sequence": ["list", "CKind"] }, )"
+             R"("list": { "sequence": ["XKind", )" + loop + "] }, "
+             + R"("run": { "sequence": ["AKind", "BKind"], "followedByFirstOf": "list", )"
+             + R"("notFollowedBy": ["CKind"] } })",
+         "mutually exclusive"},
+        // A probe that commits after its prefix never reaches the clean close.
+        {"beside commitAfterPrefix",
+         R"({ "root": { "sequence": ["list", "CKind"] }, )"
+             R"("list": { "sequence": ["XKind", )" + loop + "] }, "
+             + R"("run": { "sequence": ["AKind", "BKind"], "followedByFirstOf": "list", )"
+             + R"("commitAfterPrefix": true } })",
+         "mutually exclusive"},
+    };
+    for (Bad const& b : bads) {
+        auto r = load(b.shapes);
+        ASSERT_FALSE(r.has_value()) << b.why;
+        EXPECT_TRUE(std::ranges::any_of(r.error(), [&](auto const& d) {
+            return d.code == DiagnosticCode::C_UnknownShape
+                && d.message.find(b.needle) != std::string::npos;
+        })) << b.why << " — got: " << r.error()[0].message;
+    }
 }

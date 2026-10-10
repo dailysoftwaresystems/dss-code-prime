@@ -24,3 +24,13 @@ steps:
       python3 ./refresh_landing_log.py --check
     successPattern: 'refresh_landing_log: --check OK'
     requireInputsUnmoved: true
+
+  # The REWRITE -- a TREE WRITER, run only where a run names it: `dssharness run refresh_landing_log-write`,
+  # the runner that runs it on ONE leg, this machine's own tree (config.json). It rewrites tracked plan files
+  # by design, so it cannot carry requireInputsUnmoved; a plain run afterwards checks.
+  - name: write
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./refresh_landing_log.py --write
+    successPattern: '^refresh_landing_log: --write OK \('

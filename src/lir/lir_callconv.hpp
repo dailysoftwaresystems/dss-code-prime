@@ -47,9 +47,13 @@
 //                                                  Zero on leaf fns (no
 //                                                  calls means no callee
 //                                                  to home args for).
-//   [SP+outgoingArgAreaSize
-//      .. SP+outgoingArgAreaSize+savedRegAreaSize) saved callee-saved regs
-//   [SP+outgoingArgAreaSize+savedRegAreaSize ..)   spill slots
+//   [SP+savedRegAreaOffset()
+//      .. SP+savedRegAreaOffset()+savedRegAreaSize) saved callee-saved regs
+//                                                  (savedRegAreaOffset() is
+//                                                  outgoingArgAreaSize rounded
+//                                                  up to the widest register
+//                                                  the area saves, if any)
+//   [SP+savedRegAreaOffset()+savedRegAreaSize ..)  spill slots
 //   [SP+totalFrameSize)                            the original pre-prologue SP
 //
 // `outgoingArgAreaSize = hasCalls ? (cc.shadowSpaceBytes +
@@ -62,12 +66,12 @@
 //    ? alignedSizeWithBias(rawPreShadow, cc.stackAlignment,
 //                          cc.callPushBytes)
 //    : alignUp(rawPreShadow, cc.stackAlignment)`
-// where `rawPreShadow = outgoingArgAreaSize + savedRegAreaSize +
+// where `rawPreShadow = savedRegAreaOffset() + savedRegAreaSize +
 // spillAreaSize`. The Win64 shadow-space requirement collapses INTO
 // outgoingArgAreaSize (no separate max() with shadowSpaceBytes —
 // it's already there).
 //
-// Spill slot N is at offset `outgoingArgAreaSize + savedRegAreaSize +
+// Spill slot N is at offset `savedRegAreaOffset() + savedRegAreaSize +
 // N * regWidth`. `regWidth` is the cc's primary integer register
 // width (8 bytes on x86_64/ARM64).
 //
@@ -122,9 +126,13 @@ namespace dss {
 //
 // Consumers:
 //   * Trampoline emitter (`src/link/entry_trampoline.cpp`): passes
-//     `rawBytes = cc.shadowSpaceBytes`, `entryBias =
-//     cc.entryStackPointerBias`. Result: 40 on Win64 (32 shadow +
-//     8 realign), 0 on SysV ELF / Mach-O / ARM64.
+//     `rawBytes = cc.shadowSpaceBytes` and the DERIVED process-entry
+//     bias — `cc.callPushBytes` when the exec format's
+//     `entryTransition` says the loader CALLS the entry, 0 when it
+//     JUMPS (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
+//     Result: 40 on pe64 (32 shadow + 8 realign), 8 on Mach-O x86_64
+//     (called, no shadow), 0 on ELF x86_64 (jumped) and on every arm64
+//     (BL pushes nothing).
 //   * ML7 callconv lowering (`lir_callconv.cpp::computeFrameLayout`):
 //     anchored D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY for when normal-
 //     function call-site shadow-space tightening lands (today ML7
@@ -141,7 +149,9 @@ namespace dss {
 // load time enforces these for cc fields):
 //   * `stackAlignment` is a non-zero power of two.
 //   * `entryBias < stackAlignment` (bias is an offset INTO the
-//     quantum, not a multiple of it).
+//     quantum, not a multiple of it — the target validator holds
+//     `callPushBytes` to it, the one value a derived bias can take
+//     besides 0).
 //
 // `stackAlignment == 0` returns `rawBytes` verbatim (degenerate
 // case for non-register-machine targets).
@@ -643,12 +653,23 @@ private:
 // class, which necessarily restarted at 0 because the scalars were no longer
 // there to advance it. Identical rule, identical object, overlapping bytes.
 // ⇒ For ANY ONE CALL exactly one instance places anything. `lowerWideCallArgs`
-// owns it (it is the last tier holding the complete argument list), states every
-// aggregate's offset on its carrier and stamps `kLirInstFlagOutgoingArgsPlaced`
-// on the Call; the call arm then READS those offsets and REFUSES if asked to
-// place anything at all. The pre-scan and the callee's `arg` arm walk different
-// argument lists (the caller's reservation, the callee's own incoming region) and
-// are unaffected.
+// owns it (it is the last tier holding the complete argument list) and stamps
+// `kLirInstFlagOutgoingArgsPlaced` on the Call. ★ Since P69 round 4 that pass
+// also WRITES what it places: a stacked scalar as a `store_outgoing_arg` at its
+// byte offset, and a stacked by-value aggregate as its BYTES, copied chunk by
+// chunk before register allocation — the `(Reg, ByValueStackAgg)` carrier leaves
+// the Call, and no offset is stated on a carrier any more (the trailing
+// `MemOffset` this comment used to describe as "the aggregate's offset stated on
+// its carrier, which the call arm READS" is a form no pass produces now). So on
+// every Call the pipeline lowers the call arm places NOTHING and copies nothing.
+// The call arm's own instance and its copy remain for a module that never went
+// through that pass — a hand-built one (tests/lir, tests/asm): it copies a
+// carrier at a stated offset, places an unplaced one itself on an UNSTAMPED Call,
+// and REFUSES to place anything on a stamped one. Removing that residual arm,
+// together with the carrier form's other consumers, is owned by
+// D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET.
+// The pre-scan and the callee's `arg` arm walk different argument lists (the
+// caller's reservation, the callee's own incoming region) and are unaffected.
 //
 // ★ THE ACCESS WIDTH IS PART OF THE PLACEMENT, NOT A SEPARATE DECISION. Under
 // `Slot` the datum owns the whole pointer-width slot — the caller stored a whole
@@ -832,10 +853,12 @@ struct DSS_EXPORT FrameLayout {
     // spill area and the local-alloca area so the local base lands on the
     // max-local-alignment boundary. Nonzero ONLY when a function has an
     // over-aligned local (`alignas`, or a naturally >8-aligned type like
-    // `long double`) AND the raw local base (outgoing+saved+spill) does not
+    // `long double`) AND the raw local base (the spill area's end) does not
     // already satisfy that alignment — i.e. an ODD outgoing-arg count leaves the
-    // base ≡ 8 (mod 16). Every other frame keeps this 0 → its layout is
-    // byte-identical to before this cycle (the zero-blast-radius invariant).
+    // base ≡ 8 (mod 16), in a frame whose saved-register area was not itself
+    // moved onto that boundary by a 16-byte save (`savedRegAreaOffset`). Every
+    // other frame keeps this 0 → its layout is byte-identical to before this
+    // cycle (the zero-blast-radius invariant).
     // Folded into `localAreaOffset()` (so alloca offsets shift with it) AND into
     // `totalFrameSize` (so the prologue grows + RSP stays call-aligned).
     std::uint32_t       localAreaAlignPad = 0;
@@ -872,22 +895,56 @@ struct DSS_EXPORT FrameLayout {
     // CFI emitters) can verify the invariant without re-scanning
     // the source LIR.
     bool                hasCalls          = false;
+    // The saved-register area's OWN alignment, in bytes: the widest save the
+    // prologue makes into it — per saved register, the bytes of it the
+    // convention preserves (`calleeSavedAccessFlags`, the owner the prologue
+    // asks for each store's width). 0 when the function saves no register.
+    // `savedRegAreaOffset()` rounds the area's base up to it. Last among the
+    // data members so that no existing initializer of this struct moves.
+    std::uint32_t       savedRegAreaAlign = 0;
 
-    // Derived: saved-reg area starts immediately after the outgoing-
-    // args area. Updated by D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 closure (2026-06-02) — the
+    // Derived: THE SAVED-REGISTER AREA BEGINS AT A MULTIPLE OF THE WIDEST
+    // REGISTER IT SAVES — the first one at or above the end of the
+    // outgoing-args area. That area is counted in POINTER-width slots
+    // (`outgoingSlotSize`), so an odd count of them ends 8 bytes off a
+    // multiple of 16; a register saved WHOLE at 16 bytes would then sit in an
+    // unaligned slot, and an unwind format may be able to state such a save
+    // only at a multiple of the register's width (D-WIN64-XMM-UNWIND-RESTORE:
+    // both vector save codes of Win64 UNWIND_INFO, by the format's own
+    // documentation). The slots above the base are `slotSize` apart, and
+    // `slotSize` is the widest register of every class that occupies one
+    // (`frameSlotStride`), so a base on the boundary puts every slot on it.
+    //
+    // ★ KEYED ON WHAT THE AREA HOLDS (`savedRegAreaAlign`), NOT ON ITS STRIDE.
+    // The stride is as wide as the target's widest float register whether or
+    // not the function saves one. Rounding to it would move the frame of
+    // EVERY function whose widest call passes an odd count of stack slots —
+    // and grow most of them by a whole stack-alignment unit — to align saves
+    // that are a pointer wide. A function that saves nothing wider than a
+    // pointer keeps the frame it always had: its base IS the outgoing area's
+    // end. This is a rule of the layout — no calling convention and no object
+    // format is named — and the spill area and the locals above inherit the
+    // base. The outgoing area keeps its exact size either way: a callee reads
+    // its stack arguments there, and the VLA watermark is biased by it.
+    //
+    // The outgoing-args area itself: updated by D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 closure (2026-06-02) — the
     // outgoing area is the new SP+0 zone for stack-arg overflow on
     // ANY cc that overflows its argGprs/argFprs pool. Zero when this
     // function makes no calls or every call fits in the register
     // pool — backward-compatible with leaf-fn / register-only-call
     // shapes.
     [[nodiscard]] constexpr std::uint32_t
-    savedRegAreaOffset() const noexcept { return outgoingArgAreaSize; }
+    savedRegAreaOffset() const noexcept {
+        if (savedRegAreaAlign <= 1u) return outgoingArgAreaSize;   // nothing saved
+        return (outgoingArgAreaSize + savedRegAreaAlign - 1u)
+             / savedRegAreaAlign * savedRegAreaAlign;
+    }
 
     // Derived: spill area starts immediately after the saved-reg area
     // (which itself starts after the outgoing-args area).
     [[nodiscard]] constexpr std::uint32_t
     spillAreaOffset() const noexcept {
-        return outgoingArgAreaSize + savedRegAreaSize;
+        return savedRegAreaOffset() + savedRegAreaSize;
     }
 
     // Local-int codegen (plan step 13.3b): local-alloca area
@@ -920,8 +977,7 @@ struct DSS_EXPORT FrameLayout {
         // non-over-aligned frame) shifts the local base up to its required
         // boundary. Both the alloca-offset progression and `vaRegSaveAreaOffset`
         // derive from this, so the whole topmost frame region moves in lockstep.
-        return outgoingArgAreaSize + savedRegAreaSize + spillAreaSize
-             + localAreaAlignPad;
+        return spillAreaOffset() + spillAreaSize + localAreaAlignPad;
     }
 
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the variadic register-save-area sits
@@ -1001,6 +1057,12 @@ struct DSS_EXPORT LirCallconvResult {
     // Empty for a function whose frame is entirely absent (a zero-size frame
     // with no callee-saves changes nothing, so it has nothing to say).
     std::vector<LirFuncCfi> perFuncCfi;
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: this pass INSERTS blocks (the guard-page
+    // walk of a runtime stack descent, D-CSUBSET-VLA-WIN64-STACK-PROBE), so it publishes its block entry
+    // image: indexed by the SOURCE module's block arena (`LirBlockId.v`; slot 0 holds 0), the `.v` of the
+    // block of `lir` where that block's instructions begin. A source block's pieces run from there to the
+    // next source block's entry. `lir/lir_descriptor_blocks.hpp` follows the blocks data names through it.
+    std::vector<std::uint32_t> blockEntryImage;
     // True iff `materializeCallingConvention` ran to its successful conclusion.
     // Set ONLY at the final return, so EVERY failure early-return (a config /
     // per-function / SEH / VLA-verifier reject — each returns an empty or

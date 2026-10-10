@@ -1,0 +1,2 @@
+        if (a->unionMember.has_value() && lv.core != TypeKind::Union) {
+            std::string_view const core = literalCoreName(lv.core);

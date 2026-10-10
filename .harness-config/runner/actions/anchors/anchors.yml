@@ -1,15 +1,17 @@
-# PURPOSE: read and lint deferred-anchor registry rows, and launch the one door that writes them, dssharness write-anchor and set-anchor.
+# PURPOSE: the library the anchors family shares -- the registry row reader, its vocabulary and the one launcher of the door that writes rows, dssharness write-anchor and set-anchor.
 name: anchors
 description: >-
-  The action proves the registry row reader, its vocabulary and the door's launcher
-  can fail, and drives every refusal of the door itself in git fixture trees.
-  The program documents itself in its own header; this file declares only how a
-  runner starts it and what witnesses that it ran.
+  A LIBRARY, loaded by `anchor-rows` and `check-stale-blockers`; it has no verb of its own (its
+  `read` and `list` retired on 2026-09-30: `dssharness read-anchor` and `read-anchors` answer both). The
+  self-test proves the registry row reader, its vocabulary and the door's launcher can fail, and its
+  parity arms send the shapes the door must refuse through the REAL door in git fixture trees, so a door
+  that stops refusing one reds this action. The program documents itself in its own header; this file
+  declares only how a runner starts it and what witnesses that it ran.
   Gated by ctest as `anchors_selftest_guard`.
 steps:
   - name: self-test
     workingDirectoryRoot: action
     run: |
       python3 ./anchors.py --self-test
-    successPattern: 'anchors self-test: 0 failed'
+    successPattern: '^anchors self-test: \d+ arm\(s\), 0 failed$'
     requireInputsUnmoved: true

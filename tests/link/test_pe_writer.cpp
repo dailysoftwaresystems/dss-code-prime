@@ -2943,6 +2943,7 @@ TEST(PeExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
@@ -3023,19 +3024,25 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     // D-WIN64-PDATA-XDATA-UNWIND host-independent structural pin. A pe64
     // function carrying call-frame information (frame alloc + callee-saves) gets
     // a .pdata RUNTIME_FUNCTION + a .xdata UNWIND_INFO, and the EXCEPTION
-    // data directory (index 3) points at .pdata. Also pins the c114 FPR
-    // decision: a saved FPR (MS-x64 xmm6..15, spilled low-64 via MOVSD) is
-    // OMITTED from the unwind codes (no matching UWOP; RSP-irrelevant) while
-    // its 8-byte store STILL advances the following GPR saves' CodeOffsets.
+    // data directory (index 3) points at .pdata.
     //
-    // Frame 0x20 (ALLOC_SMALL slots=4) + prologue-order saves
-    // [xmm6@0, rbx@8, rbp@16]; the `mov` cursor starts at allocLen=7 (sub
-    // rsp,imm32) then +8 per store: xmm6→15 (omitted), rbx→23, rbp→31.
-    // RED-on-disable: reverting the FPR-omit to the old fail-loud makes
-    // encode() report an error; mis-passing the DSS ordinal (30) for xmm6
-    // instead of its hwEncoding (6) makes its width 9 → rbx CodeOffset 24,
-    // not 23; dropping the emission entirely removes .pdata/.xdata. Runs on
-    // every leg (pure byte inspection, no execution).
+    // ★ IT ALSO PINS D-WIN64-XMM-UNWIND-RESTORE FOR A FUNCTION THAT GUARDS NO
+    // REGION. A saved 16-byte vector register (MS-x64 xmm6..15) has a code of
+    // its own, UWOP_SAVE_XMM128, at the offset the prologue stores it — the
+    // code is what hands a frame further up ITS value of that register when a
+    // fault unwinds through this one, so it is owed by every function that
+    // saves one, guarding or not. (Until 2026-10-10 the save was OMITTED from
+    // the codes and this test required the omission: `CountOfCodes` 5.)
+    //
+    // Frame 0x28 (ALLOC_SMALL slots=5) + prologue-order saves
+    // [xmm6@16, rbx@8, rbp@32], their rules at the PCs the CFI states: 15, 23
+    // and 31. WHAT EACH WRONG ENCODER DOES TO THESE BYTES: one that states no
+    // vector code answers CountOfCodes 5 and moves the ALLOC code up; one that
+    // scales the vector slot by 8, as a general register's is, answers node 2
+    // for xmm6; dropping the emission entirely removes .pdata/.xdata. (The
+    // register field cannot tell the hardware number 6 from the DSS ordinal
+    // 22 here: the field is four bits and the ordinal is the number plus 16.)
+    // Runs on every leg (pure byte inspection, no execution).
     auto loaded = loadShippedExec();
     ASSERT_TRUE(loaded.format);
     ASSERT_TRUE(loaded.target);
@@ -3044,14 +3051,14 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
     fn.symbol = SymbolId{1};
-    // sub rsp, 0x20 (48 81 EC 20 00 00 00) ; ret (C3) — first byte 0x48
+    // sub rsp, 0x28 (48 81 EC 28 00 00 00) ; ret (C3) — first byte 0x48
     // satisfies the prologue-shape guard; the rest is opaque to the builder.
-    fn.bytes = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+    fn.bytes = {0x48, 0x81, 0xEC, 0x28, 0x00, 0x00, 0x00, 0xC3};
     // The CFI states each rule's PC DIRECTLY -- these are the byte offsets the
     // assembler measures for this prologue, not lengths the writer re-derives
-    // from an assumed encoding. Frame 0x20 on a convention whose CALL pushes 8,
-    // so the CFA is 8+0x20 = 40 once the sub retires, and each save's
-    // CFA-relative offset is its RSP slot minus 40. xmm6 is physical ordinal 22
+    // from an assumed encoding. Frame 0x28 on a convention whose CALL pushes 8,
+    // so the CFA is 8+0x28 = 48 once the sub retires, and each save's
+    // CFA-relative offset is its RSP slot minus 48. xmm6 is physical ordinal 22
     // (the FPR file starts at 16); its HARDWARE encoding is 6.
     CfiFunction cfi;
     cfi.codeLength    = 8;
@@ -3060,10 +3067,10 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
                                         /*returnAddressRegister=*/std::nullopt};
     cfi.prologueEndPc = 31;
     cfi.ops = {
-        CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{},  40},
-        CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(22), CfiRegRef{}, -40},
-        CfiOp{23, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(3),  CfiRegRef{}, -32},
-        CfiOp{31, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(5),  CfiRegRef{}, -24},
+        CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{},  48},
+        CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(22), CfiRegRef{}, -32},
+        CfiOp{23, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(3),  CfiRegRef{}, -40},
+        CfiOp{31, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(5),  CfiRegRef{}, -16},
     };
     fn.cfi = std::move(cfi);
     mod.functions.push_back(std::move(fn));
@@ -3071,7 +3078,7 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     DiagnosticReporter rep;
     auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
-    ASSERT_EQ(rep.errorCount(), 0u);   // the FPR save no longer fails loud
+    ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(img.empty());
 
     auto const [textRva, textPtr] =
@@ -3095,29 +3102,36 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     EXPECT_EQ(readU32LE(img, pdataPtr + 8u), xdataRva)     << "UnwindInfoAddress";
 
     // (3) The UNWIND_INFO, byte-for-byte. Header: Ver=1/Flags=0, SizeOfProlog
-    //     = 31, CountOfCodes = 5 (2 GPR saves ×2 nodes + 1 ALLOC_SMALL) — NOT
-    //     7 (the xmm6 save contributes NO code), FrameReg/Off = 0. Codes are
-    //     DESCENDING by CodeOffset: rbp(31), rbx(23), then ALLOC(7).
+    //     = 31, CountOfCodes = 7 (2 general saves x 2 nodes + 1 vector save x
+    //     2 nodes + 1 ALLOC_SMALL) — 5 is an encoder that states no vector
+    //     code — FrameReg/Off = 0. Codes are DESCENDING by CodeOffset: rbp(31),
+    //     rbx(23), xmm6(15), then ALLOC(7).
     std::size_t const u = xdataPtr;
     EXPECT_EQ(img[u + 0], 0x01u) << "Version=1, Flags=0";
     EXPECT_EQ(img[u + 1], 31u)   << "SizeOfProlog";
-    EXPECT_EQ(img[u + 2], 5u)    << "CountOfCodes: xmm6 omitted (else 7)";
+    EXPECT_EQ(img[u + 2], 7u)    << "CountOfCodes: the xmm6 save has its code (5 = omitted)";
     EXPECT_EQ(img[u + 3], 0x00u) << "FrameRegister=0, FrameOffset=0";
-    // rbp: UWOP_SAVE_NONVOL(4) | reg 5<<4 = 0x54, CodeOffset 31, node 16/8=2.
+    // rbp: UWOP_SAVE_NONVOL(4) | reg 5<<4 = 0x54, CodeOffset 31, node 32/8=4.
     EXPECT_EQ(img[u + 4], 31u)   << "rbp CodeOffset";
     EXPECT_EQ(img[u + 5], 0x54u) << "rbp SAVE_NONVOL | reg=5";
-    EXPECT_EQ(readU16LE(img, u + 6), 2u) << "rbp scaled offset 16/8";
+    EXPECT_EQ(readU16LE(img, u + 6), 4u) << "rbp scaled offset 32/8";
     // rbx: 0x34, CodeOffset 23 -- the PC the CFI STATED, carried through
     // untouched. The builder no longer computes it from an assumed store width,
     // which is exactly the defect that left every FPR-saving pe64 function's
     // SizeOfProlog one byte short PER SAVE
     // (D-WIN64-UNWIND-XMM-SPILL-WIDTH-ASSUMED-NINE-MEASURED-TEN).
-    EXPECT_EQ(img[u + 8], 23u)   << "rbx CodeOffset (xmm6 width was 8)";
+    EXPECT_EQ(img[u + 8], 23u)   << "rbx CodeOffset";
     EXPECT_EQ(img[u + 9], 0x34u) << "rbx SAVE_NONVOL | reg=3";
     EXPECT_EQ(readU16LE(img, u + 10), 1u) << "rbx scaled offset 8/8";
-    // ALLOC_SMALL(2) | (slots-1=3)<<4 = 0x32, CodeOffset 7 (end of sub rsp).
-    EXPECT_EQ(img[u + 12], 7u)    << "ALLOC CodeOffset";
-    EXPECT_EQ(img[u + 13], 0x32u) << "ALLOC_SMALL | (slots-1)=3";
+    // xmm6: UWOP_SAVE_XMM128(8) | hardware number 6<<4 = 0x68, CodeOffset 15
+    // (the end of its store), node 16/16 = 1 — a vector slot is scaled by
+    // SIXTEEN, so the same slot read as a general register's would say 2.
+    EXPECT_EQ(img[u + 12], 15u)   << "xmm6 CodeOffset";
+    EXPECT_EQ(img[u + 13], 0x68u) << "xmm6 SAVE_XMM128 | reg=6";
+    EXPECT_EQ(readU16LE(img, u + 14), 1u) << "xmm6 scaled offset 16/16";
+    // ALLOC_SMALL(2) | (slots-1=4)<<4 = 0x42, CodeOffset 7 (end of sub rsp).
+    EXPECT_EQ(img[u + 16], 7u)    << "ALLOC CodeOffset";
+    EXPECT_EQ(img[u + 17], 0x42u) << "ALLOC_SMALL | (slots-1)=4";
 }
 
 TEST(PeExecWriter, VlaFramePointerCaptureEmitsSetFpregSoTheFrameIsDescribable) {
@@ -3392,63 +3406,93 @@ TEST(PeExecWriter, SehScopeTableEmitsEhandlerFlagAndScopeRecord) {
     EXPECT_EQ(readU32LE(img, u + 28), parentRva + 0x18u) << "JumpTarget = parent+0x18";
 }
 
-TEST(PeExecWriter, SehGuardingFunctionSavingNonVolatileXmmFailsLoud) {
-    // c116 (D-WIN64-XMM-UNWIND-RESTORE, the H5 invariant): a __try-guarding
-    // function (non-empty sehScopes) that spills a NON-VOLATILE xmm must FAIL
-    // LOUD, not silently emit an unwind table that omits UWOP_SAVE_XMM128 — the
-    // __except handler resumes in the parent frame and could read an unrestored
-    // xmm. sqlite's WAL SEH functions spill zero non-volatile xmm (the H5 proof),
-    // so this never fires for the shipped corpus; the guard converts that proof
-    // into an ENFORCED invariant. RED-on-disable: drop the guardsSeh arm in
-    // pe.cpp buildFunctionUnwindInfo → the FPR save is silently omitted (as it
-    // legitimately is for a NON-SEH function) → this function encodes cleanly and
-    // ships a broken unwind table. The paired negative (a NON-SEH function with
-    // the same xmm save encodes fine) is the FunctionUnwindInfoEmitsPdata... test
-    // above (xmm6 omitted, no error).
+TEST(PeExecWriter, GuardingFunctionSavingVectorRegistersStatesEachSaveCode) {
+    // D-WIN64-XMM-UNWIND-RESTORE. A `__try`-guarding function that saves a
+    // call-preserved vector register used to be REFUSED here (this test was
+    // `SehGuardingFunctionSavingNonVolatileXmmFailsLoud` and required the
+    // refusal): the unwind information could not say where the register was,
+    // so a handler resuming in that frame could have read an unrestored one.
+    // The format CAN say it, and the reference does (✔MEASURED, cl 19.51 x64
+    // /O2: `movaps [rsp+30h],xmm6` ending at prologue byte 11 is `@11
+    // SAVE_XMM128 xmm6, 3` in a function that guards a region) — so the
+    // refusal was of valid programs: every guarding function with a `double`
+    // live across a call. This pins the capability in its three parts:
+    //
+    //   (A) THE SCALED FORM, in a guarding function: a slot that is a multiple
+    //       of 16 from RSP is `UWOP_SAVE_XMM128`, one node holding slot/16 —
+    //       and the scope table still sits right after the DWORD-aligned
+    //       codes, wherever the longer code array ends.
+    //   (B) THE FAR FORM IS THE FAR REACH: a slot whose quotient by 16 does
+    //       not fit one node is `UWOP_SAVE_XMM128_FAR`, the slot UNSCALED in
+    //       two nodes, low word first.
+    //   (C) WHAT STAYS REFUSED, BY NAME: a saved register that is neither a
+    //       general register nor a whole 16-byte vector register; a vector
+    //       slot below the stack pointer; a vector slot that is NOT A
+    //       MULTIPLE OF 16 — the format's documentation says of both codes
+    //       that the offset is always one, and the frame producer guarantees
+    //       it, so such a rule is a broken frame and neither form may be
+    //       used to state it; and a vector register whose hardware number
+    //       does not fit the code's four bits.
     auto loaded = loadShippedExec();
     ASSERT_TRUE(loaded.format);
     ASSERT_TRUE(loaded.target);
 
     AssembledModule mod;
     mod.expectedFuncCount = 2;
-    // Same parent shape as the scope-table test, but its prologue ALSO saves a
-    // non-volatile xmm (xmm6). sub rsp,0x20 (7B) then movsd [rsp],xmm6 — the
-    // bytes past [0] are opaque to the unwind builder (it reads the CFI).
+    // Function 0: the PARENT, guarding one region. Its prologue is the shape
+    // the frame producer emits — the allocation, then one whole-register store
+    // per saved register:
+    //   sub rsp,0x48 ; movups [rsp+0x20],xmm6 ; movups [rsp+0x30],xmm15
+    // ending at bytes 7, 15 and 24. The builder reads the CFI, not the bytes.
     AssembledFunction parent;
     parent.symbol = SymbolId{1};
-    parent.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00,          // sub rsp,0x20
-                     0xF2, 0x0F, 0x11, 0x34, 0x24,                      // movsd [rsp],xmm6
-                     0x90, 0x90, 0x90, 0xC3};
+    parent.bytes  = {0x48, 0x81, 0xEC, 0x48, 0x00, 0x00, 0x00,              // 0..6
+                     0x0F, 0x11, 0xB4, 0x24, 0x20, 0x00, 0x00, 0x00,        // 7..14
+                     0x44, 0x0F, 0x11, 0xBC, 0x24, 0x30, 0x00, 0x00, 0x00,  // 15..23
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,        // 24..31
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,        // 32..39
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xC3};       // 40..47
     {
         CfiFunction cfi;
-        cfi.codeLength    = 16;
+        cfi.codeLength    = 48;
         cfi.initial       = CfiInitialState{4, 8, -8, std::nullopt};
-        cfi.prologueEndPc = 17;
+        cfi.prologueEndPc = 24;
         cfi.ops = {
-            CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{}, 0x28},
-            // xmm6 = physical ordinal 22 (non-volatile under ms_x64).
-            CfiOp{17, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(22), CfiRegRef{}, -0x28},
+            // CFA = RSP + 0x50 once the allocation retires; a slot at RSP+S is
+            // at CFA + (S - 0x50). xmm6 and xmm15 are physical ordinals 22 and
+            // 31; their hardware numbers are 6 and 15.
+            CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{}, 0x50},
+            CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(22), CfiRegRef{}, 0x20 - 0x50},
+            CfiOp{24, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(31), CfiRegRef{}, 0x30 - 0x50},
         };
         parent.cfi = std::move(cfi);
         SehScopeEntry sc;
-        sc.beginByteOffset      = 0x0C;
-        sc.endByteOffset        = 0x0F;
-        sc.jumpTargetByteOffset = 0x0F;
+        sc.beginByteOffset      = 0x18;
+        sc.endByteOffset        = 0x20;
+        sc.jumpTargetByteOffset = 0x28;
         sc.filterFuncletSymbol  = SymbolId{2};
         sc.personalitySymbol    = SymbolId{3};
         parent.sehScopes.push_back(sc);
     }
     mod.functions.push_back(std::move(parent));
+    // Function 1: the FILTER FUNCLET, which guards nothing. Its one vector
+    // save sits 16 * 0x10000 bytes above RSP — a slot no shipped frame reaches
+    // (the allocation codes stop at 512 KiB), stated here because the rule is
+    // the builder's input and the quotient's bound is the builder's to honour.
     AssembledFunction funclet;
     funclet.symbol = SymbolId{2};
-    funclet.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+    funclet.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00,
+                      0x0F, 0x11, 0xBC, 0x24, 0x00, 0x00, 0x10, 0x00, 0xC3};
     {
         CfiFunction cfi;
-        cfi.codeLength    = 8;
+        cfi.codeLength    = 16;
         cfi.initial       = CfiInitialState{4, 8, -8, std::nullopt};
-        cfi.prologueEndPc = 7;
-        cfi.ops = { CfiOp{7, CfiOpKind::DefCfaOffset, CfiRegRef{},
-                          CfiRegRef{}, 0x28} };
+        cfi.prologueEndPc = 15;
+        cfi.ops = {
+            CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{}, 0x28},
+            // xmm7 = physical ordinal 23.
+            CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(23), CfiRegRef{}, 0x100000 - 0x28},
+        };
         funclet.cfi = std::move(cfi);
     }
     mod.functions.push_back(std::move(funclet));
@@ -3456,11 +3500,168 @@ TEST(PeExecWriter, SehGuardingFunctionSavingNonVolatileXmmFailsLoud) {
         ExternImport{SymbolId{3}, "__C_specific_handler", "msvcrt.dll",
                      /*isData=*/false});
 
-    DiagnosticReporter rep;
-    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_GT(rep.errorCount(), 0u)
-        << "a SEH-guarding function saving a non-volatile xmm must fail loud "
-           "(D-WIN64-XMM-UNWIND-RESTORE), not silently omit its restore";
+    {
+        DiagnosticReporter rep;
+        auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u)
+            << "a guarding function that saves a vector register is describable";
+        ASSERT_FALSE(img.empty());
+
+        auto const [textRva, textPtr] =
+            findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+        auto const [pdataRva, pdataPtr] =
+            findExecSection(img, {'.', 'p', 'd', 'a', 't', 'a', 0, 0});
+        auto const [xdataRva, xdataPtr] =
+            findExecSection(img, {'.', 'x', 'd', 'a', 't', 'a', 0, 0});
+        ASSERT_NE(textRva, 0u);
+        ASSERT_NE(pdataRva, 0u) << ".pdata section must exist";
+        ASSERT_NE(xdataRva, 0u) << ".xdata section must exist";
+        std::uint32_t const parentRva  = textRva;
+        std::uint32_t const funcletRva = textRva + 48u;
+        // Each function's UNWIND_INFO is found the way the system finds it:
+        // through its own RUNTIME_FUNCTION.
+        ASSERT_EQ(readU32LE(img, pdataPtr + 0u), parentRva);
+        ASSERT_EQ(readU32LE(img, pdataPtr + 12u), funcletRva);
+        std::size_t const u =
+            xdataPtr + (readU32LE(img, pdataPtr + 8u) - xdataRva);
+        std::size_t const f =
+            xdataPtr + (readU32LE(img, pdataPtr + 20u) - xdataRva);
+
+        // (A) the parent. Header: Version 1 | EHANDLER, SizeOfProlog 24,
+        // CountOfCodes 5 = xmm15 scaled (2 nodes) + xmm6 scaled (2) +
+        // ALLOC_SMALL (1). Codes DESCENDING by CodeOffset.
+        EXPECT_EQ(img[u + 0], 0x09u) << "Version=1, UNW_FLAG_EHANDLER";
+        EXPECT_EQ(img[u + 1], 24u)   << "SizeOfProlog";
+        EXPECT_EQ(img[u + 2], 5u)    << "CountOfCodes (1 = both vector saves omitted)";
+        EXPECT_EQ(img[u + 3], 0x00u) << "no frame register";
+        // xmm15 at RSP+0x30: UWOP_SAVE_XMM128(8) | 15<<4 = 0xF8, node 0x30/16 = 3.
+        EXPECT_EQ(img[u + 4], 24u)   << "xmm15 CodeOffset";
+        EXPECT_EQ(img[u + 5], 0xF8u) << "xmm15 SAVE_XMM128 | reg=15";
+        EXPECT_EQ(readU16LE(img, u + 6), 3u) << "xmm15 slot / 16 (6 = scaled by 8)";
+        // xmm6 at RSP+0x20: UWOP_SAVE_XMM128(8) | 6<<4 = 0x68, node 0x20/16 = 2.
+        EXPECT_EQ(img[u + 8], 15u)   << "xmm6 CodeOffset";
+        EXPECT_EQ(img[u + 9], 0x68u) << "xmm6 SAVE_XMM128 | reg=6";
+        EXPECT_EQ(readU16LE(img, u + 10), 2u) << "xmm6 slot / 16 (4 = scaled by 8)";
+        // ALLOC_SMALL(2) | (0x48/8 - 1 = 8)<<4 = 0x82.
+        EXPECT_EQ(img[u + 12], 7u)    << "ALLOC CodeOffset";
+        EXPECT_EQ(img[u + 13], 0x82u) << "ALLOC_SMALL | (slots-1)=8";
+        // Header (4) + five nodes (10) = 14; the code array is padded to an
+        // even count of nodes, so the handler routine's RVA and the scope
+        // table follow at 16.
+        EXPECT_GE(readU32LE(img, u + 16), textRva) << "handler field is a .text thunk RVA";
+        EXPECT_EQ(readU32LE(img, u + 20), 1u) << "scope Count = 1";
+        EXPECT_EQ(readU32LE(img, u + 24), parentRva + 0x18u) << "Begin";
+        EXPECT_EQ(readU32LE(img, u + 28), parentRva + 0x20u) << "End";
+        EXPECT_EQ(readU32LE(img, u + 32), funcletRva)        << "Handler = funclet RVA";
+        EXPECT_EQ(readU32LE(img, u + 36), parentRva + 0x28u) << "JumpTarget";
+
+        // (B) the funclet: xmm7 at RSP+0x100000. 0x100000 IS a multiple of 16,
+        // but its quotient (0x10000) does not fit one node, so the FAR form —
+        // 9 | 7<<4 = 0x79 — carries 0x00100000: low word 0, high word 0x10.
+        EXPECT_EQ(img[f + 0], 0x01u) << "Version=1, no handler";
+        EXPECT_EQ(img[f + 1], 15u)   << "SizeOfProlog";
+        EXPECT_EQ(img[f + 2], 4u)    << "CountOfCodes: FAR (3 nodes) + ALLOC_SMALL";
+        EXPECT_EQ(img[f + 4], 15u)   << "xmm7 CodeOffset";
+        EXPECT_EQ(img[f + 5], 0x79u) << "xmm7 SAVE_XMM128_FAR | reg=7";
+        EXPECT_EQ(readU16LE(img, f + 6), 0x0000u) << "xmm7 slot, low word";
+        EXPECT_EQ(readU16LE(img, f + 8), 0x0010u) << "xmm7 slot, high word";
+        EXPECT_EQ(img[f + 10], 7u)    << "ALLOC CodeOffset";
+        EXPECT_EQ(img[f + 11], 0x32u) << "ALLOC_SMALL | (slots-1)=3";
+    }
+
+    // (C) What stays refused. One function, one save rule the format has no
+    // code for; the refusal names the register and says why.
+    auto refusalOn = [&](TargetSchema const& target, std::uint16_t ordinal,
+                         std::int64_t cfaRelative) {
+        AssembledModule m;
+        m.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+        CfiFunction cfi;
+        cfi.codeLength    = 8;
+        cfi.initial       = CfiInitialState{4, 8, -8, std::nullopt};
+        cfi.prologueEndPc = 15;
+        cfi.ops = {
+            CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{}, CfiRegRef{}, 0x28},
+            CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(ordinal),
+                  CfiRegRef{}, cfaRelative},
+        };
+        fn.cfi = std::move(cfi);
+        m.functions.push_back(std::move(fn));
+        DiagnosticReporter r;
+        (void)encodeUntrampolined(m, target, *loaded.format, r);
+        std::string text;
+        for (auto const& d : r.all()) {
+            if (d.code == DiagnosticCode::K_UnwindRuleUnrepresentable) {
+                text += d.actual;
+            }
+        }
+        return text;
+    };
+    auto refusalOf = [&](std::uint16_t ordinal, std::int64_t cfaRelative) {
+        return refusalOn(*loaded.target, ordinal, cfaRelative);
+    };
+    // `rflags` is physical ordinal 32: class `flags`, eight bytes.
+    std::string const notASaveTheFormatHas = refusalOf(32, -0x28);
+    EXPECT_NE(notASaveTheFormatHas.find("save rule names rflags (class 'flags', 8 bytes)"),
+              std::string::npos)
+        << notASaveTheFormatHas;
+    EXPECT_NE(notASaveTheFormatHas.find("and nothing else"), std::string::npos)
+        << notASaveTheFormatHas;
+    // xmm6 eight bytes BELOW the stack pointer (CFA - 0x30 with the CFA at
+    // RSP + 0x28).
+    std::string const belowTheStackPointer = refusalOf(22, -0x30);
+    EXPECT_NE(belowTheStackPointer.find("saved-reg slot -8 for xmm6 is negative"),
+              std::string::npos)
+        << belowTheStackPointer;
+    // xmm6 at RSP+0x18 (CFA - 0x10): eight bytes off a multiple of 16. The
+    // format's documentation says of BOTH vector codes that the offset is
+    // always a multiple of 16, so the unscaled FAR form is not a way to say
+    // this slot — and before the frame producer guaranteed the alignment, a
+    // function whose widest call passed an odd number of stack slots had
+    // exactly this rule.
+    std::string const offTheStride = refusalOf(22, 0x18 - 0x28);
+    EXPECT_NE(offTheStride.find("saved-reg slot 24 for xmm6 is not a multiple of 16"),
+              std::string::npos)
+        << offTheStride;
+    // CONTROL for (C): the same one-function module with a rule the format
+    // DOES have a code for is not refused — the refusals above are of their
+    // rules, not of the fixture.
+    EXPECT_EQ(refusalOf(22, 0x10 - 0x28), std::string{});
+
+    // The two refusals no x86_64 register can reach: a floating-point register
+    // that is NOT sixteen bytes, and a sixteen-byte one whose hardware number
+    // does not fit the code's four bits. The x86_64 document has neither (its
+    // only `fpr` file is xmm0..xmm15, and its loader refuses a seventeenth). The
+    // writer takes its register table and its format as two arguments, and the
+    // format alone (`pe.machine`) selects this builder — so the same format
+    // handed the shipped ARM64 register table is a loadable pairing that has
+    // both: `d7` is the eight-byte reading of a vector register, and `v16` is a
+    // whole one numbered 16. Looked up by NAME: the fixture names an ordinal,
+    // and an ordinal is a position in one document.
+    {
+        auto arm64 = TargetSchema::loadShipped("arm64");
+        ASSERT_TRUE(arm64.has_value());
+        auto const d7  = (*arm64)->registerByName("d7");
+        auto const v16 = (*arm64)->registerByName("v16");
+        auto const v7  = (*arm64)->registerByName("v7");
+        ASSERT_TRUE(d7.has_value() && v16.has_value() && v7.has_value())
+            << "the shipped arm64 target no longer names d7, v16 and v7";
+        std::string const halfARegister = refusalOn(**arm64, *d7, 0x10 - 0x28);
+        EXPECT_NE(halfARegister.find("save rule names d7 (class 'fpr', 8 bytes)"),
+                  std::string::npos)
+            << halfARegister;
+        std::string const pastTheField = refusalOn(**arm64, *v16, 0x10 - 0x28);
+        EXPECT_NE(pastTheField.find("saved vector register v16 has hardware number 16"),
+                  std::string::npos)
+            << pastTheField;
+        // CONTROL: the same rule, the same register table, a whole vector
+        // register the four bits CAN name — not refused, so the two refusals
+        // above are of d7's width and of v16's number, not of the pairing.
+        EXPECT_EQ(refusalOn(**arm64, *v7, 0x10 - 0x28), std::string{});
+    }
 }
 
 namespace {
@@ -3488,6 +3689,7 @@ namespace {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "aapcs64",
+      "entryTransition": "called",
       "pe": {"machine": 43620, "characteristics": 34, "type": "exec"},
       "optionalHeader": {"magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "majorOperatingSystemVersion": 6, "minorOperatingSystemVersion": 0, "majorSubsystemVersion": 6, "minorSubsystemVersion": 0, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096},
       "sections": [
@@ -4468,6 +4670,7 @@ TEST(PeExecFormatJsonValidate, MissingImageBaseRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4517,6 +4720,7 @@ TEST(PeExecFormatJsonValidate, NonPow2SectionAlignmentRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 3000, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4573,6 +4777,7 @@ TEST(PeExecFormatJsonValidate, NonPow2FileAlignmentRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 600, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4608,6 +4813,7 @@ TEST(PeExecFormatJsonValidate, SectionAlignmentBelowPageSizeRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 512, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4642,6 +4848,7 @@ TEST(PeExecFormatJsonValidate, MissingSubsystemRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4671,6 +4878,7 @@ TEST(PeExecFormatJsonValidate, MissingStackHeapSizesRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4705,6 +4913,7 @@ TEST(PeExecFormatJsonValidate, SectionAlignmentLessThanFileAlignmentRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 8192, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
@@ -4740,6 +4949,7 @@ TEST(PeExecFormatJsonValidate, VirtualAddressNotMultipleOfSectionAlignmentReject
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4097}]
@@ -5353,7 +5563,9 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8},
         "class":"elf64","data":"lsb","machine":62,"type":"exec",
         "pageAlign":4096,
         "interpreter":"/lib64/ld-linux-x86-64.so.2",
@@ -5767,6 +5979,7 @@ TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "ExitProcess" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "supportedDataSections": ["rodata"],
       "pe": {"machine": 34404, "characteristics": 34, "type": "exec"},
       "optionalHeader": {"magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "majorOperatingSystemVersion": 6, "minorOperatingSystemVersion": 0, "majorSubsystemVersion": 6, "minorSubsystemVersion": 0, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096},
@@ -5790,6 +6003,57 @@ TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {
     EXPECT_EQ(::dss::test_support::countCode(rep,
                   DiagnosticCode::K_NoMatchingObjectFormat),
               1u);
+}
+
+TEST(PeExecWriter, AnImageWithImportsRefusesADocumentWithNoDynamicRow) {
+    // P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB, design c2): `.idata`'s
+    // name and Characteristics come from the document's `dynamic` row — the row
+    // that makes it READ-ONLY, which a loader-bound read-only slot inside it
+    // relies on. The writer used to hardcode 0xC0000040; a document that states
+    // no row now gets a refusal naming the kind, never a guessed section.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    char const* const kJson = R"({
+      "$comment": "Synthetic PE-Exec schema: imports, and no `dynamic` sections[] row.",
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".exe",
+  "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
+      "format": {"name": "pe-exec-no-dynamic-row", "version": "1.0", "kind": "pe"},
+      "entryPoint": "",
+      "runtimeLibraries": [{"role":"cLibrary","image":"kernel32.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "ExitProcess" },
+      "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
+      "supportedDataSections": ["rodata"],
+      "pe": {"machine": 34404, "characteristics": 34, "type": "exec"},
+      "optionalHeader": {"magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "majorOperatingSystemVersion": 6, "minorOperatingSystemVersion": 0, "majorSubsystemVersion": 6, "minorSubsystemVersion": 0, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096},
+      "sections": [
+        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
+      ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
+      "relocations": [
+        {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
+        {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
+        {"name":"IMAGE_REL_AMD64_ADDR32","kind":3,"nativeId":2}
+      ]
+    })";
+    auto fmt = ObjectFormatSchema::loadFromText(kJson, "synthetic");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod = makeModuleWithOneExtern({0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_EQ(::dss::test_support::countCode(rep, DiagnosticCode::K_NoMatchingObjectFormat), 1u);
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        named = named || d.actual.find("section kind 'dynamic'") != std::string::npos;
+    }
+    EXPECT_TRUE(named) << "the refusal must name the missing row's kind";
 }
 
 TEST(PeExecWriter, SizeOfInitializedDataSumsRdataAndIdata) {
@@ -5861,12 +6125,14 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "ExitProcess" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "supportedDataSections": ["rodata"],
       "pe": {"machine": 34404, "characteristics": 34, "type": "exec"},
       "optionalHeader": {"magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "majorOperatingSystemVersion": 6, "minorOperatingSystemVersion": 0, "majorSubsystemVersion": 6, "minorSubsystemVersion": 0, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096, "attributeCertReserveSize": 64},
       "sections": [
         {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096},
-        {"kind":"rodata","name":".rdata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}
+        {"kind":"rodata","name":".rdata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0},
+        {"kind":"dynamic","name":".idata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}
       ],
       "relocationAddends": "inPlace",
       "inputSectionPlacement": "unit",
@@ -6564,6 +6830,94 @@ peObjSectionDefAux(std::vector<std::uint8_t> const& obj,
     return mod;
 }
 
+// ── S + A, AS A LINKER COMPUTES IT —
+//    D-LK-PE-OBJ-PDATA-FIELDS-COUNT-THE-FUNCTION-OFFSET-TWICE ──
+//
+// COFF has no addend column: a linker adds the NAMED symbol's value to the
+// 4 bytes the relocation patches. ✔MEASURED 2026-09-30 on one DSS object,
+// `lld-link` 18 and GNU ld 2.42 alike, and MSVC's own objects state their
+// `.pdata` as `$LN4 + 0` / `$LN4 + <length>`. So the only honest reading of an
+// unwind field is `value(symbol) + field`, and a pin that reads the field
+// alone — as the one-function pin below did — cannot tell an addend stated in
+// the symbol's coordinate from one stated in the section's: a function at
+// offset 0 is the one case where the two agree, and it was the only case
+// pinned. Every function here sits somewhere else.
+struct ObjSymbolAt {
+    std::uint32_t value         = 0;
+    std::int16_t  sectionNumber = 0;
+};
+
+[[nodiscard]] ObjSymbolAt
+peObjSymbolAt(std::vector<std::uint8_t> const& obj, std::uint32_t idx) {
+    std::uint32_t const symPtr = readU32LE(obj, 8);
+    std::size_t const   rec    = static_cast<std::size_t>(symPtr)
+                            + static_cast<std::size_t>(idx) * 18u;
+    if (obj.size() < rec + 18u) return {};
+    return {readU32LE(obj, rec + 8),
+            static_cast<std::int16_t>(readU16LE(obj, rec + 12))};
+}
+
+// The value a linker writes into the field at `fieldOffset` of `sec`, in the
+// coordinates of the named symbol's own section: value(symbol) + the field.
+struct ResolvedField {
+    std::string   symbol;
+    std::int16_t  sectionNumber = 0;
+    std::uint32_t resolved      = 0;
+    std::uint32_t field         = 0;
+};
+
+[[nodiscard]] std::optional<ResolvedField>
+resolveUnwindField(std::vector<std::uint8_t> const& obj,
+                   ObjSectionHeader const& sec, std::uint32_t fieldOffset) {
+    for (auto const& r : peObjRelocations(obj, sec)) {
+        if (r.virtualAddress != fieldOffset) continue;
+        auto const body = peObjSectionBytes(obj, sec);
+        if (body.size() < static_cast<std::size_t>(fieldOffset) + 4u) return std::nullopt;
+        auto const at = peObjSymbolAt(obj, r.symbolTableIndex);
+        std::uint32_t const field = readU32LE(body, fieldOffset);
+        return ResolvedField{peObjSymbolName(obj, r.symbolTableIndex),
+                             at.sectionNumber, at.value + field, field};
+    }
+    return std::nullopt;
+}
+
+// THREE framed functions, laid out one after another, so two of them sit at a
+// non-zero `.text` offset — the offsets where a doubled addend lands in
+// somebody else's code or in no code at all.
+[[nodiscard]] AssembledModule makePeObjThreeFrameModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 3;
+    char const* const names[] = {"fa", "fb", "fc"};
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        AssembledModule one = makePeObjUnwindModule(/*withCfi=*/true,
+                                                    /*withTry=*/false);
+        AssembledFunction fn = std::move(one.functions.front());
+        fn.symbol = SymbolId{10u + i};
+        mod.functions.push_back(std::move(fn));
+        mod.symbols.push_back(ModuleSymbol{SymbolId{10u + i}, names[i],
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+    }
+    return mod;
+}
+
+// The `__try` module with a framed function IN FRONT of the guarded one, so
+// the scope table's interior offsets are offsets into a function that does
+// not start at `.text` offset 0.
+[[nodiscard]] AssembledModule makePeObjTryAtANonZeroOffsetModule() {
+    AssembledModule tryMod = makePeObjTryModule();
+    AssembledModule lead = makePeObjUnwindModule(/*withCfi=*/true,
+                                                 /*withTry=*/false);
+    AssembledFunction leadFn = std::move(lead.functions.front());
+    leadFn.symbol = SymbolId{9};
+    tryMod.functions.insert(tryMod.functions.begin(), std::move(leadFn));
+    tryMod.expectedFuncCount = 3;
+    tryMod.symbols.push_back(ModuleSymbol{SymbolId{9}, "lead",
+                                          SymbolBinding::Global,
+                                          SymbolVisibility::Default});
+    return tryMod;
+}
+
 // The same one-function shape, but its definition is WEAK — so its body is a
 // COMDAT and its unwind tables must be COMDATs associative to it.
 [[nodiscard]] AssembledModule makePeObjWeakUnwindModule() {
@@ -6769,13 +7123,19 @@ TEST(PeObjWriter, OrdinaryFramesCarryPdataAndXdataShapedLikeGccs) {
     // THE ADDENDS ARE IN THE FIELD, and that is the half a relocation-count
     // assertion cannot see: a table with the right relocations and zeroed
     // fields describes every function as starting at its section's origin.
+    // ⚠ ONE function at offset 0 is the one case where an addend stated from
+    // the FUNCTION and one stated from `.text` agree, so these three reads
+    // cannot see a wrong coordinate on their own; the S + A pin below
+    // (`EveryRuntimeFunctionResolvesToItsOwnFunctionUnderSPlusA`) is the one
+    // that can (D-LK-PE-OBJ-PDATA-FIELDS-COUNT-THE-FUNCTION-OFFSET-TWICE).
     auto const body = peObjSectionBytes(obj, *pdata);
     ASSERT_EQ(body.size(), 12u);
-    EXPECT_EQ(readU32LE(body, 0), 0u) << "BeginAddress = offset in .text";
+    EXPECT_EQ(readU32LE(body, 0), 0u)
+        << "BeginAddress = offset FROM the named function: 0";
     EXPECT_EQ(readU32LE(body, 4), 9u)
-        << "EndAddress = Begin + the function's 9 machine-code bytes; a "
-           "[Begin, End) that does not cover the body leaves a fault in the "
-           "tail with no unwind entry";
+        << "EndAddress = the function's 9 machine-code bytes, FROM the named "
+           "function; a [Begin, End) that does not cover the body leaves a "
+           "fault in the tail with no unwind entry";
     EXPECT_EQ(readU32LE(body, 8), 0u) << "UnwindInfoAddress = offset in .xdata";
 
     // The first two name the FUNCTION and the third names `.xdata` — this
@@ -6786,6 +7146,170 @@ TEST(PeObjWriter, OrdinaryFramesCarryPdataAndXdataShapedLikeGccs) {
               peObjSymbolName(obj, rels[1].symbolTableIndex));
     EXPECT_EQ(peObjSymbolName(obj, rels[2].symbolTableIndex), ".xdata");
     EXPECT_NE(peObjSymbolName(obj, rels[0].symbolTableIndex), ".xdata");
+}
+
+TEST(PeObjWriter, EveryRuntimeFunctionResolvesToItsOwnFunctionUnderSPlusA) {
+    // ★★ D-LK-PE-OBJ-PDATA-FIELDS-COUNT-THE-FUNCTION-OFFSET-TWICE. The writer
+    // stamped each function's offset IN `.text` into Begin/End while the
+    // relocation named the FUNCTION symbol, so a linker produced 2 x the
+    // offset: ✔MEASURED 2026-09-30, `lld-link` 18 and GNU ld 2.42 both placed
+    // a DSS object's second function at 0x32 for 0x19, and the OS's
+    // RtlLookupFunctionEntry then found no entry of its own for every
+    // function but the first. The pin resolves every field the way a linker
+    // does, on functions that do NOT start at offset 0.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    DiagnosticReporter rep;
+    auto obj = pe::encode(makePeObjThreeFrameModule(), *loaded.target,
+                          *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(obj.empty());
+
+    auto const secs = peObjSections(obj);
+    auto const* text  = findSection(secs, ".text");
+    auto const* xdata = findSection(secs, ".xdata");
+    auto const* pdata = findSection(secs, ".pdata");
+    ASSERT_NE(text, nullptr);
+    ASSERT_NE(xdata, nullptr);
+    ASSERT_NE(pdata, nullptr);
+    ASSERT_EQ(pdata->sizeOfRawData, 36u) << "three RUNTIME_FUNCTIONs";
+
+    std::uint32_t previousEnd = 0;
+    std::size_t   nonZeroStarts = 0;
+    std::vector<std::uint32_t> unwindInfoAt;
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        std::uint32_t const at = i * 12u;
+        auto const begin = resolveUnwindField(obj, *pdata, at);
+        auto const end   = resolveUnwindField(obj, *pdata, at + 4u);
+        auto const info  = resolveUnwindField(obj, *pdata, at + 8u);
+        ASSERT_TRUE(begin && end && info)
+            << "RUNTIME_FUNCTION #" << i << " must relocate all three fields";
+        // The function named is one of the three, in `.text`, and Begin lands
+        // EXACTLY on it: S + A == S, i.e. the addend is 0 from the function.
+        EXPECT_EQ(begin->sectionNumber, text->ordinal);
+        auto const named = peObjSymbolAt(
+            obj, peObjRelocations(obj, *pdata)[i * 3u].symbolTableIndex);
+        EXPECT_EQ(begin->resolved, named.value)
+            << "RUNTIME_FUNCTION #" << i << " (" << begin->symbol
+            << ") Begin resolves to 0x" << std::hex << begin->resolved
+            << " but its function starts at 0x" << named.value
+            << " - an addend stated from `.text` against the function "
+               "symbol counts the offset twice";
+        EXPECT_EQ(end->symbol, begin->symbol);
+        EXPECT_EQ(end->resolved, begin->resolved + 9u)
+            << "End must be the function's own end: Begin + its 9 bytes";
+        EXPECT_GE(begin->resolved, previousEnd)
+            << "the three ranges must tile `.text` in order, never overlap";
+        previousEnd = end->resolved;
+        if (begin->resolved != 0u) ++nonZeroStarts;
+        // UnwindInfo names `.xdata`'s section symbol (value 0), so the field
+        // IS the blob's offset, and each blob is a version-1 UNWIND_INFO.
+        EXPECT_EQ(info->symbol, ".xdata");
+        auto const xbody = peObjSectionBytes(obj, *xdata);
+        ASSERT_LT(info->resolved, xbody.size());
+        EXPECT_EQ(xbody[info->resolved] & 0x07u, 1u)
+            << "UnwindInfo must point at an UNWIND_INFO header (version 1)";
+        unwindInfoAt.push_back(info->resolved);
+    }
+    EXPECT_EQ(nonZeroStarts, 2u)
+        << "the fixture is only a pin if two of its functions sit past offset 0";
+    EXPECT_LE(previousEnd, text->sizeOfRawData);
+    std::sort(unwindInfoAt.begin(), unwindInfoAt.end());
+    EXPECT_EQ(std::adjacent_find(unwindInfoAt.begin(), unwindInfoAt.end()),
+              unwindInfoAt.end())
+        << "each function must point at ITS OWN UNWIND_INFO";
+}
+
+TEST(PeObjWriter, AScopeTableAtANonZeroOffsetResolvesToItsOwnGuardedRange) {
+    // ★★ THE SAME DEFECT'S OTHER HALF. The scope table's Begin / End /
+    // JumpTarget are INTERIOR offsets of the guarded function and its
+    // HandlerAddress the filter funclet's start; `buildFunctionUnwindInfo`
+    // states each as {symbol, offset into it} and writes a placeholder 0,
+    // and the object arm used to relocate the field WITHOUT ever writing the
+    // offset into it — so every scope claimed the guarded range was
+    // [function start, function start) and resumed at the function's first
+    // byte. `ATryRegionCarriesItsScopeTableIntoTheObject` counted five
+    // relocations of the right type and could not see it.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaWithPersonalityAndRvaRelocJson(),
+        "synthetic-pe-obj-personality-rva");
+    ASSERT_TRUE(fmt.has_value());
+
+    DiagnosticReporter rep;
+    auto obj = pe::encode(makePeObjTryAtANonZeroOffsetModule(), **target,
+                          **fmt, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(obj.empty());
+
+    auto const secs = peObjSections(obj);
+    auto const* xdata = findSection(secs, ".xdata");
+    ASSERT_NE(xdata, nullptr);
+    auto const rels = peObjRelocations(obj, *xdata);
+    ASSERT_EQ(rels.size(), 5u);
+
+    // Where the guarded function landed, read off the symbol table — the
+    // coordinate its three interior scope fields must resolve into.
+    std::optional<std::uint32_t> guardedAt;
+    std::uint32_t const numSyms = readU32LE(obj, 12);
+    for (std::uint32_t i = 0; i < numSyms; ++i) {
+        if (peObjSymbolName(obj, i) == "guarded") {
+            guardedAt = peObjSymbolAt(obj, i).value;
+        }
+    }
+    ASSERT_TRUE(guardedAt.has_value());
+    ASSERT_NE(*guardedAt, 0u)
+        << "the fixture is only a pin if the guarded function sits past offset 0";
+
+    // Read the five fields back by ROLE rather than by position, so a failure
+    // says which role went wrong.
+    for (auto const& r : rels) {
+        ASSERT_TRUE(resolveUnwindField(obj, *xdata, r.virtualAddress).has_value())
+            << "an `.xdata` relocation at " << r.virtualAddress
+            << " must patch a field inside the section";
+    }
+    // The HandlerAddress is the one field naming neither the guarded function
+    // nor the personality: the filter funclet, a DIFFERENT function, whose own
+    // start it must resolve to (addend 0 from the funclet).
+    std::size_t personality = 0, guardedFields = 0, handler = 0;
+    for (auto const& r : rels) {
+        auto const f = *resolveUnwindField(obj, *xdata, r.virtualAddress);
+        if (f.symbol == "__C_specific_handler") {
+            EXPECT_EQ(f.field, 0u) << "the personality is the extern itself";
+            ++personality;
+        } else if (f.symbol == "guarded") {
+            ++guardedFields;
+        } else {
+            auto const at = peObjSymbolAt(obj, r.symbolTableIndex);
+            EXPECT_NE(at.value, *guardedAt)
+                << "HandlerAddress names the filter funclet, not the guarded body";
+            EXPECT_EQ(f.resolved, at.value)
+                << "HandlerAddress must be the filter funclet's own start";
+            ++handler;
+        }
+    }
+    EXPECT_EQ(personality, 1u);
+    EXPECT_EQ(guardedFields, 3u);
+    EXPECT_EQ(handler, 1u);
+    // The three `guarded` fields, in the order the builder wrote them:
+    // Begin (+4), End (+8), JumpTarget (+8).
+    std::vector<std::uint32_t> guardedResolved;
+    for (auto const& r : rels) {
+        auto const f = *resolveUnwindField(obj, *xdata, r.virtualAddress);
+        if (f.symbol == "guarded") guardedResolved.push_back(f.resolved);
+    }
+    ASSERT_EQ(guardedResolved.size(), 3u);
+    EXPECT_EQ(guardedResolved[0], *guardedAt + 4u)
+        << "scope BeginAddress must be 4 bytes INTO the guarded function";
+    EXPECT_EQ(guardedResolved[1], *guardedAt + 8u)
+        << "scope EndAddress must be 8 bytes into the guarded function";
+    EXPECT_EQ(guardedResolved[2], *guardedAt + 8u)
+        << "scope JumpTarget must be 8 bytes into the guarded function";
 }
 
 TEST(PeObjWriter, AModuleWithNoFrameInformationGrowsNoUnwindSections) {
@@ -6865,6 +7389,15 @@ TEST(PeObjWriter, AWeakFunctionsUnwindTablesAreComdatsAssociativeToItsBody) {
         EXPECT_EQ(aux->number, static_cast<std::uint16_t>(weakTextOrdinal))
             << name << "'s associated section must be the weak function's own "
                        "COMDAT `.text`, not section 1";
+        // D-LK-PE-OBJ-ASSOCIATIVE-UNWIND-SECTION-PRECEDES-ITS-COMDAT: the
+        // section an associative COMDAT names must PRECEDE it. ✔MEASURED
+        // 2026-10-06 (run 20261006-215740-5f83e38e): link.exe 14.51 refuses a
+        // forward association outright — `fatal error LNK1243: invalid or
+        // corrupt file: COMDAT section 0x6 associated with following section
+        // 0x12` — while lld-link and GNU ld link it, and DSS's own reader skips
+        // the metadata whatever its ordinal, so no round trip can see it.
+        EXPECT_LT(weakTextOrdinal, peObjSectionOrdinal(secs, name, /*occurrence=*/0))
+            << name << " must come AFTER the COMDAT `.text` it is associative to";
     }
 }
 

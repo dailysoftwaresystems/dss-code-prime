@@ -32,9 +32,9 @@ that is a delegation you skipped.
 | 1–2 pick / clear blockers | `Explore` or `general-purpose` | when it means sweeping plans, the registry, or `src/` to locate work |
 | 3 plan | `Plan` / `feature-dev:code-architect` | returns the execution plan; you judge it |
 | **3.5 design-audit** | **independent `general-purpose`** | MUST be a fresh agent — the point is that it did not author the plan |
-| 4 implement | one agent per DISJOINT file set, **in parallel** | see the parallelism rule below |
+| 4 implement | one LANE per DISJOINT file set, **in parallel** — a DssHarness agent and its subagent | see the parallelism rule below and orchestration.md |
 | 5 review & fold | `pr-review-toolkit:*` / `feature-dev:code-reviewer` | |
-| 7–8 deferrals + cross-plan | `general-purpose` | mechanical registry/plan reconciliation |
+| 7–8 deferrals + cross-plan | the orchestrator itself, or a LANE | mechanical registry/plan reconciliation; a subagent that writes `.plans/**` changes the repository, so it is a lane with its own agent (orchestration.md) — its registry rows through its agent's rows directory only, never the registry files (the fold refuses a registry the lane changed as a file) |
 | **8.5 code-audit** | **independent `general-purpose`, READ-ONLY** | must not be the agent that wrote the code |
 
 **PARALLELISM:** when a step splits into disjoint file sets — engine `.cpp` vs `*.json`
@@ -88,12 +88,34 @@ fold, when no lane is live, so it gets the whole machine and the full `-j`. ⏳ 
 
 ★★★ **AND MEMORY IS A BUDGET TOO — ✔MEASURED P68 round 9, 2026-09-23.** Four lanes plus main's verify
 drove this host to its commit limit (**81.0 of 113.7 GB** committed) and the Claude host process died,
-and every lane agent with it. ⇒ **At most two heavy local jobs on this host at once, each admitted only
-below 76% committed memory, and a lane starts a heavy job only on the orchestrator's GO.** A heavy job is
-a build or a test run through DssHarness. There is no `-j` knob to divide any more: DssHarness sets each
-leg's parallelism from `.harness-config/config.json` — `buildCores` for the build, `testCores` for the
-tests — ✔MEASURED 2026-09-25: 6 each, the `defaults`, which `hosts.local` does not override. The
-admission gate is the orchestrator's — an interim until the host-memory-gate action lands in the next PR.
+and every lane agent with it. ⇒ **At most two heavy legs on a machine at once, each started only below 76%
+memory — and DssHarness ADMITS THEM ITSELF** (`.harness-config/config.json` `defaults.admission`:
+`heavyLegs` 2, `maxMemoryPercent` 76). A heavy leg is a `build` or `test` leg, or a `run` leg that BUILDS — its
+runner's `requireBuild`, or a step it runs that names `{product}` or `{buildDir}` — or one a runner's `"heavy":
+true` or a step's own `heavy: true` makes heavy, through whichever runner, `--manual-step` included (sqlite's
+`recompile` and `benchmark-speedtest1`, and the corpus and pragma censuses' compiling steps; DOCUMENTED, `dssharness
+help admission`); the repository guards stay light. It takes one of its PHYSICAL machine's slots in the order legs asked — every
+command and every tree that declares admission counts, this machine's WSL legs against Windows — then starts only
+below the limit (Windows: commit charge over commit limit), re-read after a settle while another leg holds a slot.
+A waiting leg prints each holder (tree, variant, leg, command, process, run); its line and `--json`'s `admission`
+give `admitted`, `waitedSeconds` and the memory figure; past `maxWaitMinutes` it is `not-admitted`, exit 7, never
+`failed`. ✔MEASURED 2026-10-01 (P69, lane `hm`), three commands in two trees: a heavy `run` in a throwaway second tree was "admitted at once", a `dssharness test` of the lane's worktree waited 1m04s for the settle another leg's slot asks and was admitted, and a third, the lane's linux `dssharness test`, printed "waits for one of this machine's 2 heavy-leg slot(s), 2 leg(s) ahead; held by" each of the two (tree, variant, leg, command, process, run, since) and was "admitted after 1m52s, memory 71.6% in use (commit 68.5 GiB of 95.7 GiB)" the moment a holder ended (runs 20261001-030428-a58e3b9a, 20261001-030430-b231813a, 20261001-030541-812a778b).
+⇒ **A lane runs its build or test and the harness queues it: no GO, no slot directory, no memory script by
+hand.** There is no `-j` knob to divide either: DssHarness sets each leg's parallelism from
+`.harness-config/config.json` — `buildCores` for the build, `testCores` for the tests — ✔MEASURED 2026-09-25:
+6 each, the `defaults`, which `hosts.local` does not override. Why the admission is DssHarness's and no
+ACTION's (✔MEASURED 2026-09-30, before the tool admitted legs): a command capped legs per machine only within itself
+(`defaults.maxParallelLegs`), and a `dssharness run` holds its tree-and-variant lock for its whole life, so a build
+or test of the same tree and variant started inside a step is refused as locked by its own parent — an action
+cannot hold a slot for the life of the job it admits (two sibling runs and two nested ones; a different variant's
+nested run passed). An ssh host admits by its own record the same way (✔MEASURED 2026-10-01: with the Mac's
+section declaring one slot, two Mac legs, each its own command there, ran one after the other, the second
+"admitted after 1m30s" naming the first as its holder; run 20261002-000725-ebf9dfb9). Admission also
+claims the ROOM a heavy leg's build needs where that need is known — `buildSpaceGiB`, or what a build of its
+variant recorded as it finished — against every other admitted leg's claim on that filesystem, from any command
+(`dssharness help admission`). A build nothing has measured there is admitted on its slot and memory alone, and a
+build's PEAK beyond what its directory comes to (a compiler's temporaries) is in no claim: read a host's room
+before a tree's first arm64 or macOS build (`dssharness clean --legs <leg> --dry-run` names it per leg).
 
 ⚠ **Why a cap at all, and it is not politeness to the host.** Two costs rise with lane count and
 neither is visible from inside a lane:
@@ -118,8 +140,20 @@ own private `build-warn/` reddened by 23 errors in files it did not own; and one
 scratchpad script overwritten mid-run by a sibling. **Ownership partitions WRITES; it does not
 partition the COMPILER, the build dir, or the scratchpad.**
 
-★★ **A BYTE-CHANGING MEASUREMENT GOES IN A `git worktree` — PASTE `worktrees.md` §H.0 INTO THE
-BRIEF, DO NOT CITE IT.** §H.0 already names *"red-on-disable mutants"* explicitly and predates
+★★★★ **A BRIEF THAT ASKS FOR A PIN ASKS FOR ITS ARM** (operator, 2026-10-10 — `dssharness check-mutations`
+is mandatory). The brief says, in these words or its own: the claim is a gtest TEST of a self-contained test
+binary, never an example entry alone; the lane DECLARES the arm in `tests/mutations/arms.registry` (its
+section, its block, one `S` row naming one leg by the stated rule), validates the registry, sweeps ITS OWN
+arms from its own tree on the legs they name, and reports each arm's verdict with the run id; an arm that
+names a Windows leg is reported as owed, for the orchestrator to sweep on the main tree after the fold; a
+row that rests on a pin does not close before its arm passed on the bytes it closes on. Paste the
+command lines from `mutation-arms.md`; a brief states an interface only if its author ran it.
+ⓘ An arm puts no wrong byte in any tree — the tool mutates a worker copy beside it — so the paragraph and
+the window below now concern only a mutant of the one class read by hand, and every byte-changing
+measurement that is not a pin.
+
+★★ **A BYTE-CHANGING MEASUREMENT GOES IN A WORKTREE — THE LANE'S OWN AGENT WORKTREE, OR A PLAIN PROBE
+ONE — PASTE `worktrees.md` §H.0 INTO THE BRIEF, DO NOT CITE IT.** §H.0 already names *"red-on-disable mutants"* explicitly and predates
 the incidents above, so the gap is not knowledge — it is that a brief which says *"prove
 red-on-disable"* and never says *where* leaves a lane to mutate shipped source in the shared
 tree, which is the obvious reading. ✔The cost of getting this right is trivial and measured: a
@@ -131,7 +165,12 @@ sibling lane the same day hit the wall, moved to a throwaway worktree, verified,
   wider the window.** ✔The orchestrator was fooled by exactly this: a gate run mid-window reported
   a clean verdict and a next-free diagnostic ordinal ~200 slots off, from bytes existing in no real
   tree. Nothing was wrong with the instrument.
-- Give each lane a **lane-private scratch subdirectory**; the session scratchpad is shared.
+- Give each lane its **agent's work directory**, `<repo>/.orchestrators/<o>/work/<a>/`, as an absolute path;
+  the session scratchpad is shared (orchestration.md).
+- Creating, folding and deleting a lane's agent is the ORCHESTRATOR's, never the lane's: `create-agent`
+  before the lane is spawned, its subagent id recorded with `create-agent … --session <id>` as soon as it is,
+  `fold-agent` on its report (`--new` for its new ids), `delete-agent` after its last review. `--parallel 4` makes the tool refuse a
+  fifth open lane; the ≤4-reasoning-agents rule above still counts reviewers and planners too.
 
 **★ DO NOT DELEGATE — the orchestrator keeps these:**
 - **Step 6, the gate** (builds, ctest, the eight-run `{Debug, Release} × four legs` gate, the sqlite re-probe). A delegated
@@ -164,6 +203,19 @@ not at fault — the brief asked for anchors and got anchors. Put this in every 
 > specific missing prerequisite, an unfired trigger, or a decision only the operator can make.
 > "Out of scope", "bigger than this cycle", "a follow-up" and "the natural next step" are not
 > blockers. Bring me the decision; do not park it in the registry.
+> **A `🔵 DISCLOSED` row is an open row.** A defect you meet on the way is yours to FIX in this
+> wave, whether it pre-dates the cycle or not. If you believe one is too big to fix here, do not
+> file it: tell me its MEASURED size — the files, what must be built, what must be measured first
+> — and I rule. The default answer is "close it now". Close the disclosed rows that name a file
+> or a mechanism you are touching, in the same wave.
 
 Then CHECK the returned rows before you write them. An agent reporting "anchored 6 findings" is
 reporting six unfinished jobs unless every one says CLOSED.
+
+★★★★ **THE ORCHESTRATOR IS THE ONE WHO ERODED THIS, NOT THE LANES** — operator, 2026-10-08 (the
+ruling is in `no-follow-ups.md`). ✔MEASURED in cycle P69 round 1: the lanes brought sizes and
+decisions, as the paragraph above asks, and the orchestrator answered "ONE disclosed row, scheduled
+for a later round for cycle size alone" — again and again, each ruling defensible alone — until the
+round had closed 24 rows and opened 22. When a lane brings a finding with its size, the answer is
+*close it now* unless the size is really out of the wave's reach; "it keeps the round short" is
+not a reason, and neither is "the lane's wave is already large".

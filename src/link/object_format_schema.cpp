@@ -378,26 +378,23 @@ ObjectFormatSchema::relocationDecodeTable() const {
         if (auto e = mapNative(r.nativeId, r.kind)) {
             return std::unexpected(std::move(*e));
         }
-        // `pltNativeId` is read UNCONDITIONALLY, from the schema, for every
-        // format. It is 0 on every shipped Mach-O and PE document — which is
-        // a fact about those formats (an extern call is the same wire id
-        // whether or not the linker synthesizes a stub), not a reason for
-        // their readers to omit the leg. Omitting it is what made this loop
-        // format-keyed in two places at once.
-        if (r.pltNativeId != 0u) {
-            if (auto e = mapNative(r.pltNativeId, r.kind)) {
-                return std::unexpected(std::move(*e));
-            }
-            table.callSignalNativeIds.insert(r.pltNativeId);
-        }
+        // ⓘ The `pltNativeId` leg that stood here (a second wire id decoding
+        // to the row's kind, and a call signal) is retired with the key: since
+        // P69 a call is a row of its own, `isCall`, read below.
         // The wire types a format spells by the bytes after the field
-        // (X86_64_RELOC_SIGNED_1/_2/_4) decode to the row's own kind: they
-        // differ from `nativeId` in the type alone, never in the addend.
+        // (X86_64_RELOC_SIGNED_1/_2/_4, IMAGE_REL_AMD64_REL32_1.._5) decode to
+        // the row's own kind. Mach-O's differ from `nativeId` in the type
+        // alone; COFF's also lower the addend by their byte count, which the
+        // row declares (`bytesAfterFieldLowersTheAddend`) and the table hands
+        // every reader.
         for (auto const& e : r.nativeIdByBytesAfterField) {
             if (auto err = mapNative(e.nativeId, r.kind)) {
                 return std::unexpected(std::move(*err));
             }
             if (r.isCall) table.callSignalNativeIds.insert(e.nativeId);
+            if (r.bytesAfterFieldLowersTheAddend) {
+                table.addendLoweredByType.emplace(e.nativeId, e.bytesAfterField);
+            }
         }
         if (r.isCall) table.callSignalNativeIds.insert(r.nativeId);
     }
@@ -714,6 +711,41 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                          detail::renderAllowedList(
                              allNames(kWeakDefinitionDialectTable), " or ")));
     }
+    // P69: the per-kind entries say which kinds take ANOTHER dialect than the
+    // block's, so without the block they qualify nothing; and each must name a
+    // real kind and a real dialect, once. The loader cannot produce any of
+    // these (its keys are a JSON object's, its values come from the tables);
+    // a hand-built `ObjectFormatData` can.
+    if (!weakDefinitionByKind.empty() && !weakDefinition.has_value()) {
+        fail("/weakDefinition/byKind",
+             "per-kind weak-definition dialects are stated beside NO "
+             "'weakDefinition' block — they say which kinds take another "
+             "dialect than the block's, and there is none to depart from");
+    }
+    for (std::size_t i = 0; i < weakDefinitionByKind.size(); ++i) {
+        auto const& [kind, dialect] = weakDefinitionByKind[i];
+        if (weakDefinitionKindName(kind).empty()
+            || weakDefinitionDialectName(dialect).empty()) {
+            fail("/weakDefinition/byKind",
+                 std::format("per-kind weak-definition entry #{} names no {} — "
+                             "each states a real kind ({}) and a real dialect "
+                             "({})",
+                             i,
+                             weakDefinitionKindName(kind).empty() ? "kind" : "dialect",
+                             detail::renderAllowedList(
+                                 allNames(kWeakDefinitionKindTable), " or "),
+                             detail::renderAllowedList(
+                                 allNames(kWeakDefinitionDialectTable), " or ")));
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (weakDefinitionByKind[j].first == kind) {
+                fail("/weakDefinition/byKind",
+                     std::format("the weak-definition kind '{}' is given a "
+                                 "dialect twice — one kind, one spelling",
+                                 weakDefinitionKindName(kind)));
+            }
+        }
+    }
 
     // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET: a
     //    PRESENT `objectImportSlot` block must name a prefix ──────────────
@@ -916,6 +948,151 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
+    // P69 review M1 (c) + MINOR 8 (D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE):
+    // `pcRelativeImportAddress` answers a question only an IMAGE link asks —
+    // what a unit's PC-relative, non-branch reference to an import means — and
+    // an image asks it exactly when its call entry is NOT the import's address,
+    // which is what `externAddrBinding` declares on an image. So on an image the
+    // two come together (one without the other is a format that either cannot
+    // answer the question it raises, or answers one it never raises), and on
+    // any other flavor this one is refused: a relocatable object's final linker
+    // answers it, so the declaration would never be read.
+    {
+        bool const image = backend != nullptr && backend->isImageFlavor(*this);
+        if (pcRelativeImportAddress.has_value() && !image) {
+            fail("/pcRelativeImportAddress",
+                 "'pcRelativeImportAddress' is declared on a format that is not "
+                 "an IMAGE flavor: what a unit's PC-relative reference to an "
+                 "import means is decided by the link that BINDS imports, and "
+                 "for a relocatable object or an archive member that is the "
+                 "final linker, so the declaration would never be read.");
+        }
+        if (image && externAddrBinding.has_value()
+            && !pcRelativeImportAddress.has_value()) {
+            fail("/pcRelativeImportAddress",
+                 "this image declares 'externAddrBinding' — its call entry for "
+                 "an import is not the import's address — but no "
+                 "'pcRelativeImportAddress', so it cannot say what a unit's "
+                 "`leaq puts(%rip)` (which can only reach that call entry) "
+                 "means. Declare \"callEntry\" where the format's linkers bind "
+                 "such a unit to the call entry, or \"refused\" where they refuse "
+                 "it.");
+        }
+        if (image && pcRelativeImportAddress.has_value()
+            && !externAddrBinding.has_value()) {
+            fail("/pcRelativeImportAddress",
+                 "'pcRelativeImportAddress' is declared on an image that declares "
+                 "no 'externAddrBinding': there the call entry IS the import's "
+                 "canonical address, so a PC-relative reference to it needs no "
+                 "decision and the declaration would never be read.");
+        }
+        // P69 re-review MAJOR 2: `importAddressSymbolPrefix` is read only where
+        // a member's imports are BOUND — an image link
+        // (`linker::foldImportAddressReferences`). DSS's own objects never
+        // write `<prefix>X`, so on a relocatable or archive document the
+        // declaration would never be read.
+        if (importAddressSymbolPrefix.has_value() && !image) {
+            fail("/importAddressSymbolPrefix",
+                 "'importAddressSymbolPrefix' is declared on a format that is not "
+                 "an IMAGE flavor: an import's address slot is read by name only "
+                 "by the link that binds a member's imports, and DSS's own "
+                 "objects never write one, so the declaration would never be "
+                 "read.");
+        }
+        // P69 round 3: `archiveCommonResolution` is read from the document of an
+        // archive's MEMBERS (the static link's archive search), which an image
+        // never is.
+        if (archiveCommonResolution.has_value() && image) {
+            fail("/archiveCommonResolution",
+                 "'archiveCommonResolution' is declared on an IMAGE flavor: what "
+                 "an archive search does for a COMMON's name is read from the "
+                 "document that describes the archive's MEMBERS, which an image "
+                 "never is, so the declaration would never be read.");
+        }
+        // P69 round 4: `commonYieldsTo` is read by a link that resolves a common
+        // against OTHER units' definitions — an image, or a relocatable artifact
+        // of several units — and by an image link's archive search. An archive's
+        // members are each one unit, linked alone, so on an archive document the
+        // declaration would never be read.
+        if (commonYieldsTo.has_value() && container == ObjectFormatContainer::Archive) {
+            fail("/commonYieldsTo",
+                 "'commonYieldsTo' is declared on an ARCHIVE document: which "
+                 "definitions a common yields to is read from the document of "
+                 "the link that resolves it against other units — an image or a "
+                 "relocatable artifact — and an archive's members are each "
+                 "linked alone, so the declaration would never be read.");
+        }
+        // P69 round 4 (lane `lm`): `archiveWeakReferenceSearch` is read from the
+        // document of an archive's MEMBERS — the `container: "archive"` document,
+        // and no other. Round 5: a bare relocatable link reads its archive-writing
+        // sibling's answer as an image link does, so a copy on the relocatable
+        // document would never be read, and one answer per family cannot drift
+        // from a second.
+        if (archiveWeakReferenceSearch.has_value()
+            && container != ObjectFormatContainer::Archive) {
+            fail("/archiveWeakReferenceSearch",
+                 "'archiveWeakReferenceSearch' is declared on a document that is "
+                 "not an ARCHIVE's: whether an archive search fetches a member for "
+                 "a weak reference is read from the document that describes the "
+                 "archive's MEMBERS -- the `container: \"archive\"` document, which "
+                 "every link of the family resolves -- so the declaration would "
+                 "never be read.");
+        }
+        // P69 (lane `lm`, D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO):
+        // `weakResolvedToNothing` is read only by an image that binds a weak
+        // symbol nothing defines to NOTHING — one that refuses an undefined
+        // import. An image that may carry an undefined symbol (an ELF shared
+        // object) keeps a weak one for its loader, and a relocatable's final
+        // linker decides it, so on either the block would never be read.
+        if (weakResolvedToNothing.has_value()) {
+            if (!image || backend->allowsUndefinedImports(*this)) {
+                fail("/weakResolvedToNothing",
+                     "'weakResolvedToNothing' is declared on a format whose "
+                     "artifact never binds a weak symbol to nothing: a "
+                     "relocatable object or archive member leaves it to the final "
+                     "linker, and an image that may carry an undefined symbol "
+                     "keeps it for its loader, so the declaration would never be "
+                     "read.");
+            }
+            if (weakResolvedToNothing->absolute == WeakNullReference::NextInstruction) {
+                fail("/weakResolvedToNothing/absolute",
+                     "'nextInstruction' is an answer for a BRANCH; an absolute "
+                     "field holds a value, not a destination. Declare \"zero\" or "
+                     "\"refused\".");
+            }
+            if (weakResolvedToNothing->pcRelative == WeakNullReference::NextInstruction) {
+                fail("/weakResolvedToNothing/pcRelative",
+                     "'nextInstruction' is an answer for a BRANCH; a PC-relative "
+                     "field that is not a branch computes an address. Declare "
+                     "\"zero\" or \"refused\".");
+            }
+            // `zero` for a displacement needs a writer that places the image at
+            // its link address — a backend capability, not a document's to claim.
+            bool const writesZero =
+                image && backend->writesNullAddressReferences(*this);
+            for (auto const& [cls, answer] :
+                 {std::pair<char const*, WeakNullReference>{
+                      "pcRelative", weakResolvedToNothing->pcRelative},
+                  std::pair<char const*, WeakNullReference>{
+                      "branch", weakResolvedToNothing->branch}}) {
+                if (answer == WeakNullReference::Zero && !writesZero) {
+                    fail(std::string{"/weakResolvedToNothing/"} + cls,
+                         std::string{"'"} + cls + "' declares \"zero\", but this "
+                         "format's writer does not place the image at its link "
+                         "address (`writesNullAddressReferences`), so a "
+                         "displacement from it cannot be made to reach address 0. "
+                         "Declare \"refused\"" +
+                         (std::string_view{cls} == "branch"
+                              ? std::string{", or \"nextInstruction\" where the "
+                                            "target's ABI gives such a branch the "
+                                            "instruction after it"}
+                              : std::string{}) +
+                         ".");
+                }
+            }
+        }
+    }
+
     // Cross-row reloc uniqueness + non-empty-name + non-zero-kind:
     // shared substrate with TargetSchema so the two sides of plan
     // 13 §2.6's reloc-taxonomy unifier are validated identically.
@@ -931,9 +1108,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // reverse map every object READER builds, so it must be a FUNCTION. A
     // wire type may therefore be claimed by AT MOST ONE non-alias row; any
     // further row sharing it must declare `emitOnly` (an emission alias, e.g.
-    // R_X86_64_PC32 serving both the call-site rel32 and the DWARF FDE
-    // pointer, which differ only in an implicit addend bias the wire format
-    // does not carry).
+    // R_X86_64_PC32 serving both `riprel32` — the RIP-relative operand, bias
+    // -4, the row a reader decodes it as — and `pcrel32`, the DWARF FDE
+    // pointer, bias 0, `emitOnly`: two kinds that differ only in an implicit
+    // addend bias the wire format does not carry. The call kind is not one
+    // of them: it is R_X86_64_PLT32 since P69).
     // ✔MEASURED 2026-08-13: without this, an ambiguous pair was discovered at
     // READ time and rejected every x86_64 ELF object — DSS-produced and
     // gcc-produced alike. Checking it here fails the SCHEMA that is wrong
@@ -1012,7 +1191,6 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         std::unordered_map<std::uint32_t, std::string> claimed;
         for (auto const& r : relocations) {
             if (!r.emitOnly) claimed.emplace(r.nativeId, r.name);
-            if (r.pltNativeId != 0u) claimed.emplace(r.pltNativeId, r.name);
         }
         for (std::size_t i = 0; i < relocations.size(); ++i) {
             auto const& r = relocations[i];
@@ -1021,6 +1199,17 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                      std::format("relocation '{}' is an emission alias "
                                  "(emitOnly), so its bytes-after-field wire "
                                  "types could never be decoded", r.name));
+            }
+            // A statement about how the family's types read their addend, on a
+            // row that lists no such type, states nothing a reader could apply:
+            // it is a misplaced key (or a family that was deleted under it).
+            if (r.bytesAfterFieldLowersTheAddend
+                && r.nativeIdByBytesAfterField.empty()) {
+                fail(std::format("/relocations/{}/bytesAfterFieldLowersTheAddend", i),
+                     std::format("relocation '{}' says its bytes-after-field "
+                                 "wire types lower the addend, and lists no "
+                                 "such type ('nativeIdByBytesAfterField')",
+                                 r.name));
             }
             for (std::size_t j = 0; j < r.nativeIdByBytesAfterField.size(); ++j) {
                 auto const& e = r.nativeIdByBytesAfterField[j];
@@ -1069,13 +1258,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
             if (r.decodeWhenInstruction.empty()) continue;
             auto const path =
                 std::format("/relocations/{}/decodeWhenInstruction", i);
-            if (r.emitOnly || r.isCall || r.pltNativeId != 0u
-                || !r.nativeIdByBytesAfterField.empty()) {
+            if (r.emitOnly || r.isCall || !r.nativeIdByBytesAfterField.empty()) {
                 fail(path,
                      std::format("relocation '{}' is decoded by instruction, "
                                  "so it cannot also be an emission alias, a "
-                                 "call signal, a PLT variant or a "
-                                 "bytes-after-field family",
+                                 "call signal or a bytes-after-field family",
                                  r.name));
             }
             for (std::size_t j = 0; j < r.decodeWhenInstruction.size(); ++j) {
@@ -1409,6 +1596,29 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "`processExit` block — both fields are paired "
              "(D-LK10-ENTRY §2.13). Either declare both or "
              "neither.");
+    }
+    // D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION:
+    // `entryTransition` pairs with `processExit` the same way. The
+    // trampoline derives where the stack stands at its first instruction
+    // from it (the convention's `callPushBytes` when the loader CALLS the
+    // entry, 0 when it JUMPS), so a trampoline built without one would
+    // have to assume — and assuming the jump is exactly how every Mach-O
+    // x86_64 frame ran 8 bytes off (✔MEASURED P69).
+    if (processExit.has_value() && !entryTransition.has_value()) {
+        fail("/entryTransition",
+             "format declares `processExit` but no `entryTransition` — the "
+             "entry trampoline derives the stack's position at its first "
+             "instruction from how the platform's loader enters the image: "
+             "declare `\"called\"` (a return address is pushed — dyld's "
+             "LC_MAIN, Windows' BaseThreadInitThunk) or `\"jumped\"` (nothing "
+             "pushed — the ELF kernel / ld.so hand-off), MEASURED on the "
+             "platform, never inferred.");
+    }
+    if (!processExit.has_value() && entryTransition.has_value()) {
+        fail("/entryTransition",
+             "format declares `entryTransition` but no `processExit` block — "
+             "only a format DSS builds an entry trampoline for has a process "
+             "entry to describe. Declare both or neither.");
     }
     // ═══════════════════════════════════════════════════════════════
     // THE `processExit` ⟺ `isExecFlavor` BICONDITIONAL.

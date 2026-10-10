@@ -297,9 +297,15 @@ public:
                          // what needs no pool (see its docblock), which is the
                          // honest posture for a caller that has no pool to hand it
                          // -- never a licence to call the handle good.
-                         HirInlineAsmPool const* inlineAsmPool = nullptr) noexcept
+                         HirInlineAsmPool const* inlineAsmPool = nullptr,
+                         // P69 (lane `cs`): the linkage side-table
+                         // `checkLinkageAttributes` judges. nullptr => the rule
+                         // does not run: HIR read from text has no such table (the
+                         // linkage attribute has no text form), and that is the
+                         // absence of the thing judged, never a pass.
+                         HirLinkageMap const* linkageMap = nullptr) noexcept
         : hir_(hir), sourceMap_(sourceMap), interner_(interner),
-          inlineAsmPool_(inlineAsmPool) {}
+          inlineAsmPool_(inlineAsmPool), linkageMap_(linkageMap) {}
 
     // The verifier stores a reference and must not outlive the module it
     // inspects — forbid binding to a temporary `Hir` outright. Every arity is
@@ -310,6 +316,8 @@ public:
     HirVerifier(Hir&&, HirSourceMap const*, TypeInterner const*) = delete;
     HirVerifier(Hir&&, HirSourceMap const*, TypeInterner const*,
                 HirInlineAsmPool const*)                         = delete;
+    HirVerifier(Hir&&, HirSourceMap const*, TypeInterner const*,
+                HirInlineAsmPool const*, HirLinkageMap const*)   = delete;
 
     // Run every rule, reporting each violation into `reporter`. Returns true
     // iff THIS run found no violation the reporter's policy makes an Error — by
@@ -402,6 +410,15 @@ private:
     // append an `Unreachable` after a provably-infinite loop. Interner-gated (the
     // return type is read from the FnSig). Each violation emits `H_VerifierFailure`.
     // A non-FnSig type or unresolved result is `checkFunctionSignatures`'; skipped here.
+    //
+    // This rule is the STRICT reading and it is unconditional: the verifier does
+    // not know a language. A language whose declaration form states
+    // `nonVoidFunctionEndReached: returnsUnspecifiedValue` (C23 6.9.2p13) never
+    // brings such a body here — its CST->HIR lowering completes the body with a
+    // return of an unspecified value and warns (`H_NonVoidFunctionEndReachable`),
+    // asking the SAME `pathTerminates`. So what arrives open is a language with
+    // the strict rule, HIR read from text, or a lowering defect, and all three
+    // are refused.
     void checkReturnCompleteness(DiagnosticReporter& reporter) const;
 
     // Call arguments (HR6, plan §2.8): a `Call`'s argument count and types must
@@ -434,6 +451,12 @@ private:
     // otherwise silently produce mis-shaped aggregates downstream.
     void checkConstructAggregate(DiagnosticReporter& reporter) const;
 
+    // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): every
+    // `UnnamedObject` carries a storage duration its payload can name, and its one
+    // child — the initializer — has the object's own type, so the value a consumer
+    // peels (`Hir::unnamedObjectValue`) and the object a consumer addresses agree.
+    void checkUnnamedObject(DiagnosticReporter& reporter) const;
+
     // Shader restrictions (HR6, plan §2.8): inside a `ShaderUsable` function's
     // subtree — no recursion (call-graph cycle), no indirect / function-pointer
     // call, no call to a non-shader (host) function. Each violation emits
@@ -459,12 +482,32 @@ private:
     // expression operand k binds, which is a silent miscompile with a clean log.
     void checkInlineAsm(DiagnosticReporter& reporter) const;
 
+    // P69 (lane `cs`): the linkage side-table's own invariants, which nothing
+    // else can see — the table is not part of the tree. Runs only when a table
+    // was supplied. Each violation emits `H_VerifierFailure`:
+    //
+    //   (a) a `Weak` binding NAMES ITS KIND (`WeakDefinitionKind`: overridable or
+    //       select-any). The two link differently — two select-any definitions
+    //       of one name are one, an overridable one yields to any other — so a
+    //       weak attribute that names neither would be read by a consumer as
+    //       whichever its default happens to be;
+    //   (b) a binding that is NOT weak names no kind — a kind there is read by
+    //       nothing, and a producer that wrote one meant a weak binding it did
+    //       not set;
+    //   (c) the tentative mark sits on a `Global` only, and never beside a
+    //       `Local` binding: an internal-linkage object takes no part in the
+    //       cross-unit fold the mark exists for, and a consumer reading the mark
+    //       without the binding would make two units' private objects one.
+    void checkLinkageAttributes(DiagnosticReporter& reporter) const;
+
     Hir const&          hir_;
     HirSourceMap const* sourceMap_;   // optional; nullptr = no source provenance
     TypeInterner const* interner_;    // optional; nullptr = skip type-decoding rules
     // Inline-asm P5: optional; nullptr = the handle cannot be resolved, so
     // `checkInlineAsm` runs only its pool-free half and says so.
     HirInlineAsmPool const* inlineAsmPool_;
+    // P69 (lane `cs`): optional; nullptr = no linkage side-table to judge.
+    HirLinkageMap const* linkageMap_;
     // The findings THIS run reported that the policy makes Errors; reset by
     // `verify()`, bumped only by `reportAt`. `mutable` because every rule is
     // `const` — the count is the verdict's bookkeeping, not the module's state.

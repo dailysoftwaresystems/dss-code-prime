@@ -40,6 +40,11 @@
 
 namespace dss::linker {
 
+// The ranks a caller states for a weak definition today (`CrossCuDef::weakRank`). Only
+// their ORDER means anything to the kernel.
+inline constexpr std::uint8_t kYieldingWeakDefinition = 0;   // every other weak definition of the name replaces it
+inline constexpr std::uint8_t kUnrankedWeakDefinition = 1;   // the default: folds as weak definitions always did
+
 // One externally-visible DEFINITION the resolver ranks. `name` is the cross-CU match
 // key (the raw declared identifier); `binding` is Global (strong) or Weak; `key` is the
 // definition's compound `(cuId, SymbolId)`. A `Local` binding may be passed — it is
@@ -95,6 +100,24 @@ struct CrossCuDef {
     DuplicateMatch                 duplicateMatch = DuplicateMatch::Any;
     std::size_t                    bodySize = 0;
     std::span<std::uint8_t const>  body{};
+    // ── WHERE THIS WEAK DEFINITION STANDS AMONG THE WEAK DEFINITIONS OF ITS NAME ──
+    //    D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER
+    //
+    // Read only when `binding == Weak`. A weak definition of a HIGHER rank
+    // replaces one of a lower rank whatever their keys and whatever the order
+    // they arrive in; weak definitions of ONE rank fold as weak definitions
+    // always did (the promise checked, the lowest key kept). A definition
+    // outranked by another weak definition of its name is not one of the copies
+    // the fold compares, so nothing is asked of it.
+    //
+    // ★ THE CALLER STATES THE RANK; THIS KERNEL COMPARES NUMBERS. Whether a
+    // format ranks its weak definitions at all, and which kind stands where, is
+    // the link document's fact, read by `linker::weakDefinitionRank`
+    // (`link/common_yield.hpp`). Nothing here knows a kind or a format, which is
+    // what lets the cross-unit MIR merge fold by the same rule. The default is
+    // the rank of a definition nobody ranked, so a caller that states nothing
+    // folds exactly as before.
+    std::uint8_t                   weakRank = kUnrankedWeakDefinition;
 };
 
 // One two-strong collision event. `name` is the colliding cross-CU name; `existing` is

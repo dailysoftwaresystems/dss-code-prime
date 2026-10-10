@@ -49,6 +49,7 @@
 #include <cstdio>
 #include <format>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -100,7 +101,7 @@ void announce(char const* kind, std::size_t index, std::string_view detail) {
 }
 
 std::string oneFunction(std::string const& blocks) {
-    return "dssir 3\n"
+    return "dssir 5\n"
            "symbols {\n  %1 \"f\"\n  %2 \"g\"\n}\n"
            "module {\n"
            "  function %1 : fn() -> i32 {\n" + blocks +
@@ -113,7 +114,7 @@ std::string entryBlock(std::string const& body) {
 }
 
 std::string twoFunctions(std::string const& first, std::string const& second) {
-    return "dssir 3\n"
+    return "dssir 5\n"
            "symbols {\n  %1 \"f\"\n  %2 \"g\"\n}\n"
            "module {\n"
            "  function %1 : fn() -> i32 {\n" + first +
@@ -180,7 +181,7 @@ std::vector<Shape> measuredShapes() {
                     "      %v2 = const : i32 (lit int 2 : i32)\n      return %v2\n"),
          "globaladdr names symbol %0, the invalid sentinel", 1},
         {"EG a global of the invalid symbol",
-         "dssir 3\nmodule {\n  global %0 : i32 = zero\n}\n",
+         "dssir 5\nmodule {\n  global %0 : i32 = zero\n}\n",
          "a global names symbol %0, the invalid sentinel", 1},
         // ── the block rules (`openBlockHasTerminator`, `isBlockUnopened`) ──
         {"E7 an instruction after the terminator",
@@ -271,7 +272,7 @@ struct Truncation {
 };
 
 std::vector<Truncation> measuredTruncations() {
-    std::string const head = "dssir 3\nsymbols {\n  %1 \"f\"\n}\nmodule {\n"
+    std::string const head = "dssir 5\nsymbols {\n  %1 \"f\"\n}\nmodule {\n"
                              "  function %1 : fn() -> i32 {\n";
     return {
         {"H1 cut inside an operand list",
@@ -656,7 +657,7 @@ TEST(MirTextReaderNeverAborts, OneBadBlockCostsItsOwnDiagnosticAndLaterBlocksAre
 namespace {
 
 std::string preambleOnly(std::string const& symbols) {
-    return "dssir 3\nsymbols {\n" + symbols + "}\nmodule {\n}\n";
+    return "dssir 5\nsymbols {\n" + symbols + "}\nmodule {\n}\n";
 }
 
 struct ParsedTable {
@@ -733,7 +734,7 @@ TEST(MirTextSymbolTable, AClassLetterHandlePast32BitsIsRefusedNotWrapped) {
 // holding it reads, re-emits under the same id, and reads again.
 TEST(MirTextSymbolTable, AFunctionAtTheTopSymbolIdReadsAndRoundTrips) {
     std::string const text =
-        "dssir 3\nsymbols {\n  %4294967295 \"top\"\n}\nmodule {\n"
+        "dssir 5\nsymbols {\n  %4294967295 \"top\"\n}\nmodule {\n"
         "  function %4294967295 : fn() -> i32 {\n" + kOneBlockF + "  }\n}\n";
     DiagnosticReporter r1;
     auto const first = parseMir(text, CompilationUnitId{7}, r1);
@@ -786,13 +787,25 @@ MirLiteralValue i32Literal(std::int64_t v) {
     return lit;
 }
 
+// Where a fixture's id space ends, said ONCE where its builder is made — the door
+// mints for no module that never said (`Mir::symbolIdEndIsStated`). `tableEnd`,
+// when given, is the end of the NAME TABLE the module is made from, stated as a
+// module made from a table states it: every id below it is the table's, whether
+// or not the module holds the symbol. With none, the module is made from nothing
+// but itself, and says that.
+void stateIdSpace(MirBuilder& b, std::uint32_t tableEnd) {
+    if (tableEnd != 0) b.stateSymbolIdEnd(tableEnd);
+    else               b.stateSelfContainedSymbolIds();
+}
+
 // One function `sym` that takes the addresses of TWO of its blocks (two mints)
-// and branches through them.
-Mir blockAddressModule(TypeInterner& ti, std::uint32_t sym) {
+// and branches through them. `tableEnd` as `stateIdSpace` reads it.
+Mir blockAddressModule(TypeInterner& ti, std::uint32_t sym, std::uint32_t tableEnd = 0) {
     TypeId const i32   = ti.primitive(TypeKind::I32);
     TypeId const vptr  = ti.pointer(ti.primitive(TypeKind::Void));
     TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
     MirBuilder b;
+    stateIdSpace(b, tableEnd);
     b.addFunction(fnSig, SymbolId{sym});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const t1    = b.createBlock(StructCfMarker::Linear);
@@ -810,14 +823,15 @@ Mir blockAddressModule(TypeInterner& ti, std::uint32_t sym) {
 }
 
 // One function `sym` whose switch is dense enough for a jump table (10 cases,
-// 0..9 — past the lowering's 8-case floor, span == count).
-Mir denseSwitchModule(TypeInterner& ti, std::uint32_t sym) {
+// 0..9 — past the lowering's 8-case floor, span == count). `tableEnd` as above.
+Mir denseSwitchModule(TypeInterner& ti, std::uint32_t sym, std::uint32_t tableEnd = 0) {
     constexpr std::size_t kCases = 10;
     TypeId const i32   = ti.primitive(TypeKind::I32);
     TypeId const voidT = ti.primitive(TypeKind::Void);
     std::array<TypeId, 1> params{i32};
     TypeId const fnSig = ti.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder b;
+    stateIdSpace(b, tableEnd);
     b.addFunction(fnSig, SymbolId{sym});
     MirBlockId const entry = b.createBlock(StructCfMarker::SwitchHead);
     std::array<MirBlockId, kCases> caseBlocks{};
@@ -838,13 +852,15 @@ Mir denseSwitchModule(TypeInterner& ti, std::uint32_t sym) {
     return m;
 }
 
-// Emit to `.dssir` naming only `sym`, and read it back.
-std::unique_ptr<MirParseResult> throughText(Mir const& m, TypeInterner const& ti,
-                                            std::uint32_t sym) {
+// The module's `.dssir` text, naming only `sym` (as `f`).
+std::string textOf(Mir const& m, TypeInterner const& ti, std::uint32_t sym) {
     std::unordered_map<std::uint32_t, std::string> const names{{sym, "f"}};
     MirTextContext ctx{&ti, nullptr, &names};
     DiagnosticReporter w;
-    std::string const text = emitMir(m, ctx, w);
+    return emitMir(m, ctx, w);
+}
+
+std::unique_ptr<MirParseResult> readBack(std::string const& text) {
     DiagnosticReporter r;
     auto parsed = parseMir(text, CompilationUnitId{7}, r);
     std::vector<std::string> diags;
@@ -853,16 +869,29 @@ std::unique_ptr<MirParseResult> throughText(Mir const& m, TypeInterner const& ti
     return parsed;
 }
 
+// Emit to `.dssir` naming only `sym`, and read it back.
+std::unique_ptr<MirParseResult> throughText(Mir const& m, TypeInterner const& ti,
+                                            std::uint32_t sym) {
+    return readBack(textOf(m, ti, sym));
+}
+
 struct Lowered {
     MirToLirResult           result;
     std::vector<std::string> exhausted;   // every L_SymbolIdSpaceExhausted, as text
     std::vector<std::string> errors;      // every Error, as `code: text`
 };
 
-Lowered lowerRead(MirParseResult const& parsed, DiagnosticReporter::Config cfg = {}) {
+// Lower a module as it stands. `imports` are the import rows a caller hands in
+// BESIDE the module (none for a module read from text: the text holds no row).
+Lowered lowerModule(Mir const& mir, TypeInterner const& ti, DiagnosticReporter::Config cfg = {},
+                    std::vector<ExternImport> imports = {}) {
     auto const sch = shippedX86();
     DiagnosticReporter rep{cfg};
-    Lowered out{lowerToLir(parsed.mir, *sch, parsed.interner, rep), {}, {}};
+    // An import row is lowered only beside a stated call shape (the lowering
+    // refuses rows with none); which shape is not what these pins read.
+    std::optional<ExternCallDispatch> dispatch;
+    if (!imports.empty()) dispatch = ExternCallDispatch::DirectPlt;
+    Lowered out{lowerToLir(mir, *sch, ti, rep, std::move(imports), dispatch), {}, {}};
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::L_SymbolIdSpaceExhausted) {
             EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
@@ -873,6 +902,10 @@ Lowered lowerRead(MirParseResult const& parsed, DiagnosticReporter::Config cfg =
         }
     }
     return out;
+}
+
+Lowered lowerRead(MirParseResult const& parsed, DiagnosticReporter::Config cfg = {}) {
+    return lowerModule(parsed.mir, parsed.interner, std::move(cfg));
 }
 
 // Every SymbolId a SymbolRef operand of the lowered module names.
@@ -981,6 +1014,228 @@ TEST(LoweringMintsPastTheHighWater, TheExhaustionRefusalSurvivesSuppressionAndDe
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// THE LOWERING'S IDS CONTINUE THE MODULE'S ID SPACE
+// (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE, the sixth minter).
+//
+// A module made from a name table owns EVERY id below `Mir::symbolIdEnd()`, and
+// most of them are names it never holds: a declaration defined nowhere in the
+// unit, an import the caller of the lowering did not hand in (a module read from
+// `.dssir` text is lowered with no import row at all). The seed of the lowering's
+// minter was a SCAN — the module's functions, its globals, the imports handed in
+// — so its first mint landed INSIDE the table: the block symbol of a label took
+// the id of a declared function, in silence, and the two met at the link.
+// The ids now continue the module's own (`MirSymbolIdContinuation`): the first
+// mint is `symbolIdEnd()`, whatever the module happens to hold.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+// One function `1` whose first block address is EXPORTED under `exported` — the
+// symbol HIR→MIR pre-mints for a label whose address a static initializer takes —
+// and whose second is the lowering's to name.
+Mir exportedBlockAddressModule(TypeInterner& ti, std::uint32_t exported) {
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const vptr  = ti.pointer(ti.primitive(TypeKind::Void));
+    TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
+    MirBuilder b;
+    stateIdSpace(b, 0);   // made from nothing but itself: the export's id is BESIDE its end
+    b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const t1    = b.createBlock(StructCfMarker::Linear);
+    MirBlockId const t2    = b.createBlock(StructCfMarker::Linear);
+    b.beginBlock(entry);
+    MirInstId const a1 = b.addBlockAddress(t1, vptr);
+    (void)b.addBlockAddressExport(a1, SymbolId{exported});
+    MirInstId const a2 = b.addBlockAddress(t2, vptr);
+    std::array<MirBlockId, 2> succs{t1, t2};
+    b.addIndirectBr(a2, succs);
+    b.beginBlock(t1);
+    b.addReturn(b.addConst(i32Literal(1), i32));
+    b.beginBlock(t2);
+    b.addReturn(b.addConst(i32Literal(2), i32));
+    return std::move(b).finish();
+}
+
+// `text` with one more table entry, `%slot "name"`, declared after `f`'s — a name
+// the module defines nothing under.
+std::string withDeclaredName(std::string text, std::uint32_t slot, std::string_view name) {
+    std::string const entryOfF = "  %1 \"f\"\n";
+    std::size_t const at = text.find(entryOfF);
+    if (at == std::string::npos) {
+        throw std::runtime_error("the emitted table spells its entry another way:\n" + text);
+    }
+    text.insert(at + entryOfF.size(), std::format("  %{} \"{}\"\n", slot, name));
+    return text;
+}
+
+// `text` with its whole `symbols { … }` section cut out (the section is optional:
+// a function is still spelled by its slot).
+std::string withoutSymbolsSection(std::string text) {
+    std::string const open = "symbols {\n";
+    std::size_t const at = text.find(open);
+    std::size_t const close = at == std::string::npos ? at : text.find("}\n", at);
+    if (close == std::string::npos) {
+        throw std::runtime_error("the emitted text holds no `symbols` section:\n" + text);
+    }
+    text.erase(at, close + 2 - at);
+    return text;
+}
+
+} // namespace
+
+// THE READER STATES ITS TABLE'S END. The slots a text declares are the module's id
+// space whether or not the module defines a function or a global under them: the
+// end is one past the highest DECLARED slot — sparse or not — and saturates on
+// the top id, by the door's own rule. A text that declares only what it defines
+// ends where a count of its symbols would (the control).
+TEST(MirTextSymbolTable, TheDeclaredSlotsAreTheModulesIdSpaceDefinedOrNot) {
+    TypeInterner ti{CompilationUnitId{1}};
+    std::string const text = textOf(blockAddressModule(ti, 1), ti, 1);
+    {
+        auto const parsed = readBack(text);
+        ASSERT_TRUE(parsed->ok);
+        EXPECT_EQ(parsed->mir.symbolIdEnd(), 2u) << "CONTROL: `f` alone, declared and defined";
+    }
+    {
+        auto const parsed = readBack(withDeclaredName(text, 2, "g"));
+        ASSERT_TRUE(parsed->ok);
+        EXPECT_EQ(parsed->mir.symbolIdEnd(), 3u) << "a declared, undefined `%2`";
+    }
+    {
+        auto const parsed = readBack(withDeclaredName(text, 900, "far"));
+        ASSERT_TRUE(parsed->ok);
+        EXPECT_EQ(parsed->mir.symbolIdEnd(), 901u) << "a sparse table ends past its highest slot";
+    }
+    {
+        auto const parsed = readBack(withDeclaredName(text, kTopSymbolId, "top"));
+        ASSERT_TRUE(parsed->ok);
+        EXPECT_EQ(parsed->mir.symbolIdEnd(), kTopSymbolId) << "the top id has no one-past: the end saturates";
+    }
+}
+
+// THE READER STATES WHAT IT READ — WITH A `symbols` SECTION, AND WITHOUT ONE. The
+// door mints for no module whose end nobody stated (`Mir::symbolIdEndIsStated`),
+// and it refuses by ABORTING: the entrance is at fault, never the input. So the one
+// entrance that is fed by input must state its end on every path a module leaves it
+// by — else a text with no table would kill the compiler at the first block address
+// it lowered. (The statement used to be made where the section is parsed, which a
+// text with no section never reaches.) Both texts lower here, and each mints.
+TEST(MirTextSymbolTable, AModuleReadFromTextStatesItsEndWithOrWithoutASymbolsSection) {
+    TypeInterner ti{CompilationUnitId{1}};
+    std::string const text = textOf(blockAddressModule(ti, 1), ti, 1);
+    std::string const sectionless = withoutSymbolsSection(text);
+    ASSERT_NE(text.find("symbols {"), std::string::npos);
+    ASSERT_EQ(sectionless.find("symbols"), std::string::npos) << sectionless;
+    for (std::string const* const t : {&text, &sectionless}) {
+        SCOPED_TRACE(t == &text ? "with a `symbols` section" : "with no `symbols` section");
+        auto const parsed = readBack(*t);
+        ASSERT_TRUE(parsed->ok) << *t;
+        EXPECT_TRUE(parsed->mir.symbolIdEndIsStated())
+            << "the reader handed out a module whose id space nobody stated";
+        EXPECT_EQ(parsed->mir.symbolIdEnd(), 2u) << "one past `f`, the one symbol the text defines";
+        Lowered const low = lowerRead(*parsed);
+        EXPECT_TRUE(low.errors.empty()) << listed(low.errors);
+        std::vector<std::uint32_t> const refs = symbolRefs(low.result.lir);
+        ASSERT_FALSE(refs.empty()) << "no block address was lowered: nothing was minted";
+        for (std::uint32_t const v : refs) EXPECT_GE(v, 2u);
+    }
+}
+
+// A table of nine names, of which the module holds ONE (`1`): every block symbol
+// is minted at or past the table's end, never on one of the eight others.
+TEST(LoweringMintsPastTheHighWater, ABlockSymbolIsMintedPastTheNameTableNotInsideIt) {
+    constexpr std::uint32_t kTableEnd = 10;
+    TypeInterner ti{CompilationUnitId{1}};
+    Mir const m = blockAddressModule(ti, 1, kTableEnd);
+    ASSERT_EQ(m.symbolIdEnd(), kTableEnd) << "the module does not state the table's end";
+    Lowered const low = lowerModule(m, ti);
+    EXPECT_TRUE(low.errors.empty()) << listed(low.errors);
+    std::vector<std::uint32_t> const refs = symbolRefs(low.result.lir);
+    ASSERT_FALSE(refs.empty()) << "no block address was lowered: the pin would read nothing";
+    for (std::uint32_t const v : refs) {
+        EXPECT_GE(v, kTableEnd) << "a block symbol was minted as " << v
+                                << " — an id of the name table, which another name owns";
+    }
+}
+
+// The same table, the other kind of symbol the one minter serves.
+TEST(LoweringMintsPastTheHighWater, AJumpTableSymbolIsMintedPastTheNameTableNotInsideIt) {
+    constexpr std::uint32_t kTableEnd = 10;
+    TypeInterner ti{CompilationUnitId{1}};
+    Mir const m = denseSwitchModule(ti, 1, kTableEnd);
+    ASSERT_EQ(m.symbolIdEnd(), kTableEnd) << "the module does not state the table's end";
+    Lowered const low = lowerModule(m, ti);
+    EXPECT_TRUE(low.errors.empty()) << listed(low.errors);
+    ASSERT_EQ(low.result.jumpTableDescriptors.size(), 1u);
+    JumpTableDescriptor const& jt = low.result.jumpTableDescriptors[0];
+    EXPECT_GE(jt.tableSymbol.v, kTableEnd) << "the table symbol is an id of the name table";
+    ASSERT_FALSE(jt.blockSymbols.empty());
+    for (auto const& [blk, sym] : jt.blockSymbols) {
+        EXPECT_GE(sym.v, kTableEnd) << "block " << blk << "'s symbol " << sym.v
+                                    << " is an id of the name table";
+    }
+}
+
+// THE ENTRANCE THAT HANDS IN NO IMPORT: a `.dssir` text whose table declares a
+// second name, `%2`, that no function or global of the module is. The reader
+// states the table's end, and the lowering — given the module alone — keeps `%2`.
+TEST(LoweringMintsPastTheHighWater, ANameTheTextDeclaresAndTheModuleNeverHoldsKeepsItsId) {
+    TypeInterner ti{CompilationUnitId{1}};
+    std::string const text = withDeclaredName(textOf(blockAddressModule(ti, 1), ti, 1), 2, "g");
+    auto const parsed = readBack(text);
+    ASSERT_TRUE(parsed->ok);
+    ASSERT_EQ(parsed->mir.symbolIdEnd(), 3u) << "the reader did not state the table's end:\n" << text;
+    Lowered const low = lowerRead(*parsed);
+    EXPECT_TRUE(low.errors.empty()) << listed(low.errors);
+    std::vector<std::uint32_t> const refs = symbolRefs(low.result.lir);
+    ASSERT_FALSE(refs.empty()) << "no block address was lowered: the pin would read nothing";
+    for (std::uint32_t const v : refs) {
+        EXPECT_GE(v, 3u) << "a block symbol was minted as " << v << " — the id the text gives `g`";
+    }
+}
+
+// An import row handed in BESIDE a hand-built module carries an id the module's
+// own end does not cover (the module was made from no table): the lowering keeps
+// clear of it.
+TEST(LoweringMintsPastTheHighWater, AnImportHandedInBesideTheModuleKeepsItsId) {
+    TypeInterner ti{CompilationUnitId{1}};
+    Mir const m = blockAddressModule(ti, 1);
+    ASSERT_EQ(m.symbolIdEnd(), 2u);
+    ExternImport imp;
+    imp.symbol      = SymbolId{2};
+    imp.mangledName = "g";
+    Lowered const low = lowerModule(m, ti, {}, {imp});
+    EXPECT_TRUE(low.errors.empty()) << listed(low.errors);
+    std::vector<std::uint32_t> const refs = symbolRefs(low.result.lir);
+    ASSERT_FALSE(refs.empty()) << "no block address was lowered: the pin would read nothing";
+    for (std::uint32_t const v : refs) {
+        EXPECT_GE(v, 3u) << "a block symbol was minted as " << v << " — the import's id";
+    }
+}
+
+// A block symbol PRE-MINTED for an exported label sits where the module's end is
+// when the module was built by hand (the builder's export states no id of its
+// own): the lowering names the OTHER block past it, never with it.
+TEST(LoweringMintsPastTheHighWater, ABlockSymbolAnExportAlreadyOwnsIsNotMintedAgain) {
+    constexpr std::uint32_t kExported = 2;
+    TypeInterner ti{CompilationUnitId{1}};
+    Mir const m = exportedBlockAddressModule(ti, kExported);
+    ASSERT_EQ(m.symbolIdEnd(), kExported) << "the export's symbol is meant to sit AT the module's end";
+    Lowered const low = lowerModule(m, ti);
+    EXPECT_TRUE(low.errors.empty()) << listed(low.errors);
+    std::vector<std::uint32_t> const refs = symbolRefs(low.result.lir);
+    ASSERT_FALSE(refs.empty()) << "the second block address was not lowered: the pin would read nothing";
+    // The first block's address may or may not be read through its exported symbol
+    // here; the SECOND block's symbol is the lowering's own and must be another id.
+    EXPECT_TRUE(std::any_of(refs.begin(), refs.end(),
+                            [](std::uint32_t v) { return v > kExported; }))
+        << "the lowering named the second block with the symbol the export already "
+           "publishes for the first";
+    for (std::uint32_t const v : refs) {
+        EXPECT_GE(v, kExported) << "a block symbol was minted as " << v << " — the function's own id";
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // PART 1c-b — THE MIR LITERAL TWINS (P68 round 8, lane `ht`): the SAME spellings
 // the HIR reader was held to in 1c-a, held to the SAME rules. The MIR `bitint` arm
 // `reserve`d its declared limb count before reading one limb (`1000000000000`
@@ -992,12 +1247,12 @@ TEST(LoweringMintsPastTheHighWater, TheExhaustionRefusalSurvivesSuppressionAndDe
 namespace {
 
 std::string literalGlobal(std::string const& type, std::string const& value) {
-    return "dssir 3\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
+    return "dssir 5\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
            " = lit " + value + "\n}\n";
 }
 
 std::string zeroGlobal(std::string const& type) {
-    return "dssir 3\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
+    return "dssir 5\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
            " = zero\n}\n";
 }
 
@@ -1039,7 +1294,7 @@ TEST(MirTextLiteralTwins, TheBitIntTypeWidthIsOneTheModelDefines) {
             << "_BitInt(" << w << ")" << listed(p.diagnostics);
     }
     DiagnosticReporter r;
-    auto const res = parseMir("dssir 3\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : _BitInt(" +
+    auto const res = parseMir("dssir 5\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : _BitInt(" +
                                   std::to_string(kBitIntMaxWidth) + ") = zero\n}\n",
                               CompilationUnitId{7}, r);
     std::vector<std::string> diags;

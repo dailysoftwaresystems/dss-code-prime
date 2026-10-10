@@ -610,6 +610,17 @@ TEST(FeatureQueryOperators, AnUnshimmedQueryAnswersAndAnUnknownOperatorStillFail
          "about a builtin DSS demonstrably has, not a conservative one."},
         {"__has_builtin", kAbsentBuiltin, false,
          "the CONTROL: a clang target-introspection builtin DSS does not have."},
+        // (A LIBRARY builtin — `__builtin_strlen` — answers per active target; with no
+        // pair in scope, as here, it is 0. Its arms are `ALibraryBuiltinAnswers…` below.)
+        {"__has_builtin", "__builtin_frame_address", false,
+         "P69 (lane `cs`, review M4): not a builtin of this language until DSS keeps frame "
+         "records — a call is S_UndeclaredIdentifier, so the answer is 0 with it (gcc and "
+         "clang answer 1, and that is the requirement the row holds open)."},
+        {"__has_builtin", "__builtin_expect", true,
+         "P69 (lane `cs`): a builtinFunctions row with the `first_argument` verb."},
+        {"__has_builtin", "__builtin_not_a_library_function", false,
+         "P69 (lane `cs`): the CONTROL — the library prefix alone answers nothing; the "
+         "name after it must be a listed library function."},
         {"__has_feature", "c_static_assert", true,
          "declared in preprocess.languageFeatures, and the declaration is "
          "backed by a compiled-and-run witness. ✔MEASURED: clang 18.1.3 answers "
@@ -665,6 +676,75 @@ TEST(FeatureQueryOperators, AnUnshimmedQueryAnswersAndAnUnknownOperatorStillFail
         EXPECT_EQ(codeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
                   std::optional<DiagnosticSeverity>{DiagnosticSeverity::Error})
             << op << ": the refusal is the `#if` operand diagnostic, at Error.";
+    }
+}
+
+// ── 5a. A LIBRARY BUILTIN ANSWERS WHERE ITS CALL BINDS ──────────────────────
+//
+// P69 (lane `cs`, review M3). `__builtin_strlen` IS the platform's `strlen`: a call binds
+// to the shipped corpus's realization of the function on the active target, and a use of
+// one the platform does not provide there is refused at the use
+// (S_LibraryBuiltinUnavailable). So `__has_builtin` answers 1 exactly where a shipped
+// descriptor provides the function on the active object format, and 0 elsewhere — and 0
+// with no pair in scope, where the binder provides nothing either. Answering 1 for every
+// LISTED name instead would send a portable `#if __has_builtin(__builtin_cbrt)` guard
+// straight into a call the semantic tier refuses.
+// The answer is the BINDER's, row for row: a row behind its symbol gate on the format declares
+// nothing there, so it answers 0, while a row declared there answers 1 whatever owns its body —
+// the C library's import (strndup on elf and macho) or DSS's shipped source (strndup on pe,
+// where the binder binds the row as the `#include` path binds it).
+// RED-ON-DISABLE: (a) answer from the `libraryBuiltins` list alone (the platform half of
+// `languageDeclaresBuiltin` dropped) → the `cbrt` arm and the no-pair arm answer 1;
+// (b) leave the preprocessor's platform callback unset → every provided arm answers 0;
+// (c) pass over a row whose body is shipped source → the strndup pe arm answers 0; (d) look
+// past the symbol gate → the fabsf pe arm answers 1.
+TEST(FeatureQueryOperators, ALibraryBuiltinAnswersWhereThePlatformProvidesTheFunction) {
+    struct Arm {
+        std::string_view                arg;
+        std::optional<ObjectFormatKind> fmt;
+        bool                            want;
+        char const*                     why;
+    };
+    const Arm arms[] = {
+        {"__builtin_strlen", ObjectFormatKind::Elf, true,
+         "string.json provides strlen on elf. ✔MEASURED: gcc 13.3.0 and clang 18.1.3 answer 1 "
+         "(lane `cs`'s probe r5s s28)."},
+        {"__builtin_strlen", ObjectFormatKind::Pe, true, "and on pe."},
+        {"__builtin_printf", ObjectFormatKind::Elf, true, "stdio.json's elf/macho import row."},
+        {"__builtin_printf", ObjectFormatKind::Pe, true, "stdio.json provides printf on pe."},
+        {"__builtin_cbrt", ObjectFormatKind::Elf, false,
+         "no shipped descriptor declares cbrt, so `__builtin_cbrt(x)` is refused at the use "
+         "and the answer must be 0 with it."},
+        {"__builtin_strlen", std::nullopt, false,
+         "no pair in scope: the binder provides no library function, nor does the operator."},
+        {"__builtin_strndup", ObjectFormatKind::Elf, true,
+         "string.json's strndup row imports the C library's on elf (glibc 2.39 exports it: lane "
+         "`cs`'s probe iso2g)."},
+        {"__builtin_strndup", ObjectFormatKind::Pe, true,
+         "on pe the row's body is DSS's shipped source (ucrtbase.dll exports no strndup), which "
+         "the binder binds as the `#include` path binds it."},
+        {"__builtin_strndup", ObjectFormatKind::MachO, true,
+         "and on macho the row imports libSystem's (its `dlsym` finds strndup and Apple clang "
+         "21.0.0 emits `_strndup` on both arches: lane `cs`'s probe mac1)."},
+        {"__builtin_fabsf", ObjectFormatKind::Pe, false,
+         "math.json's fabsf row is gated elf and macho (ucrtbase.dll exports no fabsf), so pe "
+         "declares none: the arm a reader looking past the symbol gate answers 1."},
+        {"__builtin_fabsf", ObjectFormatKind::Elf, true, "the same row on elf: the control."},
+        {"__builtin_strdup", ObjectFormatKind::Pe, true,
+         "strdup binds ucrtbase.dll's `_strdup` on pe through its link name."},
+    };
+    std::vector<fs::path> const noDirs;
+    for (Arm const& a : arms) {
+        auto buf = SourceBuffer::fromString(
+            "#if __has_builtin(" + std::string{a.arg} + ")\n"
+            "int answered_nonzero;\n#else\nint answered_zero;\n#endif\n",
+            "fq_lib.c");
+        PreprocessResult const r =
+            preprocess(buf, cSchema(), noDirs, kDefaultHeaderNameMatching,
+                       DiagnosticBudget::libraryDefault(), /*systemDirs=*/{}, a.fmt);
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << a.arg;
+        EXPECT_EQ(sawLexeme(r, "answered_nonzero"), a.want) << a.arg << ": " << a.why;
+        EXPECT_EQ(sawLexeme(r, "answered_zero"), !a.want) << a.arg;
     }
 }
 
@@ -728,6 +808,68 @@ TEST(FeatureQueryOperators, TheBuiltinAnswerFollowsTheDeclaredTruthSet) {
            "from a second list — which is the duplicated-truth-set defect the "
            "ruling names explicitly, and it goes out of sync the first time a "
            "builtin is added.";
+}
+
+// ── 5b. AN ATTRIBUTE THE COMPILER REFUSES BY NAME IS NOT ADVERTISED ─────────
+//
+// P69 (lane `cs`). The attribute table gained two verbs whose rows exist so that a
+// name can be REFUSED BY NAME: `unsupported` (`vector_size`, `mode`, `naked` — the
+// compiler cannot honour them at all) and `callingConvention` (`ms_abi`, … —
+// honoured only as a statement of the pair's own convention). `__has_attribute`
+// answers from that same table, and it answered 1 for every name in it — so the
+// moment those rows were written, a header that asks first
+//     #if __has_attribute(vector_size)
+//     typedef int v4 __attribute__((vector_size(16)));
+//     #else … the scalar fallback …
+// was answered INTO the refusal, where before the rows existed it was answered 0
+// and its fallback compiled. An advertisement the compiler does not honour is the
+// defect class that kept a whole real-world corpus from building for six cycles
+// (`c_atomic`); this is the same thing, one table over.
+//
+// Table-driven over the SHIPPED rows, never a hand list: a row added tomorrow
+// under either verb is asked here without anyone remembering to. Each name is
+// asked in its reserved spelling (`__name__`), which is an identifier whatever
+// the plain word is; the named cells below ask the plain words real headers use.
+//
+// RED-ON-DISABLE: drop the `attributeEffectAdvertisesItsNames` line of
+// `languageDeclaresAttribute` and every row of the two verbs answers 1.
+TEST(FeatureQueryOperators, AnAttributeThatIsRefusedByNameIsNotAdvertised) {
+    auto const answers = [](std::string const& name) {
+        PreprocessResult const r = pp("#if __has_attribute(" + name
+                                      + ")\nint yes;\n#else\nint no;\n#endif\n");
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << name;
+        bool const yes = sawLexeme(r, "yes");
+        EXPECT_NE(yes, sawLexeme(r, "no")) << name << " — exactly one arm is live";
+        return yes;
+    };
+    std::size_t refusing = 0;
+    std::size_t advertising = 0;
+    for (auto const& row : cSchema()->semantics().attributeEffects) {
+        bool const advertised = attributeEffectAdvertisesItsNames(row.effect);
+        for (auto const& n : row.names) {
+            // A qualified name (`q(name)`) is not an identifier: no program can ask
+            // the operator about it, so it has no answer to pin.
+            if (n.find('(') != std::string::npos) continue;
+            EXPECT_EQ(answers("__" + n + "__"), advertised) << n;
+            ++(advertised ? advertising : refusing);
+        }
+    }
+    EXPECT_GE(refusing, 10u)
+        << "the shipped table carries three `unsupported` words and seven "
+           "calling-convention words; a count below that means the loop above "
+           "asked nothing of one of the two verbs";
+    EXPECT_GT(advertising, 20u);
+
+    for (char const* n : {"vector_size", "mode", "naked", "ms_abi", "sysv_abi",
+                          "vectorcall", "aarch64_vector_pcs"}) {
+        EXPECT_FALSE(answers(n)) << n;
+    }
+    // CONTROLS: a name the compiler honours is still advertised, and a name
+    // nothing declares still answers 0.
+    for (char const* n : {"aligned", "noinline", "deprecated", "selectany"}) {
+        EXPECT_TRUE(answers(n)) << n;
+    }
+    EXPECT_FALSE(answers(std::string{kAbsentAttribute}));
 }
 
 // ── 6. THE SHIM SURVIVES THE INCLUDE PRE-SCAN ORACLE ────────────────────────

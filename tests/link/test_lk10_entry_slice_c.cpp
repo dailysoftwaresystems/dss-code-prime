@@ -137,11 +137,13 @@ makeSyscallElfExecFormat() {
       "entryPoint": "",
       "externCallDispatch": "direct-plt",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8},
         "class": "elf64", "data": "lsb", "osabi": "sysv", "machine": 62,
         "type": "exec", "pageAlign": 4096,
         "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": true
       },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "entryVerbs": ["none","argc-argv"],
       "processExit": {
         "mechanism": "syscall",
@@ -172,11 +174,13 @@ makeSyscallElfExecFormatArm64() {
       "entryPoint": "",
       "externCallDispatch": "direct-plt",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 1025, "jumpSlot": 1026, "relative": 1027},
         "class": "elf64", "data": "lsb", "osabi": "sysv", "machine": 183,
         "type": "exec", "pageAlign": 4096,
         "interpreter": "/lib/ld-linux-aarch64.so.1", "bindNow": true
       },
       "entryCallingConvention": "aapcs64",
+      "entryTransition": "jumped",
       "entryVerbs": ["none","argc-argv"],
       "processExit": {
         "mechanism": "syscall",
@@ -535,19 +539,26 @@ TEST(LK10EntrySliceC, LinkerSkipsInjectionWhenOverrideAlreadyPresent) {
 // `#if defined(_WIN32)` and asserts the OS-reported exit code.
 // That's the end-to-end pin, but it's invisible to non-Windows CI.
 //
-// These two tests pin the EMITTED-BYTES surface of the trampoline
-// prologue so a bias regression (e.g. someone "tidying"
-// `ms_x64.entryStackPointerBias` back to 0) is caught on EVERY host,
-// not only the one with `CreateProcess`. Strong convergence at the
-// standing 7-agent audit (test-analyzer Gap 3 + Gap 4 + silent-
-// failure HIGH-3 all flagged the host-dependence of the regression
-// floor).
+// These tests pin the EMITTED-BYTES surface of the trampoline
+// prologue so a bias regression is caught on EVERY host, not only the
+// one with `CreateProcess`. Strong convergence at the standing 7-agent
+// audit (test-analyzer Gap 3 + Gap 4 + silent-failure HIGH-3 all
+// flagged the host-dependence of the regression floor).
+// ★ P69 (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION): the
+// process-entry bias is no longer a calling-convention field; the
+// trampoline DERIVES it — the convention's `callPushBytes` where the
+// exec format's `entryTransition` says the loader CALLS the entry, 0
+// where it JUMPS. Each pin below names the format's declared transition
+// as the fact it rests on, and `MachOX64TrampolinePrologueIsSubRsp8` pins
+// the format the old per-convention bias got wrong.
 
 TEST(LK10EntrySliceC, MsX64TrampolinePrologueIsSubRsp0x28) {
-    // Win64 entry cc has entryStackPointerBias=8 + shadowSpaceBytes=32
-    // → alignedSizeWithBias = 40 = 0x28 → trampoline's first opcode
-    // MUST be `sub rsp, 0x28` (REX.W + opcode 81 /5 + ModR/M C4 +
-    // imm32 LE). Encoded bytes: `48 81 EC 28 00 00 00`.
+    // pe64 declares `entryTransition: called` (BaseThreadInitThunk CALLS
+    // the entry) and its entry cc ms_x64 has callPushBytes=8 +
+    // shadowSpaceBytes=32 → derived bias 8 → alignedSizeWithBias = 40 =
+    // 0x28 → trampoline's first opcode MUST be `sub rsp, 0x28` (REX.W +
+    // opcode 81 /5 + ModR/M C4 + imm32 LE). Encoded bytes:
+    // `48 81 EC 28 00 00 00`.
     //
     // A regression to this number re-opens STATUS_ACCESS_VIOLATION
     // (0xC0000005) on the process-exit callee's aligned-SSE stores —
@@ -572,18 +583,20 @@ TEST(LK10EntrySliceC, MsX64TrampolinePrologueIsSubRsp0x28) {
     EXPECT_EQ(trampBytes[2], 0xECu) << "ModR/M: mod=11 reg=/5 rm=100=rsp";
     EXPECT_EQ(trampBytes[3], 0x28u)
         << "imm32 LE byte 0 — value 40 = 32 shadow + 8 align. "
-           "Regression to 0x00 indicates ms_x64.entryStackPointerBias "
-           "was zeroed; regression to other values indicates "
-           "alignedSizeWithBias formula drift.";
+           "Regression to 0x20 indicates pe64's `entryTransition` stopped "
+           "saying `called` (or the trampoline stopped deriving the bias "
+           "from it); other values indicate alignedSizeWithBias formula "
+           "drift.";
     EXPECT_EQ(trampBytes[4], 0x00u) << "imm32 LE byte 1";
     EXPECT_EQ(trampBytes[5], 0x00u) << "imm32 LE byte 2";
     EXPECT_EQ(trampBytes[6], 0x00u) << "imm32 LE byte 3";
 }
 
 TEST(LK10EntrySliceC, SysvElfTrampolineEmitsNoPrologue) {
-    // Negative pin: sysv_amd64 has entryStackPointerBias=0 +
-    // shadowSpaceBytes=0 → alignedSizeWithBias = 0 → NO `sub rsp,
-    // ...` op emitted. Since c88 (D-RUNTIME-MAIN-ARGC-ARGV) the
+    // Negative pin: the ELF exec format declares `entryTransition:
+    // jumped` (the kernel / ld.so JUMPS to the entry) and sysv_amd64 has
+    // shadowSpaceBytes=0 → derived bias 0 → alignedSizeWithBias = 0 → NO
+    // `sub rsp, ...` op emitted. Since c88 (D-RUNTIME-MAIN-ARGC-ARGV) the
     // SHIPPED format's trampoline leads with the argc/argv
     // materialization pair (see ShippedElfX64TrampolineMaterializes
     // ArgcArgv for the byte pin); this test keeps the PROLOGUE
@@ -612,12 +625,44 @@ TEST(LK10EntrySliceC, SysvElfTrampolineEmitsNoPrologue) {
                          && trampBytes[i + 1] == 0x81u
                          && trampBytes[i + 2] == 0xECu;
         EXPECT_FALSE(subRsp)
-            << "SysV trampoline must NOT emit a prologue (cc.shadow=0, "
-               "cc.entryBias=0 → adjustBytes=0) — found `sub rsp, "
-               "imm32` at byte offset " << i << ". Either "
-               "entryStackPointerBias was set non-zero on sysv_amd64 "
-               "OR the `if (adjustBytes > 0)` guard was lost.";
+            << "ELF x86_64 trampoline must NOT emit a prologue (cc.shadow=0, "
+               "jumped → derived bias 0 → adjustBytes=0) — found `sub rsp, "
+               "imm32` at byte offset " << i << ". Either the ELF format's "
+               "`entryTransition` stopped saying `jumped` OR the "
+               "`if (adjustBytes > 0)` guard was lost.";
     }
+}
+
+// ★ P69 (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION): THE
+// FORMAT THE OLD PER-CONVENTION BIAS GOT WRONG. Mach-O x86_64 shares
+// sysv_amd64 with ELF, but dyld CALLS LC_MAIN's entry (✔MEASURED, Apple
+// clang 21 under Rosetta: a C entry's 16-aligned locals aligned only
+// because it was called), so the stack is 8 off at the trampoline's first
+// instruction and the derived bias is callPushBytes = 8 → with no shadow
+// space, alignedSizeWithBias(0, 16, 8) = 8 → `sub rsp, 8` FIRST (Mach-O
+// declares no processArgs, so nothing precedes it). The old bias of 0
+// emitted nothing here and ran every DSS frame 8 bytes off.
+// RED-on-disable: flip the shipped Mach-O x86_64 format's `entryTransition`
+// to `jumped` and the leading `sub rsp, 8` disappears.
+TEST(LK10EntrySliceC, MachOX64TrampolinePrologueIsSubRsp8) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(format.has_value());
+    ASSERT_EQ((*format)->entryTransition(), std::optional<EntryTransition>{EntryTransition::Called})
+        << "the shipped Mach-O x86_64 exec format must declare that dyld CALLS its entry";
+    auto mod = makeReturn42Module();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::injectEntryTrampoline(mod, **target, **format, rep));
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(mod.functions.empty());
+    auto const& t = mod.functions[0].bytes;
+    std::vector<std::uint8_t> const subRsp8 = {0x48, 0x81, 0xEC, 0x08, 0x00, 0x00, 0x00};
+    ASSERT_GE(t.size(), subRsp8.size());
+    EXPECT_EQ(std::vector<std::uint8_t>(t.begin(), t.begin() + 7), subRsp8)
+        << "the Mach-O x86_64 trampoline must lead with `sub rsp, 8`: dyld CALLED the "
+           "entry, so the stack is 8 off the 16-byte quantum until the trampoline "
+           "realigns it before its first call";
 }
 
 // ── D-RUNTIME-MAIN-ARGC-ARGV (c88): shipped-ELF argc/argv byte pins ──
@@ -745,8 +790,9 @@ TEST(LK10EntrySliceC, Arm64TrampolineEmitsExactExitSequence) {
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_GE(mod.functions.size(), 2u);
 
-    // The 5-instruction `_start` (aapcs64 → no stack prologue since
-    // entryStackPointerBias=0 + shadowSpaceBytes=0):
+    // The 5-instruction `_start` (aapcs64 → no stack prologue: BL pushes
+    // nothing, so the derived process-entry bias is 0 whether the loader
+    // calls or jumps, and shadowSpaceBytes=0):
     //   BL  user_entry  → 0x94000000 (imm26=0, call26 reloc patches it)
     //   ORR X0, XZR, X0 → 0xAA0003E0 (mov x0,x0: argGpr0←returnGpr0)
     //   MOVZ X8, #94     → 0xD2800BC8 (exit_group syscall number)
@@ -1147,6 +1193,10 @@ makeElfExecFormatData(bool withProcessExit) {
     data.elf.pageAlign    = 4096;
     data.elf.interpreter  = "/lib64/ld-linux-x86-64.so.2";
     data.elf.bindNow      = true;
+    // An executable naming an interpreter binds at load, so validate()
+    // requires the dynamic relocation types by role (P69,
+    // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB) — the x86_64 psABI's.
+    data.elf.dynamicRelocationTypes = ElfDynamicRelocationTypes{6, 7, 8};
 
     // Sections. `.text` sits at the conventional Linux x86_64 image base
     // + one page; the other three are the ELF writer's hard requirements
@@ -1230,6 +1280,10 @@ makeElfExecFormatData(bool withProcessExit) {
         // field difference" claim above is about ONE CAPABILITY declared
         // as its two mandatory halves.
         data.entryCallingConvention = "sysv_amd64";
+        // …and since P69 its third: how the loader enters the image, which
+        // the trampoline derives its process-entry bias from — an ELF image
+        // is jumped to (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
+        data.entryTransition = EntryTransition::Jumped;
     }
     return data;
 }
@@ -1287,6 +1341,7 @@ TEST(EntryGateFold, ExecFlavorWithoutProcessExitIsRejectedAtConfigLoad) {
       "entryPoint": "",
       "externCallDispatch": "direct-plt",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8},
         "class": "elf64", "data": "lsb", "osabi": "sysv", "machine": 62,
         "type": "exec", "pageAlign": 4096,
         "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": true
@@ -1731,4 +1786,75 @@ TEST(EntryGateFold, FormatLacksProcessExitRendersInTheLinkerBand) {
               static_cast<int>(DiagnosticCode::K_ExternImportAttributeConflict))
         << "0x801D must not collide with 0x801B either — the K-NEXT-SLOT "
            "marker in parse_diagnostic.hpp is what keeps this true";
+}
+
+// ── P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): THE WRITER'S OWN BELT
+// for `elf.dynamicRelocationTypes` ────────────────────────────────────────────
+//
+// The loader refuses an image that binds at load and does not state all three
+// roles (pinned in test_object_format_schema.cpp, one case per refusal). The
+// in-memory `ObjectFormatSchema{ObjectFormatData}` path never meets that rule,
+// so the dynamic writer checks `complete()` itself before it writes a single
+// `.rela.dyn` row. This builds exactly that schema — the valid exec fixture with
+// its types zeroed — and hands the writer a module that imports, so the
+// dynamic path runs.
+TEST(DynamicRelocationTypesWriterBelt, AnImageThatBindsImportsRefusesIncompleteTypes) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto data = makeElfExecFormatData(true);
+    data.name = "synth-elf-exec-no-dynamic-types";
+    data.elf.dynamicRelocationTypes = ElfDynamicRelocationTypes{};
+    ASSERT_FALSE(data.elf.interpreter.empty()) << "the fixture must bind at load";
+    ObjectFormatSchema const format{std::move(data)};
+
+    auto mod = makeReturn42Module();
+    ExternImport imp;
+    imp.symbol      = SymbolId{99};
+    imp.mangledName = "puts";
+    imp.libraryPath = "libc.so.6";
+    mod.externImports.push_back(std::move(imp));
+
+    DiagnosticReporter rep;
+    auto const bytes = elf::encode(mod, **target, format, rep);
+    EXPECT_TRUE(bytes.empty()) << "no image without the numbers its `.rela.dyn` rows carry";
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.code != DiagnosticCode::K_FormatLacksImportSupport) continue;
+        if (d.actual.find("declares no complete 'elf.dynamicRelocationTypes'") == std::string::npos) continue;
+        named = true;
+        EXPECT_NE(d.actual.find("synth-elf-exec-no-dynamic-types"), std::string::npos)
+            << "the refusal must name the format: " << d.actual;
+    }
+    EXPECT_TRUE(named) << "the writer's belt did not fire";
+}
+
+// ★ P69 (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION): NO
+// DEFAULT. A format that reaches the trampoline without declaring how its
+// loader enters the image is REFUSED, by name — a defaulted `jumped` is
+// exactly the assumption that ran every Mach-O x86_64 frame 8 bytes off.
+// Built by value (an in-memory schema skips validate(), the tier the
+// trampoline's own check defends), from the fixture that DOES declare the
+// rest of the entry cluster; the control arm is the same fixture with its
+// transition kept, which must inject. RED-on-disable: give the trampoline a
+// default and the refusal arm injects.
+TEST(LK10EntrySliceC, TrampolineRefusesAFormatThatDeclaresNoEntryTransition) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    {
+        ObjectFormatSchema const format{makeElfExecFormatData(true)};
+        auto mod = makeReturn42Module();
+        DiagnosticReporter rep;
+        EXPECT_TRUE(linker::injectEntryTrampoline(mod, **target, format, rep))
+            << "control: the fixture with its transition declared must inject";
+    }
+    auto data = makeElfExecFormatData(true);
+    data.entryTransition.reset();
+    ObjectFormatSchema const format{std::move(data)};
+    auto mod = makeReturn42Module();
+    DiagnosticReporter rep;
+    EXPECT_FALSE(linker::injectEntryTrampoline(mod, **target, format, rep));
+    bool named = false;
+    for (auto const& d : rep.all())
+        if (d.actual.find("entryTransition") != std::string::npos) named = true;
+    EXPECT_TRUE(named) << "the refusal must name the missing `entryTransition`";
 }

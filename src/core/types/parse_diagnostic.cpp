@@ -165,8 +165,22 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_StaticInitializerNotConstant";
         case DiagnosticCode::S_StaticInitializerUsesTheCommaOperator:
             return "S_StaticInitializerUsesTheCommaOperator";
+        case DiagnosticCode::S_CompoundLiteralStorageClassInvalid:
+            return "S_CompoundLiteralStorageClassInvalid";
+        case DiagnosticCode::S_BuiltinArgumentNotConstant:
+            return "S_BuiltinArgumentNotConstant";
+        case DiagnosticCode::S_BuiltinOverflowOperandType:
+            return "S_BuiltinOverflowOperandType";
+        case DiagnosticCode::S_LibraryBuiltinUnavailable:
+            return "S_LibraryBuiltinUnavailable";
+        case DiagnosticCode::S_IntegerLiteralImplicitlyUnsigned:
+            return "S_IntegerLiteralImplicitlyUnsigned";
+        case DiagnosticCode::S_AttributeNotHonoured:
+            return "S_AttributeNotHonoured";
         case DiagnosticCode::H_StaticInitializerNotFolded:
             return "H_StaticInitializerNotFolded";
+        case DiagnosticCode::H_NonVoidFunctionEndReachable:
+            return "H_NonVoidFunctionEndReachable";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -608,6 +622,14 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_InputSectionSplit";
         case DiagnosticCode::K_ImportReferenceUnbindable:
             return "K_ImportReferenceUnbindable";
+        case DiagnosticCode::K_LinkerDirectiveUnhonourable:
+            return "K_LinkerDirectiveUnhonourable";
+        case DiagnosticCode::K_LinkerDirectiveIgnored:
+            return "K_LinkerDirectiveIgnored";
+        case DiagnosticCode::K_CommonSymbolUnallocatable:
+            return "K_CommonSymbolUnallocatable";
+        case DiagnosticCode::K_ObjectSectionNotModelled:
+            return "K_ObjectSectionNotModelled";
         case DiagnosticCode::K_ExternImportAttributeConflict:
             return "K_ExternImportAttributeConflict";
         case DiagnosticCode::K_FormatLacksProcessExit:

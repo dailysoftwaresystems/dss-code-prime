@@ -25,9 +25,10 @@ commit's author will actually see it.
   the command again.
 
 ## The deletion waves, named once
-`W-anchors` · ~~`W-build` (`local-build`)~~ **LANDED** · ~~`W-test` (`run-gate`)~~ **LANDED** ·
+`W-anchors` (**PARTLY LANDED 2026-09-30**, §20) · ~~`W-build` (`local-build`)~~ **LANDED** · ~~`W-test` (`run-gate`)~~ **LANDED** ·
 ~~`W-sync` (`wsl-leg`, `remote-leg`, `macos-leg`, `ssh-macos`, `ssh-arm64-vps`, `carriage-excludes`,
-`check-carriage-paths`)~~ **LANDED** · `W-worktrees` (`lane-worktree`) · `W-run`
+`check-carriage-paths`)~~ **LANDED** · ~~`W-worktrees` (`lane-worktree`, with `lane-fold`)~~ **LANDED
+2026-09-29** (DssHarness's orchestrator verbs) · `W-run`
 (`sqlite-runtime-bench`, `sqlite-round-trip`, `macho-alias-ld64-matrix`) · `W-buildtime`
 (`profile-compile`, `compile-bench`) · `W-lineendings` · ~~`W-cilegs`~~ **LANDED** · `W-buildchecks`
 (`check-ninja-deps`, `check-root-litter`) · `W-secrets` · `W-lastconsumer` (`repo-tree`,
@@ -426,11 +427,17 @@ The 20: `anchor_balance_selftest_guard`, `anchors_selftest_guard`,
 `scripts_index_guard`, `shell_portability_guard`, `stale_refusal_citations_guard`,
 `wrapped_anchor_ids_guard`.
 
+ⓘ 2026-10-10: `ninja_deps_selftest_guard` is still one of the twenty, and the instrument above no longer
+counts it. The entry is now a test binary that starts its importer by a command line the top-level
+CMakeLists declares (`dss_declare_script_selftest`), so no `add_test` body names the program for it;
+`build/ninja-deps-freshness` still does.
+
 ⚠ `owning-tree` therefore cannot leave until `scripts/check-scripts-index`,
 `check-shell-portability`, `check-guard-output-encoding`, `check-plan-citations`,
 `check-stale-refusal-citations`, `check-wrapped-anchor-ids`, `check-diagnostic-codes`,
 `check-pkg-pipeline`, `corpus-census`, `lane-fold`, `check-anchor-balance` and `refresh_landing_log`
-have stopped importing it — and S6 keeps every one of those. 🧠INFERRED consequence: **`owning-tree`
+have stopped importing it — and S6 keeps every one of those (ⓘ `lane-fold` was retired 2026-09-29 with
+`W-worktrees`, so eleven remain). 🧠INFERRED consequence: **`owning-tree`
 outlives the migration** unless its `repoRoot()` resolution is replaced for the survivors.
 
 ---
@@ -817,11 +824,17 @@ it. Reported to the operator.
 | `check-anchor-registry` | `check-anchor-citations` | the markdown CELL-WIDTH / unescaped-pipe property over ALL of `.plans/` (✔MEASURED **340 tables, 4264 rows, 42 files**; `read-anchors --lint` sees the two registry files only); the RETIRED-ID matcher; the QUOTED-NOT-CITED expiry mechanism; every per-root collapse floor; the 21-arm self-test | guard KEPT; `anchor_citations_guard` added BESIDE it for the coverage the tool adds |
 | `check-line-endings` | `fix-line-endings --check --all` | Check A (HEAD **blobs**) and Check B (index blobs) — the tool judges the working tree; Check C (a pinned source git calls binary); Checks E1/E2 (✔MEASURED **72 files with no declared ending**, considered and not judged; and untracked files); **Check F entirely** — *"a CR instrument that cannot see one"*, which is half the stated PURPOSE; `--files`; `SCAN_FLOOR`; the watchdog and its 5-arm proof | ⛔ NOT DELETED |
 | `check-ninja-deps` | **none** | ✔MEASURED: all ten `dssharness help` topics grepped for `ninja\|depfile\|header dep` — **zero matches**. `build` checks PRODUCTS, not dependency RECORDS | ⛔ NOT DELETED |
-| `lane-worktree` | `create-worktree` / `delete-worktree` / `list-worktree` | `--preserve-to`, the VERIFIED evidence copy — the harness can only refuse or delete; and the **seed-manifest write `scripts/lane-fold/lane-fold.py` reads to adjudicate a fold** | ⛔ NOT DELETED — deleting it breaks fold adjudication |
+| `lane-worktree` | `create-worktree` / `delete-worktree` / `list-worktree` | `--preserve-to`, the VERIFIED evidence copy — the harness can only refuse or delete; and the **seed-manifest write `scripts/lane-fold/lane-fold.py` reads to adjudicate a fold** | ✅ DELETED 2026-09-29 with `lane-fold`: DssHarness's orchestrator verbs cover both gaps — `create-agent` writes the agent's seed record and `fold-agent` adjudicates against it, and `delete-agent` keeps the evidence, each copy read back, before any removal (✔MEASURED 2026-09-29: the seed adjudicated in this checkout; the evidence kept byte-identical in a throwaway repository) |
 
 ★ The path-budget and evidence gates DID port cleanly and are visible in `.harness-config/config.json`
 as `worktrees.pathBudgetReserve` / `pathLimit` / `pathBudgetMargin` / `evidenceRoots` — ✔MEASURED,
 `create-worktree` with a 20-character name refuses with the same 260-character reasoning.
+ⓘ 2026-10-10: `pathLimit` is NO LONGER DECLARED there, on purpose — a declared limit replaces the
+platform's own on EVERY host, so Windows' 260 was imposed on the Mac, WSL and the VPS too, and no mutation
+worker of a lane worktree could be placed on any of them. Undeclared, each host keeps its own (✔MEASURED
+the same day: a worker placed on the Mac at once; the same 260 refusal on a Windows leg from a lane
+worktree). The reserve, the margin and the evidence roots stay; the reasons are in the configuration's
+own `worktrees` comment.
 
 ### 17.4 `owning-tree` CANNOT RETIRE — §10's 🧠INFERRED consequence is now ✔MEASURED
 Twelve directories that SURVIVE every wave import it: `check-anchor-balance`,
@@ -832,10 +845,15 @@ Twelve directories that SURVIVE every wave import it: `check-anchor-balance`,
 `run_git()` and `root_arms`, the shared arm set each consumer's self-test runs against its own
 resolver. No DssHarness verb offers any of the three. ⇒ **the ⟶ 25 directory target is ⟶ 26**, and
 the ⟶ 8 FILE target is unaffected because `owning-tree` ships no `.sh` and no `.ps1`.
+ⓘ 2026-09-29: `lane-fold` left with `W-worktrees`, so ELEVEN of those directories survive; the directory
+target above was derived with it among the survivors and is re-derived by the next census, not here.
 ⓘ `scripts/anchors/` retires the same way and for the same reason: its eight SHELL twins are the
 door and are replaced, while `anchors.py` stays as the library `check-anchor-balance`,
-`check-stale-blockers` and `lane-fold` import. A directory is not the unit of this migration; a
-PROGRAM is.
+`check-stale-blockers`, `apply-registry-row` and `anchor-rows` import (and `lane-fold` did, until its
+retirement on 2026-09-29). A directory is not the unit of this migration; a
+PROGRAM is. ⓘ 2026-09-30 (§20): its importers are `anchor-rows` and `check-stale-blockers` alone —
+`apply-registry-row` retired, and `check-anchor-balance` (renamed `anchor-debt`) is the module `anchors.py`
+LOADS, not one that loads it.
 
 ### 17.5 `.harness-config/runner/actions` NOW HOLDS A SHELL PROGRAM, WHICH §9 SAID IT DID NOT
 ✔MEASURED: `macho-alias-ld64-matrix.remote.sh` moved there with mode **100755** (six tracked files
@@ -1102,6 +1120,22 @@ On both, the two macho legs BUILT and were skipped by `runOn=[darwin]`, and the 
 14-assertion smoke gate green on the 3 runnable legs. The first WSL attempt refused to start: Step 0 caught the clone
 lock still judging a four-line holder by its lstart line (19.5), and it was fixed and proven before the run was
 repeated.
+
+## 20. `W-anchors` — PARTLY LANDED 2026-09-30 (P69, lane `hm`)
+
+What left, what stays, and the measurement behind each. Each retired arm's defect was PLANTED in a throwaway
+repository (`git init` + `dssharness init`, `anchors.triggerCarriesVerdict: true` as this repository sets it) and
+DssHarness 0.6.4 reported it — a disposition is a measurement, never an inference from a verb's name.
+
+| Program | Disposition | Evidence (✔MEASURED 2026-09-30) |
+|---|---|---|
+| `apply-registry-row` | **DELETED** — the directory, its runner, `apply_registry_row_selftest_guard` | `set-anchor` with cell files replaces one row, and the door refuses what the launcher pre-checked: an id a cell newly cites that no row holds (exit 13) and a value it would store cut (exit 10) |
+| `check-anchor-balance` | **RENAMED `anchor-debt`**; its balance, its `--denominator` / `--breakdown` / `--per-bucket` modes and its partition and Status/Trigger arms **DELETED** | a new OPEN row since the base → `dssharness check-anchor-balance` exit 1, a new 🔵 DISCLOSED one not counted (by its STATUS cell); a CLOSED row in the pending registry and an OPEN one in the done registry → exit 1 (and `read-anchors --lint` exit 1 for the first); a Status/Trigger split written by hand → `read-anchors --lint` exit 1, the same split through the door → `write-anchor` exit 10 |
+| the balance's BOOKKEEPING arithmetic | **LOST with the balance, REPORTED, and DssHarness's since 0.6.7** — `anchor-debt`'s interim listing **DELETED** | ✔MEASURED 2026-10-01 (P69 send-back, DssHarness 0.6.6, the same throwaway setup with three OPEN seeds): one seed closed since the base with `✅ **CLOSED**` and, in a second repository, with `✅🧾 **CLOSED**` (the work predates the base, only the mark is repaired) — `check-anchor-balance --base HEAD` printed `1 closed, 0 opened ... counted -1` for BOTH, where the retired balance kept the second net-neutral (out of the open population, no credit). Reported to repo-harness; meanwhile `anchor-debt`'s `debt` step listed every `✅🧾` closure since the base as NOT PROGRESS. ✔MEASURED 2026-10-06 on 0.6.7, the same setup: the second now reads `1 closed (1 bookkeeping) ... counted 0`, the row `[bookkeeping: not credited]`, the first still `counted -1` — so the interim listing (`bookkeeping_since`, the scan's bookkeeping set, self-test arm (f2)) was deleted that day; 11 rows of the done registry carry the mark |
+| `anchors` | the CLI (`read`, `list`) **DELETED**; the LIBRARY stays | `read-anchor` / `read-anchors` answer both; its importers are `anchor-rows` and `check-stale-blockers` |
+| `anchor-debt` | STAYS | the registry DEBT no verb reports (a closure verdict under a non-closure marker, a gated row with no open opener, a discharged blocker, an unclassifiable closing-work marker, OPEN-vs-GATED prose, a `[[...]]` pointer that names no row) — its `debt` step, `dssharness run anchor-debt-debt` — and the row vocabulary five actions load. Its ARM 9 refused a row CLOSED at the base that neither registry holds now, while `check-anchor-balance` failed only a lost OPEN row (✔MEASURED 2026-10-06, P69 lane `hm`, DssHarness 0.6.7, throwaway repositories; reported to repo-harness); DELETED 2026-10-07, once the balance failed a lost closed row too (✔MEASURED that day on 0.6.9, throwaway repositories) |
+| `burndown-queue` | STAYS | no verb bands and sorts the queue; its `queue` step reads it |
+| `check-anchor-registry` | STAYS — not re-measured this cycle | — |
 
 ## Summary of disagreements with contract S4
 

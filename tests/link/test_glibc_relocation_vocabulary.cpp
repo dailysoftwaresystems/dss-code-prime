@@ -260,8 +260,7 @@ struct Shipped {
 [[nodiscard]] bool declaresNativeId(ObjectFormatSchema const& format,
                                     std::uint32_t nativeId) {
     for (auto const& r : format.relocations()) {
-        if (r.nativeId == nativeId) return true;
-        if (r.pltNativeId == nativeId) return true;
+        if (r.nativeId == nativeId) return true;   // (`pltNativeId` is retired, P69)
     }
     return false;
 }

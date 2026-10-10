@@ -79,6 +79,9 @@ struct PassState {
 [[nodiscard]] bool
 legalizeOneFunc(Lir const& src, LirFuncId srcFn, TargetSchema const& schema,
                 PassState& state, LirBuilder& b, bool& legalized,
+                // `LirTwoAddrLegalizeResult::blockEntryImage`, sized to the source
+                // block arena: this function writes the entry of each of its blocks.
+                std::vector<std::uint32_t>& entryImage,
                 DiagnosticReporter& reporter) {
     (void)b.addFunction(src.funcSymbol(srcFn));
 
@@ -96,6 +99,9 @@ legalizeOneFunc(Lir const& src, LirFuncId srcFn, TargetSchema const& schema,
         LirBlockId const srcBlk = src.funcBlockAt(srcFn, bi);
         LirBlockId const dstBlk = srcToDst[srcBlk.v];
         b.beginBlock(dstBlk);
+        // The block image this rebuild publishes: this source block's instructions
+        // begin in the block just begun.
+        entryImage[srcBlk.v] = dstBlk.v;
 
         std::uint32_t const instCount = src.blockInstCount(srcBlk);
         for (std::uint32_t ii = 0; ii < instCount; ++ii) {
@@ -269,9 +275,13 @@ legalizeTwoAddress(Lir const&          src,
     lir_pass_util::copyModuleSideStructures(src, b);
 
     std::size_t const funcCount = src.moduleFuncCount();
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: every source
+    // block's entry in the output, one slot per source block id (0 = the sentinel).
+    result.blockEntryImage.assign(src.blockCount(), 0u);
     for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
         if (legalizeOneFunc(src, src.funcAt(fi), schema, state, b,
-                            result.allFunctionsLegalized, reporter)) {
+                            result.allFunctionsLegalized,
+                            result.blockEntryImage, reporter)) {
             continue;
         }
         // D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE. Mid-failure the

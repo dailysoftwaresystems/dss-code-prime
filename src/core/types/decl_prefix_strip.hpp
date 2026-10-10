@@ -113,6 +113,218 @@ descendVisibleDecl(Tree const& tree, NodeId start,
     return cur;
 }
 
+// The declaration's HEAD node — the role child that holds its type specifiers
+// (`headChild` of a declarator-mode row, `typeChild` of a positional one), or
+// InvalidNode when the row names neither or the child is structurally absent.
+[[nodiscard]] inline NodeId
+declarationHeadNode(Tree const& tree, NodeId node, DeclarationRule const& decl) {
+    auto const headIdx = decl.headChild.has_value() ? decl.headChild : decl.typeChild;
+    if (!headIdx.has_value()) return {};
+    auto const kids = declRoleChildren(tree, node, decl);
+    return *headIdx < kids.size() ? kids[*headIdx] : NodeId{};
+}
+
+// ★★ P69 (lane `cs`) — WHICH SPELLING AN ATTRIBUTE SPECIFIER IS WRITTEN IN.
+//
+// `attributeSpellingOf` answers for a specifier node (a node of the language's
+// `attributeSemantics.attrSpecRule`): the `attributeSemantics.spellings` row whose
+// introducer is the node's FIRST token, or nullptr when the language declares no
+// such row for it (every specifier of a language that declares no spellings, and
+// the standard `[[…]]` form, which is another rule and has no spelling row).
+//
+// `enclosingAttributeSpelling` answers for anything written INSIDE a specifier — a
+// clause node, a clause-name token: the spelling of the nearest specifier that
+// holds it. The walk goes up the parent chain and stops at the first attribute
+// specifier of either form, so a clause of the standard form nested anywhere is
+// never given the spelling of some specifier further out.
+//
+// Both tiers that look an attribute NAME up (the semantic attribute fold and the
+// lowering's linkage fold) ask here and nowhere else, so the two can never come to
+// read one clause in two spellings.
+[[nodiscard]] inline AttributeSpelling const*
+attributeSpellingOf(SemanticConfig const& cfg, Tree const& tree, NodeId attrNode) {
+    if (cfg.attributeSpellings.empty() || !attrNode.valid()) return nullptr;
+    if (tree.kind(attrNode) != NodeKind::Internal) return nullptr;
+    if (!cfg.attrSpecRule.valid() || tree.rule(attrNode).v != cfg.attrSpecRule.v) {
+        return nullptr;
+    }
+    for (NodeId c : decl_prefix_detail::visibleChildren(tree, attrNode)) {
+        if (tree.kind(c) != NodeKind::Token) return nullptr;   // no opening token
+        SchemaTokenId const k = tree.tokenKind(c);
+        for (AttributeSpelling const& sp : cfg.attributeSpellings) {
+            if (sp.introducer.v == k.v) return &sp;
+        }
+        return nullptr;   // the FIRST token decides, and no row names it
+    }
+    return nullptr;
+}
+
+[[nodiscard]] inline AttributeSpelling const*
+enclosingAttributeSpelling(SemanticConfig const& cfg, Tree const& tree, NodeId n) {
+    if (cfg.attributeSpellings.empty() || !cfg.attrSpecRule.valid()) return nullptr;
+    for (NodeId cur = n; cur.valid(); cur = tree.parent(cur)) {
+        if (tree.kind(cur) != NodeKind::Internal) continue;
+        RuleId const r = tree.rule(cur);
+        if (r.v == cfg.attrSpecRule.v) return attributeSpellingOf(cfg, tree, cur);
+        if (cfg.stdAttrRule.valid() && r.v == cfg.stdAttrRule.v) return nullptr;
+    }
+    return nullptr;
+}
+
+// ★★ P69 (lane `cs`) — THE SPECIFIERS, WRITTEN AFTER A COMPOSITE'S BODY, THAT ARE THE
+// DECLARATION'S AND NOT THE TYPE'S. `list` is one composite-attribute list of a
+// specifier that DEFINES here, standing after the body. A specifier in it whose
+// spelling says so (`AttributeSpelling::afterCompositeBodyIsTheDeclarations`) is
+// appended to `out`, in source order; every other one stays the definition's own.
+//
+// ONE function, called from both sides of the question — `headAttributeRuns` (which
+// hands these to the declaration's readers) and the composite scan (which must then
+// NOT read them as the type's) — so a specifier can be neither read twice nor
+// dropped between the two. It never enters a specifier (an argument may hold a type
+// name with specifiers of its own).
+inline void
+appendDeclarationSpecifiersAfterBody(SemanticConfig const& cfg, Tree const& tree,
+                                     NodeId list, std::vector<NodeId>& out) {
+    if (cfg.attributeSpellings.empty() || !list.valid()) return;
+    std::vector<NodeId> stack{list};
+    while (!stack.empty()) {
+        NodeId const cur = stack.back();
+        stack.pop_back();
+        if (tree.kind(cur) != NodeKind::Internal) continue;
+        if (isAttributeSpecifierRule(cfg, tree.rule(cur))) {
+            AttributeSpelling const* const sp = attributeSpellingOf(cfg, tree, cur);
+            if (sp != nullptr && sp->afterCompositeBodyIsTheDeclarations) {
+                out.push_back(cur);
+            }
+            continue;
+        }
+        auto const kids = decl_prefix_detail::visibleChildren(tree, cur);
+        for (auto it = kids.rbegin(); it != kids.rend(); ++it) stack.push_back(*it);
+    }
+}
+
+// ★★ P69 round 4 (lane `cs`) — THE ATTRIBUTE RUNS WRITTEN INSIDE A TYPE HEAD, in
+// source order: a run among a type's specifiers (`unsigned __attribute__((…)) int`,
+// the language's `attributeSemantics.specifierRunRule`) and the list after a tag that
+// is only REFERRED to (`struct S __attribute__((…)) w;`, the composite attribute
+// list of a specifier that defines nothing here).
+//
+// They are not part of the type the head names — every positional reader of a head
+// skips them — and they are not a composite definition's own lists either. What they
+// decorate is decided by WHERE THE HEAD STANDS, which is why this is one walk with
+// several consumers instead of a rule inside any of them: in a DECLARATION they are
+// the declaration's (`unsigned __attribute__((aligned(16))) int v;` aligns `v`; gcc
+// 13.3.0, clang 18.1.3, Apple clang and mingw-w64 gcc agree, lane `cs`'s probe ta3),
+// so the attribute fold, the noreturn fold and the lowering's linkage fold all read
+// this one list and cannot come to see different positions; in a TYPE NAME they are
+// the named type's.
+//
+// The walk never enters an attribute specifier, a nested type name (its runs are its
+// own) or a declaration row: a row that DEFINES here owns its lists (the composite
+// scan reads them), and a row that only refers contributes its direct lists and is
+// not entered further — an enumeration's underlying type has its own specifiers,
+// which are not this head's. A run can therefore be reached only through the head's
+// own wrappers, and a grammar that puts an expression inside a head (a bit-precise
+// width, a `typeof` operand) cannot lend this walk a run of some type named in it.
+//
+// ★ A SPECIFIER THAT IS A DIRECT CHILD OF THE HEAD, WITHOUT THE RUN RULE, IS A HEAD
+// RUN TOO. The shipped C grammar wraps every such specifier in `specifierRunRule`,
+// so this arm adds nothing there; it exists for the grammar that does not — a
+// language document that places an attribute slot in its type-resolved head's own
+// sequence. Every head reader skips the specifier (it is opaque to them), so without
+// this arm NOBODY would read it and its effect would be dropped in silence: the
+// typedef-head pin `TypeHeadHijackSweep.AnAttributeInsideTheHeadIsTheDeclarationsOwn`
+// holds that shape to "honoured", where before the specifiers were opaque it was a
+// refusal. DIRECT children only: a bare specifier deeper in the head can be a
+// statement's (a statement expression inside a `typeof` operand), which is not this
+// declaration's to fold — a run among specifiers cannot be, it only ever stands in a
+// specifier sequence, under a type name or a declaration row the walk does not enter.
+//
+// Explicit stack (no input-proportional recursion); every node of the head is seen
+// at most once, and there is no bound to fall off: a run past a bound would be a
+// run nobody reads.
+[[nodiscard]] inline std::vector<NodeId>
+headAttributeRuns(SemanticConfig const& cfg, Tree const& tree, NodeId head) {
+    std::vector<NodeId> out;
+    if (!head.valid()) return out;
+    bool const haveRun  = cfg.attrSpecifierRunRule.valid();
+    bool const haveList = cfg.compositeAttrListRule.valid();
+    // A language that declares no attribute shape at all has nothing to find.
+    if (!haveRun && !haveList && !cfg.attrSpecRule.valid() && !cfg.stdAttrRule.valid()) {
+        return out;
+    }
+    std::vector<NodeId> stack{head};
+    while (!stack.empty()) {
+        NodeId const cur = stack.back();
+        stack.pop_back();
+        if (tree.kind(cur) != NodeKind::Internal) continue;
+        RuleId const r = tree.rule(cur);
+        if (haveRun && r.v == cfg.attrSpecifierRunRule.v) {
+            out.push_back(cur);
+            continue;
+        }
+        if (isAttributeSpecifierRule(cfg, r)) {
+            if (tree.parent(cur).v == head.v) out.push_back(cur);
+            continue;
+        }
+        if (cur.v != head.v && cfg.attrTypeNameRule.valid()
+            && r.v == cfg.attrTypeNameRule.v) {
+            continue;
+        }
+        DeclarationRule const* row = nullptr;
+        for (DeclarationRule const& d : cfg.declarations) {
+            if (d.rule.v == r.v) { row = &d; break; }
+        }
+        auto const kids = decl_prefix_detail::visibleChildren(tree, cur);
+        if (row != nullptr) {
+            bool defines = !row->definesWhenChildRule.has_value();
+            if (!defines) {
+                for (NodeId c : kids) {
+                    if (tree.kind(c) == NodeKind::Internal
+                        && tree.rule(c).v == row->definesWhenChildRule->v) {
+                        defines = true;
+                        break;
+                    }
+                }
+            }
+            if (!haveList) continue;
+            if (defines) {
+                // ★★ P69 (lane `cs`): A DEFINITION OWNS ITS LISTS — EXCEPT WHAT A
+                // SPELLING SAYS IS THE DECLARATION'S. After the body
+                // (`struct S { … } __declspec(align(32)) s;`) a specifier of such a
+                // spelling is an ordinary specifier of the declaration: it is
+                // handed out here, one specifier at a time, and the composite scan
+                // skips exactly the same ones
+                // (`appendDeclarationSpecifiersAfterBody`). A row that defines
+                // unconditionally has no body to stand after.
+                if (!row->definesWhenChildRule.has_value()) continue;
+                bool pastBody = false;
+                for (NodeId c : kids) {
+                    if (tree.kind(c) != NodeKind::Internal) continue;
+                    if (tree.rule(c).v == row->definesWhenChildRule->v) {
+                        pastBody = true;
+                        continue;
+                    }
+                    if (pastBody && tree.rule(c).v == cfg.compositeAttrListRule.v) {
+                        appendDeclarationSpecifiersAfterBody(cfg, tree, c, out);
+                    }
+                }
+                continue;
+            }
+            for (NodeId c : kids) {
+                if (tree.kind(c) == NodeKind::Internal
+                    && tree.rule(c).v == cfg.compositeAttrListRule.v) {
+                    out.push_back(c);
+                }
+            }
+            continue;
+        }
+        // Reverse-push so the pop order is source order.
+        for (auto it = kids.rbegin(); it != kids.rend(); ++it) stack.push_back(*it);
+    }
+    return out;
+}
+
 // ── VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): array-suffix bound locating ──
 //
 // A C99 array-PARAMETER declarator suffix (`arrayDeclSuffix`) may carry a leading

@@ -1,0 +1,4 @@
+    : end_{mir.moduleFuncCount() == 0
+               ? mir.symbolIdEnd()
+               : mir.funcSymbol(mir.funcAt(static_cast<std::uint32_t>(mir.moduleFuncCount() - 1))).v + 1u},
+      stated_{mir.symbolIdEndIsStated()} {}

@@ -5,6 +5,7 @@
 #include "analysis/semantic/type_rules.hpp"   // arrayToPointerDecay (C 6.3.2.1p3)
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"  // c97: heterogeneous scope-binding lookup
+#include "core/types/aggregate_layout.hpp"   // AggregateLayoutParams (see `aggregateLayout()`)
 #include "core/types/data_model.hpp"
 #include "core/types/declared_qualification.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -641,6 +642,16 @@ struct DSS_EXPORT SymbolRecord {
     // B/C). Orthogonal to binding/visibility (a file-scope thread_local
     // keeps external linkage). Default false.
     bool            isThreadLocal = false;
+    // P69 (lane `cs`): WHERE THIS DECLARATION'S THREAD STORAGE CAME FROM, in the
+    // one respect the redeclaration merge needs: true iff `isThreadLocal` was set
+    // only by specifiers whose linkage entry says the request YIELDS when another
+    // declaration of the object does not make it
+    // (`LinkageSpecifierEffect::threadStorageYieldsOnMismatch`; c:
+    // `__declspec(thread)`). The merge then IGNORES and WARNS the request and the
+    // object is one shared object, instead of refusing the pair as C 6.7.1p3
+    // refuses a `_Thread_local` mismatch. Never true beside the keyword, and
+    // meaningless when `isThreadLocal` is false.
+    bool            threadStorageYieldsOnMismatch = false;
     // P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the machine register
     // a GNU LOCAL REGISTER VARIABLE names — the asm label of a block-scope
     // object whose declaration carries a `{asmLabelNamesRegister: true}`
@@ -938,6 +949,58 @@ struct DSS_EXPORT ShippedExternSymbol {
 // the link WITHOUT passing through `SemanticModel::shippedExterns()`, so every
 // property the injected path reads off a row has to ride here too or that
 // property is silently dropped for exactly the declarations users write most.
+// ── P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): ONE compound
+// literal's OBJECT facts, as the semantic tier decided them ────────────────────────────
+//
+// A compound literal is an unnamed OBJECT (C 6.5.2.5p4), not its initializer's value, and
+// the tier that resolves its type name is the one that knows what kind of object: whether
+// it is const (so it may sit in read-only data, and a read through its address may fold),
+// its STORAGE DURATION — decided HERE, once, from its position and its C23 storage-class
+// specifiers — and whether its address may be taken. The HIR lowering reads THIS record —
+// never re-deriving any of it — and states it on the `UnnamedObject` node and its side
+// tables, exactly as a declaration's `SymbolRecord` feeds a `Global`'s.
+struct CompoundLiteralFacts {
+    // C 6.5.2.5p5 / C23 6.5.3.6p4-p7: STATIC outside every function body or with the
+    // `staticStorage` facet (C23 `static`); THREAD with the `threadStorage` facet
+    // (`thread_local`); AUTOMATIC otherwise.
+    enum class Storage : std::uint8_t { Automatic, Static, Thread };
+    Storage storage         = Storage::Automatic;
+    // The OBJECT is const: its type name's qualifier at the object's own level — for an
+    // array, the element's (C 6.7.3p10: an array's qualifiers are its elements') — or a
+    // `constexpr` specifier (C23 6.7.2p16: "a const-qualification is implicitly added to the
+    // object's type"). "Absent is not unqualified": a type name whose qualifiers cannot be
+    // read leaves this false, the WRITABLE placement, never wrong for a program C permits.
+    bool isConst            = false;
+    bool isConstexpr        = false;   // `constexpr` — a compound literal CONSTANT (C23 6.6p6)
+    // The `addressNotTakeable` facet (C23 `register`): the operand of unary `&` shall not
+    // designate it (C 6.5.3.2p1) — named after the config facet that says so.
+    bool addressNotTakeable = false;
+};
+
+// ── P69 (C23 6.6p6-p7): A CONSTANT SUBOBJECT, AS THE SEMANTIC TIER RESOLVED IT ─────────
+// A compound literal constant, or the `.member` of a structure or union constant, whose
+// value an integer constant expression may read: the initializer VALUE that initializes
+// it (read in `initScope`), or zero when no initializer names it, and its declared type.
+// Recorded for every such node the semantic tier meets, so the CST→HIR tier's own
+// constant evaluator (an index designator's `[s.b]`) reads the SAME answer instead of
+// re-deriving the placement — one owner, both tiers.
+struct ConstantSubobjectFact {
+    NodeId  initExpr{};
+    ScopeId initScope{};
+    TypeId  type{};
+    bool    zeroValue = false;
+};
+
+// ── P69 (lane `cs`): THE NaN PAYLOAD A FOLDED `__builtin_nan` CALL SPELLS ─────────────────────
+// Recorded on the CALL node of a `quiet_nan` builtin whose operand is a string literal gcc's
+// parser consumes wholly: the payload's low and high 64 bits, read by the CST→HIR tier to build
+// the literal in the call's own format. A binary128 `long double` keeps payload bits 0..110,
+// so one 64-bit word would not carry it.
+struct NanPayload {
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+};
+
 struct DSS_EXPORT SuppressedShippedSymbol {
     // The descriptor's per-object-format `library` map ("pe"/"elf"/"macho" →
     // runtime image), carried verbatim; folded to one string per target
@@ -1026,6 +1089,11 @@ public:
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
                   UnitAttribute<bool>                    nullPointerConstantNodes,
+                  UnitAttribute<CompoundLiteralFacts>    compoundLiteralFacts,
+                  UnitAttribute<ConstantSubobjectFact>   constantSubobjects,
+                  UnitAttribute<NanPayload>              nanPayloads,
+                  UnitAttribute<TypeId>                  overflowPredicateTargets,
+                  UnitAttribute<bool>                    attributeNamesIgnoredForKind,
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   std::unordered_map<std::string, SuppressedShippedSymbol>
                                                          suppressedShippedLibraries,
@@ -1045,7 +1113,12 @@ public:
                   // accessors below. Defaulted (0/0) for every direct constructor
                   // caller that is not the analyzer.
                   std::uint64_t                          exprTypeQueries = 0,
-                  std::uint64_t                          exprTypeNodeVisits = 0) noexcept
+                  std::uint64_t                          exprTypeNodeVisits = 0,
+                  // See `aggregateLayout()`. Last, and defaulted, for the same
+                  // reason `target` is: every direct constructor caller that is
+                  // not the analyzer has no layout to carry.
+                  std::optional<AggregateLayoutParams>   aggregateLayout =
+                      std::nullopt) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -1059,6 +1132,11 @@ public:
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
           nullPointerConstantNodes_(std::move(nullPointerConstantNodes)),
+          compoundLiteralFacts_(std::move(compoundLiteralFacts)),
+          constantSubobjects_(std::move(constantSubobjects)),
+          nanPayloads_(std::move(nanPayloads)),
+          overflowPredicateTargets_(std::move(overflowPredicateTargets)),
+          attributeNamesIgnoredForKind_(std::move(attributeNamesIgnoredForKind)),
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
@@ -1066,7 +1144,8 @@ public:
           target_(target),
           charIsUnsigned_(charIsUnsigned),
           exprTypeQueries_(exprTypeQueries),
-          exprTypeNodeVisits_(exprTypeNodeVisits) {}
+          exprTypeNodeVisits_(exprTypeNodeVisits),
+          aggregateLayout_(aggregateLayout) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -1173,6 +1252,46 @@ public:
     // structural literal `0`, which the coerce arm admits directly).
     [[nodiscard]] bool isNullPointerConstant(NodeId id) const {
         return nullPointerConstantNodes_.has(id);
+    }
+
+    // P69: the object facts of the compound literal at `id` (see `CompoundLiteralFacts`),
+    // or nullptr when `id` is no compound literal the analyzer typed.
+    [[nodiscard]] CompoundLiteralFacts const* compoundLiteralFactsFor(NodeId id) const {
+        return compoundLiteralFacts_.tryGet(id);
+    }
+    // P69: the constant subobject at `id` (see `ConstantSubobjectFact`), or nullptr.
+    // P69 (lane `cs`): the payload a folded `quiet_nan` builtin call spells (`NanPayload`),
+    // or null — the call was bound to the library function instead.
+    [[nodiscard]] NanPayload const* nanPayloadFor(NodeId id) const {
+        return nanPayloads_.tryGet(id);
+    }
+    // P69 (lane `cs`): the type a `__builtin_*_overflow_p` call's result is cast to — its
+    // third operand's own type, or `_BitInt(w)` of a bit-field's width and signedness — or
+    // InvalidType (the semantic tier refused the call's operands).
+    [[nodiscard]] TypeId overflowPredicateTargetFor(NodeId id) const {
+        TypeId const* t = overflowPredicateTargets_.tryGet(id);
+        return t != nullptr ? *t : InvalidType;
+    }
+    [[nodiscard]] ConstantSubobjectFact const* constantSubobjectFor(NodeId id) const {
+        return constantSubobjects_.tryGet(id);
+    }
+    // P69 (lane `cs`): true iff `nameToken` is the NAME token of an attribute clause
+    // the declaration-kind gate IGNORED — the language declares the attribute
+    // applicable to other kinds of entity than the one this declaration declares,
+    // and said so (`S_AttributeIgnoredForDeclarationKind`: "ignored … and its
+    // effect was discarded"). The gate's verdict is recorded HERE, as a fact, so
+    // that a second reader of the same tokens cannot apply what the first one
+    // discarded: the CST→HIR linkage fold skips such a name, which is what makes
+    // `__attribute__((selectany)) int f(void) { … }` an ordinary strong function
+    // (gcc 13.3.0 on Linux: "'selectany' attribute directive ignored", and the
+    // image runs) instead of a weak one the warning said it was not.
+    //
+    // Per CLAUSE, not per declarator: a clause shared by several declarators of
+    // one declaration is ignored for all of them as soon as one is outside the
+    // kind axis — the reading of the one reference that accepts such a
+    // declaration, which ignores the attribute altogether.
+    [[nodiscard]] bool attributeNameIgnoredForKind(NodeId nameToken) const {
+        return attributeNamesIgnoredForKind_.has(nameToken);
     }
 
     // The full attributes — convenient for tooling / forEach iteration.
@@ -1283,6 +1402,26 @@ public:
         return charIsUnsigned_;
     }
 
+    // The aggregate-layout parameters this analysis ran under — `analyze()`'s own
+    // parameter: the target's block with the active format's bit-field axes
+    // already overlaid by the driver — or `nullopt` when analysis ran with none
+    // (the LSP, the FFI header parser, every direct-API test, a target that
+    // declares no block).
+    //
+    // The HIR lowering reads THIS rather than taking a second parameter — the
+    // `dataModel()` / `charIsUnsigned()` discipline — because it asks the same
+    // question the semantic tier's constant evaluator asks: what is `sizeof(T)`,
+    // what is `_Alignof(T)`. The lowering asks it of a CONDITION (is this `if`,
+    // this loop, decided before the program runs?) and of an index designator;
+    // answered from any other source, the two tiers could size one type two ways
+    // and one of them would be claiming code unreachable that the other laid out.
+    // `nullopt` makes the lowering's fold REFUSE, never guess: without a layout a
+    // `sizeof` is not a constant there, and the statement it guards may continue.
+    [[nodiscard]] std::optional<AggregateLayoutParams> const&
+    aggregateLayout() const noexcept {
+        return aggregateLayout_;
+    }
+
 private:
     std::shared_ptr<CompilationUnit const> cu_;
     TypeLattice                            lattice_;
@@ -1311,6 +1450,12 @@ private:
     // TREE-KEYED UnitAttribute (NodeId is tree-local — a flat set would alias node
     // indices across a multi-source CU's trees → cross-tree silent miscompile).
     UnitAttribute<bool>                                   nullPointerConstantNodes_;
+    // P69: per compound-literal node, its object facts (TREE-KEYED, as above).
+    UnitAttribute<CompoundLiteralFacts>                   compoundLiteralFacts_;
+    UnitAttribute<ConstantSubobjectFact>                  constantSubobjects_;
+    UnitAttribute<NanPayload>                             nanPayloads_;
+    UnitAttribute<TypeId>                                 overflowPredicateTargets_;
+    UnitAttribute<bool>                                   attributeNamesIgnoredForKind_;
     // FF11: descriptor externs minted from resolved shipped-lib JSON
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.
@@ -1335,6 +1480,8 @@ private:
     // own work for this analysis (see the two accessors).
     std::uint64_t                                          exprTypeQueries_ = 0;
     std::uint64_t                                          exprTypeNodeVisits_ = 0;
+    // The analysis-time aggregate-layout parameters (see `aggregateLayout()`).
+    std::optional<AggregateLayoutParams>                   aggregateLayout_{};
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

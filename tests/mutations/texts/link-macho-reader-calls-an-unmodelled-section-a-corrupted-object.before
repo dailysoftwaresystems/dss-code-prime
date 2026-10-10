@@ -1,0 +1,2 @@
+                return fail(DiagnosticCode::K_ObjectSectionNotModelled,
+                    "macho::readRelocatableObject: defined symbol '"

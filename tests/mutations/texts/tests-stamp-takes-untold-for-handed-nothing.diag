@@ -1,0 +1,1 @@
+dss-build-stamp selftest: FAILED  handed: a run not told what its configure was handed is refused, and writes no header

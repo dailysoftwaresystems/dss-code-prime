@@ -1,0 +1,12 @@
+{
+  "$comment": "The C type of every constant the shipped <windows.h> declares, each stated by a _Static_assert over _Generic, so a wrong type in the shipped header fails the COMPILE on every host. The table was MEASURED 2026-10-10 on both pe references (MSVC cl 19.51 x64 and MinGW-w64 gcc 13.2.0 printed the identical 117 lines: 63 int, 22 long, 31 unsigned long, 1 unsigned int), and this same file compiles and answers 42 under both. Before this example the shipped header typed 100 of the 117 as unsigned int: 69 of them are signed under the references (47 int, 22 long), which changes the ANSWER of a comparison or a subtraction with a negative operand (`-1 < MEM_COMMIT` was false), and 31 are unsigned long, which changes what _Generic and a pointer to the constant's type see. At run time the program makes the comparisons whose answer depends on the type, each with an operand read from a volatile object so the comparison is made by emitted code and not by the folder: exit 1..4 names the first to fail, 42 = all right. The release arm is the same file through the optimizer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

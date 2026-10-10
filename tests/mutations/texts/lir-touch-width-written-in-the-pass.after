@@ -1,0 +1,2 @@
+    (void)schema; (void)reporter;   /*S6i*/
+    return ProbeTouch{8u, std::uint8_t{0}};

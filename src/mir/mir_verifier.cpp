@@ -398,6 +398,14 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
                         idx, mir_.literalPool().size()));
             }
         }
+        // P69 (lane `cs`): an `Unreachable` asserts one of the two `MirUnreachableKind`s;
+        // any other payload is a contract no pass can read.
+        if (op == MirOpcode::Unreachable
+            && mir_.instPayload(id) > static_cast<std::uint32_t>(MirUnreachableKind::Trap)) {
+            reportInst(reporter, DiagnosticCode::I_VerifierFailure, id,
+                std::format("unreachable payload {} names no MirUnreachableKind "
+                            "(0 assumed, 1 trap)", mir_.instPayload(id)));
+        }
         // ★ THE SAME RULE FOR THE ASM POOL, AND IT WAS MISSING. Both asm opcodes
         // carry a `MirAsmDescriptorPool` index in their payload, and
         // `Mir::asmDescriptor` ABORTS on an out-of-range one — so a directly
@@ -1386,8 +1394,8 @@ void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {
         // An INDIRECT call — through a function-pointer value in a register (a
         // Load of an fnptr variable, an `Arg`, a Phi) — has no static callee and
         // therefore no signature to check against. Skip it CLEANLY: it is a
-        // first-class legal shape (D-CSUBSET-FNPTR-INDIRECT-CALL; synth_threads_
-        // shim's once-adapter calls its `Arg` directly), never a violation. The
+        // first-class legal shape (D-CSUBSET-FNPTR-INDIRECT-CALL; a C call through
+        // a function-pointer parameter lowers to a Call on its `Arg`), never a violation. The
         // GlobalAddr test is the same static-edge test `call_graph_scc` uses.
         if (mir_.instOpcode(callee) != MirOpcode::GlobalAddr) return;
         TypeId const calleeTy = mir_.instType(callee);

@@ -1,0 +1,1 @@
+ninja-deps self-test: FAILED  msvc: an #include whose text names no file is refused, not guessed

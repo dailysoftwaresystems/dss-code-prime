@@ -1,0 +1,2 @@
+                        case ffi::ShippedRealizationStatus::ProvidedByShippedSource:
+                            if (!real.isFunction || !real.signature.valid()

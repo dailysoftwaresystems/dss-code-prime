@@ -46,19 +46,23 @@ namespace dss {
 // code. A `.s` ADDRESS operand or data slot (`leaq x(%rip)`, `.quad x`) naming
 // a symbol the file does not define states NOTHING. gas records the name alone
 // (✔MEASURED 2026-09-23: the same R_X86_64_PC32 for a datum and a function),
-// and ld takes the kind from the DEFINITION it finds. So does DSS:
-//   * `Stated`: `isData` is the reference's own statement (every producer
-//     except the one below, and the default);
+// and ld takes the kind from the DEFINITION it finds. So does DSS. An object's
+// untyped undefined symbol that no call relocation names states nothing either
+// (gcc, clang and DSS write every undefined ELF symbol STT_NOTYPE, and a
+// Mach-O nlist has no type at all), so since P69 the object readers mint it the
+// same way (D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA):
+//   * `Stated`: `isData` is the reference's own statement (a C declaration, a
+//     call, a typed symbol; the default);
 //   * `Pending`: the reference stated nothing, and no binder has read a
 //     definition yet. `isData` MEANS NOTHING in this state and must not be
 //     read as a statement;
 //   * `FromLibrary`: a binder read the definition's own kind from the library
 //     that owns the name and wrote it into `isData`.
 // A sibling unit's definition decides by folding the row away (the link's
-// cross-unit resolution), whatever the state. A row that SURVIVES to the
-// writers still `Pending` is refused by name, and so is one whose library
-// definition is a DATUM, because a direct reference to library data needs a
-// copy relocation (which DSS does not make). Neither is ever defaulted.
+// cross-unit resolution), whatever the state. A row bound to a library that
+// is still `Pending` is refused by name, and so is a library DATUM that code
+// names directly, whoever stated the kind, because that reference needs a copy
+// relocation (which DSS does not make). Neither is ever defaulted.
 enum class ExternKindOrigin : std::uint8_t {
     Stated,
     Pending,
@@ -115,6 +119,23 @@ struct DSS_EXPORT ExternImport {
     // `ffi::ingest`, and the assembly + pulled-archive-member ones in
     // `program/compile_pipeline.cpp`.
     bool        isThreadLocal = false;
+    // ★ THE OBJECT'S OWN SYMBOL RECORD STATES THE NAME'S STORAGE DURATION (P69,
+    // `link/thread_storage_agreement.hpp`). TRUE only on a row an OBJECT READER
+    // made from a record whose TYPE says whether the object is thread-local —
+    // today the ELF reader's COMMON rows: every common it reads is typed an
+    // ordinary object (a thread-local common is refused at the read). The link
+    // then judges the row against the definition its name binds to EVEN WHERE NO
+    // RELOCATION OF THE UNIT NAMES IT, as GNU ld and ld.lld compare the two
+    // records; a row whose record states nothing (a COFF symbol, a Mach-O nlist,
+    // a C declaration no code uses) is judged by the access its unit's code
+    // makes, and not at all where it makes none — which is what link.exe,
+    // lld-link and Apple's ld do with the same pair. Distinct from
+    // `isThreadLocal` just above, which is a DECLARATION's claim: this one says
+    // only that the record made a statement, and the statement is "ordinary".
+    // Read by `linker::reportThreadStorageDisagreements` alone, on the units a
+    // link is given; the cross-unit merge does not carry it (that header says
+    // why it need not).
+    bool        recordStatesStorageDuration = false;
     // D-LK-EXTERN-DATA-IMPORT: the imported DATA object's byte size +
     // alignment, DERIVED from the declared type's layout at HIR→MIR
     // (`computeLayout` under the active target's aggregate-layout
@@ -274,6 +295,18 @@ struct DSS_EXPORT ExternImport {
     // rows describe the same object bound the same way and differ only in whether
     // this TU could do without it.
     SymbolBinding binding = SymbolBinding::Global;
+    // ★★ A WEAK REFERENCE THAT ASKS FOR THE ARCHIVE SEARCH ITSELF (P69 round 4,
+    // D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE). Set by the COFF
+    // reader for a weak external whose search policy is SEARCH_LIBRARY (PE/COFF
+    // 5.5.3: "a library search for sym1 should be performed"): a static link's
+    // archive search fetches a member for it whatever the members' format says
+    // of weak references (`archiveWeakReferenceSearch`) — ✔MEASURED link.exe
+    // 14.51 fetches it (lld-link 18 does not; the specification decides the
+    // fork). FALSE for every other row: DSS's own weak reference states no
+    // search (its COFF writer emits ALIAS), and no other format can spell one.
+    // OR-combined across the rows a merge folds into one, as
+    // `requiredByDirective` is: one row asking for the search is the link's.
+    bool searchesArchives = false;
 
     // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: this row is NOT a
     // foreign name. It is a reference to a symbol THIS ARTIFACT ITSELF DEFINES,
@@ -334,9 +367,34 @@ struct DSS_EXPORT ExternImport {
     // at run.
     SymbolId addressSlotSymbol{};
 
-    // Where `isData` came from (see `ExternKindOrigin`). `Stated` for every
-    // producer except a `.s` address operand or data slot naming a symbol the
-    // file does not define.
+    // ★★ D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE (P69 review M1, case (c)): the
+    // THIRD realization of an import a reference may want — its CALL ENTRY as
+    // an ADDRESS. A module-local SymbolId the format walker binds to the VA of
+    // the entry a call to this import reaches (the PE import thunk). Invalid
+    // (the default) on every import that does not need one.
+    //
+    // ★ WHO WANTS IT. A unit whose CODE reaches the import by a PC-relative
+    // displacement that is NOT a branch — `leaq puts(%rip)`, MinGW gcc's
+    // default `-O2` shape — can only ever compute the call entry, because a
+    // displacement reaches nothing outside the image. Where the format says
+    // that unit's address of the import IS its call entry
+    // (`pcRelativeImportAddress: "callEntry"` — what link.exe, lld-link and
+    // GNU ld do with such an object), its other address references to the
+    // import (a `.quad puts` in its data) are retargeted here, so the unit
+    // agrees with itself (C 6.5.9) instead of mixing the entry with the
+    // loader-bound address (`linker::bindPcRelativeImportAddressUnits`).
+    //
+    // ⚠ Same contract as `addressSlotSymbol`: declared in the compound index,
+    // remapped and folded through the merge, and a walker that does not bind
+    // it fails the reference loudly.
+    SymbolId callEntrySymbol{};
+
+    // Where `isData` came from (see `ExternKindOrigin`). `Pending` for a
+    // reference that states no kind: a `.s` address operand or data slot naming
+    // a symbol the file does not define, an object's untyped undefined symbol
+    // that no call relocation names, and (P69) a COFF linker directive's row and
+    // the import an `__imp_X` reference is folded onto. `Stated` for every
+    // other producer.
     ExternKindOrigin kindOrigin = ExternKindOrigin::Stated;
 
     // ★★★ THE CODE READS THIS IMPORT THROUGH A POINTER SLOT (P68 round 9, the
@@ -365,6 +423,64 @@ struct DSS_EXPORT ExternImport {
     // "data + a got-indirect format" would send a DIRECT load (a pulled
     // member's, a `.s`'s) to a slot and load the ADDRESS instead of the value.
     bool readThroughSlot = false;
+
+    // ★★ THE LINK MUST DEFINE THIS NAME, WHETHER OR NOT ANY CODE NAMES IT
+    // (P69, D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE). Set by the COFF
+    // reader for an `/INCLUDE:<name>` directive naming a symbol its object
+    // does not define (`LinkerDirectiveMeaning::IncludeSymbol`). Such a row is
+    // a USE wherever the link asks whether a row is used, even with no
+    // relocation naming it: the reference gate keeps it and the archive pull
+    // follows it, so an archive member defining the name is pulled, a library
+    // binds it and the image imports it, and one nothing defines is refused by
+    // name (`K_SymbolUndefined`), as link.exe (LNK2001) and lld-link
+    // ("undefined symbol") refuse it — ✔MEASURED 2026-10-06: link.exe imports
+    // an otherwise unreferenced `puts` for `/INCLUDE:puts` (run
+    // 20261006-222410-df088936). OR-combined across the rows a merge folds into
+    // one: any one requirement is the link's.
+    bool requiredByDirective = false;
+
+    // ★★ WHAT A REFERENCE TO THIS NAME BINDS TO WHEN NOTHING DEFINES IT
+    // (P69, D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE). Empty for every
+    // row but one a COFF object gave a FALLBACK: `/alternatename:<name>=<B>`
+    // (cl, clang; link.exe and lld-link honour it) and a weak external whose
+    // default is another undefined symbol (PE/COFF 5.5.3). The reference
+    // linkers' meaning: when no linked unit and no library defines `<name>`,
+    // every reference to it resolves to `<B>` instead — wherever `<B>` is
+    // defined, an import library's member included (✔MEASURED 2026-10-06,
+    // link.exe: `/alternatename:my_puts=puts` calls the imported `puts`, run
+    // 20261006-222410-df088936). The reader keeps a row for a `<B>` its object
+    // does not define, so `<B>` is bound to its library and its archive member
+    // pulled like any other name; an IMAGE link decides the fallback once it
+    // knows what the link defines (`linker::bindFallbackReferences`), before
+    // anything binds a unit's imports, so no later stage of it sees one. A
+    // RELOCATABLE artifact keeps it, and the COFF writer hands it on as the
+    // directive it came from.
+    std::string fallbackName;
+
+    // ★★ A COMMON (TENTATIVE) DEFINITION, NOT A REFERENCE (P69,
+    // D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS). Zero for every row but one an
+    // object READER made from a COMMON symbol: zero-filled storage of
+    // `commonSize` bytes, aligned to `commonAlignment` (a power of two), that the
+    // final link allocates ONCE for its name — the LARGEST of the name's
+    // commons, at the WIDEST of their alignments — unless a linked unit DEFINES
+    // the name with strong binding, whose definition wins and makes every common
+    // of it a reference to that definition; a common in turn wins over a WEAK
+    // definition (the System V gABI symbol-table rules, PE/COFF 5.4.2, ld64).
+    // Every format spells it as a symbol with no section: COFF an UNDEF external
+    // whose Value is the size, ELF `SHN_COMMON` with the alignment in
+    // `st_value`, Mach-O an `N_UNDF` external whose `n_value` is the size and
+    // whose `n_desc` carries the alignment's log2. ✔MEASURED 2026-10-06: cl
+    // 19.51 writes EVERY C tentative definition (`int x;` at file scope) so, at
+    // /O2 and /Od (run 20261006-224902-a6201782), as gcc and clang do under
+    // -fcommon. Such a row is a DEFINITION: the reference gate keeps it with no
+    // relocation naming it, an IMAGE link turns it into storage before any
+    // other pass reads the rows (`linker::allocateCommonDefinitions`), and a
+    // RELOCATABLE artifact hands it on as a common, a merge folding two of one
+    // name into the larger size, the wider alignment and the stricter
+    // visibility. `commonVisibility` is the definition's visibility.
+    std::uint64_t    commonSize       = 0;
+    std::uint64_t    commonAlignment  = 0;
+    SymbolVisibility commonVisibility = SymbolVisibility::Default;
 };
 
 } // namespace dss

@@ -3,10 +3,12 @@
 //
 // ═══ WHY THIS FILE EXISTS ═══════════════════════════════════════════════════
 //
-// On pe the UCRT exports none of printf / fprintf / sprintf / snprintf / sscanf /
-// vfprintf, and on pe and Mach-O the C11 <threads.h> functions come from no
-// platform image either, so DSS SYNTHESIZES each body into the unit that
-// references it (`synthesizeStdioShim`, `synthesizeThreadsShim`). Every separately
+// On pe and Mach-O the C11 <threads.h> functions come from no platform image,
+// so DSS SYNTHESIZES each body into the unit that references it
+// (`synthesizeThreadsShim`). (The pe printf family was the second synthesized
+// family until P69; it is DSS's runtime source now — runtime/platform/src/stdio.c,
+// ONE archive member per linked image — so the rule below no longer has a stdio
+// half, and getopt.c's fprintf resolves against that member.) Every separately
 // compiled unit that references a family gets its OWN copy — a program CU, a DSS
 // static library's member, a shipped runtime unit (built as a nested
 // single-member archive: runtime/platform/src/getopt.c prints through fprintf).
@@ -30,29 +32,24 @@
 // preemptible, and is not a DCE root.
 //
 // ★ WHAT IS PINNED, per family: every function the pass ADDS is Weak + Hidden —
-// each recipe's shim AND the threads family's once-adapter (`call_once` hands
-// InitOnceExecuteOnce a synthesized trampoline, which is a synthesized body like
-// any other) — on every vehicle the family has; and the pass leaves every
-// function it did NOT add exactly as it found it (the control: a pass that
-// rewrote every binding in the module would satisfy the first half).
+// each recipe's shim (and, until P69 moved `call_once` to runtime source, the
+// once-adapter it handed InitOnceExecuteOnce) — on every vehicle the family has;
+// and the pass leaves every function it did NOT add exactly as it found it (the
+// control: a pass that rewrote every binding in the module would satisfy the
+// first half).
 //
 // RED-ON-DISABLE (✔MEASURED through ctest): `begin`'s binding back to `Global` in
-// either pass reds that family's test here. The stdio pass's also reds both
-// examples (examples/c/getopt_and_stdio_in_one_program,
-// examples/c/staticlib_and_program_share_synthesized_bodies) on
-// K_SymbolRedefinedAcrossUnits. The threads pass's reds ONLY this file: no format
-// but an exec declares that family's vehicle, so no second unit can carry a
-// threads body yet and no example can collide — this test is its whole pin.
+// the threads pass reds this file ONLY: no format but an exec declares that
+// family's vehicle, so no second unit can carry a threads body yet and no example
+// can collide — this test is its whole pin.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
 #include "core/types/object_format_kind.hpp"   // LibrarySynthesis, LibrarySynthVehicle
 #include "core/types/strong_ids.hpp"
 #include "core/types/symbol_attrs.hpp"
-#include "core/types/target_schema.hpp"        // VaListLayout
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
-#include "mir/merge/synth_stdio_shim.hpp"
 #include "mir/merge/synth_threads_shim.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
@@ -93,6 +90,10 @@ struct Callee {
 Mir buildCaller(TypeInterner& in, CallConv cc, std::vector<Callee> const& callees) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    // This hand-built module is its own table: nothing beside it names an id it
+    // does not define, so its end is the counted one, STATED (the symbol-id door
+    // refuses to mint past an end nobody stated).
+    mb.stateSelfContainedSymbolIds();
     mb.addFunction(in.fnSig({}, i32, cc), SymbolId{kMainSym});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -149,20 +150,6 @@ testing::AssertionResult isCollapsibleAndInternal(Mir const& mir, std::uint32_t 
     return testing::AssertionFailure() << "no function defines symbol {" << symV << "}";
 }
 
-// The UCRT cores `synthesizeStdioShim` forwards to — ordinary descriptor imports.
-std::vector<ExternImport> stdioCoreImports() {
-    auto make = [](std::uint32_t sym, char const* name) {
-        ExternImport e;
-        e.symbol      = SymbolId{sym};
-        e.mangledName = name;
-        e.libraryPath = "ucrtbase.dll";
-        e.isData      = false;
-        return e;
-    };
-    return {make(20, "__stdio_common_vsprintf"), make(21, "__stdio_common_vfprintf"),
-            make(22, "__acrt_iob_func"), make(23, "__stdio_common_vsscanf")};
-}
-
 LibrarySynthesis win32Vehicle() {
     return LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives,
                             "kernel32.dll"};
@@ -174,56 +161,14 @@ LibrarySynthesis pthreadVehicle() {
 
 }  // namespace
 
-// ── THE STDIO FAMILY: all six recipes, the Win64 variadic model ──────────────
-TEST(SynthShimCollapseLinkage, EveryStdioShimIsWeakAndHidden) {
-    TypeInterner in{CompilationUnitId{1}};
-    TypeId const i32 = in.primitive(TypeKind::I32);
-    TypeId const u64 = in.primitive(TypeKind::U64);
-    TypeId const pCh = in.pointer(in.primitive(TypeKind::Char));
-    std::vector<Callee> const callees{
-        {10, {pCh, pCh}, i32, true},        // sprintf(buf, fmt, ...)
-        {11, {pCh}, i32, true},             // printf(fmt, ...)
-        {12, {pCh, pCh}, i32, true},        // fprintf(stream, fmt, ...)
-        {13, {pCh, pCh, pCh}, i32, false},  // vfprintf(stream, fmt, ap)
-        {14, {pCh, pCh}, i32, true},        // sscanf(str, fmt, ...)
-        {15, {pCh, u64, pCh}, i32, true},   // snprintf(buf, n, fmt, ...)
-    };
-    Mir mir = buildCaller(in, CallConv::CcMS64, callees);
-    std::unordered_map<std::uint32_t, std::string> const recipes{
-        {10, "sprintf"}, {11, "printf"},  {12, "fprintf"},
-        {13, "vfprintf"}, {14, "sscanf"}, {15, "snprintf"}};
-    VaListLayout win64;
-    win64.strategy                 = VaListStrategy::HomogeneousPointer;
-    win64.namedArgSlotBytes        = 8;
-    win64.variadicUsesOverflowBase = false;
-    DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes, win64, stdioCoreImports(), rep));
-    ASSERT_FALSE(rep.hasErrors());
-
-    for (auto const& [symV, recipe] : recipes)
-        EXPECT_TRUE(isCollapsibleAndInternal(mir, symV)) << "the '" << recipe << "' shim";
-
-    // The control: the caller the pass did not synthesize keeps the linkage it was built
-    // with (MirBuilder's default for a plain definition: global, default visibility).
-    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
-        MirFuncId const f = mir.funcAt(i);
-        if (mir.funcSymbol(f).v != kMainSym) continue;
-        EXPECT_EQ(mir.funcBinding(f), SymbolBinding::Global);
-        EXPECT_EQ(mir.funcVisibility(f), SymbolVisibility::Default);
-    }
-    MirVerifier verifier{mir, &in};
-    EXPECT_TRUE(verifier.verify(rep));
-}
-
-// ── THE THREADS FAMILY: a shim per vehicle, and the once-adapter ─────────────
+// ── THE THREADS FAMILY: a shim per vehicle ───────────────────────────────────
 //
-// `call_once` is the recipe that makes the pass mint a body NO descriptor names — the
-// adapter it hands InitOnceExecuteOnce (Win32) — so the assertion is over EVERY function
-// the pass added, found by difference, not only over the recipe symbols. The pass mints
-// that adapter whenever call_once is present, on BOTH vehicles (on pthread nothing names
-// it and DCE drops it later), and a win32 call_once without it is the pass's own internal
-// error, which the ASSERT on the pass's result catches — so the difference always holds
-// it here (✔MEASURED: the Global mutant reds it as the fourth body on both vehicles).
+// The assertion is over EVERY function the pass added, found by difference, not only
+// over the recipe symbols: until P69 the pass also minted a body NO descriptor names —
+// the adapter `call_once` handed InitOnceExecuteOnce — and a future recipe that needs a
+// helper body of its own is caught the same way. (P69 moved call_once to DSS's runtime
+// source on pe and libSystem's pthread_once on Mach-O; `cnd_wait` takes its place in the
+// scaffold, a two-pointer recipe like it on both vehicles.)
 TEST(SynthShimCollapseLinkage, EveryThreadsBodyIsWeakAndHiddenOnBothVehicles) {
     struct Vehicle {
         char const*             name;
@@ -239,16 +184,15 @@ TEST(SynthShimCollapseLinkage, EveryThreadsBodyIsWeakAndHiddenOnBothVehicles) {
         TypeInterner in{CompilationUnitId{1}};
         TypeId const i32 = in.primitive(TypeKind::I32);
         TypeId const pV  = in.pointer(in.primitive(TypeKind::Void));
-        TypeId const vd  = in.primitive(TypeKind::Void);
         std::vector<Callee> const callees{
             {10, {pV, i32}, i32},   // mtx_init(mtx_t*, int)
             {11, {pV}, i32},        // mtx_lock(mtx_t*)
-            {12, {pV, pV}, vd},     // call_once(once_flag*, void(*)(void))
+            {12, {pV, pV}, i32},    // cnd_wait(cnd_t*, mtx_t*)
         };
         Mir mir = buildCaller(in, v.cc, callees);
         std::unordered_set<std::uint32_t> const before = funcSymbols(mir);
         std::unordered_map<std::uint32_t, std::string> const recipes{
-            {10, "mtx_init"}, {11, "mtx_lock"}, {12, "call_once"}};
+            {10, "mtx_init"}, {11, "mtx_lock"}, {12, "cnd_wait"}};
         std::vector<ExternImport> externs;
         DiagnosticReporter rep;
         ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, v.synthesis, v.scheme, externs, rep));

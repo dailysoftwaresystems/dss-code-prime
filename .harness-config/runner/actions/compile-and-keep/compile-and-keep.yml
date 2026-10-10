@@ -1,0 +1,79 @@
+# PURPOSE: compile sources carried in the request with the dsscp a leg itself BUILT, for a stated target and each stated pipeline, and KEEP the images beside a report of every compile (exit code, diagnostics, the image's name, size and md5), so an image one machine cannot build is built on a leg that can and pulled back.
+name: compile-and-keep
+description: >-
+  Compiles each source of the request with THE LEG'S OWN BUILT dsscp (the one file the leg's build is
+  declared to make, which DssHarness builds before the step; never a compiler found on PATH) for a
+  stated `<targetName>:<formatName>`
+  target, once per stated pipeline, and keeps every file each compile left, with a text report beside
+  them: per source and pipeline the compile's exit code, what the compiler printed, and each image's
+  name, size and md5. DSS builds any target on any host, so a leg that can build the compiler makes
+  the images a machine that cannot build it will run. The sources travel as base64 in `sources_b64`,
+  never as files in the tree: a synced file would overwrite the ONE copy of the repository that host
+  keeps, under whatever lane is using it; the manual `pack` step writes that value from files, on the
+  machine that holds them. A compile that fails is a measurement: the step passes whenever every compile RAN,
+  and the report carries each verdict. REFUSED before anything is compiled, each with its own exit
+  code (the program's header is the table): 2 a malformed request, 3 no built dsscp, 4 a language,
+  target or pipeline the built compiler refuses (in the compiler's own words), 5 sources that do not
+  decode, 6 a name that would leave the step's directory, 7 a stated kind the target's format does
+  not serve. BRINGING THEM BACK: `dssharness sync --pull` carries files, each named, never a
+  directory, so the report's last line but one is the whole command for the leg it ran on
+  (`dssharness sync --legs <leg> --pull <file> --pull <file> ...`; a run with `-v` shows it as the
+  step prints it), and the run's `--json` names the same files as keptOutputs. They land here at
+  the path they have there, `<action>/artifacts/<the leg's run id>/<leg>/compile/kept/`.
+  The program documents itself in its own header; this file
+  declares only how a runner starts it and what witnesses that it ran.
+  Gated by ctest as `harness/compile_and_keep_selftest`.
+steps:
+  # THE COMPILE. Its inputs are the step's own, so a run of the self-test alone is asked for none of them.
+  - name: compile
+    workingDirectoryRoot: action
+    inputs:
+      sources_b64:
+        description: "the sources: base64 (standard or URL-safe alphabet, padding optional) of a UTF-8 JSON array of {name, src, ext[, language]}, plain or as a zlib stream; the manual `pack` step writes it from files"
+        required: true
+      language:
+        description: "the source language, passed to the compiler as --language (a source may name its own)"
+        required: true
+      target:
+        description: "the compiler's own target spec, <targetName>:<formatName>, passed verbatim as --target"
+        required: true
+      configs:
+        description: "the pipelines to build, comma-separated: `baseline` passes no --config token at all, any other name is passed as --config=<name>"
+        required: true
+      kind:
+        description: "optional: the artifact profile the images must be, checked against the `artifactProfiles` of the target's format document (it selects nothing: the format names the kind)"
+        default: ''
+    # ★ EVERY OPTION IS SPELLED `--name=value`: a URL-safe base64 value can BEGIN with `-`, and argparse would read
+    # it as another option. `--kept-at` is where this leg's kept outputs of THIS step go, the step's own name after
+    # the leg's place for them: the program writes the command that brings the kept files back from it.
+    run: |
+      python3 ./compile-and-keep.py --tree="{treeDir}" --dsscp="{product}" --sources-b64="{sources_b64}" --language="{language}" --target="{target}" --configs="{configs}" --kind="{kind}" --step-dir="{stepBuild}" --leg="{leg}" --kept-at="{actionArtifacts}/compile"
+    outputs: [kept]
+    persist: true
+    successPattern: 'compile-and-keep: OK compiles=\d+ '
+  # THE PACK, run only where a run names it, on the machine that holds the files (`dssharness run compile-and-keep
+  # --legs <that machine's leg> --manual-step pack --input from=<paths>`): it writes the `sources_b64` value for those
+  # files alone on one line of its kept output, read back through the decoder the compile step uses. A run then
+  # passes that line as `--input sources_b64=<it>`. It names no product, so it needs no build.
+  - name: pack
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      from:
+        description: "the source files to carry, comma-separated; a directory stands for every file directly inside it, and a relative path is taken from the tree"
+        required: true
+    run: |
+      python3 ./compile-and-keep.py --pack --tree="{treeDir}" --from="{from}" --out="{stepBuild}/sources_b64.txt"
+    outputs: [sources_b64.txt]
+    persist: true
+    successPattern: '^compile-and-keep: PACKED \d+ source\(s\) '
+  # THE SELF-TEST, run only where a run names it (`dssharness run compile-and-keep --legs <leg> --manual-step
+  # self-test`): every refusal and every counted outcome against a stand-in compiler the program writes itself. It
+  # names no product, so it needs no build. ctest runs the same arms as `harness/compile_and_keep_selftest` and adds
+  # the live ones, with the compiler that build made.
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./compile-and-keep.py --selftest
+    successPattern: '^compile-and-keep selftest: OK \(\d+ arm\(s\)'

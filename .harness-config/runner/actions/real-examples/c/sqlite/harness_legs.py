@@ -233,6 +233,107 @@ MACHO_CPU_TYPES = {
     "arm64":  0x0100000C,
 }
 
+# ── A HOST FACT INSIDE AN ARGV TEMPLATE: THE WSL DISTRIBUTION ─────────────────
+#
+# ★ (2026-09-30, P69 lane hm: the round-12 audit's S8, its resolver half.) Every
+# argv this resolver hands out that enters WSL -- a leg's launcher, the path
+# translator, the run filesystem's mkdir/rm/copy, its requirement probes and its
+# kernel entry -- used to say `wsl.exe -e`, which enters the machine's DEFAULT
+# distribution: whatever a person last set with `wsl --set-default`. The WSL legs
+# of this tree's DssHarness configuration run in the ONE distribution they declare
+# (`.harness-config/config.json`, `legs.<leg>.wsl`), so a Windows-driven corpus
+# could build in one Linux and run its Linux legs in another.
+#
+# So the templates name the distribution with a PLACEHOLDER, and the fact is
+# ENTERED where an argv is materialized (`enter_host_facts`), read from the tree's
+# configuration the first time one needs it -- never typed here, never read on a
+# host whose plan enters no WSL. ✔MEASURED 2026-09-30 on the Windows gate host:
+# `wsl.exe --cd /tmp -d <declared> -e pwd` and `wsl.exe -d <declared> --cd /tmp -e
+# pwd` both print /tmp (the working-directory splice may land on either side of
+# the pair), and an argv whose placeholder was NOT entered fails LOUD --
+# `WSL_E_DISTRO_NOT_FOUND`, exit 4294967295 -- so a materialization site that
+# forgot the fact can never fall back to the default distribution quietly.
+WSL_DISTRIBUTION_PLACEHOLDER = "{wslDistribution}"
+
+# The fact, read once: [] until first needed, then [name]. The self-test enters its
+# own through this list so its argv assertions are the same on every machine.
+_WSL_DISTRIBUTION = []
+
+
+def wsl_distribution_of(config, where):
+    """The ONE WSL distribution a DssHarness configuration's legs declare
+    (`legs.<leg>.wsl`), or a LegError naming why there is not exactly one: none
+    declared (entering the default would be a guess), or two (which one a leg's
+    launcher should enter would be a guess). `where` names the file."""
+    legs = config.get("legs") if isinstance(config, dict) else None
+    named = sorted(set(str(d["wsl"]) for d in (legs.values() if isinstance(legs, dict) else ())
+                       if isinstance(d, dict) and d.get("wsl")))
+    if len(named) != 1:
+        raise LegError(
+            "the WSL legs of %s declare %s WSL distribution%s (legs.<leg>.wsl): an argv "
+            "that enters WSL enters the ONE distribution those legs run in, never the "
+            "machine's default" % (
+                where, "no" if not named else "%d different" % len(named),
+                "" if len(named) == 1 else "s" + ((" (%s)" % ", ".join(named)) if named else "")))
+    return named[0]
+
+
+def tree_wsl_distribution(tree=None):
+    """`wsl_distribution_of` the DSS tree `tree` (default: the tree this harness
+    ships in), READ through `owning-tree`'s JSONC reader -- or a LegError naming
+    what could not be read."""
+    root = tree or _own_checkout()
+    if not root:
+        raise LegError(
+            "the WSL distribution an argv enters is the one this tree's WSL legs declare "
+            "(%s legs.<leg>.wsl), and this copy of the harness lives in no DSS tree"
+            % "/".join(DSSHARNESS_CONFIG_REL))
+    path = os.path.join(root, *DSSHARNESS_CONFIG_REL)
+    ot = _owning_tree_module()
+    if ot is None:
+        raise LegError("%s cannot be read: `owning-tree`, the tree's JSONC reader, is not "
+                       "beside this harness" % path)
+    try:
+        config = ot.load_jsonc(path)
+    except ot.Refusal as exc:
+        raise LegError("%s cannot be read: %s" % (path, exc))
+    return wsl_distribution_of(config, path)
+
+
+def wsl_distribution():
+    """The distribution every WSL-entering argv names on this machine, read once."""
+    if not _WSL_DISTRIBUTION:
+        _WSL_DISTRIBUTION.append(tree_wsl_distribution())
+    return _WSL_DISTRIBUTION[0]
+
+
+def enter_host_facts(value):
+    """`value` -- an argv, or a plan object holding argvs -- with every host-fact
+    placeholder entered. The fact is read only when a placeholder is PRESENT, so a
+    plan that enters no WSL never asks for one (and a harness copied out of its
+    tree still plans every leg that needs none)."""
+    if isinstance(value, str):
+        if WSL_DISTRIBUTION_PLACEHOLDER in value:
+            return value.replace(WSL_DISTRIBUTION_PLACEHOLDER, wsl_distribution())
+        return value
+    if isinstance(value, list):
+        return [enter_host_facts(v) for v in value]
+    if isinstance(value, dict):
+        return dict((k, enter_host_facts(v)) for k, v in value.items())
+    return value
+
+
+def unentered_host_facts(value, where="plan"):
+    """Every place in `value` (an argv or a plan object) that still holds a host-fact
+    placeholder, as `where[...]` paths -- [] when everything was entered."""
+    if isinstance(value, str):
+        return [where] if WSL_DISTRIBUTION_PLACEHOLDER in value else []
+    if isinstance(value, list):
+        return [p for i, v in enumerate(value) for p in unentered_host_facts(v, "%s[%d]" % (where, i))]
+    if isinstance(value, dict):
+        return [p for k, v in sorted(value.items()) for p in unentered_host_facts(v, "%s.%s" % (where, k))]
+    return []
+
 # ── Launcher path translation ───────────────────────────────────────────────
 #
 # A launcher does not always share
@@ -297,7 +398,11 @@ PATH_TRANSLATIONS = {
         # to own that path's spelling is the same string surgery the paragraph
         # above refuses. Do not re-add it: if a translation ever fails again,
         # the input the tool saw must be the input this driver had.
-        "translator": ["wsl.exe", "-e", "wslpath", "-a", "-u"],
+        # `-d {wslDistribution}`: the distribution the WSL legs declare, entered
+        # where the argv is run (see A HOST FACT INSIDE AN ARGV TEMPLATE) -- the
+        # drive mount a path translates to is that distribution's own.
+        "translator": ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e",
+                       "wslpath", "-a", "-u"],
         "sourceShape": "windows-drive",
         "validHostOs": "windows",
     },
@@ -657,9 +762,12 @@ RUN_FILESYSTEMS = {
         # matters because the corpus writes multi-gigabyte databases.
         "root": "/tmp/dss-sqlite-harness",
         "workingDirArgv": ["--cd", "{dir}"],
-        "mkdirArgv": ["wsl.exe", "-e", "mkdir", "-p"],
-        "rmTreeArgv": ["wsl.exe", "-e", "rm", "-rf"],
-        "copyArgv": ["wsl.exe", "-e", "cp", "-f"],
+        # Every argv below enters the distribution the WSL legs declare
+        # (`-d {wslDistribution}`, entered where it is materialized -- A HOST FACT
+        # INSIDE AN ARGV TEMPLATE), never the machine's default one.
+        "mkdirArgv": ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e", "mkdir", "-p"],
+        "rmTreeArgv": ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e", "rm", "-rf"],
+        "copyArgv": ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e", "cp", "-f"],
         # ⚠ THE `command` PROBE IS THE ONE PLACE A SHELL APPEARS IN THIS TABLE,
         # AND IT IS AGAINST THE TABLE'S OWN RULE ABOVE. READ THIS BEFORE
         # "FIXING" IT INTO A STRING.
@@ -680,9 +788,11 @@ RUN_FILESYSTEMS = {
         # — a launcher argv
         # nobody can prove was the argv that ran.
         "probeArgv": {
-            "file":      ["wsl.exe", "-e", "test", "-f", "{path}"],
-            "directory": ["wsl.exe", "-e", "test", "-d", "{path}"],
-            "command":   ["wsl.exe", "-e", "sh", "-c",
+            "file":      ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e",
+                          "test", "-f", "{path}"],
+            "directory": ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e",
+                          "test", "-d", "{path}"],
+            "command":   ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e", "sh", "-c",
                           'command -v "$1" >/dev/null', "--", "{path}"],
         },
         "validHostOs": "windows",
@@ -700,12 +810,13 @@ RUN_FILESYSTEMS = {
         # elf64-x86_64 and 3 on elf64-arm64 that the arm64 VPS ran green from the
         # same DSS commit against the same upstream tree.
         "sharesDriverKernel": False,
-        # `wsl.exe -e` and nothing more: the KERNEL boundary, which is exactly what
-        # an environment measurement has to cross. `-e` is load-bearing here for the
-        # same reason it is in every other argv on this entry
-        # : without it WSL
-        # rebuilds a command LINE and feeds it to the distro's default shell.
-        "kernelEntryArgv": ["wsl.exe", "-e"],
+        # `wsl.exe -d <the declared distribution> -e` and nothing more: the KERNEL
+        # boundary, which is exactly what an environment measurement has to cross.
+        # `-e` is load-bearing here for the same reason it is in every other argv on
+        # this entry: without it WSL rebuilds a command LINE and feeds it to the
+        # distro's default shell. `-d` names WHICH kernel's userland: the one the
+        # WSL legs declare, never the machine's default.
+        "kernelEntryArgv": ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e"],
         # ⓘ THE DISTRO'S python3, NOT THIS DRIVER'S. Its ABSENCE is an ordinary,
         # expected answer on a minimal distro and it is handled as one: the
         # measurement is `unreachable`, every verdict for that kernel is
@@ -1031,7 +1142,7 @@ def requirement_probe_argv(fs_verb, kind, path):
             "(it implements: %s). A kind with no probe on some filesystem is a "
             "requirement that is silently never checked there."
             % (fs_verb, kind, ", ".join(sorted(templates))))
-    return [x.replace("{path}", path) for x in tmpl]
+    return enter_host_facts([x.replace("{path}", path) for x in tmpl])
 
 
 def _env_value_is_path(value):
@@ -3517,7 +3628,7 @@ def kernel_probe_argv(fs_verb, script, catalogue, only, translator=None):
     read a variable would read an empty one — silently, which is how the corpus
     resume engine once re-ran itself from the beginning."""
     spec = run_filesystem(fs_verb)
-    entry = list(spec["kernelEntryArgv"])
+    entry = enter_host_facts(list(spec["kernelEntryArgv"]))
     if not entry:
         return []
     interp = spec["kernelProbeInterpreter"]
@@ -3566,7 +3677,7 @@ def execution_monitor_plan(catalogue_doc, fs_verb, probe, watch_log,
     timeline = execution_timeline_path(watch_log, probe)
     stop = execution_stop_path(timeline)
     fs = run_filesystem(fs_verb)
-    entry = list(fs["kernelEntryArgv"])
+    entry = enter_host_facts(list(fs["kernelEntryArgv"]))
     cap = float(segment_cap_seconds or 0.0)
     # The monitor's own lifetime: the segment's cap plus room to arm and to stop, or
     # the uncapped ceiling. It exists so a monitor cannot outlive a killed driver
@@ -5540,6 +5651,25 @@ REFERENCE_SURFACE_ENTRY_KEYS = ("header", "includes", "macros")
 REFERENCE_SURFACE_DIR_NAME = "reference-surface"
 
 
+_OWNING_TREE_MOD = []
+
+
+def _owning_tree_module():
+    """`owning-tree.py`, loaded by path once (the tree's one owner of "which tree am I in" and of
+    its JSONC reader), or None when it is not there -- a harness copied out of the repository."""
+    if not _OWNING_TREE_MOD:
+        import importlib.util
+        path = os.path.join(HERE, os.pardir, os.pardir, os.pardir, "owning-tree",
+                            "owning-tree.py")
+        mod = None
+        if os.path.isfile(path):
+            spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        _OWNING_TREE_MOD.append(mod)
+    return _OWNING_TREE_MOD[0]
+
+
 def _own_checkout():
     """The DSS tree this harness ships in, by `owning-tree`'s walk, or None.
 
@@ -5551,14 +5681,9 @@ def _own_checkout():
     `real-examples` -> the actions directory). None when that owner is not there -- a
     harness copied out of the repository -- which the caller reports by name.
     """
-    import importlib.util
-    path = os.path.join(HERE, os.pardir, os.pardir, os.pardir, "owning-tree",
-                        "owning-tree.py")
-    if not os.path.isfile(path):
+    mod = _owning_tree_module()
+    if mod is None:
         return None
-    spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
     try:
         return mod.owning_tree(__file__)
     except mod.Refusal:
@@ -6680,7 +6805,7 @@ def reference_tu_rows(log_text, index):
 
 
 def recompile_verdicts(manifest_sources, dss_log_text, dss_build, reference_log_text,
-                       oracle_status, label="<unlabelled>", dss_detail="", sqlite_head=""):
+                       oracle_status, label="<unlabelled>", dss_detail="", sqlite_head="", sqlite_pin=""):
     """THE ROUND-CLOSE CENSUS: per TU of the manifest, did the reference accept it,
     did dsscp? -> a report dict: `tus` (one row per TU, manifest order, each with a
     RECOMPILE_VERDICTS verdict), `counts` {tus, referenceOk, dssOk, blockers},
@@ -6689,12 +6814,24 @@ def recompile_verdicts(manifest_sources, dss_log_text, dss_build, reference_log_
 
     `dss_build` is one of RECOMPILE_DSS_BUILDS, `dss_detail` its reason when
     `failed`; `oracle_status` is `--build-reference-oracle`'s own status, verbatim.
-    Only `built` and `build-failed` mean the reference RAN."""
+    Only `built` and `build-failed` mean the reference RAN. `sqlite_head` is the
+    sqlite commit the STAGE recorded, the one the summary names; `sqlite_pin` the
+    pinned one (legs.json stageBuild.sqliteCommit, which the CLI requires): a stage
+    that is not on the pin makes the census INCOMPLETE."""
     tus, index = recompile_tu_index(manifest_sources)
     incomplete = []
     if dss_build not in RECOMPILE_DSS_BUILDS:
         raise LegError("the dsscp build outcome %r is not one of %s"
                        % (dss_build, ", ".join(RECOMPILE_DSS_BUILDS)))
+    # ★ THE SUBJECT, MEASURED AND DECLARED, SEPARATELY (2026-09-30, the round-12 audit's
+    # S2): the driver used to hand this census the PIN as the head, so the summary named
+    # the declaration whatever the stage held. It hands both now, and a stage that is not
+    # on the pin compiled another program: nothing it says is about the pinned one.
+    if sqlite_pin and not (sqlite_head and sqlite_pin.startswith(sqlite_head)):
+        incomplete.append("the stage compiled sqlite %s, NOT the pinned %s (legs.json "
+                          "stageBuild.sqliteCommit): a census of another revision says "
+                          "nothing about the pinned one" % (sqlite_head or "<unnamed>",
+                                                            sqlite_pin[:12]))
 
     def tally():
         return dict((tu, {"errors": 0, "warnings": 0, "firstError": ""}) for tu in tus)
@@ -6788,8 +6925,8 @@ def recompile_verdicts(manifest_sources, dss_log_text, dss_build, reference_log_
               "referenceOk": sum(1 for r in rows if r["referenceOk"]),
               "dssOk": sum(1 for r in rows if r["dssOk"]),
               "blockers": sum(1 for r in rows if r["verdict"] == "BLOCKER")}
-    return {"leg": label, "sqliteHead": sqlite_head, "oracleStatus": oracle_status, "dssBuild": dss_build,
-            "tus": rows, "counts": counts, "incomplete": incomplete,
+    return {"leg": label, "sqliteHead": sqlite_head, "sqlitePin": sqlite_pin, "oracleStatus": oracle_status,
+            "dssBuild": dss_build, "tus": rows, "counts": counts, "incomplete": incomplete,
             "unplacedDss": unplaced_dss, "unplacedReference": unplaced_ref,
             "clean": counts["blockers"] == 0 and not incomplete}
 
@@ -6797,10 +6934,12 @@ def recompile_verdicts(manifest_sources, dss_log_text, dss_build, reference_log_
 def recompile_summary_line(report):
     """The ONE summary line a round close reads, naming the sqlite commit it compiled (2026-09-25: the
     subject is PINNED, legs.json `stageBuild.sqliteCommit`, and a summary that cannot name its subject
-    cannot be reproduced -- an unnamed one says UNKNOWN, which no success pattern accepts)."""
+    cannot be reproduced -- an unnamed one says UNKNOWN, which no success pattern accepts). The commit
+    is the one the STAGE recorded (2026-09-30), its first twelve digits."""
     c = report["counts"]
+    head = report.get("sqliteHead") or ""
     return ("recompile: %s sqlite=%s tus=%d reference_ok=%d dss_ok=%d blockers=%d"
-            % (report["leg"], report.get("sqliteHead") or "UNKNOWN", c["tus"], c["referenceOk"],
+            % (report["leg"], head[:12] or "UNKNOWN", c["tus"], c["referenceOk"],
                c["dssOk"], c["blockers"]))
 
 
@@ -8813,6 +8952,14 @@ def launcher_available(command, available):
 # log always states the substitution instead of hiding it.
 
 
+def _offline_flag(value):
+    """`true` / `false`, how a harness step hands a flag over; anything else is refused, named."""
+    v = str(value).strip().lower()
+    if v not in ("true", "false"):
+        raise argparse.ArgumentTypeError("%r is neither true nor false" % value)
+    return v == "true"
+
+
 def cache_root(explicit=None):
     """Where THIS MACHINE keeps caches. A host fact, in the same category as
     `searchPaths` — it decides nothing about which legs exist. Precedence:
@@ -9774,7 +9921,7 @@ def translate_path(verb, raw, runner=None):
     # no separator normalisation, no re-spelling of any kind (see the
     # `windows-to-wsl` comment: that workaround existed only to route around a
     # hidden local shell, and the shell is gone from the translator argv).
-    argv = list(spec["translator"]) + [raw]
+    argv = enter_host_facts(list(spec["translator"])) + [raw]
     if runner is None:
         runner = _run_translator
     rc, out, err = runner(argv)
@@ -9958,6 +10105,10 @@ def plan_leg(leg, host_os, host_arch, available, kernel_measurements=None):
             needed = [command] + ([translator] if translator else [])
             missing = [c for c in needed if not launcher_available(c, available)]
             if not missing:
+                # The launcher and its translator as they will be SPAWNED: the host
+                # facts their templates name (the WSL legs' distribution) entered
+                # here, where the leg is known to run through them.
+                command, translator = enter_host_facts(command), enter_host_facts(translator)
                 run["mode"] = "launched"
                 # SAME ISA through a launcher is a FOREIGN KERNEL, not emulation:
                 # wsl.exe on an arm64 Windows host executes aarch64 instructions
@@ -10382,16 +10533,17 @@ def run_dir_plan(leg, host_os, host_arch, available, driver_run_dir):
         "launcher": splice_working_dir(run["launcher"], verb,
                                        launcher_path or driver_run_dir),
         # argv PREFIXES. Empty => the driver performs the operation natively on
-        # its own filesystem, which is what `driver` means.
-        "mkdirArgv": list(spec["mkdirArgv"]),
-        "rmTreeArgv": list(spec["rmTreeArgv"]),
-        "copyArgv": list(spec["copyArgv"]),
+        # its own filesystem, which is what `driver` means. Host facts entered: they
+        # are spawned as they stand here.
+        "mkdirArgv": enter_host_facts(list(spec["mkdirArgv"])),
+        "rmTreeArgv": enter_host_facts(list(spec["rmTreeArgv"])),
+        "copyArgv": enter_host_facts(list(spec["copyArgv"])),
         # argv PREFIX that runs a program IN THE KERNEL the launched fixture executes in
         # -- the same declaration the environment probes cross with. The driver's
         # leftover-fixture sweep enumerates and kills THERE: a WSL-launched fixture is a
         # Linux process that no Windows process listing contains. Empty => this
         # driver's own kernel.
-        "kernelEntryArgv": list(spec["kernelEntryArgv"]),
+        "kernelEntryArgv": enter_host_facts(list(spec["kernelEntryArgv"])),
         "detail": (
             "run mode '%s', runFilesystem '%s' — %s"
             % (run["mode"], verb,
@@ -10441,7 +10593,7 @@ def run_dir_probe_argv(fs_verb, script, catalogue, run_dir, names,
     it) and is therefore NOT translated. The SCRIPT and the CATALOGUE live on
     this driver's filesystem and are."""
     spec = run_filesystem(fs_verb)
-    entry = list(spec["kernelEntryArgv"])
+    entry = enter_host_facts(list(spec["kernelEntryArgv"]))
     if not entry:
         return []
     interp = spec["kernelProbeInterpreter"]
@@ -10991,6 +11143,117 @@ def _lint_acquire(label, spec, libs):
     return out
 
 
+# ── ONE FACT, THREE DECLARATIONS: A HOST'S OWN TRANSLATION LAYER ─────────────
+#
+# ★ (2026-09-30, the round-12 audit's R38.) An OS that executes another ISA's
+# images itself -- Rosetta 2 on Apple Silicon, `arch -x86_64` -- is declared three
+# times, because three consumers read three schemas: this catalogue (a leg's
+# launcher on that host), the corpus runners' cross-arch gate
+# (tests/test_support/host_translations.json, whose row says so) and DssHarness's
+# leg-readiness witness (.harness-config/config.json `emulators`). Nothing held
+# the three together. The lint does now, READING the other two: for every row of
+# the tests' file -- keyed by (host OS, host arch, guest arch), never by a
+# translator's name -- the ONE launcher this catalogue declares for a leg whose
+# target is the host's own OS on the guest's ISA, and the ONE emulator of
+# config.json on that host for that processor, must carry the row's command and
+# its prerequisites: path, provides and install here (a `why` is each file's own
+# account), the command's program and every path there (DssHarness's `requires`
+# names a program or a path). A disagreement is named, with both values.
+HOST_TRANSLATIONS_REL = ("tests", "test_support", "host_translations.json")
+DSSHARNESS_CONFIG_REL = (".harness-config", "config.json")
+_TRANSLATION_SOURCES = []
+
+
+def _prerequisite_view(requires):
+    """A prerequisite list as the three declarations share it: (kind, path, provides,
+    install), sorted -- `why` left out, each file's own."""
+    return sorted((str(r.get("kind", "")), str(r.get("path", "")), str(r.get("provides", "")),
+                   str(r.get("install", ""))) for r in (requires or []) if isinstance(r, dict))
+
+
+def translation_parity_findings(legs, emulators, translations, where):
+    """-> every disagreement between the three declarations of a host's OWN
+    translation layer (see above). `legs` is the catalogue's leg list, `emulators`
+    config.json's `emulators`, `translations` the tests' parsed file, `where` names
+    {"config": ..., "tests": ...} for the findings."""
+    findings = []
+    rows = translations.get("translations") if isinstance(translations, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return ["%s declares no host translation, so the one fact it shares with this catalogue "
+                "and %s's emulators was not checked" % (where["tests"], where["config"])]
+    emulators = emulators if isinstance(emulators, dict) else {}
+    for row in rows:
+        if not isinstance(row, dict):
+            findings.append("%s holds a translation that is not an object: %r" % (where["tests"], row))
+            continue
+        h_os, h_arch = canon_os(row.get("hostOs")), canon_arch(row.get("hostArch"))
+        guest, command = canon_arch(row.get("guestArch")), list(row.get("command") or [])
+        what = ("the %s/%s host's own translation of %s images (%s)"
+                % (h_os, h_arch, guest, where["tests"]))
+        ours = [(leg.get("label"), e) for leg in legs
+                if spec_target_os(leg.get("spec", "")) == h_os
+                and canon_arch(spec_target_arch(leg.get("spec", ""))) == guest
+                for e in (leg.get("launchers") or [])
+                if isinstance(e, dict) and canon_os(e.get("hostOs")) == h_os
+                and canon_arch(e.get("hostArch")) == h_arch]
+        theirs = [(name, e) for name, e in sorted(emulators.items())
+                  if isinstance(e, dict) and canon_os(e.get("hostOs")) == h_os
+                  and canon_arch(e.get("hostProcessor")) == h_arch
+                  and canon_arch(e.get("processor")) == guest]
+        if len(ours) != 1:
+            findings.append("%s: this catalogue declares %d launcher(s) for it (%s), not exactly one"
+                            % (what, len(ours), ", ".join(str(l) for l, _e in ours) or "none"))
+        else:
+            label, entry = ours[0]
+            if list(entry.get("command") or []) != command:
+                findings.append("%s: leg %s's launcher command is %r here and %r there"
+                                % (what, label, entry.get("command"), command))
+            if _prerequisite_view(entry.get("requires")) != _prerequisite_view(row.get("requires")):
+                findings.append("%s: leg %s's launcher requires %r here and %r there (kind, path, "
+                                "provides, install)" % (what, label, _prerequisite_view(entry.get("requires")),
+                                                        _prerequisite_view(row.get("requires"))))
+        if len(theirs) != 1:
+            findings.append("%s: %s declares %d emulator(s) for it (%s), not exactly one"
+                            % (what, where["config"], len(theirs),
+                               ", ".join(n for n, _e in theirs) or "none"))
+        else:
+            name, emu = theirs[0]
+            need = sorted(set(command[:1] + [str(r.get("path", "")) for r in (row.get("requires") or [])
+                                             if isinstance(r, dict)]))
+            if list(emu.get("launcher") or []) != command:
+                findings.append("%s: %s emulator %r launches %r, and the translation is %r"
+                                % (what, where["config"], name, emu.get("launcher"), command))
+            if sorted(set(str(x) for x in (emu.get("requires") or []))) != need:
+                findings.append("%s: %s emulator %r requires %r, and the translation's program and "
+                                "prerequisites are %r" % (what, where["config"], name,
+                                                          sorted(set(emu.get("requires") or [])), need))
+    return findings
+
+
+def translation_sources():
+    """(config.json's `emulators`, the tests' host translations, where) of the DSS tree
+    this harness ships in, READ once -- or a LegError naming what could not be read."""
+    if not _TRANSLATION_SOURCES:
+        tree = _own_checkout()
+        if not tree:
+            raise LegError("this harness lives in no DSS tree, so the host translations it "
+                           "shares with %s and %s cannot be read"
+                           % ("/".join(HOST_TRANSLATIONS_REL), "/".join(DSSHARNESS_CONFIG_REL)))
+        where = {"config": "/".join(DSSHARNESS_CONFIG_REL), "tests": "/".join(HOST_TRANSLATIONS_REL)}
+        ot = _owning_tree_module()
+        try:
+            config = ot.load_jsonc(os.path.join(tree, *DSSHARNESS_CONFIG_REL))
+        except ot.Refusal as exc:
+            raise LegError("%s cannot be read: %s" % (where["config"], exc))
+        try:
+            with open(os.path.join(tree, *HOST_TRANSLATIONS_REL), "r", encoding="utf-8") as fh:
+                translations = json.load(fh)
+        except (OSError, ValueError) as exc:
+            raise LegError("%s cannot be read: %s" % (where["tests"], exc))
+        _TRANSLATION_SOURCES.append(((config or {}).get("emulators"), translations, where))
+    return _TRANSLATION_SOURCES[0]
+
+
 def lint(path=CATALOGUE):
     """Catalogue defects, host-independently. Returns a list of strings."""
     findings = []
@@ -11264,6 +11527,24 @@ def lint(path=CATALOGUE):
                             "a '%s' host"
                             % (label, entry["hostOs"], entry["hostArch"], fverb,
                                want_os))
+                    # A LAUNCHER ENTERS ITS FILESYSTEM'S KERNEL THE WAY THAT
+                    # FILESYSTEM DOES (2026-09-30, the round-12 audit's S8): on a
+                    # verb that crosses into another kernel, the command begins with
+                    # the verb's own `kernelEntryArgv` -- for `wsl-linux`, `wsl.exe -d
+                    # {wslDistribution} -e`. A launcher spelling its own entry
+                    # (`wsl.exe -e`) ran its leg in the machine's DEFAULT
+                    # distribution while every probe, copy and sweep of that leg
+                    # entered the one the WSL legs declare.
+                    _kentry = list(RUN_FILESYSTEMS[fverb]["kernelEntryArgv"])
+                    _cmd = list(entry.get("command") or [])
+                    if _kentry and _cmd[:len(_kentry)] != _kentry:
+                        findings.append(
+                            "leg '%s': launcher for (%s, %s) runs %r, which does not "
+                            "begin with runFilesystem '%s''s own kernel entry %r -- the "
+                            "leg would run somewhere its probes, copies and sweeps do "
+                            "not look"
+                            % (label, entry["hostOs"], entry["hostArch"], _cmd, fverb,
+                               _kentry))
                     # DERIVABLE, so CHECKED rather than trusted, and it is the
                     # pair that actually bites: a launcher in a foreign PATH
                     # namespace is in a foreign FILESYSTEM almost by definition —
@@ -11761,6 +12042,12 @@ def lint(path=CATALOGUE):
                             "launcher spellings: %s — one triple must have one "
                             "vocabulary" % (key[0], key[1], key[2], len(spellings),
                                             ", ".join(sorted(spellings))))
+    # ── a host's OWN translation layer, one fact in three files (READ, 2026-09-30) ──
+    try:
+        emulators, translations, where = translation_sources()
+        findings.extend(translation_parity_findings(legs, emulators, translations, where))
+    except LegError as exc:
+        findings.append("host translations: %s" % exc)
     return findings
 
 
@@ -12131,7 +12418,38 @@ def _forbidden_runner(argv):
                          % (argv,))
 
 
+# The WSL distribution every argv the self-test materializes names: its own, so an
+# assertion reads the same on every machine. The REAL reader is pinned by its own arms
+# (HOST FACTS) against synthesized configurations and against the shipped one.
+SELF_TEST_WSL_DISTRIBUTION = "dss-self-test-distribution"
+
+
 def self_test(path=CATALOGUE, out=sys.stdout):
+    """The self-test, with the WSL distribution entered as SELF_TEST_WSL_DISTRIBUTION
+    for its duration and the machine's own fact (read or not) restored after."""
+    saved = list(_WSL_DISTRIBUTION)
+    _WSL_DISTRIBUTION[:] = [SELF_TEST_WSL_DISTRIBUTION]
+    try:
+        return _self_test(path, out)
+    finally:
+        _WSL_DISTRIBUTION[:] = saved
+
+
+def _self_test_wsl(*rest):
+    """`wsl.exe -d <the self-test's distribution> -e` + `rest`: the entry every
+    WSL-entering argv the self-test materializes begins with."""
+    return ["wsl.exe", "-d", SELF_TEST_WSL_DISTRIBUTION, "-e"] + list(rest)
+
+
+def _self_test_entered(argv):
+    """A declared argv TEMPLATE as the self-test expects it materialized -- spelled
+    here independently of `enter_host_facts`, so an arm comparing the two is not
+    the function checking itself."""
+    return [SELF_TEST_WSL_DISTRIBUTION if a == WSL_DISTRIBUTION_PLACEHOLDER else a
+            for a in argv]
+
+
+def _self_test(path=CATALOGUE, out=sys.stdout):
     import struct
     passed = failed = 0
 
@@ -12168,6 +12486,62 @@ def self_test(path=CATALOGUE, out=sys.stdout):
 
     findings = lint(path)
     check("the leg catalogue lints clean", not findings, "\n      ".join(findings))
+
+    # ── a host's OWN translation layer: one fact, three files, held together by the lint (2026-09-30, R38) ──
+    # Every negative moves ONE of the three copies of the shipped declarations one way; the control is the three as
+    # shipped, and a `why` -- each file's own account -- moving is no disagreement.
+    import copy as _tp_copy
+    _tp_em, _tp_tr, _tp_where = translation_sources()
+    _tp_legs = load_catalogue(path)
+    _tp_row = (_tp_tr.get("translations") or [{}])[0]
+
+    def _tp_launcher(legs_):
+        for _l in legs_:
+            if (spec_target_os(_l.get("spec", "")) == canon_os(_tp_row.get("hostOs"))
+                    and canon_arch(spec_target_arch(_l.get("spec", ""))) == canon_arch(_tp_row.get("guestArch"))):
+                for _e in _l.get("launchers") or []:
+                    if (canon_os(_e.get("hostOs")) == canon_os(_tp_row.get("hostOs"))
+                            and canon_arch(_e.get("hostArch")) == canon_arch(_tp_row.get("hostArch"))):
+                        return _l.get("label"), _e
+        return None, {}
+
+    def _tp_moved(move):
+        legs_, em_, tr_ = _tp_copy.deepcopy(_tp_legs), _tp_copy.deepcopy(_tp_em), _tp_copy.deepcopy(_tp_tr)
+        move(legs_, em_, tr_)
+        return translation_parity_findings(legs_, em_, tr_, _tp_where)
+    _tp_label, _tp_entry = _tp_launcher(_tp_legs)
+    _tp_ok = translation_parity_findings(_tp_legs, _tp_em, _tp_tr, _tp_where)
+    check("the three declarations of every host translation AGREE as shipped -- this catalogue's launcher, "
+          "config.json's emulator and the tests' row (the control)",
+          _tp_label is not None and _tp_ok == [], "leg=%r findings=%r" % (_tp_label, _tp_ok))
+    _tp_cmd = _tp_moved(lambda l_, e_, t_: _tp_launcher(l_)[1].__setitem__("command", ["arch", "-arm64"]))
+    _tp_prov = _tp_moved(lambda l_, e_, t_: _tp_launcher(l_)[1]["requires"][0].__setitem__("provides", "moved"))
+    _tp_path = _tp_moved(lambda l_, e_, t_: t_["translations"][0]["requires"][0].__setitem__("path", "/moved"))
+    _tp_gone = _tp_moved(lambda l_, e_, t_: e_.clear())
+    _tp_why = _tp_moved(lambda l_, e_, t_: _tp_launcher(l_)[1]["requires"][0].__setitem__("why", "moved"))
+    check("a disagreement is NAMED with both values: the launcher's command, a prerequisite's provides, the tests' "
+          "path (both other files then disagree), an emulator config.json no longer declares -- and a `why` is no "
+          "disagreement",
+          len(_tp_cmd) == 1 and _tp_label in _tp_cmd[0] and "'-arm64'" in _tp_cmd[0]
+          and len(_tp_prov) == 1 and "'moved'" in _tp_prov[0]
+          and len(_tp_path) == 2 and all("/moved" in f for f in _tp_path)
+          and len(_tp_gone) == 1 and "declares 0 emulator(s)" in _tp_gone[0] and _tp_why == [],
+          "%r" % ((_tp_cmd, _tp_prov, _tp_path, _tp_gone, _tp_why),))
+    # ...and `--lint` RUNS it: a catalogue copy whose launcher moved lints with that one finding.
+    import tempfile as _tp_t
+    with open(path, "r", encoding="utf-8") as _fh:
+        _tp_doc = json.load(_fh)
+    _tp_launcher(_tp_doc["legs"])[1]["command"] = ["arch", "-arm64"]
+    _tp_fd, _tp_p = _tp_t.mkstemp(suffix=".json")
+    os.close(_tp_fd)
+    try:
+        with open(_tp_p, "w", encoding="utf-8") as _fh:
+            json.dump(_tp_doc, _fh)
+        _tp_lint = [f for f in lint(_tp_p) if "own translation" in f]
+    finally:
+        os.remove(_tp_p)
+    check("...and `--lint` RUNS the check: a catalogue copy whose launcher moved lints with exactly that finding",
+          len(_tp_lint) == 1 and "'-arm64'" in _tp_lint[0], "%r" % (_tp_lint,))
 
     # ── the stage build configuration ────────────────────────────────────────
     # Asserted on CONTENT, not on shape. "four keys are present" was satisfied
@@ -12426,10 +12800,10 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                   % (host[0], host[1], leg["label"]),
                   run["mode"] == "launched" or verb == "none",
                   "mode=%r verb=%r" % (run["mode"], verb))
-            check("the translator argv IS the verb's (%s/%s %s)"
+            check("the translator argv IS the verb's, its host facts entered (%s/%s %s)"
                   % (host[0], host[1], leg["label"]),
                   run.get("pathTranslator")
-                  == (PATH_TRANSLATIONS[verb]["translator"]
+                  == (_self_test_entered(PATH_TRANSLATIONS[verb]["translator"])
                       if run["mode"] == "launched" else []),
                   "verb=%r translator=%r" % (verb, run.get("pathTranslator")))
     # A launcher that needs a translator is UNUSABLE without it, and the verdict
@@ -12489,9 +12863,11 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           translate_path("windows-to-wsl", "C:\\a\\b", runner=_ok_runner)
           == "/mnt/c/a/b" and seen and seen[0][-1] == "C:\\a\\b",
           "translator saw %r" % (seen[0] if seen else None))
-    check("windows-to-wsl invokes the DECLARED translator argv",
+    check("windows-to-wsl invokes the DECLARED translator argv, in the declared "
+          "distribution",
           bool(seen) and seen[0][:-1]
-          == PATH_TRANSLATIONS["windows-to-wsl"]["translator"],
+          == _self_test_entered(PATH_TRANSLATIONS["windows-to-wsl"]["translator"])
+          and seen[0][:4] == _self_test_wsl(),
           "argv=%r" % (seen[0] if seen else None))
     # `wsl.exe` WITHOUT `-e` runs a LOCAL shell, pinned where the argv is
     # DECLARED. `wsl.exe <cmd>` and `wsl.exe -- <cmd>` both hand the line to the
@@ -12503,12 +12879,13 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         argv = spec["translator"]
         if not argv or os.path.basename(argv[0]).lower() not in ("wsl", "wsl.exe"):
             continue
-        check("pathTranslation %r runs wsl.exe with -e, not through a local "
-              "shell" % verb,
-              len(argv) > 1 and argv[1] in ("-e", "--exec"),
+        check("pathTranslation %r runs wsl.exe in the declared distribution with -e, "
+              "not through a local shell" % verb,
+              argv[1:4] == ["-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e"],
               "translator argv=%r — without -e the path is parsed by WSL's "
               "default shell before wslpath sees it, and `\\` is that shell's "
-              "escape character" % (argv,))
+              "escape character; without -d {wslDistribution} it is translated "
+              "in the machine's DEFAULT distribution" % (argv,))
     check("a translator that exits non-zero is FATAL, not a passthrough",
           _raises(lambda: translate_path("windows-to-wsl", "C:/a",
                                          runner=lambda a: (1, "", "boom"))))
@@ -12636,7 +13013,8 @@ def self_test(path=CATALOGUE, out=sys.stdout):
              "provides": "the ELF interpreter", "why": "MEASURED",
              "install": "apt-get install libc6-arm64-cross"}
     _lentry = {"hostOs": "windows", "hostArch": "x86_64",
-               "command": ["wsl.exe", "-e", "qemu-aarch64"],
+               "command": ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e",
+                           "qemu-aarch64"],
                "env": {"QEMU_LD_PREFIX": "/usr/aarch64-linux-gnu"},
                "pathTranslation": "windows-to-wsl", "envTransfer": "wslenv",
                "runFilesystem": "wsl-linux", "requires": [_lreq]}
@@ -12687,11 +13065,11 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # merely still-passing: these strings are the whole instrument.
     check("a wsl-linux FILE probe is the exact argv",
           requirement_probe_argv("wsl-linux", "file", "/usr/lib/x.so")
-          == ["wsl.exe", "-e", "test", "-f", "/usr/lib/x.so"],
+          == _self_test_wsl("test", "-f", "/usr/lib/x.so"),
           "%r" % (requirement_probe_argv("wsl-linux", "file", "/usr/lib/x.so"),))
     check("a wsl-linux DIRECTORY probe is the exact argv",
           requirement_probe_argv("wsl-linux", "directory", "/usr/aarch64-linux-gnu")
-          == ["wsl.exe", "-e", "test", "-d", "/usr/aarch64-linux-gnu"])
+          == _self_test_wsl("test", "-d", "/usr/aarch64-linux-gnu"))
     # ⚠ THE ONE SHELL IN THE TABLE. Pinned in full, including the `--` and the
     # `"$1"`, because the ONLY thing that makes it safe is that the path arrives
     # as a POSITIONAL ARGUMENT and is never interpolated into the script text.
@@ -12700,12 +13078,12 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("a wsl-linux COMMAND probe passes the path as $1, NEVER inside the "
           "script text",
           requirement_probe_argv("wsl-linux", "command", "qemu-aarch64")
-          == ["wsl.exe", "-e", "sh", "-c", 'command -v "$1" >/dev/null', "--",
-              "qemu-aarch64"],
+          == _self_test_wsl("sh", "-c", 'command -v "$1" >/dev/null', "--",
+                            "qemu-aarch64"),
           "%r" % (requirement_probe_argv("wsl-linux", "command", "qemu-aarch64"),))
+    _cmd_probe = requirement_probe_argv("wsl-linux", "command", "qemu-aarch64")
     check("...and the script text does NOT contain the path",
-          "qemu-aarch64" not in
-          requirement_probe_argv("wsl-linux", "command", "qemu-aarch64")[4])
+          "qemu-aarch64" not in _cmd_probe[_cmd_probe.index("-c") + 1])
     check("a `driver` launcher has NO probe argv at all — the answer is "
           "in-process",
           requirement_probe_argv("driver", "file", "/x") == []
@@ -12738,8 +13116,8 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           _rep["ok"] and _rep["verdict"] == "" and _rep["missing"] == [],
           "%r" % (_rep,))
     check("...and it probed THROUGH the launcher, with the expanded path",
-          _seen == [["wsl.exe", "-e", "test", "-f",
-                     "/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1"]],
+          _seen == [_self_test_wsl("test", "-f",
+                                   "/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1")],
           "%r" % (_seen,))
     _rep = check_launcher(_probe_leg, "windows", "x86_64", {"wsl.exe"},
                           runner=lambda argv: (1, "", ""))
@@ -12817,8 +13195,9 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           == ["/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1"],
           "%r" % (_planned["requires"],))
     check("...and with the probe argv BUILT, so the plan is the whole answer",
-          _planned["requires"][0]["probe"][:4]
-          == ["wsl.exe", "-e", "test", "-f"])
+          _planned["requires"][0]["probe"][:6]
+          == _self_test_wsl("test", "-f"),
+          "%r" % (_planned["requires"][0]["probe"],))
     check("...and every declared field survives into the plan",
           all(k in _planned["requires"][0]
               for k in LAUNCHER_REQUIREMENT_KEYS + ("probe",)))
@@ -13105,11 +13484,12 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # after the launcher's PROGRAM NAME, before the option that introduces the
     # child command — `wsl.exe --cd <dir> -e <prog>`, never `wsl.exe -e --cd …`,
     # which would hand `--cd` to the fixture. ✔MEASURED on a Windows host:
-    # `wsl.exe --cd /tmp -e pwd` -> /tmp.
+    # `wsl.exe --cd /tmp -e pwd` -> /tmp, and (2026-09-30) `wsl.exe --cd /tmp -d
+    # <distribution> -e pwd` -> /tmp: the splice may precede the distribution pair.
     check("the working-directory option is spliced after the program name",
-          splice_working_dir(["wsl.exe", "-e"], "wsl-linux", "/tmp/x")
-          == ["wsl.exe", "--cd", "/tmp/x", "-e"],
-          "got %r" % (splice_working_dir(["wsl.exe", "-e"], "wsl-linux", "/tmp/x"),))
+          splice_working_dir(_self_test_wsl(), "wsl-linux", "/tmp/x")
+          == ["wsl.exe", "--cd", "/tmp/x", "-d", SELF_TEST_WSL_DISTRIBUTION, "-e"],
+          "got %r" % (splice_working_dir(_self_test_wsl(), "wsl-linux", "/tmp/x"),))
     check("a driver-filesystem launcher's argv is returned UNCHANGED",
           splice_working_dir(["qemu-x86_64"], "driver", "/anything")
           == ["qemu-x86_64"])
@@ -13121,11 +13501,14 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("a launched wsl leg gets a run directory in the LAUNCHER's filesystem",
           _win["launcherPath"].startswith("/tmp/") and "elf64-x86_64" in _win["launcherPath"],
           "got %r" % _win["launcherPath"])
-    check("...whose launcher argv carries the working-directory option",
-          _win["launcher"] == ["wsl.exe", "--cd", _win["launcherPath"], "-e"],
+    check("...whose launcher argv carries the working-directory option and enters "
+          "the declared distribution",
+          _win["launcher"] == ["wsl.exe", "--cd", _win["launcherPath"],
+                               "-d", SELF_TEST_WSL_DISTRIBUTION, "-e"],
           "got %r" % (_win["launcher"],))
-    check("...and argv PREFIXES that never route through a local shell",
-          all(a[:2] == ["wsl.exe", "-e"]
+    check("...and argv PREFIXES that enter the declared distribution and never "
+          "route through a local shell",
+          all(a[:4] == _self_test_wsl()
               for a in (_win["mkdirArgv"], _win["rmTreeArgv"], _win["copyArgv"])),
           "a `sh -c` form would hand the argv back to the local shell "
           "`wsl.exe -e` exists to keep it "
@@ -13141,9 +13524,106 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # fixture is a Linux process no Windows process listing contains (the old PowerShell
     # driver's sweep compared two Windows spellings and matched nothing there).
     check("a launched wsl leg's plan names the prefix that enters ITS kernel",
-          _win["kernelEntryArgv"] == ["wsl.exe", "-e"], "got %r" % (_win["kernelEntryArgv"],))
+          _win["kernelEntryArgv"] == _self_test_wsl(), "got %r" % (_win["kernelEntryArgv"],))
     check("...and a native leg's is empty (this driver's own kernel)",
           _lin["kernelEntryArgv"] == [], "got %r" % (_lin["kernelEntryArgv"],))
+
+    # ── HOST FACTS: THE WSL DISTRIBUTION EVERY WSL-ENTERING ARGV NAMES ────────
+    # (2026-09-30, the round-12 audit's S8, its resolver half.) The REAL reader over
+    # synthesized configurations -- JSONC, as DssHarness reads one -- and over the
+    # shipped tree; then every argv a Windows plan hands out, walked whole.
+    import tempfile as _tf_hf
+    _hf_dir = _tf_hf.mkdtemp(prefix="dss-legs-host-facts-")
+    try:
+        def _hf_tree(name, legs_text):
+            _root = os.path.join(_hf_dir, name)
+            os.makedirs(os.path.join(_root, *DSSHARNESS_CONFIG_REL[:-1]))
+            if legs_text is not None:
+                with open(os.path.join(_root, *DSSHARNESS_CONFIG_REL), "w",
+                          encoding="utf-8") as _fh:
+                    _fh.write("{\n  // a JSONC configuration, as DssHarness reads one\n"
+                              "  \"legs\": {%s}\n}\n" % legs_text)
+            return _root
+        _hf_one = _hf_tree("one", '"a": {"os": "linux", "wsl": "Distro-A"}, '
+                                  '"b": {"os": "linux", "wsl": "Distro-A"}, '
+                                  '"c": {"os": "windows"}')
+        _hf_two = _hf_tree("two", '"a": {"os": "linux", "wsl": "Distro-A"}, '
+                                  '"b": {"os": "linux", "wsl": "Distro-B"}')
+        _hf_none = _hf_tree("none", '"c": {"os": "windows"}')
+        _hf_absent = _hf_tree("absent", None)
+        check("HOST FACTS: the WSL distribution is the ONE a configuration's WSL legs "
+              "declare (control: two legs naming the same one)",
+              tree_wsl_distribution(_hf_one) == "Distro-A")
+        _hf_why_two = _raise_text(lambda: tree_wsl_distribution(_hf_two))
+        check("...legs naming TWO distributions are REFUSED, naming both -- never a "
+              "guess between them",
+              "Distro-A" in _hf_why_two and "Distro-B" in _hf_why_two, _hf_why_two)
+        _hf_why_none = _raise_text(lambda: tree_wsl_distribution(_hf_none))
+        check("...a configuration naming NONE is REFUSED -- never the machine's "
+              "default", "no WSL distribution" in _hf_why_none, _hf_why_none)
+        _hf_why_absent = _raise_text(lambda: tree_wsl_distribution(_hf_absent))
+        check("...and a configuration that cannot be read is REFUSED, naming it",
+              "cannot be read" in _hf_why_absent, _hf_why_absent)
+    finally:
+        shutil.rmtree(_hf_dir, ignore_errors=True)
+    _hf_shipped = _raise_text(lambda: tree_wsl_distribution())
+    check("...and the SHIPPED tree's configuration declares exactly one",
+          not _hf_shipped, _hf_shipped)
+    # Every argv a Windows plan hands out -- each launched leg's launcher, its
+    # path translator and its requirement probes, and its run directory's
+    # launcher, mkdir, rm, copy and kernel entry -- enters the declared
+    # distribution, and none still holds the placeholder.
+    _hf_argvs = []
+    for _hl in plan("windows", "x86_64", {"wsl.exe"}, path)["legs"]:
+        _hr = _hl["run"]
+        if _hr["mode"] != "launched":
+            continue
+        _hf_argvs += [("%s launcher" % _hl["label"], _hr["launcher"]),
+                      ("%s pathTranslator" % _hl["label"], _hr["pathTranslator"])]
+        _hf_argvs += [("%s probe" % _hl["label"], _row["probe"])
+                      for _row in _hr.get("requires", []) if _row.get("probe")]
+        _hd = run_dir_plan(leg_by_label(legs, _hl["label"], "self-test"), "windows",
+                           "x86_64", {"wsl.exe"}, r"C:\o\run")
+        _hf_argvs += [("%s run-dir %s" % (_hl["label"], _k), _hd[_k])
+                      for _k in ("launcher", "mkdirArgv", "rmTreeArgv", "copyArgv",
+                                 "kernelEntryArgv")]
+    _hf_wsl = [(_w, _a) for _w, _a in _hf_argvs if _a and _a[0] == "wsl.exe"]
+    _hf_bad = [(_w, _a) for _w, _a in _hf_wsl
+               if "-e" not in _a
+               or _a[_a.index("-e") - 2:_a.index("-e")] != ["-d", SELF_TEST_WSL_DISTRIBUTION]]
+    _hf_left = [p for _w, _a in _hf_argvs for p in unentered_host_facts(_a, _w)]
+    check("...a Windows plan enters the declared distribution in EVERY argv it "
+          "hands out that enters WSL, and leaves no placeholder behind",
+          len(_hf_wsl) >= 10 and not _hf_bad and not _hf_left,
+          "%d WSL-entering argv(s); not entering the declared one: %r; placeholder "
+          "left in: %r" % (len(_hf_wsl), _hf_bad, _hf_left))
+    check("...an argv whose placeholder was NOT entered is named by where it is "
+          "(control: an entered one names nothing)",
+          unentered_host_facts(["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e"], "x")
+          == ["x[2]"] and unentered_host_facts(_self_test_wsl(), "x") == [])
+    # LAZY, and it matters to a harness copied out of its tree: a host whose plan
+    # enters no WSL never asks for the fact. The reader is replaced by one that
+    # REFUSES; the POSIX plans must not reach it, and the Windows plan must.
+    _hf_saved_reader, _hf_saved_fact = tree_wsl_distribution, list(_WSL_DISTRIBUTION)
+
+    def _hf_refusing_reader(tree=None):
+        raise LegError("self-test: the WSL distribution was asked for")
+    globals()["tree_wsl_distribution"] = _hf_refusing_reader
+    _WSL_DISTRIBUTION[:] = []
+    try:
+        _hf_lazy_posix = _raise_text(lambda: (
+            plan("linux", "x86_64", every, path),
+            plan("darwin", "arm64", every, path),
+            run_dir_plan(_elf, "linux", "x86_64", every, "/o/run")))
+        _hf_lazy_win = _raise_text(lambda: plan("windows", "x86_64", {"wsl.exe"}, path))
+    finally:
+        globals()["tree_wsl_distribution"] = _hf_saved_reader
+        _WSL_DISTRIBUTION[:] = _hf_saved_fact
+    check("...the fact is read ONLY where an argv enters WSL: POSIX plans never ask "
+          "(control: the Windows plan does)",
+          not _hf_lazy_posix and "was asked for" in _hf_lazy_win,
+          "posix: %r; windows: %r" % (_hf_lazy_posix, _hf_lazy_win))
+
     # TWO OUTPUT ROOTS MUST NOT COLLIDE IN ONE SHARED /tmp — the digest is what
     # makes a second checkout, or a second DSS_OUT, safe to run concurrently.
     check("the launcher run directory is derived from the DRIVER's own",
@@ -14322,16 +14802,26 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                        "  --> %s:63:1\n" % _rc_tcl)
     _rc_clean_ref = ("gcc -o ref.exe %s\n%s: In function 'f':\n%s:40:3: warning: unused variable "
                      "'x' [-Wunused-variable]\n" % (" ".join(_rc_src), _rc_d, _rc_d))
+    _rc_pin = "0123456789ab" + "cd" * 14
     _rc = recompile_verdicts(_rc_src, _rc_clean_dss, "built", _rc_clean_ref, "built", "L",
-                             sqlite_head="0123456789ab")
+                             sqlite_head=_rc_pin, sqlite_pin=_rc_pin)
     check("recompile: a clean pair -- every TU accepted, a dedup-only elision marker (the shape a "
-          "CLEAN pe64 build carries) is NOT a reason, and the summary line is exact",
+          "CLEAN pe64 build carries) is NOT a reason, and the summary line is exact, naming the "
+          "stage's commit by its first twelve digits",
           _rc["clean"] and not _rc["incomplete"]
           and [t["verdict"] for t in _rc["tus"]] == ["accepted"] * 3
           and recompile_summary_line(_rc)
           == "recompile: L sqlite=0123456789ab tus=3 reference_ok=3 dss_ok=3 blockers=0"
           and _rc["tus"][2]["reference"]["warnings"] == 1
           and _rc["tus"][0]["dss"]["warnings"] == 1, "%r" % (_rc,))
+    _rc_off = recompile_verdicts(_rc_src, _rc_clean_dss, "built", _rc_clean_ref, "built", "L",
+                                 sqlite_head="fedcba987654" + "10" * 14, sqlite_pin=_rc_pin)
+    check("recompile: the SAME clean pair over a stage that is NOT the pin is INCOMPLETE, naming both, and "
+          "the summary names what the STAGE compiled -- never the pin it was declared to hold",
+          not _rc_off["clean"] and [t["verdict"] for t in _rc_off["tus"]] == ["accepted"] * 3
+          and any("NOT the pinned 0123456789ab" in w and "fedcba987654" in w for w in _rc_off["incomplete"])
+          and recompile_summary_line(_rc_off).startswith("recompile: L sqlite=fedcba987654 "),
+          "%r" % (_rc_off["incomplete"],))
     _rc_blk_dss = _rc_dss(("error", "S_ConstViolation", _rc_b, 4335,
                            "increment or decrement of `objv`, a const-qualified object"))
     _rc_blk = recompile_verdicts(_rc_src, _rc_blk_dss, "errors", _rc_clean_ref, "built", "L",
@@ -14931,7 +15421,8 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # spells it once. With that check now asserting EQUALITY with the longest
     # common prefix, the literal was redundant as well as duplicative.
     _wslfs = RUN_FILESYSTEMS["wsl-linux"]
-    _khead = list(_wslfs["kernelEntryArgv"]) + [_wslfs["kernelProbeInterpreter"]]
+    _khead = (_self_test_entered(_wslfs["kernelEntryArgv"])
+              + [_wslfs["kernelProbeInterpreter"]])
     check("the kernel probe argv ENTERS the kernel and re-enters THIS script there",
           _kargv[:len(_khead)] == _khead
           and _kargv[len(_khead)] == "/mnt/c/r/harness_legs.py"
@@ -15190,7 +15681,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("a kernel that ANSWERS is `entered`, and its verdict decides its legs",
           _ok["outcome"] == "entered"
           and _verdict_word(_ok) == "present"
-          and "wsl.exe -e python3" in _ok["why"],
+          and " ".join(_self_test_wsl("python3")) in _ok["why"],
           "the measurement must carry the argv that produced it, or it is a "
           "verdict with no provenance; got %r" % _ok)
     for _label, _runner in (
@@ -16109,7 +16600,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
 
     def _xl(argv):
         return (0, "/mnt/c" + argv[-1][2:].replace("\\", "/"), "")
-    _wsl_head = (list(RUN_FILESYSTEMS["wsl-linux"]["kernelEntryArgv"])
+    _wsl_head = (_self_test_entered(RUN_FILESYSTEMS["wsl-linux"]["kernelEntryArgv"])
                  + [RUN_FILESYSTEMS["wsl-linux"]["kernelProbeInterpreter"]])
     _mpw = execution_monitor_plan(_doc, "wsl-linux", "clock-realtime-steps",
                                   "C:\\r\\out\\corpus.log", 3600,
@@ -18069,7 +18560,16 @@ def self_test(path=CATALOGUE, out=sys.stdout):
             for _e in leg.get("launchers", []):
                 fn(_e)
 
+        def _own_wsl_entry(e):
+            # The command a WSL launcher had before 2026-09-30: its own `wsl.exe -e`
+            # entry, which is the machine's DEFAULT distribution.
+            if e.get("runFilesystem") == "wsl-linux":
+                e.update(command=["wsl.exe", "-e"] + list(e["command"])[4:])
+
         for _row in (
+            ("linux", "own kernel entry", "a WSL launcher spelling its own kernel entry "
+             "(`wsl.exe -e`: the machine's default distribution)",
+             lambda l: _each_launcher(l, _own_wsl_entry)),
             ("windows", "loadExtHelperName", "a POSIX helper name on the Windows leg",
              lambda l: l["build"].update(loadExtHelperName="libtestloadext.so")),
             ("windows", "loadExtHelperName", "no helper name at all",
@@ -18282,6 +18782,17 @@ def main(argv=None):
     p.add_argument("--path-translations", action="store_true",
                    help="print the closed path-translation vocabulary: "
                         "'<verb>\\t<translator argv>', one per line")
+    p.add_argument("--wsl-distribution", action="store_true",
+                   help="print {\"wslDistribution\": NAME} (JSON): the ONE WSL "
+                        "distribution the WSL legs of the tree's DssHarness "
+                        "configuration declare (.harness-config/config.json "
+                        "legs.<leg>.wsl), the one every argv this resolver hands "
+                        "out that enters WSL names. The driver's POSIX half reads "
+                        "THIS instead of carrying its own reader; rc 2, naming "
+                        "why, when there is not exactly one.")
+    p.add_argument("--config-tree", default="", metavar="DIR",
+                   help="with --wsl-distribution: the DSS tree whose configuration "
+                        "is read (default: the tree this harness ships in)")
     p.add_argument("--path-translation", default=None,
                    help="the verb --translate-path / --assert-translated act "
                         "under (a leg plan's run.pathTranslation)")
@@ -18460,19 +18971,24 @@ def main(argv=None):
                         "--compile-log (dsscp's log), --dss-build (built | errors | "
                         "failed, as the driver's build reader judged it), "
                         "--oracle-log and --oracle-status (from THIS run's "
-                        "--build-reference-oracle). Prints a JSON report with the "
+                        "--build-reference-oracle), --sqlite-head (what the stage "
+                        "recorded) and --sqlite-pin (the pin). Prints a JSON report with the "
                         "driver's report lines (the per-TU table, then ONE line "
-                        "`recompile: <leg> sqlite=<sha> tus=N reference_ok=N dss_ok=N "
-                        "blockers=N`); rc 0 = no blocker and a census that saw "
-                        "everything, rc 3 = a blocker or an INCOMPLETE census.")
+                        "`recompile: <leg> sqlite=<sha12> tus=N reference_ok=N dss_ok=N "
+                        "blockers=N`, naming the stage's commit); rc 0 = no blocker and a "
+                        "census that saw everything, rc 3 = a blocker or an INCOMPLETE census "
+                        "(a stage that is not the pin is one).")
     p.add_argument("--dss-build", default="", metavar="OUTCOME",
                    help="dsscp's build outcome for --recompile-verdicts: %s"
                         % " | ".join(RECOMPILE_DSS_BUILDS))
     p.add_argument("--dss-build-detail", default="", metavar="TEXT",
                    help="why dsscp's build `failed`, for --recompile-verdicts")
     p.add_argument("--sqlite-head", default="", metavar="SHA",
-                   help="the sqlite commit the recompile compiled (the pin, legs.json "
-                        "stageBuild.sqliteCommit), named in --recompile-verdicts' summary")
+                   help="the sqlite commit the recompile's STAGE recorded (its full sha), "
+                        "named in --recompile-verdicts' summary")
+    p.add_argument("--sqlite-pin", default="", metavar="SHA",
+                   help="the PINNED sqlite commit (legs.json stageBuild.sqliteCommit, a full "
+                        "sha): a --sqlite-head that is not it makes the census INCOMPLETE")
     p.add_argument("--oracle-status", default="", metavar="STATUS",
                    help="--build-reference-oracle's reported `status`, verbatim. "
                         "Only `built`/`build-failed` mean the control RAN; "
@@ -18536,7 +19052,8 @@ def main(argv=None):
                    help="where acquired libraries are cached (default: "
                         "$DSS_HARNESS_CACHE_ROOT, else ~/.cache/dsscp). "
                         "OUTSIDE the repository, always.")
-    p.add_argument("--offline", action="store_true",
+    # `--offline` also takes true/false (2026-09-30): the sqlite action's `legs-acquire` step hands it over.
+    p.add_argument("--offline", type=_offline_flag, nargs="?", const=True, default=False,
                    help="refuse to reach the network: --acquire completes from "
                         "the cache or FAILS naming what is missing. It never "
                         "falls back to whatever else is on the machine.")
@@ -18759,7 +19276,7 @@ def main(argv=None):
 
     if not (args.verdict_vocabulary or args.verdict_classes or args.library_providers
             or args.plan or args.lint or args.self_test
-            or args.header_stages or args.path_translations
+            or args.header_stages or args.path_translations or args.wsl_distribution
             or args.translate_path or args.assert_translated
             or args.env_transfers or args.env_transfer
             or args.acquire or args.acquire_plan or args.resolve_library_argv
@@ -18781,7 +19298,8 @@ def main(argv=None):
                 "--print-probe-budget / "
                 "--header-stages / "
                 "--stage-build / --lint "
-                "/ --self-test / --path-translations / --translate-path / "
+                "/ --self-test / --path-translations / --wsl-distribution / "
+                "--translate-path / "
                 "--assert-translated / --env-transfers / --env-transfer / "
                 "--registry-controls / "
                 "--acquire / --acquire-plan / --resolve-library-argv / "
@@ -18814,6 +19332,9 @@ def main(argv=None):
         p.error("--translate-path / --assert-translated require "
                 "--path-translation <verb> — the namespace is the launcher's "
                 "DECLARATION, never something this tool infers")
+    if args.config_tree and not args.wsl_distribution:
+        p.error("--config-tree names the tree whose configuration "
+                "--wsl-distribution reads, and means nothing without it")
 
     try:
         if args.verdict_vocabulary:
@@ -18835,6 +19356,10 @@ def main(argv=None):
             for verb in sorted(PATH_TRANSLATIONS):
                 sys.stdout.write("%s\t%s\n" % (
                     verb, " ".join(PATH_TRANSLATIONS[verb]["translator"])))
+            return 0
+        if args.wsl_distribution:
+            sys.stdout.write(json.dumps({"wslDistribution": tree_wsl_distribution(
+                args.config_tree or None)}) + "\n")
             return 0
         if args.translate_path:
             for raw in args.translate_path:
@@ -19045,6 +19570,10 @@ def main(argv=None):
                 p.error("--recompile-verdicts requires --sqlite-head <the sqlite commit the stage "
                         "compiled> (got %r): a summary that cannot name its subject cannot be "
                         "reproduced." % (args.sqlite_head,))
+            if not re.match(r"^[0-9a-f]{40}$", args.sqlite_pin or ""):
+                p.error("--recompile-verdicts requires --sqlite-pin <the FULL pinned sqlite commit, "
+                        "legs.json stageBuild.sqliteCommit> (got %r): without it the census cannot "
+                        "say whether the stage it counts is the pinned revision." % (args.sqlite_pin,))
             _texts = []
             for _path, _what, _needed in (
                     (args.compile_log, "dsscp's compile log", True),
@@ -19075,7 +19604,8 @@ def main(argv=None):
                                "nothing and call it clean" % args.manifest)
             _report = recompile_verdicts(_sources, _texts[0], args.dss_build, _texts[1],
                                          args.oracle_status, leg.get("label"),
-                                         args.dss_build_detail, sqlite_head=args.sqlite_head)
+                                         args.dss_build_detail, sqlite_head=args.sqlite_head,
+                                         sqlite_pin=args.sqlite_pin)
             _report["report"] = recompile_report_lines(_report)
             sys.stdout.write(json.dumps(_report, indent=1, sort_keys=True) + "\n")
             return 0 if _report["clean"] else 3

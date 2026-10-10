@@ -1,0 +1,2 @@
+        if (size16 == *sizeRaw) {
+            auto const movOp = opcode(MnemonicSlot::Mov);

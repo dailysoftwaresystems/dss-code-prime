@@ -1,0 +1,3 @@
+                    LirInstId const inst = out.lir.blockInstAt(blk, k);
+                    if (probeTouches.contains(inst.v)) continue;  // the walk's own
+                    auto const ops = out.lir.instOperands(inst);

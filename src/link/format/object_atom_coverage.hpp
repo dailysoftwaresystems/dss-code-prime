@@ -1,17 +1,25 @@
 #pragma once
 
+#include "asm/asm.hpp"                  // AssembledData -- what a kept weak name's body is
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/extern_import.hpp" // ExternImport -- the reference row of a kept weak name
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/section_kind.hpp"  // DataSectionKind
+#include "core/types/strong_ids.hpp"    // SymbolId
 #include "core/types/symbol_attrs.hpp"  // SymbolBinding / SymbolVisibility / isExternallyVisible
+#include "link/format/record_symbol_ids.hpp"   // RecordSymbolIds -- the ids a kept weak name is stated in
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // Shared relocatable-object READER substrate: decide, in neutral coordinates,
@@ -413,6 +421,224 @@ struct AtomStartCandidate {
         g = h;
     }
     return true;
+}
+
+// ═══ THE WEAK-NAME RULE ════════════════════════════════════════════════════
+//    D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME
+//
+// ★★★ THE FAILURE. The alias rule above sends every relocation naming an
+// aliased symbol to the atom that owns the body. For a STRONG name nothing is
+// lost by that: the name can only ever denote this body. A WEAK name is the one
+// another object may define again, and every reference linker resolves a
+// reference BY NAME -- so a reference an object writes through its own weak name
+// follows the name to whatever wins it. Bound to the atom at READ time, the
+// reference was decided before the link knew the winner, and SILENTLY: the unit
+// kept reaching its own body beside an override every other unit reached.
+//
+// ✔MEASURED 2026-10-08. One object holds `other` (strong), `shared` (a WEAK
+// name of the same body, which returns 7) and a caller that reaches the body
+// through `shared`; a second object defines `shared` strong (9). Linked as the
+// pair then the override / the override then the pair / the pair alone:
+//   * GNU ld 2.42, gcc 13.3 ELF objects (`weak, alias`)                9 / 9 / 7
+//   * GNU ld 2.42, MinGW gcc 13.2 COFF objects                         9 / 9 / 7
+//   * link.exe 14.44 and lld-link 19.1.5, clang 19.1.5 COFF objects
+//     of its MSVC target and of its GNU target                         9 / 9 / 7
+//   * Apple's ld (ld-1267 for arm64 and x86_64, ld64-957.1), a pair
+//     its assembler wrote (`.weak_definition`; Apple clang refuses
+//     the alias attribute)                                             9 / 9 / 7
+//   * DSS before this rule, ELF and PE                                 7 / 7 / 7
+// A function and a datum alike. It is also the shape of EVERY MinGW
+// `__attribute__((weak))` definition -- gcc writes the body under an external
+// name of its own and the weak name as a weak external beside it -- so a weak
+// function overridden elsewhere kept being called from its own object.
+//
+// ★★ THE RULE, IN TWO HALVES THAT ARE ONE STATEMENT.
+//   (1) A relocation written through a WEAK name KEEPS THE NAME, whatever else
+//       names the body: the reader leaves it on an id of the NAME, never the
+//       atom's, and states a plain reference row of the name under that id. The
+//       link's by-name resolution then binds it as it binds any other unit's
+//       reference -- to an override, to a common, or to this very body.
+//   (2) So what a relocation of the unit names when it targets the ATOM is the
+//       BYTES: one written through a `static` name of the body, or through the
+//       section's own symbol. The row of the weak name says so
+//       (`ModuleSymbol::referencedByName`), and the merge reads it: where the
+//       link's format keeps a superseded definition's bytes
+//       (`supersededDefinition`), a body that loses its weak name keeps them,
+//       and a relocation that names them stays on them.
+// A relocatable artifact keeps the row, and its writer points the relocation at
+// the weak name's own record (`object_symbol_names.hpp`), which is what `ld -r`
+// hands on (✔MEASURED 2026-10-08, GNU ld 2.42 on ELF: the artifact's relocation
+// still names the weak symbol, a referencing unit's inside the artifact too);
+// where the format keeps the bytes, they get a record of their own beside it.
+//
+// ★★ WHY "WHATEVER ELSE NAMES THE BODY". Until the review of cycle P69's first
+// fold the rule said "beside another EXTERNAL name", and that was a hole stated
+// as a design. The argument ran: a weak name that is its body's only external
+// name needs no row, because when it loses the whole atom folds onto the winner
+// and every reference goes with it. True of a reference through the NAME; false
+// of one through a STATIC name of the same body or through the section symbol,
+// which no linker moves. ✔MEASURED 2026-10-08: one object with
+// `static int impl = 7;`, a weak alias `shared` of it, `direct` (reads `impl`)
+// and `through` (reads `shared`), beside `int shared = 9;` -- direct / through:
+//   * gcc 13.3 and clang 18.1 objects under GNU ld 2.42 and under ld.lld 18.1,
+//     each with and without -ffunction-sections -fdata-sections: both object
+//     orders, the pair through `ld -r`, and the weak object through `ld -r`
+//     and then beside the override                                     7 / 9
+//   * beside a COMMON `shared` instead (which outranks the weak definition
+//     on ELF): the static name still reads its own bytes               7 / 0
+//   * MinGW gcc 13.2 under GNU ld 2.42, and clang 19.1.5 under link.exe
+//     14.44 and lld-link 19.1.5 (COFF: the weak name is a weak external
+//     whose default is the body under an external name of its own)     7 / 9
+//   * a FUNCTION the same, and its address taken through the static name
+//     calls the unit's own body (7)
+//   * DSS before this half, ELF                                        9 / 9
+// A relocation through the section symbol is what gcc writes for `impl`
+// (`R_X86_64_PC32 .data-4`), and clang writes one against the section or the
+// local symbol. So the rule cannot ask whether the body has another NAME: a
+// stripped object keeps the relocation and loses the name. Every weak name
+// keeps its references, and the atom's id is left meaning the bytes.
+//
+// ★ WHAT HALF (2) DOES IS A FORMAT FACT, AND THE FORMATS WERE MEASURED TO
+// DIFFER — the root key `supersededDefinition` of the link's document
+// (`object_format_schema.hpp`, where each measurement is stated). Half (1)
+// holds everywhere.
+//   * ELF, `keepsItsBytes`: the table above — its STB_WEAK. (The loser of an
+//     ELF COMDAT GROUP is another matter, discarded with its sections; the
+//     schema states what was measured of it.)
+//   * Mach-O, `replacedWhole`. Apple's ld coalesces the ATOM, every label of it
+//     included: the same pair written by its assembler (`_impl` a non-external
+//     label, `_shared` a `.weak_definition`) beside a strong `_shared` reads
+//     9 / 9, in both object orders and through `ld -r` (✔MEASURED 2026-10-08,
+//     ld-1267 for arm64 and x86_64, and ld64-957.1). It is not read off whether
+//     a unit's members are kept: a Mach-O object that does NOT declare
+//     MH_SUBSECTIONS_VIA_SYMBOLS is a unit this link keeps whole, and
+//     ld64-957.1 still answers 9 / 9 for its datum (ld-1267 refuses that pair
+//     as a duplicate symbol).
+//   * PE answers PER KIND of weak definition, its two mechanisms being two
+//     kinds (`WeakDefinitionKind`). An OVERRIDABLE one, a weak external's
+//     default, `keepsItsBytes` — the 7 / 9 above, where the default has an
+//     external name of its own and is not superseded at all, and 7 / 9 under
+//     lld-link 19.1.5 where its record is made STATIC. A SELECT-ANY one, a
+//     COMDAT that loses, is `replacedWhole`: it is DISCARDED with its section;
+//     GNU ld 2.42 sends a relocation against a non-external label of it to the
+//     kept copy for a function (9 / 9), link.exe 14.44 leaves garbage or a
+//     crashing program, and lld-link refuses the link — so the one cell that
+//     works answers the winner (✔MEASURED 2026-10-08).
+//
+// ★ ONE QUESTION, ASKED BY THREE READERS AND THE MERGE.
+// `referenceFollowsTheName` owns it; the readers ask it of the symbols that
+// start their atoms and state the answer on the name's row. Nothing here knows
+// a format.
+
+// THE QUESTION. Does a reference a unit writes through this name follow the
+// NAME? For every WEAK name that has a spelling, and for no other.
+[[nodiscard]] constexpr bool referenceFollowsTheName(SymbolBinding    binding,
+                                                     std::string_view name) noexcept {
+    return binding == SymbolBinding::Weak && !name.empty();
+}
+
+// ★★ THE READERS' HALF: which symbols of one object keep their name, and the id
+// a relocation through each targets.
+//
+// ★ TWO COORDINATES, NEVER MIXED. A candidate's `symbolId` and its owner are
+// RECORD INDICES — what the alias resolution ranks by and what a relocation
+// names on the wire. What leaves this class is an ID, made by the object's
+// `RecordSymbolIds` (`record_symbol_ids.hpp`) — and record 0's id is NOT its
+// index. An index compared with an id is right for every record but that one,
+// for which `referenceRowOfAWeakName` would find no data item and state the
+// weak name of a DATUM as a function.
+class WeakNameReferences {
+public:
+    // Decided from the alias resolution's own inputs and its answer
+    // (`ownerSymbolId` as `resolveEqualOffsetAtomAliases` filled it): a
+    // candidate's atom is the symbol that owns its body.
+    void decideFrom(std::span<AtomStartCandidate const> candidates,
+                    std::span<std::uint32_t const>      ownerSymbolId,
+                    RecordSymbolIds const&              ids) {
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (!referenceFollowsTheName(candidates[i].binding, candidates[i].name)) continue;
+            bool const     ownsItsAtom = ownerSymbolId[i] == candidates[i].symbolId;
+            SymbolId const atom        = ids.of(ownerSymbolId[i]);
+            kept_.emplace(candidates[i].symbolId,
+                          Kept{candidates[i].name, atom,
+                               ownsItsAtom ? std::optional<SymbolId>{}
+                                           : std::optional<SymbolId>{ids.of(candidates[i].symbolId)},
+                               std::nullopt});
+            keptRows_.emplace(atom.v, candidates[i].name);
+        }
+    }
+
+    // States on each ROW of a kept name what this class does with the unit's
+    // references through it (`ModuleSymbol::referencedByName`): they are rows of
+    // the name, so a relocation of the unit that targets the definition names
+    // its BYTES. Called once every row of the object is in the table. A weak row
+    // no name was kept for -- a symbol that starts no atom of its own -- is left
+    // as it was: nothing was done with its references, and nothing is claimed.
+    void stateOn(std::vector<ModuleSymbol>& rows) const {
+        if (keptRows_.empty()) return;
+        for (ModuleSymbol& row : rows) {
+            if (!referenceFollowsTheName(row.binding, row.name)) continue;
+            if (keptRows_.contains(std::pair<std::uint32_t, std::string>{row.symbol.v, row.name})) {
+                row.referencedByName = true;
+            }
+        }
+    }
+
+    // What a relocation naming a kept weak name targets.
+    struct Reference {
+        SymbolId         id{};           // the id of the NAME: its row's, and the relocation's target
+        bool             fresh = false;  // the first relocation through it: the caller states the row
+        std::string_view name;
+        SymbolId         atom{};         // the body the name is a name of
+    };
+
+    // nullopt: record `recordIndex` keeps no name, and a relocation naming it
+    // takes the alias remap as before. Otherwise the id of the NAME: the
+    // symbol's own id, which no body holds once the alias rule gave the atom to
+    // another name -- or, when this weak name is the one that OWNS the atom, a
+    // fresh id of `ids`, the object's one counter of ids no record holds.
+    [[nodiscard]] std::optional<Reference> referenceFor(std::uint32_t    recordIndex,
+                                                        RecordSymbolIds& ids) {
+        auto const it = kept_.find(recordIndex);
+        if (it == kept_.end()) return std::nullopt;
+        Kept&      k     = it->second;
+        bool const fresh = !k.row.has_value();
+        if (fresh) k.row = k.own.has_value() ? *k.own : ids.fresh();
+        return Reference{*k.row, fresh, k.name, k.atom};
+    }
+
+private:
+    struct Kept {
+        std::string             name;
+        SymbolId                atom{};   // the id of the body's owning symbol
+        std::optional<SymbolId> own;      // the symbol's own id; nullopt where it OWNS the atom
+        std::optional<SymbolId> row;      // settled by the first relocation through the name
+    };
+    std::unordered_map<std::uint32_t, Kept> kept_;   // by RECORD INDEX
+    // (the id of the body, the name) of every kept name: how `stateOn` finds
+    // the name's row, which a reader files under the body's id.
+    std::set<std::pair<std::uint32_t, std::string>> keptRows_;
+};
+
+// The plain reference row a kept weak name states: the name, and what its body
+// IS -- a datum or a function, thread-local or not -- read off the atoms the
+// reader sliced (a body that is no data item is a function). The link holds
+// that statement against the definition the name finally binds to, and refuses
+// a disagreement about thread storage by name.
+[[nodiscard]] inline ExternImport
+referenceRowOfAWeakName(WeakNameReferences::Reference const& ref,
+                        std::span<AssembledData const>       dataItems) {
+    ExternImport row;
+    row.symbol      = ref.id;
+    row.mangledName = std::string{ref.name};
+    for (AssembledData const& d : dataItems) {
+        if (d.symbol != ref.atom) continue;
+        row.isData        = true;
+        row.isThreadLocal = d.section == DataSectionKind::Tdata
+                            || d.section == DataSectionKind::Tbss;
+        break;
+    }
+    return row;
 }
 
 // ★★★ THE GEOMETRY FALLBACK. Given the atoms a reader HAS reconstructed and the

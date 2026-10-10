@@ -20,12 +20,12 @@ proceed (failures, done/not done, final report, etc)"*.
    measurement, and what you are doing about it.
 2. **A pause gate** — a decision only the operator can make (§B, a pending definition, an unfired
    trigger, a hard stop). This is the one case where length is justified: options, trade-offs,
-   recommendation. AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — a fork is decided by the agent and reported veto-able in this same shape, the decision and why in place of a recommendation, and the agent pauses only for the cases of the decision gate, each with one crisp question (see SKILL.md)
+   recommendation. AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — a fork is decided by the session and reported veto-able in this same shape, the decision and why in place of a recommendation, and the session pauses only for the cases of the decision gate, each with one crisp question (see SKILL.md)
 3. **Done / not done** — a step's terminal state, when the operator's next action depends on it.
 4. **The final report** — the output contract below.
 5. **A direct answer to a direct question.**
 6. ★★★ **A DssHarness finding** (operator ruling, 2026-09-16: *"please also put in dss-cycle skill
-   that any issue found in DssHarness must be reported to me (the operator)"*). AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — the agent SENDS the report to the repo-harness session with SendMessage and tells the operator it was sent, never asking the operator to relay it (see dss-harness.md) **Emit it even when
+   that any issue found in DssHarness must be reported to me (the operator)"*). AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — the session SENDS the report to the repo-harness session with SendMessage and tells the operator it was sent, never asking the operator to relay it (see dss-harness.md) **Emit it even when
    it neither fails nor blocks this cycle** — which is the usual case, because the cycle routes
    around a tool defect by using the script that still exists, and the finding then matches none of
    categories 1–5 and dies in a lane report. SUPERSEDED 2026-09-24 by *build, sync, test and worktree management go through DssHarness* — a DssHarness BUG is the one exception, and a route around it lives only as long as the bug, is named as such, and is retired the day the fix ships (see dss-harness.md) That silence is what this item closes.
@@ -35,7 +35,7 @@ proceed (failures, done/not done, final report, etc)"*.
    - **Report it in the cycle that FINDS it**, never filed for later — the same shape as *fix it when
      you face it*.
    - **A DssHarness defect does NOT become a `D-*` row here**; it is not this repository's defect.
-     **Its route out is the report the agent SENDS to the repo-harness session, and the cycle report's
+     **Its route out is the report the session SENDS to the repo-harness session, and the cycle report's
      line saying it was sent**, which is why this item has to exist at all. That session is found by
      listing the local sessions and picking the one working in the repo-harness checkout.
    - ⚠ **Reporting does not replace fixing our side.** Where the defect has a correct LOCAL
@@ -80,7 +80,7 @@ recommendation. Everything else is a sentence or three. AMENDED 2026-09-21 by th
 A one-line cycle summary — priority closed, anchors touched, test delta, commit hash — plus:
 
 ```
-anchors: opened N, closed M, net ±K — OPEN was <before>, now <after>
+anchors: closed M, opened N (created C, disclosed D), real net ±K — OPEN was <before>, now <after>
 next: <one line, matching the top NEXT entry in .plans/_handoff.md>
 ```
 

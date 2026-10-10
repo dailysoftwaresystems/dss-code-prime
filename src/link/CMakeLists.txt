@@ -4,6 +4,11 @@ add_library(link OBJECT
     entry_trampoline.cpp
     image_request.cpp
     linker.cpp
+    # P69 review M1 (c) + MINOR 8: a unit that takes an import's address by a
+    # displacement (`pcRelativeImportAddress`), and the load-time fix-up runner
+    # an image synthesizes for the import slots its loader cannot bind.
+    pc_relative_import_address.cpp
+    load_time_fixups.cpp
     object_format_backend.cpp
     object_format_schema.cpp
     object_format_schema_json.cpp
@@ -12,6 +17,12 @@ add_library(link OBJECT
     # both writers and the project manifest.
     runpath.cpp
     static_init_tables.cpp
+    # D-LK-THREAD-STORAGE-DISAGREEMENT-REFUSED-ONLY-BY-THE-WRITER-BACKSTOP (P69 round 4): a
+    # linked reference and the definition it binds to agree on storage duration.
+    thread_storage_agreement.cpp
+    # D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE (P69 round 4): what a link
+    # decides from its units' linker-directive requests, and applies to its module.
+    unit_linker_decisions.cpp
     # D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES (TF-C125).
     # `object_format_backends.cpp` holds THE table — the one place in the tree
     # that names every format. The substrate calls into it, which makes each

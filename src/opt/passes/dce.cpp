@@ -13,6 +13,7 @@
 #include <deque>
 #include <format>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -83,12 +84,48 @@ namespace {
 // destructor is as unreachable as a constructor and is rooted by the same clause;
 // asking about `beforeEntry` alone would have deleted every `destructor` while
 // the constructor tests stayed green.
-[[nodiscard]] bool funcIsRoot(Mir const& mir, MirFuncId f) noexcept {
-    if (mir.funcStaticInit(f).any()) return true;
-    return isExternallyVisible(mir.funcBinding(f), mir.funcVisibility(f));
+//
+// ★★ D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS — THE THIRD
+// DISJUNCT IS THE MODULE'S EXTENT (`opt::ModuleExtent`). "Observable from
+// outside" is a question about the LINK, and the answer differs by what the
+// module is to it:
+//   * a `LinkInput` (a CU before the merge, a static-archive member, a
+//     relocatable object, a thin unit, an image linked with objects or
+//     operator archives) shares its link
+//     with inputs this pass cannot see, and any of them may name a definition
+//     with EXTERNAL LINKAGE — hidden visibility only keeps a symbol out of the
+//     image's dynamic surface, it does not keep the image's other inputs from
+//     resolving it. So every Global/Weak definition is a root.
+//   * a `WholeImage` sees every input that can name its definitions, so the
+//     image-level `isExternallyVisible` is the right root — plus the ENTRY,
+//     which the entry trampoline (a link input the driver synthesizes) names:
+//     a hidden `main` is still the program's entry (`entryRoots`).
+// ✔MEASURED before this disjunct, the image predicate was asked at every
+// stage: a release member and a release relocatable object lost their hidden
+// definitions, and a release image
+// failed K_SymbolUndefined when a sibling CU or an object input called a
+// hidden function its own CU never called.
+[[nodiscard]] bool isRootDefinition(SymbolBinding binding,
+                                    SymbolVisibility visibility,
+                                    ModuleExtent extent) noexcept {
+    if (extent == ModuleExtent::LinkInput) {
+        return binding != SymbolBinding::Local;
+    }
+    return isExternallyVisible(binding, visibility);
 }
-[[nodiscard]] bool globalIsRoot(Mir const& mir, MirGlobalId g) noexcept {
-    return isExternallyVisible(mir.globalBinding(g), mir.globalVisibility(g));
+[[nodiscard]] bool funcIsRoot(Mir const& mir, MirFuncId f, ModuleExtent extent,
+                              std::span<SymbolId const> entryRoots) noexcept {
+    if (mir.funcStaticInit(f).any()) return true;
+    SymbolId const sym = mir.funcSymbol(f);
+    for (SymbolId const e : entryRoots) {
+        if (e == sym) return true;
+    }
+    return isRootDefinition(mir.funcBinding(f), mir.funcVisibility(f), extent);
+}
+[[nodiscard]] bool globalIsRoot(Mir const& mir, MirGlobalId g,
+                                ModuleExtent extent) noexcept {
+    return isRootDefinition(mir.globalBinding(g), mir.globalVisibility(g),
+                            extent);
 }
 
 // Per-function live-instruction analysis: returns the set of OLD-
@@ -190,7 +227,9 @@ void collectSymbolAddrTargets(MirLiteralValue const& v,
     }
 }
 
-[[nodiscard]] SymbolScanResult scanLiveSymbols(Mir const& mir) {
+[[nodiscard]] SymbolScanResult scanLiveSymbols(Mir const& mir,
+                                               ModuleExtent extent,
+                                               std::span<SymbolId const> entryRoots) {
     SymbolScanResult out;
     std::deque<MirFuncId> funcWorklist;
 
@@ -236,7 +275,7 @@ void collectSymbolAddrTargets(MirLiteralValue const& v,
     // Phase 1: seed with externally-visible roots.
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
-        if (funcIsRoot(mir, f)) {
+        if (funcIsRoot(mir, f, extent, entryRoots)) {
             if (out.liveSymbols.insert(mir.funcSymbol(f).v).second) {
                 funcWorklist.push_back(f);
             }
@@ -245,7 +284,7 @@ void collectSymbolAddrTargets(MirLiteralValue const& v,
     std::size_t const ng = mir.moduleGlobalCount();
     for (std::uint32_t i = 0; i < ng; ++i) {
         MirGlobalId const g = mir.globalAt(i);
-        if (globalIsRoot(mir, g)) {
+        if (globalIsRoot(mir, g, extent)) {
             out.liveSymbols.insert(mir.globalSymbol(g).v);
         }
     }
@@ -392,16 +431,20 @@ private:
 } // namespace
 
 DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
-                 DiagnosticReporter& reporter) {
+                 DiagnosticReporter& reporter, ModuleExtent extent,
+                 std::span<SymbolId const> entryRoots) {
     DceResult result{};
     MirBuilder builder;
-    // DCE bypasses `cloneGlobalsOrCarveOut` (see comment below); we
-    // duplicate that helper's alias-mode propagation here so the
-    // fixed-point pipeline loop doesn't silently downgrade strict-TBAA
-    // or char-aliases-all to defaults on the iteration following DCE
-    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE).
-    builder.setAliasingMode(mir.aliasingMode());
-    builder.setCharTypesAliasAll(mir.charTypesAliasAll());
+    // DCE bypasses `cloneGlobalsOrCarveOut` (see comment below), so it calls
+    // the one list of module facts itself (`MirBuilder::carryModuleFactsOf`,
+    // what that helper calls): the alias-mode propagation, so the fixed-point
+    // pipeline loop doesn't silently downgrade strict-TBAA or
+    // char-aliases-all to defaults on the iteration following DCE
+    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE), and the continuation of
+    // the module's symbol ids — DCE deletes the highest-numbered definitions as
+    // readily as any, and a module that counted its id space from what survived
+    // would hand a later mint an id the name table still holds.
+    builder.carryModuleFactsOf(mir);
 
     // DCE has the same runtime-init carve-out as the other passes but
     // CANNOT use the shared `cloneGlobalsOrCarveOut` helper: DCE elides
@@ -431,7 +474,7 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
     // Step 1: inter-procedural live-symbol BFS — also returns per-
     // function (reachable, liveInsts) so the rebuild reuses them
     // (the scanner computes them en route).
-    auto const symScan = scanLiveSymbols(mir);
+    auto const symScan = scanLiveSymbols(mir, extent, entryRoots);
     auto const& liveSymbols = symScan.liveSymbols;
     for (std::uint32_t i = 0; i < ng; ++i) {
         MirGlobalId const g = mir.globalAt(i);

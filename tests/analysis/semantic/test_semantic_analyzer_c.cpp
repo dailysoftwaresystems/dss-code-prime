@@ -99,7 +99,12 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
     // clang's meaning, S_PredefinedIdentifierOutsideFunction at each use).
     // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
     // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
-    ASSERT_EQ(model.symbols().size() - 1, 107u)
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): +49 — the GNU
+    // builtins that row added (expect, expect_with_probability, assume_aligned, trap, prefetch,
+    // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
+    // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
+    // the three `_p` predicates).
+    ASSERT_EQ(model.symbols().size() - 1, 156u)
         << "main + x + __va_list_tag + va_list + __builtin_va_list + __umulh + "
            "_InterlockedCompareExchange + _InterlockedCompareExchange64 + "
            "_ReadWriteBarrier + __sync_synchronize + __builtin_unreachable + "
@@ -112,7 +117,7 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
            "creal/cimag/conj complex builtins + the 6 byte-swap builtins "
            "(_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + "
            "__builtin_bswap16/32/64) + __func__ + __FUNCTION__ + their 2 file-scope "
-           "twins";
+           "twins + the 51 GNU builtins of P69 (lane cs)";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -1350,8 +1355,9 @@ TEST(SemanticAnalyzerC, NullPointerConstantAdmitsAsInit) {
 //    was SILENTLY accepted. The fix re-derives a scalar (non-brace) initializer's
 //    type via subtreeType WITH the declaration's scope when the stamped walk finds
 //    nothing, so `&obj` types as Ptr<pointee> and reaches the existing check. The
-//    brace-init-list form is explicitly excluded (its per-element checks live in
-//    the HIR lowering; a DFS would surface an element's type and false-fire). ──
+//    brace-init-list form is explicitly excluded (a DFS would surface an element's
+//    type and false-fire; since P69 each element is judged against the subobject it
+//    initializes by `checkBraceInitializerElements`). ──
 
 // (a) INCOMPATIBLE object pointee, char* target: `char *p = &a` where `a` is
 // `long`. The pointee `long` is NOT compatible with `char`, so C 6.5.16.1
@@ -4155,7 +4161,12 @@ TEST(SemanticAnalyzerC, NestedBlocksShadowWithoutRedecl) {
     // builtin scope for a use outside every function body).
     // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
     // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
-    EXPECT_EQ(model.symbols().size() - 1, 108u);
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): +49 — the GNU
+    // builtins that row added (expect, expect_with_probability, assume_aligned, trap, prefetch,
+    // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
+    // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
+    // the three `_p` predicates).
+    EXPECT_EQ(model.symbols().size() - 1, 157u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -4196,7 +4207,12 @@ TEST(SemanticAnalyzerC, ForwardReferenceWithinBlock) {
     // `__FUNCTION__` (text "", bound in the builtin scope).
     // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
     // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
-    ASSERT_EQ(model.symbols().size() - 1, 107u);
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): +49 — the GNU
+    // builtins that row added (expect, expect_with_probability, assume_aligned, trap, prefetch,
+    // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
+    // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
+    // the three `_p` predicates).
+    ASSERT_EQ(model.symbols().size() - 1, 156u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -7238,7 +7254,12 @@ TEST(SemanticAnalyzerC, ValueStarValueStaysExpressionStatement) {
     // `__FUNCTION__` (text "", bound in the builtin scope).
     // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
     // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
-    EXPECT_EQ(model.symbols().size() - 1, 108u)
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): +49 — the GNU
+    // builtins that row added (expect, expect_with_probability, assume_aligned, trap, prefetch,
+    // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
+    // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
+    // the three `_p` predicates).
+    EXPECT_EQ(model.symbols().size() - 1, 157u)
         << "main + a + b + __va_list_tag + va_list + __builtin_va_list + "
            "the 6 intrinsic builtins + __builtin_unreachable + "
            "the 8 GNU value-form __atomic_* builtins + "
@@ -7247,8 +7268,8 @@ TEST(SemanticAnalyzerC, ValueStarValueStaysExpressionStatement) {
            "the 4 __builtin_complex/creal/cimag/conj complex builtins + "
            "the 6 byte-swap builtins (_byteswap_ushort/_byteswap_ulong/"
            "_byteswap_uint64 + __builtin_bswap16/32/64) + "
-           "__func__ + __FUNCTION__ + their 2 file-scope twins — the "
-           "multiplication mints none";
+           "__func__ + __FUNCTION__ + their 2 file-scope twins + the 51 GNU "
+           "builtins of P69 (lane cs) — the multiplication mints none";
 }
 
 // UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate
@@ -18713,9 +18734,18 @@ TEST(SemanticAnalyzerC, StructMemberLeadingAlignasAndAttributeCompose) {
 // ...);` compiled rc=0, emitted no diagnostic anywhere, and died at PROCESS
 // START with 0xC0000139 (MEASURED at the TF-C111 HEAD).
 //
-// These pins are the SEMANTIC half of the fix: the row's recipe id and its
-// declared signature survive suppression. The HIR half (recipe → shim, never an
-// import row; and the signature refusal) is pinned in test_hir_lowering_c.
+// These pins are the SEMANTIC half of the fix: the row's realization and its
+// declared signature survive suppression. The HIR half (never an import row; and
+// the link name the realization defines) is pinned in test_hir_lowering_c.
+//
+// ★ P69 (D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM): the pe realization
+// the suppressed row must carry is no longer a `synthesize` recipe — the family is
+// DSS's runtime SOURCE (runtime/platform/src/stdio.c) under the link name
+// `__dss_isoc23_printf`, so the three properties that must survive suppression are
+// the shipped-source path, the link name, and the EMPTY pe image (the row's own
+// source supersedes the import its descriptor would otherwise have handed it). The
+// failure a lost property causes is the same one TF-C112 measured: a raw `printf`
+// import from an image that exports none, dying at process start with rc=0.
 
 namespace {
 
@@ -18726,7 +18756,7 @@ namespace {
 // copy). The format is threaded to BOTH the UnitBuilder (macro `variants` splice)
 // and `analyze` (the per-symbol availability gate) exactly as the driver does —
 // which is load-bearing here: stdio.json carries TWO `printf` rows, and only the
-// pe one has a `synthesize` tag.
+// pe one is realized from DSS's runtime source (it had a `synthesize` tag until P69).
 [[nodiscard]] SemanticModel analyzeRealStdio(std::string mainSrc,
                                              ObjectFormatKind format,
                                              DataModel dataModel,
@@ -18781,10 +18811,10 @@ constexpr char const* kPrintfRedeclSrc =
 
 } // namespace
 
-// PE: the suppressed row keeps its `synthesize` recipe. RED before TF-C112 —
-// `SuppressedShippedSymbol` had no such field, so the answer was structurally
-// unavailable.
-TEST(SemanticAnalyzerC, TFC112SuppressedPeStdioRowCarriesItsSynthesizeRecipe) {
+// PE: the suppressed row keeps its REALIZATION. RED before TF-C112 —
+// `SuppressedShippedSymbol` had no realization field at all, so the answer was
+// structurally unavailable; since P69 the realization is DSS's runtime source.
+TEST(SemanticAnalyzerC, TFC112SuppressedPeStdioRowCarriesItsShippedSourceRealization) {
     auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Pe,
                                   DataModel::Llp64, "x86_64");
     EXPECT_FALSE(model.hasErrors());
@@ -18793,17 +18823,23 @@ TEST(SemanticAnalyzerC, TFC112SuppressedPeStdioRowCarriesItsSynthesizeRecipe) {
     auto const* sup = model.suppressedShippedSymbolFor("printf");
     ASSERT_NE(sup, nullptr)
         << "goal-2 suppressed the descriptor's printf — the row must be recorded";
-    EXPECT_EQ(sup->recipeId, "printf")
-        << "the pe row is realized as a compiler-synthesized shim; a suppressed "
-           "copy that forgets the recipe re-exports it as a ucrtbase import that "
-           "cannot load (0xC0000139)";
+    EXPECT_EQ(sup->shippedSourcePath, "runtime/platform/src/stdio.c")
+        << "the pe row's body is DSS's runtime source; a suppressed copy that forgets "
+           "it re-exports printf as a ucrtbase import that cannot load (0xC0000139)";
+    EXPECT_EQ(sup->linkName, "__dss_isoc23_printf")
+        << "the runtime unit defines the C23 engine's link name, not `printf` — a "
+           "suppressed copy that forgets it references a name nothing defines";
+    EXPECT_TRUE(sup->recipeId.empty())
+        << "the stdio recipes were retired in P69: a recipe here would be a second "
+           "owner of the body the runtime source already provides";
     // The per-format library still rides too — the c86/c156 contract is intact,
-    // not replaced. Which ROW was recorded is decided by the availability gate,
-    // and `ucrtbase.dll` here proves the PE row won (the elf/macho `printf` row
-    // carries no recipe, so recording it would have looked identical to the
-    // pre-fix bug).
+    // not replaced — and on pe it is the EMPTY image: the row's own source supersedes
+    // the `cLibrary` import its descriptor would otherwise hand it (R3 precedence).
+    // Which ROW was recorded is decided by the availability gate; the elf/macho
+    // `printf` row carries none of these three properties.
     ASSERT_TRUE(sup->library.contains("pe"));
-    EXPECT_EQ(sup->library.at("pe"), "ucrtbase.dll");
+    EXPECT_EQ(sup->library.at("pe"), "")
+        << "a non-empty pe image here plants an import of a name the image lacks";
 }
 
 // PE: and the row's DECLARED SIGNATURE, which is the shim-compatibility oracle.
@@ -18851,6 +18887,8 @@ TEST(SemanticAnalyzerC, TFC112SuppressedElfStdioRowCarriesNoRecipe) {
     EXPECT_TRUE(sup->recipeId.empty())
         << "the elf printf row is a plain libc.so.6 import — tagging it would "
            "drop a working import in favour of a shim nothing asked for";
+    EXPECT_TRUE(sup->shippedSourcePath.empty())
+        << "P69 decided NO DSS unit on ELF: the elf row binds glibc's own printf";
     ASSERT_TRUE(sup->library.contains("elf"));
     EXPECT_EQ(sup->library.at("elf"), "libc.so.6");
 }

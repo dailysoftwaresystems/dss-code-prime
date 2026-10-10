@@ -911,7 +911,6 @@ int dss_stmt_expr_probe(int n) { return ({ int t = n; t + 1; }); }
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: `__builtin_expect` is an unknown identifier to DSS (S0001) and accepted by all four gnu oracles. It appears throughout real C corpora, sqlite included.
 @why GNU __builtin_expect — pervasive in real C corpora (sqlite, glibc headers).
 @code
 int dss_builtin_expect_probe(int n) { return __builtin_expect(n != 0, 1) ? 1 : 0; }

@@ -1,10 +1,12 @@
 #include "hir/const_eval.hpp"
 
+#include "core/types/semantic_config.hpp"   // BuiltinLowering (foldBuiltinVerb, the Builtin frame)
 #include "core/types/type_lattice/type_interner.hpp"
 #include "hir/const_eval_arith.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_op.hpp"
 
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -166,6 +168,108 @@ strideOf(EvalEnvironment const& env, TypeId elem) {
     if (!s.has_value() || *s > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
         return std::nullopt;
     return static_cast<std::int64_t>(*s);
+}
+
+// P69 (lane `cs`, D-C-A-READ-THROUGH-AN-ADDRESS-CONSTANT-IN-A-STATIC-INITIALIZER-IS-REFUSED): the
+// constant `offset` bytes into an object of type `type` whose value is `value`, read as `want`.
+// Each step descends ONE level of the object's type — an array's element at the offset's stride,
+// a structure's member whose storage holds the offset — so the walk ends by structure (a type
+// cannot contain itself by value), with no cap to answer at; it steps through the value by
+// reference and copies only the sub-object it answers with. It answers only where the offset
+// lands on a sub-object OF THE READ TYPE: past the object, inside padding, a narrower or wider
+// view of the bytes, a structure with bit-fields or an explicit-offset overlay (no one member
+// holds a byte there), a union whose value names no member, or an offset inside a union that
+// lands in a member other than the one it names — each is not a constant, never a guess.
+[[nodiscard]] std::optional<HirLiteralValue>
+constantAt(TypeInterner& interner, EvalEnvironment const& env, EvalOptions const& options,
+           HirLiteralValue const& value, TypeId type, std::int64_t offset, TypeId want) {
+    want = interner.stripVolatile(want);
+    HirLiteralValue const* cur = &value;
+    while (true) {
+        type = interner.stripVolatile(type);
+        if (!type.valid() || !want.valid() || offset < 0) return std::nullopt;
+        if (offset == 0 && type == want) return *cur;
+        switch (interner.kind(type)) {
+            case TypeKind::Array: {
+                auto const ops = interner.operands(type);
+                auto const sc  = interner.scalars(type);
+                if (ops.empty() || sc.empty() || sc[0] <= 0) return std::nullopt;
+                TypeId const elem = ops[0];
+                std::int64_t const length = sc[0];
+                auto const stride = strideOf(env, elem);
+                if (!stride.has_value() || *stride <= 0) return std::nullopt;
+                std::int64_t const i = offset / *stride;
+                if (i >= length) return std::nullopt;
+                offset -= i * *stride;
+                if (auto const* agg = std::get_if<HirAggregateValue>(&cur->value)) {
+                    if (static_cast<std::uint64_t>(i) >= agg->fields.size()) return std::nullopt;
+                    cur = &agg->fields[static_cast<std::size_t>(i)];
+                    type = elem;
+                    continue;
+                }
+                if (auto const* s = std::get_if<std::string>(&cur->value)) {
+                    // A string literal's bytes, its terminating NUL included — one-byte elements
+                    // only (a wide literal's pool text is not its elements), read whole.
+                    TypeKind const ek = interner.kind(interner.stripVolatile(elem));
+                    auto const info = intKindInfo(ek, options.charIsUnsigned);
+                    if (offset != 0 || interner.stripVolatile(elem) != want || !info.has_value()
+                        || info->bits != 8 || static_cast<std::uint64_t>(i) > s->size())
+                        return std::nullopt;
+                    std::int64_t const byte = static_cast<std::uint64_t>(i) == s->size()
+                        ? 0
+                        : static_cast<std::int64_t>(
+                              static_cast<unsigned char>((*s)[static_cast<std::size_t>(i)]));
+                    return integerLiteral(wrapToIntTarget(byte, *info), ek, options);
+                }
+                return std::nullopt;
+            }
+            case TypeKind::Struct: {
+                if (!interner.scalars(type).empty() || interner.hasExplicitOffsets(type))
+                    return std::nullopt;   // bit-fields, or an overlay
+                auto const* agg = std::get_if<HirAggregateValue>(&cur->value);
+                if (agg == nullptr || !env.resolveFieldOffset || !env.resolveTypeSize)
+                    return std::nullopt;
+                std::vector<TypeId> fields;   // copied out: a span must not outlive a lookup
+                for (TypeId const ft : interner.operands(type)) fields.push_back(ft);
+                auto const at = static_cast<std::uint64_t>(offset);
+                std::optional<std::size_t> hit;
+                std::uint64_t hitOffset = 0;
+                for (std::size_t fi = 0; fi < fields.size(); ++fi) {
+                    auto const off  = env.resolveFieldOffset(type, static_cast<std::uint32_t>(fi));
+                    auto const size = env.resolveTypeSize(fields[fi]);
+                    if (!off.has_value() || !size.has_value()) return std::nullopt;
+                    if (at >= *off && at < *off + *size) {
+                        hit = fi;
+                        hitOffset = *off;
+                        break;
+                    }
+                }
+                if (!hit.has_value() || *hit >= agg->fields.size()) return std::nullopt;
+                cur    = &agg->fields[*hit];
+                offset -= static_cast<std::int64_t>(hitOffset);
+                type   = fields[*hit];
+                continue;
+            }
+            case TypeKind::Union: {
+                // Every member starts at offset 0; the bytes there are the ACTIVE member's —
+                // the one the value names (D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED).
+                auto const* agg = std::get_if<HirAggregateValue>(&cur->value);
+                auto const members = interner.operands(type);
+                if (agg == nullptr || !agg->unionMember.has_value() || agg->fields.size() != 1
+                    || *agg->unionMember >= members.size() || !env.resolveTypeSize)
+                    return std::nullopt;
+                TypeId const memberType = members[*agg->unionMember];
+                auto const size = env.resolveTypeSize(memberType);
+                if (!size.has_value() || static_cast<std::uint64_t>(offset) >= *size)
+                    return std::nullopt;
+                cur  = &agg->fields[0];
+                type = memberType;
+                continue;
+            }
+            default:
+                return std::nullopt;
+        }
+    }
 }
 
 // An address CONVERSION (6.3.2.3): an address to a pointer, to `_Bool`, to an integer; an
@@ -1069,15 +1173,20 @@ struct FoldFrame {
     // `V*` kinds fold a VALUE read — an element or member of a constant object (the
     // `constObjectRead` form reaches it through `resolveConstSymbol`), and `*f` of a
     // function. `Seq` is the comma operator (`commaOperator`).
+    // P69 (lane `cs`): `ReadAt` is a VALUE read THROUGH an address constant (`*p`, `p[i]` of a
+    // pointer) — its address, then the value of the object the address lands in. `Builtin` is
+    // a builtin call whose verb is pure arithmetic over its operands (`foldBuiltinVerb`).
     enum class Kind : std::uint8_t {
         Unary, Binary, Cast, Ref, Logical, Ternary, Aggregate,
-        AddrOf, LIndex, LMember, LDeref, VIndex, VMember, VDeref, Seq
+        AddrOf, LIndex, LMember, LDeref, VIndex, VMember, VDeref, Seq, ReadAt, Builtin
     } kind;
     HirNodeId       node;
     std::uint32_t   phase;
     HirNodeId       child;   // Ref: the resolved DEFINING expression (see `enter`)
     ConstEvalResult c0;      // Binary / LIndex / VIndex: the folded first operand
     std::vector<HirLiteralValue> parts;   // Aggregate: elements folded so far
+    HirAddressValue at{};    // ReadAt: where the read lands
+    TypeId          objType{};   // ReadAt: the type of the object it lands in
 };
 
 // Internal driver. `visitedSyms` carries the per-call Ref cycle-detection set;
@@ -1127,6 +1236,20 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
                 HirAddressValue{sym.v, 0, hir.typeId(n), as->mayBeNull}, TypeKind::Ptr));
             return;
         }
+        if (nk == HirKind::UnnamedObject) {
+            // P69: an unnamed object's OWN object — a static one's symbol (the producer
+            // mints one per node), never its initializer's storage; an automatic one has no
+            // link-time address (the semantic tier refuses taking it first).
+            std::optional<SymbolId> const s =
+                env.resolveUnnamedObject ? env.resolveUnnamedObject(n) : std::nullopt;
+            if (!s.has_value() || !s->valid()) {
+                result = fail(ConstEvalFailure::NotAConstantExpression, n);
+                return;
+            }
+            result = ok(addressLiteral(HirAddressValue{s->v, 0, hir.typeId(n), false},
+                                       TypeKind::Ptr));
+            return;
+        }
         if (nk == HirKind::Literal) {
             std::uint32_t const idx = hir.payload(n);
             std::optional<SymbolId> const s =
@@ -1157,6 +1280,10 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
     };
 
     auto const enter = [&](HirNodeId n) {
+        // P69: an unnamed object READ AS A VALUE is its initializer's value, whatever its
+        // storage — the peel is the whole arm, so it costs no frame however deep literals
+        // nest. (Its OBJECT is `enterLvalue`'s.)
+        n = hir.unnamedObjectValue(n);
         if (n.valid() && options.foldAddressConstants) {
             // P68 round 13: the address arms (see `FoldFrame`).
             HirKind const nk = hir.kind(n);
@@ -1242,6 +1369,14 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             } else if (nk == HirKind::Ternary) {
                 if (hir.children(n).size() == 3) {
                     work.push_back({.kind = FoldFrame::Kind::Ternary, .node = n, .phase = 0});
+                    return;
+                }
+            } else if (nk == HirKind::BuiltinCall) {
+                // P69 (lane `cs`): `static long x = __builtin_expect(42, 1);`, `static int n =
+                // __builtin_popcount(7);`, `case __builtin_expect(1, 0):` — every operand folds
+                // (they are all arguments, so all are evaluated), then the verb's ONE arithmetic.
+                if (hir.typeId(n).valid()) {
+                    work.push_back({.kind = FoldFrame::Kind::Builtin, .node = n, .phase = 0});
                     return;
                 }
             } else if (nk == HirKind::ConstructAggregate) {
@@ -1439,6 +1574,43 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             }
             break;
         }
+        case FoldFrame::Kind::Builtin: {
+            // P69 (lane `cs`): the operands left to right, each already converted to its
+            // parameter's type by the call's own coercion (CST→HIR), then `foldBuiltinVerb`.
+            // A verb with no constant form, or an operand that is not a constant, refuses —
+            // the failing operand's own code when it is the operand.
+            HirNodeId const node2 = f.node;
+            auto kids = hir.children(node2);
+            if (f.phase == 0) {
+                f.parts.reserve(kids.size());
+            } else {
+                if (!result.value.has_value()) {   // propagate the operand's failure
+                    work.pop_back();
+                    break;
+                }
+                f.parts.push_back(std::move(*result.value));
+            }
+            if (static_cast<std::size_t>(f.phase) == kids.size()) {
+                std::vector<TypeKind> cores;
+                cores.reserve(kids.size());
+                for (HirNodeId const k : kids)
+                    cores.push_back(hir.typeId(k).valid() ? interner.kind(hir.typeId(k))
+                                                          : TypeKind::Void);
+                std::vector<HirLiteralValue> parts = std::move(f.parts);
+                work.pop_back();
+                auto folded = foldBuiltinVerb(
+                    static_cast<BuiltinLowering>(hir.payload(node2)), parts, cores,
+                    interner.kind(hir.typeId(node2)));
+                result = folded.has_value()
+                    ? ok(std::move(*folded))
+                    : fail(ConstEvalFailure::NotAConstantExpression, node2);
+                break;
+            }
+            HirNodeId const child = kids[static_cast<std::size_t>(f.phase)];
+            f.phase += 1;
+            enter(child);                   // may invalidate `f`
+            break;
+        }
         case FoldFrame::Kind::Aggregate: {
             // D5.3: fold a struct / union / array aggregate construction. The
             // node's children are the POSITIONAL element expressions
@@ -1465,6 +1637,11 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             if (static_cast<std::size_t>(f.phase) == kids.size()) {
                 HirAggregateValue agg;
                 agg.fields = std::move(f.parts);
+                // P69 (lane `cs`, D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED):
+                // a union's value names the member its one field initializes — the node's
+                // payload (`HirBuilder::makeConstructAggregate`).
+                if (interner.kind(hir.typeId(node2)) == TypeKind::Union)
+                    agg.unionMember = hir.payload(node2);
                 work.pop_back();
                 HirLiteralValue folded;
                 folded.core  = interner.kind(hir.typeId(node2));
@@ -1597,11 +1774,20 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             // mingw-w64 — `.temp/probe/sti9` 24), or a compound literal's value, whose const-ness
             // HIR does not carry: whether reading one is a constant (const, and no volatile lvalue
             // on the path) is the semantic tier's S_StaticInitializerNotConstant alone (P68 round 13
-            // fold F7). An element read THROUGH A POINTER reads memory, and is not a constant.
+            // fold F7). An element read THROUGH A POINTER reads memory: it is a constant only where
+            // the pointer's value is an address constant into an object whose value is one — the
+            // `ReadAt` frame's question (P69, lane `cs`).
             HirNodeId const node2 = f.node;
             auto const kids = hir.children(node2);
             if (f.phase == 0) {
                 TypeId const bt = hir.typeId(kids[0]);
+                // P69 (lane `cs`): an element read through a POINTER is a read through the
+                // address its value is — the `ReadAt` frame's, under the same form.
+                if (bt.valid() && interner.kind(bt) == TypeKind::Ptr
+                    && admits(options, ConstantForm::ConstObjectRead)) {
+                    f.kind = FoldFrame::Kind::ReadAt;   // the same frame, re-dispatched
+                    break;
+                }
                 if (!bt.valid() || interner.kind(bt) != TypeKind::Array) {
                     work.pop_back();
                     result = fail(ConstEvalFailure::NotAConstantExpression, node2);
@@ -1660,11 +1846,9 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         case FoldFrame::Kind::VMember: {
             // `s.m` READ: a member of a constant STRUCTURE value (positional fields) — a volatile
             // member included: the object's volatility is what decides, and gcc folds `cs.v` of a
-            // const, non-volatile `cs` (P68 round 13 fold F7). A union's value names no member here
-            // — its one field is the initialized member, identified by type only, so reading it would
-            // also answer an inactive member's read, which every reference refuses
-            // ([[D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED]]) — and `p->m` reads
-            // memory (its base is a `*p` read).
+            // const, non-volatile `cs` (P68 round 13 fold F7) — or of a constant UNION value, whose
+            // one field is read only as the member the value names (P69, below). `p->m` reads
+            // memory: its base is a `*p` read, the `ReadAt` frame's.
             HirNodeId const node2 = f.node;
             HirNodeId const baseN = hir.children(node2)[0];
             if (f.phase == 0) {
@@ -1677,6 +1861,21 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             TypeId const bt = hir.typeId(baseN);
             auto const* agg = std::get_if<HirAggregateValue>(&result.value->value);
             std::uint32_t const fi = hir.payload(node2);
+            // P69 (lane `cs`, D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED):
+            // a UNION member read folds only for the member the value NAMES as the one its
+            // initializer made current — its one field. ✔MEASURED (lane `cs`'s probe r68, runs
+            // 20260930-170224-a170fa9b, -170242-13e7fb1b): gcc 13.3.0 and clang 18.1.3 build
+            // the active member's read (the first member, a designated one, one inside a
+            // structure, an element of an array member, a structure member) and refuse any
+            // other member's, of another type or the SAME type (`.a` of `{ .b = 42 }`).
+            if (agg != nullptr && bt.valid() && interner.kind(bt) == TypeKind::Union) {
+                if (agg->unionMember != fi || agg->fields.size() != 1) {
+                    result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                    break;
+                }
+                result = ok(agg->fields[0]);
+                break;
+            }
             if (agg == nullptr || !bt.valid() || interner.kind(bt) != TypeKind::Struct
                 || fi >= agg->fields.size()) {
                 result = fail(ConstEvalFailure::NotAConstantExpression, node2);
@@ -1690,7 +1889,28 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             // address — all four build `int (*fp)(void) = *f;`. Any other `*p` reads memory.
             HirNodeId const node2 = f.node;
             if (f.phase == 0) {
+                // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): `*&E`
+                // IS `E` (C 6.5.3.2p3, and its footnote: "*&E is equivalent to E") — the value
+                // of E, read as E is read, with no address in between. ✔MEASURED 2026-09-30
+                // (probe-reference-cc runs 20260930-164351-d81e098e, -164446-2d7c6e20): gcc
+                // -std=c2x and clang build `int x = *&(int){ 42 };`, clang `(*&(struct S){
+                // 42 }).v`, and gcc `*&k` of a const `k`, while ALL refuse the read through an
+                // address `*((int[]){ 1, 42 } + 1)` — which does not take this arm.
+                HirNodeId const op = hir.children(node2)[0];
+                if (hir.kind(op) == HirKind::AddressOf && hir.children(op).size() == 1) {
+                    HirNodeId const inner = hir.children(op)[0];
+                    work.pop_back();
+                    enter(inner);               // `f` is gone; the inner value is the result
+                    break;
+                }
                 TypeId const t = hir.typeId(node2);
+                // P69 (lane `cs`): `*p` of anything but a function reads through the address
+                // `p`'s value is — the `ReadAt` frame's question, under the same form.
+                if (t.valid() && interner.kind(t) != TypeKind::FnSig
+                    && admits(options, ConstantForm::ConstObjectRead)) {
+                    f.kind = FoldFrame::Kind::ReadAt;   // the same frame, re-dispatched
+                    break;
+                }
                 if (!t.valid() || interner.kind(t) != TypeKind::FnSig) {
                     work.pop_back();
                     result = fail(ConstEvalFailure::NotAConstantExpression, node2);
@@ -1704,6 +1924,64 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             work.pop_back();
             if (result.value.has_value() && addressArm(*result.value) == nullptr)
                 result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+            break;
+        }
+        case FoldFrame::Kind::ReadAt: {
+            // P69 (lane `cs`, D-C-A-READ-THROUGH-AN-ADDRESS-CONSTANT-IN-A-STATIC-INITIALIZER-IS-REFUSED):
+            // a READ through a pointer whose value is an address constant — `*p`, `p[i]`, and so
+            // `p->m` (a member of `*p`) — is the constant the addressed object holds there: the
+            // OBJECT's value (the caller's `resolveReadableObject`: a const, non-volatile object,
+            // a string literal's array, a const static unnamed object), navigated by the SAME
+            // layout facts the address fold scales with to the sub-object the address lands on,
+            // which must be of the read type (`constantAt`). ✔MEASURED (lane `cs`'s probe rk,
+            // run 20260930-170533-11b7a03f): clang 18.1.3 builds all eight reads probed; gcc
+            // 13.3.0 only `*&k` — one working reference makes the form required.
+            HirNodeId const node2 = f.node;
+            if (f.phase == 0) {
+                f.phase = 1;
+                enterLvalue(node2);         // WHERE the read is — may invalidate `f`
+                break;
+            }
+            if (f.phase == 1) {
+                if (!result.value.has_value()) {
+                    work.pop_back();
+                    break;
+                }
+                auto const* a = addressArm(*result.value);
+                std::optional<ReadableObject> const obj =
+                    (a != nullptr && result.value->core == TypeKind::Ptr
+                     && a->base != HirAddressValue::kNullBase && !a->baseMayBeNull
+                     && env.resolveReadableObject)
+                        ? env.resolveReadableObject(SymbolId{a->base})
+                        : std::nullopt;
+                // An object whose value reads itself through an address (`static const int
+                // *const p = &x; static const int x = *p;`) has no value: the Ref frame's cycle
+                // guard, applied to the object the read lands in.
+                if (!obj.has_value() || !obj->value.valid() || !obj->type.valid()
+                    || visitedSyms.contains(a->base)) {
+                    work.pop_back();
+                    result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                    break;
+                }
+                visitedSyms.insert(a->base);
+                f.at      = *a;
+                f.objType = obj->type;
+                f.phase   = 2;
+                HirNodeId const valueN = obj->value;
+                enter(valueN);              // the object's value — may invalidate `f`
+                break;
+            }
+            HirAddressValue const at = f.at;
+            TypeId const objType = f.objType;
+            work.pop_back();
+            visitedSyms.erase(at.base);
+            if (!result.value.has_value()) break;
+            std::optional<HirLiteralValue> read =
+                constantAt(interner, env, options, *result.value, objType, at.byteOffset,
+                           hir.typeId(node2));
+            result = read.has_value()
+                ? ok(std::move(*read))
+                : fail(ConstEvalFailure::NotAConstantExpression, node2);
             break;
         }
         case FoldFrame::Kind::Seq: {
@@ -1763,6 +2041,205 @@ ConstEvalResult evaluateConstant(Hir const& hir,
                                  EvalOptions options) {
     std::unordered_set<std::uint32_t> visitedSyms;
     return evalImpl(hir, interner, literals, expr, env, options, visitedSyms);
+}
+
+// P69 (lane `cs`): see the header. Every verb reads its operand as the UNSIGNED bit pattern
+// of its parameter's width — the same zero-extension the MIR composition performs — so the
+// sign of a `__builtin_ffs(int)` operand never reaches the arithmetic.
+std::optional<HirLiteralValue>
+foldBuiltinVerb(BuiltinLowering verb, std::span<HirLiteralValue const> args,
+                std::span<TypeKind const> argCores, TypeKind resultCore) {
+    using detail::asIntBits;
+    using detail::intKindInfo;
+    struct Bits { std::uint64_t u; int w; };
+    // Operand `i` as its parameter's W-bit unsigned pattern (W ∈ 1..64).
+    auto const operand = [&](std::size_t i) -> std::optional<Bits> {
+        if (i >= args.size() || i >= argCores.size()) return std::nullopt;
+        auto const info = intKindInfo(argCores[i], std::nullopt);
+        if (!info.has_value() || info->bits < 1 || info->bits > 64) return std::nullopt;
+        auto const raw = asIntBits(args[i]);
+        if (!raw.has_value()) return std::nullopt;
+        int const w = static_cast<int>(info->bits);
+        std::uint64_t const mask = (w >= 64) ? ~std::uint64_t{0}
+                                             : ((std::uint64_t{1} << w) - 1);
+        return Bits{static_cast<std::uint64_t>(*raw) & mask, w};
+    };
+    // A count / index / mask as a value of the call's own integer type.
+    auto const intResult = [&](std::uint64_t v) -> std::optional<HirLiteralValue> {
+        auto const info = intKindInfo(resultCore, std::nullopt);
+        if (!info.has_value() || info->bits < 1 || info->bits > 64) return std::nullopt;
+        int const w = static_cast<int>(info->bits);
+        std::uint64_t const bits = (w >= 64) ? v : (v & ((std::uint64_t{1} << w) - 1));
+        HirLiteralValue out;
+        out.core = resultCore;
+        if (resultCore == TypeKind::Bool) {
+            out.value = static_cast<std::int64_t>(bits != 0 ? 1 : 0);
+        } else if (info->isSigned) {
+            out.value = (w >= 64)
+                ? static_cast<std::int64_t>(bits)
+                : (static_cast<std::int64_t>(bits << (64 - w)) >> (64 - w));
+        } else {
+            out.value = bits;
+        }
+        return out;
+    };
+    auto const popcount = [](std::uint64_t u) { return static_cast<std::uint64_t>(std::popcount(u)); };
+    // Leading zeros of a W-bit pattern, W at 0 (the MIR `Clz` contract).
+    auto const clzW = [](Bits b) -> std::uint64_t {
+        if (b.u == 0) return static_cast<std::uint64_t>(b.w);
+        return static_cast<std::uint64_t>(std::countl_zero(b.u) - (64 - b.w));
+    };
+    // Trailing zeros of a W-bit pattern, W at 0 (the MIR `Ctz` contract).
+    auto const ctzW = [](Bits b) -> std::uint64_t {
+        if (b.u == 0) return static_cast<std::uint64_t>(b.w);
+        return static_cast<std::uint64_t>(std::countr_zero(b.u));
+    };
+    auto const notW = [](Bits b) -> Bits {
+        std::uint64_t const mask = (b.w >= 64) ? ~std::uint64_t{0}
+                                               : ((std::uint64_t{1} << b.w) - 1);
+        return Bits{~b.u & mask, b.w};
+    };
+    switch (verb) {
+        case BuiltinLowering::FirstArgument: {
+            // The first operand, as the call's own type. A pointer result keeps the operand's
+            // address constant (`__builtin_assume_aligned(&obj, 16)` in a static initializer)
+            // or a null pointer; an integer result is the integer at the result's width.
+            if (args.empty()) return std::nullopt;
+            if (resultCore == TypeKind::Ptr) {
+                if (!std::holds_alternative<HirAddressValue>(args[0].value)
+                    && !asIntBits(args[0]).has_value())
+                    return std::nullopt;
+                HirLiteralValue out = args[0];
+                out.core = TypeKind::Ptr;
+                return out;
+            }
+            auto const raw = asIntBits(args[0]);
+            if (!raw.has_value()) return std::nullopt;
+            return intResult(static_cast<std::uint64_t>(*raw));
+        }
+        case BuiltinLowering::Popcount: {
+            auto const b = operand(0);
+            if (!b) return std::nullopt;
+            return intResult(popcount(b->u));
+        }
+        case BuiltinLowering::Parity: {
+            auto const b = operand(0);
+            if (!b) return std::nullopt;
+            return intResult(popcount(b->u) & 1u);
+        }
+        case BuiltinLowering::Clz: {
+            auto const b = operand(0);
+            if (!b) return std::nullopt;
+            return intResult(clzW(*b));
+        }
+        case BuiltinLowering::Ctz: {
+            auto const b = operand(0);
+            if (!b) return std::nullopt;
+            return intResult(ctzW(*b));
+        }
+        case BuiltinLowering::Bswap: {
+            auto const b = operand(0);
+            if (!b || (b->w != 16 && b->w != 32 && b->w != 64)) return std::nullopt;
+            std::uint64_t r = 0;
+            for (int i = 0; i < b->w / 8; ++i)
+                r = (r << 8) | ((b->u >> (8 * i)) & 0xFFu);
+            return intResult(r);
+        }
+        case BuiltinLowering::UMulHigh: {
+            // The high 64 bits of the 128-bit product, through 32-bit limbs (no host
+            // 128-bit type is assumed).
+            auto const a = operand(0);
+            auto const c = operand(1);
+            if (!a || !c) return std::nullopt;
+            std::uint64_t const aLo = a->u & 0xFFFFFFFFu, aHi = a->u >> 32;
+            std::uint64_t const bLo = c->u & 0xFFFFFFFFu, bHi = c->u >> 32;
+            std::uint64_t const ll = aLo * bLo, lh = aLo * bHi, hl = aHi * bLo, hh = aHi * bHi;
+            std::uint64_t const mid = (ll >> 32) + (lh & 0xFFFFFFFFu) + (hl & 0xFFFFFFFFu);
+            return intResult(hh + (lh >> 32) + (hl >> 32) + (mid >> 32));
+        }
+        case BuiltinLowering::StdcLeadingZeros:
+        case BuiltinLowering::StdcLeadingOnes:
+        case BuiltinLowering::StdcTrailingZeros:
+        case BuiltinLowering::StdcTrailingOnes:
+        case BuiltinLowering::StdcFirstLeadingZero:
+        case BuiltinLowering::StdcFirstLeadingOne:
+        case BuiltinLowering::StdcFirstTrailingZero:
+        case BuiltinLowering::StdcFirstTrailingOne:
+        case BuiltinLowering::StdcCountZeros:
+        case BuiltinLowering::StdcCountOnes:
+        case BuiltinLowering::StdcHasSingleBit:
+        case BuiltinLowering::StdcBitWidth:
+        case BuiltinLowering::StdcBitFloor:
+        case BuiltinLowering::StdcBitCeil: {
+            // C23 7.18 over the operand's EXACT width W — `emitStdbitOp`'s formulas.
+            auto const b = operand(0);
+            if (!b) return std::nullopt;
+            std::uint64_t const W = static_cast<std::uint64_t>(b->w);
+            std::uint64_t const lz = clzW(*b);
+            std::uint64_t const lo = clzW(notW(*b));
+            std::uint64_t const tz = ctzW(*b);
+            std::uint64_t const to = ctzW(notW(*b));
+            std::uint64_t const bw = W - lz;   // bit width (0 for 0)
+            switch (verb) {
+                case BuiltinLowering::StdcLeadingZeros:     return intResult(lz);
+                case BuiltinLowering::StdcLeadingOnes:      return intResult(lo);
+                case BuiltinLowering::StdcTrailingZeros:    return intResult(tz);
+                case BuiltinLowering::StdcTrailingOnes:     return intResult(to);
+                case BuiltinLowering::StdcFirstLeadingZero: return intResult(lo == W ? 0 : lo + 1);
+                case BuiltinLowering::StdcFirstLeadingOne:  return intResult(b->u == 0 ? 0 : lz + 1);
+                case BuiltinLowering::StdcFirstTrailingZero:return intResult(to == W ? 0 : to + 1);
+                case BuiltinLowering::StdcFirstTrailingOne: return intResult(b->u == 0 ? 0 : tz + 1);
+                case BuiltinLowering::StdcCountZeros:       return intResult(W - popcount(b->u));
+                case BuiltinLowering::StdcCountOnes:        return intResult(popcount(b->u));
+                case BuiltinLowering::StdcHasSingleBit:     return intResult(popcount(b->u) == 1 ? 1 : 0);
+                case BuiltinLowering::StdcBitWidth:         return intResult(bw);
+                case BuiltinLowering::StdcBitFloor:
+                    return intResult(b->u == 0 ? 0 : (std::uint64_t{1} << (bw - 1)));
+                case BuiltinLowering::StdcBitCeil: {
+                    if (b->u <= 1) return intResult(1);
+                    std::uint64_t const bwm1 = W - clzW(Bits{b->u - 1, b->w});
+                    return intResult(bwm1 == W ? 0 : (std::uint64_t{1} << bwm1));
+                }
+                default: return std::nullopt;
+            }
+        }
+        // No constant form: memory, control flow, a frame read, an aggregate result, or a
+        // verb the CST→HIR tier lowers to ordinary HIR before any evaluator sees it.
+        case BuiltinLowering::None:
+        case BuiltinLowering::AtomicCas:
+        case BuiltinLowering::Barrier:
+        case BuiltinLowering::SehExceptionCode:
+        case BuiltinLowering::SehExceptionInfo:
+        case BuiltinLowering::AtomicLoad:
+        case BuiltinLowering::AtomicStore:
+        case BuiltinLowering::ComplexMake:
+        case BuiltinLowering::ComplexReal:
+        case BuiltinLowering::ComplexImag:
+        case BuiltinLowering::ComplexConj:
+        case BuiltinLowering::AtomicFence:
+        case BuiltinLowering::AtomicFetchAdd:
+        case BuiltinLowering::AtomicFetchSub:
+        case BuiltinLowering::AtomicFetchOr:
+        case BuiltinLowering::AtomicFetchXor:
+        case BuiltinLowering::AtomicFetchAnd:
+        case BuiltinLowering::AtomicExchange:
+        case BuiltinLowering::AtomicCompareExchange:
+        case BuiltinLowering::Unreachable:
+        case BuiltinLowering::Trap:
+        case BuiltinLowering::Prefetch:
+        case BuiltinLowering::Infinity:
+        case BuiltinLowering::QuietNan:
+        case BuiltinLowering::Alloca:
+        case BuiltinLowering::ObjectSize:
+        case BuiltinLowering::AddOverflow:
+        case BuiltinLowering::SubOverflow:
+        case BuiltinLowering::MulOverflow:
+        case BuiltinLowering::AddOverflowP:
+        case BuiltinLowering::SubOverflowP:
+        case BuiltinLowering::MulOverflowP:
+            return std::nullopt;
+    }
+    return std::nullopt;
 }
 
 } // namespace dss

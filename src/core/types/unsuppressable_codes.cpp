@@ -498,6 +498,11 @@ constexpr MembershipReason kWhySilentConstraint{
     MembershipProng::BuildFailsWithNothingSaid,
     "the build already fails on this constraint violation; silenced, it "
     "fails with ZERO diagnostics shown and no statement of why"};
+constexpr MembershipReason kWhyAttributeNotHonoured{
+    MembershipProng::BuildFailsWithNothingSaid,
+    "the build already fails on an attribute that changes a type or a call "
+    "sequence and cannot be applied; silenced, it fails with ZERO "
+    "diagnostics shown, and the attribute reads as accepted"};
 constexpr MembershipReason kWhyNullptrOperand{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, nullptr lowers through the integer-0 null constant and "
@@ -790,7 +795,7 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // `S_EnumCompatibleTypeRuleUndeclared` joins under `kWhyEnumCompatibleTypeRule`, prong
 // (1) — a suppressed one would leave a guessed compatible type reaching codegen.
 // (Written from main's 198; a fold landing another member first reconciles the count.)
-constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
+constexpr std::array<UnsuppressableEntry, 200> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1687,6 +1692,12 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     {DiagnosticCode::S_AlignasWeakerThanNatural, kWhySilentConstraint},
     {DiagnosticCode::S_AlignasInvalidContext, kWhySilentConstraint},
     {DiagnosticCode::S_AlignasNonConstant, kWhySilentConstraint},
+    // P69 round 4 (lane `cs`): a KNOWN attribute the compiler cannot honour where it
+    // is written — `vector_size`, `mode`, a calling convention that is not the
+    // pair's. The refusal is an error, so the build fails; suppressed, it would
+    // fail with nothing said, and before the refusal existed each of these was a
+    // warning beside a wrong size or a wrong call sequence.
+    {DiagnosticCode::S_AttributeNotHonoured, kWhyAttributeNotHonoured},
     // S_PackedBitfieldUnsupported (0xE032) IS DELIBERATELY ABSENT, and its absence is
     // the point. It was a member from 2026-07-08 until
     // D-CSUBSET-PACKED-BITFIELD-INTERACTION
@@ -1992,6 +2003,11 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     // is exactly why both references make it an ordinary, silenceable warning
     // (clang's is even named: -Wimplicitly-unsigned-literal) rather than an
     // error. `--warnings-as-errors` is the lever for a project that wants it out.
+    // S_IntegerLiteralImplicitlyUnsigned (P69, its phase-7 twin) is NOT a member for
+    // the same two prongs: the literal is typed `decimalPastRange` whether or not the
+    // warning shows, so suppressing it changes no answer and hides no failure — and
+    // its dedup of the Pass-1.5 pre-stamp's second visit RELIES on it staying
+    // suppressible (the reporter's duplicate window applies only to such codes).
     // P_ClosedByEndOfInput (P68 round 8,
     // D-ASM-UNTERMINATED-BLOCK-COMMENT-AT-END-OF-FILE-REFUSED) is deliberately NOT
     // a member, by the same two prongs: the input is ACCEPTED and assembled

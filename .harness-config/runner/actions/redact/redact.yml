@@ -1,0 +1,17 @@
+# PURPOSE: filter text so no tree path, home, account, host name or address leaves the machine that printed it -- the one redactor every action loads and every session pipes its output through.
+name: redact
+description: >-
+  The ONE redactor: its rules, their order and their two exemptions -- (::), a C++ scope qualifier, which is never
+  a host; and (K), a host named like a word of the tree's own vocabulary -- are documented in the program's header. read-leg-path and probe-reference-cc load it by path; a
+  session pipes what it prints through `python .harness-config/runner/actions/redact/redact.py` (a DISPLAY
+  filter -- never write a file from its output). That filter is not a step and cannot be one: a runner step reads
+  no standard input (MEASURED 2026-09-30, run 20260930-164007-b87cbb24). What must be hidden depends on the host's
+  own account and machine names, so the self-test runs on every leg the runner declares, and ctest runs it as
+  `harness/redact_selftest` on every leg that configures the tree.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./redact.py --self-test
+    successPattern: '^redact self-test: \d+ arm\(s\), 0 failed$'
+    requireInputsUnmoved: true

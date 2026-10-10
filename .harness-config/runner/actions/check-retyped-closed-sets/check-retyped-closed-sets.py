@@ -112,8 +112,11 @@ actions convention's stated carve-out, `.harness-config/runner/actions/README.md
 
 USAGE
 -----
-    python .harness-config/runner/actions/check-retyped-closed-sets/check-retyped-closed-sets.py \
-        [--min-tokens N] [--bare] [--vocab] [--self-test] [PATH-SUBSTRING ...]
+    dssharness run check-retyped-closed-sets                           # the census, then the self-test
+    dssharness run check-retyped-closed-sets --manual-step census      # --min-tokens/--bare/PATH-SUBSTRING,
+                                                                       # the step's inputs
+    dssharness run check-retyped-closed-sets --manual-step vocab       # --vocab
+    dssharness run check-retyped-closed-sets --manual-step self-test   # --self-test
 
 `PATH-SUBSTRING` filters to the files whose repo-relative path contains it.
 `--vocab` lists the harvested vocabularies instead of the hits.
@@ -531,6 +534,15 @@ def run_self_test() -> int:
     return 1 if failures else 0
 
 
+def _flag(value):
+    """`true` / `false` -- how a harness step hands a flag over, every input passed, defaults included. Anything
+    else is refused by argparse, naming it."""
+    v = str(value).strip().lower()
+    if v not in ("true", "false"):
+        raise argparse.ArgumentTypeError("%r is neither true nor false" % value)
+    return v == "true"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="census diagnostics that retype a closed vocabulary")
@@ -540,7 +552,7 @@ def main() -> int:
                          "count (default 2). 2 HIDES EVERY ONE-ELEMENT SET, "
                          "and two live drifts were found there -- run 1 before "
                          "calling a file clean")
-    ap.add_argument("--bare", action="store_true",
+    ap.add_argument("--bare", type=_flag, nargs="?", const=True, default=False,
                     help="also match UNQUOTED vocabulary runs (noisy; finds the "
                          "`(a / b / c)` shape no quoted regex can see)")
     ap.add_argument("--vocab", action="store_true",

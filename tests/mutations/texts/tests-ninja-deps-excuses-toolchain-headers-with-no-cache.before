@@ -1,0 +1,1 @@
+        return (False, "the tree has no readable CMakeCache.txt to name its compiler")

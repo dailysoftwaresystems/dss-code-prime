@@ -52,10 +52,13 @@ steps:
     successPattern: 'probe-reference-cc: OK '
   # The SELF-TEST, run only where a run names it (`dssharness run probe-reference-cc --legs <leg> --manual-step
   # self-test`): the same arms ctest runs as `harness/probe_reference_cc_selftest`, in the leg's own environment and
-  # without a build -- so the real cl arms run wherever a leg's developer environment is Visual Studio.
+  # without a build -- so the real cl arms run wherever a leg's developer environment is Visual Studio. (ctest adds
+  # `--expect-cl=yes` where the build's C++ compiler is MSVC and `--expect-cl=no` elsewhere -- the bare flag is
+  # refused -- so there a missing cl FAILS; this step cannot know the build, and says in its closing line when the
+  # cl arms were not this host's.)
   - name: self-test
     manual: true
     workingDirectoryRoot: action
     run: |
       python3 ./probe-reference-cc.py --selftest
-    successPattern: 'probe-reference-cc selftest: OK'
+    successPattern: '^probe-reference-cc selftest: OK \(\d+ arm\(s\)'

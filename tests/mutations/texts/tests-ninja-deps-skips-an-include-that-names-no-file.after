@@ -1,0 +1,3 @@
+        m = _INCLUDE_NAMED.match(line)
+        if not m:
+            continue

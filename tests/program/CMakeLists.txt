@@ -203,6 +203,30 @@ dss_add_test(NAME program/test_build_stamp
 # rebuilding the world.
 dss_use_build_stamp(dss_program_test_build_stamp)
 
+# THE STAMP SCRIPT'S OWN SELF-TEST, ONE CASE PER ARM — the ctest entry
+# `build/build_stamp_identity`. `cmake/DssBuildStamp.cmake` proves its properties in
+# throwaway trees when run in `selftest` mode (what moves the value with and without
+# git, what a handed dependency adds, what is refused), and configures fixture
+# projects against `cmake/DssBuildStampDeclaration.cmake`. This binary RUNS that
+# self-test — the command line the top-level CMakeLists composes, on the tree it was
+# configured from — and reads each arm's verdict into a case of its own; it
+# re-implements none of them. It keeps the entry's name because it IS that entry:
+# the name says what is proven, and the test trees' other `build/` entries are its
+# neighbours. The source lives here, beside the stamp's other tests.
+#
+# ★ WHY A TEST BINARY AND NOT THE BARE `cmake -P` ENTRY IT REPLACED: a script entry
+# has one verdict and no cases, so a mutation of either module could not be an arm
+# of the mutation sweep, which starts a test binary whole and judges the exact set
+# of cases that go red.
+dss_add_test(NAME build/build_stamp_identity
+             SOURCES test_build_stamp_identity.cpp)
+
+# The opt-in (top-level CMakeLists, `dss_use_script_selftest`): the generated header
+# that holds the command line, and the two stamp modules declared as inputs of this
+# target's object — no compiler reads a CMake script, so without that declaration no
+# object depended on either.
+dss_use_script_selftest(dss_build_build_stamp_identity build_stamp)
+
 # It REUSES tests/core/native_c_probe.hpp for the reference-compiler probe
 # rather than growing a second copy of host-compiler discovery, shell quoting
 # and output capture — the same reason tests/conformance adds this path.
@@ -572,3 +596,22 @@ target_link_libraries(dss_program_test_emit_hir_round_trips_every_example
 # `dynlib_runpath_origin` / `dynlib_runpath_absent_exits_127` is the run.
 dss_add_test(NAME program/test_image_runpath_build
              SOURCES test_image_runpath_build.cpp)
+
+# D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS: the shipped runtime is built
+# HIDDEN, once for the whole archive — the mechanism (an archive build restates
+# every external definition it compiles, after the optimizer, deleting none at
+# release) and the declaration (an ELF `.so` and a Mach-O `.dylib` linking the
+# runtime export their own function alone, the runtime body proved inside).
+# HOST-INDEPENDENT: built and decoded, never executed — the corpus example
+# `shared_library_exports_its_own_api_alone` is the run.
+dss_add_test(NAME program/test_archive_definition_visibility
+             SOURCES test_archive_definition_visibility.cpp)
+
+# D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: the four faces end to
+# end at the baseline and at release — a static-library member keeps its hidden
+# definitions, an image keeps the hidden definition an object input or a sibling
+# CU calls, a hidden `main` is still the entry — and the CONTROL that a whole
+# image still deletes an unreached hidden definition at release. HOST-INDEPENDENT:
+# built and decoded, never executed (three corpus examples are the runs).
+dss_add_test(NAME program/test_release_hidden_definitions
+             SOURCES test_release_hidden_definitions.cpp)

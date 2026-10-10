@@ -1,0 +1,55 @@
+{
+  "$comment": "P69 (lane lm, D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS): an image linked with an OBJECT input keeps the hidden definitions that object names. Each arm's `dependsOn` compiles obj.c to the pair's relocatable object, which the program's build takes as a link input; main.c defines a hidden function and a hidden datum that only obj.c uses, calls obj_entry, and calls obj.c's own hidden obj_hidden_bias, which nothing in obj.c uses — both directions of one link. Exit 42 iff obj_entry(20) + obj_hidden_bias() == 40 + 1 + 1 + 0. ✔MEASURED before the fix, the other direction too: a release relocatable object (`x86_64:elf64-x86_64-linux`) lost every hidden definition its unit never used — a relocatable object is completed by a LATER link, and is a `LinkInput` now. ✔MEASURED before the fix with the lane's dsscp: the baseline linked and ran 42 on pe64, and `--config=release` FAILED K_SymbolUndefined 'hidden_helper' on pe64 and ELF — the image's whole-program DCE rooted only `isExternallyVisible` definitions although the link also took an input it could not see. gcc 13.3.0 and clang 18.1.3 keep a hidden definition at `-O2 -c` (probe-reference-cc run 20261001-152924-ba09ffc4), so every reference links this program. The fix: an image whose link takes an object input (or an operator's archive) is optimized as a `opt::ModuleExtent::LinkInput`, which roots every external-linkage definition. The release arm is the witness (the defect was release-only); ✔MEASURED 2026-10-01 with the lane's dsscp, the release object and the release executable both differ from the baseline ones on all five pairs, so both levels carry `mustDifferFromBaseline`.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        { "sources": ["obj.c"], "spec": "x86_64:pe64-x86_64-windows", "artifact": "obj.obj", "mustDifferFromBaseline": true }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "dependsOn": [
+        { "sources": ["obj.c"], "spec": "x86_64:elf64-x86_64-linux", "artifact": "obj.o", "mustDifferFromBaseline": true }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "dependsOn": [
+        { "sources": ["obj.c"], "spec": "arm64:elf64-aarch64-linux", "artifact": "obj.o", "mustDifferFromBaseline": true }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "dependsOn": [
+        { "sources": ["obj.c"], "spec": "arm64:macho64-arm64-darwin", "artifact": "obj.o", "mustDifferFromBaseline": true }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "dependsOn": [
+        { "sources": ["obj.c"], "spec": "x86_64:macho64-x86_64-darwin", "artifact": "obj.o", "mustDifferFromBaseline": true }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

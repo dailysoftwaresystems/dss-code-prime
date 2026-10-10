@@ -26,10 +26,13 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>   // the "shipped file PLUS exactly one key" fixtures
 
+#include <algorithm>    // std::sort — the shipped-format census
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>   // the shipped-format census
 #include <fstream>
+#include <system_error>
 #include <iterator>
 #include <optional>
 #include <span>
@@ -302,20 +305,31 @@ TEST(ObjectFormatSchemaLoader, Arm64RelocatableFormatsDeclareGotExternAddr) {
     }
 }
 
-// D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52) NEUTRALITY: the DSS-LINKED
-// arm64 formats (exec / pie / dyn) do NOT declare externAddrBinding — they
-// materialize an extern's address via copy-relocation (exec) / the c117
-// DSS-local __got slot (pie/dyn), never the foreign-linker GOT macro. Pins
-// that only the relocatable + static-archive formats opted in (closure gate
-// #1: exec/pie/dyn output byte-identical).
-TEST(ObjectFormatSchemaLoader, DssLinkedArm64FormatsOmitExternAddrBinding) {
-    for (char const* name : {"elf64-aarch64-linux-exec",
-                             "elf64-aarch64-linux-pie",
-                             "elf64-aarch64-linux-dyn"}) {
+// D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52) NEUTRALITY, REFINED BY P69
+// (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB). An EXECUTABLE — exec and
+// PIE — still declares no externAddrBinding: it gives an address-taken library
+// function ONE address by making its own stub CANONICAL (`.dynsym` STT_FUNC,
+// st_value = the stub; the stub's slot a JUMP_SLOT), which its code and
+// initializers already name. A SHARED OBJECT cannot — its definition never
+// interposes — so since P69 it DOES declare `got`: its code loads a function's
+// address from a slot the link mints and the loader fills. Both ISAs, both
+// directions.
+TEST(ObjectFormatSchemaLoader, DssLinkedExecutablesOmitExternAddrBindingAndDsosDeclareGot) {
+    for (char const* name : {"elf64-aarch64-linux-exec", "elf64-aarch64-linux-pie",
+                             "elf64-x86_64-linux-exec", "elf64-x86_64-linux-pie"}) {
         auto r = ObjectFormatSchema::loadShipped(name);
         ASSERT_TRUE(r.has_value()) << name;
         EXPECT_FALSE((*r)->externAddrBinding().has_value())
-            << name << " must NOT declare externAddrBinding (neutrality).";
+            << name << " is an executable: its canonical stub IS the address, "
+                       "so it must NOT declare externAddrBinding.";
+    }
+    for (char const* name : {"elf64-aarch64-linux-dyn", "elf64-x86_64-linux-dyn"}) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value()) << name;
+        ASSERT_TRUE((*r)->externAddrBinding().has_value())
+            << name << " is a shared object: it can state no canonical stub, so "
+                       "a function's address must be LOADED from a slot.";
+        EXPECT_EQ(*(*r)->externAddrBinding(), ExternAddrBinding::Got) << name;
     }
 }
 
@@ -958,6 +972,7 @@ TEST(LK10EntrySliceB, ProcessExitWithoutEntryCcRejected) {
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "entryTransition": "jumped",
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 231,
@@ -1223,6 +1238,7 @@ TEST(LK10EntrySliceB, ProcessExitOnRelocatableFormatRejected) {
       "elf": { "class": "elf64", "data": "lsb", "machine": 62,
                "type": "rel" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 231,
@@ -1260,6 +1276,7 @@ TEST(LK10EntrySliceB, EntryCcLeadingWhitespaceRejected) {
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": " sysv_amd64",
+      "entryTransition": "jumped",
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 231,
@@ -1293,6 +1310,10 @@ TEST(LK10EntrySliceB, WasmFormatRejectsProcessExit) {
     // original minimal `{"mechanism":"syscall"}`) so it carries no
     // incidental "missing syscall field" noise of its own — the whole
     // point here is the wasm/exec-flavor rejection, not a malformed arm.
+    // (P69: it declares `entryTransition` for the same reason — that key
+    // pairs with `processExit` too, and leaving it out would add a fourth,
+    // incidental pairing diagnostic; the entryCallingConvention pairing stays
+    // the one pairing noise this fixture has always carried.)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
@@ -1301,6 +1322,7 @@ TEST(LK10EntrySliceB, WasmFormatRejectsProcessExit) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-wasm", "version": "0.1", "kind": "wasm" },
+      "entryTransition": "jumped",
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 231,
@@ -1440,6 +1462,7 @@ TEST(ProcessArgsSubstrate, UnknownMechanismRejected) {
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 231,
@@ -1464,6 +1487,7 @@ TEST(ProcessArgsSubstrate, MechanismNoneStringRejected) {
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 231,
@@ -1488,6 +1512,7 @@ TEST(ProcessArgsSubstrate, StackVectorMissingArgcOffsetRejected) {
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 231,
@@ -1513,6 +1538,7 @@ TEST(ProcessArgsSubstrate, StackVectorMissingArgvOffsetRejected) {
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 231,
@@ -1539,6 +1565,7 @@ TEST(ProcessArgsSubstrate, OffsetBeyondInt32Rejected) {
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 231,
@@ -1577,6 +1604,7 @@ TEST(ProcessArgsSubstrate, ProcessArgsWithoutProcessExitRejected) {
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "entryPoint": "",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8},
         "class": "elf64", "data": "lsb", "osabi": "sysv", "machine": 62,
         "type": "exec", "pageAlign": 4096,
         "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": true
@@ -1620,6 +1648,7 @@ TEST(ProcessArgsSubstrate, ProcessArgsOnRelocatableFormatRejected) {
       "elf": { "class": "elf64", "data": "lsb", "machine": 62,
                "type": "rel" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 231,
@@ -3232,5 +3261,379 @@ TEST(ObjectFormatSchemaLoader, PerMechanismBlockNamesTheArmAKeyBelongsTo) {
                "belongs to. Telling the author only that a REAL field name is "
                "unknown sends them hunting a typo that is not there — the "
                "mistake is a paste from the other arm: " << rejectSummary(bad);
+    }
+}
+
+// ── P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): EVERY REFUSAL OF THE
+// KEYS THE ROUND ADDED OR RETIRED, each by its own message ───────────────────
+//
+// A refusal no test reaches is a refusal nobody knows still fires. Each case
+// mutates a SHIPPED document by exactly one edit and asserts the refusal's own
+// words at its own pointer — so a message that drifts, or a rule that stops
+// firing, goes red by name.
+namespace {
+
+[[nodiscard]] std::string mutatedDocument(char const* stem,
+                                          void (*mutate)(nlohmann::json&)) {
+    auto const text = shippedFormatText(stem);
+    if (text.empty()) return {};
+    nlohmann::json doc = nlohmann::json::parse(text);
+    mutate(doc);
+    return doc.dump();
+}
+
+struct RefusalCase {
+    char const* label;
+    char const* document;
+    void (*mutate)(nlohmann::json&);
+    char const* path;      // the diagnostic's JSON pointer
+    char const* message;   // a fragment of the refusal's own words
+};
+
+void expectRefusal(RefusalCase const& c) {
+    SCOPED_TRACE(c.label);
+    auto const text = mutatedDocument(c.document, c.mutate);
+    ASSERT_FALSE(text.empty());
+    auto const r = ObjectFormatSchema::loadFromText(text, c.document);
+    EXPECT_FALSE(r.has_value()) << "the mutated document must be refused";
+    EXPECT_GE(countAtPath(r, c.path), 1u) << rejectSummary(r);
+    EXPECT_GE(countWithMessage(r, c.message), 1u)
+        << "the refusal must say why, in its own words: " << rejectSummary(r);
+}
+
+}  // namespace
+
+TEST(ObjectFormatSchemaLoader, DynamicRelocationTypesRefusesEveryMalformedOrMisplacedDeclaration) {
+    // `elf.dynamicRelocationTypes`: the psABI numbers an image's `.rela.dyn`
+    // rows carry, by role. Six ways to get it wrong, six refusals.
+    RefusalCase const kCases[] = {
+        {"not an object", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { d["elf"]["dynamicRelocationTypes"] = 7; },
+         "/elf/dynamicRelocationTypes", "must be an object"},
+        {"an unknown role", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { d["elf"]["dynamicRelocationTypes"]["irelative"] = 37; },
+         "/elf/dynamicRelocationTypes/irelative", "unknown key 'irelative'"},
+        {"a non-integer number", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { d["elf"]["dynamicRelocationTypes"]["jumpSlot"] = "7"; },
+         "/elf/dynamicRelocationTypes/jumpSlot", "'jumpSlot' must be a psABI relocation number"},
+        {"zero", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { d["elf"]["dynamicRelocationTypes"]["relative"] = 0; },
+         "/elf/dynamicRelocationTypes/relative", "'relative' must be a psABI relocation number"},
+        {"negative", "elf64-aarch64-linux-dyn",
+         [](nlohmann::json& d) { d["elf"]["dynamicRelocationTypes"]["globDat"] = -1025; },
+         "/elf/dynamicRelocationTypes/globDat", "'globDat' must be a psABI relocation number"},
+        {"missing on an image that binds at load", "elf64-x86_64-linux-pie",
+         [](nlohmann::json& d) { d["elf"].erase("dynamicRelocationTypes"); },
+         "/elf/dynamicRelocationTypes", "must declare 'elf.dynamicRelocationTypes' with all three roles"},
+        {"a role missing on an image that binds at load", "elf64-aarch64-linux-exec",
+         [](nlohmann::json& d) { d["elf"]["dynamicRelocationTypes"].erase("relative"); },
+         "/elf/dynamicRelocationTypes", "must declare 'elf.dynamicRelocationTypes' with all three roles"},
+        {"declared on an image that binds nothing (a relocatable object)", "elf64-x86_64-linux",
+         [](nlohmann::json& d) {
+             d["elf"]["dynamicRelocationTypes"] = {{"globDat", 6}, {"jumpSlot", 7}, {"relative", 8}};
+         },
+         "/elf/dynamicRelocationTypes", "inert config is refused by name"},
+        {"two roles sharing one number", "elf64-x86_64-linux-dyn",
+         [](nlohmann::json& d) { d["elf"]["dynamicRelocationTypes"]["jumpSlot"] = 6; },
+         "/elf/dynamicRelocationTypes", "gives two roles one number"},
+    };
+    for (auto const& c : kCases) expectRefusal(c);
+}
+
+TEST(ObjectFormatSchemaLoader, TheRetiredPltNativeIdIsRefusedAsInertConfig) {
+    // P69 retired `pltNativeId` (a second wire id on a row, the way ELF x86_64's
+    // PC32 row once stood for calls too): a call is a row of its own, `isCall`.
+    expectRefusal({"pltNativeId on the PC32 row", "elf64-x86_64-linux",
+                   [](nlohmann::json& d) {
+                       for (auto& r : d["relocations"]) {
+                           if (r.value("name", "") == "R_X86_64_PC32") r["pltNativeId"] = 4;
+                       }
+                   },
+                   "pltNativeId", "'pltNativeId' is retired"});
+}
+
+TEST(ObjectFormatSchemaLoader, ImportAddressSymbolPrefixRefusesANonStringOrEmptyPrefix) {
+    // D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED (P69): an empty prefix would
+    // read every name as an import's address slot.
+    RefusalCase const kCases[] = {
+        {"a number", "pe64-x86_64-windows-exec",
+         [](nlohmann::json& d) { d["importAddressSymbolPrefix"] = 6; },
+         "/importAddressSymbolPrefix", "must be a non-empty string"},
+        {"an empty string", "pe64-x86_64-windows-dll",
+         [](nlohmann::json& d) { d["importAddressSymbolPrefix"] = ""; },
+         "/importAddressSymbolPrefix", "an empty one would read every name as a slot"},
+    };
+    for (auto const& c : kCases) expectRefusal(c);
+    // And the shipped spelling itself loads, and is read back verbatim.
+    auto const ok = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ((*ok)->importAddressSymbolPrefix(), "__imp_");
+    // P69 re-review MAJOR 2: only an IMAGE reads the name, and DSS's own objects
+    // never write one (their GOT loads become a carried pointer, the relocation
+    // their statics use), so the PE RELOCATABLE documents state no prefix, and a
+    // relocatable or archive document that states one is refused: nothing reads it.
+    for (char const* stem : {"pe64-x86_64-windows", "pe64-x86_64-windows-staticlib"}) {
+        auto const reloc = ObjectFormatSchema::loadShipped(stem);
+        ASSERT_TRUE(reloc.has_value()) << stem;
+        EXPECT_TRUE((*reloc)->importAddressSymbolPrefix().empty()) << stem;
+        EXPECT_TRUE((*reloc)->externAddrBinding() == ExternAddrBinding::Got) << stem;
+    }
+    RefusalCase const kNotAnImage[] = {
+        {"on the relocatable document", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["importAddressSymbolPrefix"] = "__imp_"; },
+         "/importAddressSymbolPrefix", "is declared on a format that is not an IMAGE flavor"},
+        {"on the static-library document", "pe64-x86_64-windows-staticlib",
+         [](nlohmann::json& d) { d["importAddressSymbolPrefix"] = "__imp_"; },
+         "/importAddressSymbolPrefix", "is declared on a format that is not an IMAGE flavor"},
+    };
+    for (auto const& c : kNotAnImage) expectRefusal(c);
+}
+
+// ── P69 review M1 (c) + MINOR 8: `pcRelativeImportAddress` — what an image makes of
+// a unit's PC-relative, non-branch reference to an import. Declared on exactly the
+// images that declare `externAddrBinding` (their call entry is not the import's
+// address); refused anywhere else, and refused missing there. ──
+namespace {
+
+// Every shipped format's stem, from disk: a format added tomorrow is judged the
+// day it lands.
+[[nodiscard]] std::vector<std::string> allShippedFormatStems() {
+    std::vector<std::string> stems;
+    auto const root = dss::test::findConfigRoot();
+    if (!root.has_value()) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
+        return stems;
+    }
+    constexpr std::string_view kSuffix = ".format.json";
+    std::error_code ec;
+    for (auto const& entry : std::filesystem::directory_iterator{*root / "object-formats", ec}) {
+        std::string const name = entry.path().filename().string();
+        if (name.size() > kSuffix.size()
+            && name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0) {
+            stems.push_back(name.substr(0, name.size() - kSuffix.size()));
+        }
+    }
+    std::sort(stems.begin(), stems.end());
+    EXPECT_FALSE(stems.empty()) << "no shipped format found";
+    return stems;
+}
+
+}  // namespace
+
+TEST(ObjectFormatSchemaLoader, PcRelativeImportAddressIsDeclaredExactlyWhereTheCallEntryIsNotTheAddress) {
+    for (auto const& stem : allShippedFormatStems()) {
+        SCOPED_TRACE(stem);
+        auto const f = ObjectFormatSchema::loadShipped(stem);
+        ASSERT_TRUE(f.has_value());
+        bool const image = (*f)->isImageFlavor();
+        bool const callEntryIsNotTheAddress = image && (*f)->externAddrBinding().has_value();
+        EXPECT_EQ((*f)->pcRelativeImportAddress().has_value(), callEntryIsNotTheAddress);
+    }
+    auto meaningOf = [](char const* stem) {
+        auto const f = ObjectFormatSchema::loadShipped(stem);
+        return f.has_value() ? (*f)->pcRelativeImportAddress() : std::nullopt;
+    };
+    // PE: link.exe, lld-link and GNU ld bind such a unit's every address of the
+    // import to the thunk (measured 2026-10-01).
+    EXPECT_TRUE(meaningOf("pe64-x86_64-windows-exec") == PcRelativeImportAddress::CallEntry);
+    EXPECT_TRUE(meaningOf("pe64-x86_64-windows-dll") == PcRelativeImportAddress::CallEntry);
+    // ELF shared objects (GNU ld, lld) and Mach-O images (Apple ld, measured
+    // 2026-10-01) refuse the reference.
+    for (char const* stem : {"elf64-x86_64-linux-dyn", "elf64-aarch64-linux-dyn",
+                             "macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib",
+                             "macho64-x86_64-darwin-exec", "macho64-x86_64-darwin-dylib"}) {
+        EXPECT_TRUE(meaningOf(stem) == PcRelativeImportAddress::Refused) << stem;
+    }
+}
+
+TEST(ObjectFormatSchemaLoader, PcRelativeImportAddressRefusesEveryMisplacedOrMalformedDeclaration) {
+    RefusalCase const kCases[] = {
+        {"an unknown meaning", "pe64-x86_64-windows-exec",
+         [](nlohmann::json& d) { d["pcRelativeImportAddress"] = "thunk"; },
+         "/pcRelativeImportAddress", "expected one of: 'callEntry', 'refused'"},
+        {"declared on a relocatable object", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pcRelativeImportAddress"] = "callEntry"; },
+         "/pcRelativeImportAddress", "is declared on a format that is not an IMAGE flavor"},
+        {"missing on an image whose call entry is not the address", "elf64-x86_64-linux-dyn",
+         [](nlohmann::json& d) { d.erase("pcRelativeImportAddress"); },
+         "/pcRelativeImportAddress", "cannot say what a unit's `leaq puts(%rip)`"},
+        {"declared on an image whose stub is canonical", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { d["pcRelativeImportAddress"] = "refused"; },
+         "/pcRelativeImportAddress", "the call entry IS the import's canonical address"},
+    };
+    for (auto const& c : kCases) expectRefusal(c);
+}
+
+// ── P69 (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION): `entryTransition` ──
+//
+// Where the stack stands at the entry's first instruction is how the platform's loader
+// ENTERS the image — a fact of the FORMAT (one calling convention, sysv_amd64, serves ELF,
+// whose kernel / ld.so JUMPS to the entry, and Mach-O, whose dyld CALLS it). Each exec
+// document declares the transition its platform was MEASURED to use (a C function made the
+// entry point, its 16-aligned local's address mod 16: P69 runs 20261001-032102-8526afd5 ELF
+// x86_64, 20261001-032118-d313e866 Mach-O both arches, 20261001-032206-b4afdfe7 and
+// 20261001-032239-9285cd67 pe64, 20261001-032140-a29bf400 ELF aarch64 — where the SP cannot
+// tell, BL pushing nothing). The key is closed and pairs with `processExit` both ways.
+namespace {
+[[nodiscard]] std::string withEntryTransition(std::string const& text,
+                                              std::optional<char const*> value) {
+    nlohmann::json doc = nlohmann::json::parse(text);
+    if (value.has_value())
+        doc["entryTransition"] = *value;
+    else
+        doc.erase("entryTransition");
+    return doc.dump();
+}
+}  // namespace
+
+TEST(EntryTransition, ShippedExecFormatsDeclareTheirMeasuredTransition) {
+    struct Want {
+        char const*     stem;
+        EntryTransition transition;
+    };
+    constexpr Want kWant[] = {
+        {"elf64-x86_64-linux-exec", EntryTransition::Jumped},
+        {"elf64-x86_64-linux-pie", EntryTransition::Jumped},
+        {"elf64-aarch64-linux-exec", EntryTransition::Jumped},
+        {"elf64-aarch64-linux-pie", EntryTransition::Jumped},
+        {"macho64-x86_64-darwin-exec", EntryTransition::Called},
+        {"macho64-arm64-darwin-exec", EntryTransition::Called},
+        {"pe64-x86_64-windows-exec", EntryTransition::Called},
+    };
+    for (Want const& w : kWant) {
+        auto r = ObjectFormatSchema::loadShipped(w.stem);
+        ASSERT_TRUE(r.has_value()) << w.stem;
+        EXPECT_EQ((*r)->entryTransition(), std::optional<EntryTransition>{w.transition})
+            << w.stem << " must declare the transition its loader was MEASURED to use";
+    }
+}
+
+TEST(EntryTransition, AShippedExecDocumentWithoutItIsRefusedForThatAlone) {
+    for (char const* stem : {"elf64-x86_64-linux-exec", "macho64-x86_64-darwin-exec",
+                             "pe64-x86_64-windows-exec"}) {
+        // CONTROL: the shipped document as written loads.
+        std::string const text = shippedFormatText(stem);
+        ASSERT_TRUE(ObjectFormatSchema::loadFromText(text).has_value()) << stem;
+        auto const r = ObjectFormatSchema::loadFromText(withEntryTransition(text, std::nullopt));
+        ASSERT_FALSE(r.has_value())
+            << stem << ": a processExit with no entryTransition must be refused — the "
+                       "trampoline would have to assume, and assuming the jump is how every "
+                       "Mach-O x86_64 frame ran 8 bytes off";
+        EXPECT_EQ(countAtPath(r, "/entryTransition"), 1u) << stem << " -- " << rejectSummary(r);
+        EXPECT_EQ(errorCount(r), 1u) << stem << " -- " << rejectSummary(r);
+    }
+}
+
+TEST(EntryTransition, AnUnknownTransitionIsRefusedNamingTheClosedSet) {
+    std::string const text = shippedFormatText("elf64-x86_64-linux-exec");
+    auto const r = ObjectFormatSchema::loadFromText(withEntryTransition(text, "bogus"));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countWithMessage(r, "unknown entryTransition 'bogus'"), 1u) << rejectSummary(r);
+    // The one knock-on, by name: the unknown value is never stored, so validate()'s
+    // pairing rule also finds a processExit with no transition — at the same path.
+    EXPECT_EQ(countAtPath(r, "/entryTransition"), 2u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 2u) << rejectSummary(r);
+}
+
+TEST(EntryTransition, ATransitionWithoutProcessExitIsRefused) {
+    // A RELOCATABLE document has no process entry: declaring how a loader enters it is a
+    // statement about nothing.
+    std::string const text = shippedFormatText("elf64-x86_64-linux");
+    ASSERT_TRUE(ObjectFormatSchema::loadFromText(text).has_value()) << "CONTROL";
+    auto const r = ObjectFormatSchema::loadFromText(withEntryTransition(text, "jumped"));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/entryTransition"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+}
+
+// ── P69: the Mach-O x86_64 exec format's threads vehicle (the coordinator's ruling: ISO
+// C's <threads.h> ships on every pair, and examples/c/c11_call_once_two_threads is the
+// consumer that format's deliberate omission waited for) ──
+TEST(LibrarySynthesis, ShippedMachoX64ExecDeclaresPthreadVehicle) {
+    auto r = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(r.has_value());
+    auto const& ls = (*r)->librarySynthesis();
+    ASSERT_TRUE(ls.has_value())
+        << "macho x86_64 exec must declare a librarySynthesis vehicle, as its arm64 sibling does";
+    EXPECT_EQ(ls->vehicle, LibrarySynthVehicle::Pthread);
+    EXPECT_EQ(ls->libraryPath, "/usr/lib/libSystem.B.dylib");
+}
+
+// ── P69 (lane `lm`, D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO):
+// `weakResolvedToNothing` — what a reference naming a weak symbol the image resolves to
+// nothing computes, per field class. Declared by the images that bind such a symbol to
+// nothing (they refuse an undefined import); a present block is strict, and an answer a
+// class cannot take, or a `zero` the format's writer cannot produce, is refused at load.
+// The per-image answers and what each computes are pinned in
+// test_weak_resolved_to_nothing.cpp. ──
+TEST(WeakResolvedToNothingKey, EveryMalformedOrMisplacedDeclarationIsRefused) {
+    RefusalCase const kCases[] = {
+        {"not an object", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { d["weakResolvedToNothing"] = "zero"; },
+         "/weakResolvedToNothing", "'weakResolvedToNothing' must be an object"},
+        {"an unknown class", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { d["weakResolvedToNothing"]["got"] = "zero"; },
+         "/weakResolvedToNothing/got", "unknown key 'got'"},
+        {"a class left out", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { d["weakResolvedToNothing"].erase("branch"); },
+         "/weakResolvedToNothing/branch", "states no 'branch' answer"},
+        {"an unknown answer", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { d["weakResolvedToNothing"]["absolute"] = "null"; },
+         "/weakResolvedToNothing/absolute", "expected one of: 'zero', 'nextInstruction', 'refused'"},
+        {"a branch's answer for an absolute field", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { d["weakResolvedToNothing"]["absolute"] = "nextInstruction"; },
+         "/weakResolvedToNothing/absolute", "is an answer for a BRANCH"},
+        {"a branch's answer for a displacement", "elf64-aarch64-linux-exec",
+         [](nlohmann::json& d) { d["weakResolvedToNothing"]["pcRelative"] = "nextInstruction"; },
+         "/weakResolvedToNothing/pcRelative", "is an answer for a BRANCH"},
+        {"zero for a displacement from a PIE", "elf64-x86_64-linux-pie",
+         [](nlohmann::json& d) { d["weakResolvedToNothing"]["pcRelative"] = "zero"; },
+         "/weakResolvedToNothing/pcRelative", "does not place the image at its link address"},
+        {"zero for a branch from a PE image", "pe64-x86_64-windows-exec",
+         [](nlohmann::json& d) { d["weakResolvedToNothing"]["branch"] = "zero"; },
+         "/weakResolvedToNothing/branch", "does not place the image at its link address"},
+        {"zero for a displacement from a Mach-O image", "macho64-arm64-darwin-exec",
+         [](nlohmann::json& d) { d["weakResolvedToNothing"]["pcRelative"] = "zero"; },
+         "/weakResolvedToNothing/pcRelative", "does not place the image at its link address"},
+        {"on a relocatable object", "elf64-x86_64-linux",
+         [](nlohmann::json& d) {
+             d["weakResolvedToNothing"] = {{"absolute", "zero"}, {"pcRelative", "refused"},
+                                           {"branch", "refused"}};
+         },
+         "/weakResolvedToNothing", "never binds a weak symbol to nothing"},
+        {"on an ELF shared object", "elf64-x86_64-linux-dyn",
+         [](nlohmann::json& d) {
+             d["weakResolvedToNothing"] = {{"absolute", "zero"}, {"pcRelative", "refused"},
+                                           {"branch", "refused"}};
+         },
+         "/weakResolvedToNothing", "never binds a weak symbol to nothing"},
+        {"on a static library", "pe64-x86_64-windows-staticlib",
+         [](nlohmann::json& d) {
+             d["weakResolvedToNothing"] = {{"absolute", "zero"}, {"pcRelative", "refused"},
+                                           {"branch", "refused"}};
+         },
+         "/weakResolvedToNothing", "never binds a weak symbol to nothing"},
+    };
+    for (auto const& c : kCases) expectRefusal(c);
+}
+
+// The CONTROLS the refusals need: each shipped declaration loads as written, and
+// a document whose block is removed loads too and answers `refused` for every
+// class — nothing silent is the default.
+TEST(WeakResolvedToNothingKey, ADocumentThatDeclaresNoBlockRefusesEveryDirectReference) {
+    for (char const* stem : {"elf64-x86_64-linux-exec", "elf64-aarch64-linux-pie",
+                             "pe64-x86_64-windows-exec", "macho64-x86_64-darwin-dylib"}) {
+        SCOPED_TRACE(stem);
+        std::string const text = shippedFormatText(stem);
+        ASSERT_TRUE(ObjectFormatSchema::loadFromText(text, stem).has_value()) << "CONTROL";
+        nlohmann::json doc = nlohmann::json::parse(text);
+        ASSERT_TRUE(doc.contains("weakResolvedToNothing"));
+        doc.erase("weakResolvedToNothing");
+        auto const r = ObjectFormatSchema::loadFromText(doc.dump(), stem);
+        ASSERT_TRUE(r.has_value()) << rejectSummary(r);
+        auto const a = (*r)->weakResolvedToNothing();
+        EXPECT_EQ(a.absolute, WeakNullReference::Refused);
+        EXPECT_EQ(a.pcRelative, WeakNullReference::Refused);
+        EXPECT_EQ(a.branch, WeakNullReference::Refused);
     }
 }

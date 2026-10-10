@@ -6,6 +6,7 @@
 // lengths). Keeping them in one place means a radix/separator/suffix
 // rule is interpreted identically wherever a literal is evaluated.
 
+#include "core/types/float_format.hpp"       // floatKindInfo's widths and host backing
 #include "core/types/number_style.hpp"
 #include "core/types/wide_float_value.hpp"   // WideFloatValue (the F80/F128 target-precision arm)
 
@@ -840,18 +841,16 @@ struct FloatKindInfo {
     int  bits;
     bool hostBacked;
 };
+// Both facts are READ from the representation table (core/types/float_format.hpp,
+// P69 M3) — the one statement of each format's width and of whether a host `double`
+// carries it. F80 and F128 are NOT host-backed
+// (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the host `double` cannot represent a
+// 64- or 113-bit significand, so folding at binary64 would bake a silently-rounded
+// constant.
 [[nodiscard]] inline std::optional<FloatKindInfo> floatKindInfo(TypeKind k) noexcept {
-    switch (k) {
-        case TypeKind::F16:  return FloatKindInfo{16,  true};
-        case TypeKind::F32:  return FloatKindInfo{32,  true};
-        case TypeKind::F64:  return FloatKindInfo{64,  true};
-        // F80 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): NOT host-backed —
-        // the host `double` cannot represent an 80-bit-mantissa value, so
-        // folding at binary64 would bake a silently-rounded constant.
-        case TypeKind::F80:  return FloatKindInfo{80,  false};
-        case TypeKind::F128: return FloatKindInfo{128, false};
-        default: return std::nullopt;
-    }
+    FloatFormat const* const f = floatFormatOf(k);
+    if (f == nullptr) return std::nullopt;
+    return FloatKindInfo{storageBits(*f), f->hostBacked};
 }
 
 // Soft-float narrow `double → IEEE 754 binary16 → double`. Produces the

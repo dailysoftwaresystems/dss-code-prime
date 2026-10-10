@@ -1,0 +1,1 @@
+            std::int64_t const need = std::min<std::int64_t>(64, std::max(exactS, sbits(*r)));

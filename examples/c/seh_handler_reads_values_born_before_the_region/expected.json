@@ -1,0 +1,12 @@
+{
+  "$comment": "D-LIR-NO-EXCEPTIONAL-EDGE-INTO-A-TRY-HANDLER: what a __try handler reads. Control reaches a handler through the system's unwinder, from any instruction of the guarded body, and the unwinder hands over the frame and the call-preserved registers and nothing else — so a value the handler (or the code after the region) reads must be in the frame or in a call-preserved register for the whole body. Twenty-two cases, each a function of its own: a parameter, a local, a double (the vector class), a global's shared address, a struct returned through the caller's result address, a struct parameter passed by reference, a pointer the handler passes on, a region inside a loop, two regions in sequence, a handler with branches, a stack-passed parameter, a fault inside a callee, an integer division by zero caught by name. Cases 27..32 are D-WIN64-XMM-UNWIND-RESTORE, the saved vector register: a double kept across a call inside and before a region, three doubles read by a handler, and a fault that unwinds THROUGH a callee which saved every call-preserved vector register and overwrote it (thirteen doubles kept across its own call — a callee keeping one was given a different register from its caller's and proved nothing) — the handler then reads the guarding function's double only if the callee's unwind information says where it saved the register (once through a plain callee, once through a callee whose own call passes one argument on the stack — an odd count of outgoing stack slots, which used to put its register-save area 8 bytes off the multiple of 16 the unwind information requires — and once through a callee that guards a region of its own and declines the fault). The exit code names the first case to fail (11..32); 42 = all right. The reference compiler (cl 19.51 x64, /Od and /O2) runs this file to 42. The release arm is the same file through the optimizer, where a shared address or a value kept in a register across the body is the common case.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

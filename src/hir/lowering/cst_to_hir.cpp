@@ -28,6 +28,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/string_literal_decode.hpp" // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE string-body chokepoint)
+#include "core/types/wide_float_value.hpp"     // P69: a long double NaN's payload (`quietNan`)
 // Inline-asm P5: the SHARED capture (`gatherInlineAsmFacts`) the semantic
 // analyzer validates and this tier turns into a descriptor — one walk, two
 // callers, so "what the statement said" cannot differ between them.
@@ -49,6 +50,7 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstring>   // std::memcpy (a NaN literal's bits)
 #include <format>
 #include <functional>
 #include <limits>
@@ -59,6 +61,7 @@
 #include <string_view>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -394,6 +397,10 @@ struct Lowerer {
     // file-scope symbol), so reading its answer is both cheaper and correct.
     struct CarriedLinkageFacets {
         std::optional<SymbolBinding>    binding{};
+        // P69 (lane `cs`): the weak-definition kind the entity's declarations have
+        // stated so far — meaningful only while `binding` is `Weak`, and folded by
+        // `mergeDeclaredLinkage` beside it (see `settleWeakKind`).
+        std::optional<WeakDefinitionKind> weakKind{};
         std::optional<SymbolVisibility> visibility{};
         // ★ Set once the entity's DEFINING declaration has been folded. A facet
         // written on a declaration that FOLLOWS the definition is IGNORED with a
@@ -558,6 +565,13 @@ struct Lowerer {
     // wrongly in both directions.
     std::uint32_t                                    functionBodyDepth_{};
 
+    // P69 (D-C-A-STORAGE-CLASS-SPECIFIER-IN-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): the
+    // `UnnamedObject` nodes (HirNodeId.v) whose semantic facts carry the
+    // `addressNotTakeable` facet — a C23 `(register T){ … }` literal. The `&` operand check
+    // and the array-decay check read it exactly as they read a `register` variable's
+    // `SymbolRecord::addressNotTakeable`; HIR itself carries no such flag.
+    std::unordered_set<std::uint32_t>                addressNotTakeableObjects_;
+
     // The result of lowering an expression: the HIR node + its resolved type.
     struct E { HirNodeId id; TypeId type; };
 
@@ -628,14 +642,18 @@ struct Lowerer {
                 && sem.pointerConversions.implicitToVoidPtr
                 && interner.kind(ptrElem[0]) == TypeKind::Void;
             if (sameElem || vlaCompatElem || toVoidPtr) {
+                std::optional<HirSourceLoc> at;
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) { at = it->second; break; }
+                }
+                // P69 (D-C-A-REGISTER-ARRAY-DECAY-IS-NOT-REFUSED): no pointer to a
+                // `register` array — see `refusedRegisterArrayDecay`.
+                if (refusedRegisterArrayDecay(child.id, at.value_or(HirSourceLoc{})))
+                    return {builder.addLeaf(HirKind::Error, InvalidType, 0, HirFlags::HasError),
+                            InvalidType};
                 HirNodeId const decay = builder.makeCast(
                     child.id, target, HirFlags::Synthetic);
-                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
-                    if (it->first == child.id) {
-                        spans.push_back({decay, it->second});
-                        break;
-                    }
-                }
+                if (at.has_value()) spans.push_back({decay, *at});
                 return {decay, target};
             }
         }
@@ -1688,6 +1706,21 @@ struct Lowerer {
     }
     [[nodiscard]] bool isToken(NodeId n) const { return tree().kind(n) == NodeKind::Token; }
 
+    // The LAST token of `root`'s subtree, by following each node's last visible
+    // child down — a function body's closing delimiter in a brace language, and
+    // simply the construct's last token in any other. One step per tree level
+    // (a loop, never a call per level); `root` itself when it is a token or has
+    // nothing visible below it.
+    [[nodiscard]] NodeId lastTokenUnder(NodeId root) const {
+        NodeId n = root;
+        while (n.valid() && !isToken(n)) {
+            auto const kids = visible(n);
+            if (kids.empty()) break;
+            n = kids.back();
+        }
+        return n;
+    }
+
     // ⓘ `inlineAsmPayloadProbe` LIVED HERE AND IS DELETED (inline-asm P5). It was
     // a PRESENCE test — "does this statement carry an operand / clobber / label
     // list?" — whose only answer was a refusal, and P5 replaced the refusal with
@@ -1841,9 +1874,22 @@ struct Lowerer {
         if (decl.linkageSpecifiers.empty()) return roots;
         if (NodeId const pfx = specifierPrefixChild(tree(), node, decl); pfx.valid())
             roots.push_back(pfx);
-        if (decl.declarationAttrSlotRules.empty()) return roots;
+        // ★ P69 round 4 (lane `cs`): the attribute runs written INSIDE the head —
+        // among the type's specifiers (`unsigned __attribute__((weak)) int gv;`),
+        // after a tag that is only referred to — are the declaration's, exactly as
+        // the prefix is. `headAttributeRuns` is the one walk that says which they
+        // are; the semantic attribute fold and the noreturn fold read the same
+        // list, so the three cannot see different positions. They are spliced in
+        // AT the head child, which keeps the flattened token list in source order.
+        NodeId const head = declarationHeadNode(tree(), node, decl);
         for (NodeId c : visible(node)) {
             if (tree().kind(c) != NodeKind::Internal) continue;
+            if (head.valid() && c.v == head.v) {
+                for (NodeId run : headAttributeRuns(sem, tree(), c)) {
+                    roots.push_back(run);
+                }
+                continue;
+            }
             for (AttrRunRule const& sr : decl.declarationAttrSlotRules) {
                 if (sr.appertainsTo != AttrAppertainment::Declaration) continue;
                 if (tree().rule(c).v == sr.rule.v) { roots.push_back(c); break; }
@@ -1868,8 +1914,23 @@ struct Lowerer {
         if (decl.linkageSpecifiers.empty() || !declaratorNode.valid()) return roots;
         if (!sem.declarators.has_value()) return roots;
         DeclaratorConfig const& dc = *sem.declarators;
-        if (dc.afterDeclaratorAttrRules.empty()) return roots;   // language has none
         if (tree().kind(declaratorNode) != NodeKind::Internal) return roots;
+        // ★ P69 round 4 (lane `cs`): the specifiers written INSIDE the declarator,
+        // beside the declared name (`int * __attribute__((weak)) p;`, `int *
+        // __attribute__((visibility("hidden"))) f(void)`). They are this
+        // declarator's, like the run after it, and they come first because they
+        // are written first. WHICH specifiers stand there is
+        // `nameAdjacentAttributeSpecifiers`'s answer and nobody else's: the
+        // semantic attribute fold and the noreturn fold read the same list. Any
+        // carrier shape has them (a function definition's bare declarator
+        // included), which is why this precedes the `initDeclarator` test below.
+        // ✔MEASURED (probe ta8; gcc 13.3.0, clang 18.1.3, Apple clang): `int *
+        // __attribute__((weak)) p3 = 0, q3 = 0;` is `V p3` / `B q3`.
+        for (NodeId an :
+                 nameAdjacentAttributeSpecifiers(tree(), sem, declaratorNode)) {
+            roots.push_back(an);
+        }
+        if (dc.afterDeclaratorAttrRules.empty()) return roots;   // language has none
         // The attribute run is a DIRECT child of an `initDeclarator` (the grammar
         // slot between the declarator and the initializer). Matching it there —
         // rather than by a free DFS for any `attrSpec` in the declarator subtree —
@@ -2181,6 +2242,26 @@ struct Lowerer {
             // before this change `reported` and `key` are the same string and
             // no message moves.
             std::string reported{rawText};
+            // ★★ P69 (lane `cs`) — THE NAME A CLAUSE IS LOOKED UP UNDER FIRST: its
+            // spelling's QUALIFIED name (`attributeSemantics.spellings`;
+            // `__declspec(thread)` for the clause `thread` written in a
+            // `__declspec( … )`). Empty for a token that is not the name of a
+            // clause in a qualifying spelling. Both readers below try it before
+            // the plain name — the by-name ignore list (which is derived from the
+            // effects table, where such a clause's row sits under its qualified
+            // name) and the row's linkage map (where a storage request made by a
+            // clause is keyed the same way) — so a name that means one thing in
+            // one spelling and nothing in another is read as what it is. The
+            // spelling is the semantic tier's own answer
+            // (`enclosingAttributeSpelling`), never worked out a second time here.
+            std::string qualifiedKey;
+            if (inAttrName && !(i < fromAttrArg.size() && fromAttrArg[i] != 0)) {
+                if (AttributeSpelling const* const spelling =
+                        enclosingAttributeSpelling(sem, tree(), n);
+                    spelling != nullptr) {
+                    qualifiedKey = spelling->qualified(key);
+                }
+            }
             // FC16 (D-CSUBSET-NORETURN): a specifier IDENTIFIER declared a semantic
             // NO-OP by NAME (`linkageSpecifierIgnoredNames`) is skipped WITHOUT a
             // linkage effect and WITHOUT firing H_UnknownLinkageSpecifier — the
@@ -2192,8 +2273,13 @@ struct Lowerer {
             if (!decl.linkageSpecifierIgnoredNames.empty()) {
                 std::string_view const bare = stripDunder(key);
                 bool ignoredByName = false;
-                for (std::string const& nm : decl.linkageSpecifierIgnoredNames)
-                    if (bare == nm) { ignoredByName = true; break; }
+                for (std::string const& nm : decl.linkageSpecifierIgnoredNames) {
+                    if (bare == nm
+                        || (!qualifiedKey.empty() && qualifiedKey == nm)) {
+                        ignoredByName = true;
+                        break;
+                    }
+                }
                 if (ignoredByName) continue;
             }
             // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE-LEADING-ARG-SOUP): a token that came
@@ -2231,6 +2317,23 @@ struct Lowerer {
             //      linkage facet resolved silently, which is worse than the loud
             //      arg soup this fix removes.
             if (i < fromAttrArg.size() && fromAttrArg[i] != 0) continue;
+            // P69 (lane `cs`): A NAME THE SEMANTIC TIER'S DECLARATION-KIND GATE
+            // IGNORED IS IGNORED HERE TOO. That gate reads the language's own kind
+            // axis for the attribute (`attributeSemantics.effects[].appliesTo`),
+            // warns "ignored … and its effect was discarded" and records the
+            // clause's name token on the model. This fold reads the same tokens a
+            // second time and knows nothing of kinds, so without this line the
+            // warning was false for every name of the LINKAGE vocabulary:
+            // `__attribute__((selectany)) int f(void) { … }` was warned as ignored
+            // and emitted WEAK. ✔MEASURED on the one reference that accepts that
+            // declaration (gcc 13.3.0, Linux: "'selectany' attribute directive
+            // ignored", the function an ordinary strong one, the image runs);
+            // clang, mingw-w64 gcc and cl refuse it. The engine names no attribute
+            // and no kind: it asks the model whether THIS token was discarded. Its
+            // parenthesized argument needs no second skip — a string is passed
+            // over by the two string-kind tests at the top of this loop and the
+            // rest by the argument mark just above.
+            if (inAttrName && model.attributeNameIgnoredForKind(n)) continue;
             // Composite probe: the next non-ignored token opens a string
             // literal → pair this specifier with the decoded body.
             if (strStart.valid() && strBody.valid()) {
@@ -2291,8 +2394,14 @@ struct Lowerer {
             // through the attribute position. The `end()` seed is the whole
             // mechanism; the fall-through below then reports it loudly, naming
             // what the user wrote.
+            // P69 (lane `cs`): the qualified name first. It is never denied by the
+            // keyword rule: a qualified key cannot be the spelling of a keyword, so
+            // nothing can bind through it that the language did not key there.
             auto it = decl.linkageSpecifiers.end();
-            if (!keywordSpelledAttrName) it = decl.linkageSpecifiers.find(key);
+            if (!qualifiedKey.empty()) it = decl.linkageSpecifiers.find(qualifiedKey);
+            if (it == decl.linkageSpecifiers.end() && !keywordSpelledAttrName) {
+                it = decl.linkageSpecifiers.find(key);
+            }
             if (it != decl.linkageSpecifiers.end()) {
                 if (it->second.binding) {
                     // ★★ THE BINDING AXIS IS NOT LAST-WINS. Every other axis
@@ -2357,10 +2466,20 @@ struct Lowerer {
                         // `prototypeSynthesizesExtern` gate already asks
                         // specifically about `Local`), not a C specifier name —
                         // no language vocabulary is hardcoded here.
-                        if (*it->second.binding == SymbolBinding::Local)
-                            attr.binding = SymbolBinding::Local;
+                        if (*it->second.binding == SymbolBinding::Local) {
+                            attr.binding  = SymbolBinding::Local;
+                            attr.weakKind = WeakDefinitionKind{};   // read only beside Weak
+                        }
                         continue;
                     }
+                    // P69 (lane `cs`): the weak-definition KIND travels with the
+                    // binding, from the same config entry (the loader requires
+                    // `weakKind` beside every weak binding and refuses it anywhere
+                    // else). Settled BEFORE the binding is overwritten: the rule
+                    // needs to know whether a kind was already stated.
+                    attr.weakKind = settleWeakKind(attr.binding, attr.weakKind,
+                                                   *it->second.binding,
+                                                   it->second.weakKind);
                     attr.binding = *it->second.binding;
                 }
                 if (it->second.visibility) {
@@ -2634,6 +2753,41 @@ struct Lowerer {
     // so the two halves of one anchor cannot diverge in how they report. (A new
     // code would also need `core/types/parse_diagnostic.hpp`, which this lane
     // does not own.)
+    // P69 (lane `cs`): THE WEAK-DEFINITION KIND AFTER ONE MORE STATEMENT OF IT —
+    // one more specifier of a declaration (`linkageFrom`), or one more declaration
+    // of an entity (`mergeDeclaredLinkage`). `next` is what that statement says;
+    // the result is what the declaration or entity holds afterwards.
+    //
+    // ★ TWO STATEMENTS THAT DISAGREE ARE NOT A CONFLICT: the result is
+    // `Overridable`. ✔MEASURED, `__attribute__((weak, selectany)) int v = 5;`:
+    // clang 18.1.3 on Linux, Apple clang and mingw-w64 gcc 13 all accept it in
+    // silence (gcc on Linux, which implements no `selectany`, warns that it
+    // ignores that word), and mingw-w64 gcc — the one reference whose object
+    // format writes the two kinds DIFFERENTLY — emits the weak-external pair
+    // (`.weak.v5.…` + `w v5`), not a pick-any COMDAT. That is also the only
+    // reading under which neither word is contradicted: an overridable definition
+    // yields to any other definition of the name, so it yields to its own copies
+    // as well, which is all `select-any` asked for; the converse would refuse a
+    // strong definition beside it that `weak` promised to accept. No specifier
+    // NAME appears here — the two kinds are the config's own vocabulary.
+    //
+    // A binding other than `Weak` holds no kind (the value-initialized state,
+    // which `HirVerifier` requires beside every non-weak binding and refuses
+    // beside a weak one).
+    [[nodiscard]] static WeakDefinitionKind settleWeakKind(
+        SymbolBinding incumbentBinding, WeakDefinitionKind incumbentKind,
+        SymbolBinding nextBinding,
+        std::optional<WeakDefinitionKind> nextKind) noexcept {
+        if (nextBinding != SymbolBinding::Weak || !nextKind.has_value())
+            return WeakDefinitionKind{};
+        bool const incumbentNamesKind =
+            incumbentBinding == SymbolBinding::Weak
+            && !weakDefinitionKindName(incumbentKind).empty();
+        if (incumbentNamesKind && incumbentKind != *nextKind)
+            return WeakDefinitionKind::Overridable;
+        return *nextKind;
+    }
+
     template <class T>
     [[nodiscard]] std::optional<T> foldDeclaredAxis(
         std::optional<T>& carried, std::optional<T> declaredHere, NodeId at,
@@ -2728,6 +2882,12 @@ struct Lowerer {
         std::optional<SymbolBinding> bindingHere;
         if (declared.binding != SymbolBinding::Global)
             bindingHere = declared.binding;
+        // P69 (lane `cs`): the weak-definition kind this declaration states, when
+        // it states a weak binding at all.
+        std::optional<WeakDefinitionKind> weakKindHere;
+        if (declared.binding == SymbolBinding::Weak
+            && !weakDefinitionKindName(declared.weakKind).empty())
+            weakKindHere = declared.weakKind;
         std::optional<SymbolVisibility> visibilityHere;
         if (declared.visibilitySpecified) visibilityHere = declared.visibility;
         // A DEFINING declaration is one the semantic tier did not mark
@@ -2777,6 +2937,7 @@ struct Lowerer {
                     "attribute declaration must precede the definition, so it "
                     "is ignored");
             bindingHere.reset();
+            weakKindHere.reset();
             visibilityHere.reset();
         }
 
@@ -2784,6 +2945,26 @@ struct Lowerer {
                 carried.binding, bindingHere, at, "binding", &symbolBindingName,
                 DiagnosticSeverity::Error, SymbolBinding::Local))
             declared.binding = *b;
+        // P69 (lane `cs`): THE KIND FOLLOWS THE BINDING ACROSS DECLARATIONS.
+        // `extern __declspec(selectany) int v; int v = 6;` — the definition
+        // writes nothing and is the select-any one (✔MEASURED: cl 19.51 and
+        // mingw-w64 gcc both build and run it). Two declarations of one entity
+        // that state different kinds settle as two specifiers of one declaration
+        // do (`settleWeakKind`); a binding that ended anything but `Weak` holds
+        // no kind.
+        if (declared.binding == SymbolBinding::Weak) {
+            if (weakKindHere.has_value()) {
+                carried.weakKind = settleWeakKind(
+                    carried.weakKind.has_value() ? SymbolBinding::Weak
+                                                 : SymbolBinding::Global,
+                    carried.weakKind.value_or(WeakDefinitionKind{}),
+                    SymbolBinding::Weak, weakKindHere);
+            }
+            if (carried.weakKind.has_value())
+                declared.weakKind = *carried.weakKind;
+        } else {
+            declared.weakKind = WeakDefinitionKind{};
+        }
 
         // FIRST-WINS: the residue of a visibility conflict is the value the
         // entity already carries. The `value_or` is unreachable-by-construction
@@ -2916,6 +3097,23 @@ struct Lowerer {
             if (rec != nullptr && rec->isInternalLinkage
                 && attr.binding == SymbolBinding::Global)
                 attr.binding = SymbolBinding::Local;
+            // P69 (lane `cs`) — THE TENTATIVE MARK (C 6.9.2p2). The node this
+            // call records is the SURVIVOR of the redeclaration merge — an absorbed
+            // declaration emits no node — so its own record answers for the entity:
+            // `isTentativeDefinition` on a survivor means no declaration of the
+            // unit gave the object an initializer. READ from the semantic tier,
+            // never re-derived here, for the reason the inheritance arm above
+            // states.
+            //
+            // ★ NEVER BESIDE `Local`, and it is settled AFTER that arm so the
+            // inherited internal linkage counts. An internal-linkage object takes
+            // no part in the cross-unit fold the mark exists for, and a consumer
+            // that read the mark without the binding would write a COMMON for a
+            // `static int x;` — two units' private objects silently made one.
+            // `HirVerifier` holds the same line.
+            if (rec != nullptr && rec->isTentativeDefinition
+                && attr.binding != SymbolBinding::Local)
+                attr.tentative = true;
         }
         // ⚠ THE SPARSENESS TEST HAD TO GROW WITH THE STRUCT. It is what decides
         // whether the attribute is stored at all, so a new field that it does not
@@ -2926,7 +3124,8 @@ struct Lowerer {
         // the test you write first.
         if (attr.binding != SymbolBinding::Global
             || attr.visibility != SymbolVisibility::Default
-            || attr.staticInit.any())
+            || attr.staticInit.any()
+            || attr.tentative)
             linkage.push_back({node, attr});
     }
     // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): record the inliner opt-out for a lowered
@@ -4054,6 +4253,15 @@ struct Lowerer {
                     TypeId inferred = InvalidType;
                     if (calleeSig.valid()) inferred = interner.fnResult(calleeSig);
                     callCtxs[ctxIdx].resultType = typeAtOr(f.node, inferred);
+                    // P69 (lane `cs`): a builtin call whose value is a compile-time answer
+                    // is that literal; its operands are never lowered.
+                    if (auto lit = compileTimeBuiltinCall(f.n0, f.node,
+                                                          callCtxs[ctxIdx].resultType)) {
+                        work.pop_back();
+                        callCtxs.pop_back();
+                        result = *lit;
+                        break;
+                    }
                     f.phase = 2;
                     if (pumpCallArgs(ctxIdx)) break;   // entered a scalar arg — wait
                     finishCall(work, callCtxs, ctxIdx, result);  // no scalar args left
@@ -4107,7 +4315,8 @@ struct Lowerer {
                     std::uint32_t ctxIdx, E& result) {
         CallCtx const& ctx = callCtxs[ctxIdx];
         NodeId const callNode = work.back().node;   // the postfix Call node (provenance)
-        E const callE{track(emitCallOrBuiltin(ctx.base, ctx.baseE.id, ctx.args, ctx.resultType),
+        E const callE{track(emitCallOrBuiltin(ctx.base, ctx.baseE.id, ctx.args, ctx.resultType,
+                                              callNode),
                             callNode),
                       ctx.resultType};
         work.pop_back();
@@ -4256,8 +4465,11 @@ struct Lowerer {
         // child must NOT be lowered as an expression).
         for (NodeId c : visible(node)) {
             if (tree().kind(c) != NodeKind::Internal) continue;
-            if (cfg.compoundLiteralRule.valid()
-             && tree().rule(c).v == cfg.compoundLiteralRule.v) {
+            // P69: EVERY rule the language's `semantics.compoundLiterals` rows name — the
+            // one list the semantic tier types them from (C23 adds the storage-class form,
+            // D-C-A-STORAGE-CLASS-SPECIFIER-IN-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR); the
+            // hirLowering block no longer repeats it.
+            if (compoundLiteralRowFor(c) != nullptr) {
                 return lowerCompoundLiteral(c);
             }
             if (cfg.castRule.valid()
@@ -4300,6 +4512,10 @@ struct Lowerer {
             if (cfg.vaEndRule.valid()
              && tree().rule(c).v == cfg.vaEndRule.v) {
                 return lowerVaEnd(c);
+            }
+            if (cfg.vaCopyRule.valid()
+             && tree().rule(c).v == cfg.vaCopyRule.v) {
+                return lowerVaCopy(c);
             }
             // FC16: `_Generic(...)` routes to its dedicated lowering, which lowers
             // ONLY the association the SEMANTIC tier selected (the non-selected
@@ -5294,6 +5510,229 @@ struct Lowerer {
         return hit;
     }
 
+    // ★ P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): a builtin
+    // call whose value is a COMPILE-TIME ANSWER lowers to that literal, and its operands are
+    // NEVER lowered — an `object_size` operand is unevaluated by definition (gcc's manual),
+    // and the others have no effect to keep:
+    //   * `infinity` (`__builtin_inf`, `__builtin_huge_val*`): the result type's +inf;
+    //   * `quiet_nan` (`__builtin_nan("…")`): the result type's quiet NaN whose payload the
+    //     semantic tier parsed from the string literal and recorded on the call
+    //     (`foldedConstantAt`) — a non-literal operand was rebound to the library function
+    //     there, so a `quiet_nan` call reaching here always has one;
+    //   * `object_size`: the answer the semantic tier computed and recorded on the call.
+    // ✔MEASURED bit patterns (lane `cs`'s probe r5s s10, gcc 13.3.0 and clang 18.1.3, both
+    // modes): nan("") = 0x7ff8000000000000, nan("1") and nan("0x10") carry their payload in
+    // the low significand bits, nanf("") = 0x7fc00000, nanf("1") = 0x7fc00001.
+    // nullopt: not such a call — lower it as a call.
+    [[nodiscard]] std::optional<E> compileTimeBuiltinCall(NodeId calleeNode, NodeId callNode,
+                                                          TypeId resultType) {
+        SymbolId const sym = firstNameToken(calleeNode).sym;
+        if (!sym.valid() || !resultType.valid()) return std::nullopt;
+        SymbolRecord const* rec = model.recordFor(sym);
+        if (rec == nullptr) return std::nullopt;
+        TypeKind const rk = interner.kind(resultType);
+        auto const literalOf = [&](HirLiteralValue lit) -> E {
+            lit.core = rk;
+            return {track(builder.makeLiteral(resultType, literals.add(std::move(lit))),
+                          callNode),
+                    resultType};
+        };
+        switch (rec->builtinLowering) {
+            case BuiltinLowering::Infinity: {
+                HirLiteralValue lit;
+                lit.value = std::numeric_limits<double>::infinity();
+                return literalOf(std::move(lit));
+            }
+            case BuiltinLowering::QuietNan: {
+                NanPayload const* payload = model.nanPayloadFor(callNode);
+                if (payload == nullptr) {
+                    return exprError(callNode,
+                        "a `quiet_nan` builtin call carries no folded payload (the semantic "
+                        "tier binds a non-literal operand to the library function instead)");
+                }
+                HirLiteralValue lit;
+                // An 80/128-bit `long double`: the NaN in its own format, its fraction field
+                // holding the payload (`WideFloatValue::quietNan`, gcc's placement — ✔MEASURED,
+                // lane `cs`'s probe n01: `__builtin_nanl("1")` packs c000000000000001 on F80).
+                if (WideFloatValue::isSupportedKind(rk)) {
+                    lit.value = WideFloatValue::quietNan(rk, payload->lo, payload->hi);
+                    return literalOf(std::move(lit));
+                }
+                // The payload lands in the low significand bits, the quiet bit set (gcc's
+                // rule, measured above). The literal's `double` arm carries it: an F64 value
+                // directly, an F32 one through the double→float conversion, which keeps the
+                // significand's HIGH bits — so a float payload rides 29 bits up.
+                std::uint64_t bits = 0;
+                if (rk == TypeKind::F64) {
+                    bits = kCanonicalQuietNanBits | (payload->lo & 0x0007ffffffffffffull);
+                } else if (rk == TypeKind::F32) {
+                    bits = kCanonicalQuietNanBits | ((payload->lo & 0x3fffffull) << 29);
+                } else {
+                    return exprError(callNode,
+                        "a `quiet_nan` builtin's result is not a floating type this lowering "
+                        "builds a NaN of");
+                }
+                double d = 0;
+                std::memcpy(&d, &bits, sizeof d);
+                lit.value = d;
+                return literalOf(std::move(lit));
+            }
+            case BuiltinLowering::AddOverflowP:
+            case BuiltinLowering::SubOverflowP:
+            case BuiltinLowering::MulOverflowP: {
+                // Both value operands constant and the third without a side effect: the
+                // semantic tier's answer (`overflowPredicateAnswer`). Otherwise the call is the
+                // checked arithmetic `lowerOverflowBuiltin` builds.
+                auto const v = model.foldedConstantAt(callNode);
+                if (!v.has_value()) return std::nullopt;
+                HirLiteralValue lit;
+                lit.value = static_cast<std::int64_t>(*v != 0 ? 1 : 0);
+                return literalOf(std::move(lit));
+            }
+            case BuiltinLowering::ObjectSize: {
+                auto const v = model.foldedConstantAt(callNode);
+                if (!v.has_value())
+                    return exprError(callNode,
+                        "`__builtin_object_size` carries no computed answer (its type "
+                        "operand was refused)");
+                HirLiteralValue lit;
+                lit.value = *v;
+                return literalOf(std::move(lit));
+            }
+            default:
+                return std::nullopt;
+        }
+    }
+
+    // ★ P69 (lane `cs`): `__builtin_{add,sub,mul}_overflow(a, b, res)` and the 18 typed
+    // spellings, as ordinary HIR arithmetic over ONE wide type `W` that holds the operation's
+    // INFINITE-PRECISION result for the two operands' own types AND every value of the result
+    // object's type:
+    //   { W tA = a; W tB = b; R *tP = res; W tX = tA OP tB;   // exact
+    //     R tR = (R)tX;                                        // modulo R's width
+    //     *tP = tR;  yield (W)tR != tX; }                      // stored ≠ exact?
+    // Each operand is evaluated once, in order; the store goes through `res` once. `R` is
+    // `_Bool`: its ONE value bit keeps the exact result's low bit (`tX & 1`), which is what
+    // clang stores (✔MEASURED, lane `cs`'s probe r5t t01: 1+1 stores 0 and overflows, 0+1
+    // stores 1 and does not). `W` is the narrowest of int64 / __int128 (unsigned when the
+    // exact result and `R` are both non-negative) / a `_BitInt` that is wide enough.
+    // ★ P69 (lane `cs`): the `_p` predicates (`__builtin_add_overflow_p(a, b, c)`) are the
+    // same arithmetic with no store: `R` is `predicateTarget`, the type the semantic tier
+    // resolved for `c` (its own, or a bit-field's `_BitInt(width)`), and `c` is evaluated for
+    // its side effects only, after `a` and `b`.
+    [[nodiscard]] HirNodeId lowerOverflowBuiltin(BuiltinLowering verb,
+                                                 std::span<HirNodeId const> args,
+                                                 TypeId resultType, NodeId anchor,
+                                                 TypeId predicateTarget = InvalidType) {
+        if (args.size() != 3) return reportedError(anchor, "a checked-arithmetic builtin "
+                                                           "takes three operands");
+        bool const predicate = builtinLoweringIsOverflowPredicate(verb);
+        TypeId const aT = builder.typeId(args[0]);
+        TypeId const bT = builder.typeId(args[1]);
+        TypeId const pT = builder.typeId(args[2]);
+        if (predicate) {
+            if (!aT.valid() || !bT.valid() || !predicateTarget.valid())
+                return reportedError(anchor, "a checked-arithmetic predicate's operands are "
+                                             "not two integers and an integer (the semantic "
+                                             "tier reported why)");
+        } else if (!aT.valid() || !bT.valid() || !pT.valid()
+                   || interner.kind(pT) != TypeKind::Ptr || interner.operands(pT).empty()) {
+            return reportedError(anchor, "a checked-arithmetic builtin's operands are not "
+                                         "two integers and a pointer (the semantic tier "
+                                         "reported why)");
+        }
+        TypeId const rT = predicate ? predicateTarget : interner.operands(pT)[0];
+        struct Shape { std::int64_t bits = 0; bool isSigned = false; bool isBool = false; };
+        auto const shapeOf = [&](TypeId t) -> std::optional<Shape> {
+            TypeId const u = enumUnderlyingOrSelf(interner, t);
+            if (!u.valid()) return std::nullopt;
+            switch (interner.kind(u)) {
+                case TypeKind::Bool: return Shape{1, false, true};
+                case TypeKind::Char:
+                    return Shape{8, !charIsUnsigned_.value_or(false), false};
+                case TypeKind::I8:   return Shape{8, true};
+                case TypeKind::U8:   case TypeKind::Byte: return Shape{8, false};
+                case TypeKind::I16:  return Shape{16, true};
+                case TypeKind::U16:  return Shape{16, false};
+                case TypeKind::I32:  return Shape{32, true};
+                case TypeKind::U32:  return Shape{32, false};
+                case TypeKind::I64:  return Shape{64, true};
+                case TypeKind::U64:  return Shape{64, false};
+                case TypeKind::I128: return Shape{128, true};
+                case TypeKind::U128: return Shape{128, false};
+                case TypeKind::BitInt:
+                    return Shape{interner.bitIntWidth(u), interner.bitIntIsSigned(u)};
+                default: return std::nullopt;
+            }
+        };
+        auto const a = shapeOf(aT), b = shapeOf(bT), r = shapeOf(rT);
+        if (!a || !b || !r)
+            return reportedError(anchor, "a checked-arithmetic builtin's operand or result "
+                                         "type is not an integer type");
+        // Signed bits a value of each shape needs; the exact result's bound (add/sub: one
+        // more than the wider operand; mul: the sum), and whether it is never negative.
+        auto const sbits = [](Shape x) { return x.isSigned ? x.bits : x.bits + 1; };
+        bool const isMul = verb == BuiltinLowering::MulOverflow
+                        || verb == BuiltinLowering::MulOverflowP;
+        bool const isSub = verb == BuiltinLowering::SubOverflow
+                        || verb == BuiltinLowering::SubOverflowP;
+        bool const nonNegative = !isSub && !a->isSigned && !b->isSigned;
+        std::int64_t const exactS = isMul ? sbits(*a) + sbits(*b)
+                                          : std::max(sbits(*a), sbits(*b)) + 1;
+        std::int64_t const exactU = isMul ? a->bits + b->bits
+                                          : std::max(a->bits, b->bits) + 1;
+        TypeId W{};
+        if (nonNegative && !r->isSigned) {
+            std::int64_t const need = std::max(exactU, r->bits);
+            W = need <= 64  ? interner.primitive(TypeKind::U64)
+              : need <= 128 ? interner.primitive(TypeKind::U128)
+                            : interner.bitInt(need, /*isSigned=*/false);
+        } else {
+            std::int64_t const need = std::max(exactS, sbits(*r));
+            W = need <= 64  ? interner.primitive(TypeKind::I64)
+              : need <= 128 ? interner.primitive(TypeKind::I128)
+                            : interner.bitInt(need, /*isSigned=*/true);
+        }
+        HirOpKind const op = isMul ? HirOpKind::Mul : isSub ? HirOpKind::Sub : HirOpKind::Add;
+        std::vector<HirNodeId> stmts;
+        auto const bind = [&](TypeId t, HirNodeId init) {
+            SymbolId const tmp = freshSymbol();
+            stmts.push_back(builder.makeVarDecl(t, tmp.v, init, HirFlags::Synthetic));
+            return tmp;
+        };
+        auto const read = [&](TypeId t, SymbolId tmp) {
+            return builder.makeRef(t, tmp.v, HirFlags::Synthetic);
+        };
+        SymbolId const tA = bind(W, coerce(E{args[0], aT}, W).id);
+        SymbolId const tB = bind(W, coerce(E{args[1], bT}, W).id);
+        // The predicate's third operand: evaluated (once, p02), its value discarded.
+        if (predicate) stmts.push_back(builder.makeExprStmt(args[2]));
+        SymbolId const tP = predicate ? SymbolId{} : bind(pT, args[2]);
+        SymbolId const tX = bind(W, builder.addParent(HirKind::BinaryOp,
+                                                      std::array{read(W, tA), read(W, tB)},
+                                                      W, encodeOp(op)));
+        HirNodeId truncated{};
+        if (r->isBool) {
+            HirNodeId const lowBit = builder.addParent(
+                HirKind::BinaryOp, std::array{read(W, tX), synthOne(W)}, W,
+                encodeOp(HirOpKind::BitAnd));
+            truncated = coerce(E{lowBit, W}, rT).id;
+        } else {
+            truncated = coerce(E{read(W, tX), W}, rT).id;
+        }
+        SymbolId const tR = bind(rT, truncated);
+        if (!predicate)
+            stmts.push_back(builder.makeAssignStmt(
+                builder.makeDeref(read(pT, tP), rT, HirFlags::Synthetic), read(rT, tR)));
+        HirNodeId const differs = builder.addParent(
+            HirKind::BinaryOp, std::array{coerce(E{read(rT, tR), rT}, W).id, read(W, tX)},
+            boolType(), encodeOp(HirOpKind::Ne));
+        TypeId const yieldTy = resultType.valid() ? resultType : boolType();
+        HirNodeId const yield = (yieldTy.v == boolType().v)
+            ? differs : coerce(E{differs, boolType()}, yieldTy).id;
+        return builder.makeSeqExpr(stmts, yield, yieldTy, HirFlags::Synthetic);
+    }
+
     // c103 (D-CSUBSET-INTRINSIC-UMULH): emit a BuiltinCall when the callee resolves
     // to a builtin carrying a `lowering` (e.g. `__umulh`) — a DEDICATED intrinsic
     // MIR op — otherwise an ordinary Call. `calleeNode` is the callee CST subtree
@@ -5310,11 +5749,28 @@ struct Lowerer {
     // intrinsic is address-takeable, tighten this to require a DIRECT-name callee.
     [[nodiscard]] HirNodeId emitCallOrBuiltin(NodeId calleeNode, HirNodeId calleeId,
                                               std::span<HirNodeId const> args,
-                                              TypeId resultType) {
+                                              TypeId resultType, NodeId callNode) {
         SymbolId const sym = firstNameToken(calleeNode).sym;
         if (sym.valid()) {
             if (auto const* rec = model.recordFor(sym);
                 rec != nullptr && rec->builtinLowering != BuiltinLowering::None) {
+                // P69 (lane `cs`): the checked-arithmetic verbs are ordinary HIR arithmetic
+                // (`lowerOverflowBuiltin`); every other verb is a BuiltinCall.
+                switch (rec->builtinLowering) {
+                    case BuiltinLowering::AddOverflow:
+                    case BuiltinLowering::SubOverflow:
+                    case BuiltinLowering::MulOverflow:
+                        return lowerOverflowBuiltin(rec->builtinLowering, args, resultType,
+                                                    calleeNode);
+                    case BuiltinLowering::AddOverflowP:
+                    case BuiltinLowering::SubOverflowP:
+                    case BuiltinLowering::MulOverflowP:
+                        return lowerOverflowBuiltin(rec->builtinLowering, args, resultType,
+                                                    calleeNode,
+                                                    model.overflowPredicateTargetFor(callNode));
+                    default:
+                        break;
+                }
                 return builder.makeBuiltinCall(
                     static_cast<std::uint32_t>(rec->builtinLowering), args, resultType);
             }
@@ -5555,8 +6011,8 @@ struct Lowerer {
                     // shared reduction; a `char`-typed literal whose byte is above
                     // 0x7F waits on the target's char signedness, and with none
                     // (a direct-API lowering) it stays loud below, never guessed.
-                    if (auto const reduced =
-                            reducedIntegerLiteralBits(core, *iv, charIsUnsigned_)) {
+                    if (auto const reduced = reducedIntegerLiteralBits(
+                            core, *iv, charIsUnsigned_, r.outOfRange)) {
                         bits = *reduced;
                     } else {
                         ok = false;
@@ -6010,17 +6466,19 @@ struct Lowerer {
             // `register` PARAMETER ("address of register variable requested");
             // DSS compiled every one. Which specifier forbids it is the
             // language's `{addressNotTakeable: true}` facet, never a keyword.
-            if (SymbolRecord const* obj = designatedObjectRecord(operand.id);
-                obj != nullptr && obj->addressNotTakeable) {
+            // P69: the same facet on a C23 `(register T){ … }` compound literal — C23
+            // 6.5.3.6p4 reads it as a `register` definition; gcc -std=c2x: "address of
+            // register compound literal requested" (run 20260930-212759-cd6e2714 b04).
+            if (auto const who = addressForbiddingObject(operand.id, /*throughMembers=*/true)) {
                 emitH(DiagnosticCode::S_AddressOfRegisterObject, node,
-                      std::format("the address of '{}' is requested, and it is "
+                      std::format("the address of {} is requested, and it is "
                                   "declared with a storage-class specifier that "
                                   "forbids it (C 6.5.3.2p1: the operand of unary "
                                   "`&` shall not be declared `register`; gcc and "
                                   "clang: \"address of register variable "
                                   "requested\") "
                                   "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
-                                  obj->name));
+                                  *who));
                 return {errorNode(node), InvalidType};
             }
             TypeId const result = operand.type.valid() ? interner.pointer(operand.type) : InvalidType;
@@ -6428,6 +6886,20 @@ struct Lowerer {
                                                sem.pointerConversions)) {
                     common = interner.pointer(interner.primitive(TypeKind::Void));
                 }
+                // ★ P69 (lane `cs`, D-C-GENERIC-MATCHES-FUNCTION-TYPES-DIFFERING-IN-A-POINTEE-CONST):
+                // the same `void *` for a pair these TypeIds DO admit — `c ? &f_plain :
+                // &f_const` over `int (char *)` / `int (const char *)` — because the
+                // qualifier that keeps the two pointees apart is one the interner does not
+                // carry. The semantic tier reads it off the arms' spines and STAMPS the
+                // conditional `void *` (pass2Post's SE4b); that stamp is the authority,
+                // and both arms convert to it exactly as the pair above does.
+                if (!common.valid() && thenP.valid() && elseP.valid()) {
+                    TypeId const stamped = semTypeAt(node);
+                    if (stamped.valid() && interner.kind(stamped) == TypeKind::Ptr
+                        && !interner.operands(stamped).empty()
+                        && interner.kind(interner.operands(stamped)[0]) == TypeKind::Void)
+                        common = stamped;
+                }
             }
         }
         if (common.valid()) {
@@ -6529,6 +7001,13 @@ struct Lowerer {
             }();
             TypeId const calleeSig = specializedCalleeSig(
                 baseN, genericArgNodes, calleeSigOf(base.type));
+            // P69 (lane `cs`): the recursive twin of the iterative Call arm's early exit —
+            // a builtin call whose value is a compile-time answer, operands never lowered.
+            if (auto lit = compileTimeBuiltinCall(
+                    baseN, node,
+                    typeAtOr(node, calleeSig.valid() ? interner.fnResult(calleeSig)
+                                                     : InvalidType)))
+                return *lit;
             std::vector<TypeId> paramTypes;
             if (calleeSig.valid()) {
                 auto const paramSpan = interner.fnParams(calleeSig);
@@ -6552,7 +7031,7 @@ struct Lowerer {
             TypeId inferred = InvalidType;
             if (calleeSig.valid()) inferred = interner.fnResult(calleeSig);
             TypeId const result = typeAtOr(node, inferred);
-            return {track(emitCallOrBuiltin(baseN, base.id, args, result), node), result};
+            return {track(emitCallOrBuiltin(baseN, base.id, args, result, node), node), result};
         }
         if (e.target == "Index") {
             E idxE = rest.empty()
@@ -6697,6 +7176,8 @@ struct Lowerer {
         // this is the same expression written the other way round — not a
         // rewrite that needs a Cast or a temporary.
         if (which == IndexContainerOperand::Subscript) std::swap(base, idxE);
+        // P69: a subscript of a `register` array is `*(a + i)` over its address.
+        if (refusedRegisterArrayDecay(base.id, node)) return {errorNode(node), InvalidType};
         // ★★ AND THE OTHER HALF OF THE SAME CONSTRAINT: the operand that is NOT
         // the container "shall have integer type". Judged only where the lattice
         // can PROVE it is not one, so the check can never refuse a correct
@@ -6984,7 +7465,7 @@ struct Lowerer {
         bool          doWhile;  // While frame: DoWhileStmt vs WhileStmt
         NodeId        n0;       // PassThrough inner / If+While+For+Label body / If then
         NodeId        n1;       // If else body (if present)
-        NodeId        condNode; // While/For: the cond CST node (provably-infinite probe), invalid if none
+        NodeId        condNode; // If/While/For: the cond CST node (the constant-condition probes), invalid if none
         HirNodeId     condId;   // If/While: the lowered+coerced condition id
         std::optional<HirNodeId> initId, condOpt, updateId;  // For: header clause ids
         std::uint32_t labelOrd; // Label: the pre-scanned label ordinal
@@ -7088,7 +7569,7 @@ struct Lowerer {
             }
             if (k == "IfStmt") {
                 StmtFrame fr{.kind = StmtFrame::Kind::If, .node = n};
-                ifPrologue(n, fr.condId, fr.n0, fr.n1);   // cond lowered INLINE here
+                ifPrologue(n, fr.condId, fr.condNode, fr.n0, fr.n1);   // cond lowered INLINE here
                 work.push_back(fr);
                 return;
             }
@@ -7693,6 +8174,7 @@ struct Lowerer {
                 }
                 {
                     NodeId const node2 = f.node;
+                    NodeId const condNode2 = f.condNode;
                     bool const haveThen = f.n0.valid();
                     HirNodeId const thenH = f.c0;
                     HirNodeId const condIn = f.condId;
@@ -7707,7 +8189,7 @@ struct Lowerer {
                     HirNodeId const thenFinal =
                         haveThen ? thenH
                                  : reportedError(node2, "if statement has no then-branch");
-                    stmtResult = track(builder.makeIfStmt(condFinal, thenFinal, els), node2);
+                    stmtResult = finishIf(node2, condNode2, condFinal, thenFinal, els);
                 }
                 break;
             case StmtFrame::Kind::SehTry:
@@ -7775,7 +8257,7 @@ struct Lowerer {
                     HirNodeId const loop =
                         doWhile ? track(builder.makeDoWhileStmt(bodyId, condFinal), node2)
                                 : track(builder.makeWhileStmt(condFinal, bodyId), node2);
-                    stmtResult = wrapIfProvablyInfinite(node2, loop, condNode, bodyId);
+                    stmtResult = wrapLoopIfItNeverExits(node2, loop, condNode, bodyId, doWhile);
                 }
                 break;
             case StmtFrame::Kind::For:
@@ -8682,12 +9164,15 @@ struct Lowerer {
                 f.kids.push_back(delivered);
             }
             if (f.next >= f.childCount()) {
+                // A zero union is its FIRST member's zero (C 6.7.10p10) — member 0, the
+                // aggregate's default payload (P69: the member a union aggregate names).
                 HirNodeId const built =
                     (f.how == ZeroAssemble::ComplexCast)
                         ? builder.makeCast(f.kids.empty() ? HirNodeId{} : f.kids[0],
                                            f.type, HirFlags::Synthetic)
                         : builder.makeConstructAggregate(f.kids, f.type,
-                                                         HirFlags::Synthetic);
+                                                         HirFlags::Synthetic,
+                                                         /*unionMember=*/0);
                 stack.pop_back();
                 delivered       = built;
                 pendingDelivery = true;
@@ -8802,12 +9287,15 @@ struct Lowerer {
     // ── P68 round 9 (lane `cs`): A BRACE-INIT ELEMENT'S DIAGNOSED CONVERSION ─────
     // (D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS)
     //
-    // A brace-init element is the one initialization position the semantic tier
-    // never judges — only this tier knows which slot a positional or designated
-    // element lands in (the brace-level walk) — so the conversions the language
-    // admits WITH A DIAGNOSTIC (type_rules.hpp's `diagnosedConversion`, the one
-    // classifier every site asks) are reported HERE for it, in the same code and
-    // sentence the semantic tier reports at every other initialization. ✔MEASURED
+    // A brace-init element's conversion is realized HERE, in the slot the brace-level
+    // walk places it in, so the conversions the language admits WITH A DIAGNOSTIC
+    // (type_rules.hpp's `diagnosedConversion`, the one classifier every site asks) are
+    // reported here for it, in the same code and sentence the semantic tier reports at
+    // every other initialization. A pair NO rule admits never arrives: since P69 the
+    // semantic tier places every element with the same cursor and refuses that pair
+    // S_TypeMismatch at the element before this tier is built
+    // (`checkBraceInitializerElements`), leaving the diagnosed ones to this report —
+    // each element is judged once. ✔MEASURED
     // 2026-09-23, each reference separately and every program RUN: `struct A *arr[1]
     // = { &b };`, `struct H h = { &b };`, `struct H h = { .p = &b };`, a file-scope
     // `struct A *gtab[1] = { &gb };`, `struct H h = { v }` for an integer `v` and
@@ -9117,8 +9605,56 @@ struct Lowerer {
             return exprError(clNode,
                 "compound literal type-ref did not resolve to a type");
         }
-        HirNodeId const agg = lowerBraceInit(braceN, type);
-        return {track(agg, clNode), type};
+        HirNodeId const init = lowerBraceInit(braceN, type);
+        if (!init.valid() || builder.kind(init) == HirKind::Error) return {init, type};
+        // ★★ P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): a
+        // compound literal is an unnamed OBJECT initialized by its brace list (C
+        // 6.5.2.5p4), not that list's value. Lowered as the value alone it had no storage
+        // of its own: `int *p = &(int){ x }; *p = 42;` wrote `x` (DSS ran 7 where gcc,
+        // clang and MSVC run 42), a `(char[]){ "ab" }` literal WAS the read-only string
+        // (a write crashed), and a block-scope scalar literal's address was refused.
+        // The object's storage duration and const-ness are the semantic tier's facts
+        // (`CompoundLiteralFacts`: its position — 6.5.2.5p5, outside every function body
+        // static, inside one automatic — and its C23 storage-class specifiers), stated once
+        // there and never re-derived here; const-ness and volatility ride the SAME side
+        // tables a declared object's do.
+        CompoundLiteralFacts const* facts = model.compoundLiteralFactsFor(clNode);
+        if (facts == nullptr) {
+            // (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT)
+            return exprError(clNode,
+                "internal: this compound literal carries no object facts — the semantic "
+                "tier records them where it types the literal");
+        }
+        HirObjectStorage storage = HirObjectStorage::Automatic;
+        switch (facts->storage) {
+            case CompoundLiteralFacts::Storage::Automatic:
+                storage = HirObjectStorage::Automatic; break;
+            case CompoundLiteralFacts::Storage::Static:
+                storage = HirObjectStorage::Static;    break;
+            case CompoundLiteralFacts::Storage::Thread:
+                storage = HirObjectStorage::Thread;    break;
+        }
+        HirNodeId const obj =
+            track(builder.makeUnnamedObject(init, type, storage, HirFlags::None), clNode);
+        if (interner.isVolatileQualified(type))
+            volatileAcc.push_back({obj, VolatileAttr{/*isVolatile=*/true}});
+        if (facts->addressNotTakeable) addressNotTakeableObjects_.insert(obj.v);
+        if (storage != HirObjectStorage::Automatic) {
+            if (facts->isConst)
+                mutability.push_back({obj, MutabilityAttr{/*isConst=*/true}});
+            if (storage == HirObjectStorage::Thread)
+                threadLocalAcc.push_back({obj, ThreadLocalAttr{/*isThreadLocal=*/true}});
+            // No name, so no linkage: internal, like a static local's hidden global.
+            LinkageAttr internal{};
+            internal.binding = SymbolBinding::Local;
+            recordLinkage(obj, internal);
+            // The function a C23 `static` literal sits in — whose labels its initializer
+            // may name — exactly as a static local's `Global` records it.
+            if (currentFunctionSymbol_.valid())
+                enclosingFunctionAcc.push_back(
+                    {obj, EnclosingFunctionAttr{currentFunctionSymbol_.v}});
+        }
+        return {obj, type};
     }
 
     // [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (1): `sizeof ( int[n] )` — the VLA
@@ -9318,49 +9854,100 @@ struct Lowerer {
     // that type's byte size via the `type_layout` engine at MIR lowering. The ONE
     // documented exception is a VLA TYPE-NAME operand (C 6.5.3.4p2), which
     // `lowerVlaTypeNameSizeof` takes instead — see [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]].
-    [[nodiscard]] E lowerSizeof(NodeId node) {
-        // The SIZED type lives on the OPERAND (the castTypeRef for `sizeof(T)`, the
-        // unary-expr for `sizeof e`), which sits BELOW the form node that semantic
-        // stamped size_t. Descend to the form, then recover the operand's type —
-        // skipping the form's own size_t stamp.
+    // WHAT a `sizeof` / `_Alignof` node asks about: its operand's TYPE, which of the
+    // two forms the node is, and the node the form's children hang under. ONE
+    // derivation, read by the lowering of the node (`lowerSizeof`, `lowerAlignof`)
+    // and by the constant evaluator's layout hooks (`foldLayoutQuery`), so a value
+    // folded in a condition or an index designator is the size of the very type the
+    // lowered node sizes. `type` is invalid when the operand carries no stamp; each
+    // caller says why in its own words.
+    //
+    // The operand's type lives on the OPERAND (the castTypeRef for `sizeof(T)`, the
+    // unary-expr for `sizeof e`), which sits BELOW the form node that semantic
+    // stamped size_t: descend to the form, then recover the operand's type —
+    // skipping the form's own size_t stamp. The two forms take DIFFERENT reads.
+    //
+    // D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK: the VALUE form (`sizeof e`)
+    // sizes the OPERAND EXPRESSION's OWN result type — the type the semantic
+    // tier stamps DIRECTLY on the operand node (its `subtreeType`; e.g. the
+    // element type of `*arr` after C 6.3.2.1p3 array-decay, or an identifier /
+    // literal token's Pass-2 stamp). Read that DIRECT stamp and NEVER descend:
+    // `resolveStampedTypeBelow` DFS-descends past an UNSTAMPED operator node
+    // into a CHILD's stamp — a SILENT WRONG GUESS (for `sizeof(*arr)` an
+    // unstamped `*arr` fell through to `arr`'s ARRAY type: 40, not the element
+    // 4). If the operand carries no direct type, the semantic tier failed to
+    // type it — the caller FAILS LOUD rather than mis-size by guessing at a
+    // sub-expression. The TYPE form (`sizeof(T)`) keeps the descent: its stamp
+    // legitimately lives on a leaf token below the (unstamped) type-ref wrapper.
+    struct LayoutQueryOperand {
+        TypeId type = InvalidType;
+        bool   valueForm = false;
+        NodeId scan{};
+    };
+    [[nodiscard]] LayoutQueryOperand layoutQueryOperand(NodeId node, RuleId valueRule) {
+        LayoutQueryOperand out;
         NodeId form{};
         for (NodeId c : visible(node)) {
             if (tree().kind(c) == NodeKind::Internal) { form = c; break; }
         }
-        NodeId const scan = form.valid() ? form : node;
-        // D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK: the VALUE form (`sizeof e`)
-        // sizes the OPERAND EXPRESSION's OWN result type — the type the semantic
-        // tier stamps DIRECTLY on the operand node (its `subtreeType`; e.g. the
-        // element type of `*arr` after C 6.3.2.1p3 array-decay, or an identifier /
-        // literal token's Pass-2 stamp). Read that DIRECT stamp and NEVER descend:
-        // `resolveStampedTypeBelow` DFS-descends past an UNSTAMPED operator node
-        // into a CHILD's stamp — a SILENT WRONG GUESS (for `sizeof(*arr)` an
-        // unstamped `*arr` fell through to `arr`'s ARRAY type: 40, not the element
-        // 4). If the operand carries no direct type, the semantic tier failed to
-        // type it — FAIL LOUD rather than mis-size by guessing at a sub-expression.
-        // The TYPE form (`sizeof(T)`) keeps the descent: its stamp legitimately
-        // lives on a leaf token below the (unstamped) type-ref wrapper.
-        TypeId sized = InvalidType;
-        bool const valueForm =
-            form.valid() && sem.sizeofValueRule.valid()
-            && tree().rule(form).v == sem.sizeofValueRule.v;
-        if (valueForm) {
+        out.scan = form.valid() ? form : node;
+        out.valueForm = form.valid() && valueRule.valid()
+                        && tree().rule(form).v == valueRule.v;
+        if (out.valueForm) {
             for (NodeId c : visible(form)) {
-                if (TypeId t = semTypeAt(c); t.valid()) { sized = t; break; }
-            }
-            if (!sized.valid()) {
-                return exprError(node,
-                    "sizeof value-operand was not typed by the semantic analyzer "
-                    "(refusing to descend into a sub-expression and silently "
-                    "mis-size the operand)");
+                if (TypeId t = semTypeAt(c); t.valid()) { out.type = t; break; }
             }
         } else {
-            for (NodeId c : visible(scan)) {
-                if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
+            for (NodeId c : visible(out.scan)) {
+                if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { out.type = t; break; }
             }
-            if (!sized.valid()) {
-                return exprError(node, "sizeof operand did not resolve to a type");
-            }
+        }
+        return out;
+    }
+
+    // `sizeof` / `_Alignof` AS A CONSTANT at this tier: the value the constant
+    // evaluator (`evalCstConstInt`) folds a layout query to, or nullopt — "not a
+    // constant here". The operand is the one `layoutQueryOperand` gives the lowering
+    // of the same node; the size is `operandLayout`'s, under the parameters the
+    // semantic tier itself sized every type with (`SemanticModel::aggregateLayout`)
+    // and its data model — the ONE stride rule the semantic fold and the MIR
+    // `SizeOf` / `AlignOf` cases answer through, so three tiers cannot give one
+    // type three sizes.
+    //
+    // nullopt, each for its own reason and each the answer "may continue" to the
+    // predicates that ask whether a condition is decided before the program runs:
+    //   * analysis ran with NO layout (the LSP, a direct-API test, a target that
+    //     declares no block) — never a guessed size;
+    //   * the operand is VARIABLY MODIFIED (`sizeof(int[n])`, `sizeof v` of a VLA
+    //     object, a fixed array of them): C 6.5.3.4p2 EVALUATES that operand, the
+    //     result is a run-time value, and calling it a constant would let a branch
+    //     both of whose outcomes happen be claimed never to complete;
+    //   * the type has no layout (incomplete, or outside the layout engine).
+    [[nodiscard]] std::optional<std::uint64_t>
+    foldLayoutQuery(NodeId node, RuleId valueRule, bool alignment) {
+        auto const& params = model.aggregateLayout();
+        if (!params.has_value()) return std::nullopt;
+        TypeId const queried = layoutQueryOperand(node, valueRule).type;
+        if (!queried.valid()) return std::nullopt;
+        if (interner.isVlaArray(queried) || interner.typeContainsVla(queried))
+            return std::nullopt;
+        auto const layout = operandLayout(queried, interner, *params, dataModel_,
+                                          sem.nonObjectTypeSizes);
+        if (!layout.has_value()) return std::nullopt;
+        return alignment ? layout->align.bytes() : layout->size;
+    }
+
+    [[nodiscard]] E lowerSizeof(NodeId node) {
+        LayoutQueryOperand const operand = layoutQueryOperand(node, sem.sizeofValueRule);
+        NodeId const scan = operand.scan;
+        bool const valueForm = operand.valueForm;
+        TypeId const sized = operand.type;
+        if (!sized.valid()) {
+            return exprError(node, valueForm
+                ? "sizeof value-operand was not typed by the semantic analyzer "
+                  "(refusing to descend into a sub-expression and silently "
+                  "mis-size the operand)"
+                : "sizeof operand did not resolve to a type");
         }
         // D-LANG-TYPE-IDENTITY-VOCABULARY: C's `size_t` — the NAMED entry the
         // language declares for this data model, matching the semantic tier's
@@ -9527,32 +10114,14 @@ struct Lowerer {
     // its absence into a build failure instead of a guess, and the two together
     // are what make a missing type impossible to mistake for a small one.
     [[nodiscard]] E lowerAlignof(NodeId node) {
-        NodeId form{};
-        for (NodeId c : visible(node)) {
-            if (tree().kind(c) == NodeKind::Internal) { form = c; break; }
-        }
-        NodeId const scan = form.valid() ? form : node;
-        TypeId sized = InvalidType;
-        bool const valueForm =
-            form.valid() && sem.alignofValueRule.valid()
-            && tree().rule(form).v == sem.alignofValueRule.v;
-        if (valueForm) {
-            for (NodeId c : visible(form)) {
-                if (TypeId t = semTypeAt(c); t.valid()) { sized = t; break; }
-            }
-            if (!sized.valid()) {
-                return exprError(node,
-                    "_Alignof value-operand was not typed by the semantic analyzer "
-                    "(refusing to descend into a sub-expression and silently "
-                    "report the wrong operand's alignment)");
-            }
-        } else {
-            for (NodeId c : visible(scan)) {
-                if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
-            }
-        }
+        LayoutQueryOperand const operand = layoutQueryOperand(node, sem.alignofValueRule);
+        TypeId sized = operand.type;
         if (!sized.valid()) {
-            return exprError(node, "_Alignof operand did not resolve to a type");
+            return exprError(node, operand.valueForm
+                ? "_Alignof value-operand was not typed by the semantic analyzer "
+                  "(refusing to descend into a sub-expression and silently "
+                  "report the wrong operand's alignment)"
+                : "_Alignof operand did not resolve to a type");
         }
         // P68 round 12 (lane `cs`): the alignment of a type holding a VARIABLE-LENGTH array level. C 6.5.3.4p3 gives
         // an array type its element type's alignment and does not evaluate the operand, so the answer is static
@@ -9633,6 +10202,28 @@ struct Lowerer {
         if (!ap.type.valid()) return ap;
         TypeId const voidTy = interner.primitive(TypeKind::Void);
         return {track(builder.makeVaEnd(ap.id, voidTy), node), voidTy};
+    }
+
+    // P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): `va_copy ( dest, src )` → core
+    // `HirKind::VaCopy` [dest, src] — the grammar's two internal children, in order, each
+    // a `va_list` lvalue the MIR tier addresses exactly as va_start's `ap`. Result `void`.
+    [[nodiscard]] E lowerVaCopy(NodeId node) {
+        std::array<NodeId, 2> ops{};
+        std::size_t n = 0;
+        for (NodeId c : visible(node)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (n == ops.size()) return exprError(node, "va_copy takes exactly two va_list operands");
+            ops[n++] = c;
+        }
+        if (n != ops.size()) {
+            return exprError(node, "va_copy is missing a va_list operand");
+        }
+        E dest = lowerExpr(ops[0]);
+        if (!dest.type.valid()) return dest;   // diagnostic already emitted
+        E src = lowerExpr(ops[1]);
+        if (!src.type.valid()) return src;
+        TypeId const voidTy = interner.primitive(TypeKind::Void);
+        return {track(builder.makeVaCopy(dest.id, src.id, voidTy), node), voidTy};
     }
 
     // FC12a-core: `va_arg ( ap, T )` → core `HirKind::VaArg`, result type T. The
@@ -10062,6 +10653,20 @@ struct Lowerer {
             TypeId const ty = resolveStampedTypeBelow(typeRefN);
             return classifyCstCastTarget(interner, ty, charIsUnsigned_);
         };
+        // P69 (C23 6.6p6-p7): a compound literal constant / a constant's `.member` — the
+        // answer the semantic tier resolved and recorded (`constantSubobjectFor`), never
+        // re-derived here, so an index designator `[s.b]` places where the semantic tier
+        // sized the array.
+        env.resolveConstantSubobject = [this](NodeId n, std::uint32_t /*curScope*/)
+            -> std::optional<CstConstantSubobject> {
+            ConstantSubobjectFact const* f = model.constantSubobjectFor(n);
+            if (f == nullptr) return std::nullopt;
+            auto const t = classifyCstCastTarget(interner, f->type, charIsUnsigned_);
+            if (!t.has_value()) return std::nullopt;
+            return CstConstantSubobject{
+                CstResolvedSymbol{f->initExpr, f->initScope.v, std::nullopt}, *t,
+                f->zeroValue};
+        };
         // P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION):
         // a wide/UTF character constant's element core, read back off the body
         // token the semantic tier STAMPED — this tier lacks the pair, and the
@@ -10076,6 +10681,96 @@ struct Lowerer {
             TypeKind const core = charElementCoreOf(bodyTok);
             if (!isWideCharCore(core)) return std::nullopt;
             return core;
+        };
+        // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): a builtin
+        // call with a constant form (`[__builtin_expect(1, 1)] = 7`) — the callee Pass 2 bound,
+        // its declared parameters, and an `object_size` answer as the semantic tier recorded
+        // it, so this tier folds the call exactly as that one did.
+        env.resolveBuiltinCall = [this](NodeId callNode) -> std::optional<CstBuiltinCall> {
+            NodeId baseN{};
+            std::vector<NodeId> argNodes;
+            if (!callBaseAndArgs(callNode, baseN, argNodes)) return std::nullopt;
+            SymbolId const sym = firstNameToken(baseN).sym;
+            if (!sym.valid()) return std::nullopt;
+            SymbolRecord const* rec = model.recordFor(sym);
+            if (rec == nullptr || rec->builtinLowering == BuiltinLowering::None
+                || rec->genericPointee.has_value() || !rec->type.valid()
+                || interner.kind(rec->type) != TypeKind::FnSig)
+                return std::nullopt;
+            auto const result = classifyCstCastTarget(interner, interner.fnResult(rec->type),
+                                                      charIsUnsigned_);
+            if (!result.has_value()) return std::nullopt;
+            CstBuiltinCall plan;
+            plan.verb       = rec->builtinLowering;
+            plan.args       = argNodes;
+            plan.resultType = *result;
+            auto const paramSpan = interner.fnParams(rec->type);
+            std::vector<TypeId> const params(paramSpan.begin(), paramSpan.end());
+            for (std::size_t i = 0; i < argNodes.size(); ++i)
+                plan.argTypes.push_back(i < params.size()
+                    ? classifyCstCastTarget(interner, params[i], charIsUnsigned_)
+                    : std::nullopt);
+            if (plan.verb == BuiltinLowering::ObjectSize) {
+                auto const v = model.foldedConstantAt(callNode);
+                if (!v.has_value()) return std::nullopt;
+                plan.answer = *v;
+            }
+            return plan;
+        };
+        // ★ THE LAYOUT QUESTIONS AND THE SEMANTIC TIER'S RECORDED ANSWERS (P69, lane
+        // `cs`). Until these three hooks this tier's evaluator could not fold
+        // `sizeof`, `_Alignof`, `__builtin_offsetof` or `__builtin_types_compatible_p`
+        // at all — the layout parameters reached the semantic tier, HIR→MIR and the
+        // asm globals, and not CST→HIR — so everything that asks this function "is
+        // this a constant" answered NO for them: `if (sizeof(int) >= 1) return x;`
+        // as a function's last statement was a body whose end is reached (a warning
+        // no reference gives — probe fo3 body w_if_sizeof, gcc / clang / mingw gcc /
+        // cl), `while (sizeof(int)) { … }` was not an infinite loop, and
+        // `[sizeof(int)] = 7` was not an index.
+        //
+        // ONE ANSWER PER NODE: a node of a `foldedConstantRules` rule is answered by
+        // what the semantic tier RECORDED for it (`foldedConstantAt`) and is never
+        // evaluated here a second time; `sizeof` / `_Alignof` have no record, so they
+        // are answered by the same layout query, over the same parameters, on the
+        // operand the lowering of that node sizes (`foldLayoutQuery`).
+        env.resolveSizeof = [this](NodeId sizeofNode) -> std::optional<std::uint64_t> {
+            return foldLayoutQuery(sizeofNode, sem.sizeofValueRule, /*alignment*/ false);
+        };
+        env.resolveAlignof = [this](NodeId alignofNode) -> std::optional<std::uint64_t> {
+            return foldLayoutQuery(alignofNode, sem.alignofValueRule, /*alignment*/ true);
+        };
+        env.resolveFoldedConstant = [this](NodeId n) -> std::optional<std::uint64_t> {
+            return model.foldedConstantAt(n);
+        };
+        // The other recorded answer: WHICH arm a `_Generic` / a
+        // `__builtin_choose_expr` selected. The semantic tier chose it once
+        // (`selectedGenericExpr` — the record `lowerRecordedSelection` lowers the
+        // node from), and the engine then folds that arm like any other
+        // expression, so the selection is a constant exactly when its winner is.
+        env.resolveSelectedArm = [this](NodeId n) -> std::optional<NodeId> {
+            NodeId const selected = model.selectedGenericExpr(n);
+            if (!selected.valid()) return std::nullopt;
+            return selected;
+        };
+        // …and the third layout question: a member's byte offset, for the
+        // `&((T *)0)->m` spelling of offsetof (C code that predates the macro, and
+        // every `offsetof` a platform header still defines that way). ★ NOT A SECOND
+        // RESOLVER: the semantic tier's hook for the same spelling and this one call
+        // the ONE `anon_member_search::memberByteOffset` — the composite's own member
+        // or one promoted through its anonymous members, a bit-field refused, the
+        // offset `computeLayout`'s — each handing it its own view of the same scopes
+        // and symbols and the SAME layout parameters (the model carries the ones
+        // analysis ran under). Two written-out lookups were two answers, and the
+        // semantic tier's had drifted from the member rule before this tier had one.
+        env.resolveFieldOffset = [this](TypeId container, NodeId fieldTok)
+            -> std::optional<CstFieldResolution> {
+            auto const& params = model.aggregateLayout();
+            if (!params.has_value()) return std::nullopt;
+            auto const member = anon_member_search::memberByteOffset(
+                interner, container, tree().text(fieldTok), AnonMemberAccess{model},
+                *params, dataModel_);
+            if (!member.found()) return std::nullopt;
+            return CstFieldResolution{member.offset, member.type};
         };
         EvalOptions options;
         options.allowFloat = true;
@@ -10237,8 +10932,13 @@ struct Lowerer {
                 f.kids.push_back(delivered);
             }
             if (f.next >= f.slot->nested.size()) {
+                // P69 (lane `cs`, D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED):
+                // a union slot's aggregate names the member its one field initializes —
+                // `unionMember`, set by the write that chose it (a designator, or the first
+                // member positionally); every other slot has none and keeps payload 0.
                 HirNodeId const agg = builder.makeConstructAggregate(
-                    f.kids, f.slot->slotType, HirFlags::Synthetic);
+                    f.kids, f.slot->slotType, HirFlags::Synthetic,
+                    f.slot->unionMember.value_or(0));
                 stack.pop_back();
                 delivered       = agg;
                 pendingDelivery = true;
@@ -10276,10 +10976,23 @@ struct Lowerer {
 
     // FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): the CLOSED allowlist
     // (design-audit F4) of scalar TypeKinds a brace initializer may target.
-    // Exactly the kinds `synthZeroOrError`'s scalar/Enum arms mint a typed
+    // Exactly the kinds `synthZeroOrError`'s scalar/Enum/Complex arms mint a typed
     // zero for: Bool, the integer cores I8..U128, the float cores F16..F128,
-    // Char/Byte, Enum (zero-as-underlying, enum-typed), and Ptr (the null
-    // pointer — incl. Ptr<FnSig>, runtime-proven by the aggregate zero-fill).
+    // Char/Byte, Enum (zero-as-underlying, enum-typed), Ptr (the null
+    // pointer — incl. Ptr<FnSig>, runtime-proven by the aggregate zero-fill), and
+    // — P69 (lane `cs`, found closing
+    // D-C-A-INCOMPATIBLE-BRACE-ELEMENT-IS-REFUSED-BY-AN-INTERNAL-VERIFIER-FAILURE) —
+    // the two arithmetic kinds C calls scalar that the list had left out: a
+    // `_Complex` (its zero `(0, 0)` is the Complex arm's) and a `_BitInt` (the
+    // scalar tail's, as for a zero-filled `_BitInt` member). ✔MEASURED 2026-10-07
+    // (lane `cs`'s probe br5: runs 20261007-042543-49700abf, -042607-c71baabf and
+    // -042613-fca1f2d1): `double _Complex z = { 42.0 };` is built and run 42 by
+    // gcc 13.3.0 and clang 18.1.3 in both modes and mingw-w64 13.2.0, `= {}` by gcc
+    // and clang at -std=c2x, and `_BitInt(8) x = {};` / `{ 42 }` by clang -std=c2x
+    // (MSVC 19.51 has neither type) — DSS refused each H_UnsupportedLoweringForKind
+    // ("brace-init target type must be a scalar, struct, union, or array"). The
+    // examples `complex_scalar_braced_initializer` and `bit_int_scalar_braced_initializer`
+    // run them (probe sb1).
     // DELIBERATELY excluded: Void/FnSig/NullptrT (an Extension kind)/Vector/
     // Matrix/… — `(void){}` admitted here would mint a Void-typed literal and
     // corrupt the type system; those context types keep the aggregate gate's
@@ -10298,6 +11011,8 @@ struct Lowerer {
             case TypeKind::Byte:
             case TypeKind::Enum:
             case TypeKind::Ptr:
+            case TypeKind::Complex:
+            case TypeKind::BitInt:
                 return true;
             default:
                 return false;
@@ -10397,9 +11112,9 @@ struct Lowerer {
             return errorNode(braceInitListNode, contextType);
         }
         // The single-expression form — lower + coerce exactly like `= expr`, and,
-        // being a brace ELEMENT the semantic tier never judges, report its own
-        // diagnosed conversion (P68 round 9; the brace-list arm is unreachable
-        // after the N2 gate above).
+        // being a brace ELEMENT, report its own diagnosed conversion (P68 round 9;
+        // a pair no rule admits was refused by the semantic tier, P69; the
+        // brace-list arm is unreachable after the N2 gate above).
         return lowerBraceElementValue(valueExprCst, contextType);
     }
 
@@ -10651,8 +11366,8 @@ struct Lowerer {
                 // The scalar arm of `lowerExprOrBraceInit`, taken directly:
                 // `lowerExpr` is its own work stack, so this costs O(1) host
                 // frames however deep the expression is. A brace ELEMENT reports
-                // its own diagnosed conversion (P68 round 9) — the semantic tier
-                // never judges one.
+                // its own diagnosed conversion here (P68 round 9); a pair no rule
+                // admits was refused by the semantic tier before HIR (P69).
                 HirNodeId const v =
                     lowerBraceElementValue(d->valueExprCst, d->valueTargetType);
                 if (!writeInitSlotAt(f.root, d->path, v)) {
@@ -11420,27 +12135,96 @@ struct Lowerer {
     // `MemberAccess` or an `Index` over an ARRAY value designates part of its
     // base, so the walk continues into the base; a `MemberAccess` over a `Deref`
     // (`p->f`) or an `Index` over a POINTER (`p[i]`) designates the POINTEE, so
-    // the walk stops — the address taken there is not the variable's. Bounded,
-    // like every walk in this file, so a malformed tree fails soft.
-    [[nodiscard]] SymbolRecord const* designatedObjectRecord(HirNodeId id) {
-        for (int guard = 0; guard < 256 && id.valid(); ++guard) {
-            HirKind const k = builder.kind(id);
-            if (k == HirKind::Ref) {
-                SymbolId const sym{builder.payload(id)};
-                return sym.valid() ? model.recordFor(sym) : nullptr;
+    // the walk stops — the address taken there is not the variable's.
+    // ★ P69 review n15: BOUNDED BY THE ARENA, AND LOUD PAST IT. The walk descends one
+    // child per step, so it visits distinct nodes and ends within the builder's node count
+    // whatever the chain's depth — a `s.a.b.c…[i][j]…` chain of any length reaches its
+    // root. (It used to stop at 256 steps and answer "no object" for a deeper chain: the
+    // `register` checks then passed it in silence.) More steps than nodes can only mean an
+    // arena with a cycle, reported as the internal error it is.
+    // P69: the walk returns the ROOT it reaches — a `Ref` (a variable) or an
+    // `UnnamedObject` (a compound literal, D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT)
+    // — and `designatedObjectRecord` reads a variable's record off it. `throughMembers`
+    // false stops at a member: the array-DECAY check below wants only an array that IS
+    // the object or an element of one, never an array member of a `register` structure
+    // (clang 18.1.3 and MSVC 19.51 build `s.v[i]` of `register struct { int v[2]; } s`).
+    [[nodiscard]] HirNodeId designatedObjectRoot(HirNodeId id, bool throughMembers = true) {
+        for (std::size_t steps = 0; id.valid(); ++steps) {
+            if (steps > builder.size()) {
+                unsupported(NodeId{}, "internal: the designated-object walk took more steps "
+                                      "than the HIR arena has nodes (a cycle in the arena)");
+                return HirNodeId{};
             }
-            if (k != HirKind::MemberAccess && k != HirKind::Index) return nullptr;
+            HirKind const k = builder.kind(id);
+            if (k == HirKind::Ref || k == HirKind::UnnamedObject) return id;
+            if (k != HirKind::Index && (k != HirKind::MemberAccess || !throughMembers))
+                return HirNodeId{};
             auto const kids = builder.children(id);
-            if (kids.empty()) return nullptr;
+            if (kids.empty()) return HirNodeId{};
             HirNodeId const base = kids.front();
-            if (!base.valid() || builder.kind(base) == HirKind::Deref) return nullptr;
+            if (!base.valid() || builder.kind(base) == HirKind::Deref) return HirNodeId{};
             if (k == HirKind::Index) {
                 TypeId const bt = builder.typeId(base);
-                if (!bt.valid() || interner.kind(bt) != TypeKind::Array) return nullptr;
+                if (!bt.valid() || interner.kind(bt) != TypeKind::Array) return HirNodeId{};
             }
             id = base;
         }
-        return nullptr;
+        return HirNodeId{};
+    }
+    [[nodiscard]] SymbolRecord const* designatedObjectRecord(HirNodeId id) {
+        HirNodeId const root = designatedObjectRoot(id);
+        if (!root.valid() || builder.kind(root) != HirKind::Ref) return nullptr;
+        SymbolId const sym{builder.payload(root)};
+        return sym.valid() ? model.recordFor(sym) : nullptr;
+    }
+    // ★ P69: the name of the object whose `addressNotTakeable` facet (C `register`) forbids
+    // taking the address `id` designates — `'v'` for a variable, "a compound literal" for a
+    // C23 `(register T){ … }` — or nullopt when nothing forbids it. `throughMembers` as for
+    // `designatedObjectRoot`.
+    [[nodiscard]] std::optional<std::string>
+    addressForbiddingObject(HirNodeId id, bool throughMembers) {
+        HirNodeId const root = designatedObjectRoot(id, throughMembers);
+        if (!root.valid()) return std::nullopt;
+        if (builder.kind(root) == HirKind::UnnamedObject) {
+            if (!addressNotTakeableObjects_.contains(root.v)) return std::nullopt;
+            return std::string{"a compound literal"};
+        }
+        SymbolId const sym{builder.payload(root)};
+        SymbolRecord const* rec = sym.valid() ? model.recordFor(sym) : nullptr;
+        if (rec == nullptr || !rec->addressNotTakeable) return std::nullopt;
+        return std::format("'{}'", rec->name);
+    }
+    // ★ P69 (D-C-A-REGISTER-ARRAY-DECAY-IS-NOT-REFUSED): an ARRAY that is — or is an
+    // element of — a `register` object cannot become a pointer (C 6.3.2.1p3: "If the array
+    // object has register storage class, the behavior is undefined"), and a subscript of it
+    // is `*(E1 + E2)` over that pointer. ✔MEASURED 2026-09-30, each probed separately: gcc
+    // 13.3.0 and clang 18.1.3 (runs 20260930-214035-a7fd710e) and MSVC 19.51 (C2103, run
+    // 20260930-214612-2a65f721) refuse `register int a[2]; a[i]` and `int *p = a;`, and gcc
+    // `(register int[]){ 1, 41 }[i]` ("address of register compound literal requested",
+    // 20260930-212829-175f46fc b19) — DSS built both. An array MEMBER of a `register`
+    // structure is not refused: clang and MSVC build `s.v[i]`. True after the report.
+    [[nodiscard]] bool refusedRegisterArrayDecay(HirNodeId arrayExpr, HirSourceLoc const& at) {
+        TypeId const t = arrayExpr.valid() ? builder.typeId(arrayExpr) : InvalidType;
+        if (!t.valid() || interner.kind(t) != TypeKind::Array) return false;
+        auto const who = addressForbiddingObject(arrayExpr, /*throughMembers=*/false);
+        if (!who.has_value()) return false;
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_AddressOfRegisterObject;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = at.buffer;
+        d.span     = at.span;
+        d.actual   = std::format(
+            "{} is an array of register storage class, and using it as a pointer (a "
+            "subscript, or any array-to-pointer conversion) needs its address (C 6.3.2.1p3, "
+            "C 6.5.3.2p1; gcc and clang: \"address of register variable requested\", MSVC "
+            "C2103)", *who);   // D-C-A-REGISTER-ARRAY-DECAY-IS-NOT-REFUSED
+        reporter.report(std::move(d));
+        return true;
+    }
+    [[nodiscard]] bool refusedRegisterArrayDecay(HirNodeId arrayExpr, NodeId at) {
+        return refusedRegisterArrayDecay(
+            arrayExpr, HirSourceLoc{tree().source().id(),
+                                    at.valid() ? tree().span(at) : SourceSpan::empty(0)});
     }
 
     // One inline-asm operand bound to a machine register through a GNU LOCAL
@@ -11645,8 +12429,10 @@ struct Lowerer {
             TypeId const t = builder.typeId(id);
             return !t.valid() || interner.kind(t) != TypeKind::FnSig;
         }
+        // P69: a compound literal is an lvalue (C 6.5.2.5p4) — `(int){ 0 } = 5` builds
+        // on gcc, clang and MSVC (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT).
         return k == HirKind::Deref || k == HirKind::Index
-            || k == HirKind::MemberAccess;
+            || k == HirKind::MemberAccess || k == HirKind::UnnamedObject;
     }
 
     [[nodiscard]] std::optional<Lvalue> classifyLvalue(NodeId exprCst) {
@@ -11848,6 +12634,23 @@ struct Lowerer {
     // a pointer, and that is exactly the shape of claim that rots. The wrap is
     // correct here for the same reason it is correct for a direct call: the
     // declaration says the callee does not return.
+    //
+    // ★ ORDER-BLIND ON PURPOSE — DO NOT "FIX" THIS TOWARD A REFERENCE'S WARNING.
+    // The record read below is MERGED over every declaration of the function in
+    // the translation unit, so a call that PRECEDES the declaration which adds
+    // `noreturn` is a terminator too. "Does not return" is a property of the
+    // FUNCTION, not of the declaration visible at the call: "A function declared
+    // with a _Noreturn function specifier shall not return to its caller" (C23
+    // 6.7.5p8) carries no condition on where the declaration stands, and the
+    // attribute form "shall" be on the FIRST declaration (C23 6.7.13.7p3) — a
+    // later-only `[[noreturn]]` is itself undefined behaviour — so no defined
+    // program can tell the two orders apart. ✔MEASURED 2026-10-08 (probe fo3,
+    // `fo_nr.c`): gcc 13.3.0, mingw-w64 gcc and cl 14.51 agree — a body ending in
+    // such a call is NOT reported as reaching its end; clang 18.1.3 reports it, at
+    // -O0 and -O2, which is what an analysis run at the end of each body, before
+    // the later declaration has been seen, would say: a fact about when a
+    // compiler looks, not about the program. Pinned as a decision:
+    // `ACallBeforeTheDeclarationThatAddsNoreturnIsATerminator`.
     [[nodiscard]] bool isDirectNoreturnCall(HirNodeId id) const {
         // P68 round 12 (D-C-STDDEF-H-LACKS-UNREACHABLE): GNU
         // `__builtin_unreachable()` terminates like a direct noreturn call.
@@ -11859,6 +12662,101 @@ struct Lowerer {
         SymbolId const sym{builder.payload(kids.front())};
         auto const* rec = model.recordFor(sym);
         return rec != nullptr && rec->isNoreturn;
+    }
+
+    // Can the evaluation of expression `root` never FINISH — is it, on every
+    // execution, a direct call that does not return? `isDirectNoreturnCall` is the
+    // leaf; this is that fact carried through the three expression forms that
+    // cannot change it:
+    //   Cast(e)                — `(void)die();`              never iff e never
+    //   SeqExpr([s…], result)  — the comma operator `a, die()`: never iff some
+    //                            `ExprStmt` among the s never finishes, or the
+    //                            result does not
+    //   Ternary(c, a, b)       — `c ? die() : die()`: never iff c never
+    //                            finishes, or BOTH arms do not
+    // Anything else answers "may finish" — in particular `c ? die() : (void)0`
+    // (one arm returns), `c && die()`, and a call through an expression callee
+    // (the F1 guard is the leaf's and is inherited whole). ✔MEASURED (probe fo3):
+    // gcc, clang and Apple clang report none of `x ? die() : die();`,
+    // `(void)x, die();`, `x || 1 ? die() : die();` as reaching the end, and do
+    // report `x ? die() : (void)0;`.
+    //
+    // ★ HEAP, NOT HOST FRAMES: the depth follows the user's expression nesting
+    // (`a ? (b ? die() : die()) : die()` …), so each compound form is a `Frame`
+    // on a vector and its children are asked one at a time, in evaluation order,
+    // with the same short-circuits the three rules above spell.
+    [[nodiscard]] bool expressionNeverCompletes(HirNodeId root) const {
+        struct Frame {
+            HirNodeId    id;
+            std::size_t  next = 0;   // index of the child whose verdict is awaited
+        };
+        std::vector<Frame> stack;
+        HirNodeId pending     = root;
+        bool      havePending = true;
+        bool      verdict     = false;
+        for (;;) {
+            if (havePending) {
+                havePending = false;
+                HirNodeId const id = pending;
+                auto const kids = builder.children(id);
+                switch (builder.kind(id)) {
+                    case HirKind::Call:
+                    case HirKind::BuiltinCall:
+                        verdict = isDirectNoreturnCall(id);
+                        break;
+                    case HirKind::Cast:
+                    case HirKind::ExprStmt:
+                        // One operand, and the form adds nothing after it.
+                        if (kids.size() != 1) { verdict = false; break; }
+                        pending     = kids.front();
+                        havePending = true;
+                        continue;
+                    case HirKind::Ternary:
+                        if (kids.size() != 3) { verdict = false; break; }
+                        stack.push_back(Frame{.id = id, .next = 0});
+                        pending     = kids[0];
+                        havePending = true;
+                        continue;
+                    case HirKind::SeqExpr:
+                        if (kids.empty()) { verdict = false; break; }
+                        stack.push_back(Frame{.id = id, .next = 0});
+                        pending     = kids[0];
+                        havePending = true;
+                        continue;
+                    default:
+                        verdict = false;
+                        break;
+                }
+            }
+            // `verdict` is ready: answer the root, or the frame that asked.
+            if (stack.empty()) return verdict;
+            Frame& f = stack.back();
+            auto const kids = builder.children(f.id);
+            if (builder.kind(f.id) == HirKind::SeqExpr) {
+                // OR over the children, in order: the first that never finishes
+                // decides; exhausted, the answer is the last (false) verdict.
+                if (verdict || f.next + 1 >= kids.size()) { stack.pop_back(); continue; }
+                pending     = kids[++f.next];
+                havePending = true;
+                continue;
+            }
+            // Ternary: child 0 is the condition, 1 and 2 the arms.
+            if (f.next == 0) {
+                if (verdict) { stack.pop_back(); continue; }   // the condition never finishes
+                f.next      = 1;
+                pending     = kids[1];
+                havePending = true;
+                continue;
+            }
+            if (f.next == 1) {
+                if (!verdict) { stack.pop_back(); continue; }  // an arm that returns
+                f.next      = 2;
+                pending     = kids[2];
+                havePending = true;
+                continue;
+            }
+            stack.pop_back();   // the second arm's verdict is the answer
+        }
     }
 
     // The statement-position dispatch shared by exprStmt and for-init/update:
@@ -11933,7 +12831,11 @@ struct Lowerer {
         // + bare if/while/for/label arm), so this covers them all. HIR→MIR spins the
         // following statement into a dead pruned block via the existing
         // open-block-has-terminator guard (the infinite-loop wrap precedent).
-        if (isDirectNoreturnCall(e)) {
+        //
+        // P69: the question asked is `expressionNeverCompletes`, of which the
+        // direct call is the leaf — so `(void)die();`, `log(), die();` and
+        // `c ? die() : die();` terminate a path exactly as `die();` does.
+        if (expressionNeverCompletes(e)) {
             HirNodeId const stmt = track(builder.makeExprStmt(e), core);
             HirNodeId const unreach = builder.addLeaf(
                 HirKind::Unreachable, InvalidType, /*payload=*/0, HirFlags::Synthetic);
@@ -12107,14 +13009,18 @@ struct Lowerer {
     // the bodies lower, so the caller defers that emission to the finish — keeping
     // span-table order identical). `thenN`/`elseN` are the first/second `Role::Stmt`
     // children (invalid when absent — the finish emits the same "no then-branch"
-    // error there). No HIR is emitted for the If node itself here.
-    void ifPrologue(NodeId node, HirNodeId& condId, NodeId& thenN, NodeId& elseN) {
+    // error there). No HIR is emitted for the If node itself here. `condNode` is
+    // the condition's CST node (invalid when there is none), kept for the finish:
+    // whether the condition is a CONSTANT is asked of the source expression.
+    void ifPrologue(NodeId node, HirNodeId& condId, NodeId& condNode, NodeId& thenN,
+                    NodeId& elseN) {
         bool haveCond = false;
         int bodyCount = 0;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             Role const role = classify(c);
             if (role == Role::Expr && !haveCond) {
+                condNode = c;   // for `ifNeverCompletes` (a constant condition)
                 E const condE = lowerExpr(c);
                 condId = coerceCondition(condE, c).id;
                 haveCond = true;
@@ -12181,8 +13087,8 @@ struct Lowerer {
     // the same finish tail).
     HirNodeId lowerIf(NodeId node) {
         HirNodeId condId{};
-        NodeId thenN{}, elseN{};
-        ifPrologue(node, condId, thenN, elseN);
+        NodeId condNode{}, thenN{}, elseN{};
+        ifPrologue(node, condId, condNode, thenN, elseN);
         HirNodeId const then = thenN.valid() ? lowerStmt(thenN) : HirNodeId{};
         std::optional<HirNodeId> els;
         if (elseN.valid()) els = lowerStmt(elseN);
@@ -12190,7 +13096,85 @@ struct Lowerer {
             condId.valid() ? condId : orError(std::nullopt, node, "if statement has no condition");
         HirNodeId const thenFinal =
             thenN.valid() ? then : reportedError(node, "if statement has no then-branch");
-        return track(builder.makeIfStmt(condFinal, thenFinal, els), node);
+        return finishIf(node, condNode, condFinal, thenFinal, els);
+    }
+
+    // The ONE finish of an `if`, shared by `lowerIf` and the driver's If frame:
+    // build the IfStmt, and wrap it when control can never continue past it.
+    [[nodiscard]] HirNodeId finishIf(NodeId node, NodeId condNode, HirNodeId cond,
+                                     HirNodeId thenArm, std::optional<HirNodeId> elseArm) {
+        HirNodeId const stmt = track(builder.makeIfStmt(cond, thenArm, elseArm), node);
+        return ifNeverCompletes(condNode, thenArm, elseArm)
+                   ? wrapAsNeverCompleting(node, stmt)
+                   : stmt;
+    }
+
+    // ── STATEMENTS CONTROL NEVER CONTINUES PAST ─────────────────────────────────
+    // (D-HIR-INFINITE-LOOP-NOT-TERMINATING's mechanism, and since P69 the three
+    // further shapes of D-C-A-NON-VOID-FUNCTION-WHOSE-END-IS-REACHABLE-IS-REFUSED)
+    //
+    // The verifier's `pathTerminates` is deliberately STRUCTURAL: it reads HIR
+    // kinds and nothing else — no constant's value, no callee's `noreturn`. Those
+    // facts live HERE, in the tier that has the semantic model, and this tier says
+    // them in the one way the predicate can read: the statement is wrapped as
+    //     Block{ <statement>, Unreachable }        (both Synthetic)
+    // so it reads as terminating. Four shapes are wrapped, each a statement after
+    // which NO execution continues:
+    //   * a loop that never exits            — `wrapLoopIfItNeverExits`
+    //   * a statement that is a call that does not return, or an expression that
+    //     cannot finish evaluating           — `expressionNeverCompletes`
+    //   * an `if` whose condition is a constant and whose LIVE arm terminates
+    //                                         — `ifNeverCompletes`
+    //   * a `do` whose body terminates without ever reaching its condition
+    //                                         — `doBodyNeverReachesItsCondition`
+    //
+    // ★ WHY THE LAST TWO EXIST. Until P69 a C function whose end is open was
+    // REFUSED, so a body like `do { return x; } while (0);` or `if (1) return x;`
+    // — valid C whose end no execution reaches — was refused with it. C now
+    // completes an open body and WARNS, and for these shapes that would be a
+    // warning no reference gives: ✔MEASURED 2026-10-08 (probe fo3: gcc 13.3.0 and
+    // clang 18.1.3 at -Wall, Apple clang 21.0.0), of 29 bodies the references
+    // report as reaching the end EXACTLY the four that do (a `break` or a
+    // `continue` out of a `do … while (0)`, a conditional with one arm that
+    // returns, `while (1) { break; }`) and none of the others.
+    //
+    // ★ THE WRAP ASSERTS, IT NEVER REMOVES. The statement itself is lowered whole;
+    // what is added is the claim "not reached" for the position after it, which
+    // MIR lowers as an `Unreachable` in a block nothing branches to. So each
+    // predicate below must be right in ONE direction only — say "never continues"
+    // only when that is certain — and every one of them answers "may continue"
+    // when in doubt.
+    [[nodiscard]] HirNodeId wrapAsNeverCompleting(NodeId node, HirNodeId stmt) {
+        HirNodeId const unreachable =
+            builder.addLeaf(HirKind::Unreachable, InvalidType, /*payload=*/0,
+                            HirFlags::Synthetic);
+        HirNodeId const wrapped[] = {stmt, unreachable};
+        return track(builder.makeBlock(wrapped, HirFlags::Synthetic), node);
+    }
+
+    // An `if` whose condition is an integer CONSTANT leaves through one arm, the
+    // same one on every execution. Control never continues past the statement iff
+    //   (a) that arm terminates on every path (`pathTerminates`, which already
+    //       accounts for a label inside it), and
+    //   (b) the arm that is never TAKEN holds no label — a `goto` from elsewhere
+    //       could enter it and run it to its end, which IS the position after
+    //       the `if`.
+    // `if (0) S;` with no else completes at once: never wrapped. A condition that
+    // does not fold (or is not there) is not a constant: never wrapped. The value
+    // comes from the shared CST const-eval, the owner `conditionIsProvablyTruthy`
+    // asks for a loop's condition.
+    [[nodiscard]] bool ifNeverCompletes(NodeId condNode, HirNodeId thenArm,
+                                        std::optional<HirNodeId> elseArm) {
+        if (!condNode.valid()) return false;
+        auto const value = evalCstConstInt(condNode);
+        if (!value.has_value()) return false;
+        if (*value != 0) {
+            if (elseArm.has_value() && subtreeContainsLabel(builder, *elseArm)) return false;
+            return pathTerminates(builder, thenArm);
+        }
+        if (!elseArm.has_value()) return false;
+        if (subtreeContainsLabel(builder, thenArm)) return false;
+        return pathTerminates(builder, *elseArm);
     }
 
     // ── provably-infinite-loop detection (D-HIR-INFINITE-LOOP-NOT-TERMINATING) ──
@@ -12305,11 +13289,72 @@ struct Lowerer {
                                                    std::optional<NodeId> condNode,
                                                    HirNodeId loopBody) {
         if (!loopIsProvablyInfinite(condNode, loopBody)) return loopStmt;
-        HirNodeId const unreachable =
-            builder.addLeaf(HirKind::Unreachable, InvalidType, /*payload=*/0,
-                            HirFlags::Synthetic);
-        HirNodeId const wrapped[] = {loopStmt, unreachable};
-        return track(builder.makeBlock(wrapped, HirFlags::Synthetic), node);
+        return wrapAsNeverCompleting(node, loopStmt);
+    }
+
+    // Can a `break` OR a `continue` of THIS loop be reached in its body? The
+    // `do`-statement twin of `bodyHasReachableBreak`, and it has to count
+    // `continue` too: in a `do … while`, `continue` goes to the CONDITION, and
+    // the condition is where such a loop exits. Frame-respecting in the same way,
+    // with the one asymmetry C has: a nested `switch` captures a `break` and does
+    // NOT capture a `continue`; a nested loop captures both. The whole subtree is
+    // scanned (a GNU statement expression can hold either inside an expression).
+    // Heap, not host frames — `pending` is the stack, as in the sibling.
+    [[nodiscard]] bool bodyHasBreakOrContinueOfItsLoop(HirNodeId body) const {
+        struct Item {
+            HirNodeId id;
+            bool      breakCaptured;   // inside a nested switch of this loop
+        };
+        std::vector<Item> pending{Item{body, false}};
+        while (!pending.empty()) {
+            Item const here = pending.back();
+            pending.pop_back();
+            bool breakCaptured = here.breakCaptured;
+            switch (builder.kind(here.id)) {
+                case HirKind::ContinueStmt:
+                    return true;
+                case HirKind::BreakStmt:
+                    if (!breakCaptured) return true;
+                    continue;
+                case HirKind::WhileStmt:
+                case HirKind::DoWhileStmt:
+                case HirKind::ForStmt:
+                    continue;                  // a nested loop captures both
+                case HirKind::SwitchStmt:
+                    breakCaptured = true;      // …a nested switch only `break`
+                    break;
+                default:
+                    break;
+            }
+            auto const kids = builder.children(here.id);
+            for (std::size_t i = kids.size(); i-- > 0;)
+                pending.push_back(Item{kids[i], breakCaptured});
+        }
+        return false;
+    }
+
+    // A `do BODY while (COND)` runs BODY before it ever looks at COND. If BODY
+    // terminates on every path (returns, jumps away, cannot continue) and holds no
+    // `break` or `continue` of this loop, COND is never evaluated and the loop is
+    // never left by its own exit — whatever COND is. `do { return x; } while (0);`
+    // is the shape that matters (a macro body written to take a semicolon, used as
+    // the last statement of a function), and the rule needs no constant: with a
+    // non-constant COND the references say nothing either (✔MEASURED, probe fo3,
+    // `do { return x; } while (x);`).
+    [[nodiscard]] bool doBodyNeverReachesItsCondition(HirNodeId loopBody) const {
+        return pathTerminates(builder, loopBody)
+            && !bodyHasBreakOrContinueOfItsLoop(loopBody);
+    }
+
+    // The while / do-while finish: wrap a loop that never exits — provably
+    // infinite, or (a `do` only) one whose body never reaches its condition.
+    [[nodiscard]] HirNodeId wrapLoopIfItNeverExits(NodeId node, HirNodeId loopStmt,
+                                                  std::optional<NodeId> condNode,
+                                                  HirNodeId loopBody, bool isDoWhile) {
+        bool const neverExits =
+            loopIsProvablyInfinite(condNode, loopBody)
+            || (isDoWhile && doBodyNeverReachesItsCondition(loopBody));
+        return neverExits ? wrapAsNeverCompleting(node, loopStmt) : loopStmt;
     }
 
     // The while/do-while PROLOGUE shared by `lowerWhile` (recursive) and the
@@ -12352,7 +13397,7 @@ struct Lowerer {
         HirNodeId const loop =
             doWhile ? track(builder.makeDoWhileStmt(bodyId, condFinal), node)
                     : track(builder.makeWhileStmt(condFinal, bodyId), node);
-        return wrapIfProvablyInfinite(node, loop, condNodeOpt, bodyId);
+        return wrapLoopIfItNeverExits(node, loop, condNodeOpt, bodyId, doWhile);
     }
 
     // The `for` PROLOGUE shared by `lowerFor` (recursive) and the `lowerStmt`
@@ -12911,7 +13956,13 @@ struct Lowerer {
                         shipped != nullptr
                             ? shipped->library
                             : std::unordered_map<std::string, std::string>{},
-                        /*noLibraryBinding=*/shipped == nullptr,
+                        // ★ P69 (D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM):
+                        // a row whose BODY is DSS's shipped source names no image, so it
+                        // is UNBOUND exactly as the injected producer below makes it
+                        // (`!ext.shippedSourcePath.empty()`) — pe's printf family is such
+                        // a row, and bound "library-with-no-image" it stopped HIR→MIR.
+                        /*noLibraryBinding=*/shipped == nullptr
+                            || !shipped->shippedSourcePath.empty(),
                         // c156 (D-LK-ELF-SYMBOL-VERSIONING): carry the suppressed
                         // shipped symbol's required version through the user
                         // prototype's synthesized import, else the versioned
@@ -13004,14 +14055,16 @@ struct Lowerer {
             // Carry const-ness from the bound symbol to the Global node so
             // HIR→MIR can route a const-init global to read-only `.rodata` and a
             // mutable one to writable `.data` (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL).
-            // Locals are stack slots — mutability is irrelevant there.
-            // TLS C1: thread-storage duration rides the same global-only
-            // discipline (a block-scope thread_local WITHOUT static already
-            // failed loud in Pass 2 — no automatic can reach here marked).
-            if (asGlobal) {
-                recordMutability(lowered, sym);
-                recordThreadLocal(lowered, sym);
-            }
+            // P69 (lane `cs`, D-C-A-BLOCK-SCOPE-CONST-OBJECTS-VALUE-IN-A-STATIC-INITIALIZER-IS-REFUSED):
+            // a LOCAL's const-ness is recorded too — a static initializer may read a
+            // block-scope const object's value (`static int x = k;`), and the reader
+            // asks this table exactly as it asks it of a global. A local is still a
+            // stack slot; nothing places it by this bit.
+            // TLS C1: thread-storage duration rides the global-only discipline (a
+            // block-scope thread_local WITHOUT static already failed loud in Pass 2 —
+            // no automatic can reach here marked).
+            recordMutability(lowered, sym);
+            if (asGlobal) recordThreadLocal(lowered, sym);
             // c21 (D-CSUBSET-VOLATILE-QUALIFIER): volatility applies to BOTH a
             // global's load-time init store (HIR→MIR :6886) AND a local's init
             // store into its alloca (HIR→MIR :5712) — record unconditionally on
@@ -13168,6 +14221,7 @@ struct Lowerer {
             return g;
         }
         HirNodeId const vd = track(builder.makeVarDecl(type, sym.v, init), node);
+        recordMutability(vd, sym);      // P69: a static initializer may read a const local
         recordVolatility(vd, sym);      // c21: volatile local init store
         recordAlignment(vd, sym);       // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
         return vd;
@@ -13580,7 +14634,8 @@ struct Lowerer {
             ef, rec->name,
             shipped != nullptr ? shipped->library
                                : std::unordered_map<std::string, std::string>{},
-            /*noLibraryBinding=*/shipped == nullptr,
+            // ★ P69: a shipped-SOURCE row is unbound — the bare-prototype arm's rule.
+            /*noLibraryBinding=*/shipped == nullptr || !shipped->shippedSourcePath.empty(),
             shipped != nullptr ? shipped->version : std::string{},
             /*isEagerImport=*/false,
             rec->asmName,   // TF-C88 (asm label)
@@ -13690,6 +14745,8 @@ struct Lowerer {
         currentFunctionSymbol_ = savedFnSym;
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(node, body, sym, retType, decl);
+        body = maybeCompleteReachableNonVoidEnd(
+            node, bodyNode, body, sym, retType, decl);
         HirNodeId const fn_ =
             track(builder.makeFunction(sig, sym.v, params, body), node);
         // `sym` folds in the static-initializer schedule
@@ -14079,6 +15136,82 @@ struct Lowerer {
             builder.makeBlock(wrapped, HirFlags::Synthetic), node);
     }
 
+    // D-C-A-NON-VOID-FUNCTION-WHOSE-END-IS-REACHABLE-IS-REFUSED (source-agnostic):
+    // if the language's declaration form states `nonVoidFunctionEndReached:
+    // returnsUnspecifiedValue` AND the function returns a value AND `body` does
+    // not structurally terminate, COMPLETE the body —
+    //     { <body>  T unspecified;  return unspecified; }
+    // — with `unspecified` a synthetic local nothing ever stores to, and report
+    // the function ONCE, as a warning. A call that reaches the end then RETURNS,
+    // to a caller that goes on running, with a value nothing specifies; every
+    // path that does return keeps its own value. Otherwise `body` comes back
+    // unchanged, and the verifier says what the strict rule says.
+    //
+    // ★ WHY AN UNINITIALIZED LOCAL AND NOT A ZERO. A zero needs a zero FORM per
+    // result class and there is none for every class a function can return;
+    // `T t; return t;` is the one statement pair the pipeline already lowers for
+    // ALL of them — a register, a pair of registers, the x87 stack, a structure
+    // through the caller's storage — because a program can write it. It is also
+    // the truth: the value is unspecified, not zero. (What the optimizer makes of
+    // a load no store reaches is its own decision and a value either way; it is
+    // never "this path cannot run".)
+    //
+    // ★ CALLED AFTER `maybeAppendImplicitReturnZero`, AND THE ORDER IS THE RULE:
+    // a function that list answers (C's `main`) arrives here with a body that
+    // already terminates, so it is neither completed twice nor warned about.
+    //
+    // ★ "CAN BE REACHED" IS `pathTerminates`, the verifier's own predicate — the
+    // refusal, the implicit `return 0` and this warning ask ONE owner. It is
+    // structural and conservative: `do { return x; } while (0);` as a body's last
+    // statement reads as reaching the end, is completed (dead code the MIR
+    // unreachable-prune drops) and is warned about, where a flow-sensitive
+    // reference says nothing.
+    //
+    // The three synthetic nodes are tracked at the body's LAST TOKEN — where the
+    // warning points, and where a debugger should say a return at the closing
+    // brace is.
+    [[nodiscard]] HirNodeId
+    maybeCompleteReachableNonVoidEnd(NodeId node,
+                                     NodeId bodyNode,
+                                     HirNodeId body,
+                                     SymbolId sym,
+                                     TypeId retType,
+                                     DeclarationRule const& decl) {
+        if (decl.nonVoidFunctionEndReached
+            != NonVoidFunctionEndRule::ReturnsUnspecifiedValue)
+            return body;
+        if (!retType.valid()) return body;
+        if (interner.kind(retType) == TypeKind::Void) return body;
+        if (builder.kind(body) != HirKind::Block) return body;
+        // No record ⇒ no name to report the function by; leave the body as it
+        // is and let the verifier refuse it (the same substrate-shape guard
+        // `maybeAppendImplicitReturnZero` carries).
+        auto const* rec = model.recordFor(sym);
+        if (rec == nullptr) return body;
+        if (pathTerminates(builder, body)) return body;
+
+        NodeId const end = lastTokenUnder(bodyNode.valid() ? bodyNode : node);
+        emitHAt(DiagnosticCode::H_NonVoidFunctionEndReachable,
+                DiagnosticSeverity::Warning, end,
+                std::format("control can reach the end of '{}', which returns a "
+                            "value, without a return statement: a call that ends "
+                            "there returns a value nothing specifies, and using "
+                            "that value is undefined",
+                            rec->name));
+
+        SymbolId const unspecified = freshSymbol();
+        HirNodeId const local = track(
+            builder.makeVarDecl(retType, unspecified.v, std::nullopt,
+                                HirFlags::Synthetic),
+            end);
+        HirNodeId const read =
+            builder.makeRef(retType, unspecified.v, HirFlags::Synthetic);
+        HirNodeId const ret = track(
+            builder.makeReturn(read, HirFlags::Synthetic), end);
+        HirNodeId const wrapped[] = {body, local, ret};
+        return track(builder.makeBlock(wrapped, HirFlags::Synthetic), node);
+    }
+
     HirNodeId lowerFunctionDecl(NodeId node) {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) return reportedError(node, "function decl has no semantics rule");
@@ -14137,8 +15270,17 @@ struct Lowerer {
         nextLabelOrdinal_ = savedNextOrd;
         currentFunctionSymbol_ = savedFnSym;
         currentReturnType_ = savedReturn;
+        // THE END OF THE BODY, ON THE ROUTE OF A ROW THAT STATES ITS KIND (a
+        // declaration row mapped to `Function` directly — the shipped toy
+        // document's `funcDef`). The same two calls as the declarator route, in
+        // the same order, and the order is the rule: the list of names that return
+        // zero is read FIRST. Pinned on THIS route by
+        // hir/test_non_void_function_end_reached, with the two keys set in memory
+        // on the toy document's row (that document states neither).
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
+        body = maybeCompleteReachableNonVoidEnd(
+            node, bodyNode, body, sym, retType, decl);
         HirNodeId const fn_ = track(builder.makeFunction(sig, sym.v, params, body), node);
         // `sym` folds in the static-initializer schedule
         // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN) — the
@@ -14361,8 +15503,11 @@ struct Lowerer {
                 h, rec ? rec->name : std::string{},
                 shipped != nullptr ? shipped->library : libraryOverride,
                 // Nothing to bind ⇒ UNBOUND, and say so explicitly rather than
-                // leaving an empty library to be interpreted downstream.
-                /*noLibraryBinding=*/shipped == nullptr && libraryOverride.empty(),
+                // leaving an empty library to be interpreted downstream. ★ P69: a
+                // shipped-SOURCE realization binds nothing either — its body is
+                // linked from DSS's runtime archive (the bare-prototype arm's rule).
+                /*noLibraryBinding=*/(shipped == nullptr && libraryOverride.empty())
+                    || (shipped != nullptr && !shipped->shippedSourcePath.empty()),
                 shipped != nullptr ? shipped->version : std::string{}};
             // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the label was read PER
             // DECLARATOR by
@@ -14671,8 +15816,18 @@ struct Lowerer {
         nextLabelOrdinal_ = savedNextOrd;
         currentFunctionSymbol_ = savedFnSym;
         currentReturnType_ = savedReturn;
+        // THE END OF THE BODY, ON THE POSITIONAL CHILD-KIND ROUTE. No SHIPPED
+        // document is lowered here: this route is entered only for a `Decl` row
+        // that is not declarator-mode, and the one shipped document with a `Decl`
+        // row (c) is declarator-mode. The two calls are wired, in the other routes'
+        // order, because the rule is the ENGINE's and not one grammar shape's — and
+        // they are pinned all the same, by hir/test_non_void_function_end_reached
+        // on the toy document rewritten in memory into this shape (a `funcTail`
+        // child decides the kind), with the two keys set on its row.
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
+        body = maybeCompleteReachableNonVoidEnd(
+            node, bodyNode, body, sym, retType, decl);
         HirNodeId const fn_ = track(builder.makeFunction(sig, sym.v, params, body), node);
         // `sym` folds in the static-initializer schedule
         // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN) — the
@@ -15038,7 +16193,13 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
                          // Inline-asm P5: verify-on-load resolves every
                          // descriptor handle against the pool this same
                          // lowering just filled.
-                         &result->inlineAsmPool};
+                         &result->inlineAsmPool,
+                         // P69 (lane `cs`): the linkage side-table this lowering
+                         // just filled — a weak attribute that names no kind, a
+                         // kind beside a binding that is not weak, a tentative
+                         // mark off a global or beside an internal binding are
+                         // refused here, before any consumer reads them.
+                         &result->linkageMap};
     // The verifier's OWN verdict, not only the delta: a refusal the reporter drops
     // as a recent duplicate or past a cap must still fail the lowering (P68).
     bool const verified = verifier.verify(reporter);

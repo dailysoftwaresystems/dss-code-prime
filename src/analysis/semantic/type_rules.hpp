@@ -1217,8 +1217,8 @@ diagnosedConversionCode(DiagnosedConversion c) noexcept {
 }
 
 // The sentence each class reports — one wording for both tiers, so a brace element
-// (reported by the HIR tier, the one that knows which slot it fills) reads exactly
-// like the initialization the semantic tier reports.
+// (reported by the HIR tier, where its conversion is realized in the slot it fills)
+// reads exactly like the initialization the semantic tier reports.
 [[nodiscard]] inline std::string
 diagnosedConversionSentence(DiagnosedConversion c, DiagnosedConversionSite site,
                             std::string_view operandText) {

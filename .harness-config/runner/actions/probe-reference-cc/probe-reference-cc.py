@@ -37,10 +37,12 @@ leg) -- ✔MEASURED 2026-09-24: `dssharness run` on that leg enters it, and cl 1
 
 FLAGS: `--flags`, a comma-separated list; each item is percent-decoded, so a comma or a space inside
 ONE flag is written `%2C` or `%20` (`-Wl%2C-z%2Cnoexecstack`). An option that places a product this
-program reads is refused, because this program owns those paths: gnu's `-o`; msvc's `/Fe` `/Fo` `/Fa`
-and its deprecated `/o` (either prefix, `/` or `-`), and a linker `/OUT:`. MSVC's `/FA` (capital A, a
+program reads is refused, because this program owns those paths: gnu's `-o`, its long alias `--output`
+(`--output=<x>`), and a `-o` handed to the linker (`-Wl,-o,<x>`, `-Xlinker -o`); msvc's `/Fe` `/Fo` `/Fa` and
+its deprecated `/o` (either prefix, `/` or `-`), and a linker `/OUT:`. MSVC's `/FA` (capital A, a
 listing's TYPE) places nothing and is allowed, as are `/openmp` and `/options:strict`. An msvc `/link`
-tail is moved AFTER the source and the output paths, where MSVC's /link reference requires it.
+tail is moved AFTER the source and the output paths, where MSVC's /link reference requires it. The program's
+own options are never abbreviated (`--o=` is not `--out`).
 
 DUMP (object, link and run modes): `--dump`, a comma-separated argv, percent-decoded like the flags, whose
 first item is one of DUMP_TOOLS; the PRODUCT's path is appended as its last argument -- the object in object
@@ -57,13 +59,18 @@ msvc dialect (cl does not assemble). ★ AN EMPTY SOURCE IS A PROBE IN STDOUT MO
 `""`), and an item that is empty in any other mode is refused as that item.
 A compiler or dump tool that PATH does not find is NOT refused: "this host has no clang" is a
 measurement of the host, reported as `compiler=absent` / `dump=absent` (a refused step keeps no
-report, so a refusal would leave only "probe exited 2" on the orchestrating side).
+report, so a refusal would leave only "probe exited 2" on the orchestrating side). It is never COUNTED as a
+compile that was measured: a batch counts it `absent=` (the round-12 audit's PR-1: it was counted `measured=`).
 
-REDACTION: every line printed or kept passes through read-leg-path's redactor -- the ONE owner of
-that rule, loaded by path from its sibling directory -- which turns the tree into `<tree>`, the home
-directory into `~`, the user into `<user>` and the host's name into `<host>`; this program adds its
-own scratch directory, as `<probe>`, in both of the spellings a symbolic link can give it
-(`/var/...` and `/private/var/...` on macOS).
+REDACTION: every line printed or kept passes through THE ONE REDACTOR, `redact/redact.py`, loaded once by path
+from its sibling directory -- the tree becomes `<tree>`, the home `~`, this host's account `<user>` and its name
+`<host>`, and the foreign shapes that file's header lists are masked too; this program adds its own scratch
+directory, as `<probe>`, in both of the spellings a symbolic link can give it (`/var/...` and `/private/var/...` on
+macOS). A host whose account cannot be named is REFUSED, never a traceback: a single probe exits 2 with its
+`REFUSED` line, and so does a BATCH, WHOLE -- the account is a fact about the host, which no item could pass, so
+refused item by item it ended `OK ... refused=<n>` with exit 0 and the step passed having measured nothing (the
+P69 fixed-point re-review). A batch therefore builds the one redactor ONCE, before its first item, over one
+scratch directory in which each item runs in a subdirectory of its own (`<probe>/000`, `<probe>/001`, ...).
 
 THE VERDICT: a probe that fails to COMPILE is still a measurement, and the report says so; this
 program's exit code says only whether it could measure (0) or refused (2). The report is the
@@ -77,12 +84,13 @@ rules as the options). Every item runs in turn inside ONE run, so ONE sync and O
 -- MEASURED 2026-09-23: the Mac fell asleep between two single-probe runs a minute apart, and its
 keep-awake lives only as long as a run. Each item's report follows a `=== probe <name>` line; an item
 refused for a malformed field is reported there and the batch goes on; a malformed BATCH (not base64,
-not a JSON array, an unknown key, a name twice) is refused whole. SHARED SOURCES: the batch may instead
+not a JSON array, an unknown key, a name twice) is refused whole, and so is a batch on a host whose account
+cannot be named (above). SHARED SOURCES: the batch may instead
 be an OBJECT `{"sources": {"<key>": "<text>", ...}, "items": [...]}` whose items name a source with
 `src_ref` in place of `src` -- one program measured under many flag sets (arches x optimisation
 levels) is then carried ONCE, not once per item (MEASURED 2026-09-23: four programs x four variants
 repeated the text sixteen times, past the Windows command line). The last line is
-`probe-reference-cc: OK batch=<n> measured=<m> refused=<r>`. The batch's base64 is bounded by
+`probe-reference-cc: OK batch=<n> measured=<m> absent=<a> refused=<r>`. The batch's base64 is bounded by
 MAX_BATCH_B64, because a run's inputs reach the orchestrating host's DssHarness on one Windows
 command line (32767 characters).
 
@@ -91,12 +99,17 @@ mode as a pure argv, then the REAL arms: with the host's `cc`, `gcc` or `clang` 
 `llvm-nm` everywhere, and with `cl` and `dumpbin` inside a Visual Studio developer environment
 (`VCToolsInstallDir` set). A real arm's tool that PATH does not find where it is expected is a named
 FAILURE, never a skip; outside a developer environment the cl arms say, by name, that they are not
-that host's. The same self-test runs as this action's manual step on any leg the runner declares:
-`dssharness run probe-reference-cc --legs <leg> --manual-step self-test`.
+that host's, and the closing line says it too. `--selftest --expect-cl=yes` says the leg IS an MSVC one (the ctest
+entry passes `=yes` when the build's own C++ compiler is MSVC and `=no` otherwise; the bare `--expect-cl` is refused
+as USAGE), so a cl that is not there FAILS instead of being skipped. The arms are counted against a per-block exact ratchet (EXPECTED_*), so an arm lost from any block --
+or a block that silently stopped running -- is a failure. A failing arm's detail passes the redactor: its
+scratch sits under the profile's temp directory on Windows. The same self-test runs as this action's manual
+step on any leg the runner declares: `dssharness run probe-reference-cc --legs <leg> --manual-step self-test`.
 """
 import argparse
 import base64
 import binascii
+import contextlib
 import importlib.util
 import io
 import json
@@ -105,7 +118,7 @@ import re
 import shutil
 import subprocess
 import sys
-sys.dont_write_bytecode = True  # this program loads read-leg-path.py by path; no __pycache__ beside a sibling action
+sys.dont_write_bytecode = True  # this program loads redact.py by path; no __pycache__ beside a sibling action
 import tempfile
 from urllib.parse import unquote
 
@@ -151,34 +164,36 @@ class Refusal(Exception):
     pass
 
 
-def _read_leg_path():
-    """`.harness-config/runner/actions/read-leg-path/read-leg-path.py` -- the one owner of the redaction rule.
+_REDACT = []
 
-    Loaded by path from this file's sibling directory (a hyphen is not a module name). It FAILS LOUD when
-    absent rather than falling back to a local copy: a second spelling of what must never leave a host is
-    the drift one owner exists to end.
-    """
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
-                        "read-leg-path", "read-leg-path.py")
-    if not os.path.isfile(path):
-        raise SystemExit("probe-reference-cc: cannot find %s -- the redaction rule lives there and nowhere else"
-                         % path)
-    spec = importlib.util.spec_from_file_location("dss_read_leg_path", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+
+def redact_module():
+    """`.harness-config/runner/actions/redact/redact.py` -- the one owner of the redaction rule, loaded ONCE by path
+    from this file's sibling directory (every probe of a batch used to load its predecessor's file again). It FAILS
+    LOUD when absent rather than falling back to a local copy: a second spelling of what must never leave a host is
+    the drift one owner exists to end."""
+    if not _REDACT:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "redact", "redact.py")
+        if not os.path.isfile(path):
+            raise SystemExit("probe-reference-cc: cannot find %s -- the redaction rule lives there and nowhere else"
+                             % path)
+        spec = importlib.util.spec_from_file_location("dss_redact", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _REDACT.append(mod)
+    return _REDACT[0]
 
 
 def redactor(tree, scratch):
-    base = _read_leg_path().redactor(tree)
-    spellings = sorted({scratch, os.path.realpath(scratch)}, key=len, reverse=True)
-
-    def apply(text):
-        for s in spellings:  # the scratch sits outside the tree, under the system temp directory
-            if s and len(s) >= 3:
-                text = text.replace(s, "<probe>").replace(s.replace("\\", "/"), "<probe>")
-        return base(text)
-    return apply
+    """The one redactor for `tree`, with this program's scratch as its place `<probe>` (the scratch sits outside the
+    tree, under the system temp directory; the redactor marks a place in every slash spelling and its real path's).
+    Raises Refusal when this host's account cannot be named (redact.Unredactable): a refusal is a line and exit 2,
+    never a traceback."""
+    mod = redact_module()
+    try:
+        return mod.redactor(tree, places={"<probe>": scratch} if scratch else None)
+    except mod.Unredactable as exc:
+        raise Refusal(str(exc))
 
 
 def decode_source(b64, allow_empty=False):
@@ -207,25 +222,40 @@ def split_list(value):
     return [unquote(item) for item in (value or "").split(",") if item != ""]
 
 
-def program_key(cc):
+def program_key(cc, os_name=None):
     """The name a compiler is KNOWN by in DIALECT_OF and BANNER_ONLY: on Windows a program name is case-insensitive
     and PATHEXT supplies `.exe`, so `CL` and `cl.exe` there are the same `cl`; and a distribution's version suffix
-    names the same driver (✔MEASURED 2026-09-25: the WSL host's /usr/bin has `clang-cl-19` and no `clang-cl`)."""
-    key = os.path.normcase(cc)
-    if os.name == "nt" and key.endswith(".exe"):
+    names the same driver (✔MEASURED 2026-09-25: the WSL host's /usr/bin has `clang-cl-19` and no `clang-cl`).
+    `os_name` (default this host's `os.name`) lets the self-test hold the Windows rule on every host."""
+    windows = (os_name or os.name) == "nt"
+    key = cc.lower() if windows else cc
+    if windows and key.endswith(".exe"):
         key = key[:-4]
     return re.sub(r"-[0-9]+(\.[0-9]+)*$", "", key)
 
 
+def _gnu_output(flag):
+    """A gnu driver option that names the output: `-o`, `-o<path>` (never `-objc*`), and `--output`/`--output=`."""
+    return (flag == "-o" or (flag.startswith("-o") and not flag.startswith("-objc"))
+            or flag == "--output" or flag.startswith("--output="))
+
+
 def check_flags(flags, dialect="gnu"):
     """REFUSE an option that places a product this program reads -- the object, the assembly, the linked image --
-    because this program owns those paths: gnu's `-o`; msvc's `/Fe` `/Fo` `/Fa`, its deprecated `/o`, and a linker
-    `/OUT:`."""
-    for f in flags:
-        if dialect == "msvc":
+    because this program owns those paths: gnu's `-o`, `--output` and a `-o` handed to the linker (`-Wl,-o,<x>`,
+    `-Xlinker -o`); msvc's `/Fe` `/Fo` `/Fa`, its deprecated `/o`, and a linker `/OUT:` -- and `--output` in either
+    dialect (clang-cl is a clang driver)."""
+    for i, f in enumerate(flags):
+        if f == "--output" or f.startswith("--output="):
+            places_a_product = True
+        elif dialect == "msvc":
             places_a_product = bool(MSVC_PRODUCT_PATH.match(f) or MSVC_LINK_OUT.match(f))
+        elif f.startswith("-Wl,"):
+            places_a_product = any(_gnu_output(part) for part in f[len("-Wl,"):].split(","))
+        elif f == "-Xlinker" and i + 1 < len(flags):
+            places_a_product = _gnu_output(flags[i + 1])
         else:
-            places_a_product = f == "-o" or (f.startswith("-o") and not f.startswith("-objc"))
+            places_a_product = _gnu_output(f)
         if places_a_product:
             raise Refusal("--flags names %r; this program owns every output path" % f)
 
@@ -332,8 +362,11 @@ def block(lines, title, rc, out, err):
             lines.extend(body.rstrip("\n").split("\n"))
 
 
-def probe(tree, src_b64, ext, cc, flags_value, mode, dump_value, scratch_parent=None, dialect_value=""):
-    """Return (exit code, report lines). A refusal is exit 2 with one explanatory line."""
+def probe(tree, src_b64, ext, cc, flags_value, mode, dump_value, scratch_parent=None, dialect_value="",
+          shared=None):
+    """Return (exit code, report lines). A refusal is exit 2 with one explanatory line. `shared` is a batch's
+    (redactor, directory) (`run_batch`): the batch built the one redactor ONCE, so the account is known nameable,
+    and the probe runs in `directory`, which it creates and removes."""
     try:
         if mode not in MODES:
             raise Refusal("--mode %r is not one of %s" % (mode, ", ".join(MODES)))
@@ -353,14 +386,28 @@ def probe(tree, src_b64, ext, cc, flags_value, mode, dump_value, scratch_parent=
             raise Refusal("--dump tool %r is not one of %s" % (dump[0], ", ".join(DUMP_TOOLS)))
         cc_path = find_tool(cc, "--cc")
         dump_path = find_tool(dump[0], "--dump tool") if dump else None
+        # An account nobody can name is refused BEFORE the compiler is looked for: nothing this probe says may print
+        # unredacted, an absent compiler's line included -- and so the refusal holds on a host with no compiler at
+        # all (the P69 review's NIT 3: the arm passed there on `compiler=absent`, proving nothing). A batch asked
+        # once, before its first item, and gives its redactor as `shared`.
+        if shared is None:
+            redactor(tree, "")
     except Refusal as e:
         return 2, ["probe-reference-cc: REFUSED - %s" % e]
     if cc_path is None:
         return 0, ["compiler: %s is not on this host's PATH; nothing was compiled" % cc,
                    "probe-reference-cc: OK mode=%s compiler=absent" % mode]
 
-    scratch = tempfile.mkdtemp(prefix="dss-probe-reference-cc-", dir=scratch_parent)
-    red = redactor(tree, scratch)
+    if shared is not None:
+        red, scratch = shared
+        os.mkdir(scratch)
+    else:
+        scratch = tempfile.mkdtemp(prefix="dss-probe-reference-cc-", dir=scratch_parent)
+        try:
+            red = redactor(tree, scratch)
+        except Refusal as e:
+            shutil.rmtree(scratch, ignore_errors=True)
+            return 2, ["probe-reference-cc: REFUSED - %s" % e]
     lines = []
     src = os.path.join(scratch, "probe." + ext)
     with io.open(src, "wb") as f:
@@ -466,21 +513,38 @@ def decode_batch(b64):
 
 
 def run_batch(tree, batch_b64, scratch_parent=None):
-    """Every item in turn, each under its `=== probe <name>` line. Return (exit code, report lines)."""
+    """Every item in turn, each under its `=== probe <name>` line. Return (exit code, report lines).
+    The batch builds THE ONE REDACTOR once, before its first item, over one scratch directory in which item `i`
+    runs in the subdirectory `%03d` % i. An account nobody can name is a fact about the HOST, so it refuses the
+    batch WHOLE -- exit 2, one REFUSED line, the scratch removed: refused item by item, the batch ended
+    `OK ... refused=<n>` with exit 0 and its step passed having measured nothing (the P69 fixed-point
+    re-review's FINDING 1). An item's own malformed field is still that item's refusal, and the batch goes on."""
     try:
         items = decode_batch(batch_b64)
     except Refusal as e:
         return 2, ["probe-reference-cc: REFUSED - %s" % e]
-    lines, measured = [], 0
-    for item in items:
-        rc, item_lines = probe(tree, _b64(item["src"]), item.get("ext", "c"), item.get("cc", "cc"),
-                               item.get("flags", ""), item.get("mode", "run"), item.get("dump", ""), scratch_parent,
-                               item.get("dialect", ""))
-        lines.append("=== probe %s" % item["name"])
-        lines.extend(item_lines)
-        measured += 1 if rc == 0 else 0
-    lines.append("probe-reference-cc: OK batch=%d measured=%d refused=%d"
-                 % (len(items), measured, len(items) - measured))
+    scratch = tempfile.mkdtemp(prefix="dss-probe-reference-cc-", dir=scratch_parent)
+    try:
+        red = redactor(tree, scratch)
+    except Refusal as e:
+        shutil.rmtree(scratch, ignore_errors=True)
+        return 2, ["probe-reference-cc: REFUSED - %s" % e]
+    lines, counts = [], {"measured": 0, "absent": 0, "refused": 0}
+    try:
+        for index, item in enumerate(items):
+            rc, item_lines = probe(tree, _b64(item["src"]), item.get("ext", "c"), item.get("cc", "cc"),
+                                   item.get("flags", ""), item.get("mode", "run"), item.get("dump", ""),
+                                   dialect_value=item.get("dialect", ""),
+                                   shared=(red, os.path.join(scratch, "%03d" % index)))
+            lines.append("=== probe %s" % item["name"])
+            lines.extend(item_lines)
+            # An absent compiler is a measurement of the HOST, never of a compile: counted apart (the audit's PR-1).
+            kind = "refused" if rc != 0 else "absent" if item_lines[-1].endswith(" compiler=absent") else "measured"
+            counts[kind] += 1
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    lines.append("probe-reference-cc: OK batch=%d measured=%d absent=%d refused=%d"
+                 % (len(items), counts["measured"], counts["absent"], counts["refused"]))
     return 0, lines
 
 
@@ -494,18 +558,34 @@ def run(a):
     return probe(a.tree, a.src_b64, a.ext, a.cc, a.flags, a.mode, a.dump, dialect_value=a.dialect)
 
 
-def selftest():
-    failures = 0
+# ★ AN EXACT RATCHET PER BLOCK: the arms each block runs, counted where they are judged. Which blocks run depends
+# on the host (a reference compiler, a dump tool, a Visual Studio developer environment), so the expected total is
+# derived from the blocks that ran -- and a block that silently stopped running, or an arm lost from one, is a
+# failure, never a smaller green.
+EXPECTED_FIXED = 72
+EXPECTED_CC = 6
+EXPECTED_DUMPER = 1
+EXPECTED_CL = 11
+EXPECTED_NO_CL = 1
+
+
+def selftest(expect_cl=False):
+    failures, ran = [0], {"fixed": 0, "cc": 0, "dumper": 0, "cl": 0, "nocl": 0}
+    current = ["fixed"]
+    good = _b64("int main(void) { return 42; }\n")
+    tmp_holder = tempfile.TemporaryDirectory()
+    tree = os.path.realpath(tmp_holder.name)
+    # A failing arm's detail can carry the scratch or the tree, and on Windows both sit under the profile's temp
+    # directory: every detail passes the one redactor before it is printed (the round-12 audit's temp-path leak).
+    shown = redactor(tree, os.path.join(tree, "scratch"))
 
     def arm(name, ok, detail=""):
-        nonlocal failures
-        print("probe-reference-cc selftest: %-36s %s" % (name, "ok" if ok else "FAIL" + (("\n" + detail)
+        ran[current[0]] += 1
+        print("probe-reference-cc selftest: %-36s %s" % (name, "ok" if ok else "FAIL" + (("\n" + shown(detail))
                                                                                           if detail else "")))
-        failures += 0 if ok else 1
+        failures[0] += 0 if ok else 1
 
-    good = _b64("int main(void) { return 42; }\n")
-    with tempfile.TemporaryDirectory() as tmp:
-        tree = os.path.realpath(tmp)
+    try:
         refusals = [
             ("empty source refused", dict(src_b64=""), "is empty"),
             ("non-base64 source refused", dict(src_b64="not base64!!"), "not base64"),
@@ -515,6 +595,11 @@ def selftest():
             ("compiler path refused", dict(cc="/usr/bin/cc"), "bare program name"),
             ("-o among flags refused", dict(flags_value="-O2,-o,x"), "owns every output path"),
             ("-oFILE among flags refused", dict(flags_value="-ox"), "owns every output path"),
+            ("--output=FILE among flags refused", dict(flags_value="--output=x"), "owns every output path"),
+            ("--output among flags refused", dict(flags_value="-O2,--output,x"), "owns every output path"),
+            ("a linker -o (-Wl,-o,x) refused", dict(flags_value="-Wl%2C-o%2Cx"), "owns every output path"),
+            ("a linker --output (-Wl) refused", dict(flags_value="-Wl%2C--output=x"), "owns every output path"),
+            ("-Xlinker -o refused", dict(flags_value="-Xlinker,-o,-Xlinker,x"), "owns every output path"),
             ("dump in asm mode refused", dict(mode="asm", dump_value="nm"), "applies to --mode object, link"),
             ("dump in stdout mode refused", dict(mode="stdout", dump_value="nm"), "applies to --mode object, link"),
             ("an empty source outside stdout mode refused", dict(src_b64="", mode="link"), "is empty"),
@@ -525,19 +610,27 @@ def selftest():
             kw.update(over)
             rc, lines = probe(**kw)
             arm(name, rc == 2 and want in lines[0], "\n".join(lines))
+        try:
+            # (`-output...` is NOT among them: gcc reads it as `-o utput...`, an output path, and it is refused.)
+            check_flags(["-O2", "-std=c11", "-Wl,-z,noexecstack", "-objc-arc", "-Xlinker", "--gc-sections",
+                         "--param=max-inline-insns-single=10"], "gnu")
+            arm("gnu: other flags, and non-output linker flags, allowed", True)
+        except Refusal as e:
+            arm("gnu: other flags, and non-output linker flags, allowed", False, str(e))
         # ── THE MSVC DIALECT: each mode's spelling pinned as a pure argv (no cl needed); refusals by MESSAGE ──
         arm("cl and clang-cl speak msvc, the rest gnu",
             [dialect_for(c) for c in ("cl", "clang-cl", "clang-cl-19", "gcc", "cc", "clang", "gcc-13")]
             == ["msvc", "msvc", "msvc", "gnu", "gnu", "gnu", "gnu"])
         arm("--dialect overrides the compiler's name", dialect_for("gcc", "msvc") == "msvc"
             and dialect_for("cl", "gnu") == "gnu")
-        if os.name == "nt":
-            arm("a Windows program name is case-insensitive", dialect_for("CL.EXE") == "msvc"
-                and identity_argv("Cl.exe", "P") == ["P"])
+        # The Windows name rule, held on EVERY host (it once ran only where os.name == "nt", silently elsewhere).
+        arm("a Windows program name is case-insensitive", program_key("CL.EXE", "nt") == "cl"
+            and program_key("Cl.exe", "nt") in BANNER_ONLY and program_key("CL.EXE", "posix") == "CL.EXE")
         rc, lines = probe(tree, good, "c", "cl", "", "run", "", dialect_value="borland")
         arm("an unknown dialect is refused", rc == 2 and "--dialect 'borland' is not one of gnu, msvc" in lines[0],
             "\n".join(lines))
-        sc = os.path.join(tree, "sc")
+        # Pure argv arms take a SYNTHETIC root: nothing a failure prints can name a real directory.
+        sc = os.path.join(os.sep, "synthetic-root", "sc")
         src = os.path.join(sc, "probe.c")
         exe, obj, lst = (os.path.join(sc, n) for n in ("probe.exe", "probe.obj", "probe.asm"))
         for mode, want in (("run", ["CL", "/nologo", "/O2", src, "/Fe" + exe]),
@@ -565,7 +658,8 @@ def selftest():
                                   # `/Out:`, not `/out:`: the deprecated-/o rule refuses `/out:` on its own.
                                   ("msvc /link /Out: refused (any case)", "/link,/Out:x.exe"),
                                   ("msvc deprecated -o <path> refused", "-o,x.exe"),
-                                  ("msvc deprecated /o<path> refused", "/ox.exe")):
+                                  ("msvc deprecated /o<path> refused", "/ox.exe"),
+                                  ("msvc (clang-cl) --output= refused", "--output=x.exe")):
             rc, lines = probe(tree, good, "c", "cl", flags_value, "run", "")
             arm(name, rc == 2 and "owns every output path" in lines[0], "\n".join(lines))
         for ext in ("s", "S"):
@@ -600,13 +694,56 @@ def selftest():
         for spelling, text in (("native", native), ("forward-slash", native.replace("\\", "/"))):
             want = "<probe>%sprobe.c and <tree>%ssrc" % ((os.sep, os.sep) if spelling == "native" else ("/", "/"))
             arm("scratch and tree redacted (%s)" % spelling, red(text) == want, red(text))
+        # A HOST WHOSE ACCOUNT NOBODY CAN NAME: a refusal (exit 2) and its scratch removed -- never a traceback that
+        # loses the batch and leaves the scratch behind (the round-12 audit, P5).
+        mod = redact_module()
+        real_names, real_getuser = mod.account_names, mod.getpass.getuser
+        saved = {v: os.environ.pop(v, None) for v in ("USERNAME", "USER", "LOGNAME")}
+
+        def no_account():
+            raise OSError("synthetic: no account in the process table")
+        mod.account_names = lambda _home: set()
+        mod.getpass.getuser = no_account
+        try:
+            cc_any = next((c for c in ("cc", "gcc", "clang", "cl") if shutil.which(c)), "cc")
+            before = set(os.listdir(tree))
+            try:
+                rc, lines = probe(tree, good, "c", cc_any, "", "run", "", scratch_parent=tree)
+            except Exception as exc:  # noqa: BLE001 -- a raise FAILS this arm by name (a traceback is the defect)
+                rc, lines = -1, ["RAISED %s: %s" % (type(exc).__name__, exc)]
+            left = sorted(set(os.listdir(tree)) - before)
+            # THE SAME HOST FACT IN A BATCH refuses the batch WHOLE: one REFUSED line, exit 2, its scratch removed.
+            # Refused item by item it ended `OK batch=2 ... refused=2`, exit 0, and the step's successPattern
+            # passed a batch that measured nothing (the P69 fixed-point re-review's FINDING 1). Both items are
+            # well-formed, so only the host can refuse them.
+            before_batch = set(os.listdir(tree))
+            try:
+                b_rc, b_lines = run_batch(tree, b64json([
+                    {"name": "run", "src": "int main(void) { return 42; }\n", "cc": cc_any},
+                    {"name": "object", "src": "int x;\n", "cc": cc_any, "mode": "object"}]),
+                    scratch_parent=tree)
+            except Exception as exc:  # noqa: BLE001 -- as above: a raise FAILS this arm by name
+                b_rc, b_lines = -1, ["RAISED %s: %s" % (type(exc).__name__, exc)]
+            b_left = sorted(set(os.listdir(tree)) - before_batch)
+        finally:
+            mod.account_names, mod.getpass.getuser = real_names, real_getuser
+            for v, value in saved.items():
+                if value is not None:
+                    os.environ[v] = value
+        arm("an unnameable account is refused, scratch removed", rc == 2 and "account cannot be named" in lines[0]
+            and not left, "rc=%d left=%r\n%s" % (rc, left, "\n".join(lines)))
+        arm("a batch on an unnameable account is refused WHOLE", b_rc == 2 and len(b_lines) == 1
+            and b_lines[0].startswith("probe-reference-cc: REFUSED - ") and "account cannot be named" in b_lines[0]
+            and not b_left, "rc=%d left=%r\n%s" % (b_rc, b_left, "\n".join(b_lines)))
         cc = next((c for c in ("cc", "gcc", "clang") if shutil.which(c)), None)
         # ★ A LEG WITHOUT A REFERENCE COMPILER IS A NAMED FAILURE, never a skip: the arms below are the only
         # ones that run a real compiler (and the only ones that read a real linked image), and a gate leg that
         # skipped them would pass having proved nothing about what this program exists to measure.
         arm("a reference compiler is on this host's PATH", cc is not None,
             "none of cc, gcc or clang resolves on this host's PATH")
+        dumper = None
         if cc is not None:
+            current[0] = "cc"
             rc, lines = probe(tree, good, "c", cc, "", "run", "", scratch_parent=tree)
             body = "\n".join(lines)
             arm("real compile and run (%s)" % cc, rc == 0 and "compile=0" in lines[-1] and "run=42" in lines[-1]
@@ -617,39 +754,48 @@ def selftest():
                               scratch_parent=tree)
             arm("a refused compile is still a measurement", rc == 0 and "run=" not in lines[-1]
                 and "compile=0" not in lines[-1], "\n".join(lines))
-            saved = DUMP_TOOLS
-            globals()["DUMP_TOOLS"] = saved + ("no-such-dump-for-probe",)
+            saved_tools = DUMP_TOOLS
+            globals()["DUMP_TOOLS"] = saved_tools + ("no-such-dump-for-probe",)
             try:
                 rc, lines = probe(tree, good, "c", cc, "", "object", "no-such-dump-for-probe", scratch_parent=tree)
+                rc2, lines2 = probe(tree, good, "c", cc, "", "link", "no-such-dump-for-probe", scratch_parent=tree)
             finally:
-                globals()["DUMP_TOOLS"] = saved
+                globals()["DUMP_TOOLS"] = saved_tools
             arm("an absent dump tool is REPORTED, not refused", rc == 0 and "compile=0" in lines[-1]
                 and lines[-1].endswith("dump=absent"), "\n".join(lines))
-            globals()["DUMP_TOOLS"] = saved + ("no-such-dump-for-probe",)
-            try:
-                rc, lines = probe(tree, good, "c", cc, "", "link", "no-such-dump-for-probe", scratch_parent=tree)
-            finally:
-                globals()["DUMP_TOOLS"] = saved
-            arm("a dump in LINK mode reads the linked image", rc == 0 and "compile=0" in lines[-1]
-                and lines[-1].endswith("dump=absent") and "run=" not in lines[-1], "\n".join(lines))
-            rc, lines = probe(tree, _b64(""), "c", cc, "-dM,-E", "stdout", "", scratch_parent=tree)
-            arm("an EMPTY translation unit prints the predefined macros (%s)" % cc, rc == 0
-                and "compile=0" in lines[-1] and any(ln.startswith("#define ") for ln in lines),
-                "\n".join(lines[-12:]))
+            arm("a dump in LINK mode reads the linked image", rc2 == 0 and "compile=0" in lines2[-1]
+                and lines2[-1].endswith("dump=absent") and "run=" not in lines2[-1], "\n".join(lines2))
+            # THE COUNT, with a real compile beside an absent one: measured and absent are different facts.
+            rc, lines = run_batch(tree, b64json([
+                {"name": "real", "src": "int main(void) { return 42; }\n", "cc": cc},
+                {"name": "absent", "src": "int main(void) { return 42; }\n", "cc": "no-such-cc-for-probe"}]),
+                scratch_parent=tree)
+            arm("a real compile is measured, an absent compiler absent", rc == 0
+                and lines[-1] == "probe-reference-cc: OK batch=2 measured=1 absent=1 refused=0", "\n".join(lines))
             dumper = next((d for d in ("nm", "llvm-nm") if shutil.which(d)), None)
-            arm("a dump tool is on this host's PATH", dumper is not None,
-                "neither nm nor llvm-nm resolves on this host's PATH")
-            if dumper:
-                rc, lines = probe(tree, good, "c", cc, "", "run", dumper, scratch_parent=tree)
-                arm("run mode runs, then dumps the linked image (%s)" % dumper, rc == 0 and "run=42" in lines[-1]
-                    and "dump=0" in lines[-1] and any("main" in ln for ln in lines), "\n".join(lines[-12:]))
+        current[0] = "fixed"
+        arm("a dump tool is on this host's PATH", cc is None or dumper is not None,
+            "neither nm nor llvm-nm resolves on this host's PATH")
+        if dumper:
+            current[0] = "dumper"
+            rc, lines = probe(tree, good, "c", cc, "", "run", dumper, scratch_parent=tree)
+            arm("run mode runs, then dumps the linked image (%s)" % dumper, rc == 0 and "run=42" in lines[-1]
+                and "dump=0" in lines[-1] and any("main" in ln for ln in lines), "\n".join(lines[-12:]))
+            current[0] = "fixed"
         # ── REAL cl. ★ INSIDE A VISUAL STUDIO DEVELOPER ENVIRONMENT (vcvars sets VCToolsInstallDir) cl IS the
         # reference compiler, so a cl or a dumpbin that PATH does not find there is a named FAILURE, never a skip,
-        # for the reason above; outside one no cl is expected, and the arms say so by name.
-        if not os.environ.get("VCToolsInstallDir"):
-            print("probe-reference-cc selftest: %-36s %s" % ("real cl arms", "not this host's: no Visual Studio "
-                                                             "developer environment (VCToolsInstallDir unset)"))
+        # for the reason above. Outside one no cl is expected -- UNLESS the caller says this leg IS an MSVC one
+        # (`--expect-cl=yes`, which ctest passes when the build's own C++ compiler is MSVC): then its absence FAILS.
+        cl_env = bool(os.environ.get("VCToolsInstallDir"))
+        cl_note = ""
+        if not cl_env:
+            current[0] = "nocl"
+            arm("an MSVC leg has its developer environment", not expect_cl,
+                "--expect-cl=yes: this leg builds with MSVC, but VCToolsInstallDir is unset, so no cl arm could run")
+            cl_note = ", the real cl arms not this host's (no Visual Studio developer environment)"
+            current[0] = "fixed"
         else:
+            current[0] = "cl"
             arm("cl is on PATH in the developer environment", shutil.which("cl") is not None,
                 "VCToolsInstallDir is set but cl does not resolve on PATH")
             arm("dumpbin is on PATH in the developer environment", shutil.which("dumpbin") is not None,
@@ -683,8 +829,7 @@ def selftest():
                 "\n".join(lines))
             leftovers = [n for n in os.listdir(tree) if n.startswith("dss-probe-reference-cc-")]
             arm("real cl: every scratch directory is removed", not leftovers, repr(leftovers))
-        def b64json(obj):
-            return base64.urlsafe_b64encode(json.dumps(obj).encode("utf-8")).decode("ascii").rstrip("=")
+            current[0] = "fixed"
         # The refused item comes FIRST, so a batch that stopped at a refusal would lose the item after it.
         rc, lines = run_batch(tree, b64json([
             {"name": "bad-flags", "src": "int x;\n", "flags": "-o,x"},
@@ -692,7 +837,7 @@ def selftest():
         heads = [ln for ln in lines if ln.startswith("=== probe ")]
         arm("a batch runs every item; a refused item goes on", rc == 0
             and heads == ["=== probe bad-flags", "=== probe absent"]
-            and lines[-1] == "probe-reference-cc: OK batch=2 measured=1 refused=1", "\n".join(lines))
+            and lines[-1] == "probe-reference-cc: OK batch=2 measured=0 absent=1 refused=1", "\n".join(lines))
         batch_refusals = [
             ("a batch not JSON is refused whole", base64.b64encode(b"not json").decode("ascii"),
              "not a UTF-8 JSON array"),
@@ -719,7 +864,7 @@ def selftest():
             {"name": "msvc-refused", "src": "int x;\n", "cc": "cl", "flags": "/Fex.exe"},
             {"name": "dialect-override", "src": "int x;\n", "cc": "no-such-cc-for-probe", "dialect": "msvc"}]))
         arm("a batch item carries its own dialect", rc == 0
-            and lines[-1] == "probe-reference-cc: OK batch=2 measured=1 refused=1"
+            and lines[-1] == "probe-reference-cc: OK batch=2 measured=0 absent=1 refused=1"
             and any("owns every output path" in ln for ln in lines), "\n".join(lines))
         rc, lines = run_batch(tree, b64json({"sources": {"prog": "int main(void) { return 42; }\n"}, "items": [
             {"name": "v1", "src_ref": "prog", "cc": "no-such-cc-for-probe", "flags": "-O0"},
@@ -727,34 +872,66 @@ def selftest():
         rc2, lines2 = run_batch(tree, b64json({"sources": {"empty": ""}, "items": [
             {"name": "dM", "src_ref": "empty", "mode": "stdout", "flags": "-dM,-E", "cc": "no-such-cc-for-probe"},
             {"name": "link-empty", "src": "", "mode": "link", "cc": "no-such-cc-for-probe"}]}))
-        arm("a batch's empty source: measured in stdout mode, refused as ITS item elsewhere", rc2 == 0
-            and lines2[-1] == "probe-reference-cc: OK batch=2 measured=1 refused=1"
+        arm("a batch's empty source: absent in stdout mode, refused as ITS item elsewhere", rc2 == 0
+            and lines2[-1] == "probe-reference-cc: OK batch=2 measured=0 absent=1 refused=1"
             and any("is empty" in ln for ln in lines2), "\n".join(lines2))
         arm("a batch object shares one source across items", rc == 0
             and [ln for ln in lines if ln.startswith("=== probe ")] == ["=== probe v1", "=== probe v2"]
-            and lines[-1] == "probe-reference-cc: OK batch=2 measured=2 refused=0", "\n".join(lines))
+            and lines[-1] == "probe-reference-cc: OK batch=2 measured=0 absent=2 refused=0", "\n".join(lines))
         for label, argv in (("both sources", ["--src-b64=" + good, "--batch-b64=" + good]), ("no source", [])):
             rc, lines = run(build_parser().parse_args(["--tree=" + tree, "--out=o"] + argv))
             arm("exactly one source (%s refused)" % label, rc == 2 and "exactly one of" in lines[0],
                 "\n".join(lines))
+    finally:
+        tmp_holder.cleanup()
     # A flag list, a URL-safe base64 source and a dump argv can each BEGIN with `-`, which argparse reads as another
     # option unless it is spelled `--name=value` -- so the runner's own .yml must spell every option that way.
     a = build_parser().parse_args(["--tree=t", "--src-b64=-AB_", "--flags=-std=c2x,-dM", "--dump=-x", "--out=o",
                                    "--dialect=msvc"])
     arm("option values may begin with '-'", (a.src_b64, a.flags, a.dump, a.dialect)
         == ("-AB_", "-std=c2x,-dM", "-x", "msvc"))
+    # The program's own options are never ABBREVIATED: `--o=x` is not `--out` (argparse's default would bind it).
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):  # argparse's usage line is not this arm's output
+            build_parser().parse_args(["--tree=t", "--src-b64=x", "--out=o", "--o=x"])
+        abbreviated = True
+    except SystemExit:
+        abbreviated = False
+    arm("an abbreviated option is refused, not bound", not abbreviated)
+    with contextlib.redirect_stdout(io.StringIO()) as said:
+        usage_rc = main(["probe-reference-cc.py", "--selftest", "--expect-cl"])
+    arm("--selftest takes --expect-cl=yes or =no, nothing else", usage_rc == 2 and "USAGE" in said.getvalue()
+        and SELFTEST_EXPECT_CL[("--expect-cl=yes",)] is True and SELFTEST_EXPECT_CL[()] is False,
+        said.getvalue())
     yml = os.path.join(os.path.dirname(os.path.realpath(__file__)), "probe-reference-cc.yml")
     with io.open(yml, encoding="utf-8") as f:
         run_line = next((ln for ln in f if "probe-reference-cc.py" in ln and "--tree" in ln), "")
     loose = re.findall(r"(--[a-z0-9-]+)(?=\s)", run_line)
     arm("the .yml spells every option --name=value", bool(run_line) and not loose, "loose options: %r" % loose)
-    print("probe-reference-cc selftest: %s" % ("OK" if failures == 0 else "FAIL - %d arm(s)" % failures))
-    return 1 if failures else 0
+    # The expectation follows the HOST's facts, never what ran: a block deleted outright on a host that has its
+    # tool would otherwise expect nothing and pass.
+    expected = {"fixed": EXPECTED_FIXED, "cc": EXPECTED_CC if cc is not None else 0,
+                "dumper": EXPECTED_DUMPER if dumper else 0, "cl": EXPECTED_CL if cl_env else 0,
+                "nocl": 0 if cl_env else EXPECTED_NO_CL}
+    miscount = {b: (ran[b], expected[b]) for b in ran if ran[b] != expected[b]}
+    if miscount:
+        failures[0] += 1
+        print("probe-reference-cc selftest: ARM COUNT per block (ran, expected) %r -- the EXPECTED_* constants are "
+              "the ratchet" % miscount)
+    total = sum(ran.values())
+    print("probe-reference-cc selftest: %s" % ("OK (%d arm(s)%s)" % (total, cl_note) if failures[0] == 0
+                                               else "FAIL - %d of %d arm(s)" % (failures[0], total)))
+    return 1 if failures[0] else 0
+
+
+def b64json(obj):
+    return base64.urlsafe_b64encode(json.dumps(obj).encode("utf-8")).decode("ascii").rstrip("=")
 
 
 def build_parser():
     ap = argparse.ArgumentParser(description="Compile, and optionally run or dump, one probe with this host's "
-                                             "reference compiler; print and keep the report, redacted.")
+                                             "reference compiler; print and keep the report, redacted.",
+                                 allow_abbrev=False)
     ap.add_argument("--tree", required=True)
     ap.add_argument("--src-b64", default="")
     ap.add_argument("--batch-b64", default="")
@@ -768,9 +945,20 @@ def build_parser():
     return ap
 
 
+SELFTEST_EXPECT_CL = {(): False, ("--expect-cl=no",): False, ("--expect-cl=yes",): True}
+
+
 def main(argv):
-    if argv[1:] == ["--selftest"]:
-        return selftest()
+    # `--selftest [--expect-cl=yes|no]`: ctest always passes the value, `yes` where the build's own C++ compiler is
+    # MSVC -- decided when CMake CONFIGURES the tree (from `CMAKE_CXX_COMPILER_ID`; `add_test` refuses a generator
+    # expression there), so the argument is never empty.
+    if argv[1:2] == ["--selftest"]:
+        rest = tuple(argv[2:])
+        if rest not in SELFTEST_EXPECT_CL:
+            print("probe-reference-cc: USAGE - --selftest takes only --expect-cl=yes or --expect-cl=no, not %r"
+                  % (list(rest),))
+            return 2
+        return selftest(expect_cl=SELFTEST_EXPECT_CL[rest])
     a = build_parser().parse_args(argv[1:])
     rc, lines = run(a)
     text = "\n".join(lines) + "\n"

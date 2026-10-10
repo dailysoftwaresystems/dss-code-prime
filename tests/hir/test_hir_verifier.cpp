@@ -67,6 +67,14 @@ static_assert(!std::is_constructible_v<HirVerifier, Hir&&>);
 static_assert(!std::is_constructible_v<HirVerifier, Hir&&, dss::HirSourceMap const*>);
 static_assert(!std::is_constructible_v<HirVerifier, Hir&&, dss::HirSourceMap const*,
                                        dss::TypeInterner const*>);
+static_assert(!std::is_constructible_v<HirVerifier, Hir&&, dss::HirSourceMap const*,
+                                       dss::TypeInterner const*,
+                                       dss::HirInlineAsmPool const*,
+                                       dss::HirLinkageMap const*>);
+static_assert(std::is_constructible_v<HirVerifier, Hir const&, dss::HirSourceMap const*,
+                                      dss::TypeInterner const*,
+                                      dss::HirInlineAsmPool const*,
+                                      dss::HirLinkageMap const*>);
 
 namespace {
 
@@ -797,7 +805,7 @@ TEST(HirVerifier, ReturnCompletenessSkippedWithoutInterner) {
 // WHY THE HELPER WALKS THE WHOLE SUBTREE: a `goto` may target a `LabelStmt` nested
 // at ANY depth inside a dead-tail statement, so re-establishing reachability
 // (D-CSUBSET-BLOCK-TERMINATION-LAST-REACHABLE — the soundness that keeps
-// GenuineFallThroughStillFailsLoudIncludingNestedLabel red) requires scanning the
+// GenuineFallThroughIsStillSeenIncludingNestedLabel honest) requires scanning the
 // child's ENTIRE subtree for a label. It was originally recursive (one host frame
 // per HIR level); SQLite emits deeply-nested trees (especially expressions in dead
 // code), where a recursive tree-walk has overflowed the stack before — the same
@@ -1698,4 +1706,177 @@ TEST(HirVerifier, ArityFailureNamesTheConstructNotAnOrdinal) {
         << "no user-facing message may spell a raw kind ordinal: " << text;
     EXPECT_NE(text.find("#" + std::to_string(bad.v)), std::string::npos)
         << "the node id must survive — it is the reporter's dedup key: " << text;
+}
+
+// P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): an `UnnamedObject`
+// carries a storage duration its payload can name, and its initializer has the object's
+// MATERIAL type — its value (what a consumer peels) and its object (what a consumer
+// addresses) must agree. A qualifier skin on the object alone (`volatile int`) is the
+// object's, and passes. RED-ON-DISABLE: drop `checkUnnamedObject` from `verify` → the two
+// refusals below read clean.
+TEST(HirVerifier, UnnamedObjectStorageAndInitializerTypeAreChecked) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const i64  = ti.primitive(TypeKind::I64);
+    TypeId const vi32 = ti.volatileQualified(i32);
+    {
+        HirBuilder b{"toy"};
+        HirNodeId const init = b.makeLiteral(i32, 0);
+        HirNodeId const obj  = b.makeUnnamedObject(init, vi32, dss::HirObjectStorage::Static);
+        Hir h = std::move(b).finish(obj);
+        DiagnosticReporter reporter;
+        EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)))
+            << "a volatile object initialized by an int value is well-formed";
+    }
+    {
+        HirBuilder b{"toy"};
+        HirNodeId const init = b.makeLiteral(i64, 0);
+        HirNodeId const obj  = b.makeUnnamedObject(init, i32, dss::HirObjectStorage::Automatic);
+        Hir h = std::move(b).finish(obj);
+        DiagnosticReporter reporter;
+        EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+        ASSERT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+        EXPECT_NE(reporter.all().front().actual.find("UnnamedObject"), std::string::npos);
+    }
+    {
+        HirBuilder b{"toy"};
+        HirNodeId const init = b.makeLiteral(i32, 0);
+        HirNodeId const obj  = b.addParent(HirKind::UnnamedObject, std::array{init}, i32,
+                                           /*payload=*/7);
+        Hir h = std::move(b).finish(obj);
+        DiagnosticReporter reporter;
+        EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+        ASSERT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+        EXPECT_NE(reporter.all().front().actual.find("storage 7"), std::string::npos)
+            << reporter.all().front().actual;
+    }
+}
+
+// P69 (D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED): a union aggregate's
+// payload NAMES the member its child initializes, and the child must be of THAT member's type —
+// "some member's type" let a producer that named no member pass whenever its child happened to
+// share member 0's type, and a member read then folded the wrong member.
+TEST(HirVerifier, AUnionAggregateNamesTheMemberItsChildInitializes) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const f32 = ti.primitive(TypeKind::F32);
+    std::array<TypeId, 2> const variants{i32, f32};
+    TypeId const u = ti.unionType("U", variants);
+    auto const verdict = [&](TypeId childTy, std::uint32_t member) {
+        HirBuilder b{"toy"};
+        HirNodeId const child = b.makeLiteral(childTy, 0);
+        HirNodeId const agg = b.makeConstructAggregate(std::array{child}, u,
+                                                       HirFlags::None, member);
+        Hir h = std::move(b).finish(agg);
+        DiagnosticReporter reporter;
+        bool const ok = HirVerifier{h, nullptr, &ti}.verify(reporter);
+        return std::pair{ok, reporter.all().empty() ? std::string{}
+                                                    : reporter.all().front().actual};
+    };
+    EXPECT_TRUE(verdict(i32, 0).first) << "member 0, an int child";
+    EXPECT_TRUE(verdict(f32, 1).first) << "member 1, a float child";
+    auto const wrong = verdict(f32, 0);
+    EXPECT_FALSE(wrong.first) << "a float child named as member 0 (the int)";
+    EXPECT_NE(wrong.second.find("member 0"), std::string::npos) << wrong.second;
+    auto const past = verdict(i32, 2);
+    EXPECT_FALSE(past.first) << "member 2 of a two-member union";
+    EXPECT_NE(past.second.find("member 2"), std::string::npos) << past.second;
+}
+
+// P69 (lane `cs`): the linkage side-table's own invariants. The table is not part of the
+// tree, so no other rule can see them, and each one is a fact a consumer would otherwise
+// GUESS: which kind of weak definition a weak binding is (the two link differently), and
+// whether a zero-filled global is a tentative definition (two of those are one object).
+//
+// RED-ON-DISABLE: drop any one arm of `checkLinkageAttributes` and the row naming it goes
+// green where it must be red; drop the `linkageMap_ == nullptr` return's twin — the fifth
+// constructor argument — and every refused row passes.
+TEST(HirVerifier, ALinkageAttributeStatesItsWeakKindAndKeepsTheTentativeMarkOnGlobals) {
+    using dss::LinkageAttr;
+    using dss::SymbolBinding;
+    using dss::WeakDefinitionKind;
+    TypeInterner ti = makeInterner();
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const fnTy = intToIntSig(ti);
+
+    struct Row {
+        char const* what;
+        bool        onFunction;      // the attribute sits on the Function, else on the Global
+        LinkageAttr attr;
+        char const* refusedWith;     // nullptr = the module verifies clean
+    };
+    auto const weak = [](WeakDefinitionKind k) {
+        LinkageAttr a;
+        a.binding  = SymbolBinding::Weak;
+        a.weakKind = k;
+        return a;
+    };
+    auto const tentative = [](SymbolBinding b) {
+        LinkageAttr a;
+        a.binding   = b;
+        a.tentative = true;
+        return a;
+    };
+    LinkageAttr kindBesideGlobal;
+    kindBesideGlobal.weakKind = WeakDefinitionKind::SelectAny;
+    LinkageAttr kindBesideLocal;
+    kindBesideLocal.binding  = SymbolBinding::Local;
+    kindBesideLocal.weakKind = WeakDefinitionKind::Overridable;
+    LinkageAttr weakTentative = weak(WeakDefinitionKind::Overridable);
+    weakTentative.tentative = true;
+    LinkageAttr local;
+    local.binding = SymbolBinding::Local;
+
+    for (Row const& row : {
+             Row{"an overridable weak global", false,
+                 weak(WeakDefinitionKind::Overridable), nullptr},
+             Row{"a select-any weak global", false,
+                 weak(WeakDefinitionKind::SelectAny), nullptr},
+             Row{"an overridable weak function", true,
+                 weak(WeakDefinitionKind::Overridable), nullptr},
+             Row{"a weak global that names no kind", false,
+                 weak(WeakDefinitionKind{}), "names no weak-definition kind"},
+             Row{"a weak function that names no kind", true,
+                 weak(WeakDefinitionKind{}), "names no weak-definition kind"},
+             Row{"a kind beside the default binding", false, kindBesideGlobal,
+                 "names a weak-definition kind beside the 'global' binding"},
+             Row{"a kind beside the internal binding", false, kindBesideLocal,
+                 "names a weak-definition kind beside the 'local' binding"},
+             Row{"a tentative global", false, tentative(SymbolBinding::Global), nullptr},
+             Row{"a tentative weak global", false, weakTentative, nullptr},
+             Row{"an internal global, not tentative", false, local, nullptr},
+             Row{"a tentative mark on a function", true,
+                 tentative(SymbolBinding::Global), "the node is not a Global"},
+             Row{"a tentative mark beside the internal binding", false,
+                 tentative(SymbolBinding::Local), "beside the internal binding"}}) {
+        HirBuilder b{"c"};
+        HirNodeId const fn = b.makeFunction(fnTy, 1, std::array{b.makeVarDecl(i32, 10)},
+                                            b.makeBlock({}));
+        HirNodeId const g   = b.makeGlobal(i32, 2);
+        HirNodeId const mod = b.makeModule(std::array{fn, g});
+        Hir h = std::move(b).finish(mod);
+        dss::HirLinkageMap linkage{h};
+        linkage.set(row.onFunction ? fn : g, row.attr);
+
+        DiagnosticReporter reporter;
+        bool const ok =
+            HirVerifier{h, nullptr, nullptr, nullptr, &linkage}.verify(reporter);
+        if (row.refusedWith == nullptr) {
+            EXPECT_TRUE(ok) << row.what << ": "
+                            << (reporter.all().empty() ? std::string{}
+                                                       : reporter.all().front().actual);
+            EXPECT_EQ(reporter.errorCount(), 0u) << row.what;
+        } else {
+            EXPECT_FALSE(ok) << row.what;
+            ASSERT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u)
+                << row.what << " — exactly its own finding, never a second one";
+            EXPECT_NE(reporter.all().front().actual.find(row.refusedWith),
+                      std::string::npos)
+                << row.what << " — got: " << reporter.all().front().actual;
+        }
+        // CONTROL: the same module with NO table handed to the verifier is not judged
+        // on linkage at all — the rule reads the table, not the tree.
+        DiagnosticReporter quiet;
+        EXPECT_TRUE(HirVerifier{h}.verify(quiet)) << row.what;
+    }
 }

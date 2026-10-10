@@ -1,0 +1,1 @@
+        if not any(word in c.lower() for word in _NINJA_DROPS):

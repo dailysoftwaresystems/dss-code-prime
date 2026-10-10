@@ -334,9 +334,16 @@ struct Members {
                                      tri->name, tri->formulaKind});
             }
         }
-        // `___stdoutp` is libSystem's; the pipeline's archive binder would say so.
+        // `___stdoutp` is libSystem's, and a DATUM of it; the pipeline's library binder would say both. The
+        // object states no kind for it (an N_UNDF symbol no call relocation names reads Pending since P69), so
+        // the kind is the definition's, as the binder's `decideKindFromTheDefinition` takes it.
         for (auto& e : m->externImports) {
-            if (e.mangledName == "___stdoutp") e.libraryPath = "/usr/lib/libSystem.B.dylib";
+            if (e.mangledName != "___stdoutp") continue;
+            e.libraryPath = "/usr/lib/libSystem.B.dylib";
+            if (e.kindOrigin == ExternKindOrigin::Pending) {
+                e.isData     = true;
+                e.kindOrigin = ExternKindOrigin::FromLibrary;
+            }
         }
         out.modules.push_back(std::move(*m));
     }

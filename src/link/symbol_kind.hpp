@@ -34,6 +34,12 @@ enum class SymbolKind : std::uint8_t {
     // which-kind-defined-this distinction precise (it is neither a function entry
     // nor a data item).
     BlockLocal = 3,
+    // D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69): a
+    // symbol whose ADDRESS IS 0 (`AssembledModule::nullAddressSymbols`) — a weak
+    // symbol the link resolved to nothing, as a PC-relative or branch field that
+    // names it directly sees it. Neither a body nor an import: the writer that
+    // places the image at its link address gives it the address 0.
+    NullAddress = 4,
 };
 
 // A `SymbolId` scoped to its defining CompilationUnit — the linker's collision-

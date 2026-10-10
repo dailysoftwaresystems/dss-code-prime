@@ -1957,6 +1957,69 @@ TEST(Inlining, RecoverParentFrameSlotCalleeIsNotInlined) {
     EXPECT_TRUE(verifier.verify(rep));
 }
 
+// ── P69 (lane `cs`, review M2): a RUNTIME-SIZED Alloca keeps its callee out of line ──
+// f(n) { return alloca(n); }   main(n) { return f(n); }
+// A runtime-sized block (`__builtin_alloca(n)`) lives until the function holding it
+// RETURNS; spliced into main it would live until MAIN returns, so a call in a loop would
+// keep every iteration's block (examples/c/alloca_helper_called_in_a_loop is the runtime
+// witness). CONTROL: the same callee with a FIXED Alloca — a local's slot, no size
+// operand — inlines.
+// RED-on-disable: delete the runtime-sized `Alloca` arm in inlineLegalityGate → f inlines.
+TEST(Inlining, RuntimeSizedAllocaCalleeIsNotInlined) {
+    for (bool const runtimeSized : {true, false}) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const i64   = interner.primitive(TypeKind::I64);
+        TypeId const u8    = interner.primitive(TypeKind::U8);
+        TypeId const block = runtimeSized ? interner.pointer(interner.vlaArray(u8))
+                                          : interner.pointer(u8);
+        TypeId const params[] = {i64};
+        TypeId const fSig    = interner.fnSig(params, block, CallConv::CcSysV);
+        MirBuilder mb;
+
+        // f (SymbolId 55): the block, runtime-sized (operand n) or fixed (payload 16).
+        mb.addFunction(fSig, SymbolId{55});
+        MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(fEntry);
+        MirInstId const n = mb.addArg(0, i64);
+        MirInstId a;
+        if (runtimeSized) {
+            std::array<MirInstId, 1> const ops{n};
+            a = mb.addInst(MirOpcode::Alloca, ops, block, /*payload=*/0, MirInstFlags::None,
+                           /*align=*/16);
+        } else {
+            a = mb.addInst(MirOpcode::Alloca, {}, block, /*payload=*/16, MirInstFlags::None,
+                           /*align=*/16);
+        }
+        mb.addReturn(a);
+
+        // main (SymbolId 100): return f(n).
+        mb.addFunction(fSig, SymbolId{100});
+        MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(mEntry);
+        MirInstId const mArg  = mb.addArg(0, i64);
+        MirInstId const fAddr = mb.addGlobalAddr(SymbolId{55}, fSig);
+        MirInstId const callOps[] = {fAddr, mArg};
+        mb.addReturn(mb.addInst(MirOpcode::Call, callOps, block));
+        Mir mir = std::move(mb).finish();
+        ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runInlining(mir, interner, rep,
+                                                opt::kMaxInlineThreshold);
+        EXPECT_TRUE(r.ok);
+        if (runtimeSized) {
+            EXPECT_EQ(r.callsInlined, 0u)
+                << "a callee holding a runtime-sized Alloca must be REFUSED: spliced, its "
+                   "block would outlive the call by the caller's whole lifetime";
+            EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u) << "main's Call survives";
+        } else {
+            EXPECT_EQ(r.callsInlined, 1u) << "CONTROL: a fixed Alloca is a local's slot";
+        }
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep));
+    }
+}
+
 // ── VOID single-block leaf callee IS inlined (invalid-result-id path) ─
 // g() { volatile-free body; return; }  (void, no return value)
 // main() { g(); return 0; }  (g's "result" is unused)

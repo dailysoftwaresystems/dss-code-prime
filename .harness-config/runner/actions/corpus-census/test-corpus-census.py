@@ -18,7 +18,9 @@ that copy and prints its `git()` answers: nothing compiles and no census runs. A
   GIT_DIR                  another repository                           -> the same (negative: bare git names the other)
   GIT_DIR + GIT_WORK_TREE  another repository                           -> the same (negative: bare git reads it CLEAN)
   GIT_INDEX_FILE           another repository's index, ABSOLUTE         -> the same (negative: bare git status differs)
-plus one arm that the fixture box is removed.
+plus one arm that the census's legs default to the manifest's OWN target(s) -- a manifest naming none refused, never
+defaulted to every predefine class (2026-10-06, the P69 re-review's MINOR 2) -- asked of the same copy, and one arm
+that the fixture box is removed.
 
 usage:  test-corpus-census.py
 exit:   0 every arm held · 1 an arm failed · 2 cannot run
@@ -46,9 +48,12 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 # `scripts/` (2026-09-18).
 OWNER_PY = os.path.join(os.path.dirname(HERE), "owning-tree", "owning-tree.py")
 OWN_BRANCH, OTHER_BRANCH = "ge-census-own", "ge-census-other"
-EXPECTED_ARMS = 5
+EXPECTED_ARMS = 6
+# A manifest's own target, the default the census must take for it.
+OWN_TARGET = "arm64:macho64-arm64-darwin-exec"
 
-# Imports the COPY named on the command line and prints its run-identity answers as JSON.
+# Imports the COPY named on the command line and prints its run-identity answers as JSON, then its default legs for
+# a manifest naming one target and for one naming none (the exit code its refusal carries).
 _DRIVER = r'''
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("census_copy", sys.argv[1])
@@ -58,6 +63,12 @@ spec.loader.exec_module(mod)
 print("IDENTITY=" + json.dumps({"root": str(mod.REPO_ROOT), "head": mod.git("rev-parse", "HEAD"),
                                 "branch": mod.git("rev-parse", "--abbrev-ref", "HEAD"),
                                 "status": mod.git("status", "--porcelain")}))
+try:
+    mod.default_targets({"sources": ["a.c"]})
+    refused = None
+except SystemExit as exc:
+    refused = exc.code
+print("TARGETS=" + json.dumps({"own": mod.default_targets({"targets": [sys.argv[2]]}), "none": refused}))
 '''
 
 
@@ -127,20 +138,25 @@ def main(argv):
         git(other, "commit", "-q", "--no-verify", "-m", "fixture other")
         own_head = git(own, "rev-parse", "HEAD")
 
+        defaults = {}
+
         def census(extra):
             env = dict(base, GIT_CEILING_DIRECTORIES=box, **extra)
             try:
                 # `-B`: a child that loads by path writes no bytecode (check-scripts-index clause 12b).
-                p = subprocess.run([sys.executable, "-B", "-c", _DRIVER, copy], cwd=box, env=env,
+                p = subprocess.run([sys.executable, "-B", "-c", _DRIVER, copy, OWN_TARGET], cwd=box, env=env,
                                    capture_output=True,
                                    text=True, encoding="utf-8", errors="replace", timeout=180)
                 said = (p.stdout or "") + (p.stderr or "")
             except subprocess.TimeoutExpired:
                 return None, "TIMEOUT"
+            identity = None
             for line in said.splitlines():
                 if line.startswith("IDENTITY="):
-                    return json.loads(line[len("IDENTITY="):]), ""
-            return None, said.strip()[-240:]
+                    identity = json.loads(line[len("IDENTITY="):])
+                elif line.startswith("TARGETS=") and not extra:
+                    defaults.update(json.loads(line[len("TARGETS="):]))
+            return (identity, "") if identity is not None else (None, said.strip()[-240:])
 
         def bare(extra, *args):
             p = subprocess.run(["git", "-C", own] + list(args), env=dict(base, **extra), capture_output=True,
@@ -154,6 +170,9 @@ def main(argv):
             "got=%r %s" % (control, why))
         if control is None:
             return 1
+        arm(defaults.get("own") == [OWN_TARGET] and defaults.get("none") == 2,
+            "with no --target the legs are the manifest's OWN target(s); a manifest naming none is refused (exit 2)",
+            "got=%r" % (defaults,))
 
         other_git = os.path.join(other, ".git")
         cases = (
@@ -184,7 +203,8 @@ def main(argv):
         print("test-corpus-census: FAIL -- %d of %d arm(s)" % (len(failed), len(ran)))
         return 1
     print("test-corpus-census: OK -- %d arm(s): the run identity names its own tree under GIT_DIR, "
-          "GIT_DIR + GIT_WORK_TREE and an absolute GIT_INDEX_FILE" % len(ran))
+          "GIT_DIR + GIT_WORK_TREE and an absolute GIT_INDEX_FILE, and its legs default to the manifest's own "
+          "target(s)" % len(ran))
     return 0
 
 

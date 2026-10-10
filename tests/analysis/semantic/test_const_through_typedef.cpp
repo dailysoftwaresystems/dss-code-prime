@@ -288,6 +288,17 @@ TEST(ConstThroughTypedef, TheRedeclarationAxisSeesAQualifierReachedThroughATyped
          true},
         {"a function declared through a function typedef",
          "typedef const char *F(void);\nF h;\nchar *h(void);\n", true},
+        // P69 (lane `cs`, D-C-A-FUNCTION-TYPEDEFS-PARAMETER-QUALIFIERS-ARE-NOT-CLAIMED): a
+        // function declared THROUGH a function typedef takes its PARAMETERS from it too.
+        // ✔MEASURED (probes r4d t04/t06, r4k k05): gcc 13.3.0 and clang 18.1.3 refuse each,
+        // MSVC 19.51 warns C4028 — the direct spellings' split.
+        {"a function typedef's parameter pointee, against a definition",
+         "typedef int F(const char *);\nF h;\nint h(char *s) { return s[0]; }\n", true},
+        {"… and a `char *const` parameter against it (the pointee still differs)",
+         "typedef int F(const char *);\nF h;\nint h(char *const s) { return s[0]; }\n", true},
+        {"a function declared through `typeof` of a function",
+         "void f_const(const char *p) { (void)p; }\ntypeof(f_const) h;\nvoid h(char *p) { (void)p; }\n",
+         true},
         {"a pointer to a function typedef (the Fn level between)",
          "typedef const char *F(void);\nint f(F *);\nint f(char *(*)(void));\n", true},
         // THE CONTROLS: the same claims spelled both ways, and the top-level
@@ -303,6 +314,11 @@ TEST(ConstThroughTypedef, TheRedeclarationAxisSeesAQualifierReachedThroughATyped
          "typedef int *restrict RP;\nint m(RP);\nint m(int *);\n", false},
         {"a result's top-level const (gcc and mingw accept; clang and MSVC refuse)",
          "typedef const int F(void);\nF h;\nint h(void);\n", false},
+        {"a function declared through a function typedef, defined alike (r4d t05)",
+         "typedef int F(const char *);\nF h;\nint h(const char *s) { return s[0]; }\n", false},
+        {"… and through `typeof` of a function, defined alike (r4k k04)",
+         "void f_const(const char *p) { (void)p; }\ntypeof(f_const) h;\nvoid h(const char *p) { (void)p; }\n",
+         false},
     }, DiagnosticCode::S_IncompatibleRedeclaration);
 }
 
@@ -334,8 +350,17 @@ TEST(ConstThroughTypedef, ATypedefRedefinitionMustKeepItsQualifiers) {
          true},
         {"a function typedef's result pointee",
          "typedef const char *G(void);\ntypedef char *G(void);\n", true},
+        // P69 (lane `cs`, the same row): a function typedef's PARAMETERS are part of the
+        // type it names. ✔MEASURED (probe r4d t01-t03): gcc 13.3.0 and clang 18.1.3
+        // refuse t01, MSVC 19.51 warns C4028; t02 and t03 build everywhere.
+        {"a function typedef's parameter pointee",
+         "typedef int F(const char *);\ntypedef int F(char *);\n", true},
         // THE CONTROLS.
         {"redefined identically", "typedef const int T;\ntypedef const int T;\n", false},
+        {"a function typedef's parameters redefined identically",
+         "typedef int F(const char *);\ntypedef int F(const char *);\n", false},
+        {"a function typedef's parameter's own top-level const (C 6.7.6.3p15)",
+         "typedef int F(char *const);\ntypedef int F(char *);\n", false},
         {"redefined through another const typedef",
          "typedef const int CI;\ntypedef const int T;\ntypedef CI T;\n", false},
         {"a function typedef's result top-level const (C23 6.7.7.4p4; gcc accepts)",
@@ -393,4 +418,34 @@ TEST(IncrementOrDecrement, OfAConstBitFieldMemberIsAWarningAsItsAssignmentIs) {
         EXPECT_EQ(errors, 0u) << src;
         EXPECT_FALSE(model.hasErrors()) << src;
     }
+}
+
+// ── P69 (lane `cs`, D-C-TYPEOF-DROPS-ITS-OPERAND-QUALIFIERS): a write through a CAST asks
+//    the cast's TYPE NAME, as a write through a pointer asks its declaration ──────────
+// `*(T)e` is an lvalue of `T`'s pointee: its operand's own type no longer matters, so the
+// designation walk stops at the cast and reads level 1 of `T`'s spine — through a typedef
+// or a `typeof` head as well. ✔MEASURED (lane `cs`'s probe r4i, every build RUN): gcc
+// 13.3.0 and clang 18.1.3 (both modes; `typeof` at `-std=c2x`) and MSVC 19.51
+// (`/std:clatest`) refuse z01-z04 and z08 and build z05-z07.
+TEST(ConstThroughTypedef, AWriteThroughACastAsksTheCastsTypeName) {
+    expectVerdicts({
+        {"z01 `*(const char *)q = 'x'`",
+         "static void g(char *q) { *(const char *)q = 'x'; }\n", true},
+        {"z02 through a typedef'd cast",
+         "typedef const char *CCP;\nstatic void g(char *q) { *(CCP)q = 'x'; }\n", true},
+        {"z03 a subscript of the cast",
+         "static void g(int *p) { ((const int *)p)[1] = 2; }\n", true},
+        {"z04 `typeof` of a pointer-to-const object",
+         "static void g(char *q, const char *cq) { *(typeof(cq))q = 'x'; }\n", true},
+        {"z08 `typeof(*cq) *` keeps the pointee's const",
+         "static void g(char *q, const char *cq) { *(typeof(*cq) *)q = 'x'; }\n", true},
+        // THE CONTROLS: the cast discards the qualifier explicitly (C 6.5.4), a cast's own
+        // top-level const qualifies the value and not the pointee, `typeof_unqual` drops it.
+        {"z05 `*(char *)cq = 'x'`",
+         "static void g(const char *cq) { *(char *)cq = 'x'; }\n", false},
+        {"z06 `*(char *const)q = 'x'`",
+         "static void g(char *q) { *(char *const)q = 'x'; }\n", false},
+        {"z07 `typeof_unqual(*cq) *`",
+         "static void g(char *q, const char *cq) { *(typeof_unqual(*cq) *)q = 'x'; }\n", false},
+    }, DiagnosticCode::S_ConstViolation);
 }

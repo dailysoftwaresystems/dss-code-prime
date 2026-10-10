@@ -264,6 +264,12 @@ struct ReadContext {
                     rel, "symbols['" + sym.name + "']", fmt, role});
             }
             for (auto const& [fmt, img] : sym.library) {
+                // ★ P69 (the R3 precedence, `ShippedSymbol::library`): an EMPTY image
+                // is the reader's record that the symbol's OWN `realization` supersedes
+                // the import it inherits on that format — no image at all, so nothing a
+                // role could restate. Only that pairing is skipped: an empty image with
+                // no realization beside it is still collected (and refused below).
+                if (img.empty() && sym.realization.contains(fmt)) continue;
                 out.literals.push_back(LiteralEntry{
                     rel, "symbols['" + sym.name + "']", fmt, img});
             }

@@ -391,6 +391,16 @@ enum class MirOpcode : std::uint16_t {
 static_assert(static_cast<std::uint32_t>(MirOpcode::Count_) <= 0xFFFF,
               "MirOpcode must fit in its uint16_t storage");
 
+// P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): what an
+// `Unreachable` terminator ASSERTS — its payload. `Assumed` (0): control never reaches it,
+// and reaching it is undefined behaviour (`__builtin_unreachable`, a sealed dead path, a
+// noreturn call's continuation), so a transformation MAY treat the path as impossible.
+// `Trap` (1): reaching it is DEFINED — the program traps (`__builtin_trap`, the wide
+// divide-by-zero check) — so no transformation may remove the path or reason from its
+// absence. Both lower to the target's declared `unreachable` opcode (`ud2` / `brk #0`);
+// the difference is the contract a pass reads, written as ` trap` in `.dssir` text.
+enum class MirUnreachableKind : std::uint32_t { Assumed = 0, Trap = 1 };
+
 // Whether an opcode produces an SSA value (and therefore whether its result
 // `typeId` must be valid). `Optional` is for calls, which produce a value iff the
 // callee's return type is non-void — both a valid and an invalid result type are

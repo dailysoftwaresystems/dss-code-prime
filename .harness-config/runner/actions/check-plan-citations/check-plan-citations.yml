@@ -21,3 +21,25 @@ steps:
     run: |
       python3 ./check-plan-citations.py --write
     successPattern: '^check-plan-citations: re-baselined [0-9]+ document\(s\), [0-9]+ citation\(s\)'
+
+  # The self-test ALONE, without verifying the tree -- `dssharness run check-plan-citations --manual-step self-test`:
+  # the instrument's arms read while the tree itself is red, or while a mutant is being read.
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-plan-citations.py --selftest
+    successPattern: '^plan-citations: self-test OK - \d+ arms'
+    requireInputsUnmoved: true
+
+  # The verb that establishes NEW ground: it CAN RAISE a ceiling, and says so -- a TREE WRITER, run only where a run names it: `dssharness run check-plan-citations-baseline`, the runner that runs it on
+  # ONE leg, this machine's own tree (config.json). It moves a tracked file by design, so it cannot carry
+  # requireInputsUnmoved; a plain run afterwards verifies.
+
+  - name: baseline
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-plan-citations.py --baseline
+    successPattern: '^check-plan-citations: BASELINED \d+ document\(s\), \d+ citation\(s\)'

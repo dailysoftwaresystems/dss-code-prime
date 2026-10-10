@@ -12,3 +12,54 @@ steps:
       python3 ./test-corpus-census.py
     successPattern: 'test-corpus-census: OK'
     requireInputsUnmoved: true
+
+  # The CENSUS itself, with this leg's built dsscp. The report directory is the step's kept output, the per-TU
+  # logs beside the report; a relative manifest is taken from the tree. HEAVY (it compiles the corpus `--jobs` at
+  # once), and the `{product}` it measures is the leg's own build, which DssHarness builds before any step that
+  # names it, whichever runner starts the step.
+  - name: census
+    manual: true
+    heavy: true
+    workingDirectoryRoot: action
+    inputs:
+      manifest:
+        description: 'the corpus manifest a sqlite run on this leg wrote, relative to the tree'
+        required: true
+      targets:
+        description: 'target specs to census, comma-separated; empty is the target(s) the manifest names'
+        default: ''
+      dssConfig:
+        description: 'the compile config passed to DSS (debug or release); empty is the compiler default'
+        default: ''
+      jobs:
+        description: 'concurrent TU compiles; 0 is half the cores'
+        default: '0'
+    run: |
+      python3 ./corpus-census.py --dss-bin="{product}" --manifest="{manifest}" --target="{targets}" --config="{dssConfig}" --jobs="{jobs}" --out="{stepBuild}/census" --keep-logs
+    outputs: [census]
+    persist: true
+    successPattern: 'coverage COMPLETE on every leg: '
+    requireInputsUnmoved: true
+
+  # RED-ON-DISABLE: the same census with one TU withheld per leg; it passes when every such leg says INCOMPLETE.
+  - name: census-self-test
+    manual: true
+    heavy: true
+    workingDirectoryRoot: action
+    inputs:
+      manifest:
+        description: 'the corpus manifest a sqlite run on this leg wrote, relative to the tree'
+        required: true
+      targets:
+        description: 'target specs to census, comma-separated; empty is the target(s) the manifest names'
+        default: ''
+      dssConfig:
+        description: 'the compile config passed to DSS (debug or release); empty is the compiler default'
+        default: ''
+      jobs:
+        description: 'concurrent TU compiles; 0 is half the cores'
+        default: '0'
+    run: |
+      python3 ./corpus-census.py --self-test --dss-bin="{product}" --manifest="{manifest}" --target="{targets}" --config="{dssConfig}" --jobs="{jobs}" --out="{stepBuild}/census"
+    successPattern: 'SELF-TEST OK: every leg that withheld a TU'
+    requireInputsUnmoved: true

@@ -430,3 +430,28 @@ dss_add_test(NAME lir/test_lir_aapcs64_mixed_fp_call
 # floating-point register, and a bit-cast to another kind is refused by name.
 dss_add_test(NAME lir/test_lir_long_double_value_semantics
              SOURCES test_lir_long_double_value_semantics.cpp)
+
+# D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS (P69): the blocks a
+# jump table, a static `&&label` and a `__try` scope name, followed from MIR→LIR's
+# ids to the final LIR — the first piece for an entry and the last for a scope's
+# last block, a pass that publishes no image refused by name (nothing inferred),
+# the four real block-for-block rebuilds publishing the identity they performed,
+# a descriptor id with no image refused, and the assembler's offsets held to the
+# final layout (`lir/lir_descriptor_blocks.hpp`).
+dss_add_test(NAME lir/test_lir_descriptor_blocks
+             SOURCES test_lir_descriptor_blocks.cpp)
+
+# D-LIR-THREAD-LOCAL-IMPORT-STAMPED-READ-THROUGH-A-SLOT (P69): a thread-local import's
+# row leaves MIR→LIR stating that its code reads no address slot, on every shipped
+# format that lowers a thread-local access and under an indirect-slot dispatch.
+dss_add_test(NAME lir/test_thread_local_import_lowering
+             SOURCES test_thread_local_import_lowering.cpp)
+
+# D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES (P69): a guarded
+# region is a set of contiguous runs with one scope record per run — the records
+# of a nested pair in table order (inner body, inner runs, outer body, outer
+# runs), a run made only of blocks created for the region's own blocks in its own
+# function, and why no run writes a value its handler reads: a source function
+# that guards a region holds no phi at all.
+dss_add_test(NAME lir/test_guarded_region_runs
+             SOURCES test_guarded_region_runs.cpp)

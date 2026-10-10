@@ -1,0 +1,1 @@
+ninja-deps self-test: FAILED  msvc: a zero record is excused when the precompiled header and the toolchain answer every include

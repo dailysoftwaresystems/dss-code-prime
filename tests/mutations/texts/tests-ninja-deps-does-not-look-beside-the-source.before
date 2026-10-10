@@ -1,0 +1,1 @@
+        places = ([os.path.dirname(path)] if quoted else []) + dirs

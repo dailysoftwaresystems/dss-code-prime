@@ -13,6 +13,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 // CST-side const-eval engine (plan 12.5 §0.2 D6). Companion to the HIR-
 // side `evaluateConstant` — same `ConstEvalResult` return shape, same
@@ -302,6 +303,45 @@ using CstSelectedArmResolver = std::function<std::optional<NodeId>(NodeId)>;
 // constant is NOT foldable here and the consumer's own loud refusal stands.
 using CstWideCharCoreResolver = std::function<std::optional<TypeKind>(NodeId)>;
 
+// P69 (lane `cs`, C23 6.6p6-p7): a CONSTANT SUBOBJECT — a compound literal constant
+// (`(constexpr int){ 3 }`), or the `.` member access of a structure or union NAMED
+// constant or compound literal constant, "even recursively" (`s.t.v`, `(constexpr struct
+// S){ … }.b`) — given its node and the current scope, resolves to the initializer VALUE
+// that initializes it and the scope that value is read in (the `resolveSymbolInit`
+// shape: the engine evaluates THAT node), plus the subobject's DECLARED type classified
+// as a cast target, so the value is read at that type (a `constexpr` unsigned member
+// initialized by `1` is `1u`: gcc 13.3.0 -std=c2x folds `-1 < s.b` to 0). `zeroValue`: no
+// initializer names the subobject, which is then zero (C 6.7.9p10) — read at `type` too.
+// nullopt: the node is not a constant subobject (a member access then falls through to
+// the offsetof arm; a non-constant compound literal stays non-constant). The resolver
+// owns WHICH objects count as constants and how a brace list places its elements (the
+// semantic tier's placement cursor), none of which this interner-free engine may know.
+struct CstConstantSubobject {
+    CstResolvedSymbol init{};        // the initializer value, and its scope
+    CstCastTarget     type{};        // the subobject's declared type, as a conversion
+    bool              zeroValue = false;
+};
+using CstConstantSubobjectResolver =
+    std::function<std::optional<CstConstantSubobject>(NodeId, std::uint32_t)>;
+
+// P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): a CALL of a builtin
+// whose verb has a constant form — `__builtin_expect(1, 1)`, `__builtin_popcount(7)`,
+// `__builtin_object_size(g, 0)` — given the call node. The resolver owns WHICH callee the
+// call names (the tier's own name resolution) and how its operands convert (the callee's
+// declared parameters, classified by `classifyCstCastTarget`); the engine folds each
+// operand, converts it, and applies `foldBuiltinVerb` — the ONE arithmetic the HIR
+// evaluator applies too. `answer`: a compile-time answer the TIER computed instead
+// (`__builtin_object_size`, whose operands are never evaluated), used verbatim at
+// `resultType`. nullopt: not such a call (an ordinary call is never a constant).
+struct CstBuiltinCall {
+    BuiltinLowering                          verb{};
+    std::vector<NodeId>                      args;
+    std::vector<std::optional<CstCastTarget>> argTypes;   // per operand; nullopt = as is
+    CstCastTarget                            resultType{};
+    std::optional<std::uint64_t>             answer;
+};
+using CstBuiltinCallResolver = std::function<std::optional<CstBuiltinCall>(NodeId)>;
+
 struct CstEvalEnvironment {
     CstSymbolInitResolver  resolveSymbolInit{};
     CstSymbolValueResolver resolveSymbolValue{};  // Item 1 — direct inline constant value
@@ -312,6 +352,8 @@ struct CstEvalEnvironment {
     CstFoldedConstantResolver resolveFoldedConstant{};  // P31 — offsetof / types_compatible_p
     CstSelectedArmResolver    resolveSelectedArm{};     // P31/P49 — __builtin_choose_expr / _Generic
     CstWideCharCoreResolver   resolveWideCharCore{};    // P68 — L'…' / u'…' / U'…' / u8'…'
+    CstConstantSubobjectResolver resolveConstantSubobject{};   // P69 — C23 6.6p6-p7
+    CstBuiltinCallResolver       resolveBuiltinCall{};         // P69 — a constant builtin call
 };
 
 // Static recognition context. All fields are non-owning references

@@ -4085,8 +4085,14 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // `__unix`, `__ELF__` (✔MEASURED gcc 13.3.0 + clang 18.1.3, x86_64 and aarch64);
     // each carries the `impliedSurface` it backs (test_os_identity_predefines pins them
     // on every real pair). 164 un-gated, 13 pe-gated, 3 macho-gated, 6 elf-gated = 186.
-    EXPECT_EQ(pms.size(), 186u)
-        << "c declares 164 un-gated + 13 pe-gated + 3 macho-gated + 6 elf-gated predefined macros";
+    // P69 (lane lm, M4 of D-FFI-INTTYPES-H-SHIPS-FOUR-FORMAT-MACROS): +120 UN-GATED rows, the
+    // `type-format` family (`__<T>_FMT<c>__` — the printf/scanf length modifier of a TYPE and
+    // one conversion, the string <inttypes.h>'s PRI/SCN macros alias); each names a TYPE and is
+    // realized per (language × pair), un-gated for the `type-size` rows' reason
+    // (test_type_format_predefines pins the family). 284 un-gated, 13 pe-gated, 3 macho-gated,
+    // 6 elf-gated = 306.
+    EXPECT_EQ(pms.size(), 306u)
+        << "c declares 284 un-gated + 13 pe-gated + 3 macho-gated + 6 elf-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -4138,8 +4144,9 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
         << "elf targets must predefine exactly the six names gcc and clang define for a "
            "linux triple in their ISO modes (`linux`/`unix` are GNU-mode only and belong "
            "to the program)";
-    EXPECT_EQ(ungated, 164u)
-        << "the 122 GNU integer-type rows (`type-name`/`type-limit`/`type-suffix`, P68 "
+    EXPECT_EQ(ungated, 284u)
+        << "the 120 `type-format` rows (`__<T>_FMT<c>__`, P69 M4, realized per pair) + "
+           "the 122 GNU integer-type rows (`type-name`/`type-limit`/`type-suffix`, P68 "
            "round 9, realized per pair) + "
            "the 3 `type-unsigned` rows (__CHAR_UNSIGNED__/__WCHAR_UNSIGNED__/"
            "__WINT_UNSIGNED__, P68 round 9, realized per pair) + "
@@ -6595,25 +6602,27 @@ TEST(Preprocessor, PredefinedValueGuardFalseKeepsIncludeDead) {
 // EXACTLY as in the authoritative pass; value-seeding it would make the pre-scan
 // MORE-live -> a silent P0016 re-open. The prefix builder therefore SKIPS
 // `isFunctionLike` predefines (mirroring the MacroExpander ctor + the <built-in>
-// prologue). NOTE: the c schema's function-like predefines are `_declspec` (B1) +
-// `__declspec` (pe-only, value ""), a WEAK red-on-disable witness -- wrongly
-// value-seeding it yields an object-like EMPTY macro, so `#if __declspec` -> empty
-// operand -> uncertain -> conservative skip -> NO error, the SAME outcome as the
-// correct guard (`#if __declspec` -> undefined identifier -> 0 -> skip). So this pin
-// POSITIVELY confirms the guarded outcome (the function-like predefine is available
-// on pe yet its VALUE guard stays dead -> no include resolved); the CODE guard is
-// what enforces FINDING-A. Run on the pe format so __declspec passes the
-// availability filter and actually reaches the isFunctionLike guard.
+// prologue). NOTE: the c schema's function-like `constant` predefine is `_declspec`
+// (pe-only; since P69 it expands to `__declspec(x)`, and `__declspec` itself is a
+// keyword that pe also predefines OBJECT-like). It is a WEAK red-on-disable
+// witness -- wrongly value-seeding it yields an object-like macro whose value is
+// not a number, so `#if _declspec` -> uncertain -> conservative skip -> NO error,
+// the SAME outcome as the correct guard (`#if _declspec` -> a bare function-like
+// name -> identifier -> 0 -> skip). So this pin POSITIVELY confirms the guarded
+// outcome (the function-like predefine is available on pe yet its VALUE guard
+// stays dead -> no include resolved); the CODE guard is what enforces FINDING-A.
+// Run on the pe format so `_declspec` passes the availability filter and actually
+// reaches the isFunctionLike guard.
 TEST(Preprocessor, FunctionLikePredefinedNotValueSeededIntoPrescan) {
     auto schema = cSubset();
     auto buf = SourceBuffer::fromString(
-        "#if __declspec\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+        "#if _declspec\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string> noDefs;
     auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, DiagnosticBudget::libraryDefault(), {}, ObjectFormatKind::Pe, noDefs);
     EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
-        << "a function-like predefine (__declspec) must NOT be value-seeded into the "
-           "pre-scan: #if __declspec stays dead so its quote-#include is not resolved";
+        << "a function-like predefine (_declspec) must NOT be value-seeded into the "
+           "pre-scan: #if _declspec stays dead so its quote-#include is not resolved";
 }
 
 // C21 Pin G (#undef COMPOSE, Option 2): `--define M=1` followed by an in-source
@@ -7345,25 +7354,81 @@ TEST(Preprocessor, UserDefineCollidingWithOrdinaryPredefineIsNotAPredefinedDiagn
     EXPECT_EQ(lexs[3], "9") << "and it takes effect";
 }
 
-// c105 (D-PP-FUNCTION-LIKE-PREDEFINE): the pe-gated `__declspec(x)` → empty
-// erase — a params-bearing config predefine lowered through the "<built-in>"
-// prologue. The NESTED-paren argument (`align(128)`) is the hard case: the
-// arg-eater must balance parens, leaving `int x ;` exactly. Also pins the
-// declaration-position cleanliness of `__declspec(dllexport)`.
-TEST(Preprocessor, FunctionLikePredefineErasesArgsOnPe) {
+// c105 (D-PP-FUNCTION-LIKE-PREDEFINE): a params-bearing config predefine lowered
+// through the "<built-in>" prologue — since P69 the pe-gated `_declspec(x)`, which
+// expands to `__declspec(x)` (until then both spellings ERASED their argument, and
+// with it every modifier a program wrote in them). The NESTED-paren argument
+// (`align(128)`) is the hard case: the argument reader must balance parentheses
+// and substitute the WHOLE of it, so the second pair of parentheses survives.
+TEST(Preprocessor, FunctionLikePredefineSubstitutesItsArgumentOnPe) {
     PreprocessResult r;
     auto lexs = ppLexemesWithDefines(
-        "__declspec(align(128)) int x;\n__declspec(dllexport) int f(void);\n",
+        "_declspec(align(128)) int x;\n_declspec(dllexport) int f(void);\n",
         {}, r, ObjectFormatKind::Pe);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
     std::vector<std::string> const expect{
-        "int", "x", ";", "int", "f", "(", "void", ")", ";"};
+        "__declspec", "(", "align", "(", "128", ")", ")", "int", "x", ";",
+        "__declspec", "(", "dllexport", ")", "int", "f", "(", "void", ")", ";"};
     EXPECT_EQ(lexs, expect)
-        << "__declspec(...) must erase to nothing on pe, args fully eaten";
+        << "_declspec(x) is __declspec(x) on pe, the argument carried whole";
+}
+
+// P69: `__declspec` ON pe IS A KEYWORD THAT IS ALSO PREDEFINED, OBJECT-LIKE,
+// EXPANDING TO ITSELF. Three things follow and each is pinned here.
+//  * NOTHING IS ERASED: the specifier reaches the parser token for token, with
+//    one modifier, several (white space or commas — cl's forms) or none.
+//  * `defined(__declspec)` is TRUE on pe, as on mingw-w64 gcc, whose identity this
+//    compiler presents there (MEASURED: `#ifdef __declspec` 1 on mingw-w64 gcc, 0
+//    on cl); real headers branch on it (tcl.h's `defined(__GNUC__) &&
+//    defined(__declspec)`).
+//  * THE SELF-REFERENCE ENDS: a name is not replaced again inside its own
+//    replacement (C 6.10.5.4), so the bare name in a `#if` is an identifier, 0 —
+//    mingw-w64 gcc's reading of its own macro there (MEASURED) — in the
+//    authoritative pass and in the include-gating pre-scan alike. A pre-scan that
+//    re-expanded it would never return, which is why the `#if` arm is here.
+// RED-ON-DISABLE: give the row back its old shape (`params: ["x"]`, value "") and
+// the first expectation loses every token of the two specifiers.
+TEST(Preprocessor, TheDeclspecKeywordIsNotErasedAndIsDefinedOnPe) {
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDefines(
+        "__declspec(align(128)) int x;\n"
+        "__declspec(noinline, deprecated) int f(void);\n"
+        "__declspec() int e;\n",
+        {}, r, ObjectFormatKind::Pe);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    std::vector<std::string> const expect{
+        "__declspec", "(", "align", "(", "128", ")", ")", "int", "x", ";",
+        "__declspec", "(", "noinline", ",", "deprecated", ")",
+        "int", "f", "(", "void", ")", ";",
+        "__declspec", "(", ")", "int", "e", ";"};
+    EXPECT_EQ(lexs, expect) << "nothing written in __declspec( ) may be erased";
+
+    PreprocessResult rd;
+    auto defined = ppLexemesWithDefines(
+        "#ifdef __declspec\nint defined_arm;\n#endif\n"
+        "#if __declspec\nint nonzero_arm;\n#else\nint zero_arm;\n#endif\n",
+        {}, rd, ObjectFormatKind::Pe);
+    EXPECT_FALSE(rd.diagnostics->hasErrors());
+    std::vector<std::string> const expectDefined{
+        "int", "defined_arm", ";", "int", "zero_arm", ";"};
+    EXPECT_EQ(defined, expectDefined);
+
+    // Off pe the name is not predefined (and `_declspec` is no macro there).
+    PreprocessResult re;
+    auto elf = ppLexemesWithDefines(
+        "#ifdef __declspec\nint defined_arm;\n#else\nint undefined_arm;\n#endif\n"
+        "_declspec(noinline) int g;\n",
+        {}, re, ObjectFormatKind::Elf);
+    std::vector<std::string> const expectElf{
+        "int", "undefined_arm", ";",
+        "_declspec", "(", "noinline", ")", "int", "g", ";"};
+    EXPECT_EQ(elf, expectElf);
 }
 
 // FC17.9(a) (D-CSUBSET-C11-THREADS-TRAMPOLINES / -MACHO): <threads.h> is now COMPLETE on
-// ALL legs — thrd_create/call_once/thrd_join land on elf (libc FFI), pe64 (kernel32 synth)
-// AND macho (libSystem pthread synth: pthread_create/pthread_once/pthread_join). So a
+// ALL legs — thrd_create/call_once/thrd_join land on elf (libc FFI), pe64 (kernel32 synth;
+// call_once DSS's runtime source over InitOnceExecuteOnce since P69) AND macho (libSystem
+// pthread synth over pthread_create/pthread_join; call_once IS pthread_once). So a
 // conforming impl must NOT define `__STDC_NO_THREADS__` on ANY target (C11 6.10.8.3 /
 // C23 6.10.9.3) — the macro is REMOVED from c.lang.json entirely. RED-on-disable:
 // re-add the macro (any gating) → the corresponding arm flips to the no_threads
@@ -7383,16 +7448,21 @@ TEST(Preprocessor, ThreadsCompleteStdcNoThreadsRemovedAllLegs) {
     }
 }
 
-// The SAME source WITHOUT the pe format: `__declspec` is format-gated
-// (availableObjectFormats:["pe"]), so off-pe it stays an ordinary identifier —
-// the c9-class per-format filter exercised on the NEW params axis.
+// The SAME kind of source WITHOUT the pe format: the function-like predefine
+// (`_declspec`, availableObjectFormats:["pe"]) is format-gated, so off-pe the name
+// is no macro and survives verbatim — the c9-class per-format filter exercised on
+// the params axis. (`__declspec` survives everywhere since P69: it is a keyword,
+// and only its pe predefine is format-gated.)
 TEST(Preprocessor, FunctionLikePredefineOffFormatStaysIdentifier) {
     PreprocessResult r;
     auto lexs = ppLexemesWithDefines(
-        "__declspec(align(128)) int x;\n", {}, r, ObjectFormatKind::Elf);
-    ASSERT_FALSE(lexs.empty());
-    EXPECT_EQ(lexs[0], "__declspec")
-        << "off-pe the name must survive verbatim (no erase, no expansion)";
+        "_declspec(align(128)) int x;\n__declspec(align(128)) int y;\n", {}, r,
+        ObjectFormatKind::Elf);
+    std::vector<std::string> const expect{
+        "_declspec", "(", "align", "(", "128", ")", ")", "int", "x", ";",
+        "__declspec", "(", "align", "(", "128", ")", ")", "int", "y", ";"};
+    EXPECT_EQ(lexs, expect)
+        << "off-pe both names must survive verbatim (no erase, no expansion)";
 }
 
 // c105 (the MSVC-profile flip): `__int64` is a pe predefine expanding to the
@@ -16385,4 +16455,36 @@ TEST(Preprocessor, SqlitesEbcdicGuardIsAHighByteCharConstantAndStillFolds) {
         << "with no target threaded, a high-byte character constant in `#if` "
            "must fail loud — the refusal keys on the OPERAND, not on whether "
            "this particular comparison happens to be sign-agnostic";
+}
+
+// ── P69 (lane `cs`, D-PP-IF-SUFFIXED-DECIMAL-PAST-INTMAX-IS-READ-UNSIGNED-IN-SILENCE) ──────────
+// The `l` and `ll` spellings of a decimal past INTMAX_MAX are reinterpreted exactly as the
+// unsuffixed one: every candidate of their rules is signed too. ✔MEASURED 2026-10-01 (lane
+// `cs`'s probe x2, linux run 20261001-040717-5c2f17f3): gcc 13.3.0 and clang 18.1.3 warn on
+// all of them and read them UNSIGNED (`#if 9223372036854775808LL < 0` takes the #else);
+// ISO C 6.4.4p2 requires the diagnostic. MSVC 19.51 is silent and reads the `LL` one signed
+// (run 20261001-040746-9806f843) — the fork is decided for the documented unsigned reading.
+// RED-ON-DISABLE: restore the `suffix.empty()` condition → the suffixed arms lose the warning.
+TEST(PreprocessorIfIntmax, ALongSuffixedDecimalAboveIntmaxMaxWarnsToo) {
+    for (char const* e : {"9223372036854775808L > 0", "9223372036854775808LL > 0",
+                          "9223372036854775808ll > 0", "18446744073709551615LL > 0"}) {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm(e, r), "taken_if") << e;
+        EXPECT_EQ(ppCodeSeverity(r,
+                      DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned),
+                  DiagnosticSeverity::Warning) << e;
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << e;
+    }
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("9223372036854775808LL < 0", r), "taken_else")
+            << "read UNSIGNED, as gcc and clang read it";
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned));
+    }
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("9223372036854775808ULL > 0", r), "taken_if");
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned))
+            << "CONTROL: an unsigned suffix reinterprets nothing";
+    }
 }

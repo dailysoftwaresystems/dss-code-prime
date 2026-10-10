@@ -44,10 +44,10 @@ and it flattened block comments -- its reading of code differed from the owner's
 107 of the 503 files it scans (a `'"'` opened a string that hid the code after it;
 14 src files hold one) -- while no verdict differed; the switch changed none.
 
-Usage:
-    python .harness-config/runner/actions/check-path-identity/check-path-identity.py            # check
-    python .harness-config/runner/actions/check-path-identity/check-path-identity.py --selftest # prove the matcher detects
-    python .harness-config/runner/actions/check-path-identity/check-path-identity.py --regen    # reprint the allowlist
+Usage -- each a step of the action, the program's own flag after the `#`:
+    dssharness run check-path-identity                           # check, then the self-test
+    dssharness run check-path-identity --manual-step self-test   # --selftest: prove the matcher detects
+    dssharness run check-path-identity --manual-step reprint     # --reprint: PRINT the allowlist it would hold
 """
 from __future__ import annotations
 
@@ -135,7 +135,7 @@ RESOLUTION_EXEMPT = frozenset({
 })
 
 # Files that legitimately touch <filesystem> today. Generated from the tree with
-# --regen; a NEW entry is a decision, which is the entire point.
+# --reprint; a NEW entry is a decision, which is the entire point.
 ALLOWLIST = frozenset("""
 analysis/compilation_unit/compilation_unit.cpp
 analysis/compilation_unit/compilation_unit.hpp
@@ -296,7 +296,7 @@ def selftest() -> int:
     return 0
 
 
-def regen() -> int:
+def reprint() -> int:
     hits = []
     for p in sorted(SRC.rglob("*")):
         if p.suffix not in (".cpp", ".hpp", ".h", ".cc"):
@@ -313,8 +313,8 @@ def regen() -> int:
 def main() -> int:
     if "--selftest" in sys.argv:
         return selftest()
-    if "--regen" in sys.argv:
-        return regen()
+    if "--reprint" in sys.argv:
+        return reprint()
     problems = scan()
     if problems:
         print(f"check-path-identity: {len(problems)} problem(s)\n")

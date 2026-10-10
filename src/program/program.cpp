@@ -23,7 +23,6 @@
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
 #include "mir/merge/synth_pe_startup.hpp"  // realizeEntryShape (the argv spine)
-#include "mir/merge/synth_stdio_shim.hpp"  // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
@@ -1375,6 +1374,32 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                   resolveLibs.objectInputs.end());
     perCuOpts.resolveLibraries = std::move(resolveLibs.dynamicLibraries);
 
+    // ★★ D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS — WHAT THIS
+    // BUILD'S FINAL MODULE IS TO ITS LINK, decided ONCE here, where the output
+    // format and both input lists are final: a `WholeImage` only when the
+    // output IS an image and its link takes no object input and no archive but
+    // the shipped runtime's (`CompileOptions::shippedRuntimeArchives` says why
+    // those cannot keep a definition of the program alive). Otherwise it is a
+    // `LinkInput`: a relocatable object is completed by a LATER link, and an
+    // image's other inputs may name any of its external-linkage definitions,
+    // hidden ones included. ✔MEASURED before: a release relocatable object
+    // lost both hidden definitions its unit never used, and a release image
+    // linked with an object input that called a hidden function its CU never
+    // called failed K_SymbolUndefined (pe64 and ELF). The static-archive arm
+    // never reads it — a member is always a `LinkInput`.
+    opt::ModuleExtent const imageExtent = [&] {
+        if (!(*formatR)->isImageFlavor()) return opt::ModuleExtent::LinkInput;
+        if (!perCuOpts.objectInputs.empty()) return opt::ModuleExtent::LinkInput;
+        for (std::filesystem::path const& archive : staticArchives) {
+            if (std::find(compileOpts.shippedRuntimeArchives.begin(),
+                          compileOpts.shippedRuntimeArchives.end(), archive)
+                == compileOpts.shippedRuntimeArchives.end()) {
+                return opt::ModuleExtent::LinkInput;
+            }
+        }
+        return opt::ModuleExtent::WholeImage;
+    }();
+
     // Cycle 24/25 build-then-lower sequence. LOOP 1: build EVERY CU's MIR up front
     // (`buildCuMir` — sem→HIR→FFI→MIR→optimize), holding each `CuMirModule` (which keeps
     // its SemanticModel — the interner owner — alive).
@@ -1705,9 +1730,19 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             // before lowering, exactly like the N==1 sole CU. Skipping this
             // would silently ship release archives optimized at the unit
             // schedule only — the archive twin of the old double-opt defect.
+            // D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY: the member's
+            // library shims are optimizer INPUT, as on every route (the
+            // contract is on `synthesizeLibraryShims`).
+            if (!synthesizeLibraryShims(cuMirs[i], reporter)) {
+                return std::nullopt;  // internal invariant breach already reported
+            }
             if (!optimizeModule(cuMirs[i].mir, **targetR,
                                 cuMirs[i].model.lattice().interner(), compileOpts,
-                                PipelineStage::Program, reporter,
+                                PipelineStage::Program,
+                                // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS:
+                                // a member's definitions are named by the OTHER
+                                // inputs of whatever link pulls it.
+                                opt::ModuleExtent::LinkInput, {}, reporter,
                                 cuMirs[i].externImports)) {
                 return std::nullopt;  // optimize-stage failure already reported
             }
@@ -1721,6 +1756,20 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 // block, read off the schema here exactly as sehPersonality is.
                 (*formatR)->atomicsRuntime());
             if (!mod) return std::nullopt;  // back-half tier failure already reported
+            // D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS: the build's
+            // archive-wide visibility, restated on every external definition of
+            // the LOWERED member — after the optimizer, whose DCE would otherwise
+            // delete a hidden definition nothing in its own unit calls
+            // (`CompileOptions::archiveDefinitionVisibility`;
+            // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS). Each
+            // format's member writer spells it in its own vocabulary, and each
+            // image's export gate reads it back through `isExternallyVisible`.
+            if (compileOpts.archiveDefinitionVisibility.has_value()) {
+                for (ModuleSymbol& ms : mod->symbols) {
+                    if (ms.binding == SymbolBinding::Local) continue;
+                    ms.visibility = *compileOpts.archiveDefinitionVisibility;
+                }
+            }
             members.push_back(std::move(*mod));
             // Member file name: THIS CU's own source stem (see the block above),
             // uniquified only where two sources share one stem.
@@ -1992,9 +2041,27 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // the link-time schedule here exactly as the N>1 merged module does above — no
     // driver `if` on stage content, the site exists and the config decides what runs.
     if (cuMirs.size() == 1) {
+        // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: the entry
+        // trampoline names the program's entry, so it is a root whatever its
+        // visibility (✔MEASURED before: a hidden `main` failed its own release
+        // link). Every candidate is kept — the one `lowerCuMirToAssembly`
+        // resolves among them is in the set; on this path a candidate's record
+        // index IS its SymbolId.
+        std::vector<EntryCandidate> entryCands;
+        std::vector<std::uint32_t>  entryCandSym;
+        collectEntryCandidates(cuMirs[0].model, entryCands, entryCandSym);
+        std::vector<SymbolId> entryRoots;
+        entryRoots.reserve(entryCandSym.size());
+        for (std::uint32_t const s : entryCandSym) entryRoots.push_back(SymbolId{s});
+        // D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY: the sole CU's library
+        // shims are optimizer INPUT, exactly as the merge seam's are.
+        if (!synthesizeLibraryShims(cuMirs[0], reporter)) {
+            return std::nullopt;  // internal invariant breach already reported
+        }
         if (!optimizeModule(cuMirs[0].mir, **targetR,
                             cuMirs[0].model.lattice().interner(), compileOpts,
-                            PipelineStage::Program, reporter,
+                            PipelineStage::Program, imageExtent,
+                            std::span<SymbolId const>{entryRoots}, reporter,
                             // this CU's extern table; lowerCuMirToAssembly moves
                             // it into MIR→LIR only after this call returns.
                             cuMirs[0].externImports)) {
@@ -2256,6 +2323,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // it resolved by election. Both are already reported; both stop here.
     if (!merged || reporter.errorCount() != mergeEntry) return std::nullopt;
 
+    // The merged module's ids are named through `symbolNames` — which also holds ids no
+    // module scan sees (a shim symbol the merge pre-registered, not yet defined). The
+    // merge stated the end of that whole allocation to the merged module
+    // (`Mir::symbolIdEnd`), so the three synthesis passes below ask the module for their
+    // fresh ids and are handed no end here (mir/merge/synth_symbol_floor.hpp).
+
     // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
     // MATERIALIZE the resolved entry's arguments per its verb × the format's declared
     // mechanism. On the CRT-accessor route (Windows: the PE OS entry carries no C
@@ -2302,14 +2375,18 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // runs → 42" for THREADS, and no such example was ever shipped — every c11_threads /
     // pthread / thread_local example is single-source, so the claim pointed at a witness
     // that does not exist. The real coverage is: for <threads.h>, the unit test
-    // `MirMerge.MultiCuThreadsShimRegistersAndSynthesizes`; for <stdio.h>, a genuine 2-TU
+    // `MirMerge.MultiCuThreadsShimRegistersAndSynthesizes`; for <stdio.h> (until P69, when the
+    // family left this seam for the runtime unit runtime/platform/src/stdio.c — the example
+    // below now witnesses THAT), a genuine 2-TU
     // runtime witness, `examples/c/shipped_sprintf_ucrt_crosscu` (exit 42, release
-    // arm, pe64) — which exercises THIS code path, and is red-on-disable proven: neutering
+    // arm, pe64) — which exercised THIS code path, and was red-on-disable proven: neutering
     // the va-leaf refusal in `opt/passes/inlining.cpp` fails it (exit 50) while the
-    // single-source `shipped_sprintf_ucrt` still passes. That asymmetry matters because
-    // this seam synthesizes PRE-optimize while compile_pipeline's synthesizes POST — see
-    // D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY. A shim collapsed onto a real user def is a
-    // DEFINED symbol → filtered out → correctly not re-synthesized.
+    // single-source `shipped_sprintf_ucrt` still passes. That asymmetry USED to matter
+    // because this seam synthesized PRE-optimize while the single-module routes
+    // synthesized POST; since P69 every route synthesizes its library shims before its
+    // final optimize (`synthesizeLibraryShims`, the contract on its declaration;
+    // D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY). A shim collapsed onto a real
+    // user def is a DEFINED symbol → filtered out → correctly not re-synthesized.
     {
         std::unordered_set<std::uint32_t> definedOrImported;
         for (std::uint32_t i = 0; i < merged->mir.moduleFuncCount(); ++i)
@@ -2328,7 +2405,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // `D_SynthRecipeFamilyUnknown`, the SAME code the single-CU seam emits, and not
         // the linker's `K_NoMatchingObjectFormat` (which would send an operator to the
         // object-format config for what is a recipe-table defect).
-        std::unordered_map<std::uint32_t, std::string> mergedThreadsRecipes, mergedStdioRecipes;
+        std::unordered_map<std::uint32_t, std::string> mergedThreadsRecipes;
         for (auto const& [symV, name] : merged->symbolNames) {
             std::string const bare = dss::ffi::unapplyCMangling(name, cSymDecor);
             if (!dss::ffi::isKnownSynthesizeRecipe(bare)
@@ -2351,7 +2428,6 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             }
             switch (*family) {
             case dss::ffi::ShimFamily::Threads: mergedThreadsRecipes.emplace(symV, bare); break;
-            case dss::ffi::ShimFamily::Stdio:   mergedStdioRecipes.emplace(symV, bare);   break;
             }
         }
         if (!synthesizeThreadsShim(merged->mir, merged->host.interner(),
@@ -2359,28 +2435,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                    cSymDecor, merged->externImports, reporter)) {
             return std::nullopt;  // internal invariant breach (vocab/switch drift) — reported.
         }
-        // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling —
-        // see `synth_stdio_shim.hpp` for the full contract. A clean no-op when
-        // `mergedStdioRecipes` is empty. The va_list block is read from the SAME
-        // resolved CC (`abi->cc`, D-FF3-3-RESOLVED-CC-INDEX-THREADED above) the merged module's calling-convention
-        // index was derived from — no second lookup, no format-name branch. It is passed
-        // WHOLE, not narrowed to `.strategy`: `variadicUsesOverflowBase` is what selects
-        // the shim's va leaf, and dropping it here would silently emit the home-base leaf
-        // on an overflow-base target (see `CuMirModule::vaListLayout`). A CC that declares
-        // no `vaListLayout` propagates as `nullopt`, NOT as a default-constructed layout:
-        // "nothing declared" must stay distinguishable from a real declaration all the way
-        // to the synth pass, which refuses it loudly (the single-CU seam threads the same
-        // optional through `CuMirModule::vaListLayout`). Consulted only if a stdio recipe
-        // actually appears.
-        std::optional<VaListLayout> vaListLayout;
-        if (abi->cc != nullptr && abi->cc->vaListLayout.has_value()) {
-            vaListLayout = *abi->cc->vaListLayout;
-        }
-        if (!synthesizeStdioShim(merged->mir, merged->host.interner(),
-                                 mergedStdioRecipes, vaListLayout,
-                                 merged->externImports, reporter)) {
-            return std::nullopt;  // recipe/helper-import/va-strategy mismatch — reported.
-        }
+        // (P69: the <stdio.h> printf-family shim sibling that stood here is RETIRED — the pe
+        // printf/scanf rows are DSS's runtime source, runtime/platform/src/stdio.c, linked
+        // from the runtime archive like any other shipped body.)
     }
 
     // Cycle 26 (D-OPT7-1): optimize the WHOLE-PROGRAM merged module with the configured
@@ -2398,7 +2455,18 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // `["Inlining"]` override still flows here via `compileOpts.pipelineOverride`
     // (an override runs at every site).
     if (!optimizeModule(merged->mir, **targetR, merged->host.interner(),
-                        compileOpts, PipelineStage::Program, reporter,
+                        compileOpts, PipelineStage::Program,
+                        // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS:
+                        // the merged module is the image's whole program unless
+                        // its link also takes foreign relocatables
+                        // (`imageExtent`); the merge already resolved the entry
+                        // the trampoline names, which is a root whatever its
+                        // visibility.
+                        imageExtent,
+                        merged->userEntrySymbol.has_value()
+                            ? std::span<SymbolId const>{&*merged->userEntrySymbol, 1}
+                            : std::span<SymbolId const>{},
+                        reporter,
                         // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED:
                         // the MERGED module's extern table.
                         //
@@ -3607,6 +3675,17 @@ buildDependencyArtifactKey(
             "pipeline directly, which changes the emitted bytes and carries no "
             "content identity that could enter a cache key. Not cached."));
     }
+    // ⛔ THE SAME BARGAIN FOR AN ARCHIVE-WIDE DEFINITION VISIBILITY: it changes
+    // the emitted bytes and the key has no term for it. Only the shipped
+    // runtime's nested build sets it, and that build never carries a
+    // dependency policy, so this refuses nothing today; it is here so a future
+    // setter cannot be served an archive built with a different visibility.
+    if (compileOpts.archiveDefinitionVisibility.has_value()) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: this build restates the visibility of "
+            "every definition it archives, which changes the emitted bytes and "
+            "is not a term of the cache key. Not cached."));
+    }
 
     std::string const closure = unionInputDigest(cus);
     if (closure.empty()) {
@@ -4116,6 +4195,20 @@ buildDependencyArtifactKey(
             Program                        runtimeProgram;
             runtimeProgram.setOutputDir(unitDir);
             runtimeProgram.setCompileConfig(config);
+            // ★★ D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS — ONE
+            // DECLARATION FOR THE WHOLE RUNTIME: every definition a shipped
+            // runtime unit contributes is the IMPLEMENTATION of the image that
+            // links it, never that image's API, so the archive is built HIDDEN,
+            // exactly as libgcc.a's members are. ✔MEASURED before it: a DSS
+            // shared library calling memalignment re-exported the runtime's
+            // memalignment, free_sized and free_aligned_sized (`.so`), and the
+            // C23 entry points and `__dss_platform_*` bodies too (`.dll`,
+            // `.dylib`), where gcc and clang `-shared` and Apple clang
+            // `-dynamiclib` export the library's own function alone. Set here
+            // and nowhere else, beside the other hermetic properties of this
+            // build; the cache key needs no term for it, because it is a
+            // constant of this code and the compiler stamp covers the code.
+            runtimeProgram.setArchiveDefinitionVisibility(SymbolVisibility::Hidden);
             // ★★ THE POLICY IS DSS's OWN — DEFAULT-CONSTRUCTED, NEVER THE
             // USER's (`--suppress` / overrides / `--warnings-as-errors`). The
             // runtime is hermetic by design (above), and the cache key carries
@@ -4298,6 +4391,11 @@ int runCusToTargets(
     // gates them. Passed PER TARGET, not resolved once: two targets of one
     // build can differ in whether their format can carry the request.
     ImageRequest const&                         imageRequest,
+    // D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS: the visibility a
+    // static-archive build gives the definitions it compiles (nullopt on
+    // every build but the shipped runtime's), relayed into every target's
+    // `CompileOptions` — see `CompileOptions::archiveDefinitionVisibility`.
+    std::optional<SymbolVisibility>             archiveDefinitionVisibility,
     // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C): the
     // ROOT manifest's cross-build artifact cache policy, threaded verbatim from
     // the `Program` knob. nullopt (every CLI build, every root project build,
@@ -4966,6 +5064,7 @@ int runCusToTargets(
             }
         }
         compileOpts.pipelineOverride = pipelineOverride;
+        compileOpts.archiveDefinitionVisibility = archiveDefinitionVisibility;
         compileOpts.ltoMode = ltoMode == LtoModeArg::Thin
                                   ? CompileOptions::LtoMode::Thin
                                   : CompileOptions::LtoMode::Full;
@@ -5082,9 +5181,15 @@ int runCusToTargets(
         // `hello.c` free of directory-walking code it never calls.
         if (!formatByName.at(TargetSpec::parse(spec)->formatName)
                  ->isStaticArchive()) {
-            for (auto const& archive : *runtimeArchivesBySpec.at(spec))
+            // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: each
+            // one is recorded as the shipped runtime's in the SAME statement
+            // that adds it, so `compileOneTarget` can tell it from an
+            // operator's archive (`CompileOptions::shippedRuntimeArchives`).
+            for (auto const& archive : *runtimeArchivesBySpec.at(spec)) {
                 compileOpts.resolveLibraries.push_back(
                     ResolveLibrarySpec{archive});
+                compileOpts.shippedRuntimeArchives.push_back(archive);
+            }
         }
         // ── D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
         //    THE `buildCus` BOUNDARY, WHICH IS WHERE THE KEY IS COMPUTABLE ───
@@ -6420,6 +6525,7 @@ int Program::compileFiles(
         // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the CLI/manifest runpaths.
         ImageRequest{.stackReserveBytes = stackReserveBytes_,
                      .runpaths          = runpaths_},
+        archiveDefinitionVisibility_,
         // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
         // the cross-build artifact cache policy. nullopt on every CLI build and
         // on every ROOT project build; engaged only on a DEPENDENCY sub-build,
@@ -6861,6 +6967,7 @@ int Program::compileUnits(
         // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the CLI/manifest runpaths.
         ImageRequest{.stackReserveBytes = stackReserveBytes_,
                      .runpaths          = runpaths_},
+        archiveDefinitionVisibility_,
         // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
         // the cross-build artifact cache policy — see the `compileFiles` twin.
         dependencyArtifactCache_);

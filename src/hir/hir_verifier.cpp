@@ -116,8 +116,10 @@ bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     checkIntrinsicCalls(reporter);
     checkMemberAccess(reporter);
     checkConstructAggregate(reporter);
+    checkUnnamedObject(reporter);
     checkShaderRestrictions(reporter);
     checkInlineAsm(reporter);
+    checkLinkageAttributes(reporter);
     //
     // A capped reporter (the global maxDiagnostics ceiling hit — here or in a
     // prior phase sharing this reporter) silently drops further report() calls,
@@ -1215,16 +1217,25 @@ void HirVerifier::checkConstructAggregate(DiagnosticReporter& reporter) const {
             TypeId const childTy = hir_.typeId(kids[0]);
             if (!childTy.valid()) continue;
             auto const variants = interner_->operands(aggTy);
-            bool ok = false;
-            for (TypeId vty : variants) {
-                if (vty.v == childTy.v) { ok = true; break; }
+            // P69 (lane `cs`, D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED):
+            // the payload NAMES the member the child initializes, and the child must be of
+            // THAT member's type — "some variant's type" let a producer that forgot to name
+            // its member pass whenever the member shared member 0's type, and a member read
+            // would then fold the wrong member's claim.
+            std::uint32_t const member = hir_.payload(id);
+            if (member >= variants.size()) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("ConstructAggregate #{} (Union) names member {} of "
+                                     "{} declared variants",
+                                     id.v, member, variants.size()),
+                         sourceMap_);
+                continue;
             }
-            if (!ok) {
+            if (variants[member].v != childTy.v) {
                 reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
                          std::format("ConstructAggregate #{} (Union) child "
-                                     "type {} doesn't match any of the "
-                                     "{} declared variants",
-                                     id.v, childTy.v, variants.size()),
+                                     "type {} doesn't match member {}'s type {}",
+                                     id.v, childTy.v, member, variants[member].v),
                          sourceMap_);
             }
         } else if (kind == TypeKind::Array) {
@@ -1294,6 +1305,100 @@ void HirVerifier::checkConstructAggregate(DiagnosticReporter& reporter) const {
                                  "TypeKind ordinal {} (must be Struct, "
                                  "Union, or Array)",
                                  id.v, static_cast<unsigned>(kind)),
+                     sourceMap_);
+        }
+    }
+}
+
+void HirVerifier::checkLinkageAttributes(DiagnosticReporter& reporter) const {
+    if (linkageMap_ == nullptr || linkageMap_->empty()) return;
+    // By node index, not by the table's own (unspecified) order: the findings
+    // of one module come out in one order on every run.
+    std::uint32_t const moduleTag = hir_.id().v;
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        LinkageAttr const* const entry = linkageMap_->tryGet(id);
+        if (entry == nullptr) continue;
+        LinkageAttr const& attr = *entry;
+        if (hasError(hir_.flags(id))) continue;   // cascade suppression
+        bool const namesKind = !weakDefinitionKindName(attr.weakKind).empty();
+        if (attr.binding == SymbolBinding::Weak && !namesKind) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("the linkage attribute of node #{} has the weak "
+                                 "binding and names no weak-definition kind — a "
+                                 "weak definition is one any other definition of "
+                                 "the name replaces ('{}') or one of several "
+                                 "interchangeable copies ('{}'), the two link "
+                                 "differently, and nothing downstream may guess "
+                                 "which was meant",
+                                 id.v,
+                                 weakDefinitionKindName(
+                                     WeakDefinitionKind::Overridable),
+                                 weakDefinitionKindName(
+                                     WeakDefinitionKind::SelectAny)),
+                     sourceMap_);
+        }
+        if (attr.binding != SymbolBinding::Weak
+            && attr.weakKind != WeakDefinitionKind{}) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("the linkage attribute of node #{} names a "
+                                 "weak-definition kind beside the '{}' binding — "
+                                 "a kind is read only beside the weak binding, so "
+                                 "the producer meant a binding it did not set",
+                                 id.v, symbolBindingName(attr.binding)),
+                     sourceMap_);
+        }
+        if (attr.tentative && hir_.kind(id) != HirKind::Global) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("the linkage attribute of node #{} carries the "
+                                 "tentative-definition mark, and the node is not a "
+                                 "Global — only an object's definition can be a "
+                                 "tentative one", id.v),
+                     sourceMap_);
+        }
+        if (attr.tentative && attr.binding == SymbolBinding::Local) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("the linkage attribute of node #{} carries the "
+                                 "tentative-definition mark beside the internal "
+                                 "binding — an internal-linkage object takes no "
+                                 "part in the cross-unit fold the mark exists for, "
+                                 "and a consumer reading the mark alone would make "
+                                 "two units' private objects one", id.v),
+                     sourceMap_);
+        }
+    }
+}
+
+void HirVerifier::checkUnnamedObject(DiagnosticReporter& reporter) const {
+    std::uint32_t const moduleTag = hir_.id().v;
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        if (hir_.kind(id) != HirKind::UnnamedObject) continue;
+        if (hasError(hir_.flags(id))) continue;
+        if (hir_.payload(id) >= kHirObjectStorageCount) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("UnnamedObject #{} carries storage {}, which names no "
+                                 "storage duration (automatic, static or thread)",
+                                 id.v, hir_.payload(id)),
+                     sourceMap_);
+            continue;
+        }
+        auto const kids = hir_.children(id);
+        if (kids.size() != 1u) continue;   // `checkNodeArity` reports the arity
+        TypeId const objTy  = hir_.typeId(id);
+        TypeId const initTy = hir_.typeId(kids[0]);
+        if (!objTy.valid() || !initTy.valid()) continue;   // `checkRequiredTypes`'
+        // The object's qualifier skin (`volatile`, `_Atomic`, an alignment) is the
+        // OBJECT's, and its value is read unqualified (C 6.3.2.1p2), so the two agree
+        // on the material type; without the interner the ids themselves must agree.
+        bool const agree = interner_ != nullptr
+            ? interner_->stripVolatile(objTy).v == interner_->stripVolatile(initTy).v
+            : objTy.v == initTy.v;
+        if (!agree) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("UnnamedObject #{} is typed {} but its initializer is "
+                                 "typed {} — the value a consumer peels and the object it "
+                                 "addresses would disagree", id.v, objTy.v, initTy.v),
                      sourceMap_);
         }
     }

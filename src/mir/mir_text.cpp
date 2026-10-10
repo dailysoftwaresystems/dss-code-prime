@@ -10,6 +10,7 @@
 #include "core/types/target_schema.hpp"  // callConvName / kCallConvTable
 #include "core/types/type_lattice/composite_definition.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/wide_float_value.hpp"  // kCanonicalQuietNanBits — the NaN the text spells `nan`
 #include "mir/mir.hpp"
 #include "mir/mir_literal_pool.hpp"
 #include "mir/mir_opcode.hpp"
@@ -155,7 +156,23 @@ namespace {
 // table, each DEFINED ONCE with every layout channel; v1 spelled each one inline at every use.
 // v3 (P68 round 12, lane `cs`): an enumeration's FIXED underlying type is spelled, `enum "E" fixed
 // i64` — `enum E : long` and `enum E` are different types (C23 6.2.7p1), and v2 wrote both `: i64`.
-constexpr int kVersion = 3;
+// v4 (P69, lane `cs`): a DELIBERATE trap is spelled `unreachable trap` (`__builtin_trap`, a wide
+// division by zero) — a v3 reader that skipped `trap` would rebuild an assumed-unreachable point,
+// which the optimizer may delete; a NaN other than the canonical quiet one is spelled `float nanbits
+// <u64>` (`__builtin_nan("1")`), which `nan` read back as a DIFFERENT value; and the
+// `frame_address` / `return_address` opcodes joined the set. A v3 reader has no rule for any of them.
+// v5 (P69, lane `cs`, D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED): a UNION
+// aggregate literal names the member its one field initializes, `lit agg member N {…} : union` — a
+// union initializer may designate any member (C 6.7.9p17) and the field's type cannot say which. A v4
+// text carried no member, so a union value read back from it would be encoded against a guess. And
+// v4's `frame_address` / `return_address` opcodes are GONE again: the two builtins were withdrawn (P69
+// review M4 — their meaning needs frame records DSS does not keep yet), so a v5 reader has no rule
+// for either.
+constexpr int kVersion = 5;
+
+// The canonical quiet NaN is core's `kCanonicalQuietNanBits` (core/types/wide_float_value.hpp,
+// P69 review n13): the ONE NaN the text spells `nan`, every other NaN being `float nanbits
+// <u64>`. The writer asks it, and the reader produces EXACTLY it for `nan`.
 
 [[nodiscard]] std::string quote(std::string_view s) {
     std::string out;
@@ -1006,7 +1023,14 @@ private:
             } else if constexpr (std::is_same_v<T, std::uint64_t>) {
                 out_ += std::format("uint {}", v);
             } else if constexpr (std::is_same_v<T, double>) {
-                out_ += std::format("float {}", v);
+                // P69 (lane `cs`): a NaN that is not the canonical quiet one (a payload, a
+                // sign) by its bit pattern — `nan` would read back as a different value.
+                std::uint64_t nanBits = 0;
+                if (std::isnan(v)) std::memcpy(&nanBits, &v, sizeof nanBits);
+                if (std::isnan(v) && nanBits != kCanonicalQuietNanBits)
+                    out_ += std::format("float nanbits {}", nanBits);
+                else
+                    out_ += std::format("float {}", v);
             } else if constexpr (std::is_same_v<T, std::string>) {
                 out_ += "str "; out_ += quote(v);
             } else if constexpr (std::is_same_v<T, MirAggregateValue>) {
@@ -1014,7 +1038,12 @@ private:
                 // cannot name `stack` and the task type at once without pulling
                 // the whole ladder into the template); record the aggregate and
                 // let the caller schedule it.
-                out_ += "agg {";
+                // v5: a union value names the member its one field initializes,
+                // `agg member N {…}` — the field's type cannot say which.
+                out_ += "agg ";
+                if (v.unionMember.has_value())
+                    out_ += std::format("member {} ", *v.unionMember);
+                out_ += "{";
                 agg = &v;
             } else if constexpr (std::is_same_v<T, MirSymbolAddrValue>) {
                 // F5: link-time symbol-address literal (`&sym [+ addend]`).
@@ -1396,6 +1425,11 @@ private:
                 break;
             }
             case MirOpcode::Unreachable:
+                // P69 (lane `cs`): a DELIBERATE trap says so (`MirUnreachableKind`); the
+                // assumed kind keeps the bare mnemonic, byte-identical to before.
+                if (mir_.instPayload(id)
+                    == static_cast<std::uint32_t>(MirUnreachableKind::Trap))
+                    out_ += " trap";
                 break;
             case MirOpcode::SehTryBegin: {
                 // c115 SEH: `seh_try_begin <region> %b<try> %b<filter>`.
@@ -2294,6 +2328,10 @@ private:
             if (!symbolNames_.emplace(v, name.text).second) {
                 emitMalformed(std::format("symbol slot %{} is declared twice", v));
             }
+            // A declared slot is an id of the module's space whether or not a
+            // function or a global of the module is given it: the text's table
+            // is the name table this module is made from (stated in `finalize`).
+            builder_.keepSymbolIdsClearOf(SymbolId{v});
         }
         (void)expect(TokKind::RBrace);
     }
@@ -2775,8 +2813,29 @@ private:
             // The `: <core>` tail belongs to the aggregate literal itself and
             // runs AFTER its closing brace, exactly as the recursive form did.
             parseLiteralCoreTail(lv);
+            checkUnionMember(lv);
             done       = std::move(lv);
             haveResult = true;
+        }
+    }
+
+    // v5: `member N` is a UNION value's, and a union value with a field names its member
+    // (D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED). Both are refused
+    // here, at the text, rather than left for the static-data encoder: the writer never spells
+    // either, and a union value whose member is unknown has no encoding at all. Whether N is a
+    // member the union HAS is the encoder's to answer — it walks the value against its type.
+    void checkUnionMember(MirLiteralValue const& lv) {
+        auto const* a = std::get_if<MirAggregateValue>(&lv.value);
+        if (a == nullptr) return;
+        if (a->unionMember.has_value() && lv.core != TypeKind::Union) {
+            emitMalformed(std::format(
+                "`lit agg member {}` names a union member, but the literal's core is '{}' — "
+                "only a union value names its member", *a->unionMember,
+                literalCoreName(lv.core)));
+        } else if (lv.core == TypeKind::Union && !a->fields.empty()
+                   && !a->unionMember.has_value()) {
+            emitMalformed("a union aggregate literal with a field must name the member it "
+                          "initializes — `lit agg member N {…} : union`");
         }
     }
 
@@ -2817,15 +2876,49 @@ private:
             lv.value = parseNumber<std::uint64_t>(v.text, "uint literal");
         } else if (tag.text == "float") {
             Tok v = lex_.take();
-            lv.value = parseDouble(v.text);
+            if (v.kind == TokKind::Ident && v.text == "nanbits") {
+                // P69 (lane `cs`): the writer's spelling of a non-canonical NaN.
+                Tok const b = lex_.take();
+                std::uint64_t const bits = parseNumber<std::uint64_t>(b.text, "nanbits pattern");
+                double d = 0.0;
+                std::memcpy(&d, &bits, sizeof d);
+                if (!std::isnan(d)) emitMalformed("a 'nanbits' pattern that is not a NaN");
+                lv.value = d;
+            } else if (v.kind == TokKind::Ident && v.text == "nan") {
+                // The writer's spelling of the canonical quiet NaN, read as EXACTLY that pattern,
+                // never through the platform's `strtod` (see kCanonicalQuietNanBits).
+                double d = 0.0;
+                std::memcpy(&d, &kCanonicalQuietNanBits, sizeof d);
+                lv.value = d;
+            } else {
+                lv.value = parseDouble(v.text);
+            }
         } else if (tag.text == "str") {
             Tok v = lex_.take();
             lv.value = v.text;
         } else if (tag.text == "agg") {
+            // v5 (P69, lane `cs`): `agg member N {…}` — the member a UNION value's one
+            // field initializes (D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED).
+            // That it is a union, and only a union, is checked once the `: <core>` tail
+            // has been read (`parseLiteral`).
+            std::optional<std::uint32_t> member;
+            if (peekIdent("member")) {
+                lex_.take();
+                Tok const n = lex_.take();
+                if (n.kind != TokKind::Integer) {
+                    emitMalformed(std::format(
+                        "expected a member index after `lit agg member`, got '{}'", n.text));
+                } else {
+                    std::size_t const before = refusals_;
+                    std::uint32_t const idx = parseNumber<std::uint32_t>(n.text, "union member index");
+                    if (refusals_ == before) member = idx;
+                }
+            }
             // ⚠ Same token appetite as the recursive form: a missing `{` returns
             // the default literal and does NOT consume the `: <core>` tail.
             if (!expect(TokKind::LBrace)) { out = std::move(lv); return true; }
             stack.push_back(LiteralParseFrame{});
+            stack.back().agg.unionMember = member;
             return false;   // a (possibly empty) field list comes next
         } else if (tag.text == "bitint") {
             // C4b: the inverse of `appendLiteral`'s `bitint` arm, and the SAME
@@ -4007,7 +4100,14 @@ private:
             }
             case MirOpcode::Unreachable: {
                 refuseFlagsOnTerminator(mnemonic, flags);
-                builder_.addUnreachable();
+                // P69 (lane `cs`): an optional ` trap` on its own line — the writer's
+                // spelling of `MirUnreachableKind::Trap`.
+                MirUnreachableKind kind = MirUnreachableKind::Assumed;
+                if (peekIdent("trap") && onLine(lineStart, lex_.peek())) {
+                    lex_.take();
+                    kind = MirUnreachableKind::Trap;
+                }
+                builder_.addUnreachable(kind);
                 break;
             }
             // ★★★ D-CSUBSET-COMPUTED-GOTO: `indirectbr %v<addr> { %b…, %b… }`.
@@ -4275,6 +4375,22 @@ private:
             return std::make_unique<MirParseResult>(
                 Mir{}, std::move(interner_), std::move(symbolNames_));
         }
+        // ★ THE TEXT IS THE NAME TABLE THIS MODULE IS MADE FROM, AND IT IS STATED
+        // HERE — the one place every module this reader hands out passes
+        // (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE). The reader
+        // stated nothing, and the scan that holds every module builder to a
+        // statement excused it in so many words — "a parsed module is made from
+        // no table". ✔MEASURED 2026-10-08: a text declaring `%1 "f"` and `%2 "g"`
+        // and defining `f` alone read back with its id space ending at 2, so the
+        // lowering — handed the module and no import row, which a text never
+        // holds — named a block `%2`: `g`'s id, in silence. A call in the text may
+        // name an entry that is no function or global of the module; the entry is
+        // the table's all the same. The end stated is the one the declared slots
+        // (`parseSymbolsPreamble`) and the symbols the text defines have raised,
+        // by the door's own rule (the top id saturates there). A text with NO
+        // `symbols` section states it too: its table is empty, and nothing stands
+        // beside a text — so no input reaches the door's refusal of a counted end.
+        builder_.stateSymbolIdEnd(builder_.symbolIdEnd());
         Mir module = std::move(builder_).finish();
         auto result = std::make_unique<MirParseResult>(
             std::move(module), std::move(interner_), std::move(symbolNames_));

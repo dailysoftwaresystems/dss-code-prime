@@ -1,7 +1,9 @@
 #include "link/cross_cu_resolve.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -97,9 +99,29 @@ CrossCuResolution resolveCrossCuDefs(std::span<CrossCuDef const> defs) {
                                      cur.bodySize, d.bodySize});
     };
 
+    // ── THE HIGHEST RANK AMONG THE WEAK DEFINITIONS OF EACH NAME ──────────────
+    //    D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER
+    //
+    // Found BEFORE the fold, so that the fold never depends on the order the
+    // definitions arrive in: a weak definition below its name's highest rank is
+    // skipped outright. It can never be the winner — a weak definition of the
+    // higher rank is in the link — and it is not one of the copies whose
+    // duplicate-match promise the fold checks: had it been folded until the
+    // higher rank arrived, two outranked definitions would have been compared
+    // in one order of the link and not in another.
+    std::unordered_map<std::string_view, std::uint8_t> topWeakRank;
+    for (auto const& d : defs) {
+        if (d.binding != SymbolBinding::Weak || d.name.empty()) continue;
+        auto const [it, fresh] = topWeakRank.try_emplace(d.name, d.weakRank);
+        if (!fresh && d.weakRank > it->second) it->second = d.weakRank;
+    }
+
     for (auto const& d : defs) {
         if (d.binding == SymbolBinding::Local) continue;  // module-private — excluded
         if (d.name.empty()) continue;                     // producer-guarded; defensive
+        if (d.binding == SymbolBinding::Weak && d.weakRank < topWeakRank.at(d.name)) {
+            continue;                                     // outranked by another weak definition
+        }
         auto [it, inserted] = table.try_emplace(d.name, winnerOf(d));
         if (inserted) continue;
         Winner& cur = it->second;

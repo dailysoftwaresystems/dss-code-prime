@@ -271,6 +271,16 @@ using PpProductText = std::function<std::string_view()>;
 // declaring `refuse`).
 using PpOperatorRevoked = std::function<bool(std::string_view)>;
 
+// ★ P69 (lane `cs`, review M3): "does the PLATFORM provide the C library function `name`
+// on the active target?" — the half of `__has_builtin`'s answer for a LIBRARY builtin
+// (`__builtin_strlen`, `semantics.libraryBuiltins`) that only the active pair can give. A
+// call of one binds to the platform's realization of the function or is refused at the use
+// (S_LibraryBuiltinUnavailable), so the operator answers 1 exactly where the call binds:
+// the preprocessor supplies `ffi::shippedLibraryFunctionProvidedOnFormat` on its active
+// object format. UNSET (`{}`) answers false — no pair is in scope (the LSP, the direct-API
+// tests), and with no pair the binder provides no library function either.
+using PpLibraryFunctionProvided = std::function<bool(std::string_view libraryFunction)>;
+
 // ── D-PP-DEFINED-VIA-MACRO-EXPANSION ─────────────────────────────────────────
 // THE `#if`-OPERAND BARRIER: the ONE definition of "which tokens a
 // conditional-inclusion operator protects from macro expansion", shared by the
@@ -477,7 +487,10 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      // scope at all (the LSP, the direct-API tests) — and "no
                      // pair" is NOT a guessed one: a narrow body above 0x7F and
                      // every wide/UTF constant then REFUSE, loud.
-                     PpCharConstantFacts const& charFacts = {});
+                     PpCharConstantFacts const& charFacts = {},
+                     // P69 (review M3): the platform half of `__has_builtin` for a
+                     // library builtin (see `PpLibraryFunctionProvided`).
+                     PpLibraryFunctionProvided const& libraryFunctionProvided = {});
 
 // The phase-4 VALUE of a controlling expression (C 6.10.2p13: every operand
 // acts as `intmax_t` / `uintmax_t`): the 64 raw two's-complement bits plus which
@@ -502,7 +515,8 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
                           DiagnosticReporter&    rep,
                           PpHasEmbed const&      hasEmbed = {},
                           PpOperatorRevoked const& operatorRevoked = {},
-                          PpCharConstantFacts const& charFacts = {});
+                          PpCharConstantFacts const& charFacts = {},
+                          PpLibraryFunctionProvided const& libraryFunctionProvided = {});
 
 // C23 6.10.4.2 (D-PP-EMBED-PARAMS): evaluate a `limit` parameter's clause (the
 // tokens INSIDE its parens) to the element count it names. ONE implementation
@@ -534,6 +548,7 @@ evaluateEmbedLimit(std::span<Token const>   clause,
                    PpHasEmbed const&        hasEmbed,
                    PpOperatorRevoked const& operatorRevoked,
                    PpCharConstantFacts const& charFacts,
+                   PpLibraryFunctionProvided const& libraryFunctionProvided,
                    PpTokenTextFn const&     textOf,
                    PpEmbedFail const&       fail);
 
