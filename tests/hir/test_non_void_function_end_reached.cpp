@@ -469,6 +469,11 @@ TEST(NonVoidFunctionEndReached, ShapesNoExecutionLeavesAreNotReported) {
           "{ if (1) return x; }",
           "{ if (0) x = 1; else return x; }",
           "{ if (1) return x; else x = 2; }",
+          // …a constant TRUE only when its unary is reduced to its own 32 bits
+          "{ if ((unsigned long long)~0u == 0xFFFFFFFFull) return x; }",
+          // …and one that is TRUE only when a constant aggregate's member is read
+          // with its initializer's operator (`-5`, not its operand 5)
+          "{ static const struct { long long b; } g = { .b = -5 }; if (g.b == -5) return x; }",
           "{ if (sizeof(int) >= 1) return x; }",
           "{ enum { ON = 1 }; if (ON) return x; }",
           "{ if (1) { do { return x; } while (0); } }",
@@ -529,6 +534,14 @@ TEST(NonVoidFunctionEndReached, ShapesAnExecutionDoesLeaveAreStillReported) {
           "{ while (1) { break; } }",
           // `if (0) S;` with no else completes at once
           "{ if (0) return x; }",
+          // …and a condition that is a constant FALSE only when its unary is
+          // reduced to its own 32 bits: read as 2^64-1 it folded TRUE, and the
+          // statement after the `if` was deleted with the report
+          "{ if ((unsigned long long)~0u > 0xFFFFFFFFull) return x; }",
+          // …and a constant aggregate's member initialized by `-5`: read as its
+          // operand 5 the condition folded TRUE, and the statement after the `if`
+          // was deleted (the program died of an illegal instruction)
+          "{ static const struct { long long b; } g = { .b = -5 }; if (g.b != -5) return x; }",
           // a label in the arm that is never TAKEN: a goto runs it to its end
           "{ if (x) goto in; if (1) return x; else { in: x = 3; } }",
           "{ if (x) goto in; if (0) { in: x = 3; } else return x; }",

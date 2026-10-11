@@ -297,22 +297,55 @@ round's close; each checkpoint's commit message says what was and was not run on
   `link/test_common_symbols` is re-derived (257 s). **⚠ THIS COMPOSITION WAS NEVER BUILT**: the fold was measured
   on checkpoint 7's base and lands on checkpoints 8 to 11 (the stated end of a module's symbol ids among them,
   which touches the same id sources this fold widens) — the first full suite of this tree is its first reading.
-- **Silent defects FOUND in this round and NOT YET FIXED in this tree** (the base's debt unless said, all in the
-  fold the library lane has OPEN — its worktree, not this tree): in a STATIC INITIALIZER, an enumerator,
-  an array size or a `_Static_assert`, the unary `~` and `-` of an `unsigned int` constant are not reduced to
-  32 bits, so every widening of the result is wrong (✔MEASURED on pe64, baseline and release:
-  `static const unsigned long long u = ~0U;` holds 0xFFFFFFFFFFFFFFFF; and where such a widened value is a
-  CONDITION inside a function body the function dies of an illegal instruction); `_Generic` selects `default` in
-  silence where its controlling expression holds a literal in an enumerator, a file-scope array bound or a
-  bit-field width (✔MEASURED: `enum { EV = _Generic(0, int: 42, default: 9) };` gives 9). **AND ONE BORN IN THIS
-  PR, a merge blocker:** a member of a constant aggregate whose initializer is a one-operand expression is read
-  WITHOUT its operator (✔MEASURED on pe64: `static const struct S g = {.b = -5}; if (g.b != -5) return 7;` dies of
-  an illegal instruction; 134 of 247 measured cells wrong) — its fix is built and read green on
-  `macos-arm64-debug` in that lane's worktree, not handed back. LOUD, the base's debt, in the same open fold: a
-  brace element under an operator (`char first[] = { *"abc" };` at block scope; `struct S arr[] = { src[i] };`)
-  is refused by the HIR lowering where all six references accept it. FIXED since they were listed here: the
-  reference through a STATIC name following a losing weak alias (checkpoint 12); the two pe64 `__try` defects
-  found on 2026-10-08 (checkpoint 6).
+  ✔MEASURED after that commit, from the main checkout: `macos-arm64-debug` PASSED, 2739 tests — the first build of
+  checkpoints 8 to 12 together; `linux-arm64-debug` did no work (the host's disk is held by the lanes' builds); the
+  three local legs are NOT read. And a sweep of 14 of this fold's arms on `macos-arm64-debug`: 3 `passed`, 11
+  `violated`, each only for further red cases its claim row does not declare yet (no mutant stayed green).
+- **Checkpoint 13 (2026-10-10) = the library lane's CONSTANT-EVALUATOR fold, made CODE-FIRST**: 217 paths (201 new),
+  2 examples, 68 arms DECLARED AND READ BY NO SWEEP (the registry holds 307), 5 new rows. **It holds the fix of the
+  MERGE BLOCKER this PR created** (`D-C-CONSTANT-AGGREGATE-MEMBER-READ-WITHOUT-ITS-INITIALIZERS-OPERATOR`, P0, OPEN
+  until its eight arms pass): ONE statement of which nodes say something themselves
+  (`nodeSaysSomethingItself`, `src/core/types/decl_prefix_strip.hpp`) is read by every wrapper descent of the
+  analyzer AND by the HIR lowering's own peel — ✔MEASURED on pe64, baseline and release alike: 134 of 247 cells
+  wrong before, 4 after, all four one other construct (`0 ?: -5` does not parse). With it, each the base's debt: a
+  unary result is reduced to its type in both constant walkers, the `#if` evaluator and the optimizer's fold; a
+  cast or a truth test of an unsigned constant above INT64_MAX folds, and unary `+` is a constant operator; `#if`
+  truth results are `intmax_t`; `_Generic` in an enumerator, an array bound or a bit-field width stamps its
+  controlling literals before asking their type, and an unresolved controlling type selects NOTHING; a brace
+  element under an operator is no longer taken for its operand by the lowering; and whether a brace element
+  initializes the WHOLE structure is the analyzer's answer handed over as a fact on the model
+  (`braceElementValueTypeFor`), not a second reading of type stamps. Over the whole measurement: 173 of 390 cells
+  wrong before, 13 of 397 after, none newly wrong; the 13 are other constructs, each SIZED in the lane's hand-back
+  and NOT filed (the orchestrator rules on resume). Three forms accepted wrongly are refused by name. ✔MEASURED by
+  the lane on its final bytes, ON CHECKPOINT 7's BASE: the whole suite — `macos-arm64-debug`, `linux-arm64-debug`
+  and `linux-x86_64-debug` 2735 of 2735; `windows-x86_64-debug` (MinGW) and `windows-x86_64-release` (MSVC) 2762 of
+  2765, the three reds being repository guards reading the lane worktree's own registry copies and census; six
+  references run both examples to 42. Rows: 5 new (1 created by this PR and OPEN, 4 disclosed with the fix
+  folded), 13 amended — two open rows become `disclosed`, "fix folded"; three rows lose a "next cycle" schedule and
+  two gain a measured size. Balance: 643 against 620 (24 closed, 47 opened: 3 created by the tool's count, 44 disclosed), REAL net +23 — the round is CODE-FIRST
+  and its rows close as their arms pass. **⚠ THIS COMPOSITION WAS NEVER BUILT EITHER**: it lands on checkpoints 8
+  to 12; three of its paths were merged by hand over cs's and xa's folds.
+- **⏸ THE ROUND IS PAUSED at checkpoint 13 on the operator's order (2026-10-10; resume 2026-10-12)**: no agent
+  runs, every lane's work is folded and pushed, and `.temp/RESUME-P69-round1-PAUSED-2026-10-10.md` holds each
+  lane's next orders, the reviews owed (hm's three folds, xa's fold 2, lm's fold; cs's fold A2 is reviewed and its
+  send-back written, not sent) and the sweeps owed from the main checkout.
+- **Silent defects found in this round: ALL of those listed below are FIXED in this tree by checkpoint 13** (read
+  the list as history; each row stays open or disclosed until its arms pass): in a STATIC INITIALIZER, an enumerator,
+  an array size or a `_Static_assert`, the unary `~` and `-` of an `unsigned int` constant were not reduced to
+  32 bits, so every widening of the result was wrong (✔MEASURED on pe64, baseline and release:
+  `static const unsigned long long u = ~0U;` held 0xFFFFFFFFFFFFFFFF; and where such a widened value was a
+  CONDITION inside a function body the function died of an illegal instruction); `_Generic` selected `default` in
+  silence where its controlling expression held a literal in an enumerator, a file-scope array bound or a
+  bit-field width (✔MEASURED: `enum { EV = _Generic(0, int: 42, default: 9) };` gave 9). **AND ONE BORN IN THIS
+  PR, a merge blocker:** a member of a constant aggregate whose initializer is a one-operand expression was read
+  WITHOUT its operator (✔MEASURED on pe64: `static const struct S g = {.b = -5}; if (g.b != -5) return 7;` died of
+  an illegal instruction; 134 of 247 measured cells wrong, 4 after, of another construct). LOUD, the base's debt,
+  fixed in the same fold: a brace element under an operator (`char first[] = { *"abc" };` at block scope;
+  `struct S arr[] = { src[i] };`) was refused by the HIR lowering where all six references accept it. Fixed
+  earlier: the reference through a STATIC name following a losing weak alias (checkpoint 12); the two pe64 `__try`
+  defects found on 2026-10-08 (checkpoint 6). **STILL UNMEASURED, from the review of checkpoint 9:** a guarded
+  body holding `&&`, `||`, a scalar `?:` or `va_arg` puts the phi-edge split inside the guarded run, a shape no
+  test or example holds; the C front end lane measures it first on resume.
 - **HOW THIS CYCLE ENDS — operator, 2026-10-08, verbatim:** *"on finishing this cycle I'll turn on the pipes and
   try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and monitor CI until
   green"*. So P69 is this PR's EXIT: its four lanes finish what they are in (no second round opens in this PR — what

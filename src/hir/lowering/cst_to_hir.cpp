@@ -9191,18 +9191,29 @@ struct Lowerer {
         return delivered;
     }
 
-    // Peel wrapper-rule layers off `n` UNTIL reaching `braceInitListRule`
-    // (or until no more sole-meaningful descents are possible). Used by
-    // D5.3 lowering: `peelToCore` over-peels through a single-element
-    // braceInitList to its lone initElement, so callers that need to
-    // recognize a braceInitList in init position must stop AT the rule
-    // rather than past it. Returns the deepest reachable node; the
-    // caller checks the rule.
+    // Peel the GROUPING above `n` — parentheses, `__extension__`, an alternative's
+    // carrier — down to the first node that says something itself
+    // (`nodeSaysSomethingItself`, `core/types/decl_prefix_strip.hpp`: the ONE
+    // statement, shared with the semantic tier), a brace list among them, or to the
+    // last node of a single-child chain. Used by D5.3 lowering: `peelToCore`
+    // over-peels through a single-element braceInitList to its lone initElement, so
+    // callers that need to recognize a braceInitList in init position must stop AT
+    // the rule rather than past it. Returns the node reached; the caller checks its
+    // rule.
+    // ★ P69 (lane `lm`): THIS WALKED THROUGH EVERY NODE WITH ONE NON-TOKEN CHILD — a
+    // unary operator's node among them — so the OPERAND answered for the expression
+    // wherever a caller asked what the value IS: ✔MEASURED 2026-10-10, `char s[] = {
+    // *"abc" };`, `{ !"abc" }`, `{ sizeof "abc" }` and `{ *"abc", 'z' }` were taken
+    // for the braced string that initializes the array and refused by the MIR
+    // verifier (a `store` of a Char into an Array), where all six references build
+    // the one- and two-element arrays they are; and the placement cursor was asked
+    // whether `{ mk() }` initializes a structure whole of the CALLEE under the call.
+    // The callers that only ask "is it a brace list" were never wrong (no operator
+    // stands over a brace list in C) and are not changed by it.
     [[nodiscard]] NodeId peelToBraceInitOrCore(NodeId n) const {
         NodeId cur = n;
         while (tree().kind(cur) == NodeKind::Internal) {
-            if (cfg.braceInitListRule.valid()
-             && tree().rule(cur).v == cfg.braceInitListRule.v) break;
+            if (nodeSaysSomethingItself(sem, cfg, tree(), cur)) break;
             NodeId const only = soleMeaningfulChild(cur);
             if (!only.valid()) break;
             cur = only;
@@ -11475,7 +11486,17 @@ struct Lowerer {
         TypeKind const k = interner.kind(t);
         if (k == TypeKind::Array) return stringLiteralInitializesArray(core, t);
         if (k != TypeKind::Struct && k != TypeKind::Union) return false;
-        TypeId vt = semTypeAt(core);
+        // ★ P69 (lane `lm`): THE SEMANTIC TIER'S ANSWER FIRST, NOT A SECOND DERIVATION.
+        // The analyzer types the value (`braceValueInitializesWhole`) and hands the type
+        // over under this same node (`SemanticModel::braceElementValueTypeFor`). The
+        // stamps below were the only source here, and an operator's node carries none:
+        // under `src[1]` they are an array and an `int`, which disagree, so a whole
+        // structure written as an index, a dereference, a conditional or a comma
+        // expression went into the structure's FIRST MEMBER while the analyzer had sized
+        // the list for a whole one — a verifier failure on valid C. The stamps still
+        // answer where the analyzer recorded nothing.
+        TypeId vt = reprOf(model.braceElementValueTypeFor(core));
+        if (!vt.valid()) vt = semTypeAt(core);
         if (!vt.valid()) vt = resolveStampedTypeBelow(core);
         return vt.valid() && interner.stripVolatile(vt) == interner.stripVolatile(t);
     }

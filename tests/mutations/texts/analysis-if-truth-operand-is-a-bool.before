@@ -1,0 +1,1 @@
+    return intmaxOperand(truth ? 1u : 0u, /*isSigned=*/true);

@@ -39,7 +39,6 @@ using detail::applyUnaryInt;
 using detail::asBool;
 using detail::asInt64;
 using detail::asIntBits;
-using detail::makeBoolLiteral;
 
 // ── C 6.10.1p4: THE PHASE-4 EVALUATION TYPE (D-PP-IF-UNSIGNED-INTMAX) ────────
 //
@@ -72,14 +71,25 @@ using detail::makeBoolLiteral;
 //
 // The value is stored in the int64 arm as the raw two's-complement BIT PATTERN,
 // which is the representation `asIntBits` reads behind an established domain and
-// the one `applyBinaryInt`/`applyUnaryInt` already produce for their own
-// results. A `uint64_t` arm would instead make `asInt64` -- which `applyUnaryInt`
-// calls -- nullopt for exactly the large unsigned values this exists to carry.
+// the one `applyBinaryInt`/`applyUnaryInt` produce for their own results.
 [[nodiscard]] HirLiteralValue intmaxOperand(std::uint64_t bits, bool isSigned) {
     HirLiteralValue lv;
     lv.core  = isSigned ? TypeKind::I64 : TypeKind::U64;
     lv.value = static_cast<std::int64_t>(bits);
     return lv;
+}
+
+// ── A TRUTH RESULT IS AN OPERAND OF THE WIDEST TYPE TOO ─────────────────────
+// [[D-PP-IF-TRUTH-RESULT-IS-AN-INT-NOT-INTMAX]]. `==`, `<`, `!`, `&&`, `||` and
+// the `true` / `false` keywords yield 1 or 0, and in a `#if` that 1 is the
+// `intmax_t` 1 (C 6.10.1p4) — not a `_Bool`, and not an `int`. This evaluator
+// handed them on under a Bool core, which the shared fold promotes to a 32-bit
+// `int` (rightly, for a translation-phase-7 expression): ✔MEASURED 2026-10-10,
+// `#if ((1 == 1) << 40) != 0x10000000000` took the TRUE arm, in silence, and so
+// did every shift whose LEFT operand was a truth result. Every truth result of
+// this file is minted HERE, so no producer can hand the shared fold a Bool.
+[[nodiscard]] HirLiteralValue truthOperand(bool truth) {
+    return intmaxOperand(truth ? 1u : 0u, /*isSigned=*/true);
 }
 
 // Trivia recognizers (mirroring the anon-namespace helpers in
@@ -205,7 +215,7 @@ struct LiteralKinds {
 
 // The Pratt evaluator. Reads a flat `Token` vector; precedence + associativity
 // + operator mapping all come from the schema (config-driven). Reuses the
-// shared `applyBinaryInt`/`applyUnaryInt`/`asBool`/`makeBoolLiteral` core.
+// shared `applyBinaryInt`/`applyUnaryInt`/`asBool` core.
 class IceParser {
 public:
     IceParser(std::vector<Token> toks, GrammarSchema const& schema,
@@ -344,9 +354,9 @@ public:
         // The prediction was correct for the representation the plan assumed (the
         // large unsigned value in the `uint64_t` arm, where `asInt64` genuinely
         // nullopts) and wrong for the one that shipped: `intmaxOperand` stores the
-        // raw bit pattern in the INT64 arm -- it must, or `applyUnaryInt`'s own
-        // `asInt64` bridge would refuse unary operators on large unsigned values
-        // -- and `asInt64`'s int64 arm always succeeds.
+        // raw bit pattern in the INT64 arm, and `asInt64`'s int64 arm always
+        // succeeds. (It HAD to be that arm then: `applyUnaryInt` read its operand
+        // through `asInt64`. It reads the bits behind its caller's domain now.)
         //
         // ★ IT STAYS ANYWAY, as CONTRACT correctness rather than a behaviour fix:
         // `asBool` is the question the standard actually asks, and it is the only
@@ -565,9 +575,9 @@ private:
                 bool const rhsEval = eval && !shortCircuits;
                 auto rhsOpt = parseExpr(nextMin, rhsEval);
                 if (!rhsOpt.has_value()) return std::nullopt;
-                if (!eval) { lhs = makeBoolLiteral(0); continue; }
+                if (!eval) { lhs = truthOperand(false); continue; }
                 if (shortCircuits) {
-                    lhs = makeBoolLiteral(aTrue ? 1 : 0);
+                    lhs = truthOperand(aTrue);
                     continue;
                 }
                 auto bBool = asBool(*rhsOpt, /*allowFloat=*/false);
@@ -576,7 +586,7 @@ private:
                          "logical operand is not an integer in #if");
                     return std::nullopt;
                 }
-                lhs = makeBoolLiteral(*bBool ? 1 : 0);
+                lhs = truthOperand(*bBool);
                 continue;
             }
 
@@ -590,7 +600,7 @@ private:
             }
             auto rhsOpt = parseExpr(nextMin, eval);
             if (!rhsOpt.has_value()) return std::nullopt;
-            if (!eval) { lhs = makeBoolLiteral(0); continue; }  // dummy; not folded
+            if (!eval) { lhs = truthOperand(false); continue; }  // dummy; not folded
             // Both operands must be integers (no float in #if). `asIntBits`, not
             // `asInt64` -- see the unary gate above (D-PP-IF-UNSIGNED-INTMAX).
             if (!asIntBits(lhs).has_value() || !asIntBits(*rhsOpt).has_value()) {
@@ -613,7 +623,9 @@ private:
                      foldFailureMessage(why));
                 return std::nullopt;
             }
-            if (isComparison(*opK)) folded->core = TypeKind::Bool;
+            // The shared fold returns the 1 or 0; its TYPE here is this
+            // evaluator's own (see `truthOperand`).
+            if (isComparison(*opK)) folded->core = TypeKind::I64;
             lhs = std::move(*folded);
         }
         return lhs;
@@ -654,7 +666,7 @@ private:
         // The ELSE clause binds at the ternary's own precedence (right-assoc).
         auto elseOpt = parseExpr(prec, eval && !condTrue);
         if (!elseOpt.has_value()) return std::nullopt;
-        if (!eval) return makeBoolLiteral(0);   // dummy; arm not selected
+        if (!eval) return truthOperand(false);   // dummy; arm not selected
         return condTrue ? std::move(*thenOpt) : std::move(*elseOpt);
     }
 
@@ -790,7 +802,7 @@ private:
             advance();
             auto operand = parsePrimary(eval);
             if (!operand.has_value()) return std::nullopt;
-            if (!eval) return makeBoolLiteral(0);   // dummy; not folded
+            if (!eval) return truthOperand(false);   // dummy; not folded
             // Unary `+` (if a language declares it) is identity.
             if (ue->target == "Pos") return operand;
             auto opK = opFromName(ue->target);
@@ -811,12 +823,22 @@ private:
                      "non-integer operand in #if expression");
                 return std::nullopt;
             }
-            auto folded = applyUnaryInt(*opK, *operand);
+            // ★ THIS EVALUATOR STATES ITS OWN TYPE: 64 bits, and the operand's
+            // signedness. C 6.10.1p4 gives every operand of a `#if` the widest
+            // type, so `~0U` here is 0xFFFFFFFFFFFFFFFF — where the same tokens in
+            // a translation-phase-7 expression are 0xFFFFFFFF. The shared fold
+            // reduces to the type its CALLER states; it assumes no width.
+            auto folded = applyUnaryInt(
+                *opK, *operand,
+                detail::IntKindInfo{64, operand->core != TypeKind::U64});
             if (!folded.has_value()) {
                 fail(DiagnosticCode::P_PreprocessorUnsupported,
                      "unary operator not foldable in #if expression");
                 return std::nullopt;
             }
+            // `!x` comes back under a Bool core — the shared fold's answer for a
+            // phase-7 expression; here it is the widest signed type's 1 or 0.
+            if (folded->core == TypeKind::Bool) folded->core = TypeKind::I64;
             return *folded;
         }
 
@@ -825,10 +847,7 @@ private:
             for (auto const& [tok, val] : lits_.fixedValues) {
                 if (tok == t.schemaKind.v) {
                     advance();
-                    HirLiteralValue lv;
-                    lv.core  = TypeKind::Bool;
-                    lv.value = std::int64_t{val != 0 ? 1 : 0};
-                    return lv;
+                    return truthOperand(val != 0);
                 }
             }
         }

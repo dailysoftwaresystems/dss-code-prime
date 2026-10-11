@@ -274,6 +274,7 @@ struct EngineState {
           constantSubobjects{cu},
           nanPayloads{cu},
           overflowPredicateTargets{cu},
+          braceElementValueTypes{cu},
           attributeNamesIgnoredForKind{cu},
           deprecatedTypeUseWarned{cu},
           typedefNamedByToken{cu},
@@ -437,6 +438,12 @@ struct EngineState {
     // P69 (lane `cs`): every `__builtin_*_overflow_p` call's cast target (see the model's
     // `overflowPredicateTargetFor`).
     UnitAttribute<TypeId> overflowPredicateTargets;
+    // P69 (lane `lm`): the type this tier derived for the VALUE of a brace element, keyed
+    // by the value's node under its grouping — written where the placement cursor's
+    // "does it initialize the subobject whole" is answered (`braceValueInitializesWhole`),
+    // moved into the model for the HIR lowering, which asks the cursor the same question
+    // (see the model's `braceElementValueTypeFor`).
+    UnitAttribute<TypeId> braceElementValueTypes;
     // P69 (lane `cs`): the NAME token of every attribute clause the declaration-kind
     // gate ignored (see the model's `attributeNameIgnoredForKind`).
     UnitAttribute<bool> attributeNamesIgnoredForKind;
@@ -5525,11 +5532,28 @@ genericSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // Pass 2's loud re-resolve of the same node. The resolved TypeIds and the
     // benign interner side effects persist; only the reports are dropped.
     auto const snap = s.reporter.snapshotForRollback();
+    // ★ P69 (lane `lm`): THE PREPARATION A PASS-1.5 TYPE QUERY NEEDS BELONGS TO THE CALL
+    // (`preStampLiteralLeaves`'s own words), AND THIS CALL DID NOT MAKE IT. Before the
+    // expression pass a literal leaf carries no type, so the controlling expression of
+    // `_Generic(0, int: 42, default: 9)` had none — and the promise two paragraphs up
+    // ("NEVER a guessed association") was kept by nobody: `selectGenericAssociation`
+    // matched no typed association and handed back `default`. ✔MEASURED 2026-10-10 (pe64,
+    // baseline and release): `enum { EV = _Generic(0, int: 42, default: 9) };` was 9 and
+    // `static char arr[_Generic(0, int: 3, default: 7)];` had 7 elements, in silence — and
+    // so for a controlling `1.5`, `1.5f`, `'a'`, `"ab"`, `0 + 1L`, `1 + 1u`, `-1`, `1ull`,
+    // `1 ? 1 : 2L`, `(0)`, in an enumerator, an array bound that is no block-scope
+    // object's, a bit-field width and a designator's index; the same selection in a
+    // static assertion or a statement (the expression pass) was right, and the six
+    // references select the typed association everywhere.
+    preStampLiteralLeaves(s, cfg, tree, kids[cfg.genericControlChild]);
     TypeId const controllingType =
         subtreeType(s, tree, kids[cfg.genericControlChild], here);
     GenericSelection const sel =
         selectGenericAssociation(s, cfg, tree, node, here, controllingType);
     s.reporter.truncateTo(snap);
+    // An unresolved controlling type selects NOTHING: `default` is the association for
+    // a type no other names, never for a type that is not known yet.
+    if (!sel.controllingResolved) return InvalidNode;
     return sel.selected.valid() ? sel.selected : InvalidNode;
 }
 
@@ -5582,15 +5606,98 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
     return r.value;
 }
 
+// ── THE INITIALIZER DESCENTS OF THIS FILE TAKE THEIR STEPS BY ONE STATEMENT ─────────────
+// (cycle P69 round 1, lane `lm`.)
+//
+// What a wrapper is — a node that is nothing but grouping — is stated ONCE, for this tier
+// and for the HIR lowering: `nodeSaysSomethingItself` (`core/types/decl_prefix_strip.hpp`,
+// where the measurement that made it one statement is told). It is the static-initializer
+// check's own list (lane `cs`), lifted out of that check; the two functions below are this
+// file's walk through it and the one pair of operators that says nothing.
+
+// Descend the wrappers above `n` to the first node that says something itself — or that
+// has no single Internal child to pass through to (a leaf; a node with several operands
+// the statement does not name). Returns `n` itself when nothing is interposed; never
+// leaves the subtree. `what` names the descent for the one failure a strict-descendant
+// walk can have: a cyclic, malformed tree (`failOnCyclicTree`).
+[[nodiscard]] NodeId
+peelGroupingWrappers(SemanticConfig const& cfg, Tree const& tree, NodeId n, char const* what) {
+    auto const& hirCfg = tree.schema().hirLowering();
+    std::size_t const bound = tree.nodeCount() + 1;   // a strict-descendant walk cannot exceed it
+    for (std::size_t guard = 0; n.valid(); ++guard) {
+        if (guard > bound) failOnCyclicTree(what);
+        if (tree.kind(n) != NodeKind::Internal
+            || nodeSaysSomethingItself(cfg, hirCfg, tree, n)) {
+            return n;
+        }
+        NodeId sole{};
+        bool multiple = false;
+        for (NodeId c : visibleChildren(tree, n)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (sole.valid()) { multiple = true; break; }
+            sole = c;
+        }
+        if (multiple || !sole.valid()) return n;
+        n = sole;
+    }
+    return n;
+}
+
+// THE ONE PAIR OF OPERATORS THAT SAYS NOTHING. `&*E` is `E` and `*&E` designates `E`
+// (C 6.5.3.2p3: "neither that operator nor the & operator is evaluated and the result is
+// as if both were omitted"; p4 for the other order) — the rule the static-initializer
+// check states for itself. `E` when `n` is the operator `outer` applied (through wrappers)
+// to the operator `inner`, else an invalid node. A descent that stops at every operator
+// asks this where the pair was crossed before: ✔MEASURED 2026-10-10, gcc 13.3.0, MinGW
+// gcc 13.2.0 and AppleClang 21 take `constexpr int *p = &*(int *)0;` and clang 18.1.3
+// folds `(*&s).m` of a constant structure — both were read right only because every
+// operator was a wrapper.
+[[nodiscard]] NodeId
+cancelledUnaryPair(Tree const& tree, NodeId n, std::string_view outer, std::string_view inner) {
+    auto const& hirCfg = tree.schema().hirLowering();
+    auto const operandIf = [&](NodeId node, std::string_view target) -> NodeId {
+        if (!node.valid() || tree.kind(node) != NodeKind::Internal
+            || !hirCfg.unaryExprRule.valid() || tree.rule(node).v != hirCfg.unaryExprRule.v) {
+            return {};
+        }
+        NodeId opTok{}, operand{};
+        std::size_t operands = 0;
+        for (NodeId c : visibleChildren(tree, node)) {
+            if (tree.kind(c) == NodeKind::Token) {
+                if (!opTok.valid()) opTok = c;
+            } else {
+                operand = c;
+                ++operands;
+            }
+        }
+        if (!opTok.valid() || operands != 1) return {};
+        for (auto const& op : hirCfg.unaryOps) {
+            if (op.token.v == tree.tokenKind(opTok).v) {
+                return op.target == target ? operand : NodeId{};
+            }
+        }
+        return {};
+    };
+    NodeId const under = operandIf(n, outer);
+    if (!under.valid()) return {};
+    return operandIf(peelGroupingWrappers(tree.schema().semantics(), tree, under,
+                                          "the cancelled operator pair"),
+                     inner);
+}
+
 // ── P33: the two constexpr-initializer predicates ──────────────────────────
 //
 // Descend through the TRANSPARENT wrappers an initializer position interposes
 // (`initValue`'s alt node, paren groups, the expression carrier) to the first
-// node that actually says something — one with 0 or 2+ Internal children, or one
-// whose rule this engine recognizes. The SAME descent shape the FC17.5 empty-brace
-// arm uses, extracted so the brace-list arm and the empty-brace arm cannot drift
-// on what "the initializer node" means. Returns `node` itself when nothing is
-// interposed; never leaves the subtree.
+// node that actually says something (`nodeSaysSomethingItself` — a brace list among
+// them; a string literal has no child to pass through to). The SAME descent the
+// FC17.5 empty-brace arm uses, extracted so the brace-list arm and the empty-brace
+// arm cannot drift on what "the initializer node" means. Returns `node` itself when
+// nothing is interposed; never leaves the subtree.
+// ★ P69 (lane `lm`): THIS WALKED THROUGH EVERY NODE WITH ONE INTERNAL CHILD — it
+// knew the brace list and the string literal and counted for the rest, so `-5`
+// answered as `5` and `sizeof(int)` as its type name. (The analysis state it takes
+// is not read any more: the statement needs the tree's own schema alone.)
 // ★ P68 round 13 (lane `cs`): NO DEPTH CAP. This loop stopped after 64 wrappers and
 // returned the wrapper it had reached AS IF it were the initializer — so a constexpr
 // pointer whose null cast sat inside 64 or more parentheses was refused, the cast never
@@ -5598,27 +5705,9 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
 // longer than the tree has nodes can only mean a cyclic (malformed) tree
 // (`failOnCyclicTree`).
 [[nodiscard]] NodeId
-descendInitWrappers(EngineState const& s, Tree const& tree, NodeId node) {
-    NodeId walk = node;
-    std::size_t const bound = tree.nodeCount() + 1;
-    for (std::size_t step = 0; walk.valid(); ++step) {
-        if (step > bound) failOnCyclicTree("the initializer wrapper descent");
-        if (tree.kind(walk) != NodeKind::Internal) return walk;
-        if (s.idx().braceInitListRule.valid()
-            && tree.rule(walk).v == s.idx().braceInitListRule.v) return walk;
-        if (s.idx().stringLiteralExprRule.valid()
-            && tree.rule(walk).v == s.idx().stringLiteralExprRule.v) return walk;
-        NodeId sole{};
-        bool   multiple = false;
-        for (NodeId c : visibleChildren(tree, walk)) {
-            if (tree.kind(c) != NodeKind::Internal) continue;
-            if (sole.valid()) { multiple = true; break; }
-            sole = c;
-        }
-        if (multiple || !sole.valid()) return walk;
-        walk = sole;
-    }
-    return walk;
+descendInitWrappers(EngineState const&, Tree const& tree, NodeId node) {
+    return peelGroupingWrappers(tree.schema().semantics(), tree, node,
+                                "the initializer wrapper descent");
 }
 
 // ★★ P33 (D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL, C 6.3.2.3p3 + 6.6): is `node` a
@@ -5663,6 +5752,14 @@ constexprPointerCastFoldsToNull(EngineState& s, SemanticConfig const& cfg,
         if (step > bound) failOnCyclicTree("the constexpr null pointer cast chain");
         cur = descendInitWrappers(s, tree, cur);
         if (!cur.valid() || tree.kind(cur) != NodeKind::Internal) return false;
+        // `&*E` IS `E` (`cancelledUnaryPair`): gcc takes `constexpr int *p = &*(int *)0;`.
+        // Any OTHER operator over the cast is not the cast — `!(int *)0` is the integer 1,
+        // and was admitted here as a null pointer while the descent walked through it.
+        if (NodeId const same = cancelledUnaryPair(tree, cur, "AddressOf", "Deref");
+            same.valid()) {
+            cur = same;
+            continue;
+        }
         auto const it = s.idx().castByRule.find(tree.rule(cur).v);
         if (it == s.idx().castByRule.end()) return false;
         auto const& cr = tree.schema().semantics().castRules[it->second];
@@ -5946,6 +6043,20 @@ void validateConstexprObject(EngineState& s, SemanticConfig const& cfg, Tree con
             if (!value.valid()) {
                 emit(DiagnosticCode::S_ConstexprNonConstantInitializer, raw);
                 return;
+            }
+            // ★ P69 (lane `lm`): `*&E` DESIGNATES `E` (`cancelledUnaryPair`, C 6.5.3.2p4) —
+            // the one pair of operators this walk must still cross now that the descent
+            // stops at every operator. ✔MEASURED 2026-10-10: gcc 13.2.0 / 13.3.0 and
+            // AppleClang 21 take `constexpr struct W w = { *&s, 2 };` and `constexpr struct
+            // S t = *&s;`, which were admitted here only because the descent walked through
+            // both operators to the name. Any OTHER operator over a constant object is
+            // judged as what it is: `{ &k }` is an address, not the object `k`, and those
+            // three refuse it (a `constexpr` pointer is null) where this walk took it for
+            // the object under the `&`.
+            if (NodeId const designated = cancelledUnaryPair(tree, value, "Deref", "AddressOf");
+                designated.valid()) {
+                pending.push_back(designated);
+                continue;
             }
             bool const isBrace =
                 tree.kind(value) == NodeKind::Internal
@@ -11281,39 +11392,17 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
         return r.valid() && n.valid() && tree.kind(n) == NodeKind::Internal && tree.rule(n).v == r.v;
     };
     auto const isUnevaluated = [&](NodeId n) {
-        return isRule(n, hirCfg.sizeofRule) || isRule(n, hirCfg.alignofRule)
-            || isRule(n, cfg.sizeofTypeRule) || isRule(n, cfg.sizeofValueRule)
-            || isRule(n, cfg.alignofTypeRule) || isRule(n, cfg.alignofValueRule);
-    };
-    auto const isOperatorNode = [&](NodeId n) {
-        if (!n.valid() || tree.kind(n) != NodeKind::Internal) return false;
-        std::uint32_t const r = tree.rule(n).v;
-        return isRule(n, hirCfg.unaryExprRule) || isRule(n, hirCfg.binaryExprRule)
-            || isRule(n, hirCfg.postfixExprRule) || isRule(n, hirCfg.ternaryExprRule)
-            || isRule(n, hirCfg.labelAddressRule) || isRule(n, hirCfg.chooseExprRule)
-            || isRule(n, hirCfg.stmtExprRule) || isRule(n, cfg.genericRule)
-            || isRule(n, s.idx().braceInitListRule) || isRule(n, s.idx().stringLiteralExprRule)
-            || isUnevaluated(n)
-            || s.idx().castByRule.contains(r) || s.idx().compoundLiteralByRule.contains(r);
+        return nodeIsAnUnevaluatedOperandForm(cfg, hirCfg, tree, n);
     };
     // Descend the transparent single-child wrappers (a paren group, the expression carriers)
-    // — never through an operator, a cast, a literal form or a selection.
+    // — never through an operator, a cast, a brace list or a selection. What a wrapper IS
+    // was first written HERE; it is one statement for both tiers now
+    // (`nodeSaysSomethingItself`) and this check takes its steps through it like every
+    // other descent. (Its entry for the string literal went with the move: a string
+    // literal's node has no Internal child, so the walk below stops at it either way.)
     std::size_t const bound = tree.nodeCount() + 1;   // a strict-descendant walk cannot exceed it
     auto const peel = [&](NodeId n) {
-        for (std::size_t guard = 0; n.valid(); ++guard) {
-            if (guard > bound) failOnCyclicTree("the static initializer check's wrapper peel");
-            if (tree.kind(n) != NodeKind::Internal || isOperatorNode(n)) return n;
-            NodeId sole{};
-            bool multiple = false;
-            for (NodeId c : visibleChildren(tree, n)) {
-                if (tree.kind(c) != NodeKind::Internal) continue;
-                if (sole.valid()) { multiple = true; break; }
-                sole = c;
-            }
-            if (multiple || !sole.valid()) return n;
-            n = sole;
-        }
-        return n;
+        return peelGroupingWrappers(cfg, tree, n, "the static initializer check's wrapper peel");
     };
     auto const operatorOf = [&](NodeId n, std::vector<HirOperatorEntry> const& ops)
         -> HirOperatorEntry const* {
@@ -13622,20 +13711,34 @@ private:
     return out;
 }
 
-// Peel single-child wrappers off `n` until `rule` (or a node with several internal
-// children, or a leaf). The brace walks' transparent-wrapper descent — the HIR tier's
-// `peelToBraceInitOrCore` / `peelToDesignatorLeaf` take the same steps.
+// The node of `rule` that `n` IS — `n` itself, or what stands under its wrappers — else an
+// invalid node. The brace walks' descent: "is this element's value a brace list", "is it
+// the string literal that initializes the array", "is this child a designator". The HIR
+// tier's `peelToBraceInitOrCore` takes its steps by the same statement.
+// ★ P69 (lane `lm`): A WRAPPER IS WHAT THE ONE STATEMENT SAYS IT IS
+// (`nodeSaysSomethingItself`). This peeled EVERY node with one Internal child, so the
+// operand of an operator answered for the expression: ✔MEASURED 2026-10-10, `char s[] =
+// { *"abc" };`, `{ !"abc" }` and `{ sizeof "abc" }` were sized as the string under the
+// operator (four elements), and at file scope the element after one was warned as "in
+// excess of the string literal that leads its braces" and dropped. gcc, clang,
+// AppleClang, MinGW gcc and MSVC build each as the one-element array it is. No depth cap
+// either: the walk went 64 wrappers deep and then answered "no" — every step is to a
+// strict descendant, so the tree's node count bounds it.
 [[nodiscard]] NodeId peelSingleChildrenTo(Tree const& tree, NodeId n, RuleId rule) {
+    if (!rule.valid()) return {};
+    SemanticConfig const& cfg = tree.schema().semantics();
+    auto const& hirCfg = tree.schema().hirLowering();
+    std::size_t const bound = tree.nodeCount() + 1;
     NodeId cur = n;
-    for (int guard = 0; guard < 64 && cur.valid() && tree.kind(cur) == NodeKind::Internal;
-         ++guard) {
-        if (rule.valid() && tree.rule(cur).v == rule.v) return cur;
+    for (std::size_t guard = 0; cur.valid() && tree.kind(cur) == NodeKind::Internal; ++guard) {
+        if (guard > bound) failOnCyclicTree("the brace walks' wrapper peel");
+        if (tree.rule(cur).v == rule.v) return cur;
+        if (nodeSaysSomethingItself(cfg, hirCfg, tree, cur)) return {};
         auto const inner = internalChildrenOf(tree, cur);
-        if (inner.size() != 1) break;
+        if (inner.size() != 1) return {};
         cur = inner.front();
     }
-    return (cur.valid() && tree.kind(cur) == NodeKind::Internal && rule.valid()
-            && tree.rule(cur).v == rule.v) ? cur : NodeId{};
+    return {};
 }
 
 // C 6.7.9p14: the string literal an initializer VALUE is, when the character array
@@ -13683,6 +13786,27 @@ private:
         return stringLiteralInitializingArray(s, idx, tree, value, t).valid();
     if (k != TypeKind::Struct && k != TypeKind::Union) return false;
     TypeId const vt = subtreeType(s, tree, value, scope);
+    // ★ P69 (lane `lm`): THE ANSWER IS HANDED TO THE LOWERING, NOT DERIVED THERE AGAIN.
+    // The HIR tier asks the placement cursor this same question and had only the type
+    // STAMPS to answer it from — and an operator's node carries none, by this tier's own
+    // design (`nodeToType` is the door the lowering prefers over the type it computes
+    // itself, so a derived expression type is never stamped on it). ✔MEASURED 2026-10-10:
+    // this tier sized `struct S arr[] = { src[1], src[0], src[1] };` as three structures
+    // (and so `{ *p, … }`, `{ (0 ? s : s), … }`, `{ (0, s), … }`, `{ *(&s + 0), … }`, a
+    // call with no argument), while the lowering, finding an array and an `int` stamped
+    // under `src[1]`, put the element into the structure's FIRST MEMBER — two tiers, two
+    // placements, a verifier failure ("ConstructAggregate … child[0] type … doesn't match
+    // field type"), where all six references build and run every one. The lowering
+    // cannot type the value by lowering it first: the placement is decided before
+    // anything is lowered, so that an element in excess stays unevaluated. So the type
+    // derived HERE is the fact it reads, under the node both tiers reach by the one
+    // statement of what a wrapper is.
+    if (vt.valid()) {
+        s.braceElementValueTypes.set(
+            peelGroupingWrappers(tree.schema().semantics(), tree, value,
+                                 "a brace element's value"),
+            vt);
+    }
     return vt.valid() && interner.stripVolatile(vt) == interner.stripVolatile(t);
 }
 
@@ -14446,24 +14570,20 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
         if (!name.valid()) return std::nullopt;
         return std::pair{base, name};
     };
-    // A transparent wrapper (a paren group, an operand carrier): exactly one Internal
-    // child, and no member access, compound literal or identifier of its own.
+    // The wrappers above a base or a whole-aggregate initializer, by the ONE statement
+    // of what a wrapper is (`nodeSaysSomethingItself`): a member access and a compound
+    // literal say something themselves — and so does every operator, except the pair
+    // that says nothing: `(*&s).m` is `s.m` (`cancelledUnaryPair`). (This counted
+    // children too: it crossed any node with one Internal child that was neither a
+    // member access nor a compound literal, `*p` and `&s` alone included.)
     auto const peel = [&](NodeId n) {
-        for (std::size_t guard = 0; n.valid(); ++guard) {
+        for (std::size_t guard = 0;; ++guard) {
             if (guard > bound) failOnCyclicTree("the constant subobject peel");
-            if (tree.kind(n) != NodeKind::Internal || compoundLiteralRow(n) != nullptr
-                || memberAccess(n).has_value()) return n;
-            NodeId sole{};
-            bool multiple = false;
-            for (NodeId c : visibleChildren(tree, n)) {
-                if (tree.kind(c) != NodeKind::Internal) continue;
-                if (sole.valid()) { multiple = true; break; }
-                sole = c;
-            }
-            if (multiple || !sole.valid()) return n;
-            n = sole;
+            n = peelGroupingWrappers(cfg, tree, n, "the constant subobject peel");
+            NodeId const designated = cancelledUnaryPair(tree, n, "Deref", "AddressOf");
+            if (!designated.valid()) return n;
+            n = designated;
         }
-        return n;
     };
     // A constant ROOT: its initializer, its type and the scope its initializer reads in.
     struct Root { NodeId init{}; TypeId type{}; ScopeId scope{}; };
@@ -30428,6 +30548,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(s.constantSubobjects),
         std::move(s.nanPayloads),
         std::move(s.overflowPredicateTargets),
+        std::move(s.braceElementValueTypes),
         std::move(s.attributeNamesIgnoredForKind),
         std::move(shippedExterns),
         std::move(suppressedShippedLibraries),

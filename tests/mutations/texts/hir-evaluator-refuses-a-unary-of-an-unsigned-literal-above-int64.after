@@ -1,0 +1,1 @@
+    if (!asInt64(*inner.value).has_value()) {

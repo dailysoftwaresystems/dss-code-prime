@@ -212,7 +212,11 @@ asBool(HirLiteralValue const& v, bool allowFloat) noexcept {
     // `_BitInt` condition holding such a value in `&&`/`||`/`?:` would then
     // spuriously fail the whole fold, though its truth value is perfectly defined).
     if (auto p = std::get_if<BitIntValue>(&v.value)) return !p->isZero();
-    auto iv = asInt64(v);
+    // "Is it zero" is asked of the BITS. An unsigned value above INT64_MAX is an
+    // integer and it is true; `asInt64` answers "does it fit a signed int64" and so
+    // made `0x8000000000000000ull ? 1 : 2`, `&&`, `||` and `!` of such a value
+    // "not an integer" ([[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]]).
+    auto iv = asIntBits(v);
     if (!iv.has_value()) return std::nullopt;
     return *iv != 0;
 }
@@ -247,23 +251,8 @@ asBool(HirLiteralValue const& v, bool allowFloat) noexcept {
                                    * static_cast<std::uint64_t>(b));
 }
 
-// Fold a UnaryOp(Neg / BitNot / Not) on an integer operand. `Not`
-// (logical negation) re-tags the result core to Bool per C99 §6.5.3.3p5.
-// Unary `+` is identity at the value level; no v1 frontend emits it
-// as a UnaryOp.
-[[nodiscard]] inline std::optional<HirLiteralValue>
-applyUnaryInt(HirOpKind op, HirLiteralValue const& inner) {
-    auto iv64 = asInt64(inner);
-    if (!iv64.has_value()) return std::nullopt;
-    std::int64_t const iv = *iv64;
-    HirLiteralValue folded = inner;
-    switch (op) {
-        case HirOpKind::Neg:    folded.value = wrapNegI64(iv); return folded;
-        case HirOpKind::BitNot: folded.value = ~iv;    return folded;
-        case HirOpKind::Not:    folded.value = std::int64_t{iv == 0 ? 1 : 0}; folded.core = TypeKind::Bool; return folded;
-        default: return std::nullopt;
-    }
-}
+// (`applyUnaryInt` is below, after `intOpDomain`: it computes in a stated type, and
+// the verbs that state one are declared there.)
 
 
 // FC17.9(e) → LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): does the
@@ -473,11 +462,23 @@ intKindInfo(TypeKind k, std::optional<bool> charIsUnsigned) noexcept {
 // 19.51 all fold it to 2^64 and all four accept `!= -1.0`. nullopt when the value
 // has no 64-bit rendering at all (a wide `_BitInt` / `__int128`), which the
 // callers turn into a loud refusal rather than a rounded guess.
-[[nodiscard]] inline std::optional<double>
-integerConstantAsDouble(HirLiteralValue const& v,
-                        std::optional<bool> charIsUnsigned) noexcept {
+//
+// ★ ONE READING, TWO WIDENINGS. The (bits, signedness) pair is read ONCE, by
+// `integerConstantBits`, and both float targets convert from it: the host-backed
+// kinds through a `double` (`integerConstantAsDouble`) and F80/F128 exactly
+// (`integerConstantAsWideFloat`). The wide arm used to read the source by itself —
+// the HIR walker through `asInt64` (a refusal above INT64_MAX) and
+// `WideFloatValue::fromInt64` (the bits as a SIGNED number whatever the core
+// said), the CST walker through a host `double` — so `(long double)(~0ULL)` was
+// laid down as -1.0 and an integer above 2^53 lost its low bits on a target whose
+// `long double` holds them ([[D-CE-UNSIGNED-UNARY-RESULT-NOT-REDUCED-TO-ITS-TYPE]],
+// [[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]]).
+struct IntegerConstantBits { std::uint64_t bits; bool isUnsigned; };
+[[nodiscard]] inline std::optional<IntegerConstantBits>
+integerConstantBits(HirLiteralValue const& v,
+                    std::optional<bool> charIsUnsigned) noexcept {
     if (auto const* uv = std::get_if<std::uint64_t>(&v.value)) {
-        return static_cast<double>(*uv);
+        return IntegerConstantBits{*uv, true};
     }
     auto const bits = asIntBits(v);
     if (!bits.has_value()) return std::nullopt;
@@ -487,8 +488,28 @@ integerConstantAsDouble(HirLiteralValue const& v,
     } else if (auto const si = intKindInfo(v.core, charIsUnsigned); si.has_value()) {
         isUnsigned = !si->isSigned;
     }
-    return isUnsigned ? static_cast<double>(static_cast<std::uint64_t>(*bits))
-                      : static_cast<double>(*bits);
+    return IntegerConstantBits{static_cast<std::uint64_t>(*bits), isUnsigned};
+}
+
+[[nodiscard]] inline std::optional<double>
+integerConstantAsDouble(HirLiteralValue const& v,
+                        std::optional<bool> charIsUnsigned) noexcept {
+    auto const c = integerConstantBits(v, charIsUnsigned);
+    if (!c.has_value()) return std::nullopt;
+    return c->isUnsigned ? static_cast<double>(c->bits)
+                         : static_cast<double>(static_cast<std::int64_t>(c->bits));
+}
+
+// The same source to an F80/F128 target — EXACT for every 64-bit integer (a 64-
+// or 113-bit significand holds it), so there is no lossy-conversion question.
+[[nodiscard]] inline std::optional<WideFloatValue>
+integerConstantAsWideFloat(HirLiteralValue const& v, TypeKind toK,
+                           std::optional<bool> charIsUnsigned) noexcept {
+    auto const c = integerConstantBits(v, charIsUnsigned);
+    if (!c.has_value()) return std::nullopt;
+    return c->isUnsigned
+        ? WideFloatValue::fromUint64(c->bits, /*sign=*/false, toK)
+        : WideFloatValue::fromInt64(static_cast<std::int64_t>(c->bits), toK);
 }
 
 // The integral part of a folded float, toward zero, as an EXACT double.
@@ -693,6 +714,102 @@ intOpDomain(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
     }
     if (rt.isBitPrecise || rt.width > 64) return std::nullopt;
     return IntKindInfo{static_cast<int>(rt.width), rt.isSigned};
+}
+
+// ── C 6.5.3.3: THE TYPE A UNARY `-` / `~` IS PERFORMED IN ───────────────────
+// [[D-CE-UNSIGNED-UNARY-RESULT-NOT-REDUCED-TO-ITS-TYPE]]. The operand is promoted
+// and the result HAS the promoted type (6.5.3.3p3-p4); a computation of an
+// unsigned type is reduced modulo 2^N (6.2.5p9). This is `intOpDomain`'s
+// one-operand twin, built from the same two verbs — `bitIntOperandType` (the type
+// the operand's CORE states) and `promoteBitIntOperand` (6.3.1.1p2) — so a unary
+// and a binary operator cannot disagree about the type of one operand.
+//
+// nullopt exactly where `intOpDomain` is: a bit-precise or 128-bit operand (the
+// bignum's, `foldBitIntUnary`), a core that states no integer type, and a `char`
+// whose sign the caller was not told. ⓘ For that last one the 64-bit computation
+// `applyUnaryInt` then makes IS the answer, not a guess: the value is already
+// decided, promotion to `int` preserves it under either sign, and `-`/`~` of a
+// value that fits a byte fits an `int`.
+[[nodiscard]] inline std::optional<IntKindInfo>
+intUnaryDomain(HirLiteralValue const& v, std::optional<bool> charIsUnsigned) noexcept {
+    auto const ot = bitIntOperandType(v, charIsUnsigned);
+    if (!ot.has_value() || ot->isBitPrecise) return std::nullopt;
+    BitIntOperandType const rt = promoteBitIntOperand(*ot);
+    if (rt.width > 64) return std::nullopt;
+    return IntKindInfo{static_cast<int>(rt.width), rt.isSigned};
+}
+
+// Fold a UnaryOp(Neg / BitNot / Not) on an integer operand IN THE TYPE THE CALLER
+// STATES. `Not` (logical negation) yields 0 or 1 under a Bool core (C 6.5.3.3p5)
+// and asks only whether the operand is zero. Unary `+` is the identity at the
+// value level; no frontend emits it as a UnaryOp.
+//
+// ★ `domain` IS THE CALLER'S STATEMENT, AND THIS FUNCTION ASSUMES NONE. It used to
+// compute `-` and `~` on the 64-bit pattern and hand the result back under the
+// operand's core WITHOUT reducing it, where `applyBinaryInt` first establishes the
+// type the operation is performed in and reduces to it. ✔MEASURED 2026-10-10: so
+// `~0U` was 0xFFFFFFFFFFFFFFFF the moment anything widened it — `static const
+// unsigned long long u = ~0U;`, `(unsigned long long)(~0U)`, `(double)(~0U)`,
+// `-1U` as a `long long` — while cl, MinGW gcc, gcc, clang and AppleClang all
+// give 0xFFFFFFFF. The four callers and what each states:
+//   • the HIR and the CST walker — `intUnaryDomain`: the promoted type of the
+//     operand's own core;
+//   • the `#if` evaluator — its ONE width, 64, and the operand's signedness
+//     (C 6.10.1p4: every operand there is `intmax_t` or `uintmax_t`, so
+//     `#if ~0U == 0xFFFFFFFFFFFFFFFF` is TRUE and must stay true);
+//   • the optimizer's folder — nothing: it converts every result to the
+//     instruction's own type itself (`normalizeToType`).
+// With no domain the computation is the 64-bit one and the core is the operand's.
+//
+// The operand is read as BITS (`asIntBits`), behind that domain: an unsigned value
+// above INT64_MAX is an operand like any other, and `asInt64` made `~`, `-` and
+// `!` of one "not an integer constant expression"
+// ([[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]]).
+[[nodiscard]] inline std::optional<HirLiteralValue>
+applyUnaryInt(HirOpKind op, HirLiteralValue const& inner,
+              std::optional<IntKindInfo> domain) {
+    auto const bits = asIntBits(inner);
+    if (!bits.has_value()) return std::nullopt;
+    HirLiteralValue folded = inner;
+    switch (op) {
+        case HirOpKind::Neg:
+        case HirOpKind::BitNot: {
+            // Compute on the 64-bit pattern and reduce the RESULT to the operation's
+            // type. The operand is not converted first: `-` and `~` commute with the
+            // reduction modulo 2^N (the low N bits of either depend on the low N bits
+            // of the operand alone), so that conversion would be a transform nothing
+            // could tell from its absence.
+            std::int64_t const raw = (op == HirOpKind::Neg) ? wrapNegI64(*bits) : ~*bits;
+            folded.value = domain.has_value() ? wrapToIntTarget(raw, *domain) : raw;
+            if (domain.has_value()) {
+                folded.core = intKindFromWidth(
+                    static_cast<std::uint32_t>(domain->bits), domain->isSigned);
+            }
+            return folded;
+        }
+        case HirOpKind::Not:
+            folded.value = std::int64_t{*bits == 0 ? 1 : 0};
+            folded.core  = TypeKind::Bool;
+            return folded;
+        default: return std::nullopt;
+    }
+}
+
+// Unary `+` on an integer operand: its VALUE, in the promoted type (C 6.5.3.3p2).
+// Promotion preserves the value, so with a domain this re-labels the operand and
+// with none it is the identity. It is no `HirOpKind` (the lowering turns `+x`
+// into the promotion itself), which is why it has a verb of its own here.
+[[nodiscard]] inline std::optional<HirLiteralValue>
+applyUnaryPlusInt(HirLiteralValue const& inner, std::optional<IntKindInfo> domain) {
+    auto const bits = asIntBits(inner);
+    if (!bits.has_value()) return std::nullopt;
+    HirLiteralValue folded = inner;
+    if (domain.has_value()) {
+        folded.value = wrapToIntTarget(*bits, *domain);
+        folded.core  = intKindFromWidth(static_cast<std::uint32_t>(domain->bits),
+                                        domain->isSigned);
+    }
+    return folded;
 }
 
 // Fold a BinaryOp over two integer operands per the EvalOptions policy.

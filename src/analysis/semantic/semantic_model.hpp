@@ -1093,6 +1093,7 @@ public:
                   UnitAttribute<ConstantSubobjectFact>   constantSubobjects,
                   UnitAttribute<NanPayload>              nanPayloads,
                   UnitAttribute<TypeId>                  overflowPredicateTargets,
+                  UnitAttribute<TypeId>                  braceElementValueTypes,
                   UnitAttribute<bool>                    attributeNamesIgnoredForKind,
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   std::unordered_map<std::string, SuppressedShippedSymbol>
@@ -1136,6 +1137,7 @@ public:
           constantSubobjects_(std::move(constantSubobjects)),
           nanPayloads_(std::move(nanPayloads)),
           overflowPredicateTargets_(std::move(overflowPredicateTargets)),
+          braceElementValueTypes_(std::move(braceElementValueTypes)),
           attributeNamesIgnoredForKind_(std::move(attributeNamesIgnoredForKind)),
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
@@ -1270,6 +1272,16 @@ public:
     // InvalidType (the semantic tier refused the call's operands).
     [[nodiscard]] TypeId overflowPredicateTargetFor(NodeId id) const {
         TypeId const* t = overflowPredicateTargets_.tryGet(id);
+        return t != nullptr ? *t : InvalidType;
+    }
+    // P69 (lane `lm`): the type the analyzer derived for the VALUE of a brace element —
+    // `id` is the value's node under its grouping (`nodeSaysSomethingItself`,
+    // `core/types/decl_prefix_strip.hpp`) — wherever it asked whether that value
+    // initializes a structure or union subobject WHOLE (C 6.7.9p13); InvalidType where it
+    // never asked. The lowering's placement reads this answer instead of deriving one of
+    // its own from the type stamps, which an operator's node does not carry.
+    [[nodiscard]] TypeId braceElementValueTypeFor(NodeId id) const {
+        TypeId const* t = braceElementValueTypes_.tryGet(id);
         return t != nullptr ? *t : InvalidType;
     }
     [[nodiscard]] ConstantSubobjectFact const* constantSubobjectFor(NodeId id) const {
@@ -1455,6 +1467,7 @@ private:
     UnitAttribute<ConstantSubobjectFact>                  constantSubobjects_;
     UnitAttribute<NanPayload>                             nanPayloads_;
     UnitAttribute<TypeId>                                 overflowPredicateTargets_;
+    UnitAttribute<TypeId>                                 braceElementValueTypes_;
     UnitAttribute<bool>                                   attributeNamesIgnoredForKind_;
     // FF11: descriptor externs minted from resolved shipped-lib JSON
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the

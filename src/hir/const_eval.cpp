@@ -582,10 +582,18 @@ combineUnary(Hir const& hir, HirNodeId expr, EvalOptions const& options,
     // Distinguish "value isn't an integer" from "operator isn't modelled"
     // at the caller so failure codes match the other int-only fold sites
     // (LogicalAnd/Or/Ternary cond) which surface `UnsupportedTypeKind`.
-    if (!asInt64(*inner.value).has_value()) {
+    // `asIntBits`, as the binary guard below asks it: "is this an INTEGER operand",
+    // never "does it fit a signed int64" — which refused `~`, `-` and `!` of an
+    // unsigned value above INT64_MAX.
+    if (!asIntBits(*inner.value).has_value()) {
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
     }
-    if (auto folded = applyUnaryInt(op, *inner.value); folded.has_value()) {
+    // The type the operation is performed in is the promoted type of the operand's
+    // own core — the SAME statement the CST walker makes, through the same verb.
+    if (auto folded = applyUnaryInt(
+            op, *inner.value,
+            detail::intUnaryDomain(*inner.value, options.charIsUnsigned));
+        folded.has_value()) {
         return ok(std::move(*folded));
     }
     return fail(ConstEvalFailure::UnsupportedOperator, expr);
@@ -873,12 +881,17 @@ combineCast(Hir const& hir, TypeInterner& interner, EvalEnvironment const& env,
         // significand — unlike int → binary64), so it folds via the kernel's
         // exact `fromInt64`, NEVER through a lossy host `double`. (No lossy-knob
         // check: the conversion cannot lose precision.)
+        // ⚠ THE SOURCE'S SIGNEDNESS COMES FROM ITS CORE HERE TOO — the shared
+        // `integerConstantAsWideFloat`, the wide twin of the verb the host-backed
+        // arm below calls. `asInt64` + `fromInt64` refused an unsigned value above
+        // INT64_MAX and read every other bit pattern as SIGNED.
         if (WideFloatValue::isSupportedKind(toK)) {
-            auto iv = asInt64(*inner.value);
-            if (!iv.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+            auto const wide = detail::integerConstantAsWideFloat(
+                *inner.value, toK, options.charIsUnsigned);
+            if (!wide.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
             HirLiteralValue folded;
             folded.core  = toK;
-            folded.value = WideFloatValue::fromInt64(*iv, toK);
+            folded.value = *wide;
             return ok(std::move(folded));
         }
         auto info = floatKindInfo(toK);
@@ -1010,8 +1023,38 @@ combineCast(Hir const& hir, TypeInterner& interner, EvalEnvironment const& env,
         // Non-integer, non-float target (pointer / aggregate).
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
     }
-    auto iv64 = asInt64(*inner.value);
-    if (!iv64.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+    // ── A CAST READS ITS OPERAND'S BITS AND RE-LABELS THEM ───────────────────
+    // [[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]]. This asked
+    // `asInt64` — "does the value fit a signed int64" — so EVERY conversion of an
+    // unsigned constant above INT64_MAX was "not a constant expression", the
+    // identity `(unsigned long long)0x8000000000000000ull` included (✔MEASURED
+    // 2026-10-10; the six references fold all of them). The CST walker's cast arm
+    // already read `asIntBits`; the two walkers now ask the same question. The
+    // bit pattern is the representation every arm below is written for: it is what
+    // an int64 arm under an unsigned core already holds (`0ULL - 1` arrives as
+    // -1), so a value in the `uint64_t` arm takes the path its int64-arm twin took.
+    auto iv64 = asIntBits(*inner.value);
+    if (!iv64.has_value()) {
+        // ── A WIDE OPERAND NARROWED BY A CAST IS NOT A REFUSAL — HERE EITHER ──────
+        // `asIntBits` has no answer for a 128-bit (or bit-precise) constant whose
+        // VALUE does not fit 64 bits; the cast's answer is C 6.3.1.3's all the same:
+        // the value reduced modulo 2^N. The CST walker's cast has had this arm since
+        // [[D-CSUBSET-INT128-ICE-CONTEXT-REFUSED]]; this walker did not, so the same
+        // expression was a constant in an array bound and "not folded" in a static
+        // initializer: ✔MEASURED 2026-10-10, `static unsigned long long v =
+        // (unsigned long long)(((unsigned __int128)1 << 64) | 7);` and
+        // `(unsigned long long)(-(unsigned __int128)1)` were refused
+        // (H_StaticInitializerNotFolded) where gcc, clang, AppleClang and MinGW gcc
+        // store 7 and 2^64-1. Reduce to the low 64 bits first — exact, and the same
+        // modular reduction as converting straight to a target of at most 64 bits —
+        // and let the policy below apply the target's width as it does for every
+        // other source. `_Bool` asks the VALUE, not its low bits (6.3.1.2).
+        auto wide = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
+        if (!wide.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        if (toK == TypeKind::Bool) return ok(makeBoolLiteral(wide->isZero() ? 0 : 1));
+        wide->convertTo(64u, /*isSigned=*/false);
+        iv64 = static_cast<std::int64_t>(wide->low64());
+    }
     std::int64_t const iv = *iv64;
     if (toK == TypeKind::Bool) {
         return ok(makeBoolLiteral(iv));

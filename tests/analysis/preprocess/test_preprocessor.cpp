@@ -15102,6 +15102,72 @@ TEST(PreprocessorIfIntmax, EvaluationIsSixtyFourBitNotThirtyTwo) {
     EXPECT_FALSE(r.diagnostics->hasErrors());
 }
 
+// ── [[D-CE-UNSIGNED-UNARY-RESULT-NOT-REDUCED-TO-ITS-TYPE]]: `#if` IS ITS OWN DOMAIN ──
+//
+// The shared unary fold now reduces its result to the type ITS CALLER STATES.
+// In a translation-phase-7 expression that is the promoted type of the operand,
+// so `~0U` is 0xFFFFFFFF there; in a `#if` every operand has the widest type
+// (C 6.10.1p4), so the SAME tokens are 2^64-1 here, and they must stay so.
+// ✔MEASURED 2026-10-10 (reference runs of the lane's `#if` file): cl 19.51,
+// MinGW-w64 gcc, gcc, clang and AppleClang take every arm as pinned below. A fix
+// that taught the shared fold "an `unsigned int` is 32 bits" instead of asking
+// its caller would turn the first line false, in silence.
+TEST(PreprocessorIfIntmax, AUnaryOperatorIsPerformedAtTheWidestTypeWhateverItsOperandsSuffix) {
+    PreprocessResult r;
+    EXPECT_EQ(ppTakenArm("~0U == 0xFFFFFFFFFFFFFFFF", r), "taken_if")
+        << "the complement of 0U is 2^64-1 in a #if";
+    EXPECT_EQ(ppTakenArm("~0U == 0xFFFFFFFF", r), "taken_else")
+        << "…and is NOT reduced to the 32 bits its suffix names elsewhere";
+    EXPECT_EQ(ppTakenArm("-1U == 0xFFFFFFFFFFFFFFFF", r), "taken_if");
+    EXPECT_EQ(ppTakenArm("(~0U >> 60) == 15", r), "taken_if");
+    // Signed stays signed.
+    EXPECT_EQ(ppTakenArm("~0 == -1", r), "taken_if");
+    EXPECT_EQ(ppTakenArm("~0 < 0", r), "taken_if");
+    // An operand above INTMAX_MAX is an operand like any other.
+    EXPECT_EQ(ppTakenArm("~0x8000000000000000 == 0x7FFFFFFFFFFFFFFF", r), "taken_if");
+    EXPECT_EQ(ppTakenArm("-0x8000000000000000 == 0x8000000000000000", r), "taken_if");
+    EXPECT_EQ(ppTakenArm("!0x8000000000000000", r), "taken_else");
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+// ── [[D-PP-IF-TRUTH-RESULT-IS-AN-INT-NOT-INTMAX]] ───────────────────────────
+//
+// `==`, `<`, `!`, `&&` and `||` yield 1 or 0, and in a `#if` that 1 is the
+// `intmax_t` 1. The evaluator handed it on under a Bool core, which the shared
+// fold promotes to a 32-bit `int`; a SHIFT is performed in the type of its LEFT
+// operand alone, so `#if ((1 == 1) << 40) != 0x10000000000` took the TRUE arm —
+// a wrong branch of a `#if`, with no diagnostic. ✔MEASURED 2026-10-10 on the
+// class (776 lines: every truth-valued operator as the left and as the right
+// operand of every binary operator, and under `~` and `-`): the five reference
+// compilers take all 776 as computed at the widest type; DSS took 55 wrong, every
+// one a shift whose LEFT operand was a truth result or the `~` / `-` of one.
+// `defined` was right (it was never a Bool).
+TEST(PreprocessorIfIntmax, ATruthResultIsAnOperandOfTheWidestTypeNotAnInt) {
+    PreprocessResult r;
+    for (std::string const truth : {"(1 == 1)", "(1 != 2)", "(1 < 2)", "(2 > 1)", "(1 <= 1)",
+                                    "(1 >= 1)", "(!0)", "(1 && 1)", "(0 || 1)",
+                                    "(defined(DSS_PP_TRUTH_PIN_IS_NOT_DEFINED) == 0)"}) {
+        EXPECT_EQ(ppTakenArm("(" + truth + " << 40) == 0x10000000000", r), "taken_if") << truth;
+        EXPECT_EQ(ppTakenArm("(" + truth + " << 31) == 0x80000000", r), "taken_if") << truth;
+        EXPECT_EQ(ppTakenArm("(" + truth + " << 31) > 0", r), "taken_if")
+            << truth << ": bit 31 of the widest type is not a sign bit";
+        EXPECT_EQ(ppTakenArm("(" + truth + " << 32) == 0x100000000", r), "taken_if") << truth;
+        EXPECT_EQ(ppTakenArm("(" + truth + " << 62) == 0x4000000000000000", r), "taken_if") << truth;
+        // …and under the two unary operators, shifted again.
+        EXPECT_EQ(ppTakenArm("(-" + truth + " << 40) == -0x10000000000", r), "taken_if") << truth;
+        EXPECT_EQ(ppTakenArm("(~" + truth + " << 40) == -0x20000000000", r), "taken_if") << truth;
+    }
+    // A FALSE result is the widest type's 0, and its complement its -1.
+    EXPECT_EQ(ppTakenArm("((1 == 2) << 40) == 0", r), "taken_if");
+    EXPECT_EQ(ppTakenArm("(~(1 == 2) << 40) == -0x10000000000", r), "taken_if");
+    // The positions that were right keep their answers: a truth result as the
+    // RIGHT operand, and against a constant that already has the widest type.
+    EXPECT_EQ(ppTakenArm("(0x100000000 << (1 == 1)) == 0x200000000", r), "taken_if");
+    EXPECT_EQ(ppTakenArm("((1 == 1) * 0x100000000) == 0x100000000", r), "taken_if");
+    EXPECT_EQ(ppTakenArm("(-(1 == 1) >> 40) == -1", r), "taken_if");
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
 // ★★ THE SIGNEDNESS BOUNDARY IS INTMAX_MAX, NOT THE LITERAL'S OWN C TYPE, AND
 // THIS PAIR IS THE WHOLE REASON `preprocessorLiteralSignedness` EXISTS INSTEAD
 // OF A CALL TO `typeIntegerLiteral`. Asking the ordinary C 6.4.4.1 ladder types

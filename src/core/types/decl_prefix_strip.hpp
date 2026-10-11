@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/types/hir_lowering_config.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree.hpp"
@@ -395,6 +396,94 @@ arraySuffixHasModifier(Tree const& tree, NodeId suffix,
         if (array_suffix_detail::isArraySuffixModifierToken(tree, c,
                                                             modifierTokens))
             return true;
+    return false;
+}
+
+// ── WHAT A WRAPPER IS — the ONE statement every initializer descent takes its steps by ──
+// (cycle P69 round 1, lane `lm`.)
+//
+// A node is a WRAPPER when it is nothing but grouping: it has exactly one non-token child
+// and it is none of the constructs below, so its value, its type and its meaning are that
+// child's (a parenthesized expression, `__extension__ e`, an alternative's or an operand's
+// carrier). Every OTHER node says something itself, whatever the number of its children —
+// and a descent that walks through one hands its caller the OPERAND for the expression:
+//   * an operator application — unary (`-e`, `!e`, `~e`, `&e`, `*e`, `++e`), binary,
+//     postfix (`e++`, a call, an index, a member access), conditional;
+//   * `sizeof` / `_Alignof` in every form (the alternative's node, and the type and value
+//     forms under it): the operand is not evaluated, its SIZE is the value;
+//   * a cast, a compound literal, a brace list;
+//   * a compile-time selection (`_Generic`, `__builtin_choose_expr`), a label address, a
+//     statement expression.
+// (A literal's node — a string, a character — has no child to walk into, so no descent
+// needs it named; a caller that wants one asks for it by its own means.)
+//
+// ★ WHY IT IS ONE STATEMENT, AND WHY IT IS HERE. It was written once, inside the semantic
+// tier's static-initializer check (lane `cs`), and FOUR other descents counted children
+// instead — three in the semantic analyzer (the initializer descent, the constant-subobject
+// peel, the brace walks' peel) and the HIR lowering's `peelToBraceInitOrCore`: "exactly one
+// child that is not a token" was their whole test. A unary operator's node has exactly one —
+// its operator is a token. ✔MEASURED 2026-10-10 (pe64, baseline and release alike; 51 kinds
+// of initializer, each read in a condition, a static assertion, an enumerator with an array
+// bound, and on a `constexpr` object: 134 of 247 cells wrong):
+//   * `static const struct S g = {.b = -5};` — the CONSTANT read of `g.b` was 5. The static
+//     assertion `g.b == -5` failed and `g.b == 5` passed; an enumerator and an array bound
+//     built on it were wrong; and `if (g.b != -5) return 7; return 42;` died of an illegal
+//     instruction, because the lowering believes a constant condition and marks what
+//     follows the statement as never reached. The same for `!e`, `~e`, `(-e)`,
+//     `__extension__ -e`, `sizeof e` (read as the VALUE of `e`), `__alignof__(e)`, a
+//     statement expression, for a nested, a positional and a union member, a compound
+//     literal, an automatic `const` object, and for the `while`, `for` and `do` forms;
+//   * `{.a = sizeof(int)}` — the walk went on INTO the type name: the member was no
+//     constant at all, and `constexpr struct S g = {.a = sizeof n};` was refused;
+//   * `constexpr int *p = !(int *)0;` was ACCEPTED: the null-pointer-cast question was
+//     asked of the operand;
+//   * `char s[] = { *"abc" };` was taken for a string-initialized array by BOTH tiers and
+//     refused by the MIR verifier (a `store` of a character into an array).
+// The constant read of the image was never wrong at RUN time: only what the compiler
+// concluded from it. Both tiers and the evaluator already include this header for their
+// shared declaration descents; it is `core`, so neither tier reaches upward for it.
+//
+// A count is not a decision — a construct with ONE operand is the commonest kind there
+// is. A construct the grammar gains is named HERE, or it is a wrapper to every descent of
+// both tiers at once: that is the reason there is one of these.
+//
+// THE RULE IDS: each construct is read from ONE key of the language document — the
+// operators, the `sizeof` / `_Alignof` alternatives, the selection, label-address and
+// statement-expression rules and the brace list from `hirLowering`; the `sizeof` /
+// `_Alignof` forms, `_Generic`, the casts and the compound literals from `semantics` — and
+// both tiers hand in the same two blocks of the same schema.
+
+// `sizeof` / `_Alignof` in any of their forms: the operand below is not evaluated
+// (C 6.5.3.4p2).
+[[nodiscard]] inline bool
+nodeIsAnUnevaluatedOperandForm(SemanticConfig const& cfg, HirLoweringConfig const& hirCfg,
+                               Tree const& tree, NodeId n) {
+    if (!n.valid() || tree.kind(n) != NodeKind::Internal) return false;
+    std::uint32_t const r = tree.rule(n).v;
+    auto const is = [r](RuleId rule) { return rule.valid() && rule.v == r; };
+    return is(hirCfg.sizeofRule) || is(hirCfg.alignofRule)
+        || is(cfg.sizeofTypeRule) || is(cfg.sizeofValueRule)
+        || is(cfg.alignofTypeRule) || is(cfg.alignofValueRule);
+}
+
+[[nodiscard]] inline bool
+nodeSaysSomethingItself(SemanticConfig const& cfg, HirLoweringConfig const& hirCfg,
+                        Tree const& tree, NodeId n) {
+    if (!n.valid() || tree.kind(n) != NodeKind::Internal) return false;
+    std::uint32_t const r = tree.rule(n).v;
+    auto const is = [r](RuleId rule) { return rule.valid() && rule.v == r; };
+    if (is(hirCfg.unaryExprRule) || is(hirCfg.binaryExprRule)
+        || is(hirCfg.postfixExprRule) || is(hirCfg.ternaryExprRule)
+        || is(hirCfg.labelAddressRule) || is(hirCfg.chooseExprRule)
+        || is(hirCfg.stmtExprRule) || is(cfg.genericRule)
+        || is(hirCfg.braceInitListRule)
+        || nodeIsAnUnevaluatedOperandForm(cfg, hirCfg, tree, n)) {
+        return true;
+    }
+    for (auto const& row : cfg.castRules)
+        if (row.rule.valid() && row.rule.v == r) return true;
+    for (auto const& row : cfg.compoundLiteralRules)
+        if (row.rule.valid() && row.rule.v == r) return true;
     return false;
 }
 

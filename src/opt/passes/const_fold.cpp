@@ -225,7 +225,14 @@ private:
         if (oldOps.size() == 1 && unaryOpKind(op).has_value()) {
             auto const operand = readConstOperand(oldOps[0]);
             if (!operand.has_value()) return std::nullopt;
-            auto folded = detail::applyUnaryInt(*unaryOpKind(op), *operand);
+            // NO DOMAIN IS STATED, and that is this tier's statement: the
+            // reduction to the instruction's own type is `normalizeToType`'s — the
+            // one owner every fold of this pass goes through (unary, unsigned,
+            // binary). The shared fold computes on the 64-bit pattern and the
+            // conversion to `instType` is modular, so the wide intermediate cannot
+            // differ from a narrower one in any bit the type keeps.
+            auto folded = detail::applyUnaryInt(*unaryOpKind(op), *operand,
+                                                std::nullopt);
             if (!folded.has_value()) return std::nullopt;
             return normalizeToType(std::move(*folded), src_.instType(oldId));
         }

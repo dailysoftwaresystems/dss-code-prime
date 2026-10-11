@@ -211,6 +211,34 @@ combineBinaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& opti
 combineUnaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& options,
                 ConstEvalResult inner) {
     if (!inner.value.has_value()) return inner;
+    // ── UNARY `+` IS A CONSTANT OPERATOR ──────────────────────────────────────
+    // [[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]] (its named
+    // neighbour). It is no `HirOpKind` — the lowering turns `+x` into the
+    // promotion itself — so `opFromName` has no answer for it and this walker
+    // refused EVERY constant expression that held one. ✔MEASURED 2026-10-10:
+    // `_Static_assert(+5U == 5U, "")`, an enumerator `= +1` and an array bound
+    // `[+2]` were each "not an integer constant expression" (462 of the 468
+    // assertion cells of the `+` group of the unary matrix), where cl, MinGW gcc,
+    // gcc, clang and AppleClang accept every one. C 6.5.3.3p2: the result is the
+    // value of the promoted operand. The name is the configured operator TARGET,
+    // the one the `#if` evaluator and the typing rules read for this operator.
+    if (e.target == "Pos") {
+        HirLiteralValue const& v = *inner.value;
+        // A bit-precise or 128-bit operand does not promote; a float keeps its value.
+        if (std::holds_alternative<BitIntValue>(v.value) || detail::isInt128Kind(v.core)) {
+            return inner;
+        }
+        if (isFloatValue(v)) {
+            if (!options.allowFloat) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+            return inner;
+        }
+        if (auto folded = detail::applyUnaryPlusInt(
+                v, detail::intUnaryDomain(v, options.charIsUnsigned));
+            folded.has_value()) {
+            return ok(std::move(*folded));
+        }
+        return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+    }
     auto opK = opFromName(e.target);
     if (!opK.has_value()) {
         return fail(ConstEvalFailure::UnsupportedOperator, expr);
@@ -237,10 +265,17 @@ combineUnaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& optio
                         ? why : ConstEvalFailure::UnsupportedOperator,
                     expr);
     }
-    if (!asInt64(*inner.value).has_value()) {
+    // `asIntBits` — see the twin guard in const_eval.cpp: "is this an integer
+    // operand", not "does it fit a signed int64".
+    if (!detail::asIntBits(*inner.value).has_value()) {
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
     }
-    if (auto folded = applyUnaryInt(*opK, *inner.value); folded.has_value()) {
+    // The promoted type of the operand's own core, through the verb the HIR walker
+    // states its domain with.
+    if (auto folded = applyUnaryInt(
+            *opK, *inner.value,
+            detail::intUnaryDomain(*inner.value, options.charIsUnsigned));
+        folded.has_value()) {
         return ok(std::move(*folded));
     }
     return fail(ConstEvalFailure::UnsupportedOperator, expr);
@@ -447,7 +482,15 @@ convertToCastTarget(ConstEvalResult const& inner, CstCastTarget const& target,
         // wide arm, never a binary64-rounded stand-in (LD-3's rule, and the
         // reason `floatKindInfo(F80).hostBacked` is false).
         if (WideFloatValue::isSupportedKind(toK)) {
-            auto w = detail::toWideFloatOperand(*inner.value, toK);
+            // An INTEGER source converts EXACTLY and by its core's signedness —
+            // the shared verb `combineCast` calls. `toWideFloatOperand` is the
+            // FLOAT operand's bridge: it takes an integer through a host `double`,
+            // which rounds it above 2^53 and reads an unsigned 64-bit pattern as
+            // negative.
+            auto w = isFloatValue(*inner.value)
+                ? detail::toWideFloatOperand(*inner.value, toK)
+                : detail::integerConstantAsWideFloat(*inner.value, toK,
+                                                     options.charIsUnsigned);
             if (!w.has_value()) {
                 return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
             }

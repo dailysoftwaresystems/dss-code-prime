@@ -28,6 +28,13 @@ dss_add_test(NAME hir/test_brace_element_diagnosed_conversion
 # elements warn S_ExcessInitializerElements and are dropped unevaluated (6.7.9p2).
 dss_add_test(NAME hir/test_initializer_list_shapes
              SOURCES test_initializer_list_shapes.cpp)
+# P69 (lane `lm`): a brace element is the expression that was written. An operator over
+# a string is an element, not the braced string (the lowering's own peel took the
+# operand for the element); a whole structure written as an index, a dereference, a
+# conditional, a comma expression or a call is placed whole — the analyzer's answer,
+# handed to the lowering as a fact instead of derived again from the type stamps.
+dss_add_test(NAME hir/test_brace_element_as_written
+             SOURCES test_brace_element_as_written.cpp)
 # P69 (lane `cs`): a value-returning function whose end is reached is a language
 # rule (`nonVoidFunctionEndReached`); under C's the lowering completes the body
 # and warns once. Separate from test_hir_lowering_c.cpp because half of it runs

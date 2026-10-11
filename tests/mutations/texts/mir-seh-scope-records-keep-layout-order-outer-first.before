@@ -1,0 +1,2 @@
+        if (a.lastPos != b.lastPos) return a.lastPos < b.lastPos;
+        return a.firstPos > b.firstPos;
