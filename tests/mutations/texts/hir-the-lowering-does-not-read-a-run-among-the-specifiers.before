@@ -1,0 +1,2 @@
+                for (NodeId run : headAttributeRuns(sem, tree(), c)) {
+                    roots.push_back(run);

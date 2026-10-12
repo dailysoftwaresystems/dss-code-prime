@@ -1,0 +1,1 @@
+            if (tree.tokenKind(c) == cfg.identifierToken) id = c;

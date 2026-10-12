@@ -1,0 +1,3 @@
+            if (false && builder->nodeKind(cur) == NodeKind::Internal
+                && isAttributeSpecifierRule(schema->semantics(),
+                                            builder->nodeRule(cur))) {

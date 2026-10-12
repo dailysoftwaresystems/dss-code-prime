@@ -1,0 +1,1 @@
+    if (member == nullptr || member->kind != DeclarationKind::Variable)

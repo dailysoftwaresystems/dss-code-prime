@@ -325,10 +325,42 @@ round's close; each checkpoint's commit message says what was and was not run on
   two gain a measured size. Balance: 643 against 620 (24 closed, 47 opened: 3 created by the tool's count, 44 disclosed), REAL net +23 — the round is CODE-FIRST
   and its rows close as their arms pass. **⚠ THIS COMPOSITION WAS NEVER BUILT EITHER**: it lands on checkpoints 8
   to 12; three of its paths were merged by hand over cs's and xa's folds.
-- **⏸ THE ROUND IS PAUSED at checkpoint 13 on the operator's order (2026-10-10; resume 2026-10-12)**: no agent
-  runs, every lane's work is folded and pushed, and `.temp/RESUME-P69-round1-PAUSED-2026-10-10.md` holds each
-  lane's next orders, the reviews owed (hm's three folds, xa's fold 2, lm's fold; cs's fold A2 is reviewed and its
-  send-back written, not sent) and the sweeps owed from the main checkout.
+- **The round RESUMED on 2026-10-12 (it was paused at checkpoint 13 on 2026-10-10)**; DssHarness is 0.6.13.
+  ✔MEASURED from the main checkout, the whole suite at checkpoint 13 — the first reading of checkpoints 8 to 13
+  together on every leg it was sent to: `macos-arm64-debug`, `linux-x86_64-debug` and `linux-arm64-debug` PASSED,
+  2744 tests each; `windows-x86_64-release` (MSVC) 2772 of 2773 and `windows-x86_64-debug` (MinGW; a read of the
+  leg's log, its verdict `inputs-moved` because checkpoint 14 was committed under it) 2772 of 2773. No product
+  test is red on any leg.
+- **Checkpoint 14 (2026-10-12)** = the mutation registry only: the link lane's fourteen arms redeclared from their
+  first sweep; swept again from main on `macos-arm64-debug`, 14 of 14 `passed`.
+- **Checkpoint 15 (2026-10-12)** = the C front end lane's SECOND ARM BATCH, registry and texts only: 183
+  first-sweep blocks of 140 mutants of its fold A1 (180 name `linux-x86_64-debug`, 3 `macos-arm64-debug`), every
+  claim EXPECTED AND READ BY NO SWEEP; the registry holds 490 arms. With it the answers to six arms a sweep from
+  main sent back (two whose after-text named a helper the file lost at checkpoint 1 and so never compiled; four
+  whose further red cases are now declared).
+- **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
+  (1) `orphan_tests_guard` is RED on the direct Windows legs (the guard walks `*.cpp` alone; checkpoint 9
+  registered the tree's first two `.c` test sources) — the harness lane's fix is written and waits for its closing
+  run; (2) since checkpoint 12 a VALID ELF link is REFUSED: a relocation from inside a losing COMDAT group
+  (✔MEASURED 2026-10-12: GNU ld 2.42 and LLD 18.1.3 link the pair in both orders, a build without checkpoint 12's
+  link fold links it, this tree refuses it with `K_CrossCuMergeUnsupported`) — the link lane's next fold;
+  (3) `D-C-CONSTANT-AGGREGATE-MEMBER-READ-WITHOUT-ITS-INITIALIZERS-OPERATOR` stays OPEN: of its eight arms swept
+  from main, 3 `passed`, 4 were `violated` for further red cases not declared, and ONE SURVIVED
+  (`core-wrapper-statement-does-not-name-a-statement-expression`: 902 cases, none red) — the library lane probes
+  the references on `({ … })` in a constant initializer before it writes the case or the evaluator arm.
+- **Arm sweeps from the main checkout so far (checkpoint 14's registry):** `macos-arm64-debug` — 60 arms read, 52
+  `passed`, 7 `violated` (sent back; six answered in checkpoint 15), 1 `stopped`; `linux-x86_64-debug` — the eight
+  above. One arm was `stopped` because its runner's UNMUTATED control was red in the sweep's fresh worker tree:
+  `DriverArgumentSupply.SingleCuRouteRunsTheProgramStageOptimize` counts a process-wide phase counter across a
+  build that compiles the shipped runtime when the per-user runtime object cache is cold; ctest warms it first
+  through a fixture (so CI and the legs are green), a sweep runs the binary bare — the BASE's debt, fixed in the
+  library lane's current fold (each case owns its cache). The other 101 Mac arms and 151 WSL arms are being swept.
+- **Reviews:** the C front end lane's fold A2 — SEND BACK, 8 findings (its MAJOR measured clean: 78 cells × two
+  pipelines × two compilers, 312 runs, 0 wrong, at checkpoint 13's bytes); the harness lane's three folds — SEND
+  BACK, 21 (1 MAJOR: `check-ninja-deps` ignores a forced include); the link lane's fold 2 — SEND BACK, 14 (1 MAJOR,
+  the refused link above; and its reference tables in `tests/link/test_common_symbols.cpp` must be keyed to the
+  toolchain version measured before the pipes run). All accepted and in the lanes' hands. The review of the
+  library lane's fold (checkpoint 13) is OWED.
 - **Silent defects found in this round: ALL of those listed below are FIXED in this tree by checkpoint 13** (read
   the list as history; each row stays open or disclosed until its arms pass): in a STATIC INITIALIZER, an enumerator,
   an array size or a `_Static_assert`, the unary `~` and `-` of an `unsigned int` constant were not reduced to
@@ -343,9 +375,10 @@ round's close; each checkpoint's commit message says what was and was not run on
   fixed in the same fold: a brace element under an operator (`char first[] = { *"abc" };` at block scope;
   `struct S arr[] = { src[i] };`) was refused by the HIR lowering where all six references accept it. Fixed
   earlier: the reference through a STATIC name following a losing weak alias (checkpoint 12); the two pe64 `__try`
-  defects found on 2026-10-08 (checkpoint 6). **STILL UNMEASURED, from the review of checkpoint 9:** a guarded
-  body holding `&&`, `||`, a scalar `?:` or `va_arg` puts the phi-edge split inside the guarded run, a shape no
-  test or example holds; the C front end lane measures it first on resume.
+  defects found on 2026-10-08 (checkpoint 6). **MEASURED CLEAN since (2026-10-12), from the review of checkpoint 9:** a guarded
+  body holding `&&`, `||`, a scalar `?:` or `va_arg` puts the phi-edge split inside the guarded run — 78 cells in
+  both pipelines with both compilers built from checkpoint 13's bytes, 312 runs, 0 wrong, the scope tables
+  byte-identical to the fold's own; its source pin and example come with that lane's send-back fold.
 - **HOW THIS CYCLE ENDS — operator, 2026-10-08, verbatim:** *"on finishing this cycle I'll turn on the pipes and
   try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and monitor CI until
   green"*. So P69 is this PR's EXIT: its four lanes finish what they are in (no second round opens in this PR — what

@@ -1,0 +1,3 @@
+    std::vector<std::string> documentGate;
+    std::vector<std::string> symbolGate;
+};
