@@ -172,8 +172,11 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
   with the build type beside each number → `references/round-gate-and-ci.md`.
 - ★★★★ **The sweep of the mutation arms is a step of that gate** (2026-10-10): at the round's close, in the
   main tree, one `dssharness check-mutations --legs <leg>` per leg an arm names; per fold, the fold's own
-  arms on the fold's bytes; a leg that did not reach its arms is STATED with the tool's reason, never
-  skipped, and a sweep is read by its leg line, never by its exit code alone → `references/mutation-arms.md`.
+  arms on the bytes the fold landed as. A lane WRITES its arms with its fold and the ORCHESTRATOR sweeps them
+  from the main tree after the fold has landed — a fold is never held for a sweep, and an arm that does not
+  read `passed` goes back to its lane. A leg that did not reach its arms is STATED with the tool's reason,
+  never skipped, and a sweep is read by its leg line, never by its exit code alone →
+  `references/mutation-arms.md` (who writes an arm, and who sweeps it).
 - ⛔ **Never make CI run** — no label, no re-run, no push to re-trigger; ✅ always READ it
   (`dssharness check-ci-legs`): a red leg is a HARD STOP on proceeding, never on fixing → same file.
   ★ The one exception is a PR exit the operator ORDERS to end with the pipes (2026-10-08): then the
@@ -304,8 +307,9 @@ next: <one line, matching the top NEXT entry in .plans/_handoff.md>
   its rows, evidence, transcripts, host copies, and when the orchestrator itself is deleted.
 - Read `references/mutation-arms.md` **before proving a pin, declaring an arm, merging the arms registry, or
   closing a row on a red-on-disable** — what an arm's claim is, the registry's standing conditions and layout,
-  one worked arm per class, the verdicts and what each obliges, the command lines of the per-fold and
-  per-leg sweeps, what a sweep costs and from which trees it can run, and the one class that has no arm.
+  one worked arm per class, the verdicts and what each obliges, who writes an arm and who sweeps it, the
+  command lines of the per-fold and per-leg sweeps, what a sweep costs and from which trees it can run, and
+  what has no arm.
 - Read `references/worktrees.md` before any byte-changing measurement or plain worktree operation.
 - Read `references/build-layout.md` before creating ANY build tree (step 5) and before reporting a
   cycle complete (step 11) — **one root `build/`, subdirectories for distinct builds, and a lane's build

@@ -19,8 +19,14 @@ no capability depends on whether a `.sh` and a `.ps1` agree. Every program this 
 ships is one of its ACTIONS, under `.harness-config/runner/actions/`; there is no `scripts/` and no
 `real-examples/` directory.
 
-    dotnet tool install --global DssHarness      # or `dotnet tool update --global DssHarness`
+    dotnet tool install --global DssHarness      # a FIRST install; an update has one door, below
     DssHarness --version                         # every leg must match the root host
+
+★ **THE TOOL IS UPDATED THROUGH ONE DOOR — `dssharness update-tool --wait` — AND NEVER BY A LANE.** It updates this
+machine's DssHarness only while none runs here; with `--wait` it waits for every one that does, naming whom it
+waits for. A bare `dotnet tool update` beside a live `dssharness` takes the tool away from every command typed
+meanwhile — which is what an exit of 127 ("command not found") from the tool means: somebody is updating, the
+reading measured nothing, wait and run again.
 
 ⚠ **A leg installs only a PUBLISHED version.** A locally built tool cannot reach a remote leg, every
 leg must run the same version as the machine driving it, a host ahead of the root refuses the run, and
@@ -168,9 +174,22 @@ already does is USED, never re-built around and never requested upstream. Read i
   (operator, 2026-10-10). A pin is an ARM of `tests/mutations/arms.registry`; the tool mutates a worker copy,
   never a tree, and a pin is proven only when its arm reads `passed` (mutation-arms.md). Never a mutant applied
   by hand where an arm can be declared, and never a loop script: one did not rebuild after restoring a code
-  mutant, and six of its nine reads came from a stale binary (P68, 2026-09-24). The one class of mutant the
-  installed tool refuses as an arm is read by the hand protocol that file gives, and reported as that class.
-- **SYNC**: `dssharness sync` (with `--pull` and `--artifact`). Never a hand copy of a host's tree.
+  mutant, and six of its nine reads came from a stale binary (P68, 2026-09-24). A lane WRITES its arms with its
+  fold; the orchestrator SWEEPS them from the main tree after the fold has landed, a whole leg in one command
+  (who sweeps: that file). What cannot be an arm is stated as absent, never read by hand.
+- **SYNC**: `dssharness sync` (with `--pull` and `--artifact`). `--pull <file>` brings one file back from each
+  host's copy, and `--pull <dir>/` — a separator at its end — a whole directory, every file of it named and
+  verified on arrival. A sync also makes the host copy's git HEAD name the commit the tree is at, so `git
+  rev-parse HEAD` on a host answers as it does here. Never a hand copy of a host's tree.
+- **STOPPING A RUN**: a run YOU started and no longer want may be stopped. Stopping its dispatcher stops its
+  legs, the remote ones too — a host cancels a leg once its dispatcher's beat has stopped — and a sweep stopped
+  part way puts every site back and reports what it had judged. **Never touch a run that is not yours**:
+  another lane's, the orchestrator's, another repository's on the same machine. A waiting leg's own line names
+  who holds each slot; read it, wait, and clear nothing.
+- **ONE COMMAND HOLDS ITS TREE UNTIL ITS LAST LEG ENDS.** A remote leg whose result you will ITERATE on does not
+  go in one command with a contended local leg: the remote leg answers in minutes, and the tree stays held
+  while the local one waits for a slot or times out. Two commands in sequence cost one admission each and free
+  the tree in between.
 - **WORKTREE AND LANE MANAGEMENT**: a lane is an AGENT — `dssharness create-orchestrator` / `create-agent` /
   `seed-agent` / `refresh-agent` / `fold-agent` / `delete-agent` / `list-orchestrator` / `delete-orchestrator`, MANDATORY
   (orchestration.md); anything that is not a lane, `create-worktree` / `delete-worktree` / `list-worktree`

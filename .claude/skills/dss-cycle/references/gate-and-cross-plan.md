@@ -78,9 +78,10 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - `dssharness test --legs windows-x86_64-debug --json --time` 100%, including the new tests — the round
   gate is `dssharness test --legs gate`, the eight legs; `--filter <regex>` iterates but never concludes.
 - ★★★★ **THE MUTATION ARMS — `dssharness check-mutations`, every selected arm `passed`** (2026-10-10). A
-  green suite says every pin's test passes; only the sweep says each can FAIL. Per fold, the fold's own arms
-  (`--arms <ids>`) on the fold's bytes; at the round's close, in the main tree, one `--legs <leg>` per leg an
-  arm's `S` row names. Read each leg by its own line, never by the exit code alone; a leg that did not reach
+  green suite says every pin's test passes; only the sweep says each can FAIL. A lane writes its arms with
+  its fold; the orchestrator sweeps the fold's own arms (`--arms <ids>`) from the main tree on the bytes the
+  fold landed as, and at the round's close one `--legs <leg>` per leg an arm's `S` row names (who sweeps:
+  `mutation-arms.md`). Read each leg by its own line, never by the exit code alone; a leg that did not reach
   its arms is STATED with the tool's reason. A pin with no arm is unproven, and a row that rests on it does
   not close (`mutation-arms.md`, `round-gate-and-ci.md`).
 - ★★★ **A CTEST RUN THAT OVERLAPPED A BUILD IS VOID IN BOTH DIRECTIONS — AND IT CAN STILL LOOK

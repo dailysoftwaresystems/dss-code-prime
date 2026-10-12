@@ -129,9 +129,9 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      mutant and nothing else, never in a tree (never loaded; the moving tree); the reds are an exact set and
      a named neighbour must have run and stayed green (the wrong test red); the diagnostic must be SAID (the
      mutant was read); the site is put back and checked by its hash (the restored bytes). **So the clauses
-     below are no longer a checklist a person runs — they are why the verb is mandatory, and what a hand
-     reading owes in the one class of mutant the installed tool refuses as an arm.** How to declare an arm,
-     the verdicts, the sweeps the gate owes and that one class: [mutation-arms.md](mutation-arms.md).
+     below are no longer a checklist a person runs — they are why the verb is mandatory.** How to declare an
+     arm, the verdicts, who writes an arm and who sweeps it, the sweeps the gate owes and what has no arm:
+     [mutation-arms.md](mutation-arms.md).
    - **Aggregate op-count pins go INERT when a shared helper emits the same op elsewhere.** An
      `EXPECT_GE(And, N)` / op-count assertion is a worthless guard if a branchless-select (or any
      composition helper) already emits that op — deleting the guarded instance leaves the count

@@ -156,8 +156,7 @@ is the same class as a red-on-disable whose mutant never compiled in.
   by content before every sweep), so a sweep may be run on a lane's worktree and on the main checkout alike.
   A worker's path is twenty characters longer than its tree's; the workers go with their tree —
   `delete-agent` and `delete-worktree` remove those kept beside it, `clean` a leg's with its build directory.
-  The hand-applied mutant, which does change a tree, remains only for the one class of mutant the installed
-  tool refuses as an arm (mutation-arms.md).
+  No mutant is applied to a tree by hand: what cannot be an arm is stated as absent (mutation-arms.md).
 - ⚠ **A revert is not a safe undo once a concurrent lane has edited the same file.** Copying a
   pristine copy back destroys the other lane's interleaved work. Reverse-apply the specific patch
   (`git apply -R`), or leave it and report.

@@ -40,14 +40,17 @@ RED — that is the sweep's half, and a round owes both:
 - **At the round's close, in the main tree, beside the eight runs: every arm of
   `tests/mutations/arms.registry`, on the ONE leg its `S` row names** — one `dssharness check-mutations --legs
   <leg> --json` per leg that an `S` row names. Each is a leg command like any other: in the background, its
-  whole output through the redactor, never killed once a unit of it was admitted.
-- **Per fold, the fold's own arms** (`--arms <ids>`), on the fold's bytes, before the fold is called green.
+  whole output through the redactor; a whole leg in one command, never cut into batches by hand; and a run that
+  is not yours is never touched (`dss-harness.md`, STOPPING A RUN).
+- **Per fold, the fold's own arms** (`--arms <ids>`), swept by the orchestrator from the main tree on the bytes
+  the fold landed as. A lane writes its arms and hands back; a fold is never held for their sweep, and an arm
+  that does not read `passed` goes back to its lane (who sweeps: `mutation-arms.md`).
 - **Every arm must read `passed`.** A leg is read by its own line — its arms counted by verdict — never by the
   command's exit code alone; `21` is never a pass, and `7` measured nothing.
 - **A leg that did not reach its arms is STATED with the tool's reason, never skipped** — the same rule a
   declined leg of the eight has.
-- **A row that rests on a pin closes only on arms that passed on the bytes it closes on.** A fold handed back
-  before its arms passed names them as owed, and closes nothing that rests on one.
+- **A row that rests on a pin closes only on arms that passed on the bytes it closes on.** A fold is handed
+  back with its arms written and unswept: it names them, and closes nothing that rests on one until they passed.
 
 The declaration of an arm, the verdicts, the command lines, what a sweep costs and which trees a leg can be
 swept from are in `mutation-arms.md`.

@@ -360,19 +360,33 @@ round's close; each checkpoint's commit message says what was and was not run on
   from main, 3 `passed`, 4 were `violated` for further red cases not declared, and ONE SURVIVED
   (`core-wrapper-statement-does-not-name-a-statement-expression`: 902 cases, none red) — the library lane probes
   the references on `({ … })` in a constant initializer before it writes the case or the evaluator arm.
-- **Arm sweeps from the main checkout so far (checkpoint 14's registry):** `macos-arm64-debug` — 60 arms read, 52
-  `passed`, 7 `violated` (sent back; six answered in checkpoint 15), 1 `stopped`; `linux-x86_64-debug` — the eight
-  above. One arm was `stopped` because its runner's UNMUTATED control was red in the sweep's fresh worker tree:
+- **Arm sweeps from the main checkout so far:** the registry holds 502 arms. `macos-arm64-debug`: all 147 arms of
+  checkpoint 14's registry are read — 131 `passed`, 15 `violated` (all back with their lanes; six answered in
+  checkpoint 15 and read `passed` since), 1 `stopped`; of three new ones, 2 `violated` and 1 `unattributed` (the
+  mutant aborts the binary). `linux-x86_64-debug`: the eight arms of the open P0 row only. **Checkpoint 17
+  (2026-10-12) moved the sweep leg of 343 arms whose claim is about no platform from `linux-x86_64-debug` to
+  `macos-arm64-debug`** (the areas analysis, core, hir, dss-config, asm, and the harness lane's script-driven
+  ones): a sweep in the WSL distribution runs ONE worker and shares this machine's two heavy slots with every
+  lane's local leg (✔MEASURED: 16 arms in 70 minutes, one arm waiting 24 minutes for a slot), while the Mac runs
+  two (101 arms in about 50 minutes). Only the open P0 row's eight stay on the WSL leg until the library lane has
+  redeclared them. The same commit carries the harness lane's skill fold: who sweeps is stated once (the
+  orchestrator, from the main checkout, whole legs; a fold is never held for a sweep), the area's default leg is
+  a leg with more than one worker that is not this host's, a runner holds no case whose verdict depends on a
+  ctest fixture or on state an earlier run left, and the sentences the tool's help refutes are gone. The one arm that was `stopped` had its runner's
+  UNMUTATED control red in the sweep's fresh worker tree:
   `DriverArgumentSupply.SingleCuRouteRunsTheProgramStageOptimize` counts a process-wide phase counter across a
   build that compiles the shipped runtime when the per-user runtime object cache is cold; ctest warms it first
   through a fixture (so CI and the legs are green), a sweep runs the binary bare — the BASE's debt, fixed in the
-  library lane's current fold (each case owns its cache). The other 101 Mac arms and 151 WSL arms are being swept.
+  library lane's current fold (each case owns its cache).
 - **Reviews:** the C front end lane's fold A2 — SEND BACK, 8 findings (its MAJOR measured clean: 78 cells × two
   pipelines × two compilers, 312 runs, 0 wrong, at checkpoint 13's bytes); the harness lane's three folds — SEND
   BACK, 21 (1 MAJOR: `check-ninja-deps` ignores a forced include); the link lane's fold 2 — SEND BACK, 14 (1 MAJOR,
   the refused link above; and its reference tables in `tests/link/test_common_symbols.cpp` must be keyed to the
-  toolchain version measured before the pipes run). All accepted and in the lanes' hands. The review of the
-  library lane's fold (checkpoint 13) is OWED.
+  toolchain version measured before the pipes run). All accepted and in the lanes' hands. The library
+  lane's constant-evaluator fold (checkpoint 13) — SEND BACK, 14 (2 BLOCKERS, both silent wrong values INFERRED
+  by reading and being measured first: a bit-field member read as a constant ignoring its width; a named constant
+  read at its initializer's type, not its declared one, now that a folded condition deletes code). Every lane's
+  folded work has been reviewed once; the re-reviews of the send-back folds are owed.
 - **Silent defects found in this round: ALL of those listed below are FIXED in this tree by checkpoint 13** (read
   the list as history; each row stays open or disclosed until its arms pass): in a STATIC INITIALIZER, an enumerator,
   an array size or a `_Static_assert`, the unary `~` and `-` of an `unsigned int` constant were not reduced to
