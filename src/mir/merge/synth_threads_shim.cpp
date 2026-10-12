@@ -454,9 +454,25 @@ bool synthesizeThreadsShim(
     // library or a runtime member (they refuse loudly); the rule is stated here all the
     // same, because a family whose bodies stay strong is the defect waiting for the first
     // format that declares one.
+    //
+    // ★★ AND THE KIND IS `OVERRIDABLE`, STATED (P69, lane `xa`). A weak definition says
+    // WHICH kind it is (`WeakDefinitionKind`), because PE spells the two differently and
+    // its linkers treat them differently: a strong definition REPLACES an overridable one
+    // and COLLIDES with a select-any one (✔MEASURED 2026-10-12, 16 of 16 cells: link.exe
+    // 14.44, lld-link 19.1.5 and GNU ld 2.42 refuse `__declspec(selectany) int v` beside
+    // `int v = 2`). A synthesized library body is a DEFAULT — the program's own
+    // `mtx_init`, or the platform's, must be free to replace it — so it is the kind a
+    // strong definition replaces. "COFF COMDAT SELECT_ANY" in the paragraph above is what
+    // a kindless weak definition was written as; it is the spelling this body must NOT
+    // have. ⓘ On the wire today the statement changes nothing: no format that writes a
+    // relocatable declares a `librarySynthesis` vehicle (✔MEASURED 2026-10-12, the
+    // relocatable and the static-archive compile of a `<threads.h>` unit are refused), so
+    // no shim body reaches an object writer; in an image the kind decides only the fold
+    // of two units' copies, and two overridable copies fold as two weak ones always did.
     auto begin = [&](SymbolId sym, TypeId fnSig) {
-        (void)builder.addFunction(fnSig, sym, SymbolBinding::Weak,
-                                  SymbolVisibility::Hidden);
+        (void)builder.addFunction(fnSig, sym,
+                                  MirLinkage{SymbolBinding::Weak, SymbolVisibility::Hidden,
+                                             WeakDefinitionKind::Overridable});
         MirBlockId const entry = builder.createBlock(StructCfMarker::EntryBlock);
         builder.beginBlock(entry);
     };

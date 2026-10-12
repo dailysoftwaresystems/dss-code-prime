@@ -1188,6 +1188,12 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
         sym.symbol     = slotSym;
         sym.name       = fmt.objectImportSlot()->symbolPrefix + ext.mangledName;
         sym.binding    = SymbolBinding::Weak;
+        // P69 fold 3: and it SAYS which kind of weak definition it is — "several
+        // units may define this, keep one" is the select-any kind by its own
+        // definition. Until a weak definition had to state its kind this row
+        // stated none and was written as a COMDAT because that is the format's
+        // default spelling; the row now says what the comment above says.
+        sym.weakKind   = WeakDefinitionKind::SelectAny;
         sym.visibility = SymbolVisibility::Default;
         withSlots.symbols.push_back(std::move(sym));
     }
@@ -1320,13 +1326,19 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
             }
             auto const    bit  = bodies.find(s.symbol);
             DefBody const body = bit == bodies.end() ? DefBody{} : bit->second;
-            // The rank is the link document's statement about this definition's
-            // KIND (`weakDefinitionRank`): where the format ranks its weak
-            // definitions, an outranked one never wins by arriving first.
             defs.push_back(CrossCuDef{
                 s.name, s.binding, LinkedSymbolKey{m.cuId, s.symbol},
-                s.duplicateMatch, body.size, body.bytes,
-                weakDefinitionRank(format, s)});
+                s.duplicateMatch, body.size, body.bytes});
+            // What the link's document says of this definition's KIND, stated
+            // by the ONE function every door of the fold calls
+            // (`stateTheLinksAnswers`, link/common_yield.hpp): its rank among
+            // the weak definitions of its name — where the format ranks them,
+            // an outranked one never wins by arriving first — and, since P69
+            // fold 3, what it is beside a STRONG one, replaced by it or a
+            // duplicate of it. (A unit's COMMON is not a row of this table: it
+            // is an `ExternImport` that `allocateCommonDefinitions` sets
+            // against the definitions, so nothing here is tentative.)
+            stateTheLinksAnswers(defs.back(), format, s.weakKind);
         }
     }
     CrossCuResolution const resolution = resolveCrossCuDefs(defs);
@@ -1338,6 +1350,26 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
                std::to_string(c.existing.cuId.v) + " and CU #" +
                std::to_string(c.incoming.cuId.v) + ") — a strong symbol may be "
                "defined only once across the linked image.");
+    }
+    // ── A WEAK DEFINITION THE FORMAT DOES NOT LET A STRONG ONE REPLACE, AND A
+    //    PAIR THE LINK'S DOCUMENT DOES NOT DECIDE ─────────────────────────────
+    //    D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER
+    //
+    // The fold records both as data; the code and the sentence of each are made
+    // by the ONE wording all three doors of the fold share (`refusalOf`,
+    // link/common_yield.hpp, where the measurement is stated). (The fold's
+    // other undecided question — a common beside a weak definition — cannot
+    // arise here: this table holds no tentative definition, a unit's common
+    // being an `ExternImport` that `allocateCommonDefinitions` settles.)
+    for (auto const& c : resolution.collisions) {
+        CrossCuRefusal refusal = refusalOf(c, format);
+        report(reporter, refusal.code, DiagnosticSeverity::Error,
+               std::move(refusal.text));
+    }
+    for (auto const& u : resolution.undecided) {
+        CrossCuRefusal refusal = refusalOf(u, format);
+        report(reporter, refusal.code, DiagnosticSeverity::Error,
+               std::move(refusal.text));
     }
     // ── A BROKEN DUPLICATE-MATCH PROMISE IS A MULTIPLY-DEFINED SYMBOL ──────
     //    D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED
@@ -1806,8 +1838,12 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // discarded section") and one the gABI forbids an object to hold. DSS does
     // not discard section groups yet, so "keeps its bytes" would here keep bytes
     // those linkers drop and link a program they refuse around a copy that
-    // should not exist: such a definition is listed apart, and the relocation
-    // that asks for its bytes is REFUSED by name. A group beside a definition
+    // should not exist: such a definition is listed apart, and a relocation
+    // FROM OUTSIDE ITS GROUP that asks for its bytes is REFUSED by name. One
+    // from inside the same group of the same unit is no such program — both of
+    // its ends are discarded together, and the references link it — so it stays
+    // on the kept bytes (`relocationTargetFor`, where the regression fold 2
+    // made of it is stated). A group beside a definition
     // that is in NO group is not discarded (7 and 9, the same measurement) and
     // keeps its bytes like any other.
     struct DiscardedGroupMember {
@@ -1874,9 +1910,12 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             LinkedSymbolKey const key{modules[modIdx].cuId, sym};
             switch (supersededAs(modIdx, sym)) {
                 case Superseded::KeepsItsBytes:
+                    // A member of a discarded group is listed apart AND keeps an
+                    // id for its bytes like any other: until the discard itself
+                    // exists the bytes ARE in the link, and a relocation from
+                    // inside the same group stays on them (`relocationTargetFor`).
                     if (auto const member = discardedGroupOf(modIdx, sym); member.has_value()) {
                         supersededInADiscardedGroup.try_emplace(key, *member);
-                        break;
                     }
                     if (keptBytesId.try_emplace(key, nextId).second) ++nextId;
                     break;
@@ -1897,13 +1936,44 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             }
         }
     }
+    // The group the item a relocation STANDS IN is a member of — the signature
+    // its unit states for the item's input section
+    // (`AssembledModule::sectionGroupOfInputSection`), empty for an item of no
+    // group. Asked of the ITEM and not of a row: a member section need hold no
+    // named definition (a function's jump table is `.rodata.<f>`, an item with
+    // no row).
+    auto const groupOfTheItem = [&](std::size_t                             modIdx,
+                                    std::optional<InputSectionSlice> const& from)
+        -> std::string_view {
+        if (!from.has_value()) return {};
+        auto const& groups = modules[modIdx].sectionGroupOfInputSection;
+        auto const  it     = groups.find(from->section);
+        return it == groups.end() ? std::string_view{} : std::string_view{it->second};
+    };
     // What a RELOCATION naming `old` targets: the kept bytes of a unit member that
-    // lost its names, and every other symbol's merged id.
-    auto relocationTargetFor = [&](std::size_t modIdx, SymbolId old) -> std::uint32_t {
+    // lost its names, and every other symbol's merged id. `from` is the input
+    // section of the item the relocation stands in, AS ITS UNIT WROTE IT (before
+    // the merge re-keys it).
+    //
+    // ★ THE DISCARDED-GROUP REFUSAL ASKS WHERE THE RELOCATION STANDS (P69 fold 3,
+    // review F1). The rule above is about a relocation FROM OUTSIDE the group; as
+    // fold 2 wrote it the question was (unit, target) alone, so it also refused a
+    // relocation from INSIDE the losing group — and every function gcc gives a
+    // jump table holds one (`.rodata.<f>`, `R_X86_64_PC32 .text.<f> + offset`).
+    // ✔MEASURED 2026-10-12 on a pair of gcc 13.3 objects each carrying group `f`
+    // of two sections with different bodies: GNU ld 2.42 and ld.lld 18.1 link it,
+    // 44 with one unit first and 88 with the other; a DSS build without fold 2
+    // linked it to the same two; fold 2 refused both orders. A regression of the
+    // PR that made it. Both ends of such a relocation go together when the group
+    // is discarded; until the discard exists both ends are KEPT together, so the
+    // relocation stays on its unit's own bytes — an unreachable copy, which is
+    // what the build without fold 2 linked.
+    auto relocationTargetFor = [&](std::size_t modIdx, SymbolId old,
+                                   std::optional<InputSectionSlice> const& from) -> std::uint32_t {
         LinkedSymbolKey const key{modules[modIdx].cuId, old};
-        if (auto const it = keptBytesId.find(key); it != keptBytesId.end()) return it->second;
         if (auto const it = supersededInADiscardedGroup.find(key);
-            it != supersededInADiscardedGroup.end()) {
+            it != supersededInADiscardedGroup.end()
+            && groupOfTheItem(modIdx, from) != it->second.row->sectionGroup) {
             if (!discardedGroupRefused) {
                 discardedGroupRefused = true;
                 report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported, DiagnosticSeverity::Error,
@@ -1920,6 +1990,9 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             }
             return mergedIdFor(modIdx, old);
         }
+        // Kept bytes — and those of a discarded group's member too, when the
+        // relocation stands inside that same group (the case let through above).
+        if (auto const it = keptBytesId.find(key); it != keptBytesId.end()) return it->second;
         if (!supersededRefused && supersededUnanswered.contains(key)) {
             supersededRefused = true;
             std::string lostName;
@@ -1947,8 +2020,13 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     };
     // Single chokepoint for relocation retargeting — functions AND data items route
     // through it, so a future change can't retarget one kind and miss the other.
-    auto retargetRelocs = [&](std::size_t modIdx, std::vector<Relocation>& relocs) {
-        for (auto& rel : relocs) rel.target = SymbolId{relocationTargetFor(modIdx, rel.target)};
+    // `from`: the input section of the item these relocations stand in, as its
+    // unit wrote it — what the discarded-group refusal asks.
+    auto retargetRelocs = [&](std::size_t modIdx, std::vector<Relocation>& relocs,
+                              std::optional<InputSectionSlice> const& from) {
+        for (auto& rel : relocs) {
+            rel.target = SymbolId{relocationTargetFor(modIdx, rel.target, from)};
+        }
     };
 
     // Cross-CU REFERENCE resolution. An extern import bound to a sibling-CU definition
@@ -2065,7 +2143,8 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // The CODE half of the role split above: a function's relocation naming a
     // reference its code reads through a slot goes to that slot; every other
     // relocation takes the ordinary retarget.
-    auto retargetCodeRelocs = [&](std::size_t modIdx, std::vector<Relocation>& relocs) {
+    auto retargetCodeRelocs = [&](std::size_t modIdx, std::vector<Relocation>& relocs,
+                                  std::optional<InputSectionSlice> const& from) {
         for (auto& rel : relocs) {
             if (auto const it = codeSlotByReference.find(
                     LinkedSymbolKey{modules[modIdx].cuId, rel.target});
@@ -2073,7 +2152,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 rel.target = SymbolId{it->second};
                 continue;
             }
-            rel.target = SymbolId{relocationTargetFor(modIdx, rel.target)};
+            rel.target = SymbolId{relocationTargetFor(modIdx, rel.target, from)};
         }
     };
 
@@ -2581,7 +2660,8 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 }
             }
             // CODE: a reference read through a slot goes to its slot (P68 round 9).
-            retargetCodeRelocs(i, out.relocations);
+            // (`fn.inputSection`, the unit's own key: `out`'s is re-keyed above.)
+            retargetCodeRelocs(i, out.relocations, fn.inputSection);
             combined.functions.push_back(std::move(out));
         }
         for (auto const& di : m.dataItems) {
@@ -2597,7 +2677,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                          : di.symbol.valid()         ? SymbolId{mergedIdFor(i, di.symbol)}
                                                      : SymbolId{};
             remapUnit(i, out.inputSection);
-            retargetRelocs(i, out.relocations);  // same chokepoint as the function path
+            retargetRelocs(i, out.relocations, di.inputSection);  // same chokepoint as the function path
             combined.dataItems.push_back(std::move(out));
         }
         // `combined.externImports` is NOT built here: the extern path is owned

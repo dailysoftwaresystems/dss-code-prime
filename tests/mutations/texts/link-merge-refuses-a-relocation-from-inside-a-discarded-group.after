@@ -1,0 +1,1 @@
+            && (groupOfTheItem(modIdx, from) != it->second.row->sectionGroup || true)) {

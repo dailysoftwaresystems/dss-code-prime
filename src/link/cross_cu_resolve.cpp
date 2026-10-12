@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -33,11 +34,33 @@ CrossCuResolution resolveCrossCuDefs(std::span<CrossCuDef const> defs) {
         DuplicateMatch                duplicateMatch;
         std::size_t                   bodySize;
         std::span<std::uint8_t const> body;
+        CommonBesideWeakAnswer        commonBesideIt;
     };
     auto winnerOf = [](CrossCuDef const& d) {
-        return Winner{d.key, d.binding, d.duplicateMatch, d.bodySize, d.body};
+        return Winner{d.key, d.binding, d.duplicateMatch, d.bodySize, d.body,
+                      d.commonBesideIt};
     };
-    std::unordered_map<std::string, Winner> table;
+    // ── THREE CLASSES OF DEFINITION PER NAME, EACH WITH ITS OWN RUNNING WINNER ──
+    //
+    // P69 fold 3. The table held ONE running winner per name and decided each
+    // new definition against it, which is enough for two classes (strong, weak)
+    // and not for three: a tentative definition — a COMMON — is neither, and
+    // what it is beside a weak definition is not known until the name's weak
+    // winner is. So each class folds among its own, in the order the
+    // definitions arrive and by the rule it always had, and the classes are set
+    // against each other ONCE, after the walk:
+    //   strong  — the lowest key; every further strong definition is a conflict;
+    //   weak    — the top rank only; the duplicate-match promise checked, the
+    //             lowest key kept; a weak definition that arrives after a strong
+    //             one is shadowed and not folded (as before);
+    //   common  — the LARGEST (`bodySize`), the lowest key on a tie.
+    struct NameState {
+        std::optional<Winner> strong;
+        std::optional<Winner> weak;
+        std::optional<Winner> common;
+        bool                  settled = false;
+    };
+    std::unordered_map<std::string, NameState> table;
     CrossCuResolution out;
 
     // ── THE DUPLICATE-MATCH PROMISE ────────────────────────────────────────
@@ -116,43 +139,114 @@ CrossCuResolution resolveCrossCuDefs(std::span<CrossCuDef const> defs) {
         if (!fresh && d.weakRank > it->second) it->second = d.weakRank;
     }
 
-    for (auto const& d : defs) {
+    // The weak definitions that stated something other than "a strong
+    // definition replaces me" — by index, in arrival order, so what is recorded
+    // of them below is in the order the caller handed them in and not in a hash
+    // table's.
+    std::vector<std::size_t> answersOwedBesideStrong;
+
+    for (std::size_t i = 0; i < defs.size(); ++i) {
+        CrossCuDef const& d = defs[i];
         if (d.binding == SymbolBinding::Local) continue;  // module-private — excluded
         if (d.name.empty()) continue;                     // producer-guarded; defensive
-        if (d.binding == SymbolBinding::Weak && d.weakRank < topWeakRank.at(d.name)) {
-            continue;                                     // outranked by another weak definition
+        NameState& state = table.try_emplace(d.name).first->second;
+        if (d.binding == SymbolBinding::Weak) {
+            // Asked of EVERY weak definition, outranked or not: whether it may
+            // stand beside a strong definition does not depend on which other
+            // weak definitions the link holds.
+            if (d.besideStrong != WeakBesideStrongAnswer::Yields) {
+                answersOwedBesideStrong.push_back(i);
+            }
+            if (d.weakRank < topWeakRank.at(d.name)) continue;   // outranked by another weak definition
+            if (state.strong.has_value()) continue;              // the strong definition shadows it
+            if (!state.weak.has_value()) { state.weak = winnerOf(d); continue; }
+            // both weak — lowest key wins deterministically
+            checkDuplicatePromise(*state.weak, d);
+            if (lessKey(d.key, state.weak->key)) state.weak = winnerOf(d);
+            continue;
         }
-        auto [it, inserted] = table.try_emplace(d.name, winnerOf(d));
-        if (inserted) continue;
-        Winner& cur = it->second;
-        bool const newStrong = (d.binding == SymbolBinding::Global);
-        bool const curStrong = (cur.binding == SymbolBinding::Global);
-        if (newStrong && curStrong) {
-            // Two strong definitions of one name — ambiguous. Record the conflict (one
-            // entry per collision event: K strongs → K-1 entries, matching the former
-            // per-pair diagnostic count) carrying the colliding key PAIR: `existing` is
-            // the winner-so-far's key at THIS moment, `incoming` is the duplicate — the
-            // exact pair the linker names ("CU #existing and CU #incoming"). Capture
-            // before the swap below. Then keep the lowest key as the winner so `winners`
-            // is order-independent even across the conflicting strongs.
-            out.conflicts.push_back(CrossCuConflict{d.name, cur.key, d.key});
-            if (lessKey(d.key, cur.key)) cur = winnerOf(d);
-        } else if (newStrong) {        // strong shadows the existing weak
-            // ⚠ NO PROMISE CHECK HERE, AND IT IS NOT AN OMISSION. A COMDAT
-            // selection describes how the copies of a WEAK definition relate to
-            // EACH OTHER; a strong definition is not one of those copies, it
-            // OVERRIDES them all, and the format asks nothing of it. Checking
-            // here would refuse the ordinary and legal "a real definition
-            // overrides an inline/selectany one" shape.
-            cur = winnerOf(d);
-        } else if (!curStrong) {       // both weak — lowest key wins deterministically
-            checkDuplicatePromise(cur, d);
-            if (lessKey(d.key, cur.key)) cur = winnerOf(d);
-        }                              // else: existing strong shadows the new weak
+        if (d.tentative) {
+            // A COMMON: the larger extent is the object, the lowest key on a tie.
+            if (!state.common.has_value()
+                || d.bodySize > state.common->bodySize
+                || (d.bodySize == state.common->bodySize
+                    && lessKey(d.key, state.common->key))) {
+                state.common = winnerOf(d);
+            }
+            continue;
+        }
+        if (!state.strong.has_value()) {
+            // ⚠ NO PROMISE CHECK AGAINST THE WEAK DEFINITIONS, AND IT IS NOT AN
+            // OMISSION. A COMDAT selection describes how the copies of a WEAK
+            // definition relate to EACH OTHER; a strong definition is not one of
+            // those copies, and the format asks nothing of it. What a strong
+            // definition IS beside a weak one — a replacement or a duplicate —
+            // is each weak definition's own statement (`besideStrong`), settled
+            // after the walk.
+            state.strong = winnerOf(d);
+            continue;
+        }
+        // Two strong definitions of one name — ambiguous. Record the conflict (one
+        // entry per collision event: K strongs → K-1 entries, matching the former
+        // per-pair diagnostic count) carrying the colliding key PAIR: `existing` is
+        // the winner-so-far's key at THIS moment, `incoming` is the duplicate — the
+        // exact pair the linker names ("CU #existing and CU #incoming"). Capture
+        // before the swap below. Then keep the lowest key as the winner so `winners`
+        // is order-independent even across the conflicting strongs.
+        out.conflicts.push_back(CrossCuConflict{d.name, state.strong->key, d.key});
+        if (lessKey(d.key, state.strong->key)) state.strong = winnerOf(d);
     }
 
+    // ── A WEAK DEFINITION BESIDE A STRONG ONE: A REPLACEMENT, OR A DUPLICATE ───
+    for (std::size_t const i : answersOwedBesideStrong) {
+        CrossCuDef const& d     = defs[i];
+        NameState const&  state = table.at(d.name);
+        if (!state.strong.has_value()) continue;   // no strong definition: nothing was asked
+        if (d.besideStrong == WeakBesideStrongAnswer::Collides) {
+            out.collisions.push_back(CrossCuCollision{d.name, state.strong->key, d.key});
+        } else {
+            out.undecided.push_back(CrossCuUndecided{
+                d.name, state.strong->key, d.key, CrossCuQuestion::WeakBesideStrong});
+        }
+    }
+
+    // ── THE CLASSES SET AGAINST EACH OTHER, ONCE PER NAME ─────────────────────
+    // Walked in arrival order (and each name settled at its first definition) so
+    // that `undecided` is a function of the input's order, as `conflicts` is.
     out.winners.reserve(table.size());
-    for (auto const& [name, w] : table) out.winners.emplace(name, w.key);
+    for (auto const& d : defs) {
+        if (d.binding == SymbolBinding::Local || d.name.empty()) continue;
+        NameState& state = table.at(d.name);
+        if (state.settled) continue;
+        state.settled = true;
+        if (state.strong.has_value()) {            // strong shadows weak and common alike
+            out.winners.emplace(d.name, state.strong->key);
+            continue;
+        }
+        if (!state.common.has_value()) {           // all weak
+            out.winners.emplace(d.name, state.weak->key);
+            continue;
+        }
+        if (!state.weak.has_value()) {             // all tentative: one object
+            out.winners.emplace(d.name, state.common->key);
+            continue;
+        }
+        // A common beside the name's weak winner: that definition's statement.
+        switch (state.weak->commonBesideIt) {
+            case CommonBesideWeakAnswer::Yields:
+                out.winners.emplace(d.name, state.weak->key);
+                break;
+            case CommonBesideWeakAnswer::Outranks:
+                out.winners.emplace(d.name, state.common->key);
+                break;
+            case CommonBesideWeakAnswer::Unstated:
+                out.undecided.push_back(CrossCuUndecided{
+                    d.name, state.common->key, state.weak->key,
+                    CrossCuQuestion::CommonBesideWeak});
+                out.winners.emplace(d.name, state.common->key);
+                break;
+        }
+    }
     return out;
 }
 

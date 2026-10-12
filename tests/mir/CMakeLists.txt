@@ -206,3 +206,29 @@ dss_add_test(NAME mir/test_synth_symbol_floor
 # carrier reddens named cases instead of killing the process.
 dss_add_test(NAME mir/test_symbol_id_end_is_stated
              SOURCES test_symbol_id_end_is_stated.cpp)
+
+# P69 fold 3 (lane `xa`) — THE LINKAGE OF A MIR DEFINITION IS ONE RECORD (`MirLinkage`: binding, visibility, the
+# kind of a weak definition, the tentative mark) judged by ONE rule (`mirLinkageDefect`): the rule's table, both
+# builders keeping the record whole, what a common is, and the verifier's refusal by name. A binary of its own
+# because a builder's refusal is an abort.
+dss_add_test(NAME mir/test_mir_linkage_record
+             SOURCES test_mir_linkage_record.cpp)
+
+# ...and its text: `.dssir` version 6 spells the kind (`weak(overridable)`, `weak(select-any)`) and the mark
+# (`tentative`); every shape round-trips, every ill-formed spelling is refused by name, and a version-5 text is
+# refused rather than read with the kind guessed.
+dss_add_test(NAME mir/test_mir_text_linkage
+             SOURCES test_mir_text_linkage.cpp)
+
+# ...and the summary tier (`--lto=thin`): a row states the kind of its weak definition and whether it is a common;
+# the stored form is version 2, a version-1 image is refused, and a row whose linkage bytes the one rule refuses
+# is not read.
+dss_add_test(NAME mir/test_mir_summary_linkage
+             SOURCES test_mir_summary_linkage.cpp)
+
+# D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED (P69 fold 3) — the cross-unit MIR merge folds two
+# units' tentative definitions of one name into ONE object, the largest, at the widest alignment any of them asked
+# for (the references' measured answer); two units analyzed under different layout rules, or a unit handed none,
+# are refused by name; a lone tentative definition is sized by nobody; module-private definitions stay apart.
+dss_add_test(NAME mir/test_mir_merge_tentative_fold
+             SOURCES test_mir_merge_tentative_fold.cpp)

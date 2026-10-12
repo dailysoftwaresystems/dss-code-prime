@@ -53,6 +53,7 @@
 #include "opt/optimizer.hpp"
 #include "opt/passes/inlining.hpp"
 #include "diagnostic_count.hpp"
+#include "link_facts.hpp"   // linkageOf (P69: a weak MIR definition states its kind)
 
 #include <gtest/gtest.h>
 
@@ -151,7 +152,7 @@ Mir buildCallerCalleeModule(TypeInterner& interner, SymbolBinding calleeBinding,
     MirBuilder mb;
 
     // callee f (SymbolId 50): single-block leaf returning a constant.
-    mb.addFunction(fnSig, SymbolId{50}, calleeBinding, SymbolVisibility::Default);
+    mb.addFunction(fnSig, SymbolId{50}, dss::test_support::linkageOf(calleeBinding));
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(fEntry);
     mb.addReturn(mb.addConst(i32Lit(retVal), i32));
@@ -551,9 +552,9 @@ TEST(Inlining, AlwaysInlineDoesNotOverrideTheWeakCalleeRefusal) {
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
-    mb.addFunction(fnSig, SymbolId{50}, SymbolBinding::Weak,
-                   SymbolVisibility::Default, /*noInline=*/false,
-                   /*alwaysInline=*/true);
+    mb.addFunction(fnSig, SymbolId{50},
+                   dss::test_support::linkageOf(SymbolBinding::Weak),
+                   /*noInline=*/false, /*alwaysInline=*/true);
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(fEntry);
     mb.addReturn(mb.addConst(i32Lit(7), i32));

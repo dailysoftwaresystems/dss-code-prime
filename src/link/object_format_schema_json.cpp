@@ -25,6 +25,7 @@
 #include <span>     // the per-ARM key vocabularies are selected as spans
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>   // the root key vocabulary is a UNION built at load time
 
@@ -414,7 +415,14 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // describe relocations — the images and relocatable objects a link resolves
     // units for, and the archive documents, whose members a relocatable writer
     // writes.
-    static constexpr std::array<std::string_view, 52> kFormatDocumentKeys{
+    // 52 -> 53 (P69 fold 3, lane `xa`): `weakDefinitionBesideStrong`, what a weak
+    // definition is beside a strong definition of its name — replaced by it, or
+    // a duplicate of it (`WeakBesideStrong`,
+    // D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER);
+    // one answer, or one per kind of weak definition. OPTIONAL: stated by the
+    // documents a link resolves units for, an image or a relocatable artifact —
+    // the documents that state `commonYieldsTo`; refused on an archive document.
+    static constexpr std::array<std::string_view, 53> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -535,6 +543,10 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // typo would leave the document unstated, which a link then refuses only
         // when a relocation names such a definition
         "supersededDefinition",
+        // what a weak definition is beside a strong one of its name — a typo
+        // would leave the document unstated, which a link then refuses only
+        // when a weak definition meets a strong one
+        "weakDefinitionBesideStrong",
         // WHO RUNS THE STATIC-INITIALIZER SCHEDULE
         // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN). It sits
         // with the program-entry cluster in spirit — it answers a question about
@@ -4305,32 +4317,41 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // every kind exactly once — a kind left out would be a definition the
     // document says nothing of, found only when a link meets one. Both
     // vocabularies are read by name through their closed tables.
-    if (doc.contains("supersededDefinition")) {
-        auto const& v = doc.at("supersededDefinition");
-        auto const answerOf = [](json const& a) -> std::optional<SupersededDefinition> {
-            return a.is_string() ? kSupersededDefinitionTable.fromName(a.get<std::string>())
+    //
+    // ★ ONE READER FOR EVERY KEY OF THIS SHAPE (P69 fold 3). A second key took
+    // the same two forms — `weakDefinitionBesideStrong` — and the reader below
+    // is the one `supersededDefinition` had, made a function of the key's name
+    // and of its answers' table: its refusals are the same sentences, at the
+    // key's own path.
+    auto const readWeakKindStatement = [&](std::string const& key, auto const& answerTable,
+                                           auto& statement) {
+        if (!doc.contains(key)) return;
+        using Statement = std::remove_cvref_t<decltype(statement)>;
+        using Answer    = typename decltype(statement.forEveryDefinition)::value_type;
+        auto const& v = doc.at(key);
+        auto const answerOf = [&](json const& a) -> std::optional<Answer> {
+            return a.is_string() ? answerTable.fromName(a.get<std::string>())
                                  : std::nullopt;
         };
-        auto const expectedAnswer = [] {
+        auto const expectedAnswer = [&] {
             return std::format("expected one of: {}",
-                               allowedList(allNames(kSupersededDefinitionTable), ", "));
+                               allowedList(allNames(answerTable), ", "));
         };
         if (v.is_string()) {
             if (auto const answer = answerOf(v); answer.has_value()) {
-                data.supersededDefinition.forEveryDefinition = *answer;
+                statement.forEveryDefinition = *answer;
             } else {
-                coll.emit(DiagnosticCode::C_MalformedJson, "/supersededDefinition",
-                          expectedAnswer());
+                coll.emit(DiagnosticCode::C_MalformedJson, "/" + key, expectedAnswer());
             }
         } else if (v.is_object()) {
-            SupersededDefinitionStatement perKind;
-            bool                          ok = true;
+            Statement perKind;
+            bool      ok = true;
             for (auto const& [kindName, answerJson] : v.items()) {
                 auto const kind   = weakDefinitionKindFromName(kindName);
                 auto const answer = answerOf(answerJson);
                 if (!kind.has_value()) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/supersededDefinition/" + kindName,
+                              "/" + key + "/" + kindName,
                               std::format("'{}' is no kind of weak definition: expected one of: {}",
                                           kindName,
                                           allowedList(allNames(kWeakDefinitionKindTable), ", ")));
@@ -4339,7 +4360,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 }
                 if (!answer.has_value()) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/supersededDefinition/" + kindName, expectedAnswer());
+                              "/" + key + "/" + kindName, expectedAnswer());
                     ok = false;
                     continue;
                 }
@@ -4349,7 +4370,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 bool listed = false;
                 for (auto const& [of, answer] : perKind.byKind) listed = listed || of == row.first;
                 if (!listed && ok) {
-                    coll.emit(DiagnosticCode::C_MalformedJson, "/supersededDefinition",
+                    coll.emit(DiagnosticCode::C_MalformedJson, "/" + key,
                               std::format("an answer per kind of weak definition states one for "
                                           "EVERY kind, and '{}' is missing (the kinds: {})",
                                           row.second,
@@ -4357,16 +4378,23 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     ok = false;
                 }
             }
-            if (ok) data.supersededDefinition = std::move(perKind);
+            if (ok) statement = std::move(perKind);
         } else {
-            coll.emit(DiagnosticCode::C_MalformedJson, "/supersededDefinition",
+            coll.emit(DiagnosticCode::C_MalformedJson, "/" + key,
                       std::format("expected one answer for every definition (a string, one of: "
                                   "{}), or an object stating one per kind of weak definition "
                                   "({})",
-                                  allowedList(allNames(kSupersededDefinitionTable), ", "),
+                                  allowedList(allNames(answerTable), ", "),
                                   allowedList(allNames(kWeakDefinitionKindTable), ", ")));
         }
-    }
+    };
+    readWeakKindStatement("supersededDefinition", kSupersededDefinitionTable,
+                          data.supersededDefinition);
+    // weakDefinitionBesideStrong — what a weak definition is beside a strong
+    // definition of its name (`WeakBesideStrong`, P69 fold 3): replaced by it, or
+    // a duplicate of it. OPTIONAL; the same two forms, read by the same reader.
+    readWeakKindStatement("weakDefinitionBesideStrong", kWeakBesideStrongTable,
+                          data.weakDefinitionBesideStrong);
 
     // sections[] — D-LK4-2 schema row. Each entry maps a universal
     // SectionKind to format-native name + structural fields.

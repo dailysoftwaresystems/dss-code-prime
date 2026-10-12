@@ -1022,6 +1022,19 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "relocatable artifact — and an archive's members are each "
                  "linked alone, so the declaration would never be read.");
         }
+        // P69 fold 3: `weakDefinitionBesideStrong` is read where `commonYieldsTo`
+        // is — by a link that sets one unit's weak definition beside another
+        // unit's strong one — and for the same reason never from an archive
+        // document.
+        if (weakDefinitionBesideStrong.stated()
+            && container == ObjectFormatContainer::Archive) {
+            fail("/weakDefinitionBesideStrong",
+                 "'weakDefinitionBesideStrong' is declared on an ARCHIVE document: "
+                 "what a weak definition is beside a strong one of its name is "
+                 "read from the document of the link that resolves the two — an "
+                 "image or a relocatable artifact — and an archive's members are "
+                 "each linked alone, so the declaration would never be read.");
+        }
         // P69 round 4 (lane `lm`): `archiveWeakReferenceSearch` is read from the
         // document of an archive's MEMBERS — the `container: "archive"` document,
         // and no other. Round 5: a bare relocatable link reads its archive-writing

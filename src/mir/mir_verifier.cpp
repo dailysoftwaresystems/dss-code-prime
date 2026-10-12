@@ -340,6 +340,7 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     checkCallSignatures(reporter);
     checkAtomicAccessLowered(reporter);
     checkStoreValueTypes(reporter);
+    checkLinkageRecords(reporter);
     if (reporter.hitCap()) return false;
     // ★★ THE VERDICT IS THE VERIFIER'S OWN COUNT, AND-ed with the reporter's
     // delta. The delta alone was not a verdict: ✔MEASURED P68 (lane `ht`), a
@@ -1801,6 +1802,36 @@ void MirVerifier::checkAtomicAccessLowered(DiagnosticReporter& reporter) const {
             }
         }
     });
+}
+
+// P69 (lane `xa`). The rule is NOT written here: `mirLinkageDefect`
+// (mir/mir_node.hpp) is the one statement of what a well-formed linkage record
+// is, and this walk only asks it of every function and every global and names
+// the definition its sentence is about.
+void MirVerifier::checkLinkageRecords(DiagnosticReporter& reporter) const {
+    for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
+        MirFuncId const f = mir_.funcAt(fi);
+        std::string_view const defect =
+            mirLinkageDefect(mir_.funcLinkage(f), MirLinkageOwner::Function,
+                             /*hasInitializer=*/false);
+        if (defect.empty()) continue;
+        reportFunc(reporter, DiagnosticCode::I_VerifierFailure, f,
+                   std::format("the linkage of symbol %{} is not well formed: {}",
+                               mir_.funcSymbol(f).v, defect));
+    }
+    for (std::uint32_t gi = 0; gi < mir_.moduleGlobalCount(); ++gi) {
+        MirGlobalId const g = mir_.globalAt(gi);
+        bool const hasInitializer = mir_.globalInitLiteralIndex(g) != UINT32_MAX
+                                    || mir_.globalInitFunc(g).valid();
+        std::string_view const defect =
+            mirLinkageDefect(mir_.globalLinkage(g), MirLinkageOwner::Global,
+                             hasInitializer);
+        if (defect.empty()) continue;
+        report(reporter, DiagnosticCode::I_VerifierFailure,
+               std::format("mir global #{}: the linkage of symbol %{} is not well "
+                           "formed: {}",
+                           g.v, mir_.globalSymbol(g).v, defect));
+    }
 }
 
 } // namespace dss

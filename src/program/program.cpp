@@ -2137,7 +2137,8 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         }
         if (!runThinLtoImportStage(
                 std::span<CuMirModule>{cuMirs.data(), cuMirs.size()}, **targetR,
-                cSymDecor, targetSpecStr, compileOpts, thinExec, reporter)) {
+                **formatR, cSymDecor, targetSpecStr, compileOpts, thinExec,
+                reporter)) {
             return std::nullopt;   // already reported
         }
     }
@@ -2210,6 +2211,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // clone aborts on a shim GlobalAddr — the multi-CU threads defect).
         // Non-owning; `cuMir` (in `cuMirs`) outlives the merge.
         in.synthRecipes = &cuMir.libraryShimRecipes;
+        // P69 fold 3: the layout rule THIS unit was analyzed under — the one its
+        // model answered `sizeof` from — with which the merge sizes this unit's
+        // tentative definition when another unit defines the same name
+        // tentatively (`MergeCuInput::aggregateLayout`). Each unit hands its
+        // own: a size is a fact of the unit that compiled the definition.
+        in.aggregateLayout = cuMir.model.aggregateLayout();
         mergeInputs.push_back(std::move(in));
     }
 
@@ -2318,6 +2325,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         std::span<MergeCuInput const>{mergeInputs.data(), mergeInputs.size()},
         std::move(host),
         std::span<std::string const>{entryNames.data(), entryNames.size()},
+        // P69 fold 3: the document of THIS link — the rank among weak
+        // definitions, what a common is beside one, what a weak one is beside a
+        // strong one. The merge asks the reader the unit linker asks
+        // (`link/common_yield.hpp`).
+        **formatR,
         reporter);
     // Merge REFUSED (nullopt), or merge SUCCEEDED while reporting a conflict
     // it resolved by election. Both are already reported; both stop here.

@@ -101,6 +101,18 @@ inline constexpr std::string_view kMirTextRunAfterEntryAttr  = "initafter";
 inline constexpr std::string_view kMirTextConstAttr       = "const";
 inline constexpr std::string_view kMirTextThreadLocalAttr = "threadlocal";
 inline constexpr std::string_view kMirTextAlignAttr       = "align";
+// P69 (lane `xa`), format v6: a global that is a TENTATIVE definition its unit
+// never completed (C 6.9.2p2; `MirLinkage::tentative`). One spelling, shared by
+// the printer and the reader like its neighbours. A GLOBAL's word only: a
+// function has no tentative definition, and the function list does not know it.
+//
+// ⓘ THE WEAK DEFINITION'S KIND HAS NO KEYWORD HERE, deliberately: it is the
+// ARGUMENT of the binding word — `weak(overridable)`, `weak(select-any)` — and
+// both halves come from the shared tables (`symbolBindingName`,
+// `weakDefinitionKindName`, core/types/symbol_attrs.hpp), so this format has no
+// second spelling of either that could drift from the one every other tier and
+// the object-format documents use.
+inline constexpr std::string_view kMirTextTentativeAttr   = "tentative";
 // ⚠⚠ THE FIFTH HAND-WRITTEN COPY OF THE ALIGNMENT CAP, AND IT SPELLED 256.
 // [[D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN]] removed the
 // other four in P63, where the count went 1 → 3 → 4 → 5 as successive readers
@@ -140,9 +152,14 @@ inline constexpr std::uint32_t kMirTextMaxGlobalAlignBytes = Alignment::kMaxByte
 //
 // ⓘ The member defaults ARE the format's \"attribute list absent\" meaning,
 // so a global with no `[...]` needs no special case anywhere.
+//
+// ★ P69 (lane `xa`): the binding and the visibility are two members of the ONE
+// linkage record (`MirLinkage`, mir/mir_node.hpp), which also carries the weak
+// definition's kind and the tentative mark — so "five fields" above reads as
+// "the linkage record and three fields" today, and the four paths hand the
+// builder the record whole.
 struct MirTextGlobalAttrs {
-    SymbolBinding    binding        = SymbolBinding::Global;
-    SymbolVisibility visibility     = SymbolVisibility::Default;
+    MirLinkage       linkage{};
     bool             isConst        = false;
     MirThreadStorage threadStorage  = MirThreadStorage::Shared;
     std::uint32_t    alignmentBytes = 0;
@@ -168,7 +185,13 @@ namespace {
 // v4's `frame_address` / `return_address` opcodes are GONE again: the two builtins were withdrawn (P69
 // review M4 — their meaning needs frame records DSS does not keep yet), so a v5 reader has no rule
 // for either.
-constexpr int kVersion = 5;
+// v6 (P69, lane `xa`): a WEAK definition states its KIND as the argument of its binding word,
+// `weak(overridable)` / `weak(select-any)`, and a global its TENTATIVE mark, `tentative` — the two
+// facts of the linkage record (`MirLinkage`) that v5 could not spell. A v5 text wrote a weak
+// definition as the bare word, which is no module a v6 builder makes (a weak definition of no stated
+// kind is refused: the object formats spell the two kinds differently), so a v6 reader refuses the
+// bare word by name and a v5 reader has no rule for the argument.
+constexpr int kVersion = 6;
 
 // The canonical quiet NaN is core's `kCanonicalQuietNanBits` (core/types/wide_float_value.hpp,
 // P69 review n13): the ONE NaN the text spells `nan`, every other NaN being `float nanbits
@@ -463,6 +486,37 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextInstFlagTable));
         if (hasTextSpelling(op)) names.push_back(opcodeInfo(op).mnemonic);
     }
     return detail::renderAllowedList(names);
+}
+
+// The spellings of a BINDING an attribute list can state (P69 fold 3), projected
+// off the two tables the reader looks them up in: every binding by its name,
+// and the weak one ONCE PER KIND of weak definition, the kind as its argument —
+// `weak(overridable)`, `weak(select-any)` — because that is the only form of it
+// the reader takes (version 6: a bare `weak` states no kind and is refused).
+//
+// ★ ONE SET OF SPELLINGS, EACH OF WHICH THE READER ACCEPTS. The refusals of an
+// unknown attribute first advertised the binding NAMES and, beside them, the
+// kind names ("'weak' takes its kind, 'overridable' | 'select-any'"): three
+// quoted words of which the reader takes none as written — a bare `weak` is
+// refused, and `overridable` is no attribute at all. ✔MEASURED 2026-10-12 on
+// three legs: `TextTierVocabulary.MirFunctionAttributeRefusalProjectsBindingAndVisibility`,
+// which feeds every spelling a refusal advertises back to the reader, said
+// "the refusal advertises attribute 'overridable' and the reader then calls it
+// UNKNOWN". A reader of the message who wrote what it listed got a second
+// refusal.
+[[nodiscard]] std::string bindingSpellings() {
+    std::vector<std::string> spellings;
+    for (auto const& [binding, name] : kSymbolBindingTable.rows) {
+        if (binding != SymbolBinding::Weak) {
+            spellings.emplace_back(name);
+            continue;
+        }
+        for (auto const& [kind, kindName] : kWeakDefinitionKindTable.rows) {
+            (void)kind;
+            spellings.push_back(std::format("{}({})", name, kindName));
+        }
+    }
+    return detail::renderAllowedList(spellings, " | ");
 }
 
 // CallConv name mapping previously hand-rolled here (and in
@@ -1153,21 +1207,49 @@ private:
     // ⚠ PRINTED ONLY WHEN SOMETHING IS NON-DEFAULT, the same `blockMarker !=
     // Linear` discipline `appendFuncAttrs` follows — so every existing golden
     // `.dssir` text for an ordinary global is byte-unchanged by this.
+    // ── THE WORDS OF A LINKAGE RECORD, ONE PRINTER FOR BOTH LISTS (format v6) ──
+    //
+    // P69 (lane `xa`). A function's list and a global's list each printed the
+    // binding and the visibility for themselves; the record (`MirLinkage`) has
+    // four facts and both lists print them here, so the kind and the mark are
+    // not a third and a fourth thing each list remembers.
+    //   * the BINDING, unless it is the default — and a WEAK one with its kind
+    //     as the word's argument: `weak(overridable)`, `weak(select-any)`. Both
+    //     halves are projected off the shared tables. A weak binding with no
+    //     kind cannot be in a module (the builder refuses it), so the bare word
+    //     is never printed.
+    //   * the VISIBILITY, unless it is the default;
+    //   * `tentative` — a global's mark; a function's record never carries it.
+    void appendLinkageWords(MirLinkage const& linkage, bool& first) {
+        auto const sep = [&] { if (!first) out_ += ", "; first = false; };
+        if (linkage.binding != SymbolBinding::Global) {
+            sep();
+            out_ += symbolBindingName(linkage.binding);
+            if (auto const kind = linkage.statedWeakKind(); kind.has_value()) {
+                out_ += '(';
+                out_ += weakDefinitionKindName(*kind);
+                out_ += ')';
+            }
+        }
+        if (linkage.visibility != SymbolVisibility::Default) {
+            sep();
+            out_ += symbolVisibilityName(linkage.visibility);
+        }
+        if (linkage.tentative) { sep(); out_ += kMirTextTentativeAttr; }
+    }
+
     void appendGlobalAttrs(MirGlobalId g) {
-        SymbolBinding    const b  = mir_.globalBinding(g);
-        SymbolVisibility const v  = mir_.globalVisibility(g);
+        MirLinkage       const lk = mir_.globalLinkage(g);
         bool             const c  = mir_.globalIsConst(g);
         bool             const tl = mir_.globalIsThreadLocal(g);
         std::uint32_t    const al = mir_.globalAlignmentBytes(g);
-        if (b == SymbolBinding::Global && v == SymbolVisibility::Default
-            && !c && !tl && al == 0) {
+        if (lk == MirLinkage{} && !c && !tl && al == 0) {
             return;
         }
         out_ += " [";
         bool first = true;
         auto const sep = [&] { if (!first) out_ += ", "; first = false; };
-        if (b != SymbolBinding::Global)     { sep(); out_ += symbolBindingName(b); }
-        if (v != SymbolVisibility::Default) { sep(); out_ += symbolVisibilityName(v); }
+        appendLinkageWords(lk, first);
         if (c)                              { sep(); out_ += kMirTextConstAttr; }
         if (tl)                             { sep(); out_ += kMirTextThreadLocalAttr; }
         if (al != 0) {
@@ -1211,22 +1293,19 @@ private:
     // Names come from the SHARED `symbolBindingName` / `symbolVisibilityName`
     // tables — not a second spelling table that could drift from them.
     void appendFuncAttrs(MirFuncId f) {
-        SymbolBinding    const b  = mir_.funcBinding(f);
-        SymbolVisibility const v  = mir_.funcVisibility(f);
+        MirLinkage       const lk = mir_.funcLinkage(f);
         bool             const ni = mir_.funcNoInline(f);
         bool             const ai = mir_.funcAlwaysInline(f);   // TF-C81
         bool             const no = mir_.funcNoOptimize(f);     // TF-C85
         bool             const ns = mir_.funcNoSanitizeThread(f);   // TF-C92
         StaticInitSchedule const si = mir_.funcStaticInit(f);
-        if (b == SymbolBinding::Global && v == SymbolVisibility::Default && !ni
-            && !ai && !no && !ns && !si.any()) {
+        if (lk == MirLinkage{} && !ni && !ai && !no && !ns && !si.any()) {
             return;
         }
         out_ += " [";
         bool first = true;
         auto const sep = [&] { if (!first) out_ += ", "; first = false; };
-        if (b != SymbolBinding::Global)     { sep(); out_ += symbolBindingName(b); }
-        if (v != SymbolVisibility::Default) { sep(); out_ += symbolVisibilityName(v); }
+        appendLinkageWords(lk, first);   // binding (a weak one with its kind), visibility
         if (ni)                             { sep(); out_ += kMirTextNoInlineAttr; }
         if (ai)                             { sep(); out_ += kMirTextAlwaysInlineAttr; }
         if (no)                             { sep(); out_ += kMirTextNoOptimizeAttr; }
@@ -3265,9 +3344,118 @@ private:
             "entry takes none, so no module this format writes has them", mnemonic));
     }
 
-    void parseGlobalAttrs(MirTextGlobalAttrs& attrs) {
-        if (lex_.peek().kind != TokKind::LBracket) return;
+    // ── THE LINKAGE WORDS OF AN ATTRIBUTE LIST, ONE READER FOR BOTH LISTS (v6) ──
+    //
+    // P69 (lane `xa`). The twin of `Emitter::appendLinkageWords`: a function's
+    // list and a global's list hand each word here before trying their own, so
+    // the binding, its weak kind and the visibility are read by ONE arm.
+    //
+    // ★ WHAT IS REFUSED HERE, EACH BY NAME, and why here rather than at the
+    // builder: `MirBuilder` ABORTS on a linkage record its rule refuses
+    // (`mirLinkageDefect`), and a refusal that crashes is not a refusal. So a
+    // text that spells such a record is stopped at the word:
+    //   * a SECOND binding word in one list — the later one used to replace
+    //     the earlier in silence, which would now also drop a kind already read;
+    //   * an argument on a binding that is not `weak` (`global(select-any)`): a
+    //     kind is the argument of `weak` only;
+    //   * an argument that is no kind the shared table names;
+    //   * an argument list not closed on its line.
+    // A bare `weak` — a weak definition that states no kind — is READ, and then
+    // refused by the record's own rule where the list ends
+    // (`refuseAnIllFormedLinkage`), with the rule's own sentence: the reader
+    // does not restate what a well-formed record is.
+    enum class LinkageWord { NotOne, Read, Refused };
+    struct LinkageWordsRead {
+        MirLinkage linkage{};
+        bool       sawBinding = false;
+    };
+
+    [[nodiscard]] LinkageWord readLinkageWord(Tok const& word, LinkageWordsRead& into,
+                                              std::string_view listOf) {
+        if (auto const v = symbolVisibilityFromName(word.text); v.has_value()) {
+            into.linkage.visibility = *v;
+            return LinkageWord::Read;
+        }
+        auto const binding = symbolBindingFromName(word.text);
+        if (!binding.has_value()) return LinkageWord::NotOne;
+        if (into.sawBinding) {
+            emitMalformed(std::format(
+                "a {} attribute list states its binding twice — '{}' after '{}'; a "
+                "definition has one binding",
+                listOf, word.text, symbolBindingName(into.linkage.binding)));
+            return LinkageWord::Refused;
+        }
+        into.sawBinding       = true;
+        into.linkage.binding  = *binding;
+        into.linkage.weakKind = WeakDefinitionKind{};
+        if (lex_.peek().kind != TokKind::LParen) return LinkageWord::Read;
+        // The argument is the kind's name AS THE SHARED TABLE SPELLS IT, read as
+        // the source text between the parentheses rather than as a token: the
+        // table's `select-any` is not one token of this lexer (a word, then a
+        // `-` that starts what the lexer takes for a `-inf`-style number).
+        Tok const open = lex_.take();
+        Tok       close{};
+        while (true) {
+            close = lex_.take();
+            if (close.kind == TokKind::RParen) break;
+            bool const sameLine =
+                close.kind != TokKind::End
+                && lex_.text().substr(open.off, close.off - open.off).find('\n')
+                       == std::string_view::npos;
+            if (!sameLine || close.kind == TokKind::RBracket
+                || close.kind == TokKind::LBrace) {
+                emitMalformed(std::format(
+                    "'{}' in a {} attribute list opens an argument that is not "
+                    "closed with ')' on its line",
+                    word.text, listOf));
+                return LinkageWord::Refused;
+            }
+        }
+        std::string_view kindText =
+            lex_.text().substr(open.off + 1, close.off - open.off - 1);
+        while (!kindText.empty() && (kindText.front() == ' ' || kindText.front() == '\t'))
+            kindText.remove_prefix(1);
+        while (!kindText.empty() && (kindText.back() == ' ' || kindText.back() == '\t'))
+            kindText.remove_suffix(1);
+        if (*binding != SymbolBinding::Weak) {
+            emitMalformed(std::format(
+                "'{}' takes no argument — a weak-definition kind ('{}') is the "
+                "argument of '{}' only",
+                word.text, kindText, symbolBindingName(SymbolBinding::Weak)));
+            return LinkageWord::Refused;
+        }
+        auto const kind = weakDefinitionKindFromName(kindText);
+        if (!kind.has_value()) {
+            emitUnknownName(std::format(
+                "unknown weak-definition kind '{}' — accepted: {}", kindText,
+                detail::renderAllowedList(allNames(kWeakDefinitionKindTable))));
+            return LinkageWord::Refused;
+        }
+        into.linkage.weakKind = *kind;
+        return LinkageWord::Read;
+    }
+
+    // The record's OWN rule, asked where a list has been read whole and before
+    // any builder sees it. True ⇒ refused (by name, in the rule's sentence).
+    [[nodiscard]] bool refuseAnIllFormedLinkage(MirLinkage const& linkage,
+                                                MirLinkageOwner owner,
+                                                bool hasInitializer,
+                                                std::uint32_t symbol) {
+        std::string_view const defect = mirLinkageDefect(linkage, owner, hasInitializer);
+        if (defect.empty()) return false;
+        emitMalformed(std::format(
+            "the attribute list of {} %{} states a linkage that is not well formed: {}",
+            owner == MirLinkageOwner::Function ? "function" : "global", symbol, defect));
+        return true;
+    }
+
+    // Returns false when a word of the list was REFUSED — the caller builds
+    // nothing from a list it could not read.
+    [[nodiscard]] bool parseGlobalAttrs(MirTextGlobalAttrs& attrs) {
+        if (lex_.peek().kind != TokKind::LBracket) return true;
         lex_.take();
+        LinkageWordsRead linkageWords;
+        bool             readWhole = true;
         while (true) {
             Tok a = lex_.take();
             if (a.kind == TokKind::RBracket) break;
@@ -3275,7 +3463,17 @@ private:
             if (a.kind != TokKind::Ident) {
                 emitMalformed(std::format(
                     "expected a global attribute name, got '{}'", a.text));
+                readWhole = false;
                 break;
+            }
+            if (LinkageWord const w = readLinkageWord(a, linkageWords, "global");
+                w != LinkageWord::NotOne) {
+                if (w == LinkageWord::Refused) { readWhole = false; break; }
+                continue;
+            }
+            if (a.text == kMirTextTentativeAttr) {
+                linkageWords.linkage.tentative = true;
+                continue;
             }
             if (a.text == kMirTextConstAttr) { attrs.isConst = true; continue; }
             if (a.text == kMirTextThreadLocalAttr) {
@@ -3284,16 +3482,8 @@ private:
             }
             if (a.text == kMirTextAlignAttr) {
                 std::optional<std::uint32_t> const bytes = takeAlignValue("global");
-                if (!bytes.has_value()) break;
+                if (!bytes.has_value()) { readWhole = false; break; }
                 attrs.alignmentBytes = *bytes;
-                continue;
-            }
-            if (auto b = symbolBindingFromName(a.text); b.has_value()) {
-                attrs.binding = *b;
-                continue;
-            }
-            if (auto v = symbolVisibilityFromName(a.text); v.has_value()) {
-                attrs.visibility = *v;
                 continue;
             }
             // Both closed sets are PROJECTED off the tables the lookups use,
@@ -3301,15 +3491,18 @@ private:
             // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET),
             // the same discipline the function-attribute message follows.
             emitMalformed(std::format(
-                "unknown global attribute '{}' — expected a binding ({}), "
-                "a visibility ({}), '{}', '{}' or '{}=<bytes>'",
+                "unknown global attribute '{}' — expected a binding ({}), a "
+                "visibility ({}), '{}', '{}', '{}' or '{}=<bytes>'",
                 a.text,
-                detail::renderAllowedList(allNames(kSymbolBindingTable), " | "),
+                bindingSpellings(),
                 detail::renderAllowedList(allNames(kSymbolVisibilityTable), " | "),
-                kMirTextConstAttr, kMirTextThreadLocalAttr,
+                kMirTextTentativeAttr, kMirTextConstAttr, kMirTextThreadLocalAttr,
                 kMirTextAlignAttr));
+            readWhole = false;
             break;
         }
+        attrs.linkage = linkageWords.linkage;
+        return readWhole;
     }
 
     void parseGlobal() {
@@ -3321,7 +3514,10 @@ private:
         if (!expect(TokKind::Colon)) return;
         TypeId const ty = parseType();
         MirTextGlobalAttrs attrs;
-        parseGlobalAttrs(attrs);
+        // A list with a refused word built nothing it could hand a builder —
+        // `weak(bogus)` leaves a weak binding with no kind, which `addGlobal`
+        // ABORTS on. The word is already refused by name; drop the line.
+        if (!parseGlobalAttrs(attrs)) { skipRestOfLine(lineStart); return; }
         if (!expect(TokKind::Eq)) return;
         // ★★★ A REFUSAL THAT CRASHES IS NOT A REFUSAL — the rule this file states
         // three times already, at the arm it had not reached.
@@ -3352,10 +3548,22 @@ private:
             return;
         }
         Tok pk = lex_.peek();
-        if (pk.kind == TokKind::Ident && pk.text == "zero") {
+        // ★ THE LINKAGE RECORD IS JUDGED BEFORE ANY ARM HANDS IT ON (format v6).
+        // Whether the global states an initializer is part of the rule — a
+        // tentative definition is the one with none — and `zero` is the only
+        // spelling that states none, so the question is answered from the token
+        // already in hand. Refused here, by the rule's own sentence, because
+        // every arm below reaches a builder that aborts on the same record.
+        bool const statesNoInitializer = pk.kind == TokKind::Ident && pk.text == "zero";
+        if (refuseAnIllFormedLinkage(attrs.linkage, MirLinkageOwner::Global,
+                                     !statesNoInitializer, sym)) {
+            skipRestOfLine(lineStart);
+            return;
+        }
+        if (statesNoInitializer) {
             lex_.take();
             builder_.addGlobal(ty, SymbolId{sym}, UINT32_MAX, MirFuncId{},
-                               attrs.binding, attrs.visibility, attrs.isConst,
+                               attrs.linkage, attrs.isConst,
                                attrs.threadStorage, attrs.alignmentBytes);
         } else if (pk.kind == TokKind::Ident && pk.text == "initfunc") {
             lex_.take();
@@ -3366,7 +3574,7 @@ private:
             auto it = funcMap_.find(fnSlot);
             if (it != funcMap_.end()) {
                 builder_.addGlobal(ty, SymbolId{sym}, UINT32_MAX, it->second,
-                                   attrs.binding, attrs.visibility,
+                                   attrs.linkage,
                                    attrs.isConst, attrs.threadStorage,
                                    attrs.alignmentBytes);
             } else {
@@ -3377,7 +3585,7 @@ private:
             MirLiteralValue lv = parseLiteral();
             std::uint32_t const litIdx = builder_.literalPoolAdd(std::move(lv));
             builder_.addGlobal(ty, SymbolId{sym}, litIdx, MirFuncId{},
-                               attrs.binding, attrs.visibility, attrs.isConst,
+                               attrs.linkage, attrs.isConst,
                                attrs.threadStorage, attrs.alignmentBytes);
         }
     }
@@ -3393,8 +3601,10 @@ private:
         // An UNRECOGNIZED name FAILS LOUD rather than being skipped — a silently
         // ignored attribute here is precisely how `binding`/`visibility` went
         // missing for as long as they did.
-        SymbolBinding    binding    = SymbolBinding::Global;
-        SymbolVisibility visibility = SymbolVisibility::Default;
+        // P69 (format v6): the binding, its weak kind and the visibility are the
+        // ONE linkage record, read by the reader both lists share
+        // (`readLinkageWord`) and judged by the record's own rule below.
+        LinkageWordsRead linkageWords;
         bool             noInline   = false;
         bool             alwaysInline = false;   // TF-C81
         bool             noOptimize   = false;   // TF-C85
@@ -3466,12 +3676,9 @@ private:
                     staticInit.setPriorityFor(phase, prio);
                     continue;
                 }
-                if (auto b = symbolBindingFromName(a.text); b.has_value()) {
-                    binding = *b;
-                    continue;
-                }
-                if (auto v = symbolVisibilityFromName(a.text); v.has_value()) {
-                    visibility = *v;
+                if (LinkageWord const w = readLinkageWord(a, linkageWords, "function");
+                    w != LinkageWord::NotOne) {
+                    if (w == LinkageWord::Refused) break;
                     continue;
                 }
                 // ⚠ THIS SENTENCE USED TO RETYPE BOTH CLOSED SETS —
@@ -3484,11 +3691,15 @@ private:
                 // calling it invalid
                 // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
                 // Both halves are projected off the tables the lookups use.
+                // ★ P69 fold 3: the BINDING half is the spellings a list can state
+                // (`bindingSpellings`), not the binding names beside the kind
+                // names — see that function for the two words the first shape
+                // of this sentence advertised and the reader refused.
                 emitMalformed(std::format(
                     "unknown function attribute '{}' — expected a binding ({}), "
                     "a visibility ({}), '{}', '{}', '{}', '{}', '{}' or '{}'",
                     a.text,
-                    detail::renderAllowedList(allNames(kSymbolBindingTable), " | "),
+                    bindingSpellings(),
                     detail::renderAllowedList(allNames(kSymbolVisibilityTable), " | "),
                     kMirTextNoInlineAttr, kMirTextAlwaysInlineAttr,
                     kMirTextNoOptimizeAttr, kMirTextNoSanitizeThreadAttr,
@@ -3508,6 +3719,13 @@ private:
         // burying the one diagnostic that matters under a cascade about a
         // construct that is perfectly well formed.
         if (!sig.valid()) { skipBracedBody(); return; }
+        // P69 (format v6): the linkage record is judged by its OWN rule before
+        // the builder — which aborts on the same record — can see it: a bare
+        // `weak` (a weak definition that states no kind) is refused here, by the
+        // rule's sentence. A refusal sets `errors_`, so the gate below skips the
+        // body like any other refused function's.
+        (void)refuseAnIllFormedLinkage(linkageWords.linkage, MirLinkageOwner::Function,
+                                       /*hasInitializer=*/false, sym);
         // ★★ ONCE A REFUSAL IS ON RECORD, NO FURTHER FUNCTION IS BUILT. Adding one
         // makes the builder CLOSE the previous function, and `closeFunction_`
         // ABORTS on a function with no blocks or with a block never filled — the
@@ -3524,7 +3742,7 @@ private:
             return;
         }
         MirFuncId const f =
-            builder_.addFunction(sig, SymbolId{sym}, binding, visibility, noInline,
+            builder_.addFunction(sig, SymbolId{sym}, linkageWords.linkage, noInline,
                                  alwaysInline,    // TF-C81
                                  noOptimize,      // TF-C85
                                  noSanitizeThread,   // TF-C92
@@ -4346,7 +4564,7 @@ private:
                 continue;
             }
             builder_.addGlobal(pg.ty, pg.sym, UINT32_MAX, it->second,
-                               pg.attrs.binding, pg.attrs.visibility,
+                               pg.attrs.linkage,   // P69: the one record
                                pg.attrs.isConst, pg.attrs.threadStorage,
                                pg.attrs.alignmentBytes);
         }

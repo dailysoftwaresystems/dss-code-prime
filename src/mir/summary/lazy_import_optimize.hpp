@@ -237,6 +237,13 @@ using LazyOptimizeFn =
 // calls may run concurrently over one `SummaryIndex` and one set of summaries.
 // `reporter` must be per-importer (the driver's established scratch-reporter
 // shape) — it is the one shared-mutable sink otherwise.
+//
+// `linkFormat` is the document of the link these units are bound for — the one
+// `buildSummaryIndex` was handed. Each import batch is a cross-unit merge
+// (`mergeCuMirs`), and a merge reads from it what a weak definition's kind
+// means beside the other definitions of its name; a batch that read another
+// document than the index did could elect another definition than the index
+// planned for.
 [[nodiscard]] DSS_EXPORT LazyImportOutcome
 lazyImportOptimize(std::uint32_t                   importer,
                    std::span<LazyImportCu const>   cus,
@@ -244,6 +251,7 @@ lazyImportOptimize(std::uint32_t                   importer,
                    SummaryIndex const&             index,
                    SummaryIndexPolicy const&       policy,
                    std::string_view                sourceLanguage,
+                   ObjectFormatSchema const&       linkFormat,
                    LazyOptimizeFn const&           optimizeOne,
                    DiagnosticReporter&             reporter);
 

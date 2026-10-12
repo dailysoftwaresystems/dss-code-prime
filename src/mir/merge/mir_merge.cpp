@@ -2,8 +2,11 @@
 
 #include "core/substrate/phase_timers.hpp"  // the merge-side whole-program verify's `--time` row
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/type_lattice/type_layout.hpp"   // computeLayout — the extent of a tentative definition
 #include "core/types/type_lattice/type_reintern.hpp"
+#include "link/common_yield.hpp"       // the ONE reader of the link document's weak / common statements
 #include "link/cross_cu_resolve.hpp"   // resolveCrossCuDefs, CrossCuDef, LinkedSymbolKey
+#include "link/object_format_schema.hpp"   // ObjectFormatSchema — the link's document
 #include "link/symbol_kind.hpp"        // LinkedSymbolKey
 #include "mir/mir_cfg.hpp"             // mirReversePostOrder
 #include "mir/mir_opcode.hpp"
@@ -275,8 +278,12 @@ public:
         // the artifact a `.dssir` dump describes, and a per-function fact that
         // silently disappears at the CU boundary is a fact the compiler cannot be
         // said to record at all.
+        // P69: the LINKAGE crosses as its one record (`Mir::funcLinkage`) — the
+        // binding, the visibility and the weak kind together, so a weak
+        // definition that survives the merge still says which kind it is to the
+        // object writer.
         MirFuncId const newF = dst_.addFunction(
-            sig, mergedSymbol, src_.funcBinding(f), src_.funcVisibility(f),
+            sig, mergedSymbol, src_.funcLinkage(f),
             src_.funcNoInline(f), src_.funcAlwaysInline(f),
             src_.funcNoOptimize(f), src_.funcNoSanitizeThread(f),
             // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN:
@@ -641,7 +648,8 @@ private:
 
 std::optional<MergedMirModule>
 mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
-            std::span<std::string const> entryNames, DiagnosticReporter& reporter) {
+            std::span<std::string const> entryNames,
+            ObjectFormatSchema const& linkFormat, DiagnosticReporter& reporter) {
     if (cus.empty()) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::K_CrossCuMergeUnsupported;
@@ -711,6 +719,37 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // private (resolveCrossCuDefs filters Local, but pre-filtering keeps the def
     // list honest about what crosses CU boundaries).
     std::vector<linker::CrossCuDef> defs;
+    // ── WHAT THE LINK'S DOCUMENT SAYS OF A WEAK DEFINITION (P69 fold 3) ───────
+    // The kernel compares what it is handed, and until now this tier handed it
+    // a binding and nothing else — so every weak definition folded at one rank
+    // (✔MEASURED 2026-10-12 on DSS-compiled units, pe64: a select-any
+    // definition beside an overridable one ran the select-any body with its
+    // unit named first and the OVERRIDABLE one, exit 44, with it second), and a
+    // strong definition replaced a select-any one in silence where every PE
+    // reference refuses the pair. The three statements below are the ones the
+    // unit linker makes of a reader's row, read from the same document by the
+    // same functions (`link/common_yield.hpp`) off the definition's own kind
+    // (`MirLinkage::statedWeakKind`): one rule, two tiers.
+    auto const stateTheLinksAnswers = [&](linker::CrossCuDef& def,
+                                          MirLinkage const&   linkage) {
+        linker::stateTheLinksAnswers(def, linkFormat, linkage.statedWeakKind());
+    };
+    // ── THE TENTATIVE DEFINITIONS, BY NAME ───────────────────────────────────
+    //    D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED
+    // A global that is a COMMON (`Mir::globalIsCommon`) enters the election as
+    // one — `CrossCuDef::tentative` — and is remembered here with the index of
+    // its `defs` entry, so that a name two units define this way can be given
+    // the extents the fold compares (below, after the walk).
+    struct TentativeCarrier {
+        std::size_t   def;      // index into `defs`
+        std::uint32_t cu;
+        MirGlobalId   global;
+        // The alignment this carrier's own definition asks for — its type's,
+        // or the one its unit stated if that is wider. Measured only for a name
+        // with two or more carriers; 0 until then.
+        std::uint32_t alignment = 0;
+    };
+    std::unordered_map<std::string, std::vector<TentativeCarrier>> tentativeCarriers;
     // (cuIdx, MirFuncId.v) for the winning key of each externally-visible name —
     // so we can decide whether a function is the winner (keep) or a shadowed
     // loser (skip its body).
@@ -726,12 +765,13 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             // cross-CU election, or a name it merely happens to define would
             // shadow the importer's own reference to the real one.
             if (!contributesFunction(ci, name)) continue;
-            SymbolBinding const binding = m.funcBinding(f);
-            if (binding == SymbolBinding::Local) continue;
+            MirLinkage const linkage = m.funcLinkage(f);
+            if (linkage.binding == SymbolBinding::Local) continue;
             plan.definedNames.insert(name);
             defs.push_back(linker::CrossCuDef{
-                name, binding,
+                name, linkage.binding,
                 LinkedSymbolKey{CompilationUnitId{ci + 1}, m.funcSymbol(f)}});
+            stateTheLinksAnswers(defs.back(), linkage);
         }
         // Externally-visible globals participate in cross-CU resolution too (a
         // strong global shadows a weak one of the same name), exactly like
@@ -748,12 +788,105 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             MirGlobalId const g = m.globalAt(gi);
             std::string const name = cus[ci].nameOf(m.globalSymbol(g));
             if (name.empty()) continue;
-            SymbolBinding const binding = m.globalBinding(g);
-            if (binding == SymbolBinding::Local) continue;
+            MirLinkage const linkage = m.globalLinkage(g);
+            if (linkage.binding == SymbolBinding::Local) continue;
             plan.definedNames.insert(name);
             defs.push_back(linker::CrossCuDef{
-                name, binding,
+                name, linkage.binding,
                 LinkedSymbolKey{CompilationUnitId{ci + 1}, m.globalSymbol(g)}});
+            stateTheLinksAnswers(defs.back(), linkage);
+            if (m.globalIsCommon(g)) {
+                defs.back().tentative = true;
+                tentativeCarriers[name].push_back(
+                    TentativeCarrier{defs.size() - 1, ci, g});
+            }
+        }
+    }
+
+    // ── THE EXTENT OF EACH COMMON THAT HAS A SIBLING ─────────────────────────
+    // Two units' tentative definitions of one name are ONE object, the larger,
+    // at the wider alignment — what every reference linker makes of two commons
+    // (✔MEASURED 2026-10-12, PE and ELF; C leaves two declarations of one
+    // object with types that are not compatible undefined, and `int a[];`
+    // beside `int a[10];` is the shape that reaches a linker anyway). So the
+    // fold needs each carrier's SIZE, and the size of a type is the layout
+    // engine's to say — `computeLayout`, the rule `sizeof` asks — under the
+    // layout rule ITS OWN UNIT was analyzed under
+    // (`MergeCuInput::aggregateLayout`) and the link's data model.
+    //   ⓘ Asked ONLY of a name two or more units define tentatively. A lone
+    //     tentative definition is sized by nobody here: it wins or loses by its
+    //     class, and the assembler sizes what survives.
+    //   ⓘ Each carrier is measured in ITS OWN unit's lattice and under its own
+    //     unit's rule — the question is the size its unit declared, no type is
+    //     re-interned to ask it, and no unit answers for another.
+    //   ⓘ Two carriers whose units were analyzed under DIFFERENT rules have
+    //     sizes that are not comparable, and the name is refused: the driver's
+    //     units agree by construction, and this is where that is checked.
+    // `commonAlignment[name]` is the widest alignment among the name's
+    // carriers; step (5) raises the surviving global to it.
+    std::unordered_map<std::string, std::uint32_t> commonAlignment;
+    {
+        auto const sameRule = [](AggregateLayoutParams const& a,
+                                 AggregateLayoutParams const& b) {
+            return a.scalarAlignment == b.scalarAlignment
+                   && a.maxAlignment == b.maxAlignment
+                   && a.bitFieldStrategy == b.bitFieldStrategy
+                   && a.unnamedBitFieldAlignment == b.unnamedBitFieldAlignment
+                   && a.maxRequestedAlignment == b.maxRequestedAlignment;
+        };
+        auto const refuse = [&](std::string const& name, std::string why) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_CrossCuMergeUnsupported;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "mergeCuMirs: symbol '{}' is defined tentatively by {} compilation "
+                "units, which makes it ONE object as large as the largest of them "
+                "— and {}.",
+                name, tentativeCarriers.at(name).size(), why);
+            reporter.report(std::move(d));
+        };
+        std::vector<std::string> names;
+        names.reserve(tentativeCarriers.size());
+        for (auto const& [name, carriers] : tentativeCarriers) {
+            if (carriers.size() >= 2) names.push_back(name);
+        }
+        std::sort(names.begin(), names.end());   // refusals in a stated order
+        for (std::string const& name : names) {
+            std::uint32_t widest = 0;
+            std::vector<TentativeCarrier>& carriers = tentativeCarriers.at(name);
+            auto const& firstRule = cus[carriers.front().cu].aggregateLayout;
+            for (TentativeCarrier& c : carriers) {
+                Mir const& m    = *cus[c.cu].mir;
+                auto const& rule = cus[c.cu].aggregateLayout;
+                if (!rule.has_value()) {
+                    refuse(name, std::format(
+                        "the definition in CU #{} cannot be sized: the merge was "
+                        "handed no layout rule for that unit "
+                        "(MergeCuInput::aggregateLayout)", c.cu + 1));
+                    continue;
+                }
+                if (firstRule.has_value() && !sameRule(*firstRule, *rule)) {
+                    refuse(name, std::format(
+                        "CU #{} and CU #{} were analyzed under different layout "
+                        "rules, so the sizes of their definitions are not "
+                        "comparable", carriers.front().cu + 1, c.cu + 1));
+                    continue;
+                }
+                auto const lay = computeLayout(m.globalType(c.global),
+                                               *cus[c.cu].interner, *rule,
+                                               linkFormat.dataModel());
+                if (!lay.has_value()) {
+                    refuse(name, std::format(
+                        "the definition in CU #{} cannot be sized: the layout "
+                        "engine has no size for its type", c.cu + 1));
+                    continue;
+                }
+                defs[c.def].bodySize = static_cast<std::size_t>(lay->size);
+                c.alignment = std::max(static_cast<std::uint32_t>(lay->align.bytes()),
+                                       m.globalAlignmentBytes(c.global));
+                widest = std::max(widest, c.alignment);
+            }
+            commonAlignment.emplace(name, widest);
         }
     }
 
@@ -772,6 +905,24 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                      std::to_string(c.existing.cuId.v) + " and CU #" +
                      std::to_string(c.incoming.cuId.v) + ").";
         reporter.report(std::move(d));
+    }
+    // A weak definition the link's format does not let a strong one replace, and
+    // a pair the link's document was asked about and does not decide — the SAME
+    // conditions, codes and sentences as the unit linker's and the summary
+    // index's: the kernel recorded them, and the ONE wording all three doors
+    // share makes each (`linker::refusalOf`, link/common_yield.hpp).
+    auto const reportRefusal = [&](linker::CrossCuRefusal refusal) {
+        ParseDiagnostic d;
+        d.code     = refusal.code;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = "mergeCuMirs: " + std::move(refusal.text);
+        reporter.report(std::move(d));
+    };
+    for (linker::CrossCuCollision const& c : resolution.collisions) {
+        reportRefusal(linker::refusalOf(c, linkFormat));
+    }
+    for (linker::CrossCuUndecided const& u : resolution.undecided) {
+        reportRefusal(linker::refusalOf(u, linkFormat));
     }
 
     // ── (3) unified SymbolId space. CU0 retains its symbol values; CU1..N (and
@@ -1166,8 +1317,29 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                 newInitFunc = it->second;
             }
 
+            // P69 fold 3: a COMMON that survives is the ONE object of every unit
+            // that defined the name tentatively, so it takes the WIDEST
+            // alignment any of them asked for (`commonAlignment`, measured
+            // above for a name with two or more carriers) — its own type is
+            // already the largest, which is why it is the survivor. Stated on
+            // the merged global ONLY where a sibling asked for more than the
+            // survivor's own definition does: a global that is not a common, a
+            // common with no sibling, and a common whose siblings ask for no
+            // more keep exactly what their unit stated.
+            std::uint32_t alignmentBytes = m.globalAlignmentBytes(g);
+            if (auto const widest = commonAlignment.find(name);
+                widest != commonAlignment.end() && m.globalIsCommon(g)) {
+                for (TentativeCarrier const& c : tentativeCarriers.at(name)) {
+                    if (c.cu == ci && c.global.v == g.v && widest->second > c.alignment) {
+                        alignmentBytes = widest->second;
+                    }
+                }
+            }
             (void)builder.addGlobal(ty, mergedSym, newInitLit, newInitFunc,
-                                    m.globalBinding(g), m.globalVisibility(g),
+                                    // P69: the linkage crosses as its one
+                                    // record — binding, visibility, the weak
+                                    // kind and the tentative mark together.
+                                    m.globalLinkage(g),
                                     m.globalIsConst(g),
                                     // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3):
                                     // carry thread storage duration across the
@@ -1178,7 +1350,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                                     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: carry
                                     // the global's explicit alignment across the
                                     // cross-CU merge.
-                                    m.globalAlignmentBytes(g));
+                                    alignmentBytes);
         }
     }
 

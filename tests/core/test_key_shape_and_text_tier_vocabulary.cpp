@@ -466,7 +466,7 @@ struct HirAttrVocabulary {
 // Everything else is the minimum a module needs, so a diagnostic can only be
 // about the hole.
 [[nodiscard]] std::string mirGlobalModule(std::string_view globalTail) {
-    return std::string{"dssir 5\n"
+    return std::string{"dssir 6\n"
                        "symbols { %1 \"f\" %2 \"g\" }\n"
                        "module {\n"
                        "  global %2 : "} + std::string{globalTail} + "\n"
@@ -594,7 +594,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
     // in the test. Found only because a sibling pin added a POSITIVE control and
     // the control reddened; the negative arm alone can never see this.
     auto const module = [](std::string_view marker) {
-        return std::string{"dssir 5\n"
+        return std::string{"dssir 6\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -680,7 +680,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
 // anchored for later.
 TEST(TextTierVocabulary, UnknownMirCallingConventionIsRefusedAndNamesTheAcceptedSet) {
     auto const module = [](std::string_view cc) {
-        return std::string{"dssir 5\n"
+        return std::string{"dssir 6\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void cc "} +
@@ -982,7 +982,7 @@ TEST(TextTierVocabulary, UnknownMirLiteralCoreIsRefusedAndNamesTheAcceptedSet) {
 // is this file's own rule, written beside the inline-asm arm.
 TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
     auto const module = [](char const* arms, char const* extraBlock) {
-        return std::string{"dssir 5\n"
+        return std::string{"dssir 6\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1021,7 +1021,7 @@ TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
 // SILENT. `%b`, `%vx`, `%b3x` all fell out of the prefix-stripping loop as 0.
 TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 5\n"
+        return std::string{"dssir 6\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1064,7 +1064,7 @@ TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
 // crash is not a guard.
 TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 5\n"
+        return std::string{"dssir 6\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1097,7 +1097,7 @@ TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
 // the two arms pinned above were being converted in the same file.
 TEST(TextTierVocabulary, MirFunctionAttributeRefusalProjectsBindingAndVisibility) {
     auto const module = [](std::string_view attr) {
-        return std::string{"dssir 5\n"
+        return std::string{"dssir 6\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void ["} + std::string{attr} + "] {\n"
@@ -1112,9 +1112,16 @@ TEST(TextTierVocabulary, MirFunctionAttributeRefusalProjectsBindingAndVisibility
     ASSERT_FALSE(msg.empty()) << "an unknown function attribute must be refused.";
     auto advertised = quotedTokens(msg);
     std::erase(advertised, std::string{kBadSpelling});
-    // 3 bindings + 4 visibilities + the 6 text-format keywords this file owns
-    // (P44 lane h joined `initbefore` / `initafter`).
-    EXPECT_EQ(advertised.size(), 13u)
+    // 4 binding spellings + 4 visibilities + the 6 text-format keywords this
+    // file owns (P44 lane h joined `initbefore` / `initafter`).
+    // P69 fold 3 (`.dssir` version 6): a binding is advertised as the SPELLINGS a
+    // list can state — `local`, `global`, and the weak one once per kind of weak
+    // definition with the kind as its argument (`weak(overridable)`,
+    // `weak(select-any)`), the only form of it the reader takes. The first shape
+    // of the version-6 sentence advertised `weak` and the two kind names as three
+    // words, and the loop below said so on three legs: "the refusal advertises
+    // attribute 'overridable' and the reader then calls it UNKNOWN".
+    EXPECT_EQ(advertised.size(), 14u)
         << "the advertised function-attribute set changed size — a SHRINK means "
            "an attribute the reader takes stopped being advertised.\nmessage:\n  "
         << msg;

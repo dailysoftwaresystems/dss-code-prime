@@ -634,6 +634,31 @@ struct DSS_EXPORT AssembledModule {
     // `dataItems` populate) is anchored as a follow-up cycle.
     std::vector<AssembledData>     dataItems;
 
+    // ── WHICH INPUT SECTIONS OF THIS UNIT ARE MEMBERS OF WHICH SECTION GROUP ──
+    //    (P69 fold 3; D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE)
+    //
+    // Key: an input section of the unit, as its items name it
+    // (`InputSectionSlice::section`). Value: the signature of the COMDAT group
+    // that section is a member of — the text `ModuleSymbol::sectionGroup` states
+    // on the ROW of a definition stored there. Stated by an object reader whose
+    // form has such groups (ELF's `SHT_GROUP` marked `GRP_COMDAT`); empty
+    // everywhere else.
+    //
+    // ★ WHY THE ROWS' STATEMENT WAS NOT ENOUGH. Membership is a fact of a
+    // SECTION, and a member section need hold no named definition at all: the
+    // jump table gcc writes for a function of a group is `.rodata.<f>`, whose
+    // only symbol is the section's own, and it reaches the link as an item with
+    // no row. Asked through rows, "is the item this relocation stands in a
+    // member of the group its target is in?" had no answer for exactly the
+    // relocation every such table holds (`R_X86_64_PC32 .text.<f> + offset`), and
+    // the merge refused the pair of objects every reference linker links
+    // (✔MEASURED 2026-10-12, GNU ld 2.42 and ld.lld 18.1: 44 and 88 in the two
+    // orders). One reader today: that refusal (`linker.cpp`,
+    // `supersededInADiscardedGroup`), which asks it of the relocating item.
+    // Not carried into a merged module: nothing reads it there, and no
+    // relocatable writer writes a group.
+    std::unordered_map<std::uint32_t, std::string> sectionGroupOfInputSection;
+
     // ── D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69) ──
     //
     // Symbols whose ADDRESS IS 0: a weak symbol the link resolved to NOTHING,

@@ -489,7 +489,9 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
         }
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, MirFuncId{},
-                          mir.globalBinding(g), mir.globalVisibility(g),
+                          // P69: the linkage is copied as its ONE record
+                          // (binding, visibility, weak kind, tentative mark).
+                          mir.globalLinkage(g),
                           mir.globalIsConst(g),
                           // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3): preserve
                           // thread storage duration across DCE's rebuild — the

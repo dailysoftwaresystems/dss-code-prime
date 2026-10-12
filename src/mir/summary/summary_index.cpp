@@ -1,7 +1,9 @@
 #include "mir/summary/summary_index.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "link/common_yield.hpp"           // stateTheLinksAnswers, refusalOf — the fold's one statement and one wording
 #include "link/cross_cu_resolve.hpp"
+#include "link/object_format_schema.hpp"   // ObjectFormatSchema — the link's document
 
 #include <algorithm>
 #include <deque>
@@ -81,6 +83,7 @@ bool isInlineCandidate(SummaryFunction const& f,
 std::optional<SummaryIndex>
 buildSummaryIndex(std::span<ModuleSummary const> summaries,
                   SummaryIndexPolicy const&      policy,
+                  ObjectFormatSchema const&      linkFormat,
                   DiagnosticReporter&            reporter) {
     SummaryIndex out;
     out.deadSymbolsPerModule.resize(summaries.size());
@@ -108,6 +111,14 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
     // externally-visible definitions participate; a Local definition is
     // module-private (C 6.2.2p3) and is neither a winner nor a loser even when
     // it shares a name with an externally-visible symbol elsewhere.
+    //
+    // ★ EACH ROW ENTERS THE FOLD AS THE OTHER TWO DOORS' DEFINITIONS DO (P69
+    // fold 3): its weak KIND stated to the link's document through the one
+    // function they call (`linker::stateTheLinksAnswers`), and a COMMON global
+    // marked as one (`SummaryGlobal::isCommon`, which is `Mir::globalIsCommon`
+    // of the definition). A row is given no SIZE — a summary holds no type —
+    // so among the commons of a name the fold's tie rule elects the first; see
+    // `SummaryGlobal::isCommon` for why nothing reads the difference.
     std::vector<linker::CrossCuDef> defs;
     for (std::uint32_t m = 0; m < summaries.size(); ++m) {
         for (SummaryFunction const& f : summaries[m].functions) {
@@ -115,12 +126,15 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
             defs.push_back(linker::CrossCuDef{
                 f.name, f.binding,
                 LinkedSymbolKey{CompilationUnitId{cuIdOf(m)}, SymbolId{f.symbol}}});
+            linker::stateTheLinksAnswers(defs.back(), linkFormat, f.weakKind);
         }
         for (SummaryGlobal const& g : summaries[m].globals) {
             if (g.name.empty() || g.binding == SymbolBinding::Local) continue;
             defs.push_back(linker::CrossCuDef{
                 g.name, g.binding,
                 LinkedSymbolKey{CompilationUnitId{cuIdOf(m)}, SymbolId{g.symbol}}});
+            linker::stateTheLinksAnswers(defs.back(), linkFormat, g.weakKind);
+            defs.back().tentative = g.isCommon;
         }
     }
     linker::CrossCuResolution const resolution = linker::resolveCrossCuDefs(defs);
@@ -135,6 +149,25 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
             "definitions across compilation units (CU #{} and CU #{}).",
             c.name, c.existing.cuId.v, c.incoming.cuId.v);
         reporter.report(std::move(d));
+    }
+    // The fold's two other refusals, recorded by it as data and worded by the
+    // ONE wording its three doors share (`linker::refusalOf`): a weak
+    // definition the link's format does not let a strong one replace, and a
+    // pair the link's document was asked about and does not decide.
+    auto const reportRefusal = [&](std::string const&     name,
+                                   linker::CrossCuRefusal refusal) {
+        out.conflictingNames.push_back(name);
+        ParseDiagnostic d;
+        d.code     = refusal.code;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = "buildSummaryIndex: " + std::move(refusal.text);
+        reporter.report(std::move(d));
+    };
+    for (linker::CrossCuCollision const& c : resolution.collisions) {
+        reportRefusal(c.name, linker::refusalOf(c, linkFormat));
+    }
+    for (linker::CrossCuUndecided const& u : resolution.undecided) {
+        reportRefusal(u.name, linker::refusalOf(u, linkFormat));
     }
     std::sort(out.conflictingNames.begin(), out.conflictingNames.end());
     out.conflictingNames.erase(

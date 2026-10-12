@@ -282,11 +282,22 @@ public:
     // linkage attributes consumed by the optimizer's DCE pass and the
     // downstream link-tier emitter. `isExternallyVisible(binding,
     // visibility)` is the DCE-protect predicate.
+    //
+    // ★ P69: `funcLinkage` IS THE ACCESSOR A COPY USES. It returns the WHOLE
+    // record (`MirLinkage`: binding, visibility, the weak kind, the tentative
+    // mark) and a site that re-adds a function hands it to
+    // `MirBuilder::addFunction` as it came — never the fields one by one, which
+    // is how a fact added later is dropped at one of nine sites in silence.
+    // `funcBinding` / `funcVisibility` stay for a reader that ASKS one question
+    // (DCE's keep predicate, the inliner's weak refusal); they read the record.
+    [[nodiscard]] MirLinkage funcLinkage(MirFuncId id) const {
+        return funcArena_.at(id).linkage;
+    }
     [[nodiscard]] SymbolBinding funcBinding(MirFuncId id) const {
-        return funcArena_.at(id).binding;
+        return funcArena_.at(id).linkage.binding;
     }
     [[nodiscard]] SymbolVisibility funcVisibility(MirFuncId id) const {
-        return funcArena_.at(id).visibility;
+        return funcArena_.at(id).linkage.visibility;
     }
     // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): TRUE iff the source declared this function
     // `__attribute__((noinline))`. The inliner's §2.9 legality gate REFUSES to
@@ -352,11 +363,49 @@ public:
     // discipline as `funcBinding` / `funcVisibility`. A global
     // with `isExternallyVisible(binding, visibility) == true` MUST
     // survive DCE / unused-symbol elimination.
+    // ★ P69: `globalLinkage` is the accessor a COPY uses — the whole record, on
+    // the terms `funcLinkage` states above. It is also the only reader of a
+    // global's weak kind and of its tentative mark.
+    [[nodiscard]] MirLinkage globalLinkage(MirGlobalId id) const {
+        return globalArena_.at(id).linkage;
+    }
+    // ── IS THIS GLOBAL A COMMON? — the ONE statement (P69 fold 3, lane `xa`) ──
+    //    D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED
+    //
+    // A COMMON is a tentative definition the link FOLDS with the other units'
+    // (C 6.9.2p2; the common extension, C11 J.5.11): `int x;` in two units is
+    // one object, and beside an initialized definition elsewhere it is that
+    // object. Two readers ask — the cross-unit merge, which folds two of them
+    // (`mergeCuMirs`), and the pipeline, which states a unit's as the COMMON
+    // row every object reader already produces (`ExternImport::commonSize`) —
+    // and they ask HERE so that they cannot disagree about which definitions
+    // those are. It is the tentative mark, on a definition that is
+    //   * STRONG-BOUND. A weak tentative definition
+    //     (`__attribute__((weak)) int t;`) is a WEAK definition: its kind
+    //     decides what it is beside every other, and no reference writes it as
+    //     a common.
+    //   * NOT THREAD-LOCAL. ✔MEASURED 2026-10-12: no reference writes a
+    //     thread-local tentative definition as a common — cl 19.44 and clang
+    //     19.1.5 put `_Thread_local int t;` in `.tls$`, gcc 13.3 and clang 18.1
+    //     on ELF in `.tbss` even under `-fcommon`, MinGW gcc 13.2 in its
+    //     emulated-TLS control object — and two units holding one are REFUSED
+    //     by link.exe, lld-link, GNU ld and ld.lld alike (7 of 7 cells), as two
+    //     strong definitions are. So it stays a definition, and the pair stays
+    //     refused. (Mach-O is NOT measured; it is held to the same answer.)
+    // The builders already refuse the mark on a local global and beside an
+    // initializer (`mirLinkageDefect`), so neither is asked again.
+    // (The conjunction itself is `mirLinkageIsCommon`, mir/mir_node.hpp, so that
+    // a reader holding the facts WITHOUT a module — the decoder of a stored
+    // summary — is judged by the same words.)
+    [[nodiscard]] bool globalIsCommon(MirGlobalId id) const {
+        detail::MirGlobal const& g = globalArena_.at(id);
+        return mirLinkageIsCommon(g.linkage, g.isThreadLocal);
+    }
     [[nodiscard]] SymbolBinding globalBinding(MirGlobalId id) const {
-        return globalArena_.at(id).binding;
+        return globalArena_.at(id).linkage.binding;
     }
     [[nodiscard]] SymbolVisibility globalVisibility(MirGlobalId id) const {
-        return globalArena_.at(id).visibility;
+        return globalArena_.at(id).linkage.visibility;
     }
     // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: true iff the source declared this
     // global `const`. The assembler's section selection routes an INITIALIZED
@@ -657,6 +706,29 @@ public:
     // one single-flag record somewhere, not that every record is single-flag. For
     // THIS flag that discipline is the only detector available at all, since no
     // codegen difference exists to observe.
+    //
+    // ★★ P69 (lane `xa`) — THE LINKAGE IS ONE RECORD, AND THERE ARE TWO FORMS.
+    //   * THE RECORD FORM (`MirLinkage linkage`, the first declaration below) is
+    //     the one a site that COPIES a function uses — it passes
+    //     `src.funcLinkage(f)` whole — and the one a producer that knows the
+    //     symbol's weak kind uses (HIR→MIR, the text reader, a synthesis pass
+    //     whose function is weak). It REFUSES, each by name: a weak binding that
+    //     states no kind (the object writers spell the two kinds differently on
+    //     PE, so "weak, kind unknown" has no honest spelling); a kind beside a
+    //     binding that is not weak (a kind nobody may read); and a `tentative`
+    //     mark, which is a global's fact.
+    //   * THE (binding, visibility) FORM stays as the form for a symbol that is
+    //     NEITHER weak NOR tentative — a synthesized entry, a funclet, a test's
+    //     plain function. It REFUSES a weak binding by name instead of guessing a
+    //     kind for it, so no caller can make a kindless weak definition through
+    //     the shorter spelling.
+    MirFuncId addFunction(TypeId signature, SymbolId symbol,
+                          MirLinkage       linkage,
+                          bool             noInline     = false,
+                          bool             alwaysInline = false,
+                          bool             noOptimize   = false,
+                          bool             noSanitizeThread = false,
+                          StaticInitSchedule staticInit = {});
     MirFuncId addFunction(TypeId signature, SymbolId symbol,
                           SymbolBinding    binding      = SymbolBinding::Global,
                           SymbolVisibility visibility   = SymbolVisibility::Default,
@@ -709,6 +781,25 @@ public:
     // alignmentBytes)` — `MirThreadStorage` admits neither conversion, so
     // both mistakes are compile errors (see the enum's doc in mir_node.hpp;
     // propagation sites bridge via `mirThreadStorageOf(bool)`).
+    //
+    // ★★ P69 (lane `xa`) — THE LINKAGE IS ONE RECORD, in two forms, on the terms
+    // `addFunction` states above: the RECORD form is what a site that copies a
+    // global passes (`src.globalLinkage(g)`, whole) and what a producer that
+    // knows the weak kind or the tentative mark passes; the (binding,
+    // visibility) form is for a global that is neither weak nor tentative and
+    // refuses a weak binding. The record form refuses, each by name: a weak
+    // binding with no kind; a kind beside a binding that is not weak; a
+    // `tentative` mark on a module-private (`Local`) global, which the link
+    // never folds; and a `tentative` mark beside an initializer of either shape
+    // — a tentative definition is by its definition the one with none (C
+    // 6.9.2p2).
+    MirGlobalId addGlobal(TypeId type, SymbolId symbol,
+                          std::uint32_t initLiteralIndex,
+                          MirFuncId     initFunc,
+                          MirLinkage       linkage,
+                          bool             isConst,
+                          MirThreadStorage threadStorage,
+                          std::uint32_t    alignmentBytes = 0);
     MirGlobalId addGlobal(TypeId type, SymbolId symbol,
                           std::uint32_t initLiteralIndex,
                           MirFuncId     initFunc,
@@ -717,6 +808,20 @@ public:
                           bool             isConst,
                           MirThreadStorage threadStorage,
                           std::uint32_t    alignmentBytes = 0);
+
+    // ── THE ONE DOOR THAT DOES NOT ASK THE LINKAGE RULE (P69 fold 3) ───────────
+    //
+    // Replaces the linkage record of a function or a global this builder
+    // already holds, UNJUDGED: `mirLinkageDefect` is not asked. It exists for
+    // the reason `addInst` takes a raw payload — so that the VERIFIER's half of
+    // a rule the builders also hold can be reached and shown to fire. Both
+    // `addFunction` and `addGlobal` abort on an ill-formed record, which left
+    // `MirVerifier`'s refusal of one (`checkLinkageRecords`) with no module that
+    // could reach it, and a refusal nothing can reach is one nobody can pin.
+    // NO PRODUCER CALLS IT: a module that comes out of one of these is the
+    // verifier's to refuse, by name.
+    void restateLinkageUnjudged(MirFuncId function, MirLinkage linkage);
+    void restateLinkageUnjudged(MirGlobalId global, MirLinkage linkage);
 
     // Reserve a basic block in the current function WITHOUT opening it, returning
     // its id so terminators can target it before it is filled (forward branches).

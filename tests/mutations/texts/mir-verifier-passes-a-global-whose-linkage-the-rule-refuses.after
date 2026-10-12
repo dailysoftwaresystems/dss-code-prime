@@ -1,0 +1,2 @@
+                             hasInitializer);
+        if (true || defect.empty()) continue;

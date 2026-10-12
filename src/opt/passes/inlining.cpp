@@ -1057,7 +1057,9 @@ public:
         // second, independently-editable copy site for all four trailing flags —
         // and the only one for which no pass-behaviour test could notice a drop.
         dst_.addFunction(src_.funcSignature(caller), src_.funcSymbol(caller),
-                         src_.funcBinding(caller), src_.funcVisibility(caller),
+                         // P69: the linkage is copied as its ONE record
+                         // (binding, visibility, weak kind).
+                         src_.funcLinkage(caller),
                          src_.funcNoInline(caller), src_.funcAlwaysInline(caller),
                          src_.funcNoOptimize(caller),
                          src_.funcNoSanitizeThread(caller),

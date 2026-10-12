@@ -32,7 +32,7 @@
 //
 // Text grammar (representative):
 //
-//   dssir 5
+//   dssir 6
 //   types {
 //     type 1 = struct "Node" {i32, ptr<type 1>}
 //     type 2 = union "U" {i32, f32}
@@ -68,6 +68,30 @@
 // designate any member; the field's type cannot say which, since two members may share one). The
 // reader refuses `member` on a non-union literal and a union literal with a field but no member;
 // the static-data encoder refuses a member the union does not have.
+//
+// ★ v6 (P69, lane `xa`): A WEAK DEFINITION STATES ITS KIND, AND A TENTATIVE ONE SAYS SO. In the
+// attribute list of a function or a global the binding word `weak` takes one argument, the kind
+// of weak definition (`WeakDefinitionKind`, core/types/symbol_attrs.hpp): `weak(overridable)` — a
+// default any other definition of the name replaces — or `weak(select-any)` — one of several
+// equal copies. A global's list may also hold the word `tentative`: a definition its unit never
+// completed (C 6.9.2p2), which the link folds with the other units'. Both are fields of the ONE
+// linkage record a definition carries (`MirLinkage`, mir/mir_node.hpp), and the reader judges the
+// record it read by the rule the builders and the verifier ask (`mirLinkageDefect`), so each of
+// these is refused BY NAME with the line it stands on:
+//   * a bare `weak` (a v5 spelling) — a weak definition that states no kind;
+//   * a kind this build does not name, an argument on a binding word that is not `weak`, an
+//     argument left unclosed, a second binding word in one list;
+//   * `tentative` on a function, on a `local` global, or beside an initializer.
+// A v5 text is refused by the version check: its `weak` named neither kind, and the object formats
+// spell the two differently.
+//
+// HISTORY of the format's version (the reader accepts exactly the current one):
+//   1  the first form.
+//   2  composites defined once, in a `types` section (above).
+//   3  an enumeration's fixed underlying type is spelled (`enum "E" fixed i64`).
+//   4  `unreachable trap`; `float nanbits <u64>`.
+//   5  a union value names its member (above).
+//   6  a weak definition states its kind; `tentative` (above).
 //
 // ★★ ONE INSTRUCTION PER LINE, and it is a RULE of this grammar rather than a
 // habit of the emitter. `parseInstruction` refuses any instruction whose line

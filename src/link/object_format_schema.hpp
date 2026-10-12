@@ -518,28 +518,32 @@ inline constexpr EnumNameTable<SupersededDefinition, 2> kSupersededDefinitionTab
 }}};
 DSS_CHECK_ENUM_NAME_TABLE(kSupersededDefinitionTable);
 
-// WHAT ONE DOCUMENT STATES OF IT: nothing, one answer for every definition, or
-// one answer per kind of weak definition. The ONE place a reader of the key
-// gets its answer from, so that no reader spells the per-kind lookup — or a
-// default for a kind the document left out — for itself.
-struct SupersededDefinitionStatement {
+// WHAT ONE DOCUMENT STATES OF A FACT THAT MAY DEPEND ON THE KIND OF WEAK
+// DEFINITION: nothing, one answer for every definition, or one answer per kind.
+// The ONE place a reader of such a key gets its answer from, so that no reader
+// spells the per-kind lookup — or a default for a kind the document left out —
+// for itself. A template since P69 fold 3, when a SECOND key took the same two
+// forms (`weakDefinitionBesideStrong`): the lookup is one rule, and a second
+// struct beside this one would have been its second statement.
+template <class Answer>
+struct WeakKindStatement {
     // The string form: the answer whatever the definition's kind.
-    std::optional<SupersededDefinition> forEveryDefinition;
+    std::optional<Answer> forEveryDefinition;
     // The object form: an answer per kind, in the document's order. The loader
     // requires every kind of `kWeakDefinitionKindTable` exactly once.
-    std::vector<std::pair<WeakDefinitionKind, SupersededDefinition>> byKind;
+    std::vector<std::pair<WeakDefinitionKind, Answer>> byKind;
 
     [[nodiscard]] bool stated() const noexcept {
         return forEveryDefinition.has_value() || !byKind.empty();
     }
     [[nodiscard]] bool perKind() const noexcept { return !byKind.empty(); }
 
-    // The document's answer for a superseded definition of `kind` — what the
-    // definition's own row states (`ModuleSymbol::weakKind`), empty where its
-    // producer's form has one spelling for every weak definition. nullopt: the
-    // document does not say — it states nothing, or it states an answer per
-    // kind and this definition states none.
-    [[nodiscard]] std::optional<SupersededDefinition>
+    // The document's answer for a definition of `kind` — what the definition's
+    // own row states (`ModuleSymbol::weakKind`), empty where its producer's form
+    // has one spelling for every weak definition. nullopt: the document does not
+    // say — it states nothing, or it states an answer per kind and this
+    // definition states none.
+    [[nodiscard]] std::optional<Answer>
     answerFor(std::optional<WeakDefinitionKind> kind) const noexcept {
         if (forEveryDefinition.has_value()) return forEveryDefinition;
         if (!kind.has_value()) return std::nullopt;
@@ -549,6 +553,67 @@ struct SupersededDefinitionStatement {
         return std::nullopt;
     }
 };
+using SupersededDefinitionStatement = WeakKindStatement<SupersededDefinition>;
+
+// ★★★ WHAT A WEAK DEFINITION IS BESIDE A STRONG DEFINITION OF ITS NAME — a
+// FORMAT fact, the root key `weakDefinitionBesideStrong` (P69 fold 3, lane `xa`;
+// D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER),
+// stated by the documents a link resolves units for: an image, or a relocatable
+// artifact of several units — the documents that state `commonYieldsTo`.
+// "A strong definition overrides a weak one" is ELF's rule and Mach-O's, and it
+// was written into the cross-unit fold as if it were every format's. TWO
+// ANSWERS:
+//   * `yields`   — the strong definition replaces the weak one, which is not an
+//     error and not reported.
+//   * `collides` — the two are a DUPLICATE DEFINITION and the link is refused.
+// A DOCUMENT STATES ONE FOR EVERY DEFINITION, OR ONE PER KIND OF WEAK
+// DEFINITION (`WeakDefinitionKind`), in the two forms `supersededDefinition`
+// takes:
+//     "weakDefinitionBesideStrong": "yields"
+//     "weakDefinitionBesideStrong": { "overridable": "yields",
+//                                     "select-any":  "collides" }
+// ✔MEASURED, each answer on its format's reference linkers:
+//   * ELF, `yields`. 2026-10-08 — a weak definition of `shared` beside
+//     `int shared = 9;`: the name reads 9 under GNU ld 2.42 and ld.lld 18.1
+//     (gcc 13.3 and clang 18.1 objects, both orders).
+//   * Mach-O, `yields`. 2026-10-08 — a `.weak_definition` beside a strong
+//     definition of the name: 9 under ld-1267 (arm64 and x86_64) and
+//     ld64-957.1, both orders.
+//   * PE/COFF, PER KIND.
+//       - `overridable`: `yields`. 2026-10-08 — a weak external whose default
+//         is a body (MinGW gcc's and clang's `__attribute__((weak))`) beside a
+//         strong definition reads the strong one's 9 under GNU ld 2.42,
+//         link.exe 14.44 and lld-link 19.1.5: the default is used only "if sym1
+//         is not present at link time" (PE/COFF 5.5.3).
+//       - `select-any`: `collides`. 2026-10-12 — `__declspec(selectany) int v =
+//         1;` beside `int v = 2;` is REFUSED in 16 of 16 cells: link.exe
+//         14.44.35228 (LNK2005) and lld-link 19.1.5 ("duplicate symbol") on
+//         cl 19.44's and clang 19.1.5's objects, GNU ld 2.42 ("multiple
+//         definition") and lld-link on MinGW gcc 13.2's and clang's, both
+//         object orders. A COMDAT selection says how the COPIES of a definition
+//         relate to each other; a definition outside every COMDAT is not one of
+//         the copies. Until the key existed this link took the strong
+//         definition in silence — an invalid link accepted, exit 22 where every
+//         reference refuses.
+// A document that does not state it leaves a link to REFUSE the moment the
+// question arises — a weak definition beside a strong one of its name — naming
+// this key, rather than guess between the two. Under a per-kind statement a
+// definition that states NO kind has no answer and is refused the same way.
+// Read by `linker::weakBesideAStrongDefinition` (`link/common_yield.hpp`), which
+// the unit linker's fold (`link/linker.cpp`) and the cross-unit MIR merge
+// (`mir/merge/mir_merge.cpp`) both ask.
+enum class WeakBesideStrong : std::uint8_t {
+    Yields,
+    Collides,
+};
+
+inline constexpr EnumNameTable<WeakBesideStrong, 2> kWeakBesideStrongTable{{{
+    { WeakBesideStrong::Yields,   "yields"   },
+    { WeakBesideStrong::Collides, "collides" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kWeakBesideStrongTable);
+
+using WeakBesideStrongStatement = WeakKindStatement<WeakBesideStrong>;
 
 // ★★★ WHAT A PC-RELATIVE, NON-BRANCH REFERENCE TO AN IMPORT MEANS IN AN IMAGE —
 // a FORMAT fact, the root key `pcRelativeImportAddress` (P69 review M1 case (c)
@@ -2404,6 +2469,12 @@ struct DSS_EXPORT ObjectFormatData {
     // relocatable object's writer when it holds a body under a weak name its
     // unit references by row.
     SupersededDefinitionStatement supersededDefinition;
+    // What a weak definition is beside a strong definition of its name (the
+    // `weakDefinitionBesideStrong` root key — see `WeakBesideStrong`). OPTIONAL:
+    // unstated, a link refuses when a weak definition meets a strong one of its
+    // name; refused on an ARCHIVE document (`validate()`), whose members are
+    // each linked alone.
+    WeakBesideStrongStatement weakDefinitionBesideStrong;
 
     // Sections row (D-LK4-2). The walker reads sections by
     // SectionKind; `name`/`type`/`flags`/`addrAlign`/`entrySize`
@@ -3386,6 +3457,15 @@ public:
     [[nodiscard]] SupersededDefinitionStatement const&
     supersededDefinition() const noexcept {
         return d_.supersededDefinition;
+    }
+
+    // What this document states of a weak definition beside a strong one of its
+    // name (`weakDefinitionBesideStrong`): nothing, one answer, or one per kind
+    // of weak definition. Asked through `linker::weakBesideAStrongDefinition`
+    // (`link/common_yield.hpp`), the one reader, never spelled by a caller.
+    [[nodiscard]] WeakBesideStrongStatement const&
+    weakDefinitionBesideStrong() const noexcept {
+        return d_.weakDefinitionBesideStrong;
     }
 
     [[nodiscard]] ObjectFormatRelocationInfo const*

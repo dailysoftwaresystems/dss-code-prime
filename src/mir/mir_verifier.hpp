@@ -233,6 +233,17 @@ private:
     // is a fact about what a `void` pointee MEANS.
     void checkStoreValueTypes(DiagnosticReporter& reporter) const;
 
+    // P69 (lane `xa`): the LINKAGE RECORD of every function and every global is
+    // well formed — a weak definition states its kind, a kind stands beside no
+    // other binding, and the tentative mark sits only on an external global
+    // that states no initializer. The rule itself is `mirLinkageDefect`
+    // (mir/mir_node.hpp), the ONE statement the builders and the text reader
+    // ask too; this check exists for a module that reached the verifier by a
+    // road that asked neither (a decoded body, a pass that writes a record of
+    // its own). Emits I_VerifierFailure, naming the definition and carrying the
+    // rule's sentence.
+    void checkLinkageRecords(DiagnosticReporter& reporter) const;
+
     Mir const&          mir_;
     TypeInterner const* interner_;
     // The findings THIS run reported that the policy makes Errors; reset by

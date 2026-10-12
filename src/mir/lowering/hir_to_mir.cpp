@@ -15656,7 +15656,10 @@ struct Lowerer {
         // feature dead in the shipped pipeline while hand-built unit tests stayed
         // green. `la` is already threaded, so the schedule travels with the
         // linkage it belongs beside.
-        mir.addFunction(signature, symbol, la.binding, la.visibility, noInline,
+        // P69 (lane `xa`): the linkage goes down as ONE record — binding,
+        // visibility and the weak definition's KIND (`la.weakKind`), which had
+        // no reader below this tier (`mirLinkageFrom`, mir/mir_node.hpp).
+        mir.addFunction(signature, symbol, mirLinkageFrom(la), noInline,
                         alwaysInline, noOptimize, noSanitizeThread,
                         la.staticInit);
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
@@ -17848,20 +17851,25 @@ struct Lowerer {
                 ok = false;
                 continue;
             }
+            // P69 (lane `xa`): the linkage goes down as ONE record at each of
+            // the three arms — binding, visibility, the weak definition's KIND
+            // and the TENTATIVE mark (`pg.linkage.weakKind` / `.tentative`),
+            // neither of which had a reader below this tier (`mirLinkageFrom`,
+            // mir/mir_node.hpp).
             if (pg.constInit.has_value()) {
                 std::uint32_t const idx = mir.literalPoolAdd(*pg.constInit);
                 mir.addGlobal(pg.type, pg.symbol, idx, {},
-                              pg.linkage.binding, pg.linkage.visibility,
+                              mirLinkageFrom(pg.linkage),
                               pg.isConst, mirThreadStorageOf(pg.isThreadLocal),
                               pg.explicitAlignment);
             } else if (pg.runtimeInit.valid()) {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, moduleInitFunc,
-                              pg.linkage.binding, pg.linkage.visibility,
+                              mirLinkageFrom(pg.linkage),
                               pg.isConst, mirThreadStorageOf(pg.isThreadLocal),
                               pg.explicitAlignment);
             } else {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, {},
-                              pg.linkage.binding, pg.linkage.visibility,
+                              mirLinkageFrom(pg.linkage),
                               pg.isConst, mirThreadStorageOf(pg.isThreadLocal),
                               pg.explicitAlignment);
             }

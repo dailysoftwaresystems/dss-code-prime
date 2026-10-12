@@ -702,9 +702,56 @@ void MirBuilder::closeFunction_() {
     openFunc_ = MirFuncId{};
 }
 
+namespace {
+
+// The builders' side of the ONE linkage rule (`mirLinkageDefect`,
+// mir/mir_node.hpp): a record the rule refuses is a producer's bug, so it
+// aborts with the rule's own sentence, the builder verb and the symbol id.
+void requireWellFormedLinkage(MirLinkage const& linkage, MirLinkageOwner owner,
+                              bool hasInitializer, char const* verb,
+                              SymbolId symbol) {
+    std::string_view const defect = mirLinkageDefect(linkage, owner, hasInitializer);
+    if (defect.empty()) return;
+    std::fprintf(stderr,
+                 "dss::MirBuilder fatal: %s: symbol id %u: %.*s\n",
+                 verb, symbol.v, static_cast<int>(defect.size()), defect.data());
+    std::abort();
+}
+
+// The (binding, visibility) form of both builders is the form for a symbol that
+// is neither weak nor tentative. A weak binding through it would have to be
+// given a kind nobody stated, so it is refused here, by name, before the record
+// is made.
+void refuseAWeakBindingWithoutARecord(SymbolBinding binding, char const* verb,
+                                      SymbolId symbol) {
+    if (binding != SymbolBinding::Weak) return;
+    std::fprintf(stderr,
+                 "dss::MirBuilder fatal: %s: symbol id %u: a weak binding was passed "
+                 "through the (binding, visibility) form, which carries no "
+                 "weak-definition kind — pass the linkage record (MirLinkage) and "
+                 "state the kind (overridable or select-any)\n",
+                 verb, symbol.v);
+    std::abort();
+}
+
+}  // namespace
+
 MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol,
                                   SymbolBinding    binding,
                                   SymbolVisibility visibility,
+                                  bool             noInline,
+                                  bool             alwaysInline,
+                                  bool             noOptimize,
+                                  bool             noSanitizeThread,
+                                  StaticInitSchedule staticInit) {
+    refuseAWeakBindingWithoutARecord(binding, "addFunction", symbol);
+    return addFunction(signature, symbol, MirLinkage{binding, visibility},
+                       noInline, alwaysInline, noOptimize, noSanitizeThread,
+                       staticInit);
+}
+
+MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol,
+                                  MirLinkage       linkage,
                                   bool             noInline,
                                   bool             alwaysInline,
                                   bool             noOptimize,
@@ -718,14 +765,15 @@ MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol,
                    stderr);
         std::abort();
     }
+    requireWellFormedLinkage(linkage, MirLinkageOwner::Function,
+                             /*hasInitializer=*/false, "addFunction", symbol);
     closeFunction_();
     detail::MirFunc f;
     f.signature  = signature;
     f.symbol     = symbol.v;
     f.blockStart = static_cast<std::uint32_t>(blockArena_.size());  // next block slot
     f.blockCount = 0;
-    f.binding    = binding;
-    f.visibility = visibility;
+    f.linkage    = linkage;
     f.noInline   = noInline;
     f.alwaysInline = alwaysInline;   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
     f.noOptimize   = noOptimize;     // TF-C85 (#pragma optimize region)
@@ -750,6 +798,19 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
                                   bool             isConst,
                                   MirThreadStorage threadStorage,
                                   std::uint32_t    alignmentBytes) {
+    refuseAWeakBindingWithoutARecord(binding, "addGlobal", symbol);
+    return addGlobal(type, symbol, initLiteralIndex, initFunc,
+                     MirLinkage{binding, visibility}, isConst, threadStorage,
+                     alignmentBytes);
+}
+
+MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
+                                  std::uint32_t initLiteralIndex,
+                                  MirFuncId initFunc,
+                                  MirLinkage       linkage,
+                                  bool             isConst,
+                                  MirThreadStorage threadStorage,
+                                  std::uint32_t    alignmentBytes) {
     if (!type.valid()) {
         std::fputs("dss::MirBuilder fatal: addGlobal: type TypeId must be valid\n",
                    stderr);
@@ -770,18 +831,31 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
         std::abort();
     }
     if (initFunc.valid()) checkSameModule_(initFunc.arenaTag, "addGlobal initFunc");
+    requireWellFormedLinkage(linkage, MirLinkageOwner::Global,
+                             initLiteralIndex != UINT32_MAX || initFunc.valid(),
+                             "addGlobal", symbol);
     detail::MirGlobal g;
     g.type             = type;
     g.symbol           = symbol.v;
     g.initLiteralIndex = initLiteralIndex;
     g.initFunc         = initFunc;
-    g.binding          = binding;
-    g.visibility       = visibility;
+    g.linkage          = linkage;
     g.isConst          = isConst;
     g.isThreadLocal    = (threadStorage == MirThreadStorage::PerThread);
     g.alignment        = alignmentBytes;
     keepSymbolIdsClearOf(symbol);   // the id space is past every symbol the module defines
     return globalArena_.addNode(g);
+}
+
+// The unjudged door (mir/mir.hpp says why it exists and that no producer calls
+// it). The id must be one this builder made; nothing else is asked.
+void MirBuilder::restateLinkageUnjudged(MirFuncId function, MirLinkage linkage) {
+    checkSameModule_(function.arenaTag, "restateLinkageUnjudged function");
+    funcArena_.at(function).linkage = linkage;
+}
+void MirBuilder::restateLinkageUnjudged(MirGlobalId global, MirLinkage linkage) {
+    checkSameModule_(global.arenaTag, "restateLinkageUnjudged global");
+    globalArena_.at(global).linkage = linkage;
 }
 
 MirBlockId MirBuilder::createBlock(StructCfMarker marker) {

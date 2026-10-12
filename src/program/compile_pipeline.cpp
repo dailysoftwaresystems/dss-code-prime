@@ -1977,23 +1977,35 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // externally-visible synthesized globals, so an empty name is no longer a breach.
     // The merge's own `MirVerifier` + `mergedSymbolOf` fail-louds guard merged-module
     // integrity in that arm's place.)
+    //
+    // ★★ P69 (lane `xa`) — THE WEAK DEFINITION'S KIND REACHES THE ROW HERE, AND
+    // THIS IS ITS COMPILED ORIGIN. `ModuleSymbol::weakKind` is what the object
+    // writers spell a weak definition by (PE: a COMDAT for select-any, a weak
+    // external with a default for overridable) and what the link ranks it by
+    // (`linker::weakDefinitionRank`, `commonYieldsToDefinition`). Until this
+    // block read it, only a row an object READER made stated one: every
+    // DSS-COMPILED weak definition reached the writer and the link with no kind
+    // — `__attribute__((weak))` written as a select-any COMDAT on PE, and
+    // ✔MEASURED 2026-10-12 a select-any definition losing to an overridable one
+    // by link order (exit 44 with the overridable unit first, 11 otherwise). The
+    // row is made from the MIR definition's ONE linkage record, so the three
+    // facts cannot arrive in parts.
     {
-        auto appendSym = [&](SymbolId sym, SymbolBinding bind,
-                             SymbolVisibility vis) {
+        auto appendSym = [&](SymbolId sym, MirLinkage const& linkage) {
             std::string name = nameOf(sym);
             if (name.empty()) return;  // module-private (synthesized / no record)
-            assembled.symbols.push_back(
-                ModuleSymbol{sym, std::move(name), bind, vis});
+            ModuleSymbol row{sym, std::move(name), linkage.binding,
+                             linkage.visibility};
+            row.weakKind = linkage.statedWeakKind();
+            assembled.symbols.push_back(std::move(row));
         };
         for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
             MirFuncId const fid = mir.funcAt(i);
-            appendSym(mir.funcSymbol(fid), mir.funcBinding(fid),
-                      mir.funcVisibility(fid));
+            appendSym(mir.funcSymbol(fid), mir.funcLinkage(fid));
         }
         for (std::uint32_t i = 0; i < mir.moduleGlobalCount(); ++i) {
             MirGlobalId const gid = mir.globalAt(i);
-            appendSym(mir.globalSymbol(gid), mir.globalBinding(gid),
-                      mir.globalVisibility(gid));
+            appendSym(mir.globalSymbol(gid), mir.globalLinkage(gid));
         }
     }
 
@@ -4911,13 +4923,14 @@ bool compileSingleUnit(CompilationUnit const&        cu,
 // Reached only from `--lto=thin`. Every build that does not ask for it takes the
 // identical path it took before this function existed — including the
 // `PhaseTimers::read(Optimize).runs` count three driver-supply tests pin.
-bool runThinLtoImportStage(std::span<CuMirModule>  cuMirs,
-                           TargetSchema const&     target,
-                           CSymbolDecorationScheme cSymDecor,
-                           std::string_view        targetIdentity,
-                           CompileOptions const&   opts,
-                           substrate::IExecutor*   executor,
-                           DiagnosticReporter&     reporter) {
+bool runThinLtoImportStage(std::span<CuMirModule>     cuMirs,
+                           TargetSchema const&        target,
+                           ObjectFormatSchema const&  linkFormat,
+                           CSymbolDecorationScheme    cSymDecor,
+                           std::string_view           targetIdentity,
+                           CompileOptions const&      opts,
+                           substrate::IExecutor*      executor,
+                           DiagnosticReporter&        reporter) {
     if (cuMirs.size() < 2) return true;   // nothing crosses a boundary
 
     // ── (1) THE POLICY, 100% FROM THE PIPELINE DOCUMENT ─────────────────────
@@ -5027,7 +5040,8 @@ bool runThinLtoImportStage(std::span<CuMirModule>  cuMirs,
             &cuMirs[i].libraryShimRecipes});
     }
 
-    auto index = ::dss::mirsum::buildSummaryIndex(summaries, policy, reporter);
+    auto index = ::dss::mirsum::buildSummaryIndex(summaries, policy, linkFormat,
+                                                  reporter);
     if (!index.has_value()) return false;
     if (!::dss::mirsum::summariesDescribeModules(views, summaries, reporter))
         return false;
@@ -5053,7 +5067,7 @@ bool runThinLtoImportStage(std::span<CuMirModule>  cuMirs,
     auto runOne = [&](std::size_t i) {
         outcomes[i] = ::dss::mirsum::lazyImportOptimize(
             static_cast<std::uint32_t>(i), views, summaries, *index, policy,
-            srcLanguage,
+            srcLanguage, linkFormat,
             [&](Mir& m, TypeInterner const& in,
                 std::span<ExternImport const> ex) {
                 // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS:

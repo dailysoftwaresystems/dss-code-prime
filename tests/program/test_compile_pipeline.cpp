@@ -44,6 +44,7 @@
 #include "program/compile_pipeline.hpp"
 #include "program/program.hpp"
 #include "scratch_dir.hpp"
+#include "link_facts.hpp"   // ordinaryLinkFormat (P69: mergeCuMirs reads the link's document)
 
 #include <gtest/gtest.h>
 
@@ -2716,7 +2717,8 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
     auto merged = mergeCuMirs(
         std::span<MergeCuInput const>{inputs.data(), inputs.size()},
         std::move(host),
-        std::span<std::string const>{entryNames.data(), entryNames.size()}, rep);
+        std::span<std::string const>{entryNames.data(), entryNames.size()},
+        dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     // (1a) Both `main` AND `add5` are DEFINED in the single merged module — the
@@ -2874,7 +2876,8 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
         return mergeCuMirs(
             std::span<MergeCuInput const>{inputs.data(), inputs.size()},
             std::move(host),
-            std::span<std::string const>{entryNames.data(), entryNames.size()}, rep);
+            std::span<std::string const>{entryNames.data(), entryNames.size()},
+            dss::test_support::ordinaryLinkFormat(), rep);
     };
 
     // The cross_cu_call merged module always carries exactly one main→add5 Call before
@@ -3014,7 +3017,8 @@ TEST(Program_WholeProgramMerge, ShippedStageRoutingInlinesCrossCuAtProgramStage)
     auto merged = mergeCuMirs(
         std::span<MergeCuInput const>{inputs.data(), inputs.size()},
         std::move(host),
-        std::span<std::string const>{entryNames.data(), entryNames.size()}, rep);
+        std::span<std::string const>{entryNames.data(), entryNames.size()},
+        dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     // ── PROGRAM direction: the full document over the merged module. ──

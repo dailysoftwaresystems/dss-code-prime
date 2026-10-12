@@ -1071,6 +1071,14 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 }
             }
         }
+        // The same statement for the unit's ITEMS, which is where a member with
+        // no named definition can be asked (`AssembledModule::
+        // sectionGroupOfInputSection`): a member section is named by its index,
+        // the key every atom cut from it carries (`InputSectionSlice::section`,
+        // set from that index when the atoms are tied to their sections below).
+        for (auto const& [section, signature] : signatureOfSection) {
+            mod.sectionGroupOfInputSection.emplace(section, signature);
+        }
         if (!signatureOfSection.empty()) {
             std::unordered_map<std::uint32_t, std::string const*> signatureOfId;
             for (std::size_t i = 0; i < numSyms; ++i) {

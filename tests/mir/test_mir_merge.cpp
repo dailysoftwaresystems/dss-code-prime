@@ -49,6 +49,7 @@
 #include "mir/mir_verifier.hpp"
 
 #include "diagnostic_count.hpp"
+#include "link_facts.hpp"   // ordinaryLinkFormat (P69: mergeCuMirs reads the link's document)
 
 #include <gtest/gtest.h>
 
@@ -389,7 +390,7 @@ TEST(MirMerge, MergeRewiresCrossCuCallToDirect) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -466,7 +467,7 @@ TEST(MirMerge, MergeDedupsSameNamedFfiImports) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -553,7 +554,7 @@ TEST(MirMerge, MergeOrCombinesEagerImportBitAcrossCollapse) {
         std::vector<std::string> const entries = {"main"};
         DiagnosticReporter rep;
         auto merged =
-            mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+            mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
         EXPECT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
         if (!merged.has_value()) return false;
         std::size_t putsRows = 0;
@@ -631,7 +632,7 @@ mergeTwoImportCus(ExternImport a, ExternImport b, DiagnosticReporter& rep) {
     std::vector<std::string> const entries = {"main"};
     // Every piece the merge reads is alive for the whole call; the returned
     // module owns its own `Mir` + host lattice, so the locals may die here.
-    return mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    return mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
 }
 
 // The merged symbol that `fnName`'s first Call actually binds to — the thing a
@@ -1171,7 +1172,7 @@ TEST(MirMerge, MergeClonesMultiBlockCallee) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1265,7 +1266,7 @@ TEST(MirMerge, MergeRederivesStaleInputMarkers) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     // (a) the merge SUCCEEDS: its internal stored==derived verifier passes
     // BECAUSE the post-clone rederive corrected the stale stamp first.
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
@@ -1332,7 +1333,7 @@ TEST(MirMerge, MergeReinternsTypesIntoHost) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{77}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{77}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1365,7 +1366,7 @@ TEST(MirMerge, MergeDropsShadowedWeak) {
         TypeId const i32  = in.primitive(TypeKind::I32);
         TypeId const sig  = in.fnSig({}, i32, CallConv::CcSysV);
         MirBuilder mb;
-        mb.addFunction(sig, SymbolId{50}, binding, SymbolVisibility::Default);
+        mb.addFunction(sig, SymbolId{50}, dss::test_support::linkageOf(binding));
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
         mb.addReturn(mb.addConst(i32Lit(ret), i32));
@@ -1385,7 +1386,7 @@ TEST(MirMerge, MergeDropsShadowedWeak) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
     EXPECT_EQ(rep.errorCount(), 0u) << "weak-vs-strong is NOT a conflict";
 
@@ -1443,7 +1444,7 @@ TEST(MirMerge, MergeRemapsGlobalInitFunc) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1517,7 +1518,7 @@ TEST(MirMerge, MergeRemapsSymbolAddressGlobalTarget) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1629,7 +1630,7 @@ TEST(MirMerge, MergeKeepsLocalStaticGlobalDistinctFromSameNamedExtern) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
     Mir const& mm = merged->mir;
 
@@ -1728,7 +1729,7 @@ TEST(MirMerge, MergePreservesFunctionNoOptimize) {
     };
     std::vector<std::string> const entries = {"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1789,7 +1790,7 @@ TEST(MirMerge, MergePreservesFunctionNoSanitizeThread) {
     };
     std::vector<std::string> const entries = {"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{56}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{56}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1832,7 +1833,7 @@ TEST(MirMerge, MergePreservesGlobalConstness) {
     };
     std::vector<std::string> const entries = {"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1880,7 +1881,7 @@ TEST(MirMerge, MergePreservesGlobalThreadLocal) {
     };
     std::vector<std::string> const entries = {"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1923,7 +1924,7 @@ TEST(MirMerge, MergeReportsTwoStrongConflict) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
 
     EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::K_SymbolRedefinedAcrossUnits),
               1u)
@@ -4845,7 +4846,7 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
 
     std::vector<std::string> const entries{"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value())
         << "the merge must NOT abort on a referenced-only shim GlobalAddr (multi-CU defect)";
     EXPECT_EQ(rep.errorCount(), 0u);
@@ -4934,7 +4935,7 @@ TEST(MirMerge, TheMergedModuleCarriesTheEndOfTheMergesAllocation) {
 
     std::vector<std::string> const entries{"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
     ASSERT_EQ(rep.errorCount(), 0u);
 
@@ -5187,7 +5188,7 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
 
     std::vector<std::string> const entries{"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value());
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -5261,7 +5262,7 @@ TEST(MirMerge, MergePreservesVocabularyIdentityAcrossCus) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{88}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{88}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;

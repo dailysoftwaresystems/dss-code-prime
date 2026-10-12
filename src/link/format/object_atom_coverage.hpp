@@ -292,34 +292,63 @@ struct AtomStartCandidate {
 // ★ WHICH NAME OWNS THE ATOM. Ranked, and the ranking is an argument rather
 // than a convenience:
 //
-//   1. EXTERNALLY VISIBLE beats module-private. The owning id is the only one
-//      that gets a body, a `SymbolKind::Defined` row in the linker's compound
-//      index, an address, and a `.symtab`/`.dynsym` entry under its real name.
-//      Give the body to clang's local `ltmp0` and the external `_outer` becomes
-//      a name with nothing behind it: the re-emitted object exports the body as
-//      an internal `sym_<id>`, and every foreign reference to `_outer` fails to
-//      resolve. Give it to `_outer` and the object is correct; `ltmp0` losing
-//      its separate identity costs nothing, because a compiler-private section
-//      label denotes exactly the address `_outer` already denotes.
-//   2. STRONG beats WEAK among externally-visible names -- the genuine weak
-//      alias (`void f() __attribute__((weak, alias("g"))))`). Both names are
-//      real ABI, so this one is a tie-break rather than a correctness rule, and
-//      it goes to the strong name because that is the definition the alias was
-//      declared against; the weak name keeps its own `Weak` binding on its row
-//      and still exports at the same address.
-//   3. Otherwise the LOWEST symbol id -- the order the OBJECT listed them in.
+//   1. A name with EXTERNAL LINKAGE beats a module-private one. The owning id
+//      is the only one that gets a body, a `SymbolKind::Defined` row in the
+//      linker's compound index, an address, and a `.symtab`/`.dynsym` entry
+//      under its real name. Give the body to clang's local `ltmp0` and the
+//      external `_outer` becomes a name with nothing behind it: the re-emitted
+//      object exports the body as an internal `sym_<id>`, and every foreign
+//      reference to `_outer` fails to resolve. Give it to `_outer` and the
+//      object is correct; `ltmp0` losing its separate identity costs nothing,
+//      because a compiler-private section label denotes exactly the address
+//      `_outer` already denotes.
+//      ★ LINKAGE, NOT VISIBILITY (P69 fold 3). "Does a linker resolve this
+//      name" is a question about the BINDING alone — the one
+//      `ObjectSymbolNames::hasExternalLinkage` asks, for the reason stated
+//      there: a hidden definition is invisible to other IMAGES and is still an
+//      external-linkage symbol a static link resolves by name. This rule asked
+//      `isExternallyVisible` instead, which folds visibility in, so a HIDDEN
+//      external name ranked with the module-private ones.
+//   2. STRONG beats WEAK among names with external linkage -- the genuine weak
+//      alias (`void f() __attribute__((weak, alias("g"))))`). It goes to the
+//      strong name because that is the definition the alias was declared
+//      against; the weak name keeps its own `Weak` binding on its row and still
+//      exports at the same address. On ELF and Mach-O both names are real ABI
+//      and this is a tie-break. On COFF it is the format's own model: a weak
+//      external DEFERS to a record, and the record it defers to is the one
+//      that holds the bytes.
+//      ★ AND IT COMES BEFORE VISIBILITY (P69 fold 3). A weak name that is
+//      visible must not take the body from a strong one that is hidden: the
+//      strong record is still the one the weak one defers to. ✔MEASURED
+//      2026-10-12 on MinGW gcc 13.2.0's object of a weak alias of a `static`
+//      (`tests/link/data/weak_local_name_x86_64_pe_mingw.o`: the weak external,
+//      its EXTERNAL default record `.weak.<name>.<…>`, and the `static` name,
+//      at one address), the default record read back hidden: under the old
+//      order the visible weak name took the body, and a link that gave the weak
+//      name to another unit left the `static` name first with the default an
+//      external name beside it — which the COFF object writer has no record
+//      for, and refused. With visibility first, that one object changed owner
+//      the moment a reader said its default record was hidden; with it third,
+//      what a name is exported as never moves a body.
+//   3. VISIBLE beats hidden among what is left: the name a source wrote, ahead
+//      of plumbing beside it (gcc's weak alias of a strong name writes a
+//      `.weak.<alias>.<target>` default record at the target's own address).
+//   4. Otherwise the LOWEST symbol id -- the order the OBJECT listed them in.
 //      This exists so the answer is TOTAL: `std::sort` is not stable, and a
 //      reconstruction that depends on which of two equal elements the sort
 //      happened to keep is a reconstruction that can differ between two runs
 //      over the same bytes.
 [[nodiscard]] inline bool outranksAsAtomIdentity(
     AtomStartCandidate const& a, AtomStartCandidate const& b) noexcept {
-    bool const aVis = isExternallyVisible(a.binding, a.visibility);
-    bool const bVis = isExternallyVisible(b.binding, b.visibility);
-    if (aVis != bVis) return aVis;
+    bool const aLinked = a.binding != SymbolBinding::Local;
+    bool const bLinked = b.binding != SymbolBinding::Local;
+    if (aLinked != bLinked) return aLinked;
     bool const aStrong = a.binding != SymbolBinding::Weak;
     bool const bStrong = b.binding != SymbolBinding::Weak;
     if (aStrong != bStrong) return aStrong;
+    bool const aVis = isExternallyVisible(a.binding, a.visibility);
+    bool const bVis = isExternallyVisible(b.binding, b.visibility);
+    if (aVis != bVis) return aVis;
     return a.symbolId < b.symbolId;
 }
 

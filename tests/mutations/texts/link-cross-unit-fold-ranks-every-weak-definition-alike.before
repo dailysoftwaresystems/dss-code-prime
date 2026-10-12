@@ -1,1 +1,1 @@
-                weakDefinitionRank(format, s)});
+    definition.weakRank       = weakDefinitionRank(linkFormat, weakKind);

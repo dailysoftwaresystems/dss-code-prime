@@ -27,6 +27,7 @@
 #include "mir/mir_node.hpp"
 #include "opt/optimizer.hpp"
 #include "opt/passes/dce.hpp"
+#include "link_facts.hpp"   // linkageOf (P69: a weak MIR definition states its kind)
 
 #include <gtest/gtest.h>
 
@@ -57,7 +58,7 @@ constexpr SymbolId kLocalData{201};
     mb.addGlobal(i32, kLocalData, mb.literalPoolAdd(v2), MirFuncId{}, SymbolBinding::Local,
                  SymbolVisibility::Default, /*isConst=*/false, MirThreadStorage::Shared);
     auto fn = [&](SymbolId sym, SymbolBinding binding, SymbolVisibility visibility) {
-        mb.addFunction(sig, sym, binding, visibility);
+        mb.addFunction(sig, sym, dss::test_support::linkageOf(binding, visibility));
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
         MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;

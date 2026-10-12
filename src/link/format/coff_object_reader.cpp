@@ -547,6 +547,10 @@ struct DefSym {
     // EXTERNAL whose default is a body here, `SelectAny` for a symbol its COMDAT
     // section's selection makes weak. Empty for everything that is not weak.
     std::optional<WeakDefinitionKind> weakKind;
+    // P69 fold 3: for the name of a WEAK EXTERNAL whose default is a body here,
+    // the symbol-table index of that DEFAULT record (its Auxiliary Format 3
+    // TagIndex). Empty for every other definition.
+    std::optional<std::uint32_t> defaultRecord;
 };
 
 // A reconstructed [start, start+len) byte range within one section, plus the
@@ -1358,6 +1362,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 DefSym weak{i, def.value, s.name, SymbolBinding::Weak,
                             directiveVisibility(s.name)};
                 weak.weakKind = WeakDefinitionKind::Overridable;
+                weak.defaultRecord = *tag;
                 defsBySection[def.sectNum].push_back(std::move(weak));
                 continue;
             }
@@ -2085,6 +2090,63 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
         }
         weakNames.decideFrom(candidates, owner, symbolIds);
+    }
+
+    // ── THE DEFAULT RECORD OF A WEAK DEFINITION IS NO NAME OF THE PROGRAM ──────
+    //    (P69 fold 3)
+    //
+    // COFF spells an overridable weak definition as TWO records: the weak
+    // external, which is the program's name, and the DEFAULT it defers to — an
+    // EXTERNAL record at the body, because the format's linkers refuse a static
+    // one (link.exe: LNK1235). The compilers name that record after the weak
+    // name: gcc `.weak.<name>.<a strong definition of the unit>`, clang and
+    // DSS's own writer `.weak.<name>.default[.<that definition>]`
+    // (`pe.cpp`, THE WEAK-EXTERNAL ARM). It is plumbing: no source names it and
+    // no other object refers to it.
+    //
+    // So its row is HIDDEN — a definition the link resolves like any other and
+    // that no image exports. ✔MEASURED 2026-10-12, a DLL linked from an object
+    // holding a weak definition of default visibility and a hidden one, with no
+    // .def and no `dllexport` (auto-export): GNU ld 2.42 and ld.lld 19.1.5, each
+    // on MinGW gcc 13.2.0's object and on clang 19.1.5's — 4 of 4 export neither
+    // default record; and for gcc's weak ALIAS of a strong name, whose default
+    // is a `.weak.<alias>.<target>` record beside the target's own, both export
+    // the TARGET and not the default. Until fold 3 every DSS-compiled weak
+    // definition was written as a COMDAT, which has no such record; once a
+    // compiled definition reached this writer as the OVERRIDABLE kind it has,
+    // a DSS DLL exported `.weak.<name>.default.<…>` for each of them.
+    //
+    // ★ BOTH HALVES ARE ASKED, the record's role AND its name. The role alone —
+    // "the record a weak external's TagIndex names" — would also hide a default
+    // that IS a name of the program (an alias whose default is the target's own
+    // record); the name alone would hide whatever a source chose to call
+    // `.weak.…`. A record is the plumbing only when it is the default of the
+    // weak name it is named after.
+    //
+    // ★ IT IS A STATEMENT ABOUT WHAT AN IMAGE EXPORTS, AND IT MOVES NO BODY. The
+    // default is still the record the bytes belong to — the EXTERNAL record the
+    // weak one defers to — and it is said here, of the ROW, after the pass above
+    // decided which record owns the body. (That pass ranks a strong record over
+    // a weak one before it looks at visibility, `outranksAsAtomIdentity`, so a
+    // default an object's own directives hide — what DSS's writer states of this
+    // very row when the unit is written again — keeps the body too.)
+    {
+        std::unordered_map<std::uint32_t, std::string const*> weakNameOfDefault;
+        for (auto const& [sect, defs] : defsBySection) {
+            for (auto const& d : defs) {
+                if (d.defaultRecord.has_value()) weakNameOfDefault.emplace(*d.defaultRecord, &d.name);
+            }
+        }
+        if (!weakNameOfDefault.empty()) {
+            for (auto& [sect, defs] : defsBySection) {
+                for (auto& d : defs) {
+                    auto const it = weakNameOfDefault.find(d.symIdx);
+                    if (it == weakNameOfDefault.end() || d.defaultRecord.has_value()) continue;
+                    std::string const family = ".weak." + *it->second + ".";
+                    if (d.name.starts_with(family)) d.visibility = SymbolVisibility::Hidden;
+                }
+            }
+        }
     }
     // The atom identity a symbol resolves to: itself unless it aliases another.
     // Consulted at BOTH sites that need it -- the slicing loop (does this

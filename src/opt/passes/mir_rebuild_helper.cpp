@@ -169,7 +169,9 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
         }
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, MirFuncId{},
-                          mir.globalBinding(g), mir.globalVisibility(g),
+                          // P69: the linkage is copied as its ONE record
+                          // (binding, visibility, weak kind, tentative mark).
+                          mir.globalLinkage(g),
                           mir.globalIsConst(g),
                           // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3): preserve
                           // thread storage duration across the pass rebuild —
@@ -225,7 +227,9 @@ void cloneGlobalsRemappingInitFunc(Mir const& mir, MirBuilder& builder,
         }
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, newInitFunc,
-                          mir.globalBinding(g), mir.globalVisibility(g),
+                          // P69: the linkage is copied as its ONE record
+                          // (binding, visibility, weak kind, tentative mark).
+                          mir.globalLinkage(g),
                           mir.globalIsConst(g),
                           // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3): preserve
                           // thread storage duration across the clone.
@@ -272,7 +276,9 @@ void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder) {
             : MirFuncId{};
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, newInitFunc,
-                          mir.globalBinding(g), mir.globalVisibility(g),
+                          // P69: the linkage is copied as its ONE record
+                          // (binding, visibility, weak kind, tentative mark).
+                          mir.globalLinkage(g),
                           mir.globalIsConst(g),
                           // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3): preserve
                           // thread storage duration across the verbatim clone.
@@ -373,7 +379,9 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     // RebuildFunctionPreservesNoSanitizeThread` is the ONLY thing standing between
     // this argument and silent deletion.
     dst_.addFunction(src_.funcSignature(oldFn), src_.funcSymbol(oldFn),
-                     src_.funcBinding(oldFn), src_.funcVisibility(oldFn),
+                     // P69: the linkage is copied as its ONE record (binding,
+                     // visibility, weak kind) — under all 8 rebuild passes.
+                     src_.funcLinkage(oldFn),
                      src_.funcNoInline(oldFn), src_.funcAlwaysInline(oldFn),
                      src_.funcNoOptimize(oldFn),
                      src_.funcNoSanitizeThread(oldFn),

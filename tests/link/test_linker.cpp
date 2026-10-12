@@ -75,6 +75,7 @@ constexpr std::string_view kFormatMatchingX86_64 = R"({
   ],
   "relocationAddends": "explicit",
   "inputSectionPlacement": "unit",
+  "weakDefinitionBesideStrong": "yields",
   "relocations": [
     { "name": "R_X86_64_PC32",   "kind": 1, "nativeId": 2  },
     { "name": "R_X86_64_64",     "kind": 2, "nativeId": 1  },

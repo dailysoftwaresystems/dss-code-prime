@@ -1,0 +1,1 @@
+    return linkage.tentative && linkage.binding == SymbolBinding::Global

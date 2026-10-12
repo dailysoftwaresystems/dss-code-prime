@@ -920,3 +920,30 @@ dss_add_test(NAME link/test_archive_weak_reference_search
              SOURCES test_archive_weak_reference_search.cpp)
 target_link_libraries(dss_link_test_archive_weak_reference_search
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE (P69 fold 3, the review of fold 2, F1) — a relocation
+# that stands INSIDE a section group and names a member of it (a function's jump table, as gcc writes one) is no
+# reference to discarded bytes: a tracked pair of ELF objects, each carrying group `f` of two sections, links in both
+# orders with both callers on the first unit's body and each table on its own body's cases; the reader states the
+# group of every member SECTION; and a relocation from OUTSIDE a discarded group is still refused by name.
+dss_add_test(NAME link/test_group_member_relocations
+             SOURCES test_group_member_relocations.cpp)
+
+# D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER +
+# D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED (P69 fold 3) — ONE TABLE OF PAIRS, FOUR DOORS: every
+# ordered pair of {strong, tentative, overridable, select-any} definitions of one name, for ELF, PE and Mach-O, each
+# cell the answer its format's reference linkers gave, held against the fold itself, the unit linker (a relocatable
+# artifact read back), the cross-unit MIR merge and the summary index; the refusal's code and sentence through
+# every door that reports; and the key that decides a weak definition beside a strong one — refused on an archive
+# document and outside its values, and a document that does not say refused by the key's name where it is asked.
+dss_add_test(NAME link/test_cross_unit_fold_doors
+             SOURCES test_cross_unit_fold_doors.cpp)
+target_link_libraries(dss_link_test_cross_unit_fold_doors
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# P69 fold 3 — the DEFAULT RECORD of a COFF weak definition: read back hidden (its role AND its name asked) on the
+# compilers' own objects and on DSS's, so no image exports it; and still the record that owns the body, through
+# every round of write and read — which record owns a body several records name is ranked by linkage, then
+# strength, and by visibility only among what is left.
+dss_add_test(NAME link/test_weak_default_record
+             SOURCES test_weak_default_record.cpp)

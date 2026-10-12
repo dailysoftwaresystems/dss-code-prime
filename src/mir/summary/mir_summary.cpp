@@ -198,8 +198,12 @@ ModuleSummary buildModuleSummary(SummaryCuInput const& cu) {
         SummaryFunction row;
         row.name         = cu.nameOf(mir.funcSymbol(f));
         row.symbol       = mir.funcSymbol(f).v;
-        row.binding      = mir.funcBinding(f);
-        row.visibility   = mir.funcVisibility(f);
+        // The linkage is read off its ONE record (`Mir::funcLinkage`), so the
+        // kind of a weak definition arrives with the binding it qualifies.
+        MirLinkage const linkage = mir.funcLinkage(f);
+        row.binding      = linkage.binding;
+        row.visibility   = linkage.visibility;
+        row.weakKind     = linkage.statedWeakKind();
         row.noInline     = mir.funcNoInline(f);
         row.alwaysInline = mir.funcAlwaysInline(f);
         row.noOptimize   = mir.funcNoOptimize(f);
@@ -294,8 +298,11 @@ ModuleSummary buildModuleSummary(SummaryCuInput const& cu) {
         SummaryGlobal row;
         row.name           = cu.nameOf(mir.globalSymbol(g));
         row.symbol         = mir.globalSymbol(g).v;
-        row.binding        = mir.globalBinding(g);
-        row.visibility     = mir.globalVisibility(g);
+        MirLinkage const linkage = mir.globalLinkage(g);
+        row.binding        = linkage.binding;
+        row.visibility     = linkage.visibility;
+        row.weakKind       = linkage.statedWeakKind();
+        row.isCommon       = mir.globalIsCommon(g);   // the ONE statement of it
         row.isConst        = mir.globalIsConst(g);
         row.isThreadLocal  = mir.globalIsThreadLocal(g);
         row.alignmentBytes = mir.globalAlignmentBytes(g);
@@ -464,6 +471,35 @@ constexpr std::size_t kMagicBytes = 7;  // includes the NUL
     }
 }
 
+// The KIND of a weak definition on the wire (version 2): one byte, 0 for "none
+// stated", else the enumerator's own value — no enumerator of
+// `WeakDefinitionKind` is 0, which is what leaves 0 free to mean it.
+[[nodiscard]] std::uint8_t weakKindByte(std::optional<WeakDefinitionKind> kind) {
+    return kind.has_value() ? static_cast<std::uint8_t>(*kind) : std::uint8_t{0};
+}
+
+// A row's linkage bytes are judged by THE RULE EVERY OTHER PRODUCER OF A
+// LINKAGE RECORD IS JUDGED BY (`mirLinkageDefect`, mir/mir_node.hpp — the
+// builders, the verifier and the `.dssir` reader ask it too), not by a fourth
+// spelling of it here: a kind byte that names no kind, a weak row that states
+// none, a kind beside a binding that is not weak, a common that is local. And a
+// row that claims to be a COMMON must be one by the one statement of what a
+// common is (`mirLinkageIsCommon`): a weak or a thread-local row is not.
+// The summary feeds cross-unit symbol RESOLUTION, so a row the rule refuses is
+// a link-time miscompile if it is read anyway.
+[[nodiscard]] bool decodeLinkage(SymbolBinding binding, SymbolVisibility visibility,
+                                 std::uint8_t kindByte, MirLinkageOwner owner,
+                                 bool isCommon, bool isThreadLocal,
+                                 std::optional<WeakDefinitionKind>& kind) {
+    MirLinkage const linkage{binding, visibility,
+                             static_cast<WeakDefinitionKind>(kindByte), isCommon};
+    if (!mirLinkageDefect(linkage, owner, /*hasInitializer=*/false).empty())
+        return false;
+    if (isCommon && !mirLinkageIsCommon(linkage, isThreadLocal)) return false;
+    kind = linkage.statedWeakKind();
+    return true;
+}
+
 } // namespace
 
 std::vector<std::uint8_t> encodeModuleSummary(ModuleSummary const& s) {
@@ -479,6 +515,7 @@ std::vector<std::uint8_t> encodeModuleSummary(ModuleSummary const& s) {
         putU32(b, f.symbol);
         putU8(b, static_cast<std::uint8_t>(f.binding));
         putU8(b, static_cast<std::uint8_t>(f.visibility));
+        putU8(b, weakKindByte(f.weakKind));
         putU32(b, f.instCount);
         putU32(b, f.argExtent);
         putU32(b, f.blockCount);
@@ -506,6 +543,8 @@ std::vector<std::uint8_t> encodeModuleSummary(ModuleSummary const& s) {
         putU32(b, g.symbol);
         putU8(b, static_cast<std::uint8_t>(g.binding));
         putU8(b, static_cast<std::uint8_t>(g.visibility));
+        putU8(b, weakKindByte(g.weakKind));
+        putBool(b, g.isCommon);
         putBool(b, g.isConst);
         putBool(b, g.isThreadLocal);
         putU32(b, g.alignmentBytes);
@@ -544,10 +583,10 @@ decodeModuleSummary(std::span<std::uint8_t const> bytes) {
 
     {
         std::uint32_t const n = c.u32();
-        // Smallest possible function row: 4 (name len) + 4 (symbol) + 2
-        // (binding/visibility) + 12 (three u32) + 9 (bools) + 4 (refs count)
-        // + 4 (calls count) = 39.
-        if (!c.countFits(n, 39)) return std::nullopt;
+        // Smallest possible function row: 4 (name len) + 4 (symbol) + 3
+        // (binding/visibility/weak kind) + 12 (three u32) + 9 (bools) + 4 (refs
+        // count) + 4 (calls count) = 40.
+        if (!c.countFits(n, 40)) return std::nullopt;
         s.functions.reserve(n);
         for (std::uint32_t i = 0; i < n && !c.bad; ++i) {
             SummaryFunction f;
@@ -555,6 +594,11 @@ decodeModuleSummary(std::span<std::uint8_t const> bytes) {
             f.symbol = c.u32();
             if (!decodeBinding(c.u8(), f.binding)) return std::nullopt;
             if (!decodeVisibility(c.u8(), f.visibility)) return std::nullopt;
+            if (!decodeLinkage(f.binding, f.visibility, c.u8(),
+                               MirLinkageOwner::Function, /*isCommon=*/false,
+                               /*isThreadLocal=*/false, f.weakKind)) {
+                return std::nullopt;
+            }
             f.instCount          = c.u32();
             f.argExtent          = c.u32();
             f.blockCount         = c.u32();
@@ -583,7 +627,10 @@ decodeModuleSummary(std::span<std::uint8_t const> bytes) {
     }
     {
         std::uint32_t const n = c.u32();
-        if (!c.countFits(n, 21)) return std::nullopt;
+        // Smallest possible global row: 4 (name len) + 4 (symbol) + 3
+        // (binding/visibility/weak kind) + 3 (isCommon/isConst/isThreadLocal)
+        // + 4 (alignment) + 1 (hasInitFunc) + 4 (refs count) = 23.
+        if (!c.countFits(n, 23)) return std::nullopt;
         s.globals.reserve(n);
         for (std::uint32_t i = 0; i < n && !c.bad; ++i) {
             SummaryGlobal g;
@@ -591,8 +638,15 @@ decodeModuleSummary(std::span<std::uint8_t const> bytes) {
             g.symbol = c.u32();
             if (!decodeBinding(c.u8(), g.binding)) return std::nullopt;
             if (!decodeVisibility(c.u8(), g.visibility)) return std::nullopt;
+            std::uint8_t const kindByte = c.u8();
+            g.isCommon       = c.boolean();
             g.isConst        = c.boolean();
             g.isThreadLocal  = c.boolean();
+            if (!decodeLinkage(g.binding, g.visibility, kindByte,
+                               MirLinkageOwner::Global, g.isCommon,
+                               g.isThreadLocal, g.weakKind)) {
+                return std::nullopt;
+            }
             g.alignmentBytes = c.u32();
             g.hasInitFunc    = c.boolean();
             g.initSymbolRefs = c.strs();

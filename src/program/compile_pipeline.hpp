@@ -375,8 +375,8 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // ── AND WHAT THE MERGED ROUTE COSTS TO REACH AT ALL ────────────────────────
 // ✔MEASURED — the merged route is reachable ONLY through
 // `Program::compileUnits` with ≥2 sources, and
-// <!--census:examples:top.sources-->36 of the
-// <!--census:examples:manifests-->1063 shipped corpus example manifests declare a
+// <!--census:examples:top.sources-->41 of the
+// <!--census:examples:manifests-->1070 shipped corpus example manifests declare a
 // multi-source `sources` array, so the corpus exercises it roughly 3% as often
 // as the single-CU route.
 // ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census
@@ -970,14 +970,21 @@ struct DSS_EXPORT CuMirModule {
 // `executor` may be null (run serially — what a single-threaded caller and the
 // determinism comparison want). `cuMirs.size() < 2` is a no-op: nothing crosses
 // a translation-unit boundary in a one-module program.
+//
+// `linkFormat` is the document of the link these units are bound for. The stage
+// elects one definition per name twice — the summary index, and each import
+// batch's merge — and both read from it what a weak definition's kind means
+// beside the other definitions of its name, as the whole-program merge and the
+// unit linker after them do.
 [[nodiscard]] DSS_EXPORT bool
-runThinLtoImportStage(std::span<CuMirModule>  cuMirs,
-                      TargetSchema const&     target,
-                      CSymbolDecorationScheme cSymDecor,
-                      std::string_view        targetIdentity,
-                      CompileOptions const&   opts,
-                      substrate::IExecutor*   executor,
-                      DiagnosticReporter&     reporter);
+runThinLtoImportStage(std::span<CuMirModule>     cuMirs,
+                      TargetSchema const&        target,
+                      ObjectFormatSchema const&  linkFormat,
+                      CSymbolDecorationScheme    cSymDecor,
+                      std::string_view           targetIdentity,
+                      CompileOptions const&      opts,
+                      substrate::IExecutor*      executor,
+                      DiagnosticReporter&        reporter);
 
 [[nodiscard]] DSS_EXPORT std::optional<CuMirModule>
 buildCuMir(CompilationUnit const&         cu,

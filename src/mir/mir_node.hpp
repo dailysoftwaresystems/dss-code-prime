@@ -3,11 +3,14 @@
 #include "core/substrate/arena_tag.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/section_kind.hpp"           // StaticInitSchedule
-#include "core/types/symbol_attrs.hpp"           // SymbolBinding / SymbolVisibility
+#include "core/types/symbol_attrs.hpp"           // SymbolBinding / SymbolVisibility / WeakDefinitionKind
 #include "core/types/type_lattice/type_id.hpp"   // TypeId
 #include "mir/mir_opcode.hpp"
 
+#include <cstddef>      // offsetof
 #include <cstdint>
+#include <optional>
+#include <string_view>
 #include <type_traits>
 
 // MIR storage PODs (ML1). The MIR module is four dense arenas — instructions,
@@ -169,6 +172,145 @@ mirThreadStorageOf(bool isThreadLocal) noexcept {
                          : MirThreadStorage::Shared;
 }
 
+// ── HOW A MIR DEFINITION TAKES PART IN THE LINK: ONE RECORD ───────────────────
+//
+// P69 (lane `xa`). A function and a global each carry FOUR facts about their
+// place in the image — the binding, the visibility, WHICH KIND of weak
+// definition a weak one is (`WeakDefinitionKind`: overridable or select-any),
+// and whether a global is a TENTATIVE definition its unit never completed (C
+// 6.9.2p2). The last two had no reader below the HIR tier: a DSS-compiled
+// `__attribute__((weak))` reached the object writer with no kind, and two units
+// each holding `int x;` were refused as two strong definitions.
+//
+// ★ ONE VALUE, NOT FOUR FIELDS, AND THAT IS THE POINT. Nine functions re-add a
+// MIR function or global (the cross-unit merge, the optimizer's rebuilds, the
+// text reader). Copied field by field, each of them is a place where the NEXT
+// fact is dropped in silence — the tree carried (binding, visibility) through
+// all nine by hand, and the kind would have been the third hand-copied field.
+// So the record is what the builder is handed (`MirBuilder::addFunction` /
+// `addGlobal`), what ONE accessor returns (`Mir::funcLinkage` /
+// `Mir::globalLinkage`), and what every re-add site passes on WHOLE: a fact
+// added here later reaches all of them by construction.
+//
+// ★ `weakKind` IS READ ONLY BESIDE A WEAK BINDING and is value-initialized to
+// "none stated" (no enumerator has the value 0), exactly as
+// `LinkageAttr::weakKind` is one tier up. The builders and `MirVerifier` hold
+// the pairing both ways: a weak binding STATES its kind, and a kind stands
+// beside no other binding — so a producer that forgets it is refused by name on
+// its first weak definition instead of being written as whatever the object
+// format's default spelling happens to be. `statedWeakKind()` is the one way to
+// read it.
+//
+// ★ `tentative` IS A GLOBAL's FACT. A function has no tentative definition; a
+// module-private (`Local`) object is never one the link folds (`static int x;`
+// in two units is two objects), so the builders refuse both. A weak tentative
+// definition IS legal (`__attribute__((weak)) int t;`) and is a weak definition:
+// its kind decides, the mark rides along.
+//
+// Four one-byte members, so the record is 4 bytes at alignment 1.
+struct MirLinkage {
+    SymbolBinding      binding    = SymbolBinding::Global;
+    SymbolVisibility   visibility = SymbolVisibility::Default;
+    WeakDefinitionKind weakKind{};
+    bool               tentative  = false;
+
+    [[nodiscard]] constexpr std::optional<WeakDefinitionKind>
+    statedWeakKind() const noexcept {
+        return weakDefinitionKindName(weakKind).empty()
+                   ? std::nullopt
+                   : std::optional<WeakDefinitionKind>{weakKind};
+    }
+
+    friend constexpr bool operator==(MirLinkage const&, MirLinkage const&) = default;
+};
+static_assert(sizeof(MirLinkage) == 4 && alignof(MirLinkage) == 1,
+              "MirLinkage is four one-byte facts — MirFunc's and MirGlobal's "
+              "exact size pins are computed from that");
+static_assert(std::is_trivially_copyable_v<MirLinkage>);
+
+// THE ONE PLACE A LINKAGE STATEMENT OF ANOTHER TIER BECOMES THE MIR RECORD. The
+// HIR tier's `LinkageAttr` (hir/attributes/linkage_attr.hpp) states the same
+// four facts under the same four names, and HIR→MIR hands it here at each of
+// its builder calls instead of naming the fields four times over — the copy the
+// record exists to make impossible to do by halves. A template so that this
+// header does not include a HIR one: it asks only that the statement HAVE the
+// four members, and a statement that lacks one does not compile.
+template <class LinkageStatement>
+[[nodiscard]] constexpr MirLinkage
+mirLinkageFrom(LinkageStatement const& stated) noexcept {
+    return MirLinkage{stated.binding, stated.visibility, stated.weakKind,
+                      stated.tentative};
+}
+
+// What carries a linkage record. The pairing rule below asks, because the
+// tentative mark is a global's fact and a function's defect.
+enum class MirLinkageOwner : std::uint8_t { Function, Global };
+
+// ── THE ONE STATEMENT OF WHAT A WELL-FORMED LINKAGE RECORD IS ─────────────────
+//
+// Returns the EMPTY view for a well-formed record, else one sentence naming the
+// defect. THREE readers ask it and none restates it: the builders
+// (`MirBuilder::addFunction` / `addGlobal`, which abort with the sentence — a
+// producer's bug), `MirVerifier` (which reports it for a module that reached it
+// by another road), and the text reader (which refuses a `.dssir` that spells
+// it). A rule written three times is three rules the day one of them is
+// amended.
+//
+// `hasInitializer` is a global's "a constant initializer or an init function is
+// stated"; a function passes false.
+//
+// The order is the order a reader fixes them in: the binding/kind pairing first
+// (it decides what the definition IS), the tentative mark after.
+[[nodiscard]] constexpr std::string_view
+mirLinkageDefect(MirLinkage const& linkage, MirLinkageOwner owner,
+                 bool hasInitializer) noexcept {
+    bool const weak   = linkage.binding == SymbolBinding::Weak;
+    bool const stated = linkage.statedWeakKind().has_value();
+    // A byte that is neither "none stated" nor an enumerator: a corrupted
+    // record, never a kind. Asked first so it is not reported as its symptom.
+    if (!stated && linkage.weakKind != WeakDefinitionKind{}) {
+        return "its weak-definition kind is not a value this build names";
+    }
+    if (weak && !stated) {
+        return "it is a weak definition that states no weak-definition kind "
+               "(overridable or select-any) — the object formats spell the two "
+               "differently, so a weak definition of unknown kind has no spelling";
+    }
+    if (!weak && stated) {
+        return "it states a weak-definition kind beside a binding that is not "
+               "weak — a kind is read only on a weak definition";
+    }
+    if (linkage.tentative) {
+        if (owner == MirLinkageOwner::Function) {
+            return "it is a function marked as a tentative definition — only an "
+                   "object has one (C 6.9.2p2)";
+        }
+        if (linkage.binding == SymbolBinding::Local) {
+            return "it is a module-private (local) global marked as a tentative "
+                   "definition — the link folds tentative definitions of an "
+                   "external name, and a local one has none";
+        }
+        if (hasInitializer) {
+            return "it is marked as a tentative definition and states an "
+                   "initializer — a tentative definition is the one with none "
+                   "(C 6.9.2p2)";
+        }
+    }
+    return {};
+}
+
+// IS A GLOBAL WITH THIS LINKAGE A COMMON — the conjunction `Mir::globalIsCommon`
+// states and explains (mir/mir.hpp: the tentative mark on a definition that is
+// strong-bound and not thread-local, each conjunct with its measurement). It is
+// written here, over the two facts, because one reader holds them without a
+// module: the decoder of a stored summary, which refuses a row that claims to
+// be a common and could not be one.
+[[nodiscard]] constexpr bool
+mirLinkageIsCommon(MirLinkage const& linkage, bool isThreadLocal) noexcept {
+    return linkage.tentative && linkage.binding == SymbolBinding::Global
+           && !isThreadLocal;
+}
+
 namespace detail {
 
 // ── instruction POD ───────────────────────────────────────────────────────────
@@ -252,8 +394,10 @@ struct MirFunc {
     // convention. Front-ends with `static` / `inline` / `hidden`
     // emit the matching binding/visibility at HIR→MIR lowering.
     // Fits the existing 4-byte _pad slot — no struct-size growth.
-    SymbolBinding    binding    = SymbolBinding::Global;     // 1
-    SymbolVisibility visibility = SymbolVisibility::Default; // 1
+    // ★ P69: the pair is now two members of the ONE linkage record (`MirLinkage`,
+    // above) that also carries the weak kind and the tentative mark — 4 bytes
+    // where the pair took 2, and the size does not move (see the pins below).
+    MirLinkage       linkage{};                               // 4
     // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the source declared this function
     // `__attribute__((noinline))` — the optimizer's inliner MUST NOT splice its
     // body into any caller. Reaches here as source → SymbolRecord.isNoInline →
@@ -461,10 +605,26 @@ struct MirFunc {
 // four flags still fit and the fifth is still a compile error. Widening the
 // budget to swallow the addition silently would have retired the only guard that
 // makes anyone re-do this arithmetic.
+// ★★ 2026-10-12 (P69, lane `xa`): `binding` and `visibility` became the first two
+// members of the 4-byte `MirLinkage` record, which adds the weak kind and the
+// tentative mark. The record sits where the pair sat, at offset 20, and the
+// four flags follow it: linkage 20-23, noInline 24, alwaysInline 25, noOptimize
+// 26, noSanitizeThread 27, staticInit 28-35. So the "six one-byte flags at
+// 20-25" of the arithmetic above read today as "a 4-byte record and four
+// one-byte flags at 20-27": `roundUp4(20 + 4 + 4) + 8` = **36**, UNCHANGED —
+// the two bytes the record added are the two that were padding. What changed
+// is the slack: there is none left before the schedule, so the next one-byte
+// flag takes the size to 40 (the budget's edge) and the one after it breaches.
+// The offsets are pinned below, not only stated.
 static_assert(sizeof(MirFunc) == 36,
-              "detail::MirFunc is 36 bytes (roundUp4(20 + 6 one-byte flags) + an "
-              "8-byte StaticInitSchedule) — if you added a member, re-measure and "
-              "update the padding-budget comment above along with this number");
+              "detail::MirFunc is 36 bytes (20 + the 4-byte MirLinkage record + 4 "
+              "one-byte flags + an 8-byte StaticInitSchedule) — if you added a "
+              "member, re-measure and update the padding-budget comment above "
+              "along with this number");
+static_assert(offsetof(MirFunc, linkage) == 20 && offsetof(MirFunc, noInline) == 24
+                  && offsetof(MirFunc, staticInit) == 28,
+              "detail::MirFunc: the linkage record sits at 20, the flags at "
+              "24-27, the schedule at 28 — the size pin above is that sum");
 static_assert(alignof(MirFunc) == 4,
               "detail::MirFunc is 4-byte aligned because TypeId is two uint32_t "
               "— the whole padding budget above assumes 4-byte growth steps");
@@ -500,8 +660,10 @@ struct MirGlobal {
     // when `isExternallyVisible(binding, visibility)` returns true.
     // Externally-observable globals (a C-style file-scope `int g;`
     // with no `static`) MUST survive DCE / unused-symbol elimination.
-    SymbolBinding    binding    = SymbolBinding::Global;     // 1
-    SymbolVisibility visibility = SymbolVisibility::Default; // 1
+    // ★ P69: the pair is two members of the ONE linkage record (`MirLinkage`),
+    // which also carries the weak kind and — a global's own fact — the
+    // tentative mark.
+    MirLinkage       linkage{};                               // 4
     // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL (writable data sections cycle): true iff
     // the source declared this global `const`. Read by the assembler's
     // section selection (`lowerMirGlobalsToDataItems`): an INITIALIZED global
@@ -534,7 +696,33 @@ struct MirGlobal {
     // the static_assert below still holds).
     std::uint32_t    alignment  = 0;                         // 4
 };
-static_assert(sizeof(MirGlobal) <= 32, "detail::MirGlobal grew unexpectedly — review layout");
+// ★★ P69 (lane `xa`), 2026-10-12: THE EXACT SIZE AND THE OFFSETS, where a
+// `<= 32` ceiling stood. This record was FULL at 32 — type 0-7, symbol 8-11,
+// initLiteralIndex 12-15, initFunc 16-23, binding 24, visibility 25, isConst
+// 26, isThreadLocal 27, alignment 28-31 — so the comments above that say an
+// addition "consumes the former pad → zero size growth" were each true once
+// and left nothing for the next one. The linkage record (`MirLinkage`) takes 4
+// bytes where the pair took 2, and the size is now **36**, alignof 4: linkage
+// 24-27, isConst 28, isThreadLocal 29, two bytes of padding, alignment 32-35.
+// ★ WHAT THE FOUR BYTES BUY: one record that every site re-adding a global
+// copies WHOLE, instead of two more fields copied by hand at nine sites — and
+// the weak kind and the tentative mark reaching the object writers at all. The
+// alternatives were weighed and refused (a bit-packed record keeps 32 and gives
+// up a plain member a reader can name; a 16-bit `alignment` keeps 32 by
+// changing a second field's meaning). Two padding bytes remain at 30-31: the
+// next two one-byte facts of a global are free, the third is a compile error
+// here — which is the moment to re-measure rather than to quote this comment.
+static_assert(sizeof(MirGlobal) == 36,
+              "detail::MirGlobal is 36 bytes (24 + the 4-byte MirLinkage record + "
+              "2 one-byte flags + 2 padding + a 4-byte alignment) — if you added a "
+              "member, re-measure and update the comment above with this number");
+static_assert(alignof(MirGlobal) == 4,
+              "detail::MirGlobal is 4-byte aligned (TypeId and MirFuncId are "
+              "uint32_t pairs)");
+static_assert(offsetof(MirGlobal, linkage) == 24 && offsetof(MirGlobal, isConst) == 28
+                  && offsetof(MirGlobal, alignment) == 32,
+              "detail::MirGlobal: the linkage record sits at 24, the two flags at "
+              "28-29, the alignment at 32 — the size pin above is that sum");
 static_assert(std::is_trivially_copyable_v<MirGlobal>);
 
 } // namespace detail

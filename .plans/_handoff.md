@@ -351,15 +351,45 @@ round's close; each checkpoint's commit message says what was and was not run on
   (that mutant is the program as it stood: the tree's own census reddens first, 55 of 56). ✔MEASURED by the lane
   on its final bytes, ON CHECKPOINT 14's BASE: the `repo-guard` label on `windows-x86_64-debug` (MinGW) and
   `windows-x86_64-release` (MSVC), 30 of 30 on each, `orphan_tests_guard` 56 of 56 cases.
+- **Checkpoint 18 (2026-10-12) = the link lane's fold 3a: the weak-definition kind from its COMPILED origin, the
+  tentative definition, and the narrow fix of the link checkpoint 12 began to refuse.** ONE linkage record on every
+  MIR function and global (`MirLinkage`: binding, visibility, weak kind, tentative) and ONE rule
+  (`mirLinkageDefect`) asked by the builders, the verifier, the `.dssir` reader (text version 6) and the summary
+  decoder (stored form 2); ONE fold of a name several units define (`linker::resolveCrossCuDefs`) behind THREE
+  doors — the unit linker, `mergeCuMirs`, `buildSummaryIndex` — each refusing through `linker::refusalOf`; a new
+  root key of 17 link documents, `weakDefinitionBesideStrong` (ELF and Mach-O `"yields"`; PE overridable yields,
+  select-any COLLIDES — the references refuse it 16 of 16). ✔MEASURED by the lane on pe64 and ELF x86_64, 134
+  cells under {debug, release} × {`--lto=full`, `--lto=thin`}: `__declspec(selectany)` beside a strong definition
+  is refused in both orders (it linked in silence before), select-any beside an overridable one gives the
+  select-any in both orders (was link-order), two tentative definitions of one name in two SOURCES of one build
+  are one object (was refused by the merge and by the index). **The refused ELF link is back**: a relocation from
+  inside a losing COMDAT group stays on its unit's kept bytes — the tracked pair runs 44 / 88 as GNU ld and LLD
+  give, debug and release (the discard of the loser's bytes is the lane's next fold). Two defects met and fixed in
+  the fold: a DSS DLL exported a weak definition's default record (this fold's own making); the owner of a body
+  several records name was ranked visible-first (the base's rule) — linkage, then strength, then visibility now.
+  Seven new test binaries, seven examples, 32 arms DECLARED AND READ BY NO SWEEP (the registry holds 534). Rows:
+  none opened or closed; three amended. ✔MEASURED by the lane ON CHECKPOINT 13's BASE: the whole suite on
+  `windows-x86_64-debug`, `linux-x86_64-debug`, `macos-arm64-debug` with one red of its own (a refusal sentence,
+  fixed), re-read on 229 tests at the final bytes. **⚠ NOT a whole reading of this composition**: the fold lands
+  on checkpoints 14 to 17, the whole suite was not run at its final bytes, and no MSVC leg read it. NOT measured:
+  the Mach-O alignment of a merged tentative pair, the Mach-O thread-local tentative pair. STILL OWED by that
+  lane: a DSS unit writes `int v;` as a `.bss` definition, so two DSS OBJECTS with one tentative name do not
+  link (the references link their `-fcommon` and cl's default objects) — ruled built first in its next fold: a
+  compiled tentative definition is stated as a common on every format whose document can state one.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
-  (2) since checkpoint 12 a VALID ELF link is REFUSED: a relocation from inside a losing COMDAT group
-  (✔MEASURED 2026-10-12: GNU ld 2.42 and LLD 18.1.3 link the pair in both orders, a build without checkpoint 12's
-  link fold links it, this tree refuses it with `K_CrossCuMergeUnsupported`) — the link lane's next fold;
+  (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
   (3) `D-C-CONSTANT-AGGREGATE-MEMBER-READ-WITHOUT-ITS-INITIALIZERS-OPERATOR` stays OPEN: of its eight arms swept
   from main, 3 `passed`, 4 were `violated` for further red cases not declared, and ONE SURVIVED
   (`core-wrapper-statement-does-not-name-a-statement-expression`: 902 cases, none red) — the library lane probes
   the references on `({ … })` in a constant initializer before it writes the case or the evaluator arm.
+  (4) ✔MEASURED 2026-10-12 after the review of checkpoint 13, pe64, both pipelines, four references exiting 42:
+  17 of 23 CORRECT programs die of an illegal instruction — a BIT-FIELD member of a constant aggregate is read as
+  a constant without its width (7 of 10 forms; in this PR since checkpoint 1), and a NAMED constant is read at its
+  initializer's type instead of its declared one (10 of 13; the reader is older, the code that acts on a folded
+  condition came with checkpoint 5). Both fixed in the library lane's fold now reading its finals;
+  (5) found with them, the BASE's and silent: a bit-field narrower than `int` is NOT promoted (`if (v.b - 6 < 0)`
+  over `unsigned b : 3` goes the wrong way at run time) — a P0 row with that fold, built first in its next one.
 - **Arm sweeps from the main checkout so far:** the registry holds 502 arms. `macos-arm64-debug`: all 147 arms of
   checkpoint 14's registry are read — 131 `passed`, 15 `violated` (all back with their lanes; six answered in
   checkpoint 15 and read `passed` since), 1 `stopped`; of three new ones, 2 `violated` and 1 `unattributed` (the

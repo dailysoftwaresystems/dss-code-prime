@@ -8,6 +8,7 @@
 #include "mir/mir_asm_descriptor.hpp"
 #include "core/types/section_kind.hpp"
 #include "mir/mir_text.hpp"
+#include "link_facts.hpp"   // linkageOf (P69: a weak MIR definition states its kind)
 
 #include <gtest/gtest.h>
 
@@ -61,7 +62,7 @@ TEST(MirText, EmptyModuleRoundTrips) {
     DiagnosticReporter r;
     MirTextContext ctx{&ti};
     std::string out = emitMir(m, ctx, r);
-    EXPECT_NE(out.find("dssir 5"), std::string::npos);
+    EXPECT_NE(out.find("dssir 6"), std::string::npos);
     EXPECT_NE(out.find("module {"), std::string::npos);
 }
 
@@ -290,7 +291,7 @@ TEST(MirText, MalformedHeaderEmitsMalformedDiagnostic) {
 
 TEST(MirText, EmptyModuleParseRoundTripsToEmpty) {
     DiagnosticReporter r;
-    auto res = parseMir("dssir 5\nmodule { }\n", CompilationUnitId{1}, r);
+    auto res = parseMir("dssir 6\nmodule { }\n", CompilationUnitId{1}, r);
     EXPECT_TRUE(res->ok);
     EXPECT_EQ(res->mir.moduleFuncCount(), 0u);
 }
@@ -453,7 +454,7 @@ TEST(MirText, AVoidParameterIsSpelledAndReadDistinctFromNoParameter) {
 // diagnostics from the rest of the input).
 TEST(MirText, MissingFunctionLBraceDoesNotCascade) {
     std::string text =
-        "dssir 5\n"
+        "dssir 6\n"
         "symbols { %1 \"f\" }\n"
         "module {\n"
         "  function %1 : fn() -> i32\n"   // <-- missing `{`
@@ -481,7 +482,7 @@ TEST(MirText, MalformedNumericLiteralEmitsDiagnostic) {
     // Integer-but-out-of-range case (e.g. 9999999999999999999 as int32),
     // parseNumber emits the malformed diagnostic. Use that case:
     std::string text =
-        "dssir 5\n"
+        "dssir 6\n"
         "symbols { %1 \"f\" }\n"
         "module {\n"
         "  function %1 : fn() -> i32 {\n"
@@ -561,8 +562,9 @@ TEST(MirText, FunctionAttributesSurviveRoundTrip) {
     MirBlockId e2 = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(e2); b.addReturn();
     // %3 — weak, NOT noinline: proves the flags are independent, not one bit.
-    (void)b.addFunction(fnSig, SymbolId{3}, SymbolBinding::Weak,
-                        SymbolVisibility::Default, /*noInline=*/false);
+    (void)b.addFunction(fnSig, SymbolId{3},
+                        dss::test_support::linkageOf(SymbolBinding::Weak),
+                        /*noInline=*/false);
     MirBlockId e3 = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(e3); b.addReturn();
     // %4 — everything default: must round-trip with NO attribute list.
@@ -939,7 +941,7 @@ TEST(MirText, NoSanitizeThreadAttributeSurvivesRoundTrip) {
 // permissive direction is closed by construction.
 TEST(MirText, UnknownFunctionAttributeIsMalformed) {
     char const* text =
-        "dssir 5\n"
+        "dssir 6\n"
         "module {\n"
         "  function %1 : fn() -> void [frobnicate] {\n"
         "    block %b0 [entry] {\n"
@@ -1171,17 +1173,17 @@ TEST(MirText, StaticInitScheduleSurvivesRoundTripWithItsPriority) {
 TEST(MirTextParse, TruncatedOperandListIsRefusedRatherThanLoopingForever) {
     struct Case { char const* name; char const* text; };
     Case const cases[] = {
-        {"tuple",  "dssir 5\nmodule {\n  global %1 : tuple<i32"},
+        {"tuple",  "dssir 6\nmodule {\n  global %1 : tuple<i32"},
         // v1's inline composite, refused at its head since v2 and still consumed.
-        {"struct", "dssir 5\nmodule {\n  global %1 : struct \"S\" { i32"},
-        {"union",  "dssir 5\nmodule {\n  global %1 : union \"U\" { i32"},
+        {"struct", "dssir 6\nmodule {\n  global %1 : struct \"S\" { i32"},
+        {"union",  "dssir 6\nmodule {\n  global %1 : union \"U\" { i32"},
         // v2's `types` table: a truncated entry, and a truncated section.
-        {"types-struct",  "dssir 5\ntypes {\n  type 1 = struct \"S\" { i32"},
-        {"types-union",   "dssir 5\ntypes {\n  type 1 = union \"U\" { i32, "},
-        {"types-section", "dssir 5\ntypes {\n  type 1 = struct \"S\" {i32}\n"},
-        {"types-head",    "dssir 5\ntypes {\n  type 1 = struct"},
-        {"fn",     "dssir 5\nmodule {\n  function %2 : fn(i32"},
-        {"agg",    "dssir 5\nmodule {\n  global %1 : i64 = lit agg { lit int 1 : i64"},
+        {"types-struct",  "dssir 6\ntypes {\n  type 1 = struct \"S\" { i32"},
+        {"types-union",   "dssir 6\ntypes {\n  type 1 = union \"U\" { i32, "},
+        {"types-section", "dssir 6\ntypes {\n  type 1 = struct \"S\" {i32}\n"},
+        {"types-head",    "dssir 6\ntypes {\n  type 1 = struct"},
+        {"fn",     "dssir 6\nmodule {\n  function %2 : fn(i32"},
+        {"agg",    "dssir 6\nmodule {\n  global %1 : i64 = lit agg { lit int 1 : i64"},
     };
     for (Case const& c : cases) {
         DiagnosticReporter r;
@@ -1242,7 +1244,7 @@ TEST(MirText, ANanReadsBackWithItsPayloadAndSign) {
 TEST(MirText, ANanbitsPatternThatIsNotANanIsRefused) {
     DiagnosticReporter r;
     auto const parsed = parseMir(
-        "dssir 5\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : f64 = lit float nanbits "
+        "dssir 6\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : f64 = lit float nanbits "
         "4607182418800017408 : f64\n}\n",   // the bits of 1.0
         CompilationUnitId{3}, r);
     EXPECT_FALSE(parsed->ok);
@@ -1371,7 +1373,7 @@ TEST(MirText, AUnionMemberSpellingIsReadOnlyWhereItMeansSomething) {
              Case{"member without an index", "lit agg member x { lit int 1 : i32 } : union",
                   "expected a member index"},
          }) {
-        std::string const text = std::string{"dssir 5\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  "
+        std::string const text = std::string{"dssir 6\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  "
                                              "global %1 : i32 = "} + c.literal + "\n}\n";
         DiagnosticReporter r;
         auto const parsed = parseMir(text, CompilationUnitId{4}, r);
