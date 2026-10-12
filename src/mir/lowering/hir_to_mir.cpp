@@ -618,16 +618,17 @@ struct Lowerer {
     // ids (`MirSymbolIdContinuation`) and needs no scan of its own to clear them.
     //
     // The module is told the END of the id space its unit was analysed in when it
-    // is made (`lowerToMir` states `config.syntheticSymbolFloor` — the name
-    // table's end — to the builder), so a minted id is past every record the
-    // table holds: typedefs, tags, fields, locals and injected constants as well
-    // as the functions and objects MIR sees. c86
-    // (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS) is why: the whole-program merge maps
-    // a MIR symbol to a NAME through that table, so an id inside it made a NAMED
-    // strong definition of an anonymous literal.
+    // is made (`lowerToMir` states `config.symbolIdSpace` — the name table's end
+    // — to the builder), so a minted id is past every record the table holds:
+    // typedefs, tags, fields, locals and injected constants as well as the
+    // functions and objects MIR sees. c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS) is
+    // why: the whole-program merge maps a MIR symbol to a NAME through that table,
+    // so an id inside it made a NAMED strong definition of an anonymous literal.
+    // (A caller that says NOTHING of the id space gets a module that states
+    // nothing, and the first mint below is refused by name.)
     //
-    // What the table's end does not cover is a caller that states NO table (a
-    // fixture that lowers hand-built HIR: the end stated is 0) and a symbol this
+    // What the table's end does not cover is a caller whose unit IS its own table
+    // (a fixture that lowers hand-built HIR: the end stated is 0) and a symbol this
     // unit holds that the MODULE never will — an import's row lives beside the
     // Mir, not in it. So `lower()` raises the end past every symbol the collect
     // pre-passes found (`collectFunctions` / `collectThreadShimSymbols` /
@@ -18178,10 +18179,19 @@ HirToMirResult lowerToMir(Hir const&               hir,
         : MirAliasingMode::Permissive);
     lwr.mir.setCharTypesAliasAll(config.charTypesAliasAll);
     // The END of the id space this unit was analysed in — its name table's end,
-    // or 0 from a caller with no table. Stated ONCE, here, where the module is
-    // made from the model; every minter of the module asks the module from now
-    // on (`MirBuilder::mintSymbol`) and none is handed the number again.
-    lwr.mir.stateSymbolIdEnd(config.syntheticSymbolFloor);
+    // or the unit's own symbols where it is its own table. Stated ONCE, here,
+    // where the module is made from the model; every minter of the module asks
+    // the module from now on (`MirBuilder::mintSymbol`) and none is handed the
+    // number again.
+    //
+    // ★ ONLY WHAT THE CALLER SAID IS STATED. A caller that said nothing of the id
+    // space (`symbolIdSpace` absent — the default argument) gets a module whose
+    // end is COUNTED, which the door refuses to mint past, by name, like every
+    // other module nobody stated: this entrance used to state a defaulted 0, so
+    // forgetting the statement here was silent where it is loud everywhere else.
+    if (config.symbolIdSpace.has_value()) {
+        lwr.mir.stateSymbolIdEnd(config.symbolIdSpace->statedEnd);
+    }
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();

@@ -28,23 +28,55 @@
 //     split, a sparse switch's chain, a dense switch's table read);
 //   * WHY A RUN NEVER WRITES A REGISTER ITS LANDING BLOCK READS: the one shape that
 //     does is a phi above the region fed from inside it — built by hand below, in
-//     a created block and in the region's own block alike — and no source program
-//     has it, because a function that guards a region keeps its locals in memory
-//     (mem2reg promotes nothing there): the two nearest sources are compiled with
-//     the shipped release schedule and hold no phi at all, while the same loop
-//     without the `__try` does.
+//     a created block and in the region's own block alike. No source program has
+//     it for a LOCAL, because a function that guards a region keeps its locals in
+//     memory (mem2reg promotes nothing there): the two nearest sources are
+//     compiled with the shipped release schedule and hold no promoted local's phi,
+//     while the same loop without the `__try` does.
+//   * WHAT A SOURCE PROGRAM DOES PUT IN A RUN: the phi the MIR lowering makes
+//     ITSELF, with no promotion pass involved — for `&&` and `||`, for a scalar
+//     `?:` and for `va_arg`. `a && b` is `condbr a → [b], join` with a phi at the
+//     join: a two-way predecessor feeding a phi, exactly the edge this tier splits
+//     in a block it creates. So a guarded body that holds `p && *p` has a run of
+//     its own — the one created block, the split — and the register that split
+//     writes is read by the join and by nothing the handler runs (✔MEASURED
+//     2026-10-12 on pe64, debug and release, DSS beside cl over 78 cells: the
+//     image's scope table holds 2 records for `&&` and for `||`, 4 for a nested
+//     pair, and 1 for a scalar `?:` and for `va_arg`, which get no created block
+//     there).
 //
 // The LL/SC creator is pinned beside its lowering (lir/test_atomic_cas_runtime_routing),
-// the `asm goto` one through the driver, on the produced image
-// (program/test_compile_pipeline), and the runnable witness is
-// examples/c/seh_asm_goto_output_stored_on_its_edges_is_guarded.
+// the `asm goto` one and the short-circuit's split through the driver, on the
+// produced image (program/test_compile_pipeline), and the runnable witnesses are
+// examples/c/seh_asm_goto_output_stored_on_its_edges_is_guarded and
+// examples/c/seh_short_circuit_in_a_guarded_body.
 //
-// RED-ON-DISABLE (each alone): the runs emitted after ALL the bodies' records
-// instead of after their own region's; no run emitted; a run that takes every
-// created block of the function; a run that ignores which function a created
-// block is in; a creator that goes around the one place a created block is
-// written down (refused by name on the finished module); mem2reg promoting in a
-// function that guards a region.
+// THE MUTATIONS THAT HOLD THESE PINS are arms of tests/mutations/arms.registry,
+// driven by `dssharness check-mutations`. Each of the nine READ `passed` in the
+// sweeps of checkpoint 14 (macos-arm64-debug: run 20261012-151311-82d3dd43 for the
+// eight `lir-` arms, run 20261012-145059-ba433418 for the `opt-` one), against the
+// SEVEN cases this file held that day. The eighth — the short-circuit's split,
+// the last pin below — is younger than those sweeps, and three of the arms are
+// DECLARED to redden it too (`lir-no-run-is-emitted_guarded-region-runs`,
+// `lir-a-phi-edges-split-is-created-around-the-creator`,
+// `opt-mem2reg-promotes-in-a-function-that-guards-a-region`): for that case they
+// are WRITTEN, NOT READ. What each arm makes the code do:
+//   lir-every-bodys-record-then-every-run
+//       the runs emitted after ALL the bodies' records, not after their own region's
+//   lir-no-run-is-emitted_guarded-region-runs
+//       no run emitted
+//   lir-a-run-takes-every-created-block-of-its-function
+//       a run that takes every created block of the function
+//   lir-a-run-ignores-which-function-a-block-is-in
+//       a run that ignores which function a created block is in
+//   lir-a-phi-edges-split-is-created-around-the-creator,
+//   lir-a-table-read-is-created-around-the-creator,
+//   lir-a-chains-default-jump-is-created-around-the-creator,
+//   lir-a-chains-next-compare-is-created-around-the-creator
+//       a creator that goes around the one place a created block is written down
+//       (refused by name on the finished module)
+//   opt-mem2reg-promotes-in-a-function-that-guards-a-region
+//       mem2reg promoting in a function that guards a region
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/types/diagnostic_budget.hpp"
@@ -663,15 +695,17 @@ TEST(GuardedRegionRuns, OnlyAPhiAboveARegionFedFromInsideItIsWrittenInsideTheReg
     }
 }
 
-// AND NO SOURCE PROGRAM HAS THAT SHAPE. A phi above a region fed from inside it is a
-// local the optimizer promoted across the region — and a function that guards a
-// region keeps every local in memory (mem2reg promotes nothing in it: the handler
-// must read the value at the fault, not the one at the region's entry). The two
-// nearest sources — a loop variable the handler reads, written on one arm of a
-// branch inside the guarded body; the output of an `asm goto` in the body, read by
-// the handler — are compiled with the SHIPPED release schedule and hold no phi at
-// all; their handler reads through an `alloca`. THE CONTROL is the same loop with
-// no `__try`: there the schedule promotes, and the phi is there to be counted.
+// AND NO SOURCE PROGRAM HAS THAT SHAPE FOR A LOCAL. A phi above a region fed from
+// inside it is a local the optimizer promoted across the region — and a function
+// that guards a region keeps every local in memory (mem2reg promotes nothing in it:
+// the handler must read the value at the fault, not the one at the region's entry).
+// The two nearest sources — a loop variable the handler reads, written on one arm of
+// a branch inside the guarded body; the output of an `asm goto` in the body, read by
+// the handler — are compiled with the SHIPPED release schedule and hold no phi (their
+// bodies hold no `&&`, `||`, `?:` or `va_arg`, the four operators the lowering gives
+// a phi of its own — the next pin's subject); their handler reads through an
+// `alloca`. THE CONTROL is the same loop with no `__try`: there the schedule
+// promotes, and the phi is there to be counted.
 // (A jump OUT of a guarded body is not among these sources: ✔MEASURED writing this
 // pin, a `continue` that leaves one is refused by name today
 // (D-CSUBSET-SEH-EARLY-EXIT). The day that row closes, such an edge — a write in
@@ -773,7 +807,7 @@ std::string withGuard(std::string text, bool guarded) {
 
 }  // namespace
 
-TEST(GuardedRegionRuns, ASourceFunctionThatGuardsARegionHoldsNoPhiForARunToWrite) {
+TEST(GuardedRegionRuns, ASourceFunctionThatGuardsARegionHoldsNoPromotedLocalsPhi) {
     auto const tc = loadPe64();
     ASSERT_TRUE(tc.has_value());
     // The loop variables `i` and `r` are written on one arm each of a branch
@@ -836,4 +870,228 @@ TEST(GuardedRegionRuns, ASourceFunctionThatGuardsARegionHoldsNoPhiForARunToWrite
     EXPECT_GE(plainWalk.phis, 1u)
         << "CONTROL: the release schedule must promote the unguarded loop's variables — "
            "otherwise a count of zero above says nothing about the region";
+}
+
+// ── WHAT A SOURCE PROGRAM DOES PUT IN A RUN: A SHORT-CIRCUIT'S EDGE SPLIT ─────────
+//
+// The promotion pass is not the only maker of a phi. The MIR lowering gives `&&` and
+// `||` one of its own — `a && b` is `condbr a → [b], join` and a phi at the join —
+// and that `condbr` is a two-way predecessor feeding a phi: the edge this tier
+// splits, in a block it creates while it lowers a block OF THE GUARDED BODY. So the
+// split is in a run of the region, under a record of its own; before runs existed it
+// lay past every range the `__try` guarded.
+//
+// What makes that sound is read here off the real pipeline (source → the unit's MIR
+// under the shipped schedule → the funclet synthesis → this tier), for the operator
+// as a CONDITION and as a VALUE, `&&` and `||`, debug and release:
+//   * the function holds a phi (the premise: without one there is no split to place);
+//   * its region has exactly TWO records — its own blocks, then ONE run of ONE
+//     created block, with the region's own handler;
+//   * that block is the split: its one successor is a block that holds a phi;
+//   * the register the split writes for that phi is read by the join and by NO
+//     instruction of the handler block — the handler reads the local from its home
+//     in the frame, so a fault before or after the split shows it the same value.
+// THE CONTROL is the same function with no short-circuit in the body: one record,
+// no phi — so the second record above is the operator's and nothing else's.
+namespace {
+
+struct LoweredSource {
+    bool                       ok = false;
+    std::optional<CuMirModule> unit;        // owns the interner the lowered module's types name
+    MirToLirResult             lowered;
+    std::uint32_t              funcIndex = 0;   // the function's index in the module (MIR and LIR alike)
+    std::uint32_t              ownBlocks = 0;   // its MIR blocks: the 1:1 pre-pass keeps their order
+    std::vector<std::uint32_t> phiBlocks;       // the positions of its blocks that hold a phi
+    std::size_t                regions = 0;
+    std::size_t                handlerLoadsOfAnAlloca = 0;
+};
+
+// The unit schedule of `config` over `source`, then what the driver's lower half does
+// to a guarded module before this tier (the funclet synthesis, which also lays each
+// guarded body out contiguously), then this tier — for the function `name`.
+LoweredSource lowerSource(Toolchain const& tc, CompileConfig config, std::string const& source,
+                          std::string_view name) {
+    LoweredSource out;
+    UnitBuilder builder{tc.grammar, DiagnosticBudget::libraryDefault()};
+    dss::applySystemDirs(builder, *tc.grammar);
+    builder.addInMemory(source, "guarded.c");
+    CompilationUnit cu = std::move(builder).finish();
+    DiagnosticReporter rep;
+    CompileOptions opts{DiagnosticBudget::libraryDefault()};
+    opts.config = config;
+    out.unit = buildCuMir(cu, *tc.grammar, *tc.target, *tc.format, tc.ccIndex, rep, opts);
+    EXPECT_TRUE(out.unit.has_value()) << allDiagText(rep);
+    if (!out.unit.has_value()) return out;
+    EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+    CuMirModule& unit = *out.unit;
+    TypeInterner& interner = unit.model.lattice().interner();
+
+    std::vector<MirSehScope> scopes;
+    bool const synthesized = synthesizeSehFunclets(unit.mir, interner, unit.externImports,
+                                                   tc.format->sehPersonality(), unit.cSymbolDecoration,
+                                                   tc.format->name(), scopes, rep);
+    EXPECT_TRUE(synthesized) << allDiagText(rep);
+    if (!synthesized) return out;
+
+    Mir const& mir = unit.mir;
+    bool found = false;
+    for (std::uint32_t fi = 0; fi < mir.moduleFuncCount() && !found; ++fi) {
+        MirFuncId const fn = mir.funcAt(fi);
+        SymbolRecord const* const rec = unit.model.recordFor(mir.funcSymbol(fn));
+        if (rec == nullptr || rec->name != name) continue;
+        found = true;
+        out.funcIndex = fi;
+        out.ownBlocks = mir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < out.ownBlocks; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(fn, bi);
+            std::uint32_t const n = mir.blockInstCount(b);
+            bool holdsPhi = false;
+            for (std::uint32_t k = 0; k < n; ++k) {
+                if (mir.instOpcode(mir.blockInstAt(b, k)) == MirOpcode::Phi) holdsPhi = true;
+            }
+            if (holdsPhi) out.phiBlocks.push_back(bi);
+            if (n == 0) continue;
+            MirInstId const term = mir.blockInstAt(b, n - 1);
+            if (mir.instOpcode(term) == MirOpcode::SehTryBegin) ++out.regions;
+            if (mir.instOpcode(term) != MirOpcode::SehFilterReturn) continue;
+            auto const succs = mir.blockSuccessors(b);
+            if (succs.empty()) continue;
+            for (std::uint32_t k = 0; k < mir.blockInstCount(succs[0]); ++k) {
+                MirInstId const inst = mir.blockInstAt(succs[0], k);
+                if (mir.instOpcode(inst) != MirOpcode::Load) continue;
+                auto const ops = mir.instOperands(inst);
+                if (!ops.empty() && mir.instOpcode(ops[0]) == MirOpcode::Alloca) ++out.handlerLoadsOfAnAlloca;
+            }
+        }
+    }
+    EXPECT_TRUE(found) << "the unit must define `" << name << "`";
+    if (!found) return out;
+
+    // The funclet synthesis imports the format's personality routine, so the module
+    // holds an import and its calls take the call-site form the format declares.
+    out.lowered = lowerToLir(mir, *tc.target, interner, rep, unit.externImports,
+                             tc.format->externCallDispatch(), std::nullopt, std::nullopt, scopes);
+    EXPECT_TRUE(out.lowered.ok) << allDiagText(rep);
+    out.ok = out.lowered.ok;
+    return out;
+}
+
+// The position, in the function's own block order, of the LIR block with id `.v == v`;
+// the block count when there is none.
+std::uint32_t positionOf(Lir const& lir, LirFuncId fn, std::uint32_t v) {
+    for (std::uint32_t k = 0; k < lir.funcBlockCount(fn); ++k) {
+        if (lir.funcBlockAt(fn, k).v == v) return k;
+    }
+    return lir.funcBlockCount(fn);
+}
+
+bool blockReads(Lir const& lir, LirBlockId b, LirReg reg) {
+    for (std::uint32_t k = 0; k < lir.blockInstCount(b); ++k) {
+        for (LirOperand const& op : lir.instOperands(lir.blockInstAt(b, k))) {
+            if (op.kind == LirOperandKind::Reg && op.reg == reg) return true;
+        }
+    }
+    return false;
+}
+
+std::string guardedUse(std::string_view body) {
+    return std::string{"int use(int *p) {\n"
+                       "    int t = -1;\n"
+                       "    __try {\n"
+                       "        "} + std::string{body} + "\n"
+           "    } __except (1) {\n"
+           "        t += 100;\n"
+           "    }\n"
+           "    return t;\n"
+           "}\n"
+           "int main(void) { int cell = 5; return use(&cell); }\n";
+}
+
+}  // namespace
+
+TEST(GuardedRegionRuns, AShortCircuitInAGuardedBodyIsSplitInARunItsHandlerNeverReads) {
+    auto const tc = loadPe64();
+    ASSERT_TRUE(tc.has_value());
+    struct Arm {
+        char const* label;
+        char const* body;
+    };
+    constexpr std::array<Arm, 4> arms{{
+        {"`&&` as a condition", "if (p && *p) t = 1; else t = 2;"},
+        {"`||` as a condition", "if (!p || *p) t = 1; else t = 2;"},
+        {"`&&` as a value", "t = 10 + (p && *p);"},
+        {"`||` as a value", "t = 10 + (!p || *p);"},
+    }};
+    for (CompileConfig const config : {CompileConfig::Debug, CompileConfig::Release}) {
+        for (Arm const& arm : arms) {
+            SCOPED_TRACE(std::string{config == CompileConfig::Release ? "release: " : "debug: "} + arm.label);
+            LoweredSource const low = lowerSource(*tc, config, guardedUse(arm.body), "use");
+            ASSERT_TRUE(low.ok);
+            EXPECT_EQ(low.regions, 1u) << "the fixture must guard one region";
+            ASSERT_GE(low.phiBlocks.size(), 1u)
+                << "THE PREMISE: a short-circuit operator is lowered to a phi with no promotion "
+                   "pass involved — with none there is no edge to split and this pin reads nothing";
+            EXPECT_GE(low.handlerLoadsOfAnAlloca, 1u)
+                << "the handler must read the local from its home in the frame";
+
+            Lir const& lir = low.lowered.lir;
+            LirFuncId const fn = lir.funcAt(low.funcIndex);
+            std::vector<Record> records;
+            for (Record const& r : recordsOf(low.lowered)) {
+                if (r.funcIndex == low.funcIndex) records.push_back(r);
+            }
+            ASSERT_EQ(records.size(), 2u)
+                << "a guarded short-circuit is its region's own blocks and ONE run — the split of "
+                   "the operator's edge:" << shown(records);
+            Record const& body = records[0];
+            Record const& run  = records[1];
+            EXPECT_LT(positionOf(lir, fn, body.begin), low.ownBlocks);
+            EXPECT_LT(positionOf(lir, fn, body.end), low.ownBlocks);
+            EXPECT_EQ(run.handler, body.handler) << "a run enters its region's own handler";
+            EXPECT_EQ(run.funclet, body.funclet) << "and is filtered by its region's own filter";
+            EXPECT_EQ(run.begin, run.end) << "one created block: the split" << shown(records);
+            std::uint32_t const splitAt = positionOf(lir, fn, run.begin);
+            ASSERT_LT(splitAt, lir.funcBlockCount(fn));
+            EXPECT_GE(splitAt, low.ownBlocks)
+                << "a run holds blocks this tier CREATED, laid out after the function's own";
+
+            LirBlockId const split = lir.funcBlockAt(fn, splitAt);
+            auto const succs = lir.blockSuccessors(split);
+            ASSERT_EQ(succs.size(), 1u) << "a split has its edge's one target";
+            std::uint32_t const joinAt = positionOf(lir, fn, succs[0].v);
+            EXPECT_TRUE(std::find(low.phiBlocks.begin(), low.phiBlocks.end(), joinAt) != low.phiBlocks.end())
+                << "the run's block must be the split of an edge INTO A PHI's block (position "
+                << joinAt << ")";
+            ASSERT_LT(joinAt, lir.funcBlockCount(fn));
+            LirBlockId const join    = lir.funcBlockAt(fn, joinAt);
+            LirBlockId const handler = lir.funcBlockAt(fn, positionOf(lir, fn, run.handler));
+
+            // The phi's register: what the split writes and the join reads.
+            std::size_t phiRegisters = 0;
+            for (std::uint32_t k = 0; k < lir.blockInstCount(split); ++k) {
+                LirReg const written = lir.instResult(lir.blockInstAt(split, k));
+                if (!written.valid() || !blockReads(lir, join, written)) continue;
+                ++phiRegisters;
+                EXPECT_FALSE(blockReads(lir, handler, written))
+                    << "the handler reads a register the run writes: a fault before the split and "
+                       "one after it would show the handler two different values";
+            }
+            EXPECT_GE(phiRegisters, 1u)
+                << "the split must write, for the join, the register the phi became";
+        }
+    }
+    // THE CONTROL: the same guarded function with no short-circuit in its body.
+    for (CompileConfig const config : {CompileConfig::Debug, CompileConfig::Release}) {
+        SCOPED_TRACE(config == CompileConfig::Release ? "release: the control" : "debug: the control");
+        LoweredSource const low = lowerSource(*tc, config, guardedUse("t = 50 + *p;"), "use");
+        ASSERT_TRUE(low.ok);
+        EXPECT_EQ(low.regions, 1u);
+        EXPECT_TRUE(low.phiBlocks.empty())
+            << "CONTROL: a guarded body with no short-circuit holds no phi (no local is promoted)";
+        std::size_t records = 0;
+        for (Record const& r : recordsOf(low.lowered)) {
+            if (r.funcIndex == low.funcIndex) ++records;
+        }
+        EXPECT_EQ(records, 1u) << "CONTROL: with nothing created for its blocks, a region has one record";
+    }
 }

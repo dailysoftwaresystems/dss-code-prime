@@ -872,8 +872,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // ★ THIS IS THE ONE PLACE the table's end is stated (P69 round 5): the
     // module carries it from here (`Mir::symbolIdEnd`), and every later minter —
     // the optimizer's, the three synthesis passes' — asks the module.
-    mirCfg.syntheticSymbolFloor =
-        static_cast<std::uint32_t>(model.symbols().size());
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(
+        static_cast<std::uint32_t>(model.symbols().size()));
     // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the RESOLVED calling
     // convention's by-value aggregate strategy into HIR→MIR (the §B-locked
     // boundary). A struct arg/return is classified + synthesized at HIR→MIR; the

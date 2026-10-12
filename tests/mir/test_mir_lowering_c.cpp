@@ -255,6 +255,8 @@ struct Lowered {
     // DELETING the key turns these pins RED, which is the direction that proves
     // something.
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     if (!staticInitializersMustFold) mirCfg.globalsConstantForms = std::nullopt;
     // FC7 (D-FC7-MEMBER-ACCESS): thread the target's aggregate-layout params
     // (struct/union field offsets + sizes) into the MIR config exactly as
@@ -1112,6 +1114,8 @@ namespace {
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     // A target that will not load is a STOP, never a fixture that quietly
     // measures a default machine model.
     {
@@ -1200,6 +1204,8 @@ namespace {
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     // A target that will not load is a STOP, never a fixture that quietly
     // measures a default machine model.
     {
@@ -5610,16 +5616,18 @@ TEST(MirLoweringC, ForwardReferenceCallResolvesViaPrePass) {
 
 // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): a synthetic literal-promoted
 // global's SymbolId must clear the WHOLE semantic symbol table when the
-// pipeline passes `syntheticSymbolFloor = model.symbols().size()`. The
-// minter's own scan covers only MIR-VISIBLE symbols (functions/globals/
+// pipeline says `symbolIdSpace = MirSymbolIdSpace::endingAt(model.symbols().size())`.
+// The minter's own scan covers only MIR-VISIBLE symbols (functions/globals/
 // externs); the semantic table also holds typedefs, tags, fields, locals,
 // and injected constants — and the LK11 merge maps MIR symbols to NAMES
 // through that table, so an aliased synthetic id fabricates a named strong
 // definition from an anonymous string literal (the sqlite3.c+shell.c probe's
-// bogus `sqlite3_stmt`/`Fts5Tokenizer` cross-CU redefinitions). RED-ON-
-// DISABLE: state 0 in `lowerToMir`'s `stateSymbolIdEnd(config.syntheticSymbolFloor)` → the
-// promoted global's id lands inside the semantic table (this fixture's
-// table carries param/local records well past the function count).
+// bogus `sqlite3_stmt`/`Fts5Tokenizer` cross-CU redefinitions). THE MUTATION
+// THIS PIN IS WRITTEN AGAINST — `lowerToMir` stating 0 whatever the caller said,
+// so the promoted global's id lands inside the semantic table (this fixture's
+// table carries param/local records well past the function count) — is the arm
+// `mir-the-lowering-states-zero-whatever-its-caller-said` of
+// tests/mutations/arms.registry: WRITTEN, NOT READ.
 TEST(MirLoweringC, SyntheticGlobalSymbolsRespectSemanticFloor) {
     auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
@@ -5638,7 +5646,7 @@ TEST(MirLoweringC, SyntheticGlobalSymbolsRespectSemanticFloor) {
     std::uint32_t const floor =
         static_cast<std::uint32_t>(model.symbols().size());
     MirLoweringConfig cfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
-    cfg.syntheticSymbolFloor = floor;   // what compile_pipeline passes
+    cfg.symbolIdSpace = MirSymbolIdSpace::endingAt(floor);   // what compile_pipeline says
     DiagnosticReporter mirRep;
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), mirRep,
@@ -10005,6 +10013,8 @@ TEST(MirLoweringC, LabelAddressInStaticInitializerIsRefusedWithoutProvenance) {
     // Re-lower the SAME HIR with the provenance map withheld.
     DiagnosticReporter rep;
     MirLoweringConfig cfg;
+    cfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table: a block symbol is minted
+        static_cast<std::uint32_t>(withMap.model.symbols().size()));
     auto const bare = lowerToMir(withMap.hir->hir, withMap.hir->literalPool,
                                  withMap.model.lattice().interner(), rep,
                                  &withMap.hir->sourceMap, cfg);
@@ -15165,6 +15175,8 @@ constexpr char const* kSetjmpRoundTripSrc =
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     // A target that will not load is a STOP, never a fixture that quietly
     // measures a default machine model.
     {
@@ -17945,8 +17957,12 @@ TEST(MirLoweringC, AVaListReachedThroughItsDecayedPointerIsReadThroughThePointer
 // pointer load. The run-time half is examples/c/va_list_through_its_decayed_pointer
 // (`copy_into_ptr`).
 //
-// RED-ON-DISABLE: skip the pointee step and the copy is ONE pointer-sized load out of the
-// source's tag, stored over the destination's first eight bytes: sixteen bytes fewer are read.
+// THE MUTATION is the arm `mir-va-copy-shallow-on-sysv` of `dssharness check-mutations`: the
+// pointee step skipped, so the copy is ONE pointer-sized load out of the source's tag, stored
+// over the destination's first eight bytes — sixteen bytes fewer are read. Read `passed` by
+// the sweep of checkpoint 14 (macos-arm64-debug, run 20261012-145059-ba433418). The same sweep
+// read this case red under two further arms, each of which declares it since:
+// `mir-tagbase-reads-the-pointer-slot` (24 bytes where 32) and `mir-va-copy` (none read).
 namespace {
 // Every byte the function's Loads read, on the LP64 pair `lowerC` lowers for by default. A
 // load of a type with no scalar size is a failure of its own, never a silent zero.
@@ -18009,7 +18025,9 @@ TEST(MirLoweringC, VaCopyIntoADecayedListCopiesTheTagItPointsAt) {
 // which reads the same fields and holds no such load either.
 // The run-time half is examples/c/va_list_through_its_decayed_pointer (`walk`).
 //
-// RED-ON-DISABLE: let the va_list-parameter arm take a `Ptr<__va_list_tag>` parameter too.
+// THE MUTATION is the arm `mir-decayed-param-received-as-its-tag` of `dssharness
+// check-mutations`: the va_list-parameter arm takes a `Ptr<__va_list_tag>` parameter too. Read
+// `passed` by the sweep of checkpoint 14 (macos-arm64-debug, run 20261012-145059-ba433418).
 namespace {
 // Loads of a pointer whose ADDRESS operand is one of the function's incoming arguments.
 [[nodiscard]] std::size_t countPointerLoadsThroughAnArgument(Mir const& m, TypeInterner const& in,

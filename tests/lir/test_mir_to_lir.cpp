@@ -78,6 +78,8 @@ struct Lowered {
     DiagnosticReporter mirReporter;
     // The language's policy through the pipeline's ONE assembly (`languageMirLoweringConfig`).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     // VLA C1a (D-CSUBSET-VLA): thread the target's aggregate-layout params so a VLA
     // alloca's element STRIDE (sizeof(int)) resolves at MIR (cachedLayout gates on
     // aggregateLayoutLoaded — even a scalar element needs it). Harmless for the
@@ -7637,6 +7639,8 @@ TEST(MirToLir, LongDoubleComplexArithmeticLowersOnX87Axis) {
         << (hirReporter.all().empty() ? "" : hirReporter.all()[0].actual);
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     mirCfg.aggregateLayout       = (*target)->aggregateLayout();

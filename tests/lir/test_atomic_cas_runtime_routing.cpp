@@ -307,9 +307,15 @@ TEST(AtomicCasRuntimeRouting, AnLlscLoopInsideAGuardedBodyIsARunOfItsRegion) {
         << "…so the body's own block only jumps into the loop";
     EXPECT_EQ(lir.blockSuccessors(lir.funcBlockAt(fn, 1))[0].v, blockV(3));
 
-    // TWO records, in this order: the body's own block, then the loop — RED-ON-
-    // DISABLE: with the run's record gone, the exclusive load and store, and
-    // everything the guarded block does after them, sit in blocks no scope guards.
+    // TWO records, in this order: the body's own block, then the loop. With the
+    // run's record gone, the exclusive load and store, and everything the guarded
+    // block does after them, would sit in blocks no scope guards: that mutation is
+    // the arm `lir-no-run-is-emitted_atomic-cas-runtime-routing` of `dssharness
+    // check-mutations`, and the loop's three blocks created with no owner are
+    // `lir-the-llsc-retry-block-…`, `lir-the-llsc-store-block-…` and
+    // `lir-the-llsc-done-block-is-created-around-the-creator`. Each of the four READ
+    // `passed` in the sweep of checkpoint 14 (macos-arm64-debug, run
+    // 20261012-151311-82d3dd43).
     auto const& ds = L.result.sehScopeDescriptors;
     ASSERT_EQ(ds.size(), 2u);
     EXPECT_EQ(ds[0].beginLirBlockV, blockV(1));

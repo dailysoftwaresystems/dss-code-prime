@@ -1136,9 +1136,15 @@ TEST(Program_CompileFiles, AReachedEndCompilesForEveryResultClassOnEveryShippedP
 // The table is the same evaluator's third consumer — an index designator that is
 // a constant only through the layout — and must compile on every pair too.
 //
-// RED-ON-DISABLE: the model built WITHOUT the analysis's layout parameters (the
-// carried member) reports all three functions on every pair and refuses the
-// table; `resolveSizeof` removed does the same.
+// THE MUTATIONS are arms of `dssharness check-mutations`, WRITTEN, NOT READ — no
+// sweep has read either yet:
+//   analysis-the-model-carries-no-layout-parameters_compile-pipeline
+//       the analyzer hands its model no layout parameters (the carried member);
+//       expected: all three functions reported on every pair, the table refused.
+//       Its claim is this case.
+//   hir-sizeof-is-not-a-constant-to-the-lowering
+//       `resolveSizeof` removed. Its claim is `BothTiersAgreeOnSizeofPerTarget`;
+//       whether this case reddens under it too is what its first sweep says.
 TEST(Program_CompileFiles, AConstantConditionReadsTheTargetsOwnLayout) {
     struct Pair {
         std::string_view spec;
@@ -1219,7 +1225,12 @@ TEST(Program_CompileFiles, AConstantConditionReadsTheTargetsOwnLayout) {
 // does not run on a program with an error, so a hook whose SEMANTIC tier loses
 // the pair's value stops the agreed compile for all five, and all five cases go
 // red, each printing the assertion that failed. A hook whose LOWERING disagrees
-// reddens its own case alone.
+// is expected to redden its own case alone: that is what the five hook arms of
+// `dssharness check-mutations` declare (`hir-sizeof-is-not-a-constant-to-the-lowering`,
+// `hir-alignof-is-not-a-constant-to-the-lowering`,
+// `hir-a-member-offset-is-not-a-constant-to-the-lowering`,
+// `hir-a-folded-constant-is-not-read-back`, `hir-a-generic-selection-is-not-followed`)
+// — WRITTEN, NOT READ: no sweep has read any of the five yet.
 namespace {
 
 struct LayoutPair {
@@ -1714,8 +1725,9 @@ TEST(Program_CompileFiles, AGuardedAsmGotosEdgeBlocksAreUnderAScopeRecordOfTheir
         if (guarded.size() != 1u) continue;
         GuardedPeFunction const& fn = guarded[0];
         EXPECT_EQ(fn.scopes.size(), arm.records)
-            << "RED-ON-DISABLE: with the run's record gone, the blocks this "
-               "statement's edges became lie outside every range its `__try` guards";
+            << "the image's scope records are not this arm's count — one record fewer "
+               "means the blocks this statement's edges became lie outside every range "
+               "its `__try` guards";
         if (fn.scopes.empty()) continue;
         for (GuardedPeScope const& sc : fn.scopes) {
             EXPECT_LT(sc.begin, sc.end) << "an empty record guards nothing";
@@ -1729,6 +1741,133 @@ TEST(Program_CompileFiles, AGuardedAsmGotosEdgeBlocksAreUnderAScopeRecordOfTheir
         if (fn.scopes.size() == 2) {
             EXPECT_GE(fn.scopes[1].begin, fn.scopes[0].end)
                 << "the run lies after the body's own blocks, apart from them";
+        }
+    }
+}
+
+// THE SAME TABLE FOR THE BLOCK A SHORT-CIRCUIT MAKES THE LOWERING CREATE. `a && b` and
+// `a || b` reach MIR→LIR as a two-way branch feeding a phi, and that edge is split in a
+// created block — inside a `__try`, a block of the guarded body's run. No promotion
+// pass is involved, so this is the created block an ordinary C program puts in a
+// guarded body. ✔MEASURED 2026-10-12 on pe64, debug and release, DSS beside cl 19.51
+// over 78 cells (operand null, non-null, zero, a no-access page; a fault before, in
+// and after the operator): every cell equal, and these record counts. Each arm states
+// how many records `use`'s table holds, and the arms differ in exactly the facts that
+// decide it:
+//   * `&&` / `||`, as a condition and as a value: the body, and one run (the split);
+//   * a chain of two `&&`: still one run — its two splits are laid out together;
+//   * a scalar `?:` — a phi too, but each arm is a ONE-way block into the join, so
+//     no edge is split and nothing is created: one record. (A phi is not what makes
+//     a run; a created block is.);
+//   * a guarded region inside a guarded region: the split is in a run of EACH —
+//     inner body, inner run, outer body, outer run, in the table's own order;
+//   * unguarded: no handler is claimed at all.
+// The mutation that empties the run records is the arm
+// `lir-no-run-is-emitted_compile-pipeline` of tests/mutations/arms.registry: READ
+// `passed` in the sweep of checkpoint 14 (macos-arm64-debug, run
+// 20261012-151311-82d3dd43) against the `asm goto` case above, alone. This case is
+// younger than that sweep and is DECLARED red under the same arm: WRITTEN, NOT READ.
+TEST(Program_CompileFiles, AGuardedShortCircuitsEdgeSplitIsUnderAScopeRecordOfItsOwn) {
+    constexpr std::string_view kPe = "x86_64:pe64-x86_64-windows-exec";
+    struct Arm {
+        char const* stem;
+        std::size_t records;  // the scope records of `use` (0: its unwind information claims no handler)
+        std::size_t regions;  // how many `__try` the records belong to
+        char const* body;     // the statements of `use(int *q)`
+    };
+    std::array<Arm, 8> const arms{{
+        {"guarded_and_condition", 2, 1,
+         "  __try { if (q && *q) rc = 1; else rc = 2; } __except (1) { rc = 42; }\n"},
+        {"guarded_or_condition", 2, 1,
+         "  __try { if (!q || *q) rc = 1; else rc = 2; } __except (1) { rc = 42; }\n"},
+        {"guarded_and_value", 2, 1,
+         "  __try { rc = 10 + (q && *q); } __except (1) { rc = 42; }\n"},
+        {"guarded_or_value", 2, 1,
+         "  __try { rc = 10 + (!q || *q); } __except (1) { rc = 42; }\n"},
+        {"guarded_and_chain", 2, 1,
+         "  __try { if (q && *q && *q > 3) rc = 1; else rc = 2; } __except (1) { rc = 42; }\n"},
+        // a phi with no two-way predecessor: nothing is created.
+        {"guarded_scalar_conditional", 1, 1,
+         "  __try { rc = q ? *q : 7; } __except (1) { rc = 42; }\n"},
+        // the operator two regions deep: its split is a run of each.
+        {"guarded_and_nested", 4, 2,
+         "  __try {\n"
+         "    __try { if (q && *q) rc = 1; else rc = 2; } __except (1) { rc += 100; }\n"
+         "    rc += 1000;\n"
+         "  } __except (1) { rc = 42; }\n"},
+        // not guarded: the same statement with no `__try` around it.
+        {"unguarded_and_condition", 0, 0,
+         "  if (q && *q) rc = 1; else rc = 2;\n"},
+    }};
+    for (Arm const& arm : arms) {
+        SCOPED_TRACE(arm.stem);
+        ScratchDir scratch{Location::InsideRepo, "program"};
+        auto const src = writeCSource(
+            scratch.path(), std::string{arm.stem} + ".c",
+            std::string{"int use(int *q) {\n"
+                        "  int rc = 0;\n"}
+                + arm.body
+                + "  return rc;\n"
+                  "}\n"
+                  "int main(void) { int n = 5; return use(&n); }\n");
+        scratch.useAsCwd();
+
+        Program prog;
+        DiagnosticReporter rep;
+        int const rc = prog.compileFiles({src.generic_string()}, "c",
+                                         {std::string{kPe}}, rep);
+        // Every arm is read: a red one does not hide the next.
+        EXPECT_EQ(rc, 0) << (rep.all().empty() ? std::string{} : rep.all()[0].actual);
+        EXPECT_EQ(rep.errorCount(), 0u)
+            << (rep.all().empty() ? std::string{} : rep.all()[0].actual);
+        if (rc != 0) continue;
+
+        auto const img = guardedPeImage(scratch.path() / "target" / "pe64-x86_64-windows-exec"
+                                        / (std::string{arm.stem} + ".exe"));
+        EXPECT_FALSE(img.empty()) << "the compile must produce the image";
+        std::size_t resolved = 0;
+        std::vector<GuardedPeFunction> const guarded = guardedPeFunctions(img, resolved);
+        EXPECT_GE(resolved, 1u)
+            << "the premise: `.pdata` must resolve a function's unwind information";
+        if (arm.records == 0) {
+            EXPECT_TRUE(guarded.empty()) << "a function with no `__try` claims a handler";
+            continue;
+        }
+        EXPECT_EQ(guarded.size(), 1u) << "`use` alone guards a region";
+        if (guarded.size() != 1u) continue;
+        GuardedPeFunction const& fn = guarded[0];
+        EXPECT_EQ(fn.scopes.size(), arm.records)
+            << "the split of a short-circuit's edge is a created block of the guarded body: "
+               "with no record of its own it lies outside every range its `__try` guards";
+        if (fn.scopes.size() != arm.records) continue;
+        std::size_t distinctHandlers = 0;
+        for (std::size_t i = 0; i < fn.scopes.size(); ++i) {
+            GuardedPeScope const& sc = fn.scopes[i];
+            EXPECT_LT(sc.begin, sc.end) << "an empty record guards nothing";
+            EXPECT_GE(sc.begin, fn.begin);
+            EXPECT_LE(sc.end, fn.end);
+            EXPECT_FALSE(sc.target >= sc.begin && sc.target < sc.end)
+                << "a record's range holds its own handler";
+            bool seen = false;
+            for (std::size_t j = 0; j < i; ++j) seen = seen || fn.scopes[j].target == sc.target;
+            if (!seen) ++distinctHandlers;
+        }
+        EXPECT_EQ(distinctHandlers, arm.regions) << "one handler per `__try`";
+        if (arm.records == 2) {
+            EXPECT_EQ(fn.scopes[1].filter, fn.scopes[0].filter) << "a run names its region's one filter";
+            EXPECT_EQ(fn.scopes[1].target, fn.scopes[0].target) << "and enters its one handler";
+            EXPECT_GE(fn.scopes[1].begin, fn.scopes[0].end)
+                << "the run lies after the body's own blocks, apart from them";
+        }
+        if (arm.records == 4) {
+            // The table's own order: inner body, inner run, outer body, outer run.
+            EXPECT_EQ(fn.scopes[1].target, fn.scopes[0].target) << "the inner run enters the inner handler";
+            EXPECT_EQ(fn.scopes[3].target, fn.scopes[2].target) << "the outer run enters the outer handler";
+            EXPECT_NE(fn.scopes[2].target, fn.scopes[0].target) << "two regions, two handlers";
+            EXPECT_TRUE(fn.scopes[0].begin >= fn.scopes[2].begin && fn.scopes[0].end <= fn.scopes[2].end)
+                << "the inner body lies inside the outer body";
+            EXPECT_EQ(fn.scopes[1].begin, fn.scopes[3].begin) << "one created block, a run of each region";
+            EXPECT_EQ(fn.scopes[1].end, fn.scopes[3].end);
         }
     }
 }

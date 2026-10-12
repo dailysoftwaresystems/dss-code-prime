@@ -274,6 +274,8 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     // const object's value folding — a lowering the product never does, and the FOURTH miss of
     // the class the note below records three times (TF-C78 / TF-C81 / TF-C92).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     // Thread the SELECTED CC's by-value aggregate + va_list params into MIR
     // lowering, mirroring compile_pipeline.cpp — so a struct-by-value OR a
     // variadic-callee (va_start/va_arg) source lowers through THIS fixture too

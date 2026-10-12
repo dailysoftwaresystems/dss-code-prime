@@ -190,10 +190,12 @@ dss_add_test(NAME mir/test_static_pointer_cast_chain
 # id the name table it was made from holds, so no synthesized symbol is published
 # under a name the table gives to something else or shares an id with an import (an
 # x86_64 Linux image published its init as `__func__`; a release build minted its
-# zero constant on an import's id). The door, a unit lowered with no table, pass
-# arms, single-CU pipeline arms at both configurations, and two source scans (no
-# counted SymbolId under src/mir or src/opt; every module builder states or continues
-# its ids). The merged route's statement is pinned in test_mir_merge.cpp.
+# zero constant on an import's id). The door, a unit that is its own table (and one
+# NOBODY said anything of, refused by name at its first mint: an absent statement
+# states nothing), pass arms, single-CU pipeline arms at both configurations, and two
+# source scans (no counted SymbolId under src/mir or src/opt; every module builder
+# states or continues its ids). The merged route's statement is pinned in
+# test_mir_merge.cpp.
 dss_add_test(NAME mir/test_synth_symbol_floor
              SOURCES test_synth_symbol_floor.cpp)
 
@@ -201,9 +203,14 @@ dss_add_test(NAME mir/test_synth_symbol_floor
 # whether a module's symbol-id end was ever STATED or is only counted — what states
 # it and what does not, `finish`, a move, every rebuild, the frozen module's
 # continuation and the `.dssir` reader each carrying the fact, and both leaves dying
-# by name past a counted end. A binary of its own because the refusal is an abort:
-# no case here mints from a module before asserting its fact, so a mutation of the
-# carrier reddens named cases instead of killing the process.
+# by name past a counted end — and what a STATED end is held to: the verifier's rule
+# that every id a module names is below it. A binary of its own because the refusal
+# is an abort: no case here mints from a module before asserting its fact, so that a
+# mutation of the carrier reddens named cases instead of killing the process. That
+# was READ for eight of the carrier's nine arms by the sweep of checkpoint 14
+# (macos-arm64-debug, run 20261012-145059-ba433418: each `passed`, no process died);
+# the ninth, a move construction that drops the fact, read red on one named case
+# more than it declared — the reader's — and declares it since.
 dss_add_test(NAME mir/test_symbol_id_end_is_stated
              SOURCES test_symbol_id_end_is_stated.cpp)
 

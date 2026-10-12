@@ -65,6 +65,33 @@ struct DSS_EXPORT HirToMirResult {
 // reads the schema(s) and passes the resolved policy in; multi-language
 // CUs conservatively AND each schema's knob (any `false` ⇒ module-wide
 // `false`) until per-Global routing lands in plan 20.
+
+// WHAT `lowerToMir` IS TOLD ABOUT THE ID SPACE THE UNIT'S SYMBOLS WERE NUMBERED IN —
+// the statement the lowered module's symbol-id end is made from
+// (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE). It is one of two things, and
+// each caller says which; there is no value that means "nobody said".
+struct MirSymbolIdSpace {
+    // The unit was analysed against a NAME TABLE that ends at `tableEnd` — the driver's
+    // case (`model.symbols().size()`). Every id the module mints is past it, so none is
+    // a record of the table: the table holds typedefs, tags, fields, locals and injected
+    // constants beside the functions and objects MIR sees, and the whole-program merge
+    // maps a MIR symbol to a NAME through it (c86, D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS:
+    // a synthetic literal global whose id was a typedef's record entered the merge as a
+    // NAMED strong definition).
+    [[nodiscard]] static constexpr MirSymbolIdSpace endingAt(std::uint32_t tableEnd) noexcept {
+        return MirSymbolIdSpace{tableEnd};
+    }
+    // The unit IS its own table: nothing stands beside it (HIR built by hand or read
+    // from text, lowered with no semantic model). The module's end is then one past the
+    // highest symbol the unit holds — its functions, objects and imports.
+    [[nodiscard]] static constexpr MirSymbolIdSpace unitIsItsOwnTable() noexcept {
+        return MirSymbolIdSpace{0};
+    }
+    // The end to state: the table's, or 0 where the unit's own symbols are all there is
+    // (the builder's end is never below a symbol the module holds or was kept clear of).
+    std::uint32_t statedEnd = 0;
+};
+
 struct DSS_EXPORT MirLoweringConfig {
     bool globalsAllowFloat = true;
     // P68 round 13 (lane `cs`, the static-initializer item): the constant forms beyond
@@ -194,20 +221,17 @@ struct DSS_EXPORT MirLoweringConfig {
     // has_value() guard mirrors `variadicVectorCountReg.has_value()`.
     std::optional<VaListLayout> vaListLayout;
 
-    // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): the FIRST SymbolId value any
-    // symbol synthesized for the module may take — the END of the id space the
-    // unit was analysed in. The pipeline passes the SEMANTIC SYMBOL TABLE's END
-    // (`model.symbols().size()`), so a synthetic id can NEVER alias a semantic
-    // record: the symbols MIR sees are functions, objects and imports, but the
-    // table also holds typedefs, tags, fields, locals, and injected constants —
-    // and the LK11 whole-program merge maps every MIR symbol to a NAME through
-    // that table (`nameOf` → `recordFor`). Pre-fix, a per-CU synthetic literal
-    // global whose id landed on (say) the `sqlite3_stmt` TYPEDEF record entered
-    // the merge as a NAMED STRONG GLOBAL DEFINITION — two CUs doing the same
-    // produced bogus K_SymbolRedefinedAcrossUnits (witnessed: the c86
-    // sqlite3.c+shell.c probe's five opaque-tag collisions), and an alias onto a
-    // record whose name a sibling CU genuinely defines would MIS-MERGE references
-    // onto an anonymous string literal (a silent miscompile class).
+    // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): where the id space the unit was
+    // analysed in ENDS — the first SymbolId value a symbol synthesized for the
+    // module may take. The pipeline says `MirSymbolIdSpace::endingAt(the semantic
+    // symbol table's end)`, so a synthetic id can NEVER alias a semantic record
+    // (pre-fix, a per-CU synthetic literal global whose id landed on the
+    // `sqlite3_stmt` TYPEDEF record entered the LK11 merge as a NAMED STRONG GLOBAL
+    // DEFINITION — two CUs doing the same produced bogus
+    // K_SymbolRedefinedAcrossUnits, witnessed on the c86 sqlite3.c+shell.c probe's
+    // five opaque-tag collisions — and an alias onto a record whose name a sibling
+    // CU genuinely defines would MIS-MERGE references onto an anonymous string
+    // literal, a silent miscompile class).
     //
     // ★ READ BY ONE STATEMENT (P69 round 5): `lowerToMir` states it to the
     // module's builder (`MirBuilder::stateSymbolIdEnd`) when the module is made,
@@ -217,10 +241,17 @@ struct DSS_EXPORT MirLoweringConfig {
     // handed this number, so none can be handed a wrong one. Until then four
     // callers each carried it separately and the optimizer's minter had none.
     //
-    // Default 0 = a caller with no table (test fixtures / golden-MIR stability —
-    // their single-CU output never consults names): the module's end is then one
-    // past the highest symbol the unit holds.
-    std::uint32_t syntheticSymbolFloor = 0;
+    // ★ ABSENT = NOBODY SAID, AND THE MODULE THEN STATES NOTHING. This was a plain
+    // number defaulting to 0, and `lowerToMir` stated it whatever it was — so the
+    // one entrance where forgetting the statement is a DEFAULT ARGUMENT was also
+    // the one the door could not hear: a caller that passed no table got a module
+    // whose counted end read as stated, and its first mint was handed out in
+    // silence where the door refuses every other unstated module by name. Now a
+    // caller that says nothing gets a module whose end is only counted, and the
+    // first id anything mints for it is refused — INSIDE this lowering too, which
+    // mints a symbol for a string literal. A fixture that lowers hand-built HIR
+    // says `MirSymbolIdSpace::unitIsItsOwnTable()`; it does not get it by silence.
+    std::optional<MirSymbolIdSpace> symbolIdSpace;
 };
 
 class GrammarSchema;

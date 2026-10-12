@@ -23,9 +23,16 @@
 // WHAT IT DOES NOT SEE: whether the image a compile writes follows the table (the injection
 // path), and what a realized body DOES when it runs. Both are the example's.
 //
-// RED-ON-DISABLE: rename or drop any of the 26 rows and the first case names the function on
-// every pair; give `strdup` or `memccpy` its plain name on pe and the second case names the
-// pair; drop a realization (or add one where the library has the function) and the third does.
+// THE MUTATIONS THAT HOLD THESE CASES are arms of `dssharness check-mutations`
+// (tests/mutations/arms.registry), each alone. WRITTEN, NOT READ — no sweep has read any of
+// them `passed` yet, and no line below says more than what its arm declares:
+//   dss-config-strpbrk-row-renamed                      a row renamed away; declared red: all
+//                                                       three cases (each reads every row)
+//   dss-config-strdup-pe-link-name-dropped              `strdup` under its plain name on pe;
+//                                                       declared red: the second case
+//   dss-config-strndup-is-realized-on-elf-and-not-on-pe  the one realization moved to a format
+//                                                       whose library has the function;
+//                                                       declared red: the third case
 
 #include "analysis/compilation_unit/compilation_unit.hpp"   // predefinedTypeFactsFor — the pair's own facts
 #include "core/types/diagnostic_reporter.hpp"

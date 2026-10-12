@@ -30,7 +30,10 @@
 //     is made from nothing but itself, or by the module it replaces — a rebuild copies
 //     that fact and never makes it, a move carries it, and both leaves die rather than
 //     mint past an end that was only counted, through a real pass too;
-//   * a unit lowered with NO table stated still ends past its imports;
+//   * a unit that is ITS OWN TABLE ends past its imports — and so does one nobody said
+//     anything of, whose end is then only COUNTED: an absent statement states nothing
+//     (`MirLoweringConfig::symbolIdSpace` is optional), so that unit is refused by name
+//     at its first mint, through the builder and through the frozen module alike;
 //   * each synthesis pass mints past an end the module's own symbols do not reach;
 //   * the single-CU pipeline, at BOTH shipped configurations: an artifact publishes no
 //     name its source does not declare, no synthesized object shares an id with an
@@ -41,13 +44,18 @@
 // (The MERGED route's statement — `mergeCuMirs` stating its allocator's end — is pinned
 // beside the merge's other tests: `MirMerge.TheMergedModuleCarriesTheEndOfTheMergesAllocation`.)
 //
-// RED-ON-DISABLE (each alone): `lowerToMir` stating no table end (HIR→MIR's own minter
-// and every later one then count from the unit's symbols); HIR→MIR not carrying the
-// unit's symbols into the end; the one list of module facts a rebuild copies
-// (`carryModuleFactsOf`) dropping the id space; `keepSymbolIdsClearOf` raising nothing;
-// the constructor not counting; the reserved value not stepped over; and four minters
-// each counting its own id again — mem2reg's zero, the entry-shape init, a SEH funclet,
-// a threads helper import.
+// THE MUTATIONS THESE CASES WERE WRITTEN AGAINST (each alone): `lowerToMir` stating no
+// table end (the end is then only counted, and HIR→MIR's own minter dies at its first
+// id); HIR→MIR not carrying the unit's symbols into the end; the one list of module
+// facts a rebuild copies (`carryModuleFactsOf`) dropping the id space;
+// `keepSymbolIdsClearOf` raising nothing; the constructor not counting; the reserved
+// value not stepped over; and four minters each counting its own id again — mem2reg's
+// zero, the entry-shape init, a SEH funclet, a threads helper import.
+// ⚠ NO ROW OF tests/mutations/arms.registry CLAIMS A CASE OF THIS FILE FOR ANY OF THEM:
+// none is an arm of `dssharness check-mutations`, so the verb has read none (what a
+// hand reading showed in the round that wrote them is that round's record). ONE
+// mutation of this file is an arm — `lowerToMir` stating an end its caller never
+// said: `mir-the-lowering-states-an-end-nobody-said`, WRITTEN, NOT READ.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/types/diagnostic_budget.hpp"
@@ -68,7 +76,7 @@
 #include "hir/hir_attrs.hpp"               // HirFfiMap
 #include "hir/hir_node.hpp"
 #include "link/object_format_schema.hpp"
-#include "mir/lowering/hir_to_mir.hpp"     // lowerToMir, MirLoweringConfig (a unit lowered with no table)
+#include "mir/lowering/hir_to_mir.hpp"     // lowerToMir, MirLoweringConfig, MirSymbolIdSpace
 #include "mir/merge/synth_pe_startup.hpp"
 #include "mir/merge/synth_seh_funclets.hpp"
 #include "mir/merge/synth_symbol_floor.hpp"
@@ -510,42 +518,104 @@ TEST(SynthSymbolFloor, AModuleMadeWithoutABuilderEndsPastTheSymbolsItDefines) {
     EXPECT_EQ(rebuilt.mintSymbol().v, 58u) << "the first id past it, once its maker's word is given";
 }
 
-// A caller that states NO table — a fixture that lowers hand-built HIR with the default
-// `MirLoweringConfig` — still gets a module that ends past every symbol the UNIT holds,
-// its imports included: an import's row lives beside the module, so the module never
-// defines it and only HIR→MIR can carry its id into the end (once, after the collect
-// pre-passes and before anything is minted). Here the import is the unit's ONLY symbol,
-// so nothing else can raise the end: without the carry the first id minted for this
-// module is the import's own — the round-5 defect, in a fixture. (With a table stated the
-// carry changes nothing, which is why no pipeline arm can see it.)
-TEST(SynthSymbolFloor, AUnitLoweredWithNoTableEndsPastItsImports) {
-    TypeInterner ti{CompilationUnitId{1}};
-    TypeId const i32  = ti.primitive(TypeKind::I32);
-    TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
-    constexpr std::uint32_t kImportSymV = 17;
-    HirBuilder b{"c"};
-    HirNodeId const importNode = b.makeExternFunction(fnTy, /*symbol=*/kImportSymV, {});
-    HirNodeId const root = b.makeModule(std::array{importNode});
-    Hir hir = std::move(b).finish(root);
-    HirFfiMap ffi{hir};
-    FfiMetadata meta;
-    meta.mangledName   = "printf";
-    meta.importLibrary = "libc.so.6";
-    ffi.set(importNode, meta);
+// A unit with NO name table beside it — hand-built HIR, lowered with no semantic model —
+// still gets a module that ends past every symbol the UNIT holds, its imports included:
+// an import's row lives beside the module, so the module never defines it and only
+// HIR→MIR can carry its id into the end (once, after the collect pre-passes and before
+// anything is minted). Here the import is the unit's ONLY symbol, so nothing else can
+// raise the end: without the carry the first id minted for this module is the import's
+// own — the round-5 defect, in a fixture. (With a table stated the carry changes nothing,
+// which is why no pipeline arm can see it.)
+//
+// ★ THE CARRY IS ABOUT WHERE THE END IS; WHO STATED IT IS THE NEXT TWO CASES' SUBJECT, and
+// this case is on both sides of it: the end is one past the import whether the caller
+// said anything or not (the first arm says nothing and reads the COUNTED end), and a mint
+// past it needs the caller's word that the unit is its own table (the second arm). Until
+// the review of P69's second fold this case lowered with a default config and minted —
+// which passed only because `lowerToMir` stated a defaulted 0 for a caller that had said
+// nothing: the hole the next case closes.
+namespace {
 
-    DiagnosticReporter rep;
+// One import and nothing else, with its FFI row: the members in the order they are made.
+struct ImportOnlyUnit {
+    static constexpr std::uint32_t kImportSymV = 17;
+    TypeInterner   ti{CompilationUnitId{1}};
+    HirNodeId      importNode{};
+    Hir            hir;
+    HirFfiMap      ffi;
     HirLiteralPool pool;
-    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr, MirLoweringConfig{}, &ffi);
-    ASSERT_TRUE(result.ok) << allDiagText(rep);
-    ASSERT_EQ(result.mir.moduleFuncCount(), 0u)
-        << "CONTROL: the module defines nothing — the import is the unit's only symbol";
-    ASSERT_EQ(result.mir.moduleGlobalCount(), 0u);
-    EXPECT_EQ(result.mir.symbolIdEnd(), kImportSymV + 1u)
-        << "the module's end must be one past the import's id";
-    MirBuilder rebuilt;
-    rebuilt.continueSymbolIdsOf(result.mir);
-    EXPECT_GT(rebuilt.mintSymbol().v, kImportSymV)
-        << "the first id minted for the module must not be the import's";
+
+    ImportOnlyUnit() : hir(build(ti, importNode)), ffi(hir) {
+        FfiMetadata meta;
+        meta.mangledName   = "printf";
+        meta.importLibrary = "libc.so.6";
+        ffi.set(importNode, meta);
+    }
+
+private:
+    static Hir build(TypeInterner& ti, HirNodeId& importNode) {
+        TypeId const i32  = ti.primitive(TypeKind::I32);
+        TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
+        HirBuilder b{"c"};
+        importNode = b.makeExternFunction(fnTy, /*symbol=*/kImportSymV, {});
+        HirNodeId const root = b.makeModule(std::array{importNode});
+        return std::move(b).finish(root);
+    }
+};
+
+}  // namespace
+
+TEST(SynthSymbolFloor, AUnitLoweredWithNoTableEndsPastItsImports) {
+    for (bool const said : {false, true}) {
+        SCOPED_TRACE(said ? "the caller says the unit is its own table" : "the caller says nothing");
+        ImportOnlyUnit unit;
+        MirLoweringConfig cfg;
+        if (said) cfg.symbolIdSpace = MirSymbolIdSpace::unitIsItsOwnTable();
+        DiagnosticReporter rep;
+        auto result = lowerToMir(unit.hir, unit.pool, unit.ti, rep, /*sourceMap=*/nullptr, cfg, &unit.ffi);
+        ASSERT_TRUE(result.ok) << allDiagText(rep);
+        ASSERT_EQ(result.mir.moduleFuncCount(), 0u)
+            << "CONTROL: the module defines nothing — the import is the unit's only symbol";
+        ASSERT_EQ(result.mir.moduleGlobalCount(), 0u);
+        EXPECT_EQ(result.mir.symbolIdEnd(), ImportOnlyUnit::kImportSymV + 1u)
+            << "the module's end must be one past the import's id";
+        EXPECT_EQ(result.mir.symbolIdEndIsStated(), said)
+            << "the module states its end exactly when its caller said where the id space ends";
+        if (!said) continue;
+        MirBuilder rebuilt;
+        rebuilt.continueSymbolIdsOf(result.mir);
+        EXPECT_GT(rebuilt.mintSymbol().v, ImportOnlyUnit::kImportSymV)
+            << "the first id minted for the module must not be the import's";
+    }
+}
+
+// AND A CALLER THAT SAYS NOTHING IS REFUSED AT THE FIRST MINT, BY NAME. `lowerToMir`'s
+// config is a default argument, so this is the one entrance where forgetting the
+// statement costs no keystroke — and it used to state a defaulted 0 on the caller's
+// behalf, which read exactly like a stated end: a second shipped caller that omitted
+// the table would have minted inside it in silence, the row's own measured defect. Now
+// the lowered module carries a COUNTED end and both leaves of the door refuse it.
+TEST(SynthSymbolFloorDeath, AUnitLoweredWithNothingSaidOfItsIdSpaceIsRefusedAtItsFirstMint) {
+    // A function of its own: a death statement is a macro argument, and a brace list's
+    // commas would split it.
+    auto const lowerSayingNothing = [](ImportOnlyUnit& unit) {
+        DiagnosticReporter rep;
+        return lowerToMir(unit.hir, unit.pool, unit.ti, rep, /*sourceMap=*/nullptr,
+                          MirLoweringConfig{}, &unit.ffi);
+    };
+    EXPECT_DEATH({
+        ImportOnlyUnit unit;
+        auto const result = lowerSayingNothing(unit);
+        MirBuilder rebuilt;
+        rebuilt.continueSymbolIdsOf(result.mir);
+        (void)rebuilt.mintSymbol();
+    }, "MirBuilder::mintSymbol fatal: this module's symbol-id space was never stated");
+    EXPECT_DEATH({
+        ImportOnlyUnit unit;
+        auto const result = lowerSayingNothing(unit);
+        MirSymbolIdContinuation past{result.mir};
+        (void)past.mint();
+    }, "MirSymbolIdContinuation::mint fatal: this module's symbol-id space was never stated");
 }
 
 // An id counted from the symbols a builder happens to hold is the defect itself, so the

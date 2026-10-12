@@ -244,6 +244,20 @@ private:
     // rule's sentence.
     void checkLinkageRecords(DiagnosticReporter& reporter) const;
 
+    // THE SYMBOL-ID SPACE (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE):
+    // every symbol id the module NAMES is below the end it STATES. The end is
+    // where the next synthesized symbol is minted, so an id the module names at
+    // or past it is one a later mint hands out again — two things under one id,
+    // which nothing downstream can tell apart. The builder keeps the end past
+    // every id the module DEFINES; an id it only names (a `globaladdr`, a
+    // `blockaddress_export`'s symbol, a symbol address in a literal) is below the
+    // end only because whoever made the module said so, and this rule is what
+    // reads that statement back. The list of places is `forEachSymbolIdNamed`
+    // (mir/mir_symbols_named.hpp), the one the `.dssir` writer and reader also
+    // read. A module whose end is only COUNTED makes no statement to hold it to,
+    // and cannot be minted for. Emits I_VerifierFailure.
+    void checkSymbolIdsBelowTheStatedEnd(DiagnosticReporter& reporter) const;
+
     Mir const&          mir_;
     TypeInterner const* interner_;
     // The findings THIS run reported that the policy makes Errors; reset by

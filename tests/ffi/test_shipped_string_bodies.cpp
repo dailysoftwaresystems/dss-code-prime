@@ -23,8 +23,13 @@
 // WHAT IT STATES: the ISO behaviour, 7.26.2.7 and 7.26.6.2, case by case.
 // WHAT IT DOES NOT SEE: the body as DSS compiles it. That stays the example's.
 //
-// RED-ON-DISABLE: let strndup's scan forget its bound and the first and third cases name the
-// string; let memset_explicit's loop store nothing and its two storing cases name the byte.
+// THE MUTATIONS THAT HOLD THESE CASES are arms of `dssharness check-mutations`
+// (tests/mutations/arms.registry), each alone. WRITTEN, NOT READ — no sweep has read either
+// `passed` yet, and neither line below says more than what its arm declares:
+//   dss-config-strndup-body-reads-past-n            strndup's scan forgets its bound; declared
+//                                                   red: the first, third and fourth cases
+//   dss-config-memset-explicit-body-stores-nothing  memset_explicit's loop stores nothing;
+//                                                   declared red: its two storing cases
 
 #include "shipped_string_bodies.h"   // the two test-only names, declared once for both sides
 

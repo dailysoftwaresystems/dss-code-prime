@@ -37,10 +37,49 @@
 // table kept clear of — is mir/test_synth_symbol_floor; the reader's table and the
 // lowering's own minter are mir/test_mir_text_reader_never_aborts.
 //
-// RED-ON-DISABLE (each alone): `stateSelfContainedSymbolIds` states nothing; `finish`
-// drops the fact; a move drops it; `continueSymbolIdsOf` SETS the fact instead of
-// copying it; a continuation believes every end stated; the reader's statement
-// removed; either leaf mints past a counted end.
+// ═══ WHAT A STATED END IS HELD TO ═══════════════════════════════════════════════
+//
+// A statement can be WRONG, and a wrong one is as silent as none: a module that says
+// "my ids end at 2" and names `%5` is minted for at 2, 3, 4 and then at 5 — an id it
+// already names. So the verifier reads the statement back
+// (`MirVerifier::checkSymbolIdsBelowTheStatedEnd`): every id the module NAMES — the
+// six places of mir/mir_symbols_named.hpp, the list the `.dssir` writer and reader
+// read too — is below the end it states. A counted end makes no statement, so there
+// is nothing to hold it to; it cannot be minted for either.
+//
+// THE MUTATIONS THAT HOLD THESE CASES are arms of `dssharness check-mutations`
+// (tests/mutations/arms.registry), each alone.
+//
+// READ `passed` by the sweep of checkpoint 14 (macos-arm64-debug, run
+// 20261012-145059-ba433418), on the nine cases the file held that day:
+//   mir-saying-a-module-is-its-own-table-states-nothing   (`stateSelfContainedSymbolIds`
+//                                                           states nothing)
+//   mir-finish-drops-whether-the-end-was-stated           (`finish` drops the fact)
+//   mir-a-move-assignment-drops-whether-the-end-was-stated (a move assignment drops it)
+//   mir-continuing-a-module-states-its-end                (`continueSymbolIdsOf` SETS
+//                                                           the fact instead of copying it)
+//   mir-a-continuation-believes-every-end-stated          (the frozen module's
+//                                                           continuation asks nothing)
+//   mir-the-reader-states-no-end                          (the reader's statement removed)
+//   mir-the-builder-mints-past-a-counted-end,
+//   mir-the-continuation-mints-past-a-counted-end         (either leaf mints anyway)
+//
+// READ RED ON MORE THAN IT DECLARED by the same sweep, declared so since, and READ
+// `passed` in the sweep of checkpoint 15 (macos-arm64-debug, run
+// 20261012-160945-f07780d6):
+//   mir-a-move-construction-drops-whether-the-end-was-stated — its claim, and the
+//     reader's case too: `parseMir` hands its module to its result by a move
+//     construction, so a construction that drops the fact drops the reader's statement.
+//
+// WRITTEN, NOT READ — no sweep has read any of the three yet (the two cases they
+// claim are younger than the sweeps above):
+//   mir-the-verifier-holds-no-module-to-its-stated-end    (the verifier's rule, uncalled)
+//   mir-a-blockaddress-export-names-no-symbol_symbol-id-end-is-stated
+//                                                         (one of the six places left
+//                                                           out of the one list)
+//   mir-the-top-id-is-past-an-end-that-saturates-on-it_symbol-id-end-is-stated
+//                                                         (the top id held to an end
+//                                                           that has no one-past)
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
@@ -51,19 +90,23 @@
 #include "ffi/mangling/c_mangle.hpp"           // CSymbolDecorationScheme
 #include "mir/merge/synth_threads_shim.hpp"
 #include "mir/mir.hpp"
+#include "mir/mir_literal_pool.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"
 #include "mir/mir_text.hpp"
+#include "mir/mir_verifier.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"   // cloneGlobalsVerbatim (a rebuild's helper)
 
 #include <gtest/gtest.h>
 
 #include <array>
 #include <cstdint>
+#include <format>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -288,6 +331,236 @@ TEST(SymbolIdEndIsStated, AModuleReadFromTextStatesItsEndWithOrWithoutASymbolsSe
         EXPECT_TRUE(parsed->mir.symbolIdEndIsStated())
             << "the reader handed out a module whose id space nobody stated";
         EXPECT_EQ(parsed->mir.symbolIdEnd(), 2u) << "one past `f`, the one symbol the text defines";
+    }
+}
+
+namespace {
+
+// WHERE a module names a symbol id beside the ones it defines: the four places of
+// mir/mir_symbols_named.hpp that are not a definition, and the initializer's again
+// NESTED in an aggregate (the list walks a literal to its leaves).
+enum class NamedIn { GlobalAddr, BlockAddressExport, ConstLiteral, GlobalInitializer,
+                     NestedInitializer };
+
+constexpr std::array kNamedIn{NamedIn::GlobalAddr, NamedIn::BlockAddressExport,
+                              NamedIn::ConstLiteral, NamedIn::GlobalInitializer,
+                              NamedIn::NestedInitializer};
+
+// The construct as the finding names it — the `.dssir` spelling.
+std::string_view spelledAs(NamedIn where) {
+    switch (where) {
+        case NamedIn::GlobalAddr:         return "globaladdr";
+        case NamedIn::BlockAddressExport: return "blockaddress_export";
+        case NamedIn::ConstLiteral:
+        case NamedIn::GlobalInitializer:
+        case NamedIn::NestedInitializer:  return "symaddr";
+    }
+    return "?";
+}
+
+bool definesAGlobal(NamedIn where) {
+    return where == NamedIn::GlobalInitializer || where == NamedIn::NestedInitializer;
+}
+
+MirLiteralValue symbolAddressLit(std::uint32_t symbol) {
+    MirLiteralValue lit;
+    lit.value = MirSymbolAddrValue{symbol, 0};
+    lit.core  = TypeKind::Ptr;
+    return lit;
+}
+
+// `i32 f(void)` under %1 — and, for an initializer, a global under %2 — that names
+// the symbol `named` in ONE place. `say` is handed the builder before it finishes,
+// and tells it where its ids end, or tells it nothing.
+template <typename Say>
+Mir moduleNaming(TypeInterner& in, NamedIn where, std::uint32_t named, Say&& say) {
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const pi32 = in.pointer(i32);
+    TypeId const pV   = in.pointer(in.primitive(TypeKind::Void));
+    MirBuilder mb;
+    if (definesAGlobal(where)) {
+        MirLiteralValue init = symbolAddressLit(named);
+        if (where == NamedIn::NestedInitializer) {
+            MirAggregateValue inner;
+            inner.fields.push_back(i32Lit(7));
+            inner.fields.push_back(std::move(init));
+            MirLiteralValue innerLit;
+            innerLit.value = std::move(inner);
+            innerLit.core  = TypeKind::Ptr;
+            MirAggregateValue outer;
+            outer.fields.push_back(std::move(innerLit));
+            init       = MirLiteralValue{};
+            init.value = std::move(outer);
+            init.core  = TypeKind::Ptr;
+        }
+        std::uint32_t const idx = mb.literalPoolAdd(std::move(init));
+        (void)mb.addGlobal(pi32, SymbolId{2}, idx, MirFuncId{}, SymbolBinding::Global,
+                           SymbolVisibility::Default, /*isConst=*/false, MirThreadStorage::Shared);
+    }
+    mb.addFunction(in.fnSig({}, i32, CallConv::CcSysV), SymbolId{1});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    if (where == NamedIn::BlockAddressExport) {
+        MirBlockId const target = mb.createBlock(StructCfMarker::Linear);
+        mb.beginBlock(entry);
+        MirInstId const address = mb.addBlockAddress(target, pV);
+        mb.addBlockAddressExport(address, SymbolId{named});
+        std::array<MirBlockId, 1> const successors{target};
+        mb.addIndirectBr(address, successors);
+        mb.beginBlock(target);
+    } else {
+        mb.beginBlock(entry);
+        if (where == NamedIn::GlobalAddr)   (void)mb.addGlobalAddr(SymbolId{named}, pi32);
+        if (where == NamedIn::ConstLiteral) (void)mb.addConst(symbolAddressLit(named), pi32);
+    }
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    say(mb);
+    Mir mir = std::move(mb).finish();
+    rederiveStructCfMarkers(mir);   // the verifier checks stored == derived
+    return mir;
+}
+
+struct Verdict {
+    bool                     ok = false;
+    std::vector<std::string> pastTheEnd;   // the findings of the rule this file is about
+    std::vector<std::string> all;
+};
+
+Verdict verified(Mir const& mir, TypeInterner const& in) {
+    DiagnosticReporter rep;
+    Verdict v;
+    MirVerifier const verifier{mir, &in};
+    v.ok = verifier.verify(rep);
+    for (auto const& d : rep.all()) {
+        v.all.push_back(d.actual);
+        if (d.actual.find("not below the end this module states") != std::string::npos) {
+            v.pastTheEnd.push_back(d.actual);
+        }
+    }
+    return v;
+}
+
+std::string listed(std::vector<std::string> const& lines) {
+    std::string out;
+    for (std::string const& l : lines) { out += "\n    "; out += l; }
+    return out;
+}
+
+}  // namespace
+
+// THE VERIFIER READS THE STATEMENT BACK. A stated end is where the next synthesized
+// symbol is minted, so a module that names an id at or past the end it states is
+// minted for at an id it already names. In every place a module names one beside its
+// definitions: the WRONG statement is refused by name — made as "this module is its
+// own table" and as a table's end AT the id (an end is one PAST the last id) — the
+// RIGHT one passes — a table ending past it, its own table kept clear of it — and a
+// module nobody said anything of is held to nothing (it cannot be minted for either:
+// the death case below).
+TEST(SymbolIdEndIsStated, EveryIdAModuleNamesIsBelowTheEndItStates) {
+    constexpr std::uint32_t kNamed = 5;
+    for (NamedIn const where : kNamedIn) {
+        std::string const construct{spelledAs(where)};
+        SCOPED_TRACE(std::format("named by {} (shape {})", construct, static_cast<int>(where)));
+        TypeInterner in{CompilationUnitId{1}};
+        std::uint32_t const counted = definesAGlobal(where) ? 3u : 2u;   // one past what it defines
+
+        struct Wrong { char const* how; std::uint32_t end; };
+        for (Wrong const wrong : {Wrong{"its own table", counted}, Wrong{"a table ending AT the id", kNamed}}) {
+            SCOPED_TRACE(wrong.how);
+            Mir const mir = moduleNaming(in, where, kNamed, [&](MirBuilder& mb) {
+                if (wrong.end == kNamed) mb.stateSymbolIdEnd(kNamed);
+                else                     mb.stateSelfContainedSymbolIds();
+            });
+            ASSERT_TRUE(mir.symbolIdEndIsStated());
+            ASSERT_EQ(mir.symbolIdEnd(), wrong.end) << "CONTROL: the end the module states";
+            Verdict const v = verified(mir, in);
+            EXPECT_FALSE(v.ok) << "a module that names %5 and states an end of " << wrong.end
+                               << " verified";
+            ASSERT_EQ(v.pastTheEnd.size(), 1u) << listed(v.all);
+            EXPECT_NE(v.pastTheEnd[0].find(std::format(
+                          "{} names symbol %5, which is not below the end this module states "
+                          "for its symbol ids ({})", construct, wrong.end)),
+                      std::string::npos)
+                << v.pastTheEnd[0];
+            EXPECT_EQ(v.all.size(), 1u) << "the rule's finding is the module's only one:"
+                                        << listed(v.all);
+        }
+
+        struct Right { char const* how; bool keptClear; };
+        for (Right const right : {Right{"a table ending past the id", false},
+                                  Right{"its own table, kept clear of the id", true}}) {
+            SCOPED_TRACE(right.how);
+            Mir const mir = moduleNaming(in, where, kNamed, [&](MirBuilder& mb) {
+                if (right.keptClear) {
+                    mb.stateSelfContainedSymbolIds();
+                    mb.keepSymbolIdsClearOf(SymbolId{kNamed});
+                } else {
+                    mb.stateSymbolIdEnd(kNamed + 1);
+                }
+            });
+            ASSERT_TRUE(mir.symbolIdEndIsStated());
+            ASSERT_EQ(mir.symbolIdEnd(), kNamed + 1);
+            Verdict const v = verified(mir, in);
+            EXPECT_TRUE(v.ok) << listed(v.all);
+            EXPECT_TRUE(v.pastTheEnd.empty()) << listed(v.pastTheEnd);
+        }
+
+        {
+            SCOPED_TRACE("nobody said");
+            Mir const mir = moduleNaming(in, where, kNamed, [](MirBuilder&) {});
+            ASSERT_FALSE(mir.symbolIdEndIsStated());
+            Verdict const v = verified(mir, in);
+            EXPECT_TRUE(v.ok) << listed(v.all);
+            EXPECT_TRUE(v.pastTheEnd.empty())
+                << "a counted end is no statement, and the rule held the module to it:"
+                << listed(v.pastTheEnd);
+        }
+    }
+}
+
+// ONE FINDING PER ID, at its first mention, in the order the module names them; and
+// the TOP of the id space, which has no "one past": an end saturates on it, so a
+// module that holds the top id states an end EQUAL to it, and that id is inside.
+TEST(SymbolIdEndIsStated, AnIdPastTheEndIsNamedOnceAndTheTopIdIsInsideASaturatedEnd) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const pi32 = in.pointer(i32);
+    {
+        MirBuilder mb;
+        mb.addFunction(in.fnSig({}, i32, CallConv::CcSysV), SymbolId{1});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        (void)mb.addGlobalAddr(SymbolId{7}, pi32);
+        (void)mb.addGlobalAddr(SymbolId{5}, pi32);
+        (void)mb.addGlobalAddr(SymbolId{7}, pi32);
+        (void)mb.addGlobalAddr(SymbolId{1}, pi32);   // the function's own: below the end
+        mb.addReturn(mb.addConst(i32Lit(0), i32));
+        mb.stateSelfContainedSymbolIds();
+        Mir mir = std::move(mb).finish();
+        rederiveStructCfMarkers(mir);
+        Verdict const v = verified(mir, in);
+        EXPECT_FALSE(v.ok);
+        ASSERT_EQ(v.pastTheEnd.size(), 2u) << listed(v.all);
+        EXPECT_NE(v.pastTheEnd[0].find("globaladdr names symbol %7"), std::string::npos)
+            << v.pastTheEnd[0];
+        EXPECT_NE(v.pastTheEnd[1].find("globaladdr names symbol %5"), std::string::npos)
+            << v.pastTheEnd[1];
+    }
+    {
+        constexpr std::uint32_t kTop = 0xFFFFFFFFu;
+        MirBuilder mb;
+        mb.addFunction(in.fnSig({}, i32, CallConv::CcSysV), SymbolId{kTop});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        (void)mb.addGlobalAddr(SymbolId{kTop}, pi32);
+        mb.addReturn(mb.addConst(i32Lit(0), i32));
+        mb.stateSelfContainedSymbolIds();
+        Mir mir = std::move(mb).finish();
+        rederiveStructCfMarkers(mir);
+        ASSERT_EQ(mir.symbolIdEnd(), kTop) << "CONTROL: the end saturates on the top id";
+        Verdict const v = verified(mir, in);
+        EXPECT_TRUE(v.ok) << listed(v.all);
+        EXPECT_TRUE(v.pastTheEnd.empty())
+            << "the top id is inside the end that saturates on it:" << listed(v.pastTheEnd);
     }
 }
 

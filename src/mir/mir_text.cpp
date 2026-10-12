@@ -14,6 +14,7 @@
 #include "mir/mir.hpp"
 #include "mir/mir_literal_pool.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_symbols_named.hpp"   // forEachSymbolIdNamed: which ids a module names
 #include "mir/mir_verifier.hpp"
 
 #include <algorithm>   // std::max — the emitters' explicit work stacks
@@ -672,60 +673,19 @@ private:
         if (symSet_.emplace(v, true).second) symOrder_.push_back(v);
     }
 
-    // ★★ EVERY SYMBOL A RENDERED LITERAL NAMES, CLOSED OVER THE WHOLE VARIANT (P68
-    // round 8, lane `ht`, part 1c-b). `symaddr %N` is how a global initializer
-    // spells `&x`, and the `symbols` preamble never listed N unless x was also one
-    // of the module's functions or globals — an EXTERN named only by an initializer
-    // lost its name in the text. Of `MirLiteralValue`'s arms only
-    // `MirSymbolAddrValue` names a symbol and `MirAggregateValue` names one exactly
-    // when a field does; the `static_assert` stops the build until a new arm says
-    // which it is. An explicit work stack, not host recursion.
-    void noteLiteralSymbols(MirLiteralValue const& root) {
-        std::vector<MirLiteralValue const*> work{&root};
-        while (!work.empty()) {
-            MirLiteralValue const* const v = work.back();
-            work.pop_back();
-            std::visit([&](auto const& arm) {
-                using T = std::decay_t<decltype(arm)>;
-                if constexpr (std::is_same_v<T, MirSymbolAddrValue>) {
-                    noteSymbol(arm.symbol);
-                } else if constexpr (std::is_same_v<T, MirAggregateValue>) {
-                    for (std::size_t i = arm.fields.size(); i-- > 0;) work.push_back(&arm.fields[i]);
-                } else {
-                    static_assert(std::is_same_v<T, std::monostate> || std::is_same_v<T, bool>
-                                      || std::is_same_v<T, std::int64_t>
-                                      || std::is_same_v<T, std::uint64_t>
-                                      || std::is_same_v<T, double> || std::is_same_v<T, std::string>
-                                      || std::is_same_v<T, BitIntValue>
-                                      || std::is_same_v<T, WideFloatValue>,
-                                  "a new MirLiteralValue arm must say whether it names a symbol: "
-                                  "note it through noteSymbol above, or add it to this list of "
-                                  "the arms that name none");
-                }
-            }, v->value);
-        }
-    }
-
+    // ★★ EVERY SYMBOL ID THE MODULE NAMES IS DECLARED — and WHICH ids those are is
+    // stated once, beside the module (`forEachSymbolIdNamed`,
+    // mir/mir_symbols_named.hpp), where the reader's refusal and the verifier's rule
+    // read the same list. This function used to carry its own, and its own was
+    // short twice: P68 round 8 (lane `ht`, part 1c-b) found a `symaddr %N` named
+    // only by an initializer missing from the preamble — an EXTERN lost its name in
+    // the text — and P69 found a `blockaddress_export`'s symbol missing still, a
+    // raw payload the reader then stated an end BELOW. The walk over a literal
+    // (closed over the whole variant, on an explicit work stack) lives with that
+    // list; the ORDER — functions, each global with its initializer, instructions
+    // by id — is this writer's, and the preamble's lines depend on it.
     void collectSymbols() {
-        for (std::uint32_t i = 0; i < mir_.moduleFuncCount(); ++i) {
-            noteSymbol(mir_.funcSymbol(mir_.funcAt(i)).v);
-        }
-        for (std::uint32_t i = 0; i < mir_.moduleGlobalCount(); ++i) {
-            MirGlobalId const g = mir_.globalAt(i);
-            noteSymbol(mir_.globalSymbol(g).v);
-            // The initializer the writer renders (`emitGlobal`), in the same order.
-            if (std::uint32_t const litIdx = mir_.globalInitLiteralIndex(g); litIdx != UINT32_MAX) {
-                noteLiteralSymbols(mir_.literalValue(litIdx));
-            }
-        }
-        for (std::uint32_t i = 1; i < mir_.instCount(); ++i) {
-            MirInstId const id{i, mir_.id().v};
-            if (mir_.instOpcode(id) == MirOpcode::GlobalAddr) {
-                noteSymbol(mir_.globalAddrSymbol(id).v);
-            } else if (mir_.instOpcode(id) == MirOpcode::Const) {
-                noteLiteralSymbols(mir_.literalValue(mir_.constLiteralIndex(id)));
-            }
-        }
+        forEachSymbolIdNamed(mir_, [&](SymbolId s, MirSymbolMention, MirInstId) { noteSymbol(s.v); });
     }
 
     void emitSymbolsPreamble() {
@@ -3057,16 +3017,15 @@ private:
             // `&x`. ⚠ THIS ARM DID NOT EXIST (P68 round 8, lane `ht`, part 1c-b): the
             // reader refused its own writer's output for every `&global` initializer
             // as "unknown literal tag 'symaddr'". N is a raw SymbolId, as everywhere
-            // in this format, and must be one the `symbols` preamble declares — the
-            // writer's `collectSymbols` now declares every one a literal names.
+            // in this format, and must be one the text declares or defines — which
+            // is not this arm's to judge any more: it refused an id the preamble did
+            // not declare while `globaladdr` and `blockaddress_export` let the same
+            // id through, so the ONE rule for every construct that names a symbol is
+            // held where the whole module is known (`finalize`).
             std::size_t const before = refusals_;
             std::uint32_t const sym = parsePercentValue();
             if (refusals_ == before && sym == 0) {
                 emitMalformed("symaddr names symbol %0, the invalid-symbol sentinel");
-            } else if (refusals_ == before && !symbolNames_.contains(sym)) {
-                emitMalformed(std::format(
-                    "symaddr names symbol %{}, which the `symbols` preamble does not "
-                    "declare", sym));
             }
             std::int64_t addend = 0;
             if (Tok const plus = lex_.peek();
@@ -4610,6 +4569,30 @@ private:
         // beside a text — so no input reaches the door's refusal of a counted end.
         builder_.stateSymbolIdEnd(builder_.symbolIdEnd());
         Mir module = std::move(builder_).finish();
+        // ★ "NOTHING STANDS BESIDE A TEXT" IS HELD HERE, NOT ASSUMED. The end stated
+        // above covers the ids the text DECLARES and DEFINES; an id it merely NAMES
+        // — a `globaladdr`'s, a `symaddr`'s, a `blockaddress_export`'s — was outside
+        // it unless something else had raised the end, and only the `symaddr` arm
+        // asked (so `globaladdr (%5)` in a text defining `%1` alone read back stated
+        // at 2 — an end BELOW an id the module names, which a later mint can reach
+        // and hand out again). One rule for every construct that names one, by the
+        // list the writer and the verifier read (`forEachSymbolIdNamed`): such an id
+        // is refused BY NAME, and the module with it. It is asked of the FINISHED
+        // module because that is what the list reads — a literal's symbol address
+        // is in the pool, a global's initializer is its global's. The verifier's own
+        // rule ("an id the module names is below the end it states") is the weaker
+        // one for a text: an id BELOW the highest declared slot is inside the end
+        // and still nobody's, and only this one refuses it.
+        for (MirSymbolMentionAt const& stray : symbolIdsNamedButNeverIntroduced(
+                 module, [&](SymbolId s) { return symbolNames_.contains(s.v); })) {
+            emitMalformed(std::format(
+                "{} names symbol %{}, which this text neither declares in its `symbols` "
+                "preamble nor defines", mirSymbolMentionSpelling(stray.mention), stray.symbol.v));
+        }
+        if (errors_) {
+            return std::make_unique<MirParseResult>(
+                Mir{}, std::move(interner_), std::move(symbolNames_));
+        }
         auto result = std::make_unique<MirParseResult>(
             std::move(module), std::move(interner_), std::move(symbolNames_));
         // Verify-on-load. `ok` takes the verifier's OWN verdict, not only the

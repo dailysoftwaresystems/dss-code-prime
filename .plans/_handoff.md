@@ -376,6 +376,27 @@ round's close; each checkpoint's commit message says what was and was not run on
   lane: a DSS unit writes `int v;` as a `.bss` definition, so two DSS OBJECTS with one tentative name do not
   link (the references link their `-fcommon` and cl's default objects) — ruled built first in its next fold: a
   compiled tentative definition is stated as a common on every format whose document can state one.
+- **Checkpoint 19 (2026-10-12) = the C front end lane's SEND-BACK fold (the eight findings of the review of its
+  fold A2), merged over checkpoint 18.** (1) The false sentence "no source program puts a created block in a
+  guarded body" is restated in the row, the test header and the case name: `a && b` in a `__try` body IS a split
+  edge inside the region, and its faults are caught — pinned by
+  `GuardedRegionRuns.AShortCircuitInAGuardedBodyIsSplitInARunItsHandlerNeverReads`,
+  `Program_CompileFiles.AGuardedShortCircuitsEdgeSplitIsUnderAScopeRecordOfItsOwn` and the example
+  `examples/c/seh_short_circuit_in_a_guarded_body` (`cl` exits 42 on its bytes at /Od and /O2). (2)
+  `MirLoweringConfig::symbolIdSpace` is OPTIONAL (`MirSymbolIdSpace::endingAt` / `unitIsItsOwnTable`): an absent
+  statement states nothing and the first mint is refused by name. (3) ONE list of the symbol ids a module names
+  (`src/mir/mir_symbols_named.hpp`, `forEachSymbolIdNamed`), read by the `.dssir` writer, the reader and the
+  verifier (`checkSymbolIdsBelowTheStatedEnd`); the reader refuses by name any id its text neither declares nor
+  defines. (4)–(8) row cells restated (arm ids named, what each has read said, a cost on every fork). 70 paths;
+  ten shared with checkpoint 18 merged three-way by the orchestrator (`hir_to_mir.cpp`, `mir_text.cpp`,
+  `mir_verifier.cpp/.hpp`, `compile_pipeline.cpp`, four tests, the arm registry: both-added conflicts united,
+  main's first). 13 new arms on `macos-arm64-debug`, WRITTEN, NOT READ (the registry holds 547); four arms are
+  owed a second reading for the two new cases. Rows: closed 0, new 0; `D-CSUBSET-COMPOSITE-ALIGNED-HIR-TEXT` is
+  fixed since P68 and stays open only until its arm reads `passed`. ✔MEASURED by the lane ON CHECKPOINT 17's
+  BASE, one unfiltered run at the final bytes: `macos-arm64-debug` and `linux-arm64-release` 2746 of 2746,
+  `windows-x86_64-debug` (MinGW gcc) and `windows-x86_64-release` (MSVC) 2774 of 2775, the one red the document
+  census (one example more; rewritten here). **⚠ NOT a reading of this composition**: no leg has built
+  checkpoint 18 and this fold together; the whole suite is read from the main checkout after this commit.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -389,7 +410,13 @@ round's close; each checkpoint's commit message says what was and was not run on
   initializer's type instead of its declared one (10 of 13; the reader is older, the code that acts on a folded
   condition came with checkpoint 5). Both fixed in the library lane's fold now reading its finals;
   (5) found with them, the BASE's and silent: a bit-field narrower than `int` is NOT promoted (`if (v.b - 6 < 0)`
-  over `unsigned b : 3` goes the wrong way at run time) — a P0 row with that fold, built first in its next one.
+  over `unsigned b : 3` goes the wrong way at run time) — a P0 row with that fold, built first in its next one;
+  (6) the BASE's, ✔MEASURED 2026-10-12 by the C front end lane, three references exiting 42 (gcc, clang,
+  mingw-w64 gcc; Apple clang refuses `alias` by name, cl has no `__attribute__`): `__attribute__((alias("g")))`
+  is DROPPED with the warning `H_UnknownLinkageSpecifier` — the two plain aliases are then refused at link
+  (loud), and `__attribute__((weak, alias("g")))` COMPILES AND THE IMAGE DIES (0xC0000005 on pe64, signal 11 on
+  ELF). The row is `D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE` (open, restated); its build is the FIRST item of
+  that lane's next wave.
 - **Arm sweeps from the main checkout so far:** the registry holds 502 arms. `macos-arm64-debug`: all 147 arms of
   checkpoint 14's registry are read — 131 `passed`, 15 `violated` (all back with their lanes; six answered in
   checkpoint 15 and read `passed` since), 1 `stopped`; of three new ones, 2 `violated` and 1 `unattributed` (the

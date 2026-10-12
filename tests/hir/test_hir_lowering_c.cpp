@@ -1206,12 +1206,16 @@ TEST(HirLoweringC, ScalarEmptyAndSingleBraceInitLower) {
 // The runnable halves — the values read back through memory, debug and release —
 // are examples/c/complex_scalar_braced_initializer and
 // examples/c/bit_int_scalar_braced_initializer; these are the unit-tier claims, one
-// case per member, so taking ONE member out of the allowlist reddens its own case
-// and leaves the other green.
+// case per member, so that taking ONE member out of the allowlist is answered by its
+// own case.
 //
-// RED-ON-DISABLE: remove `TypeKind::Complex` (first case) or `TypeKind::BitInt`
-// (second case) from the scalar brace-init allowlist — the initializer then falls
-// to the aggregate gate, which refuses it.
+// THE MUTATIONS are arms of `dssharness check-mutations` (tests/mutations/arms.registry),
+// WRITTEN, NOT READ — no sweep has read either `passed` yet:
+//   hir-braced-complex-refused   `TypeKind::Complex` out of the scalar brace-init allowlist
+//                                (the initializer then falls to the aggregate gate, which
+//                                refuses it); declared red: the first case
+//   hir-braced-bitint-refused    `TypeKind::BitInt` out of it; declared red: the second
+//                                case, with the first as the neighbour that stays green
 TEST(HirLoweringC, AComplexIsAScalarBraceInitTarget) {
     SemanticModel model = analyzeC(
         "int main(void) {\n"
@@ -1267,9 +1271,11 @@ TEST(HirLoweringC, ABitIntIsAScalarBraceInitTarget) {
 // needed. The run-time half is examples/c/gnu_overflow_predicates and
 // examples/c/gnu_builtins_overflow_alloca; this is the unit-tier claim: W, by type.
 //
-// RED-ON-DISABLE: cap the signed W at 64 bits — the `long long` and `__int128`
-// rows then compute in a type the sum wraps in (and the `int` row, whose 33 bits
-// fit 64 either way, stays green: the control inside the case).
+// THE MUTATION is the arm `hir-overflow-wide-type` of `dssharness check-mutations`
+// (WRITTEN, NOT READ — no sweep has read it `passed` yet): the signed W capped at 64
+// bits. The `long long` and `__int128` rows would then compute in a type the sum
+// wraps in; the `int` row, whose 33 bits fit 64 either way, is the control inside
+// the case.
 TEST(HirLoweringC, CheckedArithmeticOverSignedOperandsIsComputedWideEnoughForTheExactResult) {
     struct Row {
         char const*  type;

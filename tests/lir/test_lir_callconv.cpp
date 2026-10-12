@@ -34,6 +34,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <ios>
 #include <string>
 #include <unordered_map>
@@ -1112,6 +1113,29 @@ TEST(LirCallconvAbi, ALandingTouchOwedWithoutTheTouchVerbFailsLoud) {
 
     auto m = footingModule(sch, 1, ms->stackPointer->ordinal, rax,
                            {.localBytes = 64, .call = true});
+    // THE REFUSAL IS READ FIRST IN A PROCESS OF ITS OWN. Behind it stands the builder's own
+    // check: a pass that went on past the refusal would emit the touch with no opcode, and
+    // `LirBuilder::addInst` ends the process on one — right for the builder, and the end of
+    // this BINARY's report if the refusal were only read here. A child that dies fails this
+    // statement, the case stops before the in-process reading below, and the binary goes on
+    // to report it by name. (Arm `lir-landing-touch-owed-without-the-verb-not-refused` —
+    // WRITTEN, NOT READ in this form: its first sweep, when this case read the refusal only
+    // in the binary's own process, read a binary that exited 134 and wrote no report.)
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    enum : int { kRefusedByItsCode = 43, kAccepted = 44, kRefusedOtherwise = 45 };
+    ASSERT_EXIT({
+            DiagnosticReporter childRep;
+            auto const childResult =
+                materializeCallingConvention(m.lir, sch, m.alloc, childRep);
+            std::exit(childResult.ok() ? kAccepted
+                      : ::dss::test_support::countCode(
+                            childRep, DiagnosticCode::L_RequiredLirOpcodeMissing) == 1u
+                            ? kRefusedByItsCode : kRefusedOtherwise);
+        }, ::testing::ExitedWithCode(kRefusedByItsCode), "")
+        << "a landing touch owed with no verb to make it must END IN A REFUSAL — the child "
+           "exits 43 refused with the one missing-opcode diagnostic, 44 accepted, 45 refused "
+           "otherwise; any other end is a process that died past the refusal";
+
     DiagnosticReporter rep;
     auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
     EXPECT_FALSE(result.ok());

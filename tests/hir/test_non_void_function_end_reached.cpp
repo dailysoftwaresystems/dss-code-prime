@@ -248,8 +248,11 @@ lowerUnder(std::shared_ptr<GrammarSchema const> schema, std::string src,
 
 // The shape, the one warning, and nothing else reported.
 //
-// RED-ON-DISABLE: make `maybeCompleteReachableNonVoidEnd` return `body` at once
-// and `f` is refused by the verifier (`ok` false, H_VerifierFailure, no warning).
+// THE MUTATION is the arm
+// `hir-the-relaxed-rule-is-never-applied_non-void-function-end-reached` of
+// `dssharness check-mutations` (WRITTEN, NOT READ — no sweep has read it yet):
+// `maybeCompleteReachableNonVoidEnd` returns `body` at once, so that `f` would be
+// refused by the verifier (`ok` false, H_VerifierFailure, no warning).
 TEST(NonVoidFunctionEndReached, TheBodyIsCompletedAndTheFunctionReportedOnce) {
     std::string const src =
         "int f(int x) { if (x) return 5; }\n"
@@ -360,9 +363,11 @@ TEST(NonVoidFunctionEndReached, OneWarningPerFunctionAtItsOwnClosingBrace) {
 // `main` is answered by `implicitReturnZeroForFunctionNames`, which is read
 // FIRST: it gets `return 0`, not the unspecified value, and it is not reported.
 //
-// RED-ON-DISABLE: call `maybeCompleteReachableNonVoidEnd` BEFORE
-// `maybeAppendImplicitReturnZero` and `main` is completed with the local and
-// warned about — a program whose exit status C defines as 0 would then exit
+// THE MUTATION is the arm
+// `hir-completion-precedes-the-implicit-return-zero_non-void-function-end-reached`
+// (WRITTEN, NOT READ): `maybeCompleteReachableNonVoidEnd` called BEFORE
+// `maybeAppendImplicitReturnZero`, so that `main` would be completed with the local
+// and warned about — a program whose exit status C defines as 0 would then exit
 // with whatever the result register held.
 TEST(NonVoidFunctionEndReached, MainKeepsItsImplicitReturnZeroAndIsNotReported) {
     auto const l = lowerC(
@@ -448,16 +453,32 @@ namespace {
 // P69 DSS refused the first, the third and the tenth (valid C); with the
 // completion alone it would have warned on all of them.
 //
-// RED-ON-DISABLE, one per family: `doBodyNeverReachesItsCondition` answering
-// false (the `do` rows), `ifNeverCompletes` answering false (the `if` rows),
-// the chokepoint asking `isDirectNoreturnCall` again instead of
-// `expressionNeverCompletes` (the conditional, comma and cast rows); and one per
-// HOOK of the lowering tier's constant evaluator — `resolveSizeof`,
-// `resolveAlignof`, `resolveFieldOffset`, `resolveFoldedConstant`,
-// `resolveSelectedArm` — for the rows whose condition is a constant only through
-// the machine's layout or through an answer the semantic tier recorded
+// THE MUTATIONS, one per family, are arms of `dssharness check-mutations`
+// (tests/mutations/arms.registry) — every one WRITTEN, NOT READ: no sweep has read
+// any of them yet, and each line says what its arm declares, nothing more.
+//   hir-a-do-body-that-terminates-is-not-seen       `doBodyNeverReachesItsCondition`
+//                                                   answering false (the `do` rows)
+//   hir-an-if-on-a-constant-is-never-a-terminator   `ifNeverCompletes` answering false
+//                                                   (the `if` rows)
+//   hir-only-a-direct-noreturn-call-ends-a-statement_non-void-function-end-reached
+//                                                   the chokepoint asking
+//                                                   `isDirectNoreturnCall` again instead
+//                                                   of `expressionNeverCompletes` (the
+//                                                   conditional, comma and cast rows)
+//   hir-a-comma-expression-is-never-a-terminator    a comma expression holding a call
+//                                                   that does not return, taken to complete
+// and one per HOOK of the lowering tier's constant evaluator, for the rows whose
+// condition is a constant only through the machine's layout or through an answer
+// the semantic tier recorded. These five claim their cases in
+// program/test_compile_pipeline, NOT here — whether a row of this case reddens under
+// one is what that arm's first sweep says:
+//   hir-sizeof-is-not-a-constant-to-the-lowering            `resolveSizeof`
+//   hir-alignof-is-not-a-constant-to-the-lowering           `resolveAlignof`
+//   hir-a-member-offset-is-not-a-constant-to-the-lowering   `resolveFieldOffset`
+//   hir-a-folded-constant-is-not-read-back                  `resolveFoldedConstant`
+//   hir-a-generic-selection-is-not-followed                 `resolveSelectedArm`
 // (✔MEASURED, probe fo5: gcc 13.3.0, clang 18.1.3, Apple clang 21.0.0, mingw-w64
-// gcc and cl 14.51 report none of them).
+// gcc and cl 14.51 report none of the rows.)
 TEST(NonVoidFunctionEndReached, ShapesNoExecutionLeavesAreNotReported) {
     for (std::string_view const body :
          {// a `do` whose body never reaches its condition
@@ -674,8 +695,11 @@ TEST(NonVoidFunctionEndReached, NoreturnOnOneDeclarationAmongSeveralStillTermina
 // the split is over a warning only, and a warning on an end that cannot be
 // reached would be a false one.
 //
-// RED-ON-DISABLE: an order-aware leaf (or a record no longer merged across the
-// declarations) reports all four and wraps none.
+// THE MUTATION is the arm `analysis-noreturn-is-not-merged-across-declarations` of
+// `dssharness check-mutations` (WRITTEN, NOT READ — no sweep has read it yet): the
+// record no longer merged across the declarations, so that the leaf would answer by
+// the declaration a call resolves to, report these bodies and wrap none. Which of
+// two prototypes that record is, the arm's first sweep says: its claim is this case.
 TEST(NonVoidFunctionEndReached, ACallBeforeTheDeclarationThatAddsNoreturnIsATerminator) {
     for (std::string_view const body :
          {"{ (void)x; end(); }",           // the plain call
@@ -744,8 +768,12 @@ TEST(NonVoidFunctionEndReached, ALayoutConstantIsTheAnalysisMachinesOwn) {
 // statement is claimed never to complete. The second half is the control: a
 // condition that needs no layout is still a constant without one.
 //
-// RED-ON-DISABLE (the carried member): build the model WITHOUT the parameters and
-// every layout row of `ShapesNoExecutionLeavesAreNotReported` reads as these do.
+// THE MUTATION (the carried member) is the arm
+// `analysis-the-model-carries-no-layout-parameters_non-void-function-end-reached`
+// (WRITTEN, NOT READ): the analyzer hands its model no layout parameters, so that
+// every layout row of `ShapesNoExecutionLeavesAreNotReported` would read as these
+// do. Its claim is that case; this one is its neighbour, which must stay green —
+// a model with no parameters is what it builds already.
 TEST(NonVoidFunctionEndReached, NoLayoutMeansALayoutQuestionIsNotAConstant) {
     for (std::string_view const body :
          {"{ if (sizeof(int) >= 1) return x; }",
@@ -778,9 +806,13 @@ TEST(NonVoidFunctionEndReached, NoLayoutMeansALayoutQuestionIsNotAConstant) {
 // expression says; the run-time half is in
 // `examples/c/non_void_function_end_not_reached`.
 //
-// RED-ON-DISABLE: without `resolveSizeof` / `resolveAlignof` /
-// `resolveFoldedConstant` the designator does not fold and the initializer is
-// refused.
+// THE MUTATIONS are three of the hook arms named above
+// `ShapesNoExecutionLeavesAreNotReported` — `hir-sizeof-is-not-a-constant-to-the-lowering`,
+// `hir-alignof-is-not-a-constant-to-the-lowering`, `hir-a-folded-constant-is-not-read-back`:
+// without the hook the designator would not fold and the initializer would be
+// refused. NONE DECLARES THIS CASE (each claims its own in
+// program/test_compile_pipeline) and none has been read: whether this case reddens
+// under one is what that arm's first sweep says.
 TEST(NonVoidFunctionEndReached, AnIndexDesignatorMayBeALayoutConstant) {
     auto const l = lowerC(
         "struct Q { char a; char c; short b; };\n"
@@ -799,9 +831,10 @@ TEST(NonVoidFunctionEndReached, AnIndexDesignatorMayBeALayoutConstant) {
 // the verifier's refusal and never emits the warning. `main` is unaffected in
 // both (its rule is the other key).
 //
-// RED-ON-DISABLE: drop the rule test at the head of
-// `maybeCompleteReachableNonVoidEnd` (complete whatever the document says) and
-// both arms compile `f` with a warning.
+// THE MUTATION is the arm `hir-the-rule-is-not-asked-of-the-document` (WRITTEN, NOT
+// READ): the rule test at the head of `maybeCompleteReachableNonVoidEnd` dropped
+// (complete whatever the document says), so that both arms would compile `f` with
+// a warning.
 TEST(NonVoidFunctionEndReached, ADocumentThatDoesNotStateTheRuleKeepsTheRefusal) {
     struct Arm {
         char const*                     what;
@@ -855,9 +888,10 @@ TEST(NonVoidFunctionEndReached, ADocumentThatDoesNotStateTheRuleKeepsTheRefusal)
 //     func f -> int (x : int) { … }     the positional one — `funcTail` is the
 //                                       parameters and the body, and decides the kind
 // Nothing else of the language moves, so the two routes are measured on the same
-// statements. WHICH route a document takes is proven by the mutants, not asserted:
-// taking the completion out of one route reddens that route's cases and leaves
-// the other two routes' green.
+// statements. WHICH route a document takes is not asserted by these cases, and
+// nothing has read it yet: the four arms named beside the cases below each take
+// the completion out of ONE route, or ahead of the list on it, and declare that
+// route's case red — WRITTEN, NOT READ, all four.
 namespace {
 
 enum class ToyRoute { StatesItsKind, KindByChild };
@@ -1075,15 +1109,17 @@ void expectMainKeepsItsReturnZero(ToyRoute route) {
 
 }  // namespace
 
-// RED-ON-DISABLE: take the completion out of `lowerFunctionDecl` and `f` and `h`
-// are refused by the verifier under the relaxed rule; the declarator route's
-// cases and the positional route's stay green.
+// THE MUTATION is the arm `hir-a-row-that-states-its-kind-is-not-completed` (WRITTEN,
+// NOT READ): the completion taken out of `lowerFunctionDecl`, so that `f` and `h`
+// would be refused by the verifier under the relaxed rule.
 TEST(NonVoidFunctionEndReached, ARowThatStatesItsKindIsCompletedOnItsOwnRoute) {
     expectTheRouteCompletesAReachedEnd(ToyRoute::StatesItsKind);
 }
 
-// RED-ON-DISABLE: call the completion BEFORE the list in `lowerFunctionDecl` and
-// `main` is completed with the local and warned about.
+// THE MUTATION is the arm
+// `hir-main-on-a-row-that-states-its-kind-loses-its-return-zero` (WRITTEN, NOT READ):
+// the completion called BEFORE the list in `lowerFunctionDecl`, so that `main`
+// would be completed with the local and warned about.
 TEST(NonVoidFunctionEndReached, MainKeepsItsReturnZeroOnTheRouteOfARowThatStatesItsKind) {
     expectMainKeepsItsReturnZero(ToyRoute::StatesItsKind);
 }
@@ -1091,13 +1127,15 @@ TEST(NonVoidFunctionEndReached, MainKeepsItsReturnZeroOnTheRouteOfARowThatStates
 // The positional child-kind route — reached by no shipped document, so this
 // in-memory rewrite of the toy one is the only thing that lowers a function there.
 //
-// RED-ON-DISABLE: take the completion out of `lowerFunction`; the other two
-// routes' cases stay green.
+// THE MUTATION is the arm `hir-a-positional-child-kind-row-is-not-completed` (WRITTEN,
+// NOT READ): the completion taken out of `lowerFunction`.
 TEST(NonVoidFunctionEndReached, APositionalChildKindRowIsCompletedOnItsOwnRoute) {
     expectTheRouteCompletesAReachedEnd(ToyRoute::KindByChild);
 }
 
-// RED-ON-DISABLE: call the completion BEFORE the list in `lowerFunction`.
+// THE MUTATION is the arm
+// `hir-main-on-a-positional-child-kind-row-loses-its-return-zero` (WRITTEN, NOT READ):
+// the completion called BEFORE the list in `lowerFunction`.
 TEST(NonVoidFunctionEndReached, MainKeepsItsReturnZeroOnThePositionalChildKindRoute) {
     expectMainKeepsItsReturnZero(ToyRoute::KindByChild);
 }

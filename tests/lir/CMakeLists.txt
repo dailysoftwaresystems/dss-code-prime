@@ -452,6 +452,8 @@ dss_add_test(NAME lir/test_thread_local_import_lowering
 # of a nested pair in table order (inner body, inner runs, outer body, outer
 # runs), a run made only of blocks created for the region's own blocks in its own
 # function, and why no run writes a value its handler reads: a source function
-# that guards a region holds no phi at all.
+# that guards a region holds no PROMOTED local's phi (its locals stay in memory),
+# and the phi the lowering makes itself for `&&` / `||` — whose edge split IS a
+# run of the guarded body, read from source — is read by its join alone.
 dss_add_test(NAME lir/test_guarded_region_runs
              SOURCES test_guarded_region_runs.cpp)

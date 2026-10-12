@@ -14,6 +14,7 @@
 #include "mir/mir_dom.hpp"   // shared computeMirDomTree + mirBuildPredecessors
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"  // deriveStructCfMarkers + structCfMarkerName
+#include "mir/mir_symbols_named.hpp"   // checkSymbolIdsBelowTheStatedEnd's one list
 
 #include <algorithm>
 #include <cstddef>
@@ -341,6 +342,7 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     checkAtomicAccessLowered(reporter);
     checkStoreValueTypes(reporter);
     checkLinkageRecords(reporter);
+    checkSymbolIdsBelowTheStatedEnd(reporter);
     if (reporter.hitCap()) return false;
     // ★★ THE VERDICT IS THE VERIFIER'S OWN COUNT, AND-ed with the reporter's
     // delta. The delta alone was not a verdict: ✔MEASURED P68 (lane `ht`), a
@@ -1831,6 +1833,25 @@ void MirVerifier::checkLinkageRecords(DiagnosticReporter& reporter) const {
                std::format("mir global #{}: the linkage of symbol %{} is not well "
                            "formed: {}",
                            g.v, mir_.globalSymbol(g).v, defect));
+    }
+}
+
+void MirVerifier::checkSymbolIdsBelowTheStatedEnd(DiagnosticReporter& reporter) const {
+    // One finding per id, at its first mention (the list's order is the `.dssir`
+    // writer's). The construct is named as the text spells it, so the finding
+    // reads the same whether the module came from a lowering or from a text.
+    for (MirSymbolMentionAt const& past : symbolIdsNamedPastTheStatedEnd(mir_)) {
+        std::string detail = std::format(
+            "{} names symbol %{}, which is not below the end this module states for "
+            "its symbol ids ({}) — the next synthesized symbol would be minted at an "
+            "id the module already names",
+            mirSymbolMentionSpelling(past.mention), past.symbol.v, mir_.symbolIdEnd());
+        if (past.inst.valid()) {
+            reportInst(reporter, DiagnosticCode::I_VerifierFailure, past.inst, std::move(detail));
+        } else {
+            report(reporter, DiagnosticCode::I_VerifierFailure,
+                   std::format("mir module: {}", detail));
+        }
     }
 }
 
