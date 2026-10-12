@@ -986,6 +986,15 @@ files they were written from.
 entries are not `repo-guard`: what they exercise depends on the host (process enumeration, the POSIX half in process
 or inside WSL, a real compile), so every leg runs them.
 
+ⓘ 2026-10-12: `orphan_tests_guard` is no longer one of the top directory's `${Python3_EXECUTABLE}` entries. The
+entry of that name is a test binary (`tests/harness/test_orphan_tests_selftest.cpp`) that starts the same program by
+a command line the top-level CMakeLists declares (`dss_declare_script_selftest`) and reads each of its verdicts into
+a case of its own, so a mutation of the guard can be an arm of the mutation sweep; its `repo-guard` label is set by
+hand beside its registration. The program's contract widened the same day: a test source is every file of an
+extension CMake takes as a C or C++ source (it read `*.cpp` only, and reported the tree's first two registered `.c`
+sources as files that did not exist), the compiler's own C inputs are exempted by the rows of `subjects.json`, each
+verified on every run, and its self-test went from 40 arms to 53.
+
 ### 19.3 What retired with its subject, and what covers the property now
 - `leg_tree_guard`, `repo_tree_guard` (+ `DSS_PWSH_FOR_REPO_TREE_GUARD`, the probe, refusal and not-applicable
   branches) → `owning_tree_selftest_guard`: `owning-tree.py` carries every arm both helpers proved (the identity of a

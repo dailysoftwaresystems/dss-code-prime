@@ -6,9 +6,29 @@ ONE program on every host. It replaces a `.sh` / `.ps1` pair that carried the sa
 contract, the same allowlist and the same floors twice; where the two disagreed this file
 takes the stricter reading, and every such choice is listed under DECISIONS below.
 
-THE CONTRACT. Every `*.cpp` under the tests root is either REGISTERED by a structural
+THE CONTRACT. Every TEST SOURCE under the tests root is either REGISTERED by a structural
 `dss_add_test(NAME ... SOURCES ...)` call in some `CMakeLists.txt` under that root, or
 named by a row of `allowlist.json` (beside this file) whose reference THIS GUARD VERIFIES.
+
+WHAT A TEST SOURCE IS. Every file a registration can name for a compiler: a file whose
+extension CMake takes as a source of one of the two languages the build turns on under
+the tests root, C and C++. `SOURCE_EXTENSIONS` states them ONCE, and the walk, the
+structural-token scan and the arms all read that one statement -- so a `.c` is walked,
+cleared and accused exactly as a `.cpp` is. A registration that names a file of any
+OTHER spelling names a file the walk never visits: it is refused by its own name
+(UNWALKED), never reported as a file that does not exist.
+
+A SUBJECT IS NOT A TEST SOURCE. The compiler under test reads C, so directories of its
+INPUTS hold `.c` files that no test target compiles and none should. `subjects.json`
+(beside this file) names each such directory in a row `{root, extensions, reason}`:
+under `root`, a file of a listed extension is a SUBJECT -- not judged, not an orphan.
+Every row is machine-checked on every run: the root still EXISTS; each listed extension
+still has a file there; and no registration names a subject (a file is a test source or
+a subject, never both). A root exempts ONLY the extensions it lists, so a `.cpp` beside
+the subjects is judged like any other. A row this guard cannot check -- a missing, empty
+or unknown field, an extension `SOURCE_EXTENSIONS` does not state, a root that is not a
+plain relative directory, a root that is, holds or lies inside another row's -- is a
+COLLAPSE and exempts nothing.
 
 WHY IT EXISTS. An orphan is a test source no CMakeLists names: it compiles nowhere, no
 ctest entry runs it, and not one of its assertions ever executes -- while it sits in the
@@ -36,32 +56,51 @@ direction that greens the guard. So:
 THE ALLOWLIST lives once, in `allowlist.json`, as rows `{source, site, reason}` (paths
 relative to the tests root). Every row is machine-checked on every run: the source still
 EXISTS; `dss_add_test` does NOT register it (else the exemption is false); the SITE still
-exists; and the site STRUCTURALLY references the source (a `.cpp` token in its
+exists; and the site STRUCTURALLY references the source (a source token in its
 comment-stripped text). A row missing a field, with an EMPTY field, with an unknown key,
 or repeating a source is a COLLAPSE and clears nothing -- such a row can be checked by
 nothing, and both predecessors let a row with an empty column clear its source anyway.
 
 FAIL-CLOSED. The root must exist; three floors (sources, CMakeLists, DISTINCT registered
 sources) catch a collapsed scan -- the last is the one that fails quietest; a registration
-naming a file that does not exist (PHANTOM) is a collapse; a directory the walk cannot
-list, a CMakeLists that cannot be read or decoded, or any crash of this program is a
-collapse (2), never 1, which means ORPHAN.
+naming a file that does not exist (PHANTOM), or one that exists and is spelt as no source
+(UNWALKED), is a collapse; a directory the walk cannot list, a CMakeLists that cannot be
+read or decoded, or any crash of this program is a collapse (2), never 1, which means
+ORPHAN.
 
 EXIT CODES: 0 clean · 1 ORPHAN · 2 SCAN COLLAPSED (including a failed self-test) ·
-3 STALE ALLOWLIST. Every class is reported in one run; the exit carries the highest
-(2 > 1 > 3).
+3 STALE EXEMPTION (a row of the allowlist or of the subjects file). Every class is
+reported in one run; the exit carries the highest (2 > 1 > 3).
 
 USAGE (the tree is the one this file lives in, never the caller's cwd):
     check-orphan-tests.py            scan <tree>/tests, then run the self-test
     check-orphan-tests.py <root>     scan <root> only (the self-test's children use this)
 
-THE SELF-TEST runs on every no-argument (ctest) run whose live verdict is GREEN, against
-a MIRROR in a per-run temp directory (every CMakeLists copied byte for byte, every source
-created empty -- this guard never opens a `.cpp`). The twelve inherited arms re-invoke
-this program as a child and read its EXIT CODE, because the exit code is the contract
-ctest consumes; the arms added with this port drive the production census in process.
+THE SELF-TEST runs on every no-argument run whose live verdict is GREEN, against a MIRROR
+in a per-run temp directory (every CMakeLists copied byte for byte, every source and
+every subject created empty -- this guard never opens one). The twelve inherited arms
+re-invoke this program as a child and read its EXIT CODE, because the exit code is the
+contract a caller consumes; the arms added since drive the production census in process.
 Every restore is byte-verified, every expectation is captured once before any arm runs,
 and the arm count is checked against `EXPECTED_ARMS`.
+
+THE VERDICT LINES. A no-argument run ends each judgement in one line a reader can take
+by name: `orphan-tests verdict: ok <name>`, or `orphan-tests verdict: FAILED <name> --
+<what failed>` -- one for the tree's own census (`LIVE ...`) and one per self-test arm.
+The ctest entry `orphan_tests_guard` is a test binary that runs this program once and
+reads each line into a case of its own (tests/harness/test_orphan_tests_selftest.cpp),
+which is what lets a mutation of this file be an arm of the mutation sweep. A RED report,
+a crash's traceback and an arm-count refusal go to STANDARD ERROR, which that binary
+leaves in its own log beside the cases they explain; the rest goes to standard output.
+
+ONE DIRECTION HAS NO ARM OF THE MUTATION SWEEP, AND THE ABSENCE IS STATED HERE. "A
+registered `.c` is cleared" (self-test arm K1) cannot be reddened alone while the tree
+itself holds a registered `.c`: a text that blinds the guard to one reddens the tree's
+OWN census first, and a red census runs no self-test arm -- every case of the entry but
+one goes red, which is no set an arm can declare. That mutant is this program as it
+stood until 2026-10-12, and its red was read on the tree: two registered files reported
+as PHANTOM. K1 pins the direction on the mirror, and the tree pins it by being judged on
+every run.
 
 DECISIONS
   * A RED live verdict (1, 2 or 3) skips the self-test and exits with the live code: a red
@@ -101,6 +140,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 EXIT_OK, EXIT_ORPHAN, EXIT_COLLAPSE, EXIT_STALE = 0, 1, 2, 3
+_RC_NAMES = {EXIT_OK: "clean", EXIT_ORPHAN: "ORPHAN", EXIT_COLLAPSE: "COLLAPSE", EXIT_STALE: "STALE"}
 
 # Floors far below the live figures: they catch a COLLAPSED scan, not drift. If one fires,
 # fix the scan; never lower the floor.
@@ -108,12 +148,32 @@ SOURCE_FLOOR = 150
 CMAKELISTS_FLOOR = 12
 REGISTRATION_FLOOR = 150
 PHANTOM_SHOWN = 20
+DIGEST_SHOWN = 24
+
+# THE SOURCE EXTENSIONS, STATED ONCE. What CMake takes as a source of the two languages the
+# build turns on under the tests root -- its own `CMAKE_C_SOURCE_FILE_EXTENSIONS` and
+# `CMAKE_CXX_SOURCE_FILE_EXTENSIONS`, as the compiler records of a configured tree state
+# them -- each spelt with its dot and compared EXACTLY, as CMake lists `C` and `CPP` beside
+# `c` and `cpp`. The walk, the structural-token scan and the arms read this and nothing else.
+C_SOURCE_EXTENSIONS = (".c", ".m")
+CXX_SOURCE_EXTENSIONS = (".C", ".M", ".c++", ".cc", ".cpp", ".cxx", ".m", ".mm", ".mpp", ".CPP",
+                         ".ixx", ".cppm", ".ccm", ".cxxm", ".c++m")
+SOURCE_EXTENSIONS = tuple(sorted(set(C_SOURCE_EXTENSIONS + CXX_SOURCE_EXTENSIONS)))
 
 ALLOWLIST_FILE = "allowlist.json"
 ALLOWLIST_KEYS = ("source", "site", "reason")
 ALLOWLIST_SHOWN = ".harness-config/runner/actions/check-orphan-tests/allowlist.json"
 
-EXPECTED_ARMS = 40
+SUBJECTS_FILE = "subjects.json"
+SUBJECT_KEYS = ("root", "extensions", "reason")
+SUBJECTS_SHOWN = ".harness-config/runner/actions/check-orphan-tests/subjects.json"
+
+# One line per judgement of a no-argument run, read by name (the docstring, THE VERDICT LINES).
+VERDICT = "orphan-tests verdict: "
+LIVE_ARM = "LIVE TESTS-ROOT-CENSUS"
+FAIL_HEAD = "orphan-tests: FAIL - "
+
+EXPECTED_ARMS = 53
 
 CALL_RX = re.compile(r"dss_add_test[ \t]*\(", re.ASCII | re.IGNORECASE)
 WORD_CHAR_RX = re.compile(r"[A-Za-z0-9_]")
@@ -252,6 +312,12 @@ def norm_path(directory, token):
     return "/".join(stack)
 
 
+def is_source(name):
+    """Whether `name` -- a file's name, or a `/`-separated path -- is spelt as a source: its
+    last extension is one `SOURCE_EXTENSIONS` states."""
+    return posixpath.splitext(name)[1] in SOURCE_EXTENSIONS
+
+
 def resolve_token(fname, directory, tok, quiet, errs):
     """One source token -> a tests-root-relative path, or "" with an E1/E2/E3 message
     (suppressed when `quiet`: the structural-reference pass can only cost a row its proof)."""
@@ -306,7 +372,7 @@ def parse_call_args(fname, directory, argtext, fp):
 
 
 def parse_file(fname, text):
-    """-> FileParse: registrations (path, name, file), structural `.cpp` references
+    """-> FileParse: registrations (path, name, file), structural source references
     (file, path), refusals, and the number of calls read."""
     fp = FileParse()
     st = _StripState()
@@ -337,12 +403,12 @@ def parse_file(fname, text):
             break
         parse_call_args(fname, directory, stripped[e:i], fp)
         pos = i + 1
-    # Every STRUCTURAL `.cpp` token in the file -- the evidence an allowlist site must carry.
+    # Every STRUCTURAL source token in the file -- the evidence an allowlist site must carry.
     # `(` and `)` separate tokens here too, or `add_executable(r x.cpp)` would yield `x.cpp)`.
     flat = stripped.replace("\t", " ").replace("\n", " ").replace("(", " ").replace(")", " ")
     for tok in SPACES_RX.split(flat):
         t = tok.replace('"', "")
-        if len(t) < 5 or not t.endswith(".cpp"):
+        if not is_source(t):
             continue
         p = resolve_token(fname, directory, t, True, fp.errs)
         if p:
@@ -350,42 +416,68 @@ def parse_file(fname, text):
     return fp
 
 
-# ── the allowlist ──────────────────────────────────────────────────────────────────────
+# ── the two exemption files ────────────────────────────────────────────────────────────
+
+def _beside_this_file(name):
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), name)
+
 
 def allowlist_path():
-    return os.path.join(os.path.dirname(os.path.realpath(__file__)), ALLOWLIST_FILE)
+    return _beside_this_file(ALLOWLIST_FILE)
 
 
-def load_allowlist(path, shown=ALLOWLIST_SHOWN):
-    """-> ([(source, site, reason)], [refusal]). A row that cannot be checked clears nothing."""
+def subjects_path():
+    return _beside_this_file(SUBJECTS_FILE)
+
+
+def _filled(value, is_list):
+    """A non-empty string -- or, for a list field, a non-empty array of non-empty strings."""
+    if is_list:
+        return (isinstance(value, list) and bool(value)
+                and all(isinstance(v, str) and v.strip() != "" for v in value))
+    return isinstance(value, str) and value.strip() != ""
+
+
+def _load_rows(path, shown, what, keys, lists=()):
+    """The schema both exemption files share -> ([(row number, row)], [refusal]): a JSON array
+    of objects, each holding EXACTLY `keys`, every one filled (`_filled`; a key of `lists`
+    is an array). A row that fails is refused here and handed to nobody."""
     try:
         with open(path, "rb") as fh:
             data = json.loads(fh.read().decode("utf-8"))
     except (OSError, ValueError) as exc:
-        return [], ["orphan-tests: FAIL - the allowlist %s cannot be read (%s)." % (shown, exc)]
+        return [], ["orphan-tests: FAIL - the %s %s cannot be read (%s)." % (what, shown, exc)]
     if not isinstance(data, list):
-        return [], ["orphan-tests: FAIL - the allowlist %s is not a JSON array of rows." % shown]
-    rows, errors, seen = [], [], set()
+        return [], ["orphan-tests: FAIL - the %s %s is not a JSON array of rows." % (what, shown)]
+    rows, errors = [], []
     for n, row in enumerate(data, 1):
         if not isinstance(row, dict):
-            errors.append("orphan-tests: FAIL - allowlist row %d is not an object." % n)
+            errors.append("orphan-tests: FAIL - %s row %d is not an object." % (what, n))
             continue
-        unknown = sorted(k for k in row if k not in ALLOWLIST_KEYS)
-        absent = [k for k in ALLOWLIST_KEYS if k not in row]
-        empty = [k for k in ALLOWLIST_KEYS
-                 if k in row and (not isinstance(row[k], str) or row[k].strip() == "")]
+        unknown = sorted(k for k in row if k not in keys)
+        absent = [k for k in keys if k not in row]
+        empty = [k for k in keys if k in row and not _filled(row[k], k in lists)]
         if unknown:
-            errors.append("orphan-tests: FAIL - allowlist row %d carries unknown key(s) %s; a row "
-                          "holds exactly %s." % (n, ", ".join("'%s'" % k for k in unknown),
-                                                 ", ".join(ALLOWLIST_KEYS)))
+            errors.append("orphan-tests: FAIL - %s row %d carries unknown key(s) %s; a row "
+                          "holds exactly %s." % (what, n, ", ".join("'%s'" % k for k in unknown),
+                                                 ", ".join(keys)))
         if absent:
-            errors.append("orphan-tests: FAIL - allowlist row %d is missing the field(s) %s."
-                          % (n, ", ".join("'%s'" % k for k in absent)))
+            errors.append("orphan-tests: FAIL - %s row %d is missing the field(s) %s."
+                          % (what, n, ", ".join("'%s'" % k for k in absent)))
         if empty:
-            errors.append("orphan-tests: FAIL - allowlist row %d has an EMPTY %s." % (
-                n, ", ".join("'%s'" % k for k in empty)))
+            errors.append("orphan-tests: FAIL - %s row %d has an EMPTY %s." % (
+                what, n, ", ".join("'%s'" % k for k in empty)))
         if unknown or absent or empty:
             continue
+        rows.append((n, row))
+    return rows, errors
+
+
+def load_allowlist(path, shown=ALLOWLIST_SHOWN):
+    """-> ([(source, site, reason)], [refusal]). A row that cannot be checked clears nothing."""
+    found, errors = _load_rows(path, shown, "allowlist", ALLOWLIST_KEYS)
+    rows, seen = [], set()
+    for n, row in found:
         if row["source"] in seen:
             errors.append("orphan-tests: FAIL - allowlist row %d repeats the source '%s' of an "
                           "earlier row; one source, one row." % (n, row["source"]))
@@ -399,6 +491,46 @@ def load_allowlist(path, shown=ALLOWLIST_SHOWN):
     return rows, errors
 
 
+def load_subjects(path, shown=SUBJECTS_SHOWN):
+    """-> ([(root, (extension, ...), reason)], [refusal]). A row that cannot be checked exempts
+    nothing."""
+    found, errors = _load_rows(path, shown, "subjects", SUBJECT_KEYS, lists=("extensions",))
+    rows = []
+    for n, row in found:
+        root, extensions = row["root"], row["extensions"]
+        if norm_path("", root) != root or DRIVE_RX.match(root) or "\\" in root:
+            errors.append("orphan-tests: FAIL - subjects row %d names the root '%s', which is not a "
+                          "plain directory path relative to the tests root." % (n, root))
+            continue
+        unstated = [e for e in extensions if e not in SOURCE_EXTENSIONS]
+        if unstated:
+            errors.append("orphan-tests: FAIL - subjects row %d lists the extension(s) %s, which "
+                          "SOURCE_EXTENSIONS does not state; a subject is a file the walk would "
+                          "otherwise judge." % (n, ", ".join("'%s'" % e for e in unstated)))
+            continue
+        clash = [r for r, _e, _w in rows
+                 if r == root or r.startswith(root + "/") or root.startswith(r + "/")]
+        if clash:
+            errors.append("orphan-tests: FAIL - subjects row %d names the root '%s', which is, holds "
+                          "or lies inside the root '%s' of an earlier row; one directory, one row."
+                          % (n, root, clash[0]))
+            continue
+        rows.append((root, tuple(extensions), row["reason"]))
+    if errors:
+        errors.append("  A row this guard cannot check would exempt a directory on nobody's "
+                      "authority, so it exempts nothing and the census is refused. Fix the row in "
+                      "%s; never widen a root to make a red go away." % shown)
+    return rows, errors
+
+
+def subject_root_of(path, subject_rows):
+    """The root of the row that makes `path` a subject, or ""."""
+    for root, extensions, _why in subject_rows:
+        if path.startswith(root + "/") and posixpath.splitext(path)[1] in extensions:
+            return root
+    return ""
+
+
 # ── the census ─────────────────────────────────────────────────────────────────────────
 
 class Census:
@@ -406,11 +538,11 @@ class Census:
         self.label = label
         self.root = None             # the physical tests root, once it is known to exist
         self.root_missing = False
-        self.sources, self.cmakelists = [], []
+        self.sources, self.subjects, self.cmakelists = [], [], []
         self.regs, self.reg_paths, self.toks, self.errs = [], [], set(), []
         self.calls = 0
         self.collapse_msgs, self.stale_msgs, self.orphans = [], [], []
-        self.n_stale = self.n_allow = 0
+        self.n_stale = self.n_allow = self.n_roots = 0
         self.rc = EXIT_OK
 
     @property
@@ -424,24 +556,25 @@ def _walk_error(exc):
 
 
 def enumerate_tree(root):
-    """-> (sources, cmakelists): every `*.cpp` and every `CMakeLists.txt` (exact-case names,
-    regular files or symlinks to one), dot-directories included, ordinal order. A directory
-    that cannot be listed raises Collapse."""
+    """-> (sources, cmakelists): every file spelt as a source (`is_source`) and every
+    `CMakeLists.txt` (exact-case names, regular files or symlinks to one), dot-directories
+    included, ordinal order. A directory that cannot be listed raises Collapse."""
     sources, cmakelists = [], []
     for dirpath, dirnames, filenames in os.walk(root, onerror=_walk_error):
         dirnames.sort()
         for fn in filenames:
-            if not (fn.endswith(".cpp") or fn == "CMakeLists.txt"):
+            source = is_source(fn)
+            if not (source or fn == "CMakeLists.txt"):
                 continue
             full = os.path.join(dirpath, fn)
             if not os.path.isfile(full):
                 continue
             rel = os.path.relpath(full, root).replace(os.sep, "/")
-            (sources if fn.endswith(".cpp") else cmakelists).append(rel)
+            (sources if source else cmakelists).append(rel)
     return sorted(sources), sorted(cmakelists)
 
 
-def census(root_in, label, allow_rows, allow_errors):
+def census(root_in, label, allow_rows, allow_errors, subject_rows, subject_errors):
     """The whole verdict over one tests root. It reads the tree and prints nothing."""
     c = Census(label)
     if not os.path.isdir(root_in):
@@ -449,13 +582,18 @@ def census(root_in, label, allow_rows, allow_errors):
         return c
     root = c.root = os.path.realpath(root_in)
     try:
-        c.sources, c.cmakelists = enumerate_tree(root)
+        walked, c.cmakelists = enumerate_tree(root)
     except Collapse as exc:
         c.collapse_msgs.append("orphan-tests: FAIL - the tests-root walk failed: %s. A partial "
                                "enumeration can neither clear nor accuse a source. Refusing to "
                                "report a verdict." % exc)
         c.rc = EXIT_COLLAPSE
         return c
+    # A SUBJECT is an input of the compiler under test, never a test source: under a row's
+    # root, a file of an extension the row lists. Every other walked file is judged.
+    c.subjects = [s for s in walked if subject_root_of(s, subject_rows)]
+    subject_set, walked_set = set(c.subjects), set(walked)
+    c.sources = [s for s in walked if s not in subject_set]
     if not c.cmakelists:
         c.collapse_msgs.append("orphan-tests: FAIL - found 0 CMakeLists.txt under the tests root, "
                                "below its floor of %d." % CMAKELISTS_FLOOR)
@@ -479,8 +617,8 @@ def census(root_in, label, allow_rows, allow_errors):
     n_src, n_cml, n_reg = len(c.sources), len(c.cmakelists), len(c.reg_paths)
 
     if n_src < SOURCE_FLOOR:
-        c.collapse_msgs.append("orphan-tests: FAIL - the source scan found only %d *.cpp under the "
-                               "tests root, below its floor of %d." % (n_src, SOURCE_FLOOR))
+        c.collapse_msgs.append("orphan-tests: FAIL - the source scan found only %d test source(s) "
+                               "under the tests root, below its floor of %d." % (n_src, SOURCE_FLOOR))
         c.collapse_msgs.append("  This does NOT mean every test is wired - it means the SCAN "
                                "COLLAPSED. Refusing to report a pass; fix the scan, do not lower "
                                "the floor.")
@@ -502,9 +640,25 @@ def census(root_in, label, allow_rows, allow_errors):
                                "so the parse is INCOMPLETE:" % len(c.errs))
         c.collapse_msgs.extend("    " + e for e in c.errs)
 
-    # PHANTOM: the other direction of the same property -- a registration naming nothing.
-    src_set = set(c.sources)
-    phantoms = [p for p in c.reg_paths if p not in src_set]
+    # PHANTOM and UNWALKED: the other direction of the same property -- a registration that
+    # names no walked file. The file is not there (PHANTOM), or it is there and spelt as no
+    # source the walk visits (UNWALKED): two facts, and each is reported as itself.
+    unplaced = [p for p in c.reg_paths if p not in walked_set]
+    unwalked = [p for p in unplaced if os.path.isfile(os.path.join(root, *p.split("/")))]
+    phantoms = [p for p in unplaced if p not in unwalked]
+    if unwalked:
+        c.collapse_msgs.append("orphan-tests: FAIL - %d registration(s) name a file that EXISTS "
+                               "under the tests root and is spelt as no source this guard walks:"
+                               % len(unwalked))
+        c.collapse_msgs.extend("    UNWALKED: " + p for p in unwalked[:PHANTOM_SHOWN])
+        if len(unwalked) > PHANTOM_SHOWN:
+            c.collapse_msgs.append("    ... and %d more." % (len(unwalked) - PHANTOM_SHOWN))
+        c.collapse_msgs.append("  The file is there, so this is no phantom: its extension is not one "
+                               "SOURCE_EXTENSIONS states (%s), the walk never visits it, and a file "
+                               "the walk never visits can be neither cleared nor accused. If a "
+                               "compiler takes that spelling, state it there; if none does, the "
+                               "file is not a source and SOURCES is not its place."
+                               % " ".join(SOURCE_EXTENSIONS))
     if phantoms:
         c.collapse_msgs.append("orphan-tests: FAIL - %d registration(s) name a source that does NOT "
                                "exist under the tests root:" % len(phantoms))
@@ -522,7 +676,7 @@ def census(root_in, label, allow_rows, allow_errors):
     reg_set, cml_set = set(c.reg_paths), set(c.cmakelists)
     c.n_allow = len(set(src for src, _site, _why in allow_rows))
     for ap, asite, _why in allow_rows:
-        if ap not in src_set:
+        if ap not in walked_set:
             c.stale_msgs.append("  STALE: the allowlist names '%s', which does NOT exist under the "
                                 "tests root." % ap)
             c.stale_msgs.append("         An exemption for a deleted file reads like live coverage "
@@ -543,6 +697,36 @@ def census(root_in, label, allow_rows, allow_errors):
         else:
             continue
         c.n_stale += 1
+
+    # The subject rows: one that failed validation exempts nothing; the rest are checked.
+    c.collapse_msgs.extend(subject_errors)
+    c.n_roots = len(subject_rows)
+    for sroot, extensions, _why in subject_rows:
+        if not os.path.isdir(os.path.join(root, *sroot.split("/"))):
+            c.stale_msgs.append("  STALE: the subjects file names the root '%s', which is not a "
+                                "directory under the tests root." % sroot)
+            c.stale_msgs.append("         A root that is gone exempts nothing today and whatever is "
+                                "put there tomorrow. Delete the row.")
+            c.n_stale += 1
+            continue
+        inside = [s for s in c.subjects if s.startswith(sroot + "/")]
+        held = set(posixpath.splitext(s)[1] for s in inside)
+        for extension in extensions:
+            if extension not in held:
+                c.stale_msgs.append("  STALE: the subject root '%s' lists '%s' and holds no such "
+                                    "file." % (sroot, extension))
+                c.stale_msgs.append("         An extension listed for nothing exempts the first "
+                                    "test source of that spelling put there. Take it out of the row.")
+                c.n_stale += 1
+        for s in inside:
+            if s in reg_set:
+                c.stale_msgs.append("  STALE: the subject root '%s' exempts '%s', but dss_add_test "
+                                    "REGISTERS it." % (sroot, s))
+                c.stale_msgs.append("         A file is a test source or a subject, never both: a "
+                                    "target compiles it, so the exemption is a false statement "
+                                    "about this tree. Move the file out of the root, or narrow the "
+                                    "row.")
+                c.n_stale += 1
 
     # THE PROPERTY: every source is registered or allowlisted.
     cleared = reg_set | set(src for src, _site, _why in allow_rows)
@@ -565,7 +749,7 @@ def render(c):
         out.append("orphan-tests: FAIL - the tests root does not exist. Refusing to report a pass "
                    "on a scan of nothing.")
         out.append("orphan-tests: FAIL - 0 sources / 0 CMakeLists / 0 registrations from 0 calls / "
-                   "0 allowlisted: 0 orphan(s), 0 stale allowlist entries.")
+                   "0 allowlisted / 0 subject(s) in 0 root(s): 0 orphan(s), 0 stale exemption(s).")
         return out
     out.extend(c.collapse_msgs)
     if c.orphans:
@@ -593,11 +777,16 @@ def render(c):
         out.append("      CMakeLists that references it. The guard verifies that reference on every "
                    "run, so")
         out.append("      the exemption cannot quietly stop being true.")
+        out.append("  (d) if it is an INPUT of the compiler under test and no test at all, it lives "
+                   "under a")
+        out.append("      subject root: %s names them," % SUBJECTS_SHOWN)
+        out.append("      each row verified on every run. A new root needs a reason a reviewer can "
+                   "check.")
         out.append("Do NOT widen this guard to make a red go away. An orphan is the one defect here "
                    "that")
         out.append("costs nothing to fix and everything to leave in place.")
     if c.n_stale:
-        out.append("orphan-tests: FAIL - the ALLOWLIST no longer describes this tree:")
+        out.append("orphan-tests: FAIL - an EXEMPTION no longer describes this tree:")
         out.append("")
         out.extend(c.stale_msgs)
         out.append("An exemption list that can rot is the pattern this repository has anchored "
@@ -605,10 +794,26 @@ def render(c):
         out.append("guard weakened every time it fires ends up asserting nothing. Fix the ROW.")
     verdict = "FAIL" if (c.collapsed or c.orphans or c.n_stale) else "OK"
     out.append("orphan-tests: %s - %d sources / %d CMakeLists / %d registrations from %d calls / "
-               "%d allowlisted: %d orphan(s), %d stale allowlist entries."
+               "%d allowlisted / %d subject(s) in %d root(s): %d orphan(s), %d stale exemption(s)."
                % (verdict, len(c.sources), len(c.cmakelists), len(c.reg_paths), c.calls,
-                  c.n_allow, len(c.orphans), c.n_stale))
+                  c.n_allow, len(c.subjects), c.n_roots, len(c.orphans), c.n_stale))
     return out
+
+
+def digest(report):
+    """A red report in ONE line: what each class says first, and every file it names."""
+    keep = []
+    for line in report:
+        named = line.strip()
+        if line.startswith(FAIL_HEAD):
+            keep.append(line[len(FAIL_HEAD):])
+        elif named.startswith(("ORPHAN: ", "PHANTOM: ", "UNWALKED: ", "STALE: ")):
+            keep.append(named)
+    shown = keep[:DIGEST_SHOWN]
+    if len(keep) > DIGEST_SHOWN:
+        shown.append("... and %d more line(s), in the report on standard error"
+                     % (len(keep) - DIGEST_SHOWN))
+    return " | ".join(shown)
 
 
 def summary_number(text, label):
@@ -627,6 +832,16 @@ def summary_number(text, label):
 
 def _say(msg):
     print(msg, flush=True)
+
+
+def _complain(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _verdict(name, detail=None):
+    """One judgement of a no-argument run, as its reader takes it by name."""
+    _say(VERDICT + ("ok " + name if detail is None
+                    else "FAILED %s -- %s" % (name, " ".join(detail.split()))))
 
 
 def _read(path):
@@ -710,7 +925,8 @@ _CATEGORIES = (
     (("7", "8", "9"), "stale-allowlist"), (("11",), "phantom"), (("12",), "stale-site"),
 )
 _PREFIX_CATEGORIES = (("P", "parser-semantics"), ("E", "parse-incomplete"),
-                      ("X", "precedence"), ("A", "allowlist-schema"), ("C", "crash"),
+                      ("X", "precedence"), ("A", "allowlist-schema"), ("K", "source-kind"),
+                      ("S", "subjects"), ("C", "crash"),
                       ("U", "usage"), ("R", "owning-tree root"), ("T", "temp-cleanup"))
 
 
@@ -726,10 +942,11 @@ def _category(label):
 
 
 class _Arms:
-    """Every arm is counted once by label; a failed assertion fails its arm, never the run."""
+    """Every arm is counted once by label; a failed assertion fails its arm, never the run.
+    What an arm's FIRST failure said, less the output it quotes, is its verdict's detail."""
 
     def __init__(self):
-        self.ran, self.failed = [], []
+        self.ran, self.failed, self.details = [], [], {}
 
     def begin(self, label):
         self.ran.append(label)
@@ -737,6 +954,8 @@ class _Arms:
     def fail(self, label, *lines):
         if label not in self.failed:
             self.failed.append(label)
+        self.details.setdefault(label, " ".join(line.strip() for line in lines
+                                                if not line.startswith("  | ")))
         for i, line in enumerate(lines):
             _say(("orphan-tests: SELF-TEST FAIL - arm %s " % label if i == 0 else "  ") + line)
         return False
@@ -763,15 +982,16 @@ class _Subject:
     """The mirror, its pristine CMakeLists-only twin and an empty root, with the live census
     figures captured ONCE, before any arm runs, under names no arm writes."""
 
-    def __init__(self, base, live, allow_rows):
+    def __init__(self, base, live, allow_rows, subject_rows):
         self.base, self.live, self.allow_rows = base, live, allow_rows
+        self.subject_rows = subject_rows
         self.mirror = os.path.join(base, "mirror")
         self.pristine = os.path.join(base, "pristine")
         self.empty = os.path.join(base, "empty")
         for d in (self.mirror, self.pristine, self.empty):
             os.makedirs(d)
         self.src, self.cml, self.reg = len(live.sources), len(live.cmakelists), len(live.reg_paths)
-        for rel in live.sources:
+        for rel in live.sources + live.subjects:
             _write(_native(self.mirror, rel), b"")
         self.bytes = {}
         for rel in live.cmakelists:
@@ -824,13 +1044,16 @@ def _child_arm(arms, label, root, want, note="", says=(), silent=(), census_want
     return ok
 
 
-def _judge(arms, label, sub, want, says=(), silent=(), counts=None, rows=None, errors=()):
+def _judge(arms, label, sub, want, says=(), silent=(), counts=None, rows=None, errors=(),
+           subjects=None, subject_errors=()):
     """The production census over the mirror, judged in process. -> True when it held."""
-    c = census(sub.mirror, "st", sub.allow_rows if rows is None else rows, list(errors))
+    c = census(sub.mirror, "st", sub.allow_rows if rows is None else rows, list(errors),
+               sub.subject_rows if subjects is None else subjects, list(subject_errors))
     text = "\n".join(render(c))
     ok = True
     if c.rc != want:
-        ok = arms.fail(label, "census rc=%d, expected %d:" % (c.rc, want),
+        ok = arms.fail(label, "census rc=%d (%s), expected %d (%s):"
+                       % (c.rc, _RC_NAMES.get(c.rc, "?"), want, _RC_NAMES.get(want, "?")),
                        *("  | " + line for line in text.split("\n")))
     for needle in says:
         if needle not in text:
@@ -852,24 +1075,26 @@ def _census_arm(arms, label, sub, want, **kw):
         _say("orphan-tests: self-test arm %s rc=%d as expected" % (label, want))
 
 
-def self_test(live, allow_rows):
+def self_test(live, allow_rows, subject_rows):
     """Red-on-disable. -> EXIT_OK, or EXIT_COLLAPSE when any arm failed or went missing."""
     arms = _Arms()
     ot = _owning_tree()
     base = tempfile.mkdtemp(prefix="orphan-tests-selftest-")
     try:
-        sub = _Subject(base, live, allow_rows)
+        sub = _Subject(base, live, allow_rows, subject_rows)
         _inherited_and_added_arms(arms, sub)
         for ok, why, detail in ot.root_arms(repo_root, (Collapse,), False, __file__):
             arms.holds("R " + why, ok, "did not hold: %s" % detail)
     finally:
         removed = ot.remove_tree(base)
     arms.holds("T1 TEMP-TREES-REMOVED", removed, "left %s behind." % base)
+    for label in arms.ran:
+        _verdict(label, arms.details[label] if label in arms.failed else None)
     if len(arms.ran) != EXPECTED_ARMS:
         arms.failed.append("EXPECTED_ARMS")
-        _say("orphan-tests: SELF-TEST FAIL - %d arm(s) ran, EXPECTED_ARMS says %d. An arm that "
-             "silently stops running is a property that silently stops being proven."
-             % (len(arms.ran), EXPECTED_ARMS))
+        _complain("orphan-tests: SELF-TEST FAIL - %d arm(s) ran, EXPECTED_ARMS says %d. An arm "
+                  "that silently stops running is a property that silently stops being proven."
+                  % (len(arms.ran), EXPECTED_ARMS))
     if arms.failed:
         _say("orphan-tests: SELF-TEST FAILED. Treat the verdict above as UNPROVEN: this guard has "
              "not")
@@ -895,6 +1120,19 @@ _STRUCTURE_LABELS = ("11 PHANTOM-REGISTRATION", "12 STALE-ALLOW-SITE-GONE",
                      "A4 ALLOWLIST-DUPLICATE-SOURCE")
 _STALE_LABELS = ("7 STALE-ALLOW-FILE-GONE", "8 STALE-ALLOW-NOW-REGISTERED",
                  "9 STALE-ALLOW-SITE-DROPPED-REFERENCE")
+_K_LABELS = ("K1 REGISTERED-C-SOURCE-IS-CLEARED", "K2 UNREGISTERED-C-SOURCE-IS-AN-ORPHAN",
+             "K3 REGISTERED-C-SOURCE-NOT-THERE-IS-A-PHANTOM",
+             "K4 REGISTERED-FILE-SPELT-AS-NO-SOURCE-IS-UNWALKED",
+             "K5 EVERY-STATED-EXTENSION-IS-WALKED-AND-JUDGED",
+             "K6 SITE-TOKEN-OF-A-C-SOURCE-IS-STRUCTURAL-EVIDENCE")
+_S_LABELS = ("S1 SUBJECT-ROOT-EXEMPTS-ONLY-ITS-EXTENSIONS", "S2 SUBJECT-REGISTERED-IS-STALE",
+             "S3 SUBJECT-ROOT-GONE-IS-STALE", "S4 SUBJECT-EXTENSION-HOLDING-NO-FILE-IS-STALE",
+             "S5 SUBJECTS-EXTENSION-NOT-STATED-IS-REFUSED",
+             "S6 SUBJECTS-ROOT-INSIDE-ANOTHER-IS-REFUSED", "S7 SUBJECTS-ROOT-NOT-PLAIN-IS-REFUSED")
+# What arm K5 plants: CMake's two lists, typed here a second time ON PURPOSE. It is the arm's
+# own expectation -- `SOURCE_EXTENSIONS` must equal it, and the walk must visit each of it.
+_K5_PLANTED = (".c", ".m", ".C", ".M", ".c++", ".cc", ".cpp", ".cxx", ".mm", ".mpp", ".CPP",
+               ".ixx", ".cppm", ".ccm", ".cxxm", ".c++m")
 
 
 def _refuse(arms, labels, why):
@@ -921,7 +1159,7 @@ def _inherited_and_added_arms(arms, sub):
     else:
         w_file, w_line, w_tok, w_path = w
         mutant = _without_line(sub.bytes[w_file], w_line)
-        stem = w_tok[:-4] if w_tok.endswith(".cpp") else w_tok
+        stem = posixpath.splitext(w_tok)[0]
         registration = "dss_add_test(NAME %s/%s SOURCES %s)" % (dir_of(w_path) or ".", stem, w_tok)
         if mutant == sub.bytes[w_file]:
             _refuse(arms, ("1 ORPHAN", "1b COMMENT-IS-NOT-COVERAGE"),
@@ -950,7 +1188,7 @@ def _inherited_and_added_arms(arms, sub):
 
     # ARMS 4-6 -- ONE ARM PER FLOOR, each isolated by asserted absence.
     _child_arm(arms, "4 COLLAPSE-SOURCE-FLOOR", sub.pristine, EXIT_COLLAPSE,
-               says=("the source scan found only 0 *.cpp",),
+               says=("the source scan found only 0 test source(s)",),
                silent=("the CMakeLists scan found only", "the parser resolved only"))
 
     keep = 2
@@ -1002,7 +1240,7 @@ def _inherited_and_added_arms(arms, sub):
     else:
         a_path, a_site, _why = sub.allow_rows[0]
         a_base = a_path.rsplit("/", 1)[-1]
-        a_stem = a_base[:-4] if a_base.endswith(".cpp") else a_base
+        a_stem = posixpath.splitext(a_base)[0]
         os.remove(sub.m(a_path))
         _child_arm(arms, _STALE_LABELS[0], sub.mirror, EXIT_STALE,
                    says=("does NOT exist under the tests root",),
@@ -1033,6 +1271,8 @@ def _inherited_and_added_arms(arms, sub):
                       "reproduce the pristine bytes.")
 
     _structure_arms(arms, sub, w)
+    _source_kind_arms(arms, sub, w)
+    _subject_arms(arms, sub, w)
 
     # ARM 10 -- GREEN AFTER RESTORE: every mutation above undone, the subject is back.
     _child_arm(arms, "10 GREEN-AFTER-RESTORE", sub.mirror, EXIT_OK, " (all mutations undone)",
@@ -1197,6 +1437,182 @@ def _structure_arms(arms, sub, w):
            "allowlist row %d repeats the source '%s'" % (len(rows) + 1, a_path), False)
 
 
+def _restored(arms, label, sub, rel):
+    if not sub.restore(rel):
+        arms.fail(label, "restoring %s did not reproduce the pristine bytes; later arms would "
+                  "run against this arm's mutant." % rel)
+
+
+def _source_kind_arms(arms, sub, w):
+    """K1-K6: a test source is every file a registration can name. A `.c` planted beside the
+    witness is cleared, accused and missed exactly as a `.cpp` is; a registered file spelt as
+    no source is named as that; and every stated extension is walked and judged."""
+    if w is None:
+        _refuse(arms, _K_LABELS, "no witness registration, so the arm is REFUSED.")
+        return
+    w_file = w[0]
+    d = dir_of(w_file)
+    if any((d + "/").startswith(root + "/") for root, _e, _why in sub.subject_rows):
+        _refuse(arms, _K_LABELS, "the witness directory '%s' lies under a subject root, so a "
+                "source planted beside the witness would be a subject; REFUSED." % d)
+        return
+
+    def beside(name):
+        return d + "/" + name if d else name
+
+    def register(token):
+        _write(sub.m(w_file), _appended(sub.bytes[w_file],
+                                        "dss_add_test(NAME st/k SOURCES %s)" % token))
+
+    c_src, other = beside("dss_selftest_k.c"), beside("dss_selftest_k.inc")
+
+    # K1 -- registered, and there: cleared.
+    _write(sub.m(c_src), b"")
+    register("dss_selftest_k.c")
+    _census_arm(arms, _K_LABELS[0], sub, EXIT_OK, counts=(sub.src + 1, sub.cml, sub.reg + 1, 0))
+    _restored(arms, _K_LABELS[0], sub, w_file)
+
+    # K2 -- there, and registered nowhere: an orphan.
+    _census_arm(arms, _K_LABELS[1], sub, EXIT_ORPHAN, says=("  ORPHAN: " + c_src,),
+                counts=(sub.src + 1, sub.cml, sub.reg, 1))
+
+    # K3 -- registered, and not there: a phantom, and not "unwalked".
+    os.remove(sub.m(c_src))
+    register("dss_selftest_k.c")
+    _census_arm(arms, _K_LABELS[2], sub, EXIT_COLLAPSE,
+                says=("1 registration(s) name a source that does NOT exist",
+                      "    PHANTOM: " + c_src),
+                silent=("UNWALKED: ", "  ORPHAN:"), counts=(sub.src, sub.cml, sub.reg + 1, 0))
+
+    # K4 -- registered, there, and spelt as no source: UNWALKED, and no phantom.
+    _write(sub.m(other), b"")
+    register("dss_selftest_k.inc")
+    _census_arm(arms, _K_LABELS[3], sub, EXIT_COLLAPSE,
+                says=("1 registration(s) name a file that EXISTS under the tests root",
+                      "    UNWALKED: " + other),
+                silent=("PHANTOM: ", "  ORPHAN:"), counts=(sub.src, sub.cml, sub.reg + 1, 0))
+    os.remove(sub.m(other))
+    _restored(arms, _K_LABELS[3], sub, w_file)
+
+    # K5 -- every stated extension: one unregistered file of each, and each one is accused.
+    label = _K_LABELS[4]
+    arms.begin(label)
+    planted = [(ext, beside("dss_selftest_k5_%02d%s" % (i, ext)))
+               for i, ext in enumerate(_K5_PLANTED)]
+    for _ext, rel in planted:
+        _write(sub.m(rel), b"")
+    c = census(sub.mirror, "st", sub.allow_rows, [], sub.subject_rows, [])
+    accused = set(c.orphans)
+    missed = [ext for ext, rel in planted if rel not in accused]
+    got = (c.rc, len(c.sources), len(c.orphans))
+    want = (EXIT_ORPHAN, sub.src + len(planted), len(planted))
+    if sorted(_K5_PLANTED) != sorted(SOURCE_EXTENSIONS):
+        arms.fail(label, "SOURCE_EXTENSIONS states (%s) and this arm plants (%s): an extension "
+                  "stated and never planted is one nothing proves the walk visits."
+                  % (" ".join(SOURCE_EXTENSIONS), " ".join(sorted(_K5_PLANTED))))
+    elif missed:
+        arms.fail(label, "an unregistered source of the stated extension(s) %s was not accused "
+                  "as an orphan." % " ".join(missed))
+    elif got != want:
+        arms.fail(label, "census (rc, sources, orphans) %s != expected %s." % (got, want))
+    else:
+        _say("orphan-tests: self-test arm %s rc=%d as expected (%d extensions)"
+             % (label, EXIT_ORPHAN, len(planted)))
+    for _ext, rel in planted:
+        os.remove(sub.m(rel))
+
+    # K6 -- an allowlisted `.c`: its site's structural token is the evidence, as a `.cpp`'s is.
+    _write(sub.m(c_src), b"")
+    _write(sub.m(w_file), _appended(sub.bytes[w_file],
+                                    "add_library(dss_selftest_k STATIC dss_selftest_k.c)"))
+    _census_arm(arms, _K_LABELS[5], sub, EXIT_OK,
+                rows=list(sub.allow_rows) + [(c_src, w_file, "self-test")],
+                counts=(sub.src + 1, sub.cml, sub.reg, 0))
+    os.remove(sub.m(c_src))
+    _restored(arms, _K_LABELS[5], sub, w_file)
+
+
+def _subject_arms(arms, sub, w):
+    """S1-S7: a subject root exempts what its row says and nothing else, every row is checked
+    against the tree, and a row that cannot be checked exempts nothing."""
+    live = sub.live
+    deep = [(root, s) for root, _e, _why in sub.subject_rows for s in live.subjects
+            if s.startswith(root + "/") and "/" in s[len(root) + 1:]]
+    root0, first = deep[0] if deep else ("", "")
+    under = set(posixpath.splitext(s)[1] for s in live.sources + live.subjects
+                if s.startswith(root0 + "/"))
+    spare = next((e for e in (".cpp",) + SOURCE_EXTENSIONS if e not in under), None)
+    if w is None or not deep or spare is None:
+        _refuse(arms, _S_LABELS, "needs a witness, a subject root that holds a subject in a "
+                "directory of its own, and a stated extension no file under that root carries; "
+                "REFUSED rather than skipped.")
+        return
+    w_file = w[0]
+    exts0 = [e for r, e, _why in sub.subject_rows if r == root0][0]
+
+    # S1 -- a source of an extension the row does not list, beside the subjects: judged.
+    stray = "%s/dss_selftest_s%s" % (root0, spare)
+    _write(sub.m(stray), b"")
+    _census_arm(arms, _S_LABELS[0], sub, EXIT_ORPHAN, says=("  ORPHAN: " + stray,),
+                counts=(sub.src + 1, sub.cml, sub.reg, 1))
+    os.remove(sub.m(stray))
+
+    # S2 -- a subject a registration names: the exemption is a false statement.
+    token = posixpath.relpath(first, dir_of(w_file) or ".")
+    _write(sub.m(w_file), _appended(sub.bytes[w_file],
+                                    "dss_add_test(NAME st/s2 SOURCES %s)" % token))
+    _census_arm(arms, _S_LABELS[1], sub, EXIT_STALE,
+                says=("exempts '%s', but dss_add_test REGISTERS it." % first,),
+                counts=(sub.src, sub.cml, sub.reg + 1, 0))
+    _restored(arms, _S_LABELS[1], sub, w_file)
+
+    # S3 -- a row whose root is gone.
+    gone = "dss_selftest_no_such_root"
+    _census_arm(arms, _S_LABELS[2], sub, EXIT_STALE,
+                subjects=list(sub.subject_rows) + [(gone, (".c",), "self-test")],
+                says=("names the root '%s', which is not a directory under the tests root."
+                      % gone,),
+                counts=(sub.src, sub.cml, sub.reg, 0))
+
+    # S4 -- a row listing an extension its root holds no file of.
+    widened = [(r, e + (spare,) if r == root0 else e, y) for r, e, y in sub.subject_rows]
+    _census_arm(arms, _S_LABELS[3], sub, EXIT_STALE, subjects=widened,
+                says=("the subject root '%s' lists '%s' and holds no such file."
+                      % (root0, spare),),
+                counts=(sub.src, sub.cml, sub.reg, 0))
+
+    # S5-S7 -- the row's own shape. A row that cannot be checked is a collapse AND exempts
+    # nothing: what it exempted surfaces as ORPHANs.
+    doc = [{"root": r, "extensions": list(e), "reason": y} for r, e, y in sub.subject_rows]
+    at0 = [i for i, row in enumerate(doc) if row["root"] == root0][0]
+    nested = first.rsplit("/", 1)[0]
+    box = os.path.join(sub.base, "subjects")
+    os.makedirs(box, exist_ok=True)
+
+    def schema(label, mutate, message, orphaned):
+        rows = [dict(r) for r in doc]
+        mutate(rows)
+        path = os.path.join(box, label.split(" ")[0] + ".json")
+        _write(path, json.dumps(rows, indent=2).encode("utf-8"))
+        got_rows, errs = load_subjects(path, "fixture")
+        says = [message] + (["  ORPHAN: " + first] if orphaned else [])
+        _census_arm(arms, label, sub, EXIT_COLLAPSE, says=says, subjects=got_rows,
+                    subject_errors=errs)
+
+    schema(_S_LABELS[4], lambda d: d[at0].update(extensions=[".inc"]),
+           "subjects row %d lists the extension(s) '.inc', which SOURCE_EXTENSIONS does not "
+           "state" % (at0 + 1), True)
+    schema(_S_LABELS[5],
+           lambda d: d.append({"root": nested, "extensions": list(exts0), "reason": "self-test"}),
+           "subjects row %d names the root '%s', which is, holds or lies inside the root '%s'"
+           % (len(doc) + 1, nested, root0), False)
+    schema(_S_LABELS[6],
+           lambda d: d.append({"root": "./dss_selftest_no_such_root", "extensions": [".c"],
+                               "reason": "self-test"}),
+           "subjects row %d names the root './dss_selftest_no_such_root', which is not a plain "
+           "directory path" % (len(doc) + 1), False)
+
+
 # ── the command ────────────────────────────────────────────────────────────────────────
 
 def usage_error(argv):
@@ -1209,7 +1625,7 @@ def usage_error(argv):
 
 def _guarded(fn, err=None):
     """Run `fn`; a crash is exit 2 with its traceback -- never 1, which is ORPHAN."""
-    err = err or _say
+    err = err or _complain
     try:
         return fn()
     except Exception as exc:
@@ -1236,18 +1652,22 @@ def main(argv):
         else:
             root_in, label, run_self_test = os.path.join(tree, "tests"), "tests", True
         rows, errors = load_allowlist(allowlist_path())
-        live = census(root_in, label, rows, errors)
-        for line in render(live):
-            _say(line)
+        subject_rows, subject_errors = load_subjects(subjects_path())
+        live = census(root_in, label, rows, errors, subject_rows, subject_errors)
+        report = render(live)
+        for line in report:
+            (_say if live.rc == EXIT_OK else _complain)(line)
         if not run_self_test:
             return live.rc
         if live.rc != EXIT_OK:
+            _verdict(LIVE_ARM, digest(report))
             _say("orphan-tests: self-test NOT run - the live verdict is red (rc=%d), and a red tree "
                  "cannot seed the green mirror the arms mutate. The red above is itself the proof "
                  "that this guard fails for that class; fix the tree and the next run proves the "
                  "rest." % live.rc)
             return live.rc
-        rc_self = self_test(live, rows)
+        _verdict(LIVE_ARM)
+        rc_self = self_test(live, rows, subject_rows)
         return rc_self if rc_self != EXIT_OK else live.rc
 
     return _guarded(body)

@@ -846,6 +846,29 @@ if(DSS_BUILD_TESTS)
             "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py"
             "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/owning-tree/owning-tree.py")
 
+    # THE ORPHAN-TEST-SOURCE GUARD: ITS COMMAND LINE.
+    # `.harness-config/runner/actions/check-orphan-tests/check-orphan-tests.py`, run with no
+    # argument, judges the tests root of the tree it lives in -- every test source registered or
+    # exempted by a row it verifies -- then proves each of its refusals on a mirror of that
+    # root, and prints one verdict line for the tree's own census and one per arm. Its ctest
+    # entry, `orphan_tests_guard`, is the TEST BINARY tests/harness/CMakeLists.txt registers
+    # under that name (test_orphan_tests_selftest.cpp): one case per verdict, so a mutation of
+    # the guard can be an arm of the mutation sweep (`dss_declare_script_selftest`, above).
+    # DECLARED HERE, BEFORE THE TWO add_subdirectory() CALLS BELOW, as its neighbour is and for
+    # the same reason.
+    # The two exemption files and `owning-tree.py` are scripts of the entry too: the guard
+    # reads all three on every run, and a changed row is a changed verdict.
+    dss_declare_script_selftest(orphan_tests ARGC 2
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-orphan-tests/check-orphan-tests.py"
+        SCRIPTS
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-orphan-tests/check-orphan-tests.py"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-orphan-tests/allowlist.json"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-orphan-tests/subjects.json"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/owning-tree/owning-tree.py")
+
     add_subdirectory(integrated_tests)
     add_subdirectory(tests)
 
@@ -854,9 +877,10 @@ if(DSS_BUILD_TESTS)
     # row, and no markdown table row's unescaped pipes silently drop cells.
     # `line_endings_guard`: no tracked text blob carries a line-terminating CR (HEAD, the index,
     # the working tree), and no CR instrument that cannot see a CR is left for someone to run.
-    # `orphan_tests_guard`: every `tests/**/*.cpp` is registered by a STRUCTURAL
-    # `dss_add_test(... SOURCES ...)` call or sits on the guard's machine-checked allowlist; an
-    # unregistered test source compiles nowhere and reads exactly like coverage.
+    # `orphan_tests_guard` was the third until 2026-10-12 and is no longer STARTED here: it is
+    # the test binary tests/harness/CMakeLists.txt registers under that name, which runs the
+    # same program by the command line declared above and reads each of its verdicts into a
+    # case of its own. Its `repo-guard` label is set there, beside its registration.
     # ★ EACH SELF-TESTS ON EVERY RUN: the form used here verifies the tree and drives its arms,
     # every red arm synthesizing its own negative, so the entry cannot pass without proving the
     # guard can fail.
@@ -880,11 +904,6 @@ if(DSS_BUILD_TESTS)
         NAME line_endings_guard
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-line-endings/check-line-endings.py"
-        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    add_test(
-        NAME orphan_tests_guard
-        COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-orphan-tests/check-orphan-tests.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     # ── The sqlite harness driver checks its own logic (2026-09-21, lane mig, part 4) ──

@@ -35,3 +35,23 @@ dss_add_test(NAME ninja_deps_selftest_guard
 # object — no compiler reads a Python program, so without that declaration no object
 # depended on either.
 dss_use_script_selftest(dss_ninja_deps_selftest_guard ninja_deps)
+
+# THE ORPHAN-TEST-SOURCE GUARD, ONE CASE PER VERDICT — the ctest entry `orphan_tests_guard`.
+# `.harness-config/runner/actions/check-orphan-tests/check-orphan-tests.py`, run with no
+# argument, judges the tests root of the tree it lives in, then proves each of its refusals
+# on a mirror of that root, and prints one verdict line for the tree's own census and one
+# per arm; this binary RUNS it — by the command line the top-level CMakeLists declares —
+# and reads each verdict into a case of its own. It re-implements none of them. It keeps
+# the entry's name because it IS that entry: until 2026-10-12 the program was started bare
+# by ctest, one verdict for everything it judges, so no mutation of the guard could be an
+# arm of the mutation sweep.
+dss_add_test(NAME orphan_tests_guard
+             SOURCES test_orphan_tests_selftest.cpp)
+dss_use_script_selftest(dss_orphan_tests_guard orphan_tests)
+# ★ `repo-guard`, SET BY HAND, unlike its neighbour above: the label scan of the top-level
+# CMakeLists reads the top directory's entries, and this one is registered here. It keeps
+# the label it carried there because what it judges is the SOURCE TREE, the same bytes on
+# every leg, so an indirect leg re-reading it learns nothing — the ruling the label exists
+# for. The mutation sweep starts the binary itself and asks no label.
+set_tests_properties(orphan_tests_guard PROPERTIES LABELS "repo-guard")
+message(STATUS "repo-guard label applied to 1 additional test (orphan_tests_guard), registered in tests/harness")

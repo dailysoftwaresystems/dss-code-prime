@@ -1,0 +1,1 @@
+    unwalked = [p for p in unplaced if is_source(p) and os.path.isfile(os.path.join(root, *p.split("/")))]

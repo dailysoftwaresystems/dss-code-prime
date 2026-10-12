@@ -338,10 +338,22 @@ round's close; each checkpoint's commit message says what was and was not run on
   claim EXPECTED AND READ BY NO SWEEP; the registry holds 490 arms. With it the answers to six arms a sweep from
   main sent back (two whose after-text named a helper the file lost at checkpoint 1 and so never compiled; four
   whose further red cases are now declared).
+- **Checkpoint 16 (2026-10-12) = the harness lane's fix of `orphan_tests_guard`, the red checkpoint 9 made on the
+  direct Windows legs.** The guard's contract is now "every file a registration can name": the source extensions
+  are stated ONCE (CMake's own C and C++ lists, sixteen spellings) and read by the walk and by the
+  structural-token scan alike, so a `.c` is walked, cleared and accused as a `.cpp` is. Of the 140 `.c` under
+  `tests/`, 2 are test sources and 138 are inputs of the compiler under test or the provenance of prebuilt
+  fixtures: `subjects.json` beside the guard states them in three rows (`corpus`, `ffi/data`, `link/data`), each
+  row verified on every run, and a row that cannot be checked exempts nothing. A registered file that exists and
+  is spelt as no source is `UNWALKED`, no longer "does NOT exist". The entry is a test binary driven through
+  `script_selftest.hpp` (56 cases; the self-test went 40 → 53 arms), with 12 arms in the registry (502 now),
+  DECLARED AND READ BY NO SWEEP. "A registered `.c` is cleared" has no arm, and the guard's docstring says why
+  (that mutant is the program as it stood: the tree's own census reddens first, 55 of 56). ✔MEASURED by the lane
+  on its final bytes, ON CHECKPOINT 14's BASE: the `repo-guard` label on `windows-x86_64-debug` (MinGW) and
+  `windows-x86_64-release` (MSVC), 30 of 30 on each, `orphan_tests_guard` 56 of 56 cases.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
-  (1) `orphan_tests_guard` is RED on the direct Windows legs (the guard walks `*.cpp` alone; checkpoint 9
-  registered the tree's first two `.c` test sources) — the harness lane's fix is written and waits for its closing
-  run; (2) since checkpoint 12 a VALID ELF link is REFUSED: a relocation from inside a losing COMDAT group
+  (1) `orphan_tests_guard` — FIXED by checkpoint 16;
+  (2) since checkpoint 12 a VALID ELF link is REFUSED: a relocation from inside a losing COMDAT group
   (✔MEASURED 2026-10-12: GNU ld 2.42 and LLD 18.1.3 link the pair in both orders, a build without checkpoint 12's
   link fold links it, this tree refuses it with `K_CrossCuMergeUnsupported`) — the link lane's next fold;
   (3) `D-C-CONSTANT-AGGREGATE-MEMBER-READ-WITHOUT-ITS-INITIALIZERS-OPERATOR` stays OPEN: of its eight arms swept
