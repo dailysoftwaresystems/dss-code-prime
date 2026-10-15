@@ -320,7 +320,7 @@ id_ed25519
 #
 # ★★ TWO HALVES, AND THE ORDER IS LOAD-BEARING. The tool's own rules are the MANAGED
 # BLOCK at the end of this file, written and rewritten by `dssharness init` (marked
-# `>>> repo-harness managed block >>>`, derived from `.harness-config/config.json`).
+# `>>> dss-harness managed block >>>`, derived from `.harness-config/config.json`).
 # ✔MEASURED 2026-09-18 in a throwaway repository: `init` writes exactly the lines below
 # that block's markers, and a second `init` answers `kept .gitignore (rules already
 # current)`. Until then this section was a HAND-WRITTEN copy of an older block, and it
@@ -355,13 +355,17 @@ id_ed25519
 !/.harness-config/runner/.env/
 !/.harness-config/runner/.secrets/
 
-# >>> repo-harness managed block >>>
+# >>> dss-harness managed block >>>
 /.harness-config/lock.json
 /.harness-config/runs
 /.worktrees/*
 !/.worktrees/.gitkeep
 /.orchestrators/*
 !/.orchestrators/.gitkeep
+/.mutations/*
+!/.mutations/.gitkeep
+/.legs/*
+!/.legs/.gitkeep
 /.harness-config/sshItems/*
 !/.harness-config/sshItems/.gitkeep
 /.harness-config/wslDistros/*
@@ -372,4 +376,4 @@ id_ed25519
 !/.harness-config/runner/.secrets/.gitkeep
 /.harness-config/runner/actions/**/build/
 /.harness-config/runner/actions/**/artifacts/
-# <<< repo-harness managed block <<<
+# <<< dss-harness managed block <<<
