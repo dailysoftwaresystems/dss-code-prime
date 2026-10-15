@@ -7,8 +7,10 @@
 #include "ffi/mangling/c_mangle.hpp"   // applyCMangling (per-format personality name)
 #include "mir/merge/synth_symbol_floor.hpp"  // continueSymbolIdsPastImports (the rebuild continues the module's ids)
 #include "mir/mir.hpp"
+#include "mir/mir_dom.hpp"             // mirBuildPredecessors (a filter has one way in)
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"  // rederiveStructCfMarkers (the relayout's duty)
+#include "mir/seh_filter_region.hpp"   // readSehFilterRegion (what a `__try` filter is)
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <algorithm>   // std::max
@@ -16,6 +18,7 @@
 #include <cstdint>
 #include <format>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -49,9 +52,18 @@ void emitErr(DiagnosticReporter& rep, std::string msg) {
 // module was made from holds, which names whatever symbol a funclet's id lands on.
 
 // One collected `__try` region, resolved to concrete blocks + the minted funclet
-// symbol. `filterBB` is the single block ending in SehFilterReturn (c115 lowers the
-// filter EXPRESSION to one block). `bodyBlocks` is the guarded region's MEMBERSHIP —
-// every block of the guarded body, in the source function's block order. Where the
+// symbol.
+//
+// ★ THE FILTER IS A SUB-GRAPH, NOT ONE BLOCK (`filter`, read by
+// `readSehFilterRegion` — the statement the MIR verifier holds a filter to). The
+// source writes a filter as one EXPRESSION, and `&&`, `||` and `?:` make an
+// expression a diamond of blocks joined by a `Phi`. All of it becomes the
+// funclet; the parent keeps exactly ONE block in its place, the filter's ENTRY
+// (`filterBB`), reduced to the stub — the other blocks of the filter are not in
+// the rebuilt parent at all (`filterInterior`).
+//
+// `bodyBlocks` is the guarded region's MEMBERSHIP — every block of the guarded
+// body the rebuilt parent keeps, in the source function's block order. Where the
 // body's run ENDS is not a fact about this list: it is read off the rebuilt
 // function's layout, after the relayout, by `verifyRegionLayout`.
 struct Region {
@@ -60,11 +72,37 @@ struct Region {
     SymbolId   parentSym{};
     std::uint32_t regionId = 0;
     MirBlockId tryBB{};        // SehTryBegin succ[0] — the guarded body's entry
-    MirBlockId filterBB{};     // SehTryBegin succ[1] (== the SehFilterReturn block)
-    MirBlockId handlerBB{};    // SehFilterReturn succ[0]
+    MirBlockId filterBB{};     // SehTryBegin succ[1] — the filter's ENTRY, the parent's stub
+    MirBlockId handlerBB{};    // the one successor of the filter's exit
+    SehFilterRegion filter;    // every block of the filter, its entry first
     SymbolId   funcletSym{};
     std::vector<MirBlockId> bodyBlocks;  // the guarded body's blocks, source order
+    // The values of this filter that a block the parent KEEPS names, each with
+    // every value of the filter it is computed from (`readWhatTheParentTakes`).
+    // The parent computes them again at the head of `handlerBB`.
+    std::vector<MirInstId> takenByParent;
 };
+
+// Emit, into the open block of `dst`, a copy of ONE instruction of `mir` whose
+// result is a function of its operands and of nothing else (`isOperandOnlyValue`),
+// with `newOps` in place of its operands. The one spelling of that copy, for the
+// two places a value crosses between a filter and its function: the funclet
+// computes a value of the parent again with it, and the parent computes a value
+// of its filter again with it.
+[[nodiscard]] MirInstId copyValueOfItsOperands(Mir const& mir, MirBuilder& dst,
+                                               MirInstId cur,
+                                               std::span<MirInstId const> newOps) {
+    MirOpcode const op = mir.instOpcode(cur);
+    if (op == MirOpcode::Const) {
+        return dst.addConst(mir.literalValue(mir.constLiteralIndex(cur)),
+                            mir.instType(cur));
+    }
+    if (op == MirOpcode::GlobalAddr) {
+        return dst.addGlobalAddr(mir.globalAddrSymbol(cur), mir.instType(cur));
+    }
+    return dst.addInst(op, newOps, mir.instType(cur), mir.instPayload(cur),
+                       mir.instFlags(cur), mir.instPayload2(cur));
+}
 
 // Compute a `__try` region's GUARDED-BODY block set: every block reachable from
 // `tryBB` along forward edges WITHOUT (a) following the successors of a block that
@@ -215,15 +253,21 @@ public:
     }
 };
 
-// The SEH-parent rebuild policy. For the parent function it keeps EVERY block, but
-// reduces each region's `filterBB` to the H2-fiction stub `[Const i32 0;
-// SehFilterReturn(const, id) → handlerBB]`: the original filter value-insts are
-// dropped (`shouldEmit`=false), a fresh Const is injected right before the
-// terminator (`onBlockBeforeTerminator`), and the SehFilterReturn is re-emitted
-// referencing that Const (`tryRewriteTerminator`). This keeps the
-// SehFilterReturn→handlerBB CFG edge (handlerBB forward-reachable + single-pred)
-// while removing every SehException* read from the parent — they live only in the
-// funclet. Every non-filter block is copied verbatim.
+// The SEH-parent rebuild policy. For the parent function it keeps every block that
+// is not a filter's, and of each filter ONE block — its entry — reduced to the
+// H2-fiction stub `[Const i32 0; SehFilterReturn(const, id) → handlerBB]`: the
+// entry's value-insts are dropped (`shouldEmit`=false), a fresh Const is injected
+// right before the terminator (`onBlockBeforeTerminator`), and WHATEVER the entry
+// ended in — the region's SehFilterReturn when the filter is one block, a branch
+// into the rest of the filter when its expression has one — is replaced by a
+// SehFilterReturn referencing that Const (`tryRewriteTerminator`). The other
+// blocks of a filter are not selected at all: they are the funclet's. This keeps
+// the SehFilterReturn→handlerBB CFG edge (handlerBB forward-reachable +
+// single-pred) while removing every instruction of the filter from the parent.
+// Every non-filter block is copied verbatim — with ONE addition, at the head of a
+// handler: the values of its filter that the parent's own blocks name
+// (`Region::takenByParent`) are computed there again, because the instructions
+// that computed them are the funclet's now (see `readWhatTheParentTakes`).
 class SehParentPolicy final : public IdentityClonePolicy {
 public:
     // Distinct from the base's name ON PURPOSE — see the note there. Both
@@ -234,14 +278,18 @@ public:
         return "SynthSehParent";
     }
 
-    SehParentPolicy(std::vector<Region> const& regions, MirFuncId parentFn,
-                    TypeId i32Ty)
-        : i32Ty_(i32Ty) {
+    SehParentPolicy(Mir const& src, std::vector<Region> const& regions,
+                    MirFuncId parentFn, TypeId i32Ty)
+        : src_(src), i32Ty_(i32Ty) {
         for (auto const& r : regions) {
             if (r.parentFn.v != parentFn.v) continue;
             filterBlocks_.insert(r.filterBB.v);
             handlerByFilter_.emplace(r.filterBB.v, r.handlerBB);
             regionByFilter_.emplace(r.filterBB.v, r.regionId);
+            for (MirBlockId const b : r.filter.blocks) {
+                if (b.v != r.filterBB.v) filterInterior_.insert(b.v);
+            }
+            if (!r.takenByParent.empty()) madeAtHandler_.emplace(r.handlerBB.v, &r);
             regions_.push_back(&r);
         }
     }
@@ -317,6 +365,11 @@ public:
         for (std::uint32_t i = 0; i < n; ++i) {
             MirBlockId const b = src.funcBlockAt(fn, i);
             if (emitted.contains(b.v)) continue;   // already emitted as part of a run
+            // ★ A FILTER KEEPS ONE BLOCK IN THE PARENT — its entry, the stub.
+            // Every other block of a filter with a branch is the funclet's alone
+            // and is never laid out here. (This walk is where one is met: the
+            // memberships below were handed over without them.)
+            if (filterInterior_.contains(b.v)) continue;
             std::size_t const top = outermostHolding(b.v, kNone);
             if (top == kNone) {
                 emit(b);
@@ -341,9 +394,9 @@ public:
     }
 
     [[nodiscard]] bool shouldEmit(MirInstId oldId) override {
-        // In a filterBB, drop every original non-terminator inst (the filter
-        // expr, incl. SehExceptionCode/Info). `src_` is not visible here, so the
-        // caller records the filterBB's non-terminator inst ids for us to test.
+        // In a filter's entry, drop every original non-terminator inst (the
+        // filter expr, incl. SehExceptionCode/Info). The caller records each
+        // filter block's non-terminator inst ids for us to test.
         return !droppedInsts_.contains(oldId.v);
     }
 
@@ -363,14 +416,17 @@ public:
     }
 
     [[nodiscard]] std::optional<MirInstId>
-    tryRewriteTerminator(MirOpcode op, MirInstId /*oldId*/, MirBuilder& dst,
+    tryRewriteTerminator(MirOpcode /*op*/, MirInstId /*oldId*/, MirBuilder& dst,
                          MirInstRemap const& /*rewrite*/,
                          MirBlockRemap const& blockMap)
         override {
-        // Only the filterBB's terminator (a SehFilterReturn) is rewritten; every
-        // other terminator takes the standard clone arm.
-        if (op != MirOpcode::SehFilterReturn) return std::nullopt;
-        if (curFilterBB_.v == 0) return std::nullopt;  // not a filterBB
+        // Only a filter ENTRY's terminator is rewritten; every other terminator
+        // takes the standard clone arm. WHICH terminator the entry had is not
+        // asked: a one-block filter's entry ends in the region's SehFilterReturn,
+        // the entry of a filter with a branch ends in that branch, whose targets
+        // are blocks the parent no longer has. Either way the stub ends in the
+        // SehFilterReturn that carries the handler's edge.
+        if (curFilterBB_.v == 0) return std::nullopt;  // not a filter's entry
         auto const cIt = stubConstByFilter_.find(curFilterBB_.v);
         auto const hIt = handlerByFilter_.find(curFilterBB_.v);
         auto const rIt = regionByFilter_.find(curFilterBB_.v);
@@ -388,22 +444,69 @@ public:
     // `selectBlocks` is called once, so we track the "current" filterBB by having
     // the caller pre-register each filterBB's dropped insts and set curFilterBB_
     // via the onBlockBegin hook.
-    void onBlockBegin(MirBlockId oldB, MirBlockId /*newB*/, MirBuilder& /*dst*/,
-                      MirInstRemap& /*rewrite*/,
+    void onBlockBegin(MirBlockId oldB, MirBlockId /*newB*/, MirBuilder& dst,
+                      MirInstRemap& rewrite,
                       MirBlockRemap const& /*blockMap*/)
         override {
         curFilterBB_ = filterBlocks_.contains(oldB.v) ? oldB : MirBlockId{};
+        // ★ THE HEAD OF A HANDLER IS WHERE THE PARENT COMPUTES ITS FILTER'S VALUES
+        // AGAIN. The handler's one way in is its filter's exit, so it stands
+        // before every block of the parent that could name a value of that
+        // filter — and it is the first code of the parent that RUNS after the
+        // filter (the stub in the filter's place never does). Each value brings
+        // its whole computation inside the filter (they were recorded together),
+        // operands first; an operand that is not this filter's is a value the
+        // parent already holds — one born before the region, or one made at the
+        // head of the handler of a filter around this one.
+        auto const made = madeAtHandler_.find(oldB.v);
+        if (made == madeAtHandler_.end()) return;
+        std::vector<MirInstId> const& taken = made->second->takenByParent;
+        std::unordered_set<std::uint32_t> ofThisFilter;
+        for (MirInstId const v : taken) ofThisFilter.insert(v.v);
+        std::vector<MirInstId> pending;
+        std::vector<MirInstId> newOps;
+        for (MirInstId const v : taken) {
+            pending.assign(1, v);
+            while (!pending.empty()) {
+                MirInstId const cur = pending.back();
+                if (rewrite.contains(cur.v)) {
+                    pending.pop_back();
+                    continue;
+                }
+                bool waiting = false;
+                for (MirInstId const x : src_.instOperands(cur)) {
+                    if (!rewrite.contains(x.v) && ofThisFilter.contains(x.v)) {
+                        pending.push_back(x);
+                        waiting = true;
+                    }
+                }
+                if (waiting) continue;
+                newOps.clear();
+                // `at`: an operand with no entry here is a value of the parent
+                // laid out AFTER this handler — a definition that does not
+                // precede its use, which the rebuild refuses for every block.
+                for (MirInstId const x : src_.instOperands(cur)) {
+                    newOps.push_back(rewrite.at(x.v));
+                }
+                rewrite.put(cur.v, copyValueOfItsOperands(src_, dst, cur, newOps));
+                pending.pop_back();
+            }
+        }
     }
 
     void registerDroppedInst(MirInstId id) { droppedInsts_.insert(id.v); }
 
 private:
+    Mir const&                        src_;
     TypeId                            i32Ty_;
-    std::unordered_set<std::uint32_t> filterBlocks_;
+    std::unordered_set<std::uint32_t> filterBlocks_;     // each filter's ENTRY (the stub)
+    std::unordered_set<std::uint32_t> filterInterior_;   // every other block of a filter
     std::unordered_set<std::uint32_t> droppedInsts_;
     std::unordered_map<std::uint32_t, MirBlockId> handlerByFilter_;
     std::unordered_map<std::uint32_t, std::uint32_t> regionByFilter_;
     std::unordered_map<std::uint32_t, MirInstId>  stubConstByFilter_;
+    // A handler block → the region whose filter's values are made at its head.
+    std::unordered_map<std::uint32_t, Region const*> madeAtHandler_;
     MirBlockId                        curFilterBB_{};
     // c116b: this parent's regions (borrowed from the Region vector, which
     // outlives this policy) — their memberships drive the contiguity relayout.
@@ -496,13 +599,33 @@ parentAllocaSlotIds(Mir const& mir, MirFuncId fn) {
     }
 }
 
-// Emit the filter FUNCLET body directly into `builder` (the current open function),
-// cloning `filterBB`'s non-terminator insts with the SEH rewrites. Returns false
-// (reported) on an unsupported inst. `exPtrArg` is the funclet's arg0
-// (EXCEPTION_POINTERS*, ms_x64 rcx); `establisherArg` is arg1 (the establisher-frame
-// base — the parent's post-prologue SP at fault time). `allocaSlotId` maps each
-// PARENT alloca inst id → its 0-based scan-order slot index (H1). `pVoidTy` =
-// ptr<void>; `u32Ty` = u32.
+// Emit the filter FUNCLET body directly into `builder` (the current open function,
+// whose open block `funcletEntry` already holds the two `Arg`s), cloning every
+// block of `filter` with the SEH rewrites. Returns false (reported) on an
+// unsupported inst. `exPtrArg` is the funclet's arg0 (EXCEPTION_POINTERS*, ms_x64
+// rcx); `establisherArg` is arg1 (the establisher-frame base — the parent's
+// post-prologue SP at fault time). `allocaSlotId` maps each PARENT alloca inst id
+// → its 0-based scan-order slot index (H1). `pVoidTy` = ptr<void>; `u32Ty` = u32.
+//
+// ★★★ THE FUNCLET IS THE WHOLE FILTER, EVERY PATH OF IT. A filter whose
+// expression has `&&`, `||` or `?:` is a diamond of blocks joined by a `Phi`, and
+// the funclet is that sub-graph, block for block:
+//   * the filter's ENTRY continues the funclet's own entry block (nothing branches
+//     to either), so a one-block filter is, instruction for instruction, the
+//     funclet it always was;
+//   * every other block of the filter gets a block of the funclet. They are
+//     copied in the order `readSehFilterRegion` hands them — reverse post-order,
+//     a definition before its uses — and a `Phi` is created empty where it stands
+//     and filled once every block exists (its inputs name blocks and values of
+//     blocks copied after it);
+//   * a branch is copied with its targets renamed; the block that ends in the
+//     region's `SehFilterReturn` ends the funclet in a `Return` of that value.
+// ★ A VALUE OF THE PARENT NAMED OUTSIDE THE ENTRY IS MADE IN THE ENTRY. What the
+// funclet takes from the parent — a frame slot, a value it computes again (see
+// `resolveOperand`) — is materialized where it is first named. Where that is the
+// entry it dominates everything; a later block is one arm of a branch, and what
+// it materialized would not reach the other arm or the join's `Phi`. So before
+// the entry's terminator every such value the later blocks name is made there.
 //
 // c116b H1 (D-WIN64-SEH-FUNCLETS): the filter reads parent locals (sqlite's `pWal`).
 // Because mem2reg skips SEH functions, a parent local is an ALLOCA in the parent's
@@ -513,16 +636,28 @@ parentAllocaSlotIds(Mir const& mir, MirFuncId fn) {
 // parent local from the parent frame. Any OTHER out-of-block operand (not a parent
 // alloca) is unrecoverable → fail loud.
 [[nodiscard]] bool emitFilterFuncletBody(
-    Mir const& mir, MirBuilder& builder, MirBlockId filterBB, MirInstId exPtrArg,
-    MirInstId establisherArg,
+    Mir const& mir, MirBuilder& builder, SehFilterRegion const& filter,
+    MirBlockId funcletEntry, MirInstId exPtrArg, MirInstId establisherArg,
     std::unordered_map<std::uint32_t, std::uint32_t> const& allocaSlotId,
     TypeId pVoidTy, TypeId u32Ty, TypeId i32Ty, TypeId u64Ty,
     DiagnosticReporter& reporter) {
     // old value id → new value id, within the funclet.
     std::unordered_map<std::uint32_t, MirInstId> map;
+    // The filter's blocks, and the funclet block each one becomes.
+    std::unordered_set<std::uint32_t> inFilter;
+    std::unordered_map<std::uint32_t, MirBlockId> blockOf;
+    for (MirBlockId const b : filter.blocks) {
+        inFilter.insert(b.v);
+        blockOf.emplace(b.v, b.v == filter.entry.v
+                                 ? funcletEntry
+                                 : builder.createBlock(StructCfMarker::Linear));
+    }
+    auto const definedInTheFilter = [&](MirInstId v) {
+        return inFilter.contains(mir.instBlock(v).v);
+    };
 
     // Resolve an operand: if already mapped, return it; otherwise it is defined
-    // OUTSIDE filterBB and the funclet has to obtain it some other way. Returns
+    // OUTSIDE the filter and the funclet has to obtain it some other way. Returns
     // nullopt (reported) when it cannot.
     //
     // ★★★ D-MIR-TRY-FILTER-SHARED-PURE-VALUE-REFUSED-IN-RELEASE: WHAT A FILTER
@@ -551,6 +686,18 @@ parentAllocaSlotIds(Mir const& mir, MirFuncId fn) {
     // The cone is walked with a work stack: its depth is the expression's.
     auto resolveOperand = [&](MirInstId o) -> std::optional<MirInstId> {
         if (auto it = map.find(o.v); it != map.end()) return it->second;
+        if (definedInTheFilter(o)) {
+            // The blocks are copied a definition before its uses, so a value of
+            // the filter that is not copied yet is named where its definition
+            // does not reach. Refused, never taken for a value of the parent and
+            // computed a second time.
+            emitErr(reporter, std::format(
+                    "synthesizeSehFunclets: the SEH filter names a '{}' of its own "
+                    "that no block copied before the use defines — a definition "
+                    "that does not dominate its use (internal invariant violation)",
+                    opcodeInfo(mir.instOpcode(o)).mnemonic));
+            return std::nullopt;
+        }
         std::vector<MirInstId> pending{o};
         while (!pending.empty()) {
             MirInstId const cur = pending.back();
@@ -595,29 +742,17 @@ parentAllocaSlotIds(Mir const& mir, MirFuncId fn) {
                 }
             }
             if (waiting) continue;
-            if (op == MirOpcode::Const) {
-                map[cur.v] = builder.addConst(
-                    mir.literalValue(mir.constLiteralIndex(cur)), mir.instType(cur));
-            } else if (op == MirOpcode::GlobalAddr) {
-                map[cur.v] = builder.addGlobalAddr(mir.globalAddrSymbol(cur),
-                                                   mir.instType(cur));
-            } else {
-                std::vector<MirInstId> newOps;
-                for (MirInstId const x : mir.instOperands(cur)) newOps.push_back(map.at(x.v));
-                map[cur.v] = builder.addInst(op, newOps, mir.instType(cur),
-                                             mir.instPayload(cur), mir.instFlags(cur),
-                                             mir.instPayload2(cur));
-            }
+            std::vector<MirInstId> newOps;
+            for (MirInstId const x : mir.instOperands(cur)) newOps.push_back(map.at(x.v));
+            map[cur.v] = copyValueOfItsOperands(mir, builder, cur, newOps);
             pending.pop_back();
         }
         return map.at(o.v);
     };
 
-    std::uint32_t const n = mir.blockInstCount(filterBB);
-    for (std::uint32_t i = 0; i < n; ++i) {
-        MirInstId const oldId = mir.blockInstAt(filterBB, i);
-        MirOpcode const op    = mir.instOpcode(oldId);
-        if (opcodeInfo(op).isTerminator) break;  // the SehFilterReturn — handled by caller
+    // Copy ONE non-terminator, non-`Phi` instruction of the filter into the open
+    // block. Returns false (reported) on a refusal.
+    auto const copyInst = [&](MirInstId oldId, MirOpcode op) -> bool {
         switch (op) {
             case MirOpcode::SehExceptionInfo: {
                 // → the funclet's arg0 (EXCEPTION_POINTERS*). Bitcast to the op's
@@ -704,25 +839,236 @@ parentAllocaSlotIds(Mir const& mir, MirFuncId fn) {
                 break;
             }
         }
+        return true;
+    };
+
+    // What the blocks AFTER the entry take from the parent, made in the entry
+    // (see the note above this function). Called with the entry open, its
+    // instructions copied and its terminator not yet emitted.
+    auto const materializeWhatLaterBlocksName = [&]() -> bool {
+        for (MirBlockId const b : filter.blocks) {
+            if (b.v == filter.entry.v) continue;
+            std::uint32_t const n = mir.blockInstCount(b);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                MirInstId const id = mir.blockInstAt(b, i);
+                if (mir.instOpcode(id) == MirOpcode::Phi) {
+                    for (MirPhiIncoming const& inc : mir.phiIncomings(id)) {
+                        if (definedInTheFilter(inc.value)) continue;
+                        if (!resolveOperand(inc.value).has_value()) return false;
+                    }
+                    continue;
+                }
+                for (MirInstId const o : mir.instOperands(id)) {
+                    if (definedInTheFilter(o)) continue;
+                    if (!resolveOperand(o).has_value()) return false;   // reported
+                }
+            }
+        }
+        return true;
+    };
+
+    struct PendingPhi {
+        MirInstId oldPhi;
+        MirInstId newPhi;
+    };
+    std::vector<PendingPhi> phis;
+    for (MirBlockId const b : filter.blocks) {
+        bool const isEntry = b.v == filter.entry.v;
+        if (!isEntry) builder.beginBlock(blockOf.at(b.v));
+        std::uint32_t const n = mir.blockInstCount(b);
+        for (std::uint32_t i = 0; i + 1 < n; ++i) {   // the last one is the terminator
+            MirInstId const oldId = mir.blockInstAt(b, i);
+            MirOpcode const op    = mir.instOpcode(oldId);
+            if (op == MirOpcode::Phi) {
+                if (isEntry) {
+                    emitErr(reporter, "synthesizeSehFunclets: the SEH filter's entry "
+                            "block holds a phi — the entry is reached from the "
+                            "region's opener alone, and a value that arrives with "
+                            "that edge is a value of the parent's registers, which a "
+                            "filter funclet does not have");
+                    return false;
+                }
+                MirInstId const newPhi = builder.addPhi(mir.instType(oldId));
+                map[oldId.v] = newPhi;
+                phis.push_back(PendingPhi{oldId, newPhi});
+                continue;
+            }
+            if (!copyInst(oldId, op)) return false;   // reported
+        }
+        if (isEntry && !materializeWhatLaterBlocksName()) return false;   // reported
+
+        // The terminator. The exit's `SehFilterReturn(v)` is the funclet's
+        // `Return(v)`; a branch keeps its shape and names the funclet's blocks.
+        MirInstId const term  = mir.blockTerminator(b);
+        MirOpcode const top   = mir.instOpcode(term);
+        auto const termOps    = mir.instOperands(term);
+        auto const succs      = mir.blockSuccessors(b);
+        switch (top) {
+            case MirOpcode::SehFilterReturn: {
+                if (termOps.size() != 1) {
+                    emitErr(reporter, "synthesizeSehFunclets: malformed SehFilterReturn");
+                    return false;
+                }
+                auto const fvalNew = resolveOperand(termOps[0]);
+                if (!fvalNew.has_value()) return false;   // reported
+                builder.addReturn(*fvalNew);
+                break;
+            }
+            case MirOpcode::Br: {
+                builder.addBr(blockOf.at(succs[0].v));
+                break;
+            }
+            case MirOpcode::CondBr: {
+                auto const cond = resolveOperand(termOps[0]);
+                if (!cond.has_value()) return false;   // reported
+                builder.addCondBr(*cond, blockOf.at(succs[0].v),
+                                  blockOf.at(succs[1].v));
+                break;
+            }
+            case MirOpcode::Switch: {
+                // operands = [discriminant, case values…]; successors = [case
+                // targets…, default].
+                auto const disc = resolveOperand(termOps[0]);
+                if (!disc.has_value()) return false;   // reported
+                std::size_t const ncases = succs.size() - 1;
+                std::vector<std::pair<MirInstId, MirBlockId>> cases;
+                cases.reserve(ncases);
+                for (std::size_t c = 0; c < ncases; ++c) {
+                    auto const value = resolveOperand(termOps[1 + c]);
+                    if (!value.has_value()) return false;   // reported
+                    cases.emplace_back(*value, blockOf.at(succs[c].v));
+                }
+                builder.addSwitch(*disc, cases, blockOf.at(succs[ncases].v));
+                break;
+            }
+            case MirOpcode::Unreachable: {
+                // What the terminator asserts goes with it.
+                builder.addUnreachable(
+                    static_cast<MirUnreachableKind>(mir.instPayload(term)));
+                break;
+            }
+            default: {
+                // `readSehFilterRegion` admits no other way for a filter block
+                // to end; refused here as well, by name, should that list grow.
+                emitErr(reporter, std::format(
+                        "synthesizeSehFunclets: a block of the SEH filter ends in "
+                        "'{}', which a filter funclet has no form for",
+                        opcodeInfo(top).mnemonic));
+                return false;
+            }
+        }
     }
-    // The terminator: SehFilterReturn(fval) → Return(fval).
-    MirInstId const term = mir.blockTerminator(filterBB);
-    if (mir.instOpcode(term) != MirOpcode::SehFilterReturn) {
-        emitErr(reporter, "synthesizeSehFunclets: filter block does not end in "
-                "SehFilterReturn — the SEH filter EXPRESSION must be a single basic "
-                "block (D-WIN64-SEH-FUNCLETS)");
-        return false;
+    // Every block exists now: fill the `Phi`s. A value an input names is a value
+    // of the filter (copied above) or one made in the entry for it; a block an
+    // input names is a block of the filter — nothing else reaches one.
+    for (PendingPhi const& p : phis) {
+        for (MirPhiIncoming const& inc : mir.phiIncomings(p.oldPhi)) {
+            auto const valueIt = map.find(inc.value.v);
+            auto const blockIt = blockOf.find(inc.pred.v);
+            if (valueIt == map.end() || blockIt == blockOf.end()) {
+                emitErr(reporter, "synthesizeSehFunclets: a phi of the SEH filter "
+                        "has an input whose value or whose predecessor is not the "
+                        "filter's (internal invariant violation)");
+                return false;
+            }
+            builder.addPhiIncoming(p.newPhi,
+                                   MirPhiIncoming{valueIt->second, blockIt->second});
+        }
     }
-    auto const termOps = mir.instOperands(term);
-    if (termOps.size() != 1) {
-        emitErr(reporter, "synthesizeSehFunclets: malformed SehFilterReturn");
-        return false;
-    }
-    auto fvalNew = resolveOperand(termOps[0]);
-    if (!fvalNew.has_value()) return false;   // reported
     (void)i32Ty;
     (void)u64Ty;
-    builder.addReturn(*fvalNew);
+    return true;
+}
+
+// ── WHAT THE PARENT TAKES FROM ITS OWN FILTER ───────────────────────────────
+//
+// ★★★ A FILTER'S INSTRUCTIONS LEAVE THE PARENT, AND THE PARENT MAY STILL NAME
+// ONE. The source cannot say so — a filter is an expression and a handler is a
+// statement, and they share no temporary — but in the MIR the filter's entry
+// DOMINATES the handler (the handler's one predecessor is the filter's exit), so
+// whatever reuses a dominating computation hands the handler the filter's:
+// `__except (g == 5) { rc = g + 37; }` reaches here, in release, with the
+// handler loading through the FILTER's `GlobalAddr g`. ✔MEASURED 2026-10-12 on
+// exactly that program: the rebuild of the parent, which keeps no instruction of
+// a filter, ABORTED on the handler's operand (`rewriteOperand: … has no rewrite
+// entry`); the reference compiler runs it. It is the mirror of the value born
+// before the region that a filter names (`resolveOperand` in
+// `emitFilterFuncletBody`), and it has the same answer from the other side: the
+// filter runs as a function of its own while a handler is searched for and gives
+// its function nothing but a verdict, so the function COMPUTES THE VALUE AGAIN.
+//
+// This reads, for every parent, each operand of each block the parent keeps. A
+// value defined in a block of a filter is recorded on that filter's region with
+// every value of the filter it is computed from, and each must be a function of
+// its operands and of nothing else (`isOperandOnlyValue`) — a value that reads
+// memory, the exception or a call's result at the moment the filter ran is not
+// one the function can compute again, and is REFUSED BY NAME here, before the
+// rebuild meets it. An operand that lies in ANOTHER filter (a region inside a
+// handler naming a value of the filter around it) is recorded on that one.
+//
+// ⓘ WHO PUTS SUCH A VALUE THERE IS NOT ASKED. Common-subexpression reuse is the
+// producer measured; the collection reads the module as it stands, whatever pass
+// wrote it.
+[[nodiscard]] bool readWhatTheParentTakes(Mir const& mir, std::vector<Region>& regions,
+                                          DiagnosticReporter& reporter) {
+    std::unordered_map<std::uint32_t, std::size_t> filterOf;   // a filter's block → its region
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+        for (MirBlockId const b : regions[i].filter.blocks) filterOf.emplace(b.v, i);
+    }
+    std::unordered_set<std::uint32_t> taken;
+    std::vector<MirInstId>            pending;
+    auto const take = [&](MirInstId named) -> bool {
+        pending.assign(1, named);
+        while (!pending.empty()) {
+            MirInstId const cur = pending.back();
+            pending.pop_back();
+            auto const at = filterOf.find(mir.instBlock(cur).v);
+            if (at == filterOf.end()) continue;          // a value of the parent itself
+            if (!taken.insert(cur.v).second) continue;   // recorded already
+            Region& r = regions[at->second];
+            MirOpcode const op = mir.instOpcode(cur);
+            bool const computedAgain = isOperandOnlyValue(op);
+            if (!computedAgain) {
+                emitErr(reporter, std::format(
+                        "synthesizeSehFunclets: outside the filter of SEH region {}, "
+                        "its function names a value that the filter computes, and the "
+                        "computation holds a '{}' — a filter runs as a function of its "
+                        "own while a handler is searched for and gives its function "
+                        "nothing but a verdict, so the function can have such a value "
+                        "only by computing it again, and it can compute again only "
+                        "what is a function of its operands alone",
+                        r.regionId, opcodeInfo(op).mnemonic));
+                return false;
+            }
+            r.takenByParent.push_back(cur);
+            for (MirInstId const x : mir.instOperands(cur)) pending.push_back(x);
+        }
+        return true;
+    };
+
+    std::unordered_set<std::uint32_t> parentsRead;
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+        MirFuncId const f = regions[i].parentFn;
+        if (!parentsRead.insert(f.v).second) continue;
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(f, bi);
+            if (filterOf.contains(b.v)) continue;   // the funclet's, every instruction
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                MirInstId const id = mir.blockInstAt(b, ii);
+                if (mir.instOpcode(id) == MirOpcode::Phi) {
+                    for (MirPhiIncoming const& inc : mir.phiIncomings(id)) {
+                        if (!take(inc.value)) return false;   // reported
+                    }
+                    continue;
+                }
+                for (MirInstId const o : mir.instOperands(id)) {
+                    if (!take(o)) return false;   // reported
+                }
+            }
+        }
+    }
     return true;
 }
 
@@ -763,6 +1109,10 @@ bool synthesizeSehFunclets(Mir&                                  mir,
     continueSymbolIdsPastImports(builder, mir, externImports);
     SymbolId const personalitySym = builder.mintSymbolOrAbort(kMinter);
 
+    // Who branches to each block: a filter is entered at its entry and nowhere
+    // else, which `readSehFilterRegion` reads off this.
+    auto const preds = mirBuildPredecessors(mir);
+
     std::vector<Region> regions;
     for (std::uint32_t fi = 0; fi < nf0; ++fi) {
         MirFuncId const f = mir.funcAt(fi);
@@ -787,22 +1137,18 @@ bool synthesizeSehFunclets(Mir&                                  mir,
             r.tryBB     = succs[0];
             r.filterBB  = succs[1];
 
-            // The SEH filter EXPRESSION is one basic block (c115 lowers it so, and
-            // the MIR verifier enforces it): filterBB ends directly in
-            // SehFilterReturn with 1 successor (the handler).
-            MirInstId const fterm = mir.blockTerminator(r.filterBB);
-            if (mir.instOpcode(fterm) != MirOpcode::SehFilterReturn) {
-                emitErr(reporter, "synthesizeSehFunclets: the SEH filter block must "
-                        "end in SehFilterReturn (D-WIN64-SEH-FUNCLETS)");
+            // The SEH filter EXPRESSION is a sub-graph with one way in and one way
+            // out — one block when the expression has no branch, a diamond joined
+            // by a `Phi` when it has `&&`, `||` or `?:`. The shape is
+            // `readSehFilterRegion`'s to state (the MIR verifier holds every
+            // module to the same statement); what comes back is every block of
+            // the filter and the handler its exit names.
+            r.filter = readSehFilterRegion(mir, preds, r.filterBB, r.regionId);
+            if (!r.filter.ok()) {
+                emitErr(reporter, "synthesizeSehFunclets: " + r.filter.problem);
                 return false;
             }
-            auto const fsuccs = mir.blockSuccessors(r.filterBB);
-            if (fsuccs.size() != 1) {
-                emitErr(reporter, "synthesizeSehFunclets: SehFilterReturn must have "
-                        "1 successor (the handler) (D-WIN64-SEH-FUNCLETS)");
-                return false;
-            }
-            r.handlerBB = fsuccs[0];
+            r.handlerBB = r.filter.handler;
 
             // c116b: compute the guarded body's block set (may be MULTI-block — a
             // loop/conditional/memcpy). The reorder in SehParentPolicy lays these out
@@ -841,6 +1187,31 @@ bool synthesizeSehFunclets(Mir&                                  mir,
         }
     }
     if (regions.empty()) return true;  // scan said yes but none resolved — no-op
+
+    // ★ A FILTER'S BLOCKS PAST ITS ENTRY ARE NOT THE PARENT'S. An inner region's
+    // filter stands inside the outer region's body, so the outer membership read
+    // above holds every block of it — and the rebuilt parent keeps the entry
+    // alone (the stub). They leave every membership HERE, so the relayout and
+    // the check of the layout after it count the same blocks.
+    {
+        std::unordered_set<std::uint32_t> interior;
+        for (Region const& r : regions) {
+            for (MirBlockId const b : r.filter.blocks) {
+                if (b.v != r.filterBB.v) interior.insert(b.v);
+            }
+        }
+        if (!interior.empty()) {
+            for (Region& r : regions) {
+                std::erase_if(r.bodyBlocks, [&](MirBlockId const b) {
+                    return interior.contains(b.v);
+                });
+            }
+        }
+    }
+
+    // What each parent names of its own filters — computed again at the head of
+    // the handler, or refused by name when it cannot be.
+    if (!readWhatTheParentTakes(mir, regions, reporter)) return false;
 
     // ── Register the FORMAT-DECLARED personality import ────────────────────
     //
@@ -935,15 +1306,19 @@ bool synthesizeSehFunclets(Mir&                                  mir,
     for (std::uint32_t fi = 0; fi < nf0; ++fi) {
         MirFuncId const f = mir.funcAt(fi);
         if (parentFns.contains(f.v)) {
-            SehParentPolicy policy{regions, f, i32Ty};
-            // Pre-register the dropped (filter-body) insts for this parent.
+            SehParentPolicy policy{mir, regions, f, i32Ty};
+            // Pre-register the dropped (filter-body) insts for this parent: every
+            // instruction of every block of each filter (only the entry is laid
+            // out in the parent, and it keeps none of them).
             for (auto const& r : regions) {
                 if (r.parentFn.v != f.v) continue;
-                std::uint32_t const cnt = mir.blockInstCount(r.filterBB);
-                for (std::uint32_t i = 0; i < cnt; ++i) {
-                    MirInstId const id = mir.blockInstAt(r.filterBB, i);
-                    if (!opcodeInfo(mir.instOpcode(id)).isTerminator) {
-                        policy.registerDroppedInst(id);
+                for (MirBlockId const fb : r.filter.blocks) {
+                    std::uint32_t const cnt = mir.blockInstCount(fb);
+                    for (std::uint32_t i = 0; i < cnt; ++i) {
+                        MirInstId const id = mir.blockInstAt(fb, i);
+                        if (!opcodeInfo(mir.instOpcode(id)).isTerminator) {
+                            policy.registerDroppedInst(id);
+                        }
                     }
                 }
             }
@@ -967,9 +1342,10 @@ bool synthesizeSehFunclets(Mir&                                  mir,
         }
     }
 
-    // Append the funclets. Each is a single-block function reading arg0 (exception
-    // pointers) + arg1 (establisher frame). A filter that reads a parent local (H1)
-    // recovers it off arg1 via RecoverParentFrameSlot + the parent's alloca slot map.
+    // Append the funclets. Each is a function of the filter's own blocks — one when
+    // the filter's expression has no branch — reading arg0 (exception pointers) +
+    // arg1 (establisher frame). A filter that reads a parent local (H1) recovers
+    // it off arg1 via RecoverParentFrameSlot + the parent's alloca slot map.
     for (auto const& r : regions) {
         std::unordered_map<std::uint32_t, std::uint32_t> const allocaSlotId =
             parentAllocaSlotIds(mir, r.parentFn);
@@ -982,7 +1358,7 @@ bool synthesizeSehFunclets(Mir&                                  mir,
         // parent locals off. Materialized whether or not the filter uses it (a filter
         // over only the exception code leaves it dead — regalloc drops it).
         MirInstId const establisher = builder.addArg(1, u64Ty);
-        if (!emitFilterFuncletBody(mir, builder, r.filterBB, exPtr, establisher,
+        if (!emitFilterFuncletBody(mir, builder, r.filter, entry, exPtr, establisher,
                                    allocaSlotId, pVoidTy, u32Ty, i32Ty, u64Ty,
                                    reporter)) {
             return false;

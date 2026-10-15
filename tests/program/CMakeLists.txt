@@ -313,6 +313,18 @@ dss_add_test(NAME program/test_shipped_runtime_compiles
 dss_add_test(NAME program/test_driver_argument_supply
              SOURCES test_driver_argument_supply.cpp)
 
+# THE pe64 `__try` EXAMPLES, BUILT BY THE DRIVER ON EVERY HOST (P69, lane `lm`).
+# An example that runs a `__try` is `runOn: windows`: elsewhere the in-process
+# runner builds its baseline and the CLI runner nothing, so the RELEASE arm — the
+# subject of several of them — was built on a Windows host only. This builds
+# those sources for pe64 in the pipeline each case names and reads the image's
+# scope tables and unwind codes. A binary of its own rather than more cases of
+# the one above: each case is whole image builds of real examples, and that
+# binary is already the slowest of its tier; the pe64 readers the two share are
+# `pe_image_readers.hpp`.
+dss_add_test(NAME program/test_guarded_region_examples_on_every_host
+             SOURCES test_guarded_region_examples_on_every_host.cpp)
+
 # THE FOUR SOURCE-ARGUMENT SHAPES A USER CAN TYPE
 # — BOTH EXAMPLE RUNNERS ALWAYS COMPILE AN ABSOLUTE SOURCE PATH.
 #
@@ -359,36 +371,25 @@ dss_add_test(NAME program/test_mode_routing_agreement
 dss_add_test(NAME program/test_shipped_source_language_resolution
              SOURCES test_shipped_source_language_resolution.cpp)
 
-# THE RUNTIME OBJECT CACHE'S ctest FIXTURE
-# (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF). It materialises every shipped
-# runtime archive this suite can need, ONCE, before any test that reads an EXACT
-# `PhaseTimers::read(<phase>).runs` count.
+# EVERY SHIPPED RUNTIME ARCHIVE, TAKEN THROUGH THE DRIVER'S CACHE ONCE
+# (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF): one trivial translation unit
+# compiled for every (target, object format) pair whose format kind realizes a
+# shipped runtime source, at every build configuration. What it leaves is a
+# filled per-user cache; what it refuses is having attempted nothing.
 #
-# ★★★ WHY IT IS A FIXTURE AND NOT A RELAXED ASSERTION. `PhaseTimers` is
-# process-global, so an exact phase-count instrument's real precondition is "no
-# OTHER build ran in this process". That held for free until the shipped runtime
-# stopped being compiled inside the user's build: a cache MISS now runs a nested
-# `Program` build to materialise the archive, and ✔MEASURED a cold-cache pe64
-# release exec build reads `Optimize.runs` = 6 where a warm one reads 2.
-# Relaxing the comparison to `GE(2)` would pass a cold build with the driver's
-# program-stage call DELETED (5), i.e. it would blind the instrument to the
-# exact defect it exists for. The precondition broke, so the precondition is
-# repaired. The full argument is in the file's own docblock.
-#
-# ⓘ `FIXTURES_SETUP` makes ctest schedule it before anything that declares
-# `FIXTURES_REQUIRED dss_runtime_object_cache_warm`, whatever the -j ordering.
-# It is also an ordinary test, so a fixture that stops working is a RED rather
-# than a silently skipped precondition.
+# ★★★ IT IS AN ORDINARY ENTRY AND NO ENTRY DEPENDS ON IT. It was a ctest FIXTURE
+# (`FIXTURES_SETUP`), required by `program/test_driver_argument_supply`, whose
+# two exact `PhaseTimers::read(Optimize).runs` cases counted the nested runtime
+# builds of a cache MISS as the program's own. The ordering made those cases
+# green under ctest and nowhere else: ✔MEASURED 2026-10-12, the same binary run
+# WITHOUT ctest on a cache nothing had filled read 30 where 2 — and that is how
+# `dssharness check-mutations` runs a runner, in a tree whose compiler has a
+# build stamp, and so a cache root, no other build ever had. The dependency is
+# repaired where it was: each of those cases owns its cache now and counts a
+# build that found it filled (the file says how). A case that needs the cache in
+# a KNOWN state makes that state itself; an order of entries is not a state.
 dss_add_test(NAME program/test_runtime_cache_warm
              SOURCES test_runtime_cache_warm.cpp)
-set_tests_properties(program/test_runtime_cache_warm PROPERTIES
-                     FIXTURES_SETUP dss_runtime_object_cache_warm)
-
-# The consumers. Listed here rather than beside each `dss_add_test` above so the
-# fixture and everything that depends on it read as one statement — and so a
-# future test that adds an exact phase-count assertion has one place to join.
-set_tests_properties(program/test_driver_argument_supply PROPERTIES
-                     FIXTURES_REQUIRED dss_runtime_object_cache_warm)
 
 # THE RUNTIME OBJECT CACHE'S **WIRING**
 # (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF). Its subject is the seam, not the

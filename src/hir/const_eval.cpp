@@ -1094,7 +1094,13 @@ combineCast(Hir const& hir, TypeInterner& interner, EvalEnvironment const& env,
     //                         a legal constant expression.
     //   p3 (target SIGNED):   an unrepresentable value is IMPLEMENTATION-DEFINED
     //                         (or raises a signal). A strict verifier is right
-    //                         to refuse that, and it still does.
+    //                         to refuse that — and what it refuses is narrower
+    //                         than that sentence: `valueFitsInIntTarget` judges
+    //                         the 64-bit PATTERN, so `(int)4294967295U` is
+    //                         refused and `(long long)18446744073709551615ULL`
+    //                         — as unrepresentable, but a pattern that fits —
+    //                         is accepted as -1 (READ from the two functions;
+    //                         this comment said "it still does" of both).
     // Deleting the >=64-bit guard alone was not enough: `valueFitsInIntTarget`
     // reports "no value change", which is FALSE for -1 -> 2^64-1, so the strict
     // knob still turned a defined conversion into an Overflow. Keying the knob

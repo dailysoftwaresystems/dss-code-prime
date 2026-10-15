@@ -1680,10 +1680,17 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
         // The slot is at SP_post + slotOff and CFA == SP_post + framedCfaOffset,
         // so the saved location is CFA + (slotOff - framedCfaOffset) -- negative,
         // as every unwinder expects for a callee-save below the CFA.
-        cfiOut.push_back(LirCfiOp{
+        // ★ AND THE RULE SAYS HOW MUCH OF THE REGISTER IS THERE: the bytes of the
+        // store just emitted, read back from the width that store was given —
+        // one number, so the rule cannot claim a width the store did not write.
+        // A writer whose format's save code claims a width (Win64's vector save
+        // says the whole register) holds the rule to it.
+        LirCfiOp rule{
             st, CfiOpKind::RegAtCfaOffset,
             CfiRegRef::physical(layout.savedRegs[i].id), CfiRegRef{},
-            static_cast<std::int64_t>(slotOff) - framedCfaOffset});
+            static_cast<std::int64_t>(slotOff) - framedCfaOffset};
+        rule.savedBytes = lirInstWidthBits(*saveWidth) / 8u;
+        cfiOut.push_back(rule);
     }
     ok = true;
 }

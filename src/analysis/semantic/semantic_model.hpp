@@ -984,11 +984,20 @@ struct CompoundLiteralFacts {
 // Recorded for every such node the semantic tier meets, so the CST→HIR tier's own
 // constant evaluator (an index designator's `[s.b]`) reads the SAME answer instead of
 // re-deriving the placement — one owner, both tiers.
+//
+// ★ P69 (lane `lm`): AND ITS WIDTH, WHEN THE MEMBER IS A BIT-FIELD. A bit-field's value
+// is its initializer converted to the field — the declared type RESTRICTED TO THE WIDTH
+// (C 6.7.2.1p10) — and the fact carried the declared type alone, so the read ignored
+// the width: ✔MEASURED 2026-10-12 (pe64, both pipelines), `static const struct S {
+// unsigned b : 3; } g = { .b = -1 };` read `g.b` as 4294967295 (C: 7), `= { 9 }` as 9
+// (C: 1), an `int b : 3` given 7 as 7 (C: -1), where clang 18 and AppleClang 21 fold
+// C's value.
 struct ConstantSubobjectFact {
     NodeId  initExpr{};
     ScopeId initScope{};
     TypeId  type{};
     bool    zeroValue = false;
+    std::optional<std::uint32_t> bitFieldWidth{};   // the member named is a bit-field of this width
 };
 
 // ── P69 (lane `cs`): THE NaN PAYLOAD A FOLDED `__builtin_nan` CALL SPELLS ─────────────────────

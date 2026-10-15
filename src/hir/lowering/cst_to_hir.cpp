@@ -6400,6 +6400,24 @@ struct Lowerer {
     // emitted between lhs and rhs) and the lowered `rhsE`, for the `lowerExpr`
     // driver's Comma frame: `a, b` = SeqExpr([ExprStmt a], b) yielding b's
     // value+type.
+    // ── THE VALUE AN EXPRESSION YIELDS WHEN IT IS NO LONGER AN LVALUE ───────────────
+    // (cycle P69 round 1, lane `lm`.) What a comma operator and a statement
+    // expression hand on: `e` at the type `valueConversion` (type_rules.hpp, where the
+    // measurement is told) gives its type. An ARRAY and a FUNCTION designator go
+    // through `coerce`, so the decay is the ONE node every other value context gets
+    // (the Array→Ptr / FnSig→Ptr `Cast`) and it stands INSIDE the sequence — laid
+    // over a sequence typed as the array, the static-initializer fold met a sequence
+    // where it reads an object, and `static const char *p = ({ "abc"; });` was
+    // refused (✔MEASURED 2026-10-12; it runs on all four references). A QUALIFIER
+    // alone converts nothing: the same node, at the type a value has.
+    [[nodiscard]] E convertedToItsValue(E e) {
+        TypeId const converted = valueConversion(interner, e.type);
+        if (!converted.valid() || converted == e.type) return e;
+        TypeKind const k = interner.kind(e.type);
+        if (k == TypeKind::Array || k == TypeKind::FnSig) return coerce(e, converted);
+        return E{e.id, converted};
+    }
+
     E combineComma(NodeId node, HirNodeId effect, E rhsE) {
         // ── C 6.5.17p2 [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (2) ────────────
         // The comma's result has the type AND VALUE of the right operand, and
@@ -6415,8 +6433,12 @@ struct Lowerer {
         // lowering exactly, and `lowerSizeof` reads the SEMANTIC stamp — so this
         // half ALONE changes nothing a program can observe, and that half alone
         // would stamp a type this tier does not build.
-        TypeId const decayed = arrayToPointerDecay(interner, rhsE.type);
-        if (decayed.valid() && decayed != rhsE.type) rhsE = coerce(rhsE, decayed);
+        //
+        // ★ P69 (lane `lm`): THE WHOLE CONVERSION (`convertedToItsValue`): this
+        // converted an array and nothing else, so a FUNCTION right operand kept its
+        // function type and a `volatile` / `_Atomic` one its qualifier — see the
+        // mirror in `combineBinary`, which moved with this.
+        rhsE = convertedToItsValue(rhsE);
         std::array<HirNodeId, 1> const stmts{effect};
         return {track(builder.makeSeqExpr(stmts, rhsE.id, rhsE.type, HirFlags::None), node),
                 rhsE.type};
@@ -10642,7 +10664,23 @@ struct Lowerer {
                     auto initExpr = findInitExprInDecl(
                         tree(), dr, rec->declRuleNode, rec->declNode);
                     if (!initExpr.has_value()) return std::nullopt;
-                    return CstResolvedSymbol{*initExpr, rec->scope.v};
+                    // ★ P69 (lane `lm`, D-CSUBSET-CONST-REF-DECLARED-NARROWING): WITH
+                    // THE SYMBOL'S DECLARED TYPE, as the semantic tier's resolver
+                    // hands it (`resolveConstSymbolInit`): the engine reads a named
+                    // constant as its initializer CONVERTED to that type (C
+                    // 6.7.9p11). This resolver handed none — not even the `_BitInt`
+                    // one its twin did — so a condition this tier folds
+                    // (`ifNeverCompletes`) read `const unsigned u = 5; -u` as -5:
+                    // ✔MEASURED 2026-10-12 (pe64, both pipelines), `if ((unsigned long
+                    // long)-u > 0xFFFFFFFFull) return 3; return x;` died of an illegal
+                    // instruction — the condition, false in C, taken for true, and the
+                    // `return x` after it marked as never reached.
+                    CstResolvedSymbol out{*initExpr, rec->scope.v, std::nullopt};
+                    if (rec->type.valid()) {
+                        out.declaredType =
+                            classifyCstCastTarget(interner, rec->type, charIsUnsigned_);
+                    }
+                    return out;
                 }
             }
             return std::nullopt;
@@ -10676,7 +10714,7 @@ struct Lowerer {
             if (!t.has_value()) return std::nullopt;
             return CstConstantSubobject{
                 CstResolvedSymbol{f->initExpr, f->initScope.v, std::nullopt}, *t,
-                f->zeroValue};
+                f->zeroValue, f->bitFieldWidth};
         };
         // P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION):
         // a wide/UTF character constant's element core, read back off the body
@@ -12979,7 +13017,11 @@ struct Lowerer {
         stmts.reserve(items.size() - 1);
         for (std::size_t i = 0; i + 1 < items.size(); ++i)
             stmts.push_back(lowerStmt(items[i]));
-        E const yield = lowerExpr(valueNode);
+        // ★ P69 (lane `lm`): THE CONSTRUCT YIELDS A VALUE (`convertedToItsValue`) —
+        // the last expression's type was handed on as it stood, an array as an array.
+        // ⚠ The semantic tier's statement-expression arm (`subtreeType`) is the mirror
+        // of this, moved with it, and neither moves alone.
+        E const yield = convertedToItsValue(lowerExpr(valueNode));
         return E{track(builder.makeSeqExpr(stmts, yield.id, yield.type), node),
                  yield.type};
     }

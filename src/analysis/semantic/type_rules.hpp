@@ -1703,6 +1703,47 @@ arrayToPointerDecay(TypeInterner& interner, TypeId t) noexcept {
     return elems.empty() ? t : interner.pointer(elems[0]);
 }
 
+// ── C 6.3.2.1p2-p4: THE TYPE OF AN EXPRESSION'S VALUE ──────────────────────────────
+// (cycle P69 round 1, lane `lm`.)
+//
+// An expression that is no longer an lvalue — the value a comma operator or a GNU
+// statement expression yields, the controlling expression of a generic selection —
+// has the type its operand had, CONVERTED, and the conversion is three steps and no
+// more:
+//   * an ARRAY is the pointer to its first element (p3: `arrayToPointerDecay`);
+//   * a FUNCTION designator is the pointer to the function (p4);
+//   * anything else is the unqualified, non-atomic version of its type (p2) — the
+//     qualifiers the TypeId interns, `volatile` and `_Atomic`; `const` and `restrict`
+//     are not interned, and the spine beside the TypeId says the same of them
+//     (`expressionQualifierSpine`: a value has no qualifier at level 0).
+// NOT a promotion: a `char` stays a `char` (`sizeof(({ c; }))` is 1). A type-level
+// alignment is no qualifier and stays.
+//
+// ✔MEASURED 2026-10-12 (31 questions, each through `({ e; })`, through `(0, e)` and
+// bare where the bare form is a control; `sizeof`, `_Generic` and `__typeof__` as the
+// readers): gcc 13, mingw-w64 gcc 13.2, clang 18 and AppleClang 21 apply exactly these
+// three steps to both constructs — `_Atomic` through a statement expression alone is
+// kept by clang 18 and dropped by the other three, whom this follows. A BIT-FIELD is
+// not this law's: each reference gives its value one type bare, through the braces
+// and through the comma (gcc a type of its own, clang the declared one, as DSS does).
+//
+// ★ ONE STATEMENT, BECAUSE THERE WERE THREE AND THEY DISAGREED. The generic selection
+// spelled the three steps inline and was right; the comma converted an array and
+// nothing else (`sizeof((0, f))` was 1 and `typeof((0, v))` kept `volatile`, where the
+// four say 8 and drop it); a statement expression converted nothing (`sizeof(({ "abc";
+// }))` was 4, the array's size, where the four say 8) — and a static pointer
+// initialized through one was refused, the conversion laid over the sequence instead
+// of inside it. Both tiers and all three constructs read this function.
+[[nodiscard]] inline TypeId
+valueConversion(TypeInterner& interner, TypeId t) {
+    if (!t.valid()) return t;
+    TypeKind const k = interner.kind(t);   // through any qualifier skin
+    if (k == TypeKind::Array) return arrayToPointerDecay(interner, t);
+    TypeId const material = interner.stripVolatile(t);
+    if (k == TypeKind::FnSig) return interner.pointer(material);
+    return interner.typeAligned(material, interner.typeAlignOverride(t));
+}
+
 // ── FC3 c1: config-driven usual arithmetic conversions (C 6.3.1.8) ──────
 //
 // The `arithmeticConversions` SemanticConfig block, RESOLVED for the

@@ -1,0 +1,3 @@
+                if (!arm.valid()) return out;
+                cur = arm;
+                continue;

@@ -11,8 +11,15 @@
 //   joinBB:   continuation
 // where the filter reads `SehExceptionCode` / `SehExceptionInfo`.
 //
+// ★ `filterBB` IS THE FILTER'S ENTRY, NOT ALL OF IT. A filter is one EXPRESSION,
+// and `&&`, `||` and `?:` make an expression a diamond of blocks joined by a
+// `Phi`; the `SehFilterReturn` then ends the join. What a filter is — a sub-graph
+// with one way in and one way out — is stated once, in mir/seh_filter_region.hpp,
+// and read by the MIR verifier and by this pass.
+//
 // This pass makes the catch RUNNABLE on x64. For each `__try` region it:
-//   * EXTRACTS the filter block into a synthesized FUNCLET MIR function — a normal
+//   * EXTRACTS the filter — every block of it — into a synthesized FUNCLET MIR
+//     function, a normal
 //     `ms_x64` function `int filter(void* exceptionPointers, u64 establisher)`.
 //     ms_x64 already maps arg0→rcx, arg1→rdx = the exact x64 filter ABI, so NO new
 //     calling convention is needed. `SehExceptionInfo` → the funclet's arg0;
@@ -21,7 +28,8 @@
 //     (c116a: the establisher/arg1 is UNUSED — no parent-local recovery yet; that
 //     is H1 / c116b.)
 //   * REDUCES the parent's filterBB to a STUB `[Const i32 0; SehFilterReturn(const,
-//     id) → handlerBB]`. This preserves the H2 CFG-fiction edge SehFilterReturn →
+//     id) → handlerBB]` and keeps NO other block of the filter in the parent.
+//     This preserves the H2 CFG-fiction edge SehFilterReturn →
 //     handlerBB (so handlerBB stays FORWARD-reachable = prune-safe, and single-pred
 //     = verifier-clean) while removing every `SehException*` read from the parent
 //     (they now live ONLY in the funclet, where arg0 genuinely is the exception

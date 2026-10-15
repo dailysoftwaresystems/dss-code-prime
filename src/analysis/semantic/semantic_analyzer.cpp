@@ -4823,15 +4823,15 @@ resolveConstSymbolInit(EngineState const& s, Tree const& tree,
     // — not the original use-site scope. This is what makes shadowing
     // work correctly across const ref chains.
     CstResolvedSymbol out{*initExpr, rec.scope.v, std::nullopt};
-    // C4b (I1): a const `_BitInt(N)` symbol's value is its initializer CONVERTED
-    // to `_BitInt(N)` (C 6.7.9 / 6.3.1.3). Hand the engine the declared (width,
-    // signed) so it applies the mod-2^N wrap — else `const _BitInt(4) k = 20wb;
-    // k` folds to 20 (the initializer's `_BitInt(6)` value) instead of 4.
-    auto const& in = s.lattice.interner();
-    if (rec.type.valid() && in.kind(rec.type) == TypeKind::BitInt) {
-        out.declaredBitPrecise = CstBitPreciseDeclType{
-            static_cast<std::uint32_t>(in.bitIntWidth(rec.type)),
-            in.bitIntIsSigned(rec.type)};
+    // ★ P69 (lane `lm`): THE DECLARED TYPE, FOR EVERY TYPE THE CAST CAN CONVERT TO. A
+    // const object's value is its initializer CONVERTED to its type (C 6.7.9p11), so
+    // the engine is handed that type as the conversion its cast arm applies. This
+    // handed it for a `_BitInt` declared type alone (C4b), and every other named
+    // constant was read at its initializer's type (`CstResolvedSymbol::declaredType`
+    // tells what was measured). An unclassifiable type — an aggregate — hands none.
+    if (rec.type.valid()) {
+        out.declaredType =
+            classifyCstCastTarget(s.lattice.interner(), rec.type, s.charIsUnsigned);
     }
     return out;
 }
@@ -4911,7 +4911,7 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
             if (!type.has_value()) return std::nullopt;
             return CstConstantSubobject{
                 CstResolvedSymbol{fact->initExpr, fact->initScope.v, std::nullopt}, *type,
-                fact->zeroValue};
+                fact->zeroValue, fact->bitFieldWidth};
         };
         // FC6: fold `sizeof(T)` in an array dimension (`int a[sizeof(T)]`). The
         // engine dispatches the `sizeofRule` node here (ahead of its wrapper-
@@ -5758,6 +5758,21 @@ constexprPointerCastFoldsToNull(EngineState& s, SemanticConfig const& cfg,
         if (NodeId const same = cancelledUnaryPair(tree, cur, "AddressOf", "Deref");
             same.valid()) {
             cur = same;
+            continue;
+        }
+        // ★ P69 (lane `lm`): THIS IS A QUESTION OF VALUE, and a statement expression of
+        // ONE expression has that expression's value
+        // (`soleExpressionOfStatementExpression`, beside the statement of what a wrapper
+        // is). The descent above stops at the construct, as it must for a question of
+        // form — and with it this test refused `constexpr int *p = ({ (int *)0; });`,
+        // which gcc 13, mingw-w64 gcc 13.2 and AppleClang 21 accept (✔MEASURED
+        // 2026-10-12; clang 18 refuses it). What the expression inside is, is asked of
+        // it by the same loop: `({ (int *)8; })` and `({ !(int *)0; })` are refused
+        // here as they are when written bare.
+        if (NodeId const inside = soleExpressionOfStatementExpression(
+                tree.schema().hirLowering(), tree, cur);
+            inside.valid()) {
+            cur = inside;
             continue;
         }
         auto const it = s.idx().castByRule.find(tree.rule(cur).v);
@@ -13819,6 +13834,7 @@ private:
 struct ResolvedMemberPath {
     std::vector<std::uint64_t> indices;
     TypeId                     type{};
+    std::optional<std::uint32_t> bitFieldWidth{};   // the member is a bit-field of this width
 };
 [[nodiscard]] std::optional<ResolvedMemberPath>
 resolveMemberPath(EngineState& s, TypeId container, std::string_view name) {
@@ -13843,6 +13859,7 @@ resolveMemberPath(EngineState& s, TypeId container, std::string_view name) {
     if (rec == nullptr || rec->kind != DeclarationKind::Variable) return std::nullopt;
     out.indices.push_back(rec->fieldIndex);
     out.type = rec->type;
+    out.bitFieldWidth = rec->bitFieldWidth;
     return out;
 }
 
@@ -14524,7 +14541,11 @@ judgeCompoundLiteral(EngineState& s, SemanticConfig const& cfg, Tree const& tree
 // one its initializer made current (run 20260930-215414-bc6d1ef1 m11), an element of an
 // array member (m12 — only `.` is a constant's access), a volatile object, a member of
 // aggregate type (an integer constant expression reads a scalar), a pointer through `->`.
-// Pure: it stamps nothing and reports nothing — the consumer owns the diagnostic. Bounded
+// It reports nothing — the consumer owns the diagnostic — and it records ONE thing: where
+// it asks whether a brace element initializes a subobject whole, the answer is written as
+// that element's value type (`braceValueInitializesWhole` → `s.braceElementValueTypes`),
+// the fact the lowering places the element by. (This comment said "it stamps nothing"
+// until the fold that added that write.) Bounded
 // by the tree's node count (each step moves to a strictly smaller subobject path or to a
 // different constant's initializer, and a revisited initializer is refused). The answer
 // is the model's `ConstantSubobjectFact`; `constantSubobjectAsCst` makes it the engine's.
@@ -14576,13 +14597,27 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
     // that says nothing: `(*&s).m` is `s.m` (`cancelledUnaryPair`). (This counted
     // children too: it crossed any node with one Internal child that was neither a
     // member access nor a compound literal, `*p` and `&s` alone included.)
+    // ★ "WHICH CONSTANT OBJECT IS THIS THE VALUE OF" IS A QUESTION OF VALUE, so the peel
+    // also takes the step of a statement expression of ONE expression
+    // (`soleExpressionOfStatementExpression`): `({ h; }).b`, `const struct S g = ({ h;
+    // });` and `{ ({ h; }), 2 }` read the constant `h`, as clang 18 and AppleClang 21
+    // fold them (✔MEASURED 2026-10-12; gcc refuses each as no constant). Stopped at the
+    // construct, the three were refused here.
     auto const peel = [&](NodeId n) {
         for (std::size_t guard = 0;; ++guard) {
             if (guard > bound) failOnCyclicTree("the constant subobject peel");
             n = peelGroupingWrappers(cfg, tree, n, "the constant subobject peel");
-            NodeId const designated = cancelledUnaryPair(tree, n, "Deref", "AddressOf");
-            if (!designated.valid()) return n;
-            n = designated;
+            if (NodeId const designated = cancelledUnaryPair(tree, n, "Deref", "AddressOf");
+                designated.valid()) {
+                n = designated;
+                continue;
+            }
+            if (NodeId const inside = soleExpressionOfStatementExpression(hirCfg, tree, n);
+                inside.valid()) {
+                n = inside;
+                continue;
+            }
+            return n;
         }
     };
     // A constant ROOT: its initializer, its type and the scope its initializer reads in.
@@ -14645,6 +14680,8 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
     std::vector<std::uint64_t> target;
     std::vector<bool>          unionLevel;   // per `target` step: its container is a union
     TypeId type = root->type;
+    // The LAST member named, when it is a bit-field: its width (the read is reduced to it).
+    std::optional<std::uint32_t> bitFieldWidth;
     for (NodeId name : names) {
         TypeKind const k = in.kind(type);
         if (k != TypeKind::Struct && k != TypeKind::Union) return std::nullopt;
@@ -14661,6 +14698,7 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
             container = ops[static_cast<std::size_t>(i)];
         }
         type = member->type;
+        bitFieldWidth = member->bitFieldWidth;
         if (in.isVolatileObjectType(type)) return std::nullopt;
     }
     TypeKind const scalarKind = in.kind(type);
@@ -14679,7 +14717,7 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
         if (!value.valid() || !visited.insert(value.v).second) return std::nullopt;
         bool const isList = isRule(value, idx.braceInitListRule);
         if (!isList) {
-            if (done == target.size()) return ConstantSubobjectFact{value, at, type, false};
+            if (done == target.size()) return ConstantSubobjectFact{value, at, type, false, bitFieldWidth};
             // An aggregate initialized WHOLE by another constant: continue in it.
             std::optional<Root> next = rootOf(value, at);
             if (!next.has_value()) return std::nullopt;
@@ -14692,7 +14730,7 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
             if (isRule(e, idx.initElementRule)) elements.push_back(e);
         if (done == target.size()) {
             // A scalar in braces (`{ 42 }`, C 6.7.9p11): its first element; `{}` is zero.
-            if (elements.empty()) return ConstantSubobjectFact{{}, at, type, true};
+            if (elements.empty()) return ConstantSubobjectFact{{}, at, type, true, bitFieldWidth};
             ResolvedBraceElement const el = resolveBraceElement(s, tree, elements.front(),
                                                                 object, at);
             if (!el.resolved || !el.designator.empty()) return std::nullopt;
@@ -14744,7 +14782,7 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
             for (std::size_t k = 0; k < want.size(); ++k)
                 if (unionLevel[done + k] && !active[k].has_value() && want[k] != 0)
                     return std::nullopt;
-            return ConstantSubobjectFact{{}, at, type, true};
+            return ConstantSubobjectFact{{}, at, type, true, bitFieldWidth};
         }
         // Step into the subobject the hit initializes.
         TypeId subobject = object;
@@ -21386,7 +21424,10 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     resolveTypeNode(s, cfg, tree, typeNode, here);
                 if (target.valid()) {
                     s.nodeToType.set(typeNode, target);
-                    s.nodeToType.set(node, target);
+                    // The cast EXPRESSION is a value (`subtreeType`'s "THE VALUE LAW"):
+                    // the named type without its own level's qualifiers. The type
+                    // child keeps the type as named.
+                    s.nodeToType.set(node, valueConversion(s.lattice.interner(), target));
                     TypeId const operandTy =
                         subtreeType(s, tree, operandNode);
                     // FC3.5 sweep-c3 (D-CSUBSET-CAST-VOID-DISCARD): the
@@ -23766,7 +23807,10 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
     // `int x = f();` initializer-type-flow). Set BEFORE arity/arg checks so
     // the result type is present even when an arg mismatch is reported (the
     // call's value type is its declared result regardless of arg errors).
-    s.nodeToType.set(node, s.lattice.interner().fnResult(fnSig));
+    // (A VALUE: `subtreeType`'s "THE VALUE LAW" — a result type declared `volatile`
+    // or `_Atomic` is not what the call expression has.)
+    s.nodeToType.set(node, valueConversion(s.lattice.interner(),
+                                           s.lattice.interner().fnResult(fnSig)));
 
     // Collect arg expression nodes (visible children of the args subtree
     // that are NOT separators). The argsChild subtree is a comma-separated
@@ -25547,7 +25591,13 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // The decay verb is the SHARED `arrayToPointerDecay` for the same reason
         // the ternary's is -- a second copy is how the two tiers start
         // disagreeing about the type they are both describing.
-        if (e->target == "Comma")  return decayArray(rt);           // value of RHS
+        // ★ P69 (lane `lm`): THE WHOLE CONVERSION, NOT THE ARRAY'S THIRD OF IT
+        // (`valueConversion`) — and it is no longer this arm's: the frame that
+        // finishes on ANY binary operator converts its type (see "THE VALUE LAW" where
+        // the frames end). ✔MEASURED 2026-10-12: `sizeof((0, f))` over a function
+        // was 1 and `typeof((0, v))` kept `volatile` / `_Atomic`, where gcc 13, clang
+        // 18, AppleClang 21 and mingw-w64 gcc 13.2 say 8 and drop them.
+        if (e->target == "Comma")  return rt;   // the RHS's, read as a value below
         if (e->target == "Assign" || !e->compoundBase.empty()) return lt;
         // P68 round 9 (lane `cs`): an operation the POINTER HALF of the operand
         // constraints refuses (`p * 2`, `5 - p`, `p + 1.5` — pass2Post's SE4e reports
@@ -25950,7 +26000,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     struct Frame {
         NodeId node;
         enum class Kind : std::uint8_t {
-            Binary, Unary, Postfix, Ternary, Wrapper, Generic
+            Binary, Unary, Postfix, Ternary, Wrapper, Generic, StatementValue
         } kind;
         std::uint8_t           phase;
         NodeId                  n0;     // binary lhs / unary operand / postfix base
@@ -26067,6 +26117,10 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                                      /*emitOnMiss=*/false,
                                      /*emitTypeUse=*/false);
             mut.reporter.truncateTo(snap);
+            // A cast's value is no lvalue (C 6.5.4p5): its type is the NAMED one
+            // without the qualifiers of its own level — "THE VALUE LAW", where the
+            // frames end; this arm builds no frame, so it says it here.
+            result = valueConversion(mut.lattice.interner(), result);
             return;
         }
         if (auto const it = s.idx().compoundLiteralByRule.find(r.v);
@@ -26114,57 +26168,28 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // Returning InvalidType here is what makes the two agree: leaving the old
         // descent in place for that shape would let `sizeof(({ int y = 1; }))` fold
         // to 4 — a silent answer to a question the language says has none.
+        //
+        // ★ P69 (lane `lm`): THE BODY IS READ BY THE ONE READER
+        // (`statementExpressionBody`, `core/types/decl_prefix_strip.hpp` — this arm
+        // held its own copy of the item peel, capped at 128 steps), AND THE TYPE IS
+        // THE VALUE'S, CONVERTED (`valueConversion`, `type_rules.hpp`). The value of
+        // the last expression is no lvalue: an array is the pointer to its first
+        // element and a function the pointer to it, and no qualifier of the type it
+        // was read at stays. This arm handed on the last expression's type as it
+        // stood: ✔MEASURED 2026-10-12, `sizeof(({ "abc"; }))` was 4 and `sizeof(({ a;
+        // }))` over an `int a[3]` was 12 where gcc 13, clang 18, AppleClang 21 and
+        // mingw-w64 gcc 13.2 all say 8 — a silent wrong constant — and an array
+        // "initialized" by `({ "abc"; })` passed this tier for the lowering to refuse
+        // by an internal sentence.
+        // ⚠ THIS MOVES WITH `lowerStatementExpr` (`cst_to_hir.cpp`), AND NEITHER
+        // ALONE — the comma's two halves (`combineBinary` here, `combineComma` there)
+        // say the same of themselves, and for the same reason: `lowerSizeof` reads
+        // THIS tier's stamp.
         if (hirCfg.stmtExprRule.valid() && r.v == hirCfg.stmtExprRule.v) {
-            NodeId lastItem{};
-            for (NodeId c : visibleChildren(tree, node)) {
-                if (tree.kind(c) == NodeKind::Token) continue;   // ( { } )
-                lastItem = c;
-            }
-            // Peel transparent single-child wrappers to the item's core, stopping
-            // where the lowering stops: at a token, at an expression node, or at
-            // the first rule that carries a HIR mapping of its own.
-            NodeId core = lastItem;
-            for (int guard = 0; guard < 128 && core.valid(); ++guard) {
-                if (tree.kind(core) != NodeKind::Internal) break;
-                std::uint32_t const cv = tree.rule(core).v;
-                if (cv == hirCfg.binaryExprRule.v || cv == hirCfg.unaryExprRule.v
-                    || cv == hirCfg.postfixExprRule.v || cv == hirCfg.operandRule.v
-                    || (hirCfg.ternaryExprRule.valid()
-                        && cv == hirCfg.ternaryExprRule.v)) {
-                    break;
-                }
-                bool mapped = false;
-                for (auto const& m : hirCfg.ruleMappings) {
-                    if (m.rule.v == cv) { mapped = true; break; }
-                }
-                if (mapped) break;
-                NodeId sole{};
-                bool many = false;
-                for (NodeId c : visibleChildren(tree, core)) {
-                    if (tree.kind(c) == NodeKind::Token) continue;
-                    if (sole.valid()) { many = true; break; }
-                    sole = c;
-                }
-                if (many || !sole.valid()) break;
-                core = sole;
-            }
-            NodeId valueNode{};
-            if (core.valid() && tree.kind(core) == NodeKind::Internal) {
-                for (auto const& m : hirCfg.ruleMappings) {
-                    if (m.rule.v != tree.rule(core).v) continue;
-                    if (m.hirKind != "ExprStmt") break;
-                    for (NodeId c : visibleChildren(tree, core)) {
-                        if (tree.kind(c) == NodeKind::Token) continue;
-                        valueNode = c;
-                        break;
-                    }
-                    break;
-                }
-            }
-            if (!valueNode.valid()) { result = InvalidType; return; }   // `void`
-            std::vector<NodeId> only{valueNode};
-            work.push_back(Frame{node, Frame::Kind::Wrapper, 0, {}, {}, nullptr,
-                                 std::move(only), 0, {}});
+            StatementExpressionBody const body = statementExpressionBody(hirCfg, tree, node);
+            if (!body.value.valid()) { result = InvalidType; return; }   // `void`
+            work.push_back(Frame{node, Frame::Kind::StatementValue, 0, body.value, {},
+                                 nullptr, {}, 0, {}});
             return;
         }
         // ── binary: [lhs(Internal), OP-token, rhs(Internal)] ──
@@ -26275,6 +26300,9 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // reference into `work` and the pop dangles it.
         std::size_t const depthBefore = work.size();
         NodeId const      framedNode  = work.back().node;
+        // Set by the arm that finishes a frame whose expression is NO LVALUE (see
+        // "THE VALUE LAW" below the switch).
+        bool finishedOnAValue = false;
         Frame& f = work.back();
         switch (f.kind) {
         case Frame::Kind::Binary:
@@ -26284,6 +26312,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             } else {
                 HirOperatorEntry const* e = f.e; TypeId lt = f.c0;
                 work.pop_back(); result = combineBinary(e, lt, result);
+                finishedOnAValue = true;   // every binary operator: `=` and `,` too
             }
             break;
         case Frame::Kind::Unary:
@@ -26291,6 +26320,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             else {
                 HirOperatorEntry const* e = f.e;
                 work.pop_back(); result = combineUnary(e, result);
+                finishedOnAValue = e->target != "Deref";   // `*E` alone designates an object
             }
             break;
         case Frame::Kind::Postfix:
@@ -26312,6 +26342,10 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 TypeId baseT = f.phase == 2 ? f.c0   : result;
                 work.pop_back();
                 result = combinePostfix(node, e, baseT, subT);
+                // `E[i]` and a member designate an object; `E++`, `E--` and a call's
+                // result are values.
+                finishedOnAValue = e->target == "PostInc" || e->target == "PostDec"
+                                || e->target == "Call";
             }
             break;
         case Frame::Kind::Ternary:
@@ -26329,6 +26363,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 NodeId elseN = f.list[2];
                 work.pop_back();
                 result = combineTernary(thenT, result, thenN, elseN);
+                finishedOnAValue = true;
             }
             break;
         // ★★ THE TRANSPARENT-WRAPPER AMBIGUITY GUARD
@@ -26382,6 +26417,16 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 ++f.idx; f.phase = 0;                  // keep scanning
             }
             break;
+        case Frame::Kind::StatementValue:
+            // A statement expression: the type of its last expression (`n0`), as a
+            // VALUE (see the arm that pushes this frame).
+            if (f.phase == 0) {
+                f.phase = 1; NodeId n = f.n0; enter(n);
+            } else {
+                work.pop_back();
+                finishedOnAValue = true;
+            }
+            break;
         case Frame::Kind::Generic:
             if (f.phase == 0) {
                 // Type the controlling expression on THIS work-stack (flat — a
@@ -26403,6 +26448,24 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             break;
         }
         if (work.size() < depthBefore) {
+            // ★ P69 (lane `lm`): THE VALUE LAW, SAID ONCE FOR EVERY FORM (C 6.3.2.1p2-p4;
+            // `valueConversion`, `type_rules.hpp`). An expression that is no lvalue has
+            // no qualifier at its own level — and an array or a function read as a value
+            // is the pointer. The forms: every binary operator's result (an assignment's
+            // and the comma's with it), every unary one's but `*E`, `E++` / `E--`, a
+            // call's result, a conditional, a statement expression's value; the cast arm,
+            // which builds no frame, says it for itself. The comma and the statement
+            // expression each said it alone; the others handed on the type of the OBJECT
+            // they read: ✔MEASURED 2026-10-12 (23 questions, `__typeof__(E) y;` read by
+            // `_Generic(&y, int *: 41, volatile int *: 42, default: 43)`; gcc 13,
+            // mingw-w64 gcc 13.2, clang 18 and AppleClang 21 agree in every one), a `y`
+            // declared by `typeof` of `(volatile int)m`, `+v`, `-v`, `f()` returning
+            // `volatile int`, `v = 1`, `v += 1`, `v++`, `++v`, `v--` or `--v` was
+            // `volatile` where the four declare a plain `int`. The `const` / `restrict`
+            // half of the sentence is the spine's (`expressionQualifierSpine`). The
+            // Pass-2 stamps of a cast node and of a call node never reach this line and
+            // say the same where they are set.
+            if (finishedOnAValue) result = valueConversion(interner, result);
             // This frame finished: `result` is the type of `framedNode`, derived
             // (not stamped — the stamp arm never builds a frame). Record it under
             // the scope it was derived in so the next walk that meets this node
@@ -26752,14 +26815,31 @@ typeNameOutermostLayerIsVolatileOrAtomic(EngineState const& s, SemanticConfig co
 //   * a cast → its type name's spine (level 0 dropped: C 6.5.4p5); a compound
 //     literal → its type name's; a call → the callee's RESULT spine (a function's
 //     declared spine IS its result's; a pointer to function drops its two levels);
-//   * `a, b` → `b`; an assignment, `++`/`--` → the object's; pointer ± integer →
-//     the pointer operand's (the one `E1[E2]` itself picks); `?:` → both arms, the
-//     result's pointee carrying the qualifiers of BOTH (C 6.5.16p6);
+//   * `a, b` → `b`; a statement expression → its last expression; an assignment,
+//     `++`/`--` → the object's; pointer ± integer → the pointer operand's (the one
+//     `E1[E2]` itself picks); `?:` → both arms, the result's pointee carrying the
+//     qualifiers of BOTH (C 6.5.16p6); `__builtin_choose_expr` → the arm chosen;
 //   * any other value (a literal, arithmetic, a comparison) → unqualified, of its
 //     TypeId's shape.
 // One conditional is followed; a conditional inside one of its arms answers no
 // claim, as does any shape not listed. Level 0 of the result is whatever the
 // expression's own type is; the `_Generic` consumer clears it (lvalue conversion).
+//
+// ★ P69 (lane `lm`): AN EXPRESSION THAT IS NO LVALUE HAS NO QUALIFIER AT LEVEL 0, AND
+// THAT IS SAID ONCE (`finish`). A cast, a call, a conditional, the comma, a statement
+// expression, an assignment, `++` / `--` and pointer arithmetic each MARK the point of
+// the walk where a value is read; `finish` clears level 0 there and nowhere else, the
+// levels below — what the value points to — untouched (and a function designator read
+// as a value is the pointer to it: one level prepended). Three of them cleared it
+// inline and the rest handed the object's own qualifier on: ✔MEASURED 2026-10-12 (20
+// questions, `__typeof__(E) y;` read by `_Generic(&y, …)`; gcc 13, mingw-w64 gcc
+// 13.2, clang 18 and AppleClang 21 agree in every one), `typeof((0, cp))` and
+// `typeof(({ cp; }))` over a `const int *const cp` declared a `const` pointer where
+// the four declare a plain pointer to `const int`. The `volatile` / `_Atomic` half of
+// the same sentence is the TypeId's, and `subtreeType` says it (`valueConversion`).
+// ⚠ It is the OBJECT's qualifier a value has lost: a member keeps what its own
+// declaration says (`f().m` over a `const int m` is `const int` on all four), which
+// is why the member arm below marks nothing.
 [[nodiscard]] std::optional<QualifierSpine>
 expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                          NodeId expr, ScopeId here) {
@@ -26770,11 +26850,17 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
         std::optional<QualifierSpine> spine;
         bool level0Known = true;   // false ⇒ a step exposing level 0 makes no claim
     };
+    // A point of the walk at which the expression read is a VALUE (see `finish`).
+    struct ValueAt {
+        std::size_t steps;            // how many of the path's steps lie OUTSIDE it
+        bool        functionDecays;   // a function designator read there: the pointer to it
+    };
     struct Path {
-        Base              base;
-        std::vector<Step> steps;   // outside-in
-        bool              forked = false;
-        NodeId            armA{}, armB{};
+        Base                 base;
+        std::vector<Step>    steps;    // outside-in
+        std::vector<ValueAt> values;   // in the order the walk met them
+        bool                 forked = false;
+        NodeId               armA{}, armB{};
     };
     auto const unqualified = [&](TypeId t) -> std::optional<QualifierSpine> {
         auto const levels = typeDerivationLevels(in, t);
@@ -26868,6 +26954,13 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
     auto const walk = [&](NodeId start) -> Path {
         Path out;
         NodeId cur = start;
+        // The expression the walk stands on is read as a VALUE; `operand`, when given,
+        // is the expression whose value it is (a function designator there decays).
+        auto const readAsAValue = [&](NodeId operand = NodeId{}) {
+            TypeId const t = operand.valid() ? subtreeType(s, tree, operand, here) : InvalidType;
+            out.values.push_back(
+                ValueAt{out.steps.size(), t.valid() && in.kind(t) == TypeKind::FnSig});
+        };
         for (int guard = 0; guard < 512 && cur.valid(); ++guard) {
             if (tree.kind(cur) == NodeKind::Token) {
                 if (isIdentifier(cur)) {
@@ -26889,7 +26982,11 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                 if (ops.empty()) return out;
                 if (tgt == "Deref")     { out.steps.push_back(Step::Drop);    cur = ops[0]; continue; }
                 if (tgt == "AddressOf") { out.steps.push_back(Step::Prepend); cur = ops[0]; continue; }
-                if (tgt == "PreInc" || tgt == "PreDec") { cur = ops[0]; continue; }
+                if (tgt == "PreInc" || tgt == "PreDec") {
+                    readAsAValue();
+                    cur = ops[0];
+                    continue;
+                }
                 out.base = {unqualified(subtreeType(s, tree, cur, here)), true};
                 return out;
             }
@@ -26903,13 +27000,18 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                     if (e != nullptr) break;
                 }
                 if (e == nullptr) return out;
-                if (e->target == "Comma")  { cur = ops[1]; continue; }
-                if (e->target == "Assign") { cur = ops[0]; continue; }
+                if (e->target == "Comma")  { readAsAValue(ops[1]); cur = ops[1]; continue; }
+                if (e->target == "Assign") { readAsAValue(); cur = ops[0]; continue; }
                 if (e->target == "Add" || e->target == "Sub") {
                     auto const which = indexContainerOperand(
                         in, subtreeType(s, tree, ops[0], here), subtreeType(s, tree, ops[1], here));
-                    if (which == IndexContainerOperand::Base) { cur = ops[0]; continue; }
+                    if (which == IndexContainerOperand::Base) {
+                        readAsAValue();
+                        cur = ops[0];
+                        continue;
+                    }
                     if (e->target == "Add" && which == IndexContainerOperand::Subscript) {
+                        readAsAValue();
                         cur = ops[1];
                         continue;
                     }
@@ -26933,7 +27035,11 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                     out.steps.push_back(Step::Drop);
                     continue;
                 }
-                if ((tgt == "PostInc" || tgt == "PostDec") && !ops.empty()) { cur = ops[0]; continue; }
+                if ((tgt == "PostInc" || tgt == "PostDec") && !ops.empty()) {
+                    readAsAValue();
+                    cur = ops[0];
+                    continue;
+                }
                 if (tgt == "Call" && !ops.empty()) {
                     SymbolId const sym = namedSymbol(ops[0]);   // a NAMED callee only
                     if (!sym.valid()) return out;
@@ -26945,8 +27051,7 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                     else if (isFnPointerType(in, rec.type)) drop = 2;     // [Ptr, Fn] above the result
                     else return out;
                     if (drop != 0 && !shiftQualifierSpine(sp, -drop)) return out;
-                    sp.constBits    &= ~std::uint64_t{1};   // a call's value is an rvalue
-                    sp.restrictBits &= ~std::uint64_t{1};
+                    readAsAValue();   // a call's result
                     out.base = {sp, true};
                     return out;
                 }
@@ -26996,17 +27101,33 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                 cur = *selected;
                 continue;
             }
-            // A cast: its type name's spine, level 0 dropped (the value is an rvalue).
+            // `__builtin_choose_expr`: the arm its constant condition chooses, as that
+            // arm stands — an lvalue when the arm is one. No arm ⇒ no claim.
+            if (cfg.builtinChooseExprRule.valid() && r == cfg.builtinChooseExprRule.v) {
+                NodeId const arm = chooseExprSelectedArm(s, cfg, tree, cur, here,
+                                                         /*loud=*/false);
+                if (!arm.valid()) return out;
+                cur = arm;
+                continue;
+            }
+            // A GNU statement expression: the VALUE of its last expression (the one
+            // reader of its body, `statementExpressionBody`); a body that yields
+            // nothing makes no claim.
+            if (hirCfg.stmtExprRule.valid() && r == hirCfg.stmtExprRule.v) {
+                StatementExpressionBody const body = statementExpressionBody(hirCfg, tree, cur);
+                if (!body.value.valid()) return out;
+                readAsAValue(body.value);
+                cur = body.value;
+                continue;
+            }
+            // A cast: its type name's spine, read as a value.
             if (auto const castIt = s.idx().castByRule.find(r);
                 castIt != s.idx().castByRule.end()) {
                 auto const& cr = cfg.castRules[castIt->second];
                 auto const kids = visibleChildren(tree, cur);
                 if (cr.typeChild >= kids.size()) return out;
                 auto sp = typeNameQualifierSpine(s, cfg, tree, kids[cr.typeChild]);
-                if (sp.has_value()) {
-                    sp->constBits    &= ~std::uint64_t{1};
-                    sp->restrictBits &= ~std::uint64_t{1};
-                }
+                readAsAValue();
                 out.base = {sp, true};
                 return out;
             }
@@ -27049,13 +27170,30 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
         return out;
     };
     // Apply a path's steps, inside-out, to its base.
-    auto const finish = [&](Base const& base, std::vector<Step> const& steps)
+    auto const finish = [&](Base const& base, std::vector<Step> const& steps,
+                            std::vector<ValueAt> const& values)
         -> std::optional<QualifierSpine> {
         if (!base.spine.has_value()) return std::nullopt;
         QualifierSpine sp = *base.spine;
-        int level0At = 0;   // where the base's own level 0 now sits (-1 = dropped)
-        for (auto it = steps.rbegin(); it != steps.rend(); ++it) {
-            if (*it == Step::Drop) {
+        bool level0Known = base.level0Known;
+        int  level0At    = 0;   // where the base's own level 0 now sits (-1 = dropped)
+        for (std::size_t outside = steps.size();; --outside) {
+            // `sp` is the type of the expression that `outside` steps still lie
+            // outside of. ★ THE VALUE LAW, SAID ONCE: where that expression is read
+            // as a VALUE it has no qualifier at level 0 — whatever the object it was
+            // read from had — and a function designator is the pointer to itself.
+            for (ValueAt const& v : values) {
+                if (v.steps != outside) continue;
+                if (v.functionDecays) {
+                    if (!shiftQualifierSpine(sp, +1)) return std::nullopt;
+                    if (level0At >= 0) ++level0At;
+                }
+                sp.constBits    &= ~std::uint64_t{1};
+                sp.restrictBits &= ~std::uint64_t{1};
+                if (level0At == 0) level0Known = true;   // it is known now: unqualified
+            }
+            if (outside == 0) break;
+            if (steps[outside - 1] == Step::Drop) {
                 if (!shiftQualifierSpine(sp, -1)) return std::nullopt;
                 if (level0At >= 0) --level0At;
             } else {
@@ -27063,17 +27201,17 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                 if (level0At >= 0) ++level0At;
             }
         }
-        if (!base.level0Known && level0At >= 1) return std::nullopt;
+        if (!level0Known && level0At >= 1) return std::nullopt;
         return sp;
     };
 
     Path const top = walk(expr);
-    if (!top.forked) return finish(top.base, top.steps);
+    if (!top.forked) return finish(top.base, top.steps, top.values);
     Path const a = walk(top.armA);
     Path const b = walk(top.armB);
     if (a.forked || b.forked) return std::nullopt;
-    auto sa = finish(a.base, a.steps);
-    auto sb = finish(b.base, b.steps);
+    auto sa = finish(a.base, a.steps, a.values);
+    auto sb = finish(b.base, b.steps, b.values);
     if (!sa.has_value() || !sb.has_value()) return std::nullopt;
     // P69 (lane `cs`): an arm that is a function DESIGNATOR is converted to a pointer
     // to itself (C 6.3.2.1p4) — one unqualified level above its Fn level — so `c ? f :
@@ -27110,9 +27248,10 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
         joined.constBits    = (sa->constBits | sb->constBits) & 0b10u;
         joined.restrictBits = (sa->restrictBits | sb->restrictBits) & 0b10u;
     }
-    joined.constBits    &= ~std::uint64_t{1};   // the conditional's value is an rvalue
-    joined.restrictBits &= ~std::uint64_t{1};
-    return finish(Base{joined, true}, top.steps);
+    // The conditional is a value where the walk forked: inside every step it had taken.
+    std::vector<ValueAt> values = top.values;
+    values.push_back(ValueAt{top.steps.size(), false});
+    return finish(Base{joined, true}, top.steps, values);
 }
 
 // The three halves of "A POINTER PAIR THE INTERNER CALLS COMPATIBLE, AND C DOES NOT"
@@ -27177,12 +27316,14 @@ selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
     // default: 3)`, exit 42 on gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC
     // 19.51; DSS exited 3 on both — the undecayed ARRAY type matched no pointer
     // association, so `default` was selected in silence.
-    TypeId ctrlConv = controllingType.valid()
-        ? in.stripVolatile(controllingType) : InvalidType;
-    if (ctrlConv.valid()) {
-        ctrlConv = arrayToPointerDecay(in, ctrlConv);
-        if (in.kind(ctrlConv) == TypeKind::FnSig) ctrlConv = in.pointer(ctrlConv);
-    }
+    // ★ P69 (lane `lm`): THE THREE STEPS ARE ONE FUNCTION NOW (`valueConversion`,
+    // `type_rules.hpp`), which the comma and the statement expression read too — they
+    // stood here inline, and here alone were all three applied. What stays this
+    // function's own is the strip after it: a type-level ALIGNMENT is no qualifier
+    // and the conversion keeps it, but it is no part of which association a type is
+    // compatible with.
+    TypeId const ctrlConv = controllingType.valid()
+        ? in.stripVolatile(valueConversion(in, controllingType)) : InvalidType;
     sel.controllingResolved = ctrlConv.valid();
 
     // ★ P68 round 9 (lane `cs`): THE QUALIFIER AXIS THE INTERNER DOES NOT CARRY.

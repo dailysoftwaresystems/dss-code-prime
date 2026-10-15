@@ -167,6 +167,17 @@ dss_add_test(NAME analysis/semantic/test_stmt_expr_value_type
 target_include_directories(dss_analysis_semantic_test_stmt_expr_value_type
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P69 (lane lm): a named constant, and a bit-field member of a constant aggregate,
+# are read in a constant expression as the OBJECT holds them -- the initializer
+# converted to the declared type, a bit-field reduced to its width. The semantic
+# tier's resolver and the lowering's each hand the one evaluator that fact, and the
+# lowering decides from the fold what code is never reached: a wrong value there is
+# a program that dies. Both tiers are pinned here; shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_constant_read_as_the_object_holds_it
+             SOURCES test_constant_read_as_the_object_holds_it.cpp)
+target_include_directories(dss_analysis_semantic_test_constant_read_as_the_object_holds_it
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # P32 lane A: [[D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT]] plus the SEMANTIC
 # half of [[D-CSUBSET-ATTRIBUTE-PARAM-POSITION]]. Every discard shape is pinned as
 # a PAIR -- a must-warn context beside a must-not-warn sibling -- because a

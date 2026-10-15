@@ -418,6 +418,57 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
     return NodeId{};
 }
 
+// ── A BIT-FIELD MEMBER IS READ AT ITS WIDTH ───────────────────────────────────────────
+// (cycle P69 round 1, lane `lm`.)
+//
+// A bit-field holds its initializer converted to the field: the declared type
+// RESTRICTED TO THE WIDTH (C 6.7.2.1p10) — the low `width` bits, sign-extended when the
+// declared type is signed. The constant-subobject arm converted to the declared type
+// and stopped: ✔MEASURED 2026-10-12 (pe64, both pipelines; clang 18 and AppleClang 21
+// fold C's value in every cell), `{ unsigned b : 3; } g = { .b = -1 }` read as
+// 4294967295 (7), `= { 9 }` as 9 (1), `int b : 3` given 7 as 7 (-1), `unsigned long
+// long b : 40` given -1 as 2^64-1 (2^40-1). The object itself holds the reduced value,
+// so the fold and the run-time read DISAGREED — and a condition folded so marks the
+// code after its statement as never reached: `if (g.b != 7) return 7; return 42;` over
+// the first of them died of an illegal instruction, in seven of the ten forms run.
+//
+// `atDeclaredType` holds the value already converted to the member's declared type
+// (`declared`), and the result keeps that type's core — the type the RUN-TIME read of
+// a bit-field has here, which is what a fold that decides reachability must agree
+// with. ⚠ That type is not C's for a field narrower than `int` (6.3.1.1p2 promotes it
+// to `int`): ✔MEASURED the same day, `v.b - 6 < 0` over a `volatile` 3-bit unsigned
+// field holding 5 runs FALSE here and true on gcc 13, clang 18, AppleClang 21 and
+// mingw-w64 gcc 13.2 — no constant, no fold. The promotion is the run-time read's
+// and this one's TOGETHER (`promoteBitIntOperand` over the width is the step here):
+// stated here alone it would fold `g.b - 6 < 0` true while the program computes it
+// false, the very disagreement this function removes.
+// A `_Bool` field's value is 0 or 1 at any width and is handed on as it stands.
+// Refused, as no constant: a field of a bit-precise or 128-bit type, a width the
+// declared type cannot hold, and a plain `char` field whose sign the caller was not
+// told — none of them a shape a reference was measured folding.
+[[nodiscard]] ConstEvalResult
+readThroughBitField(ConstEvalResult const& atDeclaredType, CstCastTarget const& declared,
+                    std::uint32_t width, NodeId expr) {
+    if (!atDeclaredType.value.has_value() || declared.isBool) return atDeclaredType;
+    if (!declared.isInteger || declared.intSignednessUnknown || declared.intBits > 64
+        || width == 0 || width > static_cast<std::uint32_t>(declared.intBits)) {
+        return fail(ConstEvalFailure::NotAConstantExpression, expr);
+    }
+    auto const bits = detail::asIntBits(*atDeclaredType.value);
+    if (!bits.has_value()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+    std::uint64_t const mask = width >= 64 ? ~std::uint64_t{0}
+                                           : ((std::uint64_t{1} << width) - 1);
+    std::uint64_t reduced = static_cast<std::uint64_t>(*bits) & mask;
+    if (declared.intSigned && ((reduced >> (width - 1)) & 1u) != 0) reduced |= ~mask;
+    HirLiteralValue atField = *atDeclaredType.value;   // the declared type's own core
+    if (std::holds_alternative<std::uint64_t>(atField.value)) {
+        atField.value = reduced;
+    } else {
+        atField.value = static_cast<std::int64_t>(reduced);
+    }
+    return ok(std::move(atField));
+}
+
 // ── A FOLDED VALUE CONVERTED TO A CLASSIFIED TARGET ──────────────────────────────
 // The cast arm's whole meaning, lifted out VERBATIM (P69, lane `cs`) so a second reader
 // applies the one conversion rather than a copy of it: a CONSTANT SUBOBJECT — a compound
@@ -1029,25 +1080,18 @@ evalNode(NodeId                              expr,
                                              resolved->initScopeOpaque, visitedInitNodes);
             visitedInitNodes.erase(resolved->initExpr.v);
             if (!inner.value.has_value()) inner.blamedNode = HirNodeId{expr.v};
-            // C4b (I1, D-CSUBSET-BITINT-CONSTFOLD-LARGE): a const `_BitInt(N)`
-            // symbol's value is its initializer CONVERTED to `_BitInt(N)` (C
-            // 6.7.9 / 6.3.1.3: mod-2^N wrap), not the raw initializer value —
-            // else `const _BitInt(4) k = 20wb; k` folds to 20 (the initializer's
-            // `_BitInt(6)` value) instead of `(_BitInt(4))20 == 4`. Mirrors the
-            // `(_BitInt(N))expr` cast-fold arm above (same `asBitIntValue` +
-            // `convertTo`). Only for a `_BitInt`-declared symbol; a standard
-            // declared type leaves the fold untouched — the pre-existing standard
-            // analog (`const char c=300; c` folds to 300 not 44) is tracked as
-            // `D-CSUBSET-CONST-REF-DECLARED-NARROWING`, out of this arc's scope.
-            if (resolved->declaredBitPrecise && inner.value.has_value()) {
-                if (auto bv = detail::asBitIntValue(*inner.value, options.charIsUnsigned)) {
-                    bv->convertTo(resolved->declaredBitPrecise->width,
-                                  resolved->declaredBitPrecise->isSigned);
-                    HirLiteralValue lv;
-                    lv.core  = TypeKind::BitInt;
-                    lv.value = std::move(*bv);
-                    inner.value = std::move(lv);
-                }
+            // ★ P69 (lane `lm`, [[D-CSUBSET-CONST-REF-DECLARED-NARROWING]]): A NAMED
+            // CONSTANT'S VALUE IS ITS INITIALIZER CONVERTED TO ITS DECLARED TYPE (C
+            // 6.7.9p11) — by the ONE conversion the cast uses, as a constant's member
+            // is read below. This arm converted for a `_BitInt` declared type alone
+            // (C4b: `const _BitInt(4) k = 20wb; k` is 4, not the initializer's 20) and
+            // handed every other symbol on at its initializer's type: `const unsigned
+            // char c = 300; c` folded to 300, `const unsigned u = 5; -u` to -5 (see
+            // `CstResolvedSymbol::declaredType` for the measurement). A wrong value
+            // here was a wrong static assertion, and — since a condition this folds
+            // can mark what follows a statement as never reached — deleted code.
+            if (resolved->declaredType.has_value() && inner.value.has_value()) {
+                return convertToCastTarget(inner, *resolved->declaredType, options, expr);
             }
             return inner;
         }
@@ -1218,11 +1262,17 @@ evalNode(NodeId                              expr,
                 ? env.resolveConstantSubobject(expr, currentScopeOpaque)
                 : std::nullopt;
         if (sub.has_value()) {
+            // A BIT-FIELD member is read at its width (`readThroughBitField`) — both
+            // returns below, so the one reader stays the one when it gains a step.
+            auto const asRead = [&](ConstEvalResult const& atType) -> ConstEvalResult {
+                if (!sub->bitFieldWidth.has_value() || !atType.value.has_value()) return atType;
+                return readThroughBitField(atType, sub->type, *sub->bitFieldWidth, expr);
+            };
             if (sub->zeroValue) {
                 HirLiteralValue zero;
                 zero.core  = TypeKind::I32;
                 zero.value = std::int64_t{0};
-                return convertToCastTarget(ok(std::move(zero)), sub->type, options, expr);
+                return asRead(convertToCastTarget(ok(std::move(zero)), sub->type, options, expr));
             }
             NodeId const init = sub->init.initExpr;
             if (!init.valid() || visitedInitNodes.contains(init.v)) {
@@ -1236,7 +1286,7 @@ evalNode(NodeId                              expr,
                 inner.blamedNode = HirNodeId{expr.v};
                 return inner;
             }
-            return convertToCastTarget(inner, sub->type, options, expr);
+            return asRead(convertToCastTarget(inner, sub->type, options, expr));
         }
         if (isCompoundLiteral) return fail(ConstEvalFailure::NotAConstantExpression, expr);
     }

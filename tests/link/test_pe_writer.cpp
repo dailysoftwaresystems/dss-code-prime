@@ -3572,8 +3572,10 @@ TEST(PeExecWriter, GuardingFunctionSavingVectorRegistersStatesEachSaveCode) {
 
     // (C) What stays refused. One function, one save rule the format has no
     // code for; the refusal names the register and says why.
+    // `savedBytes` is what the rule states was stored of the register (0: the
+    // rule states no width, as one read from a foreign object would not).
     auto refusalOn = [&](TargetSchema const& target, std::uint16_t ordinal,
-                         std::int64_t cfaRelative) {
+                         std::int64_t cfaRelative, std::uint32_t savedBytes = 0) {
         AssembledModule m;
         m.expectedFuncCount = 1;
         AssembledFunction fn;
@@ -3586,7 +3588,7 @@ TEST(PeExecWriter, GuardingFunctionSavingVectorRegistersStatesEachSaveCode) {
         cfi.ops = {
             CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{}, CfiRegRef{}, 0x28},
             CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(ordinal),
-                  CfiRegRef{}, cfaRelative},
+                  CfiRegRef{}, cfaRelative, savedBytes},
         };
         fn.cfi = std::move(cfi);
         m.functions.push_back(std::move(fn));
@@ -3630,6 +3632,32 @@ TEST(PeExecWriter, GuardingFunctionSavingVectorRegistersStatesEachSaveCode) {
     // DOES have a code for is not refused — the refusals above are of their
     // rules, not of the fixture.
     EXPECT_EQ(refusalOf(22, 0x10 - 0x28), std::string{});
+
+    // THE RULE'S OWN WIDTH. xmm6 is sixteen bytes; a rule stating that EIGHT of
+    // them were stored — what a convention preserving the low half of a vector
+    // register would hand this writer — is one neither code can say: both claim
+    // the whole register, and the unwinder would put back the upper half from
+    // whatever lies beside the slot. Refused, by name. The writer used to test
+    // the REGISTER's width alone, which is right only while the one shipped
+    // convention preserves all of it. Sixteen stated is the code's own claim,
+    // and none stated (the control above) says exactly what the code says.
+    std::string const halfStored = refusalOn(*loaded.target, 22, 0x10 - 0x28, 8);
+    EXPECT_NE(halfStored.find("save rule states that 8 byte(s) of xmm6 were stored"),
+              std::string::npos)
+        << halfStored;
+    EXPECT_NE(halfStored.find("only as the whole 16-byte register"), std::string::npos)
+        << halfStored;
+    EXPECT_EQ(refusalOn(*loaded.target, 22, 0x10 - 0x28, 16), std::string{});
+    // And a general register's save claims its eight bytes the same way.
+    {
+        auto const rbx = loaded.target->registerByName("rbx");
+        ASSERT_TRUE(rbx.has_value()) << "the shipped x86_64 target no longer names rbx";
+        std::string const halfAGeneral = refusalOn(*loaded.target, *rbx, 0x10 - 0x28, 4);
+        EXPECT_NE(halfAGeneral.find("save rule states that 4 byte(s) of rbx were stored"),
+                  std::string::npos)
+            << halfAGeneral;
+        EXPECT_EQ(refusalOn(*loaded.target, *rbx, 0x10 - 0x28, 8), std::string{});
+    }
 
     // The two refusals no x86_64 register can reach: a floating-point register
     // that is NOT sixteen bytes, and a sixteen-byte one whose hardware number

@@ -1033,6 +1033,12 @@ struct DSS_EXPORT LirCfiOp {
     //   the one-byte `ret` sits between them with the frame genuinely gone.
     LirBlockId   block{};
     bool         atBlockEnd = false;
+    // A saved register's rule only: how many BYTES of the register the store
+    // this rule is attached to wrote (`CfiOp::savedBytes` — the width the
+    // convention declares preserved, the whole register where it declares
+    // none). The materializer is the one tier that knows it: it chose the
+    // store's width.
+    std::uint32_t savedBytes = 0;
 };
 
 // One function's CFI production, plus the one boundary only the materializer

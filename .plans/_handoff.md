@@ -397,6 +397,28 @@ round's close; each checkpoint's commit message says what was and was not run on
   `windows-x86_64-debug` (MinGW gcc) and `windows-x86_64-release` (MSVC) 2774 of 2775, the one red the document
   census (one example more; rewritten here). **⚠ NOT a reading of this composition**: no leg has built
   checkpoint 18 and this fold together; the whole suite is read from the main checkout after this commit.
+- **Checkpoint 20 (2026-10-15) = DssHarness 0.6.14's tree layout only**: `dssharness init` keeps a tree's
+  mutation workers in `.mutations/` and a leg's own copy in `.legs/`, both ignored (a sweep is refused in a tree
+  that does not ignore them). ✔MEASURED from the main checkout at checkpoint 20, the first build of checkpoints 18
+  and 19 together: `macos-arm64-debug` (AppleClang 21) and `linux-arm64-debug` (GNU 13.3) PASSED, 2767 tests each.
+  The three local legs were not admitted (the host's memory stayed above the admission ceiling for the hour).
+- **Checkpoint 21 (2026-10-15) = the library lane's BRANCHING-FILTER fold — it FIXES known defect (4)**: a
+  bit-field member of a constant aggregate is read at its WIDTH (truncation and sign extension at the type the
+  run-time read has), a named constant is read at its DECLARED type (both resolvers convert through the cast's own
+  conversion), and an expression's VALUE loses the qualifiers and array/function types of the object it was read
+  from in both tiers (`valueConversion`, the statement expression and the comma alike) — ✔MEASURED on pe64, both
+  pipelines, images run here: every assertion of C's value holds (23 of 23), and the programs that died of an
+  illegal instruction now run (A: 8 of 10 run 42 and none dies — the two others are the promotion below and a
+  `_Bool` bit-field refused loudly; C: 13 of 13). With it: a `__try` filter holding a branch compiles (the filter is
+  a sub-graph of its own funclet) and the release compiler no longer aborts on a filter and handler naming one
+  global; a value only a handler reads no longer holds its register to the function's end (the filter stub is
+  sealed `unreachable`); the driver cases own their runtime cache (the ctest fixture is gone). 159 paths; the arm
+  registry merged by the tool BY ARM (581 arms). ✔MEASURED by the lane ON CHECKPOINT 13's BASE, the whole suite
+  unfiltered: `macos-arm64-debug` 2754 of 2754; `windows-x86_64-debug` (MinGW) and `windows-x86_64-release` (MSVC)
+  2778 of 2783, the five reds repository guards its base predates or this fold's own inventories (written at the
+  fold). Rows: 2 closed, 1 created born closed, 4 disclosed (two fix-folded, closing on their arms; two open for
+  the lane's next fold: the bit-field promotion (P0), a several-item statement expression as a constant).
+  **⚠ NOT a reading of this composition**: the fold lands on checkpoints 14–20.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -408,7 +430,7 @@ round's close; each checkpoint's commit message says what was and was not run on
   17 of 23 CORRECT programs die of an illegal instruction — a BIT-FIELD member of a constant aggregate is read as
   a constant without its width (7 of 10 forms; in this PR since checkpoint 1), and a NAMED constant is read at its
   initializer's type instead of its declared one (10 of 13; the reader is older, the code that acts on a folded
-  condition came with checkpoint 5). Both fixed in the library lane's fold now reading its finals;
+  condition came with checkpoint 5). FIXED by checkpoint 21;
   (5) found with them, the BASE's and silent: a bit-field narrower than `int` is NOT promoted (`if (v.b - 6 < 0)`
   over `unsigned b : 3` goes the wrong way at run time) — a P0 row with that fold, built first in its next one;
   (6) the BASE's, ✔MEASURED 2026-10-12 by the C front end lane, three references exiting 42 (gcc, clang,

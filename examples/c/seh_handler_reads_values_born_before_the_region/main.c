@@ -285,27 +285,50 @@ static int double_across_a_call_before_the_region(void *p, double keep) {
  * each read is a value of its own that nothing can recompute after a call. */
 static volatile double theirs = 1000.0;
 
+/* TEN reads of `theirs`, every one a value that must still be there AFTER
+ * `call` returns: each is the left operand of a comparison whose right operand
+ * holds the call, so it is read before the call is made and compared after it.
+ * Ten is the number of vector registers a call preserves under this convention
+ * (xmm6..xmm15). None of the ten is a named object: a named `double` is memory
+ * unless an optimizer promotes it, so in the baseline build it would occupy no
+ * register at all.
+ *
+ * COMPARED, NEVER ADDED. An addition is an instruction of three vector
+ * operands, and DSS holds one vector register back, in a function that has
+ * such an instruction, for reloading values it spilled: under this convention
+ * the last register a call preserves - the one a caller with a single `double`
+ * is given. MEASURED 2026-10-12 on the images of both pipelines: written as a
+ * sum, the three callees below saved xmm6..xmm14 and never touched xmm15,
+ * where each of their callers keeps the `double` its handler reads - cases 29,
+ * 31 and 32 would have answered 42 whatever a callee's unwind information
+ * said. A comparison has two vector operands; written so, each callee saves
+ * all ten, and `program/test_guarded_region_examples_on_every_host` holds the
+ * image to that on every host. */
+#define TEN_OF_THEIRS_ACROSS(call)                                             \
+    (theirs < (double)(theirs < (double)(theirs < (double)(theirs <            \
+     (double)(theirs < (double)(theirs < (double)(theirs < (double)(theirs <   \
+      (double)(theirs < (double)(theirs < (call)))))))))))
+
 /* Guards nothing. It keeps THIRTEEN doubles across a call — three that arrive
  * in registers, ten read from `theirs` — which is more than the ten vector
- * registers a call preserves under this convention, and it only ever CONVERTS
- * them, so it needs no vector register for anything else. Whichever of those
- * registers its caller chose for a `double` of its own, this function saved it
- * and overwrote it before it faults: the caller's handler reads its `double`
- * right only if the system's unwinder put it back, and the unwinder knows where
- * from only by this function's unwind information.
+ * registers a call preserves under this convention, and it only ever COMPARES
+ * and CONVERTS them, so it holds none of those registers back: it saves all ten
+ * and overwrites them (MEASURED 2026-10-12, both pipelines). Whichever of them
+ * its caller chose for a `double` of its own, this function saved it and
+ * overwrote it before it faults: the caller's handler reads its `double` right
+ * only if the system's unwinder put it back, and the unwinder knows where from
+ * only by this function's unwind information.
  *
- * ★ THIRTEEN, NOT ONE. A callee that kept a single `double` was given a
- * different register from the one its caller's handler read, and answered 42
- * whatever its unwind information said (✔MEASURED 2026-10-10: with that
- * callee's code for its saved register renamed IN THE IMAGE the program still
- * exited 42; with this callee's, it exits with this case's number). */
+ * ★ THIRTEEN, NOT ONE - AND WHICH REGISTERS, NOT HOW MANY. A callee that kept
+ * a single `double` was given a different register from the one its caller's
+ * handler read, and answered 42 whatever its unwind information said
+ * (✔MEASURED 2026-10-10: with that callee's code for its saved register
+ * renamed IN THE IMAGE the program still exited 42). A callee that kept
+ * thirteen and saved nine did no better: the one register it left alone was
+ * its caller's. */
 static int callee_that_saves_and_faults(void *p, double a, double b, double c) {
-    double d0 = theirs, d1 = theirs, d2 = theirs, d3 = theirs, d4 = theirs;
-    double d5 = theirs, d6 = theirs, d7 = theirs, d8 = theirs, d9 = theirs;
-    int r = (int)half_through(8.0);
+    int r = TEN_OF_THEIRS_ACROSS(half_through(8.0));
     r += (int)a + (int)b + (int)c;
-    r += (int)d0 + (int)d1 + (int)d2 + (int)d3 + (int)d4;
-    r += (int)d5 + (int)d6 + (int)d7 + (int)d8 + (int)d9;
     return r + *(volatile int *)p;
 }
 
@@ -345,12 +368,8 @@ static double (*volatile sum_of_five_through)(double, int, int, int, int) = sum_
  * vector register's slot at a multiple of 16, so the save area now begins at
  * the next one. */
 static int callee_with_a_stack_argument(void *p, double a, double b, double c) {
-    double d0 = theirs, d1 = theirs, d2 = theirs, d3 = theirs, d4 = theirs;
-    double d5 = theirs, d6 = theirs, d7 = theirs, d8 = theirs, d9 = theirs;
-    int r = (int)sum_of_five_through(1.0, 2, 3, 4, 5);
+    int r = TEN_OF_THEIRS_ACROSS(sum_of_five_through(1.0, 2, 3, 4, 5));
     r += (int)a + (int)b + (int)c;
-    r += (int)d0 + (int)d1 + (int)d2 + (int)d3 + (int)d4;
-    r += (int)d5 + (int)d6 + (int)d7 + (int)d8 + (int)d9;
     return r + *(volatile int *)p;
 }
 
@@ -375,12 +394,8 @@ static int unwound_through_an_odd_frame(void *p, double keep) {
 static int guarding_callee_that_declines(void *p, double a, double b, double c) {
     int r = 0;
     __try {
-        double d0 = theirs, d1 = theirs, d2 = theirs, d3 = theirs, d4 = theirs;
-        double d5 = theirs, d6 = theirs, d7 = theirs, d8 = theirs, d9 = theirs;
-        r = (int)half_through(8.0);
+        r = TEN_OF_THEIRS_ACROSS(half_through(8.0));
         r += (int)a + (int)b + (int)c;
-        r += (int)d0 + (int)d1 + (int)d2 + (int)d3 + (int)d4;
-        r += (int)d5 + (int)d6 + (int)d7 + (int)d8 + (int)d9;
         r += *(volatile int *)p;
     } __except (GetExceptionCode() == EXCEPTION_INT_DIVIDE_BY_ZERO) {
         r = 7;

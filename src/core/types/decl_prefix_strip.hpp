@@ -6,7 +6,10 @@
 #include "core/types/tree.hpp"
 #include "core/types/tree_node.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <span>
 #include <vector>
@@ -399,7 +402,7 @@ arraySuffixHasModifier(Tree const& tree, NodeId suffix,
     return false;
 }
 
-// ── WHAT A WRAPPER IS — the ONE statement every initializer descent takes its steps by ──
+// ── WHAT A WRAPPER IS — the ONE statement an initializer descent takes its steps by ─────
 // (cycle P69 round 1, lane `lm`.)
 //
 // A node is a WRAPPER when it is nothing but grouping: it has exactly one non-token child
@@ -444,8 +447,17 @@ arraySuffixHasModifier(Tree const& tree, NodeId suffix,
 // shared declaration descents; it is `core`, so neither tier reaches upward for it.
 //
 // A count is not a decision — a construct with ONE operand is the commonest kind there
-// is. A construct the grammar gains is named HERE, or it is a wrapper to every descent of
-// both tiers at once: that is the reason there is one of these.
+// is. A construct the grammar gains is named HERE, or it is a wrapper to every descent
+// that reads this: that is the reason there is one of these.
+//
+// ⚠ NOT EVERY DESCENT READS IT YET, and this comment said every one did. Six still take
+// their steps by a list or a count of their own: `wrapperChild` and the wrapper tail of
+// `evalNode` (`hir/cst_const_eval.cpp` — its dispatch list is a second statement, which is
+// why a mutant taking the statement expression out of THIS one changed no constant: the
+// evaluator peels a one-expression body by its child count); `peelBuiltinOperand` and the
+// search of `completeIncompleteArrayFromInit` (`semantic_analyzer.cpp`); `peelToCore` and
+// `peelToDesignatorLeaf` (`hir/lowering/cst_to_hir.cpp`). Each either reads this or says
+// why it must not; until then "one statement" is true of the descents named above it.
 //
 // THE RULE IDS: each construct is read from ONE key of the language document — the
 // operators, the `sizeof` / `_Alignof` alternatives, the selection, label-address and
@@ -485,6 +497,110 @@ nodeSaysSomethingItself(SemanticConfig const& cfg, HirLoweringConfig const& hirC
     for (auto const& row : cfg.compoundLiteralRules)
         if (row.rule.valid() && row.rule.v == r) return true;
     return false;
+}
+
+// ── WHAT A STATEMENT EXPRESSION IS THE VALUE OF ─────────────────────────────────────────
+// (cycle P69 round 1, lane `lm`.)
+//
+// A statement expression says something itself — the statement above names it — and for
+// a question of FORM that is the whole answer: a string literal inside one is not "the
+// string that initializes the array". ✔MEASURED 2026-10-12, `char k[] = { ({ "abc"; }) };`
+// is an array of ONE element where a reference builds it (gcc 13 and mingw-w64 gcc 13.2)
+// and a refused program elsewhere (clang 18, AppleClang 21); a string-initialized array
+// of four on none. A descent that asks what an initializer IS stops at the node.
+//
+// A question of VALUE — "is this the null pointer constant", "which constant object is
+// this the value of" — is not answered by the node. `({ e; })` of ONE expression has the
+// value of `e`: nothing is declared, changed or discarded on the way to it. The
+// references read through it: ✔MEASURED the same day, `constexpr int *p = ({ (int *)0;
+// });` is accepted by gcc 13, mingw-w64 gcc 13.2 and AppleClang 21, and
+// `_Static_assert(({ h; }).b == 9, "")` over a constant structure `h` by clang 18 and
+// AppleClang 21. Stopping such a question at the node refused both. A descent that asks
+// one takes the step below where the statement stops it — and ONLY such a descent.
+//
+// `statementExpressionBody` reads the construct as the lowering does (`stmtExprItems`,
+// `hir/lowering/cst_to_hir.cpp`): its items are its children that are not tokens, and
+// its value is the expression of the LAST item when that item is an expression
+// statement — the item peeled through its single-child carriers to the first rule with
+// a HIR mapping, which must be the kind `ExprStmt`; the expression is that node's first
+// child that is not a token. A body ending in anything else has no value (`void`).
+//
+// ★ ONE ITEM, AND IT IS SAID IN ONE PLACE. `soleExpressionOfStatementExpression` is the
+// step, and it steps only through a body of exactly one item. A body of several
+// (`({ 1; -5; })`, which clang 18 and AppleClang 21 fold and gcc does not) is read as a
+// constant by widening THIS function — to the last item, when every earlier one is
+// inert — and nowhere else.
+struct StatementExpressionBody {
+    NodeId      value{};     // the last item's expression; invalid when the body has no value
+    std::size_t items = 0;   // how many items the body holds
+};
+
+[[nodiscard]] inline StatementExpressionBody
+statementExpressionBody(HirLoweringConfig const& hirCfg, Tree const& tree, NodeId n) {
+    StatementExpressionBody out;
+    if (!n.valid() || tree.kind(n) != NodeKind::Internal || !hirCfg.stmtExprRule.valid()
+        || tree.rule(n).v != hirCfg.stmtExprRule.v) {
+        return out;
+    }
+    NodeId last{};
+    for (NodeId c : decl_prefix_detail::visibleChildren(tree, n)) {
+        if (tree.kind(c) == NodeKind::Token) continue;   // ( { } )
+        ++out.items;
+        last = c;
+    }
+    auto const mappingOf = [&](NodeId x) -> HirRuleMapping const* {
+        std::uint32_t const r = tree.rule(x).v;
+        for (HirRuleMapping const& m : hirCfg.ruleMappings)
+            if (m.rule.v == r) return &m;
+        return nullptr;
+    };
+    // The item's core: down its single-child carriers, stopping where the lowering stops —
+    // at a token, at an expression node, at the first rule with a HIR mapping. Every step
+    // is to a strict descendant, so the tree's node count bounds the walk; a walk past it
+    // is a cyclic node graph, never the program's fault, and stops the process.
+    NodeId core = last;
+    std::size_t const bound = tree.nodeCount() + 1;
+    for (std::size_t guard = 0; core.valid() && tree.kind(core) == NodeKind::Internal; ++guard) {
+        if (guard > bound) {
+            std::fprintf(stderr, "dss fatal: the statement expression's item peel took more "
+                                 "steps than its tree has nodes — the node graph is cyclic\n");
+            std::abort();
+        }
+        std::uint32_t const r = tree.rule(core).v;
+        if (r == hirCfg.binaryExprRule.v || r == hirCfg.unaryExprRule.v
+            || r == hirCfg.postfixExprRule.v || r == hirCfg.operandRule.v
+            || (hirCfg.ternaryExprRule.valid() && r == hirCfg.ternaryExprRule.v)
+            || mappingOf(core) != nullptr) {
+            break;
+        }
+        NodeId sole{};
+        bool   many = false;
+        for (NodeId c : decl_prefix_detail::visibleChildren(tree, core)) {
+            if (tree.kind(c) == NodeKind::Token) continue;
+            if (sole.valid()) { many = true; break; }
+            sole = c;
+        }
+        if (many || !sole.valid()) break;
+        core = sole;
+    }
+    if (!core.valid() || tree.kind(core) != NodeKind::Internal) return out;
+    HirRuleMapping const* const m = mappingOf(core);
+    if (m == nullptr || m->hirKind != "ExprStmt") return out;
+    for (NodeId c : decl_prefix_detail::visibleChildren(tree, core)) {
+        if (tree.kind(c) == NodeKind::Token) continue;
+        out.value = c;
+        break;
+    }
+    return out;
+}
+
+// THE STEP of a VALUE question: the expression `n` is the value of, when `n` is a
+// statement expression of exactly ONE item and that item is an expression statement;
+// else an invalid node.
+[[nodiscard]] inline NodeId
+soleExpressionOfStatementExpression(HirLoweringConfig const& hirCfg, Tree const& tree, NodeId n) {
+    StatementExpressionBody const body = statementExpressionBody(hirCfg, tree, n);
+    return body.items == 1 ? body.value : NodeId{};
 }
 
 } // namespace dss

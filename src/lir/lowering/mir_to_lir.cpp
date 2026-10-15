@@ -15021,17 +15021,29 @@ struct Lowerer {
     // (the real filter logic was extracted into a funclet by synthesizeSehFunclets;
     // the parent's filter block is a `[Const; SehFilterReturn]` stub reached only by
     // the CFG-fiction edge and never executed at runtime — the guarded body branches
-    // over it). It emits NO runtime dispatch; we seal the block with a branch to its
-    // (fiction) handler successor so the LIR CFG mirrors the MIR CFG (handlerBB keeps
-    // a predecessor). Dead at runtime; the OS resumes at handlerBB via the scope
-    // table's JumpTarget. Returns true (sealed).
+    // over it). It emits NO runtime dispatch; the OS resumes at handlerBB via the
+    // scope table's JumpTarget.
+    //
+    // ★★★ THE STUB LEADS NOWHERE IN THE LIR. Control never goes from this block
+    // to the handler: the handler's way in is the unwinder's, from any instruction
+    // of the guarded run, and liveness reads THAT off the guarded runs it is
+    // handed (`LirGuardedRegion`). This block used to be sealed with `jmp handler`
+    // "so the handler keeps a predecessor" — and nothing branches to the stub, so
+    // the block order appends it LAST, and whatever is live into the handler was
+    // live out of a block at the function's end: every value a handler reads held
+    // its register across everything laid out after the handler. ✔MEASURED
+    // 2026-10-12 on pe64, both pipelines: a function whose handler reads a
+    // parameter and which then adds two call results saved FOUR non-volatile
+    // registers in a 120-byte frame, where the same function with a handler that
+    // reads nothing saved three in 104. So the stub is sealed as what it is — a
+    // block control does not leave.
     bool lowerSehFilterReturn(MirInstId id, std::span<MirBlockId const> succs) {
         if (succs.size() != 1) {
             reportMalformed(MirOpcode::SehFilterReturn, id, std::format("{} successor(s)", succs.size()), "exactly 1 successor(s)");
             return false;
         }
-        if (!opcode(MnemonicSlot::Jmp).has_value()) {
-            reportMissingOpcode(MnemonicSlot::Jmp, "MIR SehFilterReturn");
+        if (!opcode(MnemonicSlot::Unreachable).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Unreachable, "MIR SehFilterReturn");
             return false;
         }
         if (!mirBlockToLirBlock.has(succs[0])) {
@@ -15040,9 +15052,7 @@ struct Lowerer {
                 "never created — the CFG it names is not this function's");
             return false;
         }
-        // `lirSucc` for uniformity; an identity here (one successor — nothing to
-        // split, see `lowerTerminator`).
-        emitBr(*opcode(MnemonicSlot::Jmp), lirSucc(succs[0]));
+        emitUnreachable(*opcode(MnemonicSlot::Unreachable));
         return true;
     }
 
@@ -16807,6 +16817,13 @@ struct Lowerer {
 };
 
 } // namespace
+
+// The two rows of the slot table `lowerSehTryBegin` and `lowerSehFilterReturn`
+// ask the target for, in that order — see the header.
+std::array<std::string_view, 2> guardedRegionSealMnemonics() noexcept {
+    return {kMnemonicRows[static_cast<std::size_t>(MnemonicSlot::Jmp)].mnemonic,
+            kMnemonicRows[static_cast<std::size_t>(MnemonicSlot::Unreachable)].mnemonic};
+}
 
 MirToLirResult lowerToLir(Mir const&          mir,
                           TargetSchema const& target,

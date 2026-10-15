@@ -23954,16 +23954,39 @@ TEST(SemanticAnalyzerC, AConstantAggregatesMemberIsReadWithItsInitializersOperat
             {std::string{types} + src + "int main(void){ return 0; }\n"});
         EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u) << src;
     }
-    // A statement expression is not walked into for the member's value either: the
-    // operand of its last expression's operator was read (`({ -5; })` as 5), and this
-    // assertion passed in silence.
+    // THROUGH A STATEMENT EXPRESSION OF ONE EXPRESSION THE VALUE IS THAT EXPRESSION'S,
+    // operator and all. The descent once walked into the body AND through the operator
+    // of its last expression (`({ -5; })` was read as 5, and `a.b == 5` passed in
+    // silence). ✔MEASURED 2026-10-12: clang 18 and AppleClang 21 fold each line below
+    // (gcc 13 and mingw-w64 gcc 13.2 refuse them as no constant — one working
+    // reference makes a form required). Which constant object an expression is the
+    // value of is a question of VALUE, so the base of a member access and an
+    // aggregate initialized whole are read through the construct too
+    // (`soleExpressionOfStatementExpression`); stopped at it, the last three
+    // assertions were refused as no integer constant expression.
     auto viaStatement = analyzeWithLayout({std::string{types} +
+        "struct W { struct S in; int n; };\n"
+        "int main(void){\n"
+        "    const struct S a = {.b = ({ -5; })};\n"
+        "    _Static_assert(a.b == -5, \"the member's value through a statement expression\");\n"
+        "    _Static_assert(({ h; }).b == 9, \"the base through a statement expression\");\n"
+        "    const struct S g = ({ h; });\n"
+        "    _Static_assert(g.b == 9, \"an object initialized whole through a statement expression\");\n"
+        "    const struct W w = { ({ h; }), 2 };\n"
+        "    _Static_assert(w.in.b == 9 && w.n == 2, \"a member initialized whole through a statement expression\");\n"
+        "    return 0;\n"
+        "}\n"});
+    EXPECT_EQ(countCode(viaStatement.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(viaStatement, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(viaStatement.hasErrors());
+    // …and the assertion written WRONG fails, by this code.
+    auto wrongViaStatement = analyzeWithLayout({std::string{types} +
         "int main(void){\n"
         "    const struct S a = {.b = ({ -5; })};\n"
         "    _Static_assert(a.b == 5, \"m\");\n"
         "    return 0;\n"
         "}\n"});
-    EXPECT_TRUE(viaStatement.hasErrors())
+    EXPECT_EQ(countCode(wrongViaStatement.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u)
         << "the operand under a statement expression's operator is not the member's value";
 }
 
@@ -23995,7 +24018,19 @@ TEST(SemanticAnalyzerC, AConstexprInitializerIsJudgedWholeNotByItsOperand) {
         "constexpr struct W w2 = { (*(&s1)), 3 };\n"
         "constexpr struct S s2 = *&s1;\n"
         "_Static_assert(w1.in.b == 1 && w1.n == 2 && w2.in.b == 1 && w2.n == 3 && s2.b == 1, \"\");\n"
-        "int main(void){ return 0; }\n",
+        // A statement expression of ONE expression has that expression's value, and
+        // "is this the null pointer constant" is a question of value: the test reads
+        // through the construct (`soleExpressionOfStatementExpression`). ✔MEASURED
+        // 2026-10-12: gcc 13, mingw-w64 gcc 13.2 and AppleClang 21 accept each line
+        // (clang 18 refuses them). Stopped at the construct — as a question of FORM
+        // must be — the first two were refused, while the third, which goes another
+        // way, was accepted all along.
+        "int main(void){\n"
+        "    constexpr int *e1 = ({ (int *)0; });\n"
+        "    constexpr int *e2 = (({ (int *)0; }));\n"
+        "    constexpr struct P e3 = { ({ (int *)0; }) };\n"
+        "    return e1 != 0 || e2 != 0 || e3.p != 0;\n"
+        "}\n",
     });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstexprNonConstantInitializer), 0u)
         << firstActualForCode(model, DiagnosticCode::S_ConstexprNonConstantInitializer);
@@ -24041,6 +24076,17 @@ TEST(SemanticAnalyzerC, ABraceIsAStringInitializerOnlyWhenItsElementIsTheLiteral
         "    char s3[] = { *\"abc\" };\n"
         "    char s4[] = { *\"abc\", 'z' };\n"
         "    _Static_assert(sizeof s2 == 2 && sizeof s3 == 1 && sizeof s4 == 2, \"an operator's result is an element\");\n"
+        // A STATEMENT EXPRESSION SAYS SOMETHING ITSELF, and for this question — what
+        // the element IS — that is the whole answer: the string inside it is not the
+        // string that initializes the array. ✔MEASURED 2026-10-12: gcc 13 and
+        // mingw-w64 gcc 13.2 build these as arrays of one and of two elements (the
+        // construct's value is a pointer, converted to the element); clang 18 and
+        // AppleClang 21 refuse the conversion. An array of four, on none. Walked
+        // through, both tiers' brace peel reached the literal and sized `e1` as the
+        // string.
+        "    char e1[] = { ({ \"abc\"; }) };\n"
+        "    char e2[] = { ({ \"abc\"; }), 9 };\n"
+        "    _Static_assert(sizeof e1 == 1 && sizeof e2 == 2, \"a statement expression is an element, not the string\");\n"
         "    return 0;\n"
         "}\n",
     });

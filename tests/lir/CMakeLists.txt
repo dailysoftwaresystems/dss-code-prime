@@ -11,6 +11,21 @@ dss_add_test(NAME lir/test_lir_regalloc  SOURCES test_lir_regalloc.cpp)
 # exclusion-union growth pins mutate idiv_op/shl implicitRegisters via
 # mutate_target_schema.hpp.
 target_link_libraries(dss_lir_test_lir_regalloc PRIVATE nlohmann_json::nlohmann_json)
+# D-LIR-NO-EXCEPTIONAL-EDGE-INTO-A-TRY-HANDLER (P69, lane `lm`): the landing rule
+# with the allocator's own abort CONTAINED. The allocator's audit kills the process
+# when a value a landing block reads would be lost; the cases above run in-process,
+# so a mutation of the rule kills their binary before it can name a case. Here the
+# allocation runs in a child the case requires to leave with 0. The probe is the one
+# test_lir_regalloc reads (landing_probe.hpp).
+dss_add_test(NAME lir/test_landing_rule_contains_the_audit
+             SOURCES test_landing_rule_contains_the_audit.cpp)
+# THE BLOCK LEFT WHERE A `__try` FILTER STOOD LEADS NOWHERE (P69, lane `lm`): the
+# stub in the function that holds a `__try` was sealed with a jump to the handler,
+# and what a handler reads then held its register to the function's end. The
+# lowering seals it with the target's block-with-no-way-out terminator; this pins
+# the lowering and what liveness then says of the stub and the handler.
+dss_add_test(NAME lir/test_filter_stub_is_not_a_way_into_the_handler
+             SOURCES test_filter_stub_is_not_a_way_into_the_handler.cpp)
 dss_add_test(NAME lir/test_lir_rewrite   SOURCES test_lir_rewrite.cpp)
 # D-LIR-PER-INST-REG-CONSTRAINTS: the module side-structure
 # carry-across (both pools, all four rebuild passes) and the verifier rules

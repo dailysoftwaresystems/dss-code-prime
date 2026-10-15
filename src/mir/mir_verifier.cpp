@@ -15,6 +15,7 @@
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"  // deriveStructCfMarkers + structCfMarkerName
 #include "mir/mir_symbols_named.hpp"   // checkSymbolIdsBelowTheStatedEnd's one list
+#include "mir/seh_filter_region.hpp"   // readSehFilterRegion (what a `__try` filter is)
 
 #include <algorithm>
 #include <cstddef>
@@ -734,28 +735,29 @@ void MirVerifier::checkSehStructure(DiagnosticReporter& reporter) const {
                         region, filterBB.v, predCount(filterBB)));
                 continue;
             }
-            std::uint32_t const fn2 = mir_.blockInstCount(filterBB);
-            MirInstId const fterm = fn2 > 0
-                ? mir_.blockInstAt(filterBB, fn2 - 1) : MirInstId{};
-            if (!fterm.valid()
-                || mir_.instOpcode(fterm) != MirOpcode::SehFilterReturn) {
+            // ★ THE FILTER IS A SUB-GRAPH, NOT ONE BLOCK. `&&`, the logical OR
+            // and `?:` evaluate an operand on one path only, so a filter written
+            // with any of them is a diamond joined by a `Phi`. What this check
+            // holds the filter to is ONE WAY IN AND ONE WAY OUT, and the
+            // statement of that shape is `readSehFilterRegion`'s — the pass that
+            // makes a function of the filter reads the same one, so the two
+            // cannot come to disagree about which blocks a filter is. (Until it
+            // existed this arm said "the block `SehTryBegin` names ends in
+            // `SehFilterReturn`", and every filter with a second condition was
+            // refused here, by a block number.)
+            SehFilterRegion const filter =
+                readSehFilterRegion(mir_, preds, filterBB, region);
+            if (!filter.ok()) {
                 reportInst(reporter, DiagnosticCode::I_SehStructure, term,
-                    std::format("SEH region {}: filter block #{} must terminate "
-                                "in SehFilterReturn", region, filterBB.v));
+                           filter.problem);
                 continue;
             }
-            if (mir_.instPayload(fterm) != region) {
-                reportInst(reporter, DiagnosticCode::I_SehStructure, fterm,
-                    std::format("SehFilterReturn payload {} does not match its "
-                                "SehTryBegin region {}",
-                        mir_.instPayload(fterm), region));
-            }
-            auto const fsuccs = mir_.blockSuccessors(filterBB);
-            if (fsuccs.size() == 1 && predCount(fsuccs[0]) != 1) {
-                reportInst(reporter, DiagnosticCode::I_SehStructure, fterm,
+            if (predCount(filter.handler) != 1) {
+                reportInst(reporter, DiagnosticCode::I_SehStructure,
+                    mir_.blockTerminator(filter.exit),
                     std::format("SEH region {}: handler block #{} must have "
                                 "exactly one predecessor (its filter), found {}",
-                        region, fsuccs[0].v, predCount(fsuccs[0])));
+                        region, filter.handler.v, predCount(filter.handler)));
             }
         }
         // SehTryEnd pairing + intrinsic containment (per function).

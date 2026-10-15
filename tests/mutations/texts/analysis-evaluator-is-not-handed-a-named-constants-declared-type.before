@@ -1,0 +1,2 @@
+        out.declaredType =
+            classifyCstCastTarget(s.lattice.interner(), rec.type, s.charIsUnsigned);

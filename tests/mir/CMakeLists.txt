@@ -25,6 +25,24 @@ dss_add_test(NAME mir/test_mir_lowering_extern SOURCES test_mir_lowering_extern.
 # Cycle 25 Stage B — cross-module MIR merge (mergeCuMirs) tested in isolation.
 dss_add_test(NAME mir/test_mir_merge SOURCES test_mir_merge.cpp)
 
+# A `__try` FILTER WHOSE EXPRESSION HAS A BRANCH (P69, lane `lm`): `&&`, `||` and
+# `?:` make a filter a diamond of blocks joined by a Phi. The one statement of what
+# a filter is (mir/seh_filter_region.hpp — one way in, one way out), the verifier
+# that holds a module to it, and the pass that copies the whole sub-graph into the
+# funclet and leaves the parent one stub. A binary of its own: the verifier's and
+# the merge tier's binaries are each the claim runner of many mutation arms.
+dss_add_test(NAME mir/test_seh_filter_with_a_branch
+             SOURCES test_seh_filter_with_a_branch.cpp)
+
+# A HANDLER THAT NAMES A VALUE ITS FILTER COMPUTED (P69, lane `lm`): the filter's
+# entry dominates the handler, so a pass that reuses a dominating computation gives
+# the handler the filter's — whose instructions are the funclet's. The parent
+# computes such a value again at the handler's head, or the pass refuses by name.
+# A binary of its own, and every case runs the pass in a CHILD first: the failure
+# it pins was an abort of the compiler, which an in-process case cannot report.
+dss_add_test(NAME mir/test_seh_handler_takes_a_filter_value
+             SOURCES test_seh_handler_takes_a_filter_value.cpp)
+
 # OPT11 (plan 22 §0.2) — the cross-CU SUMMARY INDEX that replaces the monolithic
 # whole-program merge above. TWO binaries, because they test opposite sides of
 # one contract and must be able to fail independently: the first pins that MIR

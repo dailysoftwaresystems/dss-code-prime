@@ -11,10 +11,12 @@
 #include "mir/merge/synth_seh_funclets.hpp"   // MirSehScope (c116 D-WIN64-SEH-FUNCLETS)
 #include "mir/mir.hpp"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -282,6 +284,21 @@ struct DSS_EXPORT DefinedSymbolName {
     SymbolId    symbol{};
     std::string name;   // the on-binary spelling; never empty
 };
+
+// THE TARGET MNEMONICS A GUARDED REGION'S OWN BLOCKS ARE SEALED WITH. A `__try`
+// adds two terminators to its function that are the region's and not the
+// source's: the opener, lowered to a jump into the guarded body, and the one
+// block left where the filter stood, which control never leaves and which is
+// lowered to the target's `unreachable`-kind terminator. A target that states
+// one of them not cannot lower a guarded region at all.
+//
+// The names are rows of the lowering's own slot table and are HANDED OUT, not
+// repeated: the (target, format) pairing check asks for them, so a target
+// document paired with a format that declares a handler routine is refused
+// where the pair is read, by the opcode's name, and not at somebody's first
+// `__try`.
+[[nodiscard]] DSS_EXPORT std::array<std::string_view, 2>
+guardedRegionSealMnemonics() noexcept;
 
 // Lower the frozen `mir` module to LIR, dispatched against `target`.
 // Diagnostics are emitted into `reporter`; unsupported opcodes produce

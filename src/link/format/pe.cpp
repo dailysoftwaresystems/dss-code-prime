@@ -592,9 +592,11 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                 // translates — "register X is at CFA+K" — is the frame
                 // producer's, whose store is as wide as the convention declares
                 // the register preserved (`calleeSavedPreservedBits`; silence
-                // means all of it, which is what `ms_x64` says). A register of
-                // any other class or width has no code at all, and is refused
-                // by name rather than described as something it is not.
+                // means all of it, which is what `ms_x64` says), and the rule
+                // carries that width (`savedBytes`, held to the claim below). A
+                // register of any other class or width has no code at all, and
+                // is refused by name rather than described as something it is
+                // not.
                 if (ri->regClass != TargetRegClass::FPR
                     || ri->widthBytes != kUwopVectorSaveBytes) {
                     return fail("save rule names " + ri->name + " (class '"
@@ -603,6 +605,29 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                                 + " bytes); Win64 UNWIND_INFO can say where a "
                                   "general register or a whole 16-byte vector "
                                   "register was saved, and nothing else");
+                }
+                // ★ AND HOW MUCH OF IT WAS STORED IS READ FROM THE RULE, NOT
+                // TAKEN FROM THE REGISTER. The test above is of the register's
+                // width; what the prologue stored is the CONVENTION's width
+                // (`CfiOp::savedBytes`: what `calleeSavedPreservedBits`
+                // declares, the whole register where it declares nothing). The
+                // shipped `ms_x64` declares nothing, so the two agree today —
+                // and a writer driven by configuration must not be right only
+                // for today's document: under a convention that preserved the
+                // low half, either code would tell the unwinder that sixteen
+                // bytes stand at a slot holding eight, and it would put back
+                // the register's upper half from whatever lies beside the
+                // slot. The format has no code for a partial save, so that
+                // rule is refused by name. A rule stating no width (0: one
+                // read back from a foreign object's unwind data, or written in
+                // assembly text) says exactly what the code says.
+                if (op.savedBytes != 0u && op.savedBytes != kUwopVectorSaveBytes) {
+                    return fail("save rule states that "
+                                + std::to_string(op.savedBytes) + " byte(s) of "
+                                + ri->name + " were stored; Win64 UNWIND_INFO "
+                                  "states a vector register's save only as the "
+                                  "whole 16-byte register, so a convention that "
+                                  "preserves part of one cannot be described");
                 }
                 if (ri->hwEncoding > 0x0Fu) {
                     return fail("saved vector register " + ri->name
@@ -641,6 +666,15 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                         2u});
                 }
                 break;
+            }
+            // The same claim for a general register: UWOP_SAVE_NONVOL says the
+            // 8-byte register is at the slot, all of it.
+            if (op.savedBytes != 0u && op.savedBytes != 8u) {
+                return fail("save rule states that "
+                            + std::to_string(op.savedBytes) + " byte(s) of "
+                            + ri->name + " were stored; Win64 UNWIND_INFO "
+                              "states a general register's save only as the "
+                              "whole 8-byte register");
             }
             if (slotFromSp < 0 || slotFromSp % 8 != 0) {
                 return fail("saved-reg slot " + std::to_string(slotFromSp)

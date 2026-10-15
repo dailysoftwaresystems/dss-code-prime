@@ -60,50 +60,8 @@ class Tree;
 struct IntegerLiteralTypingRule;
 struct FloatLiteralTypingRule;   // FC17.9(e): the float ladder rules span
 
-// Resolved-symbol record returned by the resolver. The engine
-// recurses into `initExpr` and threads `initScopeOpaque` as the
-// current scope context for any further identifier lookups inside
-// that subtree. The opaque-scope handle is meaningful only to the
-// resolver — the engine treats it as a uint32_t cookie carried
-// through recursion.
-// C4b (I1): a resolved const symbol's DECLARED `_BitInt(width, isSigned)`, when
-// it is a bit-precise type. The engine converts the folded initializer TO this.
-struct CstBitPreciseDeclType { std::uint32_t width; bool isSigned; };
-
-struct CstResolvedSymbol {
-    NodeId        initExpr{};
-    std::uint32_t initScopeOpaque = 0;
-    // C4b (I1): when the const symbol's DECLARED type is `_BitInt(N)`, its
-    // (width, isSigned). A const object's value is its initializer CONVERTED to
-    // the object's declared type (C 6.7.9 / 6.3.1.3), so the engine applies
-    // `convertTo(width, isSigned)` to the folded initializer. Without it
-    // `const _BitInt(4) k = 20wb; k` folds to the initializer's value (20, at
-    // `_BitInt(6)`) instead of `(_BitInt(4))20 == 4`. `nullopt` for a non-
-    // `_BitInt` declared type — the raw fold stands (standard-type narrowing of
-    // a const ref is a separate pre-existing concern, out of this arc's scope).
-    std::optional<CstBitPreciseDeclType> declaredBitPrecise{};
-};
-
-// Caller-supplied identifier resolver: maps a CST identifier-token
-// node + the current scope context to the CST `NodeId` of its
-// defining expression PLUS the scope-context to use when recursing
-// into it. Return `nullopt` when the name doesn't refer to a
-// compile-time constant.
-//
-// Scope-context tracking (plan 12.5 §0.2 D7): the engine threads
-// the resolver-supplied `initScopeOpaque` through recursion, so
-// when `const X=1; const Y=X+1; void f(){ const X=Y; int a[X+1]; }`
-// is evaluated, the inner-X's lookup uses the function scope (finds
-// the inner X → recurses into Y), then Y's init `X+1` is evaluated
-// with MODULE scope (where Y was declared) so the inner X is no
-// longer in view — the outer X correctly resolves to 1.
-//
-// The engine guarantees `identTok` is a token CST node. Closure-
-// carrying state goes through the std::function capture. Cycle
-// safety: visited-set keyed on the RESOLVED init-NodeId so a chain
-// like `const a=b; const b=a;` still trips at the second encounter.
-using CstSymbolInitResolver =
-    std::function<std::optional<CstResolvedSymbol>(NodeId, std::uint32_t)>;
+// (`CstResolvedSymbol` and `CstSymbolInitResolver` stand below `CstCastTarget`: a
+// resolved symbol carries its declared type as one.)
 
 // FC6: SizeOf-folding resolver for a const-expr context (an array dimension
 // `int a[sizeof(T)]`). Given the `sizeofRule` CST node, return its byte size,
@@ -214,6 +172,57 @@ struct CstCastTarget {
 // and `(size_t)int` (the offsetof spine).
 using CstCastTargetResolver = std::function<std::optional<CstCastTarget>(NodeId)>;
 
+// Resolved-symbol record returned by the resolver. The engine
+// recurses into `initExpr` and threads `initScopeOpaque` as the
+// current scope context for any further identifier lookups inside
+// that subtree. The opaque-scope handle is meaningful only to the
+// resolver — the engine treats it as a uint32_t cookie carried
+// through recursion.
+struct CstResolvedSymbol {
+    NodeId        initExpr{};
+    std::uint32_t initScopeOpaque = 0;
+    // ★ P69 (lane `lm`): THE SYMBOL'S DECLARED TYPE, AS A CONVERSION. An object's
+    // value is its initializer CONVERTED to the object's type (C 6.7.9p11), so the
+    // engine reads a named constant through the ONE conversion the cast uses
+    // (`convertToCastTarget`) — as it reads a constant's member. This field was
+    // `declaredBitPrecise`, the (width, signedness) of a `_BitInt` declared type
+    // alone, and its comment named the rest "a separate pre-existing concern": every
+    // other named constant was read at its INITIALIZER's type. ✔MEASURED 2026-10-12
+    // (pe64, both pipelines; 13 named constants in a static assertion, 11 wrong):
+    // `static const unsigned u = 5;` gave `(unsigned long long)-u` as
+    // 18446744073709551611 and `-u > 0` as 0; `const unsigned char c = 300;` read
+    // 300, `const _Bool b = 2;` read 2, `const double r = 3;` gave `r / 2` as 1,
+    // `const float f = 0.1;` compared equal to `0.1` — where clang 18 and AppleClang
+    // 21 fold each to C's value (4294967291, 1, 44, 1, 1.5, unequal). The same read
+    // decides a run-time condition whose taken branch never completes, so a wrong
+    // one deletes the code after it.
+    // nullopt: the resolver could not classify the declared type (an aggregate, a
+    // type it has no conversion for) — the initializer's value is handed on as it
+    // folded, which is right for every type that is not arithmetic or a pointer.
+    std::optional<CstCastTarget> declaredType{};
+};
+
+// Caller-supplied identifier resolver: maps a CST identifier-token
+// node + the current scope context to the CST `NodeId` of its
+// defining expression PLUS the scope-context to use when recursing
+// into it. Return `nullopt` when the name doesn't refer to a
+// compile-time constant.
+//
+// Scope-context tracking (plan 12.5 §0.2 D7): the engine threads
+// the resolver-supplied `initScopeOpaque` through recursion, so
+// when `const X=1; const Y=X+1; void f(){ const X=Y; int a[X+1]; }`
+// is evaluated, the inner-X's lookup uses the function scope (finds
+// the inner X → recurses into Y), then Y's init `X+1` is evaluated
+// with MODULE scope (where Y was declared) so the inner X is no
+// longer in view — the outer X correctly resolves to 1.
+//
+// The engine guarantees `identTok` is a token CST node. Closure-
+// carrying state goes through the std::function capture. Cycle
+// safety: visited-set keyed on the RESOLVED init-NodeId so a chain
+// like `const a=b; const b=a;` still trips at the second encounter.
+using CstSymbolInitResolver =
+    std::function<std::optional<CstResolvedSymbol>(NodeId, std::uint32_t)>;
+
 // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]: THE one place a
 // resolved `TypeId` becomes a `CstCastTarget`. Every `CstCastTargetResolver` in
 // the tree differs only in HOW it finds the cast's type node — the semantic tier
@@ -320,6 +329,9 @@ struct CstConstantSubobject {
     CstResolvedSymbol init{};        // the initializer value, and its scope
     CstCastTarget     type{};        // the subobject's declared type, as a conversion
     bool              zeroValue = false;
+    // P69 (lane `lm`): the member is a BIT-FIELD of this width — the value read is the
+    // one converted to `type`, reduced to the width (`readThroughBitField`).
+    std::optional<std::uint32_t> bitFieldWidth{};
 };
 using CstConstantSubobjectResolver =
     std::function<std::optional<CstConstantSubobject>(NodeId, std::uint32_t)>;

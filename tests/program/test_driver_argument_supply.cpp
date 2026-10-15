@@ -55,8 +55,11 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/substrate/phase_timers.hpp"
+#include "pe_image_readers.hpp"
 #include "program/program.hpp"
+#include "program/runtime_object_cache.hpp"   // kRuntimeCacheOverrideVariable
 #include "run_binary.hpp"
+#include "scoped_env.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -78,7 +81,26 @@ using dss::DiagnosticCode;
 using dss::DiagnosticReporter;
 using dss::Program;
 using dss::test_support::Location;
+using dss::test_support::ScopedEnv;
 using dss::test_support::ScratchDir;
+using dss::test_support::rdU16;
+using dss::test_support::rdU32;
+using dss::test_support::rdU64;
+using dss::test_support::readAllBytes;
+using dss::test_support::HandlerFirstRead;
+using dss::test_support::HandlerTakes;
+using dss::test_support::firstValueAHandlerTakes;
+using dss::test_support::PeSection;
+using dss::test_support::peSections;
+using dss::test_support::peRvaToOffset;
+using dss::test_support::PeScopeRecord;
+using dss::test_support::PeGuardedFunction;
+using dss::test_support::peGuardedFunctions;
+using dss::test_support::PeUnwindCode;
+using dss::test_support::PeFunctionUnwind;
+using dss::test_support::kPeUwopSaveXmm128;
+using dss::test_support::kPeUwopSaveXmm128Far;
+using dss::test_support::peFunctionUnwinds;
 
 namespace {
 
@@ -307,6 +329,63 @@ TEST(DriverArgumentSupply, AsmEncodeRouteSuppliesTheImageRequest) {
 // stage themselves. Their `Program_` suite prefix names the subject, not the
 // tier — they are unit cases, and by construction cannot see a driver that
 // stopped making the call.
+//
+// ★★★ WHOSE RUNS THE COUNT HOLDS. `PhaseTimers` counts for the whole PROCESS,
+// and a build that does not find its shipped runtime in the runtime object
+// cache compiles it then and there — one nested build per runtime unit, each
+// with Optimize runs of its own, inside the same compile call. The count read
+// after one compile is therefore the program's own ONLY when that compile found
+// every runtime archive already made; on an empty cache it holds the runtime's
+// too (✔MEASURED 2026-10-12 for the two builds below: 30 and 31, where the
+// programs' own are 2 and 3 — figures of that day's runtime, pinned nowhere).
+//
+// So each case below OWNS its cache. `DSS_RUNTIME_CACHE_DIR` names a directory
+// that was empty when the case began, the SAME compile is made twice, and the
+// two counts are kept apart:
+//   * the first found the cache EMPTY. It is the negative: it must read MORE
+//     than the second. If it does not, the directory was not this case's own —
+//     the variable no longer names the cache, or the runtime came from
+//     somewhere a case cannot empty — and the second count would say nothing
+//     about which builds it holds;
+//   * the second found what the first stored, so nothing but the program is
+//     compiled in it. ITS count is the one compared for equality.
+// Neither depends on anything that ran before the case — in this process or on
+// this machine: not a ctest fixture, not a sibling case, not the order.
+
+namespace {
+
+struct OptimizeRuns {
+    std::uint64_t onAnEmptyCache     = 0;
+    std::uint64_t onTheCacheItFilled = 0;
+};
+
+// `compile(tag)` makes ONE build, into an output directory named by `tag`, and
+// fails the case itself when the build does.
+template <typename Compile>
+[[nodiscard]] OptimizeRuns optimizeRunsOfOneCompile(Compile const& compile) {
+    ScratchDir const  cache{Location::Temp, "driver-arg-supply-runtime-cache"};
+    std::string const variable{dss::runtime::kRuntimeCacheOverrideVariable};
+    ScopedEnv const   ownCache{variable.c_str(), cache.path().string()};
+    auto const runsOf = [&compile](char const* tag) {
+        dss::substrate::PhaseTimers::reset();
+        compile(tag);
+        return dss::substrate::PhaseTimers::read(
+                   dss::substrate::CompilePhase::Optimize).runs;
+    };
+    OptimizeRuns out;
+    out.onAnEmptyCache     = runsOf("on_an_empty_cache");
+    out.onTheCacheItFilled = runsOf("on_the_cache_it_filled");
+    return out;
+}
+
+constexpr char const* kTheEmptyCacheIsTheNegative =
+    "the build that found the runtime object cache EMPTY ran no more Optimize "
+    "invocations than the same build made again. The first must also compile "
+    "the shipped runtime this format realizes, so an equal count means the "
+    "cache this case made for itself is not the one the build read — and the "
+    "exact count below then holds an unknown number of builds";
+
+} // namespace
 
 // ROUTE: N==1 sole CU (`compileFiles`) → the pre-lower program-stage optimize.
 TEST(DriverArgumentSupply, SingleCuRouteRunsTheProgramStageOptimize) {
@@ -317,23 +396,27 @@ TEST(DriverArgumentSupply, SingleCuRouteRunsTheProgramStageOptimize) {
         "int fold(int a) { return (2 + 3) * a; }\n"
         "int main(void) { return fold(1) + fold(2) - 15; }\n");
 
-    dss::substrate::PhaseTimers::reset();
-    Program prog;
-    prog.setCompileConfig(CompileConfig::Release);
-    prog.setOutputDir(scratch.path() / "solecu_out");
-    DiagnosticReporter rep;
-    ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c",
-                                {std::string{kPeExecSpec}}, rep), 0)
-        << allDiagnosticText(rep);
+    OptimizeRuns const runs = optimizeRunsOfOneCompile([&](char const* tag) {
+        Program prog;
+        prog.setCompileConfig(CompileConfig::Release);
+        prog.setOutputDir(scratch.path() / (std::string{"solecu_"} + tag));
+        DiagnosticReporter rep;
+        ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c",
+                                    {std::string{kPeExecSpec}}, rep), 0)
+            << tag << '\n' << allDiagnosticText(rep);
+    });
+    if (HasFatalFailure()) return;
 
-    EXPECT_EQ(dss::substrate::PhaseTimers::read(
-                  dss::substrate::CompilePhase::Optimize).runs,
-              2u)
+    EXPECT_GT(runs.onAnEmptyCache, runs.onTheCacheItFilled)
+        << kTheEmptyCacheIsTheNegative;
+    EXPECT_EQ(runs.onTheCacheItFilled, 2u)
         << "a 1-CU exec build must run Optimize TWICE — the UNIT stage inside "
            "`buildCuMir` and the PROGRAM stage the driver makes before "
            "`lowerCuMirToAssembly`. Reading 1 means the sole-CU route's "
            "program-stage call is gone: the artifact still builds, optimized "
-           "at the unit schedule only (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE)";
+           "at the unit schedule only (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE). "
+           "Reading MORE means this build compiled something besides the "
+           "program — the runtime the build before it had just stored";
 }
 
 // ROUTE: N>1 whole-program merge (`compileUnits`) → the merged program-stage
@@ -347,23 +430,26 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteRunsTheProgramStageOptimize) {
     auto const b = writeSrc(scratch.path(), "stage_b.c",
                             "int helper(int x) { return x + x; }\n");
 
-    dss::substrate::PhaseTimers::reset();
-    Program prog;
-    prog.setCompileConfig(CompileConfig::Release);
-    prog.setOutputDir(scratch.path() / "merged_stage_out");
-    DiagnosticReporter rep;
-    ASSERT_EQ(prog.compileUnits({a.generic_string(), b.generic_string()},
-                                "c", {std::string{kPeExecSpec}}, rep), 0)
-        << allDiagnosticText(rep);
+    OptimizeRuns const runs = optimizeRunsOfOneCompile([&](char const* tag) {
+        Program prog;
+        prog.setCompileConfig(CompileConfig::Release);
+        prog.setOutputDir(scratch.path() / (std::string{"merged_stage_"} + tag));
+        DiagnosticReporter rep;
+        ASSERT_EQ(prog.compileUnits({a.generic_string(), b.generic_string()},
+                                    "c", {std::string{kPeExecSpec}}, rep), 0)
+            << tag << '\n' << allDiagnosticText(rep);
+    });
+    if (HasFatalFailure()) return;
 
-    EXPECT_EQ(dss::substrate::PhaseTimers::read(
-                  dss::substrate::CompilePhase::Optimize).runs,
-              3u)
+    EXPECT_GT(runs.onAnEmptyCache, runs.onTheCacheItFilled)
+        << kTheEmptyCacheIsTheNegative;
+    EXPECT_EQ(runs.onTheCacheItFilled, 3u)
         << "a 2-CU merged exec build must run Optimize THREE times — one UNIT "
            "stage per CU plus the PROGRAM stage over the merged module. "
            "Reading 2 means the merged route's program-stage call is gone, and "
            "cross-CU inlining (the whole point of the merge) silently stops "
-           "happening while the binary still builds and still runs";
+           "happening while the binary still builds and still runs. Reading "
+           "MORE means this build compiled something besides the program";
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -464,37 +550,6 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsEntryVerbs) {
 
 namespace {
 
-// ── Byte readers, shared by the image pins ─────────────────────────────────
-// Bounds-safe: an out-of-range read yields 0 rather than UB, so a truncated or
-// unexpected artifact makes a pin fail with its own message instead of
-// crashing the suite.
-[[nodiscard]] std::uint16_t rdU16(std::vector<std::uint8_t> const& b,
-                                  std::size_t o) {
-    if (o + 2 > b.size()) return 0;
-    return static_cast<std::uint16_t>(static_cast<unsigned>(b[o])
-                                      | (static_cast<unsigned>(b[o + 1]) << 8));
-}
-[[nodiscard]] std::uint32_t rdU32(std::vector<std::uint8_t> const& b,
-                                  std::size_t o) {
-    if (o + 4 > b.size()) return 0;
-    return static_cast<std::uint32_t>(b[o])
-           | (static_cast<std::uint32_t>(b[o + 1]) << 8)
-           | (static_cast<std::uint32_t>(b[o + 2]) << 16)
-           | (static_cast<std::uint32_t>(b[o + 3]) << 24);
-}
-[[nodiscard]] std::uint64_t rdU64(std::vector<std::uint8_t> const& b,
-                                  std::size_t o) {
-    if (o + 8 > b.size()) return 0;
-    return static_cast<std::uint64_t>(rdU32(b, o))
-           | (static_cast<std::uint64_t>(rdU32(b, o + 4)) << 32);
-}
-
-[[nodiscard]] std::vector<std::uint8_t> readAllBytes(fs::path const& p) {
-    std::ifstream in(p, std::ios::binary);
-    return std::vector<std::uint8_t>{std::istreambuf_iterator<char>(in),
-                                     std::istreambuf_iterator<char>()};
-}
-
 // Every offset at which `needle` occurs in `hay`. Returned as a LIST, not a
 // count and not a first-hit, so a pin can assert BOTH "it is there" and "it is
 // there exactly once" — an anchor that turns out to be ambiguous makes the pin
@@ -542,11 +597,13 @@ findAll(std::vector<std::uint8_t> const& hay,
                                   std::string_view    srcB,
                                   std::string_view    targetSpec,
                                   fs::path const&     outDir,
-                                  DiagnosticReporter& rep) {
+                                  DiagnosticReporter& rep,
+                                  CompileConfig       config = CompileConfig::Debug) {
     auto const a = writeSrc(scratch.path(), nameA, srcA);
     auto const b = writeSrc(scratch.path(), nameB, srcB);
     Program prog;
     prog.setOutputDir(outDir);
+    prog.setCompileConfig(config);
     return prog.compileUnits({a.generic_string(), b.generic_string()},
                              "c", {std::string{targetSpec}}, rep);
 }
@@ -595,51 +652,6 @@ findAll(std::vector<std::uint8_t> const& hay,
 // entries actually resolved, so a pin can guard its own PREMISE (a fixture that
 // emitted no unwind info at all would otherwise report "0 handlers" and read
 // exactly like the defect).
-struct PeSection {
-    std::string   name;
-    std::uint32_t vaddr = 0, vsize = 0, rawPtr = 0, rawSize = 0;
-};
-
-[[nodiscard]] std::vector<PeSection>
-peSections(std::vector<std::uint8_t> const& img) {
-    std::vector<PeSection> out;
-    if (img.size() < 0x40) return out;
-    std::size_t const peOff = rdU32(img, 0x3C);
-    if (peOff + 24 > img.size()) return out;
-    if (!(img[peOff] == 'P' && img[peOff + 1] == 'E' && img[peOff + 2] == 0
-          && img[peOff + 3] == 0)) {
-        return out;
-    }
-    std::uint16_t const nsec    = rdU16(img, peOff + 6);
-    std::uint16_t const optSize = rdU16(img, peOff + 20);
-    std::size_t const   secOff  = peOff + 24 + optSize;
-    for (std::uint16_t i = 0; i < nsec; ++i) {
-        std::size_t const o = secOff + static_cast<std::size_t>(i) * 40;
-        if (o + 40 > img.size()) break;
-        PeSection s;
-        for (std::size_t k = 0; k < 8 && img[o + k] != 0; ++k) {
-            s.name.push_back(static_cast<char>(img[o + k]));
-        }
-        s.vsize   = rdU32(img, o + 8);
-        s.vaddr   = rdU32(img, o + 12);
-        s.rawSize = rdU32(img, o + 16);
-        s.rawPtr  = rdU32(img, o + 20);
-        out.push_back(std::move(s));
-    }
-    return out;
-}
-
-[[nodiscard]] std::size_t peRvaToOffset(std::vector<PeSection> const& secs,
-                                        std::uint32_t                 rva) {
-    for (auto const& s : secs) {
-        std::uint32_t const span = std::max(s.vsize, s.rawSize);
-        if (rva >= s.vaddr && rva < s.vaddr + span) {
-            return static_cast<std::size_t>(rva - s.vaddr) + s.rawPtr;
-        }
-    }
-    return 0;
-}
-
 [[nodiscard]] std::size_t peFunctionsWithExceptionHandler(
     std::vector<std::uint8_t> const& img, std::size_t& outTotal) {
     // UNWIND_INFO's first byte packs Version in bits 0..2 and Flags in bits
@@ -1183,79 +1195,18 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheSehScopes) {
 // host rather than only where a pe64 image runs:
 //   * WHAT A HANDLER READS. A value live into a handler must be where a call
 //     would keep it. A parameter is born in a volatile register, so a function
-//     whose handler reads one has to SAVE a non-volatile register (or spill);
-//     the SAME function with a handler that reads no parameter saves none. The
-//     unwind codes list every saved non-volatile register. The pair is the
-//     assertion: the count differs by the parameter alone.
+//     whose handler reads one keeps it in a register a call preserves, or in
+//     the frame — the allocator's choice. The pin reads the HANDLER'S OWN CODE
+//     at the address the scope record names: the first register it reads
+//     without having written it is not a volatile one. (It used to count the
+//     function's saved non-volatile registers against a control's — a claim
+//     that held only while the allocator chose a register over a slot.)
 //   * WHICH HANDLER. The handler routine gives a fault to the FIRST record, in
 //     table order, whose range holds the address. The table of two nested
 //     regions must therefore list the INNER range first, and — as the reference
 //     compiler's own table does (cl 19.51: `[+20,+32) [+20,+57)`) — the outer
 //     range must hold the inner HANDLER, which lies outside its own range.
 namespace {
-
-struct PeScopeRecord {
-    std::uint32_t begin  = 0;
-    std::uint32_t end    = 0;
-    std::uint32_t filter = 0;
-    std::uint32_t target = 0;
-};
-
-// One function of a pe64 image whose unwind info names a language handler.
-struct PeGuardedFunction {
-    std::uint32_t              begin = 0;
-    std::uint32_t              end   = 0;
-    std::size_t                savedNonVolatile = 0;   // UWOP_PUSH_NONVOL / UWOP_SAVE_NONVOL(_FAR)
-    std::vector<PeScopeRecord> records;                // the scope table, IN TABLE ORDER
-};
-
-[[nodiscard]] std::vector<PeGuardedFunction>
-peGuardedFunctions(std::vector<std::uint8_t> const& img) {
-    constexpr std::uint8_t kHandlerFlags    = 0x03;   // UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER
-    constexpr std::size_t  kRuntimeFunction = 12;
-    std::vector<PeGuardedFunction> out;
-    auto const secs = peSections(img);
-    for (auto const& s : secs) {
-        if (s.name != ".pdata") continue;
-        std::size_t const sz = std::min<std::size_t>(s.vsize, s.rawSize);
-        for (std::size_t e = 0; e + kRuntimeFunction <= sz; e += kRuntimeFunction) {
-            PeGuardedFunction f;
-            f.begin = rdU32(img, s.rawPtr + e);
-            f.end   = rdU32(img, s.rawPtr + e + 4);
-            std::size_t const at = peRvaToOffset(secs, rdU32(img, s.rawPtr + e + 8));
-            if (at == 0 || at + 4 > img.size()) continue;
-            std::uint8_t const flags  = static_cast<std::uint8_t>(img[at] >> 3);
-            std::size_t const  ncodes = img[at + 2];
-            if ((flags & kHandlerFlags) == 0) continue;
-            // The unwind codes: two bytes each, some followed by one or two
-            // slots of operand.
-            for (std::size_t i = 0; i < ncodes;) {
-                std::uint8_t const b    = img[at + 4 + 2 * i + 1];
-                std::uint8_t const op   = static_cast<std::uint8_t>(b & 0x0F);
-                std::uint8_t const info = static_cast<std::uint8_t>(b >> 4);
-                std::size_t slots = 1;
-                if (op == 1) slots = info == 0 ? 2 : 3;        // UWOP_ALLOC_LARGE
-                else if (op == 4 || op == 8) slots = 2;        // SAVE_NONVOL / SAVE_XMM128
-                else if (op == 5 || op == 9) slots = 3;        // …_FAR
-                if (op == 0 || op == 4 || op == 5) ++f.savedNonVolatile;
-                i += slots;
-            }
-            // Past the codes (padded to an even count): the handler routine's
-            // RVA, then its data — a count and that many four-field records.
-            std::size_t const after = at + 4 + 2 * ((ncodes + 1) & ~std::size_t{1});
-            if (after + 8 > img.size()) continue;
-            std::uint32_t const count = rdU32(img, after + 4);
-            if (count > 64 || after + 8 + std::size_t{16} * count > img.size()) continue;
-            for (std::uint32_t k = 0; k < count; ++k) {
-                std::size_t const r = after + 8 + std::size_t{16} * k;
-                f.records.push_back(PeScopeRecord{rdU32(img, r), rdU32(img, r + 4),
-                                                  rdU32(img, r + 8), rdU32(img, r + 12)});
-            }
-            out.push_back(std::move(f));
-        }
-    }
-    return out;
-}
 
 // `int guarded(int *p, int caught)`: one region; `handlerBody` is the statement
 // the handler runs. A filter of 1 accepts every exception, so no header is
@@ -1285,13 +1236,14 @@ TEST(DriverArgumentSupply, GuardedRegionReachesLivenessAndTheScopeTable) {
 
     // ── WHAT A HANDLER READS ────────────────────────────────────────────────
     auto const saved = [&](std::string_view tag, std::string_view handlerBody,
-                           std::size_t& outSaved) {
+                           CompileConfig config, std::size_t& outSaved,
+                           HandlerFirstRead& outFirst, std::string& outHandlerBytes) {
         auto const out = scratch.path() / (std::string{tag} + "_out");
         DiagnosticReporter rep;
         ASSERT_EQ(buildMergedPair(scratch, std::string{tag} + "_a.c",
                                   oneRegionSource(handlerBody),
                                   std::string{tag} + "_b.c", kGuardedMain,
-                                  kPeExecSpec, out, rep), 0)
+                                  kPeExecSpec, out, rep, config), 0)
             << tag << ": the pe64 build must succeed\n" << allDiagnosticText(rep);
         auto const img = readAllBytes(out / (std::string{tag} + "_a.exe"));
         ASSERT_FALSE(img.empty()) << tag;
@@ -1300,20 +1252,61 @@ TEST(DriverArgumentSupply, GuardedRegionReachesLivenessAndTheScopeTable) {
             << tag << ": exactly one function of the image names a language handler";
         ASSERT_EQ(fns[0].records.size(), 1u) << tag;
         outSaved = fns[0].savedNonVolatile;
+        std::size_t const handlerAt = peRvaToOffset(peSections(img), fns[0].records[0].target);
+        ASSERT_NE(handlerAt, 0u) << tag << ": the record's handler is code of the image";
+        outFirst        = firstValueAHandlerTakes(img, handlerAt);
+        outHandlerBytes = hexWindow(img, handlerAt, 24);
     };
-    std::size_t readsParameter = 0;
-    std::size_t readsNothing   = 0;
-    ASSERT_NO_FATAL_FAILURE(saved("reads_param", "rc = caught;", readsParameter));
-    ASSERT_NO_FATAL_FAILURE(saved("reads_const", "rc = 42;", readsNothing));
-    EXPECT_GT(readsParameter, readsNothing)
-        << "a handler that reads a PARAMETER needs that value where a call would "
-           "keep it: the function must save one more non-volatile register than "
-           "the same function whose handler reads none. Equal counts mean the "
-           "value stayed in the volatile register it was passed in, and the "
-           "handler reads what the unwinder left there";
-    EXPECT_EQ(readsNothing, 0u)
-        << "the control: with nothing live into the handler the function saves no "
-           "non-volatile register — so the count above is the parameter's doing";
+    std::size_t      readsNothing = 0;
+    HandlerFirstRead constFirst;
+    std::string      constBytes;
+    ASSERT_NO_FATAL_FAILURE(saved("reads_const", "rc = 42;", CompileConfig::Debug,
+                                  readsNothing, constFirst, constBytes));
+
+    // ★ THE CLAIM DOES NOT DEPEND ON HOW THE VALUE IS KEPT. `rc = caught;` is the
+    // handler's first statement, so the first value the handler takes from
+    // outside itself is `caught`, from wherever the function kept it — and that
+    // must be somewhere the unwinder hands over: a register a call preserves, or
+    // the frame. Which of the two is the allocator's choice and is not asked.
+    // With no guarded region handed to liveness, `caught` stays in the volatile
+    // register it arrived in and the handler reads it from there.
+    //
+    // IN BOTH PIPELINES: the handler is entered the same way whichever schedule
+    // built the function, and a stage that lost the handler's way in would lose
+    // it in one of them first.
+    struct Pipeline {
+        char const*   tag;
+        CompileConfig config;
+    };
+    for (Pipeline const p : {Pipeline{"reads_param", CompileConfig::Debug},
+                             Pipeline{"reads_param_release", CompileConfig::Release}}) {
+        SCOPED_TRACE(p.tag);
+        std::size_t      readsParameter = 0;
+        HandlerFirstRead paramFirst;
+        std::string      paramBytes;
+        ASSERT_NO_FATAL_FAILURE(saved(p.tag, "rc = caught;", p.config, readsParameter,
+                                      paramFirst, paramBytes));
+        EXPECT_TRUE(paramFirst.takes == HandlerTakes::APreservedRegister
+                    || paramFirst.takes == HandlerTakes::AValueOfTheFrame
+                    || paramFirst.takes == HandlerTakes::AVolatileRegister)
+            << "the premise: the handler of `rc = caught;` opens with instructions "
+               "this pin decodes, and one of them takes `caught`. Its first bytes: "
+            << paramBytes;
+        EXPECT_NE(paramFirst.takes, HandlerTakes::AVolatileRegister)
+            << "the handler reads register #" << paramFirst.reg << " without having "
+               "written it, which a call does not preserve — and the unwinder that "
+               "enters a handler hands over nothing else. The handler's first bytes: "
+            << paramBytes << " (this function saves " << readsParameter
+            << " non-volatile register(s); the same function whose handler reads "
+               "nothing saves " << readsNothing << " at baseline)";
+    }
+    // THE CONTROL: the handler of `rc = 42;` stores a constant and takes nothing
+    // from outside itself — so what the claim above read is `caught`, and not a
+    // read every handler opens with.
+    EXPECT_EQ(constFirst.takes, HandlerTakes::NothingFromOutside)
+        << "the handler of `rc = 42;` takes a value from outside itself (register #"
+        << constFirst.reg << "): " << constBytes << " — the claim above may then "
+           "be reading something that is not `caught`";
 
     // ── WHICH HANDLER A FAULT REACHES ───────────────────────────────────────
     auto const out = scratch.path() / "nested_out";
@@ -1394,71 +1387,6 @@ TEST(DriverArgumentSupply, GuardedRegionReachesLivenessAndTheScopeTable) {
 // And the image must hold at least one such function that guards a region and
 // one that does not, or the loop above ran over nothing.
 namespace {
-
-struct PeUnwindCode {
-    std::uint8_t  codeOffset = 0;   // the prologue byte the operation ENDS at
-    std::uint8_t  op         = 0;
-    std::uint8_t  info       = 0;
-    std::uint32_t operand    = 0;   // DECODED: a save's slot offset from RSP
-};
-
-struct PeFunctionUnwind {
-    std::uint32_t              begin  = 0;
-    bool                       guards = false;   // names a language handler
-    std::vector<PeUnwindCode>  codes;            // IN TABLE ORDER: descending offset
-    std::vector<std::uint8_t>  prologue;         // its first SizeOfProlog bytes
-};
-
-constexpr std::uint8_t kPeUwopSaveXmm128    = 8;
-constexpr std::uint8_t kPeUwopSaveXmm128Far = 9;
-
-// Every function of a pe64 image, with its unwind codes decoded the way the
-// x64 unwind-data documentation states them: a general save's node is its slot
-// divided by 8, a vector save's by 16, and a FAR form carries the offset
-// unscaled in two nodes, low word first.
-[[nodiscard]] std::vector<PeFunctionUnwind>
-peFunctionUnwinds(std::vector<std::uint8_t> const& img) {
-    constexpr std::uint8_t kHandlerFlags    = 0x03;
-    constexpr std::size_t  kRuntimeFunction = 12;
-    std::vector<PeFunctionUnwind> out;
-    auto const secs = peSections(img);
-    for (auto const& s : secs) {
-        if (s.name != ".pdata") continue;
-        std::size_t const sz = std::min<std::size_t>(s.vsize, s.rawSize);
-        for (std::size_t e = 0; e + kRuntimeFunction <= sz; e += kRuntimeFunction) {
-            PeFunctionUnwind f;
-            f.begin = rdU32(img, s.rawPtr + e);
-            std::size_t const at   = peRvaToOffset(secs, rdU32(img, s.rawPtr + e + 8));
-            std::size_t const code = peRvaToOffset(secs, f.begin);
-            if (at == 0 || code == 0 || at + 4 > img.size()) continue;
-            f.guards = ((img[at] >> 3) & kHandlerFlags) != 0;
-            std::size_t const prolog = img[at + 1];
-            std::size_t const ncodes = img[at + 2];
-            if (code + prolog > img.size() || at + 4 + 2 * ncodes > img.size()) continue;
-            f.prologue.assign(img.begin() + static_cast<std::ptrdiff_t>(code),
-                              img.begin() + static_cast<std::ptrdiff_t>(code + prolog));
-            for (std::size_t i = 0; i < ncodes;) {
-                std::size_t const n = at + 4 + 2 * i;
-                PeUnwindCode c;
-                c.codeOffset = img[n];
-                c.op         = static_cast<std::uint8_t>(img[n + 1] & 0x0F);
-                c.info       = static_cast<std::uint8_t>(img[n + 1] >> 4);
-                std::uint32_t const one = rdU16(img, n + 2);
-                std::uint32_t const two = one | (static_cast<std::uint32_t>(rdU16(img, n + 4)) << 16);
-                std::size_t slots = 1;
-                if (c.op == 1)      { slots = c.info == 0 ? 2 : 3; c.operand = c.info == 0 ? one * 8u : two; }
-                else if (c.op == 2) { c.operand = c.info * 8u + 8u; }
-                else if (c.op == 4) { slots = 2; c.operand = one * 8u; }
-                else if (c.op == kPeUwopSaveXmm128) { slots = 2; c.operand = one * 16u; }
-                else if (c.op == 5 || c.op == kPeUwopSaveXmm128Far) { slots = 3; c.operand = two; }
-                f.codes.push_back(c);
-                i += slots;
-            }
-            out.push_back(std::move(f));
-        }
-    }
-    return out;
-}
 
 // The length of the whole-register store of vector register `reg` to
 // [RSP + slot] whose LAST byte is `p[end - 1]`, or 0 when the bytes ending
@@ -1841,10 +1769,14 @@ TEST(DriverArgumentSupply, ProcessorCountNameHasItsPlatformsNumberOnEveryPosixFo
         char const*      value;
     };
     constexpr std::string_view kMachoArm64ExecSpec = "arm64:macho64-arm64-darwin-exec";
+    // EVERY POSIX executable pair DSS ships, the fourth included: the Mach-O
+    // number is the SDK header's, and that header is one file for both of the
+    // SDK's architectures.
     Row const rows[] = {
         {"x86_64:elf64-x86_64-linux-exec", "84"},
         {kElfArm64ExecSpec, "84"},
         {kMachoArm64ExecSpec, "58"},
+        {"x86_64:macho64-x86_64-darwin-exec", "58"},
     };
     auto const unit = [](char const* value) {
         std::string const v{value};

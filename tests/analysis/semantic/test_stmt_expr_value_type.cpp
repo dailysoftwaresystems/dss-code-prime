@@ -46,12 +46,16 @@
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
+#include "hir/hir.hpp"
+#include "hir/hir_node.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstddef>
 #include <string>
+#include <utility>
+#include <vector>
 
 using namespace dss;
 using namespace dss::sem_test;
@@ -185,4 +189,311 @@ TEST(StmtExprValueType, SizeofReadsTheYieldedTypeAndNotADeclaredOne) {
               0u)
         << "the fold must SUCCEED — a declined fold is the silent failure mode "
            "this probe exists to catch";
+}
+
+// ══ THE CONSTRUCT YIELDS A VALUE: ITS TYPE IS THE LAST EXPRESSION'S, CONVERTED ═══════
+// (cycle P69 round 1, lane `lm`.)
+//
+// The value of the last expression is no lvalue. Its type is the operand's with the
+// three conversions C 6.3.2.1p2-p4 names and no other (`valueConversion`,
+// `analysis/semantic/type_rules.hpp`): an array is the pointer to its first element,
+// a function designator the pointer to the function, and no qualifier stays. The
+// comma operator yields a value the same way, and the two constructs read ONE law.
+//
+// ✔MEASURED 2026-10-12 (gcc 13, mingw-w64 gcc 13.2, clang 18, AppleClang 21 — 31
+// questions each through `({ e; })`, through `(0, e)` and bare): the four agree on
+// every cell pinned here. DSS answered 4 for `sizeof(({ "abc"; }))` and 12 for
+// `sizeof(({ a; }))` over an `int a[3]` — the ARRAY's size, a silent wrong constant —
+// 1 for `sizeof(({ f; }))` and for `sizeof((0, f))`, and kept `volatile` through
+// both constructs. And because the lowering built the sequence at the array's type
+// with the conversion laid over it, `static const char *p = ({ "abc"; });` — which
+// runs on all four — was refused as "not folded", and `char k[4] = ({ "abc"; });`
+// passed this tier for the lowering to refuse by an internal sentence.
+
+namespace {
+
+[[nodiscard]] std::string firstActual(SemanticModel const& m, DiagnosticCode code) {
+    for (auto const& d : m.diagnostics().all())
+        if (d.code == code) return d.actual;
+    return {};
+}
+
+// The codes of the ERRORS the SEMANTIC tier reports for `src`, in the order it
+// reported them. (A source this tier refuses is never lowered by the pipeline.)
+[[nodiscard]] std::vector<DiagnosticCode> semanticErrorCodesOf(std::string const& src) {
+    auto model = analyzeC(src);
+    std::vector<DiagnosticCode> out;
+    for (auto const& d : model.diagnostics().all())
+        if (d.severity == DiagnosticSeverity::Error) out.push_back(d.code);
+    return out;
+}
+
+constexpr char const* kValuePrelude =
+    "static int f(void){ return 0; }\n"
+    "static int a[3];\n"
+    "static volatile int v;\n";
+
+} // namespace
+
+TEST(StmtExprValueType, AnArrayOrAFunctionYieldedIsThePointerItConvertsTo) {
+    std::string const src = std::string{kValuePrelude} +
+        "int main(void){\n"
+        "    char c = 1;\n"
+        "    _Static_assert(sizeof(({ \"abc\"; })) == sizeof(char *), \"a string through the braces\");\n"
+        "    _Static_assert(sizeof(({ a; })) == sizeof(int *), \"an array through the braces\");\n"
+        "    _Static_assert(sizeof(({ f; })) == sizeof(int (*)(void)), \"a function through the braces\");\n"
+        "    _Static_assert(sizeof((0, a)) == sizeof(int *), \"an array through the comma\");\n"
+        "    _Static_assert(sizeof((0, f)) == sizeof(int (*)(void)), \"a function through the comma\");\n"
+        "    _Static_assert(sizeof(({ c; })) == 1 && sizeof((0, c)) == 1, \"a char is not promoted\");\n"
+        "    return c + f();\n"
+        "}\n";
+    ASSERT_EQ(parseErrorsFor(src), 0u);
+    auto model = analyzeC(src);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActual(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+    // What this tier answered before. Each assertion is FALSE and must fail, by this
+    // code — the array's own size, and the size GNU C gives a function type.
+    char const* const wasSilentlyTrue[] = {
+        "_Static_assert(sizeof(({ \"abc\"; })) == 4, \"m\");",
+        "_Static_assert(sizeof(({ a; })) == 3 * sizeof(int), \"m\");",
+        "_Static_assert(sizeof(({ f; })) == 1, \"m\");",
+        "_Static_assert(sizeof((0, f)) == 1, \"m\");",
+    };
+    for (char const* line : wasSilentlyTrue) {
+        auto m = analyzeC(std::string{kValuePrelude} + "int main(void){ " + line + " return 0; }\n");
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u) << line;
+    }
+}
+
+// THE QUALIFIER THE TypeId CARRIES GOES TOO. `typeof` is the reader that shows it:
+// an object declared with the construct's type is assignable through a plain
+// `int *` only when the type lost its `volatile` — `_Generic` over its address
+// selects by the pointee's qualification. (`const` is not interned; its half of
+// the sentence, and every other value form's, is the case after the next.)
+TEST(StmtExprValueType, AQualifierOfTheLastExpressionsTypeIsNotTheValues) {
+    std::string const src = std::string{kValuePrelude} +
+        "int main(void){\n"
+        "    __typeof__(v) y0 = 0;\n"
+        "    __typeof__(({ v; })) y1 = 0;\n"
+        "    __typeof__((0, v)) y2 = 0;\n"
+        "    _Static_assert(_Generic(&y0, int *: 41, volatile int *: 42, default: 43) == 42,"
+        " \"the control: the object's own type is volatile\");\n"
+        "    _Static_assert(_Generic(&y1, int *: 41, volatile int *: 42, default: 43) == 41,"
+        " \"through the braces the value is not volatile\");\n"
+        "    _Static_assert(_Generic(&y2, int *: 41, volatile int *: 42, default: 43) == 41,"
+        " \"through the comma the value is not volatile\");\n"
+        "    return y0 + y1 + y2;\n"
+        "}\n";
+    ASSERT_EQ(parseErrorsFor(src), 0u);
+    auto model = analyzeC(src);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActual(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// THE LOWERING BUILDS WHAT THIS TIER TYPED — the two halves move together or the
+// defect stays whole (`lowerSizeof` reads this tier's stamp, the static-initializer
+// fold reads the lowering's node). Every sequence the lowering makes for a
+// statement expression or a comma whose last expression is an array or a function
+// is typed as the POINTER, with the decay inside it. (Automatic objects, which were
+// built before too — the conversion was laid OVER the sequence; the static objects
+// that form refused are the example's, in both runners.)
+TEST(StmtExprValueType, TheLoweredSequenceIsTypedAsTheValue) {
+    std::string const src = std::string{kValuePrelude} +
+        "int main(void){\n"
+        "    const char *p = ({ \"abc\"; });\n"
+        "    int *q = ({ a; });\n"
+        "    int (*g)(void) = ({ f; });\n"
+        "    int (*h)(void) = (0, f);\n"
+        "    return p[0] + q[0] + g() + h();\n"
+        "}\n";
+    ASSERT_EQ(parseErrorsFor(src), 0u);
+    auto cu = buildShippedUnit("c", {src});
+    SemanticModel model =
+        analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter reporter{};
+    auto lowered = lowerToHir(model, reporter);
+    ASSERT_TRUE(lowered != nullptr);
+    ASSERT_EQ(reporter.errorCount(), 0u);
+    Hir const& hir = lowered->hir;
+    auto const& in = model.lattice().interner();
+    std::size_t sequences = 0;
+    std::vector<HirNodeId> stack{hir.root()};
+    while (!stack.empty()) {
+        HirNodeId const id = stack.back();
+        stack.pop_back();
+        for (HirNodeId c : hir.children(id)) stack.push_back(c);
+        if (hir.kind(id) != HirKind::SeqExpr) continue;
+        ++sequences;
+        EXPECT_EQ(in.kind(hir.typeId(id)), TypeKind::Ptr)
+            << "a sequence yielding an array or a function is typed as the pointer "
+               "the value converts to, not as what its last expression designates";
+    }
+    EXPECT_EQ(sequences, 4u) << "the premise: one sequence per construct of the source";
+}
+
+// ══ AN EXPRESSION THAT IS NO LVALUE HAS NO QUALIFIER AT ITS OWN LEVEL ════════════════
+//
+// The comma and the statement expression are two of the forms; the sentence is one,
+// and it is said once per tier of the qualifier: `volatile` / `_Atomic` live in the
+// TypeId (`subtreeType`, where a frame finishes on a value form, and the two Pass-2
+// stamps that build no frame — a cast node's and a call node's), `const` / `restrict`
+// in the spine beside it (`expressionQualifierSpine`'s `finish`).
+//
+// ✔MEASURED 2026-10-12 (43 questions — 20 `const`, 23 `volatile` — each `__typeof__(E)
+// y;` read by `_Generic(&y, …)`; gcc 13, mingw-w64 gcc 13.2, clang 18 and AppleClang 21
+// agree in every one): an lvalue keeps its qualifier (a name, parentheses, `*&`, a
+// member, `__builtin_choose_expr` whose arm is the name, a compound literal); a value
+// has none (a conditional, a cast to the qualified type, `+` / `-`, a call's result,
+// an assignment, a compound assignment, `++` / `--` either side, the comma, a
+// statement expression) — and a MEMBER of a value keeps what its own declaration
+// says: it is the OBJECT's qualifier a value has lost. DSS kept `volatile` through
+// the cast, `+`, `-`, the call, `=`, `+=` and the four `++` / `--`, kept the `const` of
+// a `const` pointer through the comma and the braces, and dropped the `const` of the
+// arm `__builtin_choose_expr` chooses.
+// ⓘ Two lvalue cells of the same set are NOT pinned here, because DSS still answers
+// them wrong and they are `typeof`'s own: `typeof(_Generic(0, int: cx))` drops `const`
+// (the spine reads the selection Pass 2 records, and a declaration's `typeof` head is
+// resolved before it), and `typeof(vs.m)` over a `volatile struct` drops `volatile`
+// (this tier's member type lacks the object's).
+namespace {
+
+struct QualifierCell {
+    char const* expr;     // `Q` stands for the qualifier
+    bool        keeps;    // the expression's type keeps the qualifier at its own level
+};
+
+// One program: every cell declares `y` by `typeof` of its expression and asserts what
+// a pointer to `y` selects. The assertion's message is the expression, so a failure
+// names its cell.
+[[nodiscard]] std::string qualifierProgram(std::string const& q,
+                                           std::vector<QualifierCell> const& cells) {
+    auto const spelled = [&](std::string text) {
+        for (std::size_t at = text.find('Q'); at != std::string::npos; at = text.find('Q', at))
+            text.replace(at, 1, q), at += q.size();
+        return text;
+    };
+    std::string src = spelled(
+        "struct S { Q int qm; int m; };\n"
+        "static Q int fq(void) { return 1; }\n"
+        "static struct S fs(void) { struct S r = {1, 2}; return r; }\n"
+        "int main(void) {\n"
+        "    Q int qx = 1;\n"
+        "    int m = 1;\n"
+        "    struct S s = {1, 2};\n"
+        "    Q struct S qs = {1, 2};\n"
+        "    (void)qx; (void)m; (void)s; (void)qs;\n");
+    for (QualifierCell const& c : cells) {
+        std::string const e = spelled(c.expr);
+        src += "    { __typeof__(" + e + ") y = 0; _Static_assert(_Generic(&y, int *: 41, "
+             + q + " int *: 42, default: 43) == " + (c.keeps ? "42" : "41") + ", \"" + e
+             + "\"); (void)y; }\n";
+    }
+    src += "    return fq() + fs().m;\n}\n";
+    return src;
+}
+
+[[nodiscard]] std::string allActuals(SemanticModel const& m, DiagnosticCode code) {
+    std::string out;
+    for (auto const& d : m.diagnostics().all())
+        if (d.code == code) out += "\n    " + d.actual;
+    return out;
+}
+
+} // namespace
+
+TEST(StmtExprValueType, AValueHasNoQualifierOfTheObjectItWasReadFrom) {
+    // The forms both qualifiers can be asked of.
+    std::vector<QualifierCell> const shared = {
+        {"qx", true}, {"(qx)", true}, {"*&qx", true}, {"s.qm", true},
+        {"__builtin_choose_expr(1, qx, 0)", true}, {"(Q int){1}", true},
+        {"fs().qm", true},                       // a member of a VALUE: its own declaration's
+        {"(1 ? qx : qx)", false}, {"(Q int)m", false}, {"+qx", false}, {"-qx", false},
+        {"fq()", false}, {"fs().m", false}, {"(0, qs).m", false}, {"({ qs; }).m", false},
+        {"(0, qx)", false}, {"({ qx; })", false},
+    };
+    // A `const` object cannot be assigned, so these are `volatile`'s alone.
+    std::vector<QualifierCell> assigning = shared;
+    for (char const* e : {"(qx = 1)", "(qx += 1)", "qx++", "++qx", "qx--", "--qx"})
+        assigning.push_back({e, false});
+
+    for (auto const& [q, cells] : {std::pair{std::string{"const"}, shared},
+                                   std::pair{std::string{"volatile"}, assigning}}) {
+        SCOPED_TRACE(q);
+        std::string const src = qualifierProgram(q, cells);
+        ASSERT_EQ(parseErrorsFor(src), 0u);
+        auto model = analyzeC(src);
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+            << "the cells whose type is wrong:"
+            << allActuals(model, DiagnosticCode::S_StaticAssertFailed);
+        EXPECT_FALSE(model.hasErrors());
+    }
+
+    // The level BELOW is what the value points to, and stays: a `const` pointer to
+    // `const int` read as a value is a plain pointer to `const int`.
+    std::string const pointers =
+        "int main(void) {\n"
+        "    int m = 1;\n"
+        "    const int *const cp = &m;\n"
+        "    { __typeof__(cp) y = 0; _Static_assert(_Generic(&y, const int **: 41,"
+        " const int *const *: 42, default: 43) == 42, \"cp\"); (void)y; }\n"
+        "    { __typeof__((0, cp)) y = 0; _Static_assert(_Generic(&y, const int **: 41,"
+        " const int *const *: 42, default: 43) == 41, \"(0, cp)\"); (void)y; }\n"
+        "    { __typeof__(({ cp; })) y = 0; _Static_assert(_Generic(&y, const int **: 41,"
+        " const int *const *: 42, default: 43) == 41, \"({ cp; })\"); (void)y; }\n"
+        "    return *cp - 1;\n"
+        "}\n";
+    ASSERT_EQ(parseErrorsFor(pointers), 0u);
+    auto model = analyzeC(pointers);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "the cells whose type is wrong:"
+        << allActuals(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// AN ARRAY IS NOT INITIALIZED BY THE POINTER A STATEMENT EXPRESSION YIELDS — and DSS
+// says so as it says it of any pointer. Every reference refuses both forms
+// (✔MEASURED 2026-10-12, the four). They were refused before too, but by the
+// LOWERING's sentence about its own state ("an aggregate-typed comma/SeqExpr must be
+// lowered by ADDRESS"): this tier had taken the construct for an array and passed
+// it. The pin is the PAIR, in this tier, for an array of a STATED size: the same
+// error codes, in the same order, as the plain pointer draws — and at least one.
+//
+// ⚠ AN ARRAY OF NO STATED SIZE IS REFUSED BY THE SAME SENTENCE ABOUT ITS VALUE, AND
+// NOT YET BY THE ONE ITS POINTER TWIN DRAWS. ✔MEASURED 2026-10-12 (this binary's first
+// run, the Mac leg): `char k[] = ({ "abc"; });` draws S_TypeMismatch — an array is not
+// initialized by a pointer, what the sized form draws — where `char k[] = p;` draws
+// S_ArrayLengthOutOfRange: the search that sizes an array from its initializer
+// (`completeIncompleteArrayFromInit`) still walks INTO the construct and sizes this
+// one from the literal inside. It is one of the six descents that do not read the
+// statement of what a wrapper is (`core/types/decl_prefix_strip.hpp` names them);
+// when it does, this half becomes the pair too, and the exact code below is what
+// tells whoever changes it.
+TEST(StmtExprValueType, AnArrayInitializedByTheConstructIsRefusedAsByAnyPointer) {
+    std::string const head = "int main(void){ const char *p = \"abc\"; (void)p; ";
+    {
+        SCOPED_TRACE("char k[4]: the pair");
+        auto const construct =
+            semanticErrorCodesOf(head + "char k[4] = ({ \"abc\"; }); return k[0]; }\n");
+        auto const pointer = semanticErrorCodesOf(head + "char k[4] = p; return k[0]; }\n");
+        ASSERT_FALSE(pointer.empty()) << "the premise: the plain pointer form is refused";
+        EXPECT_EQ(construct, pointer)
+            << "the construct's value is a pointer, and this tier refuses an array "
+               "initialized by it as it refuses one initialized by any pointer";
+    }
+    {
+        SCOPED_TRACE("char k[]: refused for its value");
+        auto const construct =
+            semanticErrorCodesOf(head + "char k[] = ({ \"abc\"; }); return k[0]; }\n");
+        auto const pointer = semanticErrorCodesOf(head + "char k[] = p; return k[0]; }\n");
+        EXPECT_EQ(construct, (std::vector<DiagnosticCode>{DiagnosticCode::S_TypeMismatch}))
+            << "an array of no stated size is refused in this tier for the pointer its "
+               "initializer yields";
+        EXPECT_EQ(pointer,
+                  (std::vector<DiagnosticCode>{DiagnosticCode::S_ArrayLengthOutOfRange}))
+            << "the premise of the comment above: the plain pointer cannot size the array";
+    }
 }

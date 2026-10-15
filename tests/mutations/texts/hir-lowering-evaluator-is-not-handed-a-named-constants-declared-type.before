@@ -1,0 +1,2 @@
+                        out.declaredType =
+                            classifyCstCastTarget(interner, rec->type, charIsUnsigned_);
