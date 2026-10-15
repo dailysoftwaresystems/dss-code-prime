@@ -1024,7 +1024,9 @@
     // and the step asks the harness for no build directory, so no leg is built first and none takes a heavy-leg
     // slot: a rebuild could replace the very record a red `build/ninja-deps-freshness` is judged from. The
     // directory is an input, relative to the leg tree (`build/<processor>-<toolchain>-<config>`); the program
-    // refuses one that does not exist. Every leg: a record is read on the host that holds it.
+    // refuses one that does not exist, and one that leads anywhere but under the tree it lives in (a `build`
+    // that climbs out through `..`), and prints every line through the redactor. Every leg: a record is read
+    // on the host that holds it.
     "check-ninja-deps-record": {
       "description": "Print what ninja holds for an object of a leg's build directory as it stands, path by path - check-ninja-deps's record step, with nothing built first.",
       "legs": [
@@ -1103,6 +1105,14 @@
         "baseline"
       ],
       "action": "check-plan-citations/check-plan-citations.yml"
+    },
+    "check-repo-guard-label": {
+      "description": "Refuse a configured build in which an entry that SELF-TESTS a program carries the `repo-guard` label -- the rule's own self-test here; ctest judges each configured build.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-repo-guard-label/check-repo-guard-label.yml"
     },
     "check-retyped-closed-sets": {
       "description": "Census the diagnostics that RETYPE a closed vocabulary instead of projecting it.",
@@ -1421,56 +1431,28 @@
   },
   "sync": {
     "neverTransfer": [
-      "build",
-      "build-wsl",
-      "target",
-      ".dss-deps",
-      "scratchpad",
-      "Testing",
-      "test-scratch",
-      ".worktrees",
-      ".claude/worktrees",
-      ".temp",
-      ".venv",
-      ".kilo",
-      ".ccache",
-      ".cache",
-      // ★★ `**/name` MEANS THAT NAME AT ANY DEPTH (whole segments, so `**/cache` does not cover
-      // `src/mycache`). A BARE NAME STAYS ROOTED, deliberately, upstream -- widening bare names
-      // would silently stop transferring every nested directory of that name to every host.
-      // ⇒ ✔MEASURED before 0.5.6: every entry was then a bare name, so `__pycache__` (133 nested,
-      // no root instance), `node_modules` and `.claude/worktrees` protected NOTHING AT ALL.
-      // ★ THE ONE THAT MATTERED IS `.secrets`: a bare entry covered only the root instance, while a
-      // SECOND `.secrets` at depth 3 under `.harness-config/` -- the directory the superuser design
-      // names as where a host credential goes -- was covered by nothing. It holds only `.gitkeep`
-      // today, so this closes a LATENT exposure rather than an incident. `.env` is the same shape.
-      // ⚠ A protective rule that silently matches nothing is WORSE than no rule, because the name
-      // in this file reads as evidence that the thing is protected. 0.5.6 now says so at sync time.
-      // ★ `**/.secrets` COVERS THE ROOT INSTANCE TOO, so the bare `.secrets` beside it was removed
-      // on 2026-09-23 (in a lane worktree, which has no root `.secrets`, it warned on every sync).
-      // Removed ONLY because DssHarness's own source states the contract, ✔READ at the v0.5.8 tag:
-      // `PathPatterns.CoversAnyDepth` (src/RepoHarness.Core/Repository/PathPatterns.cs) answers
-      // "candidate is name at any depth", its first comparison being `candidate == name` -- the
-      // root itself -- and the test `PathPatternsTests.AnAnyDepthEntry_CoversThatNameWhereverItIs`
-      // pins `("**/__pycache__", "__pycache__", true)`. ONE matcher decides both sides of a sync:
-      // this tree's plan (`SyncExclusions`) and the host's own listing (`sync-serve manifest` ->
-      // `LocalSyncTransport.ReadManifestAsync` -> `PathSet` -> `PathPatterns.Matches`), so a root
-      // `.secrets` is never transferred and never deleted. Were that contract ever dropped, a
-      // bare `.secrets` must come back: a secret's exclusion is the one place a belt stays.
+      // ★★ ONLY THE SECRETS' TWO ENTRIES, AND THEY ARE A SECOND STATEMENT ON PURPOSE. A sync carries
+      // what git does not ignore, committed or not (`dssharness help runners`), so an entry `.gitignore`
+      // already ignores says one fact twice -- and two lists of one fact drift (fifteen such entries
+      // stood here: build, build-wsl, target, .dss-deps, scratchpad, Testing, test-scratch, .worktrees,
+      // .claude/worktrees, .temp, .venv, .kilo, .ccache, .cache, **/node_modules). ✔MEASURED 2026-10-15
+      // before they went, dry runs only: `dssharness sync --dry-run` from a lane tree to its WSL, Mac and
+      // VPS copies planned BYTE-IDENTICAL writes and deletions with them and without them, and with
+      // `build` alone taken out the WSL copy's own `build/` (two variants) was neither sent nor deleted.
+      // `.gitignore` is the one statement of what is not the tree's, and the walkers of the tree read it
+      // too (`owning-tree.py`, `TreeIgnores`). A directory the tool keeps in a tree is withheld by the
+      // tool itself, by name (`dssharness help layout`).
+      // ★ A SECRET'S EXCLUSION IS THE ONE PLACE A BELT STAYS: so an edit of `.gitignore` can never send
+      // one. `**/name` is that name at ANY depth, the root included: ONE matcher decides both sides of
+      // a sync, this tree's plan and the host's own listing, so a listed path is never sent and never
+      // deleted (✔READ in DssHarness's own source at v0.5.8, `PathPatterns.CoversAnyDepth`, whose first
+      // comparison is `candidate == name`, and its test `AnAnyDepthEntry_CoversThatNameWhereverItIs`).
+      // A bare `.secrets` would cover the root instance only, while the one under
+      // `.harness-config/runner/` -- where a host credential goes -- would be covered by nothing.
+      // ⚠ A protective entry that matches nothing is WORSE than none: its name reads as evidence that
+      // the thing is protected. The tool says so at sync time.
       "**/.secrets",
-      "**/.env",
-      // `node_modules` at ANY depth, because a TOOL writes one wherever the tool lives: on 2026-08-26
-      // the arm64 VPS held 3,667 files of `.kilo/node_modules` that a ROOTED `node_modules` exclusion
-      // let through (`.gitignore` records it). No `package.json` is tracked here, so nothing of ours
-      // makes one, and no deleted project can leave one behind as a husk.
-      "**/node_modules"
-      // ⛔ NO `__pycache__` ENTRY AT ALL. The bare name matched nothing -- no root instance -- and was
-      // removed on 2026-09-23, after 0.5.8 had warned on every sync that it protected nothing. And
-      // DELIBERATELY NOT `**/__pycache__`, though the upstream deploy list asked for it and
-      // repo-harness then agreed the arithmetic here is better. Protecting it makes every emptied
-      // directory persist on every host, for every `.py` this migration deletes, until somebody
-      // removes it by hand -- and `scripts_index_guard` reds on each one. Leaving it unprotected
-      // costs one `.pyc` recompile per script per host and lets 0.5.6's prune close the husk.
+      "**/.env"
     ],
     "maxDeleteFraction": 0.25
   },

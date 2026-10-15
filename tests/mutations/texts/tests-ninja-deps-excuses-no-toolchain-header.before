@@ -1,1 +1,1 @@
-            if not toolchain[0]:
+        evidence["placed"][tail] = place

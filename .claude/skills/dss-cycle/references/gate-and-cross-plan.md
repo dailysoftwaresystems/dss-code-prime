@@ -41,25 +41,37 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   holds one case per arm of it, on every leg — and the probe itself as `build/ninja-deps-freshness`,
   over the build directory ctest runs in (see round-gate-and-ci.md).
 
-  **WHAT A ZERO RECORD MEANS DEPENDS ON THE TREE'S `deps =` FLAVOUR.** On a `deps = gcc` tree it is
-  always a lost record: gcc lists the source itself. On a `deps = msvc` tree — the MSVC leg — a
-  record holds only the headers the compiler listed AND ninja's reader kept. The reader keeps no
-  path of the toolchain's own installation, and the compiler does not list again what a precompiled
-  header already read. ✔MEASURED 2026-10-10 on the MSVC leg, each record read with the command
-  below: the object that makes the tests' precompiled header — its source names every standard
-  header of the precompiled list and `<gtest/gtest.h>`, with no precompiled state to hide any —
-  recorded googletest's headers, the build tree's compiler stamp and its own header, and NOT ONE
-  standard header; and a unit given five includes of its own (one the precompiled header had read,
-  four standard ones, two of them in no precompiled header) recorded NOTHING, exactly as it did
-  with no include at all.
-  So there a zero record is the CORRECT record of a unit whose every `#include` is answered by the
-  precompiled header its edge names (that header's own record names the file) or by the toolchain,
-  and the check says so per object: `excused: <object> <- <what answers each include>`. A header
-  of the project that neither record names is still a FAIL, said with the header. The check reads
-  all of it off the tree itself, the reader's rule included: one record that names a path of the
-  toolchain's installation, and no toolchain header is excused there.
+  **WHAT A ZERO RECORD MEANS DEPENDS ON THE `deps =` FLAVOUR OF THE OBJECT'S OWN RULE.** On a
+  `deps = gcc` rule it is always a lost record: gcc lists the source itself. On a `deps = msvc`
+  rule — the MSVC leg — a record holds only the headers the compiler listed AND ninja's reader
+  kept. The reader keeps no path under `Program Files` or `Microsoft Visual Studio`, and the
+  compiler does not list again what a precompiled header already read. ✔MEASURED 2026-10-10 on the
+  MSVC leg, each record read with the command below: the object that MAKES the tests' precompiled
+  header recorded googletest's headers, the build tree's compiler stamp and its own header, and NOT
+  ONE standard header; and a unit given five includes of its own (one the precompiled header had
+  read, four standard ones, two of them in no precompiled header) recorded NOTHING, exactly as it
+  did with no include at all.
+  ⚠ THAT OBJECT'S SOURCE NAMES NOTHING (✔MEASURED 2026-10-12, read off the same leg's tree): it is
+  one comment line, and the header that names every standard header of the precompiled list and
+  `<gtest/gtest.h>` is FORCED IN by its command line (`/FI`, beside `/Yc`). So a unit's includes
+  are what its command line forces in AND what its source's directives name — and an object that
+  makes a precompiled header never has a correct empty record.
+  A zero record is the CORRECT record of a unit whose every include is answered: by the
+  precompiled header its edge names (a forced header only where `/Yu` names the same file and the
+  product is an input of the edge; any other only where that header's own record names the file),
+  or by the toolchain — a header no command line states and no record of the tree places
+  anywhere. The check says so per object: `excused: <object> <- <what answers each include>`.
+  Everything else is a FAIL said with its reason: a header of the project neither record names, a
+  directive that names no file, a command line that holds an `@file`, a rule that is not
+  `deps = msvc`, a manifest that could not be read whole. The check reads all of it off the tree
+  itself, the reader's rule included — one record that names a path the reader is taken to drop,
+  and no header under such a path is excused there. WHERE THE COMPILER LIVES IS NOT ASKED: a
+  header nobody states is placed by the tree's own records (one names it, or names a file in a
+  directory that holds it — then the reader keeps it here, and the empty record lost it). A header
+  of the project under a dropped path is said as what it is, a tree that CANNOT BE GUARDED there,
+  which no rebuild mends.
   To read what ninja holds for an object on a leg's own tree, as it stands and with nothing built
-  first:
+  first — a build directory of that tree and of no other, every line through the redactor:
 
   ```bash
   dssharness run check-ninja-deps-record --legs <leg> --input build=build/<processor>-<toolchain>-<config> --input object=<the end of the object's path> -v

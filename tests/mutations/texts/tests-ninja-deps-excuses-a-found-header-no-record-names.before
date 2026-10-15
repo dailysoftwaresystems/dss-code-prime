@@ -1,1 +1,1 @@
-        elif _key(build_dir, found) in in_pch:
+        if key in in_pch:

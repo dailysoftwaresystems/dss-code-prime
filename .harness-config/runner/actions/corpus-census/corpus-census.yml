@@ -9,7 +9,7 @@ steps:
   - name: self-test
     workingDirectoryRoot: action
     run: |
-      python3 ./test-corpus-census.py
+      python3 ./test-corpus-census.py --self-test
     successPattern: 'test-corpus-census: OK'
     requireInputsUnmoved: true
 

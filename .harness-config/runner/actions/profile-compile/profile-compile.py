@@ -60,6 +60,8 @@ Usage:
                      the step's inputs, REQUIRED with --gcc-reference true (a value that
                      begins with `-` is still the option's value).
   -h, --help         show this help and exit.
+  --self-test        prove the command line's refusals (no kit, no build), one verdict line per arm; the
+                     action's `self-test` step and the ctest entry `harness/profile_compile_selftest` run it.
   A relative --kit, --out or --build-dir is taken from the repository root -- the
   tree this file lives in. Every value flag needs a non-empty value; anything else
   on the command line is refused.
@@ -181,6 +183,17 @@ def parse_cli(argv):
             i += 1
             continue
         die("unknown argument '%s'. See --help." % a)
+    # ★ A PATH TO WRITE NEVER BEGINS WITH `-` -- owning-tree's `written_path` says so for every program: `--out --help`
+    # took `--help` for the report directory, an option read as a value. A value that is no path may begin with one
+    # (`--reference-opt -O2`), so only these two are asked.
+    for flag in ("--out", "--build-dir"):
+        key = flag[2:].replace("-", "_")
+        if o[key]:
+            owner = _owning_tree_module()
+            try:
+                o[key] = owner.written_path(o[key], flag)
+            except owner.Refusal as exc:
+                die("%s. See --help." % exc)
     if not o["kit"]:
         die("--kit is required")
     if not o["target"]:
@@ -241,26 +254,38 @@ def augment_path(environ=None, isdir=os.path.isdir):
     environ["PATH"] = os.pathsep.join(entries)
 
 
+_OWNER = []
+
+
+def _owning_tree_module():
+    """`owning-tree.py`, loaded once as a SIBLING: it names the tree this file lives in, and says what a path a
+    command line names for writing may be. A missing owner is a refusal by name."""
+    if not _OWNER:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            die("cannot find %s -- the tree this program lives in is named there and "
+                "nowhere else" % path)
+        saved = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True          # no __pycache__ in a directory not ours
+        try:
+            spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        finally:
+            sys.dont_write_bytecode = saved
+        _OWNER.append(mod)
+    return _OWNER[0]
+
+
 def _owning_tree_root():
-    """The tree this file lives in, by `owning-tree.py`'s walk, loaded as a SIBLING.
+    """The tree this file lives in, by `owning-tree.py`'s walk.
 
     ⓘ Never by counting `..` from this file: that count named `.harness-config/runner`
     the day this program moved out of `scripts/` (2026-09-18). A missing owner or a
     walk that finds nothing is a refusal by name, never a fallback to the caller's cwd.
     """
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
-                        "owning-tree", "owning-tree.py")
-    if not os.path.isfile(path):
-        die("cannot find %s -- the tree this program lives in is named there and "
-            "nowhere else (or pass --repo)" % path)
-    saved = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True          # no __pycache__ in a directory not ours
-    try:
-        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-    finally:
-        sys.dont_write_bytecode = saved
+    mod = _owning_tree_module()
     try:
         return mod.owning_tree(__file__)
     except mod.Refusal as exc:
@@ -460,8 +485,69 @@ def list_artifacts(image_dir, limit):
 
 
 # ── the run ─────────────────────────────────────────────────────────────────────
+# ── THE COMMAND LINE'S OWN SELF-TEST: no kit, no build ───────────────────────────
+SELFTEST_MARKER = "profile-compile self-test: "
+# ⚠ Raising this is the claim that the arms you added actually RUN.
+EXPECTED_ARMS = 5
+_REQUIRED = ["--kit", "kit", "--target", "x86_64:elf64-x86_64-linux-exec", "--label", "leg"]
+
+
+def self_test():
+    """Each arm parses one command line and reads what it did; a refusal is read from the program's own words."""
+    import contextlib
+    import io
+    ran = []
+
+    def arm(label, ok, detail=""):
+        ran.append(bool(ok))
+        if ok:
+            print("%sok      %s" % (SELFTEST_MARKER, label))
+        else:
+            print("%sFAILED  %s -- %s" % (SELFTEST_MARKER, label, (detail or "no detail").replace("\n", " ")[:600]))
+
+    def parsed(argv):
+        said = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(said):
+                return parse_cli(_REQUIRED + argv), None, ""
+        except SystemExit as exc:
+            return None, exc.code, said.getvalue().strip()
+
+    def refused(argv, flag):
+        got, code, text = parsed(argv)
+        if got is not None:
+            return False, "parsed, no refusal: %s=%r" % (flag, got[flag[2:].replace("-", "_")])
+        return (code == 1 and ("%s takes '" % flag) in text and "begins with `-`" in text,
+                "exit %r: %s" % (code, text[:300]))
+
+    arm("--out --help is an option taken for the directory to write: refused, naming --out",
+        *refused(["--out", "--help"], "--out"))
+    arm("--build-dir -x is an option taken for the build tree to write: refused, naming --build-dir",
+        *refused(["--build-dir", "-x"], "--build-dir"))
+    got, code, text = parsed(["--out=--help"])
+    arm("--out=--help is no spelling of a value here: refused as an unknown argument",
+        got is None and code == 1 and "unknown argument '--out=--help'" in text, "exit %r: %s" % (code, text[:300]))
+    got, code, text = parsed(["--out", "build/perf/x-y", "--build-dir", "build/rel-2"])
+    arm("a path holding a dash is kept (the control)",
+        got is not None and (got["out"], got["build_dir"]) == ("build/perf/x-y", "build/rel-2"),
+        "exit %r: %s" % (code, text[:300]) if got is None else "got %r" % ((got["out"], got["build_dir"]),))
+    got, code, text = parsed(["--gcc-reference", "true", "--reference-cc", "gcc", "--reference-opt", "-O2",
+                              "--reference-link-libs", "-lm"])
+    arm("a value that is no path may begin with `-` (the control)",
+        got is not None and (got["reference_opt"], got["reference_link_libs"]) == ("-O2", "-lm"),
+        "exit %r: %s" % (code, text[:300]) if got is None else "got %r" % ((got["reference_opt"],),))
+    failed = ran.count(False)
+    if len(ran) != EXPECTED_ARMS:
+        print("%s%d arm(s) ran, %d expected -- FAIL" % (SELFTEST_MARKER, len(ran), EXPECTED_ARMS))
+        return 1
+    print("%s%d arm(s), %d failed%s" % (SELFTEST_MARKER, len(ran), failed, "" if not failed else " -- FAIL"))
+    return 0 if not failed else 1
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
+    if argv == ["--self-test"]:
+        return self_test()
     o = parse_cli(argv)
     if o["help"]:
         sys.stdout.write(__doc__ or "profile-compile: no help text (python -OO)\n")

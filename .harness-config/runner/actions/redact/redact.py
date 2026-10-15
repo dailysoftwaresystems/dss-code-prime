@@ -98,7 +98,13 @@ THE RULES, in the order they apply
      compound the tree does not hold (`<name>-mac`). Without a tree nothing is kept by (K): over-masking stays the
      failure direction. The tree's names and its text are each walked once per redactor, only when an occurrence asks
      (a host name at all; a dotted compound around one), bounded by VOCAB_MAX_ENTRIES and VOCAB_MAX_SECONDS, and by
-     TEXT_MAX_SECONDS -- a walk cut short keeps FEWER, never more.
+     TEXT_MAX_SECONDS -- a walk cut short keeps FEWER, never more. Both walks leave out what git ignores in the
+     tree, asked of the one reader of that (`owning-tree`'s `TreeIgnores`, loaded by path from its sibling
+     action): a lane's checkout, a leg's copy, a sweep's worker, a run's records, a session's scratch hold no
+     fact of the tree. The names walk keeps ONE such directory whole, the tool's build directory (VOCAB_KEEP):
+     the names (K) exists to keep are read back from a build. A `.gitignore` the reader refuses, or an owner
+     that cannot be loaded, keeps NOTHING by (K). The filter run from the command line names no tree, so it
+     never walks one: what it prints does not depend on any tree.
 THE DECLARED REMOTE NAMES are the connection data DssHarness keeps per ssh host in
 `.harness-config/sshItems/<item>/.env` (`dssharness help secrets`): its USER, and its ADDRESS with the address's
 first label (an IP address is not keyed: rule 10 masks every one). They are read from the caller's tree, from this
@@ -149,10 +155,29 @@ VOCAB_MAX_SECONDS = 30.0
 # Rule 15's (K3): where the tree's own TEXT is read, and what bounds the read.
 TEXT_ROOTS = ("src", "tests", "examples", "integrated_tests", "cmake", "docs", ".claude", ".plans", ".github",
               ".harness-config/runner/actions")
-TEXT_SKIP = frozenset((".git", "build", "artifacts", "runs", "__pycache__", "node_modules", "sshItems", "wslDistros",
-                       ".secrets"))
 # The redactor's own directory: its self-test SPELLS host-shaped names on purpose, to mask them.
 TEXT_SKIP_PATHS = (".harness-config/runner/actions/redact",)
+# Rule 15's (K): the ONE directory git ignores whose names the vocabulary walks whole -- the tool's build directory,
+# where every leg builds (`build/<variant>`): `bin/<name>/<name>_examples_runner` is read back from it, and that
+# is the name (K) exists to keep (✔MEASURED 2026-10-15: `bin/dss` exists only under `build/<variant>/bin/`; no
+# tracked path holds one). Everything else git ignores is left out of both walks (see rule 15).
+VOCAB_KEEP = ("build",)
+_OWNER = []
+
+
+def _tree_ignores(tree, keep=()):
+    """`owning-tree`'s `TreeIgnores(tree, keep)` -- the one reader of what a walk of a tree leaves out -- with
+    `owning-tree.py` loaded ONCE by path from this file's sibling action directory. Raises what loading or reading
+    raised: a caller keeps nothing then."""
+    if not _OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "owning-tree",
+                            "owning-tree.py")
+        spec = importlib.util.spec_from_file_location("dss_owning_tree_for_redact", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNER.append(mod)
+    return _OWNER[0].TreeIgnores(tree, keep)
 TEXT_MAX_FILE_BYTES = 4 * 1024 * 1024
 TEXT_MAX_SECONDS = 10.0
 NAME_CHARS = "A-Za-z0-9"
@@ -398,26 +423,31 @@ def declared_names(trees):
 # ──────────────────────────────── the tree's vocabulary (rule 15's exemption K) ────────────────────────────────
 
 class TreeVocabulary:
-    """The file and directory NAMES under a tree and every (parent, child) name PAIR, `.git` left out -- what the
-    tree itself says (rule 15's exemption). Walked once; bounded, so a walk cut short keeps fewer names, never
-    more. `fold` compares names as the host's file system does (case-insensitively on Windows)."""
+    """The file and directory NAMES under a tree and every (parent, child) name PAIR -- what the tree itself says
+    (rule 15's exemption): what git does not ignore there, and the build directory whole (VOCAB_KEEP), asked of the
+    one reader. Walked once; bounded, so a walk cut short keeps fewer names, never more; a tree whose `.gitignore`
+    cannot be read as git reads it keeps none. `fold` compares names as the host's file system does
+    (case-insensitively on Windows)."""
 
     def __init__(self, tree, os_family, max_entries=VOCAB_MAX_ENTRIES, max_seconds=VOCAB_MAX_SECONDS):
         self.fold = (lambda s: s.casefold()) if os_family == "windows" else (lambda s: s)
         self.names, self.pairs = set(), set()
-        self.entries, self.complete = 0, True
+        self.entries, self.complete, self.why = 0, True, ""
         start = time.monotonic()
-        for dirpath, dirs, files in os.walk(tree):
-            dirs[:] = [d for d in dirs if d != ".git"]
-            parent = self.fold(os.path.basename(dirpath.rstrip("/\\")))
-            for name in dirs + files:
-                folded = self.fold(name)
-                self.names.add(folded)
-                self.pairs.add((parent, folded))
-                self.entries += 1
-            if self.entries >= max_entries or time.monotonic() - start >= max_seconds:
-                self.complete = False
-                break
+        try:
+            for dirpath, dirs, files in _tree_ignores(tree, VOCAB_KEEP).walk():
+                parent = self.fold(os.path.basename(dirpath.rstrip("/\\")))
+                for name in dirs + files:
+                    folded = self.fold(name)
+                    self.names.add(folded)
+                    self.pairs.add((parent, folded))
+                    self.entries += 1
+                if self.entries >= max_entries or time.monotonic() - start >= max_seconds:
+                    self.complete = False
+                    break
+        except Exception as exc:  # noqa: BLE001 - what the tree says is unknown: nothing is kept, never more
+            self.names, self.pairs, self.complete = set(), set(), False
+            self.why = "%s: %s" % (type(exc).__name__, exc)
         self.seconds = time.monotonic() - start
 
     def has_name(self, name):
@@ -431,10 +461,11 @@ class TreeText:
     """The DOTTED compounds the tree's own TEXT spells around a word of `names` (a host's names): every maximal run
     of `A-Za-z0-9._-` holding a `.` and one of them as a whole word, exactly as spelled -- rule 15's (K3). Read from
     the files at the tree's top and under TEXT_ROOTS -- its sources, tests, examples, plans, skills, documents and
-    actions -- never a build's, a run's, a fetch's or a secret's directory (TEXT_SKIP), never the redactor's own
-    (TEXT_SKIP_PATHS: its fixtures spell host names to mask them), never a secret path (rule 2's), a file over
-    TEXT_MAX_FILE_BYTES or one holding a NUL. Walked once; bounded by TEXT_MAX_SECONDS, so a walk cut short keeps
-    FEWER compounds, never more."""
+    actions -- less what git ignores there (a build's, a run's, a fetch's or a secret's directory among it), asked
+    of the one reader; never the redactor's own (TEXT_SKIP_PATHS: its fixtures spell host names to mask them), never
+    a secret path (rule 2's), a file over TEXT_MAX_FILE_BYTES or one holding a NUL. Walked once; bounded by
+    TEXT_MAX_SECONDS, so a walk cut short keeps FEWER compounds, never more; a tree whose `.gitignore` cannot be read
+    as git reads it keeps none."""
 
     def __init__(self, tree, names, max_seconds=None):
         max_seconds = TEXT_MAX_SECONDS if max_seconds is None else max_seconds
@@ -447,14 +478,20 @@ class TreeText:
         word = re.compile(r"(?i)(?<![A-Za-z0-9])(?:%s)(?![A-Za-z0-9])" % "|".join(re.escape(w) for w in words))
         run = re.compile(r"[%s]" % TOKEN_CHARS)
         skip = {os.path.normcase(os.path.join(tree, *p.split("/"))) for p in TEXT_SKIP_PATHS}
-        paths = [os.path.join(tree, f) for f in sorted(os.listdir(tree))
-                 if f not in TEXT_SKIP and os.path.isfile(os.path.join(tree, f))]
-        for root in TEXT_ROOTS:
-            top = os.path.join(tree, *root.split("/"))
-            for dirpath, dirs, files in os.walk(top):
-                dirs[:] = sorted(d for d in dirs if d not in TEXT_SKIP
-                                 and os.path.normcase(os.path.join(dirpath, d)) not in skip)
-                paths += [os.path.join(dirpath, f) for f in sorted(files)]
+        try:
+            ignores = _tree_ignores(tree)
+            paths = [os.path.join(tree, f) for f in sorted(os.listdir(tree))
+                     if os.path.isfile(os.path.join(tree, f)) and not ignores.leaves_out(f, False)]
+            for root in TEXT_ROOTS:
+                top = os.path.join(tree, *root.split("/"))
+                if not os.path.isdir(top):
+                    continue
+                for dirpath, dirs, files in ignores.walk(top):
+                    dirs[:] = sorted(d for d in dirs if os.path.normcase(os.path.join(dirpath, d)) not in skip)
+                    paths += [os.path.join(dirpath, f) for f in sorted(files)]
+        except Exception:  # noqa: BLE001 - what the tree's text spells is unknown: nothing is kept, never more
+            self.complete, self.seconds = False, time.monotonic() - start
+            return
         paths = [p for p in paths if not (_SECRET_COMPONENT.search(p) or _KEY_FILE_LAST.search(p))]
         for path in paths:
             if time.monotonic() - start >= max_seconds:
@@ -949,17 +986,23 @@ def _mask_ssh_line(line, host_anywhere):
 # block that silently stopped running -- is a red, not a smaller green. The count is host-independent: every arm
 # below is synthetic except "this host's and the declared names never survive", which is ONE arm however many texts
 # it checks.
-EXPECTED_ARMS = 242
+EXPECTED_ARMS = 249
 
 
 def self_test():
     ran, failed = [0], [0]
 
+    # ONE VERDICT LINE PER ARM, in the grammar `tests/test_support/script_selftest.hpp` reads: the ctest entry
+    # `harness/redact_selftest` is a test binary that runs this and holds a case per arm, so a mutation of the
+    # redactor can be an arm of the mutation sweep. Only these lines changed form: the filter's own output did not.
     def arm(label, ok, detail=""):
         ran[0] += 1
         if not ok:
             failed[0] += 1
-        print("redact self-test: %-58s %s" % (label[:58], "ok" if ok else "FAIL" + ((": " + detail) if detail else "")))
+            said = (detail or "no detail").replace("\r", " ").replace("\n", " ")
+            print("redact self-test: FAILED  %s -- %s" % (label, said))
+        else:
+            print("redact self-test: ok      %s" % label)
 
     def same(label, red, text, want):
         got = red(text)
@@ -1222,6 +1265,14 @@ def self_test():
         os.makedirs(os.path.join(tree, "build", "v1", "bin", "syn"))
         os.makedirs(os.path.join(tree, "src", "syn-config"))
         io.open(os.path.join(tree, "build", "v1", "bin", "syn", "syn_examples_runner"), "w").close()
+        # The tree says what git ignores, as a DssHarness tree does: its build (walked WHOLE: the names (K) keeps
+        # come from it), a session's scratch, and the copies the tool keeps in a tree -- each holding a name of
+        # its own beside the real files.
+        with io.open(os.path.join(tree, ".gitignore"), "w", encoding="utf-8") as fh:
+            fh.write("build/\n.temp/\n/.legs/*\n!/.legs/.gitkeep\n/.mutations/*\n!/.mutations/.gitkeep\n*.local\n")
+        for rel in (".legs/x/syn-legcopy", ".mutations/aw-1/syn-worker", ".temp/x/syn-scratch"):
+            os.makedirs(os.path.join(tree, *rel.split("/")[:-1]), exist_ok=True)
+            io.open(os.path.join(tree, *rel.split("/")), "w").close()
         syn = redactor(tree=tree, user="ubuntu", host="syn.example", home="/home/ubuntu", os_family="posix",
                        declared=none)
         for text in ("bin/syn/syn_examples_runner", "loading src/syn-config/x.json", "running syn_examples_runner",
@@ -1233,6 +1284,19 @@ def self_test():
                            ("http://syn:8080/", "http://<host>:8080/"), ("the syn prefix", "the <host> prefix"),
                            ("lib/syn/x", "lib/<host>/x"), ("syn/nothing-here", "<host>/nothing-here")):
             same("MASKED, a host position or no tree fact: %r" % text, syn, text, want)
+        for text, want in (("syn-legcopy", "<host>-legcopy"), ("syn-worker", "<host>-worker"),
+                           ("syn-scratch", "<host>-scratch")):
+            same("MASKED, a name only what git ignores holds is no tree fact: %r" % text, syn, text, want)
+        with tempfile.TemporaryDirectory() as tmp_refused:
+            refused_tree = os.path.realpath(tmp_refused)
+            os.makedirs(os.path.join(refused_tree, "build", "v1", "bin", "syn"))
+            io.open(os.path.join(refused_tree, "build", "v1", "bin", "syn", "syn_examples_runner"), "w").close()
+            with io.open(os.path.join(refused_tree, ".gitignore"), "w", encoding="utf-8") as fh:
+                fh.write("ok/\nb\\#c\n")
+            same("a .gitignore the one reader refuses keeps nothing by (K)",
+                 redactor(tree=refused_tree, user="ubuntu", host="syn.example", home="/home/ubuntu",
+                          os_family="posix", declared=none),
+                 "bin/syn/syn_examples_runner", "bin/<host>/<host>_examples_runner")
         no_tree = redactor(user="ubuntu", host="syn.example", home="/home/ubuntu", os_family="posix", declared=none)
         same("without a tree nothing is kept", no_tree, "bin/syn/syn_examples_runner",
              "bin/<host>/<host>_examples_runner")
@@ -1240,8 +1304,11 @@ def self_test():
              redactor(tree=tree, user="syn", host="h9.example", home="/home/syn", os_family="posix", declared=none),
              "bin/syn/syn_examples_runner", "bin/<user>/<user>_examples_runner")
         bounded = TreeVocabulary(tree, "posix", max_entries=1)
-        arm("a walk cut short keeps fewer names, never more", not bounded.complete and bounded.entries <= 3
-            and not bounded.has_name("syn_examples_runner"), "entries=%d" % bounded.entries)
+        whole = TreeVocabulary(tree, "posix")
+        arm("a walk cut short keeps fewer names, never more", not bounded.complete and whole.complete
+            and bounded.entries < whole.entries and not bounded.has_name("syn_examples_runner")
+            and whole.has_name("syn_examples_runner"),
+            "entries=%d of %d, complete=%r/%r" % (bounded.entries, whole.entries, bounded.complete, whole.complete))
         # ── (K3), the dotted compounds the tree's own TEXT spells (the P69 re-review's MINOR 4: on a host named like
         #    the project's prefix, the dotted host position masked its `dss.mir`) ──
         def put(rel, body):
@@ -1254,6 +1321,8 @@ def self_test():
         put("build/v1/log.txt", "syn.secret ran\n")                                   # a build's output
         put(".harness-config/runner/actions/redact/fixture.txt", "syn.fixture\n")     # the redactor's own
         put("src/.env", "syn.envtoken\n")                                             # a secret path
+        put("src/.temp/notes.md", "syn.scratchnote\n")                                # a scratch git ignores
+        put("notes.local", "syn.toplocal\n")                                          # a top file git ignores
         fresh = redactor(tree=tree, user="ubuntu", host="syn.example", home="/home/ubuntu", os_family="posix",
                          declared=none)
         before = fresh("Linux syn 6.8.0")
@@ -1268,6 +1337,8 @@ def self_test():
         for text, want in (("syn.corp is up", "<host> is up"), ("syn.devops", "<host>"),
                            ("syn.secret ran", "<host> ran"), ("syn.fixture", "<host>"), ("syn.envtoken", "<host>")):
             same("MASKED, a compound the tree's text does not give: %r" % text, fresh, text, want)
+        for text in ("syn.scratchnote", "syn.toplocal"):
+            same("MASKED, a compound only a file git ignores spells: %r" % text, fresh, text, "<host>")
         # (K3) never keeps a KNOWN name, though the tree's text spells all three: the host's full name (a whole word,
         # which rule 15 masks before K is asked), a name under its domain, and one ending in the full name -- the last
         # two are K3's own refusal, which the first cannot witness.
@@ -1338,9 +1409,12 @@ def self_test():
         if home in got or any(_word(n, re.IGNORECASE if this_os_family() == "windows" else 0).search(got)
                               for n in names):
             survivors.append(len(got))
-    arm("names never survive (%d, %d declared, %d texts)"
-        % (len(names), len(real["accounts"]) + len(real["hosts"]), len(texts)),
-        bool(names) and not survivors, "a real name survived in %d text(s) (lengths %r)" % (len(survivors), survivors))
+    # The arm's NAME is the same on every leg (the driver holds one case per name); the counts, which are this
+    # leg's, are said in its detail.
+    arm("this host's and the declared names never survive",
+        bool(names) and not survivors, "%d name(s), %d declared, %d text(s): a real name survived in %d text(s) "
+        "(lengths %r)" % (len(names), len(real["accounts"]) + len(real["hosts"]), len(texts), len(survivors),
+                          survivors))
     # ── the filter, through the REAL input path: a child fed a pipe, one line answered before the stream ends ──
     child = subprocess.Popen([sys.executable, "-B", os.path.realpath(__file__)], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1365,6 +1439,25 @@ def self_test():
             fh.write("ip 172.16.0.1\n")
         out = subprocess.run([sys.executable, "-B", os.path.realpath(__file__), f], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, timeout=60)
+        # THE FILTER NAMES NO TREE: what a session pipes through this program depends on no tree's names and no
+        # `.gitignore` -- (K) keeps nothing without a tree -- so no tree walk can move a byte of what it prints.
+        # `main` is run in this process with `redactor` watched and its output held.
+        named, real = [], globals()["redactor"]
+
+        def watched(*args, **kwargs):
+            named.append(kwargs.get("tree", args[0] if args else None))
+            return real(*args, **kwargs)
+        held, globals()["redactor"] = io.StringIO(), watched
+        try:
+            import contextlib
+            with contextlib.redirect_stdout(held):
+                rc = globals()["main"]([f])
+        except Exception as exc:  # noqa: BLE001 - a filter that crashes fails this arm, by name
+            rc = "CRASHED %s: %s" % (type(exc).__name__, exc)
+        finally:
+            globals()["redactor"] = real
+        arm("the command-line filter names no tree", named == [None] and rc == 0 and held.getvalue().strip() == "ip <ip>",
+            "trees named %r, rc=%r" % (named, rc))
         arm("the filter reads a file argument", out.stdout.decode("utf-8", "replace").strip() == "ip <ip>"
             and out.returncode == 0, repr(out.stdout))
     total = ran[0]

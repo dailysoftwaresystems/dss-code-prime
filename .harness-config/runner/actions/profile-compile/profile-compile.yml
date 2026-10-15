@@ -5,6 +5,14 @@ description: >-
   The program documents itself in its own header; this file declares only how a
   runner starts it and what witnesses that it ran.
 steps:
+  # The command line's own refusals, proven before a profile is taken: no kit, no build. ctest drives the same
+  # self-test one case per arm (`harness/profile_compile_selftest`).
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./profile-compile.py --self-test
+    successPattern: '^profile-compile self-test: \d+ arm\(s\), 0 failed$'
+    requireInputsUnmoved: true
   - name: profile
     workingDirectoryRoot: action
     inputs:

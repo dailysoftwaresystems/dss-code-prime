@@ -244,6 +244,11 @@ set(_DSS_TB_NAMED
     # Release and sanitized are NOT measured -- no run of either class has read it -- and take the
     # unit ceilings until one does.
     "link/test_tentative_definitions_as_commons|53|50|106"
+    # ★ anchor_rows_selftest_guard: NAMED 2026-10-15 (cycle P69, lane hm's fold H2), when a self-test
+    # stopped carrying the `repo-guard` label and so runs on every leg, indirect ones included.
+    # ✔MEASURED in a PASSING linux-arm64 Debug whole-suite run of the lane's tree: 236.9 s. Release and
+    # sanitized are NOT measured and take the unit ceilings until a run of either class reads it.
+    "anchor_rows_selftest_guard|53|50|237"
     "core/test_type_kind_vocabulary_projection|103|4|17"
     "analysis/semantic/test_fc3_width_semantics|96|6|19"
     "analysis/preprocess/test_preprocess_no_rework|94|5|18"

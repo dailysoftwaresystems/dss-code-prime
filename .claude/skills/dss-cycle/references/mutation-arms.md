@@ -518,10 +518,11 @@ the code will find it, with what was measured.
   subject; one opt-in. ✔ Built so: the build stamp's entry, `build/build_stamp_identity`, the dependency-record
   check's, `ninja_deps_selftest_guard`, and the guard of orphan test sources, `orphan_tests_guard`.
   ⚠ An entry that leaves the top-level CMakeLists for a test directory leaves the `repo-guard` label behind — the
-  label is given to the TOP directory's entries whose name ends in `guard` — so it runs on every leg. Decide
-  that, and say it where the entry is registered: a self-test of a program's own rules belongs on every leg (a
-  host's paths are its own); a check of the source tree does not, and keeps the label by a `set_tests_properties`
-  beside its registration (`orphan_tests_guard` does).
+  label is given to the TOP directory's entries whose name ends in `guard` — so it runs on every leg. Say
+  where the entry is registered which it is: a self-test of a program's own rules belongs on every leg and
+  never carries the label (a host's paths are its own; `harness/repo_guard_label_check` refuses one that
+  does); a check of the source tree does not, and keeps the label by a `set_tests_properties` beside its
+  registration (`orphan_tests_guard` does).
   ⚠ A script that judges the TREE before it proves itself gives that judgement a verdict line and a case of its
   own, and writes a red report to standard error: the driver keeps standard output in a file, and a red nobody
   can read in the test's log is a red nobody can fix from CI.

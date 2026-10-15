@@ -98,16 +98,21 @@ THE CONTRACT, and every clause is a way a documented figure can lie:
      guard green, so too few claims is a REFUSAL, not a clean run;
   6. at least one document was read at all.
 
-⚠ THE EXCLUSIONS ARE PART OF THE CONTRACT AND ARE TESTED AS SUCH. `.worktrees/`
-holds full checkouts of this repository while lanes are in flight, and
-`.orchestrators/` what DssHarness keeps for them -- plans, work files and kept
-evidence, copies of documents among them; scanning either would red this guard
-on another lane's half-finished document, and widening the exclusion until the
-red stops is how an exclusion silently swallows the real tree. Self-test arms 11
-and 11b assert a drifted claim inside `.worktrees/` and inside `.orchestrators/`
-is IGNORED and arm 12 asserts one in the live tree beside them is still CAUGHT,
-so the exclusion is pinned in BOTH directions -- see
-`[[feedback-an-escape-every-row-triggers-disarms-the-guard]]`.
+⚠ THE EXCLUSIONS ARE PART OF THE CONTRACT AND ARE TESTED AS SUCH. The walk leaves
+out what git ignores in the tree, as `owning-tree`'s `TreeIgnores` reads the tree's
+own `.gitignore`: the copies and workers DssHarness keeps in a tree -- `.worktrees/`
+(lane checkouts), `.orchestrators/` (plans, work files, kept evidence), `.legs/` (a
+leg's copy of the whole tree), `.mutations/` (a sweep's mutated workers) -- its run
+records, a session's scratch, a build. Scanning any of them would red this guard on
+a copy's half-finished document, or count it twice, and `--write` would EDIT the
+copy; widening the exclusion until the red stops is how an exclusion silently
+swallows the real tree. Self-test arm 11a asserts a drifted claim in each of the four
+REDS where the tree's `.gitignore` does not leave it out, arms 11, 11b, 11c and 11d
+that each is IGNORED once it does, and arm 12 that one in the live tree beside them
+is still CAUGHT, so the exclusion is pinned in BOTH directions -- see
+`[[feedback-an-escape-every-row-triggers-disarms-the-guard]]`. Nothing tracked can
+leave the scan this way: `owning-tree`'s own self-test holds this repository to
+"git's rules ignore no file git tracks".
 
 ★★★ THE SECOND CLAUSE: A QUANTIFIED CLAIM ABOUT THE CORPUS, IN CONFIG PROSE. A figure
 is one way a document states a measurement; a QUANTIFIER is the other -- "sqlite uses
@@ -200,8 +205,14 @@ def self_repo():
         raise SystemExit(EXIT_COLLAPSE)
 
 
+_OWNING_TREE = []
+
+
 def _owning_tree_module():
-    """`owning-tree`, loaded by path from this file's sibling action directory; missing, a collapse."""
+    """`owning-tree`, loaded ONCE by path from this file's sibling action directory; missing, a collapse. It answers
+    which tree this guard reads and what a walk of that tree leaves out."""
+    if _OWNING_TREE:
+        return _OWNING_TREE[0]
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
                         "owning-tree", "owning-tree.py")
     if not os.path.isfile(path):
@@ -211,6 +222,7 @@ def _owning_tree_module():
     spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    _OWNING_TREE.append(mod)
     return mod
 
 
@@ -258,72 +270,36 @@ PROVIDERS = {
 SCANNED_SUFFIXES = (".md", ".c", ".h", ".cpp", ".hpp", ".inc", ".s", ".py", ".sh",
                     ".ps1", ".cmake", ".txt", ".json", ".yml", ".yaml")
 
-# Directories never scanned. `.worktrees` holds in-flight lane checkouts of this
-# same repository and `.orchestrators` what DssHarness keeps for them (see the
-# header); the rest are build output and secrets. Both are DssHarness's own, and
-# `dssharness init` ignores them in the CONTENTS shape (`/.orchestrators/*` beside a
-# kept `.gitkeep`), which `scratch_dirs` rightly does not read as a directory home:
-# `/.harness-config/*` has that shape too, and the files it re-includes ARE documents.
-SKIP_DIRS = {".git", ".worktrees", ".orchestrators", ".secrets", "node_modules", "__pycache__"}
-SKIP_DIR_PREFIXES = ("build",)
-
-# ⚠⚠ AND SO IS EVERY DIRECTORY `.gitignore` DECLARES, FOR THE SAME REASON `.worktrees`
-# IS. ✔MEASURED 2026-09-05 (P62): this guard walked `.temp/` -- 176 markdown files of
-# session scratch -- and one of them was a lane's working COPY of `examples/README.md`,
-# so the run reported 14 phantom divergences against a file that is not a document of
-# this project, and `--write` would have EDITED THAT COPY to "repair" it. The class is
-# identical to the `census-quoted:` story above: a guard biting a document it has no
-# business reading. It had always done this; it only became visible when a scratch file
-# happened to carry the marker.
-# ★ DECLARATION-DRIVEN, NOT A SECOND HAND-KEPT LIST. The set is read from `.gitignore`'s
-#   directory-only entries, so adding a scratch home to the ignore file is the whole
-#   edit and the two cannot drift. A hardcoded twin of `.temp`, `scratchpad`,
-#   `test-scratch`, ... is exactly the duplicate that goes stale on the next one.
-# ★ READ AS GIT READS IT (corrected 2026-09-30, cycle P69): a bare name (`.temp/`) is that
-#   name at ANY depth; an entry with a slash at its start or in its middle is ANCHORED to
-#   the tree's root (`/src/dss-config/runtime/platform/dist/` is that one directory,
-#   `.claude/worktrees/` that one). Until then an anchored entry contributed its LAST
-#   segment as a name at any depth, so every `dist` and every `worktrees` directory was
-#   skipped -- and a future ignore line such as `sys/` or `lib/` would have silently cut
-#   `shippedLibs/sys/*.json` out of the claim-rot walk and out of the figure census (the
-#   round-12 audit's vector; ✔MEASURED that day no other such directory exists, so the live
-#   walk is unchanged). Arm 43 pins both halves.
-# ⚠ It DEGRADES TO THE HARD LIST when there is no `.gitignore` -- the self-test's
-#   synthetic roots rely on that, and arm 24 makes the degradation itself observable.
-def scratch_dirs(repo):
-    """-> (names, paths): the directories `.gitignore` declares -- bare names skipped at any depth, anchored entries
-    as root-relative paths -- so scratch is never read as a document."""
-    names, paths = set(), set()
+# ── WHAT THE WALK LEAVES OUT: WHAT GIT IGNORES IN THE TREE, ASKED OF THE ONE READER ──
+# ★ ONE ANSWER, NOT A LIST OF THIS GUARD'S OWN. `owning-tree`'s `TreeIgnores` reads the
+#   tree's `.gitignore` as git reads it -- every rule, in order, `!` re-including, a bare
+#   name at any depth, a rule with a slash anchored to the root -- and leaves out `.git`.
+#   The copies and workers DssHarness keeps in a tree, run records, a session's scratch
+#   and a build are all ignored there, so a directory the tool or the repository adds to
+#   that file is left out of this walk, of the redactor's vocabulary and of the C++
+#   case-collision scan at once. Until 2026-10-15 this file held its own list (`.git`,
+#   `.worktrees`, `.orchestrators`, `.secrets`, `node_modules`, `__pycache__`, every name
+#   starting `build`) plus `.gitignore`'s directory entries read by a grammar of its own --
+#   which left out neither a leg copy (`.legs/`) nor a sweep's worker (`.mutations/`):
+#   a census `--write` run while one existed would have counted every example twice.
+# ★ WHY THE SCRATCH CLASS MATTERS (✔MEASURED 2026-09-05, P62): this guard walked `.temp/`
+#   -- 176 markdown files of session scratch -- and one of them was a lane's working COPY
+#   of `examples/README.md`, so the run reported 14 phantom divergences against a file
+#   that is not a document of this project, and `--write` would have EDITED THAT COPY to
+#   "repair" it. A guard biting a document it has no business reading.
+# ⓘ A synthetic root with no `.gitignore` declares nothing ignored, so the self-test's
+#   fixtures say what they leave out (arms 11a-11d, 16-19, 43).
+def _walk(repo, top):
+    """`os.walk(top)` of the tree `repo`, sorted, less what the tree's `.gitignore` leaves out. A `.gitignore` the
+    reader cannot read as git does is a Collapse: what this guard would read is unknown."""
+    mod = _owning_tree_module()
     try:
-        text = io.open(os.path.join(repo, ".gitignore"), encoding="utf-8",
-                       errors="replace").read()
-    except OSError:
-        return names, paths
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or line.startswith("!"):
-            continue
-        if not line.endswith("/"):
-            continue                      # a file pattern, not a directory home
-        body = line.rstrip("/")
-        if not body or any(c in body for c in "*?["):
-            continue
-        if "/" in body:
-            paths.add(body.lstrip("/"))   # anchored: that directory, relative to the root
-        else:
-            names.add(body)
-    return names, paths
-
-
-def _pruned(repo, dirpath, dirs, skip_names, skip_paths):
-    """The children of `dirpath` a walk descends into: not a skipped name, not an anchored path, not a build tree."""
-    keep = []
-    for d in sorted(dirs):
-        rel = os.path.relpath(os.path.join(dirpath, d), repo).replace(os.sep, "/")
-        if d in skip_names or rel in skip_paths or d.startswith(SKIP_DIR_PREFIXES):
-            continue
-        keep.append(d)
-    return keep
+        ignores = mod.TreeIgnores(repo)
+        for dirpath, dirnames, filenames in ignores.walk(top):
+            dirnames.sort()
+            yield dirpath, dirnames, sorted(filenames)
+    except mod.Refusal as exc:
+        raise Collapse("what this tree leaves out of a walk cannot be read: %s" % exc)
 
 # A marker, then optional markdown emphasis / whitespace, then the figure.
 # The figure may carry `,` thousands separators; the separator style is PRESERVED
@@ -378,13 +354,10 @@ class Claim:
 # ── READING THE TREE ───────────────────────────────────────────────────────────
 
 def scanned_docs(repo):
-    """Every file the tree may carry a claim in, excluding the homes listed above."""
+    """Every file the tree may carry a claim in: what git does not ignore there (`_walk`)."""
     out = []
-    names, paths = scratch_dirs(repo)
-    skip = SKIP_DIRS | names
-    for root, dirs, files in os.walk(repo):
-        dirs[:] = _pruned(repo, root, dirs, skip, paths)
-        for f in sorted(files):
+    for root, _dirs, files in _walk(repo, repo):
+        for f in files:
             if f.lower().endswith(SCANNED_SUFFIXES):
                 out.append(os.path.join(root, f))
     return out
@@ -554,11 +527,8 @@ def claim_rot_findings(repo):
     root = os.path.join(repo, CLAIM_ROT_ROOT)
     docs = sents = 0
     refused = []
-    names, paths = scratch_dirs(repo)
-    skip = SKIP_DIRS | names
-    for dp, dn, fn in os.walk(root):
-        dn[:] = [d for d in _pruned(repo, dp, dn, skip, paths)]
-        for f in sorted(fn):
+    for dp, _dn, fn in _walk(repo, root):
+        for f in fn:
             if not f.endswith(".json"):
                 continue
             p = os.path.join(dp, f)
@@ -833,11 +803,23 @@ def _write(p, s):
 # passed). Every arm -- a subprocess arm, an in-process claim-rot arm, a provider arm, a printed fact -- lands here
 # where it is judged, and `selftest` fails on any count but EXPECTED_ARMS.
 _RAN = []
-EXPECTED_ARMS = 65   # arm 1c retired on 2026-09-30 (M6: check-scripts-index clause 13)
+EXPECTED_ARMS = 68   # arm 1c retired on 2026-09-30 (M6: check-scripts-index clause 13); 11a, 11c, 11d 2026-10-15
 
 
-def _count(ok):
+# ONE VERDICT LINE PER ARM, in the grammar `tests/test_support/script_selftest.hpp` reads: the ctest entry
+# `doc_census_selftest_guard` is a test binary that runs `--selftest` and holds a case per arm, so a mutation of this
+# guard can be an arm of the mutation sweep. A failing arm's detail is put on ONE line. The opening and closing lines
+# (`check-doc-census --selftest...`) are no arm's verdict.
+SELFTEST_MARKER = "check-doc-census self-test: "
+
+
+def _verdict(label, ok, detail=""):
     _RAN.append(bool(ok))
+    if ok:
+        print("%sok      %s" % (SELFTEST_MARKER, label))
+    else:
+        said = (detail or "no detail").replace("\r", " ").replace("\n", " ")[:900]
+        print("%sFAILED  %s -- %s" % (SELFTEST_MARKER, label, said))
     return ok
 
 
@@ -849,10 +831,7 @@ def _arm(label, root, expect_rc, says=None, write=False):
     ok = p.returncode == expect_rc
     if ok and says is not None:
         ok = says in out
-    print("  %-34s rc=%d (want %d) %s" % (label, p.returncode, expect_rc, "OK" if ok else "FAIL"))
-    if not ok:
-        print("      says: %s" % out.strip().replace("\n", "\n      ")[:900])
-    return _count(ok)
+    return _verdict(label, ok, "rc=%d (want %d); says: %s" % (p.returncode, expect_rc, out.strip()))
 
 
 def selftest():
@@ -884,8 +863,7 @@ def selftest():
         ok &= _arm("2c-setup", styled, EXIT_DISAGREE)          # a setup step is an arm: its failure is one
         ok &= _arm("2c-write", styled, EXIT_OK, write=True)
         style_kept = "**2,678**" in _read(sd)
-        print("  %-34s %s" % ("2c SEPARATOR-STYLE", "OK" if style_kept else "FAIL"))
-        ok &= _count(style_kept)
+        ok &= _verdict("2c SEPARATOR-STYLE", style_kept, "the repaired claim reads %r" % _read(sd)[:200])
 
         # 3 -- a key the provider does not report. A typo must not read as agreement.
         _write(d, _read(d).replace("census:examples:manifests",
@@ -928,22 +906,31 @@ def selftest():
         os.makedirs(bare, exist_ok=True)
         ok &= _arm("10 NO-DOCUMENTS", bare, EXIT_COLLAPSE, says="no scannable document")
 
-        # 11 + 12 -- THE EXCLUSION, PINNED IN BOTH DIRECTIONS.
+        # 11a-11d + 12 -- THE EXCLUSION, PINNED IN BOTH DIRECTIONS.
+        # ⚠ THE FIXTURE SYNTHESIZES THE *NEGATIVE*: a drifted copy of the document is written
+        #   into each directory DssHarness keeps in a tree FIRST, and arm 11a proves the tree
+        #   REDS while its `.gitignore` does not leave them out -- so 11-11d measure the skip,
+        #   not an empty directory. Then the tree gets the rules the tool's `init` writes.
+        both = _fixture(tmp, "exclusion")
+        for kept, label in ((".worktrees/lane", "lane copy"), (".orchestrators/o/work/a", "work copy"),
+                            (".legs/x", "leg copy"), (".mutations/aw-1", "mutation worker")):
+            copy = os.path.join(both, *(kept.split("/") + ["examples"]))
+            os.makedirs(copy, exist_ok=True)
+            _write(os.path.join(copy, "README.md"), "# %s\n\n%s**1**\n" % (label, _mark("manifests")))
+        ok &= _arm("11a HARNESS-COPIES-UNDECLARED-RED", both, EXIT_DISAGREE,
+                   says="documented 1, actual 788")
+        _write(os.path.join(both, ".gitignore"), "".join(
+            "/%s/*\n!/%s/.gitkeep\n" % (d, d) for d in (".worktrees", ".orchestrators", ".mutations", ".legs")))
         # 11: a drifted claim inside `.worktrees/` is IGNORED (an in-flight lane's
         #     half-edited document must not red this guard) ...
-        both = _fixture(tmp, "exclusion")
-        wt = os.path.join(both, ".worktrees", "lane", "examples")
-        os.makedirs(wt, exist_ok=True)
-        _write(os.path.join(wt, "README.md"),
-               "# lane copy\n\n%s**1**\n" % _mark("manifests"))
         ok &= _arm("11 WORKTREE-IGNORED", both, EXIT_OK, says="every documented figure")
         # 11b: ... and so is one inside `.orchestrators/` (a lane's work copy of a
-        #      document, which DssHarness keeps beside the lane's plans and evidence).
-        orch = os.path.join(both, ".orchestrators", "o", "work", "a", "examples")
-        os.makedirs(orch, exist_ok=True)
-        _write(os.path.join(orch, "README.md"),
-               "# work copy\n\n%s**1**\n" % _mark("manifests"))
+        #      document, which DssHarness keeps beside the lane's plans and evidence) ...
         ok &= _arm("11b ORCHESTRATORS-IGNORED", both, EXIT_OK, says="every documented figure")
+        # 11c: ... one inside `.legs/` (a leg's own copy of the whole tree) ...
+        ok &= _arm("11c LEG-COPY-IGNORED", both, EXIT_OK, says="every documented figure")
+        # 11d: ... and one inside `.mutations/` (a sweep's worker, a copy holding a mutated site).
+        ok &= _arm("11d MUTATION-WORKER-IGNORED", both, EXIT_OK, says="every documented figure")
         # 12: ... and the SAME drift in the live tree beside it is still CAUGHT, so
         #     the exclusion cannot have widened to swallow the real document.
         _write(os.path.join(both, "examples", "README.md"),
@@ -996,12 +983,14 @@ def selftest():
         _write(_doc(sc), _read(_doc(sc)).replace("**788**", "**1**", 1))
         ok &= _arm("18 LIVE-TREE-STILL-CAUGHT-BESIDE-SCRATCH", sc, EXIT_DISAGREE,
                    says="documented 1, actual 788")
-        # 19: a FILE pattern is not a directory home. `.temp` written without its
-        #     trailing slash must NOT skip anything -- otherwise `*.md`-style entries
-        #     could silence arbitrary documents, and the escape would be unbounded.
+        # 19: a LATER rule decides, as in git: `!/.temp/` after `.temp/` puts the scratch back,
+        #     and its drifted copy REDS again. (Until 2026-10-15 this arm asserted that `.temp`
+        #     without a slash skipped nothing; git reads it as that name, file or directory, and
+        #     so does the one reader. The escape stays bounded another way: `owning-tree`'s
+        #     self-test holds this repository to "git's rules ignore no file git tracks".)
         _write(_doc(sc), _read(_doc(sc)).replace("**1**", "**788**", 1))
-        _write(os.path.join(sc, ".gitignore"), "*.obj\n.temp\nbuild/\n")
-        ok &= _arm("19 FILE-PATTERN-DOES-NOT-SKIP", sc, EXIT_DISAGREE,
+        _write(os.path.join(sc, ".gitignore"), "*.obj\n.temp/\nbuild/\n!/.temp/\n")
+        ok &= _arm("19 LATER-NEGATION-RE-INCLUDES", sc, EXIT_DISAGREE,
                    says="documented 1, actual 788")
 
         # ══ 20-27 -- THE WIDENED SCAN: A SOURCE COMMENT IS A DOCUMENT ═════════════
@@ -1035,11 +1024,7 @@ def selftest():
         ok &= _arm("22-write", rep, EXIT_OK, write=True)
         after = _read(rp)
         prose_kept = (after == _SRC_BODY)
-        print("  %-34s %s" % ("22 WRITE-REPAIRS-SOURCE",
-                              "OK" if prose_kept else "FAIL"))
-        if not prose_kept:
-            print("      got: %r" % after)
-        ok &= _count(prose_kept)
+        ok &= _verdict("22 WRITE-REPAIRS-SOURCE", prose_kept, "got: %r" % after)
 
         # 23 -- a marker in a SOURCE file naming an unknown PROVIDER reds. The
         #       vocabulary check is not a markdown privilege.
@@ -1095,10 +1080,7 @@ def _rot(label, root, want_refused, says=None):
         text = str(e)
     if good and says is not None:
         good = says in text
-    print("  %-34s %s %s" % (label, got, "OK" if good else "FAIL"))
-    if not good:
-        print("      says: %s" % text[:900])
-    return _count(good)
+    return _verdict(label, good, "%s; says: %s" % (got, text))
 
 
 def _claim_rot_arms(tmp):
@@ -1187,8 +1169,7 @@ def _claim_rot_arms(tmp):
     except Collapse as e:
         got = ["COLLAPSE: %s" % e]
     anchored_ok = got == ["src/dss-config/y/dist/claim.json"]
-    print("  %-34s %s" % ("43 ANCHORED-IGNORE-SKIPS-ONE-DIR", "OK" if anchored_ok else "FAIL: %r" % got))
-    ok &= _count(anchored_ok)
+    ok &= _verdict("43 ANCHORED-IGNORE-SKIPS-ONE-DIR", anchored_ok, "refused: %r" % got)
 
     # 44-52 -- THE ESCAPES THE ROUND-12 AUDIT CALLED BROAD, each now a REFUSAL (arms 29, 30, 33 and 35 are their
     #          green controls: a real pin, a real revision, a reported history, a noun after an article).
@@ -1240,11 +1221,7 @@ def _source_provider_arms(tmp):
                            errors="replace")
         out = (p.stdout or "") + (p.stderr or "")
         good = p.returncode == expect_rc and says in out
-        print("  %-34s rc=%d (want %d) %s"
-              % (name, p.returncode, expect_rc, "OK" if good else "FAIL"))
-        if not good:
-            print("      says: %s" % out.strip().replace("\n", "\n      ")[:600])
-        return _count(good)
+        return _verdict(name, good, "rc=%d (want %d); says: %s" % (p.returncode, expect_rc, out.strip()[:600]))
 
     # 26 -- the CONTROL first: a declaration that resolves must report the real count,
     #       so arm 27's red cannot be "the provider is broken".

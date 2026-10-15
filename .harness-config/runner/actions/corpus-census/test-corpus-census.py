@@ -22,7 +22,7 @@ plus one arm that the census's legs default to the manifest's OWN target(s) -- a
 defaulted to every predefine class (2026-10-06, the P69 re-review's MINOR 2) -- asked of the same copy, and one arm
 that the fixture box is removed.
 
-usage:  test-corpus-census.py
+usage:  test-corpus-census.py --self-test     (the flag says what the run is: a self-test, every leg runs it)
 exit:   0 every arm held · 1 an arm failed · 2 cannot run
 """
 from __future__ import annotations
@@ -104,8 +104,8 @@ def put(root, rel, text=None, copy_from=None):
 
 
 def main(argv):
-    if argv:
-        print("test-corpus-census: takes no arguments (got %r)" % argv)
+    if argv != ["--self-test"]:
+        print("test-corpus-census: USAGE -- test-corpus-census.py --self-test (got %r)" % argv)
         return 2
     base = OT.git_environment()
     box = os.path.realpath(tempfile.mkdtemp(prefix="corpus-census-test-"))

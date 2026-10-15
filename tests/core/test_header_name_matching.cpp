@@ -28,6 +28,7 @@
 #include "core/types/unsuppressable_codes.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "tree_ignores.hpp"
 
 #include <gtest/gtest.h>
 
@@ -171,24 +172,24 @@ constexpr std::u8string_view kNihon = u8"\u65E5\u672C.json";    // ...from this 
 // ── the repo-hygiene checker, factored out so the guard test and its
 //    red-on-disable control run the IDENTICAL code over different trees ──
 
-// Directory names that are BUILD OUTPUT or VCS internals rather than
-// checked-out content. Skipped so the repo-wide sweep answers the question that
-// actually matters — "can this repo be CLONED onto a case-insensitive host" —
-// and does not spend minutes walking `build-dbg/`. Recursion is pruned AT the
-// directory, so their contents are never even enumerated.
-//
-// ⚠ THIS LIST MATCHES A BARE NAME AT EVERY DEPTH, so only names nobody would
-// give to CONTENT may join it. `.git`, `node_modules`, `test-scratch` qualify;
-// an ordinary word like `dist` does not. This repo has already paid for that
-// distinction once — an UNANCHORED rsync exclude `build*` also matched
-// `src/program/build_scripts.cpp`, and a gate leg was configured against a tree
-// missing a changed `.cpp`. Generated trees whose name is ordinary are pruned by
-// ABSOLUTE PATH instead; see `prunedSubtrees` on `caseCollisionsUnder` below.
-[[nodiscard]] bool isGeneratedDirName(std::string const& name) {
-    return name == ".git" || name == "test-scratch" || name == "node_modules"
-        || name == ".claude" || name == "target"
-        || name.rfind("build", 0) == 0;   // build, build-dbg, build-wsl, …
-}
+// WHAT THE SWEEP LEAVES OUT: WHAT GIT IGNORES IN THE TREE, and `.git`. The question
+// the repo-wide sweep answers is "can this repo be CLONED onto a case-insensitive
+// host", and a clone materializes nothing git ignores: build output, a session's
+// scratch, and the copies and workers DssHarness keeps in a tree (`.worktrees/`,
+// `.orchestrators/`, `.legs/`, `.mutations/` — each a whole tree of its own, whose
+// files a sweep or a lane may delete while this walk reads them, and a walk error is
+// a red here). It is asked of the ONE statement of that, the tree's own `.gitignore`,
+// through `tests/test_support/tree_ignores.hpp` — the C++ reader of the grammar
+// `owning-tree.py`'s `TreeIgnores` reads for the repository's programs. Recursion is
+// pruned AT a directory left out, so its contents are never even enumerated.
+// ⓘ Until 2026-10-15 this file kept its own list of bare names (`.git`,
+// `test-scratch`, `node_modules`, `.claude`, `target`, every name starting `build`)
+// plus one generated subtree by path: a second statement that walked the copies the
+// tool keeps — ✔MEASURED from run records: 11 to 56 s for this test on the main
+// checkout's Windows legs, against 1 to 7 s in lane trees that hold none — and that
+// pruned the TRACKED `.claude/` skills as well. An anchored rule still prunes only
+// its one path (`/src/dss-config/runtime/platform/dist/`), as git reads it.
+using dss::test_support::TreeIgnores;
 
 // Returns every group of >= 2 paths under `root` whose relative paths are equal
 // after ASCII lowercasing. Such a group cannot be checked out at all on NTFS or
@@ -227,51 +228,61 @@ struct CaseCollisionScan {
     // guards against. Counting it makes the limit legible — the sweep can then say "clean over
     // N files, and M I could not spell" instead of implying it looked at everything.
     std::size_t     unrenderable = 0;
+    // ★ AND WHAT IT LEFT OUT IS SAID, NEVER SILENT: a `.gitignore` the one reader cannot
+    // read as git does refuses the whole sweep, and so does a swept root the tree's rules
+    // leave out — a sweep of nothing.
+    std::string              refusal;
+    std::string              leftOutRoot;
+    std::vector<std::string> paths;   // every file swept, relative to the swept root, in walk order
 };
 
-// `prunedSubtrees` names ABSOLUTE subtrees to skip — the path-anchored half of
-// the prune, for generated trees whose bare NAME is too ordinary to hand to
-// `isGeneratedDirName`. Today that is
-// `src/dss-config/runtime/platform/dist/`: compiled object artifacts living
-// INSIDE the config tree (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF). Nothing
-// generated is ever CLONED, so enumerating it would make this guard answer a
-// different question than the one it states. Default empty, so a caller that
-// has no generated subtree writes nothing.
-CaseCollisionScan caseCollisionsUnder(fs::path const&              root,
-                                      std::vector<fs::path> const& prunedSubtrees = {}) {
+// `tree` is the checkout `ignores` was read from (`.gitignore` at its root), `root` the
+// directory swept — the tree itself or one under it. What `ignores` leaves out is never
+// enumerated: a path is judged RELATIVE TO THE TREE, the frame its rules are written in,
+// and reported relative to `root`.
+CaseCollisionScan caseCollisionsUnder(fs::path const& tree, fs::path const& root, TreeIgnores const& ignores) {
     CaseCollisionScan scan;
     std::map<std::string, std::vector<std::string>> byFolded;
+    if (!ignores.refusal.empty()) {
+        scan.refusal = ignores.refusal;
+        return scan;
+    }
 
-    // ⚠ NORMALIZE BOTH SIDES, AND `.` IS EXACTLY WHY. The repo-wide guard walks
-    // `*root / "."` as one of its four roots, and `.` is a REAL element of
-    // `fs::path` iteration — not a spelling the library folds away — so every
-    // entry that walk yields reads `<root>/./src/...`. An as-written compare
-    // against `<root>/src/...` therefore NEVER matches, and the prune would be
-    // live for the `src/dss-config` root while silently absent for the
-    // whole-repo one, which is the only root that reaches the generated tree at
-    // all. `lexically_normal()` also settles `/` vs `\` on Windows, so the
-    // compare is about the SUBTREE and never about how it was spelled.
-    std::vector<fs::path> pruned;
-    pruned.reserve(prunedSubtrees.size());
-    for (auto const& p : prunedSubtrees) pruned.push_back(p.lexically_normal());
+    // ⚠ NORMALIZE, AND `.` IS EXACTLY WHY. The repo-wide guard walks `*root / "."` as
+    // one of its four roots, and `.` is a REAL element of `fs::path` iteration — not a
+    // spelling the library folds away — so every entry that walk yields reads
+    // `<root>/./src/...`. Judged as written, nothing under it would ever match an
+    // anchored rule, and the whole-repo root — the only one that reaches every
+    // directory the tree's rules leave out — would silently walk them all.
+    // `lexically_normal()` settles `.` and `/` vs `\`; a trailing separator it leaves
+    // is taken off, so the frame is the TREE and never how it was spelled.
+    auto const frame = [](fs::path p) {
+        p = p.lexically_normal();
+        return p.has_filename() ? p : p.parent_path();
+    };
+    fs::path const treeFrame = frame(tree);
+    auto const     treeRel = [&](fs::path const& p) { return narrowUtf8OrEmpty(frame(p).lexically_relative(treeFrame)); };
+    if (std::string const rootRel = treeRel(root); !rootRel.empty() && rootRel != ".") {
+        scan.leftOutRoot = ignores.leavesOut(rootRel, true);
+        if (!scan.leftOutRoot.empty()) return scan;
+    }
 
     std::error_code ec;
     fs::recursive_directory_iterator it{root, ec};
     if (ec) { scan.walkError = ec; return scan; }
     for (fs::recursive_directory_iterator const end; it != end; it.increment(ec)) {
         if (ec) { scan.walkError = ec; return scan; }   // truncated — NOT a pass
+        std::string const inTree = treeRel(it->path());
+        auto const        names = dss::test_support::tree_ignores_detail::splitNames(inTree);
         std::error_code dirEc;
         if (it->is_directory(dirEc)) {
-            // An unrenderable directory name yields "" — which is not a generated name, so the
-            // walk DESCENDS rather than pruning. Erring toward scanning more is the safe
-            // direction for a collision guard.
-            bool const prunedHere =
-                isGeneratedDirName(narrowUtf8OrEmpty(it->path().filename()))
-                || std::find(pruned.begin(), pruned.end(),
-                             it->path().lexically_normal()) != pruned.end();
-            if (prunedHere) it.disable_recursion_pending();
+            // An unrenderable directory name yields "" — which no rule can judge, so the walk
+            // DESCENDS rather than pruning. Erring toward scanning more is the safe direction
+            // for a collision guard.
+            if (!inTree.empty() && !ignores.decide(names, true).empty()) it.disable_recursion_pending();
             continue;
         }
+        if (!inTree.empty() && !ignores.decide(names, false).empty()) continue;   // git ignores it: never cloned
         std::error_code relEc;
         fs::path const  relPath = fs::relative(it->path(), root, relEc);
         std::string const rel   = narrowUtf8OrEmpty(relPath);
@@ -283,6 +294,7 @@ CaseCollisionScan caseCollisionsUnder(fs::path const&              root,
             continue;
         }
         ++scan.filesScanned;
+        scan.paths.push_back(rel);
         byFolded[asciiToLower(rel)].push_back(rel);
     }
     for (auto& [folded, group] : byFolded) {
@@ -629,19 +641,17 @@ TEST(HeaderNameMatching, ShippedConfigTreeHasNoCaseCollidingPaths) {
     // the wrong half of the system.
     auto const root = dss::test::findRepoRoot();
     ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    // The ONE generated tree that `isGeneratedDirName` cannot claim, because
-    // `dist` is an ordinary word and a bare-name entry would prune EVERY
-    // directory so named anywhere in the repo (see the note there). Named by
-    // ABSOLUTE path, once, for every root below: it is simply unreachable from
-    // the two narrow roots, so listing it there costs one path compare that
-    // never fires and keeps a single source of truth for what is generated.
-    std::vector<fs::path> const generatedSubtrees{
-        *root / "src/dss-config/runtime/platform/dist"};
+    // What a clone never materializes is what git ignores in the tree — build
+    // output, a session's scratch, the generated runtime objects under
+    // `src/dss-config/runtime/platform/dist/`, the copies DssHarness keeps in a tree —
+    // read ONCE from the tree's own `.gitignore` for every root below.
+    TreeIgnores const ignores = dss::test_support::readTreeIgnores(*root);
+    ASSERT_TRUE(ignores.refusal.empty()) << ignores.refusal;
 
     // `src/dss-config/**` first (the descriptors this axis resolves), then the
     // WHOLE checked-out tree — the invariant is about CLONING the repo, not
     // just about headers, so the sweep must cover everything a clone
-    // materializes. Build output and `.git` are pruned by `isGeneratedDirName`.
+    // materializes, and nothing git ignores (`.git` included).
     for (char const* sub : {"src/dss-config/shippedLibs",
                             "src/dss-config/object-formats",
                             "src/dss-config",
@@ -650,7 +660,9 @@ TEST(HeaderNameMatching, ShippedConfigTreeHasNoCaseCollidingPaths) {
         ASSERT_TRUE(fs::is_directory(dir))
             << sub << " must exist — a guard that silently skips its own "
                       "subject is the vacuous-pass class";
-        auto const scan = caseCollisionsUnder(dir, generatedSubtrees);
+        auto const scan = caseCollisionsUnder(*root, dir, ignores);
+        EXPECT_TRUE(scan.leftOutRoot.empty())
+            << sub << ": the tree's .gitignore leaves the swept root out (" << scan.leftOutRoot << ")";
         // Prove the instrument did work before believing its verdict.
         EXPECT_FALSE(scan.walkError)
             << sub << ": the walk was TRUNCATED (" << scan.walkError.message()
@@ -690,13 +702,14 @@ TEST(HeaderNameMatching, CaseCollisionGuardActuallyDetectsACollision) {
                         "case-sensitive leg";
     }
     writeFile(dir / "nested" / "windows.json");
-    auto const clean = caseCollisionsUnder(dir);
+    TreeIgnores const none;   // the scratch tree has no `.gitignore`: nothing but `.git` is left out
+    auto const clean = caseCollisionsUnder(dir, dir, none);
     EXPECT_TRUE(clean.groups.empty())
         << "no collision yet — the guard must not fire on a clean tree";
     EXPECT_EQ(clean.filesScanned, 1u) << "and it must have actually LOOKED";
     EXPECT_FALSE(clean.walkError);
     writeFile(dir / "nested" / "Windows.json");
-    auto const scan = caseCollisionsUnder(dir);
+    auto const scan = caseCollisionsUnder(dir, dir, none);
     EXPECT_FALSE(scan.walkError);
     EXPECT_EQ(scan.filesScanned, 2u);
     ASSERT_EQ(scan.groups.size(), 1u)
@@ -706,74 +719,219 @@ TEST(HeaderNameMatching, CaseCollisionGuardActuallyDetectsACollision) {
     EXPECT_EQ(scan.groups[0][1], "nested/windows.json");
 }
 
-// CONTROL for the PATH-ANCHORED prune the repo-wide guard passes.
+// CONTROL for an ANCHORED rule of the tree's `.gitignore`, the shape the repo-wide
+// guard needs for `src/dss-config/runtime/platform/dist/`.
 //
-// ★ WHY THIS CANNOT BE LEFT TO THE REAL TREE. `src/dss-config/runtime/platform/
-// dist/` is GENERATED, so it is ABSENT from a fresh clone and absent on any host
-// that has not built the runtime — which means a prune that silently matched
-// nothing would look EXACTLY like a prune that worked, in every log this project
-// keeps. That is the vacuous-fix class, one step removed from the vacuous-pass
-// class `CaseCollisionScan` already carries a denominator for. So the mechanism
-// is exercised over a tree this test builds, in BOTH directions, on EXACT
-// counts — emptiness cannot tell "pruned" apart from "scanned nothing".
+// ★ WHY THIS CANNOT BE LEFT TO THE REAL TREE. That directory is GENERATED, so it is
+// ABSENT from a fresh clone and absent on any host that has not built the runtime —
+// which means a rule that silently matched nothing would look EXACTLY like a rule
+// that worked, in every log this project keeps. That is the vacuous-fix class, one
+// step removed from the vacuous-pass class `CaseCollisionScan` already carries a
+// denominator for. So the mechanism is exercised over a tree this test builds, in
+// BOTH directions, on EXACT counts — emptiness cannot tell "left out" apart from
+// "scanned nothing".
 //
 // It needs no case-colliding pair and therefore no host capability: the claim is
 // about WHAT WAS ENUMERATED, which every filesystem can answer.
-TEST(HeaderNameMatching, CaseCollisionScanPrunesOnlyTheSubtreesItIsGiven) {
+TEST(HeaderNameMatching, CaseCollisionScanLeavesOutOnlyTheAnchoredPathItsRuleNames) {
     ScratchDir scratch{Location::Temp, "header_case_prune"};
     fs::path const dir = scratch.path();
+    writeFile(dir / ".gitignore", "/generated/\n");
     writeFile(dir / "kept.json");
     writeFile(dir / "kept-nested" / "also-kept.json");
     writeFile(dir / "generated" / "one.o");
     writeFile(dir / "generated" / "deeper" / "two.o");
-    // ★ A SECOND DIRECTORY OF THE SAME BARE NAME, at a different path — the
-    // whole reason this prune is anchored. A bare-name `dist`/`generated` entry
-    // in `isGeneratedDirName` would take this one out too, deleting coverage of
-    // a tree that IS cloned, and the guard would still report a clean pass.
+    // ★ A SECOND DIRECTORY OF THE SAME BARE NAME, at a different path — the whole
+    // reason the rule is anchored. Read as a bare name it would take this one out
+    // too, deleting coverage of a tree that IS cloned, and the guard would still
+    // report a clean pass.
     writeFile(dir / "kept-nested" / "generated" / "three.o");
 
-    auto const all = caseCollisionsUnder(dir);
+    auto const all = caseCollisionsUnder(dir, dir, TreeIgnores{});
     EXPECT_FALSE(all.walkError);
-    EXPECT_EQ(all.filesScanned, 5u)
-        << "UNPRUNED direction: the walk must see all five files, including the "
+    EXPECT_EQ(all.filesScanned, 6u)
+        << "UNPRUNED direction: the walk must see all six files, including the "
            "two under `<dir>/generated/`. Without this the count below could be "
            "explained by the files never existing";
     EXPECT_TRUE(all.groups.empty());
 
-    auto const pruned = caseCollisionsUnder(dir, {dir / "generated"});
+    TreeIgnores const ignores = dss::test_support::readTreeIgnores(dir);
+    ASSERT_TRUE(ignores.refusal.empty()) << ignores.refusal;
+    auto const pruned = caseCollisionsUnder(dir, dir, ignores);
     EXPECT_FALSE(pruned.walkError);
-    EXPECT_EQ(pruned.filesScanned, 3u)
-        << "PRUNED direction: exactly `<dir>/generated/one.o` and "
-           "`<dir>/generated/deeper/two.o` drop out. `kept.json`, "
+    EXPECT_EQ(pruned.filesScanned, 4u)
+        << "LEFT-OUT direction: exactly `<dir>/generated/one.o` and "
+           "`<dir>/generated/deeper/two.o` drop out. `.gitignore`, `kept.json`, "
            "`kept-nested/also-kept.json` and `kept-nested/generated/three.o` "
            "remain — the last one is the anchoring proof";
     EXPECT_TRUE(pruned.groups.empty());
 }
 
-// ...and the prune must survive the root spelling the repo-wide guard actually
-// uses. `*root / "."` is one of that guard's four roots, and `.` is a REAL
-// element of `fs::path` iteration, so every entry it yields carries a `./` the
-// pruned path does not. An as-written compare fails HERE AND NOWHERE ELSE: the
-// three narrow roots would keep pruning correctly while the whole-repo root —
-// the only one that reaches the generated tree — silently walked it. The
-// unpruned scan is the control that attributes the count to the prune rather
-// than to the dot-spelled root breaking the walk.
-TEST(HeaderNameMatching, CaseCollisionScanPrunesThroughADotSpelledRoot) {
+// ...and the rule must hold through the root spelling the repo-wide guard actually
+// uses. `*root / "."` is one of that guard's four roots, and `.` is a REAL element
+// of `fs::path` iteration, so every entry it yields carries a `./`. Judged as
+// written, it fails HERE AND NOWHERE ELSE: the three narrow roots would keep their
+// rules while the whole-repo root — the only one that reaches every directory the
+// rules leave out — silently walked them. The scan with no rules is the control that
+// attributes the count to the rule rather than to the dot-spelled root breaking the walk.
+TEST(HeaderNameMatching, CaseCollisionScanLeavesOutThroughADotSpelledRoot) {
     ScratchDir scratch{Location::Temp, "header_case_prune_dot"};
     fs::path const dir = scratch.path();
+    writeFile(dir / ".gitignore", "/generated/\n");
     writeFile(dir / "kept.json");
     writeFile(dir / "generated" / "one.o");
 
-    auto const all = caseCollisionsUnder(dir / ".");
+    auto const all = caseCollisionsUnder(dir, dir / ".", TreeIgnores{});
     EXPECT_FALSE(all.walkError);
-    EXPECT_EQ(all.filesScanned, 2u)
+    EXPECT_EQ(all.filesScanned, 3u)
         << "a `.` component must not disturb the walk itself";
 
-    auto const pruned = caseCollisionsUnder(dir / ".", {dir / "generated"});
+    auto const pruned = caseCollisionsUnder(dir, dir / ".", dss::test_support::readTreeIgnores(dir));
     EXPECT_FALSE(pruned.walkError);
-    EXPECT_EQ(pruned.filesScanned, 1u)
-        << "with an as-written compare this reads 2, and the repo-wide guard "
-           "walks the generated tree it was told to skip";
+    EXPECT_EQ(pruned.filesScanned, 2u)
+        << "with an as-written compare this reads 3, and the repo-wide guard "
+           "walks the generated tree its rule names";
+}
+
+// THE COPIES DSSHARNESS KEEPS IN A TREE, A SESSION'S SCRATCH, AND A BUILD, beside the
+// real files: the sweep enumerates exactly what a clone holds. The tree's `.gitignore`
+// is written in the shapes the repository's carries — the tool's managed block (each
+// directory's CONTENTS left out, its placeholder kept), a bare scratch name, a build
+// directory — and the files in each would be swept twice, or vanish under the walk,
+// were they read.
+TEST(HeaderNameMatching, CaseCollisionScanLeavesOutTheCopiesTheToolKeepsAScratchAndABuild) {
+    ScratchDir scratch{Location::Temp, "header_case_harness_dirs"};
+    fs::path const dir = scratch.path();
+    writeFile(dir / ".gitignore",
+              ".temp/\nbuild/\n/.worktrees/*\n!/.worktrees/.gitkeep\n/.orchestrators/*\n!/.orchestrators/.gitkeep\n"
+              "/.mutations/*\n!/.mutations/.gitkeep\n/.legs/*\n!/.legs/.gitkeep\n");
+    for (char const* real : {"examples/c/x/expected.json", "src/a.json", ".legs/.gitkeep", ".mutations/.gitkeep"})
+        writeFile(dir / real);
+    for (char const* copy : {".legs/x/examples/c/x/expected.json", ".mutations/aw-1/src/a.json",
+                             ".temp/x/examples/c/x/expected.json", ".worktrees/lane/src/a.json",
+                             ".orchestrators/o/work/a/src/a.json", "build/v1/bin/dss/runner.json",
+                             "tests/.temp/y.json"})
+        writeFile(dir / copy);
+
+    auto const all = caseCollisionsUnder(dir, dir, TreeIgnores{});
+    EXPECT_EQ(all.filesScanned, 12u) << "the control: with no rule every file is swept";
+
+    auto const scan = caseCollisionsUnder(dir, dir, dss::test_support::readTreeIgnores(dir));
+    EXPECT_TRUE(scan.refusal.empty()) << scan.refusal;
+    EXPECT_FALSE(scan.walkError);
+    std::vector<std::string> swept = scan.paths;
+    std::sort(swept.begin(), swept.end());
+    EXPECT_EQ(swept, (std::vector<std::string>{".gitignore", ".legs/.gitkeep", ".mutations/.gitkeep",
+                                               "examples/c/x/expected.json", "src/a.json"}))
+        << "a leg copy, a mutation worker, a lane's checkout, a work copy, a session's scratch "
+           "(at the root and below) and a build are what git ignores here: none is swept";
+}
+
+// ── the C++ reader of the one statement (`tests/test_support/tree_ignores.hpp`) ──
+// Each case pins one rule of the grammar `owning-tree.py`'s `TreeIgnores` reads for the
+// repository's programs, on paths alone: no filesystem, so every host answers alike.
+
+namespace {
+[[nodiscard]] TreeIgnores rulesOf(std::string_view text) {
+    return dss::test_support::readTreeIgnoreRules(text, "fixture-ignore");
+}
+} // namespace
+
+TEST(TreeIgnoresGrammar, ALaterRuleDecidesAndANegationReincludes) {
+    auto const t = rulesOf("/.legs/*\n!/.legs/.gitkeep\n*.o\n!keep.o\n");
+    ASSERT_TRUE(t.refusal.empty()) << t.refusal;
+    EXPECT_EQ(t.leavesOut(".legs/x", true), "/.legs/*");
+    EXPECT_EQ(t.leavesOut(".legs/.gitkeep", false), "");
+    EXPECT_EQ(t.leavesOut("a.o", false), "*.o");
+    EXPECT_EQ(t.leavesOut("keep.o", false), "");
+}
+
+TEST(TreeIgnoresGrammar, ARuleWithNoSlashMatchesThatNameAtAnyDepth) {
+    auto const t = rulesOf(".temp/\n");
+    EXPECT_EQ(t.leavesOut(".temp/x/notes.md", false), ".temp/");
+    EXPECT_EQ(t.leavesOut("tests/.temp/y.md", false), ".temp/");
+    EXPECT_EQ(t.leavesOut("examples/c/x/main.c", false), "");
+}
+
+TEST(TreeIgnoresGrammar, ARuleWithASlashIsAnchoredToTheTreesRoot) {
+    auto const t = rulesOf("/src/dss-config/runtime/platform/dist/\n.claude/worktrees/\n");
+    EXPECT_EQ(t.leavesOut("src/dss-config/runtime/platform/dist/o.json", false),
+              "/src/dss-config/runtime/platform/dist/");
+    EXPECT_EQ(t.leavesOut("src/dist/x.json", false), "");
+    EXPECT_EQ(t.leavesOut(".claude/worktrees/w/x.md", false), ".claude/worktrees/");
+    EXPECT_EQ(t.leavesOut("docs/.claude/worktrees/z.md", false), "");
+}
+
+TEST(TreeIgnoresGrammar, ATrailingSlashMatchesADirectoryOnly) {
+    auto const t = rulesOf("build/\n");
+    EXPECT_EQ(t.leavesOut("tests/build", false), "") << "a FILE of that name stays";
+    EXPECT_EQ(t.leavesOut("build/v/bin/dss/r", false), "build/");
+}
+
+TEST(TreeIgnoresGrammar, ADoubleStarNameIsAnyNumberOfDirectories) {
+    auto const t = rulesOf("/.harness-config/runner/actions/**/build/\n/x/**\n");
+    EXPECT_EQ(t.leavesOut(".harness-config/runner/actions/a/build/o.txt", false),
+              "/.harness-config/runner/actions/**/build/");
+    EXPECT_EQ(t.leavesOut(".harness-config/runner/actions/a/b/build/o.txt", false),
+              "/.harness-config/runner/actions/**/build/");
+    EXPECT_EQ(t.leavesOut(".harness-config/runner/actions/a/a.py", false), "");
+    EXPECT_EQ(t.leavesOut("x", true), "") << "at a rule's end, `**` is one or more names";
+    EXPECT_EQ(t.leavesOut("x/y", false), "/x/**");
+}
+
+TEST(TreeIgnoresGrammar, AStarAQuestionMarkAndAClassReadAsGitReadsThem) {
+    auto const t = rulesOf("[._]*.sw[a-p]\nbuild-*/\nlo?\n[!a]z\n");
+    EXPECT_EQ(t.leavesOut(".x.swp", false), "[._]*.sw[a-p]");
+    EXPECT_EQ(t.leavesOut("x.swz", false), "");
+    EXPECT_EQ(t.leavesOut("build-dbg/o", false), "build-*/");
+    EXPECT_EQ(t.leavesOut("log", false), "lo?");
+    EXPECT_EQ(t.leavesOut("logs", false), "");
+    EXPECT_EQ(t.leavesOut("bz", false), "[!a]z");
+    EXPECT_EQ(t.leavesOut("az", false), "");
+    EXPECT_EQ(t.leavesOut("lo\xC3\xA9", false), "lo?") << "`?` takes one CHARACTER, not one byte";
+}
+
+TEST(TreeIgnoresGrammar, NothingUnderALeftOutDirectoryIsReincluded) {
+    auto const t = rulesOf("/gone/\n!/gone/back.md\n");
+    EXPECT_EQ(t.leavesOut("gone/back.md", false), "/gone/");
+}
+
+TEST(TreeIgnoresGrammar, GitsOwnIsAlwaysLeftOutAsADirectoryOrAWorktreesFile) {
+    TreeIgnores const t;
+    EXPECT_EQ(t.leavesOut(".git/HEAD", false), ".git");
+    EXPECT_EQ(t.leavesOut("sub/.git", false), ".git");
+    EXPECT_EQ(t.leavesOut("sub/x.md", false), "");
+}
+
+TEST(TreeIgnoresGrammar, ARuleItCannotReadAsGitDoesIsRefusedNamingItsLine) {
+    EXPECT_NE(rulesOf("a/\nb\\#c\n").refusal.find("fixture-ignore line 2"), std::string::npos)
+        << "a backslash (an escape)";
+    EXPECT_NE(rulesOf("x\ny\nz[ab\n").refusal.find("fixture-ignore line 3"), std::string::npos)
+        << "a class never closed";
+    EXPECT_NE(rulesOf("a//b\n").refusal.find("fixture-ignore line 1"), std::string::npos)
+        << "an empty name between two separators";
+    EXPECT_NE(rulesOf("ok\n/\n").refusal.find("fixture-ignore line 2"), std::string::npos) << "a rule of `/` alone";
+    EXPECT_NE(rulesOf("!\n").refusal.find("fixture-ignore line 1"), std::string::npos) << "a rule of `!` alone";
+    EXPECT_TRUE(rulesOf("# a comment\n\nok/   \n").refusal.empty()) << "the control: comments, blanks, trailing blanks";
+}
+
+TEST(TreeIgnoresGrammar, NamesCompareAsWrittenCaseAndAll) {
+    auto const t = rulesOf(".temp/\n");
+    EXPECT_EQ(t.leavesOut(".TEMP/x.md", false), "");
+    EXPECT_EQ(t.leavesOut(".temp/x.md", false), ".temp/");
+}
+
+// LIVE: the repository's own `.gitignore` leaves out every directory DssHarness keeps
+// in a tree and keeps each one's placeholder — the statement the sweep above relies on.
+TEST(TreeIgnoresGrammar, ThisRepositorysGitignoreLeavesOutEveryDirectoryTheToolKeepsInATree) {
+    auto const root = dss::test::findRepoRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
+    TreeIgnores const t = dss::test_support::readTreeIgnores(*root);
+    ASSERT_TRUE(t.refusal.empty()) << t.refusal;
+    for (char const* kept : {".worktrees", ".orchestrators", ".mutations", ".legs"}) {
+        EXPECT_FALSE(t.leavesOut(std::string(kept) + "/x", true).empty()) << kept << " is walked";
+        EXPECT_EQ(t.leavesOut(std::string(kept) + "/.gitkeep", false), "") << kept << "'s placeholder is left out";
+    }
 }
 
 // `.` and `..` are NAVIGATION components, not filenames — no directory listing

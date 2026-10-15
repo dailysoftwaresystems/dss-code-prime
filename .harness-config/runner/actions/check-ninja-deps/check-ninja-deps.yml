@@ -8,7 +8,9 @@ description: >-
   The step `record` prints what ninja holds for an object, path by path, in a build directory of
   the leg's tree AS IT STANDS -- the reading a red entry is judged from, and the one way to see a
   record on a leg whose host is not this one. It does not ask the harness for the leg's build
-  directory, so nothing is built first: a rebuild could replace the very record asked for. It is
+  directory, so nothing is built first: a rebuild could replace the very record asked for. The
+  program holds the directory to the tree it lives in -- one that leads anywhere else is refused
+  -- and prints every line through the redactor. It is
   manual here and has a runner of its own, which no build is required of:
   `dssharness run check-ninja-deps-record --legs <leg> --input build=build/<processor>-<toolchain>-<config> --input object=<the end of an object's path> -v`.
 steps:

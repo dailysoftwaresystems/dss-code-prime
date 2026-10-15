@@ -104,6 +104,7 @@ which is why every former `scripts/` program sits directly under the actions roo
 | **`check-path-identity`** | `check-path-identity.py` | refuse a second path canonicalizer -- path resolution lives in exactly one place. |
 | **`check-pkg-pipeline`** | `check-pkg-pipeline.py` | pin the package pipeline's release-path step sequence and refuse an artifacts-only run that can reach a release. |
 | **`check-plan-citations`** | `check-plan-citations.py` | refuse a new `path:line` citation in the plans -- a citation names a stable reference, never a line number. |
+| **`check-repo-guard-label`** | `check-repo-guard-label.py` | refuse a configured build in which an entry that SELF-TESTS a program carries the `repo-guard` label -- a self-test's verdict reads its own fixtures, which can depend on the host, so every leg runs it. |
 | **`check-retyped-closed-sets`** | `check-retyped-closed-sets.py` | census the diagnostics that RETYPE a closed vocabulary instead of projecting it. |
 | **`check-scripts-index`** | `check-scripts-index.py` | refuse an action that no index documents, an index entry that no action backs, and an action no runner can start. |
 | **`check-stale-blockers`** | `check-stale-blockers.py` | list OPEN registry rows whose Closing-work cell waits on a blocker that has since CLOSED. |
@@ -118,7 +119,7 @@ which is why every former `scripts/` program sits directly under the actions roo
 | **`examples-census`** | `examples-census.py` | re-derive every corpus-manifest figure examples/README.md states, by parsing the manifests. |
 | **`macho-alias-ld64-matrix`** | `macho-alias-ld64-matrix.py` | measure what Apple's ld64 does with a second defined symbol at the address of a canonical one, with and without -dead_strip. |
 | **`manual-end-to-end`** | `manual-end-to-end.py` | run the manual end-to-end corpus, the entries whose cost makes them wrong to put in a gate, taken deliberately instead. |
-| **`owning-tree`** | `owning-tree.py` | name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment. |
+| **`owning-tree`** | `owning-tree.py` | name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment -- and what a walk of that tree leaves out: its own .gitignore, as git reads it. |
 | **`pragma-profile-census`** | `pragma-profile-census.py` | census `#pragma` usage across the corpus and hold the profile to its expected shape. |
 | **`probe-reference-cc`** | `probe-reference-cc.py` | compile, and optionally run or dump, one probe with the reference compiler of the host a leg runs on, and keep the verdict, the diagnostics and the result redacted, so a reference is MEASURED on a host no session reaches directly. |
 | **`profile-compile`** | `profile-compile-support.py`, `profile-compile.py` | compile one fixed subject with a RELEASE dsscp on this host and report where the time went, so the HOST is the only variable across legs. |
@@ -275,7 +276,12 @@ per program, named for it, holding its `<name>.yml` and every sibling implementa
 (`.harness-config/runner/actions/[<group>/...]<name>/<name>.{yml,py}`), assets alongside, and
 nothing loose in a group directory, buried in a subdirectory, or nested inside another action. A
 program finds the tree it lives in through the one owner, `owning-tree`, never by counting `..` —
-the move out of `scripts/` broke every count at once.
+the move out of `scripts/` broke every count at once. Two more answers live there, each the one statement
+of its fact: a walk from the tree's root leaves out what the tree's `.gitignore` leaves out, read as git
+reads it (`TreeIgnores`; no walker keeps a list of its own), and a path a command line names for a
+program to WRITE never begins with `-` (`written_path`: such a value is an option taken for a value —
+`--out --help` — and is refused naming its flag; a hand-read command line takes it as a path where
+argparse does not).
 #### No `.sh` and no `.ps1` under the actions directory — one Python program per action
 
 **Operator ruling 2026-09-21:** *"I don't want .sh/.ps1 files inside .harness-config\runner\actions.

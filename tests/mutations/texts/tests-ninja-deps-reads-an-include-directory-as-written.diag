@@ -1,1 +1,1 @@
-ninja-deps self-test: FAILED  msvc: a zero record is excused when the precompiled header and the toolchain answer every include
+it is excused (src/all_answered.cpp: of its 4 include(s), 1 the precompiled header its edge names already read, 3 the toolchain

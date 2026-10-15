@@ -1,0 +1,1 @@
+SELF_TEST_FLAG = re.compile(r"^--(?:self-test|selftest)(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?")

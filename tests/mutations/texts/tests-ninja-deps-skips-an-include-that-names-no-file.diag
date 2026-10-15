@@ -1,1 +1,1 @@
-ninja-deps self-test: FAILED  msvc: an #include whose text names no file is refused, not guessed
+it is excused (src/unnamed.cpp: of its 2 include(s), 2 the precompiled header

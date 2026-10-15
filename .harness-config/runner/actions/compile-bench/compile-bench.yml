@@ -5,6 +5,14 @@ description: >-
   The program documents itself in its own header; this file declares only how a
   runner starts it and what witnesses that it ran.
 steps:
+  # The command line's own refusals, proven before a reading is taken: no compiler, no build. ctest drives the same
+  # self-test one case per arm (`harness/compile_bench_selftest`).
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./compile-bench.py --self-test
+    successPattern: '^compile-bench self-test: \d+ arm\(s\), 0 failed$'
+    requireInputsUnmoved: true
   # Every knob of the bench is an input here, spelled `--name=value`; an empty value is the program's default.
   - name: bench
     workingDirectoryRoot: action

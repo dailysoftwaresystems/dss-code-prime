@@ -1,1 +1,1 @@
-    if "msvc" not in modes:
+    if flavour == "":

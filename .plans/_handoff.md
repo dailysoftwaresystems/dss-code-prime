@@ -437,6 +437,19 @@ round's close; each checkpoint's commit message says what was and was not run on
   from main at this checkpoint. Rows: 3 new, disclosed (two fixed, closing on their arms; the template gap below,
   open). New open work it found: an inline-asm template cannot name ANY symbol of the embedding program
   (`D-ASM-TEMPLATE-CANNOT-NAME-A-SYMBOL-OF-THE-EMBEDDING-PROGRAM`, P1; the link lane's next item).
+  Read from main since: `linux-x86_64-debug` (GNU 13.3) PASSED, 2787 tests.
+- **Checkpoint 23 (2026-10-15) = the harness lane's FOLD H2**: ONE statement of what a walk of a tree leaves out —
+  the root `.gitignore`, read as git reads it (a Python reader in `owning-tree` and a C++ one in
+  `tests/test_support/tree_ignores.hpp`, one grammar, the same refusals) — asked by every walker that starts at the
+  root (the document census, the redactor's two walks, the case-collision scan), and `sync.neverTransfer` reduced to
+  the two secrets (the sync plans MEASURED byte-identical without the 15 duplicates); `check-ninja-deps` rewritten by
+  its review (forced includes, PCH makers and `@file` refused per shape; one include reader; 826 objects of the MSVC
+  tree read, 2 excused, each by its edge's precompiled header); a path a program is told to WRITE is refused when it
+  is empty or begins with `-`; a SELF-TEST never carries the `repo-guard` label (it reads its own fixtures and runs
+  on every leg — the rule stated once beside the scan that gives the label, held by `check-repo-guard-label`). 394
+  paths; 119 arms unswept. ✔MEASURED by the lane on checkpoint 21 + its fold: `linux-arm64-debug` whole suite 2789 of
+  2789; `repo-guard` on both Windows legs 22 of 22 each. The lane's arm registry was merged BY ARM by the
+  orchestrator against the lane's real base (the tool's ancestor for that path was the lane's seed): 714 arms.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

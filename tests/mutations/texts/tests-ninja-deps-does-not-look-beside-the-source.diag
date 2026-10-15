@@ -1,1 +1,1 @@
-ninja-deps self-test: FAILED  msvc: a header beside the source is found there, and LOST
+it is excused (src/beside.cpp: of its 3 include(s), 2 the precompiled header

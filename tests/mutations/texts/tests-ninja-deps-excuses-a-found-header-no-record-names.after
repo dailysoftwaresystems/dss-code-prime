@@ -1,1 +1,1 @@
-        elif found:
+        if key:

@@ -93,6 +93,8 @@ Usage -- the `bench` step (`dssharness run compile-bench`, an input for each kno
     --require-build-type NAME   refuse unless dsscp was built this way (default: Release).
     --json PATH         also write the whole reading as JSON, for a before/after diff.
     --help
+    --self-test         prove the command line's refusals (no compiler, no build), one verdict line per arm; the
+                        action's `self-test` step and the ctest entry `harness/compile_bench_selftest` run it.
 """
 from __future__ import annotations
 
@@ -166,6 +168,31 @@ def load_build_type_reader(repo):
         die("%s no longer exports read_build_type. Fix that file rather than "
             "growing a second copy of the check here." % path)
     return mod.read_build_type
+
+
+# ── A PATH TO WRITE: owning-tree's one statement of it ──────────────────────
+# `--out` and `--json` name places this program writes. Which values can be one -- never an empty one, never one
+# beginning with `-`: `--json --help` would write the report to `./--help`, an option read as a value -- is said once,
+# by `owning-tree.py`'s `written_path`, loaded as a SIBLING action. A value that is no path may begin with `-`.
+def written_path(value, flag):
+    """The path `flag` names for writing, or None for an EMPTY value -- the default, as for every option here."""
+    if value == "":
+        return None
+    path = os.path.join(os.path.dirname(HERE), "owning-tree", "owning-tree.py")
+    if not os.path.isfile(path):
+        die("%s is missing: what a path to write may be is said there, and nowhere else" % path)
+    saved = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        sys.dont_write_bytecode = saved
+    try:
+        return mod.written_path(value, flag)
+    except mod.Refusal as exc:
+        die("%s. See --help." % exc)
 
 
 # ── the host, and the target that makes gcc a fair opponent ─────────────────
@@ -910,7 +937,7 @@ def parse_args(argv):
                 a["extra"].append((sid, [native(p) for p in paths.split(",") if p]))
             i += adv
         elif t == "--out":
-            a["out"] = val(); i += adv
+            a["out"] = written_path(val(), "--out"); i += adv
         elif t == "--label":
             a["label"] = val(); i += adv
         elif t == "--cc":
@@ -924,7 +951,7 @@ def parse_args(argv):
         elif t == "--require-build-type":
             a["require_build_type"] = val(); i += adv
         elif t == "--json":
-            a["json"] = val(); i += adv
+            a["json"] = written_path(val(), "--json"); i += adv
         else:
             # ★★★ NEVER A SHRUG. Ignoring an unknown flag is how a run ends up
             # not measuring what its command line said it measured.
@@ -938,7 +965,61 @@ def parse_args(argv):
     return a
 
 
+# ── THE COMMAND LINE'S OWN SELF-TEST: no compiler, no build ──────────────────
+SELFTEST_MARKER = "compile-bench self-test: "
+# ⚠ Raising this is the claim that the arms you added actually RUN.
+EXPECTED_ARMS = 5
+
+
+def self_test():
+    """Each arm parses one command line and reads what it did; a refusal is read from the program's own words."""
+    import contextlib
+    ran = []
+
+    def arm(label, ok, detail=""):
+        ran.append(bool(ok))
+        if ok:
+            print("%sok      %s" % (SELFTEST_MARKER, label))
+        else:
+            print("%sFAILED  %s -- %s" % (SELFTEST_MARKER, label, (detail or "no detail").replace("\n", " ")[:600]))
+
+    def refused(argv, flag):
+        said = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(said):
+                got = parse_args(argv)
+        except SystemExit as exc:
+            text = said.getvalue().strip()
+            return (exc.code == 2 and ("%s takes '" % flag) in text and "begins with `-`" in text,
+                    "exit %r: %s" % (exc.code, text[:300]))
+        return False, "parsed, no refusal: %s=%r" % (flag, got.get(flag[2:]))
+
+    arm("--out --help is an option taken for the directory to write: refused, naming --out",
+        *refused(["--out", "--help"], "--out"))
+    arm("--json --help is an option taken for the file to write: refused, naming --json",
+        *refused(["--json", "--help"], "--json"))
+    arm("--out=-x spells the same mistake inline: refused, naming --out", *refused(["--out=-x"], "--out"))
+    arm("--json=--help spells the same mistake inline: refused, naming --json",
+        *refused(["--json=--help"], "--json"))
+    try:
+        given = parse_args(["--out", "build/cb-x", "--json=r-1.json"])
+        empty = parse_args(["--out=", "--json="])
+        ok = (given["out"], given["json"], empty["out"], empty["json"]) == ("build/cb-x", "r-1.json", None, None)
+        detail = "given %r, empty %r" % ((given["out"], given["json"]), (empty["out"], empty["json"]))
+    except SystemExit as exc:
+        ok, detail = False, "refused, exit %r" % (exc.code,)
+    arm("a path holding a dash is kept, and an empty value is the default (the control)", ok, detail)
+    failed = ran.count(False)
+    if len(ran) != EXPECTED_ARMS:
+        print("%s%d arm(s) ran, %d expected -- FAIL" % (SELFTEST_MARKER, len(ran), EXPECTED_ARMS))
+        return 1
+    print("%s%d arm(s), %d failed%s" % (SELFTEST_MARKER, len(ran), failed, "" if not failed else " -- FAIL"))
+    return 0 if not failed else 1
+
+
 def main(argv):
+    if argv == ["--self-test"]:
+        return self_test()
     args = parse_args(argv)
     repo = repo_root()
 
