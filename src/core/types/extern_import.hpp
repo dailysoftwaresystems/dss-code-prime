@@ -481,6 +481,19 @@ struct DSS_EXPORT ExternImport {
     std::uint64_t    commonSize       = 0;
     std::uint64_t    commonAlignment  = 0;
     SymbolVisibility commonVisibility = SymbolVisibility::Default;
+    // ★ THE ALIGNMENT THE COMMON'S OBJECT STATES, 0 WHERE IT STATES NONE (P69
+    // fold 3b, lane `xa`). `commonAlignment` is what the link allocates at,
+    // and on two formats it can be the FORMAT's derivation from the size
+    // rather than anything the unit asked for: a COFF common carries no
+    // alignment (its final linker rounds the size up to a power of two, at
+    // most 32, unless an `-aligncomm:` directive asks for more), and a Mach-O
+    // common whose `n_desc` alignment is 0 is aligned as its size (ld64). A
+    // unit's code relies on the alignment it STATED and never on a derived
+    // one, so whatever compares a common with what it needs reads this: ELF's
+    // `st_value`, Mach-O's non-zero `n_desc` alignment, the largest
+    // `-aligncomm:` a COFF object asks for its name, a compiled unit's own
+    // declared alignment; a merge of two commons keeps the larger.
+    std::uint64_t    commonAlignmentStated = 0;
 };
 
 } // namespace dss

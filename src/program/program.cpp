@@ -2593,7 +2593,27 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                      // its own body for a name the loader
                                      // has already given the process a
                                      // different answer for.
-                                     (*formatR)->preemptibleDefinitionBindings());
+                                     (*formatR)->preemptibleDefinitionBindings(),
+                                     // P68 round 9: the format kind, ONLY as a key
+                                     // into an inline-asm dialect's `symbolParts`
+                                     // (`CuMirModule::assemblyFormatKind`). P69
+                                     // fold 3b (lane `xa`): this call passed
+                                     // `std::nullopt` — the one field the sole-CU
+                                     // route sets and the merged route dropped —
+                                     // so a program of two sources whose inline
+                                     // asm names an address part (`@PAGE`,
+                                     // `:lo12:`) was refused where one source
+                                     // built (DriverArgumentSupply.
+                                     // MergedMultiCuRouteSuppliesTheAssemblyFormatKind).
+                                     (*formatR)->kind(),
+                                     // P69 fold 3b: how the merged module writes a
+                                     // tentative definition — a COMMON where the
+                                     // document states one. Passed, never left to
+                                     // the default: a merged object written with
+                                     // `.bss` definitions is refused beside another
+                                     // object of the name where the references'
+                                     // commons fold.
+                                     (*formatR)->statesCommons());
     if (!mod) return std::nullopt;  // back-half tier failure already reported via `reporter`
     // c165 (D-LK-STATIC-LINK): the merged whole-program client module links
     // against any `ar` static archives named on `--resolve-library` the same way

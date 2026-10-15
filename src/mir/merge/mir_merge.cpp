@@ -893,6 +893,69 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     linker::CrossCuResolution const resolution =
         linker::resolveCrossCuDefs(defs);
 
+    // ── A TENTATIVE DEFINITION LARGER, OR MORE ALIGNED, THAN THE DEFINITION IT
+    //    YIELDS TO IS SAID (P69 fold 3b, the review of fold 3a, F4) ───────────
+    // The unit linker's sentence (`allocateCommonDefinitions`), for the units
+    // this merge folds: the tentative definition's unit reads and writes the
+    // object as the one it declared, past the definition's end or off its
+    // alignment. Every reference linker links the pair, so this merge does, and
+    // says so (`K_CommonSymbolLargerThanItsDefinition`, a warning). Each side is
+    // sized as step (1b) sizes a carrier: its own unit's layout rule; a side that
+    // cannot be sized is not judged here (that refusal is step (1b)'s).
+    {
+        auto const extentOf = [&](std::uint32_t ci, MirGlobalId g)
+            -> std::optional<std::pair<std::uint64_t, std::uint32_t>> {
+            Mir const& m    = *cus[ci].mir;
+            auto const& rule = cus[ci].aggregateLayout;
+            if (!rule.has_value()) return std::nullopt;
+            auto const lay = computeLayout(m.globalType(g), *cus[ci].interner, *rule,
+                                           linkFormat.dataModel());
+            if (!lay.has_value()) return std::nullopt;
+            return std::pair{static_cast<std::uint64_t>(lay->size),
+                             std::max(static_cast<std::uint32_t>(lay->align.bytes()),
+                                      m.globalAlignmentBytes(g))};
+        };
+        std::vector<std::string> names;
+        for (auto const& [name, carriers] : tentativeCarriers) names.push_back(name);
+        std::sort(names.begin(), names.end());   // warnings in a stated order
+        for (std::string const& name : names) {
+            auto const won = resolution.winners.find(name);
+            if (won == resolution.winners.end()) continue;
+            auto const& carriers = tentativeCarriers.at(name);
+            bool const aCarrierWon = std::any_of(carriers.begin(), carriers.end(),
+                [&](TentativeCarrier const& c) { return defs[c.def].key == won->second; });
+            if (aCarrierWon) continue;
+            std::uint32_t const wcu = won->second.cuId.v - 1;
+            if (wcu >= cus.size()) continue;
+            Mir const& wm = *cus[wcu].mir;
+            std::optional<MirGlobalId> winner;
+            for (std::uint32_t gi = 0; gi < wm.moduleGlobalCount(); ++gi) {
+                if (wm.globalSymbol(wm.globalAt(gi)) == won->second.symbol) winner = wm.globalAt(gi);
+            }
+            if (!winner.has_value()) continue;   // a function: no storage to compare
+            auto const definition = extentOf(wcu, *winner);
+            if (!definition.has_value()) continue;
+            for (TentativeCarrier const& c : carriers) {
+                auto const tentative = extentOf(c.cu, c.global);
+                if (!tentative.has_value()) continue;
+                if (tentative->first <= definition->first && tentative->second <= definition->second) continue;
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_CommonSymbolLargerThanItsDefinition;
+                d.severity = DiagnosticSeverity::Warning;
+                d.actual   = std::format(
+                    "mergeCuMirs: the tentative definition of '{}' in CU #{} is {} bytes "
+                    "aligned to {}, and the definition of the name it yields to (CU #{}) "
+                    "is {} bytes aligned to {}: the tentative definition's unit reads and "
+                    "writes the object as the larger or more aligned one it declared. "
+                    "Linked as every reference linker links it.",
+                    name, c.cu + 1, tentative->first, tentative->second, wcu + 1,
+                    definition->first, definition->second);
+                reporter.report(std::move(d));
+                break;   // once per name
+            }
+        }
+    }
+
     // (2) report each two-strong conflict (one per collision event — mirrors the
     // linker's per-pair K_SymbolRedefinedAcrossUnits count).
     for (linker::CrossCuConflict const& c : resolution.conflicts) {

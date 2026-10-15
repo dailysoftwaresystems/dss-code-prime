@@ -588,6 +588,41 @@ TEST(PeDllWriter, DuplicateExportNameFailsLoud) {
     EXPECT_TRUE(sawDiagnosticContaining(rep, "duplicate export name"));
 }
 
+// An OVERRIDABLE weak definition — on PE a weak external, whose name defers to whatever defines it — is not a name the
+// DLL's automatic export publishes; a strong definition beside it is (P69 fold 3b, the review of fold 3a, F5).
+// MEASURED 2026-10-12: GNU ld 2.42 and ld.lld 19.1.5 export `dll_api lib_entry` and never the weak `plain_weak` from
+// MinGW gcc's and clang's objects (4 of 4); DSS exported all three.
+TEST(PeDllWriter, AnOverridableWeakDefinitionIsNotExportedAutomatically) {
+    auto loaded = loadShippedDll();
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    for (std::uint32_t s : {1u, 2u}) {
+        AssembledFunction fn;
+        fn.symbol = SymbolId{s};
+        fn.bytes  = {0xC3};
+        mod.functions.push_back(std::move(fn));
+    }
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "dss_strong", SymbolBinding::Global, SymbolVisibility::Default});
+    ModuleSymbol weak{SymbolId{2}, "dss_overridable", SymbolBinding::Weak, SymbolVisibility::Default};
+    weak.weakKind = WeakDefinitionKind::Overridable;
+    mod.symbols.push_back(weak);
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(img.empty());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    SectionView const edata = findSection(img, ".edata");
+    ASSERT_TRUE(edata.found) << "the strong definition is exported";
+    std::size_t const   dirOff   = fileOff(edata, readU32LE(img, kExportDirOff));
+    std::uint32_t const numNames = readU32LE(img, dirOff + 24);
+    std::uint32_t const nameRva  = readU32LE(img, dirOff + 32);
+    std::vector<std::string> names;
+    for (std::uint32_t i = 0; i < numNames; ++i) {
+        names.push_back(readCStr(img, fileOff(edata, readU32LE(img, fileOff(edata, nameRva) + 4u * i))));
+    }
+    EXPECT_EQ(names, std::vector<std::string>{"dss_strong"})
+        << "the overridable weak name is a reference to whatever defines it, not a definition the DLL publishes";
+}
+
 TEST(PeDllWriter, NoExportsEmitsNoEdataAndZeroDirectory) {
     // A dll whose module carries no ModuleSymbol rows (hand-built
     // substrate) is legal PE: no .edata, zero export directory — the

@@ -382,3 +382,91 @@ TEST(GroupMemberRelocations, ARelocationFromOutsideADiscardedGroupIsStillRefused
     }
     EXPECT_TRUE(refused) << "the refusal of a relocation from outside the group must stay" << diagnosticsOf(rep);
 }
+
+// ══ A relocation standing in ANOTHER discarded group of its unit (P69 fold 3b, the review of fold 3a, F2) ═══════════
+//
+// Two units that both carry the COMDAT groups `f` and `g` (`elf_group_two_groups_{a,b}.source.s`): unit B's `g` jumps
+// to a non-external label of its own `f` group, so its `.text.g` holds `R_X86_64_PC32 .text.f + 2`. Behind unit A
+// BOTH of B's groups are discarded, and no linker processes a relocation of a discarded section.
+// ✔MEASURED 2026-10-15 (gcc 13.3.0's objects, md5 a 0f9d895d4f847ae93345972d57dbe2df, b
+// 2d922a0b9d866b589754dcaadaf8b963; lane xa's `sb6/groups/ggroups.log`), main returning two_groups_a() +
+// two_groups_b(): GNU ld 2.42 and ld.lld 18.1.3, A first 6 (1 + 2, twice), B first 60 (10 + 20, twice). Fold 3a's
+// merge refused A first, asking only whether the relocation stood in the SAME group as its target.
+// What is read off the image: every call of `f` and of `g` by name lands on the FIRST unit's body, and B's own `g`
+// (kept, unreachable, until the discard exists) still jumps to B's own `.Lf_inner`.
+namespace {
+
+// `pushq %rbx; call f; movl %eax,%ebx; call g; ...` — both callers open so; the calls' displacements at +2 and +9.
+[[nodiscard]] bool opensAsTwoGroupsCaller(Image const& img, std::size_t at) {
+    return holdsAt(img, at, {0x53, 0xE8}) && holdsAt(img, at + 6, {0x89, 0xC3, 0xE8});
+}
+[[nodiscard]] std::optional<std::size_t> callTargetOf(Image const& img, std::vector<LoadSegment> const& segs,
+                                                      std::size_t displacementAt) {
+    auto const next = addressOf(segs, displacementAt + 4);
+    if (!next.has_value()) return std::nullopt;
+    auto const target =
+        offsetOf(segs, static_cast<std::uint64_t>(static_cast<std::int64_t>(*next) + rdS32(img, displacementAt)));
+    if (!target.has_value()) return std::nullopt;
+    return static_cast<std::size_t>(*target);
+}
+// `movl $imm, %eax; ret` at `at`.
+[[nodiscard]] bool answersAt(Image const& img, std::size_t at, std::uint8_t imm) {
+    return holdsAt(img, at, {0xB8, imm, 0x00, 0x00, 0x00, 0xC3});
+}
+
+}  // namespace
+
+TEST(GroupMemberRelocations, ARelocationStandingInAnotherDiscardedGroupOfItsUnitLinksInBothOrders) {
+    auto const L = loadElfX8664();
+    ASSERT_TRUE(L.target && L.relocatable && L.exec);
+    struct Order {
+        char const*  name;
+        char const*  first;
+        char const*  second;
+        char const*  entry;
+        std::uint8_t f;   // what the kept `f` answers
+        bool         gJumps;   // the kept `g` is B's (`jmp .Lf_inner`), else A's (`movl $2`)
+    };
+    for (Order const& order :
+         {Order{"unit A first", "elf_group_two_groups_a_x86_64_elf_gas.o", "elf_group_two_groups_b_x86_64_elf_gas.o",
+                "two_groups_a", 1, false},
+          Order{"unit B first", "elf_group_two_groups_b_x86_64_elf_gas.o", "elf_group_two_groups_a_x86_64_elf_gas.o",
+                "two_groups_b", 10, true}}) {
+        SCOPED_TRACE(order.name);
+        LinkedPair linked;
+        linkPair(L, order.first, order.second, order.entry, linked);
+        ASSERT_TRUE(linked.ok) << "GNU ld 2.42 and ld.lld 18.1.3 link this pair in both orders (6 and 60): the "
+                                  "relocation stands in a group the link discards, and is processed by no linker"
+                               << linked.diagnostics;
+        EXPECT_EQ(linked.reporter.errorCount(), 0u) << linked.diagnostics;
+        Image const& img  = linked.image;
+        auto const   segs = loadSegmentsOf(img);
+        ASSERT_FALSE(segs.empty());
+        std::size_t callers = 0;
+        for (std::size_t at = 0; at + 16 <= img.size(); ++at) {
+            if (!opensAsTwoGroupsCaller(img, at)) continue;
+            ++callers;
+            auto const f = callTargetOf(img, segs, at + 2);
+            auto const g = callTargetOf(img, segs, at + 9);
+            ASSERT_TRUE(f.has_value() && g.has_value()) << "a caller's call leaves the image";
+            EXPECT_TRUE(answersAt(img, *f, order.f)) << "a call of `f` by name runs the first unit's `f`";
+            if (order.gJumps) {
+                ASSERT_TRUE(holdsAt(img, *g, {0xE9})) << "a call of `g` by name runs the first unit's `g` (B's jump)";
+                auto const lands = callTargetOf(img, segs, *g + 1);
+                ASSERT_TRUE(lands.has_value());
+                EXPECT_TRUE(answersAt(img, *lands, 20)) << "B's `g` reaches B's own `.Lf_inner`";
+            } else {
+                EXPECT_TRUE(answersAt(img, *g, 2)) << "a call of `g` by name runs the first unit's `g` (A's)";
+            }
+        }
+        EXPECT_EQ(callers, 2u) << "one caller per unit";
+        // B's `g`, wherever it stands — kept or a discarded group's unreachable copy — jumps to B's own `.Lf_inner`.
+        std::size_t bJumps = 0;
+        for (std::size_t at = 0; at + 5 <= img.size(); ++at) {
+            if (img[at] != 0xE9) continue;
+            auto const lands = callTargetOf(img, segs, at + 1);
+            if (lands.has_value() && answersAt(img, *lands, 20)) ++bJumps;
+        }
+        EXPECT_EQ(bJumps, 1u) << "B's `g` stays on B's bytes in both orders";
+    }
+}

@@ -376,7 +376,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // ✔MEASURED — the merged route is reachable ONLY through
 // `Program::compileUnits` with ≥2 sources, and
 // <!--census:examples:top.sources-->41 of the
-// <!--census:examples:manifests-->1073 shipped corpus example manifests declare a
+// <!--census:examples:manifests-->1077 shipped corpus example manifests declare a
 // multi-source `sources` array, so the corpus exercises it roughly 3% as often
 // as the single-CU route.
 // ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census
@@ -945,6 +945,13 @@ struct DSS_EXPORT CuMirModule {
     // needs is a facts object, not a second key. nullopt ⇒ no format stated,
     // and every such operator is refused by name.
     std::optional<ObjectFormatKind>                assemblyFormatKind;
+
+    // ★★ HOW THIS UNIT WRITES A TENTATIVE DEFINITION (P69 fold 3b, lane `xa`) — the
+    // document's answer (`ObjectFormatSchema::statesCommons`), captured for the
+    // SAME reason as `externCallDispatch`: the LOWER half sees only this struct.
+    // True makes each global `Mir::globalIsCommon` admits the COMMON row the object
+    // readers produce instead of a `.bss` definition.
+    bool statesCommons = false;
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the
@@ -1360,7 +1367,18 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // `CuMirModule::assemblyFormatKind`). nullopt ⇒ an
                       // inline-asm address-part operator is refused by name.
                       std::optional<ObjectFormatKind> assemblyFormatKind =
-                          std::nullopt);
+                          std::nullopt,
+                      // ★★ P69 fold 3b (lane `xa`): how the merged module writes a
+                      // tentative definition — the document's answer
+                      // (`ObjectFormatSchema::statesCommons`),
+                      // pre-resolved in program.cpp for the same reason the facts
+                      // above are. ⚠ PASSED AT THE CALL SITE: a merged module
+                      // lowered with the default writes every tentative
+                      // definition as a `.bss` definition, and two such objects of
+                      // one name are refused by every linker where the references'
+                      // commons fold (`DriverArgumentSupply` pins it on the
+                      // artifact).
+                      bool statesCommons = false);
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's

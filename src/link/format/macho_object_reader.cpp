@@ -686,6 +686,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             common.binding          = SymbolBinding::Global;
             common.commonSize       = s.value;
             common.commonAlignment  = alignment;
+            // An `n_desc` alignment of 0 is ld64's derivation from the size, not
+            // one the object states.
+            common.commonAlignmentStated = alignLog2 == 0u ? 0u : alignment;
             common.commonVisibility = machoVisibility(s.type);
             externBySym.emplace(i, mod.externImports.size());
             mod.externImports.push_back(std::move(common));

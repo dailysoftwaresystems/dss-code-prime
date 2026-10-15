@@ -5473,7 +5473,17 @@ enum class DiagnosticCode : std::uint16_t {
     //   look for a damaged file. Refused rather than read without its body.
     //   Always an Error, so it needs no row in the unsuppressable table.
     K_ObjectSectionNotModelled     = 0x802E,
-    // K-NEXT-SLOT: 0x802F — grep this marker before adding a K_* code.
+    // K_CommonSymbolLargerThanItsDefinition (D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED,
+    //   P69 fold 3b) — WARNING. A COMMON (tentative) definition that yields to a
+    //   definition of its name SMALLER than it or LESS ALIGNED: the unit that wrote
+    //   the common reads and writes the object as the larger, more aligned one it
+    //   declared, past the definition's end or off its alignment. Every reference
+    //   linker links it (✔MEASURED 2026-10-15: Apple's ld warns of the size, GNU ld
+    //   of the alignment and, in one order, the size; ld.lld, link.exe, lld-link
+    //   and MinGW's GNU ld are silent), so the link proceeds — and says so.
+    //   Suppressible: the build proceeds with the meaning the references give it.
+    K_CommonSymbolLargerThanItsDefinition = 0x802F,
+    // K-NEXT-SLOT: 0x8030 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

@@ -44,6 +44,28 @@
 // never dropped in silence. P69 round 4.
 namespace dss::pe {
 
+// ── THE NAME OF A WEAK EXTERNAL'S DEFAULT RECORD ─────────────────────────────
+// (P69 fold 3b, the review of fold 3a, F11: it was spelled separately in the
+// writer, twice, and in the reader.) COFF names no default: a weak external's
+// default is any record, and the format says nothing of what it is called. The
+// GNU-family producers name it after the weak name — MinGW gcc
+// `.weak.<name>.<the unit's first strong symbol>`, clang
+// `.weak.<name>.default.<...>` (✔MEASURED 2026-10-08 on their objects) — so the
+// spelling is the PRODUCERS' convention, not a fact of the format, and it is
+// stated here and not in a format document: DSS's writer names its own default
+// in it (`.weak.<name>.default`, then `.<the unit's first strong definition>`
+// where it has one, as gcc does), and the reader recognizes a default of the
+// family by it.
+inline constexpr std::string_view kWeakDefaultRecordPrefix = ".weak.";
+// Every name a default of the weak name `weakName` takes begins with this.
+[[nodiscard]] inline std::string weakDefaultRecordFamily(std::string_view weakName) {
+    return std::string{kWeakDefaultRecordPrefix} + std::string{weakName} + ".";
+}
+// The name DSS's writer gives the default of `weakName` (before any suffix).
+[[nodiscard]] inline std::string dssWeakDefaultRecordName(std::string_view weakName) {
+    return weakDefaultRecordFamily(weakName) + "default";
+}
+
 // `alternateName`: `name=fallback` — a reference to `name` that nothing
 // defines resolves to `fallback`.
 struct CoffAlternateName {

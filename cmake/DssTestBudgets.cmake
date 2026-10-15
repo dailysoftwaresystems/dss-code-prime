@@ -233,7 +233,17 @@ set(_DSS_TB_NAMED
     # macos-arm64 Debug 256.5 s, linux-arm64 Debug 163.0 s, MinGW Debug 157.5 s with three reference
     # arms and 218.39 s with four lanes' finals on the host, linux-x86_64 Debug 51.4 s. Release
     # stays under its ceiling: MSVC Release 53.7 s, 76 s beside other lanes' builds.
-    "link/test_common_symbols|53|105|257"
+    # ★ DEBUG RE-DERIVED 2026-10-15 (cycle P69, lane xa's fold 3b: the stated-alignment and
+    # larger-common cells). ✔MEASURED in a PASSING macos-arm64 Debug run of the lane's tree, its
+    # host shared with two other lanes' builds and a mutation sweep: 308.29 s (155.24 s in that
+    # tree's whole-suite run the same afternoon). The slowest healthy run sets the ceiling.
+    "link/test_common_symbols|53|105|309"
+    # ★ link/test_tentative_definitions_as_commons: NAMED 2026-10-15 (cycle P69, lane xa's fold 3b,
+    # a new suite whose native cells ask the leg's reference linkers). ✔MEASURED in passing
+    # macos-arm64 Debug runs under the same shared load: 105.84 s (scoped), 63.27 s (whole suite).
+    # Release and sanitized are NOT measured -- no run of either class has read it -- and take the
+    # unit ceilings until one does.
+    "link/test_tentative_definitions_as_commons|53|50|106"
     "core/test_type_kind_vocabulary_projection|103|4|17"
     "analysis/semantic/test_fc3_width_semantics|96|6|19"
     "analysis/preprocess/test_preprocess_no_rework|94|5|18"

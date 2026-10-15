@@ -391,7 +391,10 @@ public:
     //     emulated-TLS control object — and two units holding one are REFUSED
     //     by link.exe, lld-link, GNU ld and ld.lld alike (7 of 7 cells), as two
     //     strong definitions are. So it stays a definition, and the pair stays
-    //     refused. (Mach-O is NOT measured; it is held to the same answer.)
+    //     refused. Mach-O agrees (✔MEASURED 2026-10-12, Apple clang 21: the
+    //     object is in `__DATA,__thread_vars`, and the pair is refused as a
+    //     duplicate symbol by ld-1267 on arm64 and x86_64 and by `-ld_classic`,
+    //     6 of 6).
     // The builders already refuse the mark on a local global and beside an
     // initializer (`mirLinkageDefect`), so neither is asked again.
     // (The conjunction itself is `mirLinkageIsCommon`, mir/mir_node.hpp, so that

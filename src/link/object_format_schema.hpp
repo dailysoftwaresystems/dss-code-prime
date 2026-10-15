@@ -432,16 +432,23 @@ DSS_CHECK_ENUM_NAME_TABLE(kCommonYieldsToTable);
 // `link/format/object_atom_coverage.hpp`). The linkers split on what the
 // definition's own BYTES are afterwards, and with it on what a relocation means
 // that its object wrote through a module-private name of the definition, or
-// through its section. TWO ANSWERS:
+// through its section — and with them on what becomes of ANOTHER external
+// name the definition carries, one no other definition holds. THREE ANSWERS:
 //   * `keepsItsBytes` — the name moves and nothing else does. The bytes stay in
-//     their input section, and a relocation that names them stays on them.
+//     their input section, a relocation that names them stays on them, and the
+//     definition's other names stay on them too.
 //   * `replacedWhole` — the definition is replaced with every label it carries,
-//     so such a relocation reaches the winner as the name does.
+//     so such a relocation reaches the winner as the name does, and so does every
+//     other name the definition carries: each now names the winner.
+//   * `discardedWhole` — the definition's section is discarded with every label
+//     in it: such a relocation reaches the winner (the one cell that works, below),
+//     and another external name only this definition held is left with NO
+//     definition — a link that needs it is refused, naming it.
 // A DOCUMENT STATES ONE FOR EVERY DEFINITION, OR ONE PER KIND OF WEAK DEFINITION
 // (`WeakDefinitionKind`, `core/types/symbol_attrs.hpp`):
 //     "supersededDefinition": "replacedWhole"
 //     "supersededDefinition": { "overridable": "keepsItsBytes",
-//                               "select-any":  "replacedWhole" }
+//                               "select-any":  "discardedWhole" }
 // The second form is keyed by the kinds' own names, every one of them, and it is
 // for a format that spells the two kinds differently and whose linkers treat
 // them differently. Nothing in shared code knows which kind keeps what: a reader
@@ -490,7 +497,7 @@ DSS_CHECK_ENUM_NAME_TABLE(kCommonYieldsToTable);
 //         every cell, link.exe reads 7 and 9 where the override comes first and
 //         refuses the object otherwise (LNK1235), and GNU ld reads 7 and 9
 //         beside the override.
-//       - `select-any`: `replacedWhole`. The definition is a COMDAT, one of
+//       - `select-any`: `discardedWhole`. The definition is a COMDAT, one of
 //         several copies, and the loser's SECTION is discarded with every label
 //         in it. What a relocation from a kept section against a non-external
 //         label of the discarded one, or against its section symbol, then
@@ -500,6 +507,16 @@ DSS_CHECK_ENUM_NAME_TABLE(kCommonYieldsToTable);
 //         ("relocation against symbol in discarded section"). The one cell that
 //         WORKS answers the winner, and so does this link, for a function and a
 //         datum alike — which is also what it did before the key existed.
+//         ✔MEASURED 2026-10-15 (P69 fold 3b, lane `xa`'s `sb6/owner/gpe_whole.log`)
+//         what becomes of an EXTERNAL label of the discarded copy that no other
+//         copy holds (a select-any `w` carrying a strong `m`, clang's assembler,
+//         beside cl's select-any `w`): lld-link 19.1.5 refuses ("undefined
+//         symbol: m"), GNU ld 2.42 refuses ("undefined reference"), link.exe 14.44
+//         links garbage — the label goes with the section, which is why this kind
+//         answers `discardedWhole` and not Mach-O's `replacedWhole`, under which
+//         the same label names the winner (ld-1267, arm64 and x86_64, both orders:
+//         a hidden strong label beside an overridden weak one reads the override,
+//         `tests/link/test_atom_ownership_shapes.cpp`).
 // A document that does not state it leaves a link to REFUSE the moment the
 // question arises — a relocation naming a superseded definition whose unit
 // references the lost name by row (`ModuleSymbol::referencedByName`) — and a
@@ -510,11 +527,13 @@ DSS_CHECK_ENUM_NAME_TABLE(kCommonYieldsToTable);
 enum class SupersededDefinition : std::uint8_t {
     KeepsItsBytes,
     ReplacedWhole,
+    DiscardedWhole,
 };
 
-inline constexpr EnumNameTable<SupersededDefinition, 2> kSupersededDefinitionTable{{{
-    { SupersededDefinition::KeepsItsBytes, "keepsItsBytes" },
-    { SupersededDefinition::ReplacedWhole, "replacedWhole" },
+inline constexpr EnumNameTable<SupersededDefinition, 3> kSupersededDefinitionTable{{{
+    { SupersededDefinition::KeepsItsBytes,  "keepsItsBytes" },
+    { SupersededDefinition::ReplacedWhole,  "replacedWhole" },
+    { SupersededDefinition::DiscardedWhole, "discardedWhole" },
 }}};
 DSS_CHECK_ENUM_NAME_TABLE(kSupersededDefinitionTable);
 
@@ -3446,6 +3465,39 @@ public:
     // the archive search, so the two cannot disagree.
     [[nodiscard]] std::optional<CommonYieldsTo> commonYieldsTo() const noexcept {
         return d_.commonYieldsTo;
+    }
+
+    // ★★★ WHETHER THIS DOCUMENT STATES COMMONS (P69 fold 3b, lane `xa`;
+    // D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED): how a common
+    // is resolved, by a link (`commonYieldsTo`: an image, a relocatable artifact)
+    // or by an archive's search (`archiveCommonResolution`, the key its members'
+    // document carries; `validate()` refuses `commonYieldsTo` there). Where it
+    // does, a unit compiled for it writes each tentative definition the link may
+    // fold (`Mir::globalIsCommon`: `int v;` at file scope, external, strong, not
+    // thread-local) as a COMMON — the row every object reader already produces
+    // (`ExternImport::commonSize`): an image link allocates it once per name, a
+    // relocatable artifact or an archive member hands it on, and each writer
+    // spells it (ELF `SHN_COMMON`, Mach-O an `N_UNDF` external with the
+    // alignment's log2, COFF an undefined external whose value is the size, plus
+    // the document's `commonAlignment` directive where the alignment is wider
+    // than the one a COFF linker gives a common of that size). That is what cl
+    // writes by default, Apple clang by default, and gcc and clang under
+    // `-fcommon` (✔MEASURED 2026-10-12, ELF x86_64, PE x86_64 and Mach-O
+    // arm64/x86_64), and two such objects of one name LINK as one object where
+    // two `.bss` definitions are refused by every linker — one working reference
+    // makes the fold required. An archive's members too (✔MEASURED 2026-10-15): a
+    // member whose only definition of a name is a common is fetched for a
+    // reference to it, and two such members fetched by one link are ONE object,
+    // under GNU ld (ELF, PE), ld.lld, link.exe, lld-link and Apple's ld-1267
+    // (`-ld_classic` alone does not fetch the first: its archive's table of
+    // contents omits commons), where the same members written as definitions are
+    // refused as duplicates by every one of them. Where the document states no
+    // common (SPIR-V, wasm), the unit writes a zero-filled definition. The ONE
+    // place the answer is read off the document: the pipeline's two lower-half
+    // callers capture it (`lowerMirModuleToAssembly`,
+    // `program/compile_pipeline.cpp`), and nothing re-derives it from the keys.
+    [[nodiscard]] bool statesCommons() const noexcept {
+        return d_.commonYieldsTo.has_value() || d_.archiveCommonResolution.has_value();
     }
 
     // What this document states of a definition whose name another definition

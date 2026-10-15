@@ -55,6 +55,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/substrate/phase_timers.hpp"
+#include "host_native_target.hpp"
 #include "pe_image_readers.hpp"
 #include "program/program.hpp"
 #include "program/runtime_object_cache.hpp"   // kRuntimeCacheOverrideVariable
@@ -1877,4 +1878,183 @@ TEST(DriverArgumentSupply,
     EXPECT_GE(countBytes(img, "__addtf3"), 1u)
         << "the premise: the fixture must really mint an F128 softcall, or the "
            "library assertion above is about a binding nothing consulted";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// `statesCommons` — whether the merged module writes a tentative definition as
+// a COMMON (P69 fold 3b, D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED).
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The document's answer (`ObjectFormatSchema::statesCommons`) reaches the sole-CU
+// route through `CuMirModule`, and the merged route ONLY through the argument
+// `program.cpp` passes at its `lowerMergedToAssembly` call — whose default
+// (`false`) compiles, and builds: the merged object then carries `int v;` as a
+// zero-filled `.bss` DEFINITION, and a second object of the name (the
+// reference's, or DSS's own) is refused as a duplicate by every linker where the
+// references' commons fold into one object. So the pin reads the ARTIFACT: the
+// merged relocatable ELF object states the merged tentative definition as
+// `SHN_COMMON`, with its size and its alignment.
+namespace {
+
+struct ElfSymbolRecord {
+    std::uint16_t shndx = 0;
+    std::uint64_t value = 0;
+    std::uint64_t size  = 0;
+};
+
+// Every `.symtab` record named `name` in an ELF64 little-endian object (found by
+// section TYPE, its string table by `sh_link`); empty for anything else.
+[[nodiscard]] std::vector<ElfSymbolRecord> elfSymbolsNamed(std::vector<std::uint8_t> const& obj,
+                                                           std::string_view                 name) {
+    constexpr std::uint32_t kShtSymtab = 2;
+    constexpr std::size_t   kSymEntry  = 24;
+    std::vector<ElfSymbolRecord> out;
+    if (obj.size() < 0x40 || !(obj[0] == 0x7F && obj[1] == 'E' && obj[2] == 'L' && obj[3] == 'F' && obj[4] == 2
+                               && obj[5] == 1)) {
+        return out;
+    }
+    std::uint64_t const shoff     = rdU64(obj, 0x28);
+    std::uint16_t const shentsize = rdU16(obj, 0x3A);
+    std::uint16_t const shnum     = rdU16(obj, 0x3C);
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        std::size_t const sh = static_cast<std::size_t>(shoff) + std::size_t{i} * shentsize;
+        if (rdU32(obj, sh + 4) != kShtSymtab) continue;
+        std::size_t const   symOff = static_cast<std::size_t>(rdU64(obj, sh + 0x18));
+        std::size_t const   symSz  = static_cast<std::size_t>(rdU64(obj, sh + 0x20));
+        std::uint32_t const link   = rdU32(obj, sh + 0x28);
+        std::size_t const   strSh  = static_cast<std::size_t>(shoff) + std::size_t{link} * shentsize;
+        std::size_t const   strOff = static_cast<std::size_t>(rdU64(obj, strSh + 0x18));
+        std::size_t const   strSz  = static_cast<std::size_t>(rdU64(obj, strSh + 0x20));
+        for (std::size_t e = 0; e + kSymEntry <= symSz; e += kSymEntry) {
+            std::size_t const at = symOff + e;
+            std::size_t const nm = rdU32(obj, at);
+            if (nm >= strSz || strOff + nm >= obj.size()) continue;
+            std::size_t end = strOff + nm;
+            while (end < obj.size() && end < strOff + strSz && obj[end] != 0) ++end;
+            std::string_view const sym{reinterpret_cast<char const*>(obj.data() + strOff + nm), end - (strOff + nm)};
+            if (sym != name) continue;
+            out.push_back(ElfSymbolRecord{rdU16(obj, at + 6), rdU64(obj, at + 8), rdU64(obj, at + 16)});
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesWhetherTheDocumentStatesCommons) {
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-states-commons"};
+    scratch.useAsCwd();
+    auto const out = scratch.path() / "commons_out";
+    DiagnosticReporter rep;
+    ASSERT_EQ(buildMergedPair(scratch, "commons_a.c",
+                              "int dss_tentative_v;\n"
+                              "int *dss_tentative_a(void) { return &dss_tentative_v; }\n",
+                              "commons_b.c",
+                              "int dss_tentative_v;\n"
+                              "int *dss_tentative_b(void) { return &dss_tentative_v; }\n",
+                              "x86_64:elf64-x86_64-linux", out, rep),
+              0)
+        << "the 2-CU relocatable ELF build of one tentative definition in each unit must succeed; a red here "
+           "means the FIXTURE is broken, not the pin\n"
+        << allDiagnosticText(rep);
+
+    std::vector<fs::path> written;
+    for (auto const& e : fs::directory_iterator(out)) {
+        if (e.is_regular_file()) written.push_back(e.path());
+    }
+    ASSERT_EQ(written.size(), 1u) << "the merged route writes ONE relocatable object";
+    auto const obj = readAllBytes(written.front());
+    ASSERT_FALSE(obj.empty()) << "the merged relocatable object must exist";
+    constexpr std::uint16_t kShnCommon = 0xFFF2;
+    auto const records = elfSymbolsNamed(obj, "dss_tentative_v");
+    ASSERT_EQ(records.size(), 1u) << "the merge folds the two tentative definitions into ONE record";
+    EXPECT_EQ(records[0].shndx, kShnCommon)
+        << "the merged object must state the tentative definition as a COMMON (`SHN_COMMON`), as gcc -fcommon, "
+           "clang -fcommon, cl and Apple clang do; a section index here (" << records[0].shndx
+        << ") is the zero-filled `.bss` DEFINITION the merged route writes when `program.cpp` stops passing "
+           "the document's `statesCommons` — and every linker refuses it beside another object of the name";
+    EXPECT_EQ(records[0].value, 4u) << "an ELF common's `st_value` is its alignment";
+    EXPECT_EQ(records[0].size, 4u);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// The FORMAT KIND — the one key an inline-asm template's address-part
+// operators are read under (`CuMirModule::assemblyFormatKind`; arm64's `@PAGE`
+// / `@PAGEOFF` on Mach-O, `:lo12:` on ELF). P69 fold 3b (lane `xa`): the sole-CU
+// route set it on its `CuMirModule` and the merged route passed `std::nullopt`
+// at its one call of `lowerMergedToAssembly` — the one field of the sole-CU
+// route's the merged route dropped (READ 2026-10-15, every other field
+// compared) — so a program of two sources was told "this build states no
+// object format to read it under", which is false of every build.
+// ✔MEASURED 2026-10-15 (Mac leg, both arms): the merged route said exactly
+// that, and the SOLE route refused the same text one step later — an inline-asm
+// template names no symbol of the embedding program at all today
+// (D-ASM-TEMPLATE-CANNOT-NAME-A-SYMBOL-OF-THE-EMBEDDING-PROGRAM; Apple clang
+// links the two sources to 42 under ld-1267 and `-ld_classic`). So the pin is
+// what both routes can be held to now: the SAME answer — the same exit code and
+// the same refusals, word for word — and neither says it has no object format.
+// Where both build (that row's fold), each image runs where the arm is the
+// host's own and reads the global (42).
+// ════════════════════════════════════════════════════════════════════════════
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheAssemblyFormatKind) {
+    struct Arm {
+        char const* label;
+        char const* spec;
+        char const* addressOf;   // the template: `%0` = the address of `dss_asm_g`, by its address parts
+    };
+    // Every error's code and words, in order: the answer a route gave, without the places it gave it at.
+    auto const answerOf = [](DiagnosticReporter const& rep) {
+        std::vector<std::string> said;
+        for (auto const& d : rep.all()) {
+            if (d.severity != dss::DiagnosticSeverity::Error) continue;
+            said.push_back(std::string{dss::diagnosticCodeName(d.code)} + ": " + d.actual);
+        }
+        return said;
+    };
+    for (Arm const& arm : {Arm{"Mach-O arm64", "arm64:macho64-arm64-darwin-exec",
+                               "adrp %0, _dss_asm_g@PAGE\\n\\tadd %0, %0, _dss_asm_g@PAGEOFF"},
+                           Arm{"ELF aarch64", "arm64:elf64-aarch64-linux-exec",
+                               "adrp %0, dss_asm_g\\n\\tadd %0, %0, :lo12:dss_asm_g"}}) {
+        SCOPED_TRACE(arm.label);
+        std::string const reader = std::string{"extern int dss_asm_g;\n"
+                                               "int dss_read_g(void) {\n"
+                                               "    int *p;\n"
+                                               "    __asm__(\""} + arm.addressOf + "\" : \"=r\"(p));\n"
+                                   "    return *p;\n"
+                                   "}\n";
+        std::string const entry = "int dss_asm_g = 42;\nint dss_read_g(void);\nint main(void) { return dss_read_g(); }\n";
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-asm-format-kind"};
+        scratch.useAsCwd();
+        bool const runsHere = dss::test_support::hostNativeTarget().execTarget == std::string_view{arm.spec};
+        // The merged route: two sources.
+        auto const         merged = scratch.path() / "merged_out";
+        DiagnosticReporter rep;
+        int const mergedRc = buildMergedPair(scratch, "asm_entry.c", entry, "asm_reader.c", reader, arm.spec, merged, rep);
+        // The sole-CU route: the same text in one source.
+        auto const         sole    = scratch.path() / "sole_out";
+        auto const         oneFile = writeSrc(scratch.path(), "asm_one.c", entry + reader);
+        DiagnosticReporter soleRep;
+        Program            prog;
+        prog.setOutputDir(sole);
+        int const soleRc = prog.compileUnits({oneFile.generic_string()}, "c", {std::string{arm.spec}}, soleRep);
+        for (auto const* said : {&rep, &soleRep}) {
+            EXPECT_EQ(allDiagnosticText(*said).find("states no object format"), std::string::npos)
+                << (said == &rep ? "the merged route" : "the sole-CU route")
+                << " read an address-part operator under NO object format — the merged route dropping the format "
+                   "kind its one call of `lowerMergedToAssembly` must pass\n"
+                << allDiagnosticText(*said);
+        }
+        EXPECT_EQ(mergedRc, soleRc) << "the two routes must give one program's text the same answer\nmerged:\n"
+                                    << allDiagnosticText(rep) << "\nsole:\n" << allDiagnosticText(soleRep);
+        EXPECT_EQ(answerOf(rep), answerOf(soleRep)) << "the same refusals, word for word";
+        if (!runsHere || mergedRc != 0 || soleRc != 0) continue;
+        for (fs::path const& dir : {merged, sole}) {
+            for (auto const& e : fs::directory_iterator(dir)) {
+                if (!e.is_regular_file()) continue;
+                auto const res = dss::test_support::runBinary(e.path(), dss::test_support::kRunBudget);
+                EXPECT_TRUE(res.spawned) << e.path() << ": " << res.diagnostic;
+                EXPECT_EQ(res.exitCode, 42) << e.path() << ": the asm reads the global through its address parts";
+            }
+        }
+    }
 }

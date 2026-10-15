@@ -1399,6 +1399,119 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
                        ? " (same length, differing content)"
                        : ""));
     }
+    // ── A DEFINITION REPLACED OR DISCARDED WHOLE TAKES ITS OTHER NAMES WITH IT ──
+    //    D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER
+    //    (P69 fold 3b, lane `xa`)
+    //
+    // The kernel resolves NAMES one at a time, so a definition that LOSES one of
+    // its names (a weak one, overridden or outranked) still WINS every other name
+    // only it holds — and so stands, bytes and all, under those. That is the
+    // format's answer only where it keeps a superseded definition's bytes. Where
+    // the link's document says otherwise (`supersededDefinition`, asked with the
+    // lost name's own kind; `object_format_schema.hpp` states each measurement):
+    //   * `replacedWhole` — every other name of the definition NAMES THE WINNER of
+    //     the lost one. ✔MEASURED 2026-10-15: a hidden strong label beside a
+    //     visible weak one at one address (Apple's assembler), the weak name
+    //     overridden by another unit: the strong label's reads reach the override
+    //     under ld-1267 (arm64 and x86_64, both orders, and after `ld -r` of the
+    //     pair's object) — `tests/link/test_atom_ownership_shapes.cpp`;
+    //   * `discardedWhole` — every other name of the definition goes with its
+    //     section and is left with NO definition: a unit that imports it finds
+    //     none (✔MEASURED the same day: lld-link 19.1.5 and GNU ld 2.42 refuse the
+    //     link naming the label, link.exe 14.44 links garbage).
+    // A definition that lost names to TWO different winners under `replacedWhole`
+    // leaves its other names no one winner to name: refused by name.
+    // AN IMAGE's LINK ONLY. A relocatable link keeps the definition under its other
+    // names: ✔MEASURED 2026-10-15 (lane xa's `sb6/mac3/gmac3.log`), a visible strong
+    // label at the address of a `.weak_definition`, linked with an override of the
+    // weak name: the image reads the override through the strong label under
+    // ld-1267 (99, arm64 and x86_64, both orders; `-ld_classic` 79), and `ld -r` of
+    // the same two objects keeps the strong label on its own bytes under both
+    // linkers — an image of that artifact reads 79.
+    // Done HERE, on the winner table itself, so that every reader of it — the
+    // reference resolution below, the merge's ids, which bytes are dropped
+    // (`isShadowedAtom`) — asks one table and agrees.
+    std::unordered_map<std::string, LinkedSymbolKey> winners = resolution.winners;
+    if (!relocatableArtifact) {
+        SupersededDefinitionStatement const& superseded = format.supersededDefinition();
+        // A name left with no definition -> the lost name that took its definition, and that unit.
+        std::unordered_map<std::string, std::pair<std::string, std::uint32_t>> discardedNames;
+        for (auto const& m : modules) {
+            std::unordered_map<std::uint32_t, std::vector<ModuleSymbol const*>> externalNamesOf;
+            for (auto const& s : m.symbols) {
+                if (s.binding == SymbolBinding::Local || s.name.empty()) continue;
+                auto& names = externalNamesOf[s.symbol.v];
+                bool const repeated = std::any_of(names.begin(), names.end(),
+                                                  [&](ModuleSymbol const* n) { return n->name == s.name; });
+                if (!repeated) names.push_back(&s);
+            }
+            for (auto const& [id, names] : externalNamesOf) {
+                if (names.size() < 2u) continue;   // one name: there is no other to take
+                LinkedSymbolKey const self{m.cuId, SymbolId{id}};
+                std::vector<LinkedSymbolKey> replacers;
+                ModuleSymbol const*          discardedFor = nullptr;
+                ModuleSymbol const*          replacedFor  = nullptr;
+                for (ModuleSymbol const* ms : names) {
+                    auto const won = resolution.winners.find(ms->name);
+                    if (won == resolution.winners.end() || won->second == self) continue;
+                    auto const answer = superseded.answerFor(ms->weakKind);
+                    if (!answer.has_value() || *answer == SupersededDefinition::KeepsItsBytes) continue;
+                    if (*answer == SupersededDefinition::DiscardedWhole) {
+                        if (discardedFor == nullptr) discardedFor = ms;
+                        continue;
+                    }
+                    if (replacedFor == nullptr) replacedFor = ms;
+                    if (std::find(replacers.begin(), replacers.end(), won->second) == replacers.end()) {
+                        replacers.push_back(won->second);
+                    }
+                }
+                if (discardedFor == nullptr && replacers.empty()) continue;
+                std::vector<std::string> kept;   // the names only this definition held
+                for (ModuleSymbol const* ms : names) {
+                    auto const won = resolution.winners.find(ms->name);
+                    if (won != resolution.winners.end() && won->second == self) kept.push_back(ms->name);
+                }
+                if (kept.empty()) continue;
+                if (discardedFor != nullptr) {
+                    for (std::string const& name : kept) {
+                        winners.erase(name);
+                        discardedNames.try_emplace(name, discardedFor->name, m.cuId.v);
+                    }
+                    continue;
+                }
+                if (replacers.size() > 1u) {
+                    report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported, DiagnosticSeverity::Error,
+                           std::format("linker: the definition of '{}' in CU #{} lost its names to two "
+                                       "different definitions, and this format's linkers replace a "
+                                       "superseded definition WHOLE, every label it carries naming "
+                                       "the winner ('supersededDefinition' of format '{}'): its "
+                                       "other name '{}' has no one winner to name -- refusing "
+                                       "rather than pick one.",
+                                       replacedFor->name, m.cuId.v, format.name(), kept.front()));
+                    continue;
+                }
+                for (std::string const& name : kept) winners[name] = replacers.front();
+            }
+        }
+        // A unit that imports such a name finds no definition of it — what the
+        // format's linkers say when they refuse the link.
+        for (auto const& m : modules) {
+            for (auto const& ext : m.externImports) {
+                if (ext.isPreemptionReference) continue;
+                auto const gone = discardedNames.find(ext.mangledName);
+                if (gone == discardedNames.end()) continue;
+                report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
+                       std::format("linker: CU #{} references '{}', which only the definition of "
+                                   "'{}' in CU #{} carried; that definition lost '{}' to another, "
+                                   "and this format's linkers discard it with every label it "
+                                   "carries ('supersededDefinition' of format '{}': "
+                                   "discardedWhole), so '{}' has no definition in the link.",
+                                   m.cuId.v, ext.mangledName, gone->second.first, gone->second.second,
+                                   gone->second.first, format.name(), ext.mangledName));
+                discardedNames.erase(gone);   // once per name
+            }
+        }
+    }
     // (2) Reference resolution — an extern import whose name is DEFINED in a sibling CU
     // binds to that definition (the definition shadows the extern declaration). Record
     // the symbolic edge; LK11b patches the referencing relocations to the def's address.
@@ -1445,8 +1558,8 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
     for (auto const& m : modules) {
         for (auto const& ext : m.externImports) {
             if (ext.isPreemptionReference) continue;
-            auto it = resolution.winners.find(ext.mangledName);
-            if (it == resolution.winners.end()) continue;
+            auto it = winners.find(ext.mangledName);
+            if (it == winners.end()) continue;
             if (weakNamesHandedOn.contains(std::format("{}:{}:{}", it->second.cuId.v,
                                                        it->second.symbol.v,
                                                        ext.mangledName))) {
@@ -1505,7 +1618,7 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
         }
     }
     image.resolvedGlobalDefs.clear();
-    for (auto const& [name, key] : resolution.winners) image.resolvedGlobalDefs.emplace(name, key);
+    for (auto const& [name, key] : winners) image.resolvedGlobalDefs.emplace(name, key);
     image.symbolCount = image.resolvedGlobalDefs.size();
 }
 
@@ -1850,6 +1963,17 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         ModuleSymbol const* row;            // the member's row that states the group
         std::size_t         firstCarrier;   // the unit whose group of that signature is kept
     };
+    // The first unit, in link order, that carries each group signature — by a row that states it, or by an input
+    // section alone (a member need hold no named definition: a jump table's `.rodata.<f>`).
+    std::unordered_map<std::string_view, std::size_t> firstUnitCarryingGroup;
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        for (ModuleSymbol const& ms : modules[i].symbols) {
+            if (!ms.sectionGroup.empty()) firstUnitCarryingGroup.try_emplace(ms.sectionGroup, i);
+        }
+        for (auto const& [section, group] : modules[i].sectionGroupOfInputSection) {
+            if (!group.empty()) firstUnitCarryingGroup.try_emplace(group, i);
+        }
+    }
     std::unordered_map<LinkedSymbolKey, std::uint32_t> keptBytesId;
     std::unordered_set<LinkedSymbolKey>                supersededUnanswered;
     bool                                               supersededRefused = false;
@@ -1858,13 +1982,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     {
         SupersededDefinitionStatement const& superseded =
             objectFormatSchema.supersededDefinition();
-        // The first unit, in link order, that carries each group signature.
-        std::unordered_map<std::string_view, std::size_t> firstCarrierOfGroup;
-        for (std::size_t i = 0; i < modules.size(); ++i) {
-            for (ModuleSymbol const& ms : modules[i].symbols) {
-                if (!ms.sectionGroup.empty()) firstCarrierOfGroup.try_emplace(ms.sectionGroup, i);
-            }
-        }
+        std::unordered_map<std::string_view, std::size_t> const& firstCarrierOfGroup = firstUnitCarryingGroup;
         auto const discardedGroupOf = [&](std::size_t modIdx,
                                           SymbolId    sym) -> std::optional<DiscardedGroupMember> {
             auto const sit = rowsById[modIdx].find(sym.v);
@@ -1896,8 +2014,8 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 auto const answer = superseded.answerFor(ms->weakKind);
                 if (!answer.has_value()) {
                     unanswered = true;
-                } else if (*answer == SupersededDefinition::ReplacedWhole) {
-                    replaced = true;
+                } else if (*answer != SupersededDefinition::KeepsItsBytes) {
+                    replaced = true;   // replaced or discarded whole: no bytes stay
                 }
             }
             if (!lost) return Superseded::No;
@@ -1950,6 +2068,15 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         auto const  it     = groups.find(from->section);
         return it == groups.end() ? std::string_view{} : std::string_view{it->second};
     };
+    // Whether the item a relocation stands in is itself a member of a DISCARDED group: one whose signature an
+    // earlier unit of the link carries. No linker processes a relocation of a discarded section.
+    auto const standsInADiscardedGroup = [&](std::size_t                             modIdx,
+                                             std::optional<InputSectionSlice> const& from) -> bool {
+        std::string_view const group = groupOfTheItem(modIdx, from);
+        if (group.empty()) return false;
+        auto const first = firstUnitCarryingGroup.find(group);
+        return first != firstUnitCarryingGroup.end() && first->second < modIdx;
+    };
     // What a RELOCATION naming `old` targets: the kept bytes of a unit member that
     // lost its names, and every other symbol's merged id. `from` is the input
     // section of the item the relocation stands in, AS ITS UNIT WROTE IT (before
@@ -1968,12 +2095,22 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // is discarded; until the discard exists both ends are KEPT together, so the
     // relocation stays on its unit's own bytes — an unreachable copy, which is
     // what the build without fold 2 linked.
+    // ★ AND FROM INSIDE ANOTHER DISCARDED GROUP OF THE SAME UNIT (P69 fold 3b, the
+    // review of fold 3a, F2). Asking only "the same group?" still refused a
+    // relocation standing in a DIFFERENT group of the unit when that group is
+    // discarded too: no linker processes a relocation of a discarded section, so
+    // the refusal is owed only where the item the relocation stands in is KEPT.
+    // ✔MEASURED 2026-10-15 (lane xa's `sb6/groups/ggroups.log`; the fixtures
+    // `elf_group_two_groups_{a,b}_x86_64_elf_gas.o`): two units carrying groups
+    // `f` and `g`, the second's `.text.g` holding `R_X86_64_PC32 .text.f + 2` —
+    // GNU ld 2.42 and ld.lld 18.1.3 link both orders (6 and 60).
     auto relocationTargetFor = [&](std::size_t modIdx, SymbolId old,
                                    std::optional<InputSectionSlice> const& from) -> std::uint32_t {
         LinkedSymbolKey const key{modules[modIdx].cuId, old};
         if (auto const it = supersededInADiscardedGroup.find(key);
             it != supersededInADiscardedGroup.end()
-            && groupOfTheItem(modIdx, from) != it->second.row->sectionGroup) {
+            && groupOfTheItem(modIdx, from) != it->second.row->sectionGroup
+            && !standsInADiscardedGroup(modIdx, from)) {
             if (!discardedGroupRefused) {
                 discardedGroupRefused = true;
                 report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported, DiagnosticSeverity::Error,
@@ -2354,6 +2491,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 // a plain reference of its name stays the common.
                 kept.commonSize       = std::max(kept.commonSize, ext.commonSize);
                 kept.commonAlignment  = std::max(kept.commonAlignment, ext.commonAlignment);
+                kept.commonAlignmentStated = std::max(kept.commonAlignmentStated, ext.commonAlignmentStated);
                 kept.commonVisibility = moreConstrainingVisibility(kept.commonVisibility,
                                                                    ext.commonVisibility);
                 // `binding` — STRONGEST WINS, as `ExternImport::binding`'s docblock
@@ -3389,6 +3527,16 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
     std::unordered_set<std::string> yieldedTo;
     std::unordered_set<std::string> leftOpen;
     std::unordered_set<std::string> weakDefinitions;
+    // The storage of the definition each yielded-to name resolves to — its
+    // extent and its alignment — and its unit: the first strong one, else the
+    // first. A definition that is a function has none and is not measured.
+    struct YieldedStorage {
+        std::uint64_t size      = 0;
+        std::uint64_t alignment = 1;
+        std::uint32_t cu        = 0;
+        bool          strong    = false;
+    };
+    std::unordered_map<std::string, YieldedStorage> yieldedStorage;
     for (auto const& m : modules) {
         for (auto const& s : m.symbols) {
             if (s.binding == SymbolBinding::Weak) weakDefinitions.insert(s.name);
@@ -3397,6 +3545,15 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
                 leftOpen.insert(s.name);
             } else if (*yields) {
                 yieldedTo.insert(s.name);
+                auto const item = std::find_if(m.dataItems.begin(), m.dataItems.end(),
+                                               [&](AssembledData const& d) { return d.symbol == s.symbol; });
+                if (item == m.dataItems.end()) continue;
+                bool const strong = s.binding == SymbolBinding::Global;
+                auto const [it, fresh] = yieldedStorage.try_emplace(s.name);
+                if (fresh || (strong && !it->second.strong)) {
+                    it->second = YieldedStorage{static_cast<std::uint64_t>(item->sizeInSection()),
+                                                item->alignment.bytes(), m.cuId.v, strong};
+                }
             }
         }
     }
@@ -3408,11 +3565,55 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
             ExternImport& e    = out[r.module].externImports[r.row];
             e.commonSize       = 0;
             e.commonAlignment  = 0;
+            e.commonAlignmentStated = 0;
             e.commonVisibility = SymbolVisibility::Default;
         };
         // A definition the common yields to turns every common of the name into
         // a reference to it.
+        // ★ AND A COMMON LARGER, OR MORE ALIGNED, THAN THAT DEFINITION IS SAID
+        // (P69 fold 3b, the review of fold 3a, F4): its unit reads and writes the
+        // object as the one it declared, past the definition's end or off its
+        // alignment. Every reference linker links it, so this link does; none of
+        // them refuses it and the silent ones run a program that writes past the
+        // object (✔MEASURED 2026-10-15, `int v[1] = {1};` beside `int v[10];`
+        // whose unit writes v[9]: clang's objects under ld.lld crash; Apple's ld
+        // warns "tentative definition ... is being replaced by real definition of
+        // smaller size", GNU ld warns of the alignment and, in one order, of the
+        // size; link.exe, lld-link and MinGW's GNU ld say nothing).
         if (yieldedTo.contains(name)) {
+            if (auto const def = yieldedStorage.find(name); def != yieldedStorage.end()) {
+                // The alignment compared is the one a common's object STATES
+                // (`ExternImport::commonAlignmentStated`): a COFF common states
+                // none but by `-aligncomm:`, and a Mach-O one whose `n_desc`
+                // alignment is 0 none at all — the alignment the format derives
+                // from their size is the linker's choice, which no unit's code
+                // relies on (`int v[10];` beside `int v[10] = {1};` on PE is no
+                // mismatch, though link.exe would give the common 32).
+                CommonRow     widest     = rows.front();
+                std::uint64_t size       = 0;
+                std::uint64_t alignment  = 0;
+                for (auto const& r : rows) {
+                    ExternImport const& e = modules[r.module].externImports[r.row];
+                    if (e.commonSize > size) {
+                        size   = e.commonSize;
+                        widest = r;
+                    }
+                    alignment = std::max(alignment, e.commonAlignmentStated);
+                }
+                if (size > def->second.size || alignment > def->second.alignment) {
+                    report(reporter, DiagnosticCode::K_CommonSymbolLargerThanItsDefinition,
+                           DiagnosticSeverity::Warning,
+                           std::format("linker: the COMMON (tentative) definition of '{}' in linked unit #{} "
+                                       "is {} bytes {}, and the definition of the name it yields to "
+                                       "(linked unit #{}) is {} bytes aligned to {}: the common's unit reads and "
+                                       "writes the object as the larger or more aligned one it declared. Linked "
+                                       "as every reference linker links it.",
+                                       name, modules[widest.module].cuId.v, size,
+                                       alignment == 0u ? std::string{"(its object states no alignment)"}
+                                                       : std::format("aligned to {}", alignment),
+                                       def->second.cu, def->second.size, def->second.alignment));
+                }
+            }
             for (auto const& r : rows) asReference(r);
             continue;
         }

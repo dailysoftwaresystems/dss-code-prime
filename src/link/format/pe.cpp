@@ -1219,7 +1219,7 @@ encode(AssembledModule const&    module,
     auto const defaultRecordNameOf = [&](SymbolId id) -> std::optional<std::string> {
         auto const it = weakExternalBodies.find(id.v);
         if (it == weakExternalBodies.end()) return std::nullopt;
-        std::string name = ".weak." + it->second->name + ".default";
+        std::string name = dssWeakDefaultRecordName(it->second->name);
         if (!firstStrongDefinition.empty()) name += "." + firstStrongDefinition;
         return name;
     };
@@ -2771,7 +2771,7 @@ encode(AssembledModule const&    module,
             // that names it is built — no back-patching, and no window in which
             // a TagIndex points at a record that does not exist yet.
             CoffSymEntry def;
-            def.name          = ".weak." + name + ".default";
+            def.name          = dssWeakDefaultRecordName(name);
             if (auto const rit = externFirstReferrer.find(e);
                 rit != externFirstReferrer.end()) {
                 def.name += "." + rit->second;
@@ -5150,8 +5150,9 @@ encodeExec(AssembledModule const&    module,
     // data global — from `module.symbols` (the same real-name rows the
     // ET_REL `.symtab` uses, c139) becomes a named export. Local /
     // Hidden / Internal symbols stay out (a `static` function is not
-    // part of the library's ABI); Weak exports export plainly (the PE
-    // export table has no binding column). Classification is by
+    // part of the library's ABI). A weak definition of the SELECT-ANY kind
+    // exports plainly (the PE export table has no binding column); an
+    // OVERRIDABLE one does not (below). Classification is by
     // definition table: a row naming a function exports its `.text`
     // RVA; a row naming a data item exports its section RVA
     // (`.rdata`/`.data`/`.bss` — a data export's EAT RVA points into
@@ -5237,6 +5238,19 @@ encodeExec(AssembledModule const&    module,
             if (!isDll) break;   // an EXE exports what its units requested, alone (below)
             if (ms.name.empty()) continue;
             if (!isExternallyVisible(ms.binding, ms.visibility)) continue;
+            // ★ AN OVERRIDABLE WEAK DEFINITION IS NOT EXPORTED AUTOMATICALLY (P69
+            // fold 3b, the review of fold 3a, F5). On PE it is a WEAK EXTERNAL: its
+            // name is a reference that defers to whatever defines the name, and
+            // the definition is its default record — so the automatic export,
+            // which publishes a DLL's definitions, never publishes the name.
+            // ✔MEASURED 2026-10-12 (lane xa's `sb5/f3/weakdll/dss_dll.log`): a DLL
+            // of `__attribute__((weak)) int plain_weak(void)` beside strong
+            // `dll_api` and `lib_entry`, clang's objects under GNU ld 2.42 and
+            // ld.lld 19.1.5 — both export `dll_api lib_entry`, never the weak
+            // name (4 of 4); DSS exported all three. A strong definition of the
+            // name in the link wins it and is exported as itself; a unit that
+            // wants the weak name exported says so (`/EXPORT:`, below).
+            if (ms.binding == SymbolBinding::Weak && ms.weakKind == WeakDefinitionKind::Overridable) continue;
             if (!seenExportNames.insert(ms.name).second) {
                 emit(reporter, DiagnosticCode::K_SymbolUndefined,
                      std::format(

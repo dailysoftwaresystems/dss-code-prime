@@ -180,6 +180,16 @@ TEST(MirTextLinkage, ASecondBindingWordInOneListIsRefused) {
     expectRefused({"global then weak", globalDoc(" [global, weak(select-any)]"), "states its binding twice"});
 }
 
+// A second VISIBILITY word in one list is refused like a second binding word: the later one used to replace the
+// earlier in silence (P69 fold 3b, the review of fold 3a, F9).
+TEST(MirTextLinkage, ASecondVisibilityWordInOneListIsRefused) {
+    expectRefused({"hidden then protected", globalDoc(" [hidden, protected]"), "states its visibility twice"});
+    expectRefused({"the same word twice", globalDoc(" [weak(overridable), hidden, hidden]"),
+                   "states its visibility twice"});
+    expectRead("CONTROL: one visibility beside a binding", globalDoc(" [weak(overridable), protected]"),
+               MirLinkage{SymbolBinding::Weak, SymbolVisibility::Protected, Kind::Overridable});
+}
+
 TEST(MirTextLinkage, AnArgumentLeftOpenIsRefused) {
     expectRefused({"the list closes inside the argument", globalDoc(" [weak(overridable]"),
                    "opens an argument that is not closed with ')' on its line"});

@@ -32,12 +32,15 @@
 #include "link/format/object_atom_coverage.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
+#include "program/program.hpp"
 #include "repo_root.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -358,5 +361,117 @@ TEST(CoffWeakDefaultRecord, WrittenAndReadAgainTheDefaultStillOwnsTheBody) {
             bytes = writtenByDss(L, *object);
             ASSERT_FALSE(bytes.empty()) << "the unit as read must be writable again";
         }
+    }
+}
+
+// ══ The unwind records of an OVERRIDABLE function name its BYTES, never its weak name ═══════════════════════════════
+//
+// P69 fold 3b (the review of fold 3a, F1). A function DSS compiles `__attribute__((weak))` is written on PE as a WEAK
+// EXTERNAL: its name a reference another object's definition may win, its body under a default record of its own.
+// The `.pdata` RUNTIME_FUNCTION this writer states for the body must name the DEFAULT record: written against the
+// weak name, a link beside a strong definition of it would give the image a RUNTIME_FUNCTION at the OVERRIDE's address
+// carrying THIS body's unwind codes — a program that links and unwinds wrong at its first exception. Every `.pdata`
+// image-relative relocation is read off the object DSS writes: none names the weak external, the body's name its
+// default record, and the strong function beside it names itself (the control that the relocations are read at all).
+namespace {
+
+struct CoffPdataRelocation {
+    std::uint32_t offset = 0;
+    std::uint16_t type   = 0;
+    std::string   symbol;
+};
+
+[[nodiscard]] std::uint32_t le32(std::span<std::uint8_t const> b, std::size_t at) {
+    return at + 4 <= b.size() ? static_cast<std::uint32_t>(b[at]) | static_cast<std::uint32_t>(b[at + 1]) << 8
+                                    | static_cast<std::uint32_t>(b[at + 2]) << 16
+                                    | static_cast<std::uint32_t>(b[at + 3]) << 24
+                              : 0u;
+}
+[[nodiscard]] std::uint16_t le16(std::span<std::uint8_t const> b, std::size_t at) {
+    return at + 2 <= b.size() ? static_cast<std::uint16_t>(b[at] | b[at + 1] << 8) : std::uint16_t{0};
+}
+
+// Every relocation of the object's `.pdata` section, with the name of the record it names (PE/COFF §5.2, §5.4).
+[[nodiscard]] std::vector<CoffPdataRelocation> pdataRelocationsOf(std::span<std::uint8_t const> obj) {
+    std::vector<CoffPdataRelocation> out;
+    if (obj.size() < 20) return out;
+    std::uint16_t const nSections   = le16(obj, 2);
+    std::uint32_t const symTable    = le32(obj, 8);
+    std::uint32_t const nSymbols    = le32(obj, 12);
+    std::uint16_t const optHeader   = le16(obj, 16);
+    std::size_t const   strings     = static_cast<std::size_t>(symTable) + std::size_t{nSymbols} * 18u;
+    auto const          nameOfIndex = [&](std::uint32_t index) -> std::string {
+        std::size_t const at = static_cast<std::size_t>(symTable) + std::size_t{index} * 18u;
+        if (at + 18 > obj.size()) return {};
+        if (le32(obj, at) == 0u) {   // a long name: an offset into the string table
+            std::size_t p = strings + le32(obj, at + 4);
+            std::string n;
+            while (p < obj.size() && obj[p] != 0) n.push_back(static_cast<char>(obj[p++]));
+            return n;
+        }
+        std::string n;
+        for (std::size_t k = 0; k < 8 && obj[at + k] != 0; ++k) n.push_back(static_cast<char>(obj[at + k]));
+        return n;
+    };
+    for (std::uint16_t s = 0; s < nSections; ++s) {
+        std::size_t const hdr = 20u + optHeader + std::size_t{s} * 40u;
+        if (hdr + 40 > obj.size()) break;
+        std::string name;
+        for (std::size_t k = 0; k < 8 && obj[hdr + k] != 0; ++k) name.push_back(static_cast<char>(obj[hdr + k]));
+        if (name != ".pdata") continue;
+        std::uint32_t const relocs  = le32(obj, hdr + 24);
+        std::uint16_t const nRelocs = le16(obj, hdr + 32);
+        for (std::uint16_t r = 0; r < nRelocs; ++r) {
+            std::size_t const at = static_cast<std::size_t>(relocs) + std::size_t{r} * 10u;
+            out.push_back(CoffPdataRelocation{le32(obj, at), le16(obj, at + 8), nameOfIndex(le32(obj, at + 4))});
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(CoffWeakDefaultRecord, AnOverridableFunctionsUnwindRecordsNameItsBytesNeverItsWeakName) {
+    auto const L = loadPe();
+    ASSERT_TRUE(L.target && L.format);
+    test_support::ScratchDir scratch{test_support::Location::Temp, "weak-pdata"};
+    auto const               dir = scratch.path();
+    std::ofstream(dir / "hook.c", std::ios::binary)
+        << "__attribute__((weak)) int dss_hook(int x) { volatile int pad[4]; pad[x & 3] = x; return pad[0] + 1; }\n"
+           "int dss_caller(void) { return dss_hook(3); }\n";
+    for (CompileConfig const config : {CompileConfig::Debug, CompileConfig::Release}) {
+        SCOPED_TRACE(config == CompileConfig::Debug ? "debug" : "release");
+        auto const out = dir / (config == CompileConfig::Debug ? "debug" : "release");
+        std::filesystem::create_directories(out);
+        Program prog;
+        prog.setOutputDir(out);
+        prog.setCompileConfig(config);
+        DiagnosticReporter rep;
+        ASSERT_EQ(prog.compileFiles({(dir / "hook.c").string()}, "c",
+                                    std::vector<std::string>{"x86_64:pe64-x86_64-windows"}, rep),
+                  0)
+            << diagnosticsOf(rep);
+        std::filesystem::path obj;
+        for (auto const& e : std::filesystem::directory_iterator(out)) {
+            if (e.is_regular_file() && e.path().extension() == ".obj") obj = e.path();
+        }
+        ASSERT_FALSE(obj.empty()) << "the object DSS wrote";
+        std::ifstream                   in{obj, std::ios::binary};
+        std::string const               raw{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+        std::vector<std::uint8_t> const bytes(raw.begin(), raw.end());
+        auto const relocs = pdataRelocationsOf(bytes);
+        ASSERT_FALSE(relocs.empty()) << "both functions carry unwind records";
+        std::size_t toDefault = 0, toCaller = 0;
+        for (auto const& r : relocs) {
+            SCOPED_TRACE(r.symbol);
+            EXPECT_EQ(r.type, 3u) << "IMAGE_REL_AMD64_ADDR32NB: an image-relative field";
+            EXPECT_NE(r.symbol, "dss_hook")
+                << "a RUNTIME_FUNCTION of the weak body written against its weak NAME describes the override's "
+                   "address with this body's unwind codes wherever another object defines the name";
+            if (r.symbol.starts_with(".weak.dss_hook.")) ++toDefault;
+            if (r.symbol == "dss_caller") ++toCaller;
+        }
+        EXPECT_EQ(toDefault, 2u) << "the body's RUNTIME_FUNCTION names its begin and its end by the default record";
+        EXPECT_EQ(toCaller, 2u) << "CONTROL: the strong function's names itself";
     }
 }

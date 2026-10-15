@@ -775,6 +775,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             common.binding          = SymbolBinding::Global;
             common.commonSize       = sy.size;
             common.commonAlignment  = sy.value;
+            common.commonAlignmentStated = sy.value;   // ELF states it in `st_value`
             common.commonVisibility = stvToVisibility(stVis(sy.other));
             // An ELF symbol's TYPE states its storage duration -- this one is not
             // `STT_TLS` (refused above) -- and GNU ld and ld.lld compare it with

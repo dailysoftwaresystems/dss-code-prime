@@ -580,7 +580,10 @@ readMachoSectionTable(fs::path const& p) {
 constexpr char kEveryDataSectionSource[] =
     "const char msg[] = \"hello from a mach-o data section\";\n"  // rodata
     "int counter = 7;\n"                                          // data
-    "int zero_global;\n"                                          // bss
+    // bss: a `static` zero-fill object. An external `int zero_global;` is a
+    // tentative definition, which a Mach-O unit writes as a COMMON (P69 fold
+    // 3b, `ObjectFormatSchema::statesCommons`) — no section at all.
+    "static int zero_global;\n"
     "static int backing = 3;\n"
     "int *const p_backing = &backing;\n"                          // relro
     "int alpha(void) { return 1; }\n"

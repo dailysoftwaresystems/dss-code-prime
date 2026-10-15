@@ -3315,6 +3315,9 @@ private:
     // text that spells such a record is stopped at the word:
     //   * a SECOND binding word in one list — the later one used to replace
     //     the earlier in silence, which would now also drop a kind already read;
+    //   * a SECOND visibility word in one list (`[hidden, protected]`), for the
+    //     same reason: the later one replaced the earlier in silence (P69 fold
+    //     3b, the review of fold 3a, F9);
     //   * an argument on a binding that is not `weak` (`global(select-any)`): a
     //     kind is the argument of `weak` only;
     //   * an argument that is no kind the shared table names;
@@ -3326,12 +3329,21 @@ private:
     enum class LinkageWord { NotOne, Read, Refused };
     struct LinkageWordsRead {
         MirLinkage linkage{};
-        bool       sawBinding = false;
+        bool       sawBinding    = false;
+        bool       sawVisibility = false;
     };
 
     [[nodiscard]] LinkageWord readLinkageWord(Tok const& word, LinkageWordsRead& into,
                                               std::string_view listOf) {
         if (auto const v = symbolVisibilityFromName(word.text); v.has_value()) {
+            if (into.sawVisibility) {
+                emitMalformed(std::format(
+                    "a {} attribute list states its visibility twice — '{}' after '{}'; a "
+                    "definition has one visibility",
+                    listOf, word.text, symbolVisibilityName(into.linkage.visibility)));
+                return LinkageWord::Refused;
+            }
+            into.sawVisibility      = true;
             into.linkage.visibility = *v;
             return LinkageWord::Read;
         }

@@ -1526,9 +1526,11 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // program either linker runs is correct under.
             if (isExt && s.value != 0u) {
                 std::uint64_t alignment = naturalCoffCommonAlignment(s.value);
+                std::uint64_t stated    = 0;   // the object states none but by a directive
                 if (auto const asked = commonAlignmentLog2.find(s.name);
                     asked != commonAlignmentLog2.end()) {
-                    alignment = std::max(alignment, std::uint64_t{1} << asked->second);
+                    stated    = std::uint64_t{1} << asked->second;
+                    alignment = std::max(alignment, stated);
                 }
                 ExternImport common;
                 common.symbol           = symbolIds.of(i);
@@ -1537,6 +1539,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 common.binding          = SymbolBinding::Global;
                 common.commonSize       = s.value;
                 common.commonAlignment  = alignment;
+                common.commonAlignmentStated = stated;
                 // A hide directive naming a common hides that definition, as it
                 // hides any other this object makes.
                 common.commonVisibility = directiveVisibility(s.name);
@@ -2142,7 +2145,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 for (auto& d : defs) {
                     auto const it = weakNameOfDefault.find(d.symIdx);
                     if (it == weakNameOfDefault.end() || d.defaultRecord.has_value()) continue;
-                    std::string const family = ".weak." + *it->second + ".";
+                    std::string const family = weakDefaultRecordFamily(*it->second);
                     if (d.name.starts_with(family)) d.visibility = SymbolVisibility::Hidden;
                 }
             }

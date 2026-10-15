@@ -1029,6 +1029,9 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // inline-asm template's address-part operators are read under — see the
     // field.
     cuMir.assemblyFormatKind = format.kind();
+    // P69 fold 3b: how this unit writes a tentative definition — the document's
+    // answer, for the LOWER half (see the field).
+    cuMir.statesCommons = format.statesCommons();
     return cuMir;
 }
 
@@ -1153,6 +1156,82 @@ bindBlockSymbol(AssembledFunction& outFn, std::uint32_t lirBlockV,
     return true;
 }
 
+// ★★★ A TENTATIVE DEFINITION WRITTEN AS A COMMON (P69 fold 3b, lane `xa`;
+// D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED). Where the unit's
+// document writes tentative definitions as commons
+// (`ObjectFormatSchema::statesCommons`), each global the link may fold
+// (`Mir::globalIsCommon`) leaves the module as the COMMON row the object readers
+// produce for a foreign one (`ExternImport::commonSize`), in place of its zero-fill
+// item and its definition row:
+//   * the SIZE and the ALIGNMENT are the zero-fill item's — the one place they are
+//     computed (`lowerMirGlobalsToDataItems`), an explicit `alignas` included;
+//   * the NAME and the VISIBILITY are the definition row's;
+//   * the unit's own code keeps its relocations against the global's SymbolId,
+//     which the row now carries. The references' objects reach their own common
+//     the same way: ✔MEASURED 2026-10-12, `R_X86_64_PC32` against the common in
+//     gcc's and clang's ELF objects, and on Mach-O Apple's two linkers link and
+//     run an object that reaches its own `.comm` directly (24 of 24) where clang
+//     itself goes through the GOT.
+// An IMAGE link allocates the row before any other pass reads the rows
+// (`linker::allocateCommonDefinitions`): the same `.bss` storage and `Global` row
+// the item and the row gave, at the widest alignment and the stricter visibility
+// of the name's commons, unless a definition of the name elsewhere wins. A
+// RELOCATABLE artifact hands it on, and each writer spells it.
+// Runs AFTER the symbol rows are built, so it reads the row the module would have
+// published, and leaves nothing of the definition behind.
+// ⓘ A global whose zero-fill item reserves NO bytes keeps its definition: a common
+// row of size zero states no common at all (`ExternImport::commonSize`).
+[[nodiscard]] static bool
+stateTentativeDefinitionsAsCommons(Mir const& mir, AssembledModule& assembled,
+                                   DiagnosticReporter& reporter) {
+    auto const breach = [&](SymbolId sym, std::string_view what) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_StaticDataEncoderInvariantBreach;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "the tentative definition SymbolId={{ {} }} is to be written as a COMMON, "
+            "and {} — the data producer and the symbol table disagree about it, so no "
+            "common can be stated for it",
+            sym.v, what);
+        reporter.report(std::move(d));
+    };
+    for (std::uint32_t i = 0; i < mir.moduleGlobalCount(); ++i) {
+        MirGlobalId const gid = mir.globalAt(i);
+        if (!mir.globalIsCommon(gid)) continue;
+        SymbolId const sym  = mir.globalSymbol(gid);
+        auto const     item = std::ranges::find(assembled.dataItems, sym,
+                                                &AssembledData::symbol);
+        if (item == assembled.dataItems.end() || item->section != DataSectionKind::Bss
+            || !item->bytes.empty()) {
+            breach(sym, "its data item is missing or is not a zero-filled one");
+            return false;
+        }
+        if (item->reservedSize == 0u) continue;   // no bytes: no common can say so
+        auto const rows = std::ranges::count(assembled.symbols, sym,
+                                             &ModuleSymbol::symbol);
+        auto const row  = std::ranges::find(assembled.symbols, sym,
+                                            &ModuleSymbol::symbol);
+        if (rows != 1 || row->binding != SymbolBinding::Global) {
+            breach(sym, std::format("the module publishes {} row(s) for it where a "
+                                    "common is ONE strong definition's name",
+                                    rows));
+            return false;
+        }
+        ExternImport common;
+        common.symbol           = sym;
+        common.mangledName      = row->name;
+        common.isData           = true;
+        common.commonSize       = item->reservedSize;
+        common.commonAlignment  = item->alignment.bytes();
+        common.commonAlignmentStated = item->alignment.bytes();   // the unit's own
+        common.commonVisibility = row->visibility;
+        assembled.dataItems.erase(item);
+        assembled.symbols.erase(row);
+        assembled.externImports.push_back(std::move(common));
+    }
+    return true;
+}
+
 // The grammar's entry-name list is intentionally NOT a parameter — the entry-name SCAN
 // needs to ENUMERATE symbols + names (which `nameOf` cannot do) plus the ambiguity
 // fail-loud, so each caller runs it and hands the resolved id here. Keeping a dead
@@ -1222,7 +1301,10 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          // P68 round 9: the format kind, ONLY as a key into
                          // the assembly dialect's `symbolParts` (see
                          // `CuMirModule::assemblyFormatKind`).
-                         std::optional<ObjectFormatKind>             assemblyFormatKind) {
+                         std::optional<ObjectFormatKind>             assemblyFormatKind,
+                         // P69 fold 3b: how the document writes a tentative
+                         // definition (`stateTentativeDefinitionsAsCommons`).
+                         bool                                        statesCommons) {
     // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the on-binary names
     // MIR→LIR needs to MINT a loader-resolved reference for a preemptible
     // definition. Built HERE because this is where names live — `nameOf` is
@@ -2009,6 +2091,12 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         }
     }
 
+    // P69 fold 3b: a tentative definition the link may fold becomes the COMMON row
+    // where the document writes one (see the function).
+    if (statesCommons && !stateTentativeDefinitionsAsCommons(mir, assembled, reporter)) {
+        return std::nullopt;
+    }
+
     // Assembly complete — return the per-CU module; linking + writing is the shared
     // `linkAndWrite` phase below, so N CUs can each assemble before one merged link.
     return assembled;
@@ -2408,7 +2496,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt),
         atomicsRuntime, cuMir.indirectSlotBindings,
         cuMir.preemptibleDefinitionBindings, reporter,
-        cuMir.assemblyFormatKind);
+        cuMir.assemblyFormatKind, cuMir.statesCommons);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2457,7 +2545,10 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // bindings, pre-resolved one level up in program.cpp
                       // (same shape as `indirectSlotBindings` above).
                       std::vector<SymbolBinding> preemptibleDefinitionBindings,
-                      std::optional<ObjectFormatKind> assemblyFormatKind) {
+                      std::optional<ObjectFormatKind> assemblyFormatKind,
+                      // P69 fold 3b: the document's answer, pre-resolved in
+                      // program.cpp (see the declaration).
+                      bool statesCommons) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
     // by the LK11a symbol-table populate (module-private), exactly as in the CU path.
@@ -2475,7 +2566,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary),
         std::move(atomicsRuntime), std::move(indirectSlotBindings),
         std::move(preemptibleDefinitionBindings), reporter,
-        assemblyFormatKind);
+        assemblyFormatKind, statesCommons);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU

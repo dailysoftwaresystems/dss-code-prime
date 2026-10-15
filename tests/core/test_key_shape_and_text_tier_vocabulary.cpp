@@ -1577,3 +1577,35 @@ TEST(ReferencedDocumentSurface, TheRefusalNamesEveryBlockTheLoopLetsThrough) {
                "then refuses it as unconsumed.";
     }
 }
+
+// ★ THE GLOBAL-ATTRIBUTE REFUSAL, the function one's sibling (P69 fold 3b): every attribute its sentence advertises —
+// the bindings and visibilities PROJECTED off the tables the lookups use, and the words `tentative`, `const`,
+// `threadlocal` and `align=<bytes>` — is one the reader takes, fed back alone on a global; `align=<bytes>` as
+// `align=8`. `tentative` is the word a `.dssir` global states a tentative definition by, the mark
+// `Mir::globalIsCommon` reads to write it as a COMMON.
+TEST(TextTierVocabulary, MirGlobalAttributeRefusalAdvertisesExactlyWhatItAccepts) {
+    auto const module = [](std::string_view attr) { return mirGlobalModule("i32 [" + std::string{attr} + "] = zero"); };
+
+    auto const msg = mirRefusal(module(kBadSpelling), "unknown global attribute");
+    ASSERT_FALSE(msg.empty()) << "an unknown global attribute must be refused:" << mirDiagnostics(module(kBadSpelling));
+    auto advertised = quotedTokens(msg);
+    std::erase(advertised, std::string{kBadSpelling});
+    // 4 binding spellings (`local`, `global`, `weak(overridable)`, `weak(select-any)`) + 4 visibilities + the four
+    // words this tier owns.
+    EXPECT_EQ(advertised.size(), 12u)
+        << "the advertised global-attribute set changed size — a SHRINK means an attribute the reader takes stopped "
+           "being advertised.\nmessage:\n  "
+        << msg;
+
+    constexpr std::string_view kBytesHole = "=<bytes>";
+    for (auto name : advertised) {
+        SCOPED_TRACE(name);
+        if (name.ends_with(kBytesHole)) name = name.substr(0, name.size() - kBytesHole.size()) + "=8";
+        EXPECT_TRUE(mirRefusal(module(name), "unknown global attribute").empty())
+            << "the refusal advertises attribute '" << name << "' and the reader then calls it UNKNOWN.";
+        DiagnosticReporter r;
+        auto const         res = dss::parseMir(module(name), CompilationUnitId{1}, r);
+        EXPECT_TRUE(res->ok) << "a global carrying the advertised attribute '" << name << "' alone must parse:"
+                             << mirDiagnostics(module(name));
+    }
+}

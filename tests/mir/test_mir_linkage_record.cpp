@@ -330,3 +330,35 @@ TEST(MirLinkageRecord, TheVerifierRefusesATentativeMarkOnAFunctionAndOnALocalGlo
     MirVerifier        v{m, &in};
     EXPECT_TRUE(v.verify(rep)) << diagnosticsOf(rep);
 }
+
+// The verifier's own answer to "does this global state an initializer" (`checkLinkageRecords` computes it from the
+// module, where the builders and the `.dssir` reader are handed it): a tentative mark beside an initializer of
+// EITHER shape — a constant literal, a runtime initializer function — is refused by name, and the same strong global
+// with no initializer is not (P69 fold 3b, the review of fold 3a, F10: no verifier test reached the cell).
+TEST(MirLinkageRecord, TheVerifierRefusesATentativeMarkBesideAnInitializerOfEitherShape) {
+    for (bool const literal : {true, false}) {
+        SCOPED_TRACE(literal ? "a constant literal" : "a runtime initializer function");
+        TypeInterner       in{CompilationUnitId{1}};
+        TypeId const       voidTy = in.primitive(TypeKind::Void);
+        TypeId const       i32    = in.primitive(TypeKind::I32);
+        MirBuilder         b;
+        MirFuncId const    f = b.addFunction(in.fnSig({}, voidTy, CallConv::CcSysV), SymbolId{5}, kStrong);
+        MirBlockId const   e = b.createBlock(StructCfMarker::EntryBlock);
+        b.beginBlock(e);
+        b.addReturn();
+        MirLiteralValue one;
+        one.value = std::int64_t{1};
+        one.core  = TypeKind::I32;
+        std::uint32_t const index = literal ? b.literalPoolAdd(one) : UINT32_MAX;
+        MirGlobalId const   g = b.addGlobal(i32, SymbolId{6}, index, literal ? MirFuncId{} : f, kStrong,
+                                            /*isConst=*/false, MirThreadStorage::Shared);
+        b.restateLinkageUnjudged(g, kTentative);
+        Mir const          m = std::move(b).finish();
+        DiagnosticReporter rep;
+        MirVerifier        v{m, &in};
+        EXPECT_FALSE(v.verify(rep)) << "a tentative definition is by its definition the one with no initializer";
+        EXPECT_TRUE(saysVerifierFailure(rep, "the linkage of symbol %6 is not well formed: it is marked as a "
+                                             "tentative definition and states an initializer"))
+            << diagnosticsOf(rep);
+    }
+}

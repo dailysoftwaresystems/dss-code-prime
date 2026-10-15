@@ -3689,6 +3689,7 @@ namespace {
 TEST(WeakNameReferences, EveryDocumentThatDescribesRelocationsSaysWhatBecomesOfASupersededDefinition) {
     auto const keeps    = std::optional{SupersededDefinition::KeepsItsBytes};
     auto const replaced = std::optional{SupersededDefinition::ReplacedWhole};
+    auto const discarded = std::optional{SupersededDefinition::DiscardedWhole};
     std::optional<SupersededDefinition> const noAnswer;
     auto const overridable = std::optional{WeakDefinitionKind::Overridable};
     auto const selectAny   = std::optional{WeakDefinitionKind::SelectAny};
@@ -3740,7 +3741,7 @@ TEST(WeakNameReferences, EveryDocumentThatDescribesRelocationsSaysWhatBecomesOfA
         }
     }
     for (char const* flavor : {"", "-exec", "-dll", "-staticlib"}) {
-        wants.push_back(Want{std::string{"pe64-x86_64-windows"} + flavor, noAnswer, keeps, replaced});
+        wants.push_back(Want{std::string{"pe64-x86_64-windows"} + flavor, noAnswer, keeps, discarded});
     }
     ASSERT_EQ(wants.size(), 22u);
     for (auto const& w : wants) {

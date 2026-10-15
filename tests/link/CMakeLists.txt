@@ -890,6 +890,30 @@ target_link_libraries(dss_link_test_common_symbols
                       PRIVATE nlohmann_json::nlohmann_json)
 dss_strict_arm_verdicts(link/test_common_symbols)
 
+# D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED (P69 fold 3b) — a unit DSS compiles writes each tentative
+# definition the link may fold as a COMMON where its document states commons (`ObjectFormatSchema::statesCommons`):
+# every shipped document's answer, the rows a unit states per document (and the definition a document without the keys
+# keeps, read off a document, never a format's name), each relocatable writer with its reader, DSS's links of two DSS
+# objects and of DSS archives of commons cell by cell, and the host's reference linkers with a DSS object beside the
+# reference's own (the table's answer asserted, the reference's own objects its control). The documents are read as
+# JSON to remove the keys, and the native arms are strict-arm verdicts.
+dss_add_test(NAME link/test_tentative_definitions_as_commons
+             SOURCES test_tentative_definitions_as_commons.cpp)
+target_link_libraries(dss_link_test_tentative_definitions_as_commons
+                      PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_tentative_definitions_as_commons)
+
+# P69 fold 3b — the two ownership shapes fold 3a's atom-identity ranking changed (a module-private name beside an
+# external hidden one; a visible weak name beside a hidden strong one), on the references' ELF and Mach-O objects
+# (`tests/link/data/owner_*`): the owner each reader ranks, and DSS's links of the shapes, both orders and after its
+# relocatable link of the shape's object, against the table its header states. Foreign-arch images run through the
+# cross-arch gate, whose verdicts are strict-arm verdicts.
+dss_add_test(NAME link/test_atom_ownership_shapes
+             SOURCES test_atom_ownership_shapes.cpp)
+target_link_libraries(dss_link_test_atom_ownership_shapes
+                      PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_atom_ownership_shapes)
+
 # D-LK-THREAD-STORAGE-DISAGREEMENT-REFUSED-ONLY-BY-THE-WRITER-BACKSTOP (P69 round 4) — a linked reference and the
 # definition it binds to agree on storage duration, or the link is refused by name before the merge, on every shipped
 # exec format that carries thread-locals; agreeing pairs link clean, and a reference nothing reads is not judged.
@@ -944,6 +968,7 @@ target_link_libraries(dss_link_test_cross_unit_fold_doors
 # P69 fold 3 — the DEFAULT RECORD of a COFF weak definition: read back hidden (its role AND its name asked) on the
 # compilers' own objects and on DSS's, so no image exports it; and still the record that owns the body, through
 # every round of write and read — which record owns a body several records name is ranked by linkage, then
-# strength, and by visibility only among what is left.
+# strength, and by visibility only among what is left. Fold 3b: the `.pdata` records DSS writes for an OVERRIDABLE
+# function's body name its default record, never its weak name (the review of fold 3a, F1).
 dss_add_test(NAME link/test_weak_default_record
              SOURCES test_weak_default_record.cpp)

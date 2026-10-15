@@ -418,7 +418,25 @@ round's close; each checkpoint's commit message says what was and was not run on
   2778 of 2783, the five reds repository guards its base predates or this fold's own inventories (written at the
   fold). Rows: 2 closed, 1 created born closed, 4 disclosed (two fix-folded, closing on their arms; two open for
   the lane's next fold: the bit-field promotion (P0), a several-item statement expression as a constant).
-  **⚠ NOT a reading of this composition**: the fold lands on checkpoints 14–20.
+  **⚠ NOT a reading of this composition**: the fold lands on checkpoints 14–20. The composition READ from main
+  since: `linux-arm64-debug` (GNU 13.3) and `macos-arm64-debug` (AppleClang 21) PASSED, 2777 tests each. Its review
+  (read-only) is SEND BACK — known defects (7) and (8) below; and three of its rows that the fold applied CLOSED with
+  their arms unswept are REOPENED at checkpoint 22 (a row closes only on arms that read `passed`).
+- **Checkpoint 22 (2026-10-15) = the link lane's FOLD 3b — a compiled unit STATES ITS COMMONS**: a tentative
+  definition is written as the COMMON row every object reader already produces, on every format whose document
+  states how a common is resolved (`ObjectFormatSchema::statesCommons`, one accessor; the merged route passes it
+  too), at the alignment its object STATES (`ExternImport::commonAlignmentStated`); a common larger or more aligned
+  than the definition it yields to is SAID (`K_CommonSymbolLargerThanItsDefinition`, a warning — references split:
+  Apple ld and GNU ld warn, the rest are silent); the superseded-definition key's third answer (`discardedWhole`) and
+  its label rule; a relocation standing in another discarded group of one unit links; a PE DLL no longer exports an
+  overridable weak name; the merged route passes the format's kind; every finding of the review of fold 3a closed
+  (F1: a DSS PE object's `.pdata` names the weak body's bytes, never its weak name — ✔MEASURED, link.exe 14.44,
+  lld-link 19.1.5 and MinGW GNU ld, both orders, baseline and release, 12 of 12 images exit 42). 154 paths; 25 arms
+  + 1 moved, unswept. ✔MEASURED by the lane on checkpoint 21 + its fold, whole suite: `macos-arm64-debug` 2787 of
+  2787, `linux-arm64-debug` 2787 of 2787; the two x86_64 legs were not admitted for the host's memory and are read
+  from main at this checkpoint. Rows: 3 new, disclosed (two fixed, closing on their arms; the template gap below,
+  open). New open work it found: an inline-asm template cannot name ANY symbol of the embedding program
+  (`D-ASM-TEMPLATE-CANNOT-NAME-A-SYMBOL-OF-THE-EMBEDDING-PROGRAM`, P1; the link lane's next item).
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -439,7 +457,17 @@ round's close; each checkpoint's commit message says what was and was not run on
   (loud), and `__attribute__((weak, alias("g")))` COMPILES AND THE IMAGE DIES (0xC0000005 on pe64, signal 11 on
   ELF). The row is `D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE` (open, restated); its build is the FIRST item of
   that lane's next wave.
-- **Arm sweeps from the main checkout so far:** the registry holds 502 arms. `macos-arm64-debug`: all 147 arms of
+  (7) A REGRESSION OF CHECKPOINT 21 (the review of that fold, INFERRED by reading; the library lane MEASURED it on
+  pe64, both pipelines): a plain `char` bit-field is read SIGNED by the constant tier on a signed-char target and
+  UNSIGNED by the run time, so a folded condition marks reachable code unreachable and a correct program dies of an
+  illegal instruction — the library lane's current fold makes both tiers ask the one target-aware char sign;
+  (8) with it: a named constant of `_Complex` type is still read at its initializer's type (the same death) — the
+  same fold.
+- **Arm sweeps from the main checkout so far:** the registry held 502 arms at checkpoint 17 (606 at checkpoint 22).
+  The sweep of 340 owed arms at checkpoint 20 (2026-10-15, `macos-arm64-debug`): 155 `passed`; 158 `violated`,
+  18 `survived`, 6 `unattributed`, and 3 `stopped` because their runner's unmutated binary had a red in the worker
+  (at checkpoint 20 it depended on its ctest fixture, which checkpoint 21 removed) — every non-passed arm is back
+  with the lane that declared it, its records pulled into the main checkout. `macos-arm64-debug`: all 147 arms of
   checkpoint 14's registry are read — 131 `passed`, 15 `violated` (all back with their lanes; six answered in
   checkpoint 15 and read `passed` since), 1 `stopped`; of three new ones, 2 `violated` and 1 `unattributed` (the
   mutant aborts the binary). `linux-x86_64-debug`: the eight arms of the open P0 row only. **Checkpoint 17

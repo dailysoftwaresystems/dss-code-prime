@@ -540,9 +540,14 @@ struct DSS_EXPORT ModuleSymbol {
     // Read only when `binding == Weak`. The COFF object reader states both: a
     // WEAK EXTERNAL whose default is a body of its object is `Overridable`
     // (MinGW gcc's and clang's `__attribute__((weak))`), a weak COMDAT symbol
-    // `SelectAny`. EMPTY where the producer's form has one spelling for both
-    // (ELF's `STB_WEAK`, Mach-O's `N_WEAK_DEF`) and on a row nobody stated a
-    // kind for: an absent kind is neither, and nothing reads it as one.
+    // `SelectAny`. A unit DSS COMPILES states the kind its front end gave the
+    // definition (`MirLinkage::statedWeakKind`, written by the pipeline's
+    // `appendSym`) on EVERY format — `__attribute__((weak))` is `Overridable`
+    // on ELF and Mach-O too. EMPTY on a row an object READER read from a format
+    // with one spelling for both (ELF's `STB_WEAK`, Mach-O's `N_WEAK_DEF`) and
+    // on a row nobody stated a kind for: an absent kind is neither, and nothing
+    // reads it as one. (P69 fold 3b, the review of fold 3a, F11: this said EMPTY
+    // on ELF and Mach-O, which compiled rows stopped being in fold 3a.)
     //
     // What a kind MEANS beside a common of the name and beside the other weak
     // definitions of it is the LINK document's fact (`commonYieldsTo`), asked
