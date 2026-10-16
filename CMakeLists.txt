@@ -860,9 +860,13 @@ if(DSS_BUILD_TESTS)
     # the same reason.
     # The two exemption files and `owning-tree.py` are scripts of the entry too: the guard
     # reads all three on every run, and a changed row is a changed verdict.
-    dss_declare_script_selftest(orphan_tests ARGC 2
+    # It is handed the root of THIS CMake (`DSS_CMAKE_ROOT`): the guard states once what a test
+    # source's extension is, and checks that statement against the two lists this CMake's own
+    # modules hold -- what it takes as a C or a C++ source.
+    dss_declare_script_selftest(orphan_tests ARGC 6
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMAND
+            "${CMAKE_COMMAND}" "-E" "env" "DSS_CMAKE_ROOT=${CMAKE_ROOT}"
             "${Python3_EXECUTABLE}"
             "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-orphan-tests/check-orphan-tests.py"
         SCRIPTS

@@ -1,1 +1,2 @@
-    unwalked = [p for p in unplaced if os.path.isfile(os.path.join(root, *p.split("/")))]
+        if not name:
+            phantoms.append(p)

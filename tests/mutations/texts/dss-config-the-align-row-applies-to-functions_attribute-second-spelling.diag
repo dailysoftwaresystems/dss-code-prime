@@ -1,1 +1,1 @@
-m.hasErrors()
+countCode(m.diagnostics(), DiagnosticCode::S_AttributeIgnoredForDeclarationKind)

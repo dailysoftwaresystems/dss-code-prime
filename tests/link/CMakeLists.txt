@@ -122,18 +122,16 @@ target_link_libraries(dss_link_test_link_veneer_vocabulary
     PRIVATE nlohmann_json::nlohmann_json)
 # ... and its REAL-SCALE end-to-end: the subject row's own shape at 144 MiB
 # through the real linker (entry trampoline, stub layout, veneer pass, writer)
-# for ELF exec, PIE and Mach-O, and RUN where an arm64 runner exists. OPT-IN,
-# because each arm holds ~600 MB and hashes the image for its build-id; the
-# default gate pins the same decisions through the planner's size-only model.
-# Enable with -DDSS_REAL_SCALE_TESTS=ON; the entry carries the `real-scale`
-# label so a gate that does enable it can still select or exclude it by name.
-option(DSS_REAL_SCALE_TESTS "Register the opt-in real-scale link tests" OFF)
-if(DSS_REAL_SCALE_TESTS)
-    dss_add_test(NAME link/test_branch_veneers_real_scale
-                 SOURCES test_branch_veneers_real_scale.cpp)
-    set_tests_properties(link/test_branch_veneers_real_scale
-                         PROPERTIES LABELS real-scale)
-endif()
+# for ELF exec, PIE and Mach-O, and RUN where an arm64 runner exists. It runs
+# on EVERY leg: an opt-in test nothing turns on is code no gate compiles. Each
+# arm holds ~600 MB at its peak and hashes the image for its build-id, one arm
+# after another in one process (✔MEASURED 2026-10-15 on macos-arm64-debug: the
+# entry passed in 26.22 s). The `real-scale` label names it, so a run that must
+# leave it out can say so by name.
+dss_add_test(NAME link/test_branch_veneers_real_scale
+             SOURCES test_branch_veneers_real_scale.cpp)
+set_tests_properties(link/test_branch_veneers_real_scale
+                     PROPERTIES LABELS real-scale)
 
 # Plan 14 LK7 — codesign-placeholder reservation tests.
 dss_add_test(NAME link/test_codesign_placeholder SOURCES test_codesign_placeholder.cpp)

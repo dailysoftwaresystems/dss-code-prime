@@ -149,7 +149,8 @@ main tree after the fold has landed, and an arm that does not read `passed` come
 tool's text (who sweeps, and the one reading a lane makes in its own tree: `mutation-arms.md`); a
 row that rests on a pin does not close before its arm passed on the bytes it closes on. Paste the
 command lines from `mutation-arms.md`; a brief states an interface only if its author ran it.
-ⓘ An arm puts no wrong byte in any tree — the tool mutates a worker copy beside it — so the paragraph and
+ⓘ An arm puts no wrong byte in any tree — the tool mutates a worker copy kept in the tree's `.mutations`, whose
+contents git ignores, and of the tree itself reads every file and writes none — so the paragraph and
 the window below concern every byte-changing measurement that is not a pin.
 
 ★★ **A BYTE-CHANGING MEASUREMENT GOES IN A WORKTREE — THE LANE'S OWN AGENT WORKTREE, OR A PLAIN PROBE

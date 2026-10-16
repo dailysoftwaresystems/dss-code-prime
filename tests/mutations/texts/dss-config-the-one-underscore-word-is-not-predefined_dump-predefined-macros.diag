@@ -1,1 +1,1 @@
-hasLineFor(pe, "_WIN32")
+form=function(x)

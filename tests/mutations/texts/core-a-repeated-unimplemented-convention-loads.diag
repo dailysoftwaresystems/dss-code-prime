@@ -1,1 +1,1 @@
-two listed ids beside one row must load
+an id listed twice must fail the load

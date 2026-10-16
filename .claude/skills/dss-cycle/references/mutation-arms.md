@@ -96,21 +96,25 @@ call VOID, is an arm with a paired control.
 - **A LANE WRITES ITS ARMS WITH ITS FOLD**: the rows, the texts, the registry validated (below). It hands the fold
   back with them WRITTEN and names each as unswept. **A fold is never held for a sweep.**
 - **THE ORCHESTRATOR SWEEPS THEM, FROM THE MAIN CHECKOUT, AFTER THE FOLD HAS LANDED** — the fold's own arms, on the
-  bytes the fold landed as, each on the leg its `S` row names. **An arm that does not read `passed` GOES BACK TO
-  ITS LANE with the tool's own text** — its verdict, its detail, its reds beside the declared ones — and leads
-  that lane's next fold.
+  bytes the fold landed as, each on the leg its `S` row names — and RECORDS the sweep with the fold: its run id,
+  and per leg which arms read `passed`. That record is the measurement condition (f) points at. **An arm that does
+  not read `passed` GOES BACK TO ITS LANE with the tool's own text** — its verdict, its detail, its reds beside the
+  declared ones, and where its records lie — and leads that lane's next fold, which rewrites the arm's rows from
+  those records.
 - **A LANE SWEEPS IN ITS OWN TREE ONLY WHAT IT NEEDS TO TRUST A `diag`**: an arm whose red set or diagnostic it
   cannot write from what it has read. That is a development reading — it says so, names its run and the bytes it
   read, and closes nothing.
-- **WHY ONE HAND SWEEPS.** A sweep's workers are whole builds kept beside the tree they copy: a lane that sweeps
-  builds the tree again beside its own worktree, and on a Windows leg can place no worker at all (the path
-  limit, below), while the main checkout's workers stay warm from fold to fold. And a fold that waits for its own
-  sweep waits for the slots the whole round is queueing for.
+- **WHY ONE HAND SWEEPS.** A sweep's workers are whole builds kept INSIDE the tree they copy (its `.mutations`;
+  on another machine, inside the sweep's own copy there): a lane that sweeps builds the tree again inside its own
+  worktree, and on a Windows leg can place no worker at all (the path limit, below), while the main checkout's
+  workers stay warm from fold to fold. And a fold that waits for its own sweep waits for the slots the whole round
+  is queueing for.
 - **THE ORCHESTRATOR SWEEPS WHOLE LEGS AND NEVER CHUNKS ONE BY HAND.** A sweep is admitted ARM BY ARM: an arm
   holds one of its machine's slots only while it runs, and gives it back before the next asks. One command that
   names every arm of a leg therefore starves no other leg, and a leg cut into hand-made batches buys nothing and
-  pays an unmutated control of every runner per batch. A WSL distribution runs ONE worker, so a WSL leg drives
-  its arms one after another however it is asked.
+  pays an unmutated control of every runner per batch. A WSL distribution is the exception on both counts: the
+  command that sends a sweep there takes it WHOLE, and it runs ONE worker, so a WSL leg drives its arms one after
+  another however it is asked, holding its slot throughout.
 
 ## The registry's standing conditions
 
@@ -128,8 +132,17 @@ Each is enforced by the tool or by this file's layout rather than restated in a 
   figure is written into the registry's comments, a plan or a skill.
 - **(e) Every arm in the registry must read `passed`.** One `violated` arm fails its sweep; one runner that is red
   UNMUTATED fails its whole leg. A mutant that cannot be an arm (the last section) has no row, not a failing one.
-- **(f) Every `C` row says how its red was MEASURED** — the sweep that read it (its run id), and a hand reading's
-  run id where one exists. A red predicted from the code and never observed is not a `C` row.
+- **(f) Every `C` row says what its red rests on, and the measurement is the TOOL'S VERDICT RECORD** — the sweep's
+  run, and in it each arm's `arm.json` and run log (reading an arm, below). An arm that reads `passed` is measured
+  by that sweep: the sweep's run id travels with the fold it swept (the orchestrator's record of the fold), and
+  the arm's rows are not rewritten for it. An arm that does NOT pass goes back to its lane, which rewrites its
+  rows FROM that record — every `C` row it writes names the run that read the red, and a red read beside the
+  declared set gets its row only once its failure text was read and understood. An arm WRITTEN before its first
+  sweep says in each `C` row what the row was declared from, and that this came BEFORE the sweep (*declared from a
+  hand pre-reading before the arm's first sweep*, *MEASURED by hand before the arm existed*, with the reading's
+  date, host and how): a declaration awaiting its measurement, which closes nothing (obligation 4) — and a
+  statement of when it was written, which the sweep that later passes it leaves true, so nothing is rewritten for
+  a pass. A hand reading's run id is kept where one exists.
 - **(g) Every mutation text and every diagnostic is a FILE.** The grammar has no escape; the text a field would
   hold is the kind that holds a `|`.
 
@@ -197,7 +210,7 @@ additions seldom meet, and its own header states the same rules:
   section the blocks are sorted by arm id.
 - **Every arm carries ONE `S` row naming ONE leg**, and its why says which rule chose the leg (the section on
   finding an arm's leg). An arm with no `S` row is refused by this convention, though the tool would run it on
-  every leg. Each section's comment block states its area's default leg.
+  every leg. Each section's comment block states its area's default leg — the one place that is stated.
 - **The `A` row's why opens `CLAIM AT <test file>, TEST <Case>.`** — the test that is the claim — and then says
   what mechanism the mutation switches off and what would be true if nothing noticed. A BUILD-RED arm's opens
   `CLAIM AT <file>, <the construct that refuses to compile>.` Never a line number.
@@ -336,9 +349,14 @@ which is the fact and not a defect of the arm.
   and the arm's entry in the `--json` ledger carries `cases` beside `declaredCases`. ⚠ Every arm of a runner
   states that count, so a change that adds a case to a test binary updates the `cases` field of EVERY arm that
   runs it, in the same change (`grep '| <runner> |' tests/mutations/arms.registry`).
-- **`diag`** — a text the mutated run must SAY, written FROM AN OBSERVED RUN, never from the recipe: the failing
-  assertion's own message, or the value it prints that shows the mechanism is off — never the case's name (the
-  `C` row already holds that).
+- **`diag`** — a text the mutated run must SAY, taken from what the claim's failing assertion PRINTS: its own
+  message, or the value it prints that shows the mechanism is off — never the case's name (the `C` row already
+  holds that), and a part that stays the same from run to run (no address, no node number, no path). An arm
+  written before its first sweep takes it from the claim's source — the message, or the expression the assertion
+  prints — and its `C` row says the text was declared before a sweep observed it. The sweep then says it, or
+  reads `violated` with *its diagnostic not said*; the lane the arm goes back to takes the text from the run log that
+  record holds, inside the CLAIM's own failure text (a text said only by another red case proves nothing about
+  the claim).
 - **the exact red set** — one `C` row per case that goes red, each saying how it was measured. For a mutant
   already read by hand, its recorded red cases of THIS binary; for a new one, declare what the claim is, sweep,
   and where the tool reads `violated` with other reds, READ why each is red before adding its `C` row: a case red
@@ -351,13 +369,10 @@ which is the fact and not a defect of the arm.
      under one platform's preprocessor branch a leg that compiles it. A second leg — a second arm, `<id>_<pin>`
      — only where the claim itself is about two platforms.
   2. **Any other claim names its AREA'S DEFAULT LEG — a leg that sweeps with MORE THAN ONE WORKER, on a machine
-     that is NOT the one the round's own legs build on.** A claim about no platform can be shown red on any
-     leg, so it goes where a sweep costs least:
-
-     | area of the site | default leg |
-     |---|---|
-     | `analysis`, `asm`, `core`, `dss-config`, `hir`, `lsp`, `source-factory`, `tokenizer`, `tests` | `macos-arm64-debug` |
-     | `ffi`, `link`, `lir`, `mir`, `opt`, `program` | `macos-arm64-debug` |
+     that is not this host's.** A claim about no platform can be shown red on any leg, so it goes where a sweep
+     costs least. **The default leg is stated ONCE, in the registry: each section's comment block names its
+     area's** — read it there, never from memory or from another file; a rule-2 `S` row names that leg, and its
+     why says `rule 2`.
 
      **What makes a leg a poor default, whatever its compiler:**
      - **it sweeps with ONE worker** — a WSL distribution does — so its arms are driven one after another;
@@ -367,7 +382,7 @@ which is the fact and not a defect of the arm.
      - **its disk cannot hold a worker** — the arm64 VPS is no area's default: one worker's build is most of
        its free disk (✔MEASURED 2026-10-10: a worker's build of this repository asked for about 5 GiB under
        the Mac's clang and about 11 GiB under WSL's gcc);
-     - **no worker fits beside the tree** — a Windows leg, from a lane's worktree (the path limit, below).
+     - **no worker fits in the tree** — a Windows leg, from a lane's worktree (the path limit, below).
 
      The Mac has two heavy slots of its own and sweeps with two workers. ✔MEASURED 2026-10-12, sweeps from the
      main checkout while the round's lanes built: the WSL leg drove 16 arms in 70 minutes, one of them waiting
@@ -434,10 +449,15 @@ a time on one tree stays the rule.
 
 ## What a sweep costs, and from which trees it can run
 
-- **A worker is a whole copy of the tree and a whole build**, kept beside the tree as `<tree>.mutation-<key>w-<n>`
-  and reused: before every sweep it is synced again by content, so its build stays warm, and only the first sweep
-  of a tree pays the full build (✔MEASURED 2026-10-10 on the Mac: two workers built whole in about eight
-  minutes). Each arm then costs the rebuild of what depends on its site, the runner's whole run, and its
+- **A worker is a whole copy of the tree and a whole build**, kept INSIDE the tree as
+  `<tree>/.mutations/<key>w-<n>` (the key: the first seven hex digits of the SHA-256 of the leg's variant, as its
+  build directory is named) and reused: before every sweep it is synced again by content, so its build stays warm,
+  and only the first sweep of a tree pays the full build (✔MEASURED 2026-10-10 on the Mac: two workers built whole
+  in about eight minutes). **On another machine a sweep never shares the host's copy of the tree**: it works in a
+  copy of its own there, `<host's copy>/.legs/<key>`, holds it whole, and keeps its workers in THAT copy's
+  `.mutations` — so a test or build of the host's copy and a sweep never hold each other off, and the copy's first
+  sweep builds the variant there from clean (`help mutations`). On this machine a sweep makes no copy of its own:
+  its workers are the copies. Each arm then costs the rebuild of what depends on its site, the runner's whole run, and its
   machine's admission (✔MEASURED the same sweep: 55 s, 59 s, 117 s and 266 s for four arms; the unmutated control
   of each runner is run once per leg).
 - **Why ONE leg per arm.** An arm proves that its claim's TEST can fail; that is shown once, on any leg the claim
@@ -449,23 +469,29 @@ a time on one tree stays the rule.
   the machine's slots, every arm waits its settle time, so a sweep on a busy machine is paced by the admission,
   not by the arms. **An arm holds its slot only while it runs** and gives it back before the next asks, so a
   whole leg in one command starves no other leg of the machine — which is why a leg is swept WHOLE and never cut
-  into batches by hand (who sweeps, above).
+  into batches by hand (who sweeps, above). **A WSL distribution is the exception**: the command that sends a
+  sweep there takes it WHOLE, as one unit, and it runs one worker — so a WSL sweep holds its slot from its first
+  arm to its last, and the machine's other legs wait for it, or it for them.
 - **On WSL the clock can step under a build**, and the tool then trusts nothing that build stamped: it says
   *"rebuilding from clean, because a clock step"* and builds again (✔MEASURED 2026-10-10: twice in one sweep
   of three arms). It is a cost, never a verdict — the arm is judged on the build that followed.
-- **A worker's path is twenty characters longer than its tree's.** On Windows, where the platform's limit binds,
-  **a worker fits beside the MAIN checkout and never beside a lane worktree** (✔MEASURED 2026-10-10 from a lane
-  worktree: `skipped-unavailable`, *"its build needs paths of 275 characters … and every path must stay under
-  260"*). So a Windows leg is swept from the main checkout and from nowhere else — one of the reasons the sweep
-  of a fold's arms is the orchestrator's, after the fold has landed (who sweeps, above).
+- **A worker's path is longer than its tree's by what `help mutations` states** — 22 characters for the first —
+  whatever the variant is called. On Windows, where the platform's limit binds, **a worker fits in the MAIN
+  checkout and never in a lane worktree** (✔MEASURED 2026-10-10 from a lane worktree, with the workers then kept
+  beside the tree at 20 characters: `skipped-unavailable`, *"its build needs paths of 275 characters … and every
+  path must stay under 260"*; two characters more only widen it). So a Windows leg is swept from the main
+  checkout and from nowhere else — one of the reasons the sweep of a fold's arms is the orchestrator's, after the
+  fold has landed (who sweeps, above).
 - **A sweep's unmutated control is the one build of this repository that is HANDED its dependencies** (each
   worker is given the sources its leg's build fetched, inside the worker's own tree), so it is where the build
   stamp's handed-dependency term and the configure guard's hand-over rules are exercised: no leg of the gate
   builds that way. It is also why a mutant of the guard's excuse for handed directories stops every worker's
   configure (the last section).
 - **Room**: the tool places a worker only where its copy and build fit, and says what keeps one out. `dssharness
-  clean --legs <leg>` removes a leg's build directory AND its workers; `delete-agent` removes the workers beside a
-  lane's worktree and beside each host's copy.
+  clean --legs <leg>` removes a leg's build directory AND its workers (on a host, the sweep's copy with its
+  workers); `delete-worktree` and `delete-agent` remove the workers kept in the worktree first, here and in each
+  host's copy of it. Workers an earlier version of the tool kept BESIDE a tree (`<tree>.mutation-…`) are no
+  workers to a sweep: only `clean --former-workers` removes them, with `--dry-run` listing each with its size.
 
 ## What has no arm
 
@@ -489,14 +515,12 @@ the code will find it, with what was measured.
   directory is declared, configures; the fixture cases that expect a refusal go red). Where no such mutant exists
   — the claim IS that the real tree, or a worker handed its dependencies, configures — the configure of every tree
   and of every worker is that claim's test, and the report says so in those words.
-- **A direction THE TREE ITSELF pins** — a guard that judges the source tree first and proves its refusals only on
-  a tree it judged green. A mutant that blinds it to something the tree HOLDS reddens the tree's own verdict
-  before any self-test arm runs, so every case of its entry but one goes red: no set an arm declares
-  (✔MEASURED 2026-10-12: the guard of orphan test sources, blind to a registered C source while the tree held
-  such sources — the full suite's one red on both Windows legs was the guard's own entry). The self-test arm
-  pins the direction on its fixture, the tree pins it by being judged on every run, and the guard's own header
-  says that the arm is absent and why. A mutant that leaves the tree green — a spelling the tree does not use, a
-  rule only the fixture meets — IS an arm, like any other of the script class.
+- **NOT a class: a mutant that reddens the TREE's own verdict first.** A guard that judges the source tree before
+  it proves its refusals runs no self-test arm on a tree it judged red, so a mutant that blinds it to something
+  the tree HOLDS turns red the tree's own case, every self-test arm's case (none was given a verdict) and the
+  case that every arm was given one. That is an exact set like any other: the arm declares each of them as a `C`
+  row, its `diag` is the guard's own digest of what it refused in the tree, and its `G` is a case the missing
+  verdicts do not touch — for a script entry, the case that the program's exit code agrees with its verdicts.
 - **NOT a class: a claim that only a SCRIPT entry holds** (a `cmake -P` self-test, a runner action's own
   self-test). It gets a gtest case that DRIVES that entry — the entry's own command line, on the tree the binary
   was configured from, one case per claim, failing (never skipping) when the entry cannot be started — and then
@@ -524,6 +548,7 @@ the code will find it, with what was measured.
   does); a check of the source tree does not, and keeps the label by a `set_tests_properties` beside its
   registration (`orphan_tests_guard` does).
   ⚠ A script that judges the TREE before it proves itself gives that judgement a verdict line and a case of its
-  own, and writes a red report to standard error: the driver keeps standard output in a file, and a red nobody
-  can read in the test's log is a red nobody can fix from CI.
+  own. Whatever explains a red — the tree's red report, and a failing self-test arm's evidence (what it ran, and
+  what that said) — goes to standard error: the driver keeps standard output in a file, and a red nobody can read
+  in the test's log is a red nobody can fix from CI.
 - **NOT a class: an example pin.** Rule 1: write the unit-tier claim.

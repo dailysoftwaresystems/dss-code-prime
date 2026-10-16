@@ -1,1 +1,1 @@
-ok.has_value()
+two rows sharing one qualifier must fail the load

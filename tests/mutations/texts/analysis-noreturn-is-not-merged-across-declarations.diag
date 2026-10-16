@@ -1,1 +1,1 @@
-countCode(l->reporter, kReached)
+H_NonVoidFunctionEndReachable: control can reach the end of

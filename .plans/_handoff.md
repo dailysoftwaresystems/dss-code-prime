@@ -478,6 +478,19 @@ round's close; each checkpoint's commit message says what was and was not run on
   lane's next fold, and `D-C-A-MEMBER-WITH-A-RUNTIME-BOUND-IS-READ-AS-A-FLEXIBLE-MEMBER` ruled to the next cycle on
   its MEASURED size (the layout's constant offsets: `computeLayout(` 41 mentions in 10 files, field offsets 101 in
   9; gcc alone builds it — clang refuses a variable-length member, cl has no VLA).
+  ✔MEASURED from main on 24f20ed5 (the commit that removed two conflict markers 65799e57 carried — the
+  orchestrator installed an unresolved merge): windows-x86_64-debug and -release 2813 of 2815 each; the two reds
+  are xa's cl arm (its fix fold) and the alias case below (fixed at checkpoint 25). Its review: SEND BACK, 16
+  findings (0 BLOCKER, 1 MAJOR — a `static` object alias refused with a false reason), in the lane's current fold.
+- **Checkpoint 25 (2026-10-15) = the harness lane's FOLD H3**: `check-orphan-tests` judges what CMake EVALUATES (a
+  registration inside a block or an unreached CMakeLists clears nothing; a case-misspelt source is MISSPELT); the
+  real-scale link test runs on every leg (the opt-in option removed; MEASURED 20-26 s); the 130 arms inherited
+  from the C front end lane state what their runs showed (14 withdrawn for that lane's own rewrite); the redactor
+  never reads inside its own marks and names an unreadable file in one sentence; the skill states where the tool
+  keeps workers and leg copies and each area's default sweep leg once. With it, the C front end lane's alias case
+  reads its document (ELF and PE keep a superseded weak body's bytes, Mach-O replaces it whole). The registry: 777
+  arms, the lane's layout kept. OWED and read from main right after the commit: the repo-guard label and the
+  harness self-tests on the Windows and WSL legs.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

@@ -1,1 +1,1 @@
-e.has_value()
+an effects name with an unclosed parenthesis must fail the load

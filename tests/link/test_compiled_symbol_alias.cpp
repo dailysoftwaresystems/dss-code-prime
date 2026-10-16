@@ -89,16 +89,22 @@ std::vector<std::uint8_t> const kRivalBody{0xB8, 0x07, 0x00, 0x00, 0x00, 0xC3};
 ImageRequest const kImage{.artifactFileName = "compiled_symbol_alias"};
 
 // One shipped x86_64 format and the C spelling of a name on it (Mach-O decorates
-// every C symbol with one leading underscore — its document's `cSymbolDecoration`).
+// every C symbol with one leading underscore — its document's `cSymbolDecoration`),
+// and what its document says becomes of a definition that lost an OVERRIDABLE weak
+// name to another unit's definition in an image (`supersededDefinition`; each answer's
+// measurement is stated in `link/object_format_schema.hpp`): ELF and PE keep its
+// bytes under its other names, Mach-O replaces it whole, every label it carries
+// naming the winner.
 struct Format {
-    char const* image;
-    char const* object;
-    char const* prefix;
+    char const*          image;
+    char const*          object;
+    char const*          prefix;
+    SupersededDefinition overridden;
 };
 constexpr Format kFormats[] = {
-    {"elf64-x86_64-linux-exec", "elf64-x86_64-linux", ""},
-    {"pe64-x86_64-windows-exec", "pe64-x86_64-windows", ""},
-    {"macho64-x86_64-darwin-exec", "macho64-x86_64-darwin", "_"},
+    {"elf64-x86_64-linux-exec", "elf64-x86_64-linux", "", SupersededDefinition::KeepsItsBytes},
+    {"pe64-x86_64-windows-exec", "pe64-x86_64-windows", "", SupersededDefinition::KeepsItsBytes},
+    {"macho64-x86_64-darwin-exec", "macho64-x86_64-darwin", "_", SupersededDefinition::ReplacedWhole},
 };
 
 // THE COMPILED SHAPE: unit `cu` defines `g` (the aliased body) under `gBinding`,
@@ -293,12 +299,24 @@ TEST(CompiledSymbolAlias, AnObjectCarriesBothNamesOnOneBodyAndItsCallMeansTheAli
 
 // A WEAK alias gives its name up to another unit's strong definition, and the
 // unit's OWN call follows the name there (what gcc, clang and MinGW gcc do: the
-// alias is a weak definition of `f`). The aliased body keeps its own name.
+// alias is a weak definition of `f`). What becomes of the aliased body is the
+// format's: where its document keeps a superseded definition's bytes (ELF, PE) the
+// body stays under its own name `g`; where it replaces one whole (Mach-O: Apple's
+// ld coalesces the atom, `g` then names the winner) the body is not in the image.
+// ⚠ A COMPILED alias never reaches this on Mach-O — its documents refuse an alias
+// by name — but the link tier takes the hand-built module whole, so it states the
+// format's answer for it too.
 TEST(CompiledSymbolAlias, AWeakAliasYieldsItsNameAndTheUnitsCallFollowsTheName) {
     for (Format const& fmt : kFormats) {
         SCOPED_TRACE(fmt.image);
         auto const L = load("x86_64", fmt.image);
         ASSERT_TRUE(L.target && L.format);
+        // The format's own statement, read — so the expectation below is the document's, and a document that
+        // changed its answer fails here by name rather than as a missing body.
+        ASSERT_EQ(L.format->supersededDefinition().answerFor(WeakDefinitionKind::Overridable),
+                  std::optional{fmt.overridden})
+            << "the document's answer for a definition that lost an overridable weak name";
+        std::size_t const bodiesKept = fmt.overridden == SupersededDefinition::KeepsItsBytes ? 1u : 0u;
         for (bool rivalFirst : {false, true}) {
             SCOPED_TRACE(rivalFirst ? "the rival unit first" : "the alias's unit first");
             std::vector<AssembledModule> mods{compiledAliasUnit(fmt.prefix, SymbolBinding::Global, SymbolBinding::Weak),
@@ -310,7 +328,11 @@ TEST(CompiledSymbolAlias, AWeakAliasYieldsItsNameAndTheUnitsCallFollowsTheName) 
             EXPECT_TRUE(someCallLandsOn(img.bytes, kRivalBody))
                 << "the unit's call through its weak alias did not follow the name to the strong definition";
             EXPECT_FALSE(someCallLandsOn(img.bytes, kAliasedBody)) << "the call still reaches the aliased body";
-            EXPECT_EQ(findAll(img.bytes, kAliasedBody).size(), 1u) << "the aliased body is gone with the weak name";
+            EXPECT_EQ(findAll(img.bytes, kAliasedBody).size(), bodiesKept)
+                << (bodiesKept == 1u ? "the aliased body is gone with the weak name, where the format keeps a "
+                                       "superseded definition's bytes under its other names"
+                                     : "the aliased body stands under its other name, where the format replaces a "
+                                       "superseded definition whole");
         }
     }
 }

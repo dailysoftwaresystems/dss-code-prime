@@ -299,13 +299,24 @@ namespace {
     X(APlaceIsMarkedLikeTheTreeInEverySlashSpelling, "a place is marked like the tree, in every slash spelling")       \
     X(TheLongestFirstSoAPlaceInsideTheHomeKeepsItsOwnMark,                                                             \
       "...the longest first, so a place inside the home keeps its own mark")                                           \
+    X(OnAHostNamedTreeTheTreeSMarkIsNotReadAsTheName,                                                                  \
+      "on a host named `tree`, the tree's mark is not read as the name")                                               \
+    X(OnAHostNamedTempAPlaceSMarkIsNotReadAsTheName,                                                                   \
+      "on a host named `temp`, a place's mark is not read as the name")                                                \
+    X(OnAHostNamedHostALineThatRunsSshKeepsTheMarksItAlreadyHolds,                                                     \
+      "on a host named `host`, a line that runs ssh keeps the marks it already holds")                                 \
+    X(AnAccountNamedUserIsNotReadInsideItsOwnMark, "an account named `user` is not read inside its own mark")          \
+    X(EveryMarkTheCodeSpellsIsOneOfOwnMarksAndEveryOneOfThemIsSpelt,                                                   \
+      "every mark the code spells is one of OWN_MARKS, and every one of them is spelt")                                \
     X(ADetailIsRedactedWholeThenCutNoPieceOfANameSurvivesEitherEnd,                                                    \
       "a detail is redacted WHOLE, then cut: no piece of a name survives either end")                                  \
     X(ThisHostSAndTheDeclaredNamesNeverSurvive, "this host's and the declared names never survive")                    \
     X(TheFilterAnswersEachLineBeforeTheStreamEnds, "the filter answers each line before the stream ends")              \
     X(TheFilterRedactsEveryLineAndExits0, "the filter redacts every line and exits 0")                                 \
     X(TheCommandLineFilterNamesNoTree, "the command-line filter names no tree")                                        \
-    X(TheFilterReadsAFileArgument, "the filter reads a file argument")
+    X(TheFilterReadsAFileArgument, "the filter reads a file argument")                                                 \
+    X(AFileThatCannotBeReadIsOneSentenceNamingItAfterTheFilesBeforeItExit1,                                            \
+      "a file that cannot be read is ONE sentence naming it, after the files before it, exit 1")
 
 #define DSS_REDACT_SELFTEST_ARM_NAME(caseName, armName) armName,
 constexpr std::string_view kArmNames[] = {DSS_REDACT_SELFTEST_ARMS(DSS_REDACT_SELFTEST_ARM_NAME)};

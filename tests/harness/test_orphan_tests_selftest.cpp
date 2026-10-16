@@ -62,6 +62,16 @@ namespace {
     X(ParseIncompleteNoName, "E4 PARSE-INCOMPLETE-NO-NAME")                                          \
     X(ParseIncompleteNoSource, "E5 PARSE-INCOMPLETE-NO-SOURCE")                                      \
     X(ParseIncompleteUnterminatedCall, "E6 PARSE-INCOMPLETE-UNTERMINATED-CALL")                      \
+    X(ARegistrationInABlockCMakeMayNotRunClearsNothing,                                              \
+      "V1 A-REGISTRATION-IN-A-BLOCK-CMAKE-MAY-NOT-RUN-CLEARS-NOTHING")                               \
+    X(ACMakeListsNoAddSubdirectoryReachesClearsNothing,                                              \
+      "V2 A-CMAKELISTS-NO-ADD-SUBDIRECTORY-REACHES-CLEARS-NOTHING")                                  \
+    X(AnAddSubdirectoryInABlockOrExcludedHoldsItsTree,                                               \
+      "V3 AN-ADD-SUBDIRECTORY-IN-A-BLOCK-OR-EXCLUDED-HOLDS-ITS-TREE")                                \
+    X(ABlockOrAReachThatCannotBeReadIsACollapse,                                                     \
+      "V4 A-BLOCK-OR-A-REACH-THAT-CANNOT-BE-READ-IS-A-COLLAPSE")                                     \
+    X(AnOptInRegistrationIsClearedByAnAllowlistRow,                                                  \
+      "V5 AN-OPT-IN-REGISTRATION-IS-CLEARED-BY-AN-ALLOWLIST-ROW")                                    \
     X(StaleAllowFileGone, "7 STALE-ALLOW-FILE-GONE")                                                 \
     X(StaleAllowNowRegistered, "8 STALE-ALLOW-NOW-REGISTERED")                                       \
     X(StaleAllowSiteDroppedReference, "9 STALE-ALLOW-SITE-DROPPED-REFERENCE")                        \
@@ -79,6 +89,9 @@ namespace {
     X(RegisteredFileSpeltAsNoSourceIsUnwalked, "K4 REGISTERED-FILE-SPELT-AS-NO-SOURCE-IS-UNWALKED")  \
     X(EveryStatedExtensionIsWalkedAndJudged, "K5 EVERY-STATED-EXTENSION-IS-WALKED-AND-JUDGED")       \
     X(SiteTokenOfACSourceIsStructuralEvidence, "K6 SITE-TOKEN-OF-A-C-SOURCE-IS-STRUCTURAL-EVIDENCE") \
+    X(RegisteredSourceSpeltInAnotherCaseIsMisspelt,                                                  \
+      "K7 REGISTERED-SOURCE-SPELT-IN-ANOTHER-CASE-IS-MISSPELT")                                      \
+    X(EveryExtensionCMakeTakesIsStated, "K8 EVERY-EXTENSION-CMAKE-TAKES-IS-STATED")                  \
     X(SubjectRootExemptsOnlyItsExtensions, "S1 SUBJECT-ROOT-EXEMPTS-ONLY-ITS-EXTENSIONS")            \
     X(SubjectRegisteredIsStale, "S2 SUBJECT-REGISTERED-IS-STALE")                                    \
     X(SubjectRootGoneIsStale, "S3 SUBJECT-ROOT-GONE-IS-STALE")                                       \
@@ -86,8 +99,10 @@ namespace {
     X(SubjectsExtensionNotStatedIsRefused, "S5 SUBJECTS-EXTENSION-NOT-STATED-IS-REFUSED")            \
     X(SubjectsRootInsideAnotherIsRefused, "S6 SUBJECTS-ROOT-INSIDE-ANOTHER-IS-REFUSED")              \
     X(SubjectsRootNotPlainIsRefused, "S7 SUBJECTS-ROOT-NOT-PLAIN-IS-REFUSED")                        \
+    X(SubjectAnyTargetNamesIsStale, "S8 SUBJECT-ANY-TARGET-NAMES-IS-STALE")                          \
     X(GreenAfterRestore, "10 GREEN-AFTER-RESTORE")                                                   \
     X(CrashIsACollapse, "C1 CRASH-IS-A-COLLAPSE")                                                    \
+    X(AFailingArmsEvidenceGoesToStandardError, "C2 A-FAILING-ARMS-EVIDENCE-GOES-TO-STANDARD-ERROR")  \
     X(UsageExtraOrEmptyArgumentRefused, "U1 USAGE-EXTRA-OR-EMPTY-ARGUMENT-REFUSED")                  \
     X(BomIsNotContent, "P8 BOM-IS-NOT-CONTENT")                                                      \
     X(OwnTreeFromItsOwnTree, "R root CONTROL: cwd = its own tree -> its own tree")                   \

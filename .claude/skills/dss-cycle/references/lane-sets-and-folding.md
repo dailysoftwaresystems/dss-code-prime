@@ -19,13 +19,14 @@ committed and pushed as soon as its fold checks pass** — while the other lanes
 working. Unpushed work is lost with one disk and invisible to the operator; the size of a fold is the
 most the main tree may ever hold uncommitted.
 
-1. **The order is fold → checks → refresh the siblings → write the inventories → commit → push.** The
-   checks are the fold's own: the anchor balance against the cycle's start commit, the registry lint,
-   `check-anchor-citations`, `check-anchor-registry`, and — where the fold changed
-   `tests/mutations/arms.registry` — the registry's validation. The arms the fold added are then SWEPT HERE,
-   from the main tree, once the fold has landed and never before: a fold is not held for its sweep, and an arm
-   that does not read `passed` goes back to its lane with the tool's text (who sweeps, and why from here:
-   mutation-arms.md). The siblings are refreshed BEFORE the commit:
+1. **The order is fold → checks → refresh the siblings → write the inventories → commit → push, and
+   only then the sweep of the fold's arms.** The checks are the fold's own: the anchor balance against
+   the cycle's start commit, the registry lint, `check-anchor-citations`, `check-anchor-registry`, and —
+   where the fold changed `tests/mutations/arms.registry` — the registry's validation. The sweep is NOT
+   one of them and gates neither the commit nor the push: after the push, the arms the fold added are
+   swept from the main tree, on the bytes the fold landed as, and the sweep is recorded with the fold;
+   an arm that does not read `passed` goes back to its lane with the tool's text (who sweeps, and why
+   from here: mutation-arms.md). The siblings are refreshed BEFORE the commit:
    ✔MEASURED 2026-10-08, `refresh-agent` sees only the main tree's UNCOMMITTED changes — after the
    commit it answers "holds the main tree's copy" for a path whose lane copy is older (reported to the
    tool's own repository). A sibling in the middle of a run is refreshed when the run ends; the commit

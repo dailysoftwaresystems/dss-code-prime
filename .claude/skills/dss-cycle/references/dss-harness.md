@@ -22,11 +22,17 @@ ships is one of its ACTIONS, under `.harness-config/runner/actions/`; there is n
     dotnet tool install --global DssHarness      # a FIRST install; an update has one door, below
     DssHarness --version                         # every leg must match the root host
 
-★ **THE TOOL IS UPDATED THROUGH ONE DOOR — `dssharness update-tool --wait` — AND NEVER BY A LANE.** It updates this
-machine's DssHarness only while none runs here; with `--wait` it waits for every one that does, naming whom it
-waits for. A bare `dotnet tool update` beside a live `dssharness` takes the tool away from every command typed
-meanwhile — which is what an exit of 127 ("command not found") from the tool means: somebody is updating, the
-reading measured nothing, wait and run again.
+★ **THE TOOL IS UPDATED THROUGH ONE DOOR, AND NEVER BY A LANE** — as `help legs` and `update-tool --help` state it:
+
+    dotnet tool exec DssHarness --yes --source https://api.nuget.org/v3/index.json -- update-tool --wait
+
+the newest release run BESIDE the installed one, without installing it, its exit code the update's — the door on
+every system. On Windows it is the only one: there a `dssharness update-tool` typed bare is itself a DssHarness
+running, changes nothing and prints this command. It updates this machine's DssHarness only while no other runs
+here; with `--wait` it waits for each, naming whom it waits for. A bare `dotnet tool update` beside a live
+`dssharness` takes the tool away from every command typed meanwhile, and a command typed then finds no tool: the
+SHELL's exit 127 ("command not found"), never a code of the tool's — somebody is updating, the reading measured
+nothing, wait and run again.
 
 ⚠ **A leg installs only a PUBLISHED version.** A locally built tool cannot reach a remote leg, every
 leg must run the same version as the machine driving it, a host ahead of the root refuses the run, and
@@ -131,7 +137,7 @@ releases never happened — all four landed in 0.5.3 instead. A document still q
 | `build` | the `local-build` program — **DELETED**. ⓘ It also reads `ninja -t deps` since 0.5.7; the `check-ninja-deps` action stays because CI runs `ctest` with no DssHarness installed |
 | `test` | the `run-gate` program — **DELETED** |
 | `check-mutations` | the red-on-disable read made by hand, one mutant per `test --filter` call. It reads the arms `tests/mutations/arms.registry` declares, mutates each in a WORKER COPY of the leg's tree — never in a tree —, builds, witnesses every object that depends on the site rebuilt, runs the arm's test binary whole and judges the EXACT set of red cases, then puts the site back by its hash (mutation-arms.md). `--self-test` proves the judge itself with a leg's toolchain and needs no registry |
-| `clean` | removing a leg's build directory by hand: it removes each selected leg's build directory AND the mutation workers its sweeps keep beside its tree, wherever the leg runs; `--dry-run` says what each holds and the room left, and removes nothing |
+| `clean` | removing a leg's build directory by hand: it removes each selected leg's build directory AND the mutation workers its sweeps keep in its tree (`.mutations`; on a host, the sweep's own copy under `.legs` with its workers), wherever the leg runs; `--former-workers` alone removes the workers an earlier version of the tool kept BESIDE a tree; `--dry-run` says what each holds and the room left, and removes nothing |
 | `sync` | the leg drivers, the carriages and the exclude derivation — **DELETED**. The `owning-tree` action is the one owner of *which tree am I standing in*; the `.sh` and PowerShell owners it stood beside were folded into it |
 | `run` | EVERY program this repository ships: each is an action under `.harness-config/runner/actions/` with a `predefinedRunners` entry, started by `dssharness run <name>` |
 
@@ -359,8 +365,9 @@ config **cannot** be overridden per machine, and a machine-specific path belongs
 
 ⚠ **The worktrees root is NOT under `.harness-config/`.** This repository's `worktrees.root` is
 `.worktrees`, at the CHECKOUT root, beside `.orchestrators` — both ignored in the contents shape with a
-tracked `.gitkeep`, as `init` writes them, and both withheld by `sync` by name, so no lane checkout ships to a
-gate host (worktrees.md). `.harness-config/worktrees/` is the tool's DEFAULT root, which this configuration
+tracked `.gitkeep`, as `init` writes them, as are `.mutations` (a tree's mutation workers) and `.legs` (the
+copies of the tree its legs work in) in every tree, and all four withheld by `sync` by name, so no lane checkout,
+worker or leg copy ships to a gate host (worktrees.md). `.harness-config/worktrees/` is the tool's DEFAULT root, which this configuration
 overrides.
 ⚠ **A help topic may state the default, not your configuration** — ask `list-worktree` where a worktree
 actually is. ✔MEASURED 2026-09-29 in this checkout: `create-agent` made its worktrees under `.worktrees/<o>/`, as

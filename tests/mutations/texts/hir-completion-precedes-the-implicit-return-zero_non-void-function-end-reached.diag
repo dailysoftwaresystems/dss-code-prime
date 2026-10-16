@@ -1,1 +1,1 @@
-main is { <body>  return 0; }
+H_NonVoidFunctionEndReachable: control can reach the end of

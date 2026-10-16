@@ -11,7 +11,10 @@ its output through it.
 
 USE
   python redact.py [FILE ...]   filter FILEs, or standard input LINE BY LINE, flushed (a monitor pipes `tail -f`
-                                through it; a whole-stdin read would print nothing until the stream ends)
+                                through it; a whole-stdin read would print nothing until the stream ends). Exits
+                                0; 1 at the first FILE that cannot be read, after what the FILEs before it printed,
+                                with ONE sentence on standard error naming it (redacted, as all it prints); 2 on a
+                                usage error or a refusal
   python redact.py --self-test  the arms, each by name, counted against EXPECTED_ARMS
   loaded by path                `redactor(tree)` -> apply(text); `Unredactable` when the account has no name;
                                 `lazy_redactor(tree, places)` -> shown(text), built on first use and WITHHELD when
@@ -105,6 +108,12 @@ THE RULES, in the order they apply
      the names (K) exists to keep are read back from a build. A `.gitignore` the reader refuses, or an owner
      that cannot be loaded, keeps NOTHING by (K). The filter run from the command line names no tree, so it
      never walks one: what it prints does not depend on any tree.
+ ★ A NAME IS NEVER READ INSIDE ONE OF THE REDACTOR'S OWN MARKS -- OWN_MARKS, and the labels of the caller's places
+     (`<temp>`): rules 14 and 15, and rule 13 on a line that runs an ssh-family command, leave a mark as it stands,
+     so a host or an account named like a mark's word (`tree`, `temp`, `host`, `user`) does not turn `<tree>` into
+     `<<host>>` -- in a text a redactor already filtered too (a log written through it and piped again). A mark
+     says nothing of the name it shares a word with. Rule 13's positions never fall inside a mark: each needs an
+     `@`, a `.`, `//` or a `:` beside the name, and no mark holds one.
 THE DECLARED REMOTE NAMES are the connection data DssHarness keeps per ssh host in
 `.harness-config/sshItems/<item>/.env` (`dssharness help secrets`): its USER, and its ADDRESS with the address's
 first label (an IP address is not keyed: rule 10 masks every one). They are read from the caller's tree, from this
@@ -289,6 +298,10 @@ LS_LONG = re.compile(r"(?m)^(\s*[-bcdlpsD][-rwxsStTlL]{9}[.+@*]?\s+\d+\s+)([^\s<
 # Rule 12 -- a UNC server at a token's start (never a URL's authority, never a doubled slash inside a path).
 UNC_SERVER = re.compile(r"(?<![0-9A-Za-z_:\\/.$])(\\\\|//)(?!(?i:wsl\.localhost|wsl\$|localhost)(?=[\\/]))"
                         r"([0-9A-Za-z][0-9A-Za-z._$-]*)(?=[\\/])")
+# Every mark the rules write. A name rule never reads inside one (the docstring's ★ after rule 15); the self-test
+# holds this list to every mark the code spells, both ways, so a mark a rule gains without a line here is a red.
+OWN_MARKS = ("<forward>", "<group>", "<host>", "<ip>", "<key-path>", "<path>", "<redacted>", "<secret-path>",
+             "<tree>", "<user>")
 
 
 class Unredactable(Exception):
@@ -525,6 +538,15 @@ class TreeText:
 
 def _word(value, flags=0):
     return re.compile("(?<![%s])%s(?![%s])" % (NAME_CHARS, re.escape(value), NAME_CHARS), flags)
+
+
+def _outside_marks(marks, rx, text, repl):
+    """`rx.sub(repl, text)` (`repl` a function of the match), save that a match inside one of the redactor's own
+    marks (`marks`, their compiled alternation) stands as it is: the mark's word is the redactor's, never a name."""
+    if not rx.search(text):
+        return text
+    spans = [m.span() for m in marks.finditer(text)]
+    return rx.sub(lambda m: m.group(0) if any(s <= m.start() and m.end() <= e for s, e in spans) else repl(m), text)
 
 
 def _token_around(text, start, end):
@@ -865,6 +887,8 @@ def redactor(tree=None, user=None, host=None, home=None, os_family=None, vocabul
                 for spelling in {form, form.replace("\\", "/"), form.replace("/", "\\")}:
                     path_pairs.append((re.compile(re.escape(spelling), word_flags), len(spelling), mark))
     path_pairs.sort(key=lambda p: p[1], reverse=True)  # the tree, or a place, before the home it sits in
+    own = re.compile("|".join(re.escape(m) for m in sorted(set(OWN_MARKS) | set(places or {}), key=len,
+                                                           reverse=True)))
     # Rule 13's positions, per host: after `@`, the DOTTED name (the name and every label after it), after `//`, and
     # before `:<port>`. The dotted one alone takes the exemptions (it is the one a tree's vocabulary spells:
     # `dss.mir`); `known` is every known FULL name and its domain, which (K3) never keeps.
@@ -927,13 +951,12 @@ def redactor(tree=None, user=None, host=None, home=None, os_family=None, vocabul
                 text = rx.sub(lambda m, t=text, n=name_len: m.group(0) if keep_host(t, m.start(), m.start() + n)
                               else "<host>", text)
         if host_anywhere and _SSH_FIND.search(text):
-            text = "\n".join(_mask_ssh_line(ln, host_anywhere) for ln in text.split("\n"))
+            text = "\n".join(_mask_ssh_line(ln, host_anywhere, own) for ln in text.split("\n"))
         for rx in account_words:                                           # rule 14: never kept
-            text = rx.sub("<user>", text)
+            text = _outside_marks(own, rx, text, lambda _m: "<user>")
         for rx in host_words:                                              # rule 15: the exemptions
-            if not rx.search(text):
-                continue
-            text = rx.sub(lambda m, t=text: m.group(0) if keep_host(t, m.start(), m.end()) else "<host>", text)
+            text = _outside_marks(own, rx, text, lambda m, t=text: m.group(0) if keep_host(t, m.start(), m.end())
+                                  else "<host>")
         return text
     # The tree walks this redactor made for rule 15 -- its names, and its text -- or None for one it did not make, so
     # a caller can say what the exemption consulted and what it cost (read-leg-path prints both on its OK line).
@@ -972,11 +995,11 @@ def cut(shown, text, n):
     return whole[:n] if n > 0 else whole[n:]
 
 
-def _mask_ssh_line(line, host_anywhere):
+def _mask_ssh_line(line, host_anywhere, own):
     if not _SSH_FIND.search(line):
         return line
     for rx in host_anywhere:
-        line = rx.sub("<host>", line)
+        line = _outside_marks(own, rx, line, lambda _m: "<host>")
     return line
 
 
@@ -986,7 +1009,7 @@ def _mask_ssh_line(line, host_anywhere):
 # block that silently stopped running -- is a red, not a smaller green. The count is host-independent: every arm
 # below is synthetic except "this host's and the declared names never survive", which is ONE arm however many texts
 # it checks.
-EXPECTED_ARMS = 249
+EXPECTED_ARMS = 255
 
 
 def self_test():
@@ -1007,6 +1030,12 @@ def self_test():
     def same(label, red, text, want):
         got = red(text)
         arm(label, got == want, "%r -> %r, want %r" % (text, got, want))
+
+    def unread(label, red, text, want):
+        """`same`, whose detail says first when a mark of the redactor's was read as a name (a mark inside a mark)."""
+        got = red(text)
+        arm(label, got == want, "%s%r -> %r, want %r" % ("a mark was read as a name: " if "<<" in got else "", text,
+                                                         got, want))
 
     none = {"accounts": (), "hosts": (), "items": ()}   # synthetic arms never depend on this host's ssh items
     posix = redactor(user="lnxacct", host="h9.example", home="/home/lnxacct", os_family="posix", declared=none)
@@ -1385,6 +1414,39 @@ def self_test():
          "at <temp>/a and <temp>\\b")
     same("...the longest first, so a place inside the home keeps its own mark", placed,
          "ran /home/lnxacct/scratch7/x from /home/lnxacct", "ran <probe>/x from ~")
+    # ── a name is never read inside the redactor's own marks: hosts and an account named like a mark's word ──
+    unread("on a host named `tree`, the tree's mark is not read as the name",
+         redactor(tree="/srv/trees/wt1", user="lnxacct", host="tree", home="/home/lnxacct", os_family="posix",
+                  declared=none), "at /srv/trees/wt1/src/a.cpp on tree", "at <tree>/src/a.cpp on <host>")
+    unread("on a host named `temp`, a place's mark is not read as the name",
+         redactor(user="lnxacct", host="temp", home="/home/lnxacct", os_family="posix", declared=none,
+                  places={"<temp>": "/srv/tmp7"}), "wrote /srv/tmp7/a.log on temp", "wrote <temp>/a.log on <host>")
+    unread("on a host named `host`, a line that runs ssh keeps the marks it already holds",
+         redactor(user="lnxacct", host="host", home="/home/lnxacct", os_family="posix", declared=none),
+         "ssh <host> uptime, then host rebooted", "ssh <host> uptime, then <host> rebooted")
+    unread("an account named `user` is not read inside its own mark",
+         redactor(user="user", host="h9.example", home="/home/user", os_family="posix", declared=none),
+         "<user> ran, then user did", "<user> ran, then <user> did")
+    import ast
+    with io.open(os.path.realpath(__file__), encoding="utf-8") as fh:
+        source = ast.parse(fh.read())
+    # What the RULES spell: every string of the code but a docstring, the self-test's own texts and the list itself.
+    not_rules = set()
+    for node in ast.walk(source):
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and body and isinstance(body[0], ast.Expr) \
+                and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+            not_rules.add(id(body[0].value))
+        if (isinstance(node, ast.FunctionDef) and node.name == "self_test") or (
+                isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == ["OWN_MARKS"]):
+            not_rules.update(id(sub) for sub in ast.walk(node))
+    spelt = set()
+    for node in ast.walk(source):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in not_rules:
+            spelt.update(re.findall(r"<[a-z][a-z-]*>", node.value))
+    arm("every mark the code spells is one of OWN_MARKS, and every one of them is spelt", spelt == set(OWN_MARKS),
+        "spelt but not listed %s, listed but not spelt %s" % (sorted(spelt - set(OWN_MARKS)),
+                                                               sorted(set(OWN_MARKS) - spelt)))
     shown = lazy_redactor()
     shown.redactor[:] = [lambda t: t.replace("zqxacct", "<user>")]   # a stand-in: this proves the ORDER, not the rules
     cuts = (cut(shown, "x" * 20 + " zqxacct ran", 24), cut(shown, "ran by zqxacct", -5))
@@ -1460,6 +1522,18 @@ def self_test():
             "trees named %r, rc=%r" % (named, rc))
         arm("the filter reads a file argument", out.stdout.decode("utf-8", "replace").strip() == "ip <ip>"
             and out.returncode == 0, repr(out.stdout))
+        # A FILE THAT CANNOT BE READ: what the files before it printed, then ONE sentence naming it, exit 1 -- never
+        # a traceback (the P69 H3 ruling). The detail says counts only: the sentence holds a temp path.
+        gone = os.path.join(tmp, "no-such-log7.txt")
+        out = subprocess.run([sys.executable, "-B", os.path.realpath(__file__), f, gone], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, timeout=60)
+        said = out.stderr.decode("utf-8", "replace").strip().split("\n")
+        arm("a file that cannot be read is ONE sentence naming it, after the files before it, exit 1",
+            out.returncode == 1 and out.stdout.decode("utf-8", "replace").strip() == "ip <ip>" and len(said) == 1
+            and "no-such-log7.txt cannot be read" in said[0] and "Traceback" not in said[0],
+            "%src=%r, %d byte(s) on standard output, %d line(s) on standard error, naming the file: %s"
+            % ("a traceback was printed: " if any("Traceback" in s for s in said) else "", out.returncode,
+               len(out.stdout), len(said), any("no-such-log7.txt" in s for s in said)))
     total = ran[0]
     ok = failed[0] == 0 and total == EXPECTED_ARMS
     if total != EXPECTED_ARMS:
@@ -1483,8 +1557,15 @@ def main(argv):
         return 2
     if argv:
         for path in argv:
-            with io.open(path, "rb") as fh:
-                sys.stdout.write(red(fh.read().decode("utf-8", errors="replace")))
+            try:
+                with io.open(path, "rb") as fh:
+                    data = fh.read()
+            except OSError as exc:  # a missing file, a directory, no permission: said, never a traceback
+                sys.stdout.flush()
+                print("redact: %s cannot be read (%s), so nothing of it is printed."
+                      % (red(path), red(exc.strerror or type(exc).__name__)), file=sys.stderr)
+                return 1
+            sys.stdout.write(red(data.decode("utf-8", errors="replace")))
         return 0
     sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     for line in sys.stdin:  # line by line, flushed: every rule is line-local, so streaming changes no output

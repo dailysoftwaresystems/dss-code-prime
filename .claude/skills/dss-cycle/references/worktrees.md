@@ -41,9 +41,12 @@ open without delete sharing, a program running from it -- naming what holds it.
 
 Four clauses, and each is measured rather than asserted — detail in §H.0b:
 
-1. **The ignore rules are what satisfy the "ALL host copies" clause.** `dssharness init` writes them —
-   `/<worktrees.root>/*`, here `/.worktrees/*`, and the fixed `/.orchestrators/*`, each beside its tracked
-   `.gitkeep` — and `sync` withholds both directories by name, independently of git. ★ A sync carries
+1. **The ignore rules are what satisfy the "ALL host copies" clause.** `dssharness init` writes them in the
+   CONTENTS shape for FOUR directories, each beside its tracked `.gitkeep` (`help layout`):
+   `/<worktrees.root>/*`, here `/.worktrees/*` (the worktrees); the fixed `/.orchestrators/*` (what each
+   orchestrator and its agents keep, in the main checkout); `/.mutations/*` (the tree's mutation workers, in
+   EVERY tree); and `/.legs/*` (the copies of the tree its legs work in, in every tree) — and `sync` withholds
+   all four by name, independently of git. Each copy in them is a whole copy of the tree. ★ A sync carries
    what git does not ignore, committed or not, so the root `.gitignore` is the one statement of what stays
    home; `.harness-config/config.json`'s `sync.neverTransfer` repeats none of it and holds only the
    secrets at any depth (`**/.secrets`, `**/.env`) — the one exclusion a second statement is kept for.
@@ -133,10 +136,10 @@ refusal, never a remembered figure; every character of an orchestrator's name is
 ⇒ **Keep names SHORT.** A descriptive name spends the margin that protects the next long test name.
 
 ⚠ **The ignore rules are what keep checkouts off every gate host**, and they are a REQUIREMENT, not
-tidiness. `dssharness init` writes them in the CONTENTS shape — `/.worktrees/*` from `worktrees.root` and
-the fixed `/.orchestrators/*`, each beside a tracked `.gitkeep` — and names either directory it finds as a
-link, writing nothing through it; the carriage, `dssharness sync`, withholds both directories by NAME
-(DOCUMENTED, `dssharness help layout`). ✔MEASURED 2026-09-29: a `sync --dry-run` from the main checkout, with
+tidiness. `dssharness init` writes them in the CONTENTS shape — `/.worktrees/*` from `worktrees.root`, the
+fixed `/.orchestrators/*`, and `/.mutations/*` and `/.legs/*` in every tree, each beside a tracked `.gitkeep`
+— and names any of the four it finds as a link, writing nothing through it; the carriage, `dssharness sync`,
+withholds all four by NAME (DOCUMENTED, `dssharness help layout`). ✔MEASURED 2026-09-29: a `sync --dry-run` from the main checkout, with
 an agent's worktree open, listed no path below either directory — one host, WSL. A gate host holding a checkout runs somebody's
 uncommitted `examples/` corpus and reports it as the cycle's.
 
@@ -154,10 +157,13 @@ is the same class as a red-on-disable whose mutant never compiled in.
   agent worktree, or a plain probe worktree. What lands in the main tree lands through the fold, or as a
   verified patch the main loop decides on.
   ★ **A red-on-disable ARM changes no tree at all**: `dssharness check-mutations` applies the mutation in a
-  WORKER COPY it keeps beside the tree (`<tree>.mutation-<key>w-<n>`, a whole copy with a whole build, synced
-  by content before every sweep), so a sweep may be run on a lane's worktree and on the main checkout alike.
-  A worker's path is twenty characters longer than its tree's; the workers go with their tree —
-  `delete-agent` and `delete-worktree` remove those kept beside it, `clean` a leg's with its build directory.
+  WORKER COPY it keeps inside the tree (`<tree>/.mutations/<key>w-<n>`, a whole copy with a whole build, synced
+  by content before every sweep; on another machine inside the sweep's own copy there,
+  `<host's copy>/.legs/<key>`), so a sweep may be run on a lane's worktree and on the main checkout alike, and
+  of the tree itself it reads every file and writes none. A worker's path is longer than its tree's by what
+  `help mutations` states; the workers go with their tree — `delete-agent` and `delete-worktree` remove those
+  kept in it, here and in each host's copy, `clean` a leg's with its build directory; workers an earlier version
+  of the tool kept BESIDE a tree go only by `clean --former-workers`.
   No mutant is applied to a tree by hand: what cannot be an arm is stated as absent (mutation-arms.md).
 - ⚠ **A revert is not a safe undo once a concurrent lane has edited the same file.** Copying a
   pristine copy back destroys the other lane's interleaved work. Reverse-apply the specific patch
