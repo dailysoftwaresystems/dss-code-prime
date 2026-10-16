@@ -330,6 +330,38 @@ TEST(GnuStatementExpression, RefusedAtFileScope) {
            "so one construct produces one diagnostic and not two";
 }
 
+// ★ REFUSAL 2, WHEREVER THE CONSTRUCT STANDS (P69, lane `lm`): the refusal is the semantic
+// tier's, at the node (`pass2Post`) — so a statement expression the lowering never meets,
+// unevaluated in a `_Generic`'s controlling expression or folded in a constant, is refused
+// too, ONCE (the lowering's guard says nothing more on a model that already holds the
+// error). ✔MEASURED 2026-10-15: each of these BUILT on DSS (pe64, both pipelines), where
+// gcc 13, clang 18, AppleClang 21 and mingw-w64 gcc 13.2 refuse every one.
+TEST(GnuStatementExpression, RefusedAtFileScopeWhereverItStands) {
+    for (char const* src : {
+             "static char arr[_Generic(({ 1; }), int: 1, default: 2)];\n"
+             "int main(void){ return 0; }\n",
+             "_Static_assert(_Generic(({ 1; }), int: 1, default: 2) == 1, \"\");\n"
+             "int main(void){ return 0; }\n",
+             "struct B { unsigned w : _Generic(({ 1; }), int: 1, default: 2) * 9; };\n"
+             "int main(void){ return 0; }\n",
+         }) {
+        EXPECT_EQ(parseErrorsFor(src), 0u) << src;
+        EXPECT_EQ(loweringCodeCount(src, DiagnosticCode::S_StatementExprAtFileScope), 1u)
+            << "refused once, by the tier that sees every one:\n" << src;
+    }
+    // THE CONTROL: inside a function body the same three are statement expressions like
+    // any other, and build.
+    std::string const inside =
+        "int main(void){\n"
+        "  static char arr[_Generic(({ 1; }), int: 1, default: 2)];\n"
+        "  _Static_assert(_Generic(({ 1; }), int: 1, default: 2) == 1, \"\");\n"
+        "  struct B { unsigned w : _Generic(({ 1; }), int: 1, default: 2) * 9; };\n"
+        "  return (int)sizeof arr - 1;\n"
+        "}\n";
+    EXPECT_EQ(parseErrorsFor(inside), 0u);
+    EXPECT_EQ(loweringCodeCount(inside, DiagnosticCode::S_StatementExprAtFileScope), 0u);
+}
+
 
 // ── [[D-C-GNU-STATEMENT-EXPRESSION]] — the ACCEPTED shapes ───────────────────
 

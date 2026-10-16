@@ -2188,6 +2188,50 @@ integerPromotedType(TypeInterner& interner, TypeId t,
     return interner.primitive(p);
 }
 
+// ── THE TYPE A BIT-FIELD'S VALUE HAS (C 6.3.1.1p2) ────────────────────────────────────
+// (cycle P69 round 1, lane `lm`.)
+//
+// A bit-field is promoted BY ITS WIDTH, not by its declared type: "If an int can represent
+// all values of the original type (as restricted by the width, for a bit-field), the value
+// is converted to an int; otherwise, it is converted to an unsigned int." `declared` is the
+// field's declared type and `width` its width; the answer, with the promotion floor `int`
+// the language names (`rules.minRank`):
+//   * an integer field narrower than `int` → `int` (every value fits);
+//   * a field of exactly `int`'s width → `int` when its type is signed, else `unsigned int`;
+//   * a WIDER field → its declared type, unchanged;
+//   * a bit-precise (`_BitInt`) field, or no integer at all → the declared type (C23
+//     6.3.1.1p2 converts a bit-precise field to its own bit-precise type).
+// ✔MEASURED 2026-10-15 (17 fields × 51 programs on AppleClang 21, clang 18, gcc 13 and
+// mingw-w64 gcc 13.2): the four promote by width whatever the declared type — `unsigned :3`,
+// `unsigned char :3`, `_Bool :1`, `unsigned long long :3` and `long long :3` are `int`;
+// `unsigned :32` and `unsigned long long :32` are `unsigned int`. A field wider than `int`
+// is the standard's to leave to the implementation, and the references split: clang 18,
+// AppleClang 21 and cl 19.51 keep the declared type, gcc gives the field a type of its own
+// width — a reading clang's sources decline, and so does this (the row says why). cl 19.51
+// promotes no bit-field by its width; ISO C, gcc and clang do, and DSS follows them.
+// The returned type for a field of `int`'s width or less is the BARE promoted type: the
+// value is `int` (or `unsigned int`), not the declared type's name — `long b : 3` on an
+// LLP64 target is an `int`, as on every other.
+[[nodiscard]] inline TypeId
+bitFieldPromotedType(TypeInterner& interner, TypeId declared, std::uint32_t width,
+                     ResolvedArithmeticRules const& rules) {
+    if (!declared.valid() || width == 0) return declared;
+    using namespace detail::type_rules;
+    TypeKind const k = interner.kind(enumUnderlyingOrSelf(interner, declared));
+    bool isInteger = intWidthRank(k) != 0;
+    for (TypeKind p : rules.alsoPromote) {
+        if (p == k) isInteger = true;   // `_Bool`, plain `char` — the promoted kinds
+    }
+    int const floorBits = intKindBits(rules.minRank);
+    if (!isInteger || floorBits == 0) return declared;
+    if (width < static_cast<std::uint32_t>(floorBits)) return interner.primitive(rules.minRank);
+    if (width == static_cast<std::uint32_t>(floorBits)) {
+        if (signedIntRank(k) != 0) return interner.primitive(rules.minRank);
+        return interner.primitive(kindAtRank(intWidthRank(rules.minRank), /*isSigned=*/false));
+    }
+    return declared;
+}
+
 // C 6.5.7 shift RESULT TYPE under the config verb `shiftResult` — the SINGLE
 // chokepoint both the CST→HIR shift lowering and the semantic-tier expression
 // typer call, so the two tiers can never diverge on the verb (a regression to

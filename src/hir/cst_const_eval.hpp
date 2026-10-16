@@ -196,9 +196,10 @@ struct CstResolvedSymbol {
     // 21 fold each to C's value (4294967291, 1, 44, 1, 1.5, unequal). The same read
     // decides a run-time condition whose taken branch never completes, so a wrong
     // one deletes the code after it.
-    // nullopt: the resolver could not classify the declared type (an aggregate, a
-    // type it has no conversion for) — the initializer's value is handed on as it
-    // folded, which is right for every type that is not arithmetic or a pointer.
+    // nullopt: the declared type is a structure, a union or an array — the initializer's
+    // value is handed on as it folded, its members read at their own types where they
+    // are read. Any other type the conversion cannot classify is NO constant, and the
+    // resolver says so by handing no symbol (`namedConstantRead`, the one statement).
     std::optional<CstCastTarget> declaredType{};
 };
 
@@ -256,6 +257,28 @@ class TypeInterner;
 [[nodiscard]] DSS_EXPORT std::optional<CstCastTarget>
 classifyCstCastTarget(TypeInterner const& interner, TypeId ty,
                       std::optional<bool> charIsUnsigned);
+
+// ★ P69 (lane `lm`; a review of checkpoint 21, its finding F2): WHAT A NAMED CONSTANT'S
+// DECLARED TYPE MAKES OF ITS READ, said ONCE for both resolvers that hand the engine a
+// symbol (the semantic tier's `resolveConstSymbolInit` and the lowering's). An object's
+// value is its initializer CONVERTED to its type (C 6.7.9p11), so:
+//   * a type the conversion classifies (`classifyCstCastTarget`) — read through it;
+//   * a structure, a union or an array — handed on as its initializer folded, with NO
+//     conversion: its value is its members' and elements', each read at its own type
+//     where it is read (the constant-subobject path);
+//   * ANY OTHER TYPE — NO CONSTANT. An arithmetic type the engine has no value for
+//     (`_Complex`: a fold holds one real number) cannot be read at its own type, and
+//     reading it at the initializer's is a different number: ✔MEASURED 2026-10-15 (pe64,
+//     both pipelines), `static const double _Complex z = 1;` read as the integer 1, so
+//     `z / 2 == 0` folded TRUE — `_Static_assert(z / 2 == 0, "")` was accepted, where
+//     clang 18 and AppleClang 21 say it fails and gcc 13 that it is no constant, and
+//     `if (z / 2 == 0) return 7; return x;` marked `return x` never reached and died of
+//     an illegal instruction where all five GNU-dialect references return x.
+// nullopt: the name is no constant (the engine's identifier read fails as not a constant
+// expression); an invalid declared type is one too.
+[[nodiscard]] DSS_EXPORT std::optional<CstResolvedSymbol>
+namedConstantRead(TypeInterner const& interner, NodeId initExpr, std::uint32_t initScopeOpaque,
+                  TypeId declaredType, std::optional<bool> charIsUnsigned);
 
 // c43: field-offset resolver — given a struct/union CONTAINER TypeId + a field-name
 // token, return the field's {byteOffset, fieldType}, or nullopt (unknown field /
@@ -325,13 +348,20 @@ using CstWideCharCoreResolver = std::function<std::optional<TypeKind>(NodeId)>;
 // the offsetof arm; a non-constant compound literal stays non-constant). The resolver
 // owns WHICH objects count as constants and how a brace list places its elements (the
 // semantic tier's placement cursor), none of which this interner-free engine may know.
+// P69 (lane `lm`): a BIT-FIELD member's read — its width, and the type its VALUE has
+// (C 6.3.1.1p2: `bitFieldPromotedType`, which the tier that resolved the member asks;
+// `int` for a field narrower than `int`), classified as a conversion.
+struct CstBitFieldRead {
+    std::uint32_t width = 0;
+    CstCastTarget valueType{};
+};
 struct CstConstantSubobject {
     CstResolvedSymbol init{};        // the initializer value, and its scope
     CstCastTarget     type{};        // the subobject's declared type, as a conversion
     bool              zeroValue = false;
-    // P69 (lane `lm`): the member is a BIT-FIELD of this width — the value read is the
-    // one converted to `type`, reduced to the width (`readThroughBitField`).
-    std::optional<std::uint32_t> bitFieldWidth{};
+    // P69 (lane `lm`): the member is a BIT-FIELD — the value read is the one converted to
+    // `type`, reduced to the width, at the value's type (`readThroughBitField`).
+    std::optional<CstBitFieldRead> bitField{};
 };
 using CstConstantSubobjectResolver =
     std::function<std::optional<CstConstantSubobject>(NodeId, std::uint32_t)>;

@@ -1,0 +1,1 @@
+        thenT = bitFieldOperandType(thenN, thenT);

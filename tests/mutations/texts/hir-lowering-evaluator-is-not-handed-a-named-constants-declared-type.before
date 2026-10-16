@@ -1,2 +1,2 @@
-                        out.declaredType =
-                            classifyCstCastTarget(interner, rec->type, charIsUnsigned_);
+                    return namedConstantRead(interner, *initExpr, rec->scope.v, rec->type,
+                                             charIsUnsigned_);

@@ -24182,7 +24182,34 @@ TEST(SemanticAnalyzerC, AGenericSelectionWithNoControllingTypeSelectsNothing) {
         "enum { EU = _Generic(undeclared_name, int: 3, default: 7) };\n"
         "int main(void){ return 0; }\n",
     });
-    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_NonConstantEnumeratorValue), 1u)
-        << "an unresolved controlling type must not select `default`";
-    EXPECT_TRUE(model.hasErrors());
+    // EXACTLY two errors, each said once: the name nothing declares, and the enumerator
+    // that is therefore no constant. "At least one" would pass a model that ALSO selected
+    // `default` and reported the name — the defect this pins.
+    std::string all;
+    std::size_t errors = 0;
+    for (auto const& d : model.diagnostics().all()) {
+        all += std::string{diagnosticCodeName(d.code)} + ": " + d.actual + "\n";
+        if (d.severity == DiagnosticSeverity::Error) ++errors;
+    }
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u) << all;
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NonConstantEnumeratorValue), 1u)
+        << "an unresolved controlling type must not select `default`\n" << all;
+    EXPECT_EQ(errors, 2u) << all;
+}
+
+// THE POSITIVE TWIN: a controlling expression whose type IS known — a variable, which a
+// generic selection never evaluates (C 6.5.1.1p3) — selects its association in the same
+// position, before the expression pass; `default` stays the association of a type no
+// other names.
+TEST(SemanticAnalyzerC, AGenericSelectionWithAKnownControllingTypeSelectsItsAssociation) {
+    auto model = analyzeWithLayout({
+        "static int declared_name;\n"
+        "enum { EK = _Generic(declared_name, int: 3, default: 7),\n"
+        "       ED = _Generic(declared_name, long: 3, default: 7) };\n"
+        "_Static_assert(EK == 3 && ED == 7, \"selected by the variable's type\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
 }

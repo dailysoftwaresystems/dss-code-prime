@@ -38,6 +38,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -284,6 +285,64 @@ void bothArmsReadALocal(Ctx& c, MirBlockId) {
                           std::array<MirInstId, 2>{picked, c.sum}, c.i32));
 }
 
+// A filter written with a statement expression lowers to more than `&&`, `||` and `?:`
+// give (a review of checkpoint 21, its F4): a `switch`, and an arm the source says is never
+// taken. Each is copied into the funclet by its own arm of the pass.
+//
+// `({ int r; switch (code) { case AV: r = 1; break; default: r = 0; } r; })`:
+//   entry : code ; Switch(code, [AV → yes], default → no)
+//   yes   : 1 ; Br(merge)        no : 0 ; Br(merge)
+//   merge : Phi[(1, yes), (0, no)] ; SehFilterReturn
+void switchOnTheCode(Ctx& c, MirBlockId) {
+    MirBlockId const yes = c.block(), no = c.block(), merge = c.block();
+    MirInstId const code = c.mb.addInst(MirOpcode::SehExceptionCode, {}, c.u32);
+    MirLiteralValue av;
+    av.value = std::int64_t{0xC0000005};
+    av.core  = TypeKind::U32;
+    MirInstId const avc = c.mb.addConst(std::move(av), c.u32);
+    std::array<std::pair<MirInstId, MirBlockId>, 1> const cases{{{avc, yes}}};
+    c.mb.addSwitch(code, cases, no);
+    c.mb.beginBlock(yes);
+    MirInstId const one = c.constant(1);
+    c.mb.addBr(merge);
+    c.mb.beginBlock(no);
+    MirInstId const zero = c.constant(0);
+    c.mb.addBr(merge);
+    c.mb.beginBlock(merge);
+    c.answer(c.phi(one, yes, zero, no));
+}
+
+// `({ if (code != AV) __builtin_trap(); 1; })` — an arm the source says is never taken:
+//   entry : isAv ; CondBr(isAv, yes, never)
+//   yes   : SehFilterReturn(1)      never : Unreachable(Trap)
+void anArmNeverTaken(Ctx& c, MirBlockId) {
+    MirBlockId const yes = c.block(), never = c.block();
+    c.mb.addCondBr(c.isAccessViolation(), yes, never);
+    c.mb.beginBlock(never);
+    c.mb.addUnreachable(MirUnreachableKind::Trap);
+    c.mb.beginBlock(yes);
+    c.answer(c.constant(1));
+}
+
+// `code == AV ? -1 : want + 1` — EXCEPTION_CONTINUE_EXECUTION on one arm, and on the
+// other a value COMPUTED in the filter from a parent local:
+//   entry : isAv ; CondBr(isAv, yes, no)
+//   yes   : -1 ; Br(merge)        no : load want + 1 ; Br(merge)
+//   merge : Phi[(-1, yes), (sum, no)] ; SehFilterReturn
+void continueOrComputed(Ctx& c, MirBlockId) {
+    MirBlockId const yes = c.block(), no = c.block(), merge = c.block();
+    c.mb.addCondBr(c.isAccessViolation(), yes, no);
+    c.mb.beginBlock(yes);
+    MirInstId const minusOne = c.constant(-1);
+    c.mb.addBr(merge);
+    c.mb.beginBlock(no);
+    MirInstId const computed = c.mb.addInst(
+        MirOpcode::Add, std::array<MirInstId, 2>{c.loadWant(), c.constant(1)}, c.i32);
+    c.mb.addBr(merge);
+    c.mb.beginBlock(merge);
+    c.answer(c.phi(minusOne, yes, computed, no));
+}
+
 struct Synthesized {
     bool                      ok = false;
     std::vector<MirSehScope>  scopes;
@@ -351,6 +410,36 @@ void expectTheParentKeepsOneStub(Mir const& mir, MirFuncId parent) {
         << "the guarded body's load is the parent's only one";
 }
 
+// Every Phi of `func` takes ONE input from each block that reaches the Phi's block,
+// and none from a block that does not; returns how many Phis it read. The module
+// verifier reads only the second half (an input naming a block that is not a
+// predecessor), so a Phi left with no input at all verifies: a case that ends by
+// verifying the module reads its funclet's Phis here as well.
+[[nodiscard]] std::uint32_t expectEveryPhiTakesOneInputPerWayIn(Mir const& mir, MirFuncId func) {
+    auto const preds = mirBuildPredecessors(mir);
+    std::uint32_t phis = 0;
+    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(func); ++bi) {
+        MirBlockId const b = mir.funcBlockAt(func, bi);
+        for (std::uint32_t ii = 0; ii < mir.blockInstCount(b); ++ii) {
+            MirInstId const inst = mir.blockInstAt(b, ii);
+            if (mir.instOpcode(inst) != MirOpcode::Phi) continue;
+            ++phis;
+            std::vector<std::uint32_t> ways;
+            if (b.v < preds.size()) {
+                for (MirBlockId const pred : preds[b.v]) ways.push_back(pred.v);
+            }
+            std::sort(ways.begin(), ways.end());
+            ways.erase(std::unique(ways.begin(), ways.end()), ways.end());
+            std::vector<std::uint32_t> inputs;
+            for (MirPhiIncoming const& inc : mir.phiIncomings(inst)) inputs.push_back(inc.pred.v);
+            std::sort(inputs.begin(), inputs.end());
+            EXPECT_EQ(inputs, ways) << "the Phi keeps one input per way into the join (the Phi of "
+                                       "block #" << b.v << ")";
+        }
+    }
+    return phis;
+}
+
 } // namespace
 
 // ═══ THE STATEMENT ════════════════════════════════════════════════════════════
@@ -392,10 +481,13 @@ TEST(SehFilterVerifier, AFilterWithABranchVerifies) {
         char const* what;
         void (*emit)(Ctx&, MirBlockId);
     };
-    constexpr std::array<Case, 3> cases{{
+    constexpr std::array<Case, 6> cases{{
         {"a && b", &shortCircuit},
         {"c ? 1 : 0", &conditional},
         {"both arms read one parent local", &bothArmsReadALocal},
+        {"a switch", &switchOnTheCode},
+        {"an arm never taken", &anArmNeverTaken},
+        {"c ? -1 : want + 1", &continueOrComputed},
     }};
     for (Case const& k : cases) {
         SCOPED_TRACE(k.what);
@@ -484,26 +576,35 @@ struct Malformed {
     void           (*emit)(Ctx&, MirBlockId);
     bool             bodyBranchesToAFilterBlock;
     std::string_view sentence;
+    // The one OTHER refusal the shape cannot help but draw, or empty: where nothing but
+    // the filter's answer branches to the handler and the shape gives it no answer that
+    // names it, the handler is reached from nowhere, and the CFG rule refuses that too.
+    std::string_view alsoUnreached;
 };
 
 constexpr std::array<Malformed, 6> kMalformed{{
     {"a block of the filter returns from the function", &interiorBlockReturns, false,
-     "a filter is left only by returning its value"},
+     "a filter is left only by returning its value", ""},
     {"two blocks answer", &twoExits, false,
-     "both return the filter's value"},
+     "both return the filter's value", ""},
     {"the join answers for another region", &answersForAnotherRegion, false,
-     "returns the filter value of region 7"},
+     "returns the filter value of region 7", ""},
     {"the guarded body branches to a block of the filter", &sharesABlockWithTheBody, true,
-     "a filter is entered at its entry and nowhere else"},
+     "a filter is entered at its entry and nowhere else", ""},
     {"the exit names a block of the filter as the handler", &handlerIsAFilterBlock, false,
-     "is also a block of the filter"},
+     "is also a block of the filter", "is not reachable from entry"},
     {"no path of the filter answers", &neverAnswers, false,
-     "the filter never returns a value"},
+     "the filter never returns a value", "is not reachable from entry"},
 }};
 
 } // namespace
 
-// Each is refused under the structure code, in a sentence that names its rule.
+// Each is refused under the structure code, ONCE, in a sentence that names its rule —
+// and by nothing else but the one other refusal its shape draws by construction (a review
+// of checkpoint 21, its F4: "at least one" let a second refusal of the same module, under
+// another rule's sentence, pass). ✔MEASURED 2026-10-15 (AppleClang 21 and gcc 13.3): the
+// two shapes that leave the handler with no way in are refused twice, the second time as
+// "block ... is not reachable from entry"; the other four once.
 TEST(SehFilterVerifier, AFilterWithAnotherWayInOrOutIsRefusedByItsRule) {
     for (Malformed const& m : kMalformed) {
         SCOPED_TRACE(m.what);
@@ -512,8 +613,12 @@ TEST(SehFilterVerifier, AFilterWithAnotherWayInOrOutIsRefusedByItsRule) {
         DiagnosticReporter rep;
         EXPECT_FALSE((MirVerifier{p.mir, &in}.verify(rep)));
         std::string const text = allDiagText(rep);
-        EXPECT_GE(countCode(rep, DiagnosticCode::I_SehStructure), 1u) << text;
+        EXPECT_EQ(countCode(rep, DiagnosticCode::I_SehStructure), 1u) << text;
+        EXPECT_EQ(rep.errorCount(), m.alsoUnreached.empty() ? 1u : 2u) << text;
         EXPECT_NE(text.find(m.sentence), std::string::npos) << text;
+        if (!m.alsoUnreached.empty()) {
+            EXPECT_NE(text.find(m.alsoUnreached), std::string::npos) << text;
+        }
     }
 }
 
@@ -704,6 +809,147 @@ TEST(SehFilterFunclet, WhatLaterBlocksTakeFromTheParentIsMadeInTheFuncletsEntry)
         if (mir.instOperands(*load)[0].v == slot->v) ++loadsOfTheSlot;
     }
     EXPECT_EQ(loadsOfTheSlot, 2u);
+    EXPECT_EQ(expectEveryPhiTakesOneInputPerWayIn(mir, *funclet), 1u)
+        << "the join's one Phi, of the two arms' loads";
+
+    DiagnosticReporter rep;
+    EXPECT_TRUE((MirVerifier{mir, &in}.verify(rep))) << allDiagText(rep);
+}
+
+// A `switch` in the filter: the funclet's entry ends in the Switch, its one case value is
+// the access-violation code, the CASE target is the arm that answers 1 and the DEFAULT the
+// arm that answers 0 — a copy that swapped them would run the handler for every other
+// exception and decline the one the filter names.
+TEST(SehFilterFunclet, ASwitchFilterKeepsItsCaseAndItsDefault) {
+    EXPECT_EXIT(synthesizeAndLeave(moduleOf(&switchOnTheCode)),
+                ::testing::ExitedWithCode(0), "") << kThePassDidNotFinish;
+    if (HasFailure()) return;
+
+    TypeInterner in{CompilationUnitId{1}};
+    Parent p = buildParent(in, switchOnTheCode);
+    Mir& mir = p.mir;
+    Synthesized const s = synthesize(mir, in);
+    ASSERT_TRUE(s.ok) << s.text;
+    ASSERT_EQ(s.scopes.size(), 1u);
+    auto const funclet = findFuncBySymbol(mir, s.scopes[0].filterFuncletSymbol);
+    ASSERT_TRUE(funclet.has_value());
+    ASSERT_EQ(mir.funcBlockCount(*funclet), 4u) << "the entry, the two arms, the join";
+    MirBlockId const entry = mir.funcBlockAt(*funclet, 0);
+    MirInstId const sw = mir.blockTerminator(entry);
+    ASSERT_EQ(mir.instOpcode(sw), MirOpcode::Switch);
+    auto const ops = mir.instOperands(sw);
+    ASSERT_EQ(ops.size(), 2u) << "the discriminant and one case value";
+    EXPECT_EQ(mir.instOpcode(ops[0]), MirOpcode::Load)
+        << "the discriminant is the exception code, read through the funclet's argument";
+    ASSERT_EQ(mir.instOpcode(ops[1]), MirOpcode::Const);
+    EXPECT_EQ(std::get<std::int64_t>(mir.literalValue(mir.constLiteralIndex(ops[1])).value),
+              std::int64_t{0xC0000005});
+    EXPECT_TRUE(isBlockOf(mir, *funclet, mir.instBlock(ops[1])))
+        << "the case value is the funclet's own constant";
+    auto const targets = mir.blockSuccessors(entry);
+    ASSERT_EQ(targets.size(), 2u) << "the case target, then the default";
+    auto const onTheCase = firstIn(mir, targets[0], MirOpcode::Const);
+    auto const byDefault = firstIn(mir, targets[1], MirOpcode::Const);
+    ASSERT_TRUE(onTheCase.has_value());
+    ASSERT_TRUE(byDefault.has_value());
+    EXPECT_EQ(constValue(mir, *onTheCase), 1) << "the CASE target answers 1";
+    EXPECT_EQ(constValue(mir, *byDefault), 0) << "the DEFAULT target answers 0";
+
+    auto const parent = findFuncBySymbol(mir, SymbolId{kParentSym});
+    ASSERT_TRUE(parent.has_value());
+    EXPECT_EQ(mir.funcBlockCount(*parent), 5u);
+    expectTheParentKeepsOneStub(mir, *parent);
+    EXPECT_EQ(countIn(mir, *parent, MirOpcode::Switch), 0u);
+
+    DiagnosticReporter rep;
+    EXPECT_TRUE((MirVerifier{mir, &in}.verify(rep))) << allDiagText(rep);
+}
+
+// An arm the source says is never taken stays one in the funclet, with what its
+// terminator asserts: a TRAP stays a trap (an `Unreachable` copied without its kind
+// would become an assumption the optimizer may delete code under).
+TEST(SehFilterFunclet, AnArmNeverTakenStaysATrap) {
+    EXPECT_EXIT(synthesizeAndLeave(moduleOf(&anArmNeverTaken)),
+                ::testing::ExitedWithCode(0), "") << kThePassDidNotFinish;
+    if (HasFailure()) return;
+
+    TypeInterner in{CompilationUnitId{1}};
+    Parent p = buildParent(in, anArmNeverTaken);
+    Mir& mir = p.mir;
+    Synthesized const s = synthesize(mir, in);
+    ASSERT_TRUE(s.ok) << s.text;
+    ASSERT_EQ(s.scopes.size(), 1u);
+    auto const funclet = findFuncBySymbol(mir, s.scopes[0].filterFuncletSymbol);
+    ASSERT_TRUE(funclet.has_value());
+    ASSERT_EQ(mir.funcBlockCount(*funclet), 3u) << "the entry, the answer, the trap";
+    std::uint32_t traps = 0, answers = 0;
+    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(*funclet); ++bi) {
+        MirInstId const term = mir.blockTerminator(mir.funcBlockAt(*funclet, bi));
+        if (mir.instOpcode(term) == MirOpcode::Unreachable) {
+            ++traps;
+            EXPECT_EQ(static_cast<MirUnreachableKind>(mir.instPayload(term)),
+                      MirUnreachableKind::Trap)
+                << "the arm keeps what its terminator asserts";
+        }
+        if (mir.instOpcode(term) == MirOpcode::Return) ++answers;
+    }
+    EXPECT_EQ(traps, 1u);
+    EXPECT_EQ(answers, 1u);
+    EXPECT_EQ(countIn(mir, *funclet, MirOpcode::SehFilterReturn), 0u);
+
+    auto const parent = findFuncBySymbol(mir, SymbolId{kParentSym});
+    ASSERT_TRUE(parent.has_value());
+    expectTheParentKeepsOneStub(mir, *parent);
+    EXPECT_EQ(countIn(mir, *parent, MirOpcode::Unreachable), 0u)
+        << "the trap is the funclet's, not the parent's";
+
+    DiagnosticReporter rep;
+    EXPECT_TRUE((MirVerifier{mir, &in}.verify(rep))) << allDiagText(rep);
+}
+
+// A filter that answers EXCEPTION_CONTINUE_EXECUTION (-1) on one arm and a value it
+// COMPUTES from a parent local on the other: the -1 is the TRUE arm's constant, the
+// other arm reads the local through the recovered frame slot and adds to it, and the
+// funclet returns the join of the two.
+TEST(SehFilterFunclet, ABranchingFilterAnswersContinueExecutionOrAComputedValue) {
+    EXPECT_EXIT(synthesizeAndLeave(moduleOf(&continueOrComputed)),
+                ::testing::ExitedWithCode(0), "") << kThePassDidNotFinish;
+    if (HasFailure()) return;
+
+    TypeInterner in{CompilationUnitId{1}};
+    Parent p = buildParent(in, continueOrComputed);
+    Mir& mir = p.mir;
+    Synthesized const s = synthesize(mir, in);
+    ASSERT_TRUE(s.ok) << s.text;
+    ASSERT_EQ(s.scopes.size(), 1u);
+    auto const funclet = findFuncBySymbol(mir, s.scopes[0].filterFuncletSymbol);
+    ASSERT_TRUE(funclet.has_value());
+    ASSERT_EQ(mir.funcBlockCount(*funclet), 4u);
+    MirBlockId const entry = mir.funcBlockAt(*funclet, 0);
+    ASSERT_EQ(mir.instOpcode(mir.blockTerminator(entry)), MirOpcode::CondBr);
+    auto const arms = mir.blockSuccessors(entry);
+    ASSERT_EQ(arms.size(), 2u);
+    auto const minusOne = firstIn(mir, arms[0], MirOpcode::Const);
+    ASSERT_TRUE(minusOne.has_value());
+    EXPECT_EQ(constValue(mir, *minusOne), -1) << "the TRUE arm answers CONTINUE_EXECUTION";
+    auto const sum = firstIn(mir, arms[1], MirOpcode::Add);
+    ASSERT_TRUE(sum.has_value()) << "the FALSE arm computes its answer";
+    auto const load = firstIn(mir, arms[1], MirOpcode::Load);
+    ASSERT_TRUE(load.has_value());
+    auto const slot = firstIn(mir, entry, MirOpcode::RecoverParentFrameSlot);
+    ASSERT_TRUE(slot.has_value()) << "the parent local is reached through its frame slot";
+    EXPECT_EQ(mir.instOperands(*load)[0].v, slot->v);
+    MirBlockId const merge = mir.blockSuccessors(arms[0])[0];
+    MirInstId const phi = mir.blockInstAt(merge, 0);
+    ASSERT_EQ(mir.instOpcode(phi), MirOpcode::Phi);
+    for (MirPhiIncoming const& inc : mir.phiIncomings(phi)) {
+        if (inc.pred.v == arms[0].v) EXPECT_EQ(inc.value.v, minusOne->v);
+        else if (inc.pred.v == arms[1].v) EXPECT_EQ(inc.value.v, sum->v);
+        else ADD_FAILURE() << "a Phi input arrives from a block that is not an arm";
+    }
+    MirInstId const ret = mir.blockTerminator(merge);
+    ASSERT_EQ(mir.instOpcode(ret), MirOpcode::Return);
+    EXPECT_EQ(mir.instOperands(ret)[0].v, phi.v);
 
     DiagnosticReporter rep;
     EXPECT_TRUE((MirVerifier{mir, &in}.verify(rep))) << allDiagText(rep);
@@ -824,6 +1070,8 @@ TEST(SehFilterFunclet, AnInnerFilterWithABranchLeavesTheOuterRunWhole) {
     auto const innerFunclet = findFuncBySymbol(mir, s.scopes[0].filterFuncletSymbol);
     ASSERT_TRUE(innerFunclet.has_value());
     EXPECT_EQ(mir.funcBlockCount(*innerFunclet), 3u);
+    EXPECT_EQ(expectEveryPhiTakesOneInputPerWayIn(mir, *innerFunclet), 1u)
+        << "the inner join's one Phi";
     EXPECT_EQ(countIn(mir, *parent, MirOpcode::Phi), 0u);
     EXPECT_EQ(countIn(mir, *parent, MirOpcode::CondBr), 0u);
 

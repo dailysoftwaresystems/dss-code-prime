@@ -472,3 +472,10 @@ dss_add_test(NAME lir/test_thread_local_import_lowering
 # run of the guarded body, read from source — is read by its join alone.
 dss_add_test(NAME lir/test_guarded_region_runs
              SOURCES test_guarded_region_runs.cpp)
+
+# P69 (lane lm): a `_Bool` bit-field is read and written — its read is the field's bit
+# compared with zero, its write merges the unit as the byte it is; nothing of the MIR
+# narrows to `_Bool` (a conversion no target realizes: every read and write was
+# refused before). Lowered to the LIR of both shipped targets.
+dss_add_test(NAME lir/test_bool_bit_field_lowers
+             SOURCES test_bool_bit_field_lowers.cpp)

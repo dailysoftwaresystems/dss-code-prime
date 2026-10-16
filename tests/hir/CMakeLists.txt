@@ -40,6 +40,15 @@ dss_add_test(NAME hir/test_brace_element_as_written
 # of unknown size lowered to the language's stated value, never a `SizeOf` of a type with no size.
 dss_add_test(NAME hir/test_hir_symbol_alias
              SOURCES test_hir_symbol_alias.cpp)
+
+# A `__try` FILTER IS LEFT ONLY BY ITS VALUE, AND GUARDS NOTHING (P69, lane `lm`): a jump
+# out of a filter's statement expression and a `__try` inside it, refused by the HIR
+# verifier by the construct. A binary of its own: `hir/test_hir_lowering_c` is the claim
+# runner of many mutation arms, whose case counts a new case moves.
+dss_add_test(NAME hir/test_seh_filter_is_left_by_its_value
+             SOURCES test_seh_filter_is_left_by_its_value.cpp)
+target_include_directories(dss_hir_test_seh_filter_is_left_by_its_value
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 # P69 (lane `cs`): a value-returning function whose end is reached is a language
 # rule (`nonVoidFunctionEndReached`); under C's the lowering completes the body
 # and warns once. Separate from test_hir_lowering_c.cpp because half of it runs

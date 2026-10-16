@@ -1,2 +1,2 @@
-        out.declaredType =
-            classifyCstCastTarget(s.lattice.interner(), rec.type, s.charIsUnsigned);
+    return namedConstantRead(s.lattice.interner(), *initExpr, rec.scope.v, rec.type,
+                             s.charIsUnsigned);

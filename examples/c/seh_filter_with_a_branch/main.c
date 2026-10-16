@@ -22,13 +22,21 @@
  *   19  a region with a branching filter inside a loop, faulting every turn
  *   20  the right operand reads a global the guarded body changes before it
  *       faults: the filter must see the value at the fault
+ *   21  the conditional answers EXCEPTION_CONTINUE_EXECUTION (-1) on its taken
+ *       arm, after its left operand committed the reserved page the guarded
+ *       body read: the faulting read runs again and reads the page's zero, and
+ *       the handler does not run (the demand-commit shape of the vendor's
+ *       documentation, written with a branch)
+ *   22  the value of each filter is COMPUTED on the arm taken, neither arm a
+ *       constant: the inner filter answers `g_disposition - 1` (0, it declines)
+ *       and the outer one `g_disposition` (1, its handler runs)
  *   10  VirtualAlloc failed (the environment, not the compiler)
  *   42  every case answered right
  * A crash instead of an exit code means a filter declined a fault it should
  * have accepted, and no region outside it took the fault.
  *
- * ✔MEASURED before the fix, on pe64, baseline and release: this file was
- * REFUSED, once for each of its twelve regions (`error[I_SehStructure]: …
+ * ✔MEASURED before the fix, on pe64, baseline and release: the file of cases
+ * 11..20 was REFUSED, once for each of its twelve regions (`error[I_SehStructure]: …
  * filter block #N must terminate in SehFilterReturn`) — the region's skeleton
  * took a filter to be one basic block. The reference compiler (cl 19.51 x64,
  * /Od and /O2) runs this file to 42.
@@ -45,10 +53,18 @@ int g_calls;
 int g_shared;
 int g_changes;
 int g_inner_ran;
+int g_disposition;
 
 static int counts_itself(void) {
     g_calls = g_calls + 1;
     return 1;
+}
+
+/* Commits the page `q` reserved: the filter's way to make the faulting read
+ * succeed when it runs again. */
+static int commits(void *q) {
+    g_calls = g_calls + 1;
+    return VirtualAlloc(q, 4096, MEM_COMMIT, PAGE_READWRITE) != 0;
 }
 
 static int record_says_access_violation(EXCEPTION_POINTERS *info) {
@@ -182,9 +198,42 @@ static int filter_sees_the_body_s_store(void *p) {
     return rc;
 }
 
+static int conditional_answers_continue_execution(void *q) {
+    int rc = 7;
+    g_calls = 0;
+    __try {
+        rc = *(volatile int *)q;
+    } __except ((IS_ACCESS_VIOLATION && commits(q)) ? EXCEPTION_CONTINUE_EXECUTION
+                                                    : EXCEPTION_CONTINUE_SEARCH) {
+        rc = 1;
+    }
+    /* The read ran again and read 0, the filter was asked once: 0 + 41 + 1. */
+    return rc + 41 + g_calls;
+}
+
+static int computed_disposition(void *p) {
+    int rc = 0;
+    g_disposition = 1;
+    g_inner_ran = 0;
+    __try {
+        __try {
+            rc = *(volatile int *)p;
+        } __except (IS_ACCESS_VIOLATION ? g_disposition - 1 : EXCEPTION_EXECUTE_HANDLER) {
+            g_inner_ran = 1;
+            rc = 1;
+        }
+    } __except (IS_ACCESS_VIOLATION ? g_disposition : EXCEPTION_CONTINUE_SEARCH) {
+        rc = 42;
+    }
+    if (g_inner_ran != 0) return 2;
+    return rc;
+}
+
 int main(void) {
     void *p = VirtualAlloc(0, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS);
-    if (p == 0) {
+    /* Reserved and not committed: a read faults until a filter commits it. */
+    void *q = VirtualAlloc(0, 4096, MEM_RESERVE, PAGE_NOACCESS);
+    if (p == 0 || q == 0) {
         return 10;
     }
     g_shared = 5;
@@ -198,5 +247,7 @@ int main(void) {
     if (handler_names_what_the_filter_named(p) != 42) return 18;
     if (region_in_a_loop(p) != 42) return 19;
     if (filter_sees_the_body_s_store(p) != 42) return 20;
+    if (conditional_answers_continue_execution(q) != 42) return 21;
+    if (computed_disposition(p) != 42) return 22;
     return 42;
 }

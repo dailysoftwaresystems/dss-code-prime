@@ -1213,6 +1213,50 @@ struct Lowerer {
         return val;
     }
 
+    // ★ P69 (lane `lm`, D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT): AN
+    // OPERAND THAT IS A BIT-FIELD'S VALUE, AT ITS PROMOTED TYPE (C 6.3.1.1p2 — by the
+    // field's WIDTH, `bitFieldPromotedType`). `operandN` is the operand's node, `v` its
+    // lowered value; WHICH node is a bit-field's value is the ONE statement both tiers ask
+    // (`bitFieldValueWidth`, decl_prefix_strip.hpp) — the semantic typer's
+    // `bitFieldOperandType` asks it too, and the two move together: that tier answers
+    // `sizeof` / `_Generic` / `typeof` / `auto`, this one computes the value. Every
+    // operator read the field at its declared type: ✔MEASURED 2026-10-15 (pe64, both
+    // pipelines, images run), `v.b - 6 < 0` over a `volatile unsigned b : 3` holding 5
+    // ran 0 and `x /= v.b` (x = -6, `v.b` = 3) left 1431655763, where gcc 13, clang 18,
+    // AppleClang 21 and mingw-w64 gcc 13.2 run 1 and -2. A selection's winner is the one
+    // the semantic tier recorded (`selectedGenericExpr`, both `_Generic` and
+    // `__builtin_choose_expr`).
+    [[nodiscard]] E asBitFieldValue(NodeId operandN, E v) {
+        if (!arith_.has_value() || !v.type.valid() || !operandN.valid()) return v;
+        // No width changes a plain `int`, a floating, a pointer or an aggregate type:
+        // the walk is asked only of a type a bit-field's promotion can change.
+        if (bitFieldPromotedType(interner, v.type, 1, *arith_).v == v.type.v) return v;
+        auto const width = bitFieldValueWidth(
+            sem, cfg, tree(), operandN,
+            [this](NodeId m) -> std::optional<std::uint32_t> {
+                auto const rf = resolveMemberField(m);
+                if (!rf || rf->frec == nullptr) return std::nullopt;
+                return rf->frec->bitFieldWidth;
+            },
+            [this](NodeId sel) -> NodeId { return model.selectedGenericExpr(sel); });
+        if (!width.has_value()) return v;
+        TypeId const t = bitFieldPromotedType(interner, v.type, *width, *arith_);
+        return (t.valid() && t.v != v.type.v) ? coerce(v, t) : v;
+    }
+
+    // The two operand nodes of a binary operator's node (its first two children that are
+    // not tokens); invalid nodes when `node` holds fewer — an operator token anchoring a
+    // flat (SQL) expression holds none, and its operands are no bit-field's.
+    [[nodiscard]] std::pair<NodeId, NodeId> binaryOperandNodes(NodeId node) const {
+        NodeId lhsN{}, rhsN{};
+        if (!node.valid() || tree().kind(node) != NodeKind::Internal) return {lhsN, rhsN};
+        for (NodeId c : visible(node)) {
+            if (isToken(c)) continue;
+            if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) { rhsN = c; break; }
+        }
+        return {lhsN, rhsN};
+    }
+
     [[nodiscard]] E coerceCondition(E cond, NodeId anchor) {
         if (!cond.type.valid()) return cond;
         TypeKind const ck = interner.kind(cond.type);
@@ -3664,14 +3708,28 @@ struct Lowerer {
     // until reaching a node the engine recognizes — an expression form, a
     // mapped statement/decl rule, or the case-label rule — so callers can
     // classify a child by ROLE without knowing the grammar's wrapper shapes.
+    // ★ P69 (lane `lm`, the review's B): A WRAPPER IS WHAT THE ONE STATEMENT SAYS IT IS
+    // (`nodeSaysSomethingItself`) — the peel stops at a node that says something itself
+    // whatever the number of its children. Every expression form the statement names is
+    // an alternative under the `operand` node, which `isExprNode` stops at first; the
+    // one the peel reached was a BRACE LIST, which it walked through to its lone element,
+    // so `{ 5 }` was classified as the expression `5` (an initializer's callers ask
+    // `isBraceInitList` beside the role, so nothing was lowered wrong by it). And no
+    // depth cap: past 128 steps this returned the node it had reached as if the walk
+    // had ended; every step is to a strict descendant, so the tree's node count bounds
+    // it and a walk past it is a cyclic node graph (`failOnCyclicNodeGraph`) — a stop no
+    // program can reach.
     [[nodiscard]] NodeId peelToCore(NodeId n) const {
         NodeId cur = n;
-        for (int guard = 0; guard < 128 && cur.valid(); ++guard) {
+        std::size_t const bound = tree().nodeCount() + 1;
+        for (std::size_t step = 0; cur.valid(); ++step) {
+            if (step > bound) failOnCyclicNodeGraph("the lowering's role peel (`peelToCore`)");
             if (tree().kind(cur) != NodeKind::Internal) return cur;  // token
             std::uint32_t const rv = tree().rule(cur).v;
             if (isExprNode(cur)) return cur;
             if (ruleMap_.count(rv) != 0) return cur;
             if (cfg.caseLabelRule.valid() && rv == cfg.caseLabelRule.v) return cur;
+            if (nodeSaysSomethingItself(sem, cfg, tree(), cur)) return cur;
             NodeId only = soleMeaningfulChild(cur);
             if (!only.valid()) return cur;
             cur = only;
@@ -4412,6 +4470,15 @@ struct Lowerer {
             // `p += n`) keeps opType==lv.type → the c41 stride-Gep, unchanged.
             E lhsE{ctx.compoundLhsRead, lv.type};
             E rhsE = result;
+            // ★ P69 (lane `lm`): a bit-field operand, either side, computes at its
+            // promoted type (`asBitFieldValue`) — `x /= v.b` and `v.b /= y` divide in
+            // `int` over `unsigned b : 3`, as `x = x / v.b` does; the result is then
+            // converted to the left operand's type as before.
+            {
+                auto const [lhsN, rhsN] = binaryOperandNodes(node);
+                lhsE = asBitFieldValue(lhsN, lhsE);
+                rhsE = asBitFieldValue(rhsN, rhsE);
+            }
             if (compoundTakesTheBinaryCombine(ctx.baseOp, lhsE.type, rhsE.type)) {
                 // `x += p` / `p -= q`: the binary operator's own value, then the
                 // conversion to the lvalue's type (see `compoundTakesTheBinaryCombine`).
@@ -6107,7 +6174,12 @@ struct Lowerer {
             unsupported(anchor, std::format("binary target '{}' is not a core binary operator", e.target));
             return {errorNode(anchor), InvalidType};
         }
-        return combineCoreBinary(anchor, *op, lhs, rhs);
+        // ★ P69 (lane `lm`): a bit-field operand at its promoted type (`asBitFieldValue`)
+        // — the arithmetic, the comparisons and the shift's left operand alike; the
+        // semantic typer's `combineBinary` reads the same two operands the same way.
+        auto const [lhsN, rhsN] = binaryOperandNodes(anchor);
+        return combineCoreBinary(anchor, *op, asBitFieldValue(lhsN, lhs),
+                                 asBitFieldValue(rhsN, rhs));
     }
 
     // P68 round 9 (lane `cs`): the core-operator half of `combineBinary`, split out
@@ -6635,7 +6707,9 @@ struct Lowerer {
                 unsupported(node, "operand of unary '+' must have arithmetic type");
                 return {errorNode(node, operand.type), operand.type};
             }
-            return operand;
+            // ★ P69 (lane `lm`): `+v.b` is the field's PROMOTED value (`asBitFieldValue`),
+            // as the semantic tier types it — the one operand `+` converts.
+            return asBitFieldValue(soleMeaningfulChild(node), operand);
         }
         auto op = coreOpFromName(e.target);
         if (!op || arityOf(*op) != HirOpArity::Unary) {
@@ -6655,6 +6729,11 @@ struct Lowerer {
         // not gated, and it keeps the `!bool`/`~bool` shape); float/pointer/≥int
         // operands pass through (`integerPromotedType` is a no-op → `-f`/`!p`
         // stay at their own width). `Pos` (`+`) returned above.
+        // ★ P69 (lane `lm`): `-v.b` and `~v.b` promote a bit-field by its width
+        // (`asBitFieldValue`) before the ordinary promotion below, which then has nothing
+        // to do; `!v.b` is a comparison with zero and is left as it is.
+        if (*op == HirOpKind::Neg || *op == HirOpKind::BitNot)
+            operand = asBitFieldValue(soleMeaningfulChild(node), operand);
         E unOperand = operand;
         TypeId promotedTy = operand.type;
         // c91 (D-CSUBSET-ARRAY-DECAY-IN-CONDITION, the `!` form): `!E` is
@@ -6803,6 +6882,16 @@ struct Lowerer {
     // `coerceCondition` is applied to `cond` by the CALLER, before then/else lower
     // — so the Ne/Cast it emits lands BEFORE the arm nodes, exactly as before.
     E combineTernary(NodeId node, E cond, E thenE, E elseE) {
+        // ★ P69 (lane `lm`): an arm that is a bit-field's value is balanced at its
+        // promoted type (`asBitFieldValue`), as the semantic typer's `combineTernary`
+        // types it: `1 ? v.b : v.b` over `unsigned b : 3` is an `int`.
+        {
+            NodeId condN{}, thenN{}, elseN{};
+            if (ternaryOperands(node, condN, thenN, elseN)) {
+                thenE = asBitFieldValue(thenN, thenE);
+                elseE = asBitFieldValue(elseN, elseE);
+            }
+        }
         // Coerce both arms to their common type (C99 conditional-expression
         // type-balance rule — the config-driven UAC engine when the
         // language declares the block; FC3 c1). Falls back to the
@@ -9294,13 +9383,23 @@ struct Lowerer {
     // position use this peel rather than `peelToCore` (which over-peels
     // through any single-child wrapper). Returns `{designatorCore, ruleIdValue}`
     // where `ruleIdValue` is 0 if the result isn't internal.
+    // ★ P69 (lane `lm`, the review's B): the peel stops at a node that says something
+    // itself (`nodeSaysSomethingItself`, the ONE statement) — a designator is never
+    // under one, so an element's VALUE is not walked into looking for one (no answer
+    // changes: the value's own node is returned either way, and the caller's rule test
+    // finds no designator there) — and is bounded by its tree's node count, LOUD past it
+    // (`failOnCyclicNodeGraph`: every step is to a strict descendant, so no program
+    // reaches the stop).
     [[nodiscard]] std::pair<NodeId, std::uint32_t>
     peelToDesignatorLeaf(NodeId n) const {
         NodeId cur = n;
-        while (tree().kind(cur) == NodeKind::Internal) {
+        std::size_t const bound = tree().nodeCount() + 1;
+        for (std::size_t step = 0; tree().kind(cur) == NodeKind::Internal; ++step) {
+            if (step > bound) failOnCyclicNodeGraph("the lowering's designator peel");
             std::uint32_t const rr = tree().rule(cur).v;
             if (cfg.designatedFieldRule.valid() && rr == cfg.designatedFieldRule.v) break;
             if (cfg.designatedIndexRule.valid() && rr == cfg.designatedIndexRule.v) break;
+            if (nodeSaysSomethingItself(sem, cfg, tree(), cur)) { break; }   // never a designator
             NodeId const only = soleMeaningfulChild(cur);
             if (!only.valid()) break;
             cur = only;
@@ -10730,12 +10829,10 @@ struct Lowerer {
                     // long)-u > 0xFFFFFFFFull) return 3; return x;` died of an illegal
                     // instruction — the condition, false in C, taken for true, and the
                     // `return x` after it marked as never reached.
-                    CstResolvedSymbol out{*initExpr, rec->scope.v, std::nullopt};
-                    if (rec->type.valid()) {
-                        out.declaredType =
-                            classifyCstCastTarget(interner, rec->type, charIsUnsigned_);
-                    }
-                    return out;
+                    // What the declared type makes of the read is said once, for this
+                    // resolver and the semantic tier's (`namedConstantRead`).
+                    return namedConstantRead(interner, *initExpr, rec->scope.v, rec->type,
+                                             charIsUnsigned_);
                 }
             }
             return std::nullopt;
@@ -10767,9 +10864,20 @@ struct Lowerer {
             if (f == nullptr) return std::nullopt;
             auto const t = classifyCstCastTarget(interner, f->type, charIsUnsigned_);
             if (!t.has_value()) return std::nullopt;
+            // P69 (lane `lm`): a bit-field's value at its PROMOTED type — the semantic
+            // tier's twin of this lambda (`buildConstEvalEnv`) says why.
+            std::optional<CstBitFieldRead> bitField;
+            if (f->bitFieldWidth.has_value()) {
+                TypeId const valueTy = arith_.has_value()
+                    ? bitFieldPromotedType(interner, f->type, *f->bitFieldWidth, *arith_)
+                    : f->type;
+                auto const vt = classifyCstCastTarget(interner, valueTy, charIsUnsigned_);
+                if (!vt.has_value()) return std::nullopt;
+                bitField = CstBitFieldRead{*f->bitFieldWidth, *vt};
+            }
             return CstConstantSubobject{
                 CstResolvedSymbol{f->initExpr, f->initScope.v, std::nullopt}, *t,
-                f->zeroValue, f->bitFieldWidth};
+                f->zeroValue, bitField};
         };
         // P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION):
         // a wide/UTF character constant's element core, read back off the body
@@ -12670,9 +12778,11 @@ struct Lowerer {
             E const combined = combineCoreBinary(binNode, *op, E{lhsRead, lv->type}, rhs);
             return asStmt(*lv, lvWrite(*lv, coerce(combined, lv->type).id), binNode);
         }
-        TypeId const common = commonArithType(lv->type, rhs.type);
-        E lhsE{lhsRead, lv->type};
-        E rhsE = rhs;
+        // ★ P69 (lane `lm`): a bit-field operand, either side, at its promoted type
+        // (`asBitFieldValue`) — the value-position twin in `finishAssign` says why.
+        E lhsE = asBitFieldValue(lhsN, E{lhsRead, lv->type});
+        E rhsE = asBitFieldValue(rhsN, rhs);
+        TypeId const common = commonArithType(lhsE.type, rhsE.type);
         TypeId const opType = common.valid() ? common : lv->type;
         if (common.valid()) {
             lhsE = coerce(lhsE, common);
@@ -13021,21 +13131,23 @@ struct Lowerer {
     // ★ The recognition is by HIR KIND ("ExprStmt"), not by a grammar rule name —
     // the `lowerStmt` driver's own idiom (`k == "Block"`, `k == "IfStmt"`), so no
     // second config key has to name which rule an expression statement is.
-    void stmtExprItems(NodeId node, std::vector<NodeId>& items, NodeId& valueNode) {
+    // ★ P69 (lane `lm`; a review of checkpoint 21, its N1): WHICH EXPRESSION IS THE VALUE
+    // IS THE ONE STATEMENT'S, `statementExpressionBody` (decl_prefix_strip.hpp), which the
+    // semantic tier's type (`subtreeType`) and every value step ask too. This function
+    // read it with a peel of its own (`peelToCore`), so "one reader" was two; it keeps
+    // only the items, which the lowering runs as statements.
+    // ★ P69 (lane `lm`): `labels` are the labeled statements the value stands under
+    // (`({ ...; in: r; })`), outermost first — the statement's report, which the value
+    // position places before the value.
+    void stmtExprItems(NodeId node, std::vector<NodeId>& items, NodeId& valueNode,
+                       std::vector<NodeId>& labels) {
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;          // ( { } )
             items.push_back(c);
         }
-        valueNode = NodeId{};
-        if (items.empty()) return;
-        NodeId const lastCore = peelToCore(items.back());
-        HirRuleMapping const* m = mappingFor(lastCore);
-        if (m == nullptr || m->hirKind != "ExprStmt") return;
-        for (NodeId c : visible(lastCore)) {
-            if (isToken(c)) continue;
-            valueNode = c;
-            return;
-        }
+        StatementExpressionBody body = statementExpressionBody(cfg, tree(), node);
+        valueNode = body.value;
+        labels    = std::move(body.labels);
     }
 
     // `({ stmt… expr; })` in VALUE position → `HirKind::SeqExpr` ([stmts…,
@@ -13045,21 +13157,31 @@ struct Lowerer {
     // value. No new HIR kind, and no MIR/LIR change: `collectLocalDecls` already
     // walks the whole body subtree, so a declaration nested inside an expression
     // already gets its entry-block `Alloca`.
-    [[nodiscard]] E lowerStatementExpr(NodeId node) {
-        // C's block scope has no meaning without a frame, and both references
-        // refuse the construct at file scope (see S_StatementExprAtFileScope).
-        // Refuse BEFORE lowering anything: a global initializer that folded to
-        // the last literal would silently DISCARD every statement before it.
-        if (functionBodyDepth_ == 0) {
+    // C's block scope has no meaning without a frame, and every reference refuses a
+    // statement expression outside a function body (S_StatementExprAtFileScope).
+    // Refuse BEFORE lowering anything: a global initializer that folded to the last
+    // literal would silently DISCARD every statement before it.
+    // ★ P69 (lane `lm`): THE REFUSAL IS THE SEMANTIC TIER'S NOW (`pass2Post`, at the
+    // node, wherever it stands — an unevaluated or a folded one too, which this tier
+    // never lowers), and the pipeline lowers no model holding an error, so on the
+    // pipeline's path this guard is UNREACHABLE. It is kept, as an assertion with a
+    // voice: reached on a model that already holds an error (a caller lowering a refused
+    // model), the refusal has been said and is not said twice; reached on a model with
+    // NO error, the semantic tier missed one, and the same words are said here.
+    [[nodiscard]] bool statementExprOutsideAFunctionBody(NodeId node) {
+        if (functionBodyDepth_ != 0) return false;
+        if (!model.hasErrors())
             emitH(DiagnosticCode::S_StatementExprAtFileScope, node,
-                  "a statement expression '({ ... })' is only valid inside a "
-                  "function (GNU C 6.1) — at file scope there is no frame to "
-                  "run its statements in");
-            return E{errorNode(node), InvalidType};
-        }
+                  std::string{kStatementExprOutsideAFunctionBody});
+        return true;
+    }
+
+    [[nodiscard]] E lowerStatementExpr(NodeId node) {
+        if (statementExprOutsideAFunctionBody(node)) return E{errorNode(node), InvalidType};
         std::vector<NodeId> items;
         NodeId valueNode{};
-        stmtExprItems(node, items, valueNode);
+        std::vector<NodeId> labels;
+        stmtExprItems(node, items, valueNode, labels);
         if (!valueNode.valid()) {
             emitH(DiagnosticCode::S_StatementExprHasNoValue, node,
                   "this statement expression has no value: its last statement "
@@ -13069,9 +13191,20 @@ struct Lowerer {
             return E{errorNode(node), InvalidType};
         }
         std::vector<HirNodeId> stmts;
-        stmts.reserve(items.size() - 1);
+        stmts.reserve(items.size() - 1 + labels.size());
         for (std::size_t i = 0; i + 1 < items.size(); ++i)
             stmts.push_back(lowerStmt(items[i]));
+        // ★ P69 (lane `lm`): A LABELED LAST ITEM (`({ ...; in: r; })`, whose value is `r` on
+        // every GNU reference — ✔MEASURED 2026-10-15, see `statementExpressionBody`): each
+        // label stands where it stood, on an empty statement, before the value is computed,
+        // so a `goto` of the body reaches the computation of the value.
+        for (NodeId const labelNode : labels) {
+            std::uint32_t ord{};
+            NodeId        labeled{};
+            if (!labelPrologue(labelNode, ord, labeled)) return E{errorNode(node), InvalidType};
+            HirNodeId const empty = track(builder.makeBlock({}), labelNode);
+            stmts.push_back(track(builder.makeLabelStmt(ord, empty), labelNode));
+        }
         // ★ P69 (lane `lm`): THE CONSTRUCT YIELDS A VALUE (`convertedToItsValue`) —
         // the last expression's type was handed on as it stood, an array as an array.
         // ⚠ The semantic tier's statement-expression arm (`subtreeType`) is the mirror
@@ -13087,13 +13220,7 @@ struct Lowerer {
     // (its value, if it has one, is discarded exactly as `f();` discards one),
     // so this arm needs no `valueNode` at all and the `void` case is not a case.
     [[nodiscard]] HirNodeId lowerStatementExprAsBlock(NodeId node) {
-        if (functionBodyDepth_ == 0) {
-            emitH(DiagnosticCode::S_StatementExprAtFileScope, node,
-                  "a statement expression '({ ... })' is only valid inside a "
-                  "function (GNU C 6.1) — at file scope there is no frame to "
-                  "run its statements in");
-            return errorNode(node);
-        }
+        if (statementExprOutsideAFunctionBody(node)) return errorNode(node);
         std::vector<HirNodeId> stmts;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;

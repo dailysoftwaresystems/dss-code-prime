@@ -1,0 +1,2 @@
+        if (false) {
+            c = selectionResultOf(s, semCfg, tree, c, scope);

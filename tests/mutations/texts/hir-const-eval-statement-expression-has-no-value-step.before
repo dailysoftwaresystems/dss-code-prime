@@ -1,0 +1,2 @@
+        if (NodeId const value = soleExpressionOfStatementExpression(cfg, tree, expr);
+            value.valid()) {

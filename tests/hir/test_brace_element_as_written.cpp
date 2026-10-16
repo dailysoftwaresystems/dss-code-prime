@@ -336,8 +336,39 @@ TEST(BraceElementAsWritten, TheAnalyzersAnswerPlacesAnIndexedStructureWhole) {
 
 // THE CONTROL OF (2): the forms whose node the analyzer STAMPS were always placed
 // whole, and are placed whole with no fact to read — a name, a member access, a call
-// with an argument, a compound literal, `*&` of a name.
+// with an argument, a compound literal, `*&` of a name. READ OFF WHERE EACH LANDS:
+// lowering cleanly is no placement (an element elided into the structure's first member
+// lowers too — only the MIR verifier refuses it, and this test never reaches it), so
+// each form writes `in` of `struct W w = { X, 7 }` and the 7 must be `n`.
 TEST(BraceElementAsWritten, ANameAMemberACallAndACompoundLiteralAreStillPlacedWhole) {
+    std::string const placed = std::string{kTypes}
+        + "static struct W gw = { { 1, 2 }, 5 };\nstatic struct W *gq = &gw;\n";
+    for (auto const& [what, element] : std::initializer_list<std::pair<char const*, char const*>>{
+             {"a name", "one"},
+             {"a member access, `.`", "gw.in"},
+             {"a member access, `->`", "gq->in"},
+             {"a call with an argument", "mk(1)"},
+             {"a compound literal", "(struct S){ 1, 2 }"},
+             {"`*&` of a name", "*&one"}}) {
+        bool inspected = false;
+        Lowered const l = lowerC(
+            placed + "void f(void) { struct W w = { " + element + ", 7 }; }\n",
+            [&](CstToHirResult const& res) {
+                HirNodeId const init = firstLocalInit(res.hir);
+                ASSERT_TRUE(init.valid()) << what;
+                ASSERT_EQ(res.hir.kind(init), HirKind::ConstructAggregate) << what;
+                auto const members = res.hir.children(init);
+                ASSERT_EQ(members.size(), 2u) << what << ": `in` and `n`";
+                EXPECT_EQ(literalValue(res, members[1]), std::optional<std::int64_t>{7})
+                    << what << ": the value after the structure belongs to `n` (elided, it is `in.b`)";
+                inspected = true;
+            });
+        EXPECT_TRUE(l.lowered) << what << "\n" << l.diagnostics;
+        EXPECT_EQ(l.hirErrors, 0u) << what << "\n" << l.diagnostics;
+        EXPECT_EQ(l.hirExcess, 0u) << what << "\n" << l.diagnostics;
+        EXPECT_TRUE(inspected) << what;
+    }
+    // And as whole elements of an array, as before.
     std::string const t = kTypes;
     expectLowersCleanly({
         {"a name", t + "int main(void) { struct S arr[] = { one, one };\n"

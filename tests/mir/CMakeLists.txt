@@ -43,6 +43,15 @@ dss_add_test(NAME mir/test_seh_filter_with_a_branch
 dss_add_test(NAME mir/test_seh_handler_takes_a_filter_value
              SOURCES test_seh_handler_takes_a_filter_value.cpp)
 
+# A BIT-FIELD'S SIGN IS THE PAIR'S, IN BOTH TIERS (P69, lane `lm`): a plain `char` field
+# by the target's plain-char answer for the format, an enumeration field by the format's
+# enumeration rule — the constant read and the run-time extraction alike, on four
+# (target, format) pairs through the driver's own derivation of the pair. A binary of its
+# own: its cases are about one question, and `mir/test_mir_lowering_c` is the claim runner
+# of many mutation arms, whose case counts a new case moves.
+dss_add_test(NAME mir/test_bit_field_sign_is_the_pairs
+             SOURCES test_bit_field_sign_is_the_pairs.cpp)
+
 # OPT11 (plan 22 §0.2) — the cross-CU SUMMARY INDEX that replaces the monolithic
 # whole-program merge above. TWO binaries, because they test opposite sides of
 # one contract and must be able to fail independently: the first pins that MIR

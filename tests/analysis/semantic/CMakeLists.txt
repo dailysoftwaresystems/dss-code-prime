@@ -178,6 +178,27 @@ dss_add_test(NAME analysis/semantic/test_constant_read_as_the_object_holds_it
 target_include_directories(dss_analysis_semantic_test_constant_read_as_the_object_holds_it
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P69 (lane lm, D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT): a bit-field's
+# value is promoted by its WIDTH (C 6.3.1.1p2). Which expression is a bit-field's value
+# is one statement both tiers ask; each form of it, and each form it leaves out by a fork
+# the references decided, is pinned in the semantic typer's answer AND in the type the
+# lowering builds the operator at; the constant evaluator folds at the same type, in both
+# tiers' resolvers. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_bit_field_value_is_promoted_by_its_width
+             SOURCES test_bit_field_value_is_promoted_by_its_width.cpp)
+target_include_directories(dss_analysis_semantic_test_bit_field_value_is_promoted_by_its_width
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane `lm`, a review's finding B): every descent takes its steps by the ONE statement
+# of what a wrapper is (`nodeSaysSomethingItself`) — the constant evaluator's statement
+# expression and braced scalar, the builtins' operand value through a selection and a
+# statement expression, the overflow predicates' bit-field operand, the array-size search.
+# Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_every_descent_reads_the_one_statement
+             SOURCES test_every_descent_reads_the_one_statement.cpp)
+target_include_directories(dss_analysis_semantic_test_every_descent_reads_the_one_statement
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # P32 lane A: [[D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT]] plus the SEMANTIC
 # half of [[D-CSUBSET-ATTRIBUTE-PARAM-POSITION]]. Every discard shape is pinned as
 # a PAIR -- a must-warn context beside a must-not-warn sibling -- because a

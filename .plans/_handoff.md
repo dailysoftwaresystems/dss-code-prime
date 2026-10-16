@@ -491,6 +491,17 @@ round's close; each checkpoint's commit message says what was and was not run on
   reads its document (ELF and PE keep a superseded weak body's bytes, Mach-O replaces it whole). The registry: 777
   arms, the lane's layout kept. OWED and read from main right after the commit: the repo-guard label and the
   harness self-tests on the Windows and WSL legs.
+  check-orphan-tests READ from main on windows-x86_64-debug and linux-x86_64-debug at checkpoint 26: passed.
+- **Checkpoint 26 (2026-10-15) = the library lane's PROMOTION FOLD** (with the review of checkpoint 21): a
+  bit-field narrower than `int` is promoted (ISO C 6.3.1.1, gcc, clang; cl promotes none — decided for the three
+  that agree), every descent reading the one statement of a bit-field's value width; a plain `char` bit-field's
+  sign is the TARGET's in both tiers (defect (7) above, fixed); a named constant of a type with no constant value is
+  no constant (defect (8), fixed — the complex half of constant evaluation is a row of its own, ruled to the NEXT
+  CYCLE: `D-C-NEITHER-CONSTANT-EVALUATOR-HOLDS-A-COMPLEX-VALUE`); a `__try` filter is left only by its value; a
+  statement expression may end in a labeled statement (`D-C-GNU-STATEMENT-EXPRESSION` reopened from the archive and
+  built). ✔MEASURED by the lane on its bytes: macos-arm64-debug and linux-x86_64-debug 2800 of 2800;
+  windows-x86_64-debug and -release 2828 of 2829 (the one red xa's cl arm). The registry: 822 arms, every section
+  sorted; `unsuppressable_codes.cpp`'s extent 202 (two lanes each added a member — a plain merge kept 201).
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

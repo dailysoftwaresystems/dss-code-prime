@@ -799,7 +799,10 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // `S_EnumCompatibleTypeRuleUndeclared` joins under `kWhyEnumCompatibleTypeRule`, prong
 // (1) — a suppressed one would leave a guessed compatible type reaching codegen.
 // (Written from main's 198; a fold landing another member first reconciles the count.)
-constexpr std::array<UnsuppressableEntry, 201> kUnsuppressableCodes{{
+// ⓘ EXTENT 200 → 202 (2026-10-15, P69 round 1): lane `cs`'s `S_SymbolAliasTargetInvalid` and lane
+// `lm`'s `H_SehRegionInsideAFilter` join — the latter under `kWhyHirStructural`, a `__try` inside a
+// filter expression, which the filter's own function has no handler table for.
+constexpr std::array<UnsuppressableEntry, 202> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1172,6 +1175,7 @@ constexpr std::array<UnsuppressableEntry, 201> kUnsuppressableCodes{{
     {DiagnosticCode::H_SehJumpIntoRegion, kWhyHirStructural},        // verifier, P68
     {DiagnosticCode::H_SehEarlyExit, kWhyHirStructural},             // verifier, P68
     {DiagnosticCode::H_SehLabelAddress, kWhyHirStructural},          // verifier, P68
+    {DiagnosticCode::H_SehRegionInsideAFilter, kWhyHirStructural},   // verifier, P69
     // H_WideCharSurrogateUnsupported (C11/C23 6.4.5, wide/UTF string literals):
     // a code point that cannot be represented in the requested element width
     // without truncation (astral under a 16-bit element, ill-formed UTF-8, or

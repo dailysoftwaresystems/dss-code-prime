@@ -2217,35 +2217,48 @@ TEST(ConstEvalUnsignedModular, WidenedUnaryOfAnUnsignedOperandKeepsItsOwnWidth) 
 }
 
 TEST(ConstEvalUnsignedModular, CastOfAnUnsignedConstantAboveInt64Folds) {
-    // `(T)18446744073709551615ULL` and `(T)0x8000000000000000ULL` for every
-    // integer target, the identity included, and the two wide float targets.
-    // The references' answer, stated independently of the evaluator: the low bits of
-    // the value at the target's width, sign-extended where the target is signed
-    // (✔MEASURED on the six, 75 static initializers: `(long long)(2^64-1)` is -1,
-    // `(int)2^63` is 0, `(signed char)0x8000000000000041` is 0x41,
-    // `(int)0xFFFFFFFF80000001` is -2147483647); `_Bool` is 1 for every one.
-    auto const lowBits = [](std::uint64_t v, int bits, bool isSigned) -> std::int64_t {
-        if (bits == 64) return static_cast<std::int64_t>(v);
-        std::uint64_t const mask = (std::uint64_t{1} << bits) - 1u;
-        std::uint64_t const low  = v & mask;
-        bool const negative = isSigned && ((low >> (bits - 1)) & 1u) != 0;
-        return static_cast<std::int64_t>(negative ? (low | ~mask) : low);
+    // `(T)S` for five unsigned constants S at and around 2^63 and every integer target,
+    // the identity included; then the two wide float targets. THE EXPECTED BITS ARE THE
+    // REFERENCES' OWN OUTPUT, copied from their runs and computed by nothing here (a
+    // formula in the test would be a second evaluator): ✔MEASURED on six references —
+    // gcc 13.3 and clang 18 on x86_64 Linux, AppleClang 21, mingw-w64 gcc 13.2, gcc 13.3
+    // on arm64 Linux, cl 19.51 at /Od and /O2 — each `static const T x = (T)S;` printed
+    // as its 16 hex digits (a signed object sign-extended), the same 45 lines on all six.
+    constexpr std::uint64_t A = 0xffffffffffffffffULL;   // 2^64 - 1
+    constexpr std::uint64_t B = 0x8000000000000000ULL;   // 2^63: the boundary
+    constexpr std::uint64_t C = 0x7fffffffffffffffULL;   // 2^63 - 1: the control, it always fitted
+    constexpr std::uint64_t D = 0x8000000000000041ULL;   // the top bit and a low byte
+    constexpr std::uint64_t E = 0xffffffff80000001ULL;   // negative as an `int`, truncated
+    struct Row { std::uint64_t source; TypeKind to; std::uint64_t printed; };
+    std::vector<Row> const rows = {
+        // unsigned char                     signed char
+        {A, TypeKind::U8, 0x00000000000000ffULL}, {A, TypeKind::I8, 0xffffffffffffffffULL},
+        {B, TypeKind::U8, 0x0000000000000000ULL}, {B, TypeKind::I8, 0x0000000000000000ULL},
+        {C, TypeKind::U8, 0x00000000000000ffULL}, {C, TypeKind::I8, 0xffffffffffffffffULL},
+        {D, TypeKind::U8, 0x0000000000000041ULL}, {D, TypeKind::I8, 0x0000000000000041ULL},
+        {E, TypeKind::U8, 0x0000000000000001ULL}, {E, TypeKind::I8, 0x0000000000000001ULL},
+        // unsigned short                    short
+        {A, TypeKind::U16, 0x000000000000ffffULL}, {A, TypeKind::I16, 0xffffffffffffffffULL},
+        {B, TypeKind::U16, 0x0000000000000000ULL}, {B, TypeKind::I16, 0x0000000000000000ULL},
+        {C, TypeKind::U16, 0x000000000000ffffULL}, {C, TypeKind::I16, 0xffffffffffffffffULL},
+        {D, TypeKind::U16, 0x0000000000000041ULL}, {D, TypeKind::I16, 0x0000000000000041ULL},
+        {E, TypeKind::U16, 0x0000000000000001ULL}, {E, TypeKind::I16, 0x0000000000000001ULL},
+        // unsigned int                      int
+        {A, TypeKind::U32, 0x00000000ffffffffULL}, {A, TypeKind::I32, 0xffffffffffffffffULL},
+        {B, TypeKind::U32, 0x0000000000000000ULL}, {B, TypeKind::I32, 0x0000000000000000ULL},
+        {C, TypeKind::U32, 0x00000000ffffffffULL}, {C, TypeKind::I32, 0xffffffffffffffffULL},
+        {D, TypeKind::U32, 0x0000000000000041ULL}, {D, TypeKind::I32, 0x0000000000000041ULL},
+        {E, TypeKind::U32, 0x0000000080000001ULL}, {E, TypeKind::I32, 0xffffffff80000001ULL},
+        // unsigned long long                long long
+        {A, TypeKind::U64, 0xffffffffffffffffULL}, {A, TypeKind::I64, 0xffffffffffffffffULL},
+        {B, TypeKind::U64, 0x8000000000000000ULL}, {B, TypeKind::I64, 0x8000000000000000ULL},
+        {C, TypeKind::U64, 0x7fffffffffffffffULL}, {C, TypeKind::I64, 0x7fffffffffffffffULL},
+        {D, TypeKind::U64, 0x8000000000000041ULL}, {D, TypeKind::I64, 0x8000000000000041ULL},
+        {E, TypeKind::U64, 0xffffffff80000001ULL}, {E, TypeKind::I64, 0xffffffff80000001ULL},
+        // _Bool
+        {A, TypeKind::Bool, 1}, {B, TypeKind::Bool, 1}, {C, TypeKind::Bool, 1},
+        {D, TypeKind::Bool, 1}, {E, TypeKind::Bool, 1},
     };
-    struct Target { TypeKind kind; int bits; bool isSigned; };
-    struct Row { std::uint64_t source; TypeKind to; std::int64_t bits; };
-    std::vector<Row> rows;
-    for (std::uint64_t const source : {0x7fffffffffffffffULL,      // 2^63-1: the control, it always fitted
-                                       0x8000000000000000ULL,      // 2^63: the boundary
-                                       0xffffffffffffffffULL,      // 2^64-1
-                                       0x8000000000000041ULL, 0xffffffff80000001ULL}) {
-        for (Target const t : {Target{TypeKind::U8, 8, false},   Target{TypeKind::I8, 8, true},
-                               Target{TypeKind::U16, 16, false}, Target{TypeKind::I16, 16, true},
-                               Target{TypeKind::U32, 32, false}, Target{TypeKind::I32, 32, true},
-                               Target{TypeKind::U64, 64, false}, Target{TypeKind::I64, 64, true}}) {
-            rows.push_back(Row{source, t.kind, lowBits(source, t.bits, t.isSigned)});
-        }
-        rows.push_back(Row{source, TypeKind::Bool, 1});
-    }
     ASSERT_EQ(rows.size(), 45u);
     for (Row const& row : rows) {
         Rig r;
@@ -2262,7 +2275,8 @@ TEST(ConstEvalUnsignedModular, CastOfAnUnsignedConstantAboveInt64Folds) {
         auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
         ASSERT_TRUE(res.value.has_value())
             << "source " << row.source << " target " << static_cast<int>(row.to);
-        EXPECT_EQ(detail::asIntBits(*res.value).value_or(0x5A5A), row.bits)
+        EXPECT_EQ(static_cast<std::uint64_t>(detail::asIntBits(*res.value).value_or(0x5A5A)),
+                  row.printed)
             << "source " << row.source << " target " << static_cast<int>(row.to);
     }
     // To a wide float: the value it IS — 2^64-1 exactly, never -1.0.

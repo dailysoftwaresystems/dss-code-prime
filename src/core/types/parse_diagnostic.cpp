@@ -409,6 +409,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_SehJumpIntoRegion:        return "H_SehJumpIntoRegion";
         case DiagnosticCode::H_SehEarlyExit:             return "H_SehEarlyExit";
         case DiagnosticCode::H_SehLabelAddress:          return "H_SehLabelAddress";
+        case DiagnosticCode::H_SehRegionInsideAFilter:   return "H_SehRegionInsideAFilter";
         case DiagnosticCode::H_WideCharSurrogateUnsupported: return "H_WideCharSurrogateUnsupported";
         case DiagnosticCode::H_Utf8CharLiteralOutOfRange: return "H_Utf8CharLiteralOutOfRange";
         case DiagnosticCode::H_WideCharValueUnrepresentable: return "H_WideCharValueUnrepresentable";

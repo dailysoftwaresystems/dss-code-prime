@@ -305,8 +305,23 @@ void HirVerifier::checkBreakContinueScoping(DiagnosticReporter& reporter) const 
 //   (4) H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, open since its 2026-09-24
 //       re-verdict: clang runs the region-internal form) — `&&label` naming a
 //       label inside any part of a __try statement.
+//   (5) ★ P69 (lane `lm`; a review of checkpoint 21, its N3): A FILTER EXPRESSION IS
+//       LEFT ONLY BY ITS VALUE AND GUARDS NOTHING. A GNU statement expression lets a
+//       filter hold statements; the filter is compiled as a function of its own,
+//       called by the dispatcher while it searches for a handler, with no scope table.
+//       So a return / goto-out / break-out / continue-out / computed goto from inside
+//       it is refused here as H_SehEarlyExit, and a `__try` inside it as
+//       H_SehRegionInsideAFilter — by the construct, where the MIR verifier refused
+//       them as `I_SehStructure` naming block numbers. ✔MEASURED 2026-10-15: cl has no
+//       statement expression; clang 18 for x86_64-pc-windows-msvc compiles the `return`
+//       and the `__try` and its frontend crashes on the other three, and nothing of its
+//       image can be run here — no working reference.
 void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
     std::uint32_t const moduleTag = hir_.id().v;
+    // The one reason every jump out of a filter is refused, said once.
+    static constexpr char const* kSehFilterIsLeftByItsValue =
+        " is not supported: the filter is compiled as a function of its own, called "
+        "while a handler is searched for, and it is left only by its value";
 
     // Zero-cost for the non-SEH world: one flat scan for either a SehTryExcept
     // node OR a SEH intrinsic builtin (`_exception_code`/`_exception_info`),
@@ -412,6 +427,13 @@ void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
                              sourceMap_);
                     break;
                 }
+                if (slot == 1u) {
+                    reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
+                             std::string{"'return' inside a __except filter expression"}
+                                 + kSehFilterIsLeftByItsValue,
+                             sourceMap_);
+                    break;
+                }
             }
             break;
         }
@@ -440,12 +462,26 @@ void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
                              sourceMap_);
                     break;
                 }
+                if (slot == 1u && !contains(lAnc, seh, 1u)) {
+                    reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
+                             std::string{"goto out of a __except filter expression"}
+                                 + kSehFilterIsLeftByItsValue,
+                             sourceMap_);
+                    break;
+                }
             }
             break;
         }
         case HirKind::IndirectGotoStmt: {
             for (auto const& [seh, slot] : sehAncestry(id)) {
                 (void)seh;
+                if (slot == 1u) {
+                    reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
+                             std::string{"computed goto inside a __except filter expression"}
+                                 + kSehFilterIsLeftByItsValue,
+                             sourceMap_);
+                    break;
+                }
                 if (slot == 0u) {
                     // Anchored: D-CSUBSET-SEH-EARLY-EXIT and D-CSUBSET-SEH-LABEL-ADDR (clang runs
                     // the region-internal form).
@@ -495,6 +531,15 @@ void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
                 if (cur == target) break;   // reached the frame first — legal
                 if (hir_.kind(cur) == HirKind::SehTryExcept) {
                     auto const kids = hir_.children(cur);
+                    if (kids.size() > 1 && kids[1] == prev) {
+                        reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
+                                 std::string{hir_.kind(id) == HirKind::BreakStmt
+                                                 ? "'break' leaving a __except filter expression"
+                                                 : "'continue' leaving a __except filter expression"}
+                                     + kSehFilterIsLeftByItsValue,
+                                 sourceMap_);
+                        break;
+                    }
                     if (!kids.empty() && kids[0] == prev) {
                         // Anchored: D-CSUBSET-SEH-EARLY-EXIT (open: MSVC and clang run it).
                         reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
@@ -509,6 +554,21 @@ void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
                     }
                 }
                 prev = cur;
+            }
+            break;
+        }
+        case HirKind::SehTryExcept: {
+            for (auto const& [seh, slot] : sehAncestry(id)) {
+                (void)seh;
+                if (slot == 1u) {
+                    reportAt(reporter, DiagnosticCode::H_SehRegionInsideAFilter, id,
+                             "a __try statement inside a __except filter expression is "
+                             "not supported: the filter is compiled as a function of its "
+                             "own, called while a handler is searched for, and that "
+                             "function has no handler table for a region inside it",
+                             sourceMap_);
+                    break;
+                }
             }
             break;
         }

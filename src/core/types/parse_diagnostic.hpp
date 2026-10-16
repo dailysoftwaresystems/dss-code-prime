@@ -3891,6 +3891,13 @@ enum class DiagnosticCode : std::uint16_t {
     //   CFG-derivable. MSVC and clang run every such exit (measured
     //   2026-09-24), so the row is owed work; it carries the mark-every-exit
     //   design.
+    //   ★ P69 (lane `lm`): AND a return / goto-out / break-out / continue-out / computed
+    //   goto from INSIDE a `__except` FILTER EXPRESSION (a GNU statement expression in
+    //   the filter). A filter is a function of its own, called while a handler is
+    //   searched for, and it is left only by its value; these were refused by the MIR
+    //   verifier as `I_SehStructure` with block numbers. ✔MEASURED 2026-10-15: clang 18
+    //   for x86_64-pc-windows-msvc compiles the `return` and its frontend crashes on the
+    //   other three; cl has no statement expression — no working reference.
     H_SehEarlyExit                = 0xF010,
     // H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, open since its 2026-09-24
     //   re-verdict: clang runs the region-internal form): `&&label` naming a
@@ -4090,6 +4097,16 @@ enum class DiagnosticCode : std::uint16_t {
     //   MSVC 19.51 warn by default; gcc 13.3.0 and mingw-w64 gcc 13.2.0 only
     //   under -Wall. None of the five refuses.
     H_NonVoidFunctionEndReachable = 0xF01D,
+    // H_SehRegionInsideAFilter (P69, lane `lm`; a review of checkpoint 21, its N3): a
+    //   `__try` statement inside a `__except` FILTER EXPRESSION (reachable only through a
+    //   GNU statement expression). A filter is compiled as a function of its own, called
+    //   by the dispatcher while it searches for a handler, and that function has no scope
+    //   table: a region inside it has no handler to reach. Refused by the construct, at
+    //   the HIR verifier, where the MIR verifier said `I_SehStructure` and block numbers.
+    //   ✔MEASURED 2026-10-15: cl has no statement expression; clang 18 for
+    //   x86_64-pc-windows-msvc COMPILES the shape, and nothing of its image can be run
+    //   here — a compile, not a working reference.
+    H_SehRegionInsideAFilter      = 0xF01E,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,

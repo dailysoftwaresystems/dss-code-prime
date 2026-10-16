@@ -351,56 +351,28 @@ isFoldedConstantRule(HirLoweringConfig const& cfg, RuleId rule) {
 }
 
 // Resolve a transparent WRAPPER node to its single child to descend into (the
-// deep-parens axis `((((expr))))`), IFF it is NOT one of the rule-dispatched
-// arms (sizeof / binary / unary / ternary) — those are matched first in
-// `evalNode` and must not be wrapper-peeled. Mirrors the recursive tail:
-// exactly one meaningful Internal child → that child; else zero internals and
-// exactly one token child → that token; else nullopt (→ delegate, which yields
-// the same NotAConstantExpression). Shared by the driver + the recursive
-// fallback so the peel decision never diverges.
+// deep-parens axis `((((expr))))`). A wrapper is what THE statement says it is
+// (`nodeSaysSomethingItself`, core/types/decl_prefix_strip.hpp): every node that
+// says something itself — an operator, `sizeof`, a cast, a compound literal, a
+// selection, a statement expression, a brace list, a folded builtin — is `evalNode`'s
+// to fold by its own arm or to refuse, never stepped through. Then: exactly one
+// meaningful Internal child → that child; else zero internals and exactly one token
+// child → that token; else invalid (→ delegate, which yields the same
+// NotAConstantExpression). Shared by the driver + `evalNode`'s tail, so the peel
+// decision never diverges.
+// ★ P69 (lane `lm`, the review's B): THIS WAS A SECOND STATEMENT — a dispatch list of
+// its own (sizeof, alignof, the operators, the cast, choose, `_Generic`, the folded
+// builtins, the compound literals), which named neither the statement expression, the
+// label address nor the brace list, and read the cast and `_Generic` rules from the
+// other key. So a statement expression was peeled to its ONE item by count, whatever
+// that item was: `({ { 5; } })` and `({ return 5; })` folded to 5 where C gives the
+// construct no value (the value is the last item's only when that item is an
+// expression statement), and a mutant taking the statement expression out of the
+// statement changed no constant.
 [[nodiscard]] NodeId
 wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
              std::vector<NodeId> const& kids) {
-    RuleId const rule = tree.rule(expr);
-    bool const isDispatched =
-        (cfg.sizeofRule.valid()      && rule.v == cfg.sizeofRule.v)      ||
-        // C11/C23 6.5.3.4: `_Alignof(T)` — like sizeof, its ONE meaningful
-        // Internal child is a castTypeRef the peel would wrongly descend into;
-        // keep it for evalNode's alignof arm (mirror sizeof).
-        (cfg.alignofRule.valid()     && rule.v == cfg.alignofRule.v)     ||
-        (cfg.binaryExprRule.valid()  && rule.v == cfg.binaryExprRule.v)  ||
-        (cfg.unaryExprRule.valid()   && rule.v == cfg.unaryExprRule.v)   ||
-        (cfg.ternaryExprRule.valid() && rule.v == cfg.ternaryExprRule.v) ||
-        // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD): a cast / postfix-member node has
-        // a type-ref or follower child the peel would mishandle — keep them for
-        // evalNode's address arms (mirror sizeof).
-        (cfg.castRule.valid()        && rule.v == cfg.castRule.v)        ||
-        (cfg.postfixExprRule.valid() && rule.v == cfg.postfixExprRule.v)  ||
-        // P31: `__builtin_choose_expr` has THREE meaningful Internal children, so
-        // the peel declines it anyway — but naming it here states the reason
-        // (evalNode owns it) instead of relying on a child count that a future
-        // grammar edit could change underneath.
-        (cfg.chooseExprRule.valid()  && rule.v == cfg.chooseExprRule.v)   ||
-        // P49 (D-CSUBSET-GENERIC-SELECTION-IS-NOT-AN-INTEGER-CONSTANT-EXPRESSION):
-        // `_Generic` is the SECOND compile-time selection and is named here for
-        // the same reason as the first. Its controlling expression plus its
-        // association list are ≥2 meaningful Internal children today, so the peel
-        // declines it on the count alone — but a count is not a decision, and
-        // peeling a `_Generic` would descend into its CONTROLLING expression,
-        // which 6.5.1.1p3 says is not even evaluated. Naming it makes evalNode's
-        // ownership explicit.
-        (cfg.genericRule.valid()     && rule.v == cfg.genericRule.v)
-        // P31: `__builtin_offsetof` / `__builtin_types_compatible_p` — each has a
-        // castTypeRef child the peel would descend into and then reject as
-        // non-constant, exactly the sizeof hazard one row up.
-        || isFoldedConstantRule(cfg, rule)
-        // P69: a compound literal — a constant only through evalNode's constant-
-        // subobject arm (C23 6.6p6), never by descending into its type name or list.
-        || std::ranges::any_of(tree.schema().semantics().compoundLiteralRules,
-                               [&](CompoundLiteralRule const& row) {
-                                   return row.rule.valid() && row.rule.v == rule.v;
-                               });
-    if (isDispatched) return NodeId{};
+    if (nodeSaysSomethingItself(tree.schema().semantics(), cfg, tree, expr)) return NodeId{};
     NodeId onlyInternal{};
     int    internalCount = 0;
     for (NodeId c : kids) {
@@ -433,23 +405,33 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
 // the first of them died of an illegal instruction, in seven of the ten forms run.
 //
 // `atDeclaredType` holds the value already converted to the member's declared type
-// (`declared`), and the result keeps that type's core — the type the RUN-TIME read of
-// a bit-field has here, which is what a fold that decides reachability must agree
-// with. ⚠ That type is not C's for a field narrower than `int` (6.3.1.1p2 promotes it
-// to `int`): ✔MEASURED the same day, `v.b - 6 < 0` over a `volatile` 3-bit unsigned
-// field holding 5 runs FALSE here and true on gcc 13, clang 18, AppleClang 21 and
-// mingw-w64 gcc 13.2 — no constant, no fold. The promotion is the run-time read's
-// and this one's TOGETHER (`promoteBitIntOperand` over the width is the step here):
-// stated here alone it would fold `g.b - 6 < 0` true while the program computes it
-// false, the very disagreement this function removes.
-// A `_Bool` field's value is 0 or 1 at any width and is handed on as it stands.
+// (`declared`); the reduced value is then handed on AT THE TYPE ITS VALUE HAS
+// (`valueType`, C 6.3.1.1p2 — `bitFieldPromotedType`, which the tier that resolved the
+// member asked): `int` for a field narrower than `int`, `unsigned int` for an unsigned
+// one of exactly `int`'s width, the declared type for a wider one. The reduced value
+// fits that type, so the conversion keeps it. ★ P69 (lane `lm`,
+// D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT): THE PROMOTION IS THE
+// RUN-TIME READ'S AND THIS ONE'S TOGETHER, and they moved together — the operators of
+// both tiers read a bit-field operand at the same type (`bitFieldValueWidth`,
+// decl_prefix_strip.hpp). Until then this kept the declared type's core, the type the
+// run-time read had: ✔MEASURED 2026-10-15 (pe64, both pipelines), `g.b - 6 < 0` over a
+// constant `unsigned b : 3` holding 5 folded 0 in an enumerator, a static initializer
+// and an `if`, and ran 0, where clang 18 and AppleClang 21 fold 1 and all four GNU
+// references run 1 — one wrong value in every tier, agreeing with itself.
+// A `_Bool` field's value is 0 or 1 at any width; it too is handed on at `valueType`.
 // Refused, as no constant: a field of a bit-precise or 128-bit type, a width the
 // declared type cannot hold, and a plain `char` field whose sign the caller was not
 // told — none of them a shape a reference was measured folding.
 [[nodiscard]] ConstEvalResult
+convertToCastTarget(ConstEvalResult const& inner, CstCastTarget const& target,
+                    EvalOptions const& options, NodeId expr);
+
+[[nodiscard]] ConstEvalResult
 readThroughBitField(ConstEvalResult const& atDeclaredType, CstCastTarget const& declared,
-                    std::uint32_t width, NodeId expr) {
-    if (!atDeclaredType.value.has_value() || declared.isBool) return atDeclaredType;
+                    CstBitFieldRead const& field, EvalOptions const& options, NodeId expr) {
+    if (!atDeclaredType.value.has_value()) return atDeclaredType;
+    if (declared.isBool) return convertToCastTarget(atDeclaredType, field.valueType, options, expr);
+    std::uint32_t const width = field.width;
     if (!declared.isInteger || declared.intSignednessUnknown || declared.intBits > 64
         || width == 0 || width > static_cast<std::uint32_t>(declared.intBits)) {
         return fail(ConstEvalFailure::NotAConstantExpression, expr);
@@ -466,7 +448,7 @@ readThroughBitField(ConstEvalResult const& atDeclaredType, CstCastTarget const& 
     } else {
         atField.value = static_cast<std::int64_t>(reduced);
     }
-    return ok(std::move(atField));
+    return convertToCastTarget(ok(std::move(atField)), field.valueType, options, expr);
 }
 
 // ── A FOLDED VALUE CONVERTED TO A CLASSIFIED TARGET ──────────────────────────────
@@ -1262,11 +1244,12 @@ evalNode(NodeId                              expr,
                 ? env.resolveConstantSubobject(expr, currentScopeOpaque)
                 : std::nullopt;
         if (sub.has_value()) {
-            // A BIT-FIELD member is read at its width (`readThroughBitField`) — both
-            // returns below, so the one reader stays the one when it gains a step.
+            // A BIT-FIELD member is read at its width and has its value's type
+            // (`readThroughBitField`) — both returns below, so the one reader stays the
+            // one when it gains a step.
             auto const asRead = [&](ConstEvalResult const& atType) -> ConstEvalResult {
-                if (!sub->bitFieldWidth.has_value() || !atType.value.has_value()) return atType;
-                return readThroughBitField(atType, sub->type, *sub->bitFieldWidth, expr);
+                if (!sub->bitField.has_value() || !atType.value.has_value()) return atType;
+                return readThroughBitField(atType, sub->type, *sub->bitField, options, expr);
             };
             if (sub->zeroValue) {
                 HirLiteralValue zero;
@@ -1641,38 +1624,53 @@ evalNode(NodeId                              expr,
         }
     }
 
-    // Wrapper rule: any internal node with exactly one meaningful child
-    // (an Internal) and any number of pure tokens (parens, separators)
-    // is treated as a transparent wrapper. Mirrors the existing peeling
-    // pattern in `constIntLength` / `resolveIndexDesignatorLiteral`.
-    NodeId onlyInternal{};
-    int    internalCount = 0;
-    for (NodeId c : kids) {
-        if (tree.kind(c) == NodeKind::Internal) {
-            ++internalCount;
-            onlyInternal = c;
+    // THE VALUE STEPS THE STATEMENT LEAVES TO A DESCENT THAT ASKS A VALUE, each by name
+    // (P69, lane `lm`, the review's B), before the wrapper rule below — which takes its
+    // steps by the statement (`wrapperChild`):
+    //   * a statement expression of ONE item that is an expression statement has that
+    //     expression's value (`soleExpressionOfStatementExpression`, the one place that
+    //     says so); a body ending in anything else has no value, and is no constant;
+    //   * a brace list of ONE undesignated element is that element's value — the
+    //     initializer of a scalar, "optionally enclosed in braces" (C 6.7.9p11): the
+    //     form a named constant's initializer `constexpr int c = { 5 };` is read in;
+    // Every other node that says something itself and reached this tail has no arm above
+    // (a label address, a statement expression of anything else, a brace list of more):
+    // `wrapperChild` declines it, so it is no constant.
+    if (tree.kind(expr) == NodeKind::Internal) {
+        if (NodeId const value = soleExpressionOfStatementExpression(cfg, tree, expr);
+            value.valid()) {
+            return evalImpl(value, ctx, env, options, currentScopeOpaque, visitedInitNodes);
         }
-    }
-    if (internalCount == 1) {
-        return evalImpl(onlyInternal, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-    }
-    // Zero internals: a single token-leaf wrapper (e.g. an `operand`
-    // rule whose sole content is an integer-literal token or an
-    // identifier-Ref token). Recurse into the sole token regardless
-    // of kind — the Token-leaf branch above dispatches integer-
-    // literal vs identifier-Ref vs other.
-    if (internalCount == 0) {
-        NodeId onlyTok{};
-        int tokCount = 0;
-        for (NodeId c : kids) {
-            if (tree.kind(c) == NodeKind::Token) {
-                ++tokCount;
-                onlyTok = c;
+        if (cfg.braceInitListRule.valid() && tree.rule(expr).v == cfg.braceInitListRule.v) {
+            NodeId element{};
+            std::size_t elements = 0;
+            for (NodeId c : kids) {
+                if (tree.kind(c) != NodeKind::Internal) continue;
+                ++elements;
+                element = c;
             }
+            if (elements == 1) {
+                NodeId value{};
+                std::size_t parts = 0;
+                for (NodeId c : visibleChildren(tree, element)) {
+                    if (tree.kind(c) != NodeKind::Internal) continue;
+                    ++parts;
+                    value = c;
+                }
+                if (parts == 1) {   // a designated element has two parts: the designation and the value
+                    return evalImpl(value, ctx, env, options, currentScopeOpaque, visitedInitNodes);
+                }
+            }
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        if (tokCount == 1) {
-            return evalImpl(onlyTok, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        }
+    }
+    // Wrapper rule: grouping — an internal node with exactly one meaningful child
+    // (an Internal) and any number of pure tokens (parens, separators), or a single
+    // token-leaf wrapper (e.g. an `operand` rule whose sole content is an
+    // integer-literal token or an identifier-Ref token: the Token-leaf branch above
+    // dispatches it). The SAME decision the driver takes (`wrapperChild`).
+    if (NodeId const child = wrapperChild(tree, cfg, expr, kids); child.valid()) {
+        return evalImpl(child, ctx, env, options, currentScopeOpaque, visitedInitNodes);
     }
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
 }
@@ -1930,6 +1928,25 @@ classifyCstCastTarget(TypeInterner const& in, TypeId ty,
         default: return std::nullopt;   // aggregate / function / void — non-foldable
     }
     return t;
+}
+
+std::optional<CstResolvedSymbol>
+namedConstantRead(TypeInterner const& in, NodeId initExpr, std::uint32_t initScopeOpaque,
+                  TypeId declaredType, std::optional<bool> charIsUnsigned) {
+    if (!declaredType.valid()) return std::nullopt;
+    CstResolvedSymbol out{initExpr, initScopeOpaque, std::nullopt};
+    if (auto const conversion = classifyCstCastTarget(in, declaredType, charIsUnsigned);
+        conversion.has_value()) {
+        out.declaredType = conversion;
+        return out;
+    }
+    switch (in.kind(declaredType)) {
+        case TypeKind::Struct: case TypeKind::Union: case TypeKind::Tuple:
+        case TypeKind::Array:  case TypeKind::Slice:
+            return out;   // read member by member, each at its own type
+        default:
+            return std::nullopt;   // a type with no constant value at its own type
+    }
 }
 
 std::optional<NodeId>

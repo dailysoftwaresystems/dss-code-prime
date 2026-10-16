@@ -462,16 +462,12 @@ TEST(StmtExprValueType, AValueHasNoQualifierOfTheObjectItWasReadFrom) {
 // it. The pin is the PAIR, in this tier, for an array of a STATED size: the same
 // error codes, in the same order, as the plain pointer draws — and at least one.
 //
-// ⚠ AN ARRAY OF NO STATED SIZE IS REFUSED BY THE SAME SENTENCE ABOUT ITS VALUE, AND
-// NOT YET BY THE ONE ITS POINTER TWIN DRAWS. ✔MEASURED 2026-10-12 (this binary's first
-// run, the Mac leg): `char k[] = ({ "abc"; });` draws S_TypeMismatch — an array is not
-// initialized by a pointer, what the sized form draws — where `char k[] = p;` draws
-// S_ArrayLengthOutOfRange: the search that sizes an array from its initializer
-// (`completeIncompleteArrayFromInit`) still walks INTO the construct and sizes this
-// one from the literal inside. It is one of the six descents that do not read the
-// statement of what a wrapper is (`core/types/decl_prefix_strip.hpp` names them);
-// when it does, this half becomes the pair too, and the exact code below is what
-// tells whoever changes it.
+// AN ARRAY OF NO STATED SIZE IS THE PAIR TOO (P69, lane `lm`, the review's B): the
+// search that sizes an array from its initializer (`completeIncompleteArrayFromInit`)
+// takes its steps by the statement of what a wrapper is now, so it stops at the
+// construct — no string literal, no brace list — and the form draws what its pointer
+// twin draws. ✔MEASURED 2026-10-12: it drew S_TypeMismatch, sized from the literal
+// INSIDE the construct, where `char k[] = p;` drew S_ArrayLengthOutOfRange.
 TEST(StmtExprValueType, AnArrayInitializedByTheConstructIsRefusedAsByAnyPointer) {
     std::string const head = "int main(void){ const char *p = \"abc\"; (void)p; ";
     {
@@ -485,15 +481,15 @@ TEST(StmtExprValueType, AnArrayInitializedByTheConstructIsRefusedAsByAnyPointer)
                "initialized by it as it refuses one initialized by any pointer";
     }
     {
-        SCOPED_TRACE("char k[]: refused for its value");
+        SCOPED_TRACE("char k[]: the pair");
         auto const construct =
             semanticErrorCodesOf(head + "char k[] = ({ \"abc\"; }); return k[0]; }\n");
         auto const pointer = semanticErrorCodesOf(head + "char k[] = p; return k[0]; }\n");
-        EXPECT_EQ(construct, (std::vector<DiagnosticCode>{DiagnosticCode::S_TypeMismatch}))
-            << "an array of no stated size is refused in this tier for the pointer its "
-               "initializer yields";
         EXPECT_EQ(pointer,
                   (std::vector<DiagnosticCode>{DiagnosticCode::S_ArrayLengthOutOfRange}))
-            << "the premise of the comment above: the plain pointer cannot size the array";
+            << "the premise: the plain pointer cannot size the array";
+        EXPECT_EQ(construct, pointer)
+            << "the construct is no string literal and no brace list: it sizes nothing, "
+               "as the pointer it yields sizes nothing";
     }
 }

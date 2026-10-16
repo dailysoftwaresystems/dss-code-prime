@@ -21,8 +21,9 @@
 //     call preserves, in both pipelines, so whichever of them a caller chose
 //     for the `double` its handler reads, the callee overwrote it and said
 //     where it saved it;
-//   * no handler of any of these images, in either pipeline, opens by taking a
-//     value from a register a call does not preserve.
+//   * no handler of any of these images, in either pipeline, reads a register
+//     a call does not preserve — general or vector, on any path to the
+//     function's return — before writing it.
 //
 // ★ ONE BUILD PER (SOURCE, PIPELINE), READ BY EVERY CASE THAT NEEDS IT
 // (`imageOf`): an image build is this tier's whole cost.
@@ -45,6 +46,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -56,23 +58,25 @@ namespace fs = std::filesystem;
 using dss::CompileConfig;
 using dss::DiagnosticReporter;
 using dss::Program;
-using dss::test_support::HandlerFirstRead;
-using dss::test_support::HandlerTakes;
+using dss::test_support::HandlerRead;
+using dss::test_support::HandlerWalk;
 using dss::test_support::Location;
 using dss::test_support::PeFunctionUnwind;
 using dss::test_support::PeGuardedFunction;
 using dss::test_support::PeScopeRecord;
 using dss::test_support::PeSection;
 using dss::test_support::ScratchDir;
-using dss::test_support::firstValueAHandlerTakes;
+using dss::test_support::everyValueAHandlerTakes;
 using dss::test_support::kPeUwopSaveXmm128;
 using dss::test_support::kPeUwopSaveXmm128Far;
+using dss::test_support::kX64Xmm;
 using dss::test_support::peFunctionUnwinds;
 using dss::test_support::peGuardedFunctions;
 using dss::test_support::peRvaToOffset;
 using dss::test_support::peSections;
 using dss::test_support::rdU32;
 using dss::test_support::readAllBytes;
+using dss::test_support::x64RegisterName;
 
 namespace {
 
@@ -156,6 +160,19 @@ struct Built {
         }
     }
     return n;
+}
+
+// `n` bytes of the image from `at`, in hex, for a failure's message.
+[[nodiscard]] std::string bytesAt(std::vector<std::uint8_t> const& img, std::size_t at,
+                                  std::size_t n) {
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string    out;
+    for (std::size_t k = 0; k < n && at + k < img.size(); ++k) {
+        if (k != 0) out += ' ';
+        out += kHex[img[at + k] >> 4];
+        out += kHex[img[at + k] & 0xFu];
+    }
+    return out;
 }
 
 // The begin RVA of every function the image's function table lists.
@@ -316,53 +333,139 @@ TEST(GuardedRegionExamples, TheCalleesAFaultUnwindsThroughSaveEveryRegisterACall
 // ── NO HANDLER TAKES A VALUE FROM A REGISTER A CALL DOES NOT PRESERVE ─────────
 //
 // A handler is entered by the unwinder, which hands it the frame and the
-// registers a call preserves and nothing else. So the first register a handler
-// reads without having written it must be one of those — the question
-// `firstValueAHandlerTakes` asks of the image. It is asked here of EVERY handler
-// of every one of these images, in BOTH pipelines: the block a filter leaves
-// behind in its function once led into the handler, and what a handler read was
-// then live to the end of the function — a wrong answer to "what does the
-// handler's entry hold" that no run on one host would have shown.
+// registers a call preserves and nothing else. So every register a handler
+// reads before writing it must be one of those — the question
+// `everyValueAHandlerTakes` asks of the image, on EVERY PATH from the handler's
+// address to the function's return (the code after the handler, which reads
+// what the handler and the code before the region left, included) and in BOTH
+// register files: rax, rcx, rdx, r8..r11 and xmm0..xmm5 are the registers it
+// must not find. It is asked of every handler of every one of these images, in
+// both pipelines: the block a filter leaves behind in its function once led into
+// the handler, and what a handler read was then live to the end of the function
+// — a wrong answer to "what does the handler's entry hold" that no run on one
+// host would have shown.
 //
-// The walk decodes the few forms a handler opens with and answers `NotDecoded`
-// for the rest, so "none takes a volatile register" could be held by a walk
-// that decoded nothing. It is not: in each pipeline at least one handler of
-// these images must be seen TAKING a value — from a call-preserved register or
-// out of the frame.
+// The statement is as wide as the walk. So EVERY path of every handler must be
+// decoded to its end — a form the decoder does not know fails here, with its
+// bytes — and in each pipeline the handlers must be seen taking a value out of
+// EACH register file: a call-preserved general register, and a call-preserved
+// vector register (the handler example's `double` cases), so neither half of the
+// decoder holds the statement by reading nothing. (The walk itself is held to
+// what it must find by the case after this one.)
 TEST(GuardedRegionExamples, NoHandlerTakesAValueACallDoesNotPreserve) {
     for (CompileConfig const config : {CompileConfig::Debug, CompileConfig::Release}) {
-        std::size_t handlers = 0, takeAValue = 0, takeNothing = 0, notDecoded = 0;
+        std::size_t handlers = 0, takeGeneral = 0, takeVector = 0, takeFromTheFrame = 0;
         for (char const* example : kExamples) {
             SCOPED_TRACE(std::string{example} + " [" + pipelineName(config) + "]");
             Built const& b = imageOf(example, config);
             ASSERT_EQ(b.rc, 0) << b.diagnostics;
             auto const secs = peSections(b.image);
             for (PeGuardedFunction const& f : peGuardedFunctions(b.image)) {
+                std::size_t const begin = peRvaToOffset(secs, f.begin);
+                ASSERT_NE(begin, 0u) << "a guarded function's address lies in no section";
+                std::size_t const end = begin + (f.end - f.begin);
                 for (PeScopeRecord const& r : f.records) {
                     std::size_t const at = peRvaToOffset(secs, r.target);
                     ASSERT_NE(at, 0u) << "a handler's address lies in no section";
-                    HandlerFirstRead const first = firstValueAHandlerTakes(b.image, at);
+                    HandlerWalk const w = everyValueAHandlerTakes(b.image, at, begin, end);
                     ++handlers;
-                    switch (first.takes) {
-                        case HandlerTakes::APreservedRegister:
-                        case HandlerTakes::AValueOfTheFrame:   ++takeAValue;  break;
-                        case HandlerTakes::NothingFromOutside: ++takeNothing; break;
-                        case HandlerTakes::NotDecoded:         ++notDecoded;  break;
-                        case HandlerTakes::AVolatileRegister:  break;
+                    EXPECT_FALSE(w.overBudget)
+                        << "the walk from the handler at " << r.target << " of the function at "
+                        << f.begin << " decoded " << w.instructions << " instructions and did "
+                           "not reach the end of every path";
+                    if (w.undecodedAt.has_value()) {
+                        ADD_FAILURE() << "the walk from the handler at " << r.target
+                                      << " of the function at " << f.begin << " met a form it "
+                                         "does not decode, at function offset +"
+                                      << (*w.undecodedAt - begin) << ": "
+                                      << bytesAt(b.image, *w.undecodedAt, 12)
+                                      << " — every path past it is unread, so the statement "
+                                         "below would hold over less than the handler";
                     }
-                    EXPECT_NE(first.takes, HandlerTakes::AVolatileRegister)
-                        << "the handler at " << r.target << " of the function at "
-                        << f.begin << " reads register " << first.reg
-                        << " before writing it — a register which a call does not "
-                           "preserve, so the unwinder hands the handler no value "
-                           "in it";
+                    for (HandlerRead const& v : w.volatileReads) {
+                        ADD_FAILURE() << "the handler at " << r.target << " of the function at "
+                                      << f.begin << " reads " << x64RegisterName(v.reg)
+                                      << " before writing it, at function offset +"
+                                      << (v.at - begin) << " (" << bytesAt(b.image, v.at, 8)
+                                      << ") — a register which a call does not preserve, so "
+                                         "the unwinder hands the handler no value in it";
+                    }
+                    if (w.preservedGeneral > 0u) ++takeGeneral;
+                    if (w.preservedVector > 0u) ++takeVector;
+                    if (w.frameLoads > 0u) ++takeFromTheFrame;
                 }
             }
         }
-        EXPECT_GE(takeAValue, 1u)
-            << pipelineName(config) << ": of " << handlers << " handler(s), "
-            << takeNothing << " open by taking nothing from outside and "
-            << notDecoded << " in a form the walk does not decode — none was seen "
-               "taking a value, so the statement above was held by nothing";
+        EXPECT_GE(takeGeneral, 1u)
+            << pipelineName(config) << ": of " << handlers << " handler(s), none was seen "
+               "taking a call-preserved general register (" << takeFromTheFrame
+            << " load a value out of the frame) — the general half of the statement above "
+               "was held by reading nothing";
+        EXPECT_GE(takeVector, 1u)
+            << pipelineName(config) << ": of " << handlers << " handler(s), none was seen "
+               "taking a call-preserved vector register — the vector half of the statement "
+               "above was held by reading nothing, though the handler example's `double` "
+               "cases read one";
+    }
+}
+
+// ── THE WALK FINDS WHAT IT LOOKS FOR ─────────────────────────────────────────
+//
+// The case above is green when the walk finds nothing, so the walk is held here
+// to FINDING each thing it looks for, on bytes written by hand: a register a
+// call does not preserve read AFTER a first read of one it does (the walk does
+// not stop at the first read), in the vector file, on the far arm of a
+// conditional jump and past an unconditional one; and to NOT finding what is no
+// such read — a zero idiom, a register a call wrote, an address of the frame
+// formed in a register — and to saying where it met a form it does not know.
+TEST(GuardedRegionExamples, TheHandlerWalkFindsWhatItLooksFor) {
+    struct Shape {
+        char const*               what;
+        std::vector<std::uint8_t> bytes;
+        std::vector<unsigned>     volatileReads;   // the registers it must find, in order
+        std::size_t               preservedGeneral, preservedVector, frameLoads;
+        bool                      decodedToItsEnd;
+    };
+    constexpr unsigned kRcx = 1, kRdx = 2, kR8 = 8, kXmm0 = kX64Xmm + 0;
+    std::vector<Shape> const shapes{
+        // mov eax, r15d ; add eax, ecx ; ret
+        {"past the first read", {0x44, 0x89, 0xF8, 0x01, 0xC8, 0xC3}, {kRcx}, 1, 0, 0, true},
+        // cvttsd2si eax, xmm0 ; ret
+        {"a vector register", {0xF2, 0x0F, 0x2C, 0xC0, 0xC3}, {kXmm0}, 0, 0, 0, true},
+        // cvttsd2si eax, xmm15 ; ret
+        {"a preserved vector register", {0xF2, 0x41, 0x0F, 0x2C, 0xC7, 0xC3}, {}, 0, 1, 0, true},
+        // xor ecx, ecx ; mov eax, ecx ; xorps xmm0, xmm0 ; addsd xmm0, xmm0 ; ret
+        {"zero idioms", {0x31, 0xC9, 0x89, 0xC8, 0x0F, 0x57, 0xC0, 0xF2, 0x0F, 0x58, 0xC0, 0xC3},
+         {}, 0, 0, 0, true},
+        // test r15d, r15d ; jne +6 ; mov eax, 1 ; ret ; mov eax, edx ; ret
+        {"the far arm of a conditional jump",
+         {0x45, 0x85, 0xFF, 0x75, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0x89, 0xD0, 0xC3},
+         {kRdx}, 1, 0, 0, true},
+        // call +0 ; mov eax, ecx ; ret
+        {"a register a call wrote", {0xE8, 0x00, 0x00, 0x00, 0x00, 0x89, 0xC8, 0xC3}, {}, 0, 0, 0,
+         true},
+        // lea r9, [rsp+0x10] ; movsd xmm1, [r9] ; ret
+        {"an address of the frame in a register",
+         {0x4C, 0x8D, 0x4C, 0x24, 0x10, 0xF2, 0x41, 0x0F, 0x10, 0x09, 0xC3}, {}, 0, 0, 1, true},
+        // jmp +2 ; (cpuid, jumped over) ; mov eax, r8d ; ret
+        {"past an unconditional jump", {0xEB, 0x02, 0x0F, 0xA2, 0x44, 0x89, 0xC0, 0xC3}, {kR8}, 0, 0,
+         0, true},
+        // cpuid ; ret
+        {"a form it does not decode", {0x0F, 0xA2, 0xC3}, {}, 0, 0, 0, false},
+    };
+    for (Shape const& s : shapes) {
+        SCOPED_TRACE(s.what);
+        HandlerWalk const w = everyValueAHandlerTakes(s.bytes, 0, 0, s.bytes.size());
+        std::vector<unsigned> found;
+        for (HandlerRead const& v : w.volatileReads) found.push_back(v.reg);
+        EXPECT_EQ(found, s.volatileReads);
+        EXPECT_EQ(w.preservedGeneral, s.preservedGeneral);
+        EXPECT_EQ(w.preservedVector, s.preservedVector);
+        EXPECT_EQ(w.frameLoads, s.frameLoads);
+        EXPECT_EQ(w.decodedToItsEnd(), s.decodedToItsEnd);
+        if (!s.decodedToItsEnd) {
+            ASSERT_TRUE(w.undecodedAt.has_value());
+            EXPECT_EQ(*w.undecodedAt, 0u) << "where the walk met the form";
+        }
     }
 }

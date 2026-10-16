@@ -1,0 +1,2 @@
+        if (nodeIsASelection(cfg, tree, n)) {
+            NodeId const result = selectionResultOf(s, cfg, tree, n, scope);

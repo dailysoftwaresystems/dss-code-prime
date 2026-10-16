@@ -1242,6 +1242,9 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
 [[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
                                  NodeId node, ScopeId scope = {});
+[[nodiscard]] std::optional<std::uint32_t>
+semanticBitFieldValueWidth(EngineState const& s, SemanticConfig const& sem, Tree const& tree,
+                           NodeId n, ScopeId scope);
 // C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION / -GENERIC-RESULT-TYPE-DEDUCTION):
 // the ONE generic-selection chokepoint. Given a `_Generic` node and its ALREADY-
 // COMPUTED controlling type, decide which association WINS from the typed/
@@ -4865,18 +4868,17 @@ resolveConstSymbolInit(EngineState const& s, Tree const& tree,
     // its init expression in the scope where the symbol was declared
     // — not the original use-site scope. This is what makes shadowing
     // work correctly across const ref chains.
-    CstResolvedSymbol out{*initExpr, rec.scope.v, std::nullopt};
     // ★ P69 (lane `lm`): THE DECLARED TYPE, FOR EVERY TYPE THE CAST CAN CONVERT TO. A
     // const object's value is its initializer CONVERTED to its type (C 6.7.9p11), so
     // the engine is handed that type as the conversion its cast arm applies. This
     // handed it for a `_BitInt` declared type alone (C4b), and every other named
     // constant was read at its initializer's type (`CstResolvedSymbol::declaredType`
-    // tells what was measured). An unclassifiable type — an aggregate — hands none.
-    if (rec.type.valid()) {
-        out.declaredType =
-            classifyCstCastTarget(s.lattice.interner(), rec.type, s.charIsUnsigned);
-    }
-    return out;
+    // tells what was measured). What the declared type makes of the read is said once,
+    // for this resolver and the lowering's: `namedConstantRead` (a structure, a union or
+    // an array is read member by member; a type with no constant value — `_Complex` —
+    // is no constant).
+    return namedConstantRead(s.lattice.interner(), *initExpr, rec.scope.v, rec.type,
+                             s.charIsUnsigned);
 }
 
 // FC17 (D-CSUBSET-CONSTEXPR): the ONE resolver-environment builder shared by
@@ -4952,9 +4954,25 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
             auto const type = classifyCstCastTarget(s.lattice.interner(), fact->type,
                                                     s.charIsUnsigned);
             if (!type.has_value()) return std::nullopt;
+            // P69 (lane `lm`): a bit-field's value has its PROMOTED type (C 6.3.1.1p2,
+            // `bitFieldPromotedType` — the one the operators read it at), so the fold and
+            // the run-time read compute in the same type. A value type that is no
+            // conversion target is no constant, never a guessed one.
+            std::optional<CstBitFieldRead> bitField;
+            if (fact->bitFieldWidth.has_value()) {
+                TypeId valueTy = fact->type;
+                if (auto const& rules = s.arithRulesFor(*cfg); rules.has_value()) {
+                    valueTy = bitFieldPromotedType(s.lattice.interner(), fact->type,
+                                                   *fact->bitFieldWidth, *rules);
+                }
+                auto const vt = classifyCstCastTarget(s.lattice.interner(), valueTy,
+                                                      s.charIsUnsigned);
+                if (!vt.has_value()) return std::nullopt;
+                bitField = CstBitFieldRead{*fact->bitFieldWidth, *vt};
+            }
             return CstConstantSubobject{
                 CstResolvedSymbol{fact->initExpr, fact->initScope.v, std::nullopt}, *type,
-                fact->zeroValue, fact->bitFieldWidth};
+                fact->zeroValue, bitField};
         };
         // FC6: fold `sizeof(T)` in an array dimension (`int a[sizeof(T)]`). The
         // engine dispatches the `sizeofRule` node here (ahead of its wrapper-
@@ -14041,6 +14059,34 @@ private:
     return out;
 }
 
+// ── A COMPILE-TIME SELECTION'S RESULT (cycle P69 round 1, lane `lm`) ────────────────────
+// `_Generic` and `__builtin_choose_expr` say something themselves (THE statement,
+// `nodeSaysSomethingItself`), and what they say is one of their operands: a descent asking
+// a VALUE question — which expression is a bit-field's value, which object a pointer
+// designates, which string a builtin folds, what an array is initialized by — takes the
+// step to that operand BY NAME, here, and never by counting children. The result is
+// Pass 2's record once it has made one; before that the ONE selector of each.
+[[nodiscard]] bool nodeIsASelection(SemanticConfig const& sem, Tree const& tree, NodeId n) {
+    if (!n.valid() || tree.kind(n) != NodeKind::Internal) return false;
+    std::uint32_t const r = tree.rule(n).v;
+    auto const& hc = tree.schema().hirLowering();
+    return (sem.genericRule.valid() && r == sem.genericRule.v)
+        || (hc.chooseExprRule.valid() && r == hc.chooseExprRule.v)
+        || (sem.builtinChooseExprRule.valid() && r == sem.builtinChooseExprRule.v);
+}
+
+[[nodiscard]] NodeId selectionResultOf(EngineState const& s, SemanticConfig const& sem,
+                                       Tree const& tree, NodeId sel, ScopeId scope) {
+    if (NodeId const* rec = s.nodeToSelectedExpr.tryGet(sel); rec != nullptr && rec->valid())
+        return *rec;
+    // The const_cast is `subtreeType`'s `__builtin_choose_expr` arm's: the selectors memoize
+    // in the interner, and no caller holds a genuinely const EngineState.
+    EngineState& mutS = const_cast<EngineState&>(s);   // NOLINT
+    if (sem.genericRule.valid() && tree.rule(sel).v == sem.genericRule.v)
+        return genericSelectedArm(mutS, sem, tree, sel, scope);
+    return chooseExprSelectedArm(mutS, sem, tree, sel, scope, /*loud=*/false);
+}
+
 // The node of `rule` that `n` IS — `n` itself, or what stands under its wrappers — else an
 // invalid node. The brace walks' descent: "is this element's value a brace list", "is it
 // the string literal that initializes the array", "is this child a designator". The HIR
@@ -14319,14 +14365,39 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
         s.reporter.report(std::move(d));
         return InvalidType;
     };
+    // An initializer that is neither a string literal nor a brace list sizes nothing
+    // (C 6.7.9p14, p16): the same refusal, naming why.
+    auto failNeither = [&]() -> TypeId {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_ArrayLengthOutOfRange;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(initNode);
+        d.actual   = "an array of unknown size takes its length from a string literal or a "
+                     "brace list (C 6.7.9p14, p16, p22), and this initializer is neither: `"
+                     + std::string{tree.text(initNode)} + "`";
+        s.reporter.report(std::move(d));
+        return InvalidType;
+    };
 
-    // Descend the initializer subtree to the FIRST string-literal expr OR brace
-    // list (the init may sit under transparent wrappers — `initValue`, paren
-    // groups). Both rule kinds are mutually exclusive at a given init position.
-    std::vector<NodeId> stack{initNode};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
-        NodeId c = stack.back(); stack.pop_back();
-        if (tree.kind(c) != NodeKind::Internal) continue;
+    // WHAT THE INITIALIZER IS — a string literal or a brace list — under GROUPING only, by
+    // THE statement of what a wrapper is (`nodeSaysSomethingItself`), and through a
+    // compile-time selection to its RESULT (`selectionResultOf`; C 6.5.1.1p3).
+    // ★ P69 (lane `lm`, the review's B): this searched ANY node, depth first and the LAST
+    // child first, for the first string literal or brace list, and stopped in silence after
+    // 8192 nodes. ✔MEASURED 2026-10-15 (pe64, both pipelines): `char s[] = (0, "abc");`,
+    // `(1 ? "abc" : "de")` and `({ "abc"; })` were sized from the literal inside them and
+    // then refused for the type — gcc 13, clang 18, AppleClang 21 and mingw-w64 gcc 13.2
+    // refuse each as no array initializer at all; `_Generic(0, int: "abc")` is four
+    // elements on all four and on DSS (READ, not run: with two string associations the
+    // search took whichever literal it met first, not the selected one's). Every step is
+    // to a strict descendant: the tree's node count bounds it, LOUD past it.
+    SemanticConfig const& semCfg = tree.schema().semantics();
+    auto const& hirCfg = tree.schema().hirLowering();
+    std::size_t const searchBound = tree.nodeCount() + 1;
+    NodeId c = initNode;
+    for (std::size_t step = 0; c.valid() && tree.kind(c) == NodeKind::Internal; ++step) {
+        if (step > searchBound) failOnCyclicTree("the initializer search of an array of unknown size");
         RuleId const r = tree.rule(c);
         if (idx.stringLiteralExprRule.valid()
             && idx.stringLiteralBodyToken.valid()
@@ -14380,8 +14451,7 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
                 if (NodeId const lit =
                         stringLiteralInitializingArray(s, idx, tree, lead.front(), declTy);
                     lit.valid()) {
-                    stack.clear();
-                    stack.push_back(lit);
+                    c = lit;
                     continue;
                 }
             }
@@ -14432,9 +14502,19 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
             if (size <= 0) return failUnsized();
             return completed(interner.array(elem, size));
         }
-        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+        // Neither: a selection is its RESULT; any other node that says something itself is
+        // no string literal and no brace list (an operator over a string is an expression
+        // of its own, C 6.7.9p14); grouping is stepped through.
+        if (nodeIsASelection(semCfg, tree, c)) {
+            c = selectionResultOf(s, semCfg, tree, c, scope);
+            continue;
+        }
+        if (nodeSaysSomethingItself(semCfg, hirCfg, tree, c)) break;
+        auto const inner = internalChildrenOf(tree, c);
+        if (inner.size() != 1) break;
+        c = inner.front();
     }
-    return failUnsized();   // no string/brace initializer found — fail loud, no hang
+    return failNeither();   // no string literal and no brace list: fail loud, no hang
 }
 
 // The kinds whose objects are SCALARS (C 6.2.5p21: the arithmetic types and the pointer
@@ -21360,6 +21440,31 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                NodeId node, ScopeId here, int loopDepth) {
     auto const k = tree.kind(node);
 
+    // ── A STATEMENT EXPRESSION OUTSIDE EVERY FUNCTION BODY (P69, lane `lm`) ─────────────
+    // is refused HERE, at its own node, wherever it stands: GNU C gives the construct a
+    // frame only inside a function (gcc: "braced-group within expression allowed only
+    // inside a function"; clang: "statement expression not allowed at file scope"). The
+    // refusal lived in the lowering alone, which never meets one that is unevaluated or
+    // folded first: ✔MEASURED 2026-10-15 (pe64, both pipelines), `static char
+    // arr[_Generic(({ 1; }), int: 1, default: 2)];`, the same selection in a file-scope
+    // static assertion and in a bit-field's width were ACCEPTED where gcc 13, clang 18,
+    // AppleClang 21 and mingw-w64 gcc 13.2 refuse each. "Inside a function body" is the
+    // chain `checkReturn` walks (`scopeIsInsideAFunctionBody`); the words are the one
+    // statement both tiers say (`kStatementExprOutsideAFunctionBody`).
+    if (k == NodeKind::Internal) {
+        RuleId const stmtExpr = tree.schema().hirLowering().stmtExprRule;
+        if (stmtExpr.valid() && tree.rule(node).v == stmtExpr.v
+            && !scopeIsInsideAFunctionBody(s, here)) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_StatementExprAtFileScope;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(node);
+            d.actual   = std::string{kStatementExprOutsideAFunctionBody};
+            s.reporter.report(std::move(d));
+        }
+    }
+
     // C23 §6.5 (D-CSUBSET-NULLPTR): the fail-loud operator gate. `nullptr`
     // (TypeKind::NullptrT) is a null pointer constant, NOT an arithmetic value;
     // under the HIR lowering it becomes the integer-0 null constant, so WITHOUT this
@@ -24570,6 +24675,30 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
     }
 }
 
+// ── WHICH EXPRESSION IS A BIT-FIELD'S VALUE, ASKED BY THIS TIER ─────────────────────────
+// (cycle P69 round 1, lane `lm`.)
+//
+// The width of the bit-field `n` is the value of, or nothing: THE statement
+// (`bitFieldValueWidth`, core/types/decl_prefix_strip.hpp) asked with this tier's two
+// answers — a member access's field by `resolveMemberAccess`, a selection's winner by
+// Pass 2's record or, before Pass 2 has made one, by the ONE selector. Every semantic
+// question of "is this a bit-field's value" asks HERE: the operators' typing
+// (`subtreeType`, C 6.3.1.1p2's promotion by width) and the third operand of the overflow
+// predicates (`overflowPredicateTarget`: a bit-field's value is checked at its width).
+[[nodiscard]] std::optional<std::uint32_t>
+semanticBitFieldValueWidth(EngineState const& s, SemanticConfig const& sem, Tree const& tree,
+                           NodeId n, ScopeId scope) {
+    return bitFieldValueWidth(
+        sem, tree.schema().hirLowering(), tree, n,
+        [&](NodeId m) -> std::optional<std::uint32_t> {
+            auto const mr = resolveMemberAccess(s, sem, tree, m, scope);
+            if (mr.status != MemberResolution::Status::Ok || !mr.fieldSym.valid())
+                return std::nullopt;
+            return s.symbols.at(mr.fieldSym).bitFieldWidth;
+        },
+        [&](NodeId sel) -> NodeId { return selectionResultOf(s, sem, tree, sel, scope); });
+}
+
 // ══ P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): the GNU builtins'
 // semantic half — what a call of one MEANS beyond its declared signature ══════════════════
 //
@@ -24584,20 +24713,25 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
 // And the library builtins (`semantics.libraryBuiltins`): `__builtin_strlen` binds, on its
 // first use in a tree, to the library function (`resolveLibraryBuiltinUse`).
 
-// The node a parenthesis / single-child wrapper chain stands for — the node that carries the
-// expression's own shape. The CST→HIR tier's `peelToCore` rule (a node with exactly ONE
-// non-token child is transparent) over the shape rules this block reads, so both tiers see
-// the same operand.
-[[nodiscard]] NodeId peelBuiltinOperand(EngineState const& s, Tree const& tree, NodeId n) {
+// The node a grouping chain stands for — the node that carries the expression's own shape:
+// down through the wrappers to the first node that says something itself, by THE statement
+// of what a wrapper is (`nodeSaysSomethingItself`, core/types/decl_prefix_strip.hpp — the
+// one both tiers' descents take their steps by).
+// ★ P69 (lane `lm`, the review's B): this stopped at a list of its own — the operators,
+// the cast, the conditional and the compound literals — so it stepped THROUGH every other
+// construct with one operand: `sizeof e` and `_Alignof` (the operand answered for the
+// size), a statement expression (its item, then the item's expression). And it stopped in
+// silence past its bound, handing back the node it had reached as if the walk had ended;
+// every step is to a strict descendant, so a walk past the node count is a cyclic node
+// graph, and that stops the process (`failOnCyclicTree`) — a stop no program can reach.
+[[nodiscard]] NodeId peelBuiltinOperand(Tree const& tree, NodeId n) {
+    SemanticConfig const& sem = tree.schema().semantics();
     auto const& hc = tree.schema().hirLowering();
     std::size_t const bound = tree.nodeCount() + 1;
-    for (std::size_t step = 0; step <= bound && n.valid(); ++step) {
+    for (std::size_t step = 0; n.valid(); ++step) {
+        if (step > bound) failOnCyclicTree("the builtin operand peel");
         if (tree.kind(n) != NodeKind::Internal) return n;
-        std::uint32_t const r = tree.rule(n).v;
-        if (r == hc.binaryExprRule.v || r == hc.unaryExprRule.v || r == hc.postfixExprRule.v
-            || r == hc.castRule.v || r == hc.ternaryExprRule.v
-            || s.idx().compoundLiteralByRule.contains(r))
-            return n;
+        if (nodeSaysSomethingItself(sem, hc, tree, n)) return n;
         NodeId only{};
         std::size_t internals = 0;
         for (NodeId c : visibleChildren(tree, n)) {
@@ -24617,6 +24751,41 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         n = only;
     }
     return n;
+}
+
+// The node a builtin's operand stands for when the question is its VALUE — which object a
+// pointer designates (`__builtin_object_size`), which string `__builtin_nan` folds: down the
+// grouping (`peelBuiltinOperand`), into a compile-time selection's result
+// (`selectionResultOf`), and into a statement expression of ONE expression statement
+// (`soleExpressionOfStatementExpression`) — the steps THE statement leaves to a descent that
+// asks a value, each by name (P69, lane `lm`). ✔MEASURED 2026-10-15 (gcc 13, clang 18,
+// AppleClang 21, mingw-w64 gcc 13.2): `__builtin_object_size` of `_Generic(0, int: buf)`,
+// `__builtin_choose_expr(1, buf, 0)` and `({ buf; })` over `char buf[10]` is 10 on all four,
+// where this tier answered the unknown -1 for each; `__builtin_nan(_Generic(0, int: "1"))`
+// folds as a static initializer on all four, where this tier refused it; and
+// `__builtin_nan(({ "1"; }))` folds on gcc and mingw-w64 gcc (both clangs refuse it: one
+// working reference makes it required). Every step is to a strict descendant: the node count
+// bounds it, LOUD past it.
+[[nodiscard]] NodeId builtinOperandValueCore(EngineState const& s, SemanticConfig const& cfg,
+                                             Tree const& tree, NodeId n, ScopeId scope) {
+    auto const& hc = tree.schema().hirLowering();
+    std::size_t const bound = tree.nodeCount() + 1;
+    for (std::size_t step = 0;; ++step) {
+        if (step > bound) failOnCyclicTree("the builtin operand's value peel");
+        n = peelBuiltinOperand(tree, n);
+        if (!n.valid() || tree.kind(n) != NodeKind::Internal) return n;
+        if (nodeIsASelection(cfg, tree, n)) {
+            NodeId const result = selectionResultOf(s, cfg, tree, n, scope);
+            if (!result.valid()) return n;
+            n = result;
+            continue;
+        }
+        if (NodeId const value = soleExpressionOfStatementExpression(hc, tree, n); value.valid()) {
+            n = value;
+            continue;
+        }
+        return n;
+    }
 }
 
 // The `hirLowering` op-table entry of the operator token directly under `node`.
@@ -24640,13 +24809,24 @@ builtinOperandOperator(Tree const& tree, NodeId node, std::vector<HirOperatorEnt
     std::size_t visited = 0;
     std::size_t const bound = tree.nodeCount() + 1;
     while (!stack.empty()) {
-        if (++visited > bound) return true;   // a malformed tree reads as "may have effects"
+        // Every node is visited once (a tree): past the node count the graph is cyclic.
+        if (++visited > bound) failOnCyclicTree("the builtin operand's side-effect walk");
         NodeId const n = stack.back();
         stack.pop_back();
         if (!n.valid() || tree.kind(n) != NodeKind::Internal) continue;
         std::uint32_t const r = tree.rule(n).v;
-        if ((hc.stmtExprRule.valid() && r == hc.stmtExprRule.v)
-            || (hc.vaStartRule.valid() && r == hc.vaStartRule.v)
+        // ★ P69 (lane `lm`): a statement expression is read for the effects it HOLDS — one
+        // whose body is a single expression statement is that expression (✔MEASURED
+        // 2026-10-15: `__builtin_object_size(({ buf; }), 0)` is 10 on gcc 13, clang 18,
+        // AppleClang 21 and mingw-w64 gcc 13.2; this answered the unknown -1). Any other
+        // body may declare, branch or jump, and is taken to have one.
+        if (hc.stmtExprRule.valid() && r == hc.stmtExprRule.v) {
+            NodeId const value = soleExpressionOfStatementExpression(hc, tree, n);
+            if (!value.valid()) return true;
+            stack.push_back(value);
+            continue;
+        }
+        if ((hc.vaStartRule.valid() && r == hc.vaStartRule.v)
             || (hc.vaArgRule.valid() && r == hc.vaArgRule.v)
             || (hc.vaEndRule.valid() && r == hc.vaEndRule.v)
             || (hc.vaCopyRule.valid() && r == hc.vaCopyRule.v))
@@ -24711,8 +24891,11 @@ designateBuiltinOperand(EngineState& s, SemanticConfig const& cfg, Tree const& t
     bool lvalue = startIsLvalue;
     std::size_t const bound = tree.nodeCount() + 1;
     std::optional<DesignatedBytes> base;
-    for (std::size_t step = 0; step <= bound; ++step) {
-        n = peelBuiltinOperand(s, tree, n);
+    for (std::size_t step = 0;; ++step) {
+        // Every step is to a strict descendant: past the node count the graph is cyclic
+        // (P69, lane `lm`: this ended in silence and answered "no object").
+        if (step > bound) failOnCyclicTree("the builtin operand's designation");
+        n = builtinOperandValueCore(s, cfg, tree, n, here);
         if (!n.valid()) return std::nullopt;
         TypeId const t = subtreeType(s, tree, n, here);
         TypeKind const tk = t.valid() ? in.kind(t) : TypeKind::Void;
@@ -25039,23 +25222,21 @@ integerShapeOf(EngineState& s, TypeId t) {
     }
 }
 
-// The third operand's cast target: its own type, or — a bit-field member — the bit-field's
+// The third operand's cast target: its own type, or — a bit-field's VALUE — the bit-field's
 // width at its declared type's signedness, as `_BitInt(width)`.
+// ★ P69 (lane `lm`): WHICH OPERAND IS A BIT-FIELD'S VALUE IS THE ONE STATEMENT
+// (`semanticBitFieldValueWidth` → `bitFieldValueWidth`), the one the operators' typing asks.
+// This re-derived it: a member access under the builtin peel — so `(0, v.b)`, `(v.b = 0)`,
+// `++v.b`, `_Generic(0, int: v.b)` and `__builtin_choose_expr(1, v.b, 0)` were checked at
+// the field's declared type, never at its width.
 [[nodiscard]] std::optional<OverflowPredicateTarget>
 overflowPredicateTarget(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         NodeId operand, ScopeId scope) {
     auto target = integerShapeOf(s, subtreeType(s, tree, operand, scope));
     if (!target.has_value()) return std::nullopt;
-    NodeId const core = peelBuiltinOperand(s, tree, operand);
-    if (core.valid() && tree.kind(core) == NodeKind::Internal
-        && s.idx().memberAccessByRule.contains(tree.rule(core).v)) {
-        MemberResolution const mr = resolveMemberAccess(s, cfg, tree, core, scope);
-        if (mr.status == MemberResolution::Status::Ok && mr.fieldSym.valid()) {
-            if (auto const w = s.symbols.at(mr.fieldSym).bitFieldWidth; w.has_value()) {
-                target->bits = static_cast<std::int64_t>(*w);
-                target->type = s.lattice.interner().bitInt(target->bits, target->isSigned);
-            }
-        }
+    if (auto const w = semanticBitFieldValueWidth(s, cfg, tree, operand, scope); w.has_value()) {
+        target->bits = static_cast<std::int64_t>(*w);
+        target->type = s.lattice.interner().bitInt(target->bits, target->isSigned);
     }
     return target;
 }
@@ -25292,7 +25473,7 @@ void checkBuiltinVerbCall(EngineState& s, SemanticConfig const& cfg, Tree const&
             // `nan`: lane `cs`'s probe r5s s12) — bound exactly as `__builtin_<name>` binds a
             // library builtin.
             if (args.size() != 1) return;
-            NodeId const op = peelBuiltinOperand(s, tree, args[0]);
+            NodeId const op = builtinOperandValueCore(s, cfg, tree, args[0], scope);
             if (op.valid() && tree.kind(op) == NodeKind::Internal) {
                 bool tokensOnly = true;
                 for (NodeId c : visibleChildren(tree, op))
@@ -26055,6 +26236,29 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         return ot;
     };
     auto const& hirCfg = tree.schema().hirLowering();
+    // ★ P69 (lane `lm`, D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT): AN OPERAND
+    // THAT IS A BIT-FIELD'S VALUE HAS ITS PROMOTED TYPE (C 6.3.1.1p2 — by the field's WIDTH,
+    // `bitFieldPromotedType`), and WHICH operand is one is the ONE statement both tiers ask
+    // (`bitFieldValueWidth`, decl_prefix_strip.hpp). Every operator read its operand at the
+    // field's declared type: ✔MEASURED 2026-10-15 (pe64, both pipelines, images run),
+    // `_Generic(v.b + 0, …)` over `unsigned b : 3` selected `unsigned int` and
+    // `v.b - 6 < 0` ran 0 where gcc 13, clang 18, AppleClang 21 and mingw-w64 gcc 13.2 say
+    // `int` and 1 — in 305 of the matrix's cells. ⚠ THIS MOVES WITH THE LOWERING's
+    // `asBitFieldValue` (cst_to_hir.cpp), AND NEITHER ALONE: this tier answers `sizeof`,
+    // `_Generic`, `typeof` and `auto`, the lowering computes the value.
+    // A selection's winner is Pass 2's record when it has made one; before that the ONE
+    // selector picks it — whose controlling type this walk derived already (the operand was
+    // typed before its operator asks), so the query is answered by the derived record and
+    // nests no deeper than the `__builtin_choose_expr` arm of `enter` already does.
+    auto const bitFieldOperandType = [&](NodeId operandN, TypeId t) -> TypeId {
+        if (!arith.has_value() || !t.valid() || !operandN.valid()) return t;
+        // No width changes a plain `int`, a floating, a pointer or an aggregate type:
+        // the walk is asked only of a type a bit-field's promotion can change.
+        if (bitFieldPromotedType(interner, t, 1, *arith).v == t.v) return t;
+        auto const width = semanticBitFieldValueWidth(s, sem, tree, operandN, scope);
+        if (!width.has_value()) return t;
+        return bitFieldPromotedType(interner, t, *width, *arith);
+    };
 
     // ── leaf typing: an identifier resolves to its symbol's type by scope ──
     // A literal token is Pass-2-stamped (handled by the `typeAt` short-circuit in
@@ -26103,7 +26307,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         return arrayToPointerDecay(interner, t);
     };
     auto const combineBinary =
-        [&](HirOperatorEntry const* e, TypeId lt, TypeId rt) -> TypeId {
+        [&](HirOperatorEntry const* e, TypeId lt, TypeId rt, NodeId lhsN,
+            NodeId rhsN) -> TypeId {
         // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE: `&&`/`||` yield C's `int`
         // (6.5.13p3 / 6.5.14p3), config-driven — the SSA carrier stays i1/Bool by
         // design (D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE).
@@ -26137,6 +26342,13 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // 18, AppleClang 21 and mingw-w64 gcc 13.2 say 8 and drop them.
         if (e->target == "Comma")  return rt;   // the RHS's, read as a value below
         if (e->target == "Assign" || !e->compoundBase.empty()) return lt;
+        // ★ P69 (lane `lm`): every other operator reads a bit-field operand at its
+        // promoted type (`bitFieldOperandType`) — the shift's left operand, the
+        // comparisons and the arithmetic alike. The comma and the assignments above hand
+        // on their operand's type: whether THEY are a bit-field's value is the walk's
+        // question, asked by the operator they are an operand of.
+        lt = bitFieldOperandType(lhsN, lt);
+        rt = bitFieldOperandType(rhsN, rt);
         // P68 round 9 (lane `cs`): an operation the POINTER HALF of the operand
         // constraints refuses (`p * 2`, `5 - p`, `p + 1.5` — pass2Post's SE4e reports
         // it, asking this same predicate) HAS no type. Handing it the fallback's
@@ -26244,7 +26456,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         if (common.valid()) return common;
         return lt.valid() ? lt : rt;
     };
-    auto const combineUnary = [&](HirOperatorEntry const* e, TypeId ot) -> TypeId {
+    auto const combineUnary = [&](HirOperatorEntry const* e, TypeId ot,
+                                  NodeId operandN) -> TypeId {
         if (e->target == "AddressOf") return ot.valid() ? interner.pointer(ot) : InvalidType;
         if (e->target == "Deref") {
             // D-CSUBSET-ARRAY-DECAY-IN-DEREF (C 6.3.2.1p3): unary `*` on an ARRAY
@@ -26265,6 +26478,9 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // also lowers prefix ++/-- to a SeqExpr whose result type is the lvalue
         // type, so the two tiers agree.
         if (e->target == "PreInc" || e->target == "PreDec") return ot;
+        // ★ P69 (lane `lm`): `+`, `-` and `~` promote a bit-field operand by its width
+        // (`bitFieldOperandType`) — `-v.b` over `unsigned b : 3` is an `int`.
+        ot = bitFieldOperandType(operandN, ot);
         // P68 round 9 (lane `cs`): unary `+`/`-`/`~` of a pointer is refused by
         // pass2Post's SE4e through this same predicate, and a refused operation has
         // no type (see `combineBinary`) — `long r = -p;` drew a second diagnostic.
@@ -26322,6 +26538,12 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     };
     auto const combineTernary = [&](TypeId thenT, TypeId elseT,
                                     NodeId thenN, NodeId elseN) -> TypeId {
+        // ★ P69 (lane `lm`): an arm that is a bit-field's value is balanced at its
+        // promoted type (`bitFieldOperandType`): `1 ? v.b : v.b` over `unsigned b : 3` is
+        // an `int` on all four references (C 6.5.15p5 applies the usual arithmetic
+        // conversions, whose first step is the promotion).
+        thenT = bitFieldOperandType(thenN, thenT);
+        elseT = bitFieldOperandType(elseN, elseT);
         TypeId const common = commonArithType(thenT, elseT);
         if (common.valid()) return common;
         // C 6.5.15p6: a conditional with ONE arm a pointer and the OTHER a
@@ -26849,7 +27071,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 f.c0 = result; f.phase = 2; NodeId n = f.n1; enter(n);
             } else {
                 HirOperatorEntry const* e = f.e; TypeId lt = f.c0;
-                work.pop_back(); result = combineBinary(e, lt, result);
+                NodeId const lhsN = f.n0, rhsN = f.n1;   // CAPTURED before the pop
+                work.pop_back(); result = combineBinary(e, lt, result, lhsN, rhsN);
                 finishedOnAValue = true;   // every binary operator: `=` and `,` too
             }
             break;
@@ -26857,7 +27080,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             if (f.phase == 0) { f.phase = 1; NodeId n = f.n0; enter(n); }
             else {
                 HirOperatorEntry const* e = f.e;
-                work.pop_back(); result = combineUnary(e, result);
+                NodeId const operandN = f.n0;            // CAPTURED before the pop
+                work.pop_back(); result = combineUnary(e, result, operandN);
                 finishedOnAValue = e->target != "Deref";   // `*E` alone designates an object
             }
             break;

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 // D-DECL-PREFIX-STRIP-SHARED-HELPER (closed 2026-06-11): the ONE source of
@@ -416,7 +417,10 @@ arraySuffixHasModifier(Tree const& tree, NodeId suffix,
 //     forms under it): the operand is not evaluated, its SIZE is the value;
 //   * a cast, a compound literal, a brace list;
 //   * a compile-time selection (`_Generic`, `__builtin_choose_expr`), a label address, a
-//     statement expression.
+//     statement expression;
+//   * a builtin the language document folds to a constant the semantic tier computes
+//     (`hirLowering.foldedConstantRules`: `__builtin_offsetof`, `__builtin_types_compatible_p`)
+//     — its operands are TYPE names and a member designator, none of them the value.
 // (A literal's node — a string, a character — has no child to walk into, so no descent
 // needs it named; a caller that wants one asks for it by its own means.)
 //
@@ -450,20 +454,36 @@ arraySuffixHasModifier(Tree const& tree, NodeId suffix,
 // is. A construct the grammar gains is named HERE, or it is a wrapper to every descent
 // that reads this: that is the reason there is one of these.
 //
-// ⚠ NOT EVERY DESCENT READS IT YET, and this comment said every one did. Six still take
-// their steps by a list or a count of their own: `wrapperChild` and the wrapper tail of
-// `evalNode` (`hir/cst_const_eval.cpp` — its dispatch list is a second statement, which is
-// why a mutant taking the statement expression out of THIS one changed no constant: the
-// evaluator peels a one-expression body by its child count); `peelBuiltinOperand` and the
-// search of `completeIncompleteArrayFromInit` (`semantic_analyzer.cpp`); `peelToCore` and
-// `peelToDesignatorLeaf` (`hir/lowering/cst_to_hir.cpp`). Each either reads this or says
-// why it must not; until then "one statement" is true of the descents named above it.
+// ★ EVERY DESCENT READS IT (cycle P69 round 1, lane `lm`; a review of the fold found six
+// that took their steps by a list or a count of their own, and this comment saying they
+// did not): the semantic tier's initializer descents, constant-subobject peel, brace walks
+// (`peelSingleChildrenTo`), builtin-operand peel (`peelBuiltinOperand`) and the search of
+// `completeIncompleteArrayFromInit`; the evaluator's `wrapperChild` and `evalNode`'s wrapper
+// tail (`hir/cst_const_eval.cpp`); the lowering's `peelToBraceInitOrCore`, `peelToCore`
+// and `peelToDesignatorLeaf` (`hir/lowering/cst_to_hir.cpp`); and `bitFieldValueWidth`
+// below. A descent asking a VALUE question takes the steps the statement leaves to it
+// (the statement expression's sole expression, a selection's result) in its own body,
+// by name — never by counting children.
 //
 // THE RULE IDS: each construct is read from ONE key of the language document — the
 // operators, the `sizeof` / `_Alignof` alternatives, the selection, label-address and
 // statement-expression rules and the brace list from `hirLowering`; the `sizeof` /
 // `_Alignof` forms, `_Generic`, the casts and the compound literals from `semantics` — and
 // both tiers hand in the same two blocks of the same schema.
+
+// THE ONE ANSWER OF A DESCENT THAT HAS TAKEN MORE STEPS THAN ITS TREE HAS NODES. Every
+// descent bounded by it moves to a strict descendant at each step, so on a well-formed
+// tree it can never get here: getting here means the node graph is cyclic — memory
+// corruption or a tree-builder bug, never the program's fault — and the process stops
+// LOUD. Never an answer as if the walk had ended: a truncated walk is how a fixed depth
+// cap skipped what it had not looked at. (The semantic tier's `failOnCyclicTree` says the
+// same for its own walks.)
+[[noreturn]] inline void
+failOnCyclicNodeGraph(char const* walk) {
+    std::fprintf(stderr, "dss fatal: %s took more steps than its tree has nodes — the node "
+                         "graph is cyclic\n", walk);
+    std::abort();
+}
 
 // `sizeof` / `_Alignof` in any of their forms: the operand below is not evaluated
 // (C 6.5.3.4p2).
@@ -492,6 +512,8 @@ nodeSaysSomethingItself(SemanticConfig const& cfg, HirLoweringConfig const& hirC
         || nodeIsAnUnevaluatedOperandForm(cfg, hirCfg, tree, n)) {
         return true;
     }
+    for (RuleId const folded : hirCfg.foldedConstantRules)
+        if (is(folded)) return true;
     for (auto const& row : cfg.castRules)
         if (row.rule.valid() && row.rule.v == r) return true;
     for (auto const& row : cfg.compoundLiteralRules)
@@ -518,21 +540,39 @@ nodeSaysSomethingItself(SemanticConfig const& cfg, HirLoweringConfig const& hirC
 // AppleClang 21. Stopping such a question at the node refused both. A descent that asks
 // one takes the step below where the statement stops it — and ONLY such a descent.
 //
-// `statementExpressionBody` reads the construct as the lowering does (`stmtExprItems`,
-// `hir/lowering/cst_to_hir.cpp`): its items are its children that are not tokens, and
+// `statementExpressionBody` is THE reading of the construct, the lowering's too (its
+// `stmtExprItems`, `hir/lowering/cst_to_hir.cpp`, asks it for the value and keeps only
+// the items it runs as statements): its items are its children that are not tokens, and
 // its value is the expression of the LAST item when that item is an expression
 // statement — the item peeled through its single-child carriers to the first rule with
 // a HIR mapping, which must be the kind `ExprStmt`; the expression is that node's first
 // child that is not a token. A body ending in anything else has no value (`void`).
+// ★ A LABEL ON THE LAST ITEM IS STEPPED THROUGH (cycle P69 round 1, lane `lm`): the
+// labeled statement's own statement is the item read. ✔MEASURED 2026-10-15,
+// `({ int r = 0; if (g) goto in; r = 1; in: r; })` is 1 for g == 0 and 0 otherwise,
+// `({ x: 5; })` is 5 and two labels in a row are stepped through alike, on AppleClang 21,
+// gcc 13.3 (x86_64 and arm64) and clang 18 — DSS refused the construct. The labels stepped
+// through are handed back (`labels`, outermost first): the lowering places each one, on
+// an empty statement, where it stood — before the value is computed — so a `goto` in the
+// body reaches it.
 //
 // ★ ONE ITEM, AND IT IS SAID IN ONE PLACE. `soleExpressionOfStatementExpression` is the
 // step, and it steps only through a body of exactly one item. A body of several
 // (`({ 1; -5; })`, which clang 18 and AppleClang 21 fold and gcc does not) is read as a
 // constant by widening THIS function — to the last item, when every earlier one is
 // inert — and nowhere else.
+// THE WORDS OF THE REFUSAL of a statement expression outside every function body
+// (`S_StatementExprAtFileScope`), said once: the semantic tier refuses the construct at its
+// own node (`pass2Post`), and the lowering's guard says the same if it is ever reached on
+// a model that holds no error.
+inline constexpr std::string_view kStatementExprOutsideAFunctionBody =
+    "a statement expression '({ ... })' is only valid inside a function (GNU C 6.1) — "
+    "at file scope there is no frame to run its statements in";
+
 struct StatementExpressionBody {
-    NodeId      value{};     // the last item's expression; invalid when the body has no value
-    std::size_t items = 0;   // how many items the body holds
+    NodeId              value{};     // the last item's expression; invalid when the body has no value
+    std::size_t         items = 0;   // how many items the body holds
+    std::vector<NodeId> labels;      // the labeled statements the value stands under, outermost first
 };
 
 [[nodiscard]] inline StatementExpressionBody
@@ -555,9 +595,11 @@ statementExpressionBody(HirLoweringConfig const& hirCfg, Tree const& tree, NodeI
         return nullptr;
     };
     // The item's core: down its single-child carriers, stopping where the lowering stops —
-    // at a token, at an expression node, at the first rule with a HIR mapping. Every step
-    // is to a strict descendant, so the tree's node count bounds the walk; a walk past it
-    // is a cyclic node graph, never the program's fault, and stops the process.
+    // at a token, at an expression node, at the first rule with a HIR mapping; a labeled
+    // statement's mapping is stepped through to its statement (its first child that is
+    // not a token) and the peel goes on. Every step is to a strict descendant, so the
+    // tree's node count bounds the walk; a walk past it is a cyclic node graph, never the
+    // program's fault, and stops the process.
     NodeId core = last;
     std::size_t const bound = tree.nodeCount() + 1;
     for (std::size_t guard = 0; core.valid() && tree.kind(core) == NodeKind::Internal; ++guard) {
@@ -567,6 +609,19 @@ statementExpressionBody(HirLoweringConfig const& hirCfg, Tree const& tree, NodeI
             std::abort();
         }
         std::uint32_t const r = tree.rule(core).v;
+        if (HirRuleMapping const* const lm = mappingOf(core);
+            lm != nullptr && lm->hirKind == "LabelStmt") {
+            NodeId stmt{};
+            for (NodeId c : decl_prefix_detail::visibleChildren(tree, core)) {
+                if (tree.kind(c) == NodeKind::Token) continue;
+                stmt = c;
+                break;
+            }
+            if (!stmt.valid()) return out;   // a label on nothing: no value
+            out.labels.push_back(core);
+            core = stmt;
+            continue;
+        }
         if (r == hirCfg.binaryExprRule.v || r == hirCfg.unaryExprRule.v
             || r == hirCfg.postfixExprRule.v || r == hirCfg.operandRule.v
             || (hirCfg.ternaryExprRule.valid() && r == hirCfg.ternaryExprRule.v)
@@ -583,9 +638,15 @@ statementExpressionBody(HirLoweringConfig const& hirCfg, Tree const& tree, NodeI
         if (many || !sole.valid()) break;
         core = sole;
     }
-    if (!core.valid() || tree.kind(core) != NodeKind::Internal) return out;
+    if (!core.valid() || tree.kind(core) != NodeKind::Internal) {
+        out.labels.clear();
+        return out;
+    }
     HirRuleMapping const* const m = mappingOf(core);
-    if (m == nullptr || m->hirKind != "ExprStmt") return out;
+    if (m == nullptr || m->hirKind != "ExprStmt") {
+        out.labels.clear();
+        return out;
+    }
     for (NodeId c : decl_prefix_detail::visibleChildren(tree, core)) {
         if (tree.kind(c) == NodeKind::Token) continue;
         out.value = c;
@@ -601,6 +662,103 @@ statementExpressionBody(HirLoweringConfig const& hirCfg, Tree const& tree, NodeI
 soleExpressionOfStatementExpression(HirLoweringConfig const& hirCfg, Tree const& tree, NodeId n) {
     StatementExpressionBody const body = statementExpressionBody(hirCfg, tree, n);
     return body.items == 1 ? body.value : NodeId{};
+}
+
+// ── WHICH EXPRESSION IS A BIT-FIELD'S VALUE ────────────────────────────────────────────
+// (cycle P69 round 1, lane `lm`.)
+//
+// C 6.3.1.1p2 promotes a bit-field by its WIDTH (`bitFieldPromotedType`, type_rules.hpp),
+// so an operator must know whether an operand IS a bit-field's value — and that is a
+// question of the expression's FORM, asked by both tiers: the semantic typer
+// (`subtreeType`) and the lowering (`asBitFieldValue`) ask THIS, and neither re-derives it.
+// The answer is the width of the field, or nothing. The forms, ✔MEASURED 2026-10-15 on
+// AppleClang 21, clang 18, gcc 13 and mingw-w64 gcc 13.2 (`_Generic` of the result + 0,
+// and a value that tells `int` from `unsigned`), each one promoted by all four:
+//   * a member access, `.` or `->`, naming a bit-field (through an element of an array of
+//     structures and a nested structure alike);
+//   * through a WRAPPER — parentheses, `__extension__` (`nodeSaysSomethingItself`);
+//   * a SELECTION's result — `_Generic(0, int: v.b)`, `__builtin_choose_expr(1, v.b, 0)`:
+//     the selected expression (`selectedArm`, the tier's record of the winner);
+//   * the comma's RIGHT operand; an assignment or a compound assignment (its value is the
+//     field's after the store); a PREFIX `++` / `--`.
+// NOT a bit-field's value, each a fork decided by the references that answer it (clang 18
+// and AppleClang 21 — the same source as the WIDER-than-`int` answer): the postfix `E++` /
+// `E--` (clang and cl 19.51 give the declared type; gcc and mingw promote); a statement
+// expression `({ v.b; })` (both clangs give the declared type; gcc and mingw promote — with
+// the own-width bit-field type the wider answer declines). A conditional is not one either
+// — its arms are each promoted and then balanced (all four agree).
+// `memberWidth(n)` is the tier's: the width of the field a member-access node `n` names,
+// when that field is a bit-field. `selectedArm(n)`: the expression a `_Generic` or
+// `__builtin_choose_expr` node selected, or an invalid node.
+// Every step is to a strict descendant (a selected arm is one), so the tree's node count
+// bounds the walk; a walk past it is a cyclic node graph and stops the process.
+template <class MemberWidth, class SelectedArm>
+[[nodiscard]] std::optional<std::uint32_t>
+bitFieldValueWidth(SemanticConfig const& cfg, HirLoweringConfig const& hirCfg, Tree const& tree,
+                   NodeId n, MemberWidth const& memberWidth, SelectedArm const& selectedArm) {
+    auto const entryOf = [&](NodeId node, std::vector<HirOperatorEntry> const& ops)
+        -> HirOperatorEntry const* {
+        for (NodeId c : decl_prefix_detail::visibleChildren(tree, node)) {
+            if (tree.kind(c) != NodeKind::Token) continue;
+            for (HirOperatorEntry const& e : ops)
+                if (e.token.v == tree.tokenKind(c).v) return &e;
+        }
+        return nullptr;
+    };
+    auto const operand = [&](NodeId node, std::size_t which) -> NodeId {
+        std::size_t k = 0;
+        for (NodeId c : decl_prefix_detail::visibleChildren(tree, node)) {
+            if (tree.kind(c) == NodeKind::Token) continue;
+            if (k++ == which) return c;
+        }
+        return NodeId{};
+    };
+    std::size_t const bound = tree.nodeCount() + 1;
+    for (std::size_t guard = 0; n.valid() && tree.kind(n) == NodeKind::Internal; ++guard) {
+        if (guard > bound) {
+            std::fprintf(stderr, "dss fatal: the bit-field value walk took more steps than its "
+                                 "tree has nodes — the node graph is cyclic\n");
+            std::abort();
+        }
+        std::uint32_t const r = tree.rule(n).v;
+        auto const is = [r](RuleId rule) { return rule.valid() && rule.v == r; };
+        if (is(hirCfg.postfixExprRule)) {
+            HirOperatorEntry const* const e = entryOf(n, hirCfg.postfixOps);
+            if (e == nullptr
+                || (e->target != "MemberAccess" && e->target != "MemberAccessThruPtr")) {
+                return std::nullopt;                      // a call, an index, `E++`, `E--`
+            }
+            return memberWidth(n);
+        }
+        if (is(hirCfg.binaryExprRule)) {
+            HirOperatorEntry const* const e = entryOf(n, hirCfg.binaryOps);
+            if (e == nullptr) return std::nullopt;
+            if (e->target == "Assign") { n = operand(n, 0); continue; }   // `=` and `OP=`
+            if (e->target == "Comma")  { n = operand(n, 1); continue; }
+            return std::nullopt;
+        }
+        if (is(hirCfg.unaryExprRule)) {
+            HirOperatorEntry const* const e = entryOf(n, hirCfg.unaryOps);
+            if (e != nullptr && (e->target == "PreInc" || e->target == "PreDec")) {
+                n = operand(n, 0);
+                continue;
+            }
+            return std::nullopt;
+        }
+        if (is(cfg.genericRule) || is(hirCfg.chooseExprRule) || is(cfg.builtinChooseExprRule)) {
+            n = selectedArm(n);
+            continue;
+        }
+        if (nodeSaysSomethingItself(cfg, hirCfg, tree, n)) return std::nullopt;
+        NodeId sole{};
+        for (NodeId c : decl_prefix_detail::visibleChildren(tree, n)) {
+            if (tree.kind(c) == NodeKind::Token) continue;
+            if (sole.valid()) return std::nullopt;        // not a wrapper after all
+            sole = c;
+        }
+        n = sole;
+    }
+    return std::nullopt;
 }
 
 } // namespace dss

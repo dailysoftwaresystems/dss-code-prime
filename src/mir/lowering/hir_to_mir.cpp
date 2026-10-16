@@ -7821,17 +7821,6 @@ struct Lowerer {
         return p.unitBytes != 0 ? &p : nullptr;
     }
 
-    // True iff `k` is a SIGNED integer kind (so a bit-field extract must
-    // sign-extend). U*/Char/Bool extract zero-extended (char bit-field signedness
-    // is implementation-defined — we choose unsigned, self-consistently).
-    [[nodiscard]] static bool bitfieldIsSigned(TypeKind k) noexcept {
-        switch (k) {
-            case TypeKind::I8: case TypeKind::I16: case TypeKind::I32:
-            case TypeKind::I64: case TypeKind::I128: return true;
-            default:                                 return false;
-        }
-    }
-
     // FC8 D-CSUBSET-ENUM-BITFIELD: an enum-typed bit-field's allocation unit IS
     // its underlying integer (C 6.7.2.1 + the enum-behaves-as-underlying rule,
     // D-CSUBSET-ENUM-INT-CONVERSION). Resolve Enum→underlying so the unit's
@@ -7848,7 +7837,7 @@ struct Lowerer {
     // D-CSUBSET-BITINT-BITFIELD: a `_BitInt(N<=64)` bit-field's allocation unit runs
     // at its native container (I8/U8..I64/U64 by width+signedness), the same
     // Enum→underlying trick (the reprKind precedent). Resolving here means
-    // bitfieldIsSigned / the shift-mask constants / mapCast all see a plain primitive,
+    // `isSignedIntKind` / the shift-mask constants / mapCast all see a plain primitive,
     // never BitInt. Wide (N>64) BitInt bit-fields are rejected at the semantic tier
     // (the >64 allocation-unit cap) and never reach codegen.
     [[nodiscard]] TypeId bitIntReprType(TypeId t) {
@@ -7892,7 +7881,15 @@ struct Lowerer {
             return mir.addInst(op, ops, computeTy);
         };
         MirInstId result;
-        if (bitfieldIsSigned(interner.kind(fieldTy))) {
+        // ★ P69 (lane `lm`): THE FIELD'S SIGN IS THE ONE TARGET-AWARE ANSWER, `isSignedIntKind`
+        // — a plain `char` field is signed exactly where the target's plain `char` is (C
+        // 6.2.5p15). A list of this function's own (I8..I128, no `Char`) read every `char`
+        // field UNSIGNED, while the constant tier read it by the target's sign: ✔MEASURED
+        // 2026-10-15 (pe64, both pipelines), `char b : 3` holding 7 read 7 where gcc 13, clang
+        // 18, AppleClang 21, mingw-w64 gcc 13.2 and cl 19.51 read -1, and `if (g.b == -1)
+        // return 42; return 7;` over a constant `g` died of an illegal instruction — the fold
+        // said TRUE, the code after the `if` was marked never reached, the run time read 7.
+        if (isSignedIntKind(interner.kind(fieldTy))) {
             MirInstId v = shiftBy(unitVal, MirOpcode::Shl, B - p.bitOffset - p.bitWidth);
             result = shiftBy(v, MirOpcode::AShr, B - p.bitWidth);
         } else {
@@ -7905,6 +7902,18 @@ struct Lowerer {
                 v = mir.addInst(MirOpcode::And, ops, computeTy);
             }
             result = v;
+        }
+        // ★ P69 (lane `lm`): A `_Bool` FIELD'S VALUE IS ITS BIT COMPARED WITH ZERO — a
+        // `_Bool` is made by a comparison (C 6.3.1.2), never by narrowing an integer, and
+        // the targets realize no narrowing to it: the Trunc below refused every read
+        // (✔MEASURED 2026-10-15, pe64, both pipelines: `L_UnsupportedLoweringForOpcode`
+        // "Trunc result: TypeKind ordinal 0" for each of 12 programs reading a
+        // `_Bool b : 1`, where gcc 13, clang 18, AppleClang 21 and mingw-w64 gcc 13.2 run
+        // all 12). The extracted bit is 0 or 1, so the comparison is its value.
+        if (promote && interner.kind(fieldTy) == TypeKind::Bool) {
+            MirInstId const zero = constIntOfType(0, computeTy);
+            std::array<MirInstId, 2> ne{result, zero};
+            return mir.addInst(MirOpcode::ICmpNe, ne, fieldTy);
         }
         if (promote) {   // Trunc the i32 result back to the field type (caller contract)
             std::array<MirInstId, 1> ta{result};
@@ -7927,6 +7936,20 @@ struct Lowerer {
         // and the unit Store at the end) carry the flag — the whole RMW is one
         // volatile access of the unit, never elided/reordered.
         fieldTy = bitIntReprType(enumReprType(fieldTy));   // enum/BitInt → container
+        // ★ P69 (lane `lm`): A `_Bool` FIELD'S UNIT IS A BYTE, and it is read, merged and
+        // stored as one — the merged unit holds every other field packed beside it, so it
+        // is no `_Bool` value, and narrowing to `_Bool` is a conversion the targets do not
+        // realize (the store's Trunc refused every write, ✔MEASURED with the read: see
+        // `emitBitfieldExtract`). The address is re-typed to the byte; the right operand
+        // stays the `_Bool` it is (0 or 1) and widens from its own type.
+        TypeKind const rhsKind = interner.kind(fieldTy);   // the caller's contract: field-typed
+        if (rhsKind == TypeKind::Bool && p.unitBytes == 1) {
+            TypeId const byteTy = interner.primitive(TypeKind::U8);
+            std::array<MirInstId, 1> pc{unitPtr};
+            unitPtr = mir.addInst(MirOpcode::Bitcast, pc, interner.pointer(byteTy));
+            if (!unitPtr.valid()) return false;
+            fieldTy = byteTy;
+        }
         // c73 (D-CSUBSET-32BIT-ALU-FORMS): mirror emitBitfieldExtract — a SUB-INT
         // unit computes the read-modify-write at the promoted int width, then
         // Truncs the merged unit back to the field type for the Store. A native
@@ -7951,8 +7974,7 @@ struct Lowerer {
             // caller coerces the value to the field type before this call). Only
             // its low `bitWidth` bits survive the mask.
             std::array<MirInstId, 1> ra{rhsVal};
-            rhsVal = mir.addInst(mapCast(interner.kind(fieldTy), TypeKind::I32),
-                                 ra, computeTy);
+            rhsVal = mir.addInst(mapCast(rhsKind, TypeKind::I32), ra, computeTy);
         }
         MirInstId const clrK = constIntOfType(static_cast<std::int64_t>(~fieldMask), computeTy);
         std::array<MirInstId, 2> ca{unit, clrK};

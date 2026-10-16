@@ -221,6 +221,23 @@ TEST(ConstantReadAsTheObjectHoldsIt, ANamedConstantIsReadAtItsDeclaredType) {
         auto m = analyzeC(std::string{kNamed} + "int main(void){ " + line + " return 0; }\n");
         EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u) << line;
     }
+    // ★ A TYPE WITH NO CONSTANT VALUE IS NO CONSTANT (a review of checkpoint 21, F2). A
+    // fold holds one real number, so a `_Complex` constant has no value at its own type,
+    // and at its initializer's it is another number: `z / 2 == 0` folded TRUE over a `z`
+    // given 1 and the assertion PASSED, where clang 18 and AppleClang 21 fail it and gcc
+    // 13 calls it no constant (✔MEASURED 2026-10-15). Both directions are no constant
+    // now — the true one too, so the refusal is not a value that happens to be false.
+    for (char const* line : {"_Static_assert(z / 2 == 0, \"m\");",
+                             "_Static_assert(z / 2 != 0, \"m\");",
+                             "_Static_assert(z == 1, \"m\");"}) {
+        auto m = analyzeC(std::string{kNamed} + "static const double _Complex z = 1;\n"
+                          "int main(void){ " + line + " return 0; }\n");
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u) << line;
+        EXPECT_NE(allActuals(m, DiagnosticCode::S_StaticAssertFailed).find("not an integer constant"),
+                  std::string::npos)
+            << line << ": a `_Complex` constant is refused as no constant, not as a false one"
+            << allActuals(m, DiagnosticCode::S_StaticAssertFailed);
+    }
 }
 
 // THE LOWERING HANDS ITS EVALUATOR THE SAME FACTS. Two programs over the same
@@ -252,4 +269,19 @@ TEST(ConstantReadAsTheObjectHoldsIt, TheLoweringMarksNoReachedCodeAsNeverReached
     EXPECT_EQ(positionsMarkedNeverReached(trueInC), 4u)
         << "the premise: each of the four conditions folds, true, over an arm that "
            "returns — one mark per function";
+
+    // A `_Complex` constant is no constant (F2): its condition is not folded either way,
+    // so nothing after the `if` is marked. Read at its initializer's type, `z / 2 == 0`
+    // over a `z` given 1 folded TRUE, `return x` was marked, and the program died of an
+    // illegal instruction where all five GNU-dialect references return x (✔MEASURED
+    // 2026-10-15, pe64, both pipelines).
+    std::string const complexConstant = objects +
+        "static const double _Complex z = 1;\n"
+        "int e(int x) { if (z / 2 == 0) return 7; return x; }\n"
+        "int f(int x) { if (z / 2 != 0) return 7; return x; }\n"
+        "int main(void) { return e(0) + f(0); }\n";
+    ASSERT_EQ(parseErrorsFor(complexConstant), 0u);
+    EXPECT_EQ(positionsMarkedNeverReached(complexConstant), 0u)
+        << "a condition over a `_Complex` constant was folded: the code after its "
+           "statement is marked as never reached";
 }
