@@ -171,7 +171,14 @@ analyzeForTargetFormat(std::shared_ptr<CompilationUnit const> cu,
         // attribute is then refused by name rather than accepted on a guess.
         callingConvention != nullptr
             ? std::optional<std::string_view>{callingConvention->name}
-            : std::nullopt);
+            : std::nullopt,
+        // P69 (lane `cs`): the format's reason to refuse a symbol alias — present
+        // where the platform's own C compilers refuse one (the Mach-O documents),
+        // absent where an alias is built.
+        format.symbolAliasUnsupportedReason(),
+        // P69 (lane `cs`): whether the format's document states commons — where it
+        // does not, the `common` attribute is refused by name.
+        format.statesCommons());
     return TargetFormatAnalysis{std::move(model), std::move(analyzeVaLayout)};
 }
 

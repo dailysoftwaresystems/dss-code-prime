@@ -338,6 +338,18 @@ ModuleSummary buildModuleSummary(SummaryCuInput const& cu) {
         out.globals.push_back(std::move(row));
     }
 
+    // P69 (lane `cs`): the TU's aliases, in the module's order (the builder's).
+    for (MirAlias const& a : mir.aliases()) {
+        SummaryAlias row;
+        row.name       = cu.nameOf(a.alias);
+        row.symbol     = a.alias.v;
+        row.targetName = cu.nameOf(a.target);
+        row.binding    = a.linkage.binding;
+        row.visibility = a.linkage.visibility;
+        row.weakKind   = a.linkage.statedWeakKind();
+        out.aliases.push_back(std::move(row));
+    }
+
     sortUnique(escaped);
     out.escapedSymbolNames = std::move(escaped);
     return out;
@@ -357,6 +369,8 @@ ModuleSummary buildModuleSummary(SummaryCuInput const& cu) {
 //   nGlobal   u32   then nGlobal global rows
 //   nImport   u32   then nImport import rows
 //   nEscape   u32   then nEscape strings
+//   nAlias    u32   then nAlias alias rows (version 3): name str, symbol u32,
+//                   target str, binding u8, visibility u8, weak kind u8
 //
 // where `str` is u32 length followed by that many raw bytes (NOT
 // NUL-terminated — a symbol name is arbitrary bytes from a descriptor and may
@@ -482,9 +496,11 @@ constexpr std::size_t kMagicBytes = 7;  // includes the NUL
 // LINKAGE RECORD IS JUDGED BY (`mirLinkageDefect`, mir/mir_node.hpp — the
 // builders, the verifier and the `.dssir` reader ask it too), not by a fourth
 // spelling of it here: a kind byte that names no kind, a weak row that states
-// none, a kind beside a binding that is not weak, a common that is local. And a
-// row that claims to be a COMMON must be one by the one statement of what a
-// common is (`mirLinkageIsCommon`): a weak or a thread-local row is not.
+// none, a kind beside a binding that is not weak — and a row that claims to be a
+// COMMON where no common can be, since a row's common flag IS the record's
+// tentative mark (a common is the mark read alone, `mirLinkageIsCommon`): a
+// local, a weak or a thread-local row that claims it is refused by the rule's
+// own sentence, the row's thread storage handed to it as a builder hands it.
 // The summary feeds cross-unit symbol RESOLUTION, so a row the rule refuses is
 // a link-time miscompile if it is read anyway.
 [[nodiscard]] bool decodeLinkage(SymbolBinding binding, SymbolVisibility visibility,
@@ -493,9 +509,8 @@ constexpr std::size_t kMagicBytes = 7;  // includes the NUL
                                  std::optional<WeakDefinitionKind>& kind) {
     MirLinkage const linkage{binding, visibility,
                              static_cast<WeakDefinitionKind>(kindByte), isCommon};
-    if (!mirLinkageDefect(linkage, owner, /*hasInitializer=*/false).empty())
+    if (!mirLinkageDefect(linkage, owner, /*hasInitializer=*/false, isThreadLocal).empty())
         return false;
-    if (isCommon && !mirLinkageIsCommon(linkage, isThreadLocal)) return false;
     kind = linkage.statedWeakKind();
     return true;
 }
@@ -563,6 +578,16 @@ std::vector<std::uint8_t> encodeModuleSummary(ModuleSummary const& s) {
     }
 
     putStrs(b, s.escapedSymbolNames);
+
+    putU32(b, static_cast<std::uint32_t>(s.aliases.size()));
+    for (SummaryAlias const& a : s.aliases) {
+        putStr(b, a.name);
+        putU32(b, a.symbol);
+        putStr(b, a.targetName);
+        putU8(b, static_cast<std::uint8_t>(a.binding));
+        putU8(b, static_cast<std::uint8_t>(a.visibility));
+        putU8(b, weakKindByte(a.weakKind));
+    }
     return b;
 }
 
@@ -669,6 +694,29 @@ decodeModuleSummary(std::span<std::uint8_t const> bytes) {
         }
     }
     s.escapedSymbolNames = c.strs();
+    {
+        std::uint32_t const n = c.u32();
+        // Smallest possible alias row: 4 (name len) + 4 (symbol) + 4 (target
+        // len) + 3 (binding/visibility/weak kind) = 15.
+        if (!c.countFits(n, 15)) return std::nullopt;
+        s.aliases.reserve(n);
+        for (std::uint32_t i = 0; i < n && !c.bad; ++i) {
+            SummaryAlias a;
+            a.name       = c.str();
+            a.symbol     = c.u32();
+            a.targetName = c.str();
+            if (!decodeBinding(c.u8(), a.binding)) return std::nullopt;
+            if (!decodeVisibility(c.u8(), a.visibility)) return std::nullopt;
+            // An alias is judged as a definition with no storage: no common,
+            // no thread storage of its own — the owner decides nothing then.
+            if (!decodeLinkage(a.binding, a.visibility, c.u8(),
+                               MirLinkageOwner::Function, /*isCommon=*/false,
+                               /*isThreadLocal=*/false, a.weakKind)) {
+                return std::nullopt;
+            }
+            s.aliases.push_back(std::move(a));
+        }
+    }
 
     if (c.bad) return std::nullopt;
     // TRAILING BYTES ARE A REFUSAL, not a shrug. A summary is carried in a

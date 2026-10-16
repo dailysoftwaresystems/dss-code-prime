@@ -177,6 +177,18 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_IntegerLiteralImplicitlyUnsigned";
         case DiagnosticCode::S_AttributeNotHonoured:
             return "S_AttributeNotHonoured";
+        case DiagnosticCode::S_TentativeArrayAssumedOneElement:
+            return "S_TentativeArrayAssumedOneElement";
+        case DiagnosticCode::S_SizeofIncompleteArrayIsZero:
+            return "S_SizeofIncompleteArrayIsZero";
+        case DiagnosticCode::S_SizeofIncompleteType:
+            return "S_SizeofIncompleteType";
+        case DiagnosticCode::S_ArrayElementTypeIncomplete:
+            return "S_ArrayElementTypeIncomplete";
+        case DiagnosticCode::S_SymbolAliasTargetInvalid:
+            return "S_SymbolAliasTargetInvalid";
+        case DiagnosticCode::S_SymbolAliasInitializerIgnored:
+            return "S_SymbolAliasInitializerIgnored";
         case DiagnosticCode::H_StaticInitializerNotFolded:
             return "H_StaticInitializerNotFolded";
         case DiagnosticCode::H_NonVoidFunctionEndReachable:

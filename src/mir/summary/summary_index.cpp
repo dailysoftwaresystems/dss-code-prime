@@ -136,6 +136,15 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
             linker::stateTheLinksAnswers(defs.back(), linkFormat, g.weakKind);
             defs.back().tentative = g.isCommon;
         }
+        // P69 (lane `cs`): an alias is a definition of its name, entered with its
+        // own binding and kind — the merge and the unit linker rank it so too.
+        for (SummaryAlias const& a : summaries[m].aliases) {
+            if (a.name.empty() || a.binding == SymbolBinding::Local) continue;
+            defs.push_back(linker::CrossCuDef{
+                a.name, a.binding,
+                LinkedSymbolKey{CompilationUnitId{cuIdOf(m)}, SymbolId{a.symbol}}});
+            linker::stateTheLinksAnswers(defs.back(), linkFormat, a.weakKind);
+        }
     }
     linker::CrossCuResolution const resolution = linker::resolveCrossCuDefs(defs);
 
@@ -177,7 +186,8 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
     // Turn each winning key back into a (module, index) site. The scan is over
     // the summaries in module order, so a name whose winner cannot be located
     // simply gets no entry — it is then not importable, which is the
-    // conservative outcome.
+    // conservative outcome. (A name an ALIAS won is one such: an alias has no
+    // body of its own to import.)
     for (std::uint32_t m = 0; m < summaries.size(); ++m) {
         for (std::uint32_t i = 0;
              i < static_cast<std::uint32_t>(summaries[m].functions.size()); ++i) {
@@ -241,8 +251,22 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
             for (SummaryFunction const& f : s.functions) {
                 if (!f.name.empty()) (void)nodeFor(f.name);
             }
+            // P69 (lane `cs`): a call to an alias is a call to its target, so an
+            // alias is a node with ONE edge, to the target (added below) — a
+            // cycle that runs through a second name is a cycle.
+            for (SummaryAlias const& a : s.aliases) {
+                if (!a.name.empty()) (void)nodeFor(a.name);
+            }
         }
         std::vector<std::vector<std::uint32_t>> adj(nodeName.size());
+        for (ModuleSummary const& s : summaries) {
+            for (SummaryAlias const& a : s.aliases) {
+                if (a.name.empty() || a.targetName.empty()) continue;
+                auto const to = nodeOf.find(a.targetName);
+                if (to == nodeOf.end()) continue;   // a global's alias — no call node
+                adj[nodeOf.at(a.name)].push_back(to->second);
+            }
+        }
         for (ModuleSummary const& s : summaries) {
             for (SummaryFunction const& f : s.functions) {
                 if (f.name.empty()) continue;
@@ -339,6 +363,11 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
                 auto& v = unionRefs[g.name];
                 v.insert(v.end(), g.initSymbolRefs.begin(), g.initSymbolRefs.end());
             }
+            // P69 (lane `cs`): reaching an alias reaches its target.
+            for (SummaryAlias const& a : s.aliases) {
+                if (a.name.empty() || a.targetName.empty()) continue;
+                unionRefs[a.name].push_back(a.targetName);
+            }
         }
 
         std::deque<std::string> worklist;
@@ -357,6 +386,15 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
                 if (!g.name.empty()
                     && isExternallyVisible(g.binding, g.visibility))
                     markLive(g.name);
+            }
+            // P69 (lane `cs`): an externally visible alias is a root, and EVERY
+            // alias roots its target whatever its own binding — the rule DCE
+            // holds (an alias is written as a row on its target's definition, so
+            // no target of one is ever deleted).
+            for (SummaryAlias const& a : s.aliases) {
+                if (!a.name.empty() && isExternallyVisible(a.binding, a.visibility))
+                    markLive(a.name);
+                markLive(a.targetName);
             }
         }
         // Phases 2+3 — one worklist covers both. `unionRefs` already merges a

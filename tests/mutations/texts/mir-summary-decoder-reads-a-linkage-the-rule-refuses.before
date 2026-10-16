@@ -1,1 +1,1 @@
-    if (!mirLinkageDefect(linkage, owner, /*hasInitializer=*/false).empty())
+    if (!mirLinkageDefect(linkage, owner, /*hasInitializer=*/false, isThreadLocal).empty())

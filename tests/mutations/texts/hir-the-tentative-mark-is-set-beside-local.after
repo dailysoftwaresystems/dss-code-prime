@@ -1,2 +1,2 @@
             if (rec != nullptr && rec->isTentativeDefinition
-                && (true || attr.binding != SymbolBinding::Local))
+                && (true || attr.binding == SymbolBinding::Global)

@@ -1,1 +1,1 @@
-           && (true || !isThreadLocal);
+        if (false && isThreadLocal) {

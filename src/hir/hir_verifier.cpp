@@ -1366,6 +1366,31 @@ void HirVerifier::checkLinkageAttributes(DiagnosticReporter& reporter) const {
                                  "two units' private objects one", id.v),
                      sourceMap_);
         }
+        // The mark means "may be written as a COMMON", and every tier below
+        // reads it alone — so it never stands where no common can be.
+        if (attr.tentative && attr.binding == SymbolBinding::Weak) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("the linkage attribute of node #{} carries the "
+                                 "tentative-definition mark beside the weak "
+                                 "binding — a weak definition is ranked by its "
+                                 "kind and is never written as a common, which is "
+                                 "what a consumer reading the mark would write",
+                                 id.v),
+                     sourceMap_);
+        }
+        if (attr.tentative && threadLocalMap_ != nullptr) {
+            ThreadLocalAttr const* const tls = threadLocalMap_->tryGet(id);
+            if (tls != nullptr && tls->isThreadLocal) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("the linkage attribute of node #{} carries "
+                                     "the tentative-definition mark on a "
+                                     "thread-local global — no object format has "
+                                     "a thread-local common, which is what a "
+                                     "consumer reading the mark would write",
+                                     id.v),
+                         sourceMap_);
+            }
+        }
     }
 }
 

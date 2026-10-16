@@ -75,7 +75,8 @@ void expectRead(char const* what, std::string const& text, MirLinkage want) {
 }
 
 // A module with every shape of the record: two weak functions of the two kinds, a weak global, a tentative global
-// and a weak tentative one.
+// and a weak select-any one with a visibility. (A weak TENTATIVE global is no shape: the rule refuses the mark beside
+// a weak binding — `ATentativeMarkIsRefusedWhereNoTentativeDefinitionCanBe`.)
 struct Shapes {
     Mir                      mir;
     std::vector<std::string> names;
@@ -100,7 +101,7 @@ struct Shapes {
     };
     addGlobal(4, MirLinkage{SymbolBinding::Weak, SymbolVisibility::Default, Kind::Overridable});
     addGlobal(5, MirLinkage{SymbolBinding::Global, SymbolVisibility::Default, Kind{}, /*tentative=*/true});
-    addGlobal(6, MirLinkage{SymbolBinding::Weak, SymbolVisibility::Protected, Kind::SelectAny, /*tentative=*/true});
+    addGlobal(6, MirLinkage{SymbolBinding::Weak, SymbolVisibility::Protected, Kind::SelectAny});
     addGlobal(7, MirLinkage{SymbolBinding::Local, SymbolVisibility::Default});
     return Shapes{std::move(b).finish(), {"", "fa", "fb", "fc", "ga", "gb", "gc", "gd"}};
 }
@@ -151,8 +152,7 @@ TEST(MirTextLinkage, TheWellFormedSpellingsAreRead) {
                MirLinkage{SymbolBinding::Weak, SymbolVisibility::Hidden, Kind::SelectAny});
     expectRead("a tentative global", globalDoc(" [tentative]"),
                MirLinkage{SymbolBinding::Global, SymbolVisibility::Default, Kind{}, /*tentative=*/true});
-    expectRead("a weak tentative global", globalDoc(" [weak(select-any), tentative]"),
-               MirLinkage{SymbolBinding::Weak, SymbolVisibility::Default, Kind::SelectAny, /*tentative=*/true});
+    expectRead("a thread-local global with no mark", globalDoc(" [threadlocal]"), MirLinkage{});
     expectRead("no list at all", globalDoc(""), MirLinkage{});
 }
 
@@ -200,6 +200,10 @@ TEST(MirTextLinkage, ATentativeMarkIsRefusedWhereNoTentativeDefinitionCanBe) {
                    "it is marked as a tentative definition and states an initializer"});
     expectRefused({"on a local global", globalDoc(" [local, tentative]"),
                    "it is a module-private (local) global marked as a tentative definition"});
+    expectRefused({"beside a weak binding", globalDoc(" [weak(select-any), tentative]"),
+                   "it is a weak definition marked as a tentative definition"});
+    expectRefused({"on a thread-local global", globalDoc(" [threadlocal, tentative]"),
+                   "it is a thread-local global marked as a tentative definition"});
     // On a FUNCTION the word is no attribute at all: the emitter's own text, with the word put in the list of the
     // one function whose list is a kind alone (`[weak(select-any)] {` — a global's list never ends in a brace, and
     // a global states that kind too, so the list is found by what follows it).

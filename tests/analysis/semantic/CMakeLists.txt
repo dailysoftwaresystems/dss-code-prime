@@ -635,3 +635,19 @@ dss_add_test(NAME analysis/semantic/test_gnu_builtins
              SOURCES test_gnu_builtins.cpp)
 target_include_directories(dss_analysis_semantic_test_gnu_builtins
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane `cs`): an array of unknown size — where one may stand (its element complete, no block-scope object
+# of one, a file-scope tentative one completed to one element) and `sizeof` of one (0 and said, as cl makes it;
+# an incomplete structure or union refused by name).
+dss_add_test(NAME analysis/semantic/test_incomplete_array_type
+             SOURCES test_incomplete_array_type.cpp)
+target_include_directories(dss_analysis_semantic_test_incomplete_array_type
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane `cs`): a second name of a definition (`alias`) resolved to the definition it ends at, refused by name
+# where it can be no second name and on a format whose platform refuses it; `common` / `nocommon`; `section`
+# refused by name.
+dss_add_test(NAME analysis/semantic/test_symbol_alias
+             SOURCES test_symbol_alias.cpp)
+target_include_directories(dss_analysis_semantic_test_symbol_alias
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

@@ -244,6 +244,16 @@ private:
     // rule's sentence.
     void checkLinkageRecords(DiagnosticReporter& reporter) const;
 
+    // P69 (lane `cs`): every ALIAS the module states (`Mir::aliases`) is one the
+    // object producer can write — one more symbol row on a definition — so its
+    // TARGET is a function or a global this module defines, its NAME is defined
+    // by nothing else here (no function, no global, no second alias), and its
+    // linkage record is well formed and not tentative (an alias has no storage).
+    // `MirBuilder::addAlias` refuses what one statement alone can show; this is
+    // the module-wide half, for every road a module reaches the verifier by.
+    // Emits I_VerifierFailure, naming the alias.
+    void checkAliases(DiagnosticReporter& reporter) const;
+
     // THE SYMBOL-ID SPACE (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE):
     // every symbol id the module NAMES is below the end it STATES. The end is
     // where the next synthesized symbol is minted, so an id the module names at

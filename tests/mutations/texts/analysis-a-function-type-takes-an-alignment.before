@@ -1,1 +1,0 @@
-    if (in.kind(ty) == TypeKind::FnSig) return ty;

@@ -359,6 +359,10 @@ struct Lowerer {
     // so its symbol must reach the synth pass exactly as an injected one does.
     // Sparse: only shim symbols.
     std::vector<std::pair<std::uint32_t, std::string>>& synthRecipeAcc;
+    // P69 (lane `cs`): shared accumulator of the unit's symbol aliases — moved onto
+    // `CstToHirResult::symbolAliases` after finish(). Written by `recordSymbolAlias`
+    // at the one declaration of each alias that emits (the merge survivor's).
+    std::vector<HirSymbolAlias>& symbolAliasAcc;
 
     // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
     // vector `lowerTree` appends top-level decls to). A block-scope `static`
@@ -1558,7 +1562,8 @@ struct Lowerer {
             std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSz,
             std::vector<std::pair<std::uint32_t, std::uint32_t>>& sizeofVlaSym,
             std::vector<std::pair<std::uint32_t, std::uint32_t>>& typedefOrigin,
-            std::vector<std::pair<std::uint32_t, std::string>>& synthRecipe)
+            std::vector<std::pair<std::uint32_t, std::string>>& synthRecipe,
+            std::vector<HirSymbolAlias>& symbolAliases)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), inlineAsm(asmPool),
           spans(sp), externDecls(ed),
@@ -1568,7 +1573,7 @@ struct Lowerer {
           threadLocalAcc(tls), enclosingFunctionAcc(enclFn), volatileAcc(vol),
           returnsTwiceAcc(rtwice), alignmentAcc(aln), vlaSizeAcc(vlaSz),
           sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin),
-          synthRecipeAcc(synthRecipe) {
+          synthRecipeAcc(synthRecipe), symbolAliasAcc(symbolAliases) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -3111,8 +3116,24 @@ struct Lowerer {
             // that read the mark without the binding would write a COMMON for a
             // `static int x;` — two units' private objects silently made one.
             // `HirVerifier` holds the same line.
+            //
+            // ★★ P69 (lane `cs`) — THE ONE STATEMENT OF THE MARK: "a tentative
+            // definition that MAY be a common". Each of these makes the object a
+            // DEFINITION of this unit and clears it, and no tier below restates the
+            // list (they read the mark alone — `mirLinkageIsCommon`):
+            //   * a WEAK binding — a weak tentative definition is a weak definition,
+            //     and its kind decides at the link (✔MEASURED by lane `xa`: no
+            //     reference writes a weak common);
+            //   * THREAD-LOCAL storage — a common has no thread-local form;
+            //   * `nocommon`, and a variable an `alias` names — both stated by the
+            //     semantic tier on the record (`tentativeNeverCommon`): every
+            //     reference refuses to equate a second name to a common, and makes
+            //     the named object a `.bss` definition at its default;
+            //   * a named section — refused by name today (`section` is an
+            //     `unsupported` row); when it is built it clears the mark here too.
             if (rec != nullptr && rec->isTentativeDefinition
-                && attr.binding != SymbolBinding::Local)
+                && attr.binding == SymbolBinding::Global
+                && !rec->isThreadLocal && !rec->tentativeNeverCommon)
                 attr.tentative = true;
         }
         // ⚠ THE SPARSENESS TEST HAD TO GROW WITH THE STRUCT. It is what decides
@@ -3127,6 +3148,22 @@ struct Lowerer {
             || attr.staticInit.any()
             || attr.tentative)
             linkage.push_back({node, attr});
+    }
+    // P69 (lane `cs`): the DEFINITION an alias declaration makes — one more name on
+    // its target's definition (`HirSymbolAlias`). Called at the one emitting
+    // declaration of the name (the merge survivor's, which carries `aliasTarget`),
+    // with the linkage that declaration's specifiers folded to; `sym` the declared
+    // name's symbol. The internal linkage a prior `static` gives the name is
+    // inherited exactly as `recordLinkage` inherits it (C 6.2.2p4/p5), and the alias
+    // is never tentative: it has no storage of its own.
+    void recordSymbolAlias(SymbolId sym, LinkageAttr attr) {
+        auto const* rec = model.recordFor(sym);
+        if (rec == nullptr || !rec->aliasTarget.valid()) return;
+        if (rec->isInternalLinkage && attr.binding == SymbolBinding::Global)
+            attr.binding = SymbolBinding::Local;
+        attr.tentative  = false;
+        attr.staticInit = {};
+        symbolAliasAcc.push_back(HirSymbolAlias{sym, rec->aliasTarget, attr});
     }
     // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): record the inliner opt-out for a lowered
     // Function node from its bound symbol's `SymbolRecord.isNoInline` (sparse:
@@ -9962,6 +9999,12 @@ struct Lowerer {
         if (!params.has_value()) return std::nullopt;
         TypeId const queried = layoutQueryOperand(node, valueRule).type;
         if (!queried.valid()) return std::nullopt;
+        // P69 (lane `cs`): `sizeof` of an array of unknown size is what the language
+        // states for one (`sizeof.incompleteArraySize`, MSVC's 0) — the semantic
+        // fold's answer (`resolveSizeof`), never a stride.
+        if (!alignment && sem.sizeofIncompleteArraySize.has_value()
+            && interner.isIncompleteArray(queried))
+            return *sem.sizeofIncompleteArraySize;
         if (interner.isVlaArray(queried) || interner.typeContainsVla(queried))
             return std::nullopt;
         auto const layout = operandLayout(queried, interner, *params, dataModel_,
@@ -9986,6 +10029,18 @@ struct Lowerer {
         // language declares for this data model, matching the semantic tier's
         // stamp on the SAME node exactly.
         TypeId const u64 = synthesizedType(sem.sizeofResultType, TypeKind::U64);
+        // P69 (lane `cs`): `sizeof` of an array of unknown size is the language's
+        // stated value (`sizeof.incompleteArraySize`, MSVC's 0, warned by the
+        // semantic tier) — a CONSTANT, lowered as one; no layout is asked, because
+        // the type has none. Unstated, the `SizeOf` below keeps its refusal.
+        if (sem.sizeofIncompleteArraySize.has_value()
+            && interner.isIncompleteArray(sized)) {
+            HirLiteralValue v;
+            v.core  = interner.kind(u64);
+            v.value = std::uint64_t{*sem.sizeofIncompleteArraySize};
+            return {track(builder.makeLiteral(u64, literals.add(std::move(v))), node),
+                    u64};
+        }
         // [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (1): a VLA TYPE-NAME operand
         // (`sizeof(int[n])`) is the one `sizeof` whose operand C 6.5.3.4p2
         // EVALUATES, so it lowers to fresh arithmetic over its bounds rather than
@@ -13992,6 +14047,13 @@ struct Lowerer {
                         linkageFrom(linkagePrefixRoots(node, *decl), *decl),
                         *decl, d);
                 };
+                // P69 (lane `cs`): a prototype whose name an `alias` makes the
+                // second name of a definition — the alias row, with this
+                // declaration's linkage. The reference the prototype is (the import
+                // below, for external linkage) stays: a use of an alias with
+                // external linkage reaches it by name.
+                if (!pr->isAbsorbedProto && pr->aliasTarget.valid())
+                    recordSymbolAlias(sym, protoLinkage());
                 if (decl->prototypeSynthesizesExtern
                     && pr->isProtoDeclaration && !pr->isAbsorbedProto
                     && pr->kind == DeclarationKind::Function
@@ -15662,6 +15724,7 @@ struct Lowerer {
                 HirNodeId const ef =
                     track(builder.makeExternFunction(type, sym.v, params), d);
                 recordExtern(ef, sym, mergedLinkage);
+                recordSymbolAlias(sym, mergedLinkage);   // P69 (lane `cs`)
                 out.push_back(ef);
                 continue;
             }
@@ -15693,6 +15756,18 @@ struct Lowerer {
             //     (gcc "'x' has both 'extern' and initializer", clang "declaration
             //     of block scope identifier with linkage cannot have an
             //     initializer", MSVC C2205).
+            // P69 (lane `cs`): an OBJECT alias — its name is a second name of the
+            // target's storage, so whatever initializer it wrote is not emitted (the
+            // semantic tier warned it ignored: gcc's reading) and the declaration
+            // lowers as the reference it is, beside the alias row.
+            if (rec->aliasTarget.valid()) {
+                HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), d);
+                recordExtern(g, sym, mergedLinkage);
+                recordThreadLocal(g, sym);
+                recordSymbolAlias(sym, mergedLinkage);
+                out.push_back(g);
+                continue;
+            }
             if (NodeId const initNode = initDeclaratorInitNode(d, dc);
                 initNode.valid()) {
                 if (rec->isExternDeclaration) {
@@ -16109,6 +16184,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // surviving declaration). Declared HERE, above the Lowerer construction, so the
     // per-schema Lowerers can bind it.
     std::vector<std::pair<std::uint32_t, std::string>> synthRecipeAcc;
+    // P69 (lane `cs`): the unit's symbol aliases, every Lowerer's (`HirSymbolAlias`).
+    std::vector<HirSymbolAlias> symbolAliasAcc;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -16124,7 +16201,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
             noSanitizeThreadAcc, inlineDefinitionAcc,
             threadLocalAcc, enclosingFunctionAcc,
             volatileAcc, returnsTwiceAcc, alignmentAcc,
-            vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc, synthRecipeAcc));
+            vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc, synthRecipeAcc,
+            symbolAliasAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -16249,6 +16327,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [symV, recipe] : synthRecipeAcc)   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
         result->synthRecipeBySymbol.emplace(symV, std::move(recipe));
     result->externDecls = std::move(externDecls);
+    result->symbolAliases = std::move(symbolAliasAcc);   // P69 (lane `cs`)
 
     // verify-on-load.
     HirVerifier verifier{result->hir, &result->sourceMap,
@@ -16260,9 +16339,11 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
                          // P69 (lane `cs`): the linkage side-table this lowering
                          // just filled — a weak attribute that names no kind, a
                          // kind beside a binding that is not weak, a tentative
-                         // mark off a global or beside an internal binding are
-                         // refused here, before any consumer reads them.
-                         &result->linkageMap};
+                         // mark off a global, beside an internal or a weak
+                         // binding, or on a thread-local global (the thread-
+                         // storage table, filled above) are refused here, before
+                         // any consumer reads them.
+                         &result->linkageMap, &result->threadLocalMap};
     // The verifier's OWN verdict, not only the delta: a refusal the reporter drops
     // as a recent duplicate or past a cap must still fail the lowering (P68).
     bool const verified = verifier.verify(reporter);

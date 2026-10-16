@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -467,6 +468,14 @@ lowerToMir(Hir const&               hir,
            // this row, because a per-function label ordinal cannot be resolved
            // without knowing its function. Every OTHER initializer is unaffected, so
            // a map-free test fixture keeps working exactly as before.
-           HirEnclosingFunctionMap const* enclosingFunctionMap = nullptr);
+           HirEnclosingFunctionMap const* enclosingFunctionMap = nullptr,
+           // P69 (lane `cs`): the unit's symbol aliases (`HirSymbolAlias`, the GNU
+           // `alias("target")` attribute) — each handed to `MirBuilder::addAlias`
+           // once the module's definitions are lowered. Supplied by the driver as
+           // `CstToHirResult::symbolAliases`. Empty (the default) for a caller that
+           // lowers a unit with none, and for a test fixture: an alias that is not
+           // threaded is a name the module does not define, which the link refuses
+           // loudly as undefined, never a silent second meaning.
+           std::span<HirSymbolAlias const> symbolAliases = {});
 
 } // namespace dss

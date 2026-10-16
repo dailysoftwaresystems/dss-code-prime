@@ -2195,6 +2195,28 @@ encode(AssembledModule const&    module,
                 appendEntry(std::move(e));
                 continue;
             }
+            if (alias->binding != SymbolBinding::Weak
+                && canonicalBinding != SymbolBinding::Weak) {
+                // P69 (lane `cs`): A GLOBAL NAME ON A MODULE-PRIVATE BODY —
+                // `static int g(void){…} int f(void) __attribute__((alias("g")));`.
+                // Neither side has a coalescing policy to differ in (that rides only
+                // a weak definition's COMDAT section), so the alias is a record of
+                // its own at the body's address with its OWN storage class,
+                // EXTERNAL — what mingw-w64 gcc 13.2.0 writes for the same
+                // declarations, and that object links and runs (✔MEASURED, lane
+                // `cs` probe al2 cell 3, -O0 and -O2). The REVERSE never reaches
+                // here: `definedAliases` yields only external-linkage names, so a
+                // module-private second name of a global body is not written — on
+                // every format, the ELF and Mach-O writers asking the same table.
+                CoffSymEntry e;
+                e.name          = alias->name;
+                e.value         = canonical.value;
+                e.sectionNumber = canonical.sectionNumber;
+                e.type          = canonical.type;
+                e.storageClass  = IMAGE_SYM_CLASS_EXTERNAL;
+                appendEntry(std::move(e));
+                continue;
+            }
             if (alias->binding == SymbolBinding::Weak
                 && canonicalBinding == SymbolBinding::Global) {
                 // The weak-external form. UNDEF section, Value 0, class 105,
@@ -2216,7 +2238,8 @@ encode(AssembledModule const&    module,
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format(
                      "pe::encode (Obj): '{}' is an alias of '{}' at the same "
-                     "address but binds {} where '{}' binds {}. COFF expresses "
+                     "address but binds {} where '{}' binds {}, and a weak side "
+                     "carries a coalescing policy. COFF expresses "
                      "a definition's coalescing policy on its SECTION (the "
                      "COMDAT Selection byte), and an alias shares its "
                      "canonical's section, so that mechanism cannot give them "

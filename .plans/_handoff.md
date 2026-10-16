@@ -440,9 +440,13 @@ round's close; each checkpoint's commit message says what was and was not run on
   Read from main since: `linux-x86_64-debug` (GNU 13.3) PASSED, 2787 tests.
 - **Checkpoint 23 (2026-10-15) = the harness lane's FOLD H2**: ONE statement of what a walk of a tree leaves out —
   the root `.gitignore`, read as git reads it (a Python reader in `owning-tree` and a C++ one in
-  `tests/test_support/tree_ignores.hpp`, one grammar, the same refusals) — asked by every walker that starts at the
-  root (the document census, the redactor's two walks, the case-collision scan), and `sync.neverTransfer` reduced to
-  the two secrets (the sync plans MEASURED byte-identical without the 15 duplicates); `check-ninja-deps` rewritten by
+  `tests/test_support/tree_ignores.hpp`, one grammar, the same refusals) — asked by the document census, the
+  redactor's two walks and the case-collision scan (its review found five more walkers that keep a list of their
+  own — check-anchor-registry, check-plan-citations, check-scripts-index, check-export-macro-placement,
+  source-census — and the readers diverging from git on POSIX classes, bytes, case and symlinks: the lane's fold
+  H4), and `sync.neverTransfer` reduced to the two secrets (the sync plans MEASURED byte-identical without the 15
+  duplicates FROM ONE LANE TREE, which holds none of the worktree or orchestrator content: for those the tool's
+  documented rule, what git does not ignore crosses, is the evidence, not the measurement); `check-ninja-deps` rewritten by
   its review (forced includes, PCH makers and `@file` refused per shape; one include reader; 826 objects of the MSVC
   tree read, 2 excused, each by its edge's precompiled header); a path a program is told to WRITE is refused when it
   is empty or begins with `-`; a SELF-TEST never carries the `repo-guard` label (it reads its own fixtures and runs
@@ -450,6 +454,30 @@ round's close; each checkpoint's commit message says what was and was not run on
   paths; 119 arms unswept. ✔MEASURED by the lane on checkpoint 21 + its fold: `linux-arm64-debug` whole suite 2789 of
   2789; `repo-guard` on both Windows legs 22 of 22 each. The lane's arm registry was merged BY ARM by the
   orchestrator against the lane's real base (the tool's ancestor for that path was the lane's seed): 714 arms.
+  ✔MEASURED from main after the commit: `linux-arm64-debug` whole suite 2799 of 2799 (GNU 13.3.0). Its review:
+  SEND BACK, 15 findings (0 BLOCKER, 0 MAJOR, 8 MINOR, 7 NIT) — the lane's fold H4, after H3.
+- **Checkpoint 24 (2026-10-15) = the C front end lane's ALIAS FOLD**: `__attribute__((alias("t")))` end to end —
+  one pending entry per declarator resolved at the unit's end, an internal alias's uses bound to its target, HIR
+  `HirSymbolAlias`, MIR `MirAlias` (`.dssir` `alias %A [linkage] = %T`), DCE rooting every target, summary v3, the
+  object rows; Mach-O refuses it BY DOCUMENT (all eight macho64 documents); the cross-unit merge reads the link
+  document's `supersededDefinition` for a lost target (its body kept under a module-private id the alias alone
+  names, the winner named, or refused by name — `DiscardedWhole`, checkpoint 22's answer, falls into the refusal
+  until the lane's next fold gives it its meaning); `common`/`nocommon` stated once (the tentative mark, read
+  alone); `section` refused by name; an array of unknown size is an incomplete TYPE on every row (`sizeof` reads 0
+  and is said between `extern int a[];` and `int a[3];`, as cl; a file-scope tentative completed to one element and
+  said); an array below a pointer composes with one of a compatible size (C 6.7.6.2p6), so `int a[n][*]` in a
+  prototype compiles (gcc and clang run it; DSS had pinned the refusal); a structure member with a runtime bound,
+  read before as a flexible member, is refused by name. 239 paths written, 17 merged three-way by the tool, 5
+  settled by the orchestrator (two comments, the census figures, the arm registry merged BY ARM: 760 arms, five
+  arms both sides changed resolved as the lane's rows at main's case count). ✔MEASURED by the lane at its final
+  bytes: `macos-arm64-debug` 2793 and `linux-arm64-release` 2793 passed; `windows-x86_64-release` (before its last
+  two changes) ran the new PE reference-link pin green (link.exe and MinGW ld take DSS's pe64 objects, 42). NOT RUN
+  on the composition before the commit: any build (this host's memory held above the admission line) — main reads
+  both Windows legs on it before any other fold, and the Windows debug reading of the lane's `copy_file` fix is the
+  fold's open risk. Rows: six new, DISCLOSED — four fixed in code (their arms unswept), `section` owed in that
+  lane's next fold, and `D-C-A-MEMBER-WITH-A-RUNTIME-BOUND-IS-READ-AS-A-FLEXIBLE-MEMBER` ruled to the next cycle on
+  its MEASURED size (the layout's constant offsets: `computeLayout(` 41 mentions in 10 files, field offsets 101 in
+  9; gcc alone builds it — clang refuses a variable-length member, cl has no VLA).
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -469,7 +497,7 @@ round's close; each checkpoint's commit message says what was and was not run on
   is DROPPED with the warning `H_UnknownLinkageSpecifier` — the two plain aliases are then refused at link
   (loud), and `__attribute__((weak, alias("g")))` COMPILES AND THE IMAGE DIES (0xC0000005 on pe64, signal 11 on
   ELF). The row is `D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE` (open, restated); its build is the FIRST item of
-  that lane's next wave.
+  that lane's next wave — BUILT by checkpoint 24 (above); the row closes when its arms read `passed`.
   (7) A REGRESSION OF CHECKPOINT 21 (the review of that fold, INFERRED by reading; the library lane MEASURED it on
   pe64, both pipelines): a plain `char` bit-field is read SIGNED by the constant tier on a signed-char target and
   UNSIGNED by the run time, so a folded condition marks reachable code unreachable and a correct program dies of an

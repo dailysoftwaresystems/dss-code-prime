@@ -554,6 +554,9 @@ public:
         for (std::uint32_t i = 0; i < mir_.moduleFuncCount(); ++i) {
             emitFunction(mir_.funcAt(i));
         }
+        // P69 (lane `cs`): the aliases LAST, after every definition they can name,
+        // so a reader of one pass meets each target before the second name on it.
+        for (MirAlias const& a : mir_.aliases()) emitAlias(a);
         out_ += "}\n";
         std::string body = takeOut();
         emitTypes();
@@ -1219,6 +1222,21 @@ private:
         out_ += "]";
     }
 
+    // P69 (lane `cs`): `alias %A [<linkage words>] = %T` — a second name of the
+    // definition `%T` (`MirAlias`). The list holds the alias's own linkage record
+    // in the one printer's words and is left out when the record is the default,
+    // as a global's is; an alias is never tentative, so the mark is never printed.
+    void emitAlias(MirAlias const& a) {
+        out_ += std::format("  alias %{}", a.alias.v);
+        if (!(a.linkage == MirLinkage{})) {
+            out_ += " [";
+            bool first = true;
+            appendLinkageWords(a.linkage, first);
+            out_ += "]";
+        }
+        out_ += std::format(" = %{}\n", a.target.v);
+    }
+
     void emitGlobal(MirGlobalId g) {
         out_ += std::format("  global %{} : ", mir_.globalSymbol(g).v);
         appendType(mir_.globalType(g));
@@ -1879,9 +1897,9 @@ public:
         }
         if (!expectIdent("module")) return makeEmptyResult();
         if (!expect(TokKind::LBrace)) return makeEmptyResult();
-        // Body: zero or more `global` / `function` items. Panic-mode
+        // Body: zero or more `global` / `function` / `alias` items. Panic-mode
         // recovery: on an unexpected token, emit ONE diagnostic and
-        // skip until the next `global`/`function` keyword or the
+        // skip until the next item keyword or the
         // closing `}` — avoids per-token cascade after a parse
         // failure inside `parseFunction` / `parseGlobal` returned
         // mid-production.
@@ -1894,15 +1912,20 @@ public:
             } else if (t.kind == TokKind::Ident && t.text == "function") {
                 lex_.take();
                 parseFunction();
+            } else if (t.kind == TokKind::Ident && t.text == "alias") {
+                lex_.take();
+                parseAlias();
             } else {
-                emitMalformed(std::format("expected 'global' or 'function', got '{}'", t.text));
+                emitMalformed(std::format("expected 'global', 'function' or 'alias', got '{}'",
+                                          t.text));
                 // Skip tokens until we find a recovery anchor.
                 while (true) {
                     Tok pk = lex_.peek();
                     if (pk.kind == TokKind::End) break;
                     if (pk.kind == TokKind::RBrace) break;
                     if (pk.kind == TokKind::Ident
-                     && (pk.text == "global" || pk.text == "function")) break;
+                     && (pk.text == "global" || pk.text == "function"
+                         || pk.text == "alias")) break;
                     lex_.take();
                 }
             }
@@ -1923,6 +1946,7 @@ private:
     std::unordered_map<std::uint32_t, MirBlockId> blockMap_;  // text slot v → builder block id
     std::unordered_map<std::uint32_t, MirInstId>  valueMap_;  // text slot v → builder inst id
     std::unordered_map<std::uint32_t, MirFuncId>  funcMap_;   // text slot v → builder func id
+    std::unordered_set<std::uint32_t>             aliasesRead_;   // P69 (lane `cs`): `parseAlias`
     // The `types` table: handle → the composite's TypeId (forward-minted by the
     // section's first pass, completed by its second), and the handles defined.
     std::unordered_map<std::uint64_t, TypeId>     typeHandles_;
@@ -3411,8 +3435,10 @@ private:
     [[nodiscard]] bool refuseAnIllFormedLinkage(MirLinkage const& linkage,
                                                 MirLinkageOwner owner,
                                                 bool hasInitializer,
+                                                bool isThreadLocal,
                                                 std::uint32_t symbol) {
-        std::string_view const defect = mirLinkageDefect(linkage, owner, hasInitializer);
+        std::string_view const defect =
+            mirLinkageDefect(linkage, owner, hasInitializer, isThreadLocal);
         if (defect.empty()) return false;
         emitMalformed(std::format(
             "the attribute list of {} %{} states a linkage that is not well formed: {}",
@@ -3476,6 +3502,77 @@ private:
         return readWhole;
     }
 
+    // P69 (lane `cs`): `alias %A [<linkage words>] = %T` — one second name of a
+    // definition (`MirAlias`). One line; a refused one is dropped to its end.
+    // Everything `MirBuilder::addAlias` ABORTS on is refused here first, by name —
+    // an invalid id, a name that is its own target or is stated twice, a word that
+    // is no linkage word (`tentative` among them: an alias has no storage), a
+    // record the one rule refuses — because a refusal that crashes is not one.
+    // Whether the module DEFINES the target, and defines the name no other way, is
+    // a fact of the whole module: the verifier's (`checkAliases`), asked on load.
+    void parseAlias() {
+        std::size_t const lineStart      = lex_.peek().off;
+        std::size_t const refusalsBefore = refusals_;
+        auto const sentinel = [&](std::uint32_t id, char const* which) {
+            if (SymbolId{id}.valid()) return false;
+            if (refusals_ == refusalsBefore) {
+                emitMalformed(std::format("an alias names symbol %0 as its {}, the invalid "
+                                          "sentinel — symbols number from %1", which));
+            }
+            skipRestOfLine(lineStart);
+            return true;
+        };
+        std::uint32_t const alias = parsePercentValue();
+        if (sentinel(alias, "name")) return;
+        LinkageWordsRead words;
+        if (lex_.peek().kind == TokKind::LBracket) {
+            lex_.take();
+            while (true) {
+                Tok const a = lex_.take();
+                if (a.kind == TokKind::RBracket) break;
+                if (a.kind == TokKind::Comma) continue;
+                if (a.kind == TokKind::Ident) {
+                    LinkageWord const w = readLinkageWord(a, words, "alias");
+                    if (w == LinkageWord::Read) continue;
+                    if (w == LinkageWord::Refused) { skipRestOfLine(lineStart); return; }
+                }
+                emitMalformed(std::format(
+                    "unknown alias attribute '{}' — an alias states its own linkage and "
+                    "nothing else: a binding ({}) or a visibility ({})",
+                    a.text, bindingSpellings(),
+                    detail::renderAllowedList(allNames(kSymbolVisibilityTable), " | ")));
+                skipRestOfLine(lineStart);
+                return;
+            }
+        }
+        if (!expect(TokKind::Eq)) { skipRestOfLine(lineStart); return; }
+        std::uint32_t const target = parsePercentValue();
+        if (sentinel(target, "target")) return;
+        if (alias == target) {
+            emitMalformed(std::format("alias %{} names itself as its target — an alias is a "
+                                      "second name of another definition", alias));
+            skipRestOfLine(lineStart);
+            return;
+        }
+        if (!aliasesRead_.insert(alias).second) {
+            emitMalformed(std::format("alias %{} is stated twice — one name, one statement",
+                                      alias));
+            skipRestOfLine(lineStart);
+            return;
+        }
+        if (std::string_view const defect =
+                mirLinkageDefect(words.linkage, MirLinkageOwner::Function,
+                                 /*hasInitializer=*/false, /*isThreadLocal=*/false);
+            !defect.empty()) {
+            emitMalformed(std::format(
+                "the attribute list of alias %{} states a linkage that is not well formed: {}",
+                alias, defect));
+            skipRestOfLine(lineStart);
+            return;
+        }
+        builder_.addAlias(SymbolId{alias}, SymbolId{target}, words.linkage);
+    }
+
     void parseGlobal() {
         // A global is one line; a refused one is dropped to the end of it, so its
         // initializer is not re-read as module items (P68, lane `ht`).
@@ -3527,7 +3624,9 @@ private:
         // every arm below reaches a builder that aborts on the same record.
         bool const statesNoInitializer = pk.kind == TokKind::Ident && pk.text == "zero";
         if (refuseAnIllFormedLinkage(attrs.linkage, MirLinkageOwner::Global,
-                                     !statesNoInitializer, sym)) {
+                                     !statesNoInitializer,
+                                     attrs.threadStorage == MirThreadStorage::PerThread,
+                                     sym)) {
             skipRestOfLine(lineStart);
             return;
         }
@@ -3696,7 +3795,8 @@ private:
         // rule's sentence. A refusal sets `errors_`, so the gate below skips the
         // body like any other refused function's.
         (void)refuseAnIllFormedLinkage(linkageWords.linkage, MirLinkageOwner::Function,
-                                       /*hasInitializer=*/false, sym);
+                                       /*hasInitializer=*/false,
+                                       /*isThreadLocal=*/false, sym);
         // ★★ ONCE A REFUSAL IS ON RECORD, NO FURTHER FUNCTION IS BUILT. Adding one
         // makes the builder CLOSE the previous function, and `closeFunction_`
         // ABORTS on a function with no blocks or with a block never filled — the

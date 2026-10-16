@@ -1,1 +1,1 @@
-an attribute NAMED volatile is an unknown attribute, not a qualifier
+a for-init's marker scan read the attribute's clause name as the storage class

@@ -246,9 +246,11 @@ set(_DSS_TB_NAMED
     "link/test_tentative_definitions_as_commons|53|50|106"
     # ★ anchor_rows_selftest_guard: NAMED 2026-10-15 (cycle P69, lane hm's fold H2), when a self-test
     # stopped carrying the `repo-guard` label and so runs on every leg, indirect ones included.
-    # ✔MEASURED in a PASSING linux-arm64 Debug whole-suite run of the lane's tree: 236.9 s. Release and
-    # sanitized are NOT measured and take the unit ceilings until a run of either class reads it.
-    "anchor_rows_selftest_guard|53|50|237"
+    # Its cost is the Python program it drives, which no build class changes, so its slowest healthy
+    # run sets all three cells. ✔MEASURED, PASSING: linux-arm64 Debug whole suite 236.9 s;
+    # windows-x86_64 Debug (MinGW) 68.96 s and windows-x86_64 Release (MSVC) 69.78 s, one run
+    # 20261015-184552-6d0d7ccc. CI's earlier runs of it are not readable (their logs expired).
+    "anchor_rows_selftest_guard|237|237|237"
     "core/test_type_kind_vocabulary_projection|103|4|17"
     "analysis/semantic/test_fc3_width_semantics|96|6|19"
     "analysis/preprocess/test_preprocess_no_rework|94|5|18"

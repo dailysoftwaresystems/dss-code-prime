@@ -1804,6 +1804,7 @@ TEST(HirVerifier, ALinkageAttributeStatesItsWeakKindAndKeepsTheTentativeMarkOnGl
         bool        onFunction;      // the attribute sits on the Function, else on the Global
         LinkageAttr attr;
         char const* refusedWith;     // nullptr = the module verifies clean
+        bool        threadLocal = false;   // the Global is thread-local (the thread-storage table says so)
     };
     auto const weak = [](WeakDefinitionKind k) {
         LinkageAttr a;
@@ -1843,7 +1844,10 @@ TEST(HirVerifier, ALinkageAttributeStatesItsWeakKindAndKeepsTheTentativeMarkOnGl
              Row{"a kind beside the internal binding", false, kindBesideLocal,
                  "names a weak-definition kind beside the 'local' binding"},
              Row{"a tentative global", false, tentative(SymbolBinding::Global), nullptr},
-             Row{"a tentative weak global", false, weakTentative, nullptr},
+             Row{"a tentative weak global", false, weakTentative, "beside the weak binding"},
+             Row{"a tentative thread-local global", false, tentative(SymbolBinding::Global),
+                 "on a thread-local global", /*threadLocal=*/true},
+             Row{"a thread-local global, not tentative", false, LinkageAttr{}, nullptr, /*threadLocal=*/true},
              Row{"an internal global, not tentative", false, local, nullptr},
              Row{"a tentative mark on a function", true,
                  tentative(SymbolBinding::Global), "the node is not a Global"},
@@ -1857,10 +1861,12 @@ TEST(HirVerifier, ALinkageAttributeStatesItsWeakKindAndKeepsTheTentativeMarkOnGl
         Hir h = std::move(b).finish(mod);
         dss::HirLinkageMap linkage{h};
         linkage.set(row.onFunction ? fn : g, row.attr);
+        dss::HirThreadLocalMap threadLocal{h};
+        if (row.threadLocal) threadLocal.set(g, dss::ThreadLocalAttr{true});
 
         DiagnosticReporter reporter;
         bool const ok =
-            HirVerifier{h, nullptr, nullptr, nullptr, &linkage}.verify(reporter);
+            HirVerifier{h, nullptr, nullptr, nullptr, &linkage, &threadLocal}.verify(reporter);
         if (row.refusedWith == nullptr) {
             EXPECT_TRUE(ok) << row.what << ": "
                             << (reporter.all().empty() ? std::string{}

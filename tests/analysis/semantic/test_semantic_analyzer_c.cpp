@@ -435,13 +435,19 @@ TEST(SemanticAnalyzerC, NonConstantArrayLengthEmitsDiagnostic) {
 
 // SE-arrays: an empty-bracket declarator (`int a[]`) has no length — a DIFFERENT
 // path from `[n]` (the length node lands on the `]` token, not an identifier).
-// Must also fail loud.
+// Must also fail loud. P69 (lane `cs`): the absent bound is no NON-CONSTANT
+// length — it gives an array of unknown size (C 6.7.6.2p4), a type that stands
+// fine as a pointee, a typedef or an `extern` declaration; what is refused is a
+// block-scope OBJECT of it, which nothing completes (S_IncompleteTypeObject).
 TEST(SemanticAnalyzerC, EmptyArrayLengthEmitsDiagnostic) {
     auto cu = buildShippedUnit("c", { "int main() { int a[]; }\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_NonConstantArrayLength), 1u);
+                        DiagnosticCode::S_IncompleteTypeObject), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u)
+        << "an absent bound is not a non-constant one";
 }
 
 // ⚠⚠ REWRITTEN BY INLINE-ASM P5, AND THE OLD PIN IS KEPT AS PROSE BECAUSE ITS
@@ -822,15 +828,16 @@ TEST(SemanticAnalyzerC, BadWideCharConstantLeavesBodyTokenUntyped) {
     }
 }
 
-// (5) A `[]` with NO initializer is NOT silently sized — the resolver's
-// S_NonConstantArrayLength still fires (inference is gated on an initializer
-// being present, so a bare `int x[];` is unaffected by c34).
+// (5) A `[]` with NO initializer is NOT silently sized — a block-scope object
+// of an array of unknown size is refused (S_IncompleteTypeObject; inference is
+// gated on an initializer being present, so a bare `int x[];` is unaffected by
+// c34).
 TEST(SemanticAnalyzerC, EmptyArrayNoInitNotSized) {
     auto cu = buildShippedUnit("c", { "int main(void){ int a[]; return 0; }\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_NonConstantArrayLength), 1u);
+                        DiagnosticCode::S_IncompleteTypeObject), 1u);
     // The symbol's type must NOT be a sized array (it stays unresolved/incomplete).
     auto const& ti = model.lattice().interner();
     SymbolRecord const* a = findSym(model, "a");
@@ -12452,21 +12459,23 @@ TEST(SemanticAnalyzerC, BlockScopeUnknownGnuAttributeWarnsInBothPositions) {
 }
 
 // THE FALSE-POSITIVE FLOOR, and it is the reason the arm above is a Warning
-// rather than an Error. All three of these are REAL GNU attributes that DSS does
-// not model; ✔MEASURED, gcc AND clang each accept every one of them at block
-// scope with NO diagnostic at all. An Error here would have refused three
-// working programs to catch one typo.
+// rather than an Error. These are REAL GNU attributes; ✔MEASURED, gcc AND clang
+// each accept every one of them at block scope with NO diagnostic at all. An
+// Error here would have refused working programs to catch one typo.
 // RED-ON-DISABLE: promote the block-scope arm to Error → `hasErrors()` becomes
-// true on all three.
+// true on both.
+//
+// P69 (lane `cs`): `section("mysec")` was the third case, and it LEFT this
+// floor: c.lang.json now states it, as a name this compiler cannot honour yet
+// (it places the object in a named output section), and a name with that row is
+// refused BY NAME at every position — a placement silently dropped is the
+// miscompile, not the typo. `SymbolAlias.ANamedSectionIsRefusedByName` pins it, at
+// file scope and at block scope.
 TEST(SemanticAnalyzerC, BlockScopeUnmodelledRealGnuAttributesStillCompile) {
     for (char const* src : {
              "static void cl(int *p) { (void)p; }\n"
              "int main(void) {\n"
              "    __attribute__((cleanup(cl))) int x = 1;\n"
-             "    return x - 1;\n"
-             "}\n",
-             "int main(void) {\n"
-             "    __attribute__((section(\"mysec\"))) static int x = 1;\n"
              "    return x - 1;\n"
              "}\n",
              "int main(void) {\n"
@@ -12480,6 +12489,7 @@ TEST(SemanticAnalyzerC, BlockScopeUnmodelledRealGnuAttributesStillCompile) {
                "replaces: " << src;
     }
 }
+
 
 // AND THE OTHER HALF OF THE BLIND-GATE ROW, kept as its own pin because the
 // shipped `GnuSiblingClauseStringIsNotThisClausesMessage` asserts only
@@ -14113,21 +14123,24 @@ TEST(SemanticAnalyzerC, PlainVlaArrayParamStillDecaysToPointer) {
 }
 
 // VLA C4a-param THE KEY OPTION-B GUARD (D-CSUBSET-VLA): a struct field `int a[n]` (variable
-// n) must STILL resolve via the struct-field FAM incompleteArray path -> a sole flexible
-// array member -> S_FlexibleArraySoleMember. Option B threads a DISTINCT paramDecay signal
-// that a struct field NEVER carries (its config row has allowFlexibleArray, not
-// paramAdjustments), so the FAM path is byte-identical. RED-ON-DISABLE: a broad fix that
-// routed struct fields through the paramDecay VLA branch would build a vlaArray instead of
-// an incompleteArray and this diagnostic vanishes.
+// n) must never take the paramDecay VLA branch. Option B threads a DISTINCT paramDecay
+// signal that a struct field NEVER carries (its config row has allowFlexibleArray, not
+// paramAdjustments). P69 (lane `cs`): what the field's runtime bound DOES get changed — it
+// used to become a flexible member (refused here only because it was the SOLE member,
+// S_FlexibleArraySoleMember, and accepted beside another member); a member cannot have a
+// variably modified type (C 6.7.2.1p9), so the bound is now refused by name at the bound,
+// sole member or not. RED-ON-DISABLE: a broad fix that routed struct fields through the
+// paramDecay VLA branch would build a vlaArray member, and the refusal vanishes.
 TEST(SemanticAnalyzerC, StructFieldVlaSoleMemberStillFailsLoud) {
     auto model = analyzeShipped("c", {
         "int n = 4;\n"
         "struct S { int a[n]; };\n"
         "int main(void) { return 0; }\n",
     });
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_FlexibleArraySoleMember), 1u)
-        << "the Option-B no-regression guard: a struct field `int a[n]` (variable n) still "
-           "routes through the FAM incompleteArray path -> S_FlexibleArraySoleMember";
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NonConstantArrayLength), 1u)
+        << "a struct field `int a[n]` (variable n) is refused at its bound: no member is "
+           "variably modified, and none is a flexible member by a runtime bound";
 }
 
 // VLA C4a-param (D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅ CLOSED): a FIXED arg
@@ -14597,19 +14610,24 @@ TEST(SemanticAnalyzerC, DerefSizedVlaStillCompiles) {
 
 // VLA C4c (D-CSUBSET-VLA, code-audit IMPORTANT): the EMERGENT multi-dim `[*]` combinations now
 // parse+fold (arrayStarSuffix rides the suffix repeat) — outside C4c's single-`[*]` scope. They
-// must be CORRECT or FAIL LOUD, NEVER a silent stride: `int a[*][3]` is the OUTER star-modifier
-// (decays exactly like `int a[][3]` → `int(*)[3]`, a FIXED inner stride — accepted, no VLA); an
-// INNER `[*]` (`int a[n][*]`) yields a pointer to an UNSPECIFIED-size array whose fixed-array
-// argument is a distinct interned type → `S_TypeMismatch` (S0003) fail-loud (NEVER a wrong/zero
-// row stride). RED-ON-DISABLE: an inner `[*]` silently accepted with a bogus stride would flip
-// the arg-compat reject.
+// must be CORRECT, NEVER a silent stride: `int a[*][3]` is the OUTER star-modifier (decays
+// exactly like `int a[][3]` → `int(*)[3]`, a FIXED inner stride — accepted, no VLA).
+// ★ P69 (lane `cs`): the INNER half used to pin a REFUSAL — an inner `[*]` (`int a[n][*]`) gave a
+// pointer to an unspecified-size array, and the fixed-array argument was refused as a type
+// mismatch. ✔MEASURED 2026-10-15 (lane `cs` probe vm cell 8): gcc 13.3.0 and clang 18.1.3 build
+// and RUN this exact program (exit 42), so the refusal was a divergence. The parameter is a
+// pointer to an array of unknown size, compatible with `int(*)[3]` (C 6.7.6.2p6), and no stride
+// can be silent: only the DEFINITION indexes, with its own bound, and a definition may not spell
+// `[*]` (`ArrayParamStarInFunctionDefinitionFailsLoud`) nor an element of unknown size
+// (`IncompleteArrayType.AnElementOfUnknownSizeIsRefusedAndAnIncompleteStructureElementIsCls`).
+// examples/c/c99_array_param_static runs the shape (`growstar`, return 6).
 // ⚠ RE-SPELLED P57 for the same reason as its sibling above: BOTH arms used to put `[*]`
 // on a function DEFINITION, which C 6.7.6.3p12 forbids and which gcc 13.3.0 and clang
 // 18.1.3 both REFUSE (✔MEASURED 2026-09-03 on `int f(int a[*][3]) { … }`, each reference
 // probed separately). This pin's subject is the multi-dim DECAY and the inner-star
 // mismatch, neither of which is about placement, so both arms move to the legal
 // prototype spelling; `ArrayParamStarInFunctionDefinitionFailsLoud` owns placement.
-TEST(SemanticAnalyzerC, ArrayStarOuterDecaysInnerStarFailsLoud) {
+TEST(SemanticAnalyzerC, ArrayStarOuterDecaysAndAnInnerStarIsAnArrayOfUnspecifiedSize) {
     auto outer = analyzeShipped("c", {
         "int f(int a[*][3]);\n"
         "int f(int a[2][3]) { return a[1][2]; }\n"
@@ -14623,16 +14641,17 @@ TEST(SemanticAnalyzerC, ArrayStarOuterDecaysInnerStarFailsLoud) {
         "int f(int n, int a[n][3]) { return a[0][0]; }\n"
         "int main(void) { int x[2][3] = {{1,0,0},{0,0,0}}; return f(2, x); }\n",
     });
-    EXPECT_TRUE(inner.hasErrors())
-        << "an INNER `[*]` (`int a[n][*]`) → ptr-to-unspecified-array: a fixed-array arg is a "
-           "distinct interned type → S_TypeMismatch fail-loud, NEVER a silent stride";
-    // ... and it must NOT be the PLACEMENT code doing the failing — the inner-star
-    // mismatch is a TYPE question and stays one. Without this the arm would keep passing
-    // for the wrong reason the moment the placement check over-fired.
+    EXPECT_FALSE(inner.hasErrors())
+        << "an INNER `[*]` (`int a[n][*]`) is a pointer to an array of unspecified size, "
+           "compatible with the `int(*)[3]` argument; gcc and clang build and run it";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(inner.diagnostics()))
+        << "the argument's `int(*)[3]` is COMPATIBLE with the prototype's pointer to an array of "
+           "unspecified size (C 6.7.6.2p6): no conversion diagnostic at all";
     EXPECT_EQ(countCode(inner.diagnostics(),
                         DiagnosticCode::S_ArrayParamStarInFunctionDefinition), 0u)
-        << "the inner-`[*]` arm must fail on the TYPE mismatch, not on placement — the "
-           "`[*]` here is in a prototype, exactly where C 6.7.6.3p12 allows it";
+        << "the `[*]` here is in a prototype, exactly where C 6.7.6.3p12 allows it";
+    EXPECT_EQ(countCode(inner.diagnostics(), DiagnosticCode::S_ArrayElementTypeIncomplete), 0u)
+        << "the outer `[n]`'s element is the `[*]` array: of unspecified size, not of unknown size";
 }
 
 // VLA C4c (D-CSUBSET-VLA, audit IMPORTANT 3): a multi-dim VLA parameter whose INNER dim
@@ -17842,8 +17861,11 @@ TEST(SemanticAnalyzerC, StaticAssertNonBinaryConditionEmitsWithoutOperandSuffix)
 }
 
 // The NON-CONSTANT branch also degrades cleanly: `sizeof` of an incomplete
-// array does not fold, so the LHS reports ITS OWN SPELLING while the RHS still
-// folds to a value. The message keeps its own "is not an integer constant
+// structure does not fold, so the LHS reports ITS OWN SPELLING while the RHS
+// still folds to a value. (P69, lane `cs`: the operand was `sizeof` of an array
+// of unknown size, which now FOLDS — to 0, cl's reading, said by a warning — so
+// it no longer reaches this branch; an incomplete structure has no size on any
+// reference.) The message keeps its own "is not an integer constant
 // expression" wording (the two failure modes stay distinguishable on one code).
 //
 // ⚠ THIS TEST USED TO REQUIRE THE LITERAL TEXT `<non-constant>`, and that string
@@ -17855,8 +17877,8 @@ TEST(SemanticAnalyzerC, StaticAssertNonBinaryConditionEmitsWithoutOperandSuffix)
 // operand must now identify itself.
 TEST(SemanticAnalyzerC, StaticAssertNonConstantOperandNamesItsOwnSpelling) {
     auto cu = buildShippedUnit("c", {
-        "typedef int T[];\n"
-        "_Static_assert(sizeof(T) == 4, \"incomplete has no size\");\n"
+        "struct T;\n"
+        "_Static_assert(sizeof(struct T) == 4, \"incomplete has no size\");\n"
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
@@ -17868,7 +17890,7 @@ TEST(SemanticAnalyzerC, StaticAssertNonConstantOperandNamesItsOwnSpelling) {
               std::string::npos) << text;
     EXPECT_EQ(text.find("<non-constant>"), std::string::npos)
         << "the undiscriminating placeholder must be gone; got: " << text;
-    EXPECT_NE(text.find("(folded: `sizeof(T)` Eq 4)"), std::string::npos)
+    EXPECT_NE(text.find("(folded: `sizeof(struct T)` Eq 4)"), std::string::npos)
         << "a side that does not fold must NAME ITSELF, and the side that does "
            "must still report its value; got: " << text;
 }
@@ -17946,19 +17968,33 @@ TEST(SemanticAnalyzerC, EmptyMacroArrayBoundTypedefMatchesTheSdkSpelling) {
     EXPECT_TRUE(model.lattice().interner().isIncompleteArray(t->type));
 }
 
-// FAIL LOUD (1): a file-scope OBJECT of the incomplete type. C 6.7p7 — an
-// object shall have a complete type. Silently sizing it 0 is the exact defect
-// class; S0028 S_IncompleteTypeObject is the guard (widened from
-// incomplete-COMPOSITE to also cover incomplete ARRAY in the same commit).
+// NEVER SIZED 0 (1): a file-scope OBJECT of the incomplete type. With no
+// `extern` and no initializer it is a TENTATIVE definition, and C 6.9.2p5
+// completes it at the end of the unit — to ONE element when nothing in the unit
+// completes it, said by S_TentativeArrayAssumedOneElement (P69, lane `cs`:
+// gcc 13.3.0 and clang 18.1.3 both build it, gcc warning "array 'x' assumed to
+// have one element" — ✔MEASURED, probe fs). It was refused here
+// (S_IncompleteTypeObject) before the completion existed; sizing it 0 is still
+// the defect class this block guards.
 TEST(SemanticAnalyzerC, IncompleteArrayTypedefFileScopeObjectFailsLoud) {
     auto model = analyzeShipped("c", {
         "typedef int T[];\n"
         "T x;\n"
         "int main(void) { return 0; }\n",
     });
+    EXPECT_FALSE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_IncompleteTypeObject), 1u)
-        << "an OBJECT of incomplete-array type must fail loud, never be sized 0";
+                        DiagnosticCode::S_TentativeArrayAssumedOneElement), 1u)
+        << "the completion to one element is said";
+    auto const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    TypeInterner const& in = model.lattice().interner();
+    ASSERT_TRUE(x->type.valid());
+    ASSERT_EQ(in.kind(x->type), TypeKind::Array);
+    EXPECT_FALSE(in.isIncompleteArray(x->type));
+    ASSERT_FALSE(in.scalars(x->type).empty());
+    EXPECT_EQ(in.scalars(x->type)[0], 1)
+        << "a tentative array of unknown size is ONE element, never 0";
 }
 
 // FAIL LOUD (2): the same at BLOCK scope — a different declaration row
@@ -17973,8 +18009,11 @@ TEST(SemanticAnalyzerC, IncompleteArrayTypedefLocalObjectFailsLoud) {
         << "a block-scope object of incomplete-array type must fail loud too";
 }
 
-// FAIL LOUD (3): `sizeof(T)`. computeLayout has no size for a bare incomplete
-// array, so a const-expr use refuses — it never folds to 0.
+// FAIL LOUD (3): `sizeof(T)`. P69 (lane `cs`): `sizeof` of an array of unknown
+// size folds to 0 and SAYS so (S_SizeofIncompleteArrayIsZero) — cl's reading,
+// C4034 (✔MEASURED, probe sz; gcc and clang refuse the `sizeof`). It is never
+// SILENT, and the zero-length array it would declare here is refused by every
+// reference (cl C2466 after its C4034) and by DSS (S_ArrayLengthOutOfRange).
 TEST(SemanticAnalyzerC, SizeofIncompleteArrayTypedefFailsLoud) {
     auto cu = buildShippedUnit("c", {
         "typedef int T[];\n"
@@ -17984,9 +18023,11 @@ TEST(SemanticAnalyzerC, SizeofIncompleteArrayTypedefFailsLoud) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_NonConstantArrayLength), 1u)
-        << "`sizeof(T)` on an incomplete array must REFUSE — folding it to 0 "
-           "would silently declare `int probe[0]`";
+                        DiagnosticCode::S_SizeofIncompleteArrayIsZero), 1u)
+        << "`sizeof(T)` on an incomplete array folds to 0 only with a word";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 1u)
+        << "and `int probe[0]` is refused, never silently declared";
 }
 
 // FAIL LOUD (4): a NON-LAST member of that type. The shared composite guard

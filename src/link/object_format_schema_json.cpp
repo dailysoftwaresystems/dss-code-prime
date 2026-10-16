@@ -422,7 +422,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // one answer, or one per kind of weak definition. OPTIONAL: stated by the
     // documents a link resolves units for, an image or a relocatable artifact —
     // the documents that state `commonYieldsTo`; refused on an archive document.
-    static constexpr std::array<std::string_view, 53> kFormatDocumentKeys{
+    static constexpr std::array<std::string_view, 54> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -521,6 +521,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // ten image documents that declare it recording NOTHING while the gate
         // accepted every request.
         "runpath", "runpathUnsupportedReason",
+        // why a program of this format may give no definition a second name
+        // (the C `alias` attribute); absent = supported. A typo would leave the
+        // Mach-O documents silently ACCEPTING what every compiler of the
+        // platform refuses.
+        "symbolAliasUnsupportedReason",
         // the weak-DEFINITION spelling (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED).
         // A typo here does NOT silently default: the walker refuses
         // an unanswered schema the moment it meets a weak definition, so the
@@ -3014,6 +3019,28 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                       ", ")));
         } else {
             data.runpathUnsupportedReason = *reason;
+        }
+    }
+
+    // P69 (lane `cs`): `symbolAliasUnsupportedReason` — why a program of this
+    // format may give no definition a second name; absent = supported. The
+    // runpath reason's shape: one closed verb, refused by name when it is not one.
+    if (doc.contains("symbolAliasUnsupportedReason")) {
+        auto const& ar = doc.at("symbolAliasUnsupportedReason");
+        std::optional<SymbolAliasUnsupportedReason> reason;
+        if (ar.is_string()) {
+            reason = symbolAliasUnsupportedReasonFromName(ar.get<std::string>());
+        }
+        if (!reason.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/symbolAliasUnsupportedReason",
+                      std::format("'symbolAliasUnsupportedReason' must be one of: "
+                                  "{}",
+                                  allowedList(
+                                      allNames(kSymbolAliasUnsupportedReasonTable),
+                                      ", ")));
+        } else {
+            data.symbolAliasUnsupportedReason = *reason;
         }
     }
 

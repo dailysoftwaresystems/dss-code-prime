@@ -938,7 +938,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           // Without it a `&&label` in a static initializer is refused
                           // (loudly — a per-function label ordinal is unresolvable
                           // without its function), and nothing else changes.
-                          &hir->enclosingFunctionMap);
+                          &hir->enclosingFunctionMap,
+                          // P69 (lane `cs`): the unit's symbol aliases (`alias`) —
+                          // threaded, an alias is a name the module defines; not,
+                          // it is a reference the link refuses as undefined.
+                          hir->symbolAliases);
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
@@ -2088,6 +2092,27 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         for (std::uint32_t i = 0; i < mir.moduleGlobalCount(); ++i) {
             MirGlobalId const gid = mir.globalAt(i);
             appendSym(mir.globalSymbol(gid), mir.globalLinkage(gid));
+        }
+        // P69 (lane `cs`) — A SECOND NAME OF A DEFINITION (`Mir::aliases`, the
+        // compiled `alias("target")`): one more row on the TARGET's id, the shape
+        // every object reader makes of a foreign alias
+        // (`ObjectSymbolNames::definedAliases`), named by the alias and carrying the
+        // alias's OWN binding, visibility and kind. The unit refers to an external
+        // alias by NAME — its declaration lowered to a reference row
+        // (`ExternImport`) — so the row says so (`referencedByName`, read beside a
+        // weak binding): a weak alias another unit's strong definition replaces
+        // takes the unit's own uses with it. A module-private alias has no
+        // reference row (the semantic tier bound its uses to the target) and says
+        // nothing. tests/link/test_compiled_symbol_alias.cpp pins what the link
+        // makes of this shape on every format.
+        for (MirAlias const& a : mir.aliases()) {
+            std::string name = nameOf(a.alias);
+            if (name.empty()) continue;   // module-private and nameless: no row to state
+            ModuleSymbol row{a.target, std::move(name), a.linkage.binding,
+                             a.linkage.visibility};
+            row.weakKind         = a.linkage.statedWeakKind();
+            row.referencedByName = a.linkage.binding != SymbolBinding::Local;
+            assembled.symbols.push_back(std::move(row));
         }
     }
 

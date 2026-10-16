@@ -182,6 +182,20 @@ analyze(std::shared_ptr<CompilationUnit const> cu,
         // BY NAME, never accepted: with no pair there is nothing to compare the
         // name against, and accepting it would be a guess about a call sequence —
         // the `longDoubleFormat` posture, for the same reason.
-        std::optional<std::string_view> activeCallingConvention = std::nullopt);
+        std::optional<std::string_view> activeCallingConvention = std::nullopt,
+        // P69 (lane `cs`): the active format's `symbolAliasUnsupportedReason` —
+        // present when the platform's own C compilers refuse to give a definition
+        // a second name (the Mach-O documents), and then the `alias` attribute is
+        // refused BY NAME with the reason's sentence. `nullopt` ⇒ the format
+        // states no refusal and an alias is built; a direct-API caller with no
+        // pair builds it too, since what an alias MEANS does not depend on the
+        // target — only whether the platform's compilers accept it does.
+        std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported = std::nullopt,
+        // P69 (lane `cs`): whether the active format's document STATES COMMONS
+        // (`ObjectFormatSchema::statesCommons`). False ⇒ the `common` attribute is
+        // refused by name: a common cannot be stated there. The default (and a
+        // direct-API caller with no pair) is true — `common` then adds nothing to a
+        // tentative definition, which is what it adds on every format that has one.
+        bool formatStatesCommons = true);
 
 } // namespace dss

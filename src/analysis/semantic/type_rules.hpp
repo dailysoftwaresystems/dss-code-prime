@@ -143,7 +143,8 @@ namespace detail::type_rules {
 // on the two references that WORK).
 //
 // The predicate walks the array spine pairwise and admits a level whose lengths
-// differ ONLY when at least one side is the VLA sentinel; two DIFFERENT constants
+// differ ONLY when at least one side is the VLA sentinel or the size-not-present one
+// (`kIncompleteArrayLength`: `int (*)[]` beside `int (*)[3]`); two DIFFERENT constants
 // stay a loud mismatch (`int (*)[2]` vs `int (*)[3]` is still `S_TypeMismatch`), and
 // so does any element-type difference below the spine. Non-array levels must be
 // interner-IDENTICAL, so this can never launder a `Ptr<int>`/`Ptr<float>` pair.
@@ -168,9 +169,16 @@ namespace detail::type_rules {
         auto const bLen = interner.scalars(b);
         if (aLen.empty() || bLen.empty()) return false;
         // Both bounds are integer constant expressions and they DIFFER → C says
-        // incompatible. Only a VLA level (a non-ICE bound) may straddle.
+        // incompatible. A VLA level (a non-ICE bound) may straddle, and so may a
+        // level whose size is NOT PRESENT (C 6.7.6.2p6: the two sizes must agree
+        // only "if both size specifiers are present and integer constant
+        // expressions"). P69 (lane `cs`): ✔MEASURED, `int (*p)[] = &buf` with an
+        // `int buf[3]` is silent on gcc 13.3.0 and clang 18.1.3 (probe sz); DSS
+        // warned it as an incompatible pointer conversion before this arm.
         if (aLen[0] != bLen[0]
-            && aLen[0] != kVlaLength && bLen[0] != kVlaLength) {
+            && aLen[0] != kVlaLength && bLen[0] != kVlaLength
+            && aLen[0] != kIncompleteArrayLength
+            && bLen[0] != kIncompleteArrayLength) {
             return false;
         }
         auto const aElem = interner.operands(a);

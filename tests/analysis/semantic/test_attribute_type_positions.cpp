@@ -230,6 +230,26 @@ TEST(AttributeTypePositions, AKeywordNamedClauseIsNotTheQualifierItSpells) {
     EXPECT_FALSE(m.lattice().interner().isVolatileQualified(p->type))
         << "an attribute NAMED volatile is an unknown attribute, not a qualifier";
     EXPECT_EQ(p->type.v, q->type.v);
+    // ...and the GATED-MARKER face (P69, lane `cs`): a for-statement's init-declaration refuses a `static` or a
+    // `_Thread_local` storage class (C 6.8.5p3), found by a scan of the declaration for the keyword — which must not
+    // read an attribute's clause NAMED by that keyword. ✔MEASURED (lane `cs`, probe ak cells 1-4): gcc 13.3.0 and
+    // clang 18.1.3 build and run `for (int __attribute__((static)) i = 0; …)` and its `_Thread_local` twin (an
+    // unknown attribute, warned), and refuse a real `static` there.
+    for (char const* src : {"int f(void) { int s = 0; for (int __attribute__((static)) i = 0; i < 3; ++i) s += i; "
+                            "return s; }\n",
+                            "int f(void) { int s = 0; for (int __attribute__((_Thread_local)) i = 0; i < 3; ++i) "
+                            "s += i; return s; }\n"}) {
+        SCOPED_TRACE(src);
+        auto const f = analyzeC({src});
+        EXPECT_EQ(countCode(f.diagnostics(), DiagnosticCode::S_StaticStorageInForInit)
+                      + countCode(f.diagnostics(), DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+                  0u)
+            << "a for-init's marker scan read the attribute's clause name as the storage class";
+        EXPECT_FALSE(f.hasErrors());
+    }
+    // CONTROL: the storage class itself is refused there.
+    auto const c = analyzeC({"int f(void) { int s = 0; for (static int i = 0; i < 3; ++i) s += i; return s; }\n"});
+    EXPECT_EQ(countCode(c.diagnostics(), DiagnosticCode::S_StaticStorageInForInit), 1u);
 }
 
 // ── A RUN AMONG THE SPECIFIERS OF A DECLARATION ────────────────────────────

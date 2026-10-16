@@ -343,6 +343,22 @@ struct DSS_EXPORT SymbolRecord {
     // lowering keys off `isAbsorbedProto` (set on whichever side is absorbed), so a
     // SURVIVING tentative emits its zero-init global unchanged. Default false.
     bool            isTentativeDefinition = false;
+    // P69 (lane `cs`): a tentative definition that is a DEFINITION of this unit and
+    // never a common — its declarations wrote `nocommon`, or an `alias` names it (a
+    // second name cannot be equated to a common: ✔MEASURED, every reference refuses
+    // it under `-fcommon` and makes a `.bss` definition at the default). Set on the
+    // merge survivor, which is the record the lowering reads; it is one of the
+    // inputs of the ONE statement of the tentative mark (`recordLinkage`,
+    // cst_to_hir.cpp: "a tentative definition that MAY be a common").
+    bool            tentativeNeverCommon = false;
+    // P69 (lane `cs`): the definition this symbol is a SECOND NAME of — set on the
+    // merge survivor of a declaration that wrote `alias("target")`, once
+    // `resolveSymbolAliases` found the target's definition in the unit (the final
+    // one, through any chain of aliases). The declared name then has no storage or
+    // body of its own: it is lowered as one more name on the target's definition,
+    // with the alias's own binding and visibility. Invalid (the default) for every
+    // other symbol.
+    SymbolId        aliasTarget{};
     // D-CSUBSET-ENUM-INT-CONVERSION (FC8): TRUE iff this symbol IS an enumerator
     // constant (bound under a `compositeKind:"enum"` decl, where `enumValue` was
     // set). DISTINGUISHES an enumerator from a storage-backed `enum E e;` local —

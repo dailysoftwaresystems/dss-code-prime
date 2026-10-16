@@ -343,6 +343,7 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     checkAtomicAccessLowered(reporter);
     checkStoreValueTypes(reporter);
     checkLinkageRecords(reporter);
+    checkAliases(reporter);
     checkSymbolIdsBelowTheStatedEnd(reporter);
     if (reporter.hitCap()) return false;
     // ★★ THE VERDICT IS THE VERIFIER'S OWN COUNT, AND-ed with the reporter's
@@ -1817,7 +1818,7 @@ void MirVerifier::checkLinkageRecords(DiagnosticReporter& reporter) const {
         MirFuncId const f = mir_.funcAt(fi);
         std::string_view const defect =
             mirLinkageDefect(mir_.funcLinkage(f), MirLinkageOwner::Function,
-                             /*hasInitializer=*/false);
+                             /*hasInitializer=*/false, /*isThreadLocal=*/false);
         if (defect.empty()) continue;
         reportFunc(reporter, DiagnosticCode::I_VerifierFailure, f,
                    std::format("the linkage of symbol %{} is not well formed: {}",
@@ -1829,12 +1830,49 @@ void MirVerifier::checkLinkageRecords(DiagnosticReporter& reporter) const {
                                     || mir_.globalInitFunc(g).valid();
         std::string_view const defect =
             mirLinkageDefect(mir_.globalLinkage(g), MirLinkageOwner::Global,
-                             hasInitializer);
+                             hasInitializer, mir_.globalIsThreadLocal(g));
         if (defect.empty()) continue;
         report(reporter, DiagnosticCode::I_VerifierFailure,
                std::format("mir global #{}: the linkage of symbol %{} is not well "
                            "formed: {}",
                            g.v, mir_.globalSymbol(g).v, defect));
+    }
+}
+
+void MirVerifier::checkAliases(DiagnosticReporter& reporter) const {
+    if (mir_.moduleAliasCount() == 0) return;
+    std::unordered_set<std::uint32_t> defined;
+    for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi)
+        defined.insert(mir_.funcSymbol(mir_.funcAt(fi)).v);
+    for (std::uint32_t gi = 0; gi < mir_.moduleGlobalCount(); ++gi)
+        defined.insert(mir_.globalSymbol(mir_.globalAt(gi)).v);
+    std::unordered_set<std::uint32_t> stated;
+    for (MirAlias const& a : mir_.aliases()) {
+        auto const say = [&](std::string_view why) {
+            report(reporter, DiagnosticCode::I_VerifierFailure,
+                   std::format("alias %{} of %{}: {}", a.alias.v, a.target.v, why));
+        };
+        if (!defined.contains(a.target.v)) {
+            say("its target is no function or global this module defines — an alias "
+                "is one more name on a definition, and there is none to name");
+        }
+        if (defined.contains(a.alias.v)) {
+            say("the name is also a function or a global this module defines — one "
+                "name, two definitions");
+        }
+        if (!stated.insert(a.alias.v).second) {
+            say("the name is stated as an alias twice");
+        }
+        if (a.linkage.tentative) {
+            say("it is marked as a tentative definition — an alias has no storage of "
+                "its own");
+        }
+        std::string_view const defect =
+            mirLinkageDefect(a.linkage, MirLinkageOwner::Function,
+                             /*hasInitializer=*/false, /*isThreadLocal=*/false);
+        if (!a.linkage.tentative && !defect.empty()) {
+            say(std::format("its linkage is not well formed: {}", defect));
+        }
     }
 }
 

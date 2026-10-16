@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -151,11 +152,13 @@ Mir::Mir(Mir&& other) noexcept
       aliasingMode_(other.aliasingMode_),
       charTypesAliasAll_(other.charTypesAliasAll_),
       symbolIdEnd_(other.symbolIdEnd_),
-      symbolIdEndStated_(other.symbolIdEndStated_) {
+      symbolIdEndStated_(other.symbolIdEndStated_),
+      aliases_(std::move(other.aliases_)) {
     other.aliasingMode_ = MirAliasingMode::Permissive;
     other.charTypesAliasAll_ = true;
     other.symbolIdEnd_ = 1;
     other.symbolIdEndStated_ = false;   // the emptied module is nobody's table
+    other.aliases_.clear();             // and defines no second name
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
                     other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_,
@@ -182,6 +185,8 @@ Mir& Mir::operator=(Mir&& other) noexcept {
     other.symbolIdEnd_ = 1;
     symbolIdEndStated_ = other.symbolIdEndStated_;
     other.symbolIdEndStated_ = false;
+    aliases_ = std::move(other.aliases_);
+    other.aliases_.clear();
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
                     other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_,
@@ -631,10 +636,39 @@ SymbolId MirBuilder::mintSymbolOrAbort(char const* who) {
     return minted;
 }
 
-void MirBuilder::carryModuleFactsOf(Mir const& rebuilt) noexcept {
+void MirBuilder::carryModuleFactsOf(Mir const& rebuilt) {
     aliasingMode_      = rebuilt.aliasingMode();
     charTypesAliasAll_ = rebuilt.charTypesAliasAll();
     continueSymbolIdsOf(rebuilt);
+    // Whole, and through the door: a rebuild that already stated one of them
+    // stated it twice, which `addAlias` refuses by name.
+    for (MirAlias const& a : rebuilt.aliases()) addAlias(a.alias, a.target, a.linkage);
+}
+
+void MirBuilder::addAlias(SymbolId alias, SymbolId target, MirLinkage linkage) {
+    auto const refuse = [&](char const* why) {
+        std::fprintf(stderr, "dss::MirBuilder fatal: addAlias: symbol id %u (alias of %u): %s\n",
+                     alias.v, target.v, why);
+        std::abort();
+    };
+    if (!alias.valid() || !target.valid()) {
+        refuse("an alias and its target are both named symbols — an invalid id names neither");
+    }
+    if (alias == target) refuse("the name is stated as an alias of itself");
+    for (MirAlias const& a : aliases_) {
+        if (a.alias == alias) refuse("the name is already stated as an alias in this module");
+    }
+    if (linkage.tentative) {
+        refuse("it is marked as a tentative definition — an alias has no storage of its "
+               "own, so there is nothing for a link to fold");
+    }
+    // The tentative mark is refused above, so the owner the rule is asked under
+    // decides nothing: only the binding/kind pairing is left for it to judge.
+    std::string_view const defect = mirLinkageDefect(
+        linkage, MirLinkageOwner::Function, /*hasInitializer=*/false, /*isThreadLocal=*/false);
+    if (!defect.empty()) refuse(std::string{defect}.c_str());
+    aliases_.push_back(MirAlias{alias, target, linkage});
+    keepSymbolIdsClearOf(alias);   // the id space is past every symbol the module defines
 }
 
 // The module's own end and the module's own word on it — never a count of the
@@ -708,9 +742,10 @@ namespace {
 // mir/mir_node.hpp): a record the rule refuses is a producer's bug, so it
 // aborts with the rule's own sentence, the builder verb and the symbol id.
 void requireWellFormedLinkage(MirLinkage const& linkage, MirLinkageOwner owner,
-                              bool hasInitializer, char const* verb,
-                              SymbolId symbol) {
-    std::string_view const defect = mirLinkageDefect(linkage, owner, hasInitializer);
+                              bool hasInitializer, bool isThreadLocal,
+                              char const* verb, SymbolId symbol) {
+    std::string_view const defect =
+        mirLinkageDefect(linkage, owner, hasInitializer, isThreadLocal);
     if (defect.empty()) return;
     std::fprintf(stderr,
                  "dss::MirBuilder fatal: %s: symbol id %u: %.*s\n",
@@ -766,7 +801,8 @@ MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol,
         std::abort();
     }
     requireWellFormedLinkage(linkage, MirLinkageOwner::Function,
-                             /*hasInitializer=*/false, "addFunction", symbol);
+                             /*hasInitializer=*/false, /*isThreadLocal=*/false,
+                             "addFunction", symbol);
     closeFunction_();
     detail::MirFunc f;
     f.signature  = signature;
@@ -833,6 +869,7 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
     if (initFunc.valid()) checkSameModule_(initFunc.arenaTag, "addGlobal initFunc");
     requireWellFormedLinkage(linkage, MirLinkageOwner::Global,
                              initLiteralIndex != UINT32_MAX || initFunc.valid(),
+                             threadStorage == MirThreadStorage::PerThread,
                              "addGlobal", symbol);
     detail::MirGlobal g;
     g.type             = type;
@@ -1844,6 +1881,7 @@ Mir MirBuilder::finish() && {
     // dropped that fact, so the first rebuild made a counted end a stated one.
     if (symbolIdEnd_ > built.symbolIdEnd_) built.symbolIdEnd_ = symbolIdEnd_;
     built.symbolIdEndStated_ = symbolIdEndStated_;
+    built.aliases_ = std::move(aliases_);   // P69 (lane `cs`): no arena holds them
     return built;
 }
 

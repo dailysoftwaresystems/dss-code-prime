@@ -3103,6 +3103,13 @@ struct DSS_EXPORT ObjectFormatData {
     // documents. See `RunpathUnsupportedReason` (link/runpath.hpp).
     std::optional<RunpathUnsupportedReason> runpathUnsupportedReason;
 
+    // P69 (lane `cs`): `"symbolAliasUnsupportedReason"` — WHY a program of this
+    // format may give no definition a second name (the C `alias` attribute), as a
+    // closed verb whose sentence the semantic tier's refusal carries. ABSENT =
+    // an alias is supported. See `SymbolAliasUnsupportedReason`
+    // (core/types/object_format_kind.hpp) for the one reason and its measurement.
+    std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupportedReason;
+
     // ── D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the weak-DEFINITION
     //    spelling this format uses (`"weakDefinition"` in the JSON) ────────
     //
@@ -3467,6 +3474,7 @@ public:
         return d_.commonYieldsTo;
     }
 
+<<<<<<< main
     // ★★★ WHETHER THIS DOCUMENT STATES COMMONS (P69 fold 3b, lane `xa`;
     // D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED): how a common
     // is resolved, by a link (`commonYieldsTo`: an image, a relocatable artifact)
@@ -3496,6 +3504,15 @@ public:
     // place the answer is read off the document: the pipeline's two lower-half
     // callers capture it (`lowerMirModuleToAssembly`,
     // `program/compile_pipeline.cpp`), and nothing re-derives it from the keys.
+=======
+    // Whether this document STATES COMMONS — a program of this format may hold a
+    // common definition. Not a key of its own: a fact with an owner gets no second
+    // one, and the owners are the two keys that say how a common links
+    // (`commonYieldsTo` on a link's document, `archiveCommonResolution` on an
+    // archive's); a document that states neither has no common to link. Read by
+    // the front end (the `common` attribute is refused by name where it is false)
+    // and by the commons' allocation, so the two cannot disagree.
+>>>>>>> agent
     [[nodiscard]] bool statesCommons() const noexcept {
         return d_.commonYieldsTo.has_value() || d_.archiveCommonResolution.has_value();
     }
@@ -4089,6 +4106,15 @@ public:
     [[nodiscard]] std::optional<RunpathUnsupportedReason>
     runpathUnsupportedReason() const noexcept {
         return d_.runpathUnsupportedReason;
+    }
+
+    // P69 (lane `cs`): why a program of this format may give no definition a
+    // second name, or `std::nullopt` — the format supports a symbol alias. The
+    // semantic tier asks it (through `analyzeForTargetFormat`) when it judges the
+    // `alias` attribute; nothing asks which format this is.
+    [[nodiscard]] std::optional<SymbolAliasUnsupportedReason>
+    symbolAliasUnsupportedReason() const noexcept {
+        return d_.symbolAliasUnsupportedReason;
     }
 
     // D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the dialect this format

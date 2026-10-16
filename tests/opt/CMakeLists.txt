@@ -57,3 +57,8 @@ dss_add_test(NAME opt/test_preemptible_definition_not_inlined
 # entry it is handed. Hand-built MIR: format-blind, every host.
 dss_add_test(NAME opt/test_dce_module_extent
              SOURCES test_dce_module_extent.cpp)
+
+# P69 (lane `cs`): a second name of a definition (`Mir::aliases`) roots it — a module-private target only an alias
+# names survives DCE, whatever the alias's own binding. Hand-built MIR: format-blind, every host.
+dss_add_test(NAME opt/test_dce_alias_root
+             SOURCES test_dce_alias_root.cpp)

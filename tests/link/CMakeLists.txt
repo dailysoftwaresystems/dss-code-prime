@@ -404,6 +404,13 @@ dss_add_test(NAME link/test_macho_eh_frame       SOURCES test_macho_eh_frame.cpp
 dss_add_test(NAME link/test_cross_cu_alias_merge
              SOURCES test_cross_cu_alias_merge.cpp)
 
+# D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE — the COMPILED shape of a symbol alias (a body, a second name on its id,
+# the unit's own uses through a reference row of the name) through the link on ELF, PE and Mach-O, as an image and as a
+# relocatable object read back by the format's own reader: the call lands on the aliased body; a weak alias yields its
+# name to another unit's strong definition and the unit's call follows the name; a strong one beside it is refused.
+dss_add_test(NAME link/test_compiled_symbol_alias
+             SOURCES test_compiled_symbol_alias.cpp)
+
 # D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET — the linker tier's
 # one site of the class: `linker::link`'s exec-flavored refusal
 # (K_FormatLacksProcessExit) ended in a REMEDY that typed the `processExit`
@@ -799,6 +806,12 @@ target_link_libraries(dss_link_test_page_offset_relocations
 # as `test_pe_object_data_import_slot` does.
 dss_add_test(NAME link/test_pe_object_unwind_reference_link
              SOURCES test_pe_object_unwind_reference_link.cpp)
+
+# P69 (lane `cs`) — a GLOBAL alias of a `static` body (`alias("target")`) in a DSS pe64 relocatable object, as
+# link.exe and MinGW's linker take it: a second DSS object calls the alias by its global name and the image RUNS,
+# the objects compiled at the baseline and at release. Windows-only; each arm skips naming the absent toolchain.
+dss_add_test(NAME link/test_pe_object_alias_reference_link
+             SOURCES test_pe_object_alias_reference_link.cpp)
 
 # D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB — the structure that gives a library function ONE address across
 # the process, read off images the production driver builds from C source: an address-taken import is STT_FUNC with

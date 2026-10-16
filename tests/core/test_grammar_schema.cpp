@@ -2643,6 +2643,13 @@ TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
                                            // caught them the same way (13 listed,
                                            // 11 here).
                                            "callingConvention", "unsupported",
+                                           // P69 (lane `cs`): a second name of a
+                                           // definition (`alias`), and the two
+                                           // answers to "may this tentative
+                                           // definition be a common?" (`common`,
+                                           // `nocommon`).
+                                           "symbolAlias", "tentativeMayBeCommon",
+                                           "tentativeNeverCommon",
                                            "none"};
     // The message under test.
     auto const bad = attrVocabSchema(

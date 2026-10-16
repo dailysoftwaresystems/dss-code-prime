@@ -14654,6 +14654,27 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readReqIndex(sz, "typeChild", "/semantics/sizeof",
                                  cfg.sizeofTypeChild, typeChildOk);
                     (void)typeChildOk;
+                    // P69 (lane `cs`): `incompleteArraySize` — what `sizeof` of an
+                    // array of unknown size yields (MSVC's 0, C4034). OPTIONAL:
+                    // absent, such a `sizeof` is refused by name. An unsigned
+                    // integer; ZERO is the measured value and is accepted.
+                    if (sz.contains("incompleteArraySize")) {
+                        auto const& v = sz.at("incompleteArraySize");
+                        if (!v.is_number_unsigned()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/sizeof/incompleteArraySize",
+                                      "'incompleteArraySize' must be a non-negative "
+                                      "integer number of bytes");
+                        } else {
+                            cfg.sizeofIncompleteArraySize = v.get<std::uint64_t>();
+                        }
+                    }
+                    static constexpr std::array<std::string_view, 4> kSizeofKeys{
+                        "typeRule", "typeChild", "valueRule", "incompleteArraySize"};
+                    DSS_CHECK_KEY_VOCABULARY(kSizeofKeys);
+                    (void)checkKeysAgainst(sz, kSizeofKeys, "/semantics/sizeof",
+                                           "the 'sizeof' block",
+                                           DiagnosticCode::C_InvalidSemantics, coll);
                 }
             }
 
@@ -15781,7 +15802,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // to learn the vocabulary, so it is derived from the
                         // vocabulary rather than restated alongside it.
                         static constexpr std::array<
-                            std::pair<std::string_view, AttributeEffect>, 13>
+                            std::pair<std::string_view, AttributeEffect>, 16>
                             kEffectVerbs{{
                                 {"callingConvention",
                                  AttributeEffect::CallingConvention},
@@ -15844,6 +15865,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 // through the same `clampedBaselineAlign` the
                                 // whole-composite `packed` uses.
                                 {"packField",      AttributeEffect::PackField},
+                                // P69 (lane `cs`): the declared entity is a
+                                // second name of a definition of the unit
+                                // (`alias("target")`), resolved by the analyzer
+                                // at the end of the unit and carried below it as
+                                // one more symbol row on the target's definition.
+                                {"symbolAlias",    AttributeEffect::SymbolAlias},
+                                // P69 (lane `cs`): the two answers to "may this
+                                // tentative definition be a common?" — `common`
+                                // (yes: what the format's own policy already
+                                // gives it) and `nocommon` (no: a definition).
+                                // Each sinks into the ONE statement of the
+                                // tentative mark the front end makes.
+                                {"tentativeMayBeCommon",
+                                 AttributeEffect::TentativeMayBeCommon},
+                                {"tentativeNeverCommon",
+                                 AttributeEffect::TentativeNeverCommon},
                                 {"none",           AttributeEffect::None}}};
                         DSS_CHECK_KEY_VOCABULARY(kEffectVerbs);
 

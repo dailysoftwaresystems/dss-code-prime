@@ -245,11 +245,27 @@ dss_add_test(NAME mir/test_mir_linkage_record
 dss_add_test(NAME mir/test_mir_text_linkage
              SOURCES test_mir_text_linkage.cpp)
 
-# ...and the summary tier (`--lto=thin`): a row states the kind of its weak definition and whether it is a common;
-# the stored form is version 2, a version-1 image is refused, and a row whose linkage bytes the one rule refuses
-# is not read.
+# ...and the summary tier (`--lto=thin`): a row states the kind of its weak definition and whether it is a common,
+# and the module's aliases are a table of their own; the stored form is version 3, an image of an earlier version
+# is refused, and a row whose linkage bytes the one rule refuses is not read.
 dss_add_test(NAME mir/test_mir_summary_linkage
              SOURCES test_mir_summary_linkage.cpp)
+
+# P69 (lane `cs`) — a second name of a definition (`MirAlias`, the compiled `alias("target")`): the builder keeps
+# every alias whole and refuses an ill-formed one by name (an abort: a binary of its own), a rebuild carries them,
+# the verifier refuses an alias of no definition, `.dssir` spells one and reads it back, and the one list of the ids
+# a module names names both of its ids.
+dss_add_test(NAME mir/test_mir_alias
+             SOURCES test_mir_alias.cpp)
+
+# ...through the cross-unit merge: an alias is a definition of its name in the election, a reference to a name an
+# alias won stays a reference row, and an alias whose target lost its name is refused by name.
+dss_add_test(NAME mir/test_mir_merge_alias
+             SOURCES test_mir_merge_alias.cpp)
+
+# ...and through the summary index (`--lto=thin`): in the election, in the liveness walk, in the call graph.
+dss_add_test(NAME mir/test_summary_index_alias
+             SOURCES test_summary_index_alias.cpp)
 
 # D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED (P69 fold 3) — the cross-unit MIR merge folds two
 # units' tentative definitions of one name into ONE object, the largest, at the widest alignment any of them asked

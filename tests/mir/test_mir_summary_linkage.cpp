@@ -9,7 +9,9 @@
 // definitions. A row now carries the KIND of its weak definition and whether it is a COMMON, each taken from the
 // one statement of it in the MIR (`MirLinkage::statedWeakKind`, `Mir::globalIsCommon`).
 //
-// THE STORED FORM is version 2: a kind byte after the visibility on every row, and a common flag on a global row.
+// THE STORED FORM is version 3: a kind byte after the visibility on every row, and a common flag on a global row
+// (version 2), and an ALIAS table at the end (version 3, P69 lane `cs`: each alias row its name, its target's name
+// and its own binding, visibility and kind, judged by the same rule as every other row).
 // A version-1 image is REFUSED, not read with the new bytes guessed — the reader has one answer for an image it
 // does not understand ("not a summary"), and that is the answer here. The codec is reached by tests alone today:
 // nothing in `src/` calls `encodeModuleSummary` or `decodeModuleSummary` (READ 2026-10-12, a scan of `src/`).
@@ -64,7 +66,8 @@ using Kind = WeakDefinitionKind;
 // One module holding every shape of definition a row can be.
 //   functions: n1 strong, n2 overridable, n3 select-any
 //   globals:   n11 strong (initialized), n12 tentative, n13 overridable, n14 select-any,
-//              n15 thread-local with no initializer (tentative in C, and NOT a common)
+//              n15 thread-local with no initializer (tentative in C, and NOT a common: the front end builds it
+//              without the mark, which the rule refuses on a thread-local global)
 [[nodiscard]] Mir everyShape(TypeInterner& in) {
     TypeId const i32   = in.primitive(TypeKind::I32);
     TypeId const fnSig = in.fnSig({}, i32, CallConv::CcSysV);
@@ -98,9 +101,13 @@ using Kind = WeakDefinitionKind;
                       false, mirThreadStorageOf(false));
     (void)b.addGlobal(i32, SymbolId{14}, literal(), MirFuncId{}, linkage(SymbolBinding::Weak, Kind::SelectAny),
                       false, mirThreadStorageOf(false));
-    (void)b.addGlobal(i32, SymbolId{15}, UINT32_MAX, MirFuncId{},
-                      linkage(SymbolBinding::Global, std::nullopt, /*tentative=*/true), false,
-                      mirThreadStorageOf(true));
+    (void)b.addGlobal(i32, SymbolId{15}, UINT32_MAX, MirFuncId{}, linkage(SymbolBinding::Global, std::nullopt),
+                      false, mirThreadStorageOf(true));
+    // aliases: n21 a strong second name of n1, n22 an overridable hidden one of n12.
+    b.addAlias(SymbolId{21}, SymbolId{1}, linkage(SymbolBinding::Global, std::nullopt));
+    MirLinkage hiddenWeak = linkage(SymbolBinding::Weak, Kind::Overridable);
+    hiddenWeak.visibility = SymbolVisibility::Hidden;
+    b.addAlias(SymbolId{22}, SymbolId{12}, hiddenWeak);
     return std::move(b).finish();
 }
 
@@ -132,6 +139,19 @@ using Kind = WeakDefinitionKind;
     s.globals.push_back(std::move(g));
     return s;
 }
+[[nodiscard]] ModuleSummary oneAliasRow(SymbolBinding binding, std::optional<Kind> kind) {
+    ModuleSummary s;
+    s.moduleDigest   = "d";
+    s.targetIdentity = "t";
+    SummaryAlias a;
+    a.name       = "a";
+    a.symbol     = 2;
+    a.targetName = "g";
+    a.binding    = binding;
+    a.weakKind   = kind;
+    s.aliases.push_back(std::move(a));
+    return s;
+}
 [[nodiscard]] ModuleSummary oneFunctionRow(SymbolBinding binding, std::optional<Kind> kind) {
     ModuleSummary s;
     s.moduleDigest   = "d";
@@ -152,6 +172,9 @@ using Kind = WeakDefinitionKind;
 constexpr std::size_t kVersionAt          = 7;
 constexpr std::size_t kFunctionBindingAt  = 7 + 4 + 5 + 5 + 4 + 5 + 4;
 constexpr std::size_t kGlobalBindingAt    = 7 + 4 + 5 + 5 + 4 + 4 + 5 + 4;
+// An `oneAliasRow` image: the four empty tables' counts (functions, globals, imports, escapes), the alias table's
+// count, then the row's one-character name, its symbol and its one-character target name.
+constexpr std::size_t kAliasBindingAt     = 7 + 4 + 5 + 5 + 4 + 4 + 4 + 4 + 4 + 5 + 4 + 5;
 // After the binding: visibility (+1), the weak kind (+2), and on a global row the common flag (+3), isConst (+4),
 // isThreadLocal (+5).
 constexpr std::size_t kKindAfterBinding   = 2;
@@ -200,12 +223,12 @@ TEST(MirSummaryLinkage, ARowStatesTheKindOfItsWeakDefinitionAndWhetherItIsACommo
     EXPECT_TRUE(global(s, "n15")->isThreadLocal);
 }
 
-TEST(MirSummaryLinkage, TheStoredFormIsVersionTwoAndEveryShapeRoundTrips) {
-    EXPECT_EQ(kSummaryFormatVersion, 2u);
+TEST(MirSummaryLinkage, TheStoredFormIsVersionThreeAndEveryShapeRoundTrips) {
+    EXPECT_EQ(kSummaryFormatVersion, 3u);
     ModuleSummary const             s     = summaryOfEveryShape();
     std::vector<std::uint8_t> const bytes = encodeModuleSummary(s);
     ASSERT_GT(bytes.size(), kVersionAt + 4);
-    EXPECT_EQ(bytes[kVersionAt], 2u);
+    EXPECT_EQ(bytes[kVersionAt], 3u);
     EXPECT_EQ(bytes[kVersionAt + 1] | bytes[kVersionAt + 2] | bytes[kVersionAt + 3], 0u);
 
     auto const back = decodeModuleSummary(bytes);
@@ -224,6 +247,22 @@ TEST(MirSummaryLinkage, TheStoredFormIsVersionTwoAndEveryShapeRoundTrips) {
         EXPECT_EQ(back->globals[i].isCommon, s.globals[i].isCommon);
         EXPECT_EQ(back->globals[i].isThreadLocal, s.globals[i].isThreadLocal);
     }
+    ASSERT_EQ(s.aliases.size(), 2u) << "the module states two aliases, and the summary carries both";
+    EXPECT_EQ(s.aliases[0].name, "n21");
+    EXPECT_EQ(s.aliases[0].targetName, "n1");
+    EXPECT_EQ(s.aliases[1].targetName, "n12");
+    EXPECT_EQ(s.aliases[1].weakKind, std::optional<Kind>{Kind::Overridable});
+    EXPECT_EQ(s.aliases[1].visibility, SymbolVisibility::Hidden);
+    ASSERT_EQ(back->aliases.size(), s.aliases.size());
+    for (std::size_t i = 0; i < s.aliases.size(); ++i) {
+        SCOPED_TRACE(s.aliases[i].name);
+        EXPECT_EQ(back->aliases[i].name, s.aliases[i].name);
+        EXPECT_EQ(back->aliases[i].symbol, s.aliases[i].symbol);
+        EXPECT_EQ(back->aliases[i].targetName, s.aliases[i].targetName);
+        EXPECT_EQ(back->aliases[i].binding, s.aliases[i].binding);
+        EXPECT_EQ(back->aliases[i].visibility, s.aliases[i].visibility);
+        EXPECT_EQ(back->aliases[i].weakKind, s.aliases[i].weakKind);
+    }
     EXPECT_EQ(encodeModuleSummary(*back), bytes) << "what was read writes the same image";
 }
 
@@ -232,10 +271,20 @@ TEST(MirSummaryLinkage, AVersionOneImageIsRefused) {
                                    oneFunctionRow(SymbolBinding::Global, std::nullopt), summaryOfEveryShape()}) {
         std::vector<std::uint8_t> bytes = encodeModuleSummary(s);
         ASSERT_TRUE(decodeModuleSummary(bytes).has_value()) << "the control: the image as written is read";
-        ASSERT_EQ(bytes[kVersionAt], 2u);
+        ASSERT_EQ(bytes[kVersionAt], 3u);
+        bytes[kVersionAt] = 2;
+        EXPECT_FALSE(decodeModuleSummary(bytes).has_value())
+            << "an image that says it is version 2 has no alias table: it is not read as if it had";
         bytes[kVersionAt] = 1;
         EXPECT_FALSE(decodeModuleSummary(bytes).has_value())
             << "an image that says it is version 1 has no kind byte and no common flag: it is not read as if it had";
+    }
+    // A real version-2 image — the current one with the (empty) alias table taken off its end — is short under
+    // version 3's number.
+    {
+        std::vector<std::uint8_t> v2 = encodeModuleSummary(oneGlobalRow(SymbolBinding::Global, std::nullopt, false, false));
+        v2.resize(v2.size() - 4);
+        EXPECT_FALSE(decodeModuleSummary(v2).has_value()) << "version 2's image under version 3's number";
     }
     // And an image that really HAS version 1's rows — the version 2 image with the kind byte and the common flag
     // taken out — is refused under either version number: version 1 is not read, and under version 2 the row is
@@ -243,7 +292,7 @@ TEST(MirSummaryLinkage, AVersionOneImageIsRefused) {
     std::vector<std::uint8_t> v1 = encodeModuleSummary(oneGlobalRow(SymbolBinding::Global, std::nullopt, false, false));
     v1.erase(v1.begin() + static_cast<std::ptrdiff_t>(kGlobalBindingAt + kKindAfterBinding),
              v1.begin() + static_cast<std::ptrdiff_t>(kGlobalBindingAt + kCommonAfterBinding + 1));
-    EXPECT_FALSE(decodeModuleSummary(v1).has_value()) << "version 1's rows under version 2's number";
+    EXPECT_FALSE(decodeModuleSummary(v1).has_value()) << "version 1's rows under version 3's number";
     v1[kVersionAt] = 1;
     EXPECT_FALSE(decodeModuleSummary(v1).has_value()) << "version 1's rows under version 1's number";
 }
@@ -298,6 +347,28 @@ TEST(MirSummaryLinkage, ARowWhoseLinkageBytesAreNotWellFormedIsRefused) {
         {"a common that is then said to be thread-local", oneGlobalRow(SymbolBinding::Global, std::nullopt, true, false),
          true, kTlsAfterBinding, 1},
     };
+    // The alias table's rows, judged by the same rule (P69, lane `cs`).
+    struct AliasCase {
+        char const*   what;
+        ModuleSummary good;
+        std::size_t   afterBinding;
+        std::uint8_t  value;
+    };
+    std::vector<AliasCase> const aliasCases{
+        {"a weak alias that states no kind", oneAliasRow(SymbolBinding::Weak, Kind::SelectAny), kKindAfterBinding, 0},
+        {"a strong alias that states a kind", oneAliasRow(SymbolBinding::Global, std::nullopt), kKindAfterBinding,
+         static_cast<std::uint8_t>(Kind::Overridable)},
+    };
+    for (auto const& c : aliasCases) {
+        SCOPED_TRACE(c.what);
+        std::vector<std::uint8_t> bytes = encodeModuleSummary(c.good);
+        ASSERT_TRUE(decodeModuleSummary(bytes).has_value()) << "the control: the image before the one byte changes";
+        std::size_t const at = kAliasBindingAt + c.afterBinding;
+        ASSERT_LT(at, bytes.size());
+        ASSERT_NE(bytes[at], c.value) << "the patch must change the byte";
+        bytes[at] = c.value;
+        EXPECT_FALSE(decodeModuleSummary(bytes).has_value());
+    }
     for (auto const& c : cases) {
         SCOPED_TRACE(c.what);
         std::vector<std::uint8_t> bytes = encodeModuleSummary(c.good);

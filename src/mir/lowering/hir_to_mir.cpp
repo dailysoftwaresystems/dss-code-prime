@@ -18134,7 +18134,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirNoSanitizeThreadMap const* noSanitizeThreadMap,
                           HirInlineAsmPool const*  inlineAsmPool,
                           HirInlineDefinitionMap const* inlineDefinitionMap,
-                          HirEnclosingFunctionMap const* enclosingFunctionMap) {
+                          HirEnclosingFunctionMap const* enclosingFunctionMap,
+                          std::span<HirSymbolAlias const> symbolAliases) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -18193,6 +18194,13 @@ HirToMirResult lowerToMir(Hir const&               hir,
         lwr.mir.stateSymbolIdEnd(config.symbolIdSpace->statedEnd);
     }
     lwr.lower();
+    // P69 (lane `cs`): the unit's symbol aliases — one more NAME on a definition
+    // this module just lowered, with the alias's own linkage. The record is the
+    // module's (`MirBuilder::addAlias`), so it rides every rebuild with the module,
+    // roots its target against dead-code removal, and reaches the object producer as
+    // one more symbol row on the target's definition.
+    for (HirSymbolAlias const& alias : symbolAliases)
+        lwr.mir.addAlias(alias.alias, alias.target, mirLinkageFrom(alias.linkage));
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();
     // Canonical-marker stamping (D-OPT4-1): the creation-time

@@ -99,7 +99,11 @@ namespace dss::mirsum {
 //      whether it is a COMMON (one byte after the kind). A version-1 image has
 //      neither byte, so every field after them would be read one or two bytes
 //      early — it is refused as any unknown version is.
-inline constexpr std::uint32_t kSummaryFormatVersion = 2;
+//   3  P69 (lane `cs`): an ALIAS table after the escape set — the TU's second
+//      names of its definitions (`SummaryAlias`). A version-2 image ends before
+//      it, so it is refused as any unknown version is, never read as a module
+//      that defines no alias.
+inline constexpr std::uint32_t kSummaryFormatVersion = 3;
 
 // One call site, recorded because the index's call graph is built from these.
 struct SummaryCallSite {
@@ -217,8 +221,9 @@ struct SummaryGlobal {
     // The kind of a weak definition, on `SummaryFunction::weakKind`'s terms.
     std::optional<WeakDefinitionKind> weakKind;
     // IS THIS GLOBAL A COMMON — `Mir::globalIsCommon`, the one statement of
-    // which tentative definitions the link folds (a strong-bound, non-thread-
-    // local one). The index enters it in the election as one
+    // which tentative definitions the link folds (the tentative mark, read
+    // alone: the rule refuses it beside a weak binding and on a thread-local
+    // global). The index enters it in the election as one
     // (`CrossCuDef::tentative`): two units' `int x;` are ONE object, not the
     // two strong definitions the index reported them as until P69 fold 3.
     //   ⓘ The row carries the FACT and not the object's SIZE (a summary holds
@@ -261,6 +266,22 @@ struct SummaryImport {
     bool          isThreadLocal = false;
 };
 
+// P69 (lane `cs`): ONE SECOND NAME OF A DEFINITION of the TU (`Mir::aliases`):
+// `name` is defined as the very definition `targetName` is. It enters the
+// index's election as a definition of `name` with its OWN binding and kind (a
+// weak alias yields to a strong definition elsewhere), it is no body a
+// prefetch can import (it has none of its own), and it roots `targetName` in
+// the liveness walk and links `name` to it in the call graph — DCE roots every
+// alias's target the same way, so the two cannot disagree about what is live.
+struct SummaryAlias {
+    std::string                       name;
+    std::uint32_t                     symbol = 0;
+    std::string                       targetName;
+    SymbolBinding                     binding    = SymbolBinding::Global;
+    SymbolVisibility                  visibility = SymbolVisibility::Default;
+    std::optional<WeakDefinitionKind> weakKind;
+};
+
 // One TU's complete summary.
 struct ModuleSummary {
     // ── self-identity, so a summary can never be mixed across machines ──
@@ -283,6 +304,7 @@ struct ModuleSummary {
     std::vector<SummaryFunction> functions;
     std::vector<SummaryGlobal>   globals;
     std::vector<SummaryImport>   imports;
+    std::vector<SummaryAlias>    aliases;   // P69 (lane `cs`)
 
     // ★★★ THE WHOLE-PROGRAM FACT (see the header comment): every NAMED symbol
     // whose address ESCAPES in this TU — referenced by a `GlobalAddr` that is

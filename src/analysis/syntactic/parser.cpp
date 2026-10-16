@@ -957,21 +957,11 @@ struct Parser::Impl {
             return node;
         }
         // LastIdentifier — track the latest identifier in source order.
-        // ★ P69 round 4 (lane `cs`): an ATTRIBUTE SPECIFIER names nothing the shape
-        // declares, so the walk does not enter one — the same stop the semantic
-        // tier's `extractNameNode` takes, off the same config role
-        // (`isAttributeSpecifierRule`). Without it `struct S __attribute__((unused))
-        // v;` bound the sketch's tag to `unused`, the attribute's clause name.
         NodeId              found{};
         std::vector<NodeId> stack{node};
         while (!stack.empty()) {
             const NodeId cur = stack.back();
             stack.pop_back();
-            if (builder->nodeKind(cur) == NodeKind::Internal
-                && isAttributeSpecifierRule(schema->semantics(),
-                                            builder->nodeRule(cur))) {
-                continue;
-            }
             if (builder->nodeKind(cur) == NodeKind::Token
                 && builder->nodeTokenKind(cur).v == identifierKind.v) {
                 found = cur;

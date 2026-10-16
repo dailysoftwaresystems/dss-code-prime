@@ -10,7 +10,8 @@
 // WHAT IS PINNED HERE:
 //   * the rule (`mirLinkageDefect`) names each defect and passes each well-formed record;
 //   * the builders keep the record WHOLE and refuse an ill-formed one by name (they abort: a producer's bug);
-//   * a global is a COMMON by one statement (`Mir::globalIsCommon`);
+//   * a global is a COMMON by its tentative mark READ ALONE (`Mir::globalIsCommon`), because the rule refuses the
+//     mark wherever no common can be — beside a weak binding and on a thread-local global too (P69, lane `cs`);
 //   * `MirVerifier` refuses an ill-formed record by name — reached through the one builder door that does not ask
 //     the rule (`MirBuilder::restateLinkageUnjudged`), which exists so that this half can be shown to fire.
 // The `.dssir` spelling of the record is `test_mir_text_linkage.cpp`'s.
@@ -48,6 +49,8 @@ constexpr MirLinkage kTentativeWeak{SymbolBinding::Weak, SymbolVisibility::Defau
 
 constexpr std::string_view kNoKind      = "it is a weak definition that states no weak-definition kind";
 constexpr std::string_view kKindNotWeak = "it states a weak-definition kind beside a binding that is not weak";
+constexpr std::string_view kMarkBesideWeak  = "it is a weak definition marked as a tentative definition";
+constexpr std::string_view kMarkThreadLocal = "it is a thread-local global marked as a tentative definition";
 
 [[nodiscard]] std::string diagnosticsOf(DiagnosticReporter const& rep) {
     std::string s;
@@ -63,9 +66,10 @@ constexpr std::string_view kKindNotWeak = "it states a weak-definition kind besi
 }
 
 // One function `%5` (returning) and one global `%6`, both strong: a module the verifier accepts. `afterBuild` may
-// restate either's linkage through the unjudged door before the module is finished.
+// restate either's linkage through the unjudged door before the module is finished. `storage` is the global's.
 template <class Restate>
-[[nodiscard]] Mir moduleOfOneFunctionAndOneGlobal(TypeInterner& in, Restate&& afterBuild) {
+[[nodiscard]] Mir moduleOfOneFunctionAndOneGlobal(TypeInterner& in, Restate&& afterBuild,
+                                                  MirThreadStorage storage = MirThreadStorage::Shared) {
     TypeId const voidTy = in.primitive(TypeKind::Void);
     TypeId const i32    = in.primitive(TypeKind::I32);
     MirBuilder   b;
@@ -74,7 +78,7 @@ template <class Restate>
     b.beginBlock(e);
     b.addReturn();
     MirGlobalId const g = b.addGlobal(i32, SymbolId{6}, UINT32_MAX, MirFuncId{}, kStrong, /*isConst=*/false,
-                                      MirThreadStorage::Shared);
+                                      storage);
     afterBuild(b, f, g);
     return std::move(b).finish();
 }
@@ -82,6 +86,9 @@ template <class Restate>
 }  // namespace
 
 // The rule, cell by cell. `mirLinkageDefect` is what the builders, the verifier and the `.dssir` reader all ask.
+// Every cell here is a global WITHOUT thread storage; the two cells of the mark where no common can be — beside a
+// weak binding, on a thread-local global — are `AGlobalIsACommonByItsMarkAloneAndTheMarkIsRefusedWhereNoneCanBe`'s,
+// so that switching either refusal off turns THAT test red and leaves this one green.
 TEST(MirLinkageRecord, TheRuleNamesEachDefectAndPassesEachWellFormedRecord) {
     using Owner = MirLinkageOwner;
     struct Cell {
@@ -98,7 +105,6 @@ TEST(MirLinkageRecord, TheRuleNamesEachDefectAndPassesEachWellFormedRecord) {
         {"an overridable weak function", kOverridable, Owner::Function, false, ""},
         {"a select-any weak global with an initializer", kSelectAnyHidden, Owner::Global, true, ""},
         {"a tentative global", kTentative, Owner::Global, false, ""},
-        {"a WEAK tentative global (legal: `__attribute__((weak)) int t;`)", kTentativeWeak, Owner::Global, false, ""},
         {"a weak definition of no kind", kWeakNoKind, Owner::Function, false, kNoKind},
         {"a weak global of no kind", kWeakNoKind, Owner::Global, true, kNoKind},
         {"a kind beside a strong binding", kKindNoWeak, Owner::Global, true, kKindNotWeak},
@@ -113,7 +119,8 @@ TEST(MirLinkageRecord, TheRuleNamesEachDefectAndPassesEachWellFormedRecord) {
     };
     for (Cell const& c : cells) {
         SCOPED_TRACE(c.what);
-        std::string_view const said = mirLinkageDefect(c.linkage, c.owner, c.hasInitializer);
+        std::string_view const said =
+            mirLinkageDefect(c.linkage, c.owner, c.hasInitializer, /*isThreadLocal=*/false);
         if (c.defect.empty()) {
             EXPECT_TRUE(said.empty()) << "a well-formed record was refused: " << said;
         } else {
@@ -141,7 +148,7 @@ TEST(MirLinkageRecord, TheBuildersKeepTheRecordWhole) {
         b.beginBlock(e);
         b.addReturn();
     }
-    MirLinkage const globalLinkage[3] = {kOverridable, kTentative, kTentativeWeak};
+    MirLinkage const globalLinkage[3] = {kOverridable, kTentative, kSelectAnyHidden};
     MirGlobalId      globals[3];
     for (int i = 0; i < 3; ++i) {
         globals[i] = b.addGlobal(i32, SymbolId{static_cast<std::uint32_t>(20 + i)}, UINT32_MAX, MirFuncId{},
@@ -160,27 +167,43 @@ TEST(MirLinkageRecord, TheBuildersKeepTheRecordWhole) {
         << "the two kinds of weak definition must stay two";
 }
 
-// A COMMON is a tentative definition that is strong-bound and not thread-local — one statement, asked by the merge
-// and by the pipeline. (✔MEASURED 2026-10-12: no reference writes a thread-local tentative definition as a common,
-// and two units holding one are refused by every linker measured; a weak tentative definition is a weak one.)
-TEST(MirLinkageRecord, AGlobalIsACommonOnlyWhenTentativeStrongBoundAndNotThreadLocal) {
+// A COMMON is a global that carries the tentative mark — the mark READ ALONE, asked by the merge and by the
+// pipeline. The mark means "this definition may be written as a common", the tier above clears it on every definition
+// that is its unit's outright, and the rule refuses it wherever no common can be: a weak tentative definition is a
+// WEAK one (its kind decides; no reference writes a weak common), and a thread-local one is a definition (✔MEASURED
+// 2026-10-12: no reference writes a thread-local tentative definition as a common, and two units holding one are
+// refused by every linker measured). So the two are refused by name here, and the globals that ARE them — built as
+// the front end builds them, without the mark — are no common.
+TEST(MirLinkageRecord, AGlobalIsACommonByItsMarkAloneAndTheMarkIsRefusedWhereNoneCanBe) {
+    using Owner = MirLinkageOwner;
+    EXPECT_NE(mirLinkageDefect(kTentativeWeak, Owner::Global, false, /*isThreadLocal=*/false).find(kMarkBesideWeak),
+              std::string_view::npos)
+        << "a weak tentative definition is a WEAK definition: its kind decides";
+    EXPECT_NE(mirLinkageDefect(kTentative, Owner::Global, false, /*isThreadLocal=*/true).find(kMarkThreadLocal),
+              std::string_view::npos)
+        << "a thread-local tentative definition is a definition";
+    // CONTROL: the same facts, each without the mark, and the mark on a strong shared global, are well formed.
+    EXPECT_TRUE(mirLinkageDefect(kOverridable, Owner::Global, false, /*isThreadLocal=*/false).empty());
+    EXPECT_TRUE(mirLinkageDefect(kStrong, Owner::Global, false, /*isThreadLocal=*/true).empty());
+    EXPECT_TRUE(mirLinkageDefect(kTentative, Owner::Global, false, /*isThreadLocal=*/false).empty());
+
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder   b;
     auto const add = [&](std::uint32_t sym, MirLinkage linkage, MirThreadStorage storage) {
         return b.addGlobal(i32, SymbolId{sym}, UINT32_MAX, MirFuncId{}, linkage, /*isConst=*/false, storage);
     };
-    MirGlobalId const tentative    = add(1, kTentative, MirThreadStorage::Shared);
-    MirGlobalId const threadLocal  = add(2, kTentative, MirThreadStorage::PerThread);
-    MirGlobalId const weak         = add(3, kTentativeWeak, MirThreadStorage::Shared);
+    MirGlobalId const tentative     = add(1, kTentative, MirThreadStorage::Shared);
+    MirGlobalId const threadLocal   = add(2, kStrong, MirThreadStorage::PerThread);
+    MirGlobalId const weak          = add(3, kOverridable, MirThreadStorage::Shared);
     MirGlobalId const zeroNotStated = add(4, kStrong, MirThreadStorage::Shared);
     Mir const m = std::move(b).finish();
     EXPECT_TRUE(m.globalIsCommon(tentative)) << "`int x;` — the link folds it with the other units'";
-    EXPECT_FALSE(m.globalIsCommon(threadLocal)) << "a thread-local tentative definition is a definition";
-    EXPECT_FALSE(m.globalIsCommon(weak)) << "a weak tentative definition is a WEAK definition: its kind decides";
+    EXPECT_FALSE(m.globalIsCommon(threadLocal)) << "`_Thread_local int t;` — built without the mark";
+    EXPECT_FALSE(m.globalIsCommon(weak)) << "`__attribute__((weak)) int t;` — built without the mark";
     EXPECT_FALSE(m.globalIsCommon(zeroNotStated)) << "CONTROL: a zero-filled global nobody marked tentative";
-    EXPECT_TRUE(mirLinkageIsCommon(kTentative, /*isThreadLocal=*/false));
-    EXPECT_FALSE(mirLinkageIsCommon(kTentative, /*isThreadLocal=*/true));
+    EXPECT_TRUE(mirLinkageIsCommon(kTentative));
+    EXPECT_FALSE(mirLinkageIsCommon(kStrong));
 }
 
 // ── the builders refuse, by name ─────────────────────────────────────────────────────────────────────────────────
@@ -192,7 +215,8 @@ void addFunctionWith(MirLinkage linkage) {
     MirBuilder   b;
     (void)b.addFunction(in.fnSig({}, in.primitive(TypeKind::Void), CallConv::CcSysV), SymbolId{5}, linkage);
 }
-void addGlobalWith(MirLinkage linkage, bool withInitializer) {
+void addGlobalWith(MirLinkage linkage, bool withInitializer,
+                   MirThreadStorage storage = MirThreadStorage::Shared) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder   b;
@@ -200,7 +224,7 @@ void addGlobalWith(MirLinkage linkage, bool withInitializer) {
     one.value = std::int64_t{1};
     one.core  = TypeKind::I32;
     std::uint32_t const literal = withInitializer ? b.literalPoolAdd(one) : UINT32_MAX;
-    (void)b.addGlobal(i32, SymbolId{6}, literal, MirFuncId{}, linkage, /*isConst=*/false, MirThreadStorage::Shared);
+    (void)b.addGlobal(i32, SymbolId{6}, literal, MirFuncId{}, linkage, /*isConst=*/false, storage);
 }
 void addFunctionThroughTheBindingForm(SymbolBinding binding) {
     TypeInterner in{CompilationUnitId{1}};
@@ -250,8 +274,14 @@ TEST(MirLinkageRecordDeathTest, ABuilderRefusesATentativeMarkWhereNoTentativeDef
                  "addGlobal: symbol id 6: it is a module-private \\(local\\) global marked as a tentative");
     EXPECT_DEATH(addGlobalWith(kTentative, true),
                  "addGlobal: symbol id 6: it is marked as a tentative definition and states an initializer");
-    // CONTROL: a tentative global with no initializer builds.
+    EXPECT_DEATH(addGlobalWith(kTentativeWeak, false),
+                 "addGlobal: symbol id 6: it is a weak definition marked as a tentative definition");
+    EXPECT_DEATH(addGlobalWith(kTentative, false, MirThreadStorage::PerThread),
+                 "addGlobal: symbol id 6: it is a thread-local global marked as a tentative definition");
+    // CONTROL: a tentative global with no initializer builds, and so do the weak and the thread-local one unmarked.
     addGlobalWith(kTentative, false);
+    addGlobalWith(kOverridable, false);
+    addGlobalWith(kStrong, false, MirThreadStorage::PerThread);
 }
 
 // ── the verifier refuses, by name ────────────────────────────────────────────────────────────────────────────────
@@ -302,6 +332,26 @@ TEST(MirLinkageRecord, TheVerifierRefusesAKindBesideABindingThatIsNotWeak) {
 }
 
 TEST(MirLinkageRecord, TheVerifierRefusesATentativeMarkOnAFunctionAndOnALocalGlobal) {
+    // Beside a weak binding, and on a thread-local global: the verifier hands the rule the global's thread storage.
+    {
+        TypeInterner in{CompilationUnitId{1}};
+        Mir const    m = moduleOfOneFunctionAndOneGlobal(
+            in, [&](MirBuilder& b, MirFuncId, MirGlobalId g) { b.restateLinkageUnjudged(g, kTentativeWeak); });
+        DiagnosticReporter rep;
+        MirVerifier        v{m, &in};
+        EXPECT_FALSE(v.verify(rep));
+        EXPECT_TRUE(saysVerifierFailure(rep, kMarkBesideWeak)) << diagnosticsOf(rep);
+    }
+    {
+        TypeInterner in{CompilationUnitId{1}};
+        Mir const    m = moduleOfOneFunctionAndOneGlobal(
+            in, [&](MirBuilder& b, MirFuncId, MirGlobalId g) { b.restateLinkageUnjudged(g, kTentative); },
+            MirThreadStorage::PerThread);
+        DiagnosticReporter rep;
+        MirVerifier        v{m, &in};
+        EXPECT_FALSE(v.verify(rep));
+        EXPECT_TRUE(saysVerifierFailure(rep, kMarkThreadLocal)) << diagnosticsOf(rep);
+    }
     {
         TypeInterner in{CompilationUnitId{1}};
         Mir const    m = moduleOfOneFunctionAndOneGlobal(

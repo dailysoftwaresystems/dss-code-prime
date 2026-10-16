@@ -1,1 +1,1 @@
-    if (false && isCommon && !mirLinkageIsCommon(linkage, isThreadLocal)) return false;
+    if (!mirLinkageDefect(linkage, owner, /*hasInitializer=*/false, /*isThreadLocal=*/false).empty())

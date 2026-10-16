@@ -3084,6 +3084,28 @@ enum class AttributeEffect : std::uint8_t {
     // place that can express it. That is the same posture the config's un-kinded
     // `none` names already take, held for a measured reason rather than a shrug.
     PackField,
+    // P69 (lane `cs`): the declared function or object is a SECOND NAME of a
+    // definition of this unit — the clause's string operand names the target by
+    // its SYMBOL name (an asm label's when it has one, the C identifier's
+    // otherwise: ✔MEASURED, gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all
+    // refuse `alias("g")` of a `g` labelled `gg` and accept `alias("gg")`). The
+    // declaration is itself the definition: a body or an initializer beside it, a
+    // second alias of the name and a later definition of it are judged by the
+    // analyzer at the end of the unit, where the target must be defined. Refused by
+    // name on a format whose platform compilers refuse an alias
+    // (`symbolAliasUnsupportedReason`).
+    SymbolAlias,
+    // P69 (lane `cs`): `common` — the tentative definition MAY be a common, which is
+    // what every tentative definition of an external, strong, non-thread-local
+    // object already is on a format whose document states commons: the verb adds
+    // nothing there, wins over a `nocommon` beside it (gcc's reading, warned), and
+    // is refused by name on a format whose document states none, and on a variable
+    // an alias names (a common cannot be equated to a second name: every reference
+    // refuses it).
+    TentativeMayBeCommon,
+    // P69 (lane `cs`): `nocommon` — the tentative definition is a DEFINITION, never
+    // a common (`.bss` storage of this unit). Clears the tentative mark.
+    TentativeNeverCommon,
     // ★ P69 round 4 (lane `cs`) — TWO VERBS WHOSE ANSWER DOES NOT DEPEND ON WHAT IS
     // DECLARED, so they carry no kind axis and are judged ONCE PER ATTRIBUTE
     // SPECIFIER wherever it is written (a declaration, a declarator, a type name, a
@@ -3661,6 +3683,17 @@ struct DSS_EXPORT SemanticConfig {
     RuleId        sizeofTypeRule{};   std::string sizeofTypeRuleName;
     std::uint32_t sizeofTypeChild = 0;
     RuleId        sizeofValueRule{};  std::string sizeofValueRuleName;
+    // P69 (lane `cs`): what `sizeof` of an ARRAY OF UNKNOWN SIZE yields
+    // (`sizeof.incompleteArraySize`). ISO C makes the operand a constraint violation
+    // (6.5.3.4p1) and gcc 13.3.0 and clang 18.1.3 refuse it; MSVC 19.51 accepts it
+    // and yields 0, its documented warning C4034 (✔MEASURED, probe sz) — and the
+    // disjunction decides acceptance. Present ⇒ the operand folds to this value at
+    // every tier and the analyzer warns `S_SizeofIncompleteArrayIsZero`; nullopt (a
+    // language that states none) ⇒ refused by name, `S_SizeofIncompleteType`. ZERO
+    // is a meaningful value here, unlike `nonObjectTypeSizes`: it is never a stride
+    // (`operandLayout` does not read it — pointer arithmetic on a pointer to an array
+    // of unknown size keeps its refusal).
+    std::optional<std::uint64_t> sizeofIncompleteArraySize;
     // C11/C23 6.5.3.4: `_Alignof`/`alignof` typing. `alignofTypeRule` = the
     // `_Alignof ( type-name )` form; pass 2 resolves + stamps its
     // `alignofTypeChild` castTypeRef child (so the HIR lowering recovers the type

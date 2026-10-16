@@ -13025,10 +13025,16 @@ TEST(HirLoweringC, ALinkageAttributeTheKindGateIgnoredIsNotAppliedByTheFold) {
 // semantic tier's own fact (`SymbolRecord::isTentativeDefinition`), read from the
 // surviving declaration.
 //
+// P69 (lane `cs`): the mark is "a tentative definition that MAY be a common", and
+// it is stated ONCE, here — a weak, a thread-local, a `nocommon` one and one an
+// `alias` names are definitions of their unit outright, and the mark is cleared on
+// each; `common` states the default and changes nothing.
+//
 // RED-ON-DISABLE: drop the tentative arm of `recordLinkage` and every `true` row
 // reads false; drop `|| attr.tentative` from its sparseness test and the same
-// (the attribute is never stored); drop the `!= Local` guard and the two
-// internal-linkage rows are refused by the verifier.
+// (the attribute is never stored); drop the `== Global` test and the internal-
+// linkage rows and the weak one are refused by the verifier; drop the
+// thread-local or the `tentativeNeverCommon` conjunct and that row is.
 TEST(HirLoweringC, AnUncompletedTentativeDefinitionIsMarkedOnItsGlobal) {
     struct Case {
         char const* what;
@@ -13041,8 +13047,16 @@ TEST(HirLoweringC, AnUncompletedTentativeDefinitionIsMarkedOnItsGlobal) {
              Case{"a declaration, then a tentative definition",
                   "extern int t;\nint t;\n", true},
              Case{"a tentative definition of an array", "int t[4];\n", true},
-             Case{"a weak tentative definition", "__attribute__((weak)) int t;\n",
+             Case{"a weak tentative definition is a WEAK definition, never a common",
+                  "__attribute__((weak)) int t;\n", false},
+             Case{"a thread-local tentative definition is a definition",
+                  "_Thread_local int t;\n", false},
+             Case{"`nocommon` makes a tentative definition a definition",
+                  "__attribute__((nocommon)) int t;\n", false},
+             Case{"`common` states the default", "__attribute__((common)) int t;\n",
                   true},
+             Case{"a tentative definition an alias names is a definition",
+                  "int t;\nextern int t_alias __attribute__((alias(\"t\")));\n", false},
              Case{"completed by a LATER definition", "int t;\nint t = 3;\n", false},
              Case{"completed by an EARLIER definition", "int t = 3;\nint t;\n", false},
              Case{"an initializer of zero is a definition", "int t = 0;\n", false},

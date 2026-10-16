@@ -550,11 +550,12 @@ void expectARecoveredDocumentIsAnalyzed(std::string_view text,
 
 // `directDeclaredType`: a direct declarator whose array suffix the parser recovered.
 TEST(LspRecoveredTree, ADirectDeclaratorsRecoveryChildIsNotReadAsARule) {
-    // The two S_ codes are the bound's own (`[]` has no length; `a` then has no
-    // constant one) — the same pair the unrecovered `int a[sizeof (int[])];` draws.
+    // The two S_ codes are the bound's own (`sizeof` of the array of unknown size
+    // `int[]` is 0, said — cl's reading; `a` then has no constant bound, the
+    // recovered `7` beside it).
     expectARecoveredDocumentIsAnalyzed(
         "int a[sizeof (int[]) 7];\nint main(void) { return 0; }\n",
-        {"P_UnexpectedToken", "S_NonConstantArrayLength", "S_NonConstantArrayLength"});
+        {"P_UnexpectedToken", "S_SizeofIncompleteArrayIsZero", "S_NonConstantArrayLength"});
 }
 
 // `gatherInlineAsmFacts`: a recovery node in an asm statement's qualifier window.

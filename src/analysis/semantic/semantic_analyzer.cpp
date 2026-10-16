@@ -586,6 +586,39 @@ struct EngineState {
     // (`judgeAttributeSpecifier`). `nullopt` ⇒ no pair in scope ⇒ such an
     // attribute is refused by name, never accepted on a guess.
     std::optional<std::string> activeCallingConvention;
+    // P69 (lane `cs`): the active format's reason to refuse a symbol alias
+    // (`analyze()`'s parameter, read off the format document's
+    // `symbolAliasUnsupportedReason`). Present ⇒ the `alias` attribute is refused
+    // by name with the reason's sentence; `nullopt` ⇒ an alias is built.
+    std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported;
+    // P69 (lane `cs`): whether the active format's document states commons
+    // (`analyze()`'s parameter). False ⇒ the `common` attribute is refused by name.
+    bool formatStatesCommons = true;
+    // P69 (lane `cs`): every file-scope declaration that wrote an `alias("target")`
+    // its declarator could keep, in source order — the declarator's own symbol (the
+    // survivor of its redeclaration merge or an absorbed record of it), the target's
+    // SYMBOL name, and where to say what is wrong. Resolved once, at the end of the
+    // unit (`resolveSymbolAliases`), where every definition of the unit is known.
+    struct PendingSymbolAlias {
+        SymbolId    declared{};
+        std::string target;
+        NodeId      clauseNode{};
+        NodeId      nameNode{};
+        TreeId      tree{};
+        // The alias declaration wrote an initializer of its own, already warned
+        // ignored: the definition it makes is not a definition "normally".
+        bool        initializerIgnored = false;
+    };
+    std::vector<PendingSymbolAlias> pendingSymbolAliases;
+    // P69 (lane `cs`): the records whose declaration wrote `common` — read only to
+    // refuse an alias of such a variable (every reference refuses one). A set of the
+    // analyzer's own, not a fact of the model: what `common` means is the format
+    // document's, and nothing below this tier asks.
+    std::unordered_set<std::uint32_t> symbolsWritingCommon;
+    // P69 (lane `cs`): the attribute clauses whose refusal or warning was already
+    // given — a declaration-level clause is copied into every declarator's facts, and
+    // one clause draws one report.
+    std::unordered_set<std::uint64_t> attributeClausesReported;
     // P69 round 4 (lane `cs`): the attribute SPECIFIER nodes a declaration's own
     // fold has already judged (`scanAttributeSemantics` with `emitUnknown` — the
     // once-per-declaration, diagnostic-owning scan), keyed (TreeId.v << 32) |
@@ -638,6 +671,16 @@ struct EngineState {
     // structural signature equality) and emits S_IncompatibleRedeclaration on a
     // mismatch. Built in Pass 1, consumed once after Pass 1.5 (before Pass 2).
     std::vector<std::pair<SymbolId, SymbolId>> mergedFnDecls;
+    // P69 (lane `cs`): the same merges read both ways — each record → the records
+    // Pass 1 merged it with. Built once before Pass 1.5, from `mergedFnDecls`, for
+    // the composite an array redeclaration takes at the declaration that completes
+    // it (`composeArrayRedeclaration`).
+    std::unordered_map<std::uint32_t /*SymbolId.v*/, std::vector<SymbolId>>
+        redeclarationPartners;
+    // P69 (lane `cs`): the type each such record's OWN declaration wrote, kept when
+    // Pass 1.5 resolves it — `composeArrayRedeclaration` then gives every record of
+    // the merge the composite, and `typeVisibleAt` needs what each one said alone.
+    std::unordered_map<std::uint32_t /*SymbolId.v*/, TypeId> ownDeclaredType;
 
     // Select the index bundle for `schema` before processing one of its trees.
     void activate(GrammarSchema const& schema) {
@@ -4981,6 +5024,13 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                 break;  // the single sizeof form
             }
             if (!sized.valid()) return std::nullopt;
+            // P69 (lane `cs`): an array of unknown size yields what the language
+            // states for one (`sizeof.incompleteArraySize`, MSVC's 0) — the same
+            // answer the HIR fold and the lowering give (`foldLayoutQuery`,
+            // `lowerSizeof`); the warning is Pass 2's, once per `sizeof`.
+            if (cfg->sizeofIncompleteArraySize.has_value()
+                && s.lattice.interner().isIncompleteArray(sized))
+                return *cfg->sizeofIncompleteArraySize;
             // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: `sizeof` asks the
             // OPERAND question, not the object one, so this fold routes through
             // `operandLayout` — identical to `computeLayout` for every type with a
@@ -6285,9 +6335,9 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     // form that `allowFlexibleArray` (a struct field) is a flexible/incomplete
     // array (C99 §6.7.2.1). It is an INCOMPLETE type, legal only as a struct's
     // LAST field; the type_layout engine lays a FAM struct out correctly and
-    // fails loud on a non-last FAM. A standalone `T x[]` (a local/global — NOT
-    // `allowFlexibleArray`) keeps the `S_NonConstantArrayLength` error below.
-    // Distinct from a present-but-non-constant length (`T x[n]`), always an error.
+    // fails loud on a non-last FAM. A standalone `T x[]` (a local/global) is the same
+    // incomplete type (P69: the arm below), refused where it is an OBJECT's type.
+    // Distinct from a present-but-non-constant length (`T x[n]`).
     bool const absentLength =
         !lenNode.valid() || tree.kind(lenNode) != NodeKind::Internal;
     // c82: `paramAdjustments` (C 6.7.6.3p7 parameter adjustment) admits the
@@ -6303,9 +6353,17 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     // declares an `arraySuffix` facet today, so this arm is unreachable in
     // practice; it is written anyway because the two resolvers drifting is the
     // failure mode this pairing exists to prevent.
-    if (absentLength
-        && (decl.allowFlexibleArray || decl.paramAdjustments
-            || decl.kind == DeclarationKind::Type)) {
+    // P69 (lane `cs`): kept arm-for-arm with the declarator-mode twin, which now
+    // builds the incomplete array for an absent bound on EVERY row (C 6.7.6.2p4) and
+    // judges the object, not the row; the element rule (C 6.7.6.2p1) is that twin's
+    // too.
+    if (absentLength) {
+        if (s.lattice.interner().isIncompleteArray(base)) {
+            emit(DiagnosticCode::S_ArrayElementTypeIncomplete,
+                 "an array's element type cannot be an array of unknown size — only "
+                 "the outermost bound of an array may be omitted (C 6.7.6.2p1)");
+            return InvalidType;
+        }
         return s.lattice.interner().incompleteArray(base);
     }
     auto len = constIntExpr(s, tree, lenNode, fromScope, cfg);
@@ -7415,6 +7473,24 @@ struct AttributeSemanticsFacts {
     // alias, or an exact 2 would be lost behind a raise-only 16.
     std::optional<std::uint32_t> alignmentFloor;
     NodeId                       alignmentFloorClause{};
+
+    // P69 (lane `cs`): every `alias("target")` clause of the declaration, in the
+    // order folded. `target` is the clause's ONE string argument, decoded; nullopt
+    // when the clause has none, or more than one (both refused by name at the
+    // declarator). More than one clause on one declaration is refused there too:
+    // every reference refuses the attribute twice, with one target or two.
+    struct SymbolAliasClause {
+        std::optional<std::string> target;
+        NodeId                     clauseNode{};
+        NodeId                     nameToken{};
+    };
+    std::vector<SymbolAliasClause> symbolAliases;
+    // P69 (lane `cs`): the `common` / `nocommon` clauses (the last of each kind
+    // folded), kept as clauses so the declarator can say which one it ignores.
+    NodeId commonClause{};
+    NodeId commonNameToken{};
+    NodeId noCommonClause{};
+    NodeId noCommonNameToken{};
 
     // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT): EVERY MATCHED
     // CLAUSE, kept as itself so the decl-kind gate can REPORT.
@@ -8622,6 +8698,28 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 // sizeof, same _Alignof, wrong bytes.
                 out.packField = true;
                 break;
+            case AttributeEffect::SymbolAlias:
+                // P69 (lane `cs`): the clause and its one string, kept as written —
+                // the target is resolved by symbol name at the end of the unit
+                // (`resolveSymbolAliases`), where every definition is known, and
+                // what the declarator can say about the clause it says there. The
+                // same clause met twice (a declaration-level clause copied into the
+                // declarator's facts and reached again) is one clause.
+                if (std::ranges::none_of(out.symbolAliases, [&](auto const& a) {
+                        return a.clauseNode.v == clauseNode.v;
+                    })) {
+                    out.symbolAliases.push_back(AttributeSemanticsFacts::SymbolAliasClause{
+                        clause->message, clauseNode, clause->nameToken});
+                }
+                break;
+            case AttributeEffect::TentativeMayBeCommon:
+                out.commonClause    = clauseNode;
+                out.commonNameToken = clause->nameToken;
+                break;
+            case AttributeEffect::TentativeNeverCommon:
+                out.noCommonClause    = clauseNode;
+                out.noCommonNameToken = clause->nameToken;
+                break;
             case AttributeEffect::CallingConvention:
             case AttributeEffect::Unsupported:
                 break;   // not reached: returned above, judged once by Pass 2
@@ -8684,14 +8782,17 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
 // typedef's alignment skin. The cost is stated in the row: `_Alignof` of such a
 // type name is gcc's answer, not clang's.
 //
-// TWO KINDS OF TYPE TAKE NO SKIN:
-//   * a FUNCTION type, by measurement — `int (__attribute__((aligned(16))) *pf)(int)`
-//     leaves `pf` an ordinary 8-aligned pointer on gcc (clang aligns the pointer;
-//     gcc's is the reading taken, for the reason above);
-//   * a type with no layout yet that is not an array awaiting its initializer (an
-//     incomplete structure, `void`, a variably modified array), by construction:
-//     the request is compared with the type's natural alignment, and the layout
-//     that would state it does not exist.
+// A TYPE WITH NO LAYOUT TAKES NO SKIN — the request is compared with the type's
+// natural alignment, and the layout that would state it does not exist — unless it
+// is an array awaiting its initializer (below). That is ONE rule, and it covers:
+//   * a FUNCTION type (`computeLayout` gives none), and the measurement agrees —
+//     `int (__attribute__((aligned(16))) *pf)(int)` leaves `pf` an ordinary
+//     8-aligned pointer on gcc (clang aligns the pointer; gcc's is the reading
+//     taken, for the reason above). P69 (lane `cs`): a separate early return for a
+//     function type stood here too; its mutation arm SURVIVED main's Mac sweep of
+//     checkpoint 17 (no case can tell the two apart, because the no-layout rule
+//     already says it), so it is gone and the one rule is the statement;
+//   * an incomplete structure, `void`, a variably modified array.
 // ⚠ FOR A VARIABLY MODIFIED ARRAY THAT IS A GAP AND NOT A READING
 // (D-C-AN-ATTRIBUTE-AFTER-A-REFERRED-TAG-NAMES-ANOTHER-TAG-AND-ONE-IN-A-TYPE-NAME-IS-REFUSED
 // carries it as owed). Such a type HAS an alignment — its element's (C23 6.5.4.4
@@ -8716,7 +8817,6 @@ typePositionAligned(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     if (!ty.valid() || roots.empty() || !s.aggregateLayout.has_value()) return ty;
     if (cfg.attributeEffects.empty()) return ty;
     TypeInterner& in = s.lattice.interner();
-    if (in.kind(ty) == TypeKind::FnSig) return ty;
     AttributeSemanticsFacts facts;
     auto const snap = s.reporter.snapshotForRollback();
     for (NodeId root : roots) {
@@ -10170,9 +10270,20 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                       bool allowFlexibleArray = false,
                       bool paramDecay = false,
                       bool allowInitInferredArray = false,
-                      bool typeAliasRow = false) {
+                      bool typeAliasRow = false,
+                      bool innerIsUnspecifiedSize = false) {
     DeclaratorConfig const& dc = *cfg.declarators;
     RuleId const r = tree.rule(suffix);
+    // P69 (lane `cs`): C 6.7.6.2p1 — an array's element type shall be complete. An
+    // array of unknown size is not; an UNSPECIFIED-size `[*]` is a variable length
+    // array type (6.7.6.2p4), complete, though it is built here as the same
+    // size-less array a `[]` builds — so the fold says which suffix built `inner`
+    // (`int f(int p[][*]);`, `int f(int p[*][*]);` are prototypes gcc 13.3.0 and
+    // clang 18.1.3 accept).
+    auto const elementOfUnknownSize = [&] {
+        return !innerIsUnspecifiedSize && inner.valid()
+            && s.lattice.interner().isIncompleteArray(inner);
+    };
     if (isFnSuffixRule(r, dc)) {
         // ★★ C 6.7.6.3p1 — "A function declarator shall not specify a return type
         // that is a function type or an array type." `inner` IS the return type this
@@ -10281,6 +10392,23 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             }
             return InvalidType;
         }
+        // P69 (lane `cs`): the element rule of the bracket arm below (C 6.7.6.2p1),
+        // for the one other suffix that builds an array.
+        if (elementOfUnknownSize()) {
+            if (emitOnMiss) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_ArrayElementTypeIncomplete;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(suffix);
+                d.actual   = "an array's element type cannot be an array of unknown "
+                             "size — only the outermost bound of an array may be "
+                             "omitted (C 6.7.6.2p1): `" + std::string{tree.text(suffix)}
+                             + "`";
+                s.reporter.report(std::move(d));
+            }
+            return InvalidType;
+        }
         return s.lattice.interner().incompleteArray(inner);
     }
     if (r == dc.arraySuffixRule) {
@@ -10317,6 +10445,22 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                  "an array declarator's `static` / type-qualifier / `*` decoration "
                  "is permitted only on a function parameter (C 6.7.6.2p1, "
                  "6.7.6.3p7)");
+            return InvalidType;
+        }
+        // P69 (lane `cs`): C 6.7.6.2p1 — "The element type shall not be an
+        // incomplete or function type." `inner` is the element this suffix wraps
+        // (suffixes fold right to left), so an ARRAY OF UNKNOWN SIZE here is an
+        // omitted bound that is not the outermost one: `int a[3][]`, `int
+        // (*p)[2][]`, a parameter's `int a[][]`. Refused by gcc 13.3.0 and clang
+        // 18.1.3 ("array type has incomplete element type"). Asked here, once for
+        // every row, because an omitted bound now builds the incomplete array
+        // wherever it is written (the arm at the end of this branch) — the object
+        // and position checks downstream judge the OUTERMOST type, and this is the
+        // one place the element is in hand.
+        if (elementOfUnknownSize()) {
+            emit(DiagnosticCode::S_ArrayElementTypeIncomplete,
+                 "an array's element type cannot be an array of unknown size — only "
+                 "the outermost bound of an array may be omitted (C 6.7.6.2p1)");
             return InvalidType;
         }
         // The length is whichever of the suffix's visible children
@@ -10379,6 +10523,23 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // was 0). Both are now the VLA the programmer wrote, and the
             // initializer constraint is judged at the declarator loop where the
             // initializer is in scope.
+            //   ★ P69 (lane `cs`): A PRESENT bound on that row is NOT a flexible
+            // member. This arm used to take it too (`struct S { int x; int a[n]; }`
+            // became a flexible member — READ, the composite guard admits a last
+            // incomplete-array member — laid out with no room for the `n` elements
+            // the program indexes), and the legacy twin `applyArraySuffix` refuses
+            // it. A member, and an object with linkage, cannot have a variably
+            // modified type (C 6.7.2.1p9, 6.7.6.2p2): its bound must be an integer
+            // constant expression, and one that does not fold is refused by name.
+            // The refusal kept the multi-dimensional member (`int a[n][m]`) from
+            // reading as an array of an array of unknown size.
+            if (allowFlexibleArray && hasPresentLength) {
+                emit(DiagnosticCode::S_NonConstantArrayLength,
+                     "a structure or union member, or an object with linkage, cannot "
+                     "have a variably modified type: its array bound must be an "
+                     "integer constant expression (C 6.7.2.1p9, 6.7.6.2p2)");
+                return InvalidType;
+            }
             if (allowFlexibleArray || (allowInitInferredArray && !hasPresentLength))
                 return s.lattice.interner().incompleteArray(inner);
             // VLA C1a (D-CSUBSET-VLA): a PRESENT-but-non-constant length on a NON-FAM,
@@ -10416,10 +10577,30 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // a non-last / sole member keeps S_FlexibleArrayNotLast / SoleMember.
             if (typeAliasRow)
                 return s.lattice.interner().incompleteArray(inner);
-            emit(DiagnosticCode::S_NonConstantArrayLength,
-                 "an array declarator in this position needs a length, and it "
-                 "must be an integer constant expression (C 6.7.6.2)");
-            return InvalidType;
+            // ★★ P69 (lane `cs`) — AND ON EVERY OTHER ROW AN ABSENT BOUND IS THE SAME
+            // INCOMPLETE TYPE (C 6.7.6.2p4: "If the size is not present, the array
+            // type is an incomplete type"). This arm used to REFUSE it
+            // (`S_NonConstantArrayLength`), which judged the bound by the ROW that
+            // carries it — parameter, flexible-array row, initializer, type alias —
+            // and never by WHERE the array sits in the declared type. ✔MEASURED
+            // (probe sz, part 2): `static int (*p)[];` was refused while `static int
+            // (*p)[] = &buf;` was accepted (the init-inference relaxation reached
+            // the pointee by accident), and the type names `int (*)[]` (a cast, a
+            // `_Generic` association) and `int[]` were refused; gcc 13.3.0 and clang
+            // 18.1.3 build and run all of them, and MSVC 19.51 all that it parses.
+            // An incomplete type is a legal pointee and a legal type name; what C
+            // forbids is an OBJECT of it, and that is judged where the object is:
+            //   * an object definition of incomplete type — `S_IncompleteTypeObject`
+            //     (a block-scope `int a[];`, a `static` one), the arm that already
+            //     refuses an object of `typedef int T[];`;
+            //   * a file-scope TENTATIVE definition — completed with one element at
+            //     the end of the unit, warned (`S_TentativeArrayAssumedOneElement`,
+            //     C 6.9.2p2), unless a later declaration completes it;
+            //   * an omitted bound that is not the outermost — refused above
+            //     (`S_ArrayElementTypeIncomplete`), the element being in hand there;
+            //   * `sizeof` of it — the language document's statement
+            //     (`sizeof.incompleteArraySize`), else refused by name.
+            return s.lattice.interner().incompleteArray(inner);
         }
         // D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18 zero-length arrays): a
         // TRAILING `uint64_t ns_threadids[0];` member — MEASURED at
@@ -10541,9 +10722,13 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 
     // Suffixes fold RIGHT-to-LEFT (source-first suffix = outermost type).
     for (std::size_t i = suffixes.size(); i-- > 0;) {
+        bool const innerIsUnspecifiedSize =
+            i + 1 < suffixes.size() && dc.arrayStarSuffixRule.has_value()
+            && tree.rule(suffixes[i + 1]) == *dc.arrayStarSuffixRule;
         t = applyDeclaratorSuffix(s, cfg, tree, suffixes[i], t, scope,
                                   emitOnMiss, allowFlexibleArray, paramDecay,
-                                  allowInitInferredArray, typeAliasRow);
+                                  allowInitInferredArray, typeAliasRow,
+                                  innerIsUnspecifiedSize);
         if (!t.valid()) return InvalidType;
     }
 
@@ -13548,6 +13733,136 @@ childScopeFor(EngineState& s, Tree const& tree, NodeId node, ScopeId current) {
     return current;
 }
 
+// The scope a declaration's declarators BIND in, from the scope Pass 1.5 hands
+// the declaration's visit. The walker passes `childScopeFor(node, current)`: the
+// child scope the declaration node itself opens when its row is a `scopes` rule
+// (✔MEASURED: a file-scope declaration is visited with such a scope, not with the
+// file scope), so the declarators' scope is that scope's PARENT — `childScopeFor`
+// read backwards. A node that opened no scope was visited with `current` itself.
+[[nodiscard]] ScopeId
+scopeBindingDeclaratorsOf(EngineState const& s, Tree const& tree, NodeId node,
+                          ScopeId here) {
+    auto const& scopes = s.scopes.scopes();
+    if (here.valid() && here.v < scopes.size() && scopes[here.v].anchor.v == node.v
+        && scopes[here.v].tree.v == tree.id().v)
+        return scopes[here.v].parent;
+    return here;
+}
+
+// P69 (lane `cs`) — C 6.2.7p4 FOR AN ARRAY OF UNKNOWN SIZE. A redeclaration of an
+// object whose prior declaration is visible makes the identifier's type, FROM THAT
+// DECLARATION ON, the composite of the two; the composite of an array of unknown size
+// and one of known size (the same element) is the known one (6.2.7p3). Every use of a
+// redeclared name binds to ONE record, its merge's survivor, so the composite is put
+// on every record of the merge when the declaration that completes it is resolved —
+// in Pass 1.5's own order: a bound written AFTER `int v[]; int v[10];` reads ten
+// elements (gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 give it ten, ✔MEASURED
+// probe fs cell 2), and one written between the two still reads the array of unknown
+// size (cl's 0, ✔MEASURED probe sz cell 2). A later declaration of unknown size takes
+// the size a prior one gave (`int v[10]; int v[];`). Two different known sizes, or
+// two element types, are no composite: the post-1.5 sweep refuses them.
+// The same holds one pointer down (C 6.7.6.2p6): `int (*p)[]; int (*p)[3];` is one
+// object whose type is the composite `int (*)[3]` (✔MEASURED, lane `cs` probe ak
+// cells 5, 6 and 9: gcc 13.3.0 and clang 18.1.3 read `sizeof *p` as 12 after the
+// second declaration, in either order), so a bound written after the declaration
+// that completes it reads three elements here too.
+void composeArrayRedeclaration(EngineState& s, SymbolId sym) {
+    auto const partners = s.redeclarationPartners.find(sym.v);
+    if (partners == s.redeclarationPartners.end()) return;
+    auto& in = s.lattice.interner();
+    auto const elementOf = [&](TypeId t) -> TypeId {
+        if (!t.valid() || in.kind(t) != TypeKind::Array) return InvalidType;
+        auto const ops = in.operands(t);
+        return ops.empty() ? InvalidType : ops[0];
+    };
+    // Two declared types of the merge that have a composite: at the top, arrays of one
+    // element one of which has no size; below a pointer, C's compatibility.
+    auto const composable = [&](TypeId x, TypeId y) {
+        if (!x.valid() || !y.valid()) return false;
+        if (x.v == y.v) return true;
+        if (in.kind(x) == TypeKind::Array || in.kind(y) == TypeKind::Array)
+            return elementOf(x).valid() && elementOf(x).v == elementOf(y).v
+                && (in.isIncompleteArray(x) || in.isIncompleteArray(y));
+        return in.kind(x) == TypeKind::Ptr && in.qualifierBits(x) == in.qualifierBits(y)
+            && sameOrEnumCompatible(in, in.stripVolatile(x), in.stripVolatile(y));
+    };
+    TypeId const mine = s.symbols.at(sym).type;
+    if (!mine.valid()
+        || (in.kind(mine) != TypeKind::Array && in.kind(mine) != TypeKind::Ptr))
+        return;
+    // The merge, as every record reachable through the partners.
+    std::vector<SymbolId> group{sym};
+    for (std::size_t i = 0; i < group.size(); ++i) {
+        auto const it = s.redeclarationPartners.find(group[i].v);
+        if (it == s.redeclarationPartners.end()) continue;
+        for (SymbolId const p : it->second)
+            if (std::find_if(group.begin(), group.end(),
+                             [&](SymbolId g) { return g.v == p.v; }) == group.end())
+                group.push_back(p);
+    }
+    // The composite: this declaration's type, completed by every resolved record of the
+    // merge that knows a size it does not (`completerOfCompatible`). A pair where each
+    // knows a size the other does not has none either spells, and changes nothing.
+    TypeId composite = mine;
+    for (SymbolId const r : group) {
+        TypeId const t = s.symbols.at(r).type;
+        if (!composable(composite, t)) continue;
+        if (TypeId const c = completerOfCompatible(in, composite, t); c.valid())
+            composite = c;
+    }
+    for (SymbolId const r : group) {
+        SymbolRecord& rec = s.symbols.at(r);
+        // A record Pass 1.5 has not reached yet has no type: nothing to compose.
+        if (rec.kind != DeclarationKind::Variable || !rec.type.valid()
+            || rec.type.v == composite.v || !composable(rec.type, composite))
+            continue;
+        rec.type = composite;
+        if (rec.declNode.valid()) s.nodeToType.set(rec.declNode, composite);
+    }
+}
+
+// P69 (lane `cs`) — C 6.2.7p4 AT A USE. Every use of a redeclared name binds to ONE
+// record, its merge's survivor, and the survivor holds the merge's composite
+// (`composeArrayRedeclaration`) — what the object IS. But the identifier's type at a
+// use is the composite of the declarations written BEFORE that use: an array a LATER
+// declaration completes is still an array of unknown size there (`extern int a[];
+// … sizeof a … int a[3];`: cl reads 0 with C4034, gcc 13.3.0 and clang 18.1.3 refuse —
+// ✔MEASURED, probe sz cell 2), and one an EARLIER declaration completed has its size
+// (`int v[10]; int v[]; … sizeof v` is 40). Asked by both readers of a name's type at a
+// use: Pass 2's reference stamp and `subtreeType`'s leaf (Pass 1.5's constants).
+// Anything but an array merge is the record's own type, unchanged.
+[[nodiscard]] TypeId typeVisibleAt(EngineState const& s, Tree const& tree, SymbolId sym,
+                                   NodeId at) {
+    TypeId const t = s.symbols.at(sym).type;
+    auto const& in = s.lattice.interner();
+    if (t.valid() && (in.kind(t) != TypeKind::Array || in.isIncompleteArray(t))) return t;
+    if (!at.valid() || !s.redeclarationPartners.contains(sym.v)) return t;
+    std::vector<SymbolId> group{sym};
+    for (std::size_t i = 0; i < group.size(); ++i) {
+        auto const it = s.redeclarationPartners.find(group[i].v);
+        if (it == s.redeclarationPartners.end()) continue;
+        for (SymbolId const p : it->second)
+            if (std::find_if(group.begin(), group.end(),
+                             [&](SymbolId g) { return g.v == p.v; }) == group.end())
+                group.push_back(p);
+    }
+    auto const where = tree.span(at).start();
+    TypeId sized = InvalidType;
+    TypeId unknownSize = InvalidType;
+    for (SymbolId const r : group) {
+        SymbolRecord const& rec = s.symbols.at(r);
+        if (rec.tree.v == tree.id().v && rec.declNode.valid()
+            && tree.span(rec.declNode).start() > where)
+            continue;   // written after the use
+        auto const own = s.ownDeclaredType.find(r.v);
+        TypeId const written = own != s.ownDeclaredType.end() ? own->second : rec.type;
+        if (!written.valid() || in.kind(written) != TypeKind::Array) continue;
+        (in.isIncompleteArray(written) ? unknownSize : sized) = written;
+    }
+    if (sized.valid()) return t.valid() ? t : sized;
+    return unknownSize.valid() ? unknownSize : t;
+}
+
 // GAP A: find the scope (anywhere in the tree) whose anchor IS `node` —
 // used to key a function's result type on the scope its body opens. The
 // body scope can be nested under an intermediate scope (e.g. c's
@@ -15672,7 +15987,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             decl.allowFlexibleArray
                             || declarationIsNonDefining(
                                    cfg, tree, node, decl, dNode,
-                                   here.v == fileScopeOf(s, tree, here).v);
+                                   scopeBindingDeclaratorsOf(s, tree, node, here).v
+                                       == fileScopeOf(s, tree, here).v);
                         // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF: a row that declares a
                         // TYPE rather than an object may name an INCOMPLETE array
                         // (C 6.7.6.2p1) — `typedef int T[];`. Config-declared via
@@ -15773,6 +16089,11 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         if (declTy.valid()) {
                             s.symbols.at(sym).type = declTy;
                             s.nodeToType.set(nameNode, declTy);
+                            if (s.symbols.at(sym).kind == DeclarationKind::Variable
+                                && s.redeclarationPartners.contains(sym.v)) {
+                                s.ownDeclaredType[sym.v] = declTy;
+                                composeArrayRedeclaration(s, sym);
+                            }
                             // VLA C4b (D-CSUBSET-VLA, design-audit I1): a VLA-typedef
                             // OBJECT (`typedef int R[n]; R a;`) derives its VLA-ness
                             // entirely from the head alias — nothing else records WHICH
@@ -16116,14 +16437,24 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     return t.valid()
                                         && ti.kind(t) == TypeKind::Void;
                                 };
+                            // P69 (lane `cs`): a file-scope TENTATIVE definition of an
+                            // array of unknown size is not refused here — C 6.9.2p2
+                            // completes it at the end of the unit, from a later
+                            // declaration or with one element (`completeTentative
+                            // Arrays`), and gcc 13.3.0 and clang 18.1.3 both build it
+                            // (✔MEASURED, probe fs).
+                            bool const tentativeIncompleteArray =
+                                s.symbols.at(sym).isTentativeDefinition
+                                && s.lattice.interner().isIncompleteArray(declTy);
                             if (s.symbols.at(sym).kind
                                         == DeclarationKind::Variable
                                 && decl.requireNamedDeclarators
                                 && !s.symbols.at(sym).isExternDeclaration
                                 && (s.lattice.interner()
                                         .isIncompleteComposite(declTy)
-                                    || s.lattice.interner()
-                                           .isIncompleteArray(declTy)
+                                    || (s.lattice.interner()
+                                            .isIncompleteArray(declTy)
+                                        && !tentativeIncompleteArray)
                                     || arrayElementIsVoid(declTy)
                                     || (declTy.valid()
                                         && s.lattice.interner().kind(declTy)
@@ -16968,6 +17299,176 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 "applicable to {} only",
                                 ksc.name, declarationKindName(eff), allowed);
                             s.reporter.report(std::move(d));
+                        }
+                        // ★★ P69 (lane `cs`) — `alias`, `common` AND `nocommon` ON THIS
+                        // DECLARATOR. Each clause the declaration-kind gate above
+                        // kept (a name it ignored for this kind of entity was said
+                        // there and is not applied here). What the declarator alone
+                        // decides is decided here, once per clause; what needs every
+                        // definition of the unit — the alias's target, and whether
+                        // another declaration defines the name — waits for
+                        // `resolveSymbolAliases` at the end of the unit.
+                        {
+                            auto const clauseKept = [&](NodeId nameToken) {
+                                if (!nameToken.valid()) return true;
+                                bool const* ignored =
+                                    s.attributeNamesIgnoredForKind.tryGet(nameToken);
+                                return ignored == nullptr || !*ignored;
+                            };
+                            auto const reportClauseOnce =
+                                [&](NodeId clauseNode, DiagnosticCode code,
+                                    DiagnosticSeverity severity, std::string actual) {
+                                    std::uint64_t const key =
+                                        (static_cast<std::uint64_t>(tree.id().v) << 32)
+                                        | clauseNode.v;
+                                    if (!s.attributeClausesReported.insert(key).second)
+                                        return;
+                                    ParseDiagnostic d;
+                                    d.code     = code;
+                                    d.severity = severity;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(clauseNode.valid() ? clauseNode
+                                                                              : nameNode);
+                                    d.actual   = std::move(actual);
+                                    s.reporter.report(std::move(d));
+                                };
+                            std::string const declaredName{tree.text(nameNode)};
+                            std::vector<AttributeSemanticsFacts::SymbolAliasClause const*>
+                                aliasClauses;
+                            for (auto const& clause : attrFacts.symbolAliases)
+                                if (clauseKept(clause.nameToken))
+                                    aliasClauses.push_back(&clause);
+                            if (!aliasClauses.empty()) {
+                                auto const& alias = *aliasClauses.front();
+                                // Where the DECLARATION stands, not the scope its
+                                // own node opened.
+                                ScopeId const declScope =
+                                    scopeBindingDeclaratorsOf(s, tree, node, here);
+                                bool const atFileScopeHere =
+                                    declScope.v == fileScopeOf(s, tree, declScope).v;
+                                if (s.symbolAliasUnsupported.has_value()) {
+                                    // The format's own refusal (the Mach-O documents):
+                                    // the platform's C compilers refuse every alias.
+                                    reportClauseOnce(
+                                        alias.clauseNode,
+                                        DiagnosticCode::S_AttributeNotHonoured,
+                                        DiagnosticSeverity::Error,
+                                        std::format(
+                                            "attribute 'alias' on '{}' cannot be honoured "
+                                            "here: {}",
+                                            declaredName,
+                                            symbolAliasUnsupportedSentence(
+                                                *s.symbolAliasUnsupported)));
+                                } else if (!atFileScopeHere) {
+                                    // ✔MEASURED (probe al2 cell 12): gcc ignores the
+                                    // attribute at block scope and the link fails;
+                                    // clang's link fails. No reference makes a
+                                    // program, so the name is refused.
+                                    reportClauseOnce(
+                                        alias.clauseNode,
+                                        DiagnosticCode::S_AttributeNotHonoured,
+                                        DiagnosticSeverity::Error,
+                                        std::format(
+                                            "attribute 'alias' on '{}' cannot be honoured "
+                                            "at block scope: an alias is a second name of "
+                                            "a definition of the unit, and no reference "
+                                            "makes a program of one written in a block",
+                                            declaredName));
+                                } else if (aliasClauses.size() > 1) {
+                                    // ✔MEASURED (probe al3 cell 10): the attribute
+                                    // twice, even with one target, is refused by all.
+                                    reportClauseOnce(
+                                        aliasClauses[1]->clauseNode,
+                                        DiagnosticCode::S_RedeclaredSymbol,
+                                        DiagnosticSeverity::Error,
+                                        std::format(
+                                            "'{}' — a declaration may make its name the "
+                                            "alias of one definition, and this one writes "
+                                            "'alias' more than once",
+                                            declaredName));
+                                } else if (!alias.target.has_value()) {
+                                    reportClauseOnce(
+                                        alias.clauseNode,
+                                        DiagnosticCode::S_SymbolAliasTargetInvalid,
+                                        DiagnosticSeverity::Error,
+                                        std::format(
+                                            "attribute 'alias' on '{}' takes exactly one "
+                                            "argument, a string naming the symbol of the "
+                                            "definition '{}' becomes a second name of",
+                                            declaredName, declaredName));
+                                } else if (isFunctionForm) {
+                                    // ✔MEASURED (probe al2 cell 5): gcc 13.3.0 and
+                                    // mingw-w64 gcc 13.2.0 run the body and warn the
+                                    // attribute ignored; clang 18.1.3 refuses. gcc's
+                                    // reading: the body stands.
+                                    reportClauseOnce(
+                                        alias.clauseNode,
+                                        DiagnosticCode::S_AttributeIgnoredForDeclarationKind,
+                                        DiagnosticSeverity::Warning,
+                                        std::format(
+                                            "attribute 'alias' is ignored on '{}' and its "
+                                            "effect was discarded: this declaration "
+                                            "defines the function, and a function with a "
+                                            "body of its own is not a second name of "
+                                            "another",
+                                            declaredName));
+                                } else {
+                                    if (initNode.valid()) {
+                                        // ✔MEASURED (probe al2 cell 11, al3 cell 1):
+                                        // gcc and mingw-w64 keep the alias and drop the
+                                        // initializer, warned; clang refuses. gcc's.
+                                        reportClauseOnce(
+                                            alias.clauseNode,
+                                            DiagnosticCode::S_SymbolAliasInitializerIgnored,
+                                            DiagnosticSeverity::Warning,
+                                            std::format(
+                                                "'{}' is an alias of '{}', which has the "
+                                                "storage and the value; the initializer "
+                                                "written here is ignored",
+                                                declaredName, *alias.target));
+                                    }
+                                    s.pendingSymbolAliases.push_back(
+                                        EngineState::PendingSymbolAlias{
+                                            sym, *alias.target, alias.clauseNode,
+                                            nameNode, tree.id(),
+                                            /*initializerIgnored=*/initNode.valid()});
+                                }
+                            }
+                            bool const commonKept = attrFacts.commonClause.valid()
+                                && clauseKept(attrFacts.commonNameToken);
+                            bool const noCommonKept = attrFacts.noCommonClause.valid()
+                                && clauseKept(attrFacts.noCommonNameToken);
+                            if (commonKept && !s.formatStatesCommons) {
+                                reportClauseOnce(
+                                    attrFacts.commonClause,
+                                    DiagnosticCode::S_AttributeNotHonoured,
+                                    DiagnosticSeverity::Error,
+                                    std::format(
+                                        "attribute 'common' on '{}' cannot be honoured "
+                                        "here: the active object format states no common "
+                                        "definition, so none can be stated for this "
+                                        "object",
+                                        declaredName));
+                            } else if (commonKept) {
+                                s.symbolsWritingCommon.insert(sym.v);
+                            }
+                            if (noCommonKept && commonKept) {
+                                // ✔MEASURED (probe fs cell 18): gcc and mingw-w64 gcc
+                                // ignore `nocommon` beside `common`, warned; clang is
+                                // silent. gcc's reading, said.
+                                reportClauseOnce(
+                                    attrFacts.noCommonClause,
+                                    DiagnosticCode::S_AttributeIgnoredForDeclarationKind,
+                                    DiagnosticSeverity::Warning,
+                                    std::format(
+                                        "attribute 'nocommon' is ignored on '{}' and its "
+                                        "effect was discarded: 'common' on the same "
+                                        "declaration keeps it a tentative definition "
+                                        "that may be a common",
+                                        declaredName));
+                            } else if (noCommonKept) {
+                                s.symbols.at(sym).tentativeNeverCommon = true;
+                            }
                         }
                         // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): mark a FUNCTION symbol the
                         // declaration annotated `noinline`. Gated on `isFnSig` —
@@ -21343,9 +21844,11 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                   "string here, as gcc and clang read it";
                             s.reporter.report(std::move(d));
                         }
-                        if (rec.type.valid()) {
-                            s.nodeToType.set(resolved.node, rec.type);
-                            s.nodeToType.set(node, rec.type);
+                        if (TypeId const visible =
+                                typeVisibleAt(s, tree, found, resolved.node);
+                            visible.valid()) {
+                            s.nodeToType.set(resolved.node, visible);
+                            s.nodeToType.set(node, visible);
                         }
                     } else {
                         // Hard (must-resolve) iff `hardParents` is empty (the
@@ -21469,6 +21972,39 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // default: 0)` silently took `default`. The core still comes from the
         // TARGET (both current models make it 64-bit), so this also carries the
         // ILP32 width for free once such a target exists.
+        // ★ P69 (lane `cs`) — WHAT `sizeof` OF AN INCOMPLETE TYPE IS, said once per
+        // `sizeof`, where the expression is typed (C 6.5.3.4p1 is a constraint of
+        // the EXPRESSION). An array of unknown size: the language's statement
+        // (`sizeof.incompleteArraySize` — MSVC's 0, C4034), warned as the extension
+        // it is; with no statement, refused. An incomplete structure or union:
+        // refused by every reference (gcc 13.3.0, clang 18.1.3, MSVC 19.51 C2027 —
+        // ✔MEASURED, probe sz), and refused here by name; before this, only the HIR
+        // tier refused it, as a lowering it could not perform.
+        auto const judgeSizeofOperand = [&](TypeId sized) {
+            if (!sized.valid()) return;
+            auto const& in = s.lattice.interner();
+            bool const unknownSizeArray = in.isIncompleteArray(sized);
+            if (!unknownSizeArray && !in.isIncompleteComposite(sized)) return;
+            ParseDiagnostic d;
+            d.buffer = tree.source().id();
+            d.span   = tree.span(node);
+            if (unknownSizeArray && cfg.sizeofIncompleteArraySize.has_value()) {
+                d.code     = DiagnosticCode::S_SizeofIncompleteArrayIsZero;
+                d.severity = DiagnosticSeverity::Warning;
+                d.actual   = std::format(
+                    "`sizeof` of an array of unknown size is {} — MSVC's extension "
+                    "(warning C4034); ISO C makes it a constraint violation "
+                    "(6.5.3.4p1): `{}`",
+                    *cfg.sizeofIncompleteArraySize, tree.text(node));
+            } else {
+                d.code     = DiagnosticCode::S_SizeofIncompleteType;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "`sizeof` of an incomplete type, which has no size "
+                    "(C 6.5.3.4p1): `{}`", tree.text(node));
+            }
+            s.reporter.report(std::move(d));
+        };
         if (cfg.sizeofTypeRule.valid() && rule.v == cfg.sizeofTypeRule.v) {
             auto kids = visibleChildren(tree, node);
             if (cfg.sizeofTypeChild < kids.size()) {
@@ -21476,6 +22012,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 TypeId const sized = resolveTypeNode(s, cfg, tree, typeNode, here);
                 if (sized.valid()) s.nodeToType.set(typeNode, sized);
                 // sized invalid ⇒ resolveTypeNode emitted S_UnknownType (fail loud).
+                judgeSizeofOperand(sized);
             }
             s.nodeToType.set(node,
                              synthesizedType(s.lattice.interner(),
@@ -21519,6 +22056,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (tree.kind(opnd) != NodeKind::Internal) continue;
                 if (TypeId t = subtreeType(s, tree, opnd, here); t.valid()) {
                     s.nodeToType.set(opnd, t);
+                    judgeSizeofOperand(t);   // P69 (lane `cs`), above
                 }
                 break;  // the single operand child
             }
@@ -25532,7 +26070,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         if (!scope.valid()) return InvalidType;
         SymbolId const sym = s.scopes.lookup(scope, tree.text(tok));
         if (!sym.valid()) return InvalidType;
-        return s.symbols.at(sym).type;
+        return typeVisibleAt(s, tree, sym, tok);
     };
     // The visible operator token + its `hirLowering` op-table entry — the entry's
     // `target` (HIR op NAME / special tag) the law dispatches on, matching
@@ -27720,6 +28258,246 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     }
 }
 
+// ★★ P69 (lane `cs`) — THE END OF THE UNIT FOR `alias("target")`.
+//
+// Each declaration whose declarator kept an `alias` clause left one pending entry
+// (`EngineState::pendingSymbolAliases`). Only here is every definition of the unit
+// known, so only here can three questions be answered, each by what the references
+// do (✔MEASURED, probes al2 and al3: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0):
+//   1. IS THE NAME DEFINED OTHERWISE? An alias declaration IS the definition of its
+//      name: a second alias declaration of it, a definition of it elsewhere, an
+//      object alias not declared `extern` (a tentative definition) — each refused by
+//      all ("redefinition", "defined both normally and as 'alias' attribute").
+//   2. WHAT IS THE TARGET? The definition of the unit whose SYMBOL name the string
+//      is — an asm label's when the definition has one — reached through any chain
+//      of aliases. Undefined, only declared, a C99 inline definition, a cycle, an
+//      empty name: refused by all. A common (`common` written on it): refused by
+//      all. A thread-local and a non-thread-local storage: refused here — the two
+//      storages cannot be one.
+//   3. HOW ARE ITS USES REACHED? An alias with external linkage is reached BY NAME:
+//      its declaration stays a reference to the name (an import of it), and the
+//      definition the alias makes — one more symbol row on the target's
+//      definition — answers it, or a strong definition of another unit does when
+//      the alias is weak, which is what a weak alias is for. An alias with
+//      INTERNAL linkage has no name another unit or a reference row can reach, so
+//      its uses are bound here to the target itself (the same address).
+// A variable an alias names is a DEFINITION of the unit and never a common: its
+// tentative mark is cleared (`tentativeNeverCommon`).
+void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
+    if (s.pendingSymbolAliases.empty()) return;
+    std::unordered_map<std::uint32_t, Tree const*> treeById;
+    for (auto const& tree : trees) treeById[tree.id().v] = &tree;
+    auto const atFileScope = [&](SymbolRecord const& rec) {
+        auto const it = treeById.find(rec.tree.v);
+        return it != treeById.end()
+            && rec.scope.v == fileScopeOf(s, *it->second, rec.scope).v;
+    };
+    // The survivor of each record's redeclaration merge (absorbed → survivor, along
+    // any chain of merges).
+    std::unordered_map<std::uint32_t, SymbolId> survivorOfAbsorbed;
+    for (auto const& [survivor, absorbed] : s.mergedFnDecls)
+        if (survivor.valid() && absorbed.valid() && survivor.v != absorbed.v)
+            survivorOfAbsorbed[absorbed.v] = survivor;
+    auto const survivorOf = [&](SymbolId id) {
+        for (int guard = 0; guard < 4096; ++guard) {
+            auto const it = survivorOfAbsorbed.find(id.v);
+            if (it == survivorOfAbsorbed.end()) break;
+            id = it->second;
+        }
+        return id;
+    };
+    std::unordered_map<std::uint32_t, std::vector<SymbolId>> groupOf;   // survivor → records
+    for (auto const& [absorbedV, survivor] : survivorOfAbsorbed)
+        groupOf[survivorOf(survivor).v].push_back(SymbolId{absorbedV});
+    auto const symbolNameOf = [](SymbolRecord const& rec) -> std::string const& {
+        return rec.asmName.empty() ? rec.name : rec.asmName;
+    };
+    // A DEFINITION of the unit, as the record that survived its merge: a function
+    // with a body, or an object this unit gives storage (an initializer, or a
+    // tentative definition).
+    auto const defines = [&](SymbolRecord const& rec) {
+        if (rec.isAbsorbedProto || !atFileScope(rec)) return false;
+        if (rec.kind == DeclarationKind::Function)
+            return !rec.isProtoDeclaration && !rec.isExternDeclaration;
+        if (rec.kind == DeclarationKind::Variable)
+            return !rec.isExternDeclaration && !rec.isProtoDeclaration
+                && !rec.isEnumerator && !rec.isInjectedConstant;
+        return false;
+    };
+    std::unordered_map<std::string, SymbolId> definitionNamed;
+    {
+        std::size_t const count = s.symbols.records().size();
+        for (std::size_t i = 1; i < count; ++i) {
+            SymbolId const id{static_cast<std::uint32_t>(i)};
+            SymbolRecord const& rec = s.symbols.at(id);
+            if (defines(rec)) definitionNamed.emplace(symbolNameOf(rec), id);
+        }
+    }
+    auto const report = [&](EngineState::PendingSymbolAlias const& p, DiagnosticCode code,
+                            std::string actual) {
+        auto const it = treeById.find(p.tree.v);
+        if (it == treeById.end()) return;
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = it->second->source().id();
+        d.span     = it->second->span(p.clauseNode.valid() ? p.clauseNode : p.nameNode);
+        d.actual   = std::move(actual);
+        s.reporter.report(std::move(d));
+    };
+    // 1. One alias declaration per name, and no other definition of it.
+    std::unordered_map<std::uint32_t, std::size_t> aliasOfSurvivor;   // survivor → pending
+    std::unordered_map<std::string, std::size_t> aliasNamed;          // symbol name → pending
+    for (std::size_t i = 0; i < s.pendingSymbolAliases.size(); ++i) {
+        auto const& p = s.pendingSymbolAliases[i];
+        SymbolId const survivor = survivorOf(p.declared);
+        SymbolRecord const& sRec = s.symbols.at(survivor);
+        if (aliasOfSurvivor.contains(survivor.v)) {
+            report(p, DiagnosticCode::S_RedeclaredSymbol,
+                   std::format("'{}' — a name may be the alias of one definition, and "
+                               "another declaration already makes it one",
+                               sRec.name));
+            continue;
+        }
+        bool const definedHere = defines(sRec)
+            && !(survivor.v == p.declared.v && p.initializerIgnored);
+        if (definedHere) {
+            report(p, DiagnosticCode::S_RedeclaredSymbol,
+                   std::format("'{}' is defined both as an alias and by a declaration of "
+                               "its own{} — an alias is the definition of its name",
+                               sRec.name,
+                               sRec.kind == DeclarationKind::Variable
+                                   ? " (an object alias is declared `extern`)" : ""));
+            continue;
+        }
+        aliasOfSurvivor.emplace(survivor.v, i);
+        aliasNamed.emplace(symbolNameOf(sRec), i);
+    }
+    // 2. Each alias's target, through any chain of aliases.
+    for (auto const& [survivorV, index] : aliasOfSurvivor) {
+        auto const& p = s.pendingSymbolAliases[index];
+        SymbolId const survivor{survivorV};
+        SymbolRecord& sRec = s.symbols.at(survivor);
+        auto const refuse = [&](std::string why) {
+            report(p, DiagnosticCode::S_SymbolAliasTargetInvalid,
+                   std::format("'{}' cannot be an alias of '{}': {}", sRec.name, p.target,
+                               why));
+        };
+        if (p.target.empty()) {
+            refuse("the target's symbol name is empty");
+            continue;
+        }
+        std::string name = p.target;
+        std::unordered_set<std::string> visited{symbolNameOf(sRec)};
+        SymbolId target{};
+        std::string why;
+        for (int guard = 0; guard < 4096; ++guard) {
+            if (auto const def = definitionNamed.find(name); def != definitionNamed.end()) {
+                target = def->second;
+                break;
+            }
+            auto const next = aliasNamed.find(name);
+            if (next == aliasNamed.end()) {
+                why = std::format("no definition of a symbol named '{}' is in this unit "
+                                  "(an alias names a definition of its own unit, by its "
+                                  "symbol name)", name);
+                break;
+            }
+            if (!visited.insert(name).second) {
+                why = "the aliases name each other in a cycle, and none of them is a "
+                      "definition";
+                break;
+            }
+            name = s.pendingSymbolAliases[next->second].target;
+        }
+        if (!target.valid()) {
+            refuse(why.empty() ? std::string{"the chain of aliases does not end"} : why);
+            continue;
+        }
+        SymbolRecord& tRec = s.symbols.at(target);
+        if (tRec.kind == DeclarationKind::Function && tRec.isInline
+            && !tRec.isInternalLinkage) {
+            refuse(std::format("'{}' is an inline definition, which gives the unit no "
+                               "external definition to name", tRec.name));
+            continue;
+        }
+        bool targetWritesCommon = s.symbolsWritingCommon.contains(target.v);
+        if (auto const g = groupOf.find(target.v); g != groupOf.end())
+            for (SymbolId const r : g->second)
+                targetWritesCommon = targetWritesCommon
+                                  || s.symbolsWritingCommon.contains(r.v);
+        if (targetWritesCommon) {
+            refuse(std::format("'{}' is declared `common`, and a common cannot be given "
+                               "a second name", tRec.name));
+            continue;
+        }
+        if (sRec.isThreadLocal != tRec.isThreadLocal) {
+            refuse(std::format("'{}' is {}thread-local and '{}' is {}: one storage cannot "
+                               "be both", sRec.name, sRec.isThreadLocal ? "" : "not ",
+                               tRec.name, tRec.isThreadLocal ? "thread-local"
+                                                             : "not"));
+            continue;
+        }
+        sRec.aliasTarget = target;
+        if (tRec.kind == DeclarationKind::Variable) tRec.tentativeNeverCommon = true;
+        // 3. An alias with internal linkage: its uses are the target's.
+        if (sRec.isInternalLinkage) {
+            std::vector<SymbolId> group{survivor};
+            if (auto const g = groupOf.find(survivor.v); g != groupOf.end())
+                group.insert(group.end(), g->second.begin(), g->second.end());
+            auto& targetUses = s.usesBySymbol[target.v];
+            for (SymbolId const r : group) {
+                auto const uses = s.usesBySymbol.find(r.v);
+                if (uses == s.usesBySymbol.end()) continue;
+                for (NodeId const use : uses->second) {
+                    s.nodeToSymbol.set(use, target);
+                    targetUses.push_back(use);
+                }
+                uses->second.clear();
+            }
+        }
+    }
+}
+
+// ★ P69 (lane `cs`) — C 6.9.2p2 AT THE END OF THE UNIT. A file-scope TENTATIVE
+// definition of an array of unknown size that no declaration of the unit completed
+// (a later `int v[10];` did, through the redeclaration sweep's composite) is
+// completed here with ONE element, zero-initialized, and the warning both
+// references give says so (✔MEASURED, probe fs: gcc 13.3.0 "array 'v' assumed to
+// have one element", clang 18.1.3 "tentative array definition assumed to have one
+// element"; the program runs on both). After Pass 2 on purpose: a use before the
+// end of the unit sees the array of unknown size C says it is there.
+void completeTentativeArrays(EngineState& s, std::span<Tree const> trees) {
+    std::unordered_map<std::uint32_t, Tree const*> treeById;
+    for (auto const& tree : trees) treeById[tree.id().v] = &tree;
+    auto& interner = s.lattice.interner();
+    std::size_t const count = s.symbols.records().size();
+    for (std::size_t i = 1; i < count; ++i) {
+        SymbolRecord& rec = s.symbols.at(SymbolId{static_cast<std::uint32_t>(i)});
+        if (!rec.isTentativeDefinition || rec.isAbsorbedProto) continue;
+        if (rec.kind != DeclarationKind::Variable || !rec.type.valid()) continue;
+        if (!interner.isIncompleteArray(rec.type)) continue;
+        auto const element = interner.operands(rec.type);
+        if (element.empty() || !element[0].valid()) continue;
+        TypeId const completed = interner.array(element[0], 1);
+        rec.type = completed;
+        if (rec.declNode.valid()) s.nodeToType.set(rec.declNode, completed);
+        auto const it = treeById.find(rec.tree.v);
+        if (it == treeById.end()) continue;
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_TentativeArrayAssumedOneElement;
+        d.severity = DiagnosticSeverity::Warning;
+        d.buffer   = it->second->source().id();
+        d.span     = it->second->span(rec.declNode.valid() ? rec.declNode
+                                                           : rec.declRuleNode);
+        d.actual   = std::format("the tentative definition of the array '{}' is "
+                                 "completed with one element at the end of the unit "
+                                 "(C 6.9.2p2): no declaration gives it a size",
+                                 rec.name);
+        s.reporter.report(std::move(d));
+    }
+}
+
 } // namespace
 
 // The full semantic-analysis pass, factored out of the public `analyze`
@@ -27739,7 +28517,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  TargetSchema const* target,
                                  RuntimeLibraryRoleResolver const* roleResolver,
                                  EnumCompatibleTypeRule enumCompatibleTypeRule,
-                                 std::optional<std::string_view> activeCallingConvention);
+                                 std::optional<std::string_view> activeCallingConvention,
+                                 std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported,
+                                 bool formatStatesCommons);
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DiagnosticBudget budget,
@@ -27753,7 +28533,9 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       std::size_t deepRecursionReserveBytes,
                       RuntimeLibraryRoleResolver const* roleResolver,
                       EnumCompatibleTypeRule enumCompatibleTypeRule,
-                      std::optional<std::string_view> activeCallingConvention) {
+                      std::optional<std::string_view> activeCallingConvention,
+                      std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported,
+                      bool formatStatesCommons) {
     // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
     // `activeFormat` and `roleResolver` are two statements about the SAME format,
     // and nothing but this check makes them agree. A caller passing one format's
@@ -27804,7 +28586,8 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                                std::move(vaListStrategy), std::move(activeFormat),
                                std::move(activeTarget), longDoubleFormat, target,
                                roleResolver, enumCompatibleTypeRule,
-                               activeCallingConvention);
+                               activeCallingConvention, symbolAliasUnsupported,
+                               formatStatesCommons);
         });
 }
 
@@ -27819,7 +28602,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  TargetSchema const* target,
                                  RuntimeLibraryRoleResolver const* roleResolver,
                                  EnumCompatibleTypeRule enumCompatibleTypeRule,
-                                 std::optional<std::string_view> activeCallingConvention) {
+                                 std::optional<std::string_view> activeCallingConvention,
+                                 std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported,
+                                 bool formatStatesCommons) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
@@ -27846,6 +28631,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     if (activeTarget.has_value()) s.activeTarget = std::string{*activeTarget};
     if (activeCallingConvention.has_value())
         s.activeCallingConvention = std::string{*activeCallingConvention};
+    s.symbolAliasUnsupported = symbolAliasUnsupported;
+    s.formatStatesCommons = formatStatesCommons;
 
     // FC3 c1: ILP32 is DECLARED-ONLY (the wasm/spirv skeleton formats
     // carry it for honesty) — no exercised 32-bit width path exists, so
@@ -29351,6 +30138,12 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         }
     }
 
+    for (auto const& [survivor, absorbed] : s.mergedFnDecls) {
+        if (!survivor.valid() || !absorbed.valid() || survivor.v == absorbed.v) continue;
+        s.redeclarationPartners[survivor.v].push_back(absorbed);
+        s.redeclarationPartners[absorbed.v].push_back(survivor);
+    }
+
     // Pass 1.5 per tree: resolve declaration types + function signatures.
     // A derived expression type is only reusable while the facts it read are
     // unchanged, and a PASS is the unit that changes them — Pass 1 minted symbols
@@ -29815,8 +30608,16 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 auto& in = s.lattice.interner();
                 if (in.qualifierBits(sRec.type) == in.qualifierBits(aRec.type)
                     && sameOrEnumCompatible(in, in.stripVolatile(sRec.type),
-                                            in.stripVolatile(aRec.type)))
+                                            in.stripVolatile(aRec.type))) {
+                    // P69 (lane `cs`): two pointers to arrays, one of a size the other
+                    // leaves unknown (`extern int (*p)[]; int (*p)[3];`), are compatible
+                    // (C 6.7.6.2p6), and the object's type is their COMPOSITE (C 6.2.7p3)
+                    // on every record — the statement Pass 1.5 made at the declaration
+                    // that completed it, for a record whose type another path set (the
+                    // array arm below says the same).
+                    composeArrayRedeclaration(s, absorbed);
                     continue;
+                }
             }
             // C 6.2.7 (D-CSUBSET-EXTERN-MULTI-DECLARATOR): two array types with the
             // SAME element type are compatible when ONE side is INCOMPLETE — the
@@ -29839,8 +30640,20 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     auto const sOps = in.operands(sRec.type);
                     auto const aOps = in.operands(aRec.type);
                     if (!sOps.empty() && !aOps.empty()
-                        && sOps[0].valid() && sOps[0].v == aOps[0].v)
+                        && sOps[0].valid() && sOps[0].v == aOps[0].v) {
+                        // P69 (lane `cs`): AND EVERY RECORD OF THE MERGE HOLDS THE
+                        // COMPOSITE (C 6.2.7p3: the composite of an array of unknown
+                        // size and one of known size is the known one). Pass 1.5 put
+                        // it there at the declaration that completed it; this is the
+                        // same statement, for a record whose type another path set.
+                        // The survivor is the record the lowering reads: had it kept
+                        // `int[]` (`int v[]; int v[10];`, the earlier survives), the
+                        // object would have been completed with one element instead
+                        // of ten (✔MEASURED, probe fs cell 2: gcc 13.3.0, clang
+                        // 18.1.3 and mingw-w64 gcc 13.2.0 give it ten).
+                        composeArrayRedeclaration(s, absorbed);
                         continue;   // same element type + one incomplete → compatible
+                    }
                 }
             }
             auto aTreeIt = treeById.find(aRec.tree.v);
@@ -30554,6 +31367,14 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     // P69 (lane `cs`): the binder captured this function's realization state, and the
     // extern list it appends to is handed to the model below — no caller past Pass 2.
     s.resolveLibraryFunction = {};
+
+    // P69 (lane `cs`): the end of the unit — every definition is known and every use
+    // is bound. Each alias finds its target (and an internal-linkage alias's uses
+    // become the target's), and a tentative array no declaration completed takes one
+    // element (C 6.9.2p2). Before the unused-variable sweep below, which reads the
+    // use index the first may move.
+    resolveSymbolAliases(s, trees);
+    completeTentativeArrays(s, trees);
 
     // D8: unused-variable warnings. After Pass 2 has fully populated the
     // SE7 reverse use-index (`usesBySymbol`), any symbol whose minting

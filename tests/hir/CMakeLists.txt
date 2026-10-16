@@ -35,6 +35,11 @@ dss_add_test(NAME hir/test_initializer_list_shapes
 # handed to the lowering as a fact instead of derived again from the type stamps.
 dss_add_test(NAME hir/test_brace_element_as_written
              SOURCES test_brace_element_as_written.cpp)
+# P69 (lane `cs`): a second name of a definition (`alias`) stated by the lowering once, with its target and its own
+# linkage (a `static` alias module-private, a weak one of C's `weak` kind, never a common); and `sizeof` of an array
+# of unknown size lowered to the language's stated value, never a `SizeOf` of a type with no size.
+dss_add_test(NAME hir/test_hir_symbol_alias
+             SOURCES test_hir_symbol_alias.cpp)
 # P69 (lane `cs`): a value-returning function whose end is reached is a language
 # rule (`nonVoidFunctionEndReached`); under C's the lowering completes the body
 # and warns once. Separate from test_hir_lowering_c.cpp because half of it runs

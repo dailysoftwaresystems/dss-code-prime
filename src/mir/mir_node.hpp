@@ -201,11 +201,16 @@ mirThreadStorageOf(bool isThreadLocal) noexcept {
 // format's default spelling happens to be. `statedWeakKind()` is the one way to
 // read it.
 //
-// ★ `tentative` IS A GLOBAL's FACT. A function has no tentative definition; a
-// module-private (`Local`) object is never one the link folds (`static int x;`
-// in two units is two objects), so the builders refuse both. A weak tentative
-// definition IS legal (`__attribute__((weak)) int t;`) and is a weak definition:
-// its kind decides, the mark rides along.
+// ★ `tentative` IS A GLOBAL's FACT, AND IT MEANS ONE THING: this definition MAY
+// be written as a COMMON — the link folds it with the other units' tentative
+// definitions of the name. The tier above states it once (CST→HIR, the one
+// statement of the mark) and clears it on every definition that is a definition
+// of its unit outright, so every reader here reads the mark ALONE. A function has
+// no tentative definition; a module-private (`Local`) object is never one the
+// link folds (`static int x;` in two units is two objects); a weak tentative
+// definition (`__attribute__((weak)) int t;`) is a WEAK definition, ranked by its
+// kind (no reference writes a weak common); and a thread-local one has no common
+// form in any object format. So the builders refuse the mark beside all four.
 //
 // Four one-byte members, so the record is 4 bytes at alignment 1.
 struct MirLinkage {
@@ -257,13 +262,14 @@ enum class MirLinkageOwner : std::uint8_t { Function, Global };
 // amended.
 //
 // `hasInitializer` is a global's "a constant initializer or an init function is
-// stated"; a function passes false.
+// stated", and `isThreadLocal` its "it has thread storage duration"; a function
+// passes false for both.
 //
 // The order is the order a reader fixes them in: the binding/kind pairing first
 // (it decides what the definition IS), the tentative mark after.
 [[nodiscard]] constexpr std::string_view
 mirLinkageDefect(MirLinkage const& linkage, MirLinkageOwner owner,
-                 bool hasInitializer) noexcept {
+                 bool hasInitializer, bool isThreadLocal) noexcept {
     bool const weak   = linkage.binding == SymbolBinding::Weak;
     bool const stated = linkage.statedWeakKind().has_value();
     // A byte that is neither "none stated" nor an enumerator: a corrupted
@@ -290,6 +296,16 @@ mirLinkageDefect(MirLinkage const& linkage, MirLinkageOwner owner,
                    "definition — the link folds tentative definitions of an "
                    "external name, and a local one has none";
         }
+        if (weak) {
+            return "it is a weak definition marked as a tentative definition — the "
+                   "mark says the definition may be written as a common, and a "
+                   "weak definition is ranked by its kind, never folded as one";
+        }
+        if (isThreadLocal) {
+            return "it is a thread-local global marked as a tentative definition — "
+                   "the mark says the definition may be written as a common, and "
+                   "no object format has a thread-local common";
+        }
         if (hasInitializer) {
             return "it is marked as a tentative definition and states an "
                    "initializer — a tentative definition is the one with none "
@@ -299,17 +315,39 @@ mirLinkageDefect(MirLinkage const& linkage, MirLinkageOwner owner,
     return {};
 }
 
-// IS A GLOBAL WITH THIS LINKAGE A COMMON — the conjunction `Mir::globalIsCommon`
-// states and explains (mir/mir.hpp: the tentative mark on a definition that is
-// strong-bound and not thread-local, each conjunct with its measurement). It is
-// written here, over the two facts, because one reader holds them without a
-// module: the decoder of a stored summary, which refuses a row that claims to
-// be a common and could not be one.
+// IS A GLOBAL WITH THIS LINKAGE A COMMON — the MARK, read alone. Every
+// conjunct that once sat beside it (a strong binding, no thread storage) is now
+// a defect of the record (`mirLinkageDefect` refuses the mark beside a weak or a
+// local binding and on a thread-local global), so a well-formed record that
+// carries the mark IS a common, and no reader restates which definitions are
+// not. `Mir::globalIsCommon` asks it of a module's global.
 [[nodiscard]] constexpr bool
-mirLinkageIsCommon(MirLinkage const& linkage, bool isThreadLocal) noexcept {
-    return linkage.tentative && linkage.binding == SymbolBinding::Global
-           && !isThreadLocal;
+mirLinkageIsCommon(MirLinkage const& linkage) noexcept {
+    return linkage.tentative;
 }
+
+// ── A SECOND NAME OF A DEFINITION OF THE MODULE (P69, lane `cs`) ─────────────
+//
+// The GNU `alias("target")` attribute after the tiers above resolved it: `alias`
+// is a name this module DEFINES as the very definition `target` is — one more
+// symbol row on the target function's or global's definition, never a body or
+// storage of its own. `linkage` is the second name's own binding, visibility and
+// weak kind (an alias may be weak, hidden, or module-private while its target is
+// not); it is never tentative, because an alias has no storage to fold.
+//
+// A fact of the MODULE, keyed by two symbols, not of any function or global: the
+// builder holds the list (`MirBuilder::addAlias`), every rebuild carries it whole
+// (`MirBuilder::carryModuleFactsOf`), DCE roots each target, the `.dssir` text
+// spells it (`alias %A = %T [...]`), and `MirVerifier` holds what makes one
+// well formed — a target the module defines, a name it does not otherwise
+// define, one statement per name.
+struct MirAlias {
+    SymbolId   alias{};
+    SymbolId   target{};
+    MirLinkage linkage{};
+
+    friend constexpr bool operator==(MirAlias const&, MirAlias const&) = default;
+};
 
 namespace detail {
 

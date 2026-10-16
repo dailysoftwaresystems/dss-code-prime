@@ -1,2 +1,2 @@
-                             hasInitializer);
+                             hasInitializer, mir_.globalIsThreadLocal(g));
         if (defect.empty()) continue;

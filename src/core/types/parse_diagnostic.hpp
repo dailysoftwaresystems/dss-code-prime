@@ -2665,6 +2665,54 @@ enum class DiagnosticCode : std::uint16_t {
     // (`unsuppressable_codes.cpp`) — a suppressed refusal here is the silent wrong
     // type it replaces.
     S_AttributeNotHonoured                = 0xE091,
+    // P69 (lane `cs`): a file-scope TENTATIVE definition of an array of unknown size
+    // (`int v[];`) that no later declaration of the unit completes. C 6.9.2p2: at
+    // the end of the unit it is completed with ONE element, initialized to zero — a
+    // WARNING, the one gcc 13.3.0 ("array 'v' assumed to have one element") and
+    // clang 18.1.3 ("tentative array definition assumed to have one element") both
+    // give, and the program builds and runs on both (✔MEASURED, probe fs). cl reads
+    // `int v[];` as an undefined external instead; that MEANING split is decided by
+    // ISO 6.9.2 and the two references that read it so. `.actual` names the object.
+    S_TentativeArrayAssumedOneElement     = 0xE092,
+    // P69 (lane `cs`): `sizeof` of an ARRAY OF UNKNOWN SIZE (an `extern int a[]`, a
+    // flexible array member, the type name `int[]`, `*p` of an `int (*p)[]`). A
+    // constraint violation in ISO C (6.5.3.4p1) and refused by gcc 13.3.0 and clang
+    // 18.1.3; ACCEPTED by MSVC 19.51, documented as warning C4034 "sizeof returns 0",
+    // and the program runs (✔MEASURED, probe sz). The disjunction decides acceptance,
+    // so the language document states the result (`sizeof.incompleteArraySize`) and
+    // this WARNING names cl's extension. `.actual` names the operand's type.
+    S_SizeofIncompleteArrayIsZero         = 0xE093,
+    // P69 (lane `cs`): `sizeof` of an incomplete type no reference sizes — an
+    // incomplete structure, union or enumeration, or an array of unknown size where
+    // the language states no size for one. ✔MEASURED, gcc 13.3.0, clang 18.1.3 and
+    // MSVC 19.51 (C2027) all refuse `sizeof(struct S)` of an incomplete `struct S`.
+    // Before this code the refusal came from the HIR tier, as a lowering it could
+    // not perform; it is a constraint of the expression (C 6.5.3.4p1), named where
+    // the expression is typed. `.actual` names the type.
+    S_SizeofIncompleteType                = 0xE094,
+    // P69 (lane `cs`): an array whose ELEMENT is an array of unknown size —
+    // `int a[3][]`, `int (*p)[2][]`. C 6.7.6.2p1: "The element type shall not be an
+    // incomplete or function type"; only the outermost bound of an array may be
+    // omitted. Refused by gcc 13.3.0 and clang 18.1.3 ("array type has incomplete
+    // element type").
+    S_ArrayElementTypeIncomplete          = 0xE095,
+    // P69 (lane `cs`): an `alias("target")` attribute whose target cannot be the
+    // definition the declared entity becomes a second name of — no definition of
+    // that symbol name in the unit, a cycle of aliases, an empty name, a common, a
+    // thread-local and a non-thread-local storage, or an argument that is not one
+    // string. Every case is refused by gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc
+    // 13.2.0 (✔MEASURED, probes al2 and al3) except the thread-local mismatch, which
+    // this compiler refuses because the two storages cannot be one. `.actual` names
+    // the alias, the target and which. An ERROR, UNSUPPRESSABLE: silenced, the
+    // declared name would stay a reference by name and link to whatever another unit
+    // defines under it.
+    S_SymbolAliasTargetInvalid            = 0xE096,
+    // P69 (lane `cs`): an object alias written WITH an initializer (`extern int f
+    // __attribute__((alias("g"))) = 40;`). gcc 13.3.0 and mingw-w64 gcc 13.2.0 keep
+    // the alias and drop the initializer, warned; clang 18.1.3 refuses. gcc's reading
+    // is the one taken — the alias stands, the initializer is ignored, and this
+    // WARNING says so. `.actual` names the object.
+    S_SymbolAliasInitializerIgnored       = 0xE097,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

@@ -1,1 +1,1 @@
-    return linkage.tentative
+        if (false && weak) {

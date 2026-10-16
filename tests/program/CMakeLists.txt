@@ -616,3 +616,11 @@ dss_add_test(NAME program/test_archive_definition_visibility
 # built and decoded, never executed (three corpus examples are the runs).
 dss_add_test(NAME program/test_release_hidden_definitions
              SOURCES test_release_hidden_definitions.cpp)
+
+# P69 (lane `cs`): `alias("target")` compiled from C through every tier into a relocatable object, at the baseline
+# and at release — on two ELF architectures and PE each alias is one more name on its target's definition with its
+# own binding, and the `static` body only an alias names survives release; a Mach-O target refuses an alias by name,
+# and the shipped format documents state where an alias and a common can be. HOST-INDEPENDENT: built and decoded,
+# never executed (examples/c/symbol_alias_second_name is the run).
+dss_add_test(NAME program/test_compiled_symbol_alias_object
+             SOURCES test_compiled_symbol_alias_object.cpp)

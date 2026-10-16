@@ -1,0 +1,207 @@
+// P69 (lane `cs`) — `alias("target")` COMPILED FROM C, THROUGH EVERY TIER, INTO A RELOCATABLE OBJECT.
+//
+// The semantic tier resolves each alias to its definition, the HIR carries it (`HirSymbolAlias`), the
+// MIR module states it (`MirAlias`), DCE roots its target, and the object producer writes it as ONE
+// MORE SYMBOL ROW on the target's definition with the alias's own binding (what gcc, clang and
+// mingw-w64 gcc write, and what every object reader makes of a foreign alias). These cases compile
+// C source with the driver, at the baseline and at `--config=release`, for an ELF object on two
+// architectures and a PE object, and read the object back with DSS's own readers:
+//   * each alias's name is defined by the object, on the SAME symbol as its target's name;
+//   * a weak alias is a weak definition of its name, a strong one a global one;
+//   * an alias of a module-private (`static`) definition nothing else calls keeps that definition at
+//     release (DCE roots every alias target).
+// And the formats' side of the decision, which these documents state and the front end reads:
+//   * a Mach-O target refuses an alias BY NAME (every Apple clang refuses one: "aliases are not
+//     supported on darwin") — the Mach-O documents' `symbolAliasUnsupportedReason`, and no other
+//     document's;
+//   * a document states commons exactly where it states how a common is resolved
+//     (`ObjectFormatSchema::statesCommons`), and where it states none `common` is refused.
+// Nothing here runs a binary: examples/c/symbol_alias_second_name runs one on three targets.
+
+#include "core/types/diagnostic_reporter.hpp"
+#include "core/types/object_format_kind.hpp"
+#include "core/types/parse_diagnostic.hpp"
+#include "core/types/symbol_attrs.hpp"
+#include "core/types/target_schema.hpp"
+#include "link/format/coff_object_reader.hpp"
+#include "link/format/elf_object_reader.hpp"
+#include "link/object_format_schema.hpp"
+#include "program/cli_args.hpp"
+#include "program/program.hpp"
+#include "repo_root.hpp"
+#include "scratch_dir.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+using namespace dss;
+using namespace dss::test_support;
+namespace fs = std::filesystem;
+
+namespace {
+
+[[nodiscard]] std::vector<std::uint8_t> readFileBytes(fs::path const& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        ADD_FAILURE() << "cannot open " << path.string();
+        return {};
+    }
+    auto const end = f.tellg();
+    f.seekg(0);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(end));
+    if (!bytes.empty()) f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return bytes;
+}
+
+fs::path writeText(fs::path const& dir, std::string_view name, std::string_view text) {
+    fs::path const path = dir / name;
+    std::ofstream  out(path, std::ios::binary);
+    out << text;
+    return path;
+}
+
+[[nodiscard]] std::string diagnosticsOf(DiagnosticReporter const& rep) {
+    std::string s;
+    for (auto const& d : rep.all()) s += "\n  " + std::string{diagnosticCodeName(d.code)} + ": " + d.actual;
+    return s.empty() ? std::string{"\n  (no diagnostics)"} : s;
+}
+
+// One relocatable-object pair, the reader of its format and its artifact's extension.
+struct ObjectPair {
+    char const* target;
+    char const* format;
+    char const* extension;
+    bool        pe;
+};
+constexpr ObjectPair kPairs[] = {
+    {"x86_64", "elf64-x86_64-linux", ".o", false},
+    {"arm64", "elf64-aarch64-linux", ".o", false},
+    {"x86_64", "pe64-x86_64-windows", ".obj", true},
+};
+
+constexpr CompileConfig kConfigs[] = {CompileConfig::Debug, CompileConfig::Release};
+
+// Every shape of alias the object must carry, and a caller of each name so none is only declared.
+constexpr char kAliasUnit[] =
+    "int dss_add(int a, int b) { return a + b; }\n"
+    "int dss_sum(int, int) __attribute__((alias(\"dss_add\")));\n"
+    "int dss_weak_sum(int, int) __attribute__((weak, alias(\"dss_add\")));\n"
+    "int dss_counter = 5;\n"
+    "extern int dss_counter_too __attribute__((alias(\"dss_counter\")));\n"
+    "static int dss_private_body(void) { return 7; }\n"
+    "int dss_exported_body(void) __attribute__((alias(\"dss_private_body\")));\n"
+    "int dss_tentative;\n"
+    "extern int dss_tentative_too __attribute__((alias(\"dss_tentative\")));\n"
+    "int dss_use(void) { return dss_sum(1, 2) + dss_weak_sum(3, 4) + dss_counter_too + dss_tentative_too; }\n";
+
+}  // namespace
+
+TEST(CompiledSymbolAliasObject, EachAliasIsOneMoreNameOnItsTargetsDefinitionInTheObject) {
+    struct Expect {
+        char const*   alias;
+        char const*   target;
+        SymbolBinding binding;
+    };
+    constexpr Expect kExpected[] = {
+        {"dss_sum", "dss_add", SymbolBinding::Global},
+        {"dss_weak_sum", "dss_add", SymbolBinding::Weak},
+        {"dss_counter_too", "dss_counter", SymbolBinding::Global},
+        {"dss_tentative_too", "dss_tentative", SymbolBinding::Global},
+    };
+    for (ObjectPair const& pair : kPairs) {
+        for (CompileConfig const config : kConfigs) {
+            SCOPED_TRACE(std::string{pair.target} + ":" + pair.format + ", "
+                         + (config == CompileConfig::Release ? "release" : "baseline"));
+            ScratchDir scratch{Location::InsideRepo, "compiled-alias-object"};
+            auto const src = writeText(scratch.path(), "unit.c", kAliasUnit);
+            Program    p;
+            p.setOutputDir(scratch.path());
+            p.setCompileConfig(config);
+            DiagnosticReporter rep;
+            ASSERT_EQ(p.compileFiles({src.string()}, "c", {std::string{pair.target} + ":" + pair.format}, rep), 0)
+                << diagnosticsOf(rep);
+            auto const bytes  = readFileBytes(scratch.path() / (std::string{"unit"} + pair.extension));
+            auto const target = TargetSchema::loadShipped(pair.target);
+            auto const format = ObjectFormatSchema::loadShipped(pair.format);
+            ASSERT_TRUE(target && format);
+            DiagnosticReporter readRep;
+            auto const object = pair.pe ? pe::readRelocatableObject(bytes, **target, **format, readRep)
+                                        : elf::readRelocatableObject(bytes, **target, **format, readRep);
+            ASSERT_TRUE(object.has_value()) << diagnosticsOf(readRep);
+            auto const rowNamed = [&](std::string_view name) -> ModuleSymbol const* {
+                for (auto const& s : object->symbols) {
+                    if (s.name == name) return &s;
+                }
+                return nullptr;
+            };
+            for (Expect const& e : kExpected) {
+                SCOPED_TRACE(e.alias);
+                ModuleSymbol const* aliasRow  = rowNamed(e.alias);
+                ModuleSymbol const* targetRow = rowNamed(e.target);
+                ASSERT_NE(targetRow, nullptr) << "the target's own name is defined by the object";
+                ASSERT_NE(aliasRow, nullptr) << "the alias's name is not defined by the object";
+                EXPECT_EQ(aliasRow->symbol, targetRow->symbol) << "the alias is not one more name on its target";
+                EXPECT_EQ(aliasRow->binding, e.binding);
+            }
+            // The module-private body nothing calls but through its exported alias.
+            ModuleSymbol const* exported = rowNamed("dss_exported_body");
+            ASSERT_NE(exported, nullptr) << "the exported alias of a `static` body is not defined by the object";
+            EXPECT_EQ(exported->binding, SymbolBinding::Global);
+            bool bodyKept = false;
+            for (auto const& fn : object->functions) bodyKept = bodyKept || fn.symbol == exported->symbol;
+            EXPECT_TRUE(bodyKept) << "the `static` body an alias names was removed: its alias names nothing";
+        }
+    }
+}
+
+TEST(CompiledSymbolAliasObject, AMachOTargetRefusesAnAliasByName) {
+    for (char const* spec : {"x86_64:macho64-x86_64-darwin", "arm64:macho64-arm64-darwin"}) {
+        SCOPED_TRACE(spec);
+        ScratchDir scratch{Location::InsideRepo, "compiled-alias-macho"};
+        auto const src = writeText(scratch.path(), "unit.c",
+                                   "int dss_add(int a, int b) { return a + b; }\n"
+                                   "int dss_sum(int, int) __attribute__((alias(\"dss_add\")));\n");
+        Program p;
+        p.setOutputDir(scratch.path());
+        DiagnosticReporter rep;
+        EXPECT_NE(p.compileFiles({src.string()}, "c", {spec}, rep), 0);
+        std::size_t refused = 0;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::S_AttributeNotHonoured && d.actual.find("'alias'") != std::string::npos)
+                ++refused;
+        }
+        EXPECT_EQ(refused, 1u) << "a Mach-O target refuses an alias once, by name" << diagnosticsOf(rep);
+    }
+}
+
+TEST(CompiledSymbolAliasObject, TheFormatDocumentsStateWhereAnAliasAndACommonCanBe) {
+    std::size_t formats = 0;
+    for (auto const& entry : fs::directory_iterator{dss::test::configRoot() / "object-formats"}) {
+        std::string const file = entry.path().filename().string();
+        auto const        at   = file.find(".format.json");
+        if (at == std::string::npos) continue;
+        std::string const name = file.substr(0, at);
+        SCOPED_TRACE(name);
+        auto const format = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(format.has_value());
+        ++formats;
+        bool const macho = (*format)->kind() == ObjectFormatKind::MachO;
+        EXPECT_EQ((*format)->symbolAliasUnsupportedReason(),
+                  macho ? std::optional<SymbolAliasUnsupportedReason>{SymbolAliasUnsupportedReason::PlatformCompilersRefuse}
+                        : std::nullopt)
+            << "only the Mach-O documents say their platform's compilers refuse an alias";
+        bool const writesObjects = (*format)->kind() == ObjectFormatKind::Elf || (*format)->kind() == ObjectFormatKind::Pe
+                                   || macho;
+        EXPECT_EQ((*format)->statesCommons(), writesObjects)
+            << "every ELF, PE and Mach-O document states how a common is resolved, and the others state none";
+    }
+    EXPECT_GE(formats, 24u) << "the shipped documents were not all read";
+}

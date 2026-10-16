@@ -379,18 +379,24 @@ public:
     // (`mergeCuMirs`), and the pipeline, which states a unit's as the COMMON
     // row every object reader already produces (`ExternImport::commonSize`) —
     // and they ask HERE so that they cannot disagree about which definitions
-    // those are. It is the tentative mark, on a definition that is
-    //   * STRONG-BOUND. A weak tentative definition
+    // those are. It is the tentative mark, READ ALONE: the mark means "may be
+    // written as a common", the tier above states it once and clears it on every
+    // definition that is its unit's outright (P69, lane `cs`: `nocommon`, a
+    // variable an `alias` names, and the two below), and the builders refuse it
+    // where it could not mean that (`mirLinkageDefect`) — so no reader restates
+    // the list. The two a reader once asked beside the mark, now defects:
+    //   * A WEAK BINDING. A weak tentative definition
     //     (`__attribute__((weak)) int t;`) is a WEAK definition: its kind
     //     decides what it is beside every other, and no reference writes it as
     //     a common.
-    //   * NOT THREAD-LOCAL. ✔MEASURED 2026-10-12: no reference writes a
+    //   * THREAD STORAGE. ✔MEASURED 2026-10-12: no reference writes a
     //     thread-local tentative definition as a common — cl 19.44 and clang
     //     19.1.5 put `_Thread_local int t;` in `.tls$`, gcc 13.3 and clang 18.1
     //     on ELF in `.tbss` even under `-fcommon`, MinGW gcc 13.2 in its
     //     emulated-TLS control object — and two units holding one are REFUSED
     //     by link.exe, lld-link, GNU ld and ld.lld alike (7 of 7 cells), as two
     //     strong definitions are. So it stays a definition, and the pair stays
+<<<<<<< main
     //     refused. Mach-O agrees (✔MEASURED 2026-10-12, Apple clang 21: the
     //     object is in `__DATA,__thread_vars`, and the pair is refused as a
     //     duplicate symbol by ld-1267 on arm64 and x86_64 and by `-ld_classic`,
@@ -399,10 +405,16 @@ public:
     // initializer (`mirLinkageDefect`), so neither is asked again.
     // (The conjunction itself is `mirLinkageIsCommon`, mir/mir_node.hpp, so that
     // a reader holding the facts WITHOUT a module — the decoder of a stored
+=======
+    //     refused. (Mach-O is NOT measured; it is held to the same answer.)
+    // The builders refuse the mark there, on a local global and beside an
+    // initializer alike (`mirLinkageDefect`), so none is asked again.
+    // (The reading itself is `mirLinkageIsCommon`, mir/mir_node.hpp, so that a
+    // reader holding the record WITHOUT a module — the decoder of a stored
+>>>>>>> agent
     // summary — is judged by the same words.)
     [[nodiscard]] bool globalIsCommon(MirGlobalId id) const {
-        detail::MirGlobal const& g = globalArena_.at(id);
-        return mirLinkageIsCommon(g.linkage, g.isThreadLocal);
+        return mirLinkageIsCommon(globalArena_.at(id).linkage);
     }
     [[nodiscard]] SymbolBinding globalBinding(MirGlobalId id) const {
         return globalArena_.at(id).linkage.binding;
@@ -508,10 +520,20 @@ public:
     // an entrance that forgets its statement is loud at the first id it needs.
     [[nodiscard]] bool symbolIdEndIsStated() const noexcept { return symbolIdEndStated_; }
 
+    // ── SECOND NAMES OF THE MODULE's DEFINITIONS (P69, lane `cs`) ──
+    // Every `alias("target")` the module defines (`MirAlias`, mir/mir_node.hpp),
+    // in the order the builder was handed them. A name here is a definition of
+    // the module: the object producer writes it as one more symbol row on its
+    // target's definition, and a symbol-keyed reader that asks "does this module
+    // define the name" asks here too.
+    [[nodiscard]] std::span<MirAlias const> aliases() const noexcept { return aliases_; }
+    [[nodiscard]] std::size_t moduleAliasCount() const noexcept { return aliases_.size(); }
+
 private:
     // `MirBuilder::finish` hands the built module the builder's symbol-id end —
     // the one fact of a module its arenas cannot state (the constructor's own
-    // count covers the symbols they define, never the name table's).
+    // count covers the symbols they define, never the name table's) — and the
+    // module's aliases, which no arena holds.
     friend class MirBuilder;
 
     InstArena                   instArena_;
@@ -533,6 +555,7 @@ private:
     bool                        charTypesAliasAll_ = true;
     std::uint32_t               symbolIdEnd_ = 1;   // see `symbolIdEnd()`
     bool                        symbolIdEndStated_ = false;   // see `symbolIdEndIsStated()`
+    std::vector<MirAlias>       aliases_;           // see `aliases()`
 };
 
 // `MirAttribute<T>` — the HIR-style side-table over the instruction tier (the
@@ -665,8 +688,20 @@ public:
     // rebuild once copied its own list, which is how strict-TBAA was silently
     // downgraded after the first pass
     // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE) and how a fourth list could
-    // have forgotten the id space.
-    void carryModuleFactsOf(Mir const& rebuilt) noexcept;
+    // have forgotten the id space. P69 (lane `cs`): the module's ALIASES too
+    // (`Mir::aliases`) — keyed by symbol ids, which no rebuild renumbers, so they
+    // are carried whole; DCE roots each target, so no rebuild drops one.
+    void carryModuleFactsOf(Mir const& rebuilt);
+
+    // ── A SECOND NAME OF A DEFINITION (P69, lane `cs`) ──
+    // States that this module defines `alias` as the definition `target` is
+    // (`MirAlias`). Aborts, by name, on a producer's bug: an invalid id, a name
+    // that is its own target, a name already stated as an alias here, a tentative
+    // mark (an alias has no storage), or a linkage record the one rule refuses
+    // (`mirLinkageDefect`). Whether the module DEFINES `target`, and defines
+    // `alias` in no other way, is a fact of the whole module: `MirVerifier` holds
+    // it (`checkAliases`), and the `.dssir` reader asks it before calling here.
+    void addAlias(SymbolId alias, SymbolId target, MirLinkage linkage);
 
     // ── function / block lifecycle ──
     // Open a function. Closes any open function first (which requires its current
@@ -1245,6 +1280,7 @@ private:
     // to the module.
     std::uint32_t               symbolIdEnd_ = 1;
     bool                        symbolIdEndStated_ = false;
+    std::vector<MirAlias>       aliases_;   // `addAlias`; handed over by `finish`
     void raiseSymbolIdEndTo_(std::uint32_t end) noexcept {
         if (end > symbolIdEnd_) symbolIdEnd_ = end;
     }

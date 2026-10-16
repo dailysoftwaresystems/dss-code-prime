@@ -303,9 +303,15 @@ public:
                          // does not run: HIR read from text has no such table (the
                          // linkage attribute has no text form), and that is the
                          // absence of the thing judged, never a pass.
-                         HirLinkageMap const* linkageMap = nullptr) noexcept
+                         HirLinkageMap const* linkageMap = nullptr,
+                         // P69 (lane `cs`): the thread-storage side-table the
+                         // same rule reads beside the linkage one (a tentative
+                         // mark on a thread-local global, (c)). nullptr => that
+                         // one arm does not run, for the same reason.
+                         HirThreadLocalMap const* threadLocalMap = nullptr) noexcept
         : hir_(hir), sourceMap_(sourceMap), interner_(interner),
-          inlineAsmPool_(inlineAsmPool), linkageMap_(linkageMap) {}
+          inlineAsmPool_(inlineAsmPool), linkageMap_(linkageMap),
+          threadLocalMap_(threadLocalMap) {}
 
     // The verifier stores a reference and must not outlive the module it
     // inspects — forbid binding to a temporary `Hir` outright. Every arity is
@@ -318,6 +324,9 @@ public:
                 HirInlineAsmPool const*)                         = delete;
     HirVerifier(Hir&&, HirSourceMap const*, TypeInterner const*,
                 HirInlineAsmPool const*, HirLinkageMap const*)   = delete;
+    HirVerifier(Hir&&, HirSourceMap const*, TypeInterner const*,
+                HirInlineAsmPool const*, HirLinkageMap const*,
+                HirThreadLocalMap const*)                        = delete;
 
     // Run every rule, reporting each violation into `reporter`. Returns true
     // iff THIS run found no violation the reporter's policy makes an Error — by
@@ -497,7 +506,11 @@ private:
     //   (c) the tentative mark sits on a `Global` only, and never beside a
     //       `Local` binding: an internal-linkage object takes no part in the
     //       cross-unit fold the mark exists for, and a consumer reading the mark
-    //       without the binding would make two units' private objects one.
+    //       without the binding would make two units' private objects one. Nor
+    //       beside a `Weak` binding, nor on a thread-local global (read from the
+    //       thread-storage table when one is supplied): the mark means "may be
+    //       written as a common", every tier below reads it ALONE, and neither a
+    //       weak definition nor a thread-local one is ever a common.
     void checkLinkageAttributes(DiagnosticReporter& reporter) const;
 
     Hir const&          hir_;
@@ -508,6 +521,8 @@ private:
     HirInlineAsmPool const* inlineAsmPool_;
     // P69 (lane `cs`): optional; nullptr = no linkage side-table to judge.
     HirLinkageMap const* linkageMap_;
+    // P69 (lane `cs`): optional; nullptr = the thread-local arm of (c) is not run.
+    HirThreadLocalMap const* threadLocalMap_;
     // The findings THIS run reported that the policy makes Errors; reset by
     // `verify()`, bumped only by `reportAt`. `mutable` because every rule is
     // `const` — the count is the verdict's bookkeeping, not the module's state.

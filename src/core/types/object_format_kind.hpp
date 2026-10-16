@@ -1496,6 +1496,56 @@ stackReserveUnsupportedRemedy(StackReserveUnsupportedReason r) noexcept {
     return kStackReserveUnsupportedRemedyTable.name(r);
 }
 
+// ── WHY A FORMAT GIVES NO DEFINITION A SECOND NAME (`"symbolAliasUnsupportedReason"`)
+//    P69 (lane `cs`) ─────────────────────────────────────────────────────────
+//
+// A symbol ALIAS — `__attribute__((alias("g"))) int f(void)` — gives the
+// definition `g` a second external name `f`. Whether an artifact of a format
+// may carry one is the FORMAT's fact, asked by the semantic tier when it judges
+// the attribute, and an ABSENT key means "supported": the ELF and PE documents
+// declare nothing, and gcc, clang and mingw-w64 gcc all build aliases there.
+//
+// A declared reason REFUSES the attribute by name, with the reason's sentence.
+// One reason exists, and it is not a limit of the object file: ✔MEASURED
+// (lane `cs`, probe al2, 2026-10-15) Apple clang refuses every one of 32 alias
+// cells with "aliases are not supported on darwin", while the measurement the
+// `macho-alias-ld64-matrix` action keeps shows Apple's ld64 linking a plain
+// second defined symbol at one address. Accepting what no compiler of the
+// platform accepts would be a defect of its own, whatever the linker can carry,
+// so the reason names the PLATFORM's compilers, not the format's records.
+enum class SymbolAliasUnsupportedReason : std::uint8_t {
+    PlatformCompilersRefuse = 1,
+};
+
+inline constexpr EnumNameTable<SymbolAliasUnsupportedReason, 1>
+kSymbolAliasUnsupportedReasonTable{{{
+    { SymbolAliasUnsupportedReason::PlatformCompilersRefuse, "platform-compilers-refuse" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kSymbolAliasUnsupportedReasonTable);
+
+[[nodiscard]] constexpr std::string_view
+symbolAliasUnsupportedReasonName(SymbolAliasUnsupportedReason r) noexcept {
+    return kSymbolAliasUnsupportedReasonTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<SymbolAliasUnsupportedReason>
+symbolAliasUnsupportedReasonFromName(std::string_view s) noexcept {
+    return kSymbolAliasUnsupportedReasonTable.fromName(s);
+}
+
+// The sentence a refusal carries for a declared reason.
+inline constexpr EnumNameTable<SymbolAliasUnsupportedReason, 1>
+kSymbolAliasUnsupportedSentenceTable{{{
+    { SymbolAliasUnsupportedReason::PlatformCompilersRefuse,
+      "the C compilers of this platform refuse a symbol alias, so no program "
+      "written for it defines one, and this compiler refuses it as they do" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kSymbolAliasUnsupportedSentenceTable);
+
+[[nodiscard]] constexpr std::string_view
+symbolAliasUnsupportedSentence(SymbolAliasUnsupportedReason r) noexcept {
+    return kSymbolAliasUnsupportedSentenceTable.name(r);
+}
+
 struct DSS_EXPORT StackReserveControl {
     StackReserveVehicle vehicle = StackReserveVehicle::PeOptionalHeader;
     // Smallest honourable request. Below this the image is legal but the

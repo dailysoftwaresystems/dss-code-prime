@@ -288,6 +288,21 @@ void collectSymbolAddrTargets(MirLiteralValue const& v,
             out.liveSymbols.insert(mir.globalSymbol(g).v);
         }
     }
+    // P69 (lane `cs`): A SECOND NAME OF A DEFINITION ROOTS IT (`Mir::aliases`).
+    // The object producer writes an alias as one more symbol row on its target's
+    // definition, and every rebuild carries the aliases whole
+    // (`MirBuilder::carryModuleFactsOf`) — so a target this pass deleted would
+    // leave a row naming nothing (`MirVerifier::checkAliases` refuses it). Every
+    // alias roots its target whatever its own binding: an internal alias's uses
+    // were bound to the target by the semantic tier, so nothing else holds it,
+    // and keeping one unreferenced definition is the price of never writing a
+    // dangling row.
+    for (MirAlias const& a : mir.aliases()) {
+        if (!out.liveSymbols.insert(a.target.v).second) continue;
+        if (auto const it = symToFunc.find(a.target.v); it != symToFunc.end()) {
+            funcWorklist.push_back(it->second);
+        }
+    }
 
     // Phase 2: BFS — for each live function, compute its live-set ONCE + scan
     // reachable blocks for live GlobalAddr referrals (marking referenced

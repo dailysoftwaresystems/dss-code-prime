@@ -503,6 +503,10 @@ constexpr MembershipReason kWhyAttributeNotHonoured{
     "the build already fails on an attribute that changes a type or a call "
     "sequence and cannot be applied; silenced, it fails with ZERO "
     "diagnostics shown, and the attribute reads as accepted"};
+constexpr MembershipReason kWhySymbolAliasTargetInvalid{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, the alias is not made and its name stays a reference by name, "
+    "which the link binds to whatever another unit defines under it"};
 constexpr MembershipReason kWhyNullptrOperand{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, nullptr lowers through the integer-0 null constant and "
@@ -795,7 +799,7 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // `S_EnumCompatibleTypeRuleUndeclared` joins under `kWhyEnumCompatibleTypeRule`, prong
 // (1) — a suppressed one would leave a guessed compatible type reaching codegen.
 // (Written from main's 198; a fold landing another member first reconciles the count.)
-constexpr std::array<UnsuppressableEntry, 200> kUnsuppressableCodes{{
+constexpr std::array<UnsuppressableEntry, 201> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1698,6 +1702,11 @@ constexpr std::array<UnsuppressableEntry, 200> kUnsuppressableCodes{{
     // fail with nothing said, and before the refusal existed each of these was a
     // warning beside a wrong size or a wrong call sequence.
     {DiagnosticCode::S_AttributeNotHonoured, kWhyAttributeNotHonoured},
+    // P69 (lane `cs`): an `alias("target")` whose target cannot be the definition the
+    // declared entity becomes a second name of. Silenced, the declared name stays a
+    // reference by name and the link binds it to whatever another unit defines under
+    // that name — a program no reference builds, shipped green.
+    {DiagnosticCode::S_SymbolAliasTargetInvalid, kWhySymbolAliasTargetInvalid},
     // S_PackedBitfieldUnsupported (0xE032) IS DELIBERATELY ABSENT, and its absence is
     // the point. It was a member from 2026-07-08 until
     // D-CSUBSET-PACKED-BITFIELD-INTERACTION

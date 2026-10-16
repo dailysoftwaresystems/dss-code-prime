@@ -1,1 +1,1 @@
-a weak global that claims to be a common
+a thread-local global that claims to be a common

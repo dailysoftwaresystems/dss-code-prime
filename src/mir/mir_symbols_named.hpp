@@ -3,11 +3,12 @@
 // EVERY SYMBOL ID A MIR MODULE NAMES — THE ONE STATEMENT OF IT
 // (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE).
 //
-// A module names a symbol id in six places and no more: the id a FUNCTION is given,
+// A module names a symbol id in eight places and no more: the id a FUNCTION is given,
 // the id a GLOBAL is given, a symbol address nested anywhere in a global's
 // INITIALIZER, a `GlobalAddr` instruction's payload, the symbol a
-// `BlockAddressExport` publishes its block under, and a symbol address nested
-// anywhere in a `Const` instruction's literal. Three readers must agree on that
+// `BlockAddressExport` publishes its block under, a symbol address nested
+// anywhere in a `Const` instruction's literal, and an ALIAS's two ids — the name it
+// defines and the definition it names (P69, lane `cs`). Three readers must agree on that
 // list, and each used to carry its own:
 //   * the `.dssir` WRITER, whose `symbols` preamble declares the ids the text names
 //     (it left `BlockAddressExport` out, so that id travelled as a raw payload the
@@ -26,7 +27,7 @@
 //
 // The ORDER is the writer's and is observable: the preamble lists ids as they are
 // first met — the module's functions, then each global followed by its initializer's
-// symbols, then the instructions in id order.
+// symbols, then the instructions in id order, then each alias's name and target.
 
 #include "core/types/strong_ids.hpp"
 #include "mir/mir.hpp"
@@ -51,6 +52,8 @@ enum class MirSymbolMention : std::uint8_t {
     GlobalAddr,          // a `globaladdr` instruction's payload
     BlockAddressExport,  // the symbol a `blockaddress_export` publishes its block under
     ConstLiteral,        // a symbol address nested in a `const` instruction's literal
+    Alias,               // an alias of the module is given the id (it DEFINES it)
+    AliasTarget,         // the definition an alias is one more name on
 };
 
 // The mention as the `.dssir` text spells the construct that makes it: what a refusal
@@ -63,13 +66,17 @@ enum class MirSymbolMention : std::uint8_t {
         case MirSymbolMention::GlobalAddr:         return "globaladdr";
         case MirSymbolMention::BlockAddressExport: return "blockaddress_export";
         case MirSymbolMention::ConstLiteral:       return "symaddr";
+        case MirSymbolMention::Alias:              return "alias";
+        case MirSymbolMention::AliasTarget:        return "alias";
     }
     return "symbol";
 }
 
-// Does the mention DEFINE the id (give it to a function or a global of the module)?
+// Does the mention DEFINE the id (give it to a function, a global or an alias of the
+// module)?
 [[nodiscard]] constexpr bool mirSymbolMentionDefines(MirSymbolMention m) noexcept {
-    return m == MirSymbolMention::Function || m == MirSymbolMention::Global;
+    return m == MirSymbolMention::Function || m == MirSymbolMention::Global
+           || m == MirSymbolMention::Alias;
 }
 
 namespace detail {
@@ -142,6 +149,10 @@ void forEachSymbolIdNamed(Mir const& mir, Visit&& visit) {
             default:
                 break;
         }
+    }
+    for (MirAlias const& a : mir.aliases()) {
+        named(a.alias, MirSymbolMention::Alias, MirInstId{});
+        named(a.target, MirSymbolMention::AliasTarget, MirInstId{});
     }
 }
 

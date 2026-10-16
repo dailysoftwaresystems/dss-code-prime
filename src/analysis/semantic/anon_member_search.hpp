@@ -167,8 +167,9 @@ memberByteOffset(TypeInterner const& interner, TypeId container, std::string_vie
         member      = access.record(promoted->symbol);
         anonIndices = std::move(promoted->anonIndices);
     }
-    if (member == nullptr || member->kind != DeclarationKind::Variable)
-        return miss(MemberOffsetStatus::NotAMember);
+    // A member scope binds member OBJECTS only: a field row is an object row with no kind
+    // discriminator, and a tag declared in the body lives in the tag namespace.
+    if (member == nullptr) return miss(MemberOffsetStatus::NotAMember);
 
     // WHAT the member is, before WHERE it is: the composites on the way are read from
     // the types alone, so a bit-field is named as one even where no layout can be

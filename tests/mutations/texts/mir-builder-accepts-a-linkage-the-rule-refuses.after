@@ -1,1 +1,1 @@
-    std::string_view const defect = ((void)mirLinkageDefect(linkage, owner, hasInitializer), std::string_view{});
+        ((void)mirLinkageDefect(linkage, owner, hasInitializer, isThreadLocal), std::string_view{});
