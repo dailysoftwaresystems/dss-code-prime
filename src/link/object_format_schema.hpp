@@ -3474,12 +3474,13 @@ public:
         return d_.commonYieldsTo;
     }
 
-<<<<<<< main
     // ★★★ WHETHER THIS DOCUMENT STATES COMMONS (P69 fold 3b, lane `xa`;
     // D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED): how a common
     // is resolved, by a link (`commonYieldsTo`: an image, a relocatable artifact)
     // or by an archive's search (`archiveCommonResolution`, the key its members'
-    // document carries; `validate()` refuses `commonYieldsTo` there). Where it
+    // document carries; `validate()` refuses `commonYieldsTo` there). Not a key of
+    // its own: a fact with an owner gets no second one, and those two keys are its
+    // owners; a document that states neither has no common to link. Where it
     // does, a unit compiled for it writes each tentative definition the link may
     // fold (`Mir::globalIsCommon`: `int v;` at file scope, external, strong, not
     // thread-local) as a COMMON — the row every object reader already produces
@@ -3500,19 +3501,12 @@ public:
     // (`-ld_classic` alone does not fetch the first: its archive's table of
     // contents omits commons), where the same members written as definitions are
     // refused as duplicates by every one of them. Where the document states no
-    // common (SPIR-V, wasm), the unit writes a zero-filled definition. The ONE
-    // place the answer is read off the document: the pipeline's two lower-half
-    // callers capture it (`lowerMirModuleToAssembly`,
-    // `program/compile_pipeline.cpp`), and nothing re-derives it from the keys.
-=======
-    // Whether this document STATES COMMONS — a program of this format may hold a
-    // common definition. Not a key of its own: a fact with an owner gets no second
-    // one, and the owners are the two keys that say how a common links
-    // (`commonYieldsTo` on a link's document, `archiveCommonResolution` on an
-    // archive's); a document that states neither has no common to link. Read by
-    // the front end (the `common` attribute is refused by name where it is false)
-    // and by the commons' allocation, so the two cannot disagree.
->>>>>>> agent
+    // common (SPIR-V, wasm), the unit writes a zero-filled definition. The answer
+    // is read off the document HERE alone, by its two readers: the pipeline's two
+    // lower-half callers capture it (`lowerMirModuleToAssembly`,
+    // `program/compile_pipeline.cpp`), and the front end refuses the `common`
+    // attribute by name where it is false (`analysis/semantic`); nothing
+    // re-derives it from the keys, so the two cannot disagree.
     [[nodiscard]] bool statesCommons() const noexcept {
         return d_.commonYieldsTo.has_value() || d_.archiveCommonResolution.has_value();
     }

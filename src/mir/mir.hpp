@@ -396,22 +396,14 @@ public:
     //     emulated-TLS control object — and two units holding one are REFUSED
     //     by link.exe, lld-link, GNU ld and ld.lld alike (7 of 7 cells), as two
     //     strong definitions are. So it stays a definition, and the pair stays
-<<<<<<< main
     //     refused. Mach-O agrees (✔MEASURED 2026-10-12, Apple clang 21: the
     //     object is in `__DATA,__thread_vars`, and the pair is refused as a
     //     duplicate symbol by ld-1267 on arm64 and x86_64 and by `-ld_classic`,
     //     6 of 6).
-    // The builders already refuse the mark on a local global and beside an
-    // initializer (`mirLinkageDefect`), so neither is asked again.
-    // (The conjunction itself is `mirLinkageIsCommon`, mir/mir_node.hpp, so that
-    // a reader holding the facts WITHOUT a module — the decoder of a stored
-=======
-    //     refused. (Mach-O is NOT measured; it is held to the same answer.)
     // The builders refuse the mark there, on a local global and beside an
     // initializer alike (`mirLinkageDefect`), so none is asked again.
     // (The reading itself is `mirLinkageIsCommon`, mir/mir_node.hpp, so that a
     // reader holding the record WITHOUT a module — the decoder of a stored
->>>>>>> agent
     // summary — is judged by the same words.)
     [[nodiscard]] bool globalIsCommon(MirGlobalId id) const {
         return mirLinkageIsCommon(globalArena_.at(id).linkage);
