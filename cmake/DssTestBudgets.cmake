@@ -241,9 +241,13 @@ set(_DSS_TB_NAMED
     # ★ link/test_tentative_definitions_as_commons: NAMED 2026-10-15 (cycle P69, lane xa's fold 3b,
     # a new suite whose native cells ask the leg's reference linkers). ✔MEASURED in passing
     # macos-arm64 Debug runs under the same shared load: 105.84 s (scoped), 63.27 s (whole suite).
-    # Release and sanitized are NOT measured -- no run of either class has read it -- and take the
-    # unit ceilings until one does.
-    "link/test_tentative_definitions_as_commons|53|50|106"
+    # ★ RELEASE AND DEBUG RE-DERIVED 2026-10-16 (cycle P69, lane xa's fix fold of fold 3b: the cl
+    # arm compiles C11 and the MinGW arm's cells run, each a reference compiler and linker per cell).
+    # ✔MEASURED in passing whole-suite runs of the lane's final bytes: MSVC Release 129.38 s
+    # (windows-x86_64-release), MinGW Debug 390.99 s (windows-x86_64-debug). The slowest healthy run
+    # sets the ceiling. Sanitized is NOT measured -- no run of that class has read it -- and takes the
+    # unit ceiling until one does.
+    "link/test_tentative_definitions_as_commons|53|130|391"
     # ★ anchor_rows_selftest_guard: NAMED 2026-10-15 (cycle P69, lane hm's fold H2), when a self-test
     # stopped carrying the `repo-guard` label and so runs on every leg, indirect ones included.
     # Its cost is the Python program it drives, which no build class changes, so its slowest healthy

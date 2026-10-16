@@ -518,7 +518,24 @@ round's close; each checkpoint's commit message says what was and was not run on
   macos-arm64-debug, windows-x86_64-debug, linux-x86_64-debug passed; NOT run by it: linux-arm64-debug (its host
   short of disk), windows-x86_64-release. The registry: 834 arms, merged by arm by the tool, 0 out of order.
   KNOWN RED of our own guard: `check-line-endings` refuses the lane's `m.target.back() == '\r'` (its unanchored
-  verb `rg` matches inside `target`) — the harness lane fixes the guard in H4.
+  verb `rg` matches inside `target`) — the harness lane fixes the guard in H4. ✔MEASURED from the main checkout
+  (2026-10-16): linux-x86_64-debug 2831 passed; macos-arm64-debug 2830 of 2831, the one red
+  `landing_log_git_environment_guard` — the Mac's Apple python 3.9.6 (main's `find_package(Python3)` states no
+  floor) refusing `Path.write_text(newline=)`; the harness lane's H4 states the floor.
+- **Checkpoint 28 (2026-10-16) = the link lane's FIX FOLD** (the re-review of fold 3b): an over-aligned tentative
+  definition on PE is written as the DEFINITION it is wherever it is wider than every linker gives a common of its
+  size and another linker reads the object — the four PE documents state that rule as data
+  (`commonAlignmentFromSizeAtMost: 32`, lld-link's, the least of link.exe's and lld-link's measured placements),
+  since link.exe ignores `-aligncomm:` and one unit's `_Alignas(64) int v;` had landed misaligned in silence; a
+  definition a common yields to is measured at the alignment its offset allows; and a MISCOMPILE older than the
+  cycle, found by the lane's finals and fixed here: all three object readers read a declared section alignment
+  above 256 as ONE byte (`D-LK-OBJECT-READERS-READ-A-SECTION-ALIGNMENT-ABOVE-256-AS-ONE-BYTE`, new, disclosed;
+  every power of two to 2^31 is carried, a field that is no alignment refused by name). ✔MEASURED by the lane on
+  its final bytes, whole suite: macos-arm64-debug and linux-arm64-debug 2788 passed; windows-x86_64-debug (MinGW)
+  2817 passed; windows-x86_64-release (MSVC 19.51) 2815 of 2817, the two reds the App Execution Alias guards below.
+  Folded onto checkpoint 27 with four three-way merges and two settled by hand (`kFormatDocumentKeys` holds 55: two
+  lanes each added one key over 53; the registry merged by arm, 857 arms). NOT YET BUILT as composed: the whole
+  suite of checkpoint 28 is read after this commit.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -551,6 +568,13 @@ round's close; each checkpoint's commit message says what was and was not run on
   and the evaluator's conditional returns the selected arm without the usual arithmetic conversions — a folded
   condition marks reachable code unreachable (`if (({ g.b; }) - 6 < 0)`, `(1 ? 5 : 0u) - 6 < 0`); the library
   lane's P0 fold, one rule for a read's type in all three tiers and the arms balanced in both.
+  (10) OURS, ✔MEASURED by the link lane on windows-x86_64-release: `ninja_deps_selftest_guard` and
+  `orphan_tests_guard` are red there — that build's CMake cache names the WindowsApps App Execution Alias for
+  python3, and the test spawner refuses it as no executable; the harness lane's H4 classifies a candidate by asking
+  the OS. And on the Mac the one red of checkpoint 27 above (no Python floor) — the same fold.
+  (11) An alias of a LOSING select-any copy still competes for its name (the review of checkpoint 27, ✔MEASURED by
+  the C front end lane): the settled-order election is the C front end lane's fold f26 for the merge, and the link
+  lane's next fold adopts it in the linker.
 - **Arm sweeps from the main checkout so far:** the registry held 502 arms at checkpoint 17 (606 at checkpoint 22).
   The sweep of 340 owed arms at checkpoint 20 (2026-10-15, `macos-arm64-debug`): 155 `passed`; 158 `violated`,
   18 `survived`, 6 `unattributed`, and 3 `stopped` because their runner's unmutated binary had a red in the worker

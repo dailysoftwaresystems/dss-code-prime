@@ -157,9 +157,10 @@
 //     the linker's unbound-extern gate regardless, so isData never drives a
 //     silent miscompile.
 //   * an EXTERNAL UNDEF symbol with a non-zero Value is a COMMON (PE/COFF
-//     5.4.2: the Value is its size; cl writes every C tentative definition
+//     5.4.2: the Value is its size; cl writes every plain C tentative definition
 //     so) and becomes a COMMON row (`ExternImport::commonSize`), aligned as
-//     the COFF linkers align it (`naturalCoffCommonAlignment`, widened by a
+//     every COFF linker aligns it (the document's
+//     `CommonsStatement::alignmentEveryLinkerGives`, widened by a
 //     `-aligncomm:` directive), which the link allocates once per name
 //     (P69, D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS).
 //   * the directive section's requests are read through the format's

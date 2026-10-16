@@ -968,8 +968,9 @@ TEST(CommonSymbols, AMachOObjectsCommonReadsBackAsTheSameCommon) {
     EXPECT_EQ(hidden->commonVisibility, SymbolVisibility::Hidden) << "a private-extern common";
 }
 
-// COFF states a common's alignment only in a directive, and only where link.exe would align the common less
-// (`pe::naturalCoffCommonAlignment`); a hidden common is hidden the way any hidden definition is.
+// COFF states a common's alignment only in a directive, and only where a linker would align the common less (the
+// document's `CommonsStatement::alignmentEveryLinkerGives`); a hidden common is hidden the way any hidden definition
+// is.
 TEST(CommonSymbols, ACoffObjectsCommonReadsBackAsTheSameCommon) {
     auto const L = load("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(L.target && L.format);
@@ -1007,6 +1008,54 @@ TEST(CommonSymbols, ACoffObjectsCommonReadsBackAsTheSameCommon) {
     auto const* hidden = rowNamed(*back, "chidden");
     ASSERT_NE(hidden, nullptr);
     EXPECT_EQ(hidden->commonVisibility, SymbolVisibility::Hidden);
+}
+
+// The COFF writer and reader read the alignment every linker gives a common from the DOCUMENT (the re-review of fold
+// 3b, MAJOR 1): under the PE document stating 16 instead of the shipped 32, a 40-byte common aligned to 32 is WIDER
+// than the rule gives it, so the writer states it in a directive (`-aligncomm:shared,5`) where under the shipped
+// document it states none; and the object written under the shipped document — no directive — reads back aligned to
+// 32 under the shipped document and to 16 under the one stating 16. No number of the rule lives in the code.
+TEST(CommonSymbols, TheCoffWriterAndReaderReadTheDocumentsCommonAlignment) {
+    auto const L = load("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(L.target && L.format);
+    auto const path = dss::test::configRoot() / "object-formats" / "pe64-x86_64-windows.format.json";
+    std::ifstream in{path};
+    auto doc = nlohmann::json::parse(in);
+    doc["commonAlignmentFromSizeAtMost"] = 16;
+    auto const sixteen = ObjectFormatSchema::loadFromText(doc.dump(), "pe64-x86_64-windows stating 16");
+    ASSERT_TRUE(sixteen.has_value());
+    AssembledModule const m = unitWithCommon(1, "reader_fn", 40, 32, /*entry=*/false);
+    // The directive section's text, read off the file.
+    auto const directiveOf = [](std::vector<std::uint8_t> const& obj) {
+        std::uint16_t const nSec = static_cast<std::uint16_t>(rdLE(obj, 2, 2));
+        std::string         directive;
+        for (std::uint16_t i = 0; i < nSec; ++i) {
+            std::size_t const h = 20u + i * 40u;
+            std::string       name;
+            for (std::size_t k = 0; k < 8 && obj[h + k] != 0; ++k) name.push_back(static_cast<char>(obj[h + k]));
+            if (name != ".drectve") continue;
+            auto const size = rdLE(obj, h + 16, 4), raw = rdLE(obj, h + 20, 4);
+            directive.assign(obj.begin() + static_cast<std::ptrdiff_t>(raw),
+                             obj.begin() + static_cast<std::ptrdiff_t>(raw + size));
+        }
+        return directive;
+    };
+    DiagnosticReporter rep;
+    auto const shippedObj = pe::encode(m, *L.target, *L.format, rep);
+    auto const sixteenObj = pe::encode(m, *L.target, **sixteen, rep);
+    ASSERT_FALSE(shippedObj.empty() || sixteenObj.empty()) << diagnosticsOf(rep);
+    EXPECT_EQ(directiveOf(shippedObj).find("-aligncomm:"), std::string::npos)
+        << "every linker gives a 40-byte common 32 under the shipped document: " << directiveOf(shippedObj);
+    EXPECT_NE(directiveOf(sixteenObj).find("-aligncomm:shared,5"), std::string::npos)
+        << "under a document stating 16 the common's 32 is said: " << directiveOf(sixteenObj);
+    for (auto const& [doc16, want] : {std::pair{false, 32u}, std::pair{true, 16u}}) {
+        SCOPED_TRACE(doc16 ? "read under the document stating 16" : "read under the shipped document");
+        auto const back = pe::readRelocatableObject(shippedObj, *L.target, doc16 ? **sixteen : *L.format, rep);
+        ASSERT_TRUE(back.has_value()) << diagnosticsOf(rep);
+        auto const* shared = rowNamed(*back, "shared");
+        ASSERT_NE(shared, nullptr);
+        EXPECT_EQ(shared->commonAlignment, want) << "the reader aligns a common as the document's rule gives it";
+    }
 }
 
 // ══ Native: the programs the reference compilers write ═══════════════════════
@@ -2422,7 +2471,7 @@ TEST(CommonSymbolsNative, ACommonAgainstAThreadLocalMemberIsRefusedByName) {
 //
 // D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT and D-LK-MACHO-ARCHIVE-COMMON-RESOLUTION-UNMEASURED. The
 // host's reference compiler writes `int shared;` as a COMMON (`tu_common`, whose `read_shared` reads it: -fcommon, and
-// cl writes every tentative definition so), and three members: `m_weak` (a WEAK definition, 5 —
+// cl writes every plain tentative definition so), and three members: `m_weak` (a WEAK definition, 5 —
 // `__attribute__((weak))`, cl `__declspec(selectany)`), `m_strong` (7) and `m_function` (a FUNCTION named `shared`).
 // A DSS main returns what `read_shared` reads. Eight cells: `m_weak` linked beside the common, four archives (their
 // members in the order named), and — since send-back 5 — three in which a weak definition is already in the link when

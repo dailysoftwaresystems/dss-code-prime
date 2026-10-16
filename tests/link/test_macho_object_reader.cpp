@@ -1689,9 +1689,9 @@ TEST(MachoObjectReader, RelocationTargetingAnEqualOffsetAliasBindsToTheOwner) {
 // its constraint. That is the read-side mirror of writing 16 into a field that
 // then claims 2^16.
 //
-// RED ON DISABLE: drop `di.alignment = alignFromLog2(sec.align)` in
-// `macho_object_reader.cpp`, or route it through
-// `foreignSectionAlignmentFromByteCount` instead of `...FromLog2`.
+// RED ON DISABLE: drop `di.alignment = sec.alignment` in
+// `macho_object_reader.cpp`, or route the header walk's `alignFromLog2`
+// through `foreignSectionAlignmentFromByteCount` instead of `...FromLog2`.
 TEST(MachOObjectReader, DeclaredSectionAlignmentSurvivesTheRoundTrip) {
     auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
     ASSERT_TRUE(loaded.target && loaded.format);
@@ -2570,4 +2570,126 @@ TEST(MachoUnwindRelocations, TheLoaderHoldsThePairsToTheirRules) {
         EXPECT_GE(countAtPath(r, cell.path), 1u) << rejectSummary(r);
         EXPECT_GE(countWithMessage(r, cell.says), 1u) << rejectSummary(r);
     }
+}
+
+// ── A DECLARED ALIGNMENT ABOVE 256 IS CARRIED; ONE NO ALIGNMENT HOLDS IS REFUSED ──
+//
+// (P69, the windows-x86_64 finals of the re-review of fold 3b.) The shared
+// read-side policy (`link/format/foreign_section_alignment.hpp`) read every
+// declared section alignment above 256 as ONE byte — ✔MEASURED 2026-10-15 on
+// PE, where a DSS object's `_Alignas(4096) char v;` linked by DSS landed at an
+// address no multiple of 4096; this reader shares the kernel. Each power of
+// two up to `Alignment::kMaxBytes` comes back as declared, and a
+// `section_64.align` past 31 — no alignment an `Alignment` holds, and a shift
+// past the width of the type — refuses the object by name at the section
+// header, before any atom is cut.
+
+namespace {
+
+// One `__bss` item of 4096 and one `__data` item of 8192, each alone in its
+// section, written by DSS's own Mach-O writer.
+[[nodiscard]] std::vector<std::uint8_t> pageAlignedMachO(Loaded const& loaded) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // ret
+    mod.functions.push_back(fn);
+    AssembledData page;
+    page.symbol       = SymbolId{10};
+    page.section      = DataSectionKind::Bss;
+    page.reservedSize = 1;
+    page.alignment    = Alignment::of<4096>();
+    mod.dataItems.push_back(page);
+    AssembledData wider;
+    wider.symbol    = SymbolId{11};
+    wider.section   = DataSectionKind::Data;
+    wider.bytes     = {7, 0, 0, 0};
+    wider.alignment = Alignment::of<8192>();
+    mod.dataItems.push_back(wider);
+    mod.symbols = {
+        ModuleSymbol{SymbolId{1},  "_fn",    SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{10}, "_page",  SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{11}, "_wider", SymbolBinding::Global, SymbolVisibility::Default},
+    };
+    DiagnosticReporter wrep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, wrep);
+    EXPECT_EQ(wrep.errorCount(), 0u);
+    return bytes;
+}
+
+// The file offset of the `align` field of the `__DATA,__data` section_64, or 0.
+[[nodiscard]] std::size_t machoDataAlignField(std::vector<std::uint8_t> const& obj) {
+    auto rd32 = [&](std::size_t o) {
+        std::uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) v |= static_cast<std::uint32_t>(obj[o + i]) << (i * 8);
+        return v;
+    };
+    auto name16 = [&](std::size_t o) {
+        std::string s;
+        for (std::size_t i = 0; i < 16 && obj[o + i] != 0u; ++i) s += static_cast<char>(obj[o + i]);
+        return s;
+    };
+    std::uint32_t const ncmds = rd32(16);
+    std::size_t         lc    = 32;   // past mach_header_64
+    for (std::uint32_t c = 0; c < ncmds && lc + 8 <= obj.size(); ++c) {
+        std::uint32_t const cmd = rd32(lc), size = rd32(lc + 4);
+        if (cmd == 0x19u) {   // LC_SEGMENT_64
+            std::uint32_t const nsects = rd32(lc + 64);
+            for (std::uint32_t s = 0; s < nsects; ++s) {
+                std::size_t const sec = lc + 72 + static_cast<std::size_t>(s) * 80;
+                if (name16(sec) == "__data" && name16(sec + 16) == "__DATA") return sec + 52;
+            }
+        }
+        lc += size;
+    }
+    return 0;
+}
+
+// What a reporter said, one line a diagnostic.
+[[nodiscard]] std::string whatItSaid(DiagnosticReporter const& rep) {
+    std::string out;
+    for (auto const& d : rep.all()) {
+        out += "\n  ";
+        out += d.actual;
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(MachOObjectReader, ASectionAlignmentAboveTwoHundredFiftySixIsCarried) {
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = pageAlignedMachO(loaded);
+    ASSERT_FALSE(obj.empty());
+    DiagnosticReporter rrep;
+    auto const back = macho::readRelocatableObject(obj, *loaded.target, *loaded.format, rrep);
+    ASSERT_TRUE(back.has_value()) << whatItSaid(rrep);
+    auto const* page  = dataNamed(*back, "_page");
+    auto const* wider = dataNamed(*back, "_wider");
+    ASSERT_NE(page, nullptr);
+    ASSERT_NE(wider, nullptr);
+    EXPECT_EQ(page->alignment.bytes(), 4096u) << "a `__bss` declared 2^12 is read as 4096, never as one byte";
+    EXPECT_EQ(wider->alignment.bytes(), 8192u) << "a `__data` declared 2^13 is read as 8192";
+}
+
+TEST(MachOObjectReader, ASectionAlignmentNoAlignmentHoldsIsRefusedByName) {
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto obj = pageAlignedMachO(loaded);
+    std::size_t const field = machoDataAlignField(obj);
+    ASSERT_NE(field, 0u) << "the object holds a `__DATA,__data` section";
+    obj[field]     = 32u;   // 2^32: past what an `Alignment` holds, and past the width of a shift
+    obj[field + 1] = obj[field + 2] = obj[field + 3] = 0u;
+    DiagnosticReporter rep;
+    EXPECT_FALSE(macho::readRelocatableObject(obj, *loaded.target, *loaded.format, rep).has_value())
+        << "a field that is no alignment must not be read as one";
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        named = named
+             || (d.code == DiagnosticCode::F_CorruptedBinary
+                 && d.actual.find("'__DATA,__data' declares alignment 2^32,") != std::string::npos);
+    }
+    EXPECT_TRUE(named) << "refused by name at the section header: " << whatItSaid(rep);
 }

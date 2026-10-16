@@ -4362,28 +4362,31 @@ TEST(CoffForeignObject, LegacyNoPadBitMeansByteAlignment) {
     EXPECT_EQ(item->alignment.bytes(), 1u);
 }
 
-TEST(CoffForeignObject, AlignmentAboveWhatTheNewtypeModelsDegradesToByte) {
-    // COFF encodes up to 8192 (class 14); the `Alignment` newtype stops at 256.
-    // The degrade is DOWNWARD on purpose and is the only safe direction here:
-    // it can only make the merge place the atom more freely, which shows up as
-    // a layout difference. Substituting some "reasonable" larger alignment
-    // instead would let the atom ride at an alignment nothing in the input
-    // declared -- a false fact about our own output, which is what the parent
-    // row was filed about in the first place.
+TEST(CoffForeignObject, AnAlignmentAboveTwoHundredFiftySixIsCarried) {
+    // COFF encodes up to 8192 (class 14), and every class is an alignment an
+    // `Alignment` holds, so each comes back as declared. Until P69 everything
+    // above 256 came back as ONE byte, on the argument that a declared
+    // alignment is a re-layout hint -- the under-aligning direction:
+    // ✔MEASURED 2026-10-15, a DSS `.bss` definition declared 2**12 linked by
+    // DSS at an address no multiple of 4096 (the policy's note,
+    // `link/format/foreign_section_alignment.hpp`). Class 15, which the format
+    // does not define, reads as GNU objdump 2.42 was measured reading it: the
+    // unspecified 16.
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
-    for (std::uint32_t cls : {10u, 12u, 14u}) {   // 512, 2048, 8192
-        SCOPED_TRACE("IMAGE_SCN_ALIGN class " + std::to_string(cls));
+    struct AlignCase { std::uint32_t cls; std::uint32_t bytes; };
+    for (auto const& c : std::vector<AlignCase>{{10u, 512u}, {12u, 2048u}, {13u, 4096u},
+                                                {14u, 8192u}, {15u, 16u}}) {
+        SCOPED_TRACE("IMAGE_SCN_ALIGN class " + std::to_string(c.cls));
         std::string why;
         auto const got = readOneObject(
-            objWithRdataChars(rdataWithAlignClass(cls), {3, 3, 3, 3}),
+            objWithRdataChars(rdataWithAlignClass(c.cls), {3, 3, 3, 3}),
             loaded, why);
-        ASSERT_TRUE(got.has_value())
-            << "an alignment we cannot model is not a reason to refuse an "
-               "object every reference linker accepts: " << why;
+        ASSERT_TRUE(got.has_value()) << why;
         auto const* item = dataNamed(*got, "datum");
         ASSERT_NE(item, nullptr);
-        EXPECT_EQ(item->alignment.bytes(), 1u);
+        EXPECT_EQ(item->alignment.bytes(), c.bytes)
+            << "a declared alignment is carried as declared, never read as less";
     }
 }
 

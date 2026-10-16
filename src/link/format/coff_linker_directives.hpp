@@ -103,19 +103,11 @@ struct CoffDirectiveRequests {
 // alignment a COFF section header can state (IMAGE_SCN_ALIGN_8192BYTES).
 inline constexpr std::uint8_t kMaxCoffCommonAlignmentLog2 = 13;
 
-// The alignment link.exe gives a COMMON symbol of `size` bytes that no
-// `-aligncomm:` names: the size rounded up to a power of two, at most 32 bytes.
-// ✔MEASURED 2026-10-06 (link.exe 14.51, run 20261006-225314-2e577758: sizes 1,
-// 3, 5, 17, 40, 100 and 5000 land 1, 4, 8, 32, 32, 32 and 32 aligned);
-// lld-link's source states the same rule. The COFF reader aligns a common at
-// least this much, and the COFF writer states a common's alignment in a
-// directive only where it exceeds this.
-inline constexpr std::uint64_t kCoffCommonNaturalAlignmentCap = 32;
-[[nodiscard]] constexpr std::uint64_t naturalCoffCommonAlignment(std::uint64_t size) noexcept {
-    std::uint64_t alignment = 1;
-    while (alignment < size && alignment < kCoffCommonNaturalAlignmentCap) alignment <<= 1;
-    return alignment;
-}
+// ⓘ The alignment every COFF linker gives a COMMON that no `-aligncomm:` names
+// is the DOCUMENT's (`commonAlignmentFromSizeAtMost`, read through
+// `ObjectFormatSchema::commonsStatement`): the COFF reader aligns a common at
+// least that much, and the COFF writer states a common's alignment in a
+// directive only where it exceeds it. No number of it lives here.
 
 // The meanings whose requests ONE LINK DECIDES ACROSS ITS UNITS: the nine image
 // settings, each held once by an image, and the exports, one per exported name.
@@ -760,7 +752,7 @@ unspellableName(std::string_view what, std::string_view name, std::string_view o
 // can carry): the definitions its visibility hides, the names an `/INCLUDE:`
 // required of the object it was read from, the fallbacks it carries, and the
 // alignment of each COMMON it hands on that the final linker would otherwise
-// align less (`naturalCoffCommonAlignment`); and, VERBATIM, every other
+// align less (`CommonsStatement::alignmentEveryLinkerGives`); and, VERBATIM, every other
 // directive of a foreign unit it holds (`UnitLinkerRequests::handOn`: an
 // export, an image request, an ignored or warned option), so its final linker
 // is asked what the unit asked.

@@ -1022,6 +1022,17 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "relocatable artifact — and an archive's members are each "
                  "linked alone, so the declaration would never be read.");
         }
+        // P69 (the re-review of fold 3b): `commonAlignmentFromSizeAtMost` says how
+        // a COMMON is aligned, so it is read only where the document states commons.
+        if (commonAlignmentFromSizeAtMost.has_value() && !commonYieldsTo.has_value()
+            && !archiveCommonResolution.has_value()) {
+            fail("/commonAlignmentFromSizeAtMost",
+                 "'commonAlignmentFromSizeAtMost' is declared on a document that "
+                 "states no common (neither 'commonYieldsTo' nor "
+                 "'archiveCommonResolution'): the alignment a linker gives a common "
+                 "is read only where a common is written or resolved, so the "
+                 "declaration would never be read.");
+        }
         // P69 fold 3: `weakDefinitionBesideStrong` is read where `commonYieldsTo`
         // is — by a link that sets one unit's weak definition beside another
         // unit's strong one — and for the same reason never from an archive

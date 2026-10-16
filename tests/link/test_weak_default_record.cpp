@@ -23,15 +23,21 @@
 //     LINKAGE first (the binding alone), then STRONG before weak, and visibility only among what is left — so what
 //     a name is exported as never moves a body.
 
+#include "analysis/compilation_unit/compilation_unit.hpp"
 #include "asm/asm.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
+#include "ffi/abi/abi_catalog.hpp"
 #include "link/format/coff_object_reader.hpp"
+#include "link/format/pe.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
+#include "program/compile_pipeline.hpp"
 #include "program/program.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
@@ -391,8 +397,10 @@ struct CoffPdataRelocation {
     return at + 2 <= b.size() ? static_cast<std::uint16_t>(b[at] | b[at + 1] << 8) : std::uint16_t{0};
 }
 
-// Every relocation of the object's `.pdata` section, with the name of the record it names (PE/COFF §5.2, §5.4).
-[[nodiscard]] std::vector<CoffPdataRelocation> pdataRelocationsOf(std::span<std::uint8_t const> obj) {
+// Every relocation of the object's `section` (`.pdata` unless named), with the name of the record it names (PE/COFF
+// §5.2, §5.4).
+[[nodiscard]] std::vector<CoffPdataRelocation> pdataRelocationsOf(std::span<std::uint8_t const> obj,
+                                                                  std::string_view section = ".pdata") {
     std::vector<CoffPdataRelocation> out;
     if (obj.size() < 20) return out;
     std::uint16_t const nSections   = le16(obj, 2);
@@ -418,7 +426,7 @@ struct CoffPdataRelocation {
         if (hdr + 40 > obj.size()) break;
         std::string name;
         for (std::size_t k = 0; k < 8 && obj[hdr + k] != 0; ++k) name.push_back(static_cast<char>(obj[hdr + k]));
-        if (name != ".pdata") continue;
+        if (name != section) continue;
         std::uint32_t const relocs  = le32(obj, hdr + 24);
         std::uint16_t const nRelocs = le16(obj, hdr + 32);
         for (std::uint16_t r = 0; r < nRelocs; ++r) {
@@ -474,4 +482,62 @@ TEST(CoffWeakDefaultRecord, AnOverridableFunctionsUnwindRecordsNameItsBytesNever
         EXPECT_EQ(toDefault, 2u) << "the body's RUNTIME_FUNCTION names its begin and its end by the default record";
         EXPECT_EQ(toCaller, 2u) << "CONTROL: the strong function's names itself";
     }
+}
+
+// The same for the `.xdata` of a GUARDED overridable body (the re-review of fold 3b, NIT 9): its UNWIND_INFO's scope
+// table (`__C_specific_handler`'s C_SCOPE_TABLE: the guarded range's begin and end and the handler's target, each
+// image-relative to the function) is written by the same pass of the OBJECT writer as the `.pdata` above, and must
+// name the body's DEFAULT record too - against the weak name, an override's address would carry this body's guarded
+// ranges. A relocatable PE document refuses a `__try` before that writer is reached (it states no `sehPersonality`:
+// MEASURED by this pin's first run, `L_UnsupportedLoweringForOpcode`), so the writer is reached IN PROCESS: the unit
+// is assembled under the exe document, which states the personality, and its module written by the object writer
+// under the relocatable one. No `.xdata` relocation names the weak external, the body's scope fields name its default
+// record, and a strong guarded function of the same shape beside it names itself as often.
+TEST(CoffWeakDefaultRecord, AGuardedOverridableFunctionsScopeTableNamesItsBytesNeverItsWeakName) {
+    auto const L    = loadPe();
+    auto const exec = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    auto const g    = GrammarSchema::loadShipped("c");
+    ASSERT_TRUE(L.target && L.format && exec.has_value() && g.has_value());
+    DiagnosticReporter rep;
+    auto const abi = dss::ffi::resolveAbi(*L.target, **exec, rep);
+    ASSERT_TRUE(abi.has_value() && abi->cc != nullptr) << diagnosticsOf(rep);
+    auto const span = L.target->callingConventions();
+    auto const cc   = static_cast<std::uint16_t>(std::distance(span.data(), abi->cc));
+    UnitBuilder builder{*g, DiagnosticBudget::libraryDefault()};
+    builder.addInMemory("__attribute__((weak)) int dss_guarded(int x) {\n"
+                        "    int r = 0;\n"
+                        "    __try { r = 100 / x; } __except (1) { r = -1; }\n"
+                        "    return r;\n"
+                        "}\n"
+                        "int dss_guarded_strong(int x) {\n"
+                        "    int r = 0;\n"
+                        "    __try { r = 100 / x; } __except (1) { r = -1; }\n"
+                        "    return r;\n"
+                        "}\n"
+                        // The exe document starts a program, so the unit holds its entry.
+                        "int main(void) { return dss_guarded(1) + dss_guarded_strong(1); }\n",
+                        "guard.c");
+    CompilationUnit cu = std::move(builder).finish();
+    auto const module =
+        assembleUnit(cu, **g, *L.target, **exec, cc, rep, CompileOptions{DiagnosticBudget::libraryDefault()});
+    ASSERT_TRUE(module.has_value()) << diagnosticsOf(rep);
+    auto const bytes = pe::encode(*module, *L.target, *L.format, rep);
+    ASSERT_FALSE(bytes.empty()) << "the object writer writes the guarded unit:" << diagnosticsOf(rep);
+    auto const relocs = pdataRelocationsOf(bytes, ".xdata");
+    ASSERT_FALSE(relocs.empty()) << "both guarded functions carry a scope table";
+    std::size_t toDefault = 0, toStrong = 0;
+    for (auto const& r : relocs) {
+        SCOPED_TRACE(r.symbol);
+        EXPECT_NE(r.symbol, "dss_guarded")
+            << "a scope record of the weak body written against its weak NAME describes the override's address with "
+               "this body's guarded ranges wherever another object defines the name";
+        if (r.symbol.starts_with(".weak.dss_guarded.")) {
+            EXPECT_EQ(r.type, 3u) << "IMAGE_REL_AMD64_ADDR32NB: an image-relative field";
+            ++toDefault;
+        }
+        if (r.symbol == "dss_guarded_strong") ++toStrong;
+    }
+    EXPECT_GE(toDefault, 2u) << "the body's scope record names its guarded range by the default record";
+    EXPECT_GE(toStrong, 2u) << "CONTROL: the strong guarded function's names itself";
+    EXPECT_EQ(toDefault, toStrong) << "the two functions' scope tables carry the same fields";
 }

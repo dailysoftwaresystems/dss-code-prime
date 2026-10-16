@@ -201,8 +201,9 @@ rangeExceedsBuffer(std::uint64_t off, std::uint64_t size, std::uint64_t total) n
 // the declared section alignment; the POLICY that turns a declared alignment
 // into an `Alignment` is shared with the Mach-O and COFF readers and lives in
 // `link/format/foreign_section_alignment.hpp` -- this reader supplies only the
-// fact that ELF spells it as a raw BYTE COUNT.
-[[nodiscard]] Alignment alignFromSection(std::uint64_t shAddrAlign) noexcept {
+// fact that ELF spells it as a raw BYTE COUNT. nullopt: the field is no
+// alignment (the header walk refuses the object by name).
+[[nodiscard]] std::optional<Alignment> alignFromSection(std::uint64_t shAddrAlign) noexcept {
     return link::format::foreignSectionAlignmentFromByteCount(shAddrAlign);
 }
 
@@ -231,6 +232,9 @@ struct Shdr {
     std::uint32_t link      = 0;
     std::uint32_t info      = 0;
     std::uint64_t addrAlign = 0;
+    // `addrAlign` as the alignment every item cut from this section has (the
+    // header walk carries it, or refuses the object).
+    Alignment     alignment{};
     std::uint64_t entSize   = 0;
     std::string   name;
     std::optional<SectionKind> kind;  // resolved from `name` via the format schema
@@ -377,6 +381,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         s.info      = rdU32(bytes, base + 44);
         s.addrAlign = rdU64(bytes, base + 48);
         s.entSize   = rdU64(bytes, base + 56);
+        // The declared alignment is a CORRECTNESS input (the policy's note):
+        // carried as declared, or -- a field that is no alignment -- the
+        // object refused here, by name, before any item is cut from it.
+        std::optional<Alignment> const declared = alignFromSection(s.addrAlign);
+        if (!declared.has_value()) {
+            return fail(DiagnosticCode::F_CorruptedBinary,
+                "elf::readRelocatableObject: section #" + std::to_string(i)
+                + " declares sh_addralign " + std::to_string(s.addrAlign)
+                + ", which is not a power of two no greater than 2^31: no "
+                  "alignment its bytes can be placed at.");
+        }
+        s.alignment = *declared;
         // Every non-NOBITS section's body must lie within the file.
         if (s.type != kShtNobits
             && rangeExceedsBuffer(s.offset, s.size, bytes.size())) {
@@ -938,7 +954,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             AssembledData di;
             di.symbol    = symbolIds.of(static_cast<std::uint32_t>(i));
             di.section   = *dk;
-            di.alignment = alignFromSection(sec.addrAlign);  // section-granular (see header)
+            di.alignment = sec.alignment;  // section-granular (see header)
             if (isZeroFill(*dk)) {
                 di.reservedSize = sy.size;
             } else {
@@ -1281,7 +1297,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             AssembledData di;
             di.symbol    = symbolIds.fresh();
             di.section   = *dk;
-            di.alignment = alignFromSection(sec.addrAlign);
+            di.alignment = sec.alignment;
             std::size_t const b0 = static_cast<std::size_t>(sec.offset + gapStart);
             di.bytes.assign(bytes.begin() + b0,
                             bytes.begin() + b0 + static_cast<std::size_t>(gapEnd - gapStart));

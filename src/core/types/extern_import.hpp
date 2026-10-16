@@ -470,11 +470,13 @@ struct DSS_EXPORT ExternImport {
     // whose Value is the size, ELF `SHN_COMMON` with the alignment in
     // `st_value`, Mach-O an `N_UNDF` external whose `n_value` is the size and
     // whose `n_desc` carries the alignment's log2. ✔MEASURED 2026-10-06: cl
-    // 19.51 writes EVERY C tentative definition (`int x;` at file scope) so, at
-    // /O2 and /Od (run 20261006-224902-a6201782), as gcc and clang do under
-    // -fcommon. Such a row is a DEFINITION: the reference gate keeps it with no
-    // relocation naming it, an IMAGE link turns it into storage before any
-    // other pass reads the rows (`linker::allocateCommonDefinitions`), and a
+    // 19.51 writes a plain C tentative definition (`int x;` at file scope) so,
+    // at /O2 and /Od (run 20261006-224902-a6201782), as gcc and clang do under
+    // -fcommon; an explicitly aligned one cl (/std:c11 and /std:c17) writes as
+    // a `.bss` definition (✔MEASURED 2026-10-15). Such a row is a DEFINITION:
+    // the reference gate keeps it with no relocation naming it, an IMAGE link
+    // turns it into storage before any other pass reads the rows
+    // (`linker::allocateCommonDefinitions`), and a
     // RELOCATABLE artifact hands it on as a common, a merge folding two of one
     // name into the larger size, the wider alignment and the stricter
     // visibility. `commonVisibility` is the definition's visibility.
@@ -485,8 +487,11 @@ struct DSS_EXPORT ExternImport {
     // fold 3b, lane `xa`). `commonAlignment` is what the link allocates at,
     // and on two formats it can be the FORMAT's derivation from the size
     // rather than anything the unit asked for: a COFF common carries no
-    // alignment (its final linker rounds the size up to a power of two, at
-    // most 32, unless an `-aligncomm:` directive asks for more), and a Mach-O
+    // alignment (every COFF linker gives it at least the document's rule for
+    // its size — `CommonsStatement::alignmentEveryLinkerGives` — and only GNU
+    // ld and lld-link honour an `-aligncomm:` directive asking for more;
+    // link.exe ignores it, so a unit DSS compiles writes no common wider than
+    // that rule — `CommonsStatement::admitsCommon`), and a Mach-O
     // common whose `n_desc` alignment is 0 is aligned as its size (ld64). A
     // unit's code relies on the alignment it STATED and never on a derived
     // one, so whatever compares a common with what it needs reads this: ELF's

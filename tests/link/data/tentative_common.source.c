@@ -3,7 +3,7 @@
  * them as `tests/ffi/data/libtls.source.c` is kept beside its own.
  *
  * WHAT IT IS. A TENTATIVE DEFINITION -- `int dss_tentative;` -- which every
- * reference compiler writes as a COMMON under `-fcommon` (cl writes every C
+ * reference compiler writes as a COMMON under `-fcommon` (cl writes every plain C
  * tentative definition as one), and a function that reads it. Linked beside a
  * definition of the name that may be stated more than once, the reference
  * linkers SPLIT on which of the two the program reads: GNU ld's ELF and PE

@@ -1921,10 +1921,14 @@ encode(AssembledModule const&    module,
     std::vector<pe::CoffAlternateName>  fallbackImports;
     // ...and of each COMMON the object hands on (P69,
     // D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS): a hidden one is a hidden
-    // definition like any other, and an alignment wider than the one link.exe
-    // gives a common of its size (`naturalCoffCommonAlignment`) is stated, as
-    // gcc states it, or the final linker would align it less.
+    // definition like any other, and an alignment wider than the one every
+    // linker gives a common of its size (the document's
+    // `CommonsStatement::alignmentEveryLinkerGives`) is stated, as gcc states
+    // it, or the final linker would align it less. A DSS unit writes no such
+    // common (`CommonsStatement::admitsCommon` keeps it a definition); a
+    // foreign one handed on keeps the alignment its object asked.
     std::vector<pe::CoffCommonAlignment> commonAlignments;
+    CommonsStatement const               commons = fmt.commonsStatement();
     // An export's internal name the unit does not define is a REQUIRED row too
     // (an export is a reference, the COFF reader's rule): the `/EXPORT:` handed
     // on below restates that reference itself, and an `/INCLUDE:` beside it would
@@ -1942,7 +1946,7 @@ encode(AssembledModule const&    module,
         if (!isExternallyVisible(SymbolBinding::Global, ext.commonVisibility)) {
             hiddenDefinitions.push_back(ext.mangledName);
         }
-        if (ext.commonAlignment > pe::naturalCoffCommonAlignment(ext.commonSize)) {
+        if (ext.commonAlignment > commons.alignmentEveryLinkerGives(ext.commonSize).value_or(1u)) {
             commonAlignments.push_back(pe::CoffCommonAlignment{
                 ext.mangledName, static_cast<std::uint8_t>(std::countr_zero(ext.commonAlignment))});
         }

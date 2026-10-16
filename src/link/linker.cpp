@@ -30,6 +30,7 @@
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <format>
 #include <limits>
 #include <map>
@@ -2104,12 +2105,16 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // `elf_group_two_groups_{a,b}_x86_64_elf_gas.o`): two units carrying groups
     // `f` and `g`, the second's `.text.g` holding `R_X86_64_PC32 .text.f + 2` —
     // GNU ld 2.42 and ld.lld 18.1.3 link both orders (6 and 60).
+    // ★ ONE QUESTION ANSWERS BOTH (P69, the re-review of fold 3b's sweep): an item that stands in the losing
+    // group of its own unit stands in a DISCARDED group — the definition's group is discarded, which is why it
+    // is listed here — so asking whether the item is KEPT (`standsInADiscardedGroup`) is the whole rule, and the
+    // same-group test fold 3 wrote before it was implied by it: a mutant of that test survived a sweep
+    // (host run 20261015-220940-db013ab7), no input telling the two apart. It is removed, not kept beside the rule.
     auto relocationTargetFor = [&](std::size_t modIdx, SymbolId old,
                                    std::optional<InputSectionSlice> const& from) -> std::uint32_t {
         LinkedSymbolKey const key{modules[modIdx].cuId, old};
         if (auto const it = supersededInADiscardedGroup.find(key);
             it != supersededInADiscardedGroup.end()
-            && groupOfTheItem(modIdx, from) != it->second.row->sectionGroup
             && !standsInADiscardedGroup(modIdx, from)) {
             if (!discardedGroupRefused) {
                 discardedGroupRefused = true;
@@ -3498,6 +3503,26 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
 // yields to still turns each common into a reference, and a WEAK one the common
 // outranks gives the NAME up (`handTheNameToTheCommon`). Returns TRUE when no
 // row is a common (`out` untouched).
+//
+// The alignment a definition an object reader cut from a section HAS (P69, the
+// re-review of fold 3b, MINOR 3). Each reader states an item's alignment as its
+// SECTION's, and where the section is one unit (`InputSectionSlice`) the item
+// sits at its offset in it, so it is aligned to the smaller of the section's
+// alignment and the largest power of two dividing that offset: gcc's
+// `char pad __attribute__((aligned(64))) = 1; char w = 1;` puts `w` at offset 1
+// of a 64-aligned `.data`, and `w` is aligned to 1, not 64: beside
+// `_Alignas(64) char w;` GNU ld 2.42 warns "alignment 1 of normal symbol `w'
+// ... is smaller than 64 used by the common definition", in both orders, and
+// the program reads `&w % 64` as 1 (✔MEASURED 2026-10-15, gcc 13.3.0; ld.lld
+// 18.1.3 links it in silence). An item at offset 0, or placed alone, has its
+// section's.
+[[nodiscard]] std::uint64_t alignmentTheItemHas(AssembledData const& item) noexcept {
+    std::uint64_t const ofSection = item.alignment.bytes();
+    if (!item.inputSection.has_value() || item.inputSection->offset == 0u) return ofSection;
+    std::uint64_t const ofOffset = std::uint64_t{1} << std::countr_zero(item.inputSection->offset);
+    return std::min(ofSection, ofOffset);
+}
+
 [[nodiscard]] bool allocateCommonDefinitions(std::span<AssembledModule const> modules,
                                              ObjectFormatSchema const&         format,
                                              std::vector<AssembledModule>&     out,
@@ -3552,7 +3577,7 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
                 auto const [it, fresh] = yieldedStorage.try_emplace(s.name);
                 if (fresh || (strong && !it->second.strong)) {
                     it->second = YieldedStorage{static_cast<std::uint64_t>(item->sizeInSection()),
-                                                item->alignment.bytes(), m.cuId.v, strong};
+                                                alignmentTheItemHas(*item), m.cuId.v, strong};
                 }
             }
         }
@@ -3589,7 +3614,11 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
                 // from their size is the linker's choice, which no unit's code
                 // relies on (`int v[10];` beside `int v[10] = {1};` on PE is no
                 // mismatch, though link.exe would give the common 32).
-                CommonRow     widest     = rows.front();
+                // Each reason is said with the unit it comes from (MINOR 3):
+                // the largest common's for the size, the most aligned one's for
+                // the alignment — two units where they differ.
+                CommonRow     widest      = rows.front();
+                CommonRow     mostAligned = rows.front();
                 std::uint64_t size       = 0;
                 std::uint64_t alignment  = 0;
                 for (auto const& r : rows) {
@@ -3598,19 +3627,22 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
                         size   = e.commonSize;
                         widest = r;
                     }
+                    if (e.commonAlignmentStated > alignment) mostAligned = r;
                     alignment = std::max(alignment, e.commonAlignmentStated);
                 }
                 if (size > def->second.size || alignment > def->second.alignment) {
                     report(reporter, DiagnosticCode::K_CommonSymbolLargerThanItsDefinition,
                            DiagnosticSeverity::Warning,
-                           std::format("linker: the COMMON (tentative) definition of '{}' in linked unit #{} "
-                                       "is {} bytes {}, and the definition of the name it yields to "
+                           std::format("linker: the COMMON (tentative) definition of '{}' is {} bytes "
+                                       "(linked unit #{}) {}, and the definition of the name it yields to "
                                        "(linked unit #{}) is {} bytes aligned to {}: the common's unit reads and "
                                        "writes the object as the larger or more aligned one it declared. Linked "
                                        "as every reference linker links it.",
-                                       name, modules[widest.module].cuId.v, size,
-                                       alignment == 0u ? std::string{"(its object states no alignment)"}
-                                                       : std::format("aligned to {}", alignment),
+                                       name, size, modules[widest.module].cuId.v,
+                                       alignment == 0u
+                                           ? std::string{"(its object states no alignment)"}
+                                           : std::format("aligned to {} (linked unit #{})", alignment,
+                                                         modules[mostAligned.module].cuId.v),
                                        def->second.cu, def->second.size, def->second.alignment));
                 }
             }

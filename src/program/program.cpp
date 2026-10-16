@@ -2608,12 +2608,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                      (*formatR)->kind(),
                                      // P69 fold 3b: how the merged module writes a
                                      // tentative definition — a COMMON where the
-                                     // document states one. Passed, never left to
-                                     // the default: a merged object written with
-                                     // `.bss` definitions is refused beside another
-                                     // object of the name where the references'
-                                     // commons fold.
-                                     (*formatR)->statesCommons());
+                                     // document states one and every linker gives
+                                     // it its alignment. Required: a merged object
+                                     // written with `.bss` definitions is refused
+                                     // beside another object of the name where the
+                                     // references' commons fold.
+                                     (*formatR)->commonsStatement());
     if (!mod) return std::nullopt;  // back-half tier failure already reported via `reporter`
     // c165 (D-LK-STATIC-LINK): the merged whole-program client module links
     // against any `ar` static archives named on `--resolve-library` the same way

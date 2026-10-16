@@ -1702,9 +1702,10 @@ TEST(RelocatableObjectReader, EqualStValueWithDifferentStSizeFailsLoud) {
 // picked up a sibling's encoding by copy-paste would answer 2 or 3 where 4 is
 // right, and this asserts the BYTES so that reading is caught.
 //
-// RED ON DISABLE: drop `di.alignment = alignFromSection(sec.addrAlign)` at
-// either `AssembledData` site in `elf_object_reader.cpp`, or route it through
-// `foreignSectionAlignmentFromLog2` instead of `...FromByteCount`.
+// RED ON DISABLE: drop `di.alignment = sec.alignment` at either
+// `AssembledData` site in `elf_object_reader.cpp`, or route the header walk's
+// `alignFromSection` through `foreignSectionAlignmentFromLog2` instead of
+// `...FromByteCount`.
 TEST(RelocatableObjectReader, DeclaredSectionAlignmentSurvivesTheRoundTrip) {
     auto loaded = loadShipped();
     ASSERT_TRUE(loaded.target && loaded.format);
@@ -1778,4 +1779,119 @@ TEST(RelocatableObjectReader, DeclaredSectionAlignmentSurvivesTheRoundTrip) {
     EXPECT_NE(rWide->alignment.bytes(), rNarrow->alignment.bytes())
         << "a reader answering one constant for every section would satisfy "
            "either assertion above on its own";
+}
+
+// ── A DECLARED ALIGNMENT ABOVE 256 IS CARRIED; ONE NO ALIGNMENT HOLDS IS REFUSED ──
+//
+// (P69, the windows-x86_64 finals of the re-review of fold 3b.) The shared
+// read-side policy (`link/format/foreign_section_alignment.hpp`) read every
+// declared section alignment above 256 as ONE byte — ✔MEASURED 2026-10-15: a
+// DSS object's `_Alignas(4096) char v;` (`.bss`, 2**12) linked by DSS landed at
+// an address no multiple of 4096. A declared alignment is a correctness input:
+// each power of two up to `Alignment::kMaxBytes` comes back as declared, and an
+// `sh_addralign` that is no such alignment (not a power of two, which the gABI
+// does not allow, or past 2^31) refuses the object by name.
+
+namespace {
+
+// One `.bss` item of 4096 and one `.data` item of 8192, each alone in its
+// section, written by DSS's own ELF writer.
+[[nodiscard]] std::vector<std::uint8_t> pageAlignedObject(Loaded const& loaded) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(fn);
+    AssembledData page;
+    page.symbol       = SymbolId{10};
+    page.section      = DataSectionKind::Bss;
+    page.reservedSize = 1;
+    page.alignment    = Alignment::of<4096>();
+    mod.dataItems.push_back(page);
+    AssembledData wider;
+    wider.symbol    = SymbolId{11};
+    wider.section   = DataSectionKind::Data;
+    wider.bytes     = {7, 0, 0, 0};
+    wider.alignment = Alignment::of<8192>();
+    mod.dataItems.push_back(wider);
+    mod.symbols = {
+        ModuleSymbol{SymbolId{1},  "fn",    SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{10}, "page",  SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{11}, "wider", SymbolBinding::Global, SymbolVisibility::Default},
+    };
+    DiagnosticReporter wrep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, wrep);
+    EXPECT_EQ(wrep.errorCount(), 0u);
+    return bytes;
+}
+
+// What a reporter said, one line a diagnostic (a refusal's words, read when an
+// assertion fails).
+[[nodiscard]] std::string whatItSaid(DiagnosticReporter const& rep) {
+    std::string out;
+    for (auto const& d : rep.all()) {
+        out += "\n  ";
+        out += d.actual;
+    }
+    return out;
+}
+
+// The file offset of the `sh_addralign` field of the first SHF_ALLOC|SHF_WRITE
+// PROGBITS section (`.data`), or 0.
+[[nodiscard]] std::size_t dataAddrAlignField(std::vector<std::uint8_t> const& obj) {
+    auto rd = [&](std::size_t o, int n) {
+        std::uint64_t v = 0;
+        for (int i = 0; i < n; ++i) v |= static_cast<std::uint64_t>(obj[o + i]) << (i * 8);
+        return v;
+    };
+    std::uint64_t const shoff = rd(40, 8);
+    std::uint64_t const shnum = rd(60, 2);
+    for (std::uint64_t i = 0; i < shnum; ++i) {
+        std::size_t const sh = static_cast<std::size_t>(shoff + i * 64);
+        if (rd(sh + 4, 4) == 1u && (rd(sh + 8, 8) & 0x7u) == 0x3u) return sh + 48;
+    }
+    return 0;
+}
+
+} // namespace
+
+TEST(RelocatableObjectReader, ASectionAlignmentAboveTwoHundredFiftySixIsCarried) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = pageAlignedObject(loaded);
+    ASSERT_FALSE(obj.empty());
+    DiagnosticReporter rrep;
+    auto const back = elf::readRelocatableObject(obj, *loaded.target, *loaded.format, rrep);
+    ASSERT_TRUE(back.has_value()) << whatItSaid(rrep);
+    auto const* page  = dataNamed(*back, "page");
+    auto const* wider = dataNamed(*back, "wider");
+    ASSERT_NE(page, nullptr);
+    ASSERT_NE(wider, nullptr);
+    EXPECT_EQ(page->alignment.bytes(), 4096u) << "a `.bss` declared 4096 is read as 4096, never as one byte";
+    EXPECT_EQ(wider->alignment.bytes(), 8192u) << "a `.data` declared 8192 is read as 8192";
+}
+
+TEST(RelocatableObjectReader, ASectionAlignmentNoAlignmentHoldsIsRefusedByName) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    struct Case {
+        std::uint64_t value;
+        char const*   says;
+    };
+    for (Case const c : {Case{24u, "declares sh_addralign 24,"}, Case{std::uint64_t{1} << 32, "declares sh_addralign 4294967296,"}}) {
+        SCOPED_TRACE(c.says);
+        auto obj = pageAlignedObject(loaded);
+        std::size_t const field = dataAddrAlignField(obj);
+        ASSERT_NE(field, 0u) << "the object holds a `.data` section";
+        for (int i = 0; i < 8; ++i) obj[field + i] = static_cast<std::uint8_t>(c.value >> (i * 8));
+        DiagnosticReporter rep;
+        EXPECT_FALSE(elf::readRelocatableObject(obj, *loaded.target, *loaded.format, rep).has_value())
+            << "a field that is no alignment must not be read as one";
+        bool named = false;
+        for (auto const& d : rep.all()) {
+            named = named || (d.code == DiagnosticCode::F_CorruptedBinary && d.actual.find(c.says) != std::string::npos);
+        }
+        EXPECT_TRUE(named) << "refused by name, F_CorruptedBinary saying `" << c.says << "`: " << whatItSaid(rep);
+    }
 }

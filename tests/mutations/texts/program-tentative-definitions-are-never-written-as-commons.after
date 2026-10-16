@@ -1,1 +1,1 @@
-    if (false && !stateTentativeDefinitionsAsCommons(mir, assembled, reporter)) {
+    if (false && !stateTentativeDefinitionsAsCommons(mir, assembled, commons, reporter)) {

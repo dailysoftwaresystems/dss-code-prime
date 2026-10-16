@@ -1,0 +1,8 @@
+                if (!declared.has_value()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: section '" + sec.segName
+                        + "," + sec.sectName + "' declares alignment 2^"
+                        + std::to_string(sec.align)
+                        + ", which is not an alignment any atom can have.");
+                }
+                sec.alignment = *declared;

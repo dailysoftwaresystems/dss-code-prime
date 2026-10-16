@@ -946,12 +946,14 @@ struct DSS_EXPORT CuMirModule {
     // and every such operator is refused by name.
     std::optional<ObjectFormatKind>                assemblyFormatKind;
 
-    // ★★ HOW THIS UNIT WRITES A TENTATIVE DEFINITION (P69 fold 3b, lane `xa`) — the
-    // document's answer (`ObjectFormatSchema::statesCommons`), captured for the
-    // SAME reason as `externCallDispatch`: the LOWER half sees only this struct.
-    // True makes each global `Mir::globalIsCommon` admits the COMMON row the object
-    // readers produce instead of a `.bss` definition.
-    bool statesCommons = false;
+    // ★★ HOW THIS UNIT WRITES A TENTATIVE DEFINITION (P69 fold 3b, lane `xa`; the
+    // re-review's MAJOR 1) — the document's facts (`ObjectFormatSchema::
+    // commonsStatement`), captured for the SAME reason as `externCallDispatch`:
+    // the LOWER half sees only this struct. Where the document states commons,
+    // each global `Mir::globalIsCommon` admits is the COMMON row the object
+    // readers produce instead of a `.bss` definition — unless it is wider than
+    // every linker gives a common of its size (`CommonsStatement::admitsCommon`).
+    CommonsStatement commons;
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the
@@ -1332,10 +1334,14 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // atomics-runtime block, pre-resolved in program.cpp for
                       // the same reason the softcall library above is (no
                       // ObjectFormatKind in scope in the merge lower body).
-                      // Trailing + defaulted, like every format fact on
-                      // `lowerToLir`.
-                      std::optional<AtomicsRuntime> atomicsRuntime =
-                          std::nullopt,
+                      // ★ EVERY ARGUMENT FROM HERE ON IS REQUIRED (P69, the
+                      // re-review of fold 3b, MINOR 4): a defaulted trailing
+                      // format fact is how the one caller once left the
+                      // format kind out, and the merged route then read no
+                      // inline-asm address part
+                      // (D-PROGRAM-MERGED-ROUTE-DROPS-THE-ASSEMBLY-FORMAT-KIND).
+                      // A caller states each one, "none" included.
+                      std::optional<AtomicsRuntime> atomicsRuntime,
                       // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
                       // (P55): the format's DECLARED narrowing of WHICH symbol
                       // bindings the `indirect-slot` dispatch above reaches
@@ -1347,38 +1353,35 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // unnarrowed cost while its format document said
                       // otherwise — and, worse, its call sites would disagree
                       // with the linker's slot pass, which reads the format
-                      // directly. Defaulted only so the positional tail stays
-                      // additive; program.cpp passes it.
-                      std::vector<SymbolBinding> indirectSlotBindings = {},
+                      // directly.
+                      std::vector<SymbolBinding> indirectSlotBindings,
                       // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
                       // the format's DECLARED set of definition bindings
                       // this artifact's LOADER may replace with another
                       // image's body, pre-resolved in program.cpp for the
                       // same reason the facts above are. Empty = nothing is
-                      // preemptible. ⚠ PASSED AT THE CALL SITE, NOT LEFT TO
-                      // THE DEFAULT, for the reason the narrowing above
-                      // states one level sharper: a merged module lowered
-                      // without it emits the DIRECT branch that is the
+                      // preemptible. ⚠ Required for the reason the
+                      // narrowing above states, one level sharper: a merged
+                      // module lowered without it emits the DIRECT branch that is the
                       // whole defect, and nothing downstream can tell that
                       // branch from a legitimately module-private one.
-                      std::vector<SymbolBinding> preemptibleDefinitionBindings = {},
+                      std::vector<SymbolBinding> preemptibleDefinitionBindings,
                       // P68 round 9: the format kind, ONLY as a key into the
                       // assembly dialect's `symbolParts` (see
                       // `CuMirModule::assemblyFormatKind`). nullopt ⇒ an
                       // inline-asm address-part operator is refused by name.
-                      std::optional<ObjectFormatKind> assemblyFormatKind =
-                          std::nullopt,
+                      std::optional<ObjectFormatKind> assemblyFormatKind,
                       // ★★ P69 fold 3b (lane `xa`): how the merged module writes a
-                      // tentative definition — the document's answer
-                      // (`ObjectFormatSchema::statesCommons`),
-                      // pre-resolved in program.cpp for the same reason the facts
-                      // above are. ⚠ PASSED AT THE CALL SITE: a merged module
-                      // lowered with the default writes every tentative
-                      // definition as a `.bss` definition, and two such objects of
-                      // one name are refused by every linker where the references'
-                      // commons fold (`DriverArgumentSupply` pins it on the
-                      // artifact).
-                      bool statesCommons = false);
+                      // tentative definition — the document's facts
+                      // (`ObjectFormatSchema::commonsStatement`: whether it
+                      // states commons, and the alignment every linker gives
+                      // one), pre-resolved in program.cpp for the same reason
+                      // the facts above are. A merged module lowered without
+                      // them writes every tentative definition as a `.bss`
+                      // definition, and two such objects of one name are
+                      // refused by every linker where the references' commons
+                      // fold (`DriverArgumentSupply` pins it on the artifact).
+                      CommonsStatement const& commons);
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's

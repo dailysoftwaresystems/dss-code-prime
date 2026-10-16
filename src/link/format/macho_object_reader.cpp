@@ -209,8 +209,9 @@ rdName(std::span<std::uint8_t const> b, std::uint64_t tabStart, std::uint64_t ta
 // POLICY that turns a declared section alignment into an `Alignment` is shared
 // with the ELF and COFF readers and lives in
 // `link/format/foreign_section_alignment.hpp` -- this reader supplies only the
-// fact that Mach-O spells the field as a LOG2 EXPONENT.
-[[nodiscard]] Alignment alignFromLog2(std::uint32_t log2) noexcept {
+// fact that Mach-O spells the field as a LOG2 EXPONENT. nullopt: past what an
+// `Alignment` holds (the header walk refuses the object by name).
+[[nodiscard]] std::optional<Alignment> alignFromLog2(std::uint32_t log2) noexcept {
     return link::format::foreignSectionAlignmentFromLog2(log2);
 }
 
@@ -230,6 +231,7 @@ struct Section {
     std::uint64_t size     = 0;
     std::uint64_t offset   = 0;   // file offset of the section body
     std::uint32_t align    = 0;   // log2
+    Alignment     alignment{};    // `align`, carried by the header walk (or the object refused)
     std::uint64_t reloff   = 0;   // file offset of this section's reloc table
     std::uint32_t nreloc   = 0;
     std::uint32_t flags    = 0;
@@ -473,6 +475,20 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 sec.nreloc   = rdU32(bytes, secOff + 60);
                 sec.flags    = rdU32(bytes, secOff + 64);
                 sec.zeroFill = (sec.flags & kSectTypeMask) == kSZerofill;
+                // The declared alignment is a CORRECTNESS input (the policy's
+                // note): carried as declared, or -- an exponent past what an
+                // `Alignment` holds, where a shift would pass the width of the
+                // type -- the object refused here, by name, before any atom is
+                // cut. This value comes off a foreign wire.
+                std::optional<Alignment> const declared = alignFromLog2(sec.align);
+                if (!declared.has_value()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: section '" + sec.segName
+                        + "," + sec.sectName + "' declares alignment 2^"
+                        + std::to_string(sec.align)
+                        + ", which is not an alignment any atom can have.");
+                }
+                sec.alignment = *declared;
                 // A file-backed section's body must lie within the file. A
                 // zero-fill section carries no file bytes (its offset may be 0
                 // / past EOF legitimately), so it is exempt -- exactly like the
@@ -1207,7 +1223,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             AssembledData di;
             di.symbol    = symbolIds.of(defs[k].symIdx);
             di.section   = *dk;
-            di.alignment = alignFromLog2(sec.align);
+            di.alignment = sec.alignment;
             di.inputSection = sliceOf(ordinal, off);
             if (isZeroFill(*dk)) {
                 di.reservedSize = len;
@@ -2040,18 +2056,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 //   up to 16 is 16 and the atom ends at 100. The bound is the
                 //   document's declared alignment, not a constant.
                 std::uint64_t const atomEnd = hit->start + hit->len;
-                // `section_64.align` is a LOG2 exponent. Read from the OWNING
-                // section rather than from a constant, and refused rather than
-                // shifted when it is absurd -- a shift past the width of the
-                // type is undefined, and this value comes off a foreign wire.
-                if (owner->align > 31u) {
-                    return fail(DiagnosticCode::F_CorruptedBinary,
-                        "macho::readRelocatableObject: section '"
-                        + owner->segName + "," + owner->sectName
-                        + "' declares alignment 2^" + std::to_string(owner->align)
-                        + ", which is not an alignment any atom can have.");
-                }
-                std::uint64_t const alignBytes = std::uint64_t{1} << owner->align;
+                // The OWNING section's declared alignment, rather than a
+                // constant -- carried by the header walk, which refused an
+                // exponent no `Alignment` holds before this point.
+                std::uint64_t const alignBytes = owner->alignment.bytes();
                 std::uint64_t const describedEnd = hit->start + fde.cfi.codeLength;
                 std::uint64_t const paddedEnd =
                     ((describedEnd + alignBytes - 1u) / alignBytes) * alignBytes;

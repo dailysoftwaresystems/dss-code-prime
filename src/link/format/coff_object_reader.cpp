@@ -263,16 +263,25 @@ constexpr std::uint32_t kScnAlignShift = 20u;
 constexpr std::uint32_t kScnTypeNoPad  = 0x00000008u;
 
 // Byte alignment the producer declared for `chars`, as the shared read-side
-// policy carries it (`link/format/foreign_section_alignment.hpp`): a
-// re-layout hint, degrading to byte alignment above what the newtype models.
+// policy carries it (`link/format/foreign_section_alignment.hpp`) -- every
+// class as declared, 1 through 8192 (until P69 everything above 256 was read
+// as ONE byte, a miscompile the policy's note measures).
+//
+// ★ CLASS 15 IS NO CLASS OF THE FORMAT: the IMAGE_SCN_ALIGN_* values stop at
+// 8192BYTES (class 14), and the references' arithmetic parts on it --
+// ✔MEASURED 2026-10-15, GNU objdump 2.42 (MinGW-w64) reads a `.bss` of class
+// 13 as 2**12, 14 as 2**13 and 15 as 2**4, the unspecified default. DSS takes
+// the reading a reference was measured giving: class 15 is class 0.
 [[nodiscard]] Alignment
 alignFromCharacteristics(std::uint32_t chars) noexcept {
     if ((chars & kScnTypeNoPad) != 0u) return Alignment{};
     std::uint32_t const cls = (chars & kScnAlignMask) >> kScnAlignShift;
-    // Class 0 = unspecified = the references' 16-byte default = exponent 4.
-    // Otherwise the class ordinal is one MORE than the log2 exponent.
-    return link::format::foreignSectionAlignmentFromLog2(
-        cls == 0u ? 4u : cls - 1u);
+    // Class 0 (and 15) = unspecified = the references' 16-byte default =
+    // exponent 4. Otherwise the class ordinal is one MORE than the log2
+    // exponent, at most 13 -- which an `Alignment` always holds, so the
+    // policy's answer is engaged by construction.
+    std::uint32_t const log2 = cls == 0u || cls == 15u ? 4u : cls - 1u;
+    return *link::format::foreignSectionAlignmentFromLog2(log2);
 }
 
 // IMAGE_SCN_LNK_COMDAT: this section participates in COMDAT
@@ -1514,18 +1523,19 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // MSVC C object with a file-scope `int x;`. mingw gcc 13.2.0 writes
             // the same record under -fcommon.
             //
-            // THE ALIGNMENT is the final linker's to choose, and the two COFF
-            // linkers choose by different rules: link.exe 14.51 aligns a common
-            // to its size rounded up to a power of two, at most 32 bytes
-            // (✔MEASURED 2026-10-06, run 20261006-225314-2e577758: sizes 1, 3,
-            // 5, 17, 40, 100 and 5000 land 1, 4, 8, 32, 32, 32 and 32 aligned;
-            // lld-link states the same rule in its source), and GNU ld takes the
-            // object's `-aligncomm:` (`LinkerDirectiveMeaning::CommonAlignment`;
+            // THE ALIGNMENT is the final linker's to choose: every COFF linker
+            // gives a common at least the document's rule for its size
+            // (`commonAlignmentFromSizeAtMost`: the size rounded up to a power of
+            // two, at most 32 — the minimum of link.exe's and lld-link's,
+            // ✔MEASURED 2026-10-15), and GNU ld and lld-link take the object's
+            // `-aligncomm:` (`LinkerDirectiveMeaning::CommonAlignment`;
             // ✔MEASURED, run 20261006-222413-52787563: a common named in one is
-            // aligned as it asks). DSS takes the WIDER of the two, which every
-            // program either linker runs is correct under.
+            // aligned as it asks), which link.exe ignores. DSS takes the WIDER
+            // of the two. A document that states no such rule gives no
+            // alignment beyond the directive's.
             if (isExt && s.value != 0u) {
-                std::uint64_t alignment = naturalCoffCommonAlignment(s.value);
+                std::uint64_t alignment =
+                    objectFormatSchema.commonsStatement().alignmentEveryLinkerGives(s.value).value_or(1u);
                 std::uint64_t stated    = 0;   // the object states none but by a directive
                 if (auto const asked = commonAlignmentLog2.find(s.name);
                     asked != commonAlignmentLog2.end()) {

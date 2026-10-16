@@ -1,1 +1,1 @@
-    cuMir.statesCommons = format.statesCommons();
+    cuMir.commons = format.commonsStatement();

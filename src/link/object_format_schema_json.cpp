@@ -422,7 +422,17 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // one answer, or one per kind of weak definition. OPTIONAL: stated by the
     // documents a link resolves units for, an image or a relocatable artifact —
     // the documents that state `commonYieldsTo`; refused on an archive document.
-    static constexpr std::array<std::string_view, 54> kFormatDocumentKeys{
+    // 53 -> 54 (P69, lane `cs`, the alias fold): `symbolAliasUnsupportedReason`,
+    // why a program of this format may give no definition a second name (the C
+    // `alias` attribute), a closed verb whose sentence the semantic tier's
+    // refusal carries (`SymbolAliasUnsupportedReason`). OPTIONAL: stated by the
+    // eight Mach-O documents; absent, an alias is supported.
+    // 54 -> 55 (P69, lane `xa`, the re-review of fold 3b, MAJOR 1):
+    // `commonAlignmentFromSizeAtMost`, the alignment every linker gives a COMMON
+    // that states none — its size rounded up to a power of two, at most this
+    // (`CommonsStatement`). OPTIONAL: stated by the four PE documents, whose
+    // commons state their alignment only by a directive one linker ignores.
+    static constexpr std::array<std::string_view, 55> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -544,6 +554,10 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // unstated, which a link then refuses only when a common meets a weak
         // definition of its name
         "commonYieldsTo",
+        // the alignment every linker gives a common that states none — a typo
+        // would leave the document unstated, and an over-aligned tentative
+        // definition would be written as a common a linker misaligns in silence
+        "commonAlignmentFromSizeAtMost",
         // what becomes of a definition whose name another definition wins — a
         // typo would leave the document unstated, which a link then refuses only
         // when a relocation names such a definition
@@ -4334,6 +4348,20 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                   allowedList(allNames(kCommonYieldsToTable), ", ")));
         } else {
             data.commonYieldsTo = *yields;
+        }
+    }
+
+    // commonAlignmentFromSizeAtMost — the alignment every linker gives a COMMON
+    // that states none (`CommonsStatement`). OPTIONAL; a power of two.
+    if (doc.contains("commonAlignmentFromSizeAtMost")) {
+        auto const& v = doc.at("commonAlignmentFromSizeAtMost");
+        std::uint64_t const n = v.is_number_unsigned() ? v.get<std::uint64_t>() : 0u;
+        if (n == 0u || (n & (n - 1u)) != 0u) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/commonAlignmentFromSizeAtMost",
+                      "expected a power of two: the most bytes of alignment every linker "
+                      "gives a common that states none");
+        } else {
+            data.commonAlignmentFromSizeAtMost = n;
         }
     }
 

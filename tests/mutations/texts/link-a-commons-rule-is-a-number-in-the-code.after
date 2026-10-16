@@ -1,0 +1,1 @@
+        while (alignment < size && alignment < 32u) alignment <<= 1;

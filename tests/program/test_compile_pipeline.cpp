@@ -2903,7 +2903,16 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
                                      /*externAddrBinding=*/std::nullopt,
                                      /*tlsAccess=*/std::nullopt,
                                      /*sehScopes=*/{},
-                                     /*wideFloatSoftcallLibrary=*/std::nullopt, rep);
+                                     /*wideFloatSoftcallLibrary=*/std::nullopt, rep,
+                                     // P69 (the re-review of fold 3b, MINOR 4):
+                                     // the trailing facts are REQUIRED, so the
+                                     // document's own are stated, as the route
+                                     // states them (program.cpp).
+                                     (*formatR)->atomicsRuntime(),
+                                     (*formatR)->indirectSlotBindings(),
+                                     (*formatR)->preemptibleDefinitionBindings(),
+                                     (*formatR)->kind(),
+                                     (*formatR)->commonsStatement());
     ASSERT_TRUE(mod.has_value()) << "errorCount=" << rep.errorCount();
 
     // (2) The lowered module carries no `add5` import either (direct call).

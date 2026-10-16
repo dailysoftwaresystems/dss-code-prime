@@ -418,6 +418,74 @@ inline constexpr EnumNameTable<CommonYieldsTo, 3> kCommonYieldsToTable{{{
     { CommonYieldsTo::AnyDefinition,            "anyDefinition"            },
     { CommonYieldsTo::NonOverridableDefinition, "nonOverridableDefinition" },
 }}};
+
+// ★★★ HOW A UNIT WRITES ITS TENTATIVE DEFINITIONS UNDER ONE DOCUMENT — the facts
+// the lower half reads, asked of the document ONCE (`ObjectFormatSchema::
+// commonsStatement`) and carried as one object (P69, lane `xa`; the re-review of
+// fold 3b, MAJOR 1; D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED):
+//   * `states` — whether the document states commons at all
+//     (`ObjectFormatSchema::statesCommons`);
+//   * `alignmentFromSizeAtMost` — the root key `commonAlignmentFromSizeAtMost`:
+//     where a format's COMMON cannot state its alignment to EVERY linker its
+//     objects reach, the alignment every one of them gives a common that states
+//     none — its size rounded up to a power of two, at most this many bytes.
+//     COFF: a common is an undefined external whose value is its size, and the
+//     only way to state its alignment is the `-aligncomm:` directive, which GNU
+//     ld and lld-link honour and link.exe IGNORES (LNK4229). ✔MEASURED
+//     2026-10-15 (min of three placements, no directive): link.exe 14.44 gives 4
+//     to a common of 4 bytes or fewer and 32 to every larger one; lld-link 19.1.5
+//     gives the size rounded up to a power of two, at most 32 — the MINIMUM of
+//     the two is lld-link's rule, which the PE documents state. Absent (ELF,
+//     Mach-O), the common states its own alignment in its symbol and every
+//     linker honours it.
+// A tentative definition wider than that for its size, in a unit whose OBJECT
+// another linker reads (`objectReadByAnotherLinker`: a relocatable or archive
+// document), is NOT written as a common (`admitsCommon`): it stays the
+// zero-filled DEFINITION it is, as the MSVC-environment references write every
+// explicitly aligned tentative definition (✔MEASURED 2026-10-15: cl 19.44 /std:c11 and /std:c17, and clang
+// 19.1.5 --target=x86_64-pc-windows-msvc -fcommon — `_Alignas(4) int v;` to
+// `_Alignas(4096) char v;`, each a `.bss` definition; one unit's `_Alignas(64)
+// int v;` lands at 64 under link.exe and lld-link). Written as a common it lands
+// at the size's alignment under link.exe — the silent misalignment the review
+// found. THE COST: two units' over-aligned tentative definitions of one name are
+// two definitions, refused as duplicates — as cl's are under link.exe (LNK2005)
+// — where MinGW gcc's commons with `-aligncomm:` fold under GNU ld. One no wider
+// than every linker gives (`_Alignas(4) int v;`) stays a common, folding where
+// cl writes a definition. UNDER AN IMAGE DOCUMENT the rule writes nothing: DSS
+// links the unit itself, and its own link allocates every common at the
+// alignment its unit states (`linker::allocateCommonDefinitions`), so two units'
+// over-aligned tentative definitions, or one beside a definition of its name,
+// fold as one program's (✔MEASURED 2026-10-15: written as a definition there, the
+// sources of `_Alignas(64) char w;` and `char w = 1;` compiled together were
+// refused as two definitions, Mac leg host run 20261015-222515-3b081ea3).
+struct DSS_EXPORT CommonsStatement {
+    bool                         states = false;
+    std::optional<std::uint64_t> alignmentFromSizeAtMost;
+    // Whether the unit's commons reach a linker other than DSS's own: the
+    // document writes an OBJECT (a relocatable or an archive document), not an
+    // image DSS links itself (`ObjectFormatSchema::isImageFlavor`).
+    bool                         objectReadByAnotherLinker = true;
+
+    // The alignment every linker gives a common of `size` bytes that states
+    // none, or nullopt where the common states its own.
+    [[nodiscard]] std::optional<std::uint64_t>
+    alignmentEveryLinkerGives(std::uint64_t size) const noexcept {
+        if (!alignmentFromSizeAtMost.has_value()) return std::nullopt;
+        std::uint64_t alignment = 1;
+        while (alignment < size && alignment < *alignmentFromSizeAtMost) alignment <<= 1;
+        return alignment;
+    }
+    // Whether a tentative definition of `size` bytes aligned to `alignment` may
+    // be written as a common: the document states commons, and DSS's own link
+    // allocates it (an image document) or every linker its object reaches gives
+    // the common at least `alignment`.
+    [[nodiscard]] bool admitsCommon(std::uint64_t size, std::uint64_t alignment) const noexcept {
+        if (!states) return false;
+        if (!objectReadByAnotherLinker) return true;
+        auto const gives = alignmentEveryLinkerGives(size);
+        return !gives.has_value() || alignment <= *gives;
+    }
+};
 DSS_CHECK_ENUM_NAME_TABLE(kCommonYieldsToTable);
 
 // ★★★ WHAT BECOMES OF A DEFINITION WHOSE NAME ANOTHER DEFINITION WINS — a FORMAT
@@ -2482,6 +2550,12 @@ struct DSS_EXPORT ObjectFormatData {
     // weak definition of its name; refused on an ARCHIVE document (`validate()`),
     // whose members are each linked alone.
     std::optional<CommonYieldsTo> commonYieldsTo;
+    // The alignment every linker gives a COMMON that states none: its size
+    // rounded up to a power of two, at most this (the
+    // `commonAlignmentFromSizeAtMost` root key — see `CommonsStatement`).
+    // OPTIONAL: absent, the format's common states its own alignment. A power of
+    // two, and only where the document states commons (`validate()`).
+    std::optional<std::uint64_t> commonAlignmentFromSizeAtMost;
     // What becomes of a definition whose name another definition wins (the
     // `supersededDefinition` root key — see `SupersededDefinition`). OPTIONAL:
     // unstated, a link refuses when a relocation names such a definition, and a
@@ -3482,17 +3556,21 @@ public:
     // its own: a fact with an owner gets no second one, and those two keys are its
     // owners; a document that states neither has no common to link. Where it
     // does, a unit compiled for it writes each tentative definition the link may
-    // fold (`Mir::globalIsCommon`: `int v;` at file scope, external, strong, not
-    // thread-local) as a COMMON — the row every object reader already produces
+    // fold (`Mir::globalIsCommon`, the tentative mark read alone: `int v;` at file
+    // scope, external, strong, not thread-local, and not cleared by the front end —
+    // `nocommon`, or a variable an `alias` names, is its unit's outright) as a
+    // COMMON — the row every object reader already produces
     // (`ExternImport::commonSize`): an image link allocates it once per name, a
     // relocatable artifact or an archive member hands it on, and each writer
     // spells it (ELF `SHN_COMMON`, Mach-O an `N_UNDF` external with the
-    // alignment's log2, COFF an undefined external whose value is the size, plus
-    // the document's `commonAlignment` directive where the alignment is wider
-    // than the one a COFF linker gives a common of that size). That is what cl
-    // writes by default, Apple clang by default, and gcc and clang under
-    // `-fcommon` (✔MEASURED 2026-10-12, ELF x86_64, PE x86_64 and Mach-O
-    // arm64/x86_64), and two such objects of one name LINK as one object where
+    // alignment's log2, COFF an undefined external whose value is the size).
+    // ⚠ NOT every tentative definition: one wider than every linker gives a
+    // common of its size stays a definition (`CommonsStatement::admitsCommon` —
+    // COFF's `-aligncomm:` is ignored by link.exe). A plain one is what cl writes
+    // (/std:c11, every explicitly aligned one a definition), Apple clang by
+    // default, and gcc and clang under `-fcommon` (✔MEASURED 2026-10-12 and
+    // 2026-10-15, ELF x86_64, PE x86_64 and Mach-O arm64/x86_64), and two such
+    // objects of one name LINK as one object where
     // two `.bss` definitions are refused by every linker — one working reference
     // makes the fold required. An archive's members too (✔MEASURED 2026-10-15): a
     // member whose only definition of a name is a common is fetched for a
@@ -3502,13 +3580,26 @@ public:
     // contents omits commons), where the same members written as definitions are
     // refused as duplicates by every one of them. Where the document states no
     // common (SPIR-V, wasm), the unit writes a zero-filled definition. The answer
-    // is read off the document HERE alone, by its two readers: the pipeline's two
-    // lower-half callers capture it (`lowerMirModuleToAssembly`,
-    // `program/compile_pipeline.cpp`), and the front end refuses the `common`
-    // attribute by name where it is false (`analysis/semantic`); nothing
-    // re-derives it from the keys, so the two cannot disagree.
+    // is read off the document HERE alone, by its readers: each route's lower half
+    // captures it through `commonsStatement()` below — a unit compiled alone in
+    // `program/compile_pipeline.cpp` (`format.commonsStatement()`), the units the
+    // merge joins in `program/program.cpp` (`(*formatR)->commonsStatement()`) —
+    // and the front end refuses the `common` attribute by name where it is false
+    // (`analysis/semantic/target_format_analysis.cpp`, `format.statesCommons()`);
+    // the COFF reader and the PE writer read only the statement's alignment rule.
+    // Nothing re-derives it from the keys, so no two readers can disagree.
     [[nodiscard]] bool statesCommons() const noexcept {
         return d_.commonYieldsTo.has_value() || d_.archiveCommonResolution.has_value();
+    }
+
+    // The facts a unit compiled for this document writes its tentative
+    // definitions by (`CommonsStatement`): whether the document states commons,
+    // and the alignment every linker gives one that states none. Captured by
+    // both routes' lower halves (`compile_pipeline.cpp`, `program.cpp`), and read
+    // by the COFF reader and the PE writer, which align and spell a common by the
+    // same rule.
+    [[nodiscard]] CommonsStatement commonsStatement() const noexcept {
+        return CommonsStatement{statesCommons(), d_.commonAlignmentFromSizeAtMost, !isImageFlavor()};
     }
 
     // What this document states of a definition whose name another definition

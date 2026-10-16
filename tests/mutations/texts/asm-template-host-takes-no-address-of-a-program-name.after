@@ -1,0 +1,3 @@
+        if (false && namesProgramSymbol(symbol, at)) {
+            auto const sym = programSymbolOf(symbol, at, mnemonic, AsmTemplateNameUse::Address);
+            if (!sym.has_value()) return false;

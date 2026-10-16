@@ -447,6 +447,12 @@ TEST(AtomOwnershipShapes, ASupersededDefinitionsOtherNameFollowsItsDocument) {
         LinkedImage const            img = linker::link(std::span<AssembledModule const>{mods}, **t, *f, rep);
         EXPECT_FALSE(img.ok());
         EXPECT_TRUE(reported(rep, DiagnosticCode::K_SymbolUndefined, "'kept_name'")) << diagnosticsOf(rep);
+        // Refused for its REASON, in the linker's own words: another tier refuses the same import as undefined
+        // too, so a case that asked only for the code would hold with the reason gone (the arm on that sentence
+        // survived a sweep that way).
+        EXPECT_TRUE(reported(rep, DiagnosticCode::K_SymbolUndefined,
+                             "references 'kept_name', which only the definition of 'contested'"))
+            << "the definition that carried the name was discarded whole:" << diagnosticsOf(rep);
 
         std::vector<AssembledModule> unneeded{loser(), winner(true)};
         DiagnosticReporter           rep2;
