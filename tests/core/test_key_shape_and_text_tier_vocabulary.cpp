@@ -466,7 +466,7 @@ struct HirAttrVocabulary {
 // Everything else is the minimum a module needs, so a diagnostic can only be
 // about the hole.
 [[nodiscard]] std::string mirGlobalModule(std::string_view globalTail) {
-    return std::string{"dssir 6\n"
+    return std::string{"dssir 7\n"
                        "symbols { %1 \"f\" %2 \"g\" }\n"
                        "module {\n"
                        "  global %2 : "} + std::string{globalTail} + "\n"
@@ -594,7 +594,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
     // in the test. Found only because a sibling pin added a POSITIVE control and
     // the control reddened; the negative arm alone can never see this.
     auto const module = [](std::string_view marker) {
-        return std::string{"dssir 6\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -680,7 +680,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
 // anchored for later.
 TEST(TextTierVocabulary, UnknownMirCallingConventionIsRefusedAndNamesTheAcceptedSet) {
     auto const module = [](std::string_view cc) {
-        return std::string{"dssir 6\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void cc "} +
@@ -982,7 +982,7 @@ TEST(TextTierVocabulary, UnknownMirLiteralCoreIsRefusedAndNamesTheAcceptedSet) {
 // is this file's own rule, written beside the inline-asm arm.
 TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
     auto const module = [](char const* arms, char const* extraBlock) {
-        return std::string{"dssir 6\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1021,7 +1021,7 @@ TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
 // SILENT. `%b`, `%vx`, `%b3x` all fell out of the prefix-stripping loop as 0.
 TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 6\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1064,7 +1064,7 @@ TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
 // crash is not a guard.
 TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 6\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1097,7 +1097,7 @@ TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
 // the two arms pinned above were being converted in the same file.
 TEST(TextTierVocabulary, MirFunctionAttributeRefusalProjectsBindingAndVisibility) {
     auto const module = [](std::string_view attr) {
-        return std::string{"dssir 6\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void ["} + std::string{attr} + "] {\n"

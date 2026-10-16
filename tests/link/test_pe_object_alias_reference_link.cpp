@@ -84,14 +84,6 @@ constexpr CompileConfig kConfigs[] = {CompileConfig::Debug, CompileConfig::Relea
         && buildObj(dir, "entry", test::pe_raw_entry::kSource, config, rep);
 }
 
-[[nodiscard]] bool mingwGccOnPath() {
-#if defined(_WIN32)
-    return std::system("where gcc >nul 2>&1") == 0;
-#else
-    return false;
-#endif
-}
-
 }  // namespace
 
 TEST(PeObjectAliasReferenceLinkNative, LinkExeCallsTheStaticBodyThroughItsGlobalAlias) {
@@ -118,9 +110,11 @@ TEST(PeObjectAliasReferenceLinkNative, LinkExeCallsTheStaticBodyThroughItsGlobal
 }
 
 TEST(PeObjectAliasReferenceLinkNative, MingwCallsTheStaticBodyThroughItsGlobalAlias) {
-    if (!mingwGccOnPath()) GTEST_SKIP() << "no MinGW `gcc` on PATH, or not a Windows host -- the MinGW arm is inert";
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "pe-alias-ref-link"};
     auto const dir = scratch.path();
+    auto const gcc = test_support::native_probe::locateMingwGcc(dir);
+    if (gcc.toolAbsent()) GTEST_SKIP() << gcc.detail;
+    ASSERT_TRUE(gcc.ok()) << gcc.describe();
     for (CompileConfig const config : kConfigs) {
         SCOPED_TRACE(configName(config));
         DiagnosticReporter rep;

@@ -32,7 +32,7 @@
 //
 // Text grammar (representative):
 //
-//   dssir 6
+//   dssir 7
 //   types {
 //     type 1 = struct "Node" {i32, ptr<type 1>}
 //     type 2 = union "U" {i32, f32}
@@ -85,6 +85,13 @@
 // A v5 text is refused by the version check: its `weak` named neither kind, and the object formats
 // spell the two differently.
 //
+// ★ v7 (P69, lane `cs`): A MODULE STATES ITS ALIASES — `alias %A [linkage] = %T` after its
+// functions and globals, one more name `%A` on the definition `%T` (`MirAlias`, the compiled
+// `alias("target")`), with the alias's own linkage words. The item first appeared inside v6, which
+// left two grammars under one number: a reader built before it refuses the item by name ("expected
+// 'global' or 'function'") — loud, but a version that no longer says what a text spells. So the
+// step: a v6 text is refused by the version check, and a v6 reader refuses a v7 text by its header.
+//
 // HISTORY of the format's version (the reader accepts exactly the current one):
 //   1  the first form.
 //   2  composites defined once, in a `types` section (above).
@@ -92,6 +99,7 @@
 //   4  `unreachable trap`; `float nanbits <u64>`.
 //   5  a union value names its member (above).
 //   6  a weak definition states its kind; `tentative` (above).
+//   7  a module states its aliases, `alias %A [linkage] = %T` (above).
 //
 // ★★ ONE INSTRUCTION PER LINE, and it is a RULE of this grammar rather than a
 // habit of the emitter. `parseInstruction` refuses any instruction whose line

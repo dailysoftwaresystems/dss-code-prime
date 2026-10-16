@@ -14253,6 +14253,30 @@ struct Lowerer {
             }
             TypeId type = InvalidType;
             if (auto const* rec = model.recordFor(sym)) type = reprOf(rec->type);
+            // P69 (lane `cs`): the declaration that survived the merge of an OBJECT
+            // ALIAS's name at file scope — a `static` alias, or a tentative declaration
+            // of the name the alias absorbed (the semantic tier cleared its tentative
+            // fact). A second name of its target's storage, with no storage of its own.
+            // With external linkage it lowers as the reference it is, exactly as the
+            // `extern` arm lowers one (a use reaches the alias BY NAME), an unbound row
+            // the link resolves to the alias; with internal linkage there is no name a
+            // reference could reach (its uses were bound to the target) and it lowers to
+            // nothing. The alias row is the caller's, with this declarator's linkage.
+            if (asGlobal) {
+                if (auto const* ar = model.recordFor(sym);
+                    ar != nullptr && ar->aliasTarget.valid()) {
+                    if (!ar->isInternalLinkage) {
+                        HirNodeId const ref = track(builder.makeExternGlobal(type, sym.v), d);
+                        HirExternRecord row{ref, ar->name, {}, /*noLibraryBinding=*/true, {}};
+                        row.asmName  = ar->asmName;
+                        row.linkName = ar->linkName;
+                        externDecls.push_back(std::move(row));
+                        recordThreadLocal(ref, sym);
+                        pushOut(ref, d);
+                    }
+                    continue;
+                }
+            }
             // The init = the init-declarator's visible Internal child that
             // is NOT the declarator (`[declarator, '=', initValue]`).
             // P65: through the SHARED `initDeclaratorInitNode` — this used to be
@@ -15229,6 +15253,19 @@ struct Lowerer {
             }
             recordLinkage(out[i], attr, sym);
         }
+        // P69 (lane `cs`): the ALIAS ROW of an object alias whose surviving declaration
+        // is one of these (`lowerVarLikeInto` lowered no storage for it), with that
+        // declarator's folded linkage. A record that names no target records nothing; a
+        // function's alias row is the prototype arm's.
+        for (std::size_t k = 0; k < declarators.size(); ++k) {
+            NodeId const nameNode = declaratorNameNode(tree(), declarators[k], dc);
+            if (!nameNode.valid()) continue;
+            SymbolId const sym = model.symbolAt(nameNode);
+            auto const* rec = model.recordFor(sym);
+            if (rec == nullptr || rec->isAbsorbedProto || rec->kind != DeclarationKind::Variable)
+                continue;
+            recordSymbolAlias(sym, perDeclarator[k]);
+        }
     }
 
     // topLevelDecl → Function (when the kindByChild discriminator resolves to
@@ -15885,13 +15922,17 @@ struct Lowerer {
             //     initializer", MSVC C2205).
             // P69 (lane `cs`): an OBJECT alias — its name is a second name of the
             // target's storage, so whatever initializer it wrote is not emitted (the
-            // semantic tier warned it ignored: gcc's reading) and the declaration
-            // lowers as the reference it is, beside the alias row.
+            // semantic tier warned it ignored: gcc's reading). With external linkage
+            // the declaration lowers as the reference it is, beside the alias row: a
+            // use reaches the alias BY NAME. With internal linkage there is no name a
+            // reference could reach — the semantic tier bound its uses to the target —
+            // so the alias row is all it lowers to.
             if (rec->aliasTarget.valid()) {
+                recordSymbolAlias(sym, mergedLinkage);
+                if (rec->isInternalLinkage) continue;
                 HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), d);
                 recordExtern(g, sym, mergedLinkage);
                 recordThreadLocal(g, sym);
-                recordSymbolAlias(sym, mergedLinkage);
                 out.push_back(g);
                 continue;
             }

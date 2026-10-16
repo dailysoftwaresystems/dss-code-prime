@@ -253,10 +253,10 @@ set(_DSS_TB_NAMED
     "anchor_rows_selftest_guard|237|237|237"
     # ★ program/test_driver_argument_supply: NAMED 2026-10-15 (cycle P69, lane lm's promotion fold), when its
     # debug ceiling passed 60 s. ✔MEASURED, PASSING, whole-suite runs of the lane's fold on this workstation's
-    # everyday load: windows-x86_64 Debug (MinGW) 76.77 s and 60.52 s; windows-x86_64 Release (MSVC) 58.24 s and
-    # 32.23 s; macos-arm64 Debug 23.10 s. Sanitized is NOT measured and takes the unit ceiling until the round
-    # close's sanitized run reads it.
-    "program/test_driver_argument_supply|53|59|77"
+    # everyday load: windows-x86_64 Debug (MinGW) 84.12 s (run 20261015-132816-532e3210), 76.77 s and 60.52 s;
+    # windows-x86_64 Release (MSVC) 58.24 s and 32.23 s; macos-arm64 Debug 23.10 s. Sanitized is NOT measured and
+    # takes the unit ceiling until the round close's sanitized run reads it.
+    "program/test_driver_argument_supply|53|59|85"
     "core/test_type_kind_vocabulary_projection|103|4|17"
     "analysis/semantic/test_fc3_width_semantics|96|6|19"
     "analysis/preprocess/test_preprocess_no_rework|94|5|18"

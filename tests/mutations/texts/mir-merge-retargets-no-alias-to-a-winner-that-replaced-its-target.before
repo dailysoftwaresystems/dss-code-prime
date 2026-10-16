@@ -1,1 +1,1 @@
-                                  SupersededDefinition::ReplacedWhole}) {
+                } else if (answer == std::optional{SupersededDefinition::ReplacedWhole}) {

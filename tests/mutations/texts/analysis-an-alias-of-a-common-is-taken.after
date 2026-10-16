@@ -1,1 +1,1 @@
-        if (false && targetWritesCommon) {
+        if (false && targetWritesCommon && !targetInitialized) {

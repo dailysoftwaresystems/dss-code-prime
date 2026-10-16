@@ -230,34 +230,6 @@ TEST(PeObjectUnwindReferenceLink, EveryRuntimeFunctionOfACompiledObjectNamesItsO
     EXPECT_GE(pastZero, 3u) << "the pin needs functions past `.text` offset 0 to mean anything";
 }
 
-namespace {
-
-// MinGW's linker, reached through the `gcc` on PATH (`-nostartfiles -e <the raw
-// entry>` keeps the CRT out: the subject is ONE object, beside the entry's).
-// `where` is Windows-only, so on any other host this reports ABSENT.
-struct MingwGcc {
-    bool usable = false;
-    std::string detail;
-};
-
-[[nodiscard]] MingwGcc locateMingwGcc() {
-    MingwGcc g;
-#if defined(_WIN32)
-    if (std::system("where gcc >nul 2>&1") != 0) {
-        g.detail = "no MinGW `gcc` on PATH -- the MinGW arm is inert on this host";
-        return g;
-    }
-    g.usable = true;
-#else
-    // `where` and `nul` are cmd.exe's: on a POSIX shell `>nul` creates a FILE named
-    // `nul` in the working directory, and a MinGW toolchain is not this host's anyway.
-    g.detail = "not a Windows host -- the MinGW arm is inert here";
-#endif
-    return g;
-}
-
-}  // namespace
-
 TEST(PeObjectUnwindReferenceLinkNative, LinkExeImageFindsEveryFunctionsOwnEntry) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "pe-unwind-ref-link"};
     auto const dir = scratch.path();
@@ -287,8 +259,12 @@ TEST(PeObjectUnwindReferenceLinkNative, LinkExeImageFindsEveryFunctionsOwnEntry)
 TEST(PeObjectUnwindReferenceLinkNative, MingwImageFindsEveryFunctionsOwnEntry) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "pe-unwind-ref-link"};
     auto const dir = scratch.path();
-    auto const gcc = locateMingwGcc();
-    if (!gcc.usable) GTEST_SKIP() << gcc.detail;
+    // MinGW's linker, reached through the `gcc` on PATH that reports MinGW-w64's x86-64
+    // target (`-nostartfiles -e <the raw entry>` keeps the CRT out: the subject is ONE
+    // object, beside the entry's).
+    auto const gcc = test_support::native_probe::locateMingwGcc(dir);
+    if (gcc.toolAbsent()) GTEST_SKIP() << gcc.detail;
+    ASSERT_TRUE(gcc.ok()) << gcc.describe();
 
     DiagnosticReporter rep;
     auto const obj = buildObj(dir, rep);

@@ -494,7 +494,10 @@ round's close; each checkpoint's commit message says what was and was not run on
   check-orphan-tests READ from main on windows-x86_64-debug and linux-x86_64-debug at checkpoint 26: passed.
 - **Checkpoint 26 (2026-10-15) = the library lane's PROMOTION FOLD** (with the review of checkpoint 21): a
   bit-field narrower than `int` is promoted (ISO C 6.3.1.1, gcc, clang; cl promotes none — decided for the three
-  that agree), every descent reading the one statement of a bit-field's value width; a plain `char` bit-field's
+  that agree) — NOT yet by one rule in every tier: the review of this checkpoint (SEND BACK, 2 BLOCKERs) READ the
+  constant tier promoting every bit-field read, `({ g.b; })` included, where the typer and the run time promote
+  only a bit-field's value, and the evaluator's conditional returning the selected arm unbalanced
+  (`(1 ? 5 : 0u) - 6 < 0` folds true, runs false) — defect (9) below; a plain `char` bit-field's
   sign is the TARGET's in both tiers (defect (7) above, fixed); a named constant of a type with no constant value is
   no constant (defect (8), fixed — the complex half of constant evaluation is a row of its own, ruled to the NEXT
   CYCLE: `D-C-NEITHER-CONSTANT-EVALUATOR-HOLDS-A-COMPLEX-VALUE`); a `__try` filter is left only by its value; a
@@ -502,6 +505,20 @@ round's close; each checkpoint's commit message says what was and was not run on
   built). ✔MEASURED by the lane on its bytes: macos-arm64-debug and linux-x86_64-debug 2800 of 2800;
   windows-x86_64-debug and -release 2828 of 2829 (the one red xa's cl arm). The registry: 822 arms, every section
   sorted; `unsuppressable_codes.cpp`'s extent 202 (two lanes each added a member — a plain merge kept 201).
+- **Checkpoint 27 (2026-10-16) = the C front end lane's fold f25** (with the review of checkpoint 24): an alias
+  whose target's copy the link discards WHOLE (PE's select-any kind) — its own unit's uses name the winner,
+  another unit's use is refused `K_SymbolUndefined` in the linker's words, an unused declaration is taken (the
+  object route's own-unit half is the linker's, in lane xa's fold 3c); the review's sixteen findings, each
+  reference cell measured first: a `static` object alias with no initializer is admitted (and a static alias's own
+  record is no definition of its name); `nocommon` on a later tentative declaration decided by gcc's reading (a
+  meaning split, recorded in the row); a pointer reads its composite type before the declaration that completes
+  it; a function and an object alias of one another keep ONE storage (clang's address model, its cost recorded);
+  the initializer exemption only for `extern`; `.dssir` v7 (a v6 text refused, pinned); one `locateMingwGcc`. The
+  six arms that died with exit 134 now fail by name. ✔MEASURED by the lane on its 28 affected entries:
+  macos-arm64-debug, windows-x86_64-debug, linux-x86_64-debug passed; NOT run by it: linux-arm64-debug (its host
+  short of disk), windows-x86_64-release. The registry: 834 arms, merged by arm by the tool, 0 out of order.
+  KNOWN RED of our own guard: `check-line-endings` refuses the lane's `m.target.back() == '\r'` (its unanchored
+  verb `rg` matches inside `target`) — the harness lane fixes the guard in H4.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -515,7 +532,8 @@ round's close; each checkpoint's commit message says what was and was not run on
   initializer's type instead of its declared one (10 of 13; the reader is older, the code that acts on a folded
   condition came with checkpoint 5). FIXED by checkpoint 21;
   (5) found with them, the BASE's and silent: a bit-field narrower than `int` is NOT promoted (`if (v.b - 6 < 0)`
-  over `unsigned b : 3` goes the wrong way at run time) — a P0 row with that fold, built first in its next one;
+  over `unsigned b : 3` goes the wrong way at run time) — BUILT by checkpoint 26, but not yet by one rule in every
+  tier: defect (9);
   (6) the BASE's, ✔MEASURED 2026-10-12 by the C front end lane, three references exiting 42 (gcc, clang,
   mingw-w64 gcc; Apple clang refuses `alias` by name, cl has no `__attribute__`): `__attribute__((alias("g")))`
   is DROPPED with the warning `H_UnknownLinkageSpecifier` — the two plain aliases are then refused at link
@@ -525,9 +543,14 @@ round's close; each checkpoint's commit message says what was and was not run on
   (7) A REGRESSION OF CHECKPOINT 21 (the review of that fold, INFERRED by reading; the library lane MEASURED it on
   pe64, both pipelines): a plain `char` bit-field is read SIGNED by the constant tier on a signed-char target and
   UNSIGNED by the run time, so a folded condition marks reachable code unreachable and a correct program dies of an
-  illegal instruction — the library lane's current fold makes both tiers ask the one target-aware char sign;
-  (8) with it: a named constant of `_Complex` type is still read at its initializer's type (the same death) — the
-  same fold.
+  illegal instruction — FIXED by checkpoint 26 (both tiers ask the one target-aware char sign);
+  (8) with it: a named constant of `_Complex` type was read at its initializer's type (the same death) — FIXED by
+  checkpoint 26 (no constant; the complex half of constant evaluation is its own row, ruled to the next cycle);
+  (9) IN MAIN SINCE CHECKPOINT 26 (its review, READ; the library lane measures each cell before fixing it): the
+  constant tier promotes every bit-field read while the typer and the run time promote only a bit-field's value,
+  and the evaluator's conditional returns the selected arm without the usual arithmetic conversions — a folded
+  condition marks reachable code unreachable (`if (({ g.b; }) - 6 < 0)`, `(1 ? 5 : 0u) - 6 < 0`); the library
+  lane's P0 fold, one rule for a read's type in all three tiers and the arms balanced in both.
 - **Arm sweeps from the main checkout so far:** the registry held 502 arms at checkpoint 17 (606 at checkpoint 22).
   The sweep of 340 owed arms at checkpoint 20 (2026-10-15, `macos-arm64-debug`): 155 `passed`; 158 `violated`,
   18 `survived`, 6 `unattributed`, and 3 `stopped` because their runner's unmutated binary had a red in the worker

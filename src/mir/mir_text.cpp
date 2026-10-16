@@ -192,7 +192,11 @@ namespace {
 // definition as the bare word, which is no module a v6 builder makes (a weak definition of no stated
 // kind is refused: the object formats spell the two kinds differently), so a v6 reader refuses the
 // bare word by name and a v5 reader has no rule for the argument.
-constexpr int kVersion = 6;
+// v7 (P69, lane `cs`, the review of the alias fold): a module states its ALIASES, `alias %A [linkage]
+// = %T`. The item first appeared inside v6, where a reader built before it refuses it by name — two
+// grammars under one number. The step makes the header say which: a v6 text is refused here, and a v6
+// reader refuses a v7 text before reading an item.
+constexpr int kVersion = 7;
 
 // The canonical quiet NaN is core's `kCanonicalQuietNanBits` (core/types/wide_float_value.hpp,
 // P69 review n13): the ONE NaN the text spells `nan`, every other NaN being `float nanbits

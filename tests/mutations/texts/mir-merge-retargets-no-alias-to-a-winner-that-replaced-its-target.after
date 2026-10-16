@@ -1,1 +1,1 @@
-                                  SupersededDefinition::KeepsItsBytes}) {
+                } else if (answer == std::optional{SupersededDefinition::KeepsItsBytes}) {

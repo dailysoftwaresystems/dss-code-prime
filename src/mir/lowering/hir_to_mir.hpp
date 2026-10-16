@@ -471,11 +471,17 @@ lowerToMir(Hir const&               hir,
            HirEnclosingFunctionMap const* enclosingFunctionMap = nullptr,
            // P69 (lane `cs`): the unit's symbol aliases (`HirSymbolAlias`, the GNU
            // `alias("target")` attribute) — each handed to `MirBuilder::addAlias`
-           // once the module's definitions are lowered. Supplied by the driver as
-           // `CstToHirResult::symbolAliases`. Empty (the default) for a caller that
-           // lowers a unit with none, and for a test fixture: an alias that is not
-           // threaded is a name the module does not define, which the link refuses
-           // loudly as undefined, never a silent second meaning.
+           // once the module's definitions are lowered. Supplied by the one
+           // production caller, the driver (`compile_pipeline.cpp`), as
+           // `CstToHirResult::symbolAliases`. Empty (the default) for a test fixture
+           // that lowers a unit with none.
+           // ⚠ THE DEFAULT IS NO SAFE ANSWER FOR A UNIT THAT HAS ONE. An alias left
+           // out is a name the module does not define: an external alias's uses stay
+           // a reference row of its name, which the link refuses as undefined when
+           // the alias is strong — and binds to NOTHING (address 0, the image faulting
+           // where it is read) when it is weak, a weak reference no definition
+           // answers. So every caller lowering a unit the front end produced passes
+           // the table; the default exists for the fixture calls that predate it.
            std::span<HirSymbolAlias const> symbolAliases = {});
 
 } // namespace dss

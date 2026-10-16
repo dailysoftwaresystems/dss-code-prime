@@ -9,7 +9,11 @@
 //   * each alias's name is defined by the object, on the SAME symbol as its target's name;
 //   * a weak alias is a weak definition of its name, a strong one a global one;
 //   * an alias of a module-private (`static`) definition nothing else calls keeps that definition at
-//     release (DCE roots every alias target).
+//     release (DCE roots every alias target);
+//   * the OBJECT shapes the review of the alias fold named that an object can hold — `static` and
+//     `extern` object aliases of `static` and external objects, a hidden alias, a `static` alias of
+//     another type — name their target's storage, each value stored once, and a WEAK alias of a
+//     `static` body is a weak definition of that body.
 // And the formats' side of the decision, which these documents state and the front end reads:
 //   * a Mach-O target refuses an alias BY NAME (every Apple clang refuses one: "aliases are not
 //     supported on darwin") — the Mach-O documents' `symbolAliasUnsupportedReason`, and no other
@@ -102,6 +106,42 @@ constexpr char kAliasUnit[] =
     "extern int dss_tentative_too __attribute__((alias(\"dss_tentative\")));\n"
     "int dss_use(void) { return dss_sum(1, 2) + dss_weak_sum(3, 4) + dss_counter_too + dss_tentative_too; }\n";
 
+// The OBJECT shapes of an alias the review of the alias fold asked for, each with a value no other object of the
+// unit holds, so its storage is found by its BYTES:
+//   * object aliases written `static` — of a `static` object, of an external one — and an external alias of a
+//     `static` object (gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 run each: ✔MEASURED, lane `cs` probe rv
+//     cells 1-3);
+//   * a hidden alias and a `static` alias of an object of another type (probe rv cells 7 and 9: they run
+//     wherever they compile; mingw-w64 gcc ignores the visibility, warned). NOT HERE, each for a reason of its
+//     own: a thread-local alias (rv cell 6) — no thread-local definition can be written to a relocatable object
+//     yet, which is a row of the link tier's own (examples/c/symbol_alias_second_name runs one in an image); and a
+//     protected alias (rv cell 8) — `visibility("protected")` is no linkage specifier of the language document
+//     yet (warned and dropped, ✔MEASURED on this case's first run), which is a row of its own too;
+//   * a WEAK alias of a `static` body (mingw-w64 gcc 13.2.0 writes the pe64 object and runs it, probe al3 cell 22;
+//     its form, ✔MEASURED by probe pw: the body under an EXTERNAL default record, the weak name a weak external
+//     of it).
+constexpr char kObjectShapesUnit[] =
+    "static int dss_s = 1101;\n"
+    "static int dss_s_too __attribute__((alias(\"dss_s\")));\n"
+    "extern int dss_s_ext __attribute__((alias(\"dss_s\")));\n"
+    "int dss_e = 1202;\n"
+    "static int dss_e_private __attribute__((alias(\"dss_e\")));\n"
+    "int dss_h = 1404;\n"
+    "extern int dss_h_hidden __attribute__((alias(\"dss_h\"), visibility(\"hidden\")));\n"
+    "static int dss_word = 1505;\n"
+    "static unsigned char dss_word_low __attribute__((alias(\"dss_word\")));\n"
+    "static int dss_private_fn(void) { return 42; }\n"
+    "int dss_weak_fn(void) __attribute__((weak, alias(\"dss_private_fn\")));\n"
+    "int dss_use_shapes(void) {\n"
+    "    return dss_s_too + dss_s_ext + dss_e_private + dss_h_hidden + dss_word_low + dss_weak_fn();\n"
+    "}\n";
+
+// The 32-bit little-endian value `v` as the bytes of an object holding it.
+[[nodiscard]] std::vector<std::uint8_t> wordBytes(std::uint32_t v) {
+    return {static_cast<std::uint8_t>(v), static_cast<std::uint8_t>(v >> 8), static_cast<std::uint8_t>(v >> 16),
+            static_cast<std::uint8_t>(v >> 24)};
+}
+
 }  // namespace
 
 TEST(CompiledSymbolAliasObject, EachAliasIsOneMoreNameOnItsTargetsDefinitionInTheObject) {
@@ -158,6 +198,82 @@ TEST(CompiledSymbolAliasObject, EachAliasIsOneMoreNameOnItsTargetsDefinitionInTh
             bool bodyKept = false;
             for (auto const& fn : object->functions) bodyKept = bodyKept || fn.symbol == exported->symbol;
             EXPECT_TRUE(bodyKept) << "the `static` body an alias names was removed: its alias names nothing";
+        }
+    }
+}
+
+TEST(CompiledSymbolAliasObject, EachObjectAliasShapeIsOneMoreNameOnItsStorage) {
+    for (ObjectPair const& pair : kPairs) {
+        for (CompileConfig const config : kConfigs) {
+            SCOPED_TRACE(std::string{pair.target} + ":" + pair.format + ", "
+                         + (config == CompileConfig::Release ? "release" : "baseline"));
+            ScratchDir scratch{Location::InsideRepo, "compiled-alias-shapes"};
+            auto const src = writeText(scratch.path(), "unit.c", kObjectShapesUnit);
+            Program    p;
+            p.setOutputDir(scratch.path());
+            p.setCompileConfig(config);
+            DiagnosticReporter rep;
+            ASSERT_EQ(p.compileFiles({src.string()}, "c", {std::string{pair.target} + ":" + pair.format}, rep), 0)
+                << diagnosticsOf(rep);
+            auto const bytes  = readFileBytes(scratch.path() / (std::string{"unit"} + pair.extension));
+            auto const target = TargetSchema::loadShipped(pair.target);
+            auto const format = ObjectFormatSchema::loadShipped(pair.format);
+            ASSERT_TRUE(target && format);
+            DiagnosticReporter readRep;
+            auto const object = pair.pe ? pe::readRelocatableObject(bytes, **target, **format, readRep)
+                                        : elf::readRelocatableObject(bytes, **target, **format, readRep);
+            ASSERT_TRUE(object.has_value()) << diagnosticsOf(readRep);
+            auto const rowNamed = [&](std::string_view name) -> ModuleSymbol const* {
+                for (auto const& s : object->symbols) {
+                    if (s.name == name) return &s;
+                }
+                return nullptr;
+            };
+            auto const storageHolding = [&](std::uint32_t value) {
+                std::vector<SymbolId> at;
+                auto const            want = wordBytes(value);
+                for (auto const& d : object->dataItems) {
+                    if (d.bytes == want) at.push_back(d.symbol);
+                }
+                return at;
+            };
+            // Every value is stored ONCE: no alias is storage of its own.
+            for (std::uint32_t const v : {1101u, 1202u, 1404u, 1505u}) {
+                SCOPED_TRACE(v);
+                EXPECT_EQ(storageHolding(v).size(), 1u)
+                    << "the value is stored more than once, or not at all: an alias was given storage of its own";
+            }
+            // Each EXTERNAL alias is one more name on its target's storage, with its own binding (and, on ELF, its
+            // own visibility: COFF has none to state, and mingw-w64 gcc ignores the attribute there, warned).
+            struct Named {
+                char const*      alias;
+                std::uint32_t    value;
+                SymbolVisibility visibility;
+            };
+            for (Named const n : {Named{"dss_s_ext", 1101u, SymbolVisibility::Default},
+                                  Named{"dss_h_hidden", 1404u, SymbolVisibility::Hidden}}) {
+                SCOPED_TRACE(n.alias);
+                ModuleSymbol const* row = rowNamed(n.alias);
+                ASSERT_NE(row, nullptr) << "the alias's name is not a record of the object";
+                EXPECT_EQ(row->binding, SymbolBinding::Global);
+                auto const at = storageHolding(n.value);
+                ASSERT_EQ(at.size(), 1u);
+                EXPECT_EQ(row->symbol, at.front()) << "the alias is not one more name on its target's storage";
+                if (!pair.pe) EXPECT_EQ(row->visibility, n.visibility) << "the alias's own visibility";
+            }
+            // A module-private alias is never an exported name.
+            for (char const* name : {"dss_s_too", "dss_e_private", "dss_word_low"}) {
+                for (auto const& s : object->symbols) {
+                    if (s.name == name) EXPECT_EQ(s.binding, SymbolBinding::Local) << name << " is exported";
+                }
+            }
+            // The weak alias of a `static` body: a weak definition of the body's bytes.
+            ModuleSymbol const* weak = rowNamed("dss_weak_fn");
+            ASSERT_NE(weak, nullptr) << "the weak alias of a `static` body is not a record of the object";
+            EXPECT_EQ(weak->binding, SymbolBinding::Weak);
+            bool onTheBody = false;
+            for (auto const& fn : object->functions) onTheBody = onTheBody || fn.symbol == weak->symbol;
+            EXPECT_TRUE(onTheBody) << "the weak alias does not name the `static` body";
         }
     }
 }

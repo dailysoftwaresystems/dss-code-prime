@@ -197,6 +197,21 @@ TEST(IncompleteArrayType, APointerToAnArrayOfUnknownSizeIsCompatibleWithOneOfAny
         EXPECT_EQ(arrayLength(m, "probe"), std::optional<std::int64_t>{13})
             << "the object's type is the composite, a pointer to three elements" << everyDiagnostic(m);
     }
+    // C 6.2.7p4 ONE POINTER DOWN: a use BEFORE the declaration that completes the pointee reads the pointer to an
+    // array of unknown size written so far, a use after it the composite. ✔MEASURED (lane `cs` probe rv3 cells 1
+    // and 2): `sizeof *p` of `extern int (*p)[];` is 0 under cl 19.51 (C4034) — the language document's
+    // `sizeof.incompleteArraySize`, said — and refused by gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0; the
+    // redeclaration with three elements is built by gcc and clang (probe ak) and refused by cl (C2369). Each reading
+    // is taken where a reference gives it: `before` reads 0 + 1, `after` 12 + 1.
+    {
+        SemanticModel const m = analyzeWithLayout(
+            "extern int (*p)[];\nchar before[sizeof *p + 1];\nint (*p)[3];\nchar after[sizeof *p + 1];\n");
+        EXPECT_FALSE(m.hasErrors()) << everyDiagnostic(m);
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_SizeofIncompleteArrayIsZero), 1u) << everyDiagnostic(m);
+        EXPECT_EQ(arrayLength(m, "before"), std::optional<std::int64_t>{1})
+            << "a use before the completing declaration read its composite" << everyDiagnostic(m);
+        EXPECT_EQ(arrayLength(m, "after"), std::optional<std::int64_t>{13}) << everyDiagnostic(m);
+    }
     // CONTROLS: two KNOWN sizes that differ are not compatible, in a conversion or a redeclaration.
     {
         SemanticModel const c = analyzeWithLayout("extern int (*p)[2];\nint (*p)[3];\n");

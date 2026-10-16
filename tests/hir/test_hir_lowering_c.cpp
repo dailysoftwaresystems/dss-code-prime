@@ -41,6 +41,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -289,6 +290,16 @@ namespace {
     return model.lattice().interner().kind(res->hir.typeId(shift));
 }
 
+// The value a RETURN statement returns, read only once the node IS one with a value: nullopt for any other node
+// and for a `return;`. `Hir::returnValue` ASSERTS the node's kind and hands back an optional, so a test that took a
+// body's child on faith and read it there ABORTED the binary when a lowering put another node in its place — and
+// every test after it was never run (the arm `hir-a-body-that-terminates-is-completed-too`: exit 134 at
+// CallAndTypedef, no report). Each reader asserts what it got, by name.
+[[nodiscard]] std::optional<HirNodeId> returnedValue(Hir const& h, HirNodeId stmt) {
+    if (!stmt.valid() || h.kind(stmt) != HirKind::ReturnStmt) return std::nullopt;
+    return h.returnValue(stmt);
+}
+
 } // namespace
 
 TEST(HirLoweringC, EmptyVoidFunction) {
@@ -386,7 +397,9 @@ TEST(HirLoweringC, ArithmeticAndParams) {
     auto stmts = res->hir.children(body);
     ASSERT_EQ(stmts.size(), 1u);
     ASSERT_EQ(res->hir.kind(stmts[0]), HirKind::ReturnStmt);
-    HirNodeId ret = *res->hir.returnValue(stmts[0]);
+    auto const retValue = returnedValue(res->hir, stmts[0]);
+    ASSERT_TRUE(retValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId ret = *retValue;
     EXPECT_EQ(res->hir.kind(ret), HirKind::BinaryOp);           // a + b
 }
 
@@ -964,7 +977,9 @@ TEST(HirLoweringC, CallAndTypedef) {
     // f's body returns a Call.
     HirNodeId fbody = res->hir.functionBody(decls[2]);
     HirNodeId ret = res->hir.children(fbody)[0];
-    EXPECT_EQ(res->hir.kind(*res->hir.returnValue(ret)), HirKind::Call);
+    auto const value = returnedValue(res->hir, ret);
+    ASSERT_TRUE(value.has_value()) << "the node read as a return statement is not one with a value";
+    EXPECT_EQ(res->hir.kind(*value), HirKind::Call);
 }
 
 // D-LANG-POINTER-VOID-CONVERT (audit-fold G4, step 13.2, 2026-06-02):
@@ -996,7 +1011,9 @@ TEST(HirLoweringC, CoerceEmitsCastForCharPtrToVoidPtrArg) {
     ASSERT_GE(stmts.size(), 1u);
     // Last statement is `return handler(s);` — find its Call.
     HirNodeId const ret = stmts.back();
-    HirNodeId const call = *res->hir.returnValue(ret);
+    auto const callValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(callValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId const call = *callValue;
     ASSERT_EQ(res->hir.kind(call), HirKind::Call);
     // Call children: [callee, arg0, arg1, ...]
     auto const callKids = res->hir.children(call);
@@ -1037,7 +1054,9 @@ TEST(HirLoweringC, CoerceEmitsCastForVoidPtrToCharPtrArg) {
     HirNodeId const mainBody = res->hir.functionBody(decls.back());
     auto const stmts = res->hir.children(mainBody);
     HirNodeId const ret = stmts.back();
-    HirNodeId const outerCall = *res->hir.returnValue(ret);
+    auto const outerCallValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(outerCallValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId const outerCall = *outerCallValue;
     ASSERT_EQ(res->hir.kind(outerCall), HirKind::Call);
     auto const outerKids = res->hir.children(outerCall);
     ASSERT_EQ(outerKids.size(), 2u);
@@ -1112,7 +1131,9 @@ TEST(HirLoweringC, ExplicitCastOfStringLiteralLowersViaDecay) {
     auto const stmts = res->hir.children(mainBody);
     ASSERT_GE(stmts.size(), 1u);
     HirNodeId const ret = stmts.back();
-    HirNodeId const outer = *res->hir.returnValue(ret);
+    auto const outerValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(outerValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId const outer = *outerValue;
     // (int) ← (long) ← decay(Ptr<Char>) ← "xy"
     ASSERT_EQ(res->hir.kind(outer), HirKind::Cast);
     EXPECT_EQ(ti.kind(res->hir.typeId(outer)), TypeKind::I32);
@@ -1682,7 +1703,7 @@ TEST(HirLoweringC, MemberAccessLowersToHirMemberAccess) {
     ASSERT_EQ(stmts.size(), 1u);
     HirNodeId const ret = stmts[0];
     ASSERT_EQ(res->hir.kind(ret), HirKind::ReturnStmt);
-    auto const retVal = res->hir.returnValue(ret);
+    auto const retVal = returnedValue(res->hir, ret);
     ASSERT_TRUE(retVal.has_value());
     HirNodeId const access = *retVal;
     ASSERT_EQ(res->hir.kind(access), HirKind::MemberAccess);
@@ -1818,7 +1839,7 @@ TEST(HirLoweringC, DotMemberAccessLowersWithoutDeref) {
     auto stmts = res->hir.children(body);
     ASSERT_EQ(stmts.size(), 1u);
     HirNodeId const ret = stmts[0];
-    auto const retVal = res->hir.returnValue(ret);
+    auto const retVal = returnedValue(res->hir, ret);
     ASSERT_TRUE(retVal.has_value());
     HirNodeId const access = *retVal;
     ASSERT_EQ(res->hir.kind(access), HirKind::MemberAccess);
@@ -2264,7 +2285,9 @@ TEST(HirLoweringC, ValueYieldingIncrementLowersToSeqExpr) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     HirNodeId ret  = res->hir.children(body)[0];
-    HirNodeId val  = *res->hir.returnValue(ret);
+    auto const valValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(valValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId val  = *valValue;
     ASSERT_EQ(res->hir.kind(val), HirKind::SeqExpr);
     // stmts: [var tmp = x, assign x = x+1]; result: ref tmp.
     EXPECT_EQ(res->hir.seqExprStmts(val).size(), 2u);
@@ -2443,12 +2466,16 @@ TEST(HirLoweringC, AtomicIncrementYieldsTheReplacedOrRecomputedValueNeverAReRead
     ASSERT_EQ(bodies.size(), 2u);
 
     HirNodeId const postRet = res->hir.children(bodies[0])[0];
-    HirNodeId const postVal = peelCasts(res->hir, *res->hir.returnValue(postRet));
+    auto const postReturned = returnedValue(res->hir, postRet);
+    ASSERT_TRUE(postReturned.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId const postVal = peelCasts(res->hir, *postReturned);
     EXPECT_EQ(res->hir.kind(postVal), HirKind::ReadModifyWrite)
         << "postfix's result IS the value the read-modify-write replaced";
 
     HirNodeId const preRet = res->hir.children(bodies[1])[0];
-    HirNodeId const preVal = peelCasts(res->hir, *res->hir.returnValue(preRet));
+    auto const preReturned = returnedValue(res->hir, preRet);
+    ASSERT_TRUE(preReturned.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId const preVal = peelCasts(res->hir, *preReturned);
     ASSERT_EQ(res->hir.kind(preVal), HirKind::SeqExpr);
     auto const stmts = res->hir.seqExprStmts(preVal);
     ASSERT_EQ(stmts.size(), 1u);
@@ -2657,8 +2684,9 @@ TEST(HirLoweringC, NonTerminatingStraightLineMainNestsImplicitReturnZero) {
     HirNodeId const ret = outerKids[1];
     ASSERT_EQ(res->hir.kind(ret), HirKind::ReturnStmt);
     EXPECT_TRUE(has(res->hir.flags(ret), HirFlags::Synthetic));
-    ASSERT_TRUE(res->hir.returnValue(ret).has_value());
-    EXPECT_EQ(res->hir.kind(*res->hir.returnValue(ret)), HirKind::Literal);
+    auto const value = returnedValue(res->hir, ret);
+    ASSERT_TRUE(value.has_value()) << "the node read as a return statement is not one with a value";
+    EXPECT_EQ(res->hir.kind(*value), HirKind::Literal);
 }
 
 // ── D-HIR-INFINITE-LOOP-NOT-TERMINATING HIR-tier pins ───────────────────────
@@ -5343,7 +5371,9 @@ TEST(HirLoweringC, ReturnOfBoolFromIntFunctionEmitsCast) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     HirNodeId ret  = res->hir.children(body)[0];
-    HirNodeId val  = *res->hir.returnValue(ret);
+    auto const valValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(valValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId val  = *valValue;
     // The returned expression is now `Cast(BinaryOp(Gt, ...), int)`.
     EXPECT_EQ(res->hir.kind(val), HirKind::Cast);
     auto castKids = res->hir.children(val);
@@ -5383,7 +5413,9 @@ TEST(HirLoweringC, TernaryLowersToTernaryNode) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     HirNodeId ret  = res->hir.children(body)[0];
-    HirNodeId tern = *res->hir.returnValue(ret);
+    auto const ternValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(ternValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId tern = *ternValue;
     ASSERT_EQ(res->hir.kind(tern), HirKind::Ternary);
     auto kids = res->hir.children(tern);
     ASSERT_EQ(kids.size(), 3u);
@@ -5425,7 +5457,9 @@ TEST(HirLoweringC, LogicalAndIntOperandsTakeTruthinessNe) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     HirNodeId ret  = res->hir.children(body)[0];
-    HirNodeId tern = *res->hir.returnValue(ret);
+    auto const ternValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(ternValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId tern = *ternValue;
     ASSERT_EQ(res->hir.kind(tern), HirKind::Ternary);
     // The ternary cond is the LogicalAnd itself — already Bool, so
     // coerceCondition adds NO extra node on top of it.
@@ -8424,7 +8458,9 @@ TEST(HirLoweringC, PrefixIncrementValueYieldsNewValue) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     HirNodeId ret  = res->hir.children(body)[0];
-    HirNodeId val  = *res->hir.returnValue(ret);
+    auto const valValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(valValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId val  = *valValue;
     ASSERT_EQ(res->hir.kind(val), HirKind::SeqExpr);
     // stmts: [assign x = x+1] ONLY (no tmp save).
     ASSERT_EQ(res->hir.seqExprStmts(val).size(), 1u)
@@ -8457,10 +8493,13 @@ TEST(HirLoweringC, PrefixVsPostfixDistinctReturn) {
     ASSERT_TRUE(pre->ok);
     auto seqOf = [](auto const& res) {
         HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
-        return *res->hir.returnValue(res->hir.children(body)[0]);
+        return returnedValue(res->hir, res->hir.children(body)[0]);
     };
-    HirNodeId postSeq = seqOf(post);
-    HirNodeId preSeq  = seqOf(pre);
+    auto const postReturned = seqOf(post);
+    auto const preReturned  = seqOf(pre);
+    ASSERT_TRUE(postReturned.has_value() && preReturned.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId postSeq = *postReturned;
+    HirNodeId preSeq  = *preReturned;
     ASSERT_EQ(post->hir.kind(postSeq), HirKind::SeqExpr);
     ASSERT_EQ(pre->hir.kind(preSeq), HirKind::SeqExpr);
     // Distinct stmt counts: postfix saves the old value first (2), prefix does not (1).
@@ -8972,7 +9011,7 @@ TEST(HirLoweringC, DerefOfArrayOperandDecaysToPointer) {
     auto const stmts = res->hir.children(mainBody);
     ASSERT_GE(stmts.size(), 1u);
     HirNodeId const ret = stmts.back();
-    auto const rv = res->hir.returnValue(ret);
+    auto const rv = returnedValue(res->hir, ret);
     ASSERT_TRUE(rv.has_value()) << "the last statement is `return *(a);`";
     HirNodeId const deref = *rv;
     // `*(a)` is a Deref TYPED as the element (int → I32), NOT the pre-fix
@@ -13053,6 +13092,12 @@ TEST(HirLoweringC, AnUncompletedTentativeDefinitionIsMarkedOnItsGlobal) {
                   "_Thread_local int t;\n", false},
              Case{"`nocommon` makes a tentative definition a definition",
                   "__attribute__((nocommon)) int t;\n", false},
+             // Of two tentative declarations the LAST one's `nocommon` is the definition's (gcc's reading of
+             // the split ✔MEASURED by lane `cs` probe rv cells 14 and 15; `settleNoCommon`).
+             Case{"`nocommon` on the later of two tentative declarations is the definition's",
+                  "int t;\n__attribute__((nocommon)) int t;\n", false},
+             Case{"a plain tentative declaration after a `nocommon` one makes it a common again",
+                  "__attribute__((nocommon)) int t;\nint t;\n", true},
              Case{"`common` states the default", "__attribute__((common)) int t;\n",
                   true},
              Case{"a tentative definition an alias names is a definition",

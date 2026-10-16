@@ -10,8 +10,17 @@
 // binds an internal alias's uses to its target. A tentative definition an alias names is a
 // definition of the unit: it is never a common (`tentativeNeverCommon`).
 //
+// An OBJECT alias's declaration is written `extern` (an initializer of its own ignored, warned), or
+// `static` with no initializer: gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 run a `static` alias
+// of a `static` object, an `extern` one of a `static` object, a `static` one of an external object and
+// an external alias of a `static` alias, -O0 and -O2 (✔MEASURED, lane `cs` probes rv cells 1-3, rv3
+// cells 3 and 5). Written with external linkage and no `extern`, or `static` with an initializer, it is
+// a definition of its own, refused by all (probes al2 cell 10, rv cell 10, rv2 cell 1).
+//
 // `nocommon` states that a tentative definition is never written as a common; `common` states the
-// default where the format has commons and is refused by name where it has none.
+// default where the format has commons and is refused by name where it has none. Of several tentative
+// declarations of one name, the LAST one's `nocommon` is the definition's (gcc's reading of a split the
+// references disagree on, `settleNoCommon`).
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
@@ -23,9 +32,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 using namespace dss;
 using namespace dss::sem_test;
@@ -79,6 +90,24 @@ struct Format {
     return false;
 }
 
+// The MERGE SURVIVOR's answer — the one record of the object `name` no other absorbed, which is the
+// record the lowering reads — or nullopt (with a failure) when there is not exactly one.
+[[nodiscard]] std::optional<bool> survivorNeverCommon(SemanticModel const& m, std::string_view name) {
+    SymbolRecord const* survivor = nullptr;
+    std::size_t         count    = 0;
+    for (std::size_t i = 1; i < m.symbols().size(); ++i) {
+        SymbolRecord const& r = m.symbols()[i];
+        if (r.name != name || r.kind != DeclarationKind::Variable || r.isAbsorbedProto) continue;
+        survivor = &r;
+        ++count;
+    }
+    if (count != 1) {
+        ADD_FAILURE() << "the object '" << name << "' has " << count << " surviving records, not one";
+        return std::nullopt;
+    }
+    return survivor->tentativeNeverCommon;
+}
+
 }  // namespace
 
 TEST(SymbolAlias, ASecondNameIsResolvedToTheDefinitionItEndsAt) {
@@ -98,6 +127,33 @@ TEST(SymbolAlias, ASecondNameIsResolvedToTheDefinitionItEndsAt) {
              Case{"static int g(void) { return 41; }\nstatic int f(void) __attribute__((alias(\"g\")));\n"
                   "int use(void) { return f(); }\n",
                   "f", "g"},
+             // OBJECT aliases of each linkage pair (probe rv cells 1-3).
+             Case{"static int t = 5;\nstatic int a __attribute__((alias(\"t\")));\nint use(void) { return a; }\n",
+                  "a", "t"},
+             Case{"static int t = 5;\nextern int a __attribute__((alias(\"t\")));\nint use(void) { return a; }\n",
+                  "a", "t"},
+             Case{"int t = 5;\nstatic int a __attribute__((alias(\"t\")));\nint use(void) { return a; }\n", "a",
+                  "t"},
+             // A tentative declaration of the alias's name, before it (gcc runs it, clang refuses it: probe rv2
+             // cells 2 and 3) and after it (both run it: rv2 cell 4) — no definition beside the alias.
+             Case{"static int t = 5;\nstatic int a;\nstatic int a __attribute__((alias(\"t\")));\n"
+                  "int use(void) { return a; }\n",
+                  "a", "t"},
+             Case{"static int t = 5;\nstatic int a __attribute__((alias(\"t\")));\nstatic int a;\n"
+                  "int use(void) { return a; }\n",
+                  "a", "t"},
+             Case{"int t = 5;\nint a;\nextern int a __attribute__((alias(\"t\")));\nint use(void) { return a; }\n",
+                  "a", "t"},
+             // An external alias of a `static` alias ends at the storage (probe rv3 cell 3): a name an alias
+             // defines is reached as an alias, never as a definition of its own.
+             Case{"static int t = 42;\nstatic int a __attribute__((alias(\"t\")));\n"
+                  "extern int b __attribute__((alias(\"a\")));\nint use(void) { return b; }\n",
+                  "b", "t"},
+             // `common` on an object the unit INITIALIZES makes no common, so the object has a second name
+             // (probe rv cells 11 and 12).
+             Case{"int g __attribute__((common)) = 5;\nextern int a __attribute__((alias(\"g\")));\n", "a", "g"},
+             Case{"int g __attribute__((common));\nint g = 5;\nextern int a __attribute__((alias(\"g\")));\n", "a",
+                  "g"},
          }) {
         SCOPED_TRACE(c.src);
         SemanticModel const m = analyzeC(c.src);
@@ -118,6 +174,8 @@ TEST(SymbolAlias, AnAliasThatNamesNoDefinitionItCanBeIsRefusedByName) {
              "inline int g(void) { return 1; }\nint f(void) __attribute__((alias(\"g\")));\n",
              "int t __attribute__((common));\nextern int a __attribute__((alias(\"t\")));\n",
              "_Thread_local int t = 1;\nextern int a __attribute__((alias(\"t\")));\n",
+             // A `static` object alias that names itself: a cycle (probe rv3 cell 4, refused by all).
+             "static int a __attribute__((alias(\"a\")));\nint use(void) { return a; }\n",
          }) {
         SCOPED_TRACE(src);
         SemanticModel const m = analyzeC(src);
@@ -144,8 +202,16 @@ TEST(SymbolAlias, AnAliasWhereNoSecondNameCanBeIsSaid) {
              Case{"int g(void) { return 1; }\n"
                   "void u(void) { extern int f(void) __attribute__((alias(\"g\"))); }\n",
                   DiagnosticCode::S_AttributeNotHonoured, true},
-             Case{"int v = 3;\nint w __attribute__((alias(\"v\"))) = 4;\n",
+             // Written `extern`, the object alias's own initializer is ignored and said (gcc's reading: gcc and
+             // mingw-w64 gcc warn and run it, clang refuses; probe rv cell 16) ...
+             Case{"int v = 3;\nextern int w __attribute__((alias(\"v\"))) = 4;\n",
                   DiagnosticCode::S_SymbolAliasInitializerIgnored, false},
+             // ... and without `extern` the declaration is a definition of its own, refused by all: with an
+             // initializer (probe rv cell 10), `static` with one (rv2 cell 1), or external with none (al2 cell 10).
+             Case{"int v = 3;\nint w __attribute__((alias(\"v\"))) = 4;\n", DiagnosticCode::S_RedeclaredSymbol, true},
+             Case{"static int v = 3;\nstatic int w __attribute__((alias(\"v\"))) = 4;\n",
+                  DiagnosticCode::S_RedeclaredSymbol, true},
+             Case{"int v = 3;\nint w __attribute__((alias(\"v\")));\n", DiagnosticCode::S_RedeclaredSymbol, true},
          }) {
         SCOPED_TRACE(c.src);
         SemanticModel const m = analyzeC(c.src);
@@ -175,6 +241,19 @@ TEST(SymbolAlias, CommonAndNocommonStateWhatATentativeDefinitionMayBe) {
         SemanticModel const m = analyzeC("int t;\nextern int a __attribute__((alias(\"t\")));\n");
         EXPECT_FALSE(m.hasErrors()) << everyDiagnostic(m);
         EXPECT_TRUE(neverCommon(m, "t")) << "a tentative definition an alias names is a definition";
+    }
+    // Two tentative declarations of one object, `nocommon` on one of them: the MERGE SURVIVOR — the record the
+    // lowering reads — holds the LAST one's answer. ✔MEASURED (probe rv cells 14 and 15, nm under -fcommon):
+    // `int t; int t __attribute__((nocommon));` is a `.bss` definition on gcc 13.3.0, clang 18.1.3 and mingw-w64
+    // gcc 13.2.0; `int t __attribute__((nocommon)); int t;` is a COMMON on gcc and mingw-w64 gcc and a `.bss`
+    // definition on clang — gcc's reading, decided (`settleNoCommon`).
+    for (auto const& [src, never] : {std::pair<char const*, bool>{"int t;\nint t __attribute__((nocommon));\n", true},
+                                     std::pair<char const*, bool>{"int t __attribute__((nocommon));\nint t;\n", false}}) {
+        SCOPED_TRACE(src);
+        SemanticModel const m = analyzeC(src);
+        EXPECT_FALSE(m.hasErrors()) << everyDiagnostic(m);
+        EXPECT_EQ(survivorNeverCommon(m, "t"), std::optional<bool>{never})
+            << "the survivor holds the last tentative declaration's `nocommon`";
     }
     {
         SemanticModel const m = analyzeC("int t __attribute__((common, nocommon));\n");

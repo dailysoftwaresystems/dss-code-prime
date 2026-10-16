@@ -1,1 +1,1 @@
-        if (false && definedHere) {
+        if (!declarationIsTheAlias || (false && definedOtherwise)) {

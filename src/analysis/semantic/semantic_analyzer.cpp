@@ -605,13 +605,17 @@ struct EngineState {
         NodeId      clauseNode{};
         NodeId      nameNode{};
         TreeId      tree{};
-        // The alias declaration wrote an initializer of its own, already warned
-        // ignored: the definition it makes is not a definition "normally".
-        bool        initializerIgnored = false;
+        // The alias declaration wrote an initializer of its own (warned ignored
+        // where it is written `extern`, refused at the end of the unit otherwise).
+        bool        wroteInitializer = false;
+        // The alias declaration is written `extern` — read off its specifiers, not
+        // off the record, whose non-defining fact an initializer overrides.
+        bool        writtenExtern = false;
     };
     std::vector<PendingSymbolAlias> pendingSymbolAliases;
     // P69 (lane `cs`): the records whose declaration wrote `common` — read only to
-    // refuse an alias of such a variable (every reference refuses one). A set of the
+    // refuse an alias of such a variable no declaration initializes (every reference
+    // refuses one; an initialized one is no common and may be aliased). A set of the
     // analyzer's own, not a fact of the model: what `common` means is the format
     // document's, and nothing below this tier asks.
     std::unordered_set<std::uint32_t> symbolsWritingCommon;
@@ -10583,7 +10587,8 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // `typedef int vm_page_info_data_t[];`.
             //   ★ WHY `typeAliasRow` AND NOT `allowFlexibleArray`. Reusing the FAM
             // flag was tried and MEASURED WRONG: it is tested ABOVE the VLA arm (a
-            // struct field's `int a[n]` is deliberately a FAM, not a VLA member), so
+            // struct field's runtime bound is no VLA member — refused there by name,
+            // S_NonConstantArrayLength, since P69), so
             // a typedef carrying it made `typedef int R[n];` stop building a vlaArray
             // and silently become an incomplete array instead. The two are different
             // rules. C's own distinction is TYPE-vs-OBJECT — 6.7.6.2p1 lets a type be
@@ -13848,12 +13853,25 @@ void composeArrayRedeclaration(EngineState& s, SymbolId sym) {
 // ✔MEASURED, probe sz cell 2), and one an EARLIER declaration completed has its size
 // (`int v[10]; int v[]; … sizeof v` is 40). Asked by both readers of a name's type at a
 // use: Pass 2's reference stamp and `subtreeType`'s leaf (Pass 1.5's constants).
-// Anything but an array merge is the record's own type, unchanged.
+// EVERY composite the merge builds is read so, the one a pointer down included
+// (`composeArrayRedeclaration`): between `int (*p)[];` and `int (*p)[3];` a use reads
+// `int (*)[]`, so `sizeof *p` there asks the size of an array of unknown size
+// (✔MEASURED, probe rv cell 13: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and
+// Apple clang refuse it; cl 19.51 gives 0 with C4034, probe rv3 cell 1 — the language
+// document's `sizeof.incompleteArraySize`; it read the composite's 12 before). The declarations written
+// before the use are composed as the merge composes them (`completerOfCompatible`);
+// a name with no partner, or a type the merge never composes, is the record's own.
 [[nodiscard]] TypeId typeVisibleAt(EngineState const& s, Tree const& tree, SymbolId sym,
                                    NodeId at) {
     TypeId const t = s.symbols.at(sym).type;
     auto const& in = s.lattice.interner();
-    if (t.valid() && (in.kind(t) != TypeKind::Array || in.isIncompleteArray(t))) return t;
+    // The types a merge composes. A record Pass 1.5 has not typed yet (an invalid `t`,
+    // asked by a constant evaluated before the record's own pass) reads the declarations
+    // written so far like any other.
+    auto const composed = [&](TypeId ty) {
+        return ty.valid() && (in.kind(ty) == TypeKind::Array || in.kind(ty) == TypeKind::Ptr);
+    };
+    if (t.valid() && !composed(t)) return t;
     if (!at.valid() || !s.redeclarationPartners.contains(sym.v)) return t;
     std::vector<SymbolId> group{sym};
     for (std::size_t i = 0; i < group.size(); ++i) {
@@ -13865,8 +13883,7 @@ void composeArrayRedeclaration(EngineState& s, SymbolId sym) {
                 group.push_back(p);
     }
     auto const where = tree.span(at).start();
-    TypeId sized = InvalidType;
-    TypeId unknownSize = InvalidType;
+    TypeId visible = InvalidType;
     for (SymbolId const r : group) {
         SymbolRecord const& rec = s.symbols.at(r);
         if (rec.tree.v == tree.id().v && rec.declNode.valid()
@@ -13874,11 +13891,16 @@ void composeArrayRedeclaration(EngineState& s, SymbolId sym) {
             continue;   // written after the use
         auto const own = s.ownDeclaredType.find(r.v);
         TypeId const written = own != s.ownDeclaredType.end() ? own->second : rec.type;
-        if (!written.valid() || in.kind(written) != TypeKind::Array) continue;
-        (in.isIncompleteArray(written) ? unknownSize : sized) = written;
+        if (!composed(written) || (t.valid() && in.kind(written) != in.kind(t))) continue;
+        if (!visible.valid()) {
+            visible = written;
+        } else if (in.kind(written) != in.kind(visible)) {
+            continue;
+        } else if (TypeId const c = completerOfCompatible(in, visible, written); c.valid()) {
+            visible = c;
+        }
     }
-    if (sized.valid()) return t.valid() ? t : sized;
-    return unknownSize.valid() ? unknownSize : t;
+    return visible.valid() ? visible : t;
 }
 
 // GAP A: find the scope (anywhere in the tree) whose anchor IS `node` —
@@ -16017,7 +16039,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // initNode.valid()` and hand the OR to the resolver's
                         // `allowFlexibleArray` parameter. The resolver tests that
                         // parameter ABOVE its VLA arm (deliberately — a struct
-                        // field's non-constant bound is a FAM, not a VLA member),
+                        // field's non-constant bound is no VLA member, and is refused
+                        // there by name since P69),
                         // so ANY initialized declarator with a PRESENT-but-non-
                         // constant bound took the FAM path: the written `argc`
                         // bound was DISCARDED and the object re-sized from the
@@ -17493,10 +17516,18 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             "another",
                                             declaredName));
                                 } else {
-                                    if (initNode.valid()) {
-                                        // ✔MEASURED (probe al2 cell 11, al3 cell 1):
-                                        // gcc and mingw-w64 keep the alias and drop the
-                                        // initializer, warned; clang refuses. gcc's.
+                                    // Written `extern` — the specifiers' answer, which an
+                                    // initializer does not override.
+                                    bool const writtenExtern =
+                                        declarationIsNonDefining(cfg, tree, node, decl);
+                                    if (initNode.valid() && writtenExtern) {
+                                        // ✔MEASURED (probe al2 cell 11, al3 cell 1,
+                                        // probe rv cell 16): gcc and mingw-w64 keep the
+                                        // alias and drop the initializer, warned; clang
+                                        // refuses. gcc's. Without `extern` the
+                                        // declaration is a definition of its own,
+                                        // refused at the end of the unit (probe rv cell
+                                        // 10, rv2 cell 1: refused by all).
                                         reportClauseOnce(
                                             alias.clauseNode,
                                             DiagnosticCode::S_SymbolAliasInitializerIgnored,
@@ -17511,7 +17542,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         EngineState::PendingSymbolAlias{
                                             sym, *alias.target, alias.clauseNode,
                                             nameNode, tree.id(),
-                                            /*initializerIgnored=*/initNode.valid()});
+                                            /*wroteInitializer=*/initNode.valid(),
+                                            writtenExtern});
                                 }
                             }
                             bool const commonKept = attrFacts.commonClause.valid()
@@ -17530,6 +17562,11 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         "object",
                                         declaredName));
                             } else if (commonKept) {
+                                // Whether the `common` takes effect is asked ONCE, where
+                                // it is read (`resolveSymbolAliases`): an object some
+                                // declaration of the unit initializes — this one or
+                                // another — is a definition, and `common` on it is
+                                // nothing (probe fs; probe rv cells 11-12).
                                 s.symbolsWritingCommon.insert(sym.v);
                             }
                             if (noCommonKept && commonKept) {
@@ -28489,15 +28526,17 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // known, so only here can three questions be answered, each by what the references
 // do (✔MEASURED, probes al2 and al3: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0):
 //   1. IS THE NAME DEFINED OTHERWISE? An alias declaration IS the definition of its
-//      name: a second alias declaration of it, a definition of it elsewhere, an
-//      object alias not declared `extern` (a tentative definition) — each refused by
-//      all ("redefinition", "defined both normally and as 'alias' attribute").
+//      name: a second alias declaration of it, a definition of it elsewhere (a body,
+//      an initializer), an object alias with external linkage not written `extern`,
+//      a `static` one with an initializer — each refused by all ("redefinition",
+//      "defined both normally and as 'alias' attribute"). A TENTATIVE declaration of
+//      the name is no definition beside it: the alias absorbs it.
 //   2. WHAT IS THE TARGET? The definition of the unit whose SYMBOL name the string
 //      is — an asm label's when the definition has one — reached through any chain
 //      of aliases. Undefined, only declared, a C99 inline definition, a cycle, an
-//      empty name: refused by all. A common (`common` written on it): refused by
-//      all. A thread-local and a non-thread-local storage: refused here — the two
-//      storages cannot be one.
+//      empty name: refused by all. A common (`common` written on a tentative
+//      definition no declaration initializes): refused by all. A thread-local and a
+//      non-thread-local storage: refused here — the two storages cannot be one.
 //   3. HOW ARE ITS USES REACHED? An alias with external linkage is reached BY NAME:
 //      its declaration stays a reference to the name (an import of it), and the
 //      definition the alias makes — one more symbol row on the target's
@@ -28507,6 +28546,72 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 //      its uses are bound here to the target itself (the same address).
 // A variable an alias names is a DEFINITION of the unit and never a common: its
 // tentative mark is cleared (`tentativeNeverCommon`).
+// The REDECLARATION GROUPS of the unit: the survivor of each record's merge (absorbed
+// → survivor, along any chain of merges) and the records each survivor absorbed. A
+// chain is followed to its end, with no cap: the walk stops at a record that absorbed
+// nothing, or at the first record it meets twice (a cycle, which no merge makes).
+struct RedeclarationGroups {
+    std::unordered_map<std::uint32_t, SymbolId>              survivorOfAbsorbed;
+    std::unordered_map<std::uint32_t, std::vector<SymbolId>> absorbedBy;   // survivor → records
+    [[nodiscard]] SymbolId survivorOf(SymbolId id) const {
+        std::unordered_set<std::uint32_t> met{id.v};
+        for (;;) {
+            auto const it = survivorOfAbsorbed.find(id.v);
+            if (it == survivorOfAbsorbed.end() || !met.insert(it->second.v).second) return id;
+            id = it->second;
+        }
+    }
+};
+
+[[nodiscard]] RedeclarationGroups redeclarationGroupsOf(EngineState const& s) {
+    RedeclarationGroups g;
+    for (auto const& [survivor, absorbed] : s.mergedFnDecls)
+        if (survivor.valid() && absorbed.valid() && survivor.v != absorbed.v)
+            g.survivorOfAbsorbed[absorbed.v] = survivor;
+    for (auto const& [absorbedV, survivor] : g.survivorOfAbsorbed)
+        g.absorbedBy[g.survivorOf(survivor).v].push_back(SymbolId{absorbedV});
+    return g;
+}
+
+// ★ P69 (lane `cs`) — WHICH DECLARATION'S `nocommon` A TENTATIVE DEFINITION KEEPS.
+// Each declarator's `nocommon` marked its OWN record; the lowering reads the merge
+// SURVIVOR's. The LAST tentative declaration of the name decides (✔MEASURED, probe
+// rv cells 14 and 15, nm under -fcommon): `int t; int t __attribute__((nocommon));`
+// is a `.bss` definition on gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0, and
+// `int t __attribute__((nocommon)); int t;` is a COMMON on gcc and mingw-w64 gcc and
+// a `.bss` definition on clang — gcc copies the later declaration's mark, clang
+// inherits the attribute. A MEANING split, decided for gcc's reading: it is the one
+// under which two units each written so LINK (their commons fold), where clang
+// refuses them as two definitions — and one reference that builds a program makes
+// it one this compiler builds. An alias naming the variable overrides both (after
+// this, `resolveSymbolAliases`).
+void settleNoCommon(EngineState& s, std::span<Tree const> trees) {
+    RedeclarationGroups const groups = redeclarationGroupsOf(s);
+    if (groups.absorbedBy.empty()) return;
+    std::unordered_map<std::uint32_t, std::size_t> treeOrder;
+    for (std::size_t i = 0; i < trees.size(); ++i) treeOrder[trees[i].id().v] = i;
+    auto const positionOf = [&](SymbolRecord const& rec) {
+        auto const t = treeOrder.find(rec.tree.v);
+        std::size_t const tree = t == treeOrder.end() ? trees.size() : t->second;
+        std::uint32_t const at = (t != treeOrder.end() && rec.declNode.valid())
+                                     ? trees[tree].span(rec.declNode).start()
+                                     : 0u;
+        return std::pair{tree, at};
+    };
+    for (auto const& [survivorV, absorbed] : groups.absorbedBy) {
+        SymbolRecord& survivor = s.symbols.at(SymbolId{survivorV});
+        if (survivor.kind != DeclarationKind::Variable) continue;
+        SymbolRecord const* last = nullptr;
+        auto const consider = [&](SymbolRecord const& rec) {
+            if (!rec.isTentativeDefinition) return;
+            if (last == nullptr || positionOf(*last) < positionOf(rec)) last = &rec;
+        };
+        consider(survivor);
+        for (SymbolId const r : absorbed) consider(s.symbols.at(r));
+        if (last != nullptr) survivor.tentativeNeverCommon = last->tentativeNeverCommon;
+    }
+}
+
 void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
     if (s.pendingSymbolAliases.empty()) return;
     std::unordered_map<std::uint32_t, Tree const*> treeById;
@@ -28516,23 +28621,9 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
         return it != treeById.end()
             && rec.scope.v == fileScopeOf(s, *it->second, rec.scope).v;
     };
-    // The survivor of each record's redeclaration merge (absorbed → survivor, along
-    // any chain of merges).
-    std::unordered_map<std::uint32_t, SymbolId> survivorOfAbsorbed;
-    for (auto const& [survivor, absorbed] : s.mergedFnDecls)
-        if (survivor.valid() && absorbed.valid() && survivor.v != absorbed.v)
-            survivorOfAbsorbed[absorbed.v] = survivor;
-    auto const survivorOf = [&](SymbolId id) {
-        for (int guard = 0; guard < 4096; ++guard) {
-            auto const it = survivorOfAbsorbed.find(id.v);
-            if (it == survivorOfAbsorbed.end()) break;
-            id = it->second;
-        }
-        return id;
-    };
-    std::unordered_map<std::uint32_t, std::vector<SymbolId>> groupOf;   // survivor → records
-    for (auto const& [absorbedV, survivor] : survivorOfAbsorbed)
-        groupOf[survivorOf(survivor).v].push_back(SymbolId{absorbedV});
+    RedeclarationGroups const groups = redeclarationGroupsOf(s);
+    auto const survivorOf = [&](SymbolId id) { return groups.survivorOf(id); };
+    auto const& groupOf = groups.absorbedBy;
     auto const symbolNameOf = [](SymbolRecord const& rec) -> std::string const& {
         return rec.asmName.empty() ? rec.name : rec.asmName;
     };
@@ -28548,15 +28639,6 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
                 && !rec.isEnumerator && !rec.isInjectedConstant;
         return false;
     };
-    std::unordered_map<std::string, SymbolId> definitionNamed;
-    {
-        std::size_t const count = s.symbols.records().size();
-        for (std::size_t i = 1; i < count; ++i) {
-            SymbolId const id{static_cast<std::uint32_t>(i)};
-            SymbolRecord const& rec = s.symbols.at(id);
-            if (defines(rec)) definitionNamed.emplace(symbolNameOf(rec), id);
-        }
-    }
     auto const report = [&](EngineState::PendingSymbolAlias const& p, DiagnosticCode code,
                             std::string actual) {
         auto const it = treeById.find(p.tree.v);
@@ -28583,19 +28665,69 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
                                sRec.name));
             continue;
         }
-        bool const definedHere = defines(sRec)
-            && !(survivor.v == p.declared.v && p.initializerIgnored);
-        if (definedHere) {
+        // The alias declaration itself. A function's is a prototype. An object's is
+        // written `extern` (an initializer of its own ignored, warned where written),
+        // or `static` with no initializer (✔MEASURED, probe rv cells 1-3: gcc 13.3.0,
+        // clang 18.1.3 and mingw-w64 gcc 13.2.0 run a `static` alias of a `static`
+        // object, an `extern` one of a `static` object and a `static` one of an
+        // external object, -O0 and -O2). Written with external linkage and no
+        // `extern`, or `static` with an initializer, it is a definition of its own
+        // (probe al2 cell 10, rv cell 10, rv2 cell 1: refused by all three).
+        SymbolRecord const& dRec = s.symbols.at(p.declared);
+        bool const objectAlias = dRec.kind == DeclarationKind::Variable;
+        bool const declarationIsTheAlias = !objectAlias || p.writtenExtern
+            || (dRec.isInternalLinkage && !p.wroteInitializer);
+        // Another declaration DEFINING the name: a function body, or an object's
+        // initializer. A TENTATIVE declaration of an object is none — the alias is the
+        // definition, and absorbs it (✔MEASURED, probe rv2 cells 2-4: gcc runs a
+        // tentative declaration written before the alias and one written after it;
+        // clang refuses the first, "alias definition after tentative definition", and
+        // runs the second — one reference that runs it makes it accepted).
+        std::vector<SymbolId> named{survivor};
+        if (auto const g = groupOf.find(survivor.v); g != groupOf.end())
+            named.insert(named.end(), g->second.begin(), g->second.end());
+        bool definedOtherwise = false;
+        for (SymbolId const r : named) {
+            if (r.v == p.declared.v) continue;
+            SymbolRecord const& rec = s.symbols.at(r);
+            if (!atFileScope(rec) || rec.isExternDeclaration || rec.isProtoDeclaration)
+                continue;
+            if (rec.kind == DeclarationKind::Function)
+                definedOtherwise = true;
+            else if (rec.kind == DeclarationKind::Variable && !rec.isTentativeDefinition
+                     && !rec.isEnumerator && !rec.isInjectedConstant)
+                definedOtherwise = true;
+        }
+        if (!declarationIsTheAlias || definedOtherwise) {
             report(p, DiagnosticCode::S_RedeclaredSymbol,
                    std::format("'{}' is defined both as an alias and by a declaration of "
                                "its own{} — an alias is the definition of its name",
                                sRec.name,
-                               sRec.kind == DeclarationKind::Variable
-                                   ? " (an object alias is declared `extern`)" : ""));
+                               definedOtherwise ? ""
+                               : p.wroteInitializer
+                                   ? " (an object alias with an initializer is written "
+                                     "`extern`, and the initializer is ignored)"
+                                   : " (an object alias with external linkage is written "
+                                     "`extern`)"));
             continue;
         }
         aliasOfSurvivor.emplace(survivor.v, i);
         aliasNamed.emplace(symbolNameOf(sRec), i);
+    }
+    // The definitions an alias can name. A name an alias declaration defines is no
+    // definition of its own, whatever its records look like — a `static` object alias
+    // and a tentative declaration it absorbed are each a tentative definition by their
+    // shape — so it is reached as an alias (`aliasNamed`), never as the end of a chain:
+    // an alias of it ends at ITS target, and an alias that names itself is a cycle.
+    std::unordered_map<std::string, SymbolId> definitionNamed;
+    {
+        std::size_t const count = s.symbols.records().size();
+        for (std::size_t i = 1; i < count; ++i) {
+            SymbolId const id{static_cast<std::uint32_t>(i)};
+            SymbolRecord const& rec = s.symbols.at(id);
+            if (defines(rec) && !aliasOfSurvivor.contains(survivorOf(id).v))
+                definitionNamed.emplace(symbolNameOf(rec), id);
+        }
     }
     // 2. Each alias's target, through any chain of aliases.
     for (auto const& [survivorV, index] : aliasOfSurvivor) {
@@ -28615,7 +28747,9 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
         std::unordered_set<std::string> visited{symbolNameOf(sRec)};
         SymbolId target{};
         std::string why;
-        for (int guard = 0; guard < 4096; ++guard) {
+        // Followed to its end: each step either ends the walk or names an alias not
+        // met before (`visited`), and the unit holds finitely many.
+        for (;;) {
             if (auto const def = definitionNamed.find(name); def != definitionNamed.end()) {
                 target = def->second;
                 break;
@@ -28635,7 +28769,7 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
             name = s.pendingSymbolAliases[next->second].target;
         }
         if (!target.valid()) {
-            refuse(why.empty() ? std::string{"the chain of aliases does not end"} : why);
+            refuse(why);
             continue;
         }
         SymbolRecord& tRec = s.symbols.at(target);
@@ -28645,12 +28779,25 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
                                "external definition to name", tRec.name));
             continue;
         }
-        bool targetWritesCommon = s.symbolsWritingCommon.contains(target.v);
+        // A COMMON is what `common` makes of a tentative definition no declaration of
+        // the unit initialized. Where one is initialized there is no common to name
+        // (✔MEASURED, probe rv cells 11 and 12: `int g __attribute__((common)) = 5;`,
+        // and `common` on a tentative declaration beside `int g = 5;`, each aliased and
+        // run, 42 on gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0).
+        std::vector<SymbolId> targetRecords{target};
         if (auto const g = groupOf.find(target.v); g != groupOf.end())
-            for (SymbolId const r : g->second)
-                targetWritesCommon = targetWritesCommon
-                                  || s.symbolsWritingCommon.contains(r.v);
-        if (targetWritesCommon) {
+            targetRecords.insert(targetRecords.end(), g->second.begin(), g->second.end());
+        bool targetWritesCommon = false;
+        bool targetInitialized  = false;
+        for (SymbolId const r : targetRecords) {
+            SymbolRecord const& rec = s.symbols.at(r);
+            targetWritesCommon = targetWritesCommon || s.symbolsWritingCommon.contains(r.v);
+            targetInitialized  = targetInitialized
+                || (rec.kind == DeclarationKind::Variable && atFileScope(rec)
+                    && !rec.isExternDeclaration && !rec.isProtoDeclaration
+                    && !rec.isTentativeDefinition);
+        }
+        if (targetWritesCommon && !targetInitialized) {
             refuse(std::format("'{}' is declared `common`, and a common cannot be given "
                                "a second name", tRec.name));
             continue;
@@ -28664,6 +28811,11 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
         }
         sRec.aliasTarget = target;
         if (tRec.kind == DeclarationKind::Variable) tRec.tentativeNeverCommon = true;
+        // The alias is the definition of its name: the declaration that survived its
+        // merge (a `static` alias's own, or a tentative one it absorbed) is no
+        // tentative definition — no storage of its own, no C 6.9.2p2 completion, no
+        // common.
+        if (sRec.kind == DeclarationKind::Variable) sRec.isTentativeDefinition = false;
         // 3. An alias with internal linkage: its uses are the target's.
         if (sRec.isInternalLinkage) {
             std::vector<SymbolId> group{survivor};
@@ -31596,7 +31748,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     // is bound. Each alias finds its target (and an internal-linkage alias's uses
     // become the target's), and a tentative array no declaration completed takes one
     // element (C 6.9.2p2). Before the unused-variable sweep below, which reads the
-    // use index the first may move.
+    // use index the first may move. Which declaration's `nocommon` a merged tentative
+    // definition keeps is settled first, so an alias naming it overrides that.
+    settleNoCommon(s, trees);
     resolveSymbolAliases(s, trees);
     completeTentativeArrays(s, trees);
 

@@ -118,6 +118,26 @@ using Inspect = std::function<void(SemanticModel const&, CstToHirResult const&, 
     return std::nullopt;
 }
 
+// How many module definitions of STORAGE (`Global` nodes) are bound to a symbol named `name`.
+[[nodiscard]] std::size_t storageNamed(SemanticModel const& m, CstToHirResult const& res, std::string_view name) {
+    std::size_t n = 0;
+    for (HirNodeId d : res.hir.moduleDecls(res.hir.root())) {
+        if (res.hir.kind(d) != HirKind::Global) continue;
+        if (nameOf(m, res.hir.globalSymbol(d)) == name) ++n;
+    }
+    return n;
+}
+
+// How many module REFERENCES of an object (`ExternGlobal` nodes) are bound to a symbol named `name`.
+[[nodiscard]] std::size_t importsNamed(SemanticModel const& m, CstToHirResult const& res, std::string_view name) {
+    std::size_t n = 0;
+    for (HirNodeId d : res.hir.moduleDecls(res.hir.root())) {
+        if (res.hir.kind(d) != HirKind::ExternGlobal) continue;
+        if (nameOf(m, res.hir.externGlobalSymbol(d)) == name) ++n;
+    }
+    return n;
+}
+
 [[nodiscard]] std::size_t countKind(Hir const& h, HirKind k) {
     std::size_t         n   = 0;
     std::uint32_t const tag = h.id().v;
@@ -150,6 +170,22 @@ TEST(HirSymbolAliasLowering, EachAliasIsStatedOnceWithItsTargetAndItsOwnLinkage)
                   "v", SymbolBinding::Global, WeakDefinitionKind{}},
              Case{"int t;\nextern int w __attribute__((alias(\"t\")));\nint use(void) { return w; }\n", "w", "t",
                   SymbolBinding::Global, WeakDefinitionKind{}},
+             // OBJECT aliases written `static` (lane `cs` probe rv cells 1-3, rv2 cells 2-4): module-private
+             // when the alias is, and never storage of their own, whichever declaration of the name survived.
+             Case{"static int t = 5;\nstatic int a __attribute__((alias(\"t\")));\nint use(void) { return a; }\n",
+                  "a", "t", SymbolBinding::Local, WeakDefinitionKind{}},
+             Case{"static int t = 5;\nextern int a __attribute__((alias(\"t\")));\nint use(void) { return a; }\n",
+                  "a", "t", SymbolBinding::Global, WeakDefinitionKind{}},
+             Case{"int t = 5;\nstatic int a __attribute__((alias(\"t\")));\nint use(void) { return a; }\n", "a",
+                  "t", SymbolBinding::Local, WeakDefinitionKind{}},
+             Case{"static int t = 5;\nstatic int a;\nstatic int a __attribute__((alias(\"t\")));\n"
+                  "int use(void) { return a; }\n",
+                  "a", "t", SymbolBinding::Local, WeakDefinitionKind{}},
+             Case{"static int t = 5;\nstatic int a __attribute__((alias(\"t\")));\nstatic int a;\n"
+                  "int use(void) { return a; }\n",
+                  "a", "t", SymbolBinding::Local, WeakDefinitionKind{}},
+             Case{"int t = 5;\nint a;\nextern int a __attribute__((alias(\"t\")));\nint use(void) { return a; }\n",
+                  "a", "t", SymbolBinding::Global, WeakDefinitionKind{}},
          }) {
         SCOPED_TRACE(c.src);
         std::string const failed = lowerC(c.src, [&](SemanticModel const& m, CstToHirResult const& res, DiagnosticReporter const&) {
@@ -160,6 +196,11 @@ TEST(HirSymbolAliasLowering, EachAliasIsStatedOnceWithItsTargetAndItsOwnLinkage)
             EXPECT_EQ(a->linkage.binding, c.binding) << "the alias's own binding";
             if (c.binding == SymbolBinding::Weak) EXPECT_EQ(a->linkage.weakKind, c.kind);
             EXPECT_FALSE(a->linkage.tentative) << "an alias has no storage, so it is never a common";
+            EXPECT_EQ(storageNamed(m, res, c.alias), 0u) << "the alias's name was given storage of its own";
+            // A module-private alias has no name a reference could reach: its uses are its target's (the semantic
+            // tier bound them), so it lowers to its alias row alone — an import of it is a name nothing defines.
+            if (c.binding == SymbolBinding::Local)
+                EXPECT_EQ(importsNamed(m, res, c.alias), 0u) << "a module-private alias was lowered as a reference to its name";
         });
         EXPECT_EQ(failed, "");
     }

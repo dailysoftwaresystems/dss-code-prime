@@ -24,6 +24,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <memory>
 #include <set>
 #include <string>
@@ -516,6 +517,30 @@ namespace {
 
 void expectARecoveredDocumentIsAnalyzed(std::string_view text,
                                         std::vector<std::string> const& codes) {
+    // ★ FIRST IN A CHILD PROCESS. A scan that reads a recovery node through another
+    // arm's accessor ABORTS on that accessor's assertion — and an abort in THIS process
+    // ended the whole runner: every test after the site never ran and no report was
+    // written (✔MEASURED, the five mutation arms of these sites: "exited 134 and wrote no
+    // report"). In a death-test child the abort is THIS test's failure, named, and the
+    // runner goes on to the next. The child does all the server does here and exits with
+    // its answer; the checks of WHAT it published then run in this process.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    std::string const document{text};
+    EXPECT_EXIT(
+        {
+            LspTestHarness child;
+            child.push(lspInitialize(1));
+            child.push(didOpen("file:///recovered.c", document));
+            child.push(posRequest("textDocument/hover", 7, "file:///recovered.c", 0, 0));
+            child.push(lspShutdown(2));
+            child.push(std::string{lspExit});
+            std::exit(child.runUntilExit() == 0 ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), "")
+        << "the server must still answer after the analysis: analyzing the recovered document "
+           "did not end in a clean exit";
+    if (::testing::Test::HasFailure()) return;
+
     LspTestHarness h;
     h.push(lspInitialize(1));
     h.push(didOpen("file:///recovered.c", text));
