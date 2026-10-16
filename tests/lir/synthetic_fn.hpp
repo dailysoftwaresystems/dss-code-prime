@@ -72,6 +72,11 @@ SyntheticFn buildSyntheticFn(
     auto const retT = probeTypeOfKind(out.interner, returnKind);
     auto const sig  = out.interner.fnSig(params, retT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    // This hand-built module is its own table: nothing beside it names an id it
+    // does not define, so its end is the counted one, STATED. A probe whose
+    // lowering mints a symbol (a float's sign mask, a jump table) would otherwise
+    // be refused by the symbol-id door, which mints past no end nobody stated.
+    mb.stateSelfContainedSymbolIds();
     mb.addFunction(sig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);

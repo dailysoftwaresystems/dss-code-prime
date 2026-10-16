@@ -1,0 +1,2 @@
+            if(_dss_abs STREQUAL "")
+                continue()                     # nothing handed: the dependency is fetched

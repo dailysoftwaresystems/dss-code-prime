@@ -1,0 +1,1 @@
+extern __declspec(thread) int e;

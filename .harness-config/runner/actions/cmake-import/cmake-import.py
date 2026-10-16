@@ -17,10 +17,12 @@ relative paths against the directory the manifest is in, so the manifest names t
 same files from any working directory. Write it at the project root and it stays
 relocatable with the project; written anywhere else, its paths are absolute.
 
-Usage:
-  python3 .harness-config/runner/actions/cmake-import/cmake-import.py <root-cmake-dir> <output-project-file> [options]
-  python3 .harness-config/runner/actions/cmake-import/cmake-import.py --self-test
-  python3 .harness-config/runner/actions/cmake-import/cmake-import.py --prove-any-cwd <dsscp>
+Usage: `dssharness run cmake-import` converts the bundled example (`./example`); the gate's ctest entries
+`harness/cmake_import_selftest` and `harness/cmake_import_any_cwd` run `--self-test` and `--prove-any-cwd`.
+The program's forms:
+  cmake-import.py <root-cmake-dir> <output-project-file> [options]
+  cmake-import.py --self-test
+  cmake-import.py --prove-any-cwd <dsscp>
 
 Positional (both required):
   <root-cmake-dir>       CMake project root (must contain CMakeLists.txt)

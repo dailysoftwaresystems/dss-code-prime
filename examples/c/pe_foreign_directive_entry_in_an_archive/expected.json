@@ -1,0 +1,28 @@
+{
+  "$comment": "★★ A LINKED OBJECT'S `/ENTRY:` IS A REFERENCE THE ARCHIVE SEARCH ANSWERS (P69 send-back 5, review-xa4 MINOR 3; D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE). The object NAMED to the link is cl's build of `#pragma comment(linker, \"/ENTRY:dss_archived_entry\") int dss_entry_ref_marker(void) { return 3; }`: it states the image's entry and does NOT define it. Only the archive's one member does -- `int dss_archived_entry(void) { return 42; }` -- and nothing else of the link refers to it. ✔MEASURED 2026-10-08 (the same main.c built by cl; link.exe 14.44.35228 and lld-link 19.1.5): both pull the member for the entry's name alone, the process starts there with no C runtime startup, and exits 42; WITHOUT the archive both refuse the name as unresolved (link.exe LNK2001, lld-link 'undefined symbol: dss_archived_entry'), and the command line's `/ENTRY:` behaves the same. A DSS link takes that answer: an entry that an object named to the link states and does not define is a REQUIRED reference of that object (`linker::requireEntryReference`), which the archive search answers as it answers an `/INCLUDE:` or an `/EXPORT:`; one nothing defines is refused by name. This `main` is the witness that the startup never ran: it would exit 7. (A member the archive search ITSELF pulls names no entry -- `examples/c/pe_foreign_directive_entry_from_an_archive_member_warned` -- so the stating object here is named to the link.) The `release` arm pins that optimizing the DSS half changes nothing: the image never runs it.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "The bare object that STATES the entry. Its source, with the commands that rebuild it, is `tests/link/data/pe_directive_entry_reference_x86_64_pe.source.c` (cl 19.44.35228 `/c /O2 /MD /GS- /experimental:deterministic /pathmap:`; md5 a12aeb09b00410b879bc390e2f43579e). A relocatable object named to the link is an OBJECT INPUT, linked eagerly, as link.exe links one named on its command line. The witness is the directive itself.",
+          "path": "tests/link/data/pe_directive_entry_reference_x86_64_pe.obj",
+          "containerWitness": "/ENTRY:dss_archived_entry"
+        },
+        {
+          "$comment": "The archive whose one member DEFINES the entry. Its source, with the commands that rebuild it, is `tests/link/data/libpe_directive_entry_definition_x86_64_pe.source.c` (the same cl build + llvm-ar 19.1.5 `rcs --format=gnu`; member md5 7dfcc67fa7cd1f36c1cc8b4623421527, archive md5 e72223602d36f58109d507eaa84502b7). The witness is the entry's own name: an archive that does not define it cannot pass.",
+          "path": "tests/link/data/libpe_directive_entry_definition_x86_64_pe.a",
+          "containerWitness": "dss_archived_entry"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

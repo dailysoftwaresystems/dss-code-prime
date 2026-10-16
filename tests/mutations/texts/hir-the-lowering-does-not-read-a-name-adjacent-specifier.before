@@ -1,0 +1,2 @@
+                 nameAdjacentAttributeSpecifiers(tree(), sem, declaratorNode)) {
+            roots.push_back(an);

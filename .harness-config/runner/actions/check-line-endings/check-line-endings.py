@@ -583,8 +583,8 @@ These spellings do not measure what they appear to measure on this host
   · `awk '/\\r$/'`, `sed -n '/\\r/p'`, `grep -P '\\r$'` return 0 over a
     file that is entirely CRLF, because the reader strips the CR first.
 Use instead:
-  (a) `python3 .harness-config/runner/actions/check-line-endings/check-line-endings.py --files PATH...`
-      — the supported way to ask about specific files; or
+  (a) `dssharness run check-line-endings --manual-step files --input list=FILE` (FILE names the paths,
+      one per line) — the supported way to ask about specific files; or
   (b) count CR BYTES (`tr -dc '\\r' < f | wc -c`, expect 0) if you must inline it; or
   (c) `git grep`/`git ls-files --eol`, which read blobs and are unaffected.
 If the line is DOCUMENTATION that quotes the idiom on purpose, put the marker

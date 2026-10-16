@@ -284,6 +284,18 @@ LirReg LirBuilder::newVReg(LirRegClass cls) {
     return r;
 }
 
+void LirBuilder::reserveVRegIdsThrough(std::uint32_t id) {
+    if (!openFunc_.valid()) lirFatal("LirBuilder::reserveVRegIdsThrough: no open function");
+    if (id > kLirRegMaxId) {
+        lirFatal("LirBuilder::reserveVRegIdsThrough: the copied function holds a "
+                 "virtual register id past what a LirReg id can name — the id space "
+                 "is exhausted (see newVReg)");
+    }
+    if (id < nextVReg_) return;
+    nextVReg_ = id + 1;
+    funcArena_.at(openFunc_).numVRegs = id;
+}
+
 std::uint32_t LirBuilder::appendOperands_(std::span<LirOperand const> operands) {
     std::uint32_t const start = static_cast<std::uint32_t>(operandPool_.size());
     for (auto const& o : operands) operandPool_.push_back(o);

@@ -22,7 +22,9 @@ These are the same seven non-negotiables `dss-cycle` builds to (§A there). The 
    passes when the implementation is silently broken is **not** strict enough (§E catalogues the
    ways this hides).
 6. **The full gate held:** build green · full ctest green · anchor-registry guard OK · agnosticism
-   scan clean · review folded · **and all CI legs green, not just local** (§F).
+   scan clean · review folded · **and every leg green, not just local**: the eight-run gate
+   (`dssharness test --legs gate`, Debug and Release on each of the four legs) and CI's verdicts
+   (`dssharness check-ci-legs`) (§F).
 7. **No un-anchored issue.** Every issue the cycle came across is ANCHORED — a real registry row, committed
    in the same cycle — AND handled: fixed, or pinned as a genuine deferral behind a named blocker or an
    unfired trigger. A workaround that hides an issue (a masked test, a swallowed error, "green on the other
@@ -51,7 +53,7 @@ So every verdict (§G) **separates two lists**:
 - **GREEN-BUT-RULE-BREAKING** — passes the mechanical gate, violates the bar (§A) or a guardrail
   (§F). These are regressions to fix, *not* closed items, no matter how green.
 
-If the auditor could not verify an item (e.g. CI legs it can't run locally, §K), it says
+If the auditor could not verify an item (e.g. a leg whose run records it could not read, §K), it says
 **"unverified"** explicitly — never rounds it up to clean.
 
 ---
@@ -124,9 +126,10 @@ to the linkage P1+P2 plan
   loop. There is no cross-session control channel; the agent tools reach only subagents this skill
   spawns, not an independent loop. The loop's own stop-on-red gate is the real-time brake — the
   auditor is the after-the-fact check on whether it held.
-- **CI legs it cannot run locally** (macOS clang, Linux GCC) it marks **unverified** and says how to
-  confirm (`gh run list`) — it never reports green it did not observe. The local build is one platform;
-  the cross-platform blind spot (§E #7) is real and shared.
+- **A leg it cannot read** — no gate run record on it, no CI verdict — it marks **unverified** and says
+  how to confirm (`dssharness test --legs gate --json` for the gate's ledger, `dssharness check-ci-legs`
+  for CI's) — it never reports green it did not observe. Every leg the gate names runs through DssHarness
+  (Windows, WSL, macOS and the arm64 VPS); the cross-platform blind spot (§E #7) is real and shared.
 - Periodic auditing while a human is away ≈ one thorough audit on their return, in *outcome* — because
   detection without the ability to act or relay changes nothing until they read it. Prefer one rigorous
   pass over polling-theater; offer a timestamped trail only if the human explicitly wants faster triage,

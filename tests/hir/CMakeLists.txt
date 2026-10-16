@@ -28,6 +28,36 @@ dss_add_test(NAME hir/test_brace_element_diagnosed_conversion
 # elements warn S_ExcessInitializerElements and are dropped unevaluated (6.7.9p2).
 dss_add_test(NAME hir/test_initializer_list_shapes
              SOURCES test_initializer_list_shapes.cpp)
+# P69 (lane `lm`): a brace element is the expression that was written. An operator over
+# a string is an element, not the braced string (the lowering's own peel took the
+# operand for the element); a whole structure written as an index, a dereference, a
+# conditional, a comma expression or a call is placed whole — the analyzer's answer,
+# handed to the lowering as a fact instead of derived again from the type stamps.
+dss_add_test(NAME hir/test_brace_element_as_written
+             SOURCES test_brace_element_as_written.cpp)
+# P69 (lane `cs`): a second name of a definition (`alias`) stated by the lowering once, with its target and its own
+# linkage (a `static` alias module-private, a weak one of C's `weak` kind, never a common); and `sizeof` of an array
+# of unknown size lowered to the language's stated value, never a `SizeOf` of a type with no size.
+dss_add_test(NAME hir/test_hir_symbol_alias
+             SOURCES test_hir_symbol_alias.cpp)
+
+# A `__try` FILTER IS LEFT ONLY BY ITS VALUE, AND GUARDS NOTHING (P69, lane `lm`): a jump
+# out of a filter's statement expression and a `__try` inside it, refused by the HIR
+# verifier by the construct. A binary of its own: `hir/test_hir_lowering_c` is the claim
+# runner of many mutation arms, whose case counts a new case moves.
+dss_add_test(NAME hir/test_seh_filter_is_left_by_its_value
+             SOURCES test_seh_filter_is_left_by_its_value.cpp)
+target_include_directories(dss_hir_test_seh_filter_is_left_by_its_value
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+# P69 (lane `cs`): a value-returning function whose end is reached is a language
+# rule (`nonVoidFunctionEndReached`); under C's the lowering completes the body
+# and warns once. Separate from test_hir_lowering_c.cpp because half of it runs
+# under the shipped C document with that ONE key rewritten, which needs the JSON
+# document in hand and a fixture of its own.
+dss_add_test(NAME hir/test_non_void_function_end_reached
+             SOURCES test_non_void_function_end_reached.cpp)
+target_link_libraries(dss_hir_test_non_void_function_end_reached
+                      PRIVATE nlohmann_json::nlohmann_json)
 # D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION. Separate from
 # test_hir_lowering_c.cpp because that file's fixture deliberately pins the
 # long-double axis at `None` ("moving it would silently re-point every one of

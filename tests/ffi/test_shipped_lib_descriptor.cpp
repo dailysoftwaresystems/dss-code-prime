@@ -1558,6 +1558,147 @@ TEST(ShippedLibDescriptor, SymbolSignatureNoArmFollowsDeclaredAvailability) {
     }
 }
 
+// ── P69 (lane lm): a read that cannot DECIDE an arm is not a pair the arm misses ──
+// A refusal says "this pair has no prototype", which only a read carrying every fact the
+// arms name can say. A direct-API read with no long-double axis (`analyze` without one —
+// <windows.h> includes <stdlib.h>, whose strtold keys on it) and a format-less read (the
+// LSP's language-only mode) cannot decide a `longDoubleFormat` or `format` arm: the symbol
+// is ABSENT from that read and the rest of the descriptor reads clean. The pair that CAN
+// decide and has no arm is still refused — the control that keeps this from being a
+// blanket softening.
+TEST(ShippedLibDescriptor, ASignatureArmThisReadCannotDecideLeavesTheSymbolAbsent) {
+    ScratchDir dir{Location::Temp, "shipped-lib-undecided"};
+    auto const path = writeTemp(dir, "ld.json", R"JSON({ "header": "ld.h", "symbols": [
+        { "name": "wide",
+          "signature": { "variants": [
+              { "when": { "longDoubleFormat": "x87-80" }, "value": "fn() -> f80" },
+              { "when": { "longDoubleFormat": "f64" }, "value": "fn() -> f64" } ] } },
+        { "name": "byformat",
+          "signature": { "variants": [
+              { "when": { "format": "elf" }, "value": "fn() -> i64" },
+              { "when": { "format": "pe" }, "value": "fn() -> i32" } ] } },
+        { "name": "plain", "signature": "fn() -> i32" } ] })JSON");
+    auto readWith = [&](std::optional<LongDoubleFormat> ldf, std::optional<ObjectFormatKind> fmt,
+                        DiagnosticReporter& rep) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        ShippedPairFacts facts;
+        facts.dataModel = DataModel::Lp64;
+        if (ldf.has_value()) facts.longDoubleFormat = *ldf;
+        auto d = readShippedLibDescriptor(
+            path, interner, typeReg, rep, DataModel::Lp64,
+            fmt.has_value() ? std::optional<std::string_view>{"x86_64"} : std::nullopt, fmt, {},
+            nullptr, ldf.has_value() ? &facts : nullptr);
+        std::vector<std::string> names;
+        if (d.has_value())
+            for (auto const& s : d->symbols) names.push_back(s.name);
+        return std::make_pair(d.has_value() && !rep.hasErrors(), names);
+    };
+    {   // CONTROL: every fact known, an arm for each — all three injected
+        DiagnosticReporter rep;
+        auto const [clean, names] = readWith(LongDoubleFormat::X87_80, ObjectFormatKind::Elf, rep);
+        EXPECT_TRUE(clean);
+        EXPECT_EQ(names, (std::vector<std::string>{"wide", "byformat", "plain"}));
+    }
+    {   // DECIDABLE, NO ARM: the long double known (ieee128) and matched by no arm — refused
+        DiagnosticReporter rep;
+        auto const [clean, names] = readWith(LongDoubleFormat::Ieee128, ObjectFormatKind::Elf, rep);
+        EXPECT_FALSE(clean) << "a read that carries the fact and finds no arm is still refused";
+        EXPECT_TRUE(anyDiagMentions(rep, "symbol 'wide'"));
+    }
+    {   // UNDECIDABLE: a format but no long-double axis (the direct API) — `wide` absent, clean
+        DiagnosticReporter rep;
+        auto const [clean, names] = readWith(std::nullopt, ObjectFormatKind::Elf, rep);
+        EXPECT_TRUE(clean) << "no long-double axis: the arms cannot be decided, nothing is refused";
+        EXPECT_EQ(names, (std::vector<std::string>{"byformat", "plain"}));
+    }
+    {   // UNDECIDABLE: no format and no axis (the language-only read) — both per-pair rows absent
+        DiagnosticReporter rep;
+        auto const [clean, names] = readWith(std::nullopt, std::nullopt, rep);
+        EXPECT_TRUE(clean);
+        EXPECT_EQ(names, (std::vector<std::string>{"plain"}));
+    }
+}
+
+// ── P69 (lane lm, plan M2): a prototype naming a type THIS READ did not publish ──
+// The (3.struct.pre) gate's rule for a symbol: a name the descriptor declares whose variants
+// selected nothing here does not exist here, and neither does a function whose prototype names
+// it — absent, not a refusal of the whole descriptor — where the symbol does not CLAIM this read:
+// no object format, or a pair its declared availability excludes. A symbol that claims the pair
+// is still REFUSED there (P68 round 12's ruling (iii): its availability is a claim the data cannot
+// back), and a name the descriptor declares NOWHERE is a typo that refuses the read on every
+// pair — the two halves that keep the rule honest.
+TEST(ShippedLibDescriptor, ASymbolNamingADeclaredTypeThisReadDoesNotPublishIsAbsentHere) {
+    ScratchDir dir{Location::Temp, "shipped-lib-unpublished"};
+    auto const path = writeTemp(dir, "pos.json", R"JSON({ "header": "pos.h",
+        "typedefs": [ { "name": "pos_t", "variants": [
+            { "when": { "format": "elf" }, "type": "i64 \"long\"" },
+            { "when": { "format": "pe" }, "type": "i64 \"long long\"" } ] } ],
+        "symbols": [
+            { "name": "getpos", "availableObjectFormats": ["elf", "pe"],
+              "signature": "fn(ptr<pos_t>) -> i32" },
+            { "name": "perpair", "signature": { "variants": [
+                { "when": { "format": "elf" }, "value": "fn(ptr<pos_t>) -> i64" },
+                { "when": { "format": "macho" }, "value": "fn() -> i32" } ] } },
+            { "name": "plain", "signature": "fn() -> i32" } ] })JSON");
+    auto readOn = [&](std::optional<ObjectFormatKind> fmt, std::filesystem::path const& p,
+                      DiagnosticReporter& rep) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto d = readShippedLibDescriptor(
+            p, interner, typeReg, rep, DataModel::Lp64,
+            fmt.has_value() ? std::optional<std::string_view>{"x86_64"} : std::nullopt, fmt);
+        std::vector<std::string> names;
+        if (d.has_value())
+            for (auto const& s : d->symbols) names.push_back(s.name);
+        return std::make_pair(d.has_value() && !rep.hasErrors(), names);
+    };
+    {   // CONTROL: elf publishes pos_t — both of its users are injected
+        DiagnosticReporter rep;
+        auto const [clean, names] = readOn(ObjectFormatKind::Elf, path, rep);
+        EXPECT_TRUE(clean);
+        EXPECT_EQ(names, (std::vector<std::string>{"getpos", "perpair", "plain"}));
+    }
+    {   // macho publishes no pos_t and getpos does not claim macho: absent; perpair's macho arm
+        // names none — injected
+        DiagnosticReporter rep;
+        auto const [clean, names] = readOn(ObjectFormatKind::MachO, path, rep);
+        EXPECT_TRUE(clean) << "a type this read does not publish must not refuse the descriptor";
+        EXPECT_EQ(names, (std::vector<std::string>{"perpair", "plain"}));
+    }
+    {   // a format-less read publishes no pos_t: both of its users absent
+        DiagnosticReporter rep;
+        auto const [clean, names] = readOn(std::nullopt, path, rep);
+        EXPECT_TRUE(clean);
+        EXPECT_EQ(names, (std::vector<std::string>{"plain"}));
+    }
+    {   // RULING (iii): the same prototype on a symbol that CLAIMS macho is refused there, loudly
+        auto const claims = writeTemp(dir, "claims.json", R"JSON({ "header": "claims.h",
+            "typedefs": [ { "name": "pos_t", "variants": [
+                { "when": { "format": "elf" }, "type": "i64 \"long\"" } ] } ],
+            "symbols": [ { "name": "getpos", "signature": "fn(ptr<pos_t>) -> i32" } ] })JSON");
+        {
+            DiagnosticReporter rep;
+            auto const [clean, names] = readOn(ObjectFormatKind::Elf, claims, rep);
+            EXPECT_TRUE(clean) << "control: elf publishes pos_t";
+            EXPECT_EQ(names, (std::vector<std::string>{"getpos"}));
+        }
+        DiagnosticReporter rep;
+        auto const [clean, names] = readOn(ObjectFormatKind::MachO, claims, rep);
+        EXPECT_FALSE(clean) << "a symbol available on macho whose type macho lacks is a claim the "
+                               "data cannot back — refused, never silently dropped";
+        EXPECT_TRUE(anyDiagMentions(rep, "unknown type 'pos_t'"));
+    }
+    {   // A TYPO — a name the descriptor declares nowhere — still refuses the read
+        auto const typo = writeTemp(dir, "typo.json", R"JSON({ "header": "typo.h",
+            "symbols": [ { "name": "getpos", "signature": "fn(ptr<pso_t>) -> i32" } ] })JSON");
+        DiagnosticReporter rep;
+        auto const [clean, names] = readOn(ObjectFormatKind::Elf, typo, rep);
+        EXPECT_FALSE(clean) << "an undeclared name is a typo, not an unpublished type";
+        EXPECT_TRUE(anyDiagMentions(rep, "pso_t"));
+    }
+}
+
 // ── `$`-DOCUMENTATION KEYS, ON EVERY OBJECT AND NOT ONLY THE ROOT ─────────
 //
 // The repo-wide convention is that ANY config object may carry a `$`-prefixed
@@ -4263,6 +4404,20 @@ TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
 // reads every row on every distinct shipped pair and demands the arm that pair
 // selects — a swapped arm, a dropped arm or an arm keyed on the wrong model
 // goes RED on the pair it breaks.
+//
+// ★ AND THE WIDTH IS HALF OF THE TYPE (P69 round 4). Six of these rows — atol,
+// strtol, strtoul, labs, ftell, fseek — and the two private platform rows wrote
+// their `long` position as an ANONYMOUS core: `i32` on LLP64, which is the C type
+// `int`, and `i64` on LP64, which is neither `long` nor `long long`. Every width
+// assertion here held, and every program that asked the TYPE got the wrong one —
+// `_Generic (labs, long (*)(long): …)` took no arm on any of the five pairs.
+// ✔MEASURED 2026-10-08 (`_Generic` over each designator and each call): `long` /
+// `unsigned long` on MSVC 19.51 and mingw-w64 gcc 13.2.0 (run
+// 20261008-050017-91422066), gcc 13.3.0, clang 18.1.3 and aarch64 gcc (run
+// 20261008-050022-f85aa2ce), Apple clang 21 on both arches (run
+// 20261008-050011-b7042a11). So each position is now pinned by IDENTITY as well:
+// the interned type must be the vocabulary entry `long` / `unsigned long` of the
+// pair's width, which an untagged arm of the right width is not.
 namespace {
 // Every `long` position of the per-pair rows. `pos` −1 is the result.
 struct LongPosition {
@@ -4271,19 +4426,24 @@ struct LongPosition {
     int         pos;
     TypeKind    lp64;
     TypeKind    llp64;
+    char const* vocabulary;   // the C type the position names
 };
 constexpr LongPosition kLongPositions[] = {
-    {"stdlib", "atol",    -1, TypeKind::I64, TypeKind::I32},
-    {"stdlib", "strtol",  -1, TypeKind::I64, TypeKind::I32},
-    {"stdlib", "strtoul", -1, TypeKind::U64, TypeKind::U32},
-    {"stdlib", "labs",    -1, TypeKind::I64, TypeKind::I32},
+    {"stdlib", "atol",    -1, TypeKind::I64, TypeKind::I32, "long"},
+    {"stdlib", "strtol",  -1, TypeKind::I64, TypeKind::I32, "long"},
+    {"stdlib", "strtoul", -1, TypeKind::U64, TypeKind::U32, "unsigned long"},
+    {"stdlib", "labs",    -1, TypeKind::I64, TypeKind::I32, "long"},
     // labs takes long too — pinned so a revert of the ARG width (not just the
     // result) also goes RED.
-    {"stdlib", "labs",     0, TypeKind::I64, TypeKind::I32},
-    {"stdlib", "ldiv",     0, TypeKind::I64, TypeKind::I32},
-    {"stdlib", "ldiv",     1, TypeKind::I64, TypeKind::I32},
-    {"stdio",  "ftell",   -1, TypeKind::I64, TypeKind::I32},
-    {"stdio",  "fseek",    1, TypeKind::I64, TypeKind::I32},
+    {"stdlib", "labs",     0, TypeKind::I64, TypeKind::I32, "long"},
+    {"stdlib", "ldiv",     0, TypeKind::I64, TypeKind::I32, "long"},
+    {"stdlib", "ldiv",     1, TypeKind::I64, TypeKind::I32, "long"},
+    {"stdio",  "ftell",   -1, TypeKind::I64, TypeKind::I32, "long"},
+    {"stdio",  "fseek",    1, TypeKind::I64, TypeKind::I32, "long"},
+    // The platform's own strtol / strtoul, under the names DSS's runtime units
+    // call them by: the same two C types.
+    {"stdlib", "__dss_platform_strtol",  -1, TypeKind::I64, TypeKind::I32, "long"},
+    {"stdlib", "__dss_platform_strtoul", -1, TypeKind::U64, TypeKind::U32, "unsigned long"},
 };
 }  // namespace
 
@@ -4327,12 +4487,77 @@ TEST(ShippedLibDescriptor, ShippedLongPositionsTakeThePairsDataModelArm) {
             }
             EXPECT_EQ(interner.kind(position), lp64 ? at.lp64 : at.llp64)
                 << "the arm this pair's data model selects";
+            // The IDENTITY: the vocabulary entry of that width, never the
+            // anonymous core (`i32` alone is `int`; `i64` alone is no C type).
+            EXPECT_EQ(position, interner.primitive(lp64 ? at.lp64 : at.llp64, at.vocabulary))
+                << "the position must be the C type `" << at.vocabulary
+                << "`: an arm of the right width that carries no vocabulary tag is another type";
+            EXPECT_NE(position, interner.primitive(lp64 ? at.lp64 : at.llp64))
+                << "the anonymous core of the width is not `" << at.vocabulary << "`";
         }
     }
     // Both arms must actually have been READ — a sweep that met only one data
     // model would pin half the claim and report it whole.
     EXPECT_GE(lp64Pairs, 1u) << "no LP64 pair was read";
     EXPECT_GE(llp64Pairs, 1u) << "no LLP64 pair was read";
+}
+
+// ★ P69 round 4 — <windows.h>'s DWORD is `unsigned long`. Four kernel32 rows wrote
+// a DWORD position as a bare `u32`, which is `unsigned int`: `ExitThread` and
+// `Sleep` (the parameter), `GetLastError` and `GetCurrentThreadId` (the result).
+// ✔MEASURED 2026-10-08, each one's WHOLE prototype with `_Generic` over its
+// designator on both pe references: `void (*)(unsigned long)` and
+// `unsigned long (*)(void)` on MSVC 19.51 and mingw-w64 gcc 13.2.0 (run
+// 20261008-050017-91422066; the designator forms of the last two in the example's
+// own reference run, 20261008-053703-6cd2baed). The tag is the same one the file's
+// `DWORD` typedef has always carried. Only the positions MEASURED are pinned: the
+// other bare `u32` rows of the file are a mix of DWORD and UINT, and each waits
+// for the same measurement of its own SDK type.
+TEST(ShippedLibDescriptor, ShippedDwordPositionsAreUnsignedLong) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    auto const* pair = dss::test_support::shippedReadPair("x86_64", ObjectFormatKind::Pe);
+    ASSERT_NE(pair, nullptr);
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto const namedTypes = sysvVaListBinding(interner);
+    ShippedPairFacts const facts = pair->pairFacts();
+    auto desc = readShippedLibDescriptor(root / "windows.json", interner, typeReg, rep,
+                                         pair->dataModel(), pair->activeTarget(),
+                                         pair->activeFormat(), namedTypes, nullptr, &facts);
+    ASSERT_TRUE(desc.has_value()) << "windows.json failed to load";
+    EXPECT_FALSE(rep.hasErrors()) << "windows.json emitted diagnostics";
+
+    TypeId const dword = interner.primitive(TypeKind::U32, "unsigned long");
+    struct DwordPosition { char const* sym; int pos; };   // `pos` −1 is the result
+    constexpr DwordPosition kDwordPositions[] = {
+        {"ExitThread", 0}, {"Sleep", 0}, {"GetLastError", -1}, {"GetCurrentThreadId", -1},
+    };
+    for (DwordPosition const& at : kDwordPositions) {
+        SCOPED_TRACE(std::string{at.sym} + " position " + std::to_string(at.pos));
+        auto const sym = std::find_if(desc->symbols.begin(), desc->symbols.end(),
+                                      [&](ShippedSymbol const& s) { return s.name == at.sym; });
+        ASSERT_NE(sym, desc->symbols.end()) << at.sym << " not found in windows.json";
+        ASSERT_EQ(interner.kind(sym->signature), TypeKind::FnSig);
+        TypeId position = InvalidType;
+        if (at.pos < 0) {
+            position = interner.fnResult(sym->signature);
+        } else {
+            auto const params = interner.fnParams(sym->signature);
+            ASSERT_GT(params.size(), static_cast<std::size_t>(at.pos));
+            position = params[static_cast<std::size_t>(at.pos)];
+        }
+        EXPECT_EQ(interner.kind(position), TypeKind::U32) << "a DWORD is 32 bits wide";
+        EXPECT_EQ(position, dword)
+            << "a DWORD position is `unsigned long`; the anonymous `u32` is `unsigned int`";
+    }
+    // The file's own typedef is the authority the rows now agree with.
+    auto const typedefIt = std::find_if(desc->typedefs.begin(), desc->typedefs.end(),
+                                        [](auto const& t) { return t.name == "DWORD"; });
+    ASSERT_NE(typedefIt, desc->typedefs.end()) << "windows.json declares no DWORD typedef";
+    EXPECT_EQ(typedefIt->type, dword) << "DWORD itself is `unsigned long`";
 }
 
 // Model 3 per-format `library` MAP: a shipped descriptor routes a DIFFERENT
@@ -5817,49 +6042,76 @@ TEST(ShippedLibDescriptor, RealWindowsFindDataAndConsoleLayouts) {
     EXPECT_EQ(sr->size, 8u);
 }
 
-// c106: the strtoll SPLIT — msvcrt.dll does not export strtoll (pre-C99 CRT);
-// on pe `strtoll` is a MACRO onto the real _strtoi64 export while the
-// [elf,macho]-gated strtoll SYMBOL stays un-injected; on elf the inverse.
-// A drift in either direction is a loader break (importing a phantom strtoll
-// on pe → 0xC0000139) or a broken elf build (losing the real symbol), so BOTH
-// sides of BOTH formats pin.
-TEST(ShippedLibDescriptor, RealStdlibStrtollPeMacroSplit) {
+// strtoll on pe (c106, revised by P69 E1). c106 made pe's `strtoll` a MACRO onto
+// `_strtoi64` because msvcrt.dll — a pre-C99 CRT — exports no strtoll. DSS links the
+// UCRT, and ucrtbase.dll DOES export strtoll (✔MEASURED, its export table), so the
+// macro answered a library DSS no longer links; and C23 changed strtoll's meaning (the
+// `0b` subject), which the UCRT's does not implement
+// (D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM). Now `strtoll` is a function on
+// every format: glibc's C23 entry point on elf, DSS's `__dss_isoc23_strtoll` on pe
+// (runtime/platform/src/stdlib_strto.c), which reaches the UCRT's own strtoll through the
+// private `__dss_platform_strtoll` row; `_strtoi64` stays the MSVC name it is, pe-gated.
+// A drift back to the macro would silently drop the C23 subject on pe, so every side pins.
+TEST(ShippedLibDescriptor, RealStdlibStrtollIsAFunctionOnEveryFormat) {
     fs::path const root = shippedLibsRoot();
     ASSERT_FALSE(root.empty());
     // Macro VARIANTS select at decode (flat result per format); symbol
     // availability filters at semantic INJECTION — so the symbol side pins
     // the per-symbol gate through the SAME predicate the injector applies
     // (objectFormatInAvailabilitySet), never mere presence in the vector.
-    auto scan = [&](ObjectFormatKind fmt, bool& macroStrtoll,
-                    bool& symStrtoll, bool& symStrtoi64) {
+    struct Seen {
+        bool        macro = false;
+        bool        symbol = false;
+        bool        strtoi64 = false;
+        std::string linkName;
+        std::string realization;
+        std::string platformLink;   // the private `__dss_platform_strtoll` row's link name
+        bool        platformRow = false;
+    };
+    auto scan = [&](ObjectFormatKind fmt, std::string const& fmtName) {
+        Seen seen;
         TypeInterner interner{CompilationUnitId{1}};
         TypeRegistry typeReg;
-        auto desc = decodeShippedFor(root / "stdlib.json", interner, typeReg, fmt);
-        ASSERT_TRUE(desc.has_value());
-        macroStrtoll = symStrtoll = symStrtoi64 = false;
+        // The pair's own data model (every shipped pe64 document declares LLP64): a pe read
+        // under LP64 is no pair at all, and a row keyed on {format: pe, dataModel: LLP64}
+        // (P69's mbtowc family) rightly finds no arm in it.
+        auto desc = decodeShippedFor(root / "stdlib.json", interner, typeReg, fmt,
+                                     fmt == ObjectFormatKind::Pe ? DataModel::Llp64 : DataModel::Lp64);
+        EXPECT_TRUE(desc.has_value());
+        if (!desc.has_value()) return seen;
         for (auto const& m : desc->macros)
-            if (m.name == "strtoll") {
-                macroStrtoll = true;
-                EXPECT_EQ(m.replacement, "_strtoi64");
-            }
+            if (m.name == "strtoll") seen.macro = true;
         for (auto const& s : desc->symbols) {
-            if (s.name == "strtoll")
-                symStrtoll = objectFormatInAvailabilitySet(
-                    s.availableObjectFormats, fmt);
-            if (s.name == "_strtoi64")
-                symStrtoi64 = objectFormatInAvailabilitySet(
-                    s.availableObjectFormats, fmt);
+            bool const here = objectFormatInAvailabilitySet(s.availableObjectFormats, fmt);
+            if (s.name == "strtoll" && here) {
+                seen.symbol   = true;
+                seen.linkName = s.linkName;
+                if (auto const r = s.realization.find(fmtName); r != s.realization.end())
+                    seen.realization = r->second;
+            }
+            if (s.name == "_strtoi64") seen.strtoi64 = here;
+            if (s.name == "__dss_platform_strtoll" && here) {
+                seen.platformRow  = true;
+                seen.platformLink = s.linkName;
+            }
         }
+        return seen;
     };
-    bool m = false, s = false, s64 = false;
-    scan(ObjectFormatKind::Pe, m, s, s64);
-    EXPECT_TRUE(m)   << "pe strtoll must be the _strtoi64 macro";
-    EXPECT_FALSE(s)  << "a pe strtoll IMPORT is a phantom (msvcrt has none)";
-    EXPECT_TRUE(s64) << "pe must import the real _strtoi64";
-    scan(ObjectFormatKind::Elf, m, s, s64);
-    EXPECT_FALSE(m)  << "elf strtoll is the real symbol, not a macro";
-    EXPECT_TRUE(s);
-    EXPECT_FALSE(s64) << "_strtoi64 is pe-gated";
+    Seen const pe = scan(ObjectFormatKind::Pe, "pe");
+    EXPECT_FALSE(pe.macro) << "pe strtoll is a function now — the _strtoi64 macro answered msvcrt";
+    EXPECT_TRUE(pe.symbol);
+    EXPECT_EQ(pe.linkName, "__dss_isoc23_strtoll");
+    EXPECT_EQ(pe.realization, "runtime/platform/src/stdlib_strto.c");
+    EXPECT_TRUE(pe.platformRow) << "DSS's strtoll reaches the UCRT's through a private row";
+    EXPECT_EQ(pe.platformLink, "strtoll") << "ucrtbase.dll exports strtoll";
+    EXPECT_TRUE(pe.strtoi64) << "_strtoi64 stays the MSVC name it is";
+    Seen const elf = scan(ObjectFormatKind::Elf, "elf");
+    EXPECT_FALSE(elf.macro);
+    EXPECT_TRUE(elf.symbol);
+    EXPECT_EQ(elf.linkName, "__isoc23_strtoll") << "glibc's C23 entry point";
+    EXPECT_TRUE(elf.realization.empty());
+    EXPECT_FALSE(elf.platformRow) << "glibc needs no private row";
+    EXPECT_FALSE(elf.strtoi64) << "_strtoi64 is pe-gated";
 }
 
 // c106: the glibc timespec-flattening macros (st_atime -> st_atim_sec …) must
@@ -6005,7 +6257,8 @@ TEST(ShippedLibDescriptor, RealWindowsUlargeOverlayLayout) {
 
 // A known recipe id that EQUALS the symbol name decodes onto `ShippedSymbol.synthesize`.
 // The vocabulary predicate is the SINGLE source of truth shared with the driver's merged
-// reconstruction; Cycle 2 ADDED thrd_create/call_once/thrd_join (the last threads recipes).
+// reconstruction; Cycle 2 ADDED thrd_create/call_once/thrd_join, and P69 RETIRED call_once
+// (DSS's runtime source on pe, libSystem's pthread_once on Mach-O — a negative below).
 TEST(ShippedLibDescriptor, SynthesizeTagDecodesForKnownRecipe) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "threads.json", R"({
@@ -6032,7 +6285,7 @@ TEST(ShippedLibDescriptor, SynthesizeTagDecodesForKnownRecipe) {
     EXPECT_TRUE(isKnownSynthesizeRecipe("tss_create"));
     EXPECT_TRUE(isKnownSynthesizeRecipe("thrd_create"));   // Cycle 2 (DIRECT-PASS)
     EXPECT_TRUE(isKnownSynthesizeRecipe("thrd_join"));     // Cycle 2 (multi-block)
-    EXPECT_TRUE(isKnownSynthesizeRecipe("call_once"));     // Cycle 2 (once trampoline)
+    EXPECT_FALSE(isKnownSynthesizeRecipe("call_once"));    // Cycle 2's trampoline, retired P69
     EXPECT_FALSE(isKnownSynthesizeRecipe("bogus"));
 }
 
@@ -6121,9 +6374,11 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
     {"tss_set", ShimFamily::Threads},       {"tss_delete", ShimFamily::Threads},
     {"thrd_current", ShimFamily::Threads},  {"thrd_yield", ShimFamily::Threads},
     {"thrd_exit", ShimFamily::Threads},     {"thrd_detach", ShimFamily::Threads},
-    // … + the 3 trampolines.
+    // … + 2 of Cycle 2's 3 trampolines (★ P69 retired the third, `call_once`, to
+    // `kNonRecipes` below: it is DSS's runtime source on pe and libSystem's pthread_once
+    // on Mach-O, and C23 declares it in <stdlib.h> too, so a recipe would have put its
+    // body into every program that included <stdlib.h>).
     {"thrd_create", ShimFamily::Threads},   {"thrd_join", ShimFamily::Threads},
-    {"call_once", ShimFamily::Threads},
     // … + the 4 that closed the header on every leg (D-CSUBSET-C11-THREADS-TIMED,
     // P49 lane tw). ★ THREE OF THESE GRADUATED OUT OF `kNonRecipes` BELOW, where they
     // sat as "deferred threads ids" — the negative list was RIGHT while the deferral
@@ -6135,8 +6390,11 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
     // guessing. `thrd_equal` was never in the negative list — it was simply absent.
     {"thrd_sleep", ShimFamily::Threads},    {"mtx_timedlock", ShimFamily::Threads},
     {"cnd_timedwait", ShimFamily::Threads}, {"thrd_equal", ShimFamily::Threads},
-    // <stdio.h> printf/scanf family over the UCRT __stdio_common_v* cores — SIX recipes
-    // as of TF-C119, where `sprintf` was once the only one and P3 grew it to five.
+    // ★ P69: the <stdio.h> family is RETIRED from this table — its six ids moved to
+    // `kNonRecipes` below, because the pe printf/scanf rows are DSS's runtime SOURCE now
+    // (runtime/platform/src/stdio.c; D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM).
+    // The history of the family, kept because it is why those ids are negatives now:
+    // it was SIX recipes as of TF-C119, where `sprintf` was once the only one and P3 grew it to five.
     // ucrtbase.dll exports NOT ONE of these six names (in a real MSVC build each is a
     // header inline over a `__stdio_common_v*` core), so once the pe CRT flipped off
     // msvcrt a compiler that binds by export table has nothing to import and must
@@ -6151,12 +6409,13 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
     // `__stdio_common_vsnprintf` to import (ucrtbase has `__stdio_common_vsprintf` at
     // ordinal 117 and `__stdio_common_vsnprintf_s` at 115, nothing between), so it reuses
     // `sprintf`'s core with a different `_Options` bit and a real `_BufferCount`.
-    {"printf", ShimFamily::Stdio},          {"fprintf", ShimFamily::Stdio},
-    {"sprintf", ShimFamily::Stdio},         {"snprintf", ShimFamily::Stdio},
-    {"vfprintf", ShimFamily::Stdio},        {"sscanf", ShimFamily::Stdio},
 };
 
-// Ids that must NOT be recipes. Three groups, each catching a different regression:
+// Ids that must NOT be recipes. Five groups, each catching a different regression:
+//   * the RETIRED stdio recipes (P69) — the pe printf/scanf family is DSS's runtime
+//     source now, so a synth recipe for any of them would be a second owner of one body;
+//   * the RETIRED once trampoline (P69) — `call_once`, runtime source on pe for the same
+//     reason, and the one threads function C23 also declares in <stdlib.h>;
 //   * the UNSHIPPED stdio id — a speculative body sneaking into `kRecipes` reds here;
 //   * DEFERRED threads ids (thrd_sleep + the timed waits stay elf-FFI-only) — promoting
 //     one to a synth recipe without a body reds here;
@@ -6186,8 +6445,19 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
 // symbol it can simply import. `vsnprintf` is added as the fresh negative in `snprintf`'s
 // place — it is the next plausible speculative body (the UCRT header reaches the core
 // through it), and it has no descriptor row, so a recipe landing ahead of one still reds.
+// ★ P69 REVERSED THE GRADUATION: all six went back to this list when the pe family became
+// runtime/platform/src/stdio.c — the recipe the migration moved them into had become a
+// second owner of each body. (`vsnprintf` HAS a descriptor row since P69 — an [elf,macho]
+// import and a [pe] realization — and is still a negative for the same reason.)
 constexpr char const* kNonRecipes[] = {
+    // ★ P69: the RETIRED stdio recipes — a synth recipe for any of them would give the
+    // family a second owner beside runtime/platform/src/stdio.c.
+    "printf", "fprintf", "sprintf", "snprintf", "vfprintf", "sscanf",
     "vsnprintf", "snprintf_s",                               // unshipped stdio arms
+    // ★ P69: the RETIRED once trampoline — call_once is runtime/platform/src/threads_once.c
+    // on pe (realized from threads.json AND stdlib.json) and pthread_once on Mach-O, so a
+    // recipe for it would be a second owner of that body.
+    "call_once",
     // ★ `thrd_sleep`, `mtx_timedlock` and `cnd_timedwait` USED TO SIT HERE as
     // "deferred threads ids" and MOVED into kPinnedRecipes in P49
     // (D-CSUBSET-C11-THREADS-TIMED): they are real recipes on pe and macho now. The
@@ -6206,11 +6476,12 @@ constexpr char const* kNonRecipes[] = {
 // `SynthesizeTagDecodesForKnownRecipe` does for `isKnownSynthesizeRecipe`) cannot catch a
 // family typo on the 19th row; walking the whole table costs nothing and does.
 //
-// RED-ON-DISABLE: flip any one `kRecipes` row's family tag (e.g. make `sprintf` Threads)
-// and this reds on that id alone — and the corresponding real build breaks, because the
-// threads pass would then be handed a recipe it has no arm for.
+// RED-ON-DISABLE: drop any one `kRecipes` row and this reds on that id alone. (While a
+// second family existed, flipping a row's family tag red it too; since P69 retired the
+// <stdio.h> family, `ShimFamily` has one enumerator and the family check is a presence
+// check — the count pin is what still catches a silent addition.)
 TEST(ShippedLibDescriptor, ShimFamilyOfPartitionsEveryRecipeInTheVocabulary) {
-    std::size_t threads = 0, stdio = 0;
+    std::size_t threads = 0;
     for (auto const& r : kPinnedRecipes) {
         EXPECT_TRUE(isKnownSynthesizeRecipe(r.id))
             << "pinned recipe '" << r.id << "' vanished from the closed vocabulary";
@@ -6220,19 +6491,16 @@ TEST(ShippedLibDescriptor, ShimFamilyOfPartitionsEveryRecipeInTheVocabulary) {
                "treat that as an internal invariant breach and abort the build";
         EXPECT_EQ(*fam, r.family)
             << "recipe '" << r.id << "' is routed to the WRONG synthesis pass";
-        (r.family == ShimFamily::Threads ? threads : stdio) += 1;
+        if (r.family == ShimFamily::Threads) ++threads;
     }
     // The shape of the vocabulary itself, so a silent addition/removal is visible.
-    EXPECT_EQ(threads, 25u)
-        << "the <threads.h> family is the 18 non-trampoline + 3 trampolines + the 4 "
-           "timed/identity recipes that closed the header on every leg "
-           "(D-CSUBSET-C11-THREADS-TIMED)";
-    EXPECT_EQ(stdio, 6u)
-        << "the <stdio.h> family ships EXACTLY "
-           "printf/fprintf/sprintf/snprintf/vfprintf/sscanf (P3 grew it from 1 to 5; "
-           "TF-C119 added snprintf) — a SEVENTH would mean a body landed ahead of its "
-           "stdio.json row, and a FIFTH that one was retired without retiring its "
-           "descriptor row";
+    EXPECT_EQ(threads, 24u)
+        << "the <threads.h> family is the 18 non-trampoline + 2 trampolines (call_once, "
+           "the third, is runtime source since P69) + the 4 timed/identity recipes that "
+           "closed the header on every leg (D-CSUBSET-C11-THREADS-TIMED)";
+    EXPECT_EQ(std::size(kPinnedRecipes), threads)
+        << "every pinned recipe is a <threads.h> one since P69 retired the <stdio.h> "
+           "family to runtime/platform/src/stdio.c";
 }
 
 // THE LOCKSTEP INVARIANT, asserted as the biconditional the header documents rather than
@@ -6242,7 +6510,7 @@ TEST(ShippedLibDescriptor, ShimFamilyOfPartitionsEveryRecipeInTheVocabulary) {
 // `isKnownSynthesizeRecipe(id)`.
 //
 // RED-ON-DISABLE: give either function an early-out the other lacks — e.g. make
-// `shimFamilyOf` return `ShimFamily::Stdio` for anything starting with "s", or have
+// `shimFamilyOf` return a family for anything starting with "s", or have
 // `isKnownSynthesizeRecipe` short-circuit true on a prefix — and the mutation sweep reds
 // even though every hand-written sample would still pass.
 TEST(ShippedLibDescriptor, ShimFamilyOfAndIsKnownRecipeStayInLockstep) {
@@ -7093,8 +7361,12 @@ struct DarwinBsdClusterRead {
 
 static void readDarwinBsdCluster(fs::path const& path, std::string_view arch,
                                  ObjectFormatKind fmt, DarwinBsdClusterRead& out) {
+    // The pair's own data model — every shipped pe64 document declares LLP64 (P69: a pe
+    // read under LP64 finds no arm for a row keyed on {format: pe, dataModel: LLP64}).
     out.desc = readShippedLibDescriptor(path, out.interner, out.typeReg, out.rep,
-                                        DataModel::Lp64, arch, fmt);
+                                        fmt == ObjectFormatKind::Pe ? DataModel::Llp64
+                                                                    : DataModel::Lp64,
+                                        arch, fmt);
     ASSERT_TRUE(out.desc.has_value())
         << path.generic_string() << " failed to load for arch=" << arch;
     ASSERT_FALSE(out.rep.hasErrors())
@@ -7984,65 +8256,99 @@ TEST(ShippedLibDescriptor, PreprocessorVisibleMustBeBoolean) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
-// ★ THE AXIS REFUSAL, and it is what makes the preprocessor's `activeTarget =
-// nullopt` SAFE rather than merely lucky. The splice threads the object-format
-// and no arch, so an arch-keyed VISIBLE constant would select in the semantic
-// tier and be absent from `#if` on every target — this row's defect, one axis
-// over. Refused at LOAD, on every target.
-TEST(ShippedLibDescriptor, APreprocessorVisibleConstantMaySelectOnFormatOnly) {
+// ★ A PREPROCESSOR-VISIBLE CONSTANT SELECTS ON THE FULL PAIR (P69,
+// D-FFI-FCNTL-AARCH64-OPEN-FLAGS-TAKE-X86-64-VALUES). It used to be refused every axis
+// but `format`, because the splice threaded no arch — which made a per-ARCH value
+// inexpressible, and Linux aarch64's O_DIRECTORY/O_NOFOLLOW shipped with x86_64's
+// bits. The splice now reads with the pair's target, so the arm `#if` sees is the arm
+// the semantic tier injects. With no target an arch-keyed arm matches nothing: the
+// same answer a format-keyed arm gives with no format.
+TEST(ShippedLibDescriptor, APreprocessorVisibleConstantSelectsOnTheFullPair) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
-    // NEGATIVE: an arch axis on a visible constant.
-    {
-        auto const path = writeTemp(dir, "archy.json", R"JSON({
-            "header": "archy.h",
-            "constants": [
-              { "name": "K", "variants": [
-                { "when": { "arch": "x86_64" }, "value": 1, "type": "i32" },
-                { "when": { "arch": "arm64" },  "value": 2, "type": "i32" }
-              ] }
-            ]
-        })JSON");
+    auto const path = writeTemp(dir, "archy.json", R"JSON({
+        "header": "archy.h",
+        "constants": [
+          { "name": "K", "variants": [
+            { "when": { "format": "elf", "arch": "x86_64" }, "value": 1, "type": "i32" },
+            { "when": { "format": "elf", "arch": "arm64" },  "value": 2, "type": "i32" },
+            { "when": { "format": "macho" },                 "value": 3, "type": "i32" }
+          ] }
+        ]
+    })JSON");
+    struct Case {
+        std::optional<std::string_view> arch;
+        ObjectFormatKind                format;
+        std::optional<std::int64_t>     selected;
+    };
+    std::array<Case, 6> const cases{{
+        {std::string_view{"x86_64"}, ObjectFormatKind::Elf, 1},
+        {std::string_view{"arm64"}, ObjectFormatKind::Elf, 2},
+        {std::string_view{"arm64"}, ObjectFormatKind::MachO, 3},
+        {std::string_view{"x86_64"}, ObjectFormatKind::MachO, 3},
+        {std::nullopt, ObjectFormatKind::Elf, std::nullopt},
+        {std::string_view{"x86_64"}, ObjectFormatKind::Pe, std::nullopt},
+    }};
+    for (Case const& c : cases) {
+        SCOPED_TRACE(std::string{c.arch.value_or("<no target>")} + " x "
+                     + std::string{objectFormatKindName(c.format)});
         DiagnosticReporter rep;
-        EXPECT_FALSE(readShippedLibConstants(path, rep).has_value());
-        EXPECT_TRUE(rep.hasErrors());
-    }
-    // POSITIVE CONTROL 1: the same shape on `format` loads clean, so the
-    // refusal is about the AXIS and not about variants as such.
-    {
-        auto const path = writeTemp(dir, "fmtk.json", R"JSON({
-            "header": "fmtk.h",
-            "constants": [
-              { "name": "K", "variants": [
-                { "when": { "format": "elf" }, "value": 1, "type": "i32" },
-                { "when": { "format": "pe" },  "value": 2, "type": "i32" }
-              ] }
-            ]
-        })JSON");
-        DiagnosticReporter rep;
-        auto ks = readShippedLibConstants(path, rep, std::nullopt,
-                                          ObjectFormatKind::Elf);
+        auto const ks = readShippedLibConstants(path, rep, c.arch, c.format);
         ASSERT_TRUE(ks.has_value());
         EXPECT_FALSE(rep.hasErrors());
-        ASSERT_EQ(ks->size(), 1u);
-        EXPECT_EQ(ks->at(0).value, 1);
+        if (c.selected.has_value()) {
+            ASSERT_EQ(ks->size(), 1u);
+            EXPECT_EQ(ks->at(0).name, "K");
+            EXPECT_EQ(ks->at(0).value, *c.selected);
+        } else {
+            EXPECT_TRUE(ks->empty()) << "no arm names this pair, so nothing reaches `#if`";
+        }
     }
-    // POSITIVE CONTROL 2: a SEMANTIC-ONLY constant may still use any axis — the
-    // refusal is scoped to the rows that must reach the preprocessor.
-    {
-        auto const path = writeTemp(dir, "archyok.json", R"JSON({
-            "header": "archyok.h",
-            "constants": [
-              { "name": "K", "preprocessorVisible": false, "variants": [
-                { "when": { "arch": "x86_64" }, "value": 1, "type": "i32" },
-                { "when": { "arch": "arm64" },  "value": 2, "type": "i32" }
-              ] }
-            ]
-        })JSON");
+}
+
+// The REAL <fcntl.h> on every real pair: the open flags Linux aarch64 overrides take
+// each ISA's own value. ✔MEASURED glibc 2.39 / gcc 13.3.0 on each ISA (runs
+// 20260930-175639-f43a1fd8 x86_64, 20260930-175657-9088f3f4 aarch64) and Apple clang 21
+// on both Mach-O arches (run 20260930-184722-16d7667e). pe declares none of them.
+TEST(ShippedLibDescriptor, FcntlOpenFlagsTakeEachArchsOwnValue) {
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
+    auto const fcntl = *root / "shippedLibs" / "fcntl.json";
+    struct Want {
+        std::string_view arch;
+        ObjectFormatKind format;
+        std::int64_t     directory;
+        std::int64_t     nofollow;
+        std::int64_t     tmpfile;   // 0 = not declared on this pair
+    };
+    std::array<Want, 5> const wants{{
+        {"x86_64", ObjectFormatKind::Elf, 0x10000, 0x20000, 0x410000},
+        {"arm64", ObjectFormatKind::Elf, 0x4000, 0x8000, 0x404000},
+        {"x86_64", ObjectFormatKind::MachO, 0x100000, 0x100, 0},
+        {"arm64", ObjectFormatKind::MachO, 0x100000, 0x100, 0},
+        {"x86_64", ObjectFormatKind::Pe, 0, 0, 0},
+    }};
+    for (Want const& w : wants) {
+        dss::test_support::ShippedReadPair const* pair =
+            dss::test_support::shippedReadPair(w.arch, w.format);
+        ASSERT_NE(pair, nullptr);
+        SCOPED_TRACE(pair->label());
+        ShippedPairFacts const facts = pair->pairFacts();
         DiagnosticReporter rep;
-        auto ks = readShippedLibConstants(path, rep, std::string_view{"x86_64"});
-        ASSERT_TRUE(ks.has_value());
-        EXPECT_FALSE(rep.hasErrors());
-        EXPECT_TRUE(ks->empty()) << "semantic-only, so nothing for the splice";
+        auto const ks = readShippedLibConstants(fcntl, rep, pair->activeTarget(),
+                                                pair->activeFormat(), &facts);
+        ASSERT_TRUE(ks.has_value()) << "fcntl.json no longer reads on " << pair->label();
+        auto const valueOf = [&](std::string_view name) -> std::int64_t {
+            std::int64_t found = 0;
+            std::size_t  seen  = 0;
+            for (auto const& k : *ks) {
+                if (k.name == name) { found = k.value; ++seen; }
+            }
+            EXPECT_LE(seen, 1u) << name << " realized twice";
+            return found;
+        };
+        EXPECT_EQ(valueOf("O_DIRECTORY"), w.directory);
+        EXPECT_EQ(valueOf("O_NOFOLLOW"), w.nofollow);
+        EXPECT_EQ(valueOf("O_TMPFILE"), w.tmpfile);
     }
 }
 
@@ -8255,3 +8561,153 @@ TEST(ShippedLibDescriptor, AnEmptyWhenSelectorIsRefused) {
 }
 
 } // namespace
+
+// ★ P69 (lane lm) — THE LIBRARY-DATUM ALIAS KEY. ONE row per object, its other
+// exported names in `aliases` per object format (✔MEASURED per library: glibc
+// exports `environ`, `__environ` and `_environ` at one address on both ELF arches;
+// libSystem exports `environ` alone). Each alias is also a declared row of its own
+// name (`aliasOf` naming the canonical row), so a program can write any of them.
+//
+// RED-ON-DISABLE: drop unistd.json's `aliases` and the elf half fails (no
+// `__environ`/`_environ` row, no alias set); restore the old `__environ` row
+// beside the alias and the load refuses it (the cross-row rule below).
+namespace {
+
+[[nodiscard]] std::vector<ShippedSymbol const*>
+rowsNamedOn(ShippedLibDescriptor const& d, std::string_view name, ObjectFormatKind fmt) {
+    std::vector<ShippedSymbol const*> out;
+    for (auto const& s : d.symbols) {
+        if (s.name == name && objectFormatInAvailabilitySet(s.availableObjectFormats, fmt))
+            out.push_back(&s);
+    }
+    return out;
+}
+
+// True iff SOME diagnostic's text contains `needle`.
+[[nodiscard]] bool sawText(DiagnosticReporter const& rep, std::string_view needle) {
+    for (auto const& d : rep.all())
+        if (d.actual.find(needle) != std::string::npos) return true;
+    return false;
+}
+
+}  // namespace
+
+TEST(ShippedLibDescriptor, RealUnistdEnvironIsOneObjectUnderThreeNamesOnElf) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto const desc = decodeShippedFor(root / "unistd.json", interner, typeReg, ObjectFormatKind::Elf);
+        ASSERT_TRUE(desc.has_value());
+        auto const env = rowsNamedOn(*desc, "environ", ObjectFormatKind::Elf);
+        ASSERT_EQ(env.size(), 1u) << "one row for the object";
+        EXPECT_EQ(env[0]->aliases, (std::vector<std::string>{"__environ", "_environ"}))
+            << "glibc's other names of the object, as measured";
+        EXPECT_TRUE(env[0]->aliasOf.empty());
+        for (std::string_view const alias : {"__environ", "_environ"}) {
+            auto const rows = rowsNamedOn(*desc, alias, ObjectFormatKind::Elf);
+            ASSERT_EQ(rows.size(), 1u) << alias << " must be declared exactly once on elf";
+            EXPECT_EQ(rows[0]->aliasOf, "environ") << alias;
+            EXPECT_TRUE(rows[0]->aliases.empty()) << alias;
+            EXPECT_EQ(rows[0]->signature, env[0]->signature) << alias << ": the same declaration";
+            EXPECT_EQ(rows[0]->kind, ShippedSymbolKind::Object) << alias;
+            EXPECT_TRUE(rows[0]->linkName.empty()) << alias << " IS an export name of glibc";
+        }
+    }
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto const desc = decodeShippedFor(root / "unistd.json", interner, typeReg, ObjectFormatKind::MachO);
+        ASSERT_TRUE(desc.has_value());
+        auto const env = rowsNamedOn(*desc, "environ", ObjectFormatKind::MachO);
+        ASSERT_EQ(env.size(), 1u);
+        EXPECT_TRUE(env[0]->aliases.empty()) << "libSystem exports `environ` alone";
+        EXPECT_TRUE(rowsNamedOn(*desc, "__environ", ObjectFormatKind::MachO).empty());
+        EXPECT_TRUE(rowsNamedOn(*desc, "_environ", ObjectFormatKind::MachO).empty());
+    }
+}
+
+TEST(ShippedLibDescriptor, AnAliasThatIsAlsoItsOwnRowIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib-alias"};
+    // On elf, `obj_alias` is BOTH an alias of `obj` and a row of its own: refused.
+    auto const twoRows = writeTemp(dir, "tworows.json", R"({
+        "header": "aliasprobe.h",
+        "availableObjectFormats": ["elf", "macho"],
+        "symbols": [
+            { "name": "obj", "signature": "i32", "kind": "object", "linkage": "external",
+              "aliases": { "elf": ["obj_alias"] } },
+            { "name": "obj_alias", "signature": "i32", "kind": "object", "linkage": "external",
+              "availableObjectFormats": ["elf"] }
+        ]
+    })");
+    // ...checked whatever format the read selects: a macho read refuses it too.
+    for (ObjectFormatKind const fmt : {ObjectFormatKind::Elf, ObjectFormatKind::MachO}) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto const desc = readShippedLibDescriptor(twoRows, interner, typeReg, rep, DataModel::Lp64,
+                                                   std::string_view{"x86_64"}, fmt);
+        EXPECT_FALSE(desc.has_value()) << objectFormatKindName(fmt);
+        EXPECT_TRUE(sawText(rep, "is ALSO a row of its own there")) << objectFormatKindName(fmt);
+    }
+
+    // CONTROL: the same name as a row on ANOTHER format only is not the same object.
+    auto const otherFormat = writeTemp(dir, "otherformat.json", R"({
+        "header": "aliasprobe.h",
+        "availableObjectFormats": ["elf", "macho"],
+        "symbols": [
+            { "name": "obj", "signature": "i32", "kind": "object", "linkage": "external",
+              "aliases": { "elf": ["obj_alias"] } },
+            { "name": "obj_alias", "signature": "i32", "kind": "object", "linkage": "external",
+              "availableObjectFormats": ["macho"] }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto const desc = readShippedLibDescriptor(otherFormat, interner, typeReg, rep, DataModel::Lp64,
+                                               std::string_view{"x86_64"}, ObjectFormatKind::Elf);
+    ASSERT_TRUE(desc.has_value()) << (rep.all().empty() ? std::string{} : rep.all().front().actual);
+    auto const rows = rowsNamedOn(*desc, "obj_alias", ObjectFormatKind::Elf);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0]->aliasOf, "obj");
+}
+
+TEST(ShippedLibDescriptor, AMalformedAliasesMapIsRefused) {
+    struct Case {
+        char const* aliases;
+        char const* needle;
+    };
+    Case const cases[] = {
+        {R"(["obj_alias"])", "must be a per-object-format object"},
+        {R"({"elf": []})", "NON-EMPTY array"},
+        {R"({"elf": "obj_alias"})", "NON-EMPTY array"},
+        {R"({"elf": ["obj"]})", "lists the row's own name"},
+        {R"({"elf": ["a1", "a1"]})", "twice"},
+        {R"({"elf": ["not an identifier"]})", "not a C identifier"},
+        {R"({"elf": [3]})", "not a C identifier"},
+        {R"({"coff": ["a1"]})", "unknown object-format key"},
+    };
+    ScratchDir dir{Location::Temp, "shipped-lib-alias-shape"};
+    std::size_t n = 0;
+    for (Case const& c : cases) {
+        SCOPED_TRACE(c.aliases);
+        std::string const text = std::string{R"({
+            "header": "aliasprobe.h",
+            "symbols": [
+                { "name": "obj", "signature": "i32", "kind": "object", "linkage": "external",
+                  "aliases": )"} + c.aliases + R"( }
+            ]
+        })";
+        auto const path = writeTemp(dir, "case" + std::to_string(n++) + ".json", text);
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto const desc = readShippedLibDescriptor(path, interner, typeReg, rep, DataModel::Lp64,
+                                                   std::string_view{"x86_64"}, ObjectFormatKind::Elf);
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_TRUE(sawText(rep, c.needle))
+            << (rep.all().empty() ? std::string{"(no diagnostic)"} : rep.all().front().actual);
+    }
+}

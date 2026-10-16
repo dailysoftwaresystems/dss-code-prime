@@ -15,6 +15,11 @@
 //     ✔MEASURED 2026-09-23: clang 18.1.3 writes `fc ff ff ff` into the field of
 //     `movl $5, counter(%rip)` (COFF REL32 and Mach-O SIGNED_4 alike), and
 //     mingw gas writes the symbol's section offset less 4 there.
+//     ⚠ A WIRE TYPE CAN LOWER IT FURTHER: COFF's REL32_1.._5 are
+//     S + field - (P + 4 + N), so their field holds DSS's addend PLUS N — cl
+//     writes REL32_4 with 0 in the field of `mov dword ptr [x],imm32`
+//     (✔MEASURED 2026-10-07). The format declares it per row
+//     (`bytesAfterFieldLowersTheAddend`), and a reader passes the type's N.
 //
 // ★★ EVERY WRITER STAMPS THROUGH `placeRelocationAddend` AND EVERY READER READS
 // THROUGH `recoverRelocationAddend`, so a writer and a reader can never
@@ -105,20 +110,35 @@ placeRelocationAddend(RelocationAddendStorage      storage,
 // column (explicit) or from the patched field (in place — sign-extended from the
 // field's width). An in-place field of a non-linear kind holds instruction bits
 // and carries no addend.
+//
+// `loweredByTheType` is what the record's WIRE TYPE subtracts on top of that —
+// `RelocationDecodeTable::addendLoweringOf(type)`, non-zero only for a type the
+// format declares `bytesAfterFieldLowersTheAddend` for (COFF's REL32_1.._5,
+// whose field holds the offset measured from the instruction's END). A required
+// argument, so no reader can forget it: the readers that took every `.text`
+// addend as 0 are why this file exists.
 [[nodiscard]] inline std::expected<std::int64_t, std::string>
 recoverRelocationAddend(RelocationAddendStorage          storage,
                         TargetRelocationInfo const&      tri,
                         std::optional<std::int64_t>      column,
-                        std::span<std::uint8_t const>    field) {
+                        std::span<std::uint8_t const>    field,
+                        std::uint8_t                     loweredByTheType) {
     if (storage == RelocationAddendStorage::Explicit) {
         if (!column.has_value()) {
             return std::unexpected(std::format(
                 "relocation '{}' was read from a format whose records carry an "
                 "addend column, and this record's was not supplied", tri.name));
         }
-        return *column - tri.addendBias;
+        return *column - tri.addendBias - std::int64_t{loweredByTheType};
     }
-    if (!relocationFieldHoldsAnAddend(tri)) return std::int64_t{0};
+    if (!relocationFieldHoldsAnAddend(tri)) {
+        if (loweredByTheType == 0u) return std::int64_t{0};
+        return std::unexpected(std::format(
+            "relocation '{}' patches an instruction field, which holds no "
+            "addend, and its wire type lowers the addend by {} byte(s) -- a "
+            "type that lowers an addend needs a field that holds one",
+            tri.name, loweredByTheType));
+    }
     if (field.size() != tri.widthBytes) {
         return std::unexpected(std::format(
             "relocation '{}' patches a {}-byte field and only {} byte(s) of it "
@@ -128,11 +148,12 @@ recoverRelocationAddend(RelocationAddendStorage          storage,
     for (std::size_t b = 0; b < field.size(); ++b) {
         raw |= static_cast<std::uint64_t>(field[b]) << (8u * b);
     }
-    if (field.size() == 4u) {
-        return static_cast<std::int64_t>(static_cast<std::int32_t>(
-            static_cast<std::uint32_t>(raw)));
-    }
-    return static_cast<std::int64_t>(raw);
+    std::int64_t const inField =
+        field.size() == 4u
+            ? static_cast<std::int64_t>(static_cast<std::int32_t>(
+                  static_cast<std::uint32_t>(raw)))
+            : static_cast<std::int64_t>(raw);
+    return inField - std::int64_t{loweredByTheType};
 }
 
 } // namespace dss::link::format

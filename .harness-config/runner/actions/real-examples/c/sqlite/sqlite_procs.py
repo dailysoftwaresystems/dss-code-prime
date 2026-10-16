@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """sqlite_procs.py -- the SQLite corpus harness's PROCESSES: enumeration, the leftover-fixture
-sweep, the tree kill, start markers, the output-tree RUN LOCK and the shared-clone lock.
+sweep, the tree kill, start markers, the output-tree RUN LOCK and the per-checkout CLONE LOCK.
 
 It replaces the process half of the two old drivers (lane mig, part 4, 2026-09-21): the bash
 twin's `ps_enum_available` / `our_fixture_pids` / `stop_our_fixtures` / `proc_start_marker`, the
@@ -9,8 +9,8 @@ twin's `ps_enum_available` / `our_fixture_pids` / `stop_our_fixtures` / `proc_st
 run-lock liveness (`Get-LockOwner`, `Test-LockOwnerAlive`). The union, with two defects closed:
   * the PowerShell sweep compared two WINDOWS spellings of a fixture that a WSL launcher runs as
     a LINUX process, so on WSL legs it matched nothing; a launched fixture is now swept INSIDE its
-    own kernel (the plan's `kernelEntryArgv`, e.g. `wsl.exe -e`), matching the path spelled in
-    that kernel's namespace;
+    own kernel (the plan's `kernelEntryArgv`, e.g. `wsl.exe -d <the WSL legs' distribution> -e`),
+    matching the path spelled in that kernel's namespace;
   * the bash sweep excluded only itself; this process AND its ancestors are excluded now, and an
     enumeration that cannot run is UNVERIFIED (warned), never "none found".
 
@@ -300,8 +300,8 @@ def _default_runner(argv):
 
 def enumerate_processes(launcher_prefix=None, runner=None):
     """Every process this host shows -> Enumeration. With `launcher_prefix` (the plan's
-    `kernelEntryArgv`, e.g. `["wsl.exe", "-e"]`) the listing is taken INSIDE that kernel with
-    `ps`; without it, natively (ps on POSIX, the Toolhelp32 snapshot on Windows). `runner` is the
+    `kernelEntryArgv`, e.g. `["wsl.exe", "-d", <distribution>, "-e"]`) the listing is taken INSIDE
+    that kernel with `ps`; without it, natively (ps on POSIX, the Toolhelp32 snapshot on Windows). `runner` is the
     ps spawner (injectable; default = `C.capture` under LC_ALL=C)."""
     prefix = [str(a) for a in (launcher_prefix or [])]
     if prefix or os.name != "nt":
@@ -829,26 +829,21 @@ class RunLock:
                 pass
 
 
-# ── the SHARED-CLONE lock (reader/writer), on-disk format of the bash twin kept ─────────
+# ── the CHECKOUT lock (reader/writer), on-disk format of the bash twin kept ─────────────
 
 CLONE_LOCK_BLOCKED = "DSS-CLONE-LOCK-BLOCKED"
 _KEY_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
 
 
 def clone_lock_key(clone_dir, environ=None):
-    """The lock directory of one sqlite clone: `${XDG_CACHE_HOME:-$HOME/.cache}/dsscp/clone-locks/`
-    + the clone's REAL path with every byte outside `A-Za-z0-9._-` turned into `_` (the bash
-    twin's `tr -c`). The real path is `cd <p> && pwd -P` for an existing directory; for one not
-    created yet the bash twin used the literal string, which split the write and read locks of a
-    first run across two directories when the path went through a symlink -- the real path of the
-    existing prefix is used instead (⚠DECISION)."""
-    env = os.environ if environ is None else environ
-    base = env.get("XDG_CACHE_HOME") or ""
-    if not base:
-        home = env.get("HOME") or ""
-        if not home:
-            C.die("neither XDG_CACHE_HOME nor HOME is set, so the shared-clone lock has no home.")
-        base = home + "/.cache"
+    """The lock directory of one sqlite checkout: `${XDG_CACHE_HOME:-$HOME/.cache}/dsscp/clone-locks/`
+    (`sqlite_common.posix_cache_root`, the one rule for that cache) + the checkout's REAL path with every
+    byte outside `A-Za-z0-9._-` turned into `_` (the bash twin's `tr -c`). The real path is
+    `cd <p> && pwd -P` for an existing directory; for one not created yet the bash twin used the
+    literal string, which split the write and read locks of a first run across two directories when
+    the path went through a symlink -- the real path of the existing prefix is used instead
+    (⚠DECISION). One key PER CHECKOUT: each consumer's own checkout has its own (2026-09-30)."""
+    base = C.posix_cache_root(environ)
     real = os.fsencode(os.path.realpath(clone_dir))
     mapped = "".join(chr(b) if b in _KEY_BYTES else "_" for b in real)
     return "%s/dsscp/clone-locks/%s" % (base, mapped)
@@ -868,15 +863,21 @@ def _lstart_marker(pid):
 
 
 class CloneLock:
-    """The reader/writer lock of the ONE sqlite clone every harness run shares.
-      WRITE  short, mutating: fetch/pull, configure, the stage (a POSIX host's Steps 3-7; a
+    """The reader/writer lock of ONE sqlite checkout.
+      WRITE  short, mutating: fetch, checkout, configure, the stage (a POSIX host's Steps 3-7; a
              Windows host's derive, inside WSL).
       READ   long, read-only: a POSIX host's corpus run reads the .test files straight out of the
-             clone for hours; it takes WRITE first and DOWNGRADES to READ (marker first, then the
+             checkout for hours; it takes WRITE first and DOWNGRADES to READ (marker first, then the
              writer released), so the long window blocks a mutator without blocking a reader.
+    ★ ONE CHECKOUT PER CONSUMER (2026-09-30): until then every run on a host shared ONE clone,
+    `~/src/sqlite` inside WSL, so the four-leg `dssharness run sqlite` refused one of its OWN legs here
+    whenever the stage had to refresh (the Windows leg's derive writing while the WSL leg read its
+    corpus). Each consumer now has its own checkout (`sqlite_stage.consumer_checkout`: a POSIX host's
+    inside its output tree, a Windows host's in WSL's cache keyed by its output tree), so each has its
+    own key here; the lock stays, per checkout, for a checkout a person names for two runs by hand.
     A live holder FAILS LOUD (`CloneLockBlocked`, exit 3, first line `DSS-CLONE-LOCK-BLOCKED`);
     staleness is liveness (pid + start marker), so a crashed run's lock is stolen and the theft
-    noted. The state lives OUTSIDE the clone, keyed on its real path (`clone_lock_key`).
+    noted. The state lives OUTSIDE the checkout, keyed on its real path (`clone_lock_key`).
     ON-DISK FORMAT: `<key>/w.lock/owner` and `<key>/readers/<pid>.reader`, each
     `pid\\nlstart-marker\\nepoch\\nwhat\\n` -- the bash twin's four lines, unchanged, so a copy of
     that twin still reads this lock exactly as before -- plus a FIFTH line
@@ -896,9 +897,9 @@ class CloneLock:
         # Keyed on WHERE the POSIX half runs (`PosixSide`, the driver's one host switch), never on
         # an `os.name` test of its own: the lock is taken where the clone's other users take it.
         if C.PosixSide(C.host_os()).needs_wsl:
-            C.die("CloneLock is POSIX-only: the shared sqlite clone and its lock live on the POSIX "
+            C.die("CloneLock is POSIX-only: a sqlite checkout and its lock live on the POSIX "
                   "side, which on this host is WSL -- the derive takes this lock there. A lock taken "
-                  "from here would be one no other run of the clone could see.")
+                  "from here would be one no other user of the checkout could see.")
         self.clone = clone_dir
         self.lock_dir = clone_lock_key(clone_dir, environ)
         self.writer = self.lock_dir + "/w.lock"
@@ -994,28 +995,30 @@ class CloneLock:
             "%s\n\n [X] ERROR: %s\n"
             "      clone  : %s\n"
             "      held by: %s\n"
-            "      Every harness run shares this checkout: a POSIX host's run reads the .test "
-            "corpus\n"
-            "      DIRECTLY out of it for its whole corpus step, while a Windows host's derive "
-            "(inside\n"
-            "      WSL) fetches, pulls and checks it out during staging. Both at once rewrite "
-            ".test files\n"
-            "      under a live fixture — silently, and the corrupted run still reports a "
-            "verdict.\n"
-            "      Wait for the holder above, or point this run at a different checkout:\n"
+            "      A POSIX host's run reads the .test corpus DIRECTLY out of its checkout for its "
+            "whole\n"
+            "      corpus step, and a derive fetches and checks its checkout out while it stages. "
+            "Both at\n"
+            "      once rewrite .test files under a live fixture — silently, and the corrupted run "
+            "still\n"
+            "      reports a verdict. Each run's OWN checkout is its output tree's, so two runs meet "
+            "here\n"
+            "      only on a checkout a person named for both (SQLITE_DIR). Wait for the holder "
+            "above, or\n"
+            "      unset SQLITE_DIR (each run then stages from its own), or name another:\n"
             "        SQLITE_DIR=/path/to/another/sqlite"
             % (CLONE_LOCK_BLOCKED, headline, self.clone, holder))
 
     def _note(self, text, log):
         self.notes.append(text)
         if log is not None:
-            log.warn("shared-clone lock: %s" % text)
+            log.warn("clone lock: %s" % text)
 
     def _prepare(self):
         try:
             os.makedirs(self.readers, exist_ok=True)
         except OSError as exc:
-            C.die("could not create the shared-clone lock directory %s: %s" % (self.readers, exc))
+            C.die("could not create the checkout lock directory %s: %s" % (self.readers, exc))
 
     def write(self, what, log=C.LOG):
         """Take the WRITE lock (a mutator). A live writer or a live reader blocks it."""
@@ -1431,9 +1434,12 @@ def _selftest_capabilities(t):
     ok, why = C.wsl_usable(runner=runner(0, C.WSL_ANSWER + "\n"), which_=lambda _n: None)
     t.check("HC02 no wsl.exe on PATH is NOT usable, and nothing is asked to run", not ok and "not on PATH" in why
             and asked == [], repr((why, asked)))
-    ok, why = C.wsl_usable(runner=runner(0, C.WSL_ANSWER + "\n"), which_=lambda _n: "wsl.exe")
-    t.check("HC03 control: a wsl.exe that exits 0 printing the token IS usable, asked `wsl.exe -e echo <token>`",
-            ok and why == "" and asked == [["wsl.exe", "-e", "echo", C.WSL_ANSWER]], repr((ok, why, asked)))
+    ok, why = C.wsl_usable(runner=runner(0, C.WSL_ANSWER + "\n"), which_=lambda _n: "wsl.exe",
+                           side=C.PosixSide("windows", distribution="an-injected-distro"))
+    t.check("HC03 control: a wsl.exe that exits 0 printing the token IS usable, asked `wsl.exe -d <the distribution "
+            "the POSIX half runs in> -e echo <token>` -- never the machine's default distribution",
+            ok and why == "" and asked == [["wsl.exe", "-d", "an-injected-distro", "-e", "echo", C.WSL_ANSWER]],
+            repr((ok, why, asked)))
     ok, why = C.wsl_usable(runner=runner(0, ""), which_=lambda _n: "wsl.exe")
     t.check("HC04 a wsl.exe that exits 0 WITHOUT the token is NOT usable: an exit code alone is no answer",
             not ok and "printed nothing" in why, why)
@@ -1586,7 +1592,9 @@ def _selftest_unverified(t):
 
 
 def _wsl_path(win_path):
-    r = _run(["wsl.exe", "-e", "wslpath", "-a", "-u", win_path], timeout=ENUM_TIMEOUT_S,
+    # Through the POSIX side's own entry: the distribution the WSL legs declare, the one `wsl_usable` judged
+    # (2026-09-30, the round-12 audit's S8) -- never the machine's default.
+    r = _run(C.PosixSide("windows").argv(["wslpath", "-a", "-u", win_path]), timeout=ENUM_TIMEOUT_S,
              c_locale=False)
     out = r.out.replace("\0", "").strip()
     return out.splitlines()[-1].strip() if r.rc == 0 and out else ""
@@ -1614,7 +1622,8 @@ def _selftest_launched(t, work):
     if os.name == "nt":
         if not _launched_capability(t, *C.wsl_usable()):
             return
-        prefix = ["wsl.exe", "-e"]
+        # The kernel `wsl_usable` just judged: the WSL legs' own distribution, never the machine's default.
+        prefix = C.PosixSide("windows").entry()
         ready_win = os.path.join(work, tag + ".ready")
         ready = _wsl_path(ready_win)
         marker = "/tmp/%s/testfixture" % tag
@@ -1872,15 +1881,15 @@ def _blocked(lock, act):
         return str(exc)
 
 
-# The shared-clone lock's POSIX-only arms, BY NAME: a Windows host skips exactly these (the lock
-# lives where the clone lives), and a POSIX run proves it ran exactly these (arm CL20), so the
+# The clone lock's POSIX-only arms, BY NAME: a Windows host skips exactly these (the lock lives
+# where the checkout lives), and a POSIX run proves it ran exactly these (arm CL20), so the
 # by-name skips cannot drift from the arms.
 _CL_POSIX_ARMS = tuple(["CL%02d" % k for k in range(1, 11)] + ["CL10b"]
-                       + ["CL%02d" % k for k in range(11, 20)])
+                       + ["CL%02d" % k for k in range(11, 20)] + ["CL19b"])
 
 
 def _selftest_clone_lock(t, work):
-    t.section("CL  the shared-clone lock (reader/writer, the bash twin's on-disk format)")
+    t.section("CL  the per-checkout clone lock (reader/writer, the bash twin's on-disk format)")
     if C.PosixSide(C.host_os()).needs_wsl:        # the constructor's own predicate
         try:
             CloneLock(work)
@@ -2022,6 +2031,35 @@ def _selftest_clone_lock(t, work):
         fh.write("\nm\nnot-a-number\n")
     t.eq("CL19 a corrupt owner reads as `pid ? — unknown — holding for 0h00m`",
          "pid ? — unknown — holding for 0h00m", lk.holder_desc(corrupt))
+    # CL19b (2026-09-30): ONE CHECKOUT PER CONSUMER, the two consumers of one four-leg `dssharness run sqlite` -- the
+    # WSL leg's corpus run (a POSIX host: its checkout inside its output tree) and the Windows leg's derive (inside
+    # WSL: its checkout in the cache, keyed by its output tree) -- each checkout derived by the REAL rule
+    # (`sqlite_stage.consumer_checkout`). The corpus holds ITS checkout for READ from a LIVE process (its hours);
+    # the derive takes WRITE on ITS OWN and proceeds. The negative, measured the same way: the derive on the ONE
+    # checkout both used to share is refused, `DSS-CLONE-LOCK-BLOCKED` -- the refusal the run met at its own leg.
+    import sqlite_stage as S
+    cenv = {"XDG_CACHE_HOME": cache, "HOME": "/nonexistent-home"}
+    wsl_leg = S.consumer_checkout("linux", C.output_tree(os.path.join(work, "wsl-tree"), "linux"), cenv)
+    win_leg = S.consumer_checkout("windows", C.output_tree(os.path.join(work, "win-tree"), "windows"), cenv)
+    for d in (wsl_leg, win_leg):
+        os.makedirs(d, exist_ok=True)
+    corpus, derive = CloneLock(wsl_leg, cenv), CloneLock(win_leg, cenv)
+    s2 = _sleeper()
+    try:
+        _clone_owner("%s/%d.reader" % (corpus.readers, s2.pid), s2.pid, _lstart_marker(s2.pid),
+                     "the WSL leg's corpus run", proc_start=proc_start_marker(s2.pid))
+        own = _blocked(derive, "write")
+        took = derive.role == "write"
+        derive.release()
+        shared = _blocked(CloneLock(wsl_leg, cenv), "write")
+    finally:
+        _reap(s2)
+    t.check("CL19b TWO CONCURRENT consumers, each on its OWN checkout (the real consumer rule): the Windows leg's "
+            "derive takes WRITE while the WSL leg's corpus holds its own for READ; on ONE shared checkout the "
+            "second is refused, first line DSS-CLONE-LOCK-BLOCKED",
+            wsl_leg != win_leg and corpus.lock_dir != derive.lock_dir and not own and took
+            and shared.split("\n")[0] == CLONE_LOCK_BLOCKED and "being READ by a corpus run in progress" in shared,
+            repr((wsl_leg, win_leg, own[:300], shared[:300])))
     ran = [x for x in t.labels if re.match(r"CL\d\d[a-z]?$", x) and x != "CL00"]
     t.eq("CL20 the lock arms this POSIX run ran are EXACTLY the ones a Windows host skips by name",
          list(_CL_POSIX_ARMS), ran)

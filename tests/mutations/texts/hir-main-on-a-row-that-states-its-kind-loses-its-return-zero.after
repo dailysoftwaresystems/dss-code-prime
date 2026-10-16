@@ -1,0 +1,3 @@
+        // on the toy document's row (that document states neither).
+        body = maybeCompleteReachableNonVoidEnd(
+            node, bodyNode, body, sym, retType, decl);

@@ -126,6 +126,7 @@
 #include "core/types/entry_shape.hpp"         // EntryMaterialization (the verb)
 #include "core/types/target_schema.hpp"       // ProcessArgs
 
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -161,6 +162,12 @@ class DiagnosticReporter;
 // mechanism this pass has no arm for, or when the declared mechanism's own
 // fields are unusable. NO resolved entry (a library TU with no `main`) is a clean
 // no-op: there is nothing to materialize into.
+//
+// The init's symbol and its imports' are minted by the MODULE (`Mir::symbolIdEnd`,
+// `MirBuilder::mintSymbolOrAbort` — see mir/merge/synth_symbol_floor.hpp): past every id
+// the module holds and every id the name table it was made from holds, so the init — a
+// GLOBAL definition — is never published under a name the table gives to something else.
+// No caller hands this pass an end; tests/mir/test_synth_symbol_floor.cpp pins the ids.
 [[nodiscard]] DSS_EXPORT bool
 realizeEntryShape(Mir&                              mir,
                   TypeInterner&                     interner,

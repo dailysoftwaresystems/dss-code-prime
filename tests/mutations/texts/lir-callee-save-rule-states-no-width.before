@@ -1,0 +1,1 @@
+        rule.savedBytes = lirInstWidthBits(*saveWidth) / 8u;

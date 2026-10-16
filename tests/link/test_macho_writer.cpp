@@ -2164,6 +2164,7 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -2850,6 +2851,7 @@ TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld" },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}]
@@ -2928,6 +2930,7 @@ TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
@@ -2968,6 +2971,7 @@ TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}]
@@ -3448,6 +3452,7 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3512,6 +3517,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsDefaultsToFalse) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3542,6 +3548,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsAcceptsTrue) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3577,6 +3584,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsRejectsNonBoolean) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3638,6 +3646,7 @@ loadChainedFixupsExecFormat() {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3698,6 +3707,7 @@ loadChainedFixupsExecFormatWithData() {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3924,6 +3934,7 @@ loadLegacyBindingExecFormat() {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -4128,6 +4139,7 @@ loadDataImportExecFormat(bool useChainedFixups) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "dataImportBinding": "got-indirect",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -4745,6 +4757,7 @@ TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -4784,6 +4797,7 @@ TEST(MachOExecFormatJson, PageZeroSizeMustBePowerOfTwo) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 12884901888,
@@ -4933,6 +4947,7 @@ TEST(MachOExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -4976,6 +4991,7 @@ TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,

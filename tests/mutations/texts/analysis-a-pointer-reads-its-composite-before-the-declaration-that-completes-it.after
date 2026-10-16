@@ -1,0 +1,1 @@
+        return ty.valid() && in.kind(ty) == TypeKind::Array;

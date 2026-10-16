@@ -1,0 +1,46 @@
+{
+  "$comment": "P69 (lane lm): a statement expression whose LAST item is labeled has the labeled expression's value (GNU C 6.1, as every GNU reference reads it) - `({ ...; in: r; })` with a `goto` of the body reaching the label, a label alone `({ x: 5; })`, two labels in a row, a label the body loops back to, and the construct as an operand. MEASURED 2026-10-15: AppleClang 21 and gcc 13.3 (x86_64 and arm64), clang 18 run its first five to the answers checked here; DSS refused every one (\"this statement expression has no value\"). RED-ON-DISABLE (DECLARED from reading the code; the arms' sweep measures it): take the label step out of `statementExpressionBody` -> the build is refused again; place no label in `lowerStatementExpr` -> a goto to a label that stands nowhere. The release arm is the same file through the optimizer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

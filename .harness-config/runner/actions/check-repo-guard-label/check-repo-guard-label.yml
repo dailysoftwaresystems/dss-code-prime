@@ -1,0 +1,16 @@
+# PURPOSE: refuse a configured build in which an entry that SELF-TESTS a program carries the `repo-guard` label -- a self-test's verdict reads its own fixtures, which can depend on the host, so every leg runs it.
+name: check-repo-guard-label
+description: >-
+  The action proves the rule's refusals on synthetic listings, with no build.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  A configured build is judged by ctest as `harness/repo_guard_label_check` (it reads that build's own
+  `ctest --show-only=json-v1`), and the self-test runs there as `harness/repo_guard_label_selftest`, one case
+  per arm.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-repo-guard-label.py --self-test
+    successPattern: '^check-repo-guard-label self-test: \d+ arm\(s\), 0 failed$'
+    requireInputsUnmoved: true

@@ -14,11 +14,12 @@ All paths below are relative to the repo root.
 ## Prerequisites
 
 - Node ≥ 18 (verified with v22.12) and git on PATH — nothing else; the driver has zero deps.
-- A built CLI. The driver auto-picks the **newest** of `build/bin/dss/{Debug,Release}/`,
-  `build-rel/bin/dss/`, `build-dbg/bin/dss/`. To (re)build the MSVC Debug one:
+- A built CLI. The driver auto-picks the **newest** `dsscp` under any `build/<tree>/bin/dss/` — DssHarness
+  builds each leg's variant there (`build/x86_64-mingw-gcc-debug`, `build/x86_64-msvc-release`, ...). To
+  (re)build one, through DssHarness, never a bare `cmake`:
 
 ```powershell
-cmake --build build --config Debug --target dss-code-prime
+dssharness build --legs windows-x86_64-debug
 ```
 
 - Optional (Windows): WSL gives the ELF runtime witnesses. This box has `qemu-aarch64` 8.2.2
@@ -109,7 +110,7 @@ exits 0 since 2026-06-12 — the `ptr_swap_through` miscompile is FIXED, see bel
   (`buildInfoOf()`), so a single-config Ninja dir gets no `-C`. Before this fix the test axis
   hardcoded `build/` and reported garbage (a `2/2` partial log; a `145/448` from the broken
   MSVC dir) while the real suite was `448/448` in `build-dbg`. To rebuild the active one:
-  `cmake --build build-dbg --target dss-code-prime` (Ninja, single-config — no `--config`).
+  `dssharness build --legs <the leg whose variant it is>` (the tree is `build/<variant>`).
 - **The `ptr_swap_through` miscompile is FIXED (2026-06-12)**: the probe's exit-34 was NOT a
   pointer bug — the swap compiled perfectly; `return x - y + 4;` parsed RIGHT-associative
   (`x - (y + 4)`) because same-precedence infix chains nested rightward in the Pratt walker.
@@ -122,9 +123,8 @@ exits 0 since 2026-06-12 — the `ptr_swap_through` miscompile is FIXED, see bel
 
 ## Troubleshooting
 
-- **`fatal: no dss-code-prime binary found`** — build one:
-  `cmake --build build --config Debug --target dss-code-prime` (MSVC multi-config: the
-  `--config Debug` matters; plain `cmake --build build` builds no config).
+- **`fatal: no dsscp binary found`** — build one through DssHarness:
+  `dssharness build --legs windows-x86_64-debug` (or the leg you mean; its tree is `build/<variant>`).
 - **`fatal: plan-23 parse found only N FC rows`** — plan-23's §0.1 table format changed;
   fix `parsePlan23()` + recalibrate `PHASE_CYCLE_EST`.
 - **Matrix row `WRONG exit …`** — that's a real cross-target regression, not a harness issue;

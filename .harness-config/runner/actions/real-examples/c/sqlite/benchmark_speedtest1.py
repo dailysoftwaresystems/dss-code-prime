@@ -43,7 +43,8 @@ THE PHASES
            call); SQLITE_CORE by name AND every `stageBuild.requiredDefines` (the .sh checked only
            SQLITE_CORE); `shell.c` -> `speedtest1.c`; the build dir appended LAST to the include
            list; the manifest. In THIS process on a POSIX host. On a Windows host inside WSL as
-               wsl.exe -e python3 <this file's WSL path> --derive-only --path-style windows ...
+               wsl.exe -d <the WSL legs' distribution> -e python3 <this file's WSL path> --derive-only
+                       --path-style windows ...
            -- THIS program, never a second implementation -- whose manifest comes back with every
            path spelled for the Windows host (`wslpath -w`, once per path, a double translation
            REFUSED), beside `<out>/derive-result.json`.
@@ -76,11 +77,13 @@ WHAT THE UNION DECIDED (each pinned by a self-test arm):
     explicit `--sqlite-dir` is read AS-IS -- never switched, pulled or cleaned -- and REFUSED unless its
     HEAD IS the pin; and whichever checkout is measured is REFUSED when its working tree differs from its
     HEAD in a tracked file (`worktree_changes`): one revision is measured, as one is compiled. SQLITE_DIR is
-    NOT read (P68 round 13's audit, F3-A-SP-3): it names the corpus driver's SHARED clone, which that driver
+    NOT read (P68 round 13's audit, F3-A-SP-3): it names the corpus driver's checkout -- then one clone every
+    run shared, since 2026-09-30 an explicit one a person names for that driver by hand -- which that driver
     writes under its own lock, so read here it made the benchmark measure a checkout outside the tree that
     another tree's corpus run can move; set, it is SAID. The plan still carries the pin beside the head it
     read, and the report names that head and whether it IS the pin, in the .json and the .md alike (the
-    core's R10).
+    core's R10); a head nobody can read is REFUSED before anything is derived (2026-09-30), and a run that
+    measured another sqlite than the pin exits 6 (the core's R11).
   * ONE RUN PER TREE, ON EVERY HOST (P68 round 13): the whole measuring run holds the output tree's run
     lock (`sqlite_procs.RunLock` on `<output tree>/.harness-lock` -- atomic mkdir, liveness-checked, the
     lock the driver's run and the round-close recompile take on the same tree), Windows included, so two
@@ -113,13 +116,15 @@ Refusal ids of the plan writer: W1 no reference compiler record reached the writ
 manifest is unreadable or lacks sources/includes/defines · W3 the plan cannot be written.
 
 CLI (the .sh's flags): see USAGE below, or `--help`. Exit codes: 0 measured (or `--derive-only`
-complete) · 1 a refusal (a live run already holding this tree's run lock included) · 2 usage · 3 no
-compiler produced a binary · 4 dsscp's arm was not measured, the report written and naming why (3 and
-4 are the measurement core's). The 5 that meant "another run holds the shared sqlite clone" retired with
-the clone (P68 round 13): this program no longer reads or writes it.
+complete) · 1 a refusal (a live run already holding this tree's run lock included, and a checkout whose
+head cannot be read) · 2 usage · 3 no compiler produced a binary · 4 dsscp's arm was not measured, the
+report written and naming why · 6 the sqlite measured is NOT the pin, the report written and saying so
+(3, 4 and 6 are the measurement core's; 6 since 2026-09-30, when an off-pin run stopped exiting 0). The
+5 that meant "another run holds the shared sqlite clone" retired with the clone (P68 round 13): this
+program no longer reads or writes it, and the code is not reused.
 Environment: SQLITE_REPO_URL (the origin the harness's own checkout is cloned from), SRC_DIR (default: the
 tree this file lives in), OUT_DIR (the sqlite harness's output tree), DSS_BIN, CC,
-DSS_ALLOW_NONRELEASE_COMPILER, DSS_CONFIG_ROOT. SQLITE_DIR is not read (the corpus driver's shared clone).
+DSS_ALLOW_NONRELEASE_COMPILER, DSS_CONFIG_ROOT. SQLITE_DIR is not read (the corpus driver's explicit checkout).
 
 `--self-test` (alias `--selftest`): every check of both retired drivers plus the negatives they
 lacked, counted against EXPECTED_ARMS; summary `passed=N failed=N skipped=N`, exit 0 only when
@@ -244,10 +249,20 @@ DEFAULTS = {"size": 25, "build_repeats": 3, "run_repeats": 5, "jobs_arms": [1, 4
 MEASURING_HOST_FLAGS = (("dss", "--dss"), ("dss_src", "--dss-src"), ("cc", "--cc"),
                         ("plan", "--plan"), ("size", "--size"), ("testset", "--testset"),
                         ("build_repeats", "--build-repeats"), ("run_repeats", "--run-repeats"),
-                        ("jobs_arms", "--jobs-arms"))
+                        ("jobs_arms", "--jobs-arms"), ("step", "--step"))
 # git's repository-local variables: a hook-exported GIT_DIR must not answer for the sqlite clone.
 GIT_LOCAL_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
                  "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_PREFIX")
+# ★ STEP MODE (2026-09-30, the round-12 audit's S4) -- this program's share of the corpus driver's rule
+# (`sqlite_common.STEERING`): each variable below steers a measuring run (the tree measured and its output tree --
+# so the checkout, the lock and the scratch --, the origin cloned, one pinned reference compiler, a non-Release
+# dsscp, the config root), and the `benchmark-speedtest1` step, which says so on its run line
+# (`--step=benchmark-speedtest1`; DssHarness sets no variable a program could read that from), REFUSES each one set
+# in its environment, by name: a step's values are its inputs, on its command line. DSS_BIN is the step's own
+# compiler (`{product}`), refused only when it names another binary than --dss (`parse_args`). By hand every one is
+# read as before.
+BENCH_STEPS = ("benchmark-speedtest1",)
+BENCH_STEERING = ("SRC_DIR", "OUT_DIR", "SQLITE_REPO_URL", "CC", "DSS_ALLOW_NONRELEASE_COMPILER", "DSS_CONFIG_ROOT")
 
 # ── THE REFERENCE C COMPILERS, PLURAL ────────────────────────────────────────────────
 # Every reference found is measured, each its own arm; every catalogue name NOT measured is
@@ -280,8 +295,8 @@ test/speedtest1.c FROM FULL SOURCE, and print the measurement.
                         the round-close recompile compile -- and its working tree holds no change
                         to a tracked file. Default: the harness's OWN checkout inside the tree,
                         <output tree>/speedtest1/sqlite (cloned when absent, put on the pin, never
-                        pulled). $SQLITE_DIR is NOT read: it names the corpus driver's shared
-                        clone. On Windows it must be on a LOCAL disk: a UNC path is refused.
+                        pulled). $SQLITE_DIR is NOT read: it names the corpus driver's explicit
+                        checkout. On Windows it must be on a LOCAL disk: a UNC path is refused.
   --dss-src DIR         the DSS checkout whose src/dss-config is the default config root and whose
                         output tree (OUT_DIR, else build/real-examples/c/sqlite[/windows]) holds
                         the benchmark's checkout and run lock. Default: $SRC_DIR, else the tree
@@ -304,6 +319,9 @@ test/speedtest1.c FROM FULL SOURCE, and print the measurement.
   --run-repeats N       timed runs per arm (default 5).
   --jobs-arms "N M"     the worker counts to measure (default "1 4").
   --derive-only         stop once the plan is written; the measurement is the caller's.
+  --step NAME           THIS RUN IS THE DssHarness step NAME (benchmark-speedtest1): every variable
+                        below except DSS_BIN (the step's own compiler, --dss) that is set in the
+                        environment is REFUSED by name -- a step is steered by its inputs alone.
   --path-style S        posix|windows. `windows` on a POSIX host makes THIS process the derive
                         half of a Windows measuring host: it needs --derive-only, --sqlite-dir,
                         --out and --target, writes <out>/derive-result.json beside a manifest
@@ -313,10 +331,11 @@ test/speedtest1.c FROM FULL SOURCE, and print the measurement.
 
 environment: SQLITE_REPO_URL, SRC_DIR, OUT_DIR, DSS_BIN, CC, DSS_ALLOW_NONRELEASE_COMPILER (1/true/yes:
 a named non-Release dsscp is measured, and said), DSS_CONFIG_ROOT (the directory that CONTAINS
-src/dss-config; honoured on every host). SQLITE_DIR is not read: it names the corpus driver's shared clone.
+src/dss-config; honoured on every host). SQLITE_DIR is not read: it names the corpus driver's explicit checkout.
 exit: 0 measured (or --derive-only complete) - 1 refused (another live run holding this tree's run
 lock included) - 2 usage - 3 no compiler produced a binary - 4 dsscp's arm was not measured, the
-report written and naming why (3 and 4 are the measurement core's)."""
+report written and naming why - 6 the sqlite measured is NOT the pin, the report written and saying
+so (3, 4 and 6 are the measurement core's)."""
 
 
 class UsageError(Exception):
@@ -529,13 +548,13 @@ def checkout_revision(sqlite_dir):
 
 def explicit_checkout(args, log):
     """-> the checkout `--sqlite-dir` names, or "" -- NEVER SQLITE_DIR (P68 round 13's audit, F3-A-SP-3): that
-    variable (and its alias SQLITE_WSL_DIR) names the corpus driver's SHARED clone, which that driver writes under
-    its own POSIX lock; read here too, one knob held two meanings, and the benchmark measured a checkout outside
-    the tree that another tree's corpus run could move under it. Set, it is SAID, so a person who meant it for
-    this program learns it was not read."""
+    variable (and its alias SQLITE_WSL_DIR) names the corpus driver's checkout -- an explicit one, by hand -- which
+    that driver writes under its own POSIX lock; read here too, one knob held two meanings, and the benchmark
+    measured a checkout outside the tree that another tree's corpus run could move under it. Set, it is SAID, so a
+    person who meant it for this program learns it was not read."""
     for name in ("SQLITE_DIR", "SQLITE_WSL_DIR"):
         if C.env(name).strip():
-            log.info("sqlite    : %s is set -- it names the corpus driver's shared clone, which this benchmark "
+            log.info("sqlite    : %s is set -- it names the corpus driver's checkout, which this benchmark "
                      "does not read; name a checkout with --sqlite-dir" % name)
     return args.sqlite_dir or ""
 
@@ -1246,8 +1265,8 @@ def verify_host_paths(manifest):
 
 
 def hop_argv(posix, this_posix, sqlite_posix, out_posix, facts):
-    """The WSL hop: THIS program's derive half, argv only (`wsl.exe -e`, never a login shell, never
-    `wsl.exe --`, never a shell string)."""
+    """The WSL hop: THIS program's derive half, argv only (`wsl.exe -d <the WSL legs' distribution> -e`,
+    never a login shell, never `wsl.exe --`, never a shell string)."""
     return posix.argv(["python3", this_posix, "--derive-only", "--path-style", "windows",
                        "--sqlite-dir", sqlite_posix, "--out", out_posix, "--target", facts.spec,
                        "--recipe-transform", facts.transform, "--stack-reserve", str(facts.reserve)])
@@ -1389,9 +1408,9 @@ def resolve_msvc(*, scratch, core=None, python=sys.executable):
 
 def measure(plan_path, out_dir, *, scratch, core=None, python=sys.executable):
     """`speedtest1_bench.py --plan`, natively, its output straight to this console -> its exit
-    code (0 every required arm measured, 1 refused, 2 usage, 3 no arm produced a binary, 4 the
-    required arm -- dsscp's -- was not measured; the report is still written and names why). The timed
-    databases are written in `scratch` (`--scratch`)."""
+    code (0 every required arm measured, of the pinned sqlite; 1 refused, 2 usage, 3 no arm produced a
+    binary, 4 the required arm -- dsscp's -- was not measured, 6 the sqlite measured is not the pin; the
+    report is still written and names why). The timed databases are written in `scratch` (`--scratch`)."""
     argv = [python, core or C.BENCH_CORE, "--plan", plan_path, "--scratch", scratch,
             "--json-out", os.path.join(out_dir, "benchmark-speedtest1.json"),
             "--md-out", os.path.join(out_dir, "benchmark-speedtest1.md")]
@@ -1461,8 +1480,14 @@ def _measure_on_host(args, host, log, repo_root, tree_out, checkout=None):
     check_subject(sqlite_dir)
     refuse_modified(sqlite_dir)
     head, why = sqlite_head(sqlite_dir)
-    log.info("sqlite    : %s  (upstream %s%s; the pin is %s)"
-             % (sqlite_dir, head, (" %s %s" % (DASH, why)) if why else "", pin[:12]))
+    if head == "UNKNOWN":
+        # ★ REFUSED, NOT LOGGED (2026-09-30, the round-12 audit's S3): the report says WHICH sqlite it measured and
+        # whether it IS the pin, and a head nobody could read is neither -- the measurement core refuses such a
+        # plan too (its R10), but only after the derive; here it costs nothing.
+        die("the SQLite checkout %s names no revision (%s): the report says WHICH sqlite it measured and whether it "
+            "IS the pinned %s, and a head nobody could read is neither -- refused before anything is derived or "
+            "measured" % (sqlite_dir, why, pin[:12]))
+    log.info("sqlite    : %s  (upstream %s; the pin is %s)" % (sqlite_dir, head, pin[:12]))
     if host == "windows":
         # USABLE, not merely present: Windows ships wsl.exe with no distribution (C.wsl_usable), and a run
         # that took its presence for a carriage would stop later, at the first path it translated -- INFERRED
@@ -1610,11 +1635,20 @@ def _nonempty(what):
     return conv
 
 
+def _empty_is_none(text):
+    """An EMPTY value is the option's default, as a step's default input hands it over."""
+    return text or None
+
+
 def build_parser():
     p = _Parser(prog="benchmark_speedtest1.py", add_help=False, allow_abbrev=False)
-    for flag in ("--sqlite-dir", "--dss-src", "--dss", "--out", "--plan", "--target", "--cc"):
+    for flag in ("--sqlite-dir", "--dss-src", "--dss", "--out", "--target"):
         p.add_argument(flag, type=_nonempty(flag))
-    p.add_argument("--testset")
+    # ★ `--plan`, `--cc` and `--testset` are the `benchmark-speedtest1` step's inputs (2026-09-30): a step
+    # hands every input over, its default included, so an EMPTY value is the default -- the plan written
+    # here, the pinned reference compiler, speedtest1's own test set.
+    for flag in ("--plan", "--cc", "--testset"):
+        p.add_argument(flag, type=_empty_is_none)
     p.add_argument("--size", type=_int_at_least(1, "--size"))
     p.add_argument("--build-repeats", type=_int_at_least(1, "--build-repeats"))
     p.add_argument("--run-repeats", type=_int_at_least(1, "--run-repeats"))
@@ -1623,6 +1657,7 @@ def build_parser():
     p.add_argument("--stack-reserve", type=_int_at_least(0, "--stack-reserve"))
     p.add_argument("--derive-only", action="store_true")
     p.add_argument("--path-style", choices=("posix", "windows"))
+    p.add_argument("--step", choices=BENCH_STEPS)
     p.add_argument("--self-test", "--selftest", dest="self_test", action="store_true")
     p.add_argument("-h", "--help", dest="help", action="store_true")
     return p
@@ -1636,6 +1671,13 @@ def parse_args(argv):
     if args.dss and dss_env and dss_env != args.dss:
         raise UsageError("--dss names %s and DSS_BIN names %s -- one compiler, named once: unset DSS_BIN "
                          "or drop --dss" % (args.dss, dss_env))
+    if args.step:
+        ambient = [n for n in BENCH_STEERING if os.environ.get(n) not in (None, "")]
+        if ambient:
+            die("the `%s` step is steered by its own inputs alone, on its command line (sqlite.yml): %s %s set in "
+                "this step's environment and %s no input of it -- unset %s. By hand (no --step) this program still "
+                "reads every one of them." % (args.step, ", ".join(ambient), "is" if len(ambient) == 1 else "are",
+                                              "is" if len(ambient) == 1 else "are", " ".join(ambient)))
     if args.recipe_transform is not None and args.recipe_transform not in generator_transforms():
         raise UsageError("--recipe-transform '%s' is not a transform the manifest generator implements "
                          "(%s)" % (args.recipe_transform, ", ".join(generator_transforms())))
@@ -1707,13 +1749,15 @@ def main(argv=None):
 # `make`, `wsl.exe` and the resolver run where they exist, and an arm that needs what this host
 # lacks is a NAMED, counted SKIP. An arm asserting an ABSENCE also proves its negative can occur.
 
-# 22 sh + 7 ps + 1 core + 88 new (P68 round 13 retired n16-n18 with the dsscp search they pinned, and added
+# 22 sh + 7 ps + 1 core + 91 new (P68 round 13 retired n16-n18 with the dsscp search they pinned, and added
 # n76-n82: a nameless run refused; the subject inside the tree, an explicit one only on the pin; one run per tree;
 # then its audit's fold F6 added n83-n90: an exported GIT_DIR steers no checkout; a nameless run refused first; the
 # core's temporaries in the tree's scratch, made fresh and removed; SQLITE_DIR not read; a changed tracked file
 # refused in an explicit checkout and in the harness's own; one normalisation of the path knobs; P68's PR exit
-# added ps07: ps03's capability site pinned under an injected lack)
-EXPECTED_ARMS = 118
+# added ps07: ps03's capability site pinned under an injected lack; P69 lane hm added n91: a head nobody can read is
+# refused before anything is derived, n92: the benchmark step is steered by its inputs alone, and n93: a skip is one
+# SKIPPABLE declares; and on 2026-10-06 n94: a failing arm's detail is redacted whole, then cut)
+EXPECTED_ARMS = 122
 # the pin the plan-writer arms hand over: a FULL sha, as legs.json declares one
 _PIN_FX = "0123456789abcdef0123456789abcdef01234567"
 
@@ -1759,10 +1803,26 @@ sys.exit(%d)
 _SILENT = "import sys\nsys.exit(0)\n"
 
 
+# ★ WHICH ARMS MAY SKIP, AND WHY (2026-09-30, the round-12 audit's S6): `finish` counted a skip as an arm that RAN,
+# so an arm that began to skip kept EXPECTED_ARMS whole and the self-test green. A skip must now be one of these arms
+# -- a regex over its id, the label's first word -- for the HOST's reason, or `finish` FAILS naming it. Declared from
+# the skip sites below, never from one host's measurement (the corpus driver's Step 0 declares its suites' the same
+# way: `build_and_test.SKIP_ALLOWANCE`).
+SKIPPABLE = (
+    (r"sh(1[89]|2[0-2])", "the REAL make: a host without make on its PATH (a Windows host's derive runs in WSL)"),
+    (r"ps0[3-5]", "the derive hop's carriage: a Windows host's usable WSL (ps03's capability judgement); a POSIX "
+                  "host runs its POSIX half in this process"),
+    (r"n24", "an explicit dsscp that is not EXECUTABLE: a host with no execute bit (Windows)"),
+    (r"n75", "the derive half loading inside WSL: a Windows host's usable WSL; a POSIX host IS the POSIX side"),
+    (r"n(78|79|80|83|88|89|91)", "REAL git: a host without git on its PATH"),
+)
+
+
 class _Arms:
     def __init__(self):
         self.passed = self.failed = self.skipped = self.ran = 0
         self.labels = set()
+        self.skipped_ids = []
 
     def arm(self, label, fn):
         """One counted arm: `fn()` returns a bool, (bool, detail), or (_SKIP, why)."""
@@ -1779,6 +1839,7 @@ class _Arms:
         ok, detail = r if isinstance(r, tuple) else (r, "")
         if ok is _SKIP:
             self.skipped += 1
+            self.skipped_ids.append((label.split() or [label])[0])
             print("  [SKIP] %s %s %s" % (label, DASH, detail), flush=True)
         elif ok:
             self.passed += 1
@@ -1797,10 +1858,8 @@ class _Arms:
     def _fail(self, label, detail):
         self.failed += 1
         print("  [FAIL] %s" % label)
-        # the system temp directory masked (both spellings a path takes in a repr): on Windows it lies under the
-        # user profile, and a failing arm's fixture path must not name the account in a run's log
-        tmp = tempfile.gettempdir()
-        detail = str(detail).replace(tmp, "<temp>").replace(tmp.replace("\\", "\\\\"), "<temp>")
+        # the temp directory, then THE redactor over the WHOLE detail (the P69 review's MINOR 5)
+        detail = _shown(detail)
         for line in str(detail).split("\n"):
             if line:
                 print("         %s" % line)
@@ -1815,11 +1874,18 @@ class _Arms:
             for line in traceback.format_exc().rstrip().split("\n"):
                 print("         %s" % line)
 
-    def finish(self, expected):
+    def finish(self, expected, skippable=None):
         if self.ran != expected:
             self.failed += 1
             print("  [FAIL] ran %d arm(s), but EXPECTED_ARMS declares %d %s an arm was added, "
                   "removed or never reached" % (self.ran, expected, DASH))
+        undeclared = [a for a in self.skipped_ids
+                      if not any(re.fullmatch(p, a) for p, _why in (SKIPPABLE if skippable is None else skippable))]
+        if undeclared:
+            self.failed += 1
+            print("  [FAIL] %d arm(s) SKIPPED that SKIPPABLE does not declare: %s %s a skip nobody declared is an "
+                  "arm that stopped proving anything, and it no longer counts as one that ran"
+                  % (len(undeclared), " ".join(undeclared), DASH))
         print("\npassed=%d failed=%d skipped=%d" % (self.passed, self.failed, self.skipped))
         return 0 if self.failed == 0 else 1
 
@@ -2108,8 +2174,8 @@ class _FakePosix:
         return ["wsl.exe", "-e"] + [str(a) for a in args]
 
 
-_PS03 = ("ps03 a usable WSL answers (this host can derive): `wsl.exe -e echo` prints its token, not merely "
-         "wsl.exe on PATH")
+_PS03 = ("ps03 a usable WSL answers (this host can derive): `wsl.exe -d <the WSL legs' distribution> -e echo` "
+         "prints its token, not merely wsl.exe on PATH")
 
 
 def _carriage_capability(A, wsl_ok, wsl_why):
@@ -2162,7 +2228,7 @@ def _st_carriage(A, fx):
             ok = C.capture(side.argv(["echo", "posix-ok"]), timeout=120)
             bad = C.capture(side.argv(["false"]), timeout=120)
             return (ok.rc == 0 and "posix-ok" in ok.out and bad.rc != 0 and "posix-ok" not in bad.out,
-                    "echo: rc=%d %r / false: rc=%d" % (ok.rc, ok.out[:80], bad.rc))
+                    "echo: rc=%d %r / false: rc=%d" % (ok.rc, _cut(ok.out, 80), bad.rc))
         A.arm("ps04 the WSL carriage answers (control: a failing command fails through it)", answers)
 
         def literal():
@@ -2170,7 +2236,7 @@ def _st_carriage(A, fx):
             shell = C.capture(side.argv(["sh", "-c", 'printf "[%s]\\n" "echo A=$(uname -m)"']),
                               timeout=120)
             return ("$(uname -m)" in lit.out and "$(uname" not in shell.out and "A=" in shell.out,
-                    "-e: %r / a shell inside WSL: %r" % (lit.out[:80], shell.out[:80]))
+                    "-e: %r / a shell inside WSL: %r" % (_cut(lit.out, 80), _cut(shell.out, 80)))
         A.arm("ps05 wsl.exe -e suppresses the second expansion (control: a shell inside WSL DOES "
               "expand it, so an expansion is visible)", literal)
     # ps03's SITE, pinned on every host: the gate's hosts have a usable WSL, so their real ps03 never reaches
@@ -2459,7 +2525,8 @@ def _st_subject(A, fx):
                       "the pin is read AS-IS", "n80 an EXPLICIT checkout off the pin is REFUSED",
                       "n83 REAL git: an exported GIT_DIR does not steer the checkout",
                       "n88 REAL git: an EXPLICIT checkout on the pin with a changed tracked file is REFUSED",
-                      "n89 REAL git: the harness's own checkout with a changed tracked file is REFUSED"):
+                      "n89 REAL git: the harness's own checkout with a changed tracked file is REFUSED",
+                      "n91 REAL git: a checkout whose HEAD cannot be read is REFUSED before anything is derived"):
             A.arm(label, lambda: (_SKIP, "git is not on this host's PATH"))
     else:
         S = _stage()
@@ -2554,6 +2621,22 @@ def _st_subject(A, fx):
               "it as the subject -- remove it, and the next run clones it again",
               lambda: (not own_err and own_run is not None
                        and "differs from its HEAD in 1 tracked file(s) (configure)" in own_run, (own_err, own_run)))
+        # n91 (2026-09-30, the round-12 audit's S3): a head nobody can read -- a repository with no commit, whose
+        # working tree is clean (the subject file untracked) -- used to be LOGGED as UNKNOWN and measured.
+        tree91 = os.path.join(g, "tree91")
+        t_out91 = C.output_tree(tree91, fx.host)
+
+        def headless(url, dest, log=None, commit="", env=None):
+            S._git(genv, "init", "--quiet", dest)
+            _put(os.path.join(dest, "test", MAIN_TU), "int main(void){return 0;}\n")
+        with _env(DSS_BIN=None, SQLITE_DIR=None, SQLITE_WSL_DIR=None, **hermetic):
+            h91, h91_err = _attempt(lambda: _dies(lambda: _measure_on_host(
+                args89, fx.host, fx.log()[0], tree91, t_out91, checkout=headless)))
+        A.arm("n91 REAL git: a checkout whose HEAD cannot be read (a repository with no commit, its tree clean) is "
+              "REFUSED, naming it, before anything is derived -- never logged as UNKNOWN and measured (control: n78's "
+              "checkout, whose head reads, is measured)",
+              lambda: (not h91_err and h91 is not None and "names no revision" in h91
+                       and not os.path.exists(os.path.join(default_out(t_out91), PLAN_FILE)), (h91_err, h91)))
     lt = fx.fresh("lock-tree")
     args = argparse.Namespace(dss_src=lt)
     lock_dir = os.path.join(C.output_tree(lt, fx.host), C.RUN_LOCK)
@@ -2639,13 +2722,13 @@ def _st_subject(A, fx):
                    and part86 is not None and "part-way" in part86 and gone86b,
                    (e86, pe86, rc86, seen86, gone86, part86, gone86b)))
 
-    # n87 (F3-A-SP-3): SQLITE_DIR names the corpus driver's SHARED clone and is never the benchmark's subject.
-    shared87 = fx.fresh("shared-clone87")
+    # n87 (F3-A-SP-3): SQLITE_DIR names the corpus driver's checkout and is never the benchmark's subject.
+    shared87 = fx.fresh("driver-checkout87")
     log87, buf87 = fx.log()
     with _env(SQLITE_DIR=shared87, SQLITE_WSL_DIR=None):
         none87 = explicit_checkout(argparse.Namespace(sqlite_dir=None), log87)
         named87 = explicit_checkout(argparse.Namespace(sqlite_dir="a-named-checkout"), fx.log()[0])
-    A.arm("n87 SQLITE_DIR -- the corpus driver's shared clone -- is NOT read as the benchmark's subject, and that is "
+    A.arm("n87 SQLITE_DIR -- the corpus driver's checkout -- is NOT read as the benchmark's subject, and that is "
           "SAID; --sqlite-dir names one (control)",
           lambda: (none87 == "" and "SQLITE_DIR is set" in buf87.getvalue() and "does not read" in buf87.getvalue()
                    and named87 == "a-named-checkout", (none87, named87, buf87.getvalue())))
@@ -2661,6 +2744,35 @@ def _st_subject(A, fx):
     with _env(OUT_DIR="   "):
         blank_cfg = _dies(C.Config)
         blank_tree = _dies(lambda: C.output_tree(repo90, fx.host, C.env("OUT_DIR")))
+    # n92 (2026-09-30, the round-12 audit's S4): the benchmark STEP is steered by its inputs alone -- a steering
+    # variable left in its environment is refused by name; by hand the same environment is read as before.
+    unset92 = dict((n, None) for n in BENCH_STEERING + ("DSS_BIN",))
+    with _env(**dict(unset92, OUT_DIR=fx.fresh("ambient-out92"), CC="an-ambient-cc")):
+        stepped92, s_err = _attempt(lambda: _dies(lambda: parse_args(["--step=benchmark-speedtest1", "--dss", "x"])))
+        by_hand92, h_err = _attempt(lambda: parse_args(["--dss", "x"]))
+    with _env(**unset92):
+        clean92, c_err = _attempt(lambda: parse_args(["--step=benchmark-speedtest1", "--dss", "x"]))
+        other92 = _raised(lambda: parse_args(["--step=recompile", "--dss", "x"]), UsageError)
+    A.arm("n92 the benchmark STEP (--step=benchmark-speedtest1) refuses, by name, each steering variable set in its "
+          "environment (OUT_DIR, CC here) and none that is not; by hand the same environment is read as before, a "
+          "clean step environment is accepted, and a step name that is not this program's is a usage error",
+          lambda: (not (s_err or h_err or c_err) and stepped92 is not None and "OUT_DIR, CC are set" in stepped92
+                   and "SRC_DIR" not in stepped92.split(" -- ")[0] and by_hand92 is not None and by_hand92.step is None
+                   and clean92 is not None and clean92.step == "benchmark-speedtest1" and other92 is not None,
+                   (s_err, h_err, c_err, stepped92, other92)))
+    # n93 (2026-09-30, the round-12 audit's S6): a skip is an arm SKIPPABLE declares, or the self-test fails.
+    def ceiling93(label):
+        inner, sink = _Arms(), io.StringIO()
+        with contextlib.redirect_stdout(sink):
+            inner.arm(label, lambda: (_SKIP, "a host that lacks something"))
+            rc = inner.finish(1)
+        return rc, sink.getvalue()
+    rc93_no, said93_no = ceiling93("zz99 an arm nobody declared skippable")
+    rc93_ok, said93_ok = ceiling93("n24 an explicit dsscp that is not EXECUTABLE")
+    A.arm("n93 a SKIP is an arm SKIPPABLE declares, for the host's reason: an undeclared one FAILS the self-test, "
+          "named, although EXPECTED_ARMS still adds up; a declared one passes (the control)",
+          lambda: (rc93_no == 1 and "SKIPPED that SKIPPABLE does not declare: zz99" in said93_no and rc93_ok == 0,
+                   (_cut(said93_no, -300), _cut(said93_ok, -200))))
     A.arm("n90 ONE normalisation of the path knobs: a padded OUT_DIR / SRC_DIR gives the driver's Config and the "
           "benchmark the SAME output tree (so one run lock) and the same DSS tree, and a value of blanks alone is "
           "REFUSED by both",
@@ -2669,6 +2781,20 @@ def _st_subject(A, fx):
                    and blank_cfg is not None and "names nothing but blanks" in blank_cfg
                    and blank_tree is not None and "names nothing but blanks" in blank_tree,
                    (cfg_err, src_err, drv90, bench90, src90, blank_cfg, blank_tree)))
+    # n94 (2026-10-06, the P69 review's MINOR 5): `_cut` hands the redactor the WHOLE text and cuts what comes back
+    # -- a cut taken first leaves a piece of a name no rule knows. A stand-in redactor masking one made-up account
+    # proves the ORDER through this program's own `_cut`, never the rules (redact.py's own arms); the real one is
+    # put back before the arm is judged.
+    built94 = _redact()[1].redactor
+    real94 = list(built94)
+    built94[:] = [lambda t: t.replace("zqxacct", "<user>")]
+    try:
+        cuts94 = (_cut("x" * 20 + " zqxacct ran", 24), _cut("ran by zqxacct", -5))
+    finally:
+        built94[:] = real94
+    A.arm("n94 a failing arm's detail is redacted WHOLE, then cut: no piece of a name survives a cut at its head or "
+          "its tail",
+          lambda: (not any(piece in "|".join(cuts94) for piece in ("zqx", "qxa", "xac", "acc", "cct")), cuts94))
 
 
 # ── new: the catalogue's leg facts ───────────────────────────────────────────────────
@@ -2876,7 +3002,7 @@ def _st_derive(A, fx):
     A.arm("n60 a reference build that exits non-zero only WARNS (the floors are the gate), and the "
           "derivation still completes",
           lambda: (db.tu_count == 105 and "did not fully link (exit 2)" in wb["buf"].getvalue(),
-                   wb["buf"].getvalue()[-300:]))
+                   _cut(wb["buf"].getvalue(), -300)))
 
 
 # ── new: the plan, the hop's result, the measurement ────────────────────────────────
@@ -2983,11 +3109,14 @@ def _st_plan(A, fx):
           "when an OLD result lies there (it is removed first)",
           lambda: (f1 is not None and "FAILED (exit 1)" in f1 and f2 is not None
                    and "wrote no result" in f2, "%r / %r" % (f1, f2)))
-    argv = hop_argv(C.PosixSide("windows"), "/mnt/c/x/benchmark_speedtest1.py", "/mnt/c/s", "/mnt/c/o", facts)
-    parsed = parse_args(argv[4:])
-    A.arm("n67 the hop argv is `wsl.exe -e python3 <this> ...` (no `--`, no login shell), and the "
-          "derive half ACCEPTS exactly what the Windows side builds",
-          lambda: (argv[:4] == ["wsl.exe", "-e", "python3", "/mnt/c/x/benchmark_speedtest1.py"]
+    argv = hop_argv(C.PosixSide("windows", distribution="an-injected-distro"), "/mnt/c/x/benchmark_speedtest1.py",
+                    "/mnt/c/s", "/mnt/c/o", facts)
+    parsed = parse_args(argv[6:])
+    A.arm("n67 the hop argv is `wsl.exe -d <the WSL legs' distribution> -e python3 <this> ...` (no `--`, no login "
+          "shell, never the machine's default distribution), and the derive half ACCEPTS exactly what the Windows "
+          "side builds",
+          lambda: (argv[:6] == ["wsl.exe", "-d", "an-injected-distro", "-e", "python3",
+                                "/mnt/c/x/benchmark_speedtest1.py"]
                    and "--" not in argv and "-l" not in argv and "bash" not in argv
                    and validate_mode(parsed, "linux") == "windows"
                    and parsed.stack_reserve == 8388608, argv))
@@ -3046,10 +3175,10 @@ def _st_cli(A, fx):
           "bad style, non-integers, a zero worker count, a negative reserve, an unknown transform, "
           "--self-test with company, a missing value, an abbreviation",
           lambda: (all(rc == 2 and "USAGE" in err for rc, _o, err in got),
-                   [(c, rc, err.strip()[:90]) for c, (rc, _o, err) in zip(cases, got) if rc != 2]))
+                   [(c, rc, _cut(err.strip(), 90)) for c, (rc, _o, err) in zip(cases, got) if rc != 2]))
     rc, out, _e = _run_main(["-h"])
     A.arm("n73 -h exits 0 and prints the usage (the flags and the exit codes)",
-          lambda: (rc == 0 and "--path-style" in out and "exit:" in out, out[:120]))
+          lambda: (rc == 0 and "--path-style" in out and "exit:" in out, _cut(out, 120)))
 
     def mode(argv, host):
         try:
@@ -3093,6 +3222,41 @@ _SECTIONS = (("substitution", _st_substitution), ("presence", _st_presence), ("l
              ("dsscp", _st_dsscp), ("subject", _st_subject), ("legs", _st_legs), ("translation", _st_translation),
              ("capabilities", _st_capabilities), ("derive", _st_derive), ("plan", _st_plan),
              ("preflight", _st_preflight), ("cli", _st_cli))
+
+
+# ── A FAILING ARM'S DETAIL, AS IT MAY BE PRINTED (2026-10-01, the P69 review's MINOR 5; ONE implementation since
+#    2026-10-06, the re-review's NIT 10) ──
+# THE redactor (`redact/redact.py`, loaded ONCE by path) marks the system temp directory `<temp>` (on Windows it lies
+# under the profile), runs over the WHOLE text, and only then is the text cut: a cut taken first can split a name the
+# rules would have masked whole (the review found anchors' arm (36h) printing the profile's temp path). All three are
+# the redactor's own (`lazy_redactor`, its `places`, `cut`); `_redact()[1].redactor` holds what it built, so arm
+# n94 can put a stand-in in its place.
+_REDACT = []
+
+
+def _redact():
+    """-> [the redact module, its lazily built shown()], loaded once, by path, from the actions directory."""
+    if not _REDACT:
+        sys.dont_write_bytecode = True   # a by-path load must not leave a __pycache__ in another action's directory
+        actions = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+        path = os.path.join(actions, "redact", "redact.py")
+        if not os.path.isfile(path):
+            sys.exit("benchmark_speedtest1: cannot find %s -- the redaction rule lives there and nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_redact", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _REDACT.extend((mod, mod.lazy_redactor(tree=None, places={"<temp>": tempfile.gettempdir()})))
+    return _REDACT
+
+
+def _shown(text):
+    return _redact()[1](text)
+
+
+def _cut(text, n):
+    """`_shown(text)`, then its first n characters (n > 0) or its last -n (n < 0): the redactor's own `cut`."""
+    mod, shown = _redact()
+    return mod.cut(shown, text, n)
 
 
 def self_test():

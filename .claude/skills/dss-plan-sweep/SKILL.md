@@ -48,8 +48,9 @@ something is mechanical or a judgment, it is a judgment.**
 1. **Orient.** `git branch --show-current`, `git log --oneline -10`, `git status -s`, remote sync.
    If a `/loop` or `dss-cycle` is *actively editing the plans right now*, do not write those files —
    flag their staleness in the report instead and list them as skipped.
-2. **Baseline the authorities.** Run `ctest --test-dir build --output-on-failure` for the real suite
-   count, `.harness-config/runner/actions/check-anchor-registry/check-anchor-registry.{ps1,sh}` for src↔registry, and
+2. **Baseline the authorities.** Run `dssharness test --legs windows-x86_64-debug --json` for the real suite
+   count (the run's record names it; a bare `ctest` is not how this repository runs its suite),
+   `dssharness run check-anchor-registry` for src↔registry, and
    `git rev-list --left-right --count origin/<branch>...HEAD` for push state.
 3. **Inventory.** Every file under `.plans/`, plus `README.md` and the sibling skills. Name them in
    the report — an unswept plan is a hole in the guarantee.

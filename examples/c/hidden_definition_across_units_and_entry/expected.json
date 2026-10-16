@@ -1,0 +1,17 @@
+{
+  "$comment": "P69 (lane lm, D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS): a hidden definition is still a LINK-TIME definition. helper.c defines a hidden function and a hidden datum that nothing in helper.c uses; main.c — whose own `main` is hidden too — calls and reads them. Exit 42 iff both arrived (40 + 1 + 1). ✔MEASURED before the fix with the lane's dsscp: the baseline built and ran 42 on pe64, and `--config=release` FAILED K_SymbolUndefined for the cross-unit helper on pe64 and ELF alike — release.pipeline.json runs `release-unit`, which holds Dce, on each unit BEFORE the merge, and DCE rooted only `isExternallyVisible` definitions, so the defining unit deleted what its sibling called; a hidden `main` likewise failed its own release link (the entry trampoline names it). gcc 13.3.0 and clang 18.1.3 keep a hidden definition at `-O2 -c` (probe-reference-cc run 20261001-152924-ba09ffc4), so every reference links this program. The fix roots every external-linkage definition of a module that is ONE input of its link (`opt::ModuleExtent::LinkInput` — each unit before the merge), and the image's entry at the whole-image stage. The release arm is the witness: the defect was release-only; ✔MEASURED 2026-10-01 with the lane's dsscp, the release executable differs from the baseline one on all five pairs, so the arm carries `mustDifferFromBaseline`.",
+  "language": "c",
+  "sources": ["main.c", "helper.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" },
+    { "spec": "x86_64:macho64-x86_64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

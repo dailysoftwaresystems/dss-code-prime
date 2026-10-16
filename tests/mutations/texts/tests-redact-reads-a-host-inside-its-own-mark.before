@@ -1,0 +1,2 @@
+            text = _outside_marks(own, rx, text, lambda m, t=text: m.group(0) if keep_host(t, m.start(), m.end())
+                                  else "<host>")

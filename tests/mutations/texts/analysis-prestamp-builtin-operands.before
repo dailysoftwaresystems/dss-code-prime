@@ -1,0 +1,2 @@
+    for (NodeId const a : args) preStampLiteralLeaves(s, cfg, tree, a);
+    CstBuiltinCall plan;

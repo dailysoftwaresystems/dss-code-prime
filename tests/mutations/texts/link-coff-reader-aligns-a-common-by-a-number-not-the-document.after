@@ -1,0 +1,1 @@
+                    (s.value <= 4u ? std::uint64_t{4} : std::uint64_t{32});

@@ -1,0 +1,2 @@
+            exSuccs.empty() || topIndex == UINT32_MAX
+                ? 0u : static_cast<std::uint32_t>(exSuccs[topIndex].size());

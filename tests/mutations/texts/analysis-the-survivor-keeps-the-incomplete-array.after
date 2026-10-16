@@ -1,0 +1,2 @@
+        if (TypeId const c = completerOfCompatible(in, composite, t); false && c.valid())
+            composite = c;

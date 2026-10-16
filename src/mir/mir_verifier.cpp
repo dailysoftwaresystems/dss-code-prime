@@ -14,6 +14,8 @@
 #include "mir/mir_dom.hpp"   // shared computeMirDomTree + mirBuildPredecessors
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"  // deriveStructCfMarkers + structCfMarkerName
+#include "mir/mir_symbols_named.hpp"   // checkSymbolIdsBelowTheStatedEnd's one list
+#include "mir/seh_filter_region.hpp"   // readSehFilterRegion (what a `__try` filter is)
 
 #include <algorithm>
 #include <cstddef>
@@ -340,6 +342,9 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     checkCallSignatures(reporter);
     checkAtomicAccessLowered(reporter);
     checkStoreValueTypes(reporter);
+    checkLinkageRecords(reporter);
+    checkAliases(reporter);
+    checkSymbolIdsBelowTheStatedEnd(reporter);
     if (reporter.hitCap()) return false;
     // ★★ THE VERDICT IS THE VERIFIER'S OWN COUNT, AND-ed with the reporter's
     // delta. The delta alone was not a verdict: ✔MEASURED P68 (lane `ht`), a
@@ -397,6 +402,14 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
                     std::format("const payload {} out of literal-pool range [0, {})",
                         idx, mir_.literalPool().size()));
             }
+        }
+        // P69 (lane `cs`): an `Unreachable` asserts one of the two `MirUnreachableKind`s;
+        // any other payload is a contract no pass can read.
+        if (op == MirOpcode::Unreachable
+            && mir_.instPayload(id) > static_cast<std::uint32_t>(MirUnreachableKind::Trap)) {
+            reportInst(reporter, DiagnosticCode::I_VerifierFailure, id,
+                std::format("unreachable payload {} names no MirUnreachableKind "
+                            "(0 assumed, 1 trap)", mir_.instPayload(id)));
         }
         // ★ THE SAME RULE FOR THE ASM POOL, AND IT WAS MISSING. Both asm opcodes
         // carry a `MirAsmDescriptorPool` index in their payload, and
@@ -723,28 +736,29 @@ void MirVerifier::checkSehStructure(DiagnosticReporter& reporter) const {
                         region, filterBB.v, predCount(filterBB)));
                 continue;
             }
-            std::uint32_t const fn2 = mir_.blockInstCount(filterBB);
-            MirInstId const fterm = fn2 > 0
-                ? mir_.blockInstAt(filterBB, fn2 - 1) : MirInstId{};
-            if (!fterm.valid()
-                || mir_.instOpcode(fterm) != MirOpcode::SehFilterReturn) {
+            // ★ THE FILTER IS A SUB-GRAPH, NOT ONE BLOCK. `&&`, the logical OR
+            // and `?:` evaluate an operand on one path only, so a filter written
+            // with any of them is a diamond joined by a `Phi`. What this check
+            // holds the filter to is ONE WAY IN AND ONE WAY OUT, and the
+            // statement of that shape is `readSehFilterRegion`'s — the pass that
+            // makes a function of the filter reads the same one, so the two
+            // cannot come to disagree about which blocks a filter is. (Until it
+            // existed this arm said "the block `SehTryBegin` names ends in
+            // `SehFilterReturn`", and every filter with a second condition was
+            // refused here, by a block number.)
+            SehFilterRegion const filter =
+                readSehFilterRegion(mir_, preds, filterBB, region);
+            if (!filter.ok()) {
                 reportInst(reporter, DiagnosticCode::I_SehStructure, term,
-                    std::format("SEH region {}: filter block #{} must terminate "
-                                "in SehFilterReturn", region, filterBB.v));
+                           filter.problem);
                 continue;
             }
-            if (mir_.instPayload(fterm) != region) {
-                reportInst(reporter, DiagnosticCode::I_SehStructure, fterm,
-                    std::format("SehFilterReturn payload {} does not match its "
-                                "SehTryBegin region {}",
-                        mir_.instPayload(fterm), region));
-            }
-            auto const fsuccs = mir_.blockSuccessors(filterBB);
-            if (fsuccs.size() == 1 && predCount(fsuccs[0]) != 1) {
-                reportInst(reporter, DiagnosticCode::I_SehStructure, fterm,
+            if (predCount(filter.handler) != 1) {
+                reportInst(reporter, DiagnosticCode::I_SehStructure,
+                    mir_.blockTerminator(filter.exit),
                     std::format("SEH region {}: handler block #{} must have "
                                 "exactly one predecessor (its filter), found {}",
-                        region, fsuccs[0].v, predCount(fsuccs[0])));
+                        region, filter.handler.v, predCount(filter.handler)));
             }
         }
         // SehTryEnd pairing + intrinsic containment (per function).
@@ -1386,8 +1400,8 @@ void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {
         // An INDIRECT call — through a function-pointer value in a register (a
         // Load of an fnptr variable, an `Arg`, a Phi) — has no static callee and
         // therefore no signature to check against. Skip it CLEANLY: it is a
-        // first-class legal shape (D-CSUBSET-FNPTR-INDIRECT-CALL; synth_threads_
-        // shim's once-adapter calls its `Arg` directly), never a violation. The
+        // first-class legal shape (D-CSUBSET-FNPTR-INDIRECT-CALL; a C call through
+        // a function-pointer parameter lowers to a Call on its `Arg`), never a violation. The
         // GlobalAddr test is the same static-edge test `call_graph_scc` uses.
         if (mir_.instOpcode(callee) != MirOpcode::GlobalAddr) return;
         TypeId const calleeTy = mir_.instType(callee);
@@ -1793,6 +1807,92 @@ void MirVerifier::checkAtomicAccessLowered(DiagnosticReporter& reporter) const {
             }
         }
     });
+}
+
+// P69 (lane `xa`). The rule is NOT written here: `mirLinkageDefect`
+// (mir/mir_node.hpp) is the one statement of what a well-formed linkage record
+// is, and this walk only asks it of every function and every global and names
+// the definition its sentence is about.
+void MirVerifier::checkLinkageRecords(DiagnosticReporter& reporter) const {
+    for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
+        MirFuncId const f = mir_.funcAt(fi);
+        std::string_view const defect =
+            mirLinkageDefect(mir_.funcLinkage(f), MirLinkageOwner::Function,
+                             /*hasInitializer=*/false, /*isThreadLocal=*/false);
+        if (defect.empty()) continue;
+        reportFunc(reporter, DiagnosticCode::I_VerifierFailure, f,
+                   std::format("the linkage of symbol %{} is not well formed: {}",
+                               mir_.funcSymbol(f).v, defect));
+    }
+    for (std::uint32_t gi = 0; gi < mir_.moduleGlobalCount(); ++gi) {
+        MirGlobalId const g = mir_.globalAt(gi);
+        bool const hasInitializer = mir_.globalInitLiteralIndex(g) != UINT32_MAX
+                                    || mir_.globalInitFunc(g).valid();
+        std::string_view const defect =
+            mirLinkageDefect(mir_.globalLinkage(g), MirLinkageOwner::Global,
+                             hasInitializer, mir_.globalIsThreadLocal(g));
+        if (defect.empty()) continue;
+        report(reporter, DiagnosticCode::I_VerifierFailure,
+               std::format("mir global #{}: the linkage of symbol %{} is not well "
+                           "formed: {}",
+                           g.v, mir_.globalSymbol(g).v, defect));
+    }
+}
+
+void MirVerifier::checkAliases(DiagnosticReporter& reporter) const {
+    if (mir_.moduleAliasCount() == 0) return;
+    std::unordered_set<std::uint32_t> defined;
+    for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi)
+        defined.insert(mir_.funcSymbol(mir_.funcAt(fi)).v);
+    for (std::uint32_t gi = 0; gi < mir_.moduleGlobalCount(); ++gi)
+        defined.insert(mir_.globalSymbol(mir_.globalAt(gi)).v);
+    std::unordered_set<std::uint32_t> stated;
+    for (MirAlias const& a : mir_.aliases()) {
+        auto const say = [&](std::string_view why) {
+            report(reporter, DiagnosticCode::I_VerifierFailure,
+                   std::format("alias %{} of %{}: {}", a.alias.v, a.target.v, why));
+        };
+        if (!defined.contains(a.target.v)) {
+            say("its target is no function or global this module defines — an alias "
+                "is one more name on a definition, and there is none to name");
+        }
+        if (defined.contains(a.alias.v)) {
+            say("the name is also a function or a global this module defines — one "
+                "name, two definitions");
+        }
+        if (!stated.insert(a.alias.v).second) {
+            say("the name is stated as an alias twice");
+        }
+        if (a.linkage.tentative) {
+            say("it is marked as a tentative definition — an alias has no storage of "
+                "its own");
+        }
+        std::string_view const defect =
+            mirLinkageDefect(a.linkage, MirLinkageOwner::Function,
+                             /*hasInitializer=*/false, /*isThreadLocal=*/false);
+        if (!a.linkage.tentative && !defect.empty()) {
+            say(std::format("its linkage is not well formed: {}", defect));
+        }
+    }
+}
+
+void MirVerifier::checkSymbolIdsBelowTheStatedEnd(DiagnosticReporter& reporter) const {
+    // One finding per id, at its first mention (the list's order is the `.dssir`
+    // writer's). The construct is named as the text spells it, so the finding
+    // reads the same whether the module came from a lowering or from a text.
+    for (MirSymbolMentionAt const& past : symbolIdsNamedPastTheStatedEnd(mir_)) {
+        std::string detail = std::format(
+            "{} names symbol %{}, which is not below the end this module states for "
+            "its symbol ids ({}) — the next synthesized symbol would be minted at an "
+            "id the module already names",
+            mirSymbolMentionSpelling(past.mention), past.symbol.v, mir_.symbolIdEnd());
+        if (past.inst.valid()) {
+            reportInst(reporter, DiagnosticCode::I_VerifierFailure, past.inst, std::move(detail));
+        } else {
+            report(reporter, DiagnosticCode::I_VerifierFailure,
+                   std::format("mir module: {}", detail));
+        }
+    }
 }
 
 } // namespace dss

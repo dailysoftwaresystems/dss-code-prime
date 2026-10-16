@@ -9,6 +9,8 @@
 #include "link/object_format_schema.hpp"
 
 #include <format>
+#include <span>
+#include <string>
 #include <string_view>
 
 // ── THE WEAK-DEFINITION DIALECT GATE ──────────────────────────────────────
@@ -109,14 +111,27 @@ moduleDefinesWeakSymbol(AssembledModule const& module) {
 // walker has no encoder for needs the DECLARATION fixed (or that encoder
 // built). Collapsing them into one message sends half the readers to the wrong
 // file.
+//
+// `spelled` is a SET since P69: a format may have more than one mechanism for a
+// weak definition and say per KIND which a definition takes
+// (`weakDefinition.byKind`), and its walker then spells each. The comparison
+// stays config vocabulary against config vocabulary — EVERY dialect the
+// document can answer with must be one this walker writes — so a document
+// that gives some kind a spelling the walker lacks is refused the moment the
+// module holds a weak definition, whichever kind that one is.
 [[nodiscard]] inline bool
-requireWeakDefinitionDialect(AssembledModule const&    module,
-                             ObjectFormatSchema const& fmt,
-                             WeakDefinitionDialect     spelled,
-                             std::string_view          where,
-                             DiagnosticReporter&       reporter) {
+requireWeakDefinitionDialects(AssembledModule const&                 module,
+                              ObjectFormatSchema const&              fmt,
+                              std::span<WeakDefinitionDialect const> spelled,
+                              std::string_view                       where,
+                              DiagnosticReporter&                    reporter) {
     if (!moduleDefinesWeakSymbol(module)) return true;
 
+    std::string spelledList;
+    for (WeakDefinitionDialect const d : spelled) {
+        if (!spelledList.empty()) spelledList += "' or '";
+        spelledList += weakDefinitionDialectName(d);
+    }
     auto const declared = fmt.weakDefinition();
     if (!declared.has_value()) {
         detail::emit(
@@ -129,10 +144,15 @@ requireWeakDefinitionDialect(AssembledModule const&    module,
                 "spelling would publish it as a STRONG definition on any "
                 "format whose dialect differs. "
                 "D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED.",
-                where, fmt.name(), weakDefinitionDialectName(spelled)));
+                where, fmt.name(),
+                spelled.empty() ? std::string_view{}
+                                : weakDefinitionDialectName(spelled.front())));
         return false;
     }
-    if (declared->dialect != spelled) {
+    for (WeakDefinitionDialect const stated : fmt.weakDefinitionDialectsStated()) {
+        bool written = false;
+        for (WeakDefinitionDialect const d : spelled) written = written || d == stated;
+        if (written) continue;
         detail::emit(
             reporter, DiagnosticCode::K_FormatLacksWeakDefinitionDialect,
             std::format(
@@ -143,12 +163,24 @@ requireWeakDefinitionDialect(AssembledModule const&    module,
                 "definition. Fix the declaration, or land the encoder for "
                 "'{}'. D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED.",
                 where, fmt.name(),
-                weakDefinitionDialectName(declared->dialect),
-                weakDefinitionDialectName(spelled),
-                weakDefinitionDialectName(declared->dialect)));
+                weakDefinitionDialectName(stated),
+                spelledList,
+                weakDefinitionDialectName(stated)));
         return false;
     }
     return true;
+}
+
+// The gate for a walker that spells ONE dialect — every caller until P69, and
+// still the ELF and Mach-O walkers.
+[[nodiscard]] inline bool
+requireWeakDefinitionDialect(AssembledModule const&    module,
+                             ObjectFormatSchema const& fmt,
+                             WeakDefinitionDialect     spelled,
+                             std::string_view          where,
+                             DiagnosticReporter&       reporter) {
+    return requireWeakDefinitionDialects(
+        module, fmt, std::span<WeakDefinitionDialect const>{&spelled, 1}, where, reporter);
 }
 
 } // namespace dss::link::format

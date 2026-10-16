@@ -1,0 +1,1 @@
+        bool const arrays = belowPointer && ka == TypeKind::Array && kb == TypeKind::Array;

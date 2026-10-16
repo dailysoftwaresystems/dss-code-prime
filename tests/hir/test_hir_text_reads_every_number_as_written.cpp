@@ -50,6 +50,7 @@
 
 #include <gtest/gtest.h>
 
+#include <bit>       // std::bit_cast: a NaN bit pattern (P69)
 #include <cstdint>
 #include <format>
 #include <functional>
@@ -106,7 +107,7 @@ static_assert(Alignment::kMaxBytes == 2147483648u,
 }
 
 // ── the module texts ─────────────────────────────────────────────────────────
-constexpr std::string_view kHead = "dsshir 6\nproducer \"\"\n";
+constexpr std::string_view kHead = "dsshir 8\nproducer \"\"\n";
 constexpr std::string_view kBuffer1 = "buffers {\n  buf 1 \"a.c\"\n}\n";
 constexpr std::string_view kSymbols = "symbols {\n  %1 \"f\"\n  %2 \"g\"\n}\n";
 
@@ -993,3 +994,64 @@ TEST(HirTextLiteralSymbols, AnAggregateWithAComplexFieldRoundTrips) {
 }
 
 } // namespace
+
+
+// ── P69 (lane `cs`, row 5): A NaN READS BACK WITH ITS PAYLOAD AND SIGN ──────────────────────────
+// `std::format` spells every NaN `nan`, and the reader turns `nan` into the CANONICAL quiet NaN, so
+// a literal carrying a payload (`__builtin_nan("1")` folds to one) read back as a DIFFERENT value
+// through a clean reporter. The writer spells any other NaN by its 64-bit pattern, `float nanbits
+// <u64>` (v7); the canonical one keeps `nan`. A pattern that is not a NaN is refused by name.
+// RED-ON-DISABLE: write every NaN through `std::format` again → the payload rows read back canonical.
+TEST(HirTextNumbers, ANanReadsBackWithItsPayloadAndSign) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const f64   = in.primitive(TypeKind::F64);
+    TypeId const voidT = in.primitive(TypeKind::Void);
+    TypeId const sig   = in.fnSig({}, voidT, CallConv::CcSysV);
+    std::uint64_t const patterns[] = {
+        0x7ff8000000000000ull,   // the canonical quiet NaN — spelled `nan`, as before
+        0x7ff8000000000001ull,   // a payload: `__builtin_nan("1")`
+        0xfff8000000000000ull,   // a negative quiet NaN
+        0x7ff0000000000001ull,   // a signalling NaN
+    };
+    HirLiteralPool pool;
+    HirBuilder b{"toy"};
+    std::vector<HirNodeId> stmts;
+    for (std::uint64_t const bits : patterns) {
+        stmts.push_back(b.makeExprStmt(b.makeLiteral(
+            f64, pool.add(HirLiteralValue{std::bit_cast<double>(bits), TypeKind::F64}))));
+    }
+    stmts.push_back(b.makeReturn());
+    HirNodeId const body = b.makeBlock(stmts);
+    HirNodeId const fnNode = b.makeFunction(sig, 1, {}, body);
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{fnNode});
+    Hir hir = std::move(b).finish(root);
+    std::vector<std::string> names{"", "f"};
+    HirTextContext ctx;
+    ctx.interner = &in; ctx.symbolNames = &names; ctx.literalPool = &pool;
+
+    DiagnosticReporter w;
+    std::string const text = emitHir(hir, ctx, w);
+    ASSERT_TRUE(errorsOf(w).empty()) << joined(errorsOf(w));
+    EXPECT_NE(text.find("lit float nan :"), std::string::npos)
+        << "CONTROL: the canonical quiet NaN keeps its spelling\n" << text;
+    std::string const payload = std::format("lit float nanbits {} :", patterns[1]);
+    EXPECT_NE(text.find(payload), std::string::npos) << text;
+
+    DiagnosticReporter r;
+    auto const res = parseHir(text, CompilationUnitId{9}, r);
+    ASSERT_TRUE(res->ok) << joined(errorsOf(r));
+    ASSERT_EQ(res->literalPool.size(), std::size(patterns));
+    for (std::size_t i = 0; i < std::size(patterns); ++i) {
+        auto const* back = std::get_if<double>(&res->literalPool.at(i).value);
+        ASSERT_NE(back, nullptr) << "literal " << i;
+        EXPECT_EQ(std::bit_cast<std::uint64_t>(*back), patterns[i]) << "literal " << i;
+    }
+
+    // A pattern that is not a NaN (the bits of 1.0) is refused by name, never read as that number.
+    std::string bad = text;
+    std::size_t const at = bad.find(payload);
+    ASSERT_NE(at, std::string::npos);
+    bad.replace(at, payload.size(), "lit float nanbits 4607182418800017408 :");
+    EXPECT_TRUE(anyContains(moduleErrors(bad), "'nanbits' pattern is not a NaN"))
+        << joined(moduleErrors(bad));
+}

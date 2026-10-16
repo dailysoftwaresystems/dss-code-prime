@@ -1,0 +1,2 @@
+        if (elementOfUnknownSize()) {
+            emit(DiagnosticCode::S_ArrayElementTypeIncomplete,

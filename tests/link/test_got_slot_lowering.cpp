@@ -427,12 +427,20 @@ struct Linked {
 }
 
 // What the compile pipeline's archive-member binder does with a member's
-// undefined `stdout`: the platform corpus names its library. The reader leaves
-// `readThroughSlot` false, as it does on every row it mints.
+// undefined `stdout`: the platform corpus names its library, and — the member's
+// STT_NOTYPE symbol stating no kind (`Pending`, P69,
+// D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA) — the library's row states it, a
+// datum (`decideKindFromTheDefinition`). The reader leaves `readThroughSlot`
+// false, as it does on every row it mints.
 void bindStdoutToLibc(Members& members) {
     for (auto& m : members.modules) {
         for (auto& e : m.externImports) {
-            if (e.mangledName == "stdout") e.libraryPath = "libc.so.6";
+            if (e.mangledName != "stdout") continue;
+            e.libraryPath = "libc.so.6";
+            if (e.kindOrigin == ExternKindOrigin::Pending) {
+                e.isData     = true;
+                e.kindOrigin = ExternKindOrigin::FromLibrary;
+            }
         }
     }
 }
@@ -1042,4 +1050,129 @@ TEST(GotSlotLowering, AUnitThatReadsALibraryDatumThroughItsSlotIsNotJudged) {
         EXPECT_TRUE(reported(rep, DiagnosticCode::K_ImportReferenceUnbindable))
             << "the same reference, direct, needs a copy relocation:\n" << errorText(rep);
     }
+}
+
+// ══ C. A RELOCATABLE FORMAT THAT CANNOT SPELL A GOT LOAD (P69 re-review MAJOR 2) ══
+//
+// A relocatable format keeps every GOT relocation it can SPELL — those are the
+// final linker's — and lowers the ones it cannot exactly as an image does: onto
+// a pointer the object CARRIES, one absolute relocation to the symbol. COFF has
+// no GOT relocation at all, so every GOT load of a PE object reads a carried
+// pointer — whatever the import's binding, library or kind — and that pointer
+// is filled through the relocation the object's own statics use, so the code's
+// `&X` and a static `{X}` are one value under every linker. The `__imp_X` load
+// this lowering used to write for a strong import with a known library (MSVC
+// `/MD`'s code shape) gave the code the IAT value while the statics kept the
+// import thunk: ✔MEASURED 2026-10-06, exit 1006 under GNU ld 2.42 and lld-link
+// 18 (run 20261006-215740-5f83e38e, test_pe_object_function_address_reference_link.cpp).
+
+TEST(GotSlotLowering, APeObjectCarriesOnePointerPerSymbolForEveryGotLoad) {
+    auto const t = target("x86_64");
+    auto const f = format("pe64-x86_64-windows");
+    ASSERT_TRUE(t && f);
+    ASSERT_TRUE(f->externAddrBinding() == ExternAddrBinding::Got);
+    RelocationKind const gotLoad = kindNamed(*t, "gotriprel32_load");
+    ASSERT_EQ(f->relocationByKind(gotLoad), nullptr) << "COFF spells no GOT load";
+    AssembledModule in;
+    in.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes.assign(64, 0);
+    fn.relocations = {Relocation{3, SymbolId{2}, gotLoad, -4},    // &puts
+                      Relocation{13, SymbolId{2}, gotLoad, -4},   // &puts again: ONE name
+                      Relocation{23, SymbolId{3}, gotLoad, -4},   // &sibling: no library known
+                      Relocation{33, SymbolId{4}, gotLoad, -4}};  // &maybe: weak
+    in.functions.push_back(std::move(fn));
+    auto addImport = [&](std::uint32_t id, char const* name, char const* lib, SymbolBinding b) {
+        ExternImport e;
+        e.symbol      = SymbolId{id};
+        e.mangledName = name;
+        e.libraryPath = lib;
+        e.binding     = b;
+        in.externImports.push_back(e);
+    };
+    addImport(2, "puts", "ucrtbase.dll", SymbolBinding::Global);
+    addImport(3, "sibling", "", SymbolBinding::Global);
+    addImport(4, "maybe", "ucrtbase.dll", SymbolBinding::Weak);
+    AssembledModule out;
+    DiagnosticReporter rep;
+    ASSERT_FALSE(linker::lowerGotSlotReferences(in, out, *t, *f, rep)) << "lowered";
+    ASSERT_FALSE(rep.hasErrors()) << errorText(rep);
+    RelocationKind const direct = kindNamed(*t, "riprel32");
+    auto const& rs = out.functions[0].relocations;
+    for (auto const& r : rs) {
+        EXPECT_EQ(r.kind, direct) << "no GOT relocation reaches the COFF writer";
+        EXPECT_EQ(r.addend, -4) << "x86's displacement bias stays on the reference";
+    }
+    // Every load reads a pointer the object carries — the strong import with a
+    // known library (puts) exactly like the sibling-defined extern and the weak
+    // import — holding the symbol through the ONE absolute pointer relocation.
+    EXPECT_EQ(rs[0].target, rs[1].target) << "one slot per symbol, however many loads";
+    for (std::size_t i : {std::size_t{0}, std::size_t{2}, std::size_t{3}}) {
+        SCOPED_TRACE(i);
+        auto const* slot = itemNamed(out, rs[i].target);
+        ASSERT_NE(slot, nullptr) << "a carried pointer, never a name the final linker resolves";
+        EXPECT_EQ(slot->section, DataSectionKind::RelRoConst);
+        ASSERT_EQ(slot->relocations.size(), 1u);
+        EXPECT_EQ(slot->relocations[0].target, SymbolId{i == 0 ? 2u : (i == 2 ? 3u : 4u)});
+        EXPECT_EQ(slot->relocations[0].kind, kindNamed(*t, "abs64"));
+        EXPECT_EQ(slot->relocations[0].addend, 0);
+    }
+    EXPECT_NE(rs[0].target, rs[2].target);
+    EXPECT_NE(rs[2].target, rs[3].target);
+    // ... and no undefined name is minted: the import rows are the module's own.
+    ASSERT_EQ(out.externImports.size(), in.externImports.size());
+    for (auto const& e : out.externImports) {
+        EXPECT_NE(e.mangledName.rfind("__imp_", 0), 0u)
+            << "'" << e.mangledName << "': an IAT name in the object is MSVC /MD's code "
+               "shape, whose statics keep the thunk — two addresses of one function";
+    }
+}
+
+TEST(GotSlotLowering, ARelocatableFormatKeepsEveryGotLoadItCanSpell) {
+    // The x86_64 ELF relocatable spells the GOT load (R_X86_64_REX_GOTPCRELX): it
+    // is the final linker's, which makes the slot.
+    auto const t = target("x86_64");
+    auto const f = format("elf64-x86_64-linux");
+    ASSERT_TRUE(t && f);
+    RelocationKind const gotLoad = kindNamed(*t, "gotriprel32_load");
+    ASSERT_NE(f->relocationByKind(gotLoad), nullptr);
+    AssembledModule in = moduleWith({Relocation{3, SymbolId{2}, gotLoad, -4}},
+                                    /*datumIsAnImport=*/true);
+    AssembledModule out;
+    DiagnosticReporter rep;
+    EXPECT_TRUE(linker::lowerGotSlotReferences(in, out, *t, *f, rep)) << "nothing to do";
+    EXPECT_FALSE(rep.hasErrors());
+}
+
+TEST(GotSlotLowering, ARelocatableFormatLowersOnlyTheGotKindItCannotSpell) {
+    // The rule is PER KIND, not per format: the x86_64 ELF relocatable spells
+    // `gotriprel32_load` (R_X86_64_REX_GOTPCRELX) but has no row for
+    // `gotriprel32` — Mach-O's X86_64_RELOC_GOT — so a module carrying one of
+    // each keeps the first for the final linker and carries a pointer for the
+    // second, rather than handing the writer a kind it cannot write.
+    auto const t = target("x86_64");
+    auto const f = format("elf64-x86_64-linux");
+    ASSERT_TRUE(t && f);
+    RelocationKind const spelled = kindNamed(*t, "gotriprel32_load");
+    RelocationKind const unspelled = kindNamed(*t, "gotriprel32");
+    ASSERT_NE(f->relocationByKind(spelled), nullptr);
+    ASSERT_EQ(f->relocationByKind(unspelled), nullptr);
+    AssembledModule in = moduleWith({Relocation{3, SymbolId{2}, spelled, -4},
+                                     Relocation{13, SymbolId{2}, unspelled, -4}},
+                                    /*datumIsAnImport=*/true);
+    AssembledModule out;
+    DiagnosticReporter rep;
+    ASSERT_FALSE(linker::lowerGotSlotReferences(in, out, *t, *f, rep)) << "lowered";
+    ASSERT_FALSE(rep.hasErrors()) << errorText(rep);
+    auto const& rs = out.functions[0].relocations;
+    ASSERT_EQ(rs.size(), 2u);
+    EXPECT_EQ(rs[0].kind, spelled) << "the GOT load the format spells is the final linker's";
+    EXPECT_EQ(rs[0].target, SymbolId{2});
+    EXPECT_EQ(rs[1].kind, kindNamed(*t, "riprel32"));
+    auto const* slot = itemNamed(out, rs[1].target);
+    ASSERT_NE(slot, nullptr) << "the kind the format cannot spell reads a carried pointer";
+    ASSERT_EQ(slot->relocations.size(), 1u);
+    EXPECT_EQ(slot->relocations[0].target, SymbolId{2});
+    EXPECT_EQ(slot->relocations[0].kind, kindNamed(*t, "abs64"));
 }

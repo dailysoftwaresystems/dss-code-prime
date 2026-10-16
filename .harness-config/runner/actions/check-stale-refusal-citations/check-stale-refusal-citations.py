@@ -26,7 +26,25 @@ A finding is ONE SENTENCE that satisfies all six:
   (2) EVERY row id it cites is CLOSED;
   (3) after the ids are MASKED OUT, it carries a PERSISTENCE word followed within
       26 characters by a REFUSAL word (or the predicative `still/stays/remains
-      open`);
+      open`), that word not a `still` bound to a participle on the claim's
+      SUBJECT (`a document still declaring it is REFUSED`). The guard reads
+      exactly ONE construction as that, and skips nothing else:
+        (A) `still <word>ing`, then -- with NO COMMA and NO JOINER between
+            (and/or/but/so/yet/nor; because/since/while/whilst/whereas/although/
+            though/unless/if/when/once/until/after/before/as) -- a finite `is` or
+            `are` immediately before the refusal word; and
+        (B) the `still`'s OWN CLAUSE -- the text before it, back to the nearest
+            comma, semicolon, colon, dash, joiner or clause-opening word (that/
+            which/who/whom/whose/what/why/how/where/whether) -- holds NO COPULA
+            (is/are/was/were/be/been/being, remain(s)/remained, stay(s)/stayed;
+            a contracted `'s`/`'re` only as the last word before the `still`,
+            since anywhere else it is as likely a possessive), UNLESS that
+            clause is a relative one in its plainest form: opened by `that`,
+            `which` or `who`, the copula right after the pronoun (`a config that
+            is still declaring it is REFUSED`).
+      WHERE A PATTERN CANNOT TELL whether a sentence is that construction, THE
+      GUARD CONVICTS. The paragraph `(3)'s PARTICIPLE SKIP` below says which
+      sentences that costs, and what the construction itself does not read;
   (4) no past-tense GOVERNOR sits immediately before that phrase;
   (5) no RETRACTION marker appears anywhere in the sentence;
   (6) no RESIDUAL-BOUNDARY qualifier scopes the claim to something OUTSIDE what
@@ -67,6 +85,53 @@ than one member of it.
 ⚠ THE COST IS STATED RATHER THAN HIDDEN: a bare *"X is refused (D-CLOSED-…)"*
 that went stale is NOT reported. That is the FP-safe direction, and this guard's
 first false accusation is the one that gets it turned off.
+
+★★★ (3)'s PARTICIPLE SKIP: WHAT IT READS, WHICH WAY IT ERRS, AND WHAT THAT COSTS.
+Stated 2026-10-08, after three reviews each found a sentence the construction
+misjudged: the bar this skip is held to is "TRUE TO THE PREDICATE STATED HERE,
+WITH ITS COST STATED", never "judges every English sentence". A later review
+can then find a breach of this predicate; another sentence is not one.
+The skip exists because a TRUE sentence was convicted (✔MEASURED 2026-10-07):
+*"a document still declaring it is REFUSED AT LOAD"* -- the `still` persists the
+document's declaring, and the refusal is what the cited closure DELIVERED. It is
+an EXEMPTION from a conviction the predicate has already made, so narrowing it
+errs toward CONVICTING, the opposite of (3)'s own direction, and that is
+DECIDED: a true sentence convicted costs its author a REPHRASE, which is cheap;
+a stale one excused costs a FALSE CITATION, which is the defect this guard
+exists for. So everything outside the one construction (A)+(B) convicts:
+  * A JOINER ANYWHERE between the participle and the refusal's copula refuses the
+    skip -- whether a CLAUSE follows it (*"still pending so the call is refused"*,
+    *"still missing since it is refused"*) or only a PHRASE does (*"still naming
+    rax and eax is refused"*, *"still using it as a key is refused"*). A pattern
+    cannot tell a second clause from a compound object or a prepositional
+    phrase. COST: the TRUE second kind is convicted, and rephrased.
+  * A COPULA ANYWHERE in the `still`'s own clause makes the `still` the
+    predicate's (*"the fix is also still pending ..."*, *"the two lowerings are
+    both still failing ..."*), whatever stands between the two -- adverbs are not
+    enumerated, and only a comma, a semicolon, a colon, a dash, a joiner or a
+    clause-opening word ends a clause; a comment marker a wrapped line keeps
+    (`is // still`) and a masked id (`is (<id>) still`) do not, so neither hides
+    the copula. COST: a TRUE sentence whose subject holds a copula with none of
+    those after it (*"the document being loaded still declaring it is refused"*)
+    is convicted, and rephrased.
+  * A RELATIVE CLAUSE keeps the skip only in its plainest form, `that|which|who
+    <copula> ... still <word>ing ...`. One with a subject of its own (*"a config
+    that the loader is still reading is refused"*) is a clause whose `still`
+    follows its own copula: it convicts. COST: a rephrase.
+  * ⚠ AND THE CONSTRUCTION DOES NOT READ **WHAT** PERSISTS -- the one place the
+    skip errs toward SILENCE, stated so that nobody has to find it. *"The
+    lowering still missing is unsupported"* and *"the lowering that is still
+    missing is unsupported"* are skipped exactly as *"a document still declaring
+    it is refused"* is: a pattern does not tell a gap's participle (missing,
+    pending, failing) from an input's (declaring, using, naming), and a list of
+    either would be a word list where every other narrowing of this guard is a
+    construction. COST, and it is the dear one: a STALE sentence of exactly that
+    shape is excused. ✔MEASURED 2026-10-08 by disabling the skip: the guard then
+    reports exactly ONE new site on the governed tree -- the sentence the skip
+    was built for, and it is true. That measurement is the check to repeat
+    whenever this construction is touched.
+Each bullet is pinned by self-test arms under "WHERE THE `still` SITS" and "THE
+STATED PREDICATE", and each rule reds an arm of its own when it is disabled.
 
 ★★ (3) ALSO MASKS THE IDS, AND THE HONEST MEASUREMENT IS THAT THE MASK BUYS
 **NOTHING TODAY**. Row names ARE English -- one ends in `-IS-UNELECTABLE`, another
@@ -120,7 +185,7 @@ Every file `git ls-files --cached --others --exclude-standard` reports, MINUS
     on routine work is a guard that gets weakened, which asserts nothing.
     ★ AND THE PLAN SIDE IS ALREADY GOVERNED, BY THE INSTRUMENT THAT OWNS IT: a
     registry row whose own opening verdict contradicts its marker is
-    `check-anchor-balance`'s mismarked-closure arm, and a row that still PRESENTS
+    `anchor-debt`'s mismarked-closure arm, and a row that still PRESENTS
     as blocked while its trigger has fired is that same instrument's `unblocked`
     arm. A closed row's status cell RECAPPING what used to be refused is not a
     defect at all -- it is what a closure looks like.
@@ -130,7 +195,7 @@ Every file `git ls-files --cached --others --exclude-standard` reports, MINUS
     live statement of what the compiler does, and nothing rewrites them per cycle.
 
 ── THE ROW SETS: IMPORTED, NEVER RE-DERIVED ────────────────────────────────────
-`check-anchor-balance` is imported and asked for both populations.
+`anchor-debt` is imported and asked for both populations.
   * A ROW IS CLOSED IFF ITS STATUS CELL BEGINS WITH THE CLOSURE MARK after
     `lstrip("*_ ")` -- `is_closed()`, unchanged and unread by this file. THE
     COMPLEMENT IS DEFINED, NEVER THE VARIANTS: an ad-hoc enumeration of status
@@ -200,11 +265,11 @@ with exit 2, never a pass. An empty scan is a COLLAPSE (a guard that fails OPEN 
 the worst kind).
 
 Usage:
-    python .harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py
-    python .harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py --list
-    python .harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py --write
-    python .harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py --baseline
-    python .harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py --selftest
+    dssharness run check-stale-refusal-citations                              verify, then self-test
+    dssharness run check-stale-refusal-citations --manual-step list           every site, ceilings ignored
+    dssharness run check-stale-refusal-citations-write                        burn down (--write)
+    dssharness run check-stale-refusal-citations-baseline                     new ground (--baseline)
+    dssharness run check-stale-refusal-citations --manual-step self-test      the self-test alone
 
 ★★ THE NO-ARGUMENT FORM (the ctest form) VERIFIES THE TREE **AND THEN RUNS THE
 SELF-TEST**, honouring both statuses and short-circuiting NEITHER. A guard whose
@@ -341,7 +406,7 @@ def sentences(text):
 
 # ── the vocabulary. Each list is a POSITIVE declaration, so it is enumerated ──
 # and every member was read in the tree before it was added. That is the same
-# licence `check-anchor-balance`'s WALK_BACK list takes and for the same reason:
+# licence `anchor-debt`'s WALK_BACK list takes and for the same reason:
 # there is no complement of "asserts a refusal persists" to invert. The residual
 # risk is a MISS, never a false accusation, and a miss is this guard's safe
 # direction.
@@ -375,6 +440,82 @@ OPEN_CLAIM = r"\b(?:STILL|STAYS?|REMAINS?)[-\s]+OPEN\b"
 
 CLAIM = re.compile(r"\b(?:%s)\b[^.;!?]{0,%d}?\b(?:%s)\b|%s"
                    % (PERSISTENCE, GAP, REFUSAL, OPEN_CLAIM), re.IGNORECASE)
+
+# ★★ A `STILL` BOUND TO A PARTICIPLE IN THE CLAIM'S SUBJECT PERSISTS THAT ACTION, NOT THE REFUSAL.
+# ✔MEASURED 2026-10-07 on the integrated P69 tree: `target_schema_json.cpp` says a document "still declaring" a
+# removed key "is REFUSED AT LOAD", citing the CLOSED row whose closure removed the key -- the refusal is what that
+# closure DELIVERED, the sentence is TRUE, and this guard went red on it. The tell is a CONSTRUCTION, not a word
+# list: `still <word>ing`, then no comma, then a finite `is`/`are` IMMEDIATELY before the refusal word -- the
+# predicate carries no persistence word of its own. `still being refused` is not that (no copula before the
+# refusal word), and `still pending, so the call is refused` is not either (a comma ends the participle's reach):
+# both stay findings. A skipped match is searched past its own `still` only, so a persistence word later in the
+# same sentence (`... is refused and stays refused`) still convicts.
+# ★ AND THE CONSTRUCTION SAYS WHERE THE `STILL` SITS (2026-10-07, the P69 fixed-point re-review's MINOR 2: until then
+# it never located the subject, and the comma alone decided; restated 2026-10-08 as the ONE construction the module
+# docstring's predicate (3) spells, after a third review found sentences on both sides of it). ✔MEASURED by those
+# reviews on verbatim copies of these patterns, each sentence citing a CLOSED row -- STALE, and excused by the
+# narrowing as it then stood: "the fix is still pending so the call is refused", "the lowering is still missing and
+# is unsupported", "the fix is also still pending because it is refused", "the two lowerings are both still failing
+# while each is rejected", "the arm64 lowering still missing since it is refused", "the lowering seems still missing
+# because it is refused"; TRUE, and convicted by it: "a config that is still declaring it is refused at load",
+# "documents which are still using the old key are rejected". Three rules, each a construction:
+#   JOINED        a joiner between the participle and the refusal's copula -- a coordinator OR a subordinator --
+#                 refuses the skip, whatever follows it. "a target still naming rax and eax is refused at load" is
+#                 TRUE and is CONVICTED by this rule: a compound object and a second clause are one shape to a
+#                 pattern, and where it cannot tell the guard convicts (the docstring states the cost).
+#   CLAUSE_COPULA a copula anywhere in the `still`'s OWN CLAUSE makes the `still` the predicate's, whatever stands
+#                 between them (`is also still`, `are both still`). The clause is what follows the last
+#                 CLAUSE_OPENER before the `still`: a comma, semicolon, colon or dash, a joiner, or a clause-opening
+#                 word. ⚠ A comment marker and a masked id open NO clause: a sentence keeps the markers of the lines
+#                 it spans (`is // still`, `is # still`, `**is** still`) and a masked id is punctuation too (`is
+#                 (<id>) still`), so neither may hide the copula.
+#   RELATIVE      ... unless that clause is a relative one in its plainest form -- opened by `that`, `which` or
+#                 `who`, the copula right after the pronoun: the unreduced spelling of the very construction this
+#                 skip exists for.
+JOINER = (r"AND|OR|BUT|SO|YET|NOR|BECAUSE|SINCE|WHILE|WHILST|WHEREAS|ALTHOUGH|THOUGH|UNLESS|IF|WHEN|ONCE|UNTIL|"
+          r"AFTER|BEFORE|AS")
+COPULA = r"IS|ARE|WAS|WERE|BE|BEEN|BEING|REMAINS?|REMAINED|STAYS?|STAYED"
+PARTICIPLE_BOUND = re.compile(r"STILL\s+[A-Z]+ING\b(?P<between>[^,]*?)\b(?:IS|ARE)\s+(?:%s)$" % REFUSAL,
+                              re.IGNORECASE)
+JOINED = re.compile(r"\b(?:%s)\b" % JOINER, re.IGNORECASE)
+CLAUSE_OPENER = re.compile(r"[,;:]|--|[—–]|\b(?:%s|THAT|WHICH|WHO|WHOM|WHOSE|WHAT|WHY|HOW|WHERE|WHETHER)\b" % JOINER,
+                           re.IGNORECASE)
+CLAUSE_COPULA = re.compile(r"\b(?:%s)\b" % COPULA, re.IGNORECASE)
+# A CONTRACTED copula (`it's still`, `they're still`) counts only as the LAST word before the `still`: anywhere else
+# in the clause an `'s` is as likely a possessive (`the config's key still declaring it ...`), which is no copula.
+CONTRACTED_COPULA = re.compile(r"\w['’](?:S|RE)\W*$", re.IGNORECASE)
+RELATIVE = re.compile(r"(?:THAT|WHICH|WHO)$", re.IGNORECASE)
+RELATIVE_COPULA = re.compile(r"(?:\W*\b(?:IS|ARE|WAS|WERE)\b|['’](?:S|RE)\b)", re.IGNORECASE)
+
+
+def _predicate_still(before):
+    """Does the `still` that follows `before` (the masked sentence up to it) sit AFTER A COPULA OF ITS OWN CLAUSE?
+    Its clause is what follows the last CLAUSE_OPENER; a relative clause in its plainest form -- opened by
+    that/which/who, the copula right after the pronoun -- is the one clause whose copula does not make the `still`
+    the predicate's."""
+    opener = None
+    for opener in CLAUSE_OPENER.finditer(before):
+        pass
+    clause = before[opener.end():] if opener else before
+    if CLAUSE_COPULA.search(clause) is None and CONTRACTED_COPULA.search(before) is None:
+        return False
+    if opener is not None and RELATIVE.match(opener.group(0)) and RELATIVE_COPULA.match(clause):
+        return False
+    return True
+
+
+def _participle_bound(m, masked):
+    """Is this CLAIM match (in `masked`) a `still` bound to a participle on the claim's SUBJECT -- the ONE
+    construction predicate (3) spells? Never when a joiner stands between the participle and the refusal's copula,
+    nor when the `still` follows a copula of its own clause."""
+    pb = PARTICIPLE_BOUND.match(m.group(0))
+    if pb is None:
+        return False
+    if JOINED.search(pb.group("between")):
+        return False
+    if _predicate_still(masked[:m.start()]):
+        return False
+    return True
 
 # ★★★ A REFUSAL SCOPED TO A **BOUNDARY OUTSIDE WHAT THE ROW CLOSED** IS TRUE, NOT
 # STALE, AND IT IS THE LARGEST FALSE-POSITIVE CLASS THIS GUARD HAS.
@@ -439,6 +580,8 @@ def claim_in(sentence, anchor_token):
     """
     masked = anchor_token.sub(lambda m: MASK_CHAR * len(m.group(0)), sentence)
     m = CLAIM.search(masked)
+    while m is not None and _participle_bound(m, masked):
+        m = CLAIM.search(masked, m.start() + len(m.group(0).split(None, 1)[0]))
     if m is None:
         return None
     if GOVERNOR.search(masked[:m.start()]) or RETRACTION.search(masked):
@@ -452,7 +595,7 @@ def findings_in(text, anchor_token, names, closed):
     """-> [(cited_ids, excerpt, sentence)] for one file's text.
 
     `names` is every id that HAS a row; `closed` is the subset whose every home
-    is closed. Both come from `check-anchor-balance`; neither is derived here.
+    is closed. Both come from `anchor-debt`; neither is derived here.
     """
     found = []
     for sentence in sentences(text):
@@ -469,25 +612,24 @@ def findings_in(text, anchor_token, names, closed):
 
 
 # ═══════════════════════ THE ROW SETS AND THE GOVERNED SET ═══════════════════
-def _load_anchor_balance(root):
-    """`check-anchor-balance` as a module, or a loud death.
+def _load_anchor_debt(root):
+    """`anchor-debt` as a module, or a loud death.
 
     Imported rather than copied for the reason `check-wrapped-anchor-ids` imports
     it: two copies of "what a row is and when it is closed" is exactly the drift
     the whole registry discipline exists to stop. The import fails LOUD if the
     sibling moves.
     """
-    sibling = os.path.join(root, ACTIONS_REL, "check-anchor-balance",
-                           "check-anchor-balance.py")
+    sibling = os.path.join(root, ACTIONS_REL, "anchor-debt", "anchor-debt.py")
     if not os.path.isfile(sibling):
         raise Collapse(
             "cannot find the shared anchor vocabulary at %s.\n"
             "  This guard must take its row population, its closed-status rule and "
-            "its anchor-token pattern from that script, or the two instruments "
+            "its anchor-token pattern from that program, or the two instruments "
             "start disagreeing about what a CLOSED row IS. Restore the sibling; do "
             "NOT copy its definitions here."
             % os.path.relpath(sibling, root).replace("\\", "/"))
-    spec = importlib.util.spec_from_file_location("_anchor_balance", sibling)
+    spec = importlib.util.spec_from_file_location("_anchor_debt", sibling)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -501,7 +643,7 @@ def row_sets(root):
     The closed set is therefore the COMPLEMENT, computed rather than matched --
     no glyph is enumerated anywhere in this file.
     """
-    ab = _load_anchor_balance(root)
+    ab = _load_anchor_debt(root)
     try:
         scan = ab.scan_worktree(root)
     except SystemExit as exc:                # `scan_worktree` exits on a bad tree
@@ -686,8 +828,7 @@ def report_comment_divergence(comment):
     print("  commit landed.")
     print("  FIX: DECIDE WHICH SIDE IS TRUE FIRST; the repair is not symmetric.")
     print("  If the CODE is right, re-stamp the JSON:")
-    print("      python .harness-config/runner/actions/check-stale-refusal-citations/"
-          "check-stale-refusal-citations.py --write")
+    print("      dssharness run check-stale-refusal-citations-write")
     print("  If the JSON is right, edit `_INVENTORY_COMMENT` to match it -")
     print("  running `--write` would DESTROY the corrected text. The species is")
     print("  this guard's own subject: a claim TRUE WHEN IT WAS TYPED and FALSE")
@@ -805,8 +946,7 @@ def run(root, write=False, baseline=False):
         print("  You corrected sentences without lowering the ceiling. Unclaimed")
         print("  headroom is exactly where the next one hides. Re-baseline in the")
         print("  same commit:")
-        print("      python .harness-config/runner/actions/check-stale-refusal-citations/"
-              "check-stale-refusal-citations.py --write")
+        print("      dssharness run check-stale-refusal-citations-write")
         print("  That verb only lowers, so it cannot hide a regression while it does.")
         return EXIT_RATCHET
 
@@ -859,11 +999,11 @@ def list_sites(root):
 # 2026-09-01, so a
 # bare two-segment fixture is now a citation of an anchor with no row, INSIDE the
 # guard that reports stale citations, and the registry guard refuses the whole
-# tree for it. `check-anchor-balance`'s two-segment `ANCHOR_TOKEN` still matches
+# tree for it. `anchor-debt`'s two-segment `ANCHOR_TOKEN` still matches
 # the ASSEMBLED value at run time, which is what the arms need.
 # ✔MEASURED on this file's first draft: an over-threshold fixture reddened
 # `check-anchor-registry` at once. Settled precedent, not preference --
-# `check-anchor-balance`'s self-test renamed eleven such
+# the self-test of `anchor-debt` (then `check-anchor-balance`) renamed eleven such
 # names rather than allowlisting them, because an allowlist entry silences a name
 # repo-wide and forever; the fragment pattern is that ruling's successor.
 # ⚠ THE TRAP THAT ROW RECORDS FROM ITS OWN FIX IS PROSE: it came back twice, once
@@ -872,7 +1012,8 @@ def list_sites(root):
 # rule as the literals, and the one fixture that NEEDS a realistic length is
 # ASSEMBLED from fragments no grep can join.
 
-EXPECTED_ARMS = 70
+EXPECTED_ARMS = 92  # 70 until 2026-10-07: the participle-bound `still`, four arms; then where the `still` sits, four;
+#                     2026-10-08: the stated predicate, fourteen
 
 # The one synthetic plan document every arm's temp repo carries. The closure mark
 # is taken from the shared module at run time rather than written here -- this
@@ -931,8 +1072,7 @@ def _tmp_repo(root, files, ceilings, closed_mark, subject_mark=None,
     payload = dict(files)
     payload[".plans/00-synthetic.md"] = _plan_text(closed_mark,
                                                    subject_mark=subject_mark)
-    sibling = os.path.join(ACTIONS_REL, "check-anchor-balance",
-                           "check-anchor-balance.py")
+    sibling = os.path.join(ACTIONS_REL, "anchor-debt", "anchor-debt.py")
     with io.open(os.path.join(root, sibling), encoding="utf-8") as fh:
         payload[sibling.replace(os.sep, "/")] = fh.read()
     for rel, text in payload.items():
@@ -977,7 +1117,7 @@ def selftest(root):
         print("  [%s] %s%s" % ("ok " if cond else "FAIL", label,
                                (" (" + detail + ")") if detail else ""))
 
-    ab = _load_anchor_balance(root)
+    ab = _load_anchor_debt(root)
     tok = ab.ANCHOR_TOKEN
     NAMES = {_CLOSED_ROW, _OPEN_ROW, _LONG_CLOSED_ROW, _FILLER_ROW}
     CLOSED = {_CLOSED_ROW, _LONG_CLOSED_ROW, _FILLER_ROW}
@@ -1054,6 +1194,100 @@ def selftest(root):
           "not a live-blocker claim",
           hits("emitted into the entry block, which is still the open block here "
                "(%s).\n" % _CLOSED_ROW) == [])
+    # ★ THE PARTICIPLE-BOUND `still` (2026-10-07): the target_schema_json.cpp sentence, its control with `still` on
+    # the predicate, a comma ending the participle's reach, and a later persistence word still convicting.
+    check("a STILL bound to a participle in the subject (`a document still declaring it is REFUSED`) is "
+          "not a finding, and the skip is what stops it",
+          hits("so a document still declaring it is refused at load (%s).\n" % _CLOSED_ROW) == []
+          and CLAIM.search("so a document still declaring it is refused at load (%s)." % _CLOSED_ROW)
+          is not None)
+    check("... but the SAME sentence with STILL on the predicate is a finding",
+          [h[0] for h in hits("so a document declaring it is still refused at load (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("... and a comma ends the participle's reach (`still pending, so the call is refused`)",
+          [h[0] for h in hits("the fix is still pending, so the call is refused (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("... and a later persistence word in the same sentence still convicts",
+          [h[0] for h in hits("a document still declaring it is refused and stays refused (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    # ★ WHERE THE `still` SITS (2026-10-07, the re-review's MINOR 2): the review's two silenced sentences, then each
+    # half of the construction alone -- a `still` after a copula with no coordinator (across a wrapped comment line,
+    # so the marker between them is pinned too), and a coordinator with the `still` in the subject -- so disabling
+    # either half reds an arm of its own. The review's two each carry BOTH halves, so neither can tell them apart.
+    check("a STILL after a copula, then a coordinated clause, convicts (`the fix is still pending so the call is "
+          "refused`)",
+          [h[0] for h in hits("the fix is still pending so the call is refused (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("... as does `the lowering is still missing and is unsupported`",
+          [h[0] for h in hits("the lowering is still missing and is unsupported (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("a STILL after a copula is the PREDICATE's, with no coordinator at all, and a wrapped comment line "
+          "between them does not hide the copula (`the loader is // still declaring it is refused`)",
+          [h[0] for h in hits("// the loader is\n// still declaring it is refused at load (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("a coordinator between the participle and the copula convicts, the STILL in the subject "
+          "(`a document still pending so the call is refused`)",
+          [h[0] for h in hits("a document still pending so the call is refused (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    # ★ THE STATED PREDICATE (2026-10-08, the third review's MINOR 2): the seven sentences that review measured --
+    # three TRUE, four STALE -- each an arm; then each rule ALONE, so disabling one reds an arm of its own. The
+    # guard is held to predicate (3) as the module docstring states it, cost included: where a pattern cannot tell
+    # it CONVICTS, and the review's third true sentence is pinned AS CONVICTED for exactly that reason.
+    check("TRUE, skipped: a relative clause on the subject, `that` + copula (`a config that is still declaring it "
+          "is refused at load`)",
+          hits("a config that is still declaring it is refused at load (%s).\n" % _CLOSED_ROW) == [])
+    check("TRUE, skipped: ... `which` + copula, and `who` (`documents which are still using the old key are "
+          "rejected`)",
+          hits("documents which are still using the old key are rejected (%s).\n" % _CLOSED_ROW) == []
+          and hits("users who are still passing the old flag are refused (%s).\n" % _CLOSED_ROW) == [])
+    check("TRUE, and CONVICTED by the stated predicate: a joiner refuses the skip even where only a compound "
+          "object follows it (`a target still naming rax and eax is refused at load`) -- the cost is a rephrase",
+          [h[0] for h in hits("a target still naming rax and eax is refused at load (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("STALE, convicted: a copula, an adverb, the STILL, then a subordinate clause (`the fix is also still "
+          "pending because it is refused`)",
+          [h[0] for h in hits("the fix is also still pending because it is refused (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("STALE, convicted: ... `the two lowerings are both still failing while each is rejected`",
+          [h[0] for h in hits("the two lowerings are both still failing while each is rejected (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("STALE, convicted: a subordinator alone, no copula before the STILL (`the arm64 lowering still missing "
+          "since it is refused`)",
+          [h[0] for h in hits("the arm64 lowering still missing since it is refused (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("STALE, convicted: ... after a linking verb that is no copula (`the lowering seems still missing because "
+          "it is refused`)",
+          [h[0] for h in hits("the lowering seems still missing because it is refused (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("a copula of the STILL's own clause convicts whatever stands between them, no joiner at all (`the loader "
+          "is also still declaring it is refused`)",
+          [h[0] for h in hits("the loader is also still declaring it is refused at load (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("... but a copula of an EARLIER clause does not: the sentence that found this skip, whole (`the bias is "
+          "deliberately absent, so a document still declaring it is refused at load`)",
+          hits("the bias is deliberately absent, so a document still declaring it is refused at load (%s).\n"
+               % _CLOSED_ROW) == [])
+    check("a relative clause with a subject of its own is a clause whose STILL follows its own copula: convicted "
+          "(`a config that the loader is still reading is refused`)",
+          [h[0] for h in hits("a config that the loader is still reading is refused at load (%s).\n"
+                              % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("a comma alone ends the participle's reach, no copula and no joiner in the sentence (`a document still "
+          "pending, it is refused`)",
+          [h[0] for h in hits("a document still pending, it is refused (%s).\n" % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("a CONTRACTED copula right before the STILL is its clause's copula (`what's still missing is "
+          "unsupported`)",
+          [h[0] for h in hits("what's still missing is unsupported (%s).\n" % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    check("... and an `'s` anywhere else in the clause is as likely a possessive: no copula (`the config's key still "
+          "declaring it is refused at load`)",
+          hits("the config's key still declaring it is refused at load (%s).\n" % _CLOSED_ROW) == [])
+    # ... and THE COST THE DOCSTRING STATES IN THE OTHER DIRECTION, held like the compound-object one: this STALE
+    # shape is SKIPPED today. A guard that starts convicting it has changed the stated predicate, and the docstring
+    # is where that change is made first.
+    check("THE STATED COST, pinned: the construction does not read WHAT persists, so a gap's participle is skipped "
+          "like an input's (`the lowering still missing is unsupported`, and its `that is still missing` form) -- "
+          "the one place the skip errs toward silence",
+          hits("the lowering still missing is unsupported (%s).\n" % _CLOSED_ROW) == []
+          and hits("the lowering that is still missing is unsupported (%s).\n" % _CLOSED_ROW) == [])
 
     # ── A2. the RESIDUAL-BOUNDARY exemption ─────────────────────────────────
     # ★★ THE LARGEST FALSE-POSITIVE CLASS, and it is a TRUE sentence citing a
@@ -1107,9 +1341,11 @@ def selftest(root):
     check("a colon does NOT end a sentence (a claim and its reason are one unit)",
           [h[0] for h in hits("it stays refused: the engine cannot elect it "
                               "(%s).\n" % _CLOSED_ROW)] == [[_CLOSED_ROW]])
+    # A guard that finds NO site here must read as this arm FAILING, never as the self-test breaking: indexing
+    # the first hit unasked raised IndexError, and every arm after this one then never ran nor was named.
+    quoted = hits("it therefore stays refused fail-loud (%s).\n" % _CLOSED_ROW)
     check("the reported excerpt quotes the author's own words",
-          "stays refused fail-loud" in
-          hits("it therefore stays refused fail-loud (%s).\n" % _CLOSED_ROW)[0][1])
+          bool(quoted) and "stays refused fail-loud" in quoted[0][1])
 
     # ── B. the four row-mandated cases, through the REAL scan ───────────────
     # The floors are the only thing standing in the way of a synthetic tree, so
@@ -1297,7 +1533,7 @@ def selftest(root):
               "identical sentence is GREEN",
               rc == EXIT_OK and "0 site(s)" in out, "rc=%d" % rc)
 
-        # A repo with no `check-anchor-balance` at all.
+        # A repo with no `anchor-debt` at all.
         box = tempfile.mkdtemp(prefix="stale-refusal-noab-")
         boxes.append(box)
         os.makedirs(os.path.join(box, ".plans"))
@@ -1310,7 +1546,7 @@ def selftest(root):
                      encoding="utf-8", newline="\n") as fh:
             fh.write(two)
         rc, out = _capture(box)
-        check("a MISSING check-anchor-balance is a COLLAPSE (the import fails "
+        check("a MISSING anchor-debt is a COLLAPSE (the import fails "
               "loud)", rc == EXIT_COLLAPSE and "shared anchor vocabulary" in out)
 
         # ── F. the plan tree really is out of the governed set ──────────────

@@ -51,7 +51,9 @@ struct PassRunResult {
                                     passes::InlineGrowthLedger& inlineLedger,
                                     std::optional<bool> charIsUnsigned,
                                     std::span<SymbolBinding const>
-                                        preemptibleDefinitionBindings) {
+                                        preemptibleDefinitionBindings,
+                                    ModuleExtent extent,
+                                    std::span<SymbolId const> entryRoots) {
     switch (id) {
         case PassId::Identity:
             return {true, false};  // no-op; exercises the engine wiring.
@@ -61,7 +63,8 @@ struct PassRunResult {
             return {r.ok, r.instructionsFolded > 0};
         }
         case PassId::Dce: {
-            auto const r = passes::runDce(mir, interner, reporter);
+            auto const r =
+                passes::runDce(mir, interner, reporter, extent, entryRoots);
             return {r.ok,
                     r.instructionsEliminated + r.blocksEliminated
                   + r.functionsEliminated   + r.globalsEliminated > 0};
@@ -266,6 +269,10 @@ struct ScheduleInterpreter {
     // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: threaded to the Inlining
     // leaf, for the reason stated one line up about `charIsUnsigned`.
     std::span<SymbolBinding const> preemptibleDefinitionBindings;
+    // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: threaded to the
+    // Dce leaf — what the module is to its link, and the image entry's roots.
+    ModuleExtent              extent;
+    std::span<SymbolId const> entryRoots;
 
     // Failure latch — once a pass or a verify fails, unwind without
     // running anything further (the pre-tree early `return result`).
@@ -421,7 +428,7 @@ struct ScheduleInterpreter {
         auto const passResult =
             runPass(p, mir, target, interner, pipeline, reporter,
                     inlineLedger, charIsUnsigned,
-                    preemptibleDefinitionBindings);
+                    preemptibleDefinitionBindings, extent, entryRoots);
         if (optTrace) {
             auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -541,7 +548,9 @@ OptResult optimize(Mir& mir,
                    std::span<ExternImport const> externImports,
                    std::optional<bool> charIsUnsigned,
                    std::span<SymbolBinding const>
-                       preemptibleDefinitionBindings) {
+                       preemptibleDefinitionBindings,
+                   ModuleExtent extent,
+                   std::span<SymbolId const> entryRoots) {
     // D-OPT1-RETURN-FALSE-DIAGNOSTIC-CONTRACT: a false return MUST
     // be paired with a new error. Snapshot + belt-and-suspenders
     // emit below covers any future failure path that forgets to.
@@ -582,7 +591,8 @@ OptResult optimize(Mir& mir,
                                result, entryErrorCount,
                                std::getenv("DSS_OPT_TRACE") != nullptr,
                                inlineLedger, charIsUnsigned,
-                               preemptibleDefinitionBindings};
+                               preemptibleDefinitionBindings, extent,
+                               entryRoots};
     interp.run(pipeline.schedule, std::string{});
     if (interp.stopped) {
         // A failed pass / failed verify unwinds WITHOUT the epilogues —

@@ -103,11 +103,11 @@ review the written file as a diff, where a changed `_comment` is plainly visible
 Exit codes: 0 OK · 1 a ceiling was exceeded or is stale, or the inventory's
 `_comment` diverged from the literal · 2 the scan collapsed · 3 usage error.
 
-Usage:
-    python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py             # verify
-    python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py --write     # burn down
-    python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py --baseline  # new ground
-    python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py --selftest  # prove it fails
+Usage -- each a step of the action, the program's own flag after the `#`:
+    dssharness run check-plan-citations                           # verify, then the self-test
+    dssharness run check-plan-citations-write                     # --write: burn down, this machine's tree
+    dssharness run check-plan-citations-baseline                  # --baseline: new ground, this machine's tree
+    dssharness run check-plan-citations --manual-step self-test   # --selftest: prove it fails
 """
 from __future__ import annotations
 
@@ -305,9 +305,23 @@ WRITE_VERB = "dssharness run check-plan-citations-write"
 # 2026-09-25): a root that falls under it lost most of itself, which no ordinary
 # churn does. A root added to `SCAN_ROOTS` without a floor is refused at import.
 DOC_ROOT_FLOORS = {".plans": 25, ".claude": 20}
-if set(DOC_ROOT_FLOORS) != set(SCAN_ROOTS):
-    raise SystemExit("check-plan-citations: DOC_ROOT_FLOORS names %s but SCAN_ROOTS is %s -- every documentation "
-                     "root needs its own floor" % (sorted(DOC_ROOT_FLOORS), sorted(SCAN_ROOTS)))
+
+
+def floor_table_refusal(roots, floors):
+    """Why a documentation floor table does not fit the roots the scan reads, or None: every root needs its OWN
+    floor, and a floor naming a root the scan does not read guards nothing. A function (the round-12 audit: the
+    import-time refusal was unpinned) so the self-test holds it both ways -- arms FLOOR-TABLE-*."""
+    if set(floors) != set(roots):
+        return ("check-plan-citations: DOC_ROOT_FLOORS names %s but SCAN_ROOTS is %s -- every documentation root "
+                "needs its own floor" % (sorted(floors), sorted(roots)))
+    return None
+
+
+# Refused at IMPORT, before anything is scanned -- and as a structural COLLAPSE (exit 2), never as the ratchet's
+# exit 1, which says the tree gained a citation.
+if floor_table_refusal(SCAN_ROOTS, DOC_ROOT_FLOORS):
+    print(floor_table_refusal(SCAN_ROOTS, DOC_ROOT_FLOORS), file=sys.stderr)
+    raise SystemExit(EXIT_COLLAPSE)
 
 # ★ THE CODE FAMILY GETS ITS OWN FLOOR, NOT A SHARED ONE. A single total
 # would let one family collapse entirely while the other's size covered for it --
@@ -371,20 +385,9 @@ def repo_root():
         raise Collapse(str(exc))
 
 
-def remedy_runner_fact():
-    """-> (ok, detail): the runner WRITE_VERB names is declared in this tree's config.json, runs this action's
-    `write` step ALONE, on ONE leg whose definition names no other host -- this machine's own tree (P68 round 13's
-    audit, F1-A11: the remedy named the two-leg runner, whose `--manual-step write` rewrote the WSL leg's copy
-    too). Read from config, never assumed: a second leg added there reds the self-test."""
-    cfg = _owning_tree().load_jsonc(os.path.join(repo_root(), ".harness-config", "config.json"))
-    name = WRITE_VERB.split()[-1]
-    runner = (cfg.get("predefinedRunners") or {}).get(name) if isinstance(cfg, dict) else None
-    legs = (runner.get("legs") or []) if isinstance(runner, dict) else []
-    leg = (cfg.get("legs") or {}).get(legs[0]) if len(legs) == 1 else None
-    others = [k for k in (cfg.get("hosts") or {}) if k != "local" and isinstance(leg, dict) and k in leg]
-    ok = (isinstance(runner, dict) and runner.get("action") == "check-plan-citations/check-plan-citations.yml"
-          and runner.get("steps") == ["write"] and isinstance(leg, dict) and not others)
-    return ok, "runner %r: %r; its leg names another host: %r" % (name, runner, others)
+# ⓘ `remedy_runner_fact()` (P68 round 13, F1-A11) retired on 2026-09-30 with its arm: check-scripts-index
+# clause 13 is the ONE statement that a remedy names a runner config.json declares, and that a writer's
+# runner has ONE leg of this machine's own tree -- for every program, not for this one alone.
 
 
 def _walk(root, rel_roots, keep):
@@ -756,7 +759,7 @@ def run(root, write, baseline=False):
 # an arm that checks only the code cannot tell which one it proved. That mistake
 # was measured in a sibling guard in this same cycle.
 
-EXPECTED_ARMS = 47
+EXPECTED_ARMS = 48   # arm 2c retired on 2026-09-30 (M6: check-scripts-index clause 13)
 # A documentation root cut down to this many documents is a COLLAPSE (arms 5c, 11c): every
 # floor in `DOC_ROOT_FLOORS` must sit above it, or those arms fail.
 PARTIAL_DOCS = 10
@@ -954,6 +957,11 @@ def selftest(root):
                     drop.append(n)
             return drop
 
+        # The floor table's own refusal, both ways: a root with no floor names that root; the live table is whole.
+        refusal = floor_table_refusal(SCAN_ROOTS + ("docs",), DOC_ROOT_FLOORS)
+        ok &= _fact("FLOOR-TABLE-REFUSES-ROOT", bool(refusal) and "'docs'" in refusal, refusal or "no refusal")
+        ok &= _fact("FLOOR-TABLE-LIVE-WHOLE", floor_table_refusal(SCAN_ROOTS, DOC_ROOT_FLOORS) is None)
+
         for rel_root in SCAN_ROOTS + CODE_ROOTS:
             src = os.path.join(root, rel_root)
             if os.path.isdir(src):
@@ -1037,9 +1045,6 @@ def selftest(root):
         io.open(subject, "w", encoding="utf-8", newline="").write(converted)
         ok &= _arm("2 CEILING-NOW-STALE", tmp, EXIT_RATCHET,
                    says=("above the live count", WRITE_VERB), not_says="new positional citation")
-        # 2c -- ...and the runner that remedy names runs `write` alone, on ONE leg of this machine's own tree.
-        _fact_ok, _fact_detail = remedy_runner_fact()
-        ok &= _fact("2c REMEDY-RUNNER-ONE-LEG", _fact_ok, "" if _fact_ok else _fact_detail[:300])
         io.open(subject, "w", encoding="utf-8", newline="").write(pristine)
         ok &= _arm("2b RESTORED", tmp, EXIT_OK)
 
@@ -1202,8 +1207,11 @@ def selftest(root):
         # real one. ✔FOUND 2026-09-25 by round 12's independent audit: every floor could
         # be lowered to 1 with all 44 arms still green. `GREEN-CONTROL` holds each floor
         # below its root's live count, so the floors sit in (PARTIAL_DOCS, live].
-        for label, rel_root in (("5c PLANS-PARTIAL-COLLAPSE", ".plans"),
-                                ("11c CLAUDE-PARTIAL-COLLAPSE", ".claude")):
+        # EVERY root in SCAN_ROOTS, never a hand-kept pair (the round-12 audit): a root added later gets its
+        # partial-collapse arm by construction, and EXPECTED_ARMS says so.
+        partial_labels = {".plans": "5c PLANS-PARTIAL-COLLAPSE", ".claude": "11c CLAUDE-PARTIAL-COLLAPSE"}
+        for rel_root in SCAN_ROOTS:
+            label = partial_labels.get(rel_root, "PARTIAL-COLLAPSE " + rel_root)
             docs = [d for d in documents(tmp) if d.startswith(rel_root + "/")]
             moved = docs[PARTIAL_DOCS:]
             for rel in moved:

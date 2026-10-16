@@ -1,0 +1,44 @@
+{
+  "$comment": "P69 (lane lm, D-C-STDIO-H-LACKS-THIRTEEN-ISO-FUNCTIONS): <stdio.h>'s C 7.23 functions a program could not name before P69 — tmpfile, tmpnam, setbuf, fgetpos, fsetpos, the scanf family (scanf, fscanf, vscanf, vfscanf, vsscanf) and the va_list printf family (vprintf, vsprintf, vsnprintf) — with fpos_t and BUFSIZ/FOPEN_MAX/L_tmpnam/TMP_MAX. A tmpfile is round-tripped through fgetpos/fsetpos and read back with fscanf and vfscanf; text is formatted through vsnprintf (bounded and truncating), vsprintf and vprintf and read back through vsscanf and sscanf; setbuf hands the stream a BUFSIZ buffer; tmpnam fills an L_tmpnam array. On pe and Mach-O every printf and scanf entry point is DSS's C23 entry point, runtime/platform/src/stdio.c (over the UCRT's __stdio_common_v* cores on pe, which export none of the family, and over libSystem's own functions on Mach-O); on ELF the scanf family binds glibc's C23 entry points (__isoc23_<name> @GLIBC_2.38) and the printf family glibc's own. ✔MEASURED, the same stdout and exit 42 from gcc 13.3.0 and clang 18.1.3 on glibc 2.39, Apple clang 21 on both arches and MSVC 19.51 on the UCRT (probe-reference-cc runs 20260930-223022-28dd5d84, 20260930-222954-f4d022ae, 20260930-223316-9b692574). The minimums line prints C's own floors (BUFSIZ >= 256, FOPEN_MAX >= 8, TMP_MAX >= 25) and the tmpnam contract (the name fits L_tmpnam) — each library's own values are pinned per pair by tests/ffi/test_stdio_h_iso_surface. ⚠ A mingw-w64 gcc that links msvcrt.dll prints tmpnam=0: msvcrt's L_tmpnam is 14 and its tmpnam writes a full temp-directory path past it (measured, same runs) — the UCRT's L_tmpnam is 260.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "vsnprintf=9:42-abc-ff truncated=6:123 vsprintf=7:[ 3.14]\r\nvsscanf=3:7,seven,31 sscanf=1:99\r\ntmpfile fsetpos+fscanf=2:second,17 vfscanf=1:first\r\nminimums BUFSIZ=1 FOPEN_MAX=1 TMP_MAX=1 L_tmpnam=1 tmpnam=1\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "vsnprintf=9:42-abc-ff truncated=6:123 vsprintf=7:[ 3.14]\nvsscanf=3:7,seven,31 sscanf=1:99\ntmpfile fsetpos+fscanf=2:second,17 vfscanf=1:first\nminimums BUFSIZ=1 FOPEN_MAX=1 TMP_MAX=1 L_tmpnam=1 tmpnam=1\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "vsnprintf=9:42-abc-ff truncated=6:123 vsprintf=7:[ 3.14]\nvsscanf=3:7,seven,31 sscanf=1:99\ntmpfile fsetpos+fscanf=2:second,17 vfscanf=1:first\nminimums BUFSIZ=1 FOPEN_MAX=1 TMP_MAX=1 L_tmpnam=1 tmpnam=1\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "vsnprintf=9:42-abc-ff truncated=6:123 vsprintf=7:[ 3.14]\nvsscanf=3:7,seven,31 sscanf=1:99\ntmpfile fsetpos+fscanf=2:second,17 vfscanf=1:first\nminimums BUFSIZ=1 FOPEN_MAX=1 TMP_MAX=1 L_tmpnam=1 tmpnam=1\n"
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "vsnprintf=9:42-abc-ff truncated=6:123 vsprintf=7:[ 3.14]\nvsscanf=3:7,seven,31 sscanf=1:99\ntmpfile fsetpos+fscanf=2:second,17 vfscanf=1:first\nminimums BUFSIZ=1 FOPEN_MAX=1 TMP_MAX=1 L_tmpnam=1 tmpnam=1\n"
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

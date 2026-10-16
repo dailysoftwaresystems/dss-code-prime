@@ -117,9 +117,20 @@ ruleFor(std::string_view suffix,
 // answer changes; the caller refuses, loud, never a guessed sign. A 128-bit kind
 // holds every 64-bit magnitude, so its reduction is the identity. Any other core
 // is not a type an integer literal can have (nullopt).
+//
+// ★ P69 (lane `cs`, D-C-INTEGER-LITERAL-OUT-OF-RANGE-VERB-IS-NEVER-READ): `outOfRange`
+// is the matched rule's own verb — engaged for a FIXED-TYPE rule only, because a
+// ladder or bit-precise type holds its magnitude by construction (`typeIntegerLiteral`
+// returns it as `IntegerLadderResult::outOfRange`). A magnitude the type cannot
+// represent is reduced only as that verb says; with NO verb it is refused (nullopt),
+// never silently wrapped. The verb is the switch's subject with no `default`, so a
+// verb added to `IntegerLiteralOutOfRange` cannot load clean and do nothing here —
+// the config field was parsed and never read, which made every verb but the one
+// hard-wired reduction a knob that lied.
 [[nodiscard]] inline std::optional<std::uint64_t>
 reducedIntegerLiteralBits(TypeKind kind, std::uint64_t magnitude,
-                          std::optional<bool> charIsUnsigned) noexcept {
+                          std::optional<bool> charIsUnsigned,
+                          std::optional<IntegerLiteralOutOfRange> outOfRange) noexcept {
     int  width    = 0;
     bool isSigned = true;
     if (kind == TypeKind::Char) {
@@ -133,6 +144,21 @@ reducedIntegerLiteralBits(TypeKind kind, std::uint64_t magnitude,
         width = detail::int_ladder::integerWidth(kind);
         if (width == 0) return std::nullopt;
         isSigned = detail::int_ladder::isSignedIntKind(kind);
+    }
+    // Does the type hold the magnitude as written? (`char` with no target answer: a byte
+    // at or below 0x7F reads the same either way — the caller's refusal above covers the
+    // rest.)
+    bool const fits = width >= 64
+        ? (!isSigned || magnitude <= static_cast<std::uint64_t>(
+                                         std::numeric_limits<std::int64_t>::max()))
+        : (isSigned ? magnitude <= ((std::uint64_t{1} << (width - 1)) - 1)
+                    : magnitude <= ((std::uint64_t{1} << width) - 1));
+    if (!fits) {
+        if (!outOfRange.has_value()) return std::nullopt;
+        switch (*outOfRange) {
+            case IntegerLiteralOutOfRange::Wrap:
+                break;   // modulo 2^width, read at the type's signedness (below)
+        }
     }
     if (width >= 64) return magnitude;
     std::uint64_t bits = magnitude & ((std::uint64_t{1} << width) - 1);
@@ -162,6 +188,16 @@ struct IntegerLadderResult {
     // `_Generic`'s `long:` association could not match. A view into the
     // schema's `DataModelTypeRef`, which outlives every ladder call.
     std::string_view    vocabularyName{};
+    // P69 (lane `cs`): the typing rule's out-of-range verb — engaged only for a
+    // FIXED-TYPE rule (`IntegerLiteralTypingRule::fixedType`), whose type may not hold
+    // the magnitude; the value tiers hand it to `reducedIntegerLiteralBits`.
+    std::optional<IntegerLiteralOutOfRange> outOfRange{};
+    // P69 (lane `cs`, D-C-DECIMAL-CONSTANT-PAST-LONG-LONG-IS-REFUSED-WHERE-EVERY-REFERENCE-ACCEPTS-IT):
+    // the type is the rule's `decimalPastRange` — the decimal magnitude exceeded every
+    // (signed) candidate and the literal is READ AS UNSIGNED. The semantic tier warns
+    // from this report, never from a re-parsed suffix, so "was it reinterpreted" cannot
+    // drift from "what type did the ladder give it" (`PhaseFourLiteral`'s twin).
+    bool                                    reinterpretedUnsigned = false;
 };
 
 // Run the ladder. `rawText` is the literal token's verbatim source text;
@@ -189,20 +225,39 @@ typeIntegerLiteral(std::string_view rawText,
     //     answer, which every tier that needs the value asks.
     if (rule->fixedType.has_value()) {
         return {IntegerLadderStatus::Typed, rule->fixedType->resolveCore(dm),
-                rule->fixedType->vocabularyName};
+                rule->fixedType->vocabularyName, rule->outOfRange};
     }
 
     // 3. Radix class: prefixed (per the declared numberStyle prefixes)
     //    selects the `nondecimal` candidate list; else `decimal`.
-    auto const& candidates = integerLiteralIsPrefixed(rawText, ns)
-                                 ? rule->nondecimal
-                                 : rule->decimal;
+    bool const prefixed = integerLiteralIsPrefixed(rawText, ns);
+    auto const& candidates = prefixed ? rule->nondecimal : rule->decimal;
 
     // 4. First candidate whose range fits wins.
     for (auto const& c : candidates) {
         TypeKind const k = c.resolveCore(dm);
         if (detail::int_ladder::magnitudeFits(k, magnitude)) {
             return {IntegerLadderStatus::Typed, k, c.vocabularyName};
+        }
+    }
+
+    // 5. P69 (lane `cs`, D-C-DECIMAL-CONSTANT-PAST-LONG-LONG-IS-REFUSED-WHERE-EVERY-REFERENCE-ACCEPTS-IT):
+    //    a DECIMAL magnitude past every (signed — the loader's check) candidate is read as
+    //    the rule's `decimalPastRange` type when one is declared and holds it, and the
+    //    result says it was REINTERPRETED. C gives such a constant no type (6.4.4.1p6:
+    //    no extended integer type holds it while `intmax_t` is 64 bits), so a diagnostic
+    //    is required (6.4.4p2) — the caller's warning. ✔MEASURED 2026-10-01 (lane `cs`'s
+    //    probe x3): clang 18.1.3 and AppleClang type `9223372036854775808`, `...L` and
+    //    `...LL` `unsigned long long` and warn "interpreting as unsigned"; gcc 13.3.0
+    //    warns "integer constant is so large that it is unsigned" — its documented
+    //    reading — yet types them `__int128`; MSVC 19.51 reads the unsuffixed and `L`
+    //    forms `unsigned long long` in silence and wraps `LL` to a negative `long long`.
+    //    The type is the C document's to declare; the decision is in that document.
+    if (!prefixed && rule->decimalPastRange.has_value()) {
+        TypeKind const k = rule->decimalPastRange->resolveCore(dm);
+        if (detail::int_ladder::magnitudeFits(k, magnitude)) {
+            return {IntegerLadderStatus::Typed, k, rule->decimalPastRange->vocabularyName,
+                    std::nullopt, /*reinterpretedUnsigned=*/true};
         }
     }
     return {IntegerLadderStatus::TooLarge, TypeKind::Void};
@@ -285,6 +340,9 @@ enum class PhaseFourLiteralStatus : std::uint8_t {
                          // varies by data model -- substrate drift, refuse
     CharSignednessUnknown,  // a `char`-typed literal with no target pair: its
                             // phase-4 signedness is the target's to decide
+    TooLarge,            // P69: every candidate is signed, the magnitude exceeds
+                         // INTMAX_MAX, and the rule declares no `decimalPastRange`
+                         // reading — the literal has no type, in phase 4 as in phase 7
 };
 struct PhaseFourLiteral {
     PhaseFourLiteralStatus status   = PhaseFourLiteralStatus::NoRule;
@@ -323,7 +381,8 @@ preprocessorLiteral(std::string_view rawText,
         } else {
             isSigned = detail::int_ladder::isSignedIntKind(k);
         }
-        auto const bits = reducedIntegerLiteralBits(k, magnitude, charIsUnsigned);
+        auto const bits =
+            reducedIntegerLiteralBits(k, magnitude, charIsUnsigned, rule->outOfRange);
         if (!bits.has_value()) return {};   // a kind the loader never admits
         return {PhaseFourLiteralStatus::Operand, *bits, isSigned};
     }
@@ -346,9 +405,8 @@ preprocessorLiteral(std::string_view rawText,
                 rule->bitPreciseSigned && !fitsSigned};
     }
 
-    auto const& candidates = integerLiteralIsPrefixed(rawText, ns)
-                                 ? rule->nondecimal
-                                 : rule->decimal;
+    bool const prefixed = integerLiteralIsPrefixed(rawText, ns);
+    auto const& candidates = prefixed ? rule->nondecimal : rule->decimal;
 
     // A candidate's SIGNEDNESS, which a data model must not change. LP64 / LLP64
     // / ILP32 are WIDTH models -- `long` is 64-bit or 32-bit but signed in every
@@ -389,11 +447,29 @@ preprocessorLiteral(std::string_view rawText,
     // substitutes a TRUNCATED value while clang refuses and DSS refuses with it.
     // A magnitude too large for `uintmax_t` never reaches here: `decodeInteger`
     // has already nullopt'd and the caller has failed loud.
-    // REINTERPRETED only for the UNSUFFIXED rule — the case both references are
-    // measured warning about, and the one the evaluator's warning has always
-    // covered; an `l`/`ll` decimal past INTMAX_MAX reads unsigned here too and
-    // keeps the silence the evaluator has always given it.
-    return {PhaseFourLiteralStatus::Operand, magnitude, false, suffix.empty()};
+    // ★ P69 (lane `cs`, D-PP-IF-SUFFIXED-DECIMAL-PAST-INTMAX-IS-READ-UNSIGNED-IN-SILENCE):
+    // REINTERPRETED for EVERY rule that reaches here, the `l` / `ll` ones included —
+    // their candidates are all signed too. This was `suffix.empty()`, so
+    // `#if 9223372036854775808LL < 0` read unsigned in SILENCE. ✔MEASURED 2026-10-01
+    // (lane `cs`'s probe x2, linux run 20261001-040717-5c2f17f3): gcc 13.3.0 and clang
+    // 18.1.3 read every such literal — unsuffixed, `L`, `LL` — UNSIGNED and say so
+    // ("integer constant is so large that it is unsigned" / "interpreting as
+    // unsigned"; an error under -pedantic-errors); ISO C 6.4.4p2 makes a constant
+    // outside its type's range a constraint violation, so a diagnostic is REQUIRED.
+    // MSVC 19.51 is silent and reads the `LL` one SIGNED (run 20261001-040746-9806f843)
+    // — a meaning fork decided for gcc's and clang's documented unsigned reading, which
+    // the one that diagnoses as ISO C requires and the reading this function already
+    // gave; only the silence changes.
+    // ★ P69 (lane `cs`, D-C-DECIMAL-CONSTANT-PAST-LONG-LONG-IS-REFUSED-WHERE-EVERY-REFERENCE-ACCEPTS-IT):
+    // and the reading is the RULE's, not this function's — the same `decimalPastRange`
+    // the phase-7 ladder (`typeIntegerLiteral`, step 5) types the literal by, whose
+    // loader check makes it unsigned. A rule declaring none gives such a literal no
+    // type in phase 4 either (TooLarge — the caller refuses), so the two phases cannot
+    // disagree about whether a spelling is a constant at all.
+    if (!prefixed && rule->decimalPastRange.has_value()) {
+        return {PhaseFourLiteralStatus::Operand, magnitude, false, true};
+    }
+    return {PhaseFourLiteralStatus::TooLarge};
 }
 
 // The SIGNEDNESS alone — true = signed, false = unsigned — of the phase-4 operand

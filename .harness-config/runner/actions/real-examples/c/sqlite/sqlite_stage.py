@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""sqlite_stage.py -- the POSIX half of the SQLite corpus harness: fetch the shared sqlite clone,
-configure it, build the two reference oracles, derive the full-source recipes, find the Tcl and
-zlib headers, and -- for a Windows host -- stage all of it where the Windows side can read it.
+"""sqlite_stage.py -- the POSIX half of the SQLite corpus harness: put THIS consumer's own sqlite
+checkout on the pin (`consumer_checkout`: one checkout per consumer, since 2026-09-30), configure it,
+build the two reference oracles, derive the full-source recipes, find the Tcl and zlib headers, and
+-- for a Windows host -- stage all of it where the Windows side can read it.
 
 ONE implementation since 2026-09-21 (lane mig, part 4; the transcription rows are P4-11.2's
 R50-R77 and the S34-* / derive checks of report 08). It replaces:
@@ -35,6 +36,7 @@ import collections  # noqa: E402
 import contextlib  # noqa: E402
 import fnmatch  # noqa: E402
 import glob  # noqa: E402
+import hashlib  # noqa: E402
 import importlib  # noqa: E402
 import io  # noqa: E402
 import json  # noqa: E402
@@ -101,6 +103,155 @@ def stage_dir_of(out_root):
     """`<out_root>/stage`: where the stage of the run whose output tree is `out_root` lives, on every host
     (`STAGE_SUBDIR`). The HOST's own join: the driver calls it with a host path."""
     return os.path.join(out_root, STAGE_SUBDIR)
+
+
+# ★ ONE CHECKOUT PER CONSUMER (2026-09-30, lane p69/hm; the row that closed it names the measurement). Until
+# then every run on a host staged from ONE clone, `~/src/sqlite` on the POSIX side, and `dssharness run sqlite`
+# runs its Windows and WSL legs AT ONCE: the WSL leg holds that clone for READ through its whole corpus (hours),
+# the Windows leg's derive -- inside WSL -- takes it for WRITE, the two legs pin different Tcl, so every run
+# re-stages, and the clone lock refused one of the run's OWN legs (exit 3). A bounded wait cannot fix that: the
+# WSL leg holds the clone for the corpus's hours. So each consumer -- a run's OUTPUT TREE -- has its own
+# checkout, put on the pin by `clone_or_update(..., commit=)` under its run lock, the precedent the speedtest1
+# benchmark set in P68 round 13 (`benchmark_speedtest1.default_subject`):
+#   * a POSIX host's run: INSIDE its own output tree, `<output tree>/checkout` (CONSUMER_CHECKOUT) -- the tree
+#     every DssHarness leg keeps on the host's own disk (ext4 inside WSL);
+#   * a Windows host's run: its derive runs configure and make INSIDE WSL, so its checkout must be on the Linux
+#     filesystem, never through /mnt/c (configure and make over 9P, and the WSL clock this project already
+#     measured as unreliable): in the POSIX side's user cache -- the root the clone locks already use --
+#     `<cache>/dsscp/sqlite-consumers/<key>/sqlite`, keyed by a digest of the consuming output tree's path, so
+#     each Windows tree has its own and a re-run of the same tree reuses it. A cache: disposable, never shared.
+# The clone lock stays, per checkout (a second run of the same tree is refused first by its run lock); SQLITE_DIR
+# still names an explicit checkout by hand, which two runs then share under that lock.
+CONSUMER_CHECKOUT = "checkout"
+CONSUMERS_DIR = "sqlite-consumers"
+CONSUMER_KEY_HEX = 16
+
+
+def consumer_key(out_root):
+    """The key of one consuming output tree: a digest of its path as ITS OWN host spells it -- absolute, and
+    case-folded where that host folds case -- so a tree has one key however its path was spelled, and two trees
+    two. Computed on the host that owns the tree (the Windows driver, for its WSL checkout)."""
+    ident = os.path.normcase(os.path.abspath(out_root))
+    return hashlib.sha256(ident.encode("utf-8")).hexdigest()[:CONSUMER_KEY_HEX]
+
+
+def consumer_checkout(host, out_root, posix_environ=None):
+    """THE sqlite CHECKOUT OF ONE CONSUMER -- the run whose output tree is `out_root`, on a `host` host --
+    spelled on the POSIX side, where every checkout lives. Keyed on the driver's ONE host switch, where its
+    POSIX half runs (`sqlite_common.PosixSide`): in this process, the checkout is INSIDE the output tree
+    (`<out_root>/checkout`, the host's own join); inside WSL, it is in the POSIX side's cache
+    (`sqlite_common.posix_cache_root` over `posix_environ`, the POSIX side's XDG_CACHE_HOME and HOME, which the
+    caller reads THERE), `<cache>/dsscp/sqlite-consumers/<consumer_key(out_root)>/sqlite`, POSIX-joined."""
+    if not C.PosixSide(host).needs_wsl:
+        return os.path.join(out_root, CONSUMER_CHECKOUT)
+    if posix_environ is None:
+        C.die("INTERNAL: a %s host's checkout lives in the POSIX side's cache, placed by THAT side's XDG_CACHE_HOME "
+              "and HOME -- the caller reads them there; this process's own would name the wrong home." % host)
+    return posixpath.join(consumers_root(posix_environ), consumer_key(out_root), "sqlite")
+
+
+def consumers_root(posix_environ):
+    """`<cache>/dsscp/sqlite-consumers`: where the POSIX side keeps the Windows consumers' checkouts, one directory
+    per consumer key, placed by that side's own XDG_CACHE_HOME and HOME (`sqlite_common.posix_cache_root`)."""
+    return posixpath.join(C.posix_cache_root(posix_environ), "dsscp", CONSUMERS_DIR)
+
+
+# ★ A CONSUMER'S CHECKOUT GOES WITH ITS TREE (2026-10-01, the P69 review's MINOR 2). A Windows tree's checkout lives
+# in the POSIX side's cache, which nothing removed when the tree went -- a lane worktree's delete removes the tree and
+# DssHarness's host copies of it, never this cache -- so every worktree that ever ran a Windows sqlite leg left a
+# whole sqlite clone behind. Each checkout now carries the RECORD of the tree it belongs to,
+# `<root>/<key>/consumer.json` = {"tree": <the consuming output tree, as ITS host spells it>}, written by the derive
+# under the checkout's write lock (`--consumer-of`); and before each derive the Windows driver asks for the records
+# (`sqlite_stage.py consumers --root R`) and has removed the checkouts whose tree is GONE on its host
+# (`... --prune KEY ...`), each under that checkout's own write lock: one a live run holds is KEPT, and said so. A key
+# with no record cannot be judged, and is never removed: the driver reports it.
+CONSUMER_RECORD = "consumer.json"
+
+
+def write_consumer_record(sqlite_dir, tree):
+    """The record beside one consumer's checkout (`<root>/<key>/consumer.json`), naming the tree it belongs to."""
+    path = os.path.join(os.path.dirname(sqlite_dir.rstrip("/\\")), CONSUMER_RECORD)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps({"tree": tree}, sort_keys=True) + "\n")
+    return path
+
+
+def list_consumers(root):
+    """-> [{"key", "tree"}] for every consumer directory under `root`, sorted by key: `tree` is what its record
+    names, or None when it has no record that reads as one (it cannot be judged)."""
+    out = []
+    try:
+        names = sorted(os.listdir(root))
+    except FileNotFoundError:
+        return out
+    for key in names:
+        kdir = os.path.join(root, key)
+        if not os.path.isdir(kdir):
+            continue
+        tree = None
+        try:
+            with open(os.path.join(kdir, CONSUMER_RECORD), "r", encoding="utf-8") as fh:
+                value = json.loads(fh.read()).get("tree")
+            tree = value if isinstance(value, str) and value else None
+        except (OSError, ValueError, AttributeError):
+            tree = None
+        out.append({"key": key, "tree": tree})
+    return out
+
+
+def prune_consumers(root, keys, lock_factory=None, log=None):
+    """Remove the consumer directories `keys` under `root`, each under its checkout's WRITE lock -> {"pruned",
+    "held", "missing"}: a checkout a live run holds is kept ("held"), a key with no directory is "missing". A key
+    that is not a consumer key (CONSUMER_KEY_HEX hex digits) is REFUSED: it is joined to a path."""
+    result = {"pruned": [], "held": [], "missing": []}
+    for key in keys:
+        if not re.fullmatch(r"[0-9a-f]{%d}" % CONSUMER_KEY_HEX, key):
+            C.die("%r is not a consumer key (%d lowercase hex digits): refusing to remove anything by it"
+                  % (key, CONSUMER_KEY_HEX))
+        kdir = os.path.join(root, key)
+        if not os.path.isdir(kdir):
+            result["missing"].append(key)
+            continue
+        lock = (lock_factory or _default_lock_factory)(os.path.join(kdir, "sqlite"))
+        try:
+            lock.write("sqlite_stage.py consumers --prune: the tree this checkout belongs to is gone", log)
+        except C.CloneLockBlocked:
+            result["held"].append(key)
+            continue
+        try:
+            shutil.rmtree(kdir)
+        finally:
+            lock.release()
+        lock_dir = getattr(lock, "lock_dir", "")
+        if lock_dir:
+            shutil.rmtree(lock_dir, ignore_errors=True)   # the gone checkout's own lock state, outside it
+        result["pruned"].append(key)
+    return result
+
+
+def consumers_main(args, out=None, err=None, lock_factory=None):
+    """`consumers --root R [--prune KEY ...]` -> exit code (0; 1 refusal; 2 usage): the records as JSON
+    ({"consumers": [...]}), or what --prune removed ({"pruned", "held", "missing"})."""
+    out = out if out is not None else sys.stdout
+    err = err if err is not None else sys.stderr
+    p = _Parser(prog="sqlite_stage.py consumers", add_help=False)
+    p.add_argument("--root", required=True)
+    p.add_argument("--prune", nargs="+", default=None)
+    try:
+        a = p.parse_args(args)
+    except _UsageError as exc:
+        err.write("sqlite_stage.py consumers: %s\n%s" % (exc, p.format_usage()))
+        return 2
+    try:
+        if a.prune is None:
+            out.write(json.dumps({"consumers": list_consumers(a.root)}, sort_keys=True) + "\n")
+        else:
+            out.write(json.dumps(prune_consumers(a.root, a.prune, lock_factory, C.Log(err)), sort_keys=True) + "\n")
+    except C.HarnessDie as exc:
+        _report(err, exc)
+        return getattr(exc, "exit_code", 1)
+    return 0
 
 
 def _abs(p):
@@ -656,7 +807,9 @@ def _parse_jobs(value):
 
 class StageConfig:
     """Every input the POSIX half reads, validated once; `stage()` reads nothing else (no globals,
-    no os.environ). Build it with `from_env` (a POSIX host's driver) or through the `derive` CLI."""
+    no os.environ). Build it with `from_run` (a POSIX host's driver) or through the `derive` CLI (a
+    Windows host's, inside WSL). Its `sqlite_dir` is always NAMED by the caller -- the consumer's own
+    checkout (`consumer_checkout`) or one a person names -- never defaulted to a shared one."""
 
     def __init__(self, *, sqlite_dir, out_dir, stage_build, tier=DEFAULT_TIER, test_file="",
                  jobs=None, tcl_version="", sqlite_repo_url=DEFAULT_SQLITE_REPO_URL,
@@ -664,7 +817,8 @@ class StageConfig:
                  environ=None, pkg_install=None, lock_what=""):
         if host_os not in ("linux", "darwin"):
             C.die("the POSIX half runs on a POSIX host (this one is '%s'): in-process on linux/darwin, "
-                  "and inside WSL through `wsl.exe -e python3 sqlite_stage.py derive ...` for a Windows "
+                  "and inside WSL through `wsl.exe -d <the WSL legs' distribution> -e python3 sqlite_stage.py "
+                  "derive ...` for a Windows "
                   "host." % host_os)
         if not sqlite_dir or not out_dir:
             C.die("INTERNAL: StageConfig needs both sqlite_dir and out_dir.")
@@ -719,24 +873,9 @@ class StageConfig:
             C.die("the stage %s lies inside the sqlite clone %s; a stage is wiped and re-copied on every "
                   "run and must never live inside the checkout it is copied from." % (self.out_dir, clone))
 
-    @classmethod
-    def from_env(cls, *, out_dir, stage_build, environ=None, **overrides):
-        """The driver's variables: SQLITE_DIR ($HOME/src/sqlite), SQLITE_REPO_URL, DSS_JOBS (else JOBS,
-        else nproc -- `sqlite_common.Config`'s order, the one rule for that knob), DSS_TCL_VERSION,
-        DSS_TIER (veryquick), DSS_TEST_FILE."""
-        e = dict(os.environ if environ is None else environ)
-        home = e.get("HOME") or os.path.expanduser("~")
-        kw = dict(sqlite_dir=e.get("SQLITE_DIR") or _j(home, "src", "sqlite"),
-                  sqlite_repo_url=e.get("SQLITE_REPO_URL") or DEFAULT_SQLITE_REPO_URL,
-                  jobs=_parse_jobs((e.get("DSS_JOBS") or "").strip() or e.get("JOBS") or ""),
-                  tcl_version=e.get("DSS_TCL_VERSION", ""),
-                  tier=e.get("DSS_TIER") or DEFAULT_TIER,
-                  test_file=e.get("DSS_TEST_FILE", ""),
-                  environ=e)
-        if "host_os" not in overrides:
-            kw["host_os"] = C.host_os()
-        kw.update(overrides)
-        return cls(out_dir=out_dir, stage_build=stage_build, **kw)
+    # (`from_env`, the retired bash driver's reading of the environment -- its SQLITE_DIR defaulting to the one
+    # shared `$HOME/src/sqlite` -- was deleted 2026-09-30 with that default: no caller had used it since the POSIX
+    # driver moved to `from_run`, and a default to a shared checkout is what one checkout per consumer retired.)
 
     @classmethod
     def from_run(cls, run, **overrides):
@@ -1296,21 +1435,62 @@ def libdir_for(ctx, name, probe_cc):
 
 # ── git ────────────────────────────────────────────────────────────────────────────
 
+def git_local_names():
+    """git's OWN list of its repository-LOCAL variables (`git rev-parse --local-env-vars`: GIT_DIR, GIT_WORK_TREE,
+    GIT_INDEX_FILE and the rest), asked through the tree's one owner of that question (`owning-tree`), never a
+    second copy of a fact git owns. Refused, by name, when git cannot answer it."""
+    ot = C.owning_tree_module()
+    try:
+        return ot.local_git_env_names()
+    except ot.Refusal as exc:
+        C.die("git's repository-local variables cannot be named (%s), so no git this stage runs could be kept from "
+              "a caller's GIT_DIR" % exc)
+
+
 def _git_env(env=None, **extra):
-    # GIT_TERMINAL_PROMPT=0: with stdin=DEVNULL a credential prompt would otherwise HANG the run.
-    e = dict(os.environ if env is None else env)
+    """The environment of every git this module runs. GIT_TERMINAL_PROMPT=0: with stdin=DEVNULL a credential
+    prompt would otherwise HANG the run.
+    ★ WITHOUT git's repository-LOCAL variables (2026-09-30, the round-12 audit's S4; the benchmark's F3-A-SP-4 the
+    round before): `git -C <checkout>` still obeys an exported GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE -- a hook
+    exports them -- so a caller's selection would aim the checkout's fetch, checkout and status at ANOTHER
+    repository, typically the DSS tree whose output tree now holds the checkout."""
+    local = git_local_names()
+    e = dict((k, v) for k, v in (os.environ if env is None else env).items() if k not in local)
     e["GIT_TERMINAL_PROMPT"] = "0"
     e.update(extra)
     return e
 
 
+def tracked_changes(d, env=None):
+    """-> ([the TRACKED files whose working-tree content differs from HEAD in the checkout `d`], "") or ([], why that
+    could not be read): `git status --porcelain --untracked-files=no`, the benchmark's rule (`worktree_changes`), asked
+    through this module's git environment. What a build writes is UNTRACKED (a stage's `bld-dss`, a stray log) and is
+    never counted: HEAD alone does not say what a checkout would compile, its tracked files do."""
+    r = C.capture(["git", "-C", d, "status", "--porcelain", "--untracked-files=no"], env_=_git_env(env), timeout=300)
+    if r.rc != 0:
+        return [], "git status exited %d: %s" % (r.rc, C.first_lines(r.err or r.out, 1) or "(no output)")
+    return [ln[3:].strip() for ln in (r.out or "").splitlines() if ln.strip()], ""
+
+
 def git_head_short(d, env=None):
     """short sha | UNKNOWN(<why>) -- never empty (a provenance field that silently prints nothing
     reads as fine). `.git` may be a FILE (worktree/submodule); without one, `git -C` would walk UP
-    and name an enclosing repository's commit."""
-    if not os.path.exists(_j(d, ".git")):
+    and name an enclosing repository's commit. `d` is a HOST path (the driver's opt-in fresh DSS clone
+    reaches here on Windows too), joined with the host's own functions."""
+    return _git_head(d, ["--short"], env)
+
+
+def git_head_full(d, env=None):
+    """The FULL sha of `d`'s HEAD | UNKNOWN(<why>) -- what a stage RECORDS as the sqlite it compiled
+    (2026-09-30): the round-close recompile names it in its summary, and a summary naming an abbreviation
+    of unknown length could not be held to the pin's twelve digits."""
+    return _git_head(d, [], env)
+
+
+def _git_head(d, flags, env):
+    if not os.path.exists(os.path.join(d, ".git")):
         return "UNKNOWN(no .git under %s)" % d
-    r = C.capture(["git", "-C", d, "rev-parse", "--short", "HEAD"], env_=_git_env(env), timeout=120)
+    r = C.capture(["git", "-C", d, "rev-parse"] + list(flags) + ["HEAD"], env_=_git_env(env), timeout=120)
     sha = r.out.strip() if r.rc == 0 else ""
     return sha or "UNKNOWN(rev-parse HEAD failed in %s)" % d
 
@@ -1357,8 +1537,12 @@ def _pinned_checkout(url, dest, commit, log, genv):
     sha itself -- and nothing is pulled, so a fetch can never move a pinned subject. A populated directory
     that is not a checkout cannot be put on a commit, so it is REFUSED (the unpinned path uses such a
     source tree as-is). -> [] (no warning: the subject is exactly the declared one).
-    ★ THE CALLER HOLDS THE CHECKOUT'S LOCK, and nothing here takes one: the stage holds the shared clone's
-    CloneLock (POSIX, where that clone lives), the speedtest1 benchmark its output tree's run lock (every
+    ★ ON THE PIN IS NOT ENOUGH: THE TRACKED FILES MUST BE THE PIN'S TOO (2026-09-30, the round-12 audit's S1).
+    HEAD alone was checked, so a checkout on the pin with an edited tracked file was staged and compiled as the
+    pin. It is REFUSED now, naming the files (`tracked_changes`: untracked files -- a build's own -- are never
+    counted), and never cleaned: whose edit it is, this program cannot know.
+    ★ THE CALLER HOLDS THE CHECKOUT'S LOCK, and nothing here takes one: the stage holds its checkout's
+    CloneLock (POSIX, where that checkout lives), the speedtest1 benchmark its output tree's run lock (every
     host, Windows included) over the checkout it keeps inside the tree. Paths are the HOST's own -- the
     benchmark calls this on Windows too -- and a checkout cloned here is cloned with `core.autocrlf=false`:
     its text feeds a POSIX configure, and a git whose configuration converts to CRLF on checkout (Git for
@@ -1394,7 +1578,16 @@ def _pinned_checkout(url, dest, commit, log, genv):
     got = C.capture(["git", "-C", dest, "rev-parse", "HEAD"], env_=genv, timeout=120).out.strip()
     if got != commit:
         C.die("the pinned checkout of %s in %s landed on %s" % (commit, dest, got or "<nothing>"))
-    log.info("  at %s (DETACHED, pinned by legs.json stageBuild.sqliteCommit)" % commit[:12])
+    changed, why = tracked_changes(dest, genv)
+    if why:
+        C.die("the pinned checkout %s cannot be shown to hold no local change: %s" % (dest, why))
+    if changed:
+        C.die("the pinned checkout %s is on the pinned %s but differs from it in %d tracked file(s) (%s%s): what it "
+              "would compile is not the pinned revision.\n      Nothing here cleans a checkout -- whose edit it is, "
+              "this program cannot know. A checkout the harness keeps for itself: remove it, and the next run clones "
+              "it again; any other: discard or commit the change there." % (
+                  dest, commit[:12], len(changed), ", ".join(changed[:3]), " ..." if len(changed) > 3 else ""))
+    log.info("  at %s (DETACHED, pinned by legs.json stageBuild.sqliteCommit; no tracked file changed)" % commit[:12])
     return []
 
 
@@ -1409,13 +1602,16 @@ def clone_or_update(url, dest, want="", log=None, env=None, commit=""):
     `./configure` (a source tree, e.g. a tarball), which is used as-is with a warning.
     -> the warning reasons it logged ([] normally).
     `commit` (2026-09-25) PINS the checkout instead: the ONE sqlite revision the harness compiles
-    (legs.json `stageBuild.sqliteCommit`), put on EXACTLY, detached (`_pinned_checkout`)."""
+    (legs.json `stageBuild.sqliteCommit`), put on EXACTLY, detached (`_pinned_checkout`).
+    ★ `dest` IS A HOST PATH ON BOTH BRANCHES, joined and split with the host's own functions (2026-09-30, the
+    round-12 audit's S7): the unpinned branch is the driver's opt-in fresh DSS clone, which runs on a Windows
+    host too, and a POSIX split of a backslashed path answers the whole path as its name and "" as its parent."""
     log = log if log is not None else C.LOG
     genv = _git_env(env)
     if commit:
         return _pinned_checkout(url, dest, commit, log, genv)
-    if os.path.exists(_j(dest, ".git")):
-        log.info("updating %s in %s" % (posixpath.basename(dest.rstrip("/")), dest))
+    if os.path.exists(os.path.join(dest, ".git")):
+        log.info("updating %s in %s" % (os.path.basename(dest.rstrip("/\\")), dest))
         C.run_checked(["git", "-C", dest, "fetch", "--all", "--prune", "--quiet"],
                       "git fetch (updating %s)" % dest, env_=genv)
         branch = want or default_branch(dest, env)
@@ -1429,7 +1625,7 @@ def clone_or_update(url, dest, want="", log=None, env=None, commit=""):
         C.run_checked(["git", "-C", dest, "pull", "--rebase", "--quiet"],
                       "git pull --rebase (in %s)" % dest, env_=genv)
     elif os.path.isdir(dest) and os.listdir(dest):
-        if os.path.isfile(_j(dest, "configure")):
+        if os.path.isfile(os.path.join(dest, "configure")):
             reason = "%s is not a git checkout -- its source tree is used as-is, not updated" % dest
             log.warn("%s is not a git checkout; using the source tree there AS-IS (it cannot be updated, "
                      "and its provenance is UNKNOWN)." % dest)
@@ -1439,7 +1635,9 @@ def clone_or_update(url, dest, want="", log=None, env=None, commit=""):
               "you have confirmed what it is." % dest)
     else:
         log.info("cloning %s -> %s" % (url, dest))
-        os.makedirs(posixpath.dirname(dest.rstrip("/")) or "/", exist_ok=True)
+        parent = os.path.dirname(dest.rstrip("/\\"))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         C.run_checked(["git", "clone", "--quiet", url, dest], "git clone %s" % url, env_=genv)
         if want:
             C.run_checked(["git", "-C", dest, "checkout", "--quiet", want],
@@ -1731,7 +1929,7 @@ def stage(cfg, log=None, lock=None):
         C.die("INTERNAL: stage() takes a StageConfig")
     own = lock is None
     if own:
-        procs = _sibling("sqlite_procs", "the shared-clone lock")
+        procs = _sibling("sqlite_procs", "the checkout's clone lock")
         lock = procs.CloneLock(cfg.sqlite_dir)
         lock.write(cfg.lock_what, log)
         log.info("clone lock: WRITE on %s" % cfg.sqlite_dir)
@@ -2119,7 +2317,7 @@ def _stage_locked(cfg, log, lock):
         tier=cfg.tier, test_file=cfg.test_file, tcl_version=tcl_ver, tcl_lib_file=vals["TCL_LIB_FILE"],
         reference_fixture_why=ref_fixture_why, reference_cli_why=ref_cli_why,
         amalgamation_regen=amalgamation_regen,
-        sqlite_head=git_head_short(clone, ctx.env), sqlite_branch=git_head_branch(clone, ctx.env),
+        sqlite_head=git_head_full(clone, ctx.env), sqlite_branch=git_head_branch(clone, ctx.env),
         stage_identity=stamp_now, make_options=mo,
         configure_args=configure_args, required_defines=list(cfg.required_defines),
         clone_lock_notes=[str(n) for n in (getattr(lock, "notes", None) or [])],
@@ -2158,7 +2356,7 @@ def _report(err, exc):
 
 
 def _default_lock_factory(clone):
-    return _sibling("sqlite_procs", "the shared-clone lock").CloneLock(clone)
+    return _sibling("sqlite_procs", "the checkout's clone lock").CloneLock(clone)
 
 
 _VAR_RE = re.compile(r"\$(\w+)|\$\{(\w+)\}")
@@ -2179,29 +2377,36 @@ def _expand(path, env):
 
 def derive_main(args, which=None, lock_factory=None, translator=None, stage_fn=None, out=None,
                 err=None, environ=None, host_os=None):
-    """`derive --out <stage> [--sqlite-dir D] [--sqlite-repo-url U] [--tcl-version V] [--jobs N]
-    --stage-build-json F --tier T [--test-file F]` -> exit code (0; 1 refusal; 2 usage; 3 a blocked
-    clone lock, stderr line 1 `DSS-CLONE-LOCK-BLOCKED`). Every path argument is in the POSIX side's
+    """`derive --out <stage> --sqlite-dir D [--sqlite-repo-url U] [--tcl-version V] [--jobs N]
+    --stage-build-json F --tier T [--test-file F] [--consumer-of TREE]` -> exit code (0; 1 refusal; 2 usage;
+    3 a blocked clone lock, stderr line 1 `DSS-CLONE-LOCK-BLOCKED`). `--consumer-of` names the tree whose
+    checkout this is, recorded beside it under the lock (`write_consumer_record`, 2026-10-01: the record that
+    lets a Windows tree's checkout go with the tree). Every path argument is in the POSIX side's
     own spelling (--out and --test-file must be absolute); the result, `<out>/derive-result.json`,
     spells every host path for Windows. It must run under the PLAIN PATH of `wsl.exe -e` (the
     PowerShell driver used a login shell), so the toolchain is checked BY NAME first. It takes the
-    clone WRITE lock itself and releases it however the stage ends. The injectable parameters exist
-    for the self-test."""
+    checkout's WRITE lock itself and releases it however the stage ends. --sqlite-dir is REQUIRED
+    (2026-09-30): the caller names the consumer's own checkout (`consumer_checkout`) or one a person
+    named -- the default this CLI had, `$HOME/src/sqlite`, was the ONE clone every run shared. The
+    injectable parameters exist for the self-test."""
     out = out if out is not None else sys.stdout
     err = err if err is not None else sys.stderr
     which = which or shutil.which
     env = dict(os.environ if environ is None else environ)
     p = _Parser(prog="sqlite_stage.py derive", add_help=False)
     p.add_argument("--out", required=True)
-    p.add_argument("--sqlite-dir", default="")
+    p.add_argument("--sqlite-dir", required=True)
     p.add_argument("--sqlite-repo-url", default=DEFAULT_SQLITE_REPO_URL)
     p.add_argument("--tcl-version", default="")
     p.add_argument("--jobs", default="")
     p.add_argument("--stage-build-json", required=True)
     p.add_argument("--tier", required=True)
     p.add_argument("--test-file", default="")
+    p.add_argument("--consumer-of", default="")   # the consuming output tree, as its host spells it (2026-10-01)
     try:
         a = p.parse_args(args)
+        if not a.sqlite_dir.strip():
+            raise _UsageError("--sqlite-dir names nothing: the caller names the checkout the derive stages from")
     except _UsageError as exc:
         err.write("sqlite_stage.py derive: %s\n%s" % (exc, p.format_usage()))
         return 2
@@ -2229,8 +2434,7 @@ def derive_main(args, which=None, lock_factory=None, translator=None, stage_fn=N
                 sb_text = fh.read()
         except OSError as exc:
             C.die("could not read the stage build configuration %s: %s" % (a.stage_build_json, exc))
-        home = env.get("HOME") or os.path.expanduser("~")
-        sqlite_dir = _expand(a.sqlite_dir, env) if a.sqlite_dir else _j(home, "src", "sqlite")
+        sqlite_dir = _expand(a.sqlite_dir, env)
         cfg = StageConfig(sqlite_dir=sqlite_dir, out_dir=a.out, stage_build=sb_text, tier=a.tier,
                           test_file=a.test_file, jobs=_parse_jobs(a.jobs), tcl_version=a.tcl_version,
                           sqlite_repo_url=a.sqlite_repo_url, copy_to_stage=True,
@@ -2246,6 +2450,9 @@ def derive_main(args, which=None, lock_factory=None, translator=None, stage_fn=N
         lock.write(cfg.lock_what, log)
         log.info("clone lock: WRITE on %s (held for the derive, released when it ends)" % cfg.sqlite_dir)
         try:
+            if a.consumer_of:
+                # the record that lets the checkout go with its tree, written before anything can fail
+                write_consumer_record(cfg.sqlite_dir, a.consumer_of)
             result = stage_and_persist(cfg, log, lock=lock, stage_fn=stage_fn)
         finally:
             lock.release()
@@ -2262,7 +2469,7 @@ def derive_main(args, which=None, lock_factory=None, translator=None, stage_fn=N
 
 ARMS = ("mk_var", "tcl_h_version", "tcl_select", "pin_shim", "stamp", "required_defines",
         "capabilities", "ldflags", "find", "zlib_headers", "tcl_headers", "stage_build", "config",
-        "stage_dir", "staging", "json", "translate", "derive_cli", "git", "sourcing", "tcl_choice",
+        "consumers", "stage_dir", "staging", "json", "translate", "derive_cli", "git", "sourcing", "tcl_choice",
         "tclsh_real", "probe_link", "pin_exec", "orchestration", "capability_sites")
 
 _GOOD_SB = {"configureFlags": ["--enable-all", "--fts3"], "makeOptions": "-DSQLITE_ENABLE_STAT4",
@@ -2643,24 +2850,15 @@ def _st_pure(t):
 
     with t.arm("config"):
         tmp = _tmp("cfg")
-        e = {"HOME": _j(tmp, "home"), "PATH": os.environ.get("PATH", "")}
-        c = StageConfig.from_env(out_dir=_j(tmp, "out"), stage_build=_GOOD_SB, environ=e, host_os="linux")
-        t.check("SQLITE_DIR defaults to $HOME/src/sqlite", c.sqlite_dir == _abs(_j(tmp, "home", "src", "sqlite")))
+        c = _cfg(tmp, jobs=None)
         t.check("the sqlite URL defaults to https", c.sqlite_repo_url == DEFAULT_SQLITE_REPO_URL)
         t.check("the tier defaults to veryquick", c.tier == "veryquick")
         t.check("jobs default to a positive count", c.jobs >= 1)
-        e2 = dict(e, SQLITE_DIR=_j(tmp, "s"), JOBS="3", DSS_TIER="quick", DSS_TCL_VERSION=" 9.0 ", DSS_TEST_FILE="/x.test")
-        c = StageConfig.from_env(out_dir=_j(tmp, "out"), stage_build=_GOOD_SB, environ=e2, host_os="linux")
-        t.check("the environment is honoured", (c.sqlite_dir, c.jobs, c.tier, c.tcl_version, c.test_file)
-                == (_abs(_j(tmp, "s")), 3, "quick", "9.0", "/x.test"))
-        t.check("DSS_JOBS wins over JOBS (sqlite_common.Config's order)", StageConfig.from_env(
-            out_dir=_j(tmp, "out"), stage_build=_GOOD_SB, environ=dict(e, DSS_JOBS="5", JOBS="3"),
-            host_os="linux").jobs == 5)
-        t.check("a blank DSS_JOBS falls through to JOBS", StageConfig.from_env(
-            out_dir=_j(tmp, "out"), stage_build=_GOOD_SB, environ=dict(e, DSS_JOBS=" ", JOBS="3"),
-            host_os="linux").jobs == 3)
-        died, msg, _ = _dies(StageConfig.from_env, out_dir=_j(tmp, "out"), stage_build=_GOOD_SB, environ=dict(e, JOBS="x"), host_os="linux")
-        t.check("a non-integer JOBS is refused up front", died and "JOBS='x'" in msg)
+        died, msg, _ = _dies(StageConfig, out_dir=_j(tmp, "out"), stage_build=_GOOD_SB, sqlite_dir="", host_os="linux")
+        t.check("a config naming NO checkout is refused -- its checkout is always named by the caller, never "
+                "defaulted to a shared one", died and "needs both sqlite_dir and out_dir" in msg, msg)
+        died, msg, _ = _dies(_parse_jobs, "x")
+        t.check("a non-integer --jobs (the derive's) is refused up front", died and "JOBS='x'" in msg)
         died, msg, _ = _dies(_cfg, tmp, translate_for_host=lambda p: p)
         t.check("a translator without copy_to_stage is refused", died and "identity" in msg)
         died, msg, _ = _dies(_cfg, tmp, out_dir=tmp)
@@ -2738,6 +2936,91 @@ def _st_pure(t):
         t.check("an install ATTEMPT is recorded (Step 6 re-takes the inventory) and reaches the installer",
                 ctx.install_attempted and got == [("tcl-dev", "tcl-tk")])
         t.check("... and forgets every remembered PATH lookup", ctx._which == {})
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    with t.arm("consumers"):
+        # ★ ONE CHECKOUT PER CONSUMER (2026-09-30), pinned on the SHIPPED rule -- `consumer_checkout`, the function
+        # the driver's Steps 3-4 call for both hosts -- never a synthetic pair of keys. The two consumers of one
+        # four-leg run: the WSL leg's output tree (a POSIX host) and the Windows leg's (whose derive runs in WSL).
+        tmp = _tmp("cons")
+        env = {"XDG_CACHE_HOME": "", "HOME": "/home/a-wsl-account"}      # the POSIX side's own, as read THERE
+        cache = C.posix_cache_root(env)
+        wsl_out = C.output_tree(os.path.join(tmp, "wsl-tree"), "linux")
+        win_out = C.output_tree(os.path.join(tmp, "win-tree"), "windows")
+        mine, theirs = consumer_checkout("linux", wsl_out, env), consumer_checkout("windows", win_out, env)
+        t.check("the TWO consumers of one run -- the WSL leg's output tree and the Windows leg's -- get DIFFERENT "
+                "checkouts", mine != theirs, (mine, theirs))
+        t.check("the POSIX consumer's checkout lies INSIDE its own output tree (<output tree>/checkout)",
+                mine == os.path.join(wsl_out, CONSUMER_CHECKOUT)
+                and os.path.normcase(mine).startswith(os.path.normcase(wsl_out) + os.sep), mine)
+        other = consumer_checkout("windows", C.output_tree(os.path.join(tmp, "another-win-tree"), "windows"), env)
+        t.check("the Windows consumer's lies under the POSIX side's cache, keyed by ITS output tree: "
+                "<cache>/dsscp/sqlite-consumers/<key>/sqlite, the same on every call (a re-run reuses it), another "
+                "tree's elsewhere",
+                theirs == posixpath.join(cache, "dsscp", CONSUMERS_DIR, consumer_key(win_out), "sqlite")
+                and theirs.startswith("/home/a-wsl-account/.cache/dsscp/sqlite-consumers/")
+                and theirs == consumer_checkout("windows", win_out, env) and other != theirs,
+                (theirs, other))
+        t.check("...keyed by the tree, not by its spelling: a relative spelling of the same tree keys the same, and "
+                "XDG_CACHE_HOME moves the cache root",
+                consumer_key(os.path.relpath(win_out)) == consumer_key(win_out)
+                and consumer_checkout("windows", win_out, dict(env, XDG_CACHE_HOME="/x/cache")).startswith(
+                    "/x/cache/dsscp/sqlite-consumers/"), consumer_key(win_out))
+        died, msg, _ = _dies(consumer_checkout, "windows", win_out, None)
+        died2, msg2, _ = _dies(consumer_checkout, "windows", win_out, {"XDG_CACHE_HOME": "", "HOME": ""})
+        t.check("a Windows consumer placed WITHOUT the POSIX side's environment is refused (this process's own names "
+                "the wrong home), and so is one where that side names no home at all",
+                died and "POSIX side's cache" in msg and died2 and "neither XDG_CACHE_HOME nor HOME" in msg2,
+                (msg, msg2))
+        # NEGATIVE, the collision the arms above prove gone: the RETIRED rule (SQLITE_DIR unset -> `~/src/sqlite`,
+        # expanded on the POSIX side) named ONE checkout for both consumers of the same run.
+        retired = dict((h, posixpath.join(env["HOME"], "src", "sqlite")) for h in ("linux", "windows"))
+        t.check("NEGATIVE: under the RETIRED rule the same two consumers named ONE checkout (<home>/src/sqlite) -- "
+                "the collision the four-leg run met at its own leg",
+                retired["linux"] == retired["windows"] and mine != theirs, retired)
+        # ★ A CONSUMER'S CHECKOUT GOES WITH ITS TREE (2026-10-01, the P69 review's MINOR 2): the records, and the
+        # prune that removes a checkout under its own write lock -- over a synthetic consumers' directory, the lock
+        # injected (the real one is POSIX-only; its arms are the clone lock's own, CL01-CL20).
+        root = _j(tmp, "consumers")
+        k_live, k_gone, k_held, k_bare = "a" * 16, "b" * 16, "c" * 16, "d" * 16
+        for k, tree in ((k_live, "C:\\trees\\live"), (k_gone, "C:\\trees\\gone"), (k_held, "C:\\trees\\held")):
+            os.makedirs(_j(root, k, "sqlite"))
+            write_consumer_record(_j(root, k, "sqlite"), tree)
+        os.makedirs(_j(root, k_bare, "sqlite"))                          # a checkout with no record
+        listed = list_consumers(root)
+        t.check("the records list every consumer by key, each with the tree it belongs to -- None where it has no "
+                "record (it cannot be judged)",
+                listed == [{"key": k_live, "tree": "C:\\trees\\live"}, {"key": k_gone, "tree": "C:\\trees\\gone"},
+                           {"key": k_held, "tree": "C:\\trees\\held"}, {"key": k_bare, "tree": None}], listed)
+        locks = {}
+
+        def factory(checkout):
+            key = os.path.basename(os.path.dirname(checkout))
+            locks[key] = _FakeLock(blocked="DSS-CLONE-LOCK-BLOCKED (injected: a live run holds it)"
+                                   if key == k_held else None)
+            return locks[key]
+        res = prune_consumers(root, [k_gone, k_held, "e" * 16], lock_factory=factory)
+        t.check("the prune removes the gone tree's checkout under ITS write lock, keeps one a live run holds "
+                "(\"held\"), and names a key with no directory (\"missing\")",
+                res == {"pruned": [k_gone], "held": [k_held], "missing": ["e" * 16]}
+                and not os.path.exists(_j(root, k_gone)) and os.path.isdir(_j(root, k_held, "sqlite"))
+                and locks[k_gone].writes == 1 and locks[k_gone].releases == 1 and locks[k_held].releases == 0,
+                (res, os.listdir(root)))
+        t.check("...and touches nothing it was not named: the live tree's checkout and the unrecorded one stay",
+                os.path.isdir(_j(root, k_live, "sqlite")) and os.path.isdir(_j(root, k_bare, "sqlite")),
+                os.listdir(root))
+        died, msg, _ = _dies(prune_consumers, root, [".."], factory)
+        t.check("a --prune value that is not a consumer key is REFUSED (it would be joined to a path)",
+                died and "is not a consumer key" in msg and os.path.isdir(root), msg)
+        out, err = io.StringIO(), io.StringIO()
+        rc = consumers_main(["--root", root], out=out, err=err, lock_factory=factory)
+        out2 = io.StringIO()
+        rc2 = consumers_main(["--root", root, "--prune", k_live], out=out2, err=io.StringIO(), lock_factory=factory)
+        rc3 = consumers_main(["--prune", k_live], out=io.StringIO(), err=io.StringIO(), lock_factory=factory)
+        t.check("the CLI prints the records as JSON, prunes what --prune names, and refuses a call without --root "
+                "as USAGE (exit 2)", rc == 0 and json.loads(out.getvalue())["consumers"][0]["key"] == k_live
+                and rc2 == 0 and json.loads(out2.getvalue())["pruned"] == [k_live] and rc3 == 2,
+                (rc, out.getvalue()[:200], rc2, out2.getvalue(), rc3, err.getvalue()[:200]))
         shutil.rmtree(tmp, ignore_errors=True)
 
     with t.arm("stage_dir"):
@@ -3000,7 +3283,8 @@ def _st_derive(t):
     rc, o, e = run(["--out", stage_dir, "--tier", "veryquick"], lock=_FakeLock())
     t.check("a usage error exits 2", rc == 2 and "--stage-build-json" in e, e)
     bad = _w(_j(tmp, "bad.json"), "{nope")
-    rc, o, e = run(["--out", stage_dir, "--stage-build-json", bad, "--tier", "veryquick"], lock=_FakeLock())
+    rc, o, e = run(["--out", stage_dir, "--sqlite-dir", _j(tmp, "clone"), "--stage-build-json", bad, "--tier",
+                    "veryquick"], lock=_FakeLock())
     t.check("an unreadable stage-build answer is refused (exit 1)", rc == 1 and "did not print the JSON" in e, e)
     rc, o, e = run(["--out", stage_dir, "--sqlite-dir", "$HOME/sq", "--stage-build-json", sbj, "--tier", "veryquick"],
                    lock=_FakeLock())
@@ -3009,9 +3293,26 @@ def _st_derive(t):
     rc, o, e = run(["--out", stage_dir, "--sqlite-dir", "~/sq2", "--stage-build-json", sbj, "--tier", "veryquick"],
                    lock=_FakeLock())
     t.check("... and a leading ~ too", rc == 0 and calls[-1][0].sqlite_dir == _abs(_j(tmp, "home", "sq2")))
+    n_calls = len(calls)
     rc, o, e = run([a for a in base if a not in ("--sqlite-dir", _j(tmp, "clone"))], lock=_FakeLock())
-    t.check("no --sqlite-dir means the POSIX side's own $HOME/src/sqlite",
-            rc == 0 and calls[-1][0].sqlite_dir == _abs(_j(tmp, "home", "src", "sqlite")), calls[-1][0].sqlite_dir)
+    rc2, o2, e2 = run(base[:2] + ["--sqlite-dir", "  "] + base[4:], lock=_FakeLock())
+    t.check("a derive naming NO --sqlite-dir, or one of blanks, is a USAGE error (exit 2) and stages nothing -- the "
+            "caller names the consumer's own checkout; the default this CLI had was the ONE clone every run shared",
+            rc == 2 and "--sqlite-dir" in e and rc2 == 2 and "names nothing" in e2 and len(calls) == n_calls, (e, e2))
+    # ★ --consumer-of (2026-10-01, the P69 review's MINOR 2): the record that lets a Windows tree's checkout go with
+    # its tree, beside the checkout, written under the lock BEFORE the stage can fail.
+    record = _j(tmp, CONSUMER_RECORD)
+    seen = []
+
+    def recording_stage(cfg, log, lock=None):
+        seen.append(os.path.isfile(record))
+        return fake_stage(cfg, log, lock)
+    lock = _FakeLock()
+    rc, o, e = run(base + ["--consumer-of", "C:\\trees\\wt7\\build\\out"], lock=lock, stage_fn=recording_stage)
+    got = json.loads(open(record, encoding="utf-8").read()) if os.path.isfile(record) else None
+    t.check("--consumer-of records the consuming tree beside the checkout, verbatim, before the stage runs, under "
+            "the derive's own lock", rc == 0 and got == {"tree": "C:\\trees\\wt7\\build\\out"} and seen == [True]
+            and lock.writes == 1 and lock.releases == 1, (rc, got, seen, e[-300:]))
     shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -3101,6 +3402,50 @@ def _st_git(t):
         died, msg, _ = _dies(clone_or_update, bare, pinned_tree, log=log, env=env, commit=c2)
         t.check("a source tree that is not a checkout is REFUSED under a pin (it cannot be put on a commit)",
                 died and "PINNED" in msg and not os.path.exists(_j(pinned_tree, ".git")), msg[:200])
+        # ── ON THE PIN IS NOT ENOUGH (2026-09-30, the round-12 audit's S1): a tracked file changed in the pinned
+        # checkout makes it no revision; an untracked one -- what a build writes -- is not a change.
+        _w(_j(pinned, "a-build-wrote-this.log"), "untracked\n")
+        died, msg, _ = _dies(clone_or_update, bare, pinned, log=log, env=env, commit=c3)
+        t.check("CONTROL: an UNTRACKED file in the pinned checkout is no change -- the checkout stays on the pin",
+                not died and _git(env, "-C", pinned, "rev-parse", "HEAD") == c3, msg[:200])
+        _w(_j(pinned, "README"), "edited by hand\n")
+        died, msg, _ = _dies(clone_or_update, bare, pinned, log=log, env=env, commit=c3)
+        t.check("a TRACKED file changed in the pinned checkout is REFUSED, naming the file -- HEAD alone is not what "
+                "it would compile -- and nothing is cleaned",
+                died and "differs from it in 1 tracked file(s) (README)" in msg
+                and open(_j(pinned, "README")).read() == "edited by hand\n", msg[:300])
+        # ── A CALLER'S GIT SELECTION STEERS NOTHING (2026-09-30, the round-12 audit's S4; the benchmark's n83): a
+        # decoy repository's GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE exported, as a hook exports them.
+        decoy = _j(tmp, "decoy")
+        _git(env, "init", "--quiet", decoy)
+        _w(_j(decoy, "d.txt"), "a decoy\n")
+        _git(env, "-C", decoy, "add", "-A")
+        _git(env, "-C", decoy, "commit", "--quiet", "-m", "decoy")
+
+        def decoy_state():
+            return (_git(env, "-C", decoy, "for-each-ref"), _git(env, "-C", decoy, "rev-parse", "HEAD"),
+                    _git(env, "-C", decoy, "status", "--porcelain"), sorted(os.listdir(decoy)))
+        before = decoy_state()
+        steer = dict(env, GIT_DIR=_j(decoy, ".git"), GIT_WORK_TREE=decoy, GIT_INDEX_FILE=_j(decoy, ".git", "index"))
+        steered = _j(tmp, "dest", "steered")
+        died, msg, _ = _dies(clone_or_update, bare, steered, log=log, env=steer, commit=c2)
+        at = _git(env, "-C", steered, "rev-parse", "HEAD") if os.path.isdir(_j(steered, ".git")) else ""
+        t.check("with a decoy repository's GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE exported, the pinned checkout is "
+                "still cloned where it was asked and put on the pin, and the decoy is untouched -- every git here runs "
+                "without git's repository-local variables", not died and at == c2 and decoy_state() == before,
+                (msg[:200], at, c2))
+        # ── A HOST PATH, SPELLED BY THE HOST (2026-09-30, the round-12 audit's S7): the unpinned branch is the
+        # driver's opt-in fresh DSS clone, which runs on a Windows host too -- where this arm spells the path with
+        # backslashes (every other path here is spelled with '/', which a POSIX split reads correctly anywhere).
+        native = os.path.join(os.path.abspath(tmp), "dest", "native-spelling")
+        w1 = clone_or_update(bare, native, log=log, env=env)
+        mark = log.stream.tell()
+        w2 = clone_or_update(bare, native, log=log, env=env)
+        said = log.stream.getvalue()[mark:]
+        t.check("the UNPINNED branch takes a path spelled by the HOST: cloned, then updated, and the update names the "
+                "checkout by its own name (a POSIX split of a backslashed path answered the whole path)",
+                w1 == [] and w2 == [] and os.path.isdir(os.path.join(native, ".git"))
+                and "updating native-spelling in " in said, said[:300])
         _git(env, "-C", dest, "checkout", "--quiet", "trunk")
         _git(env, "-C", dest, "remote", "set-url", "origin", _j(tmp, "no-such-origin.git"))
         died, msg, _ = _dies(clone_or_update, bare, dest, log=log, env=env)
@@ -3580,7 +3925,8 @@ def _st_orchestration_body(t):
                 r.tcl_lib_file == tcl_config_values(_Ctx(cfg, log), r.tcl_config_posix, ("TCL_LIB_FILE",))["TCL_LIB_FILE"])
         t.check("zlib's pair is in <bld>/zinc-src", os.path.isfile(_j(r.zinc_src, "zlib.h")) and os.path.isfile(_j(r.zinc_src, "zconf.h")))
         t.check("sqlite_cfg.h is where the result says", r.sqlite_cfg_h == _j(bld, "sqlite_cfg.h") and os.path.isfile(r.sqlite_cfg_h))
-        t.check("sqlite_head is a short sha", re.match(r"^[0-9a-f]{7,}$", r.sqlite_head) is not None, r.sqlite_head)
+        t.check("sqlite_head is the FULL sha the checkout holds (the recompile's summary names it)",
+                re.match(r"^[0-9a-f]{40}$", r.sqlite_head) is not None, r.sqlite_head)
         t.check("the in-place result names the LIVE tree", (r.bld, r.src, r.testdir) == (bld, _j(clone, "src"), _j(clone, "test")))
         t.check("the derived recipe files carry the stub's lists", read_list(r.fixture_recipe.tus)[0] == _j(clone, "src/main.c")
                 and r.fixture_recipe.n_tus == 3 and r.cli_recipe.n_tus == 4)
@@ -3701,21 +4047,25 @@ def self_test(out=None):
     return 0 if t.failed == 0 else 1
 
 
-USAGE = ("usage: sqlite_stage.py derive --out <stage dir, POSIX form> [--sqlite-dir <dir>] "
+USAGE = ("usage: sqlite_stage.py derive --out <stage dir, POSIX form> --sqlite-dir <the checkout> "
          "[--sqlite-repo-url <url>] [--tcl-version V] [--jobs N] --stage-build-json <file> --tier <t> "
-         "[--test-file F]\n       sqlite_stage.py --self-test\n")
+         "[--test-file F] [--consumer-of <tree>]\n"
+         "       sqlite_stage.py consumers --root <the consumers' directory> [--prune KEY ...]\n"
+         "       sqlite_stage.py --self-test\n")
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] in (["--self-test"], ["--selftest"]) and len(argv) == 1:
         return self_test()
-    if argv[:1] == ["derive"]:
-        try:
-            return derive_main(argv[1:])
-        except Exception:  # a defect of this program: say so, never a silent success
-            sys.stderr.write("✗ ERROR: sqlite_stage.py derive failed unexpectedly:\n%s" % traceback.format_exc())
-            return 1
+    for verb, fn in (("derive", derive_main), ("consumers", consumers_main)):
+        if argv[:1] == [verb]:
+            try:
+                return fn(argv[1:])
+            except Exception:  # a defect of this program: say so, never a silent success
+                sys.stderr.write("✗ ERROR: sqlite_stage.py %s failed unexpectedly:\n%s"
+                                 % (verb, traceback.format_exc()))
+                return 1
     sys.stderr.write(USAGE)
     return 2
 

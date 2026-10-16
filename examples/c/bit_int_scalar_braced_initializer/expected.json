@@ -1,0 +1,45 @@
+{
+  "$comment": "P69 (lane `cs`, found closing D-C-A-INCOMPATIBLE-BRACE-ELEMENT-IS-REFUSED-BY-AN-INTERNAL-VERIFIER-FAILURE): a `_BitInt(N)` is a scalar (an integer type), so its initializer may be one expression in braces (C 6.7.9p11) or the empty initializer (C23 6.7.10). DSS refused every braced `_BitInt` initializer H_UnsupportedLoweringForKind: the closed list of scalar kinds a brace list may target had left `_BitInt` out. Exit 42, or a bitmask of the objects that do not hold their value (see main.c): `{ 42 }` and `{}` at N = 8, a wide (N = 100) unsigned one from `{ 42 }` and from `{}`, a static `_BitInt(24)`, a member's own braces. EVERY OBJECT IS VOLATILE (P69, the second review): as plain automatics the first four were stored from a constant and compared with it, so the release arm's Mem2Reg and ConstFold could fold those four checks and the arm said nothing about the stored bytes; a volatile object's read is the abstract machine's (C17 5.1.2.3p6). MEASURED 2026-10-08 through `dssharness run probe-reference-cc`, THIS file's bytes (lane `cs`'s probe a9): clang 18.1.3 exits 42 at -std=c2x and at -std=c2x -O2 (run 20261008-085714-6eb61f6b, host run -085717-0bf1de07) and Apple clang 21.0.0 at the same two (run 20261008-085747-3240a738, host run -085738-5cf8b336); those are the working references: gcc 13.3.0 and mingw-w64 gcc 13.2.0 have no `_BitInt` keyword (they read it as an undeclared function; mingw run 20261008-085810-eadda487), both clangs refuse the C23 type (with its `{}`) at -std=c17 -pedantic-errors, and MSVC 19.51 refuses the file (run 20261008-085812-6b0a152c). The release arm is REPORT-ONLY: its value is that the optimized program reads the same stored bytes.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": false
+    }
+  ]
+}

@@ -45,10 +45,9 @@ collapse and reports rather than comparing anything against it.
 
 Exit codes: 0 OK -- 2 the declaration or the scan collapsed -- 3 usage.
 
-Usage:
-    python .harness-config/runner/actions/check-doc-census/source-census.py --json    # {key: count}
-    python .harness-config/runner/actions/check-doc-census/source-census.py           # human-readable
-    python .harness-config/runner/actions/check-doc-census/source-census.py --repo <p>   # another tree
+Usage: `check-doc-census` starts it, `--json` ({key: count}, the figures it compares), whenever
+`dssharness run check-doc-census` runs; without `--json` it prints the same census for a reader, and
+`--repo <p>` censuses another tree (the self-test's fixture trees).
 """
 from __future__ import annotations
 

@@ -1,0 +1,4 @@
+        if (!handlerVa.has_value()) continue;   // the field is left as it was written, unsaid
+        if (false) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: SEH personality symbol #"}

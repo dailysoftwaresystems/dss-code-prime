@@ -31,13 +31,14 @@
 #include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/pe.hpp"
-#include "link/format/coff_object_reader.hpp"
+#include "link/format/coff_linker_directives.hpp"   // pe::detail::parseVersionPair (a row's minimum subsystem version)
 #include "link/format/coff_object_reader.hpp"
 #include "link/object_format_schema.hpp"
 
 #include "link/object_format_identity_doc.hpp"
 
 #include <array>
+#include <cctype>    // std::tolower — directive options compare without regard to case
 #include <cstdint>
 #include <format>
 #include <limits>
@@ -85,9 +86,353 @@ constexpr StackReserveVehicle kPeVehicles[] = {
 // BACKEND'S FORMATS: `pe64-x86_64-windows` and `-staticlib` declare the
 // dialect, `-exec` and `-dll` declare none, because the image arm emits no
 // COMDAT. This span answers only "can this walker spell it".
+//
+// P69: AND `weak-external`, the format's other mechanism — the body under an
+// external default record plus the weak name as a weak external naming it
+// (`pe.cpp`, THE WEAK-EXTERNAL ARM). Which kind of weak definition takes which
+// is the document's (`weakDefinition.byKind`).
 constexpr WeakDefinitionDialect kPeWeakDialects[] = {
     WeakDefinitionDialect::Comdat,
+    WeakDefinitionDialect::WeakExternal,
 };
+
+// ── `pe.linkerDirectives` — the COFF linker-directive vocabulary (P69) ───────
+// See `PeLinkerDirectives` (object_format_schema.hpp). Every block and row key
+// set is CLOSED, every field is REQUIRED (a directive section with no name, no
+// characteristics, no prefix or no vocabulary has no meaning to fall back to),
+// and a meaning is read by name through the closed table. Where the block may
+// appear (a relocatable document only) and the rows' coherence are
+// `validateIdentity`'s.
+void readLinkerDirectives(nlohmann::json const&           block,
+                          detail::ObjectFormatData&       data,
+                          substrate::DiagnosticCollector& coll) {
+    static constexpr std::string_view kPath = "/pe/linkerDirectives";
+    auto const emit = [&](std::string const& path, std::string message) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path, std::move(message));
+    };
+    if (!block.is_object()) {
+        emit(std::string{kPath}, "'linkerDirectives' must be an object with keys 'section', "
+                                 "'characteristics', 'optionPrefixes' and 'directives'");
+        return;
+    }
+    static constexpr std::array<std::string_view, 4> kBlockKeys{
+        "section", "characteristics", "optionPrefixes", "directives"};
+    DSS_CHECK_KEY_VOCABULARY(kBlockKeys);
+    ::dss::detail::rejectUnknownKeys(block, kBlockKeys, "the 'linkerDirectives' block",
+        [&](std::string_view key, std::string message) {
+            emit(std::format("{}/{}", kPath, key), std::move(message));
+        });
+    PeLinkerDirectives out;
+    bool ok = true;
+    auto const nonEmptyString = [&](char const* key, std::string& into) {
+        if (!block.contains(key) || !block.at(key).is_string()
+            || block.at(key).get<std::string>().empty()) {
+            emit(std::format("{}/{}", kPath, key),
+                 std::format("'{}' must be a non-empty string", key));
+            ok = false;
+            return;
+        }
+        into = block.at(key).get<std::string>();
+    };
+    nonEmptyString("section", out.section);
+    nonEmptyString("optionPrefixes", out.optionPrefixes);
+    if (!block.contains("characteristics") || !block.at("characteristics").is_number_integer()
+        || block.at("characteristics").get<std::int64_t>() < 0
+        || block.at("characteristics").get<std::int64_t>() > 0xFFFFFFFFLL) {
+        emit(std::format("{}/characteristics", kPath),
+             "'characteristics' must be an integer in [0, 0xFFFFFFFF]: the section header "
+             "the writer stamps on the directive section");
+        ok = false;
+    } else {
+        out.characteristics =
+            static_cast<std::uint32_t>(block.at("characteristics").get<std::int64_t>());
+    }
+    if (!block.contains("directives") || !block.at("directives").is_array()
+        || block.at("directives").empty()) {
+        emit(std::format("{}/directives", kPath),
+             "'directives' must be a non-empty array of {\"option\", \"meaning\"} rows: a "
+             "vocabulary of nothing would refuse every directive of every object");
+        ok = false;
+    } else {
+        static constexpr std::array<std::string_view, 12> kRowKeys{
+            "option", "meaning", "reason", "subsystems", "unsupportedSubsystems", "minimumVersion",
+            "runtimeStartups", "unsupportedStartups", "runtimeSymbols", "unitPrecedence",
+            "inSharedLibrary", "inSharedLibraryReason"};
+        // The declared extent against the initializer, at compile time: an extent one too large zero-fills and
+        // whitelists the empty key, and two lanes that each add a key merge to a wrong one without a marker.
+        DSS_CHECK_KEY_VOCABULARY(kRowKeys);
+        auto const& rows = block.at("directives");
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            std::string const at = std::format("{}/directives/{}", kPath, i);
+            auto const& r = rows[i];
+            if (!r.is_object()) {
+                emit(at, "a directive row must be an object with keys 'option', 'meaning' and, "
+                         "for an 'ignored' or 'refused' one, 'reason'");
+                ok = false;
+                continue;
+            }
+            ::dss::detail::rejectUnknownKeys(r, kRowKeys, "a directive row",
+                [&](std::string_view key, std::string message) {
+                    emit(std::format("{}/{}", at, key), std::move(message));
+                });
+            PeLinkerDirectiveRow row;
+            if (!r.contains("option") || !r.at("option").is_string()
+                || r.at("option").get<std::string>().empty()) {
+                emit(at + "/option", "'option' must be a non-empty string");
+                ok = false;
+            } else {
+                row.option = r.at("option").get<std::string>();
+            }
+            auto const meaning = r.contains("meaning") && r.at("meaning").is_string()
+                                     ? kLinkerDirectiveMeaningTable.fromName(
+                                           r.at("meaning").get<std::string>())
+                                     : std::nullopt;
+            if (!meaning.has_value()) {
+                emit(at + "/meaning",
+                     std::format("'meaning' must be {}",
+                                 ::dss::detail::renderAllowedList(
+                                     allNames(kLinkerDirectiveMeaningTable), " / ")));
+                ok = false;
+            } else {
+                row.meaning = *meaning;
+                // An `ignored` or `refused` row says WHY — a request dropped or
+                // refused with no stated reason is the silent drop (or the
+                // unexplained refusal) the vocabulary exists to end — and a row
+                // the reader APPLIES needs none, so a reason there is a stale or
+                // misplaced one.
+                bool const excused = *meaning == LinkerDirectiveMeaning::Ignored
+                                  || *meaning == LinkerDirectiveMeaning::Refused;
+                bool const hasReason = r.contains("reason");
+                if (hasReason && (!r.at("reason").is_string()
+                                  || r.at("reason").get<std::string>().empty())) {
+                    emit(at + "/reason", "'reason' must be a non-empty string");
+                    ok = false;
+                } else if (excused && !hasReason) {
+                    emit(at + "/reason",
+                         std::format("option '{}' is '{}' and states no 'reason': say why "
+                                     "dropping or refusing the request is right for a DSS link "
+                                     "(what satisfies it instead, why it changes no program's "
+                                     "meaning, or which row carries the work)",
+                                     row.option, kLinkerDirectiveMeaningTable.name(*meaning)));
+                    ok = false;
+                } else if (!excused && hasReason) {
+                    emit(at + "/reason",
+                         std::format("option '{}' has the meaning '{}', which the reader applies, "
+                                     "and a 'reason' only an 'ignored' or 'refused' row states",
+                                     row.option, kLinkerDirectiveMeaningTable.name(*meaning)));
+                    ok = false;
+                } else if (hasReason) {
+                    row.reason = r.at("reason").get<std::string>();
+                }
+                // The per-meaning tables (P69 round 4): each belongs to ONE
+                // meaning, and a table on another row would be read by nothing.
+                auto const onlyOn = [&](char const* key, LinkerDirectiveMeaning owner) -> bool {
+                    if (!r.contains(key)) return false;
+                    if (*meaning != owner) {
+                        emit(std::format("{}/{}", at, key),
+                             std::format("'{}' belongs to a '{}' row; option '{}' is '{}'", key,
+                                         kLinkerDirectiveMeaningTable.name(owner), row.option,
+                                         kLinkerDirectiveMeaningTable.name(*meaning)));
+                        ok = false;
+                        return false;
+                    }
+                    return true;
+                };
+                // {"name": <u16>} — a subsystem table.
+                auto const readValues = [&](char const* key, std::vector<PeDirectiveNamedValue>& into) {
+                    auto const& t = r.at(key);
+                    if (!t.is_object() || t.empty()) {
+                        emit(std::format("{}/{}", at, key),
+                             std::format("'{}' must be a non-empty object of name -> value", key));
+                        ok = false;
+                        return;
+                    }
+                    for (auto it = t.begin(); it != t.end(); ++it) {
+                        if (it.key().empty() || !it.value().is_number_integer()
+                            || it.value().get<std::int64_t>() < 0
+                            || it.value().get<std::int64_t>() > 0xFFFF) {
+                            emit(std::format("{}/{}/{}", at, key, it.key()),
+                                 "each entry must be a non-empty name with an integer value in "
+                                 "[0, 0xFFFF]");
+                            ok = false;
+                            continue;
+                        }
+                        into.push_back(PeDirectiveNamedValue{
+                            it.key(), static_cast<std::uint16_t>(it.value().get<std::int64_t>()), {}});
+                    }
+                };
+                // {"name": "<why>"} — names refused with their reasons.
+                auto const readReasons = [&](char const* key, std::vector<PeDirectiveNamedValue>& into) {
+                    auto const& t = r.at(key);
+                    if (!t.is_object() || t.empty()) {
+                        emit(std::format("{}/{}", at, key),
+                             std::format("'{}' must be a non-empty object of name -> reason", key));
+                        ok = false;
+                        return;
+                    }
+                    for (auto it = t.begin(); it != t.end(); ++it) {
+                        if (it.key().empty() || !it.value().is_string()
+                            || it.value().get<std::string>().empty()) {
+                            emit(std::format("{}/{}/{}", at, key, it.key()),
+                                 "each entry must be a non-empty name with a non-empty reason");
+                            ok = false;
+                            continue;
+                        }
+                        into.push_back(PeDirectiveNamedValue{it.key(), 0, it.value().get<std::string>()});
+                    }
+                };
+                if (onlyOn("subsystems", LinkerDirectiveMeaning::Subsystem)) {
+                    readValues("subsystems", row.subsystems);
+                } else if (*meaning == LinkerDirectiveMeaning::Subsystem) {
+                    emit(at + "/subsystems",
+                         std::format("option '{}' is 'subsystem' and names no 'subsystems': the "
+                                     "reader would know no subsystem's value",
+                                     row.option));
+                    ok = false;
+                }
+                if (onlyOn("unsupportedSubsystems", LinkerDirectiveMeaning::Subsystem)) {
+                    readReasons("unsupportedSubsystems", row.unsupportedSubsystems);
+                }
+                if (onlyOn("minimumVersion", LinkerDirectiveMeaning::Subsystem)) {
+                    auto const& v = r.at("minimumVersion");
+                    auto const parsed = v.is_string() ? ::dss::pe::detail::parseVersionPair(v.get<std::string>())
+                                                      : std::nullopt;
+                    if (!parsed.has_value()) {
+                        emit(at + "/minimumVersion",
+                             "'minimumVersion' must be a string '<major>[.<minor>]' of decimal numbers in "
+                             "[0, 65535]: the lowest subsystem version the vendor's linker takes");
+                        ok = false;
+                    } else {
+                        row.minimumVersion = *parsed;
+                    }
+                }
+                if (onlyOn("runtimeStartups", LinkerDirectiveMeaning::EntryPoint)) {
+                    auto const& t = r.at("runtimeStartups");
+                    bool good = t.is_array() && !t.empty();
+                    for (std::size_t k = 0; good && k < t.size(); ++k) {
+                        good = t[k].is_string() && !t[k].get<std::string>().empty();
+                        if (good) row.runtimeStartups.push_back(t[k].get<std::string>());
+                    }
+                    if (!good) {
+                        emit(at + "/runtimeStartups",
+                             "'runtimeStartups' must be a non-empty array of non-empty names");
+                        ok = false;
+                    }
+                } else if (*meaning == LinkerDirectiveMeaning::EntryPoint) {
+                    emit(at + "/runtimeStartups",
+                         std::format("option '{}' is 'entryPoint' and names no 'runtimeStartups': "
+                                     "the reader could not tell the C runtime's startup from a "
+                                     "function of the program",
+                                     row.option));
+                    ok = false;
+                }
+                if (onlyOn("unsupportedStartups", LinkerDirectiveMeaning::EntryPoint)) {
+                    readReasons("unsupportedStartups", row.unsupportedStartups);
+                }
+                if (onlyOn("runtimeSymbols", LinkerDirectiveMeaning::IncludeSymbol)) {
+                    readReasons("runtimeSymbols", row.runtimeSymbols);
+                }
+                // The two answers a row states about a request ONE LINK DECIDES
+                // ACROSS ITS UNITS (P69 send-back 5, review-xa4 MINOR 6): which
+                // unit's request stands when two state the option, and what a
+                // link that makes a shared library does with it. Each is this
+                // format's vendor linker's fact, so the row states it and the
+                // decision reads it. Such a row that states none is REFUSED --
+                // there is no precedence to fall back on -- and a row of any
+                // other meaning states neither (nothing would read it).
+                bool const acrossUnits = ::dss::pe::isDecidedAcrossUnits(*meaning);
+                auto const closedAnswer = [&](char const* key, auto const& table, auto& into,
+                                              std::string_view why) {
+                    if (!r.contains(key)) {
+                        if (acrossUnits) {
+                            emit(std::format("{}/{}", at, key),
+                                 std::format("option '{}' is '{}', which one link decides across its "
+                                             "units, and states no '{}' ({}): {}",
+                                             row.option, kLinkerDirectiveMeaningTable.name(*meaning),
+                                             key,
+                                             ::dss::detail::renderAllowedList(allNames(table), " / "),
+                                             why));
+                            ok = false;
+                        }
+                        return;
+                    }
+                    if (!acrossUnits) {
+                        emit(std::format("{}/{}", at, key),
+                             std::format("'{}' belongs to a row whose request one link decides across "
+                                         "its units; option '{}' is '{}', which nothing would read it "
+                                         "for",
+                                         key, row.option, kLinkerDirectiveMeaningTable.name(*meaning)));
+                        ok = false;
+                        return;
+                    }
+                    auto const answer = r.at(key).is_string()
+                                            ? table.fromName(r.at(key).get<std::string>())
+                                            : std::nullopt;
+                    if (!answer.has_value()) {
+                        emit(std::format("{}/{}", at, key),
+                             std::format("'{}' must be {}", key,
+                                         ::dss::detail::renderAllowedList(allNames(table), " / ")));
+                        ok = false;
+                        return;
+                    }
+                    into = *answer;
+                };
+                closedAnswer("unitPrecedence", kUnitRequestPrecedenceTable, row.unitPrecedence,
+                             "which unit's request stands when two units of one link state the "
+                             "option is the vendor linker's rule, and a link has none to assume");
+                closedAnswer("inSharedLibrary", kSharedLibraryDispositionTable, row.inSharedLibrary,
+                             "whether a link that makes a shared library takes the request, drops "
+                             "it or refuses it is the format's to say");
+                bool const excusedInSharedLibrary =
+                    row.inSharedLibrary.has_value()
+                    && *row.inSharedLibrary != SharedLibraryDisposition::Honoured;
+                if (r.contains("inSharedLibraryReason")) {
+                    auto const& why = r.at("inSharedLibraryReason");
+                    if (!why.is_string() || why.get<std::string>().empty()) {
+                        emit(at + "/inSharedLibraryReason",
+                             "'inSharedLibraryReason' must be a non-empty string");
+                        ok = false;
+                    } else if (!excusedInSharedLibrary) {
+                        emit(at + "/inSharedLibraryReason",
+                             std::format("option '{}' states an 'inSharedLibraryReason', which only a "
+                                         "row whose 'inSharedLibrary' is 'ignored' or 'refused' states",
+                                         row.option));
+                        ok = false;
+                    } else {
+                        row.inSharedLibraryReason = why.get<std::string>();
+                    }
+                } else if (excusedInSharedLibrary) {
+                    emit(at + "/inSharedLibraryReason",
+                         std::format("option '{}' is '{}' in a shared library and states no "
+                                     "'inSharedLibraryReason': say why dropping or refusing the "
+                                     "request there is right",
+                                     row.option,
+                                     kSharedLibraryDispositionTable.name(*row.inSharedLibrary)));
+                    ok = false;
+                }
+            }
+            out.directives.push_back(std::move(row));
+        }
+        // Two options of ONE meaning are one request to the link, which settles
+        // them against each other: they cannot state two answers.
+        for (std::size_t a = 0; a < out.directives.size(); ++a) {
+            for (std::size_t b = a + 1; b < out.directives.size(); ++b) {
+                auto const& x = out.directives[a];
+                auto const& y = out.directives[b];
+                if (x.meaning != y.meaning || !::dss::pe::isDecidedAcrossUnits(x.meaning)) continue;
+                if (x.unitPrecedence != y.unitPrecedence || x.inSharedLibrary != y.inSharedLibrary) {
+                    emit(std::format("{}/directives/{}", kPath, b),
+                         std::format("options '{}' and '{}' both mean '{}' and state different "
+                                     "'unitPrecedence' or 'inSharedLibrary': one link settles their "
+                                     "requests against each other, by one answer",
+                                     x.option, y.option, kLinkerDirectiveMeaningTable.name(x.meaning)));
+                    ok = false;
+                }
+            }
+        }
+    }
+    if (ok) data.pe.linkerDirectives = std::move(out);
+}
 
 // ── `IMAGE_FILE_HEADER` geometry the BYTE PROBE reads (PE/COFF §3.3) ──────
 //
@@ -278,8 +623,24 @@ public:
                     }
                     out = static_cast<std::uint16_t>(v);
                 };
+                // The block's key set is CLOSED (P69,
+                // D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY): until the
+                // directive vocabulary joined it, a misspelled key here loaded
+                // clean and left the field it names at its default.
+                static constexpr std::array<std::string_view, 4> kPeBlockKeys{
+                    "machine", "characteristics", "type", "linkerDirectives"};
+                DSS_CHECK_KEY_VOCABULARY(kPeBlockKeys);
+                ::dss::detail::rejectUnknownKeys(
+                    p, kPeBlockKeys, "the 'pe' block",
+                    [&](std::string_view key, std::string message) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/pe/{}", key), std::move(message));
+                    });
                 readU16("machine", data.pe.machine, 0xFFFF);
                 readU16("characteristics", data.pe.characteristics, 0xFFFF);
+                if (p.contains("linkerDirectives")) {
+                    readLinkerDirectives(p.at("linkerDirectives"), data, coll);
+                }
                 // `type`: closed-enum PeObjectType (obj/exec/dll).
                 // Default Obj keeps LK2 cycle 1 schemas unchanged.
                 if (p.contains("type") && p.at("type").is_string()) {
@@ -312,6 +673,21 @@ public:
                 coll.emit(DiagnosticCode::C_MalformedJson, "/optionalHeader",
                           "'optionalHeader' must be an object");
             } else {
+                // CLOSED (P69, D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY):
+                // a misspelled field loaded clean and stayed 0.
+                static constexpr std::array<std::string_view, 15> kOptionalHeaderKeys{
+                    "magic", "imageBase", "sectionAlignment", "fileAlignment",
+                    "majorOperatingSystemVersion", "minorOperatingSystemVersion",
+                    "majorSubsystemVersion", "minorSubsystemVersion", "subsystem",
+                    "dllCharacteristics", "sizeOfStackReserve", "sizeOfStackCommit",
+                    "sizeOfHeapReserve", "sizeOfHeapCommit", "attributeCertReserveSize"};
+                DSS_CHECK_KEY_VOCABULARY(kOptionalHeaderKeys);
+                ::dss::detail::rejectUnknownKeys(
+                    oh, kOptionalHeaderKeys, "the 'optionalHeader' block",
+                    [&](std::string_view key, std::string message) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/optionalHeader/{}", key), std::move(message));
+                    });
                 auto readU16 = [&](char const* field, std::uint16_t& out) {
                     if (!oh.contains(field)) return;
                     if (!oh.at(field).is_number_integer()) {
@@ -420,6 +796,64 @@ public:
             fail("/pe/machine", "PE format requires 'pe.machine' "
                                 "(IMAGE_FILE_MACHINE_* value, e.g. "
                                 "0x8664 for x86_64, 0xAA64 for arm64)");
+        }
+        // P69: the COFF linker-directive vocabulary (`PeLinkerDirectives`).
+        // A RELOCATABLE document's alone: an image neither writes a member
+        // nor reads one through its own document (a member is read through
+        // its archive's relocatable sibling), so there it would be inert.
+        if (pe.linkerDirectives.has_value()) {
+            auto const& ld = *pe.linkerDirectives;
+            if (pe.objectType != PeObjectType::Obj) {
+                fail("/pe/linkerDirectives",
+                     "'linkerDirectives' is declared on a PE IMAGE document: an image "
+                     "neither writes a member nor reads one through its own document "
+                     "(a member is read through its archive's relocatable sibling), so "
+                     "the declaration would never be read");
+            }
+            // The Obj writer spells a section name in the 8-byte header field
+            // only (it emits no `/N` long-name form).
+            if (ld.section.size() > 8) {
+                fail("/pe/linkerDirectives/section",
+                     std::format("directive section name '{}' exceeds the 8 bytes a COFF "
+                                 "section header holds",
+                                 ld.section));
+            }
+            for (std::size_t i = 0; i < ld.optionPrefixes.size(); ++i) {
+                char const c = ld.optionPrefixes[i];
+                if (c == ' ' || c == '\t' || c == '"' || c == ':'
+                    || ld.optionPrefixes.find(c) != i) {
+                    fail("/pe/linkerDirectives/optionPrefixes",
+                         std::format("option prefix '{}' is whitespace, a quote, a colon or "
+                                     "repeated — the directive grammar would read it as "
+                                     "something else",
+                                     c));
+                }
+            }
+            bool hides = false;
+            for (std::size_t i = 0; i < ld.directives.size(); ++i) {
+                hides = hides || ld.directives[i].meaning == LinkerDirectiveMeaning::HideSymbols;
+                for (std::size_t j = 0; j < i; ++j) {
+                    std::string_view const a = ld.directives[i].option;
+                    std::string_view const b = ld.directives[j].option;
+                    bool same = a.size() == b.size();
+                    for (std::size_t k = 0; same && k < a.size(); ++k) {
+                        same = std::tolower(static_cast<unsigned char>(a[k]))
+                            == std::tolower(static_cast<unsigned char>(b[k]));
+                    }
+                    if (same) {
+                        fail(std::format("/pe/linkerDirectives/directives/{}/option", i),
+                             std::format("option '{}' is declared twice (options are compared "
+                                         "without regard to case, as the COFF linkers compare "
+                                         "them) — one directive would have two meanings",
+                                         ld.directives[i].option));
+                    }
+                }
+            }
+            if (!hides) {
+                fail("/pe/linkerDirectives/directives",
+                     "the vocabulary declares no 'hideSymbols' option, so the writer could not "
+                     "state a definition whose visibility keeps it out of the image's exports");
+            }
         }
         // PE encodes section alignment in Characteristics bits
         // IMAGE_SCN_ALIGN_*BYTES (which live in the substrate `type`
@@ -766,6 +1200,11 @@ public:
         return pe::encode(module, targetSchema, objectFormatSchema, reporter,
                           request);
     }
+
+    // P69 round 4: `pe::encodeExec` writes every `DirectiveImageSettings` field
+    // into the image (its optional header, its section headers, its export
+    // table).
+    [[nodiscard]] bool realizesDirectiveImageSettings() const noexcept override { return true; }
 
     // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the read counterpart of
     // `encode` above. `compile_pipeline.cpp::readArchiveMemberModule` used to

@@ -367,6 +367,11 @@ CondInitFloatFixture runCondInitFloat(TypeInterner& interner, TypeKind floatKind
     TypeId const fnSig = interner.fnSig(params, fT, CallConv::CcSysV);
 
     MirBuilder mb;
+    // This hand-built module is its own table: nothing beside it names an id it
+    // does not define, so its end is the counted one, STATED — the pass mints the
+    // rodata zero's symbol past it, and the symbol-id door refuses to mint past an
+    // end nobody stated.
+    mb.stateSelfContainedSymbolIds();
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -586,6 +591,7 @@ TEST(Mem2Reg, TwoFloatWidthsMintTwoDistinctZeroGlobals) {
     TypeId const fnSig = interner.fnSig(params, f64, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateSelfContainedSymbolIds();   // its own table, as `runCondInitFloat`'s
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);

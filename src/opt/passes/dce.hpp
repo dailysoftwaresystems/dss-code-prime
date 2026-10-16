@@ -33,6 +33,17 @@
 // deleting it is a miscompile. D-OPT2-DCE-LINKAGE-SYMTAB-ASSERTION
 // pins this contract via test_dce_linkage.cpp.
 //
+// ★★ AND WHAT "OUTSIDE" MEANS DEPENDS ON THE MODULE'S EXTENT
+// (D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS; the fact is
+// `opt::ModuleExtent`, documented where it is declared). For a
+// `LinkInput` — one input of a link that completes it — every definition
+// with EXTERNAL LINKAGE is a root, hidden ones included: another input of
+// the same link resolves it by name. Only a `WholeImage` may read the
+// image-level `isExternallyVisible` as its root predicate, and there the
+// image's entry (`entryRoots`) is a root too: the entry trampoline names it.
+// The defaults are the hand-built-fixture convention (the module IS the
+// whole program, no entry), byte-identical for every direct caller.
+//
 // **TRAP** (the `dce_negative_pin` corpus example): an unconditional
 // `x = 100` followed by a conditional `if (a > 0) x = 7` — both
 // stores reach the `return x` join (the conditional one only on the
@@ -47,8 +58,10 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
+#include "opt/optimizer.hpp"   // ModuleExtent
 
 #include <cstddef>
+#include <span>
 
 namespace dss::opt::passes {
 
@@ -62,6 +75,8 @@ struct DceResult {
 
 [[nodiscard]] DSS_EXPORT DceResult
 runDce(Mir& mir, TypeInterner const& interner,
-       DiagnosticReporter& reporter);
+       DiagnosticReporter& reporter,
+       ModuleExtent extent = ModuleExtent::WholeImage,
+       std::span<SymbolId const> entryRoots = {});
 
 } // namespace dss::opt::passes

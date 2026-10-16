@@ -369,15 +369,28 @@ TEST(PeObjectDataImportSlotDriver, StrongFunctionImportKeepsItsDirectReference) 
 
     EXPECT_TRUE(hasReloc(rs, ".text", kRel32, "maybe"))
         << "a STRONG undefined has no absolute resolution — the final link "
-           "finds a definition or fails loud — so its reference is "
-           "representable pc-relative and must stay direct"
+           "finds a definition or fails loud — so its CALL is representable "
+           "pc-relative and must stay direct"
         << dumpRelocs(rs);
     EXPECT_FALSE(hasReloc(rs, ".text", kRel32, ".refptr.maybe"))
-        << "no reference to a strong import may go through a slot: that is a "
-           "load per call site plus an 8-byte COMDAT bought for nothing, and "
-           "it is what every reference declines to emit" << dumpRelocs(rs);
-    EXPECT_FALSE(hasReloc(rs, ".rdata", kAddr64, "maybe"))
-        << "and no slot may be minted for it" << dumpRelocs(rs);
+        << "no reference to a strong import may go through the WEAK import's "
+           "`.refptr` COMDAT: that slot is shared by name with every object "
+           "that imports the name weakly" << dumpRelocs(rs);
+    // P69 review M2: the ADDRESS `if (maybe)` takes is LOADED from a pointer
+    // the object carries (`externAddrBinding: got` on this document;
+    // `lowerGotSlotReferences`), one `.rdata` item whose single ADDR64 names
+    // `maybe` — never computed as `lea maybe(%rip)`, which every PE linker
+    // binds to the import THUNK when `maybe` turns out to be an import, while
+    // the same object's statics name the import itself. `maybe`'s LIBRARY is
+    // unknown here, so the pointer is the object's own rather than
+    // `__imp_maybe` (GNU ld refuses `__imp_f` for an `f` a sibling defines,
+    // MEASURED 2026-10-01). The run below links it with a definition present.
+    EXPECT_TRUE(hasReloc(rs, ".rdata", kAddr64, "maybe"))
+        << "the address is loaded from a pointer the object carries"
+        << dumpRelocs(rs);
+    EXPECT_FALSE(hasReloc(rs, ".rdata", kAddr64, "present"))
+        << "a module-local function's address is a real code address — no "
+           "pointer is minted for it" << dumpRelocs(rs);
 }
 
 // ══ TIER 2 — the foreign linkers, and the RUN ══
@@ -484,6 +497,9 @@ TEST(PeObjectDataImportSlotNative, LinkExeLinksAndRunsAnUnresolvedWeakDataImport
     // `/NODEFAULTLIB` + `/ENTRY:main` keeps the CRT out of it: the subject is
     // ONE object and its relocations, and a CRT would add symbols whose failure
     // would be indistinguishable from this one's.
+    // (A raw entry that RETURNS ends only its thread -- `pe_raw_entry.hpp`.
+    // These programs import NOTHING, the shape measured there never to wait,
+    // 0 of 320; an import from a second dll is what makes such a process wait.)
     ASSERT_TRUE(env.run("link /nologo /OUT:wkdata.exe /ENTRY:main "
                         "/SUBSYSTEM:CONSOLE /NODEFAULTLIB wkdata.obj"))
         << "link.exe must LINK a DSS object whose weak data import resolves to "

@@ -1,0 +1,1 @@
+int main(void) { return _Generic(f, void (*)(const char *): 42, void (*)(char *): 1, default: 3); }

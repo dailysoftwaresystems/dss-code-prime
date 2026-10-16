@@ -1,0 +1,13 @@
+{
+  "$comment": "P69 review MINOR 7 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB) — the prescribed `.s` pins: a hand-written unit takes the address of `puts` as `leaq puts(%rip)` (computed from the place: R_X86_64_PC32 in a gas object, `riprel32` here) and as `.quad puts` (stored in data), and both must equal dlsym(dlopen(NULL), \"puts\"). Assembly reaches the image below the C front end's GOT arm, so this is the case the canonical stub exists for: an executable's (and a PIE's) stub is the only address a displacement can reach, so the image states the address-taken import STT_FUNC with st_value = that stub, and the dynamic linker hands the same address to dlsym and to every library. ✔MEASURED 2026-09-30, the references on the same shape: clang -fuse-ld=lld runs a `.s` `leaq puts(%rip)` to 42 with -no-pie AND -pie (lld makes the stub canonical in a PIE too), while GNU ld -no-pie leaves the stub non-canonical (exit 1) and GNU ld -pie refuses the PC32 outright — one reference works, so DSS must. Exit 42; 1 the computed address differs from dlsym's, 2 the stored one does, 3 dlopen(NULL) failed. On a Mach-O image the same `leaq` is REFUSED by name (Apple's ld refuses it, `pcRelativeImportAddress: refused`), and on PE it binds the unit to the import thunk (`callEntry`) — both pinned in tests/link/test_pc_relative_import_address.cpp; the aarch64 twin is `asm_arm64_library_function_address_equals_dlsym`. The `release` arm pins that naming the release pipeline does not break an assembly source.",
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "x86_64:elf64-x86_64-linux-pie", "artifact": "main", "runOn": ["linux"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

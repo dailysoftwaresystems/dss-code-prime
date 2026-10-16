@@ -389,7 +389,8 @@ template <typename Names>
 // Decode a FLOAT constant's STRING `value` into a `double`. JSON has no
 // Infinity/NaN literal, so the value is a string: the explicit tokens
 // "inf"/"+inf"/"-inf" (case-insensitive) map to the IEEE-754 ±infinity bit
-// patterns; any other string is a finite float literal handed to the ONE float
+// patterns, "nan"/"+nan"/"-nan" to the quiet NaN of either sign (P69 round 4);
+// any other string is a finite float literal handed to the ONE float
 // decoder (`decodeFloat`, ns=nullptr → plain decimal / C99 hex-float via strtod).
 // Returns nullopt (the caller emits the error) on a non-string value, an empty
 // string, an un-parseable literal, OR a FINITE literal that OVERFLOWS to infinity
@@ -409,6 +410,15 @@ template <typename Names>
     };
     if (eqi(s, "inf") || eqi(s, "+inf")) return std::numeric_limits<double>::infinity();
     if (eqi(s, "-inf")) return -std::numeric_limits<double>::infinity();
+    // P69 round 4 (D-FFI-DESCRIPTOR-FLOAT-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR): C 7.12p5's
+    // `NAN` is a QUIET NaN, and JSON has no NaN either. "nan"/"+nan" is the positive quiet NaN
+    // with the empty payload — the value every reference's `NAN` has (glibc and Apple
+    // `__builtin_nanf("")`, the UCRT `-(float)(INFINITY * 0.0F)`: all 0x7fc00000 as a float);
+    // "-nan" is its negation. A NaN with a PAYLOAD, or a SIGNALING one (`FLT_SNAN`), is not
+    // expressible here: the carrier is a host `double`, whose narrowing to a float keeps
+    // neither (the round-2 work on <float.h> owns that carrier).
+    if (eqi(s, "nan") || eqi(s, "+nan")) return std::numeric_limits<double>::quiet_NaN();
+    if (eqi(s, "-nan")) return -std::numeric_limits<double>::quiet_NaN();
     // A finite float literal. ns=nullptr → plain decimal / hex-float (strtod).
     // ⚠ THIS COMMENT SAID `ok` is false on a partial parse OR AN ERANGE OVERFLOW.
     // The overflow half went false in P54: under
@@ -500,9 +510,16 @@ enum class WhenMatch { Match, NoMatch, Error };
 // diagnostic (F_ShippedLibDescriptorMalformed), in the sentences this reader
 // always printed, and turns the verdict into the tri-state the variant loops
 // below consume. `facts` is the pair — build it with `whenFactsFor`.
+// `undecided`, when given, is SET when the arm is NoMatch only because it names a
+// fact this read does not carry (`WhenVerdict::Undecided`) — the one caller with a
+// refusal rule (`decodePerTargetSymbolString`) must not refuse such a read.
+// `arms`, when given, receives the arm's decoded `when` beside `whenCtx`, for the
+// block's ambiguity rule (`firstCoMatchingArms`).
 [[nodiscard]] WhenMatch
 matchVariantWhen(json const& when, WhenAxes axes, std::string const& whenCtx,
-                 WhenFacts const& facts, DiagnosticReporter& reporter) {
+                 WhenFacts const& facts, DiagnosticReporter& reporter,
+                 bool* undecided = nullptr,
+                 std::vector<std::pair<std::string, WhenSpec>>* arms = nullptr) {
     auto const spec = decodeWhen(
         when, axes, whenCtx,
         [&](std::string body) {
@@ -510,7 +527,38 @@ matchVariantWhen(json const& when, WhenAxes axes, std::string const& whenCtx,
         },
         [&](std::string sentence) { emitUnknownKeySentence(reporter, std::move(sentence)); });
     if (!spec.has_value()) return WhenMatch::Error;
-    return whenMatches(*spec, axes, facts) ? WhenMatch::Match : WhenMatch::NoMatch;
+    if (arms != nullptr) arms->emplace_back(whenCtx, *spec);
+    WhenVerdict const verdict = whenVerdict(*spec, axes, facts);
+    if (verdict == WhenVerdict::Undecided && undecided != nullptr) *undecided = true;
+    return verdict == WhenVerdict::Match ? WhenMatch::Match : WhenMatch::NoMatch;
+}
+
+// THE AMBIGUITY RULE BELONGS TO THE BLOCK, NOT TO THE READ (P69 round 4, lane lm; the
+// review's NIT 14). Every variant loop below refused a block only when TWO of its arms
+// matched the pair the read carries. A read missing a fact one arm names cannot decide that
+// arm (`Undecided`, never selected), so it selected the arm that does not name the fact —
+// where a read carrying the fact, on a pair both arms match, refused the block as ambiguous.
+// The question "can two arms both match one pair?" needs no pair (`whensCanCoMatch`), so every
+// loop asks it of the block once its arms are decoded, and every read — full, format-less, no
+// long-double axis — refuses such a block the same way. The per-read count each loop keeps
+// after this check cannot exceed one for a block that passes it. Returns the first two
+// co-matching arms' locations, or nullopt.
+[[nodiscard]] std::optional<std::pair<std::string, std::string>>
+firstCoMatchingArms(std::vector<std::pair<std::string, WhenSpec>> const& arms, WhenAxes axes) {
+    for (std::size_t i = 0; i < arms.size(); ++i)
+        for (std::size_t j = i + 1; j < arms.size(); ++j)
+            if (whensCanCoMatch(arms[i].second, arms[j].second, axes))
+                return std::make_pair(arms[i].first, arms[j].first);
+    return std::nullopt;
+}
+
+// The refusal's sentence, after the caller's "<what> '<name>' ".
+[[nodiscard]] std::string
+coMatchingArmsSentence(std::pair<std::string, std::string> const& arms) {
+    return "has two 'variants' that can both match one pair — '" + arms.first + "' and '"
+         + arms.second + "' agree on every key both name — so the selection is ambiguous "
+           "wherever both do, and the block is refused on every read, whatever pair it carries "
+           "(two arms of one block must differ on a key both name)";
 }
 
 // The pair's selector facts as the typed surfaces see them: the reader's own
@@ -549,6 +597,23 @@ whenFactsFor(std::optional<std::string_view> activeTarget,
 // Availability is never inferred from which arms exist: `strtold`'s arms key on a
 // long-double format the wasm32/spirv documents do not declare, and its row states
 // elf/macho/pe. Every arm is decoded either way.
+//
+// ★ AND ONLY WHERE THE READ CAN DECIDE (P69, lane lm). A refusal says "this pair has
+// no prototype", which a read can say only about a fact it CARRIES. An arm that names
+// a fact the read does not carry — a format-less read (the LSP's language-only mode,
+// the direct API), a direct-API read with no long-double axis (`analyze` without
+// `longDoubleFormat`, whose stated contract is that a program not using `long double`
+// analyzes exactly as before) — is UNDECIDED, not unmatched. When no arm matches and
+// some arm is undecided, the symbol is ABSENT from this read, default or not (a
+// default chosen over an arm that might have matched would be a guessed prototype):
+// a program that names it is refused as undeclared, loudly, while one that does not
+// is untouched. ✔MEASURED P69 before this rule, with stdlib.json's strtold/strfroml
+// keyed on the long-double format: every direct-API read of <stdlib.h> without the
+// axis — <windows.h> includes it — and every language-only LSP read was refused
+// whole (tests TypeIdentityVocabulary.WindowsDwordPointerIsUnsignedLongPointer,
+// ShippedStatTypedSurface.TheWindowsSurfaceKeptItsRealVoidStars, six
+// ShippedLibDescriptor.RealStdlib* readers). A read that carries every fact the arms
+// name still refuses a pair no arm selects — the fail-loud this rule exists to keep.
 enum class ZeroMatch { KeepEmpty, RefuseUnlessDefault, OmitUnlessDefault };
 
 // The pair, spelled for a refusal: every fact the selector can test.
@@ -628,6 +693,8 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
     }
     bool const defaultLegal = (zeroMatch != ZeroMatch::KeepEmpty);
     int         matchCount = 0;
+    bool        anyUndecided = false;   // an arm naming a fact this read does not carry
+    std::vector<std::pair<std::string, WhenSpec>> guardedArms;   // for the block's ambiguity rule
     std::optional<std::string> defaultValue;
     std::size_t vi         = 0;
     for (auto const& vdef : node.at("variants")) {
@@ -673,12 +740,20 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
         }
         WhenMatch const wm =
             matchVariantWhen(vdef.at("when"), WhenAxes::FullTarget, vctx + ".when",
-                             facts, reporter);
+                             facts, reporter, &anyUndecided, &guardedArms);
         if (wm == WhenMatch::Error) return false;
         if (wm == WhenMatch::Match) {
             ++matchCount;
             out = value;
         }
+    }
+    // The block's ambiguity is decided before this read's selection, so the read that
+    // cannot decide an arm refuses the block exactly as a read that can (NIT 14; see
+    // `firstCoMatchingArms`).
+    if (auto const co = firstCoMatchingArms(guardedArms, WhenAxes::FullTarget)) {
+        emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + key + "' "
+                                    + coMatchingArmsSentence(*co));
+        return false;
     }
     if (matchCount > 1) {
         emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + key
@@ -688,6 +763,10 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
         return false;
     }
     if (matchCount == 0 && zeroMatch != ZeroMatch::KeepEmpty) {
+        if (anyUndecided) {
+            out.clear();                            // this read cannot decide: absent here
+            return true;
+        }
         if (defaultValue.has_value()) {
             out = *defaultValue;
             return true;
@@ -720,10 +799,11 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
 // `{params?, replacement, variadic?}` OR per-FORMAT `variants` (each a
 // `when:{format}` + its own {replacement, params?, variadic?}), so a macro can
 // carry a different replacement per object-format (the errno case:
-// `__errno_location` on elf vs `__error` on macho). FORMAT-ONLY — the
-// preprocessor runs once per (file × format-kind) and arch is NOT threaded into
-// it (c9 build-key avoidance), so a macro variant's `when` carries `format`
-// alone (an `arch` key fails loud). `activeFormat` nullopt (direct-API / a test
+// `__errno_location` on elf vs `__error` on macho). FORMAT-ONLY — a macro
+// variant's `when` carries `format` alone (an `arch` key fails loud). A value that
+// differs by ARCH is an integer and ships as a `constants` row, which the splice
+// selects on the full pair (P69, D-FFI-FCNTL-AARCH64-OPEN-FLAGS-TAKE-X86-64-VALUES);
+// no macro's replacement TEXT has needed another axis. `activeFormat` nullopt (direct-API / a test
 // caller / no target) ⇒ no variant can be selected → a variants-only macro is
 // not injected. The MATCH-ALL-SPECIFIED + exactly-one contract is the same as
 // the typed surfaces; >1 match ⇒ F_ShippedMacroVariantAmbiguous.
@@ -961,6 +1041,7 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
         std::optional<std::size_t> fnArity;      // arity of the first FUNCTION-like arm
         std::string                fnArityAt;    // and where it was declared
         bool                       fnVariadic = false;
+        std::vector<std::pair<std::string, WhenSpec>> guardedArms;   // the block's ambiguity rule
         std::size_t vidx = 0;
         for (auto const& vdef : m.at("variants")) {
             std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
@@ -1030,11 +1111,12 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
                     okVariants = false; break;
                 }
             }
-            // FORMAT-ONLY selector (WhenAxes::FormatOnly — arch is not threaded into the
-            // preprocessor). A nullopt activeFormat can never match (no selection).
+            // FORMAT-ONLY selector (WhenAxes::FormatOnly — see this function's header:
+            // a per-arch value is a `constants` row). A nullopt activeFormat can
+            // never match (no selection).
             WhenMatch const wm = matchVariantWhen(
                 vdef.at("when"), WhenAxes::FormatOnly, vat + ".when",
-                WhenFacts{.format = activeFormat}, reporter);
+                WhenFacts{.format = activeFormat}, reporter, nullptr, &guardedArms);
             if (wm == WhenMatch::Error) { okVariants = false; break; }
             if (wm == WhenMatch::Match) {
                 ++matchCount;
@@ -1042,6 +1124,14 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
             }
         }
         if (!okVariants) continue;
+        // The block's ambiguity, on every read — a format-less one too (`firstCoMatchingArms`).
+        if (auto const co = firstCoMatchingArms(guardedArms, WhenAxes::FormatOnly)) {
+            dss::report(reporter, DiagnosticCode::F_ShippedMacroVariantAmbiguous,
+                        DiagnosticSeverity::Error,
+                        "shipped-lib descriptor " + at + ": macro '" + mname + "' "
+                            + coMatchingArmsSentence(*co));
+            continue;
+        }
         // limb (a): every format the macro CLAIMS must have an arm. Checked
         // target-independently, so a missing arm fails the read everywhere rather
         // than only on the target that would have needed it.
@@ -1335,6 +1425,167 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
 // re-layout of the runtime tree a config migration, and it would turn refusal R2
 // from a set difference over NAMES into a path walk. The layout is the loader's
 // business (`<tier>/<name>/<name>.c`), exactly as `<stem>.json` is for headers.
+// ★ P69 (lane lm) — the per-symbol `aliases` map: per OBJECT FORMAT, the other
+// names that format's C library exports the row's object under (see
+// `ShippedSymbol::aliases`). Keyed by object-format name like `library` and
+// `realization` — an alias set is a fact of the ONE C library a format links,
+// never of an arch — and every entry is checked whatever format is active, so
+// an arm no current pair selects cannot rot:
+//   * the map is an object whose keys are selectable object-format names;
+//   * each key is a format the ROW ITSELF is available on — inside the document's
+//     `availableObjectFormats` and inside the row's own, the two gates every
+//     consumer applies as a conjunction. An alias is the row under another name,
+//     so it exists only where the row does: without this rule the read DECLARED
+//     an alias on a format where it did not declare the row it is an alias of;
+//   * each value is a non-empty array of distinct C identifiers;
+//   * no alias spells the row's own name.
+// The cross-row rule (an alias may not also be its own row) needs every row, so
+// the caller checks it once the symbol loop is done
+// (`refuseAliasesThatAreTheirOwnRow`).
+[[nodiscard]] bool isCIdentifier(std::string_view s) {
+    if (s.empty()) return false;
+    auto const head = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    };
+    if (!head(s.front())) return false;
+    for (char const c : s) {
+        if (!head(c) && !(c >= '0' && c <= '9')) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool decodeAliasesMap(
+    json const& node, std::string const& ctx, std::string const& rowName,
+    std::span<std::string const> documentFormats,
+    std::span<std::string const> rowFormats,
+    DiagnosticReporter& reporter,
+    std::unordered_map<std::string, std::vector<std::string>>& out) {
+    if (!node.is_object()) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases' must be a "
+            "per-object-format object whose values list the other names that format's C "
+            "library exports this object under, e.g. {\"elf\": [\"__environ\", \"_environ\"]}");
+        return false;
+    }
+    bool ok = true;
+    for (auto const& kv : node.items()) {
+        auto const keyKind = objectFormatKindFromName(kv.key());
+        if (!keyKind.has_value()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx
+                + ": 'aliases' has unknown object-format key '" + kv.key()
+                + "' (expected one of the object-format names: "
+                + allowedList(kSelectableObjectFormatKindNames) + ")");
+            ok = false;
+            continue;
+        }
+        if (!isSelectableObjectFormatKind(*keyKind)) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx
+                + ": 'aliases' names the invalid sentinel — "
+                + std::string{kObjectFormatKindSentinelRejection});
+            ok = false;
+            continue;
+        }
+        // The row's two gates, each EMPTY ⇒ unrestricted, asked with the ONE shared
+        // predicate — the question the injector and the realization oracle ask of
+        // the row itself.
+        bool const documentHasIt = objectFormatInAvailabilitySet(documentFormats, *keyKind);
+        if (!documentHasIt || !objectFormatInAvailabilitySet(rowFormats, *keyKind)) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + kv.key()
+                + "' lists other names of '" + rowName + "' on the object format '" + kv.key()
+                + "', where " + (documentHasIt ? "the row's" : "the document's")
+                + " own 'availableObjectFormats' says '" + rowName + "' does not exist — an "
+                  "alias is the row under another name, so it is listed only for a format the "
+                  "row is available on");
+            ok = false;
+            continue;
+        }
+        if (!kv.value().is_array() || kv.value().empty()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + kv.key()
+                + "' must be a NON-EMPTY array of names (omit the format to say it has none)");
+            ok = false;
+            continue;
+        }
+        std::vector<std::string> names;
+        for (auto const& e : kv.value()) {
+            if (!e.is_string() || !isCIdentifier(e.get<std::string>())) {
+                emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + kv.key()
+                    + "' holds an entry that is not a C identifier string");
+                ok = false;
+                continue;
+            }
+            std::string alias = e.get<std::string>();
+            if (alias == rowName) {
+                emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + kv.key()
+                    + "' lists the row's own name '" + rowName + "' — an alias is ANOTHER name "
+                      "of the object");
+                ok = false;
+                continue;
+            }
+            if (std::find(names.begin(), names.end(), alias) != names.end()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + kv.key()
+                    + "' lists '" + alias + "' twice");
+                ok = false;
+                continue;
+            }
+            names.push_back(std::move(alias));
+        }
+        out.insert_or_assign(kv.key(), std::move(names));
+    }
+    return ok;
+}
+
+// The cross-row half of the alias rule, over the RAW `symbols` array so it holds
+// for every format at once (the decoded rows are one pair's): an alias may not
+// also be a row of its own on a format where both exist. Two rows for one object
+// are two declarations the linker cannot know are one — exactly the ambiguity
+// the alias key exists to remove. Reports each offence; returns false if any.
+[[nodiscard]] bool refuseAliasesThatAreTheirOwnRow(
+    json const& symbols, std::vector<std::string> const& documentFormats,
+    std::string const& pathStr, DiagnosticReporter& reporter) {
+    // name -> every format some row of that name is available on.
+    std::unordered_map<std::string, std::vector<std::string>> rowFormats;
+    auto formatsOf = [&](json const& sym) {
+        std::vector<std::string> f;
+        if (sym.contains("availableObjectFormats") && sym.at("availableObjectFormats").is_array()) {
+            for (auto const& e : sym.at("availableObjectFormats"))
+                if (e.is_string()) f.push_back(e.get<std::string>());
+        }
+        if (f.empty()) f = documentFormats;
+        if (f.empty()) {
+            for (auto const& n : kSelectableObjectFormatKindNames) f.emplace_back(n);
+        }
+        return f;
+    };
+    for (auto const& sym : symbols) {
+        if (!sym.is_object() || !sym.contains("name") || !sym.at("name").is_string()) continue;
+        auto& dst = rowFormats[sym.at("name").get<std::string>()];
+        for (std::string const& f : formatsOf(sym)) dst.push_back(f);
+    }
+    bool ok = true;
+    std::size_t idx = 0;
+    for (auto const& sym : symbols) {
+        std::size_t const at = idx++;
+        if (!sym.is_object() || !sym.contains("aliases") || !sym.at("aliases").is_object()) continue;
+        std::string const rowName =
+            sym.contains("name") && sym.at("name").is_string() ? sym.at("name").get<std::string>() : std::string{};
+        for (auto const& kv : sym.at("aliases").items()) {
+            if (!kv.value().is_array()) continue;   // shape refused by decodeAliasesMap
+            for (auto const& e : kv.value()) {
+                if (!e.is_string()) continue;
+                std::string const alias = e.get<std::string>();
+                auto const it = rowFormats.find(alias);
+                if (it == rowFormats.end()) continue;
+                if (std::find(it->second.begin(), it->second.end(), kv.key()) == it->second.end()) continue;
+                emitMalformed(reporter, "shipped-lib descriptor '" + pathStr + "' symbols["
+                    + std::to_string(at) + "] ('" + rowName + "'): its alias '" + alias
+                    + "' on the object format '" + kv.key() + "' is ALSO a row of its own there — "
+                      "one object has one row, and its other names are its aliases");
+                ok = false;
+            }
+        }
+    }
+    return ok;
+}
+
 [[nodiscard]] bool decodeRealizationMap(
     json const& node, std::string const& ctx, std::string const& field,
     DiagnosticReporter& reporter,
@@ -2264,6 +2515,7 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
                 bool okVariants = true;
                 std::size_t matchCount = 0;
                 bool selectedUnrealized = false;   // P68 round 9: an abiTypedef arm the pair lacks
+                std::vector<std::pair<std::string, WhenSpec>> guardedArms;   // the block's ambiguity rule
                 std::size_t vidx = 0;
                 for (auto const& vdef : t.at("variants")) {
                     std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
@@ -2288,7 +2540,7 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
                     WhenMatch const wm = matchVariantWhen(
                         vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
                         whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts),
-                        reporter);
+                        reporter, nullptr, &guardedArms);
                     if (wm == WhenMatch::Error) { okVariants = false; break; }
                     if (wm == WhenMatch::Match) {
                         ++matchCount;
@@ -2299,6 +2551,14 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
                     }
                 }
                 if (!okVariants) continue;
+                // The block's ambiguity, on every read (`firstCoMatchingArms`).
+                if (auto const co = firstCoMatchingArms(guardedArms, WhenAxes::FullTarget)) {
+                    dss::report(reporter, DiagnosticCode::F_ShippedTypedefVariantAmbiguous,
+                                DiagnosticSeverity::Error,
+                                "shipped-lib descriptor " + at + ": typedef '" + tname + "' "
+                                    + coMatchingArmsSentence(*co));
+                    continue;
+                }
                 if (matchCount > 1) {
                     dss::report(reporter, DiagnosticCode::F_ShippedTypedefVariantAmbiguous,
                                 DiagnosticSeverity::Error,
@@ -3118,6 +3378,7 @@ if (doc.contains("constants")) {
                     : std::string{};
             bool okVariants = true;
             std::size_t matchCount = 0;
+            std::vector<std::pair<std::string, WhenSpec>> guardedArms;   // the block's ambiguity rule
             std::size_t vidx = 0;
             for (auto const& vdef : c.at("variants")) {
                 std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
@@ -3134,32 +3395,16 @@ if (doc.contains("constants")) {
                                                   "(e.g. {\"arch\":\"x86_64\",\"format\":\"elf\"})");
                     okVariants = false; break;
                 }
-                // D-FFI-DESCRIPTOR-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR:
-                // a PREPROCESSOR-VISIBLE constant may select on `format`
-                // ONLY. The preprocessor splice has the active object-format
-                // and no active ARCH (macros are format-only there for the
-                // same reason), so an arch-keyed visible constant would
-                // select in the semantic tier and be ABSENT from `#if` on
-                // every target — the exact silent divergence this row
-                // closed, re-introduced one axis over. Refused at LOAD, on
-                // every target, rather than left to be discovered by a
-                // branch that quietly went the other way.
-                if (cPpVisible) {
-                    for (auto const& [wk, wv] : vdef.at("when").items()) {
-                        (void)wv;
-                        if (wk == "format") continue;
-                        emitMalformed(reporter, "shipped-lib descriptor " + vat
-                            + ": a 'preprocessorVisible' constant may select its "
-                              "variants on 'format' only (found '" + wk
-                            + "'). The preprocessor splice threads the active "
-                              "object-format and no arch/data-model, so any other "
-                              "axis would reach the semantic tier and NOT the "
-                              "`#if` evaluator. Declare \"preprocessorVisible\": "
-                              "false if this constant is semantic-only.");
-                        okVariants = false; break;
-                    }
-                    if (!okVariants) break;
-                }
+                // A PREPROCESSOR-VISIBLE constant selects on the FULL pair, like
+                // every typed surface (D-FFI-FCNTL-AARCH64-OPEN-FLAGS-TAKE-X86-64-VALUES).
+                // It used to be refused any axis but `format`, because the
+                // splice threaded no arch — and that made a per-ARCH value
+                // inexpressible: Linux aarch64's <fcntl.h> overrides
+                // O_DIRECTORY/O_NOFOLLOW, so `fcntl.json` keyed them by format
+                // and aarch64 silently got x86_64's bits. The splice now reads
+                // this surface with the pair's arch, data model and long-double
+                // format (`SynthBuilder::activeTarget` + `pairFacts`), so the
+                // `#if` evaluator and the semantic tier select the SAME arm.
                 // Decode this variant's {value,type} EAGERLY (every variant), so
                 // a malformed inactive variant fails the read on every target.
                 std::int64_t vValue = 0;
@@ -3172,7 +3417,7 @@ if (doc.contains("constants")) {
                 WhenMatch const wm = matchVariantWhen(
                     vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
                     whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts),
-                    reporter);
+                    reporter, nullptr, &guardedArms);
                 if (wm == WhenMatch::Error) { okVariants = false; break; }
                 if (wm == WhenMatch::Match) {
                     ++matchCount;
@@ -3180,6 +3425,14 @@ if (doc.contains("constants")) {
                 }
             }
             if (!okVariants) continue;
+            // The block's ambiguity, on every read (`firstCoMatchingArms`).
+            if (auto const co = firstCoMatchingArms(guardedArms, WhenAxes::FullTarget)) {
+                dss::report(reporter, DiagnosticCode::F_ShippedConstantVariantAmbiguous,
+                            DiagnosticSeverity::Error,
+                            "shipped-lib descriptor " + at + ": constant '" + cname + "' "
+                                + coMatchingArmsSentence(*co));
+                continue;
+            }
             if (matchCount > 1) {
                 dss::report(reporter, DiagnosticCode::F_ShippedConstantVariantAmbiguous,
                             DiagnosticSeverity::Error,
@@ -3209,6 +3462,105 @@ if (doc.contains("constants")) {
     return true;
 }
 
+// (5.5) Optional `floatConstants` array (c52, D-FFI-MATH-INFINITY) — the
+// FLOAT-valued sibling of `constants` (which is integer-ONLY; a float there
+// still fails loud). A header's float object-like macros (`INFINITY`, `NAN`,
+// `HUGE_VAL`) ship here. Each: required non-empty `name`; required hir-text
+// `type` that MUST decode to a FLOAT SCALAR (F32/F64); required STRING `value`
+// (JSON has no Infinity or NaN literal — "inf"/"+inf"/"-inf" map to ±infinity,
+// "nan"/"+nan"/"-nan" to the quiet NaN, any other string is a finite float
+// literal). Collect-all (continue on error; the read still fails via the
+// errorCount delta). A non-float-scalar type or an un-parseable /
+// silently-overflowing value FAILS LOUD — never a silent wrong constant. No
+// per-target `variants` (every float constant shipped is target-invariant
+// IEEE-754; a future per-target float would be its own cycle). A `false`
+// return means the array itself was malformed.
+//
+// ★ ONE DECODE FOR BOTH READERS (P69 round 4,
+// D-FFI-DESCRIPTOR-FLOAT-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR): the semantic
+// read (`readShippedLibDescriptor`) and the preprocessor's interner-free read
+// (`readShippedLibFloatConstants`) both decode through here — the
+// `decodeShippedConstants` precedent — so the macro the preprocessor splices and
+// the row a non-preprocessing consumer is injected cannot disagree on a value or
+// a type. It was inline in the semantic read while that was its only reader.
+[[nodiscard]] bool
+decodeShippedFloatConstants(json const& doc, std::string const& pathStr,
+                            TypeInterner& interner, TypeRegistry& typeReg,
+                            DiagnosticReporter& reporter,
+                            std::vector<ShippedFloatConstant>& out,
+                            std::span<NamedTypeBinding const> namedTypes) {
+    if (!doc.contains("floatConstants")) return true;
+    if (!doc.at("floatConstants").is_array()) {
+        emitMalformed(reporter, std::string{"shipped-lib descriptor '"} + pathStr
+                                    + "': 'floatConstants' must be an array");
+        return false;
+    }
+    json const& fconstants = doc.at("floatConstants");
+    out.reserve(out.size() + fconstants.size());
+    std::size_t fcidx = 0;
+    for (auto const& c : fconstants) {
+        std::string const at = std::string{"'"} + pathStr
+            + "' floatConstants[" + std::to_string(fcidx) + "]";
+        ++fcidx;
+        if (!c.is_object()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+            continue;
+        }
+        (void)rejectUnknownKeys(reporter, c,
+                                "floatConstants[" + std::to_string(fcidx - 1) + "]",
+                                {"name", "value", "type"});
+        if (!c.contains("name") || !c.at("name").is_string()
+            || c.at("name").get<std::string>().empty()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at
+                                        + ": missing or empty 'name'");
+            continue;
+        }
+        std::string cname = c.at("name").get<std::string>();
+
+        // `type` must decode to a FLOAT SCALAR (F32/F64). A non-float-scalar
+        // (or undecodable) type fails loud F_ShippedLibUnsupportedType — the
+        // float-surface sibling of the integer gate (so an INTEGER in
+        // `floatConstants` is just as out-of-scope as a float in `constants`).
+        if (!c.contains("type") || !c.at("type").is_string()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at
+                                        + ": missing or non-string 'type'");
+            continue;
+        }
+        std::string const typeText = c.at("type").get<std::string>();
+        TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes);
+        if (!cty.valid() || cty == InvalidType) {
+            dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                        DiagnosticSeverity::Error,
+                        "shipped-lib descriptor " + at + ": float constant '" + cname
+                            + "' has a 'type' that failed to decode ('" + typeText + "')");
+            continue;
+        }
+        if (!isFloatScalarKind(interner.kind(cty))) {
+            dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                        DiagnosticSeverity::Error,
+                        "shipped-lib descriptor " + at + ": float constant '" + cname
+                            + "' type '" + typeText + "' is not a float scalar "
+                              "(a 'floatConstants' entry must be f32/f64; an integer "
+                              "constant belongs in 'constants')");
+            continue;
+        }
+        if (!c.contains("value")) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at + ": missing 'value'");
+            continue;
+        }
+        auto const dv = decodeFloatConstantValue(c.at("value"));
+        if (!dv.has_value()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at + ": float constant '"
+                + cname + "' has an invalid 'value' (expected a string: \"inf\"/\"+inf\"/"
+                          "\"-inf\", \"nan\"/\"+nan\"/\"-nan\", or a finite float literal; an "
+                          "out-of-range finite literal that overflows to infinity is rejected)");
+            continue;
+        }
+        out.push_back(ShippedFloatConstant{std::move(cname), *dv, cty});
+    }
+    return true;
+}
+
 } // namespace
 
 // See the header. The counters live beside the cache they describe and share its
@@ -3218,18 +3570,23 @@ ShippedDescriptorCacheStats shippedDescriptorCacheStats() { return cacheStats();
 namespace {
 
 // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER + Cycle-2 D-CSUBSET-C11-THREADS-TRAMPOLINES) +
-// D-FFI-PE-CRT-UCRT-MIGRATION Phase 3: the CLOSED pe64 synth-recipe vocabulary — 31
-// recipes across TWO families: 25 <threads.h> + 6 <stdio.h>. Each is named for the C
-// function it implements (the `synthesize` value MUST equal the symbol name); rows are
-// grouped by family for auditability.
+// D-FFI-PE-CRT-UCRT-MIGRATION Phase 3: the CLOSED synth-recipe vocabulary (pe and Mach-O)
+// — 24 recipes, ONE family since P69: <threads.h>. Each is named for the C function it
+// implements (the `synthesize` value MUST equal the symbol name); rows are grouped by
+// family for auditability.
 //
-// <threads.h> (25): Cycle 1 shipped the 18 single-basic-block recipes; Cycle 2 adds
+// <threads.h> (24): Cycle 1 shipped the 18 single-basic-block recipes; Cycle 2 adds
 // thrd_create (a branchless SINGLE block — DIRECT-PASS to CreateThread, no closure: the
-// C11 int(*)(void*) start routine has the SAME x64 ABI as the Win32 DWORD(*)(void*)),
-// call_once (SINGLE block over InitOnceExecuteOnce, via the module-scoped __dss_once_tramp
-// adapter the synth pass emits once + address-takes), and thrd_join (the first MULTI-block
-// recipe — `WaitForSingleObject; if(res) GetExitCodeThread; CloseHandle`, its canonical
-// StructCfMarkers rederived module-wide after finish()).
+// C11 int(*)(void*) start routine has the SAME x64 ABI as the Win32 DWORD(*)(void*)) and
+// thrd_join (the first MULTI-block recipe — `WaitForSingleObject; if(res)
+// GetExitCodeThread; CloseHandle`, its canonical StructCfMarkers rederived module-wide
+// after finish()). ★ P69 RETIRED `call_once`, Cycle 2's third: C23 7.24p2 declares it in
+// <stdlib.h> too, so a recipe would have synthesized its body into every pe and Mach-O
+// program that included <stdlib.h>; and its pe body needed an adapter for
+// InitOnceExecuteOnce's callback shape, which is C, not stateless glue. It is DSS's
+// runtime source on pe (runtime/platform/src/threads_once.c, realized identically from
+// threads.json and stdlib.json) and libSystem's own `pthread_once` on Mach-O (the row's
+// linkName) — a negative in the vocabulary tests now.
 //
 // Cycle 3 (D-CSUBSET-C11-THREADS-TIMED, P49 lane tw) adds the LAST FOUR — thrd_sleep,
 // mtx_timedlock, cnd_timedwait, thrd_equal — closing the header on all three formats.
@@ -3242,18 +3599,15 @@ namespace {
 // The only <threads.h> function still deferred is macho `mtx_recursive`'s semantics
 // (D-CSUBSET-C11-THREADS-MACHO-MTX-PLAIN-RECURSIVE) — a mutex TYPE, not a function.
 //
-// <stdio.h> (6): the WHOLE printf/scanf family the UCRT leaves undefined — `printf`,
-// `fprintf`, `sprintf`, `snprintf`, `vfprintf`, `sscanf`. `ucrtbase.dll` exports NOT ONE of
-// those six names (MEASURED, `objdump -p C:/Windows/System32/ucrtbase.dll`; msvcrt.dll
-// exports all but `snprintf`, which is exactly why the other five only became shims when
-// the pe CRT flipped — and why `snprintf` was NEVER importable on pe under either CRT): in
-// a real MSVC build each is a HEADER INLINE over one of the `__stdio_common_v*` cores, so a
-// compiler that binds the CRT by export table finds nothing to import and must synthesize
-// the body. This table is the loader's ADVERTISED vocabulary, so it lists what actually
-// ships: a row here with no descriptor row and no synth arm would advertise a recipe that
-// cannot be used. Each FURTHER printf-family recipe (the `_s` family, the wide twins) lands
-// together with its stdio.json row, its `__stdio_common_v*` core's symbol row, and a
-// runtime witness — never ahead of them.
+// <stdio.h>: NONE since P69. The UCRT leaves its whole printf/scanf family undefined
+// (ucrtbase.dll exports only the `__stdio_common_v*` cores), and six of those bodies were
+// once synthesized here as MIR recipes. They are DSS's runtime SOURCE now —
+// runtime/platform/src/stdio.c over stdio_ucrt.c's primitives, rows realized by stdio.json
+// — because owning a format parse (D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM) is
+// nontrivial control flow, which the shipped-source tier exists for, and the compiler
+// synthesizes only stateless glue. This table is the loader's ADVERTISED vocabulary, so it
+// lists what actually ships: a row here with no descriptor row and no synth arm would
+// advertise a recipe that cannot be used.
 //
 // A closed `contains`-check — never an `if (id == ...)` chain that could silently drift;
 // MUST stay in lock-step with each family's synth-pass switch (a vocab id with no arm
@@ -3277,18 +3631,11 @@ constexpr RecipeRow kRecipes[] = {
     {"tss_set", ShimFamily::Threads},       {"tss_delete", ShimFamily::Threads},
     {"thrd_current", ShimFamily::Threads},  {"thrd_yield", ShimFamily::Threads},
     {"thrd_exit", ShimFamily::Threads},     {"thrd_detach", ShimFamily::Threads},
-    // Cycle 2 (direct-pass / trampoline / multi-block)
+    // Cycle 2 (direct-pass / multi-block; call_once, the trampoline, retired in P69)
     {"thrd_create", ShimFamily::Threads},   {"thrd_join", ShimFamily::Threads},
-    {"call_once", ShimFamily::Threads},
     // Cycle 3 (the timed waits + the identity predicate) — D-CSUBSET-C11-THREADS-TIMED
     {"thrd_sleep", ShimFamily::Threads},    {"mtx_timedlock", ShimFamily::Threads},
     {"cnd_timedwait", ShimFamily::Threads}, {"thrd_equal", ShimFamily::Threads},
-    // <stdio.h> printf/scanf family — synthesized over the UCRT __stdio_common_v* cores,
-    // which ucrtbase exports in place of any concrete printf/sprintf/…
-    // (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3). See the note above for why these six and no more.
-    {"printf", ShimFamily::Stdio},          {"fprintf", ShimFamily::Stdio},
-    {"sprintf", ShimFamily::Stdio},         {"snprintf", ShimFamily::Stdio},
-    {"vfprintf", ShimFamily::Stdio},        {"sscanf", ShimFamily::Stdio},
 };
 
 } // namespace
@@ -3796,6 +4143,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                             : std::string{};
                     bool okVariants = true;
                     std::size_t matchCount = 0;
+                    std::vector<std::pair<std::string, WhenSpec>> guardedArms;   // the block's ambiguity rule
                     std::size_t vidx = 0;
                     for (auto const& vdef : sdef.at("variants")) {
                         std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
@@ -3840,7 +4188,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         WhenMatch const wm = matchVariantWhen(
                             vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
                             whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts),
-                            reporter);
+                            reporter, nullptr, &guardedArms);
                         if (wm == WhenMatch::Error) { okVariants = false; break; }
                         if (wm == WhenMatch::Match) {
                             ++matchCount;
@@ -3853,6 +4201,14 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         }
                     }
                     if (!okVariants) continue;
+                    // The block's ambiguity, on every read (`firstCoMatchingArms`).
+                    if (auto const co = firstCoMatchingArms(guardedArms, WhenAxes::FullTarget)) {
+                        dss::report(reporter, DiagnosticCode::F_ShippedStructVariantAmbiguous,
+                                    DiagnosticSeverity::Error,
+                                    "shipped-lib descriptor " + at + ": struct '" + sname + "' "
+                                        + coMatchingArmsSentence(*co));
+                        continue;
+                    }
                     if (matchCount > 1) {
                         // >1 variant matched the active target — a silent
                         // wrong-layout risk (which would be picked?). Fail loud.
@@ -3981,6 +4337,63 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // is selected for — built once; the long-double format rides in from the
     // caller's pair facts.
     WhenFacts const symFacts = whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts);
+    // ★ P69 (lane lm, plan M2) — A SIGNATURE NAMING A TYPE THIS READ DID NOT PUBLISH.
+    // The (3.struct.pre) gate's rule, applied to a symbol: a name this descriptor
+    // DECLARES — a `typedefs` entry (a `shippedTypedef` reference included), a `unions`
+    // or a `structs` entry — whose variants selected nothing on this read (or whose
+    // owner publishes nothing here) does not exist on this read, so neither does a
+    // function whose prototype names it — where the symbol does not CLAIM this read:
+    // a read with no object format, or a pair its declared availability excludes. Then
+    // the symbol is ABSENT here, exactly as the typedef is. `fpos_t` is format-keyed
+    // (glibc's 16-byte struct, the UCRT's and libSystem's `long long`) and fgetpos/fsetpos
+    // declare elf/macho/pe, so on a format-less read (the LSP's language-only mode, the
+    // direct API) and on the wasm32/spirv pairs the consistency sweeps cross, there is
+    // no `fgetpos`; `once_flag` likewise for `call_once`. ✔MEASURED P69 before this
+    // rule: those reads refused the WHOLE descriptor ("unknown type 'fpos_t'"), and
+    // the editor squiggled every buffer including <stdio.h>
+    // (LspDriverAgreement.EditorAcceptsAConsumedStdioTheDriverAccepts).
+    // FAIL-LOUD SURVIVES, twice: a symbol that CLAIMS the pair is refused when the pair
+    // lacks its type (P68 round 12's ruling (iii), applied at the selected arm below);
+    // and only a name this descriptor declares can make a symbol absent — a name it
+    // declares nowhere, a typo, still reaches the decoder and refuses the read on every
+    // pair. The scan is lexical over the type text:
+    // identifier tokens outside the quoted vocabulary tags (`i64 "long"`); the type
+    // grammar's own words (`ptr`, `fn`, `const` …) are never a descriptor's type name.
+    std::vector<std::string> declaredTypeNames = declaredNamesOf("typedefs");
+    for (char const* key : {"unions", "structs"}) {
+        auto more = declaredNamesOf(key);
+        declaredTypeNames.insert(declaredTypeNames.end(), more.begin(), more.end());
+    }
+    auto unpublishedDeclaredNameIn = [&](std::string_view text) -> std::optional<std::string> {
+        auto const isIdentStart = [](char c) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+        };
+        auto const isIdentChar = [&](char c) { return isIdentStart(c) || (c >= '0' && c <= '9'); };
+        std::size_t i = 0;
+        while (i < text.size()) {
+            char const c = text[i];
+            if (c == '"') {                                  // a quoted vocabulary tag
+                std::size_t const close = text.find('"', i + 1);
+                i = (close == std::string_view::npos) ? text.size() : close + 1;
+                continue;
+            }
+            if (!isIdentStart(c)) {
+                ++i;
+                continue;
+            }
+            std::size_t const start = i;
+            while (i < text.size() && isIdentChar(text[i])) ++i;
+            std::string_view const word = text.substr(start, i - start);
+            bool const declared =
+                std::find(declaredTypeNames.begin(), declaredTypeNames.end(), word)
+                != declaredTypeNames.end();
+            bool const published =
+                std::any_of(mergedNamedTypes.begin(), mergedNamedTypes.end(),
+                            [&](NamedTypeBinding const& nb) { return nb.name == word; });
+            if (declared && !published) return std::string{word};
+        }
+        return std::nullopt;
+    };
     std::size_t idx = 0;
     for (auto const& sym : symbols) {
         std::string const at =
@@ -4197,6 +4610,17 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                                      reporter, symRealization))
             continue;
 
+        // ★ P69 (lane lm): the per-symbol `aliases` map — the other names each
+        // format's C library exports this object under (`ShippedSymbol::aliases`).
+        // Every entry is validated whatever the active format — against the row's
+        // two availability gates among the rest; the active format's list is what
+        // this read carries.
+        std::unordered_map<std::string, std::vector<std::string>> symAliases;
+        if (sym.contains("aliases")
+            && !decodeAliasesMap(sym.at("aliases"), at, name, out.availableObjectFormats,
+                                 symAvail, reporter, symAliases))
+            continue;
+
         // ★ THE SIGNATURE FOR THIS PAIR (P68 round 12, S2a-1 of
         // D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES). A prototype that differs by
         // pair — C's `long` is 64-bit on LP64 and 32-bit on LLP64; `long double`
@@ -4220,12 +4644,26 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                                                        : ZeroMatch::OmitUnlessDefault,
                                          reporter, sigText, &sigArms))
             continue;
+        // (M2) The selected prototype names a type this read did not publish: the
+        // symbol does not exist on this read (see `unpublishedDeclaredNameIn`) — on a
+        // read with no object format, or on a pair its DECLARED availability excludes.
+        // Where the symbol CLAIMS the pair and the pair declares no such type, the
+        // decode below refuses it, loudly: P68 round 12's ruling (iii) — a reference
+        // takes its owner's "not declared here", and a USE of it there is an unknown
+        // type (`ShippedLibDescriptor.TypedefReferenceTakesTheOwnersAbsenceAndAUseIsRefused`)
+        // — because that symbol's availability is a claim the data cannot back.
+        bool const mayBeAbsentHere = !activeFormat.has_value() || !availableHere;
+        bool const absentHere = mayBeAbsentHere && !sigText.empty()
+                             && unpublishedDeclaredNameIn(sigText).has_value();
         // EAGER: every arm must decode as a TYPE, the active one or not — an arm
         // no current pair selects would otherwise lurk until that pair is first
-        // compiled.
+        // compiled. (M2) An arm naming a type this read did not publish cannot be
+        // decoded HERE; it is decoded on every read that publishes the name, which the
+        // all-pair sweeps cross.
         bool armsOk = true;
         for (std::string const& arm : sigArms) {
             if (arm == sigText) continue;               // decoded below, with its claim
+            if (unpublishedDeclaredNameIn(arm).has_value()) continue;
             TypeId const armSig = parseTypeFromText(arm, interner, typeReg, reporter, mergedNamedTypes);
             if (!armSig.valid() || armSig == InvalidType) {
                 dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
@@ -4238,16 +4676,18 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             }
         }
         if (!armsOk) continue;
-        // No arm and no default on a pair the symbol is NOT available on: it is not
-        // injected here (every arm was still decoded above).
-        if (sigText.empty()) continue;
+        // No arm and no default on a pair the symbol is NOT available on, or on a read
+        // that cannot decide its arms: it is not injected here (every arm this read can
+        // decode was still decoded above). Nor is one whose prototype names a type this
+        // read did not publish (M2).
+        if (sigText.empty() || absentHere) continue;
 
         // Reject unknown per-symbol keys (closed key set).
         (void)rejectUnknownKeys(reporter, sym, "symbols[" + std::to_string(idx - 1) + "]",
                                 {"name", "signature",
                                  "kind", "linkage", "availableObjectFormats",
                                  "noreturn", "returnsTwice", "synthesize", "version",
-                                 "linkName", "library", "realization"});
+                                 "linkName", "library", "realization", "aliases"});
 
         // Decode the pair's signature via the ONE type-text decoder. A decode
         // failure is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
@@ -4286,7 +4726,34 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                           std::move(version), std::move(linkName),
                           std::move(symLibrary), std::move(symRealization),
                           std::move(symLibraryRoles)});
+
+        // ★ P69 (lane lm): the active format's aliases, each ALSO a declared row
+        // of its own name (`ShippedSymbol::aliases` says why). An alias row is the
+        // canonical row under another name: the same declaration and library, its
+        // OWN name as the exported name (an alias IS an export of the library, so
+        // no `linkName` rename carries over), available on this format alone, and
+        // `aliasOf` naming the canonical row. A pair-less read selects no format
+        // and appends none.
+        if (activeFormat.has_value()) {
+            std::string const fmtName{objectFormatKindName(*activeFormat)};
+            if (auto const it = symAliases.find(fmtName); it != symAliases.end()) {
+                out.symbols.back().aliases = it->second;
+                ShippedSymbol const canonical = out.symbols.back();
+                for (std::string const& alias : canonical.aliases) {
+                    ShippedSymbol row = canonical;
+                    row.name                   = alias;
+                    row.aliases.clear();
+                    row.aliasOf                = canonical.name;
+                    row.linkName.clear();
+                    row.availableObjectFormats = {fmtName};
+                    out.symbols.push_back(std::move(row));
+                }
+            }
+        }
     }
+    // The cross-row half of the alias rule — format-independent, over the raw rows.
+    (void)refuseAliasesThatAreTheirOwnRow(symbols, out.availableObjectFormats,
+                                          core::genericSpelling(path), reporter);
 
     // ══ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — R1 + R3, AT LOAD ==========
     //
@@ -4296,14 +4763,6 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // format — 39 of the 40 descriptors declare no `realization` at all and pay
     // literally nothing.
     {
-        // Generic over the mapped type: the `library` map holds images and the
-        // `libraryRoles` map holds roles, and BOTH are overridden per symbol by
-        // the same base-then-override rule.
-        auto effective = [](auto const& base, auto const& ov) {
-            auto m = base;
-            for (auto const& [k, v] : ov) m.insert_or_assign(k, v);
-            return m;
-        };
         // ★★★ THE IMPORT R3 IS ABOUT IS DECLARED IN EITHER SPELLING, AND READING
         // THE RESOLVED IMAGE MAP ALONE NARROWS THE RULE FROM FORMAT-INDEPENDENT
         // TO RESOLVER-DEPENDENT
@@ -4376,13 +4835,50 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 }
             };
         checkOwner(out.library, out.libraryRoles, out.realization, "(root)");
+        // ★ R3 PRECEDENCE (P69, M1 of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES). Two owners
+        // are refused at ONE level only. A symbol's OWN `realization.F` beside the IMPORT
+        // it would INHERIT from its descriptor on F is not two owners: the symbol names
+        // its one body, exactly as a per-symbol `library` override names its one image.
+        // That is the shape a C library's gap takes — <stdlib.h>'s descriptor imports
+        // from the C library on every format while `memalignment`, which no platform
+        // exports, is DSS's shipped source. Merging the two maps first (as this check
+        // once did) refused every such row. What stays refused, each naming both owners:
+        //   (1) the root's own import and source on one format (checked above);
+        //   (2) the symbol's own import and its own source on one format;
+        //   (3) the symbol's own import on a format its DESCRIPTOR realizes from source —
+        //       a symbol re-importing what its whole header ships as source.
         for (std::size_t i = 0; i < out.symbols.size(); ++i) {
-            auto const& sym = out.symbols[i];
+            auto& sym = out.symbols[i];
             if (sym.realization.empty() && out.realization.empty()) continue;
-            checkOwner(effective(out.library, sym.library),
-                       effective(out.libraryRoles, sym.libraryRoles),
-                       effective(out.realization, sym.realization),
-                       "symbols[" + std::to_string(i) + "] ('" + sym.name + "')");
+            std::string const ctx = "symbols[" + std::to_string(i) + "] ('" + sym.name + "')";
+            checkOwner(sym.library, sym.libraryRoles, sym.realization, ctx);   // (2), and R1
+            for (auto const& [fmt, src] : out.realization) {                    // (3)
+                if (sym.realization.contains(fmt)) continue;
+                if (std::string const declared =
+                        declaredImport(sym.library, sym.libraryRoles, fmt);
+                    !declared.empty()) {
+                    // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R3, case (3) above.
+                    emitMalformed(reporter,
+                        "shipped-lib descriptor '" + core::genericSpelling(path) + "' "
+                        + ctx + " declares its own import (" + declared
+                        + ") for the object format '" + fmt + "', where its descriptor "
+                          "realizes every symbol from source ('realization." + fmt
+                        + ".source' = '" + src + "') — two owners for one body: drop "
+                          "the symbol's import, or give the format's body to one of them");
+                }
+            }
+            // The supersession, recorded where every consumer already reads it: an EMPTY
+            // image on the symbol for each format its own source realizes. Each consumer
+            // merges the descriptor's `library` and then the symbol's over it (the
+            // injector, the hand-declared realization, `realizeRow`), and an empty image
+            // is the value every binder fold already routes UNBOUND
+            // (D-FFI-DESCRIPTOR-KNOWN-NAME-HAS-NO-LIBRARY-FOR-FORMAT) — so a
+            // user-declared twin of the row cannot bind the inherited image either.
+            for (auto const& [fmt, src] : sym.realization) {
+                (void)src;
+                if (!declaredImport(out.library, out.libraryRoles, fmt).empty())
+                    sym.library.insert_or_assign(fmt, std::string{});
+            }
         }
     }
 
@@ -4397,88 +4893,12 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         return std::nullopt;
     }
 
-    // (5.5) Optional `floatConstants` array (c52, D-FFI-MATH-INFINITY) — the
-    // FLOAT-valued sibling of `constants` (which is integer-ONLY; a float there
-    // still fails loud). A header's float object-like macros (`INFINITY`, `M_PI`,
-    // `DBL_MAX`) ship here. Each: required non-empty `name`; required hir-text
-    // `type` that MUST decode to a FLOAT SCALAR (F32/F64); required STRING `value`
-    // (JSON has no Infinity literal — "inf"/"+inf"/"-inf" map to ±infinity, any
-    // other string is a finite float literal). Collect-all (continue on error; the
-    // read still fails via the errorCount delta). A non-float-scalar type or an
-    // un-parseable / silently-overflowing value FAILS LOUD — never a silent wrong
-    // constant. No per-target `variants` (every float constant here — INFINITY — is
-    // target-invariant IEEE-754; a future per-target float would be its own cycle).
-    if (doc.contains("floatConstants")) {
-        if (!doc.at("floatConstants").is_array()) {
-            emitMalformed(reporter,
-                std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
-                    + "': 'floatConstants' must be an array");
-            return std::nullopt;
-        }
-        json const& fconstants = doc.at("floatConstants");
-        out.floatConstants.reserve(fconstants.size());
-        std::size_t fcidx = 0;
-        for (auto const& c : fconstants) {
-            std::string const at = std::string{"'"} + core::genericSpelling(path)
-                + "' floatConstants[" + std::to_string(fcidx) + "]";
-            ++fcidx;
-            if (!c.is_object()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
-                continue;
-            }
-            (void)rejectUnknownKeys(reporter, c,
-                                    "floatConstants[" + std::to_string(fcidx - 1) + "]",
-                                    {"name", "value", "type"});
-            if (!c.contains("name") || !c.at("name").is_string()
-                || c.at("name").get<std::string>().empty()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at
-                                            + ": missing or empty 'name'");
-                continue;
-            }
-            std::string cname = c.at("name").get<std::string>();
-
-            // `type` must decode to a FLOAT SCALAR (F32/F64). A non-float-scalar
-            // (or undecodable) type fails loud F_ShippedLibUnsupportedType — the
-            // float-surface sibling of the integer gate (so an INTEGER in
-            // `floatConstants` is just as out-of-scope as a float in `constants`).
-            if (!c.contains("type") || !c.at("type").is_string()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at
-                                            + ": missing or non-string 'type'");
-                continue;
-            }
-            std::string const typeText = c.at("type").get<std::string>();
-            TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter, mergedNamedTypes);
-            if (!cty.valid() || cty == InvalidType) {
-                dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
-                            DiagnosticSeverity::Error,
-                            "shipped-lib descriptor " + at + ": float constant '" + cname
-                                + "' has a 'type' that failed to decode ('" + typeText + "')");
-                continue;
-            }
-            if (!isFloatScalarKind(interner.kind(cty))) {
-                dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
-                            DiagnosticSeverity::Error,
-                            "shipped-lib descriptor " + at + ": float constant '" + cname
-                                + "' type '" + typeText + "' is not a float scalar "
-                                  "(a 'floatConstants' entry must be f32/f64; an integer "
-                                  "constant belongs in 'constants')");
-                continue;
-            }
-            if (!c.contains("value")) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at + ": missing 'value'");
-                continue;
-            }
-            auto const dv = decodeFloatConstantValue(c.at("value"));
-            if (!dv.has_value()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at + ": float constant '"
-                    + cname + "' has an invalid 'value' (expected a string: \"inf\"/\"+inf\"/"
-                              "\"-inf\" or a finite float literal; an out-of-range finite "
-                              "literal that overflows to infinity is rejected)");
-                continue;
-            }
-            out.floatConstants.push_back(
-                ShippedFloatConstant{std::move(cname), *dv, cty});
-        }
+    // (5.5) `floatConstants` — decoded through the ONE shared chokepoint (see
+    // `decodeShippedFloatConstants`), which the preprocessor's interner-free
+    // `readShippedLibFloatConstants` reads too (P69 round 4).
+    if (!decodeShippedFloatConstants(doc, core::genericSpelling(path), interner, typeReg,
+                                     reporter, out.floatConstants, mergedNamedTypes)) {
+        return std::nullopt;
     }
 
     // (6) `typedefs` — resolved EARLY, at (3.pre), BEFORE structs/symbols/
@@ -4615,11 +5035,11 @@ readShippedLibConstants(std::filesystem::path const&    path,
 
     TypeLattice lattice{CompilationUnitId{1}};
     // P68 round 9: the data model a variant is selected by is the PAIR's, or none.
-    // This read used to select under LP64 unconditionally — harmless while a
-    // preprocessor-visible constant could key its variants on `format` alone (it
-    // still must), and wrong the moment a derived row's `of` names a typedef
-    // keyed `{dataModel, format}` (`int64_t`): with no pair that selection must
-    // miss, not borrow LP64's answer. An empty name matches no `dataModel` key.
+    // This read used to select under LP64 unconditionally — wrong the moment a
+    // derived row's `of` names a typedef keyed `{dataModel, format}` (`int64_t`),
+    // and wrong for a visible constant itself since such a constant may select on
+    // the full pair (P69): with no pair the selection must miss, not borrow LP64's
+    // answer. An empty name matches no `dataModel` key.
     std::optional<DataModel> const pairModel =
         pairFacts != nullptr ? pairFacts->dataModel : std::optional<DataModel>{};
     std::string const activeModelName =
@@ -4672,6 +5092,56 @@ readShippedLibConstants(std::filesystem::path const&    path,
             std::string{lattice.interner().vocabularyName(c.type)}});
     }
     return out;   // empty ⇒ no constants, or none preprocessor-visible
+}
+
+std::optional<std::vector<ShippedPpFloatConstant>>
+readShippedLibFloatConstants(std::filesystem::path const& path,
+                             DiagnosticReporter&          reporter) {
+    // P69 round 4 (D-FFI-DESCRIPTOR-FLOAT-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR):
+    // the `readShippedLibConstants` pattern exactly — the cached parse, a
+    // FUNCTION-LOCAL lattice whose TypeIds never escape, the ONE
+    // `decodeShippedFloatConstants` the semantic read uses, and no other surface
+    // read, so this read is never STRICTER than the full one. Only the projected
+    // {name, value, core} crosses: everything a language-shaped spelling needs.
+    // A float constant's `type` is a float SCALAR, which interns with no
+    // `namedTypes` at all.
+    std::size_t const errBefore = reporter.errorCount();
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    TypeLattice lattice{CompilationUnitId{1}};   // valid tag; see readShippedLibConstants
+    std::vector<ShippedFloatConstant> decoded;
+    if (!decodeShippedFloatConstants(*docPtr, core::genericSpelling(path), lattice.interner(),
+                                     lattice.registry(), reporter, decoded, {})) {
+        return std::nullopt;
+    }
+    if (reporter.errorCount() != errBefore) return std::nullopt;
+    std::vector<ShippedPpFloatConstant> out;
+    out.reserve(decoded.size());
+    for (auto const& c : decoded) {
+        out.push_back(ShippedPpFloatConstant{c.name, c.value, lattice.interner().kind(c.type)});
+    }
+    return out;   // empty ⇒ the descriptor declares no `floatConstants`
+}
+
+std::optional<FunctionTypeShape>
+readFunctionTypeShape(std::string_view typeText) {
+    // A private lattice and a scratch reporter: the text is a configuration
+    // document's (a language builtin's `signature`), which that document's own
+    // loader and the semantic tier's injection validate and report; this read
+    // only asks what the text SAYS, so a text it cannot decode is simply not a
+    // candidate (nullopt), never a second report of the same defect.
+    TypeLattice        lattice{CompilationUnitId{1}};   // valid tag; see readShippedLibConstants
+    DiagnosticReporter scratch;
+    TypeId const t = parseTypeFromText(typeText, lattice.interner(), lattice.registry(),
+                                       scratch, {});
+    if (!t.valid() || t == InvalidType || scratch.errorCount() != 0) return std::nullopt;
+    TypeInterner const& in = lattice.interner();
+    if (in.kind(t) != TypeKind::FnSig) return std::nullopt;
+    FunctionTypeShape shape;
+    for (TypeId const p : in.fnParams(t)) shape.operandCores.push_back(in.kind(p));
+    shape.variadic = in.fnIsVariadic(t);
+    shape.result   = in.kind(in.fnResult(t));
+    return shape;
 }
 
 std::expected<std::vector<ShippedPpTypedef>, std::string>
@@ -5156,6 +5626,18 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
                 continue;
             }
             out.push_back(std::move(name));
+            // ★ P69: a row's aliases on this format are declared names too — the
+            // full read appends a row for each (`ShippedSymbol::aliases`), so the
+            // name scan answers the same question the same way.
+            if (auto const al = sym.find("aliases"); al != sym.end() && al->is_object()) {
+                if (auto const lst = al->find(std::string{objectFormatKindName(fmt)});
+                    lst != al->end() && lst->is_array()) {
+                    for (auto const& a : *lst) {
+                        if (a.is_string() && !a.get<std::string>().empty())
+                            out.push_back(a.get<std::string>());
+                    }
+                }
+            }
         }
     }
 
@@ -5202,6 +5684,14 @@ struct CorpusSymbolRow {
     // encoding, verbatim).
     std::vector<std::string> formats;
     bool                     isObject = false;   // `kind: "object"` (vs function)
+    // P69 (lane `cs`, review M3): the row's two availability GATES kept apart — the
+    // document's and the symbol's own, each EMPTY ⇒ unrestricted — because the
+    // realization oracle applies them as a CONJUNCTION (`realizeRow`: the document
+    // gate, then the symbol gate), which `formats`' tier fallback does not. With them
+    // `shippedLibraryFunctionProvidedOnFormat` answers the binder's question without
+    // decoding a signature.
+    std::vector<std::string> documentGate;
+    std::vector<std::string> symbolGate;
 };
 
 struct CorpusIndex {
@@ -5290,11 +5780,41 @@ struct CorpusIndex {
             // TIER 1 per-symbol gate, TIER 2 the document gate, else everywhere
             // (an unrestricted row leaves `formats` EMPTY, which every consumer
             // reads through `objectFormatInAvailabilitySet` as "every format").
-            if (!scanAvailability(sym, row.formats) && hasDoc)
-                row.formats = docFormats;
+            bool const hasOwn = scanAvailability(sym, row.symbolGate);
+            if (hasOwn) row.formats = row.symbolGate;
+            else if (hasDoc) row.formats = docFormats;
+            row.documentGate = docFormats;
             auto const kindIt = sym.find("kind");
             row.isObject = kindIt != sym.end() && kindIt->is_string()
                         && kindIt->get<std::string>() == "object";
+            // ★ P69: each ALIAS is a name of the same row on the formats that
+            // list it (`ShippedSymbol::aliases`) — indexed so a program's own
+            // declaration of an alias finds the row the full read appends for it.
+            // ★ AND IT CARRIES ITS TWO GATES, LIKE EVERY OTHER ROW (P69 round 4). The
+            // full read appends an alias row for its LISTING format alone, inside a
+            // document that exists there: so the listing format is the alias row's
+            // symbol gate and the document's gate is its document gate. They were
+            // left EMPTY — "every format" — while `formats` held the listing format,
+            // so the one question answered off the gates
+            // (`shippedLibraryFunctionProvidedOnFormat`) said "provided" for an alias
+            // on formats that never list it, where the binder finds no row. Nothing
+            // in that query special-cases an alias: one availability rule answers
+            // for every row class because every row class states its gates here.
+            if (auto const al = sym.find("aliases"); al != sym.end() && al->is_object()) {
+                for (auto const& kv : al->items()) {
+                    if (!kv.value().is_array()) continue;
+                    for (auto const& a : kv.value()) {
+                        if (!a.is_string() || a.get<std::string>().empty()) continue;
+                        CorpusSymbolRow aliasRow;
+                        aliasRow.relPath      = relPath;
+                        aliasRow.formats      = {kv.key()};
+                        aliasRow.isObject     = row.isObject;
+                        aliasRow.documentGate = docFormats;
+                        aliasRow.symbolGate   = {kv.key()};
+                        idx.byName[a.get<std::string>()].push_back(std::move(aliasRow));
+                    }
+                }
+            }
             idx.byName[sym.at("name").get<std::string>()]
                 .push_back(std::move(row));
         }
@@ -5351,6 +5871,8 @@ realizeRow(ShippedLibDescriptor const& desc, ShippedSymbol const& sym,
     real.linkName   = sym.linkName;
     real.signature  = sym.signature;
     real.isFunction = sym.kind == ShippedSymbolKind::Function;
+    real.noreturn     = sym.noreturn;       // P69 (lane `cs`)
+    real.returnsTwice = sym.returnsTwice;
     // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the per-SYMBOL `realization` override
     // MERGED OVER the descriptor's map by the SAME rule as `library` directly
     // above — one merge shape for one axis pair, so the two cannot answer
@@ -5482,6 +6004,27 @@ collectShippedExternSymbolFormats() {
                                           : std::move(acc));
     }
     return byName;
+}
+
+std::optional<bool> shippedLibraryFunctionProvidedOnFormat(std::string_view name,
+                                                           ObjectFormatKind fmt) {
+    CorpusIndex const* const idx = corpusIndex();
+    if (idx == nullptr) return std::nullopt;   // discovery failed
+    auto const it = idx->byName.find(std::string{name});
+    if (it == idx->byName.end()) return false;   // `Unknown`: no row declares it
+    // `realizeShippedExternSymbols` step (3), row for row: the index holds a name's rows
+    // in the oracle's own candidate order (descriptors by relPath, a descriptor's rows in
+    // declaration order), and a row behind either gate is not declared here. The walk
+    // takes the FIRST row declared here, whatever owns its body — an image import, a
+    // synthesized shim, an image the link tier finds, or DSS's shipped source, which
+    // the binder binds as the `#include` path binds it — so that row decides, its kind
+    // with it (the binder refuses an object).
+    for (CorpusSymbolRow const& row : it->second) {
+        if (objectFormatInAvailabilitySet(row.documentGate, fmt)
+            && objectFormatInAvailabilitySet(row.symbolGate, fmt))
+            return !row.isObject;
+    }
+    return false;
 }
 
 namespace {
@@ -5717,20 +6260,32 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
             // shim was never claimed, so a hand-declared printf reached the linker
             // as an undefined symbol. A non-realized row is only ever a FALLBACK
             // status — it must never shadow a realizable sibling.
+            // ★ P69 (D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM): and a row
+            // whose BODY is DSS's shipped source is realizable here too. It was left
+            // out of `usable`, so the same declaration-order shadowing came back for
+            // it: ✔MEASURED, pe's printf (the [pe] row realized by
+            // runtime/platform/src/stdio.c, declared AFTER the [elf,macho] import
+            // row) answered `UnavailableForFormat` off the elf row, the hand-declared
+            // `int printf(const char *, ...);` kept the plain name, and the link
+            // refused it as undefined (hello_printf, printf_float, printf_int,
+            // shipped_printf_redecl_shim, variadic_spilled_fp_arg). A single-row
+            // name (memalignment) was answered right only because its first row
+            // was the realizable one.
+            auto const realizable = [](ShippedRealizationStatus s) {
+                return s == ShippedRealizationStatus::Realized
+                    || s == ShippedRealizationStatus::NoLibraryForFormat
+                    || s == ShippedRealizationStatus::ProvidedByShippedSource;
+            };
             for (auto const& sym : desc.symbols) {
                 if (sym.name != name) continue;
                 sawRow = true;
                 auto candidate =
                     realizeRow(desc, sym, *activeFormat, formatKey, docHere);
-                bool const usable =
-                    candidate.status == ShippedRealizationStatus::Realized
-                    || candidate.status == ShippedRealizationStatus::NoLibraryForFormat;
-                if (usable) { real = std::move(candidate); break; }
+                if (realizable(candidate.status)) { real = std::move(candidate); break; }
                 if (real.status == ShippedRealizationStatus::Unknown)
                     real = std::move(candidate);   // remember "declared, not here"
             }
-            if (real.status == ShippedRealizationStatus::Realized
-                || real.status == ShippedRealizationStatus::NoLibraryForFormat)
+            if (realizable(real.status))
                 break;   // first descriptor that realizes the name wins
         }
         if (sawRow) out.emplace(name, std::move(real));

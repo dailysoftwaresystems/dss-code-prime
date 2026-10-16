@@ -1,0 +1,1 @@
+        entryImage[srcBlk.v] = srcToDst[srcBlk.v].v;

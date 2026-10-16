@@ -1,0 +1,3 @@
+        if (!isBlockOf(produced, funcIndex, v)) {
+            return v;
+        }

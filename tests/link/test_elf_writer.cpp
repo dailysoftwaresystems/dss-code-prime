@@ -147,11 +147,22 @@ TEST(ElfFormatJson, ShippedFileLoadsCleanly) {
     EXPECT_NE(loaded.format->sectionByKind(SectionKind::Symtab), nullptr);
     EXPECT_NE(loaded.format->sectionByKind(SectionKind::Strtab), nullptr);
     EXPECT_NE(loaded.format->sectionByKind(SectionKind::ShStrtab), nullptr);
-    // Reloc rows carry nativeId.
-    auto const* pc32 = loaded.format->relocationByKind(RelocationKind{1});
+    // Reloc rows carry nativeId — and, since P69
+    // (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB), their ROLE: kind 1
+    // (`rel32`) is the CALL row, R_X86_64_PLT32, and says so; kind 8
+    // (`riprel32`, every address and memory operand) owns R_X86_64_PC32, so a
+    // reader takes a foreign PC32 as an address, never as a call.
+    auto const* call = loaded.format->relocationByKind(RelocationKind{1});
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->name, "R_X86_64_PLT32");
+    EXPECT_EQ(call->nativeId, 4u);
+    EXPECT_TRUE(call->isCall);
+    auto const* pc32 = loaded.format->relocationByKind(RelocationKind{8});
     ASSERT_NE(pc32, nullptr);
     EXPECT_EQ(pc32->name, "R_X86_64_PC32");
     EXPECT_EQ(pc32->nativeId, 2u);
+    EXPECT_FALSE(pc32->isCall);
+    EXPECT_FALSE(pc32->emitOnly) << "PC32 must DECODE, as the address kind";
 }
 
 // ── Elf64_Ehdr golden bytes ──────────────────────────────────────
@@ -557,9 +568,9 @@ TEST(ElfWriter, ObjectExternCallEmitsUndefImportNameAndCall26RelocOnAarch64) {
     // name; its BL call reloc must be R_AARCH64_CALL26 (283) — NOT a PLT-variant.
     // AArch64 has no distinct PLT26 reloc: CALL26 against an undefined symbol is
     // exactly what gcc/clang emit and the foreign linker inserts the veneer/PLT
-    // transparently — so the CALL26 row carries NO pltNativeId, and the writer emits
-    // its plain nativeId 283 (the pltNativeId==0 branch of the reloc-type selection).
-    // This locks in the "no pltNativeId is correct on arm64" decision against drift.
+    // transparently — so the CALL26 row IS the call row (`isCall`), and the writer
+    // emits its nativeId 283. (The retired `pltNativeId` — a second wire id on a row —
+    // never applied to arm64; this locks in that the call row's own type is right.)
     // RED-ON-DISABLE: remove externCallDispatch from elf64-aarch64-linux.format.json
     // -> elf::encode rejects the ET_REL extern (K_FormatLacksImportSupport, errors>0).
     auto target = TargetSchema::loadShipped("arm64");
@@ -608,7 +619,7 @@ TEST(ElfWriter, ObjectExternCallEmitsUndefImportNameAndCall26RelocOnAarch64) {
     std::uint64_t const rInfo = readU64LE(bytes, relaOff + 8);
     EXPECT_EQ(static_cast<std::uint32_t>(rInfo), 283u)
         << "arm64 extern-call reloc must be R_AARCH64_CALL26 (283), not a PLT variant "
-           "(AArch64 has none — the CALL26 row carries no pltNativeId)";
+           "(AArch64 has none — the CALL26 row is the call row)";
     std::int64_t const addend = static_cast<std::int64_t>(readU64LE(bytes, relaOff + 16));
     EXPECT_EQ(addend, 0) << "arm64 CALL26 addend = 0 (no baked bias)";
 
@@ -780,12 +791,15 @@ TEST(ElfWriter, ObjectDataExternRefEmitsUndefNameAndPc32NotPlt32) {
     AssembledFunction fn;
     fn.symbol = SymbolId{10};
     // Synthetic opcodes; only the two relocations drive the ELF Rela under
-    // test. Byte 3: rel32 slot of a `mov rax,[rip+stdout]`; byte 8: rel32
-    // slot of a `call fputs`.
+    // test. Byte 3: the displacement of a `mov rax,[rip+stdout]` — a MEMORY
+    // operand, so it carries the kind the target's memory and address operands
+    // declare (`riprel32`, kind 8; since P69 only a CALL declares `rel32`,
+    // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB); byte 8: rel32 slot of
+    // a `call fputs`.
     fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0,   // mov rax,[rip+disp32]  (7 bytes)
                  0xE8, 0, 0, 0, 0};              // call rel32            (5 bytes)
     fn.relocations.push_back(Relocation{/*offset=*/3u, /*target=*/SymbolId{20},
-                                        /*kind=*/RelocationKind{1}, /*addend=*/0});
+                                        /*kind=*/RelocationKind{8}, /*addend=*/0});
     fn.relocations.push_back(Relocation{/*offset=*/8u, /*target=*/SymbolId{30},
                                         /*kind=*/RelocationKind{1}, /*addend=*/0});
     mod.functions.push_back(std::move(fn));
@@ -901,7 +915,7 @@ TEST(ElfWriter, RelaRecordsNativeRelocTypeAndSymtabIndex) {
     Relocation rel;
     rel.offset = 1;                  // patch site = byte 1 (the rel32)
     rel.target = SymbolId{2};        // undefined extern
-    rel.kind   = RelocationKind{1};  // matches `rel32` (PC32 in elf JSON)
+    rel.kind   = RelocationKind{1};  // matches `rel32`: the CALL row (PLT32 in elf JSON)
     rel.addend = 0;                  // real codegen stamps 0; the psABI -4 for a
                                      // rel32 field lives in the target schema's
                                      // addendBias, baked into r_addend at emit
@@ -923,7 +937,10 @@ TEST(ElfWriter, RelaRecordsNativeRelocTypeAndSymtabIndex) {
     std::uint64_t const rInfo = readU64LE(bytes, relaOff + 8);
     std::uint32_t const symIdx = static_cast<std::uint32_t>(rInfo >> 32);
     std::uint32_t const type   = static_cast<std::uint32_t>(rInfo);
-    EXPECT_EQ(type, 2u) << "R_X86_64_PC32 = 2";
+    EXPECT_EQ(type, 4u)
+        << "R_X86_64_PLT32 = 4: every CALL is written PLT32 since P69, as gcc has "
+           "written every call since binutils 2.31 "
+           "(D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB)";
     // sym 0 = STN_UNDEF, sym 1 = section, sym 2 = caller, sym 3 = target.
     EXPECT_EQ(symIdx, 3u);
     // r_addend == -4 = rel.addend(0) + the rel32 addendBias(-4), baked in for a

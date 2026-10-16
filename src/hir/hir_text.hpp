@@ -140,7 +140,20 @@ class TypeRegistry;
 // (P68 round 12, lane `cs`): `enum E : long` and `enum E` are different types
 // (C23 6.2.7p1), and v5 wrote both as `enum "E" : i64`. A v5 reader meeting the
 // v6 spelling reads `enum "E"` and then meets `fixed` with no rule for it.
-inline constexpr std::uint32_t kHirTextFormatVersion = 6;
+// v7 added the `unnamed` expression — `unnamed <storage> : <type> (<init>)`, an
+// unnamed OBJECT (C's compound literal) of automatic, static or thread storage
+// (P69, lane `cs`, D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT). A
+// v6 reader meeting it has no rule for the keyword — and one that skipped it would
+// rebuild the literal as its initializer's VALUE, the very aliasing the node exists
+// to end.
+// v8 spelled the member a UNION literal value's one field initializes, `lit agg member N
+// {…} : type <H>` — `.dssir` v5's spelling (P69, lane `cs`). The member is load-bearing past
+// the fold: MIR's literal carries it and the static-data encoder pairs the field with the
+// member it names, refusing a union value that names none. v7 wrote `agg {…}` for every
+// aggregate and so dropped it; a v7 reader meeting `member` has no rule for the word, and
+// one that skipped it would hand the encoder a union value initialized through no member.
+// A v8 reader refuses a union-typed `agg` with a field and no member AT THE TEXT.
+inline constexpr std::uint32_t kHirTextFormatVersion = 8;
 
 // ── kHirTextMaxNodeDepth — THE FORMAT'S DECLARED NESTING LIMIT ────────────────
 //

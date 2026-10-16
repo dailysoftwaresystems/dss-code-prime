@@ -1,0 +1,2 @@
+        if (objectFormatInAvailabilitySet(row.documentGate, fmt))
+            return !row.isObject;

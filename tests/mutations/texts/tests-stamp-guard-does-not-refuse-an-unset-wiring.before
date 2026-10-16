@@ -1,0 +1,1 @@
+    if(NOT DEFINED "${handed_var}")

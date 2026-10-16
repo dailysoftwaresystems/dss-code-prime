@@ -1,0 +1,1 @@
+    if (width < static_cast<std::uint32_t>(floorBits)) return interner.primitive(rules.minRank);

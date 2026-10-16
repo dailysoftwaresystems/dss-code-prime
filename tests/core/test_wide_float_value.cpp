@@ -382,3 +382,101 @@ TEST(WideFloatValue, DifferentialAgainstGccNativeF128) {
     expectMatchNative(*WideFloatValue::div(f128(1.0),  f128(3.0)),  nativeF128Bytes((__float128)1 / (__float128)3), 16, "F128 div 1/3");
 }
 #endif  // gcc-native differential
+
+// ── P69 (lane `cs`): A NaN KEEPS ITS FRACTION FIELD — payload, quiet bit and sign ─────────────
+// Every value below is gcc's own, ✔MEASURED by lane `cs`'s probes: n01/n02 (gcc 13.3.0 and clang
+// 18.1.3 on x86_64, x87 long double, linux run 20261001-043258-26b9692a) and n03 (aarch64-linux-
+// gnu-gcc 13.3.0 and clang 18.1.3 --target=aarch64, binary128, run 20261001-044457-d0d46a44).
+// Before P69 every NaN packed as the canonical quiet one: a payload was lost in silence.
+// RED-ON-DISABLE: pack a NaN as the canonical quiet one again → every payload row fails.
+namespace {
+double fromBits(std::uint64_t b) { double d = 0; std::memcpy(&d, &b, sizeof d); return d; }
+std::uint64_t bitsOf(double d) { std::uint64_t b = 0; std::memcpy(&b, &d, sizeof b); return b; }
+}  // namespace
+
+TEST(WideFloatValue, AQuietNanPacksItsPayloadWhereGccPlacesIt) {
+    auto const f80 = [](std::uint64_t lo, std::uint64_t hi = 0) {
+        return WideFloatValue::quietNan(TypeKind::F80, lo, hi).pack();
+    };
+    auto const f128 = [](std::uint64_t lo, std::uint64_t hi = 0) {
+        return WideFloatValue::quietNan(TypeKind::F128, lo, hi).pack();
+    };
+    // x87: the payload under the quiet bit, the integer bit set; bits above 61 are not kept.
+    EXPECT_EQ(f80(1).lo, 0xc000000000000001ull);
+    EXPECT_EQ(f80(1).hi, 0x7fffull);
+    EXPECT_EQ(f80(0x10).lo, 0xc000000000000010ull);
+    EXPECT_EQ(f80(0x7fffffffffffffffull).lo, 0xffffffffffffffffull);
+    EXPECT_EQ(f80(0xffffffffffffffffull).lo, 0xffffffffffffffffull);
+    // binary128: the low word whole, payload bits 64..110 in the high word under the quiet bit.
+    EXPECT_EQ(f128(1).lo, 0x1ull);
+    EXPECT_EQ(f128(1).hi, 0x7fff800000000000ull);
+    EXPECT_EQ(f128(0x567890abcdef1234ull, 0x1234).lo, 0x567890abcdef1234ull);
+    EXPECT_EQ(f128(0x567890abcdef1234ull, 0x1234).hi, 0x7fff800000001234ull);
+    // The sign: `-__builtin_nanl("1")` (n01 / n03).
+    EXPECT_EQ(WideFloatValue::quietNan(TypeKind::F80, 1).negate().pack().hi, 0xffffull);
+    EXPECT_EQ(WideFloatValue::quietNan(TypeKind::F128, 3).negate().pack().hi, 0xffff800000000000ull);
+    // CONTROL: the canonical quiet NaN packs the bytes it always packed.
+    EXPECT_EQ(WideFloatValue::nan(TypeKind::F80).pack().lo, 0xc000000000000000ull);
+    EXPECT_EQ(WideFloatValue::nan(TypeKind::F128).pack().hi, 0x7fff800000000000ull);
+    EXPECT_EQ(WideFloatValue::nan(TypeKind::F128).pack().lo, 0x0ull);
+    EXPECT_EQ(WideFloatValue::quietNan(TypeKind::F80, 0), WideFloatValue::nan(TypeKind::F80));
+}
+
+TEST(WideFloatValue, EveryNanRoundTripsThroughItsPackedBytes) {
+    auto const roundtrip = [](WideFloatValue const& v) {
+        auto const p = v.pack();
+        return WideFloatValue::fromPacked(p.lo, p.hi, v.kind());
+    };
+    for (TypeKind const k : {TypeKind::F80, TypeKind::F128}) {
+        for (std::uint64_t payload : {0ull, 1ull, 0x10ull, 0x123456789ull, 0x3fffffffffffffffull}) {
+            auto const v = WideFloatValue::quietNan(k, payload);
+            EXPECT_EQ(roundtrip(v), v) << "payload " << payload;
+            EXPECT_EQ(roundtrip(v.negate()), v.negate()) << "negative payload " << payload;
+        }
+    }
+    // A SIGNALLING NaN (quiet bit clear, a payload set) reads back as itself, not quieted.
+    auto const sF80 = WideFloatValue::fromPacked(0x8000000000000001ull, 0x7fffull, TypeKind::F80);
+    EXPECT_TRUE(sF80.isNaN());
+    EXPECT_EQ(sF80.pack().lo, 0x8000000000000001ull);
+    auto const sF128 = WideFloatValue::fromPacked(0x5ull, 0x7fff000000000000ull, TypeKind::F128);
+    EXPECT_TRUE(sF128.isNaN());
+    EXPECT_EQ(sF128.pack().lo, 0x5ull);
+    EXPECT_EQ(sF128.pack().hi, 0x7fff000000000000ull);
+}
+
+TEST(WideFloatValue, ANanWidensToTheTopAndNarrowsFromTheTop) {
+    // (long double)__builtin_nan("0x800"): the double's fraction at the TOP of the wide field.
+    double const n800 = fromBits(0x7ff8000000000800ull);
+    EXPECT_EQ(WideFloatValue::fromDouble(n800, TypeKind::F80).pack().lo, 0xc000000000400000ull);
+    EXPECT_EQ(WideFloatValue::fromDouble(n800, TypeKind::F128).pack().hi, 0x7fff800000000080ull);
+    EXPECT_EQ(WideFloatValue::fromDouble(n800, TypeKind::F128).pack().lo, 0x0ull);
+    EXPECT_EQ(WideFloatValue::fromDouble(fromBits(0x7ff8000000012345ull), TypeKind::F80).pack().lo,
+              0xc0000000091a2800ull);
+    // (double)__builtin_nanl(...): the field's TOP 52 bits.
+    EXPECT_EQ(bitsOf(WideFloatValue::quietNan(TypeKind::F80, 0x800).toDouble()),
+              0x7ff8000000000001ull);
+    EXPECT_EQ(bitsOf(WideFloatValue::quietNan(TypeKind::F80, 0x12345).toDouble()),
+              0x7ff8000000000024ull);
+    EXPECT_EQ(bitsOf(WideFloatValue::quietNan(TypeKind::F128, 0x800000000000000ull).toDouble()),
+              0x7ff8000000000000ull);
+    EXPECT_EQ(bitsOf(WideFloatValue::quietNan(TypeKind::F80, 1).negate().toDouble()),
+              0xfff8000000000000ull);
+}
+
+TEST(WideFloatValue, ArithmeticReturnsTheFirstNanOperandWithItsOwnSign) {
+    using W = WideFloatValue;
+    for (TypeKind const k : {TypeKind::F80, TypeKind::F128}) {
+        W const one = W::fromDouble(1.0, k), two = W::fromDouble(2.0, k);
+        auto const nanP = [&](std::uint64_t p) { return W::quietNan(k, p); };
+        EXPECT_EQ(*W::add(nanP(1), one), nanP(1));
+        EXPECT_EQ(*W::add(one, nanP(2)), nanP(2));
+        EXPECT_EQ(*W::sub(one, nanP(2)), nanP(2)) << "not negated";
+        EXPECT_EQ(*W::sub(nanP(8), one), nanP(8));
+        EXPECT_EQ(*W::mul(nanP(3), two), nanP(3));
+        EXPECT_EQ(*W::add(nanP(4), nanP(5)), nanP(4)) << "the first";
+        EXPECT_EQ(*W::div(nanP(6).negate(), two), nanP(6).negate()) << "its own sign";
+        EXPECT_EQ(*W::div(two, nanP(7).negate()), nanP(7).negate()) << "its own sign";
+        // CONTROL: an invalid operation still makes the canonical quiet NaN.
+        EXPECT_EQ(*W::mul(W::infinity(k, false), W::zero(k, false)), W::nan(k));
+    }
+}

@@ -165,8 +165,34 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_StaticInitializerNotConstant";
         case DiagnosticCode::S_StaticInitializerUsesTheCommaOperator:
             return "S_StaticInitializerUsesTheCommaOperator";
+        case DiagnosticCode::S_CompoundLiteralStorageClassInvalid:
+            return "S_CompoundLiteralStorageClassInvalid";
+        case DiagnosticCode::S_BuiltinArgumentNotConstant:
+            return "S_BuiltinArgumentNotConstant";
+        case DiagnosticCode::S_BuiltinOverflowOperandType:
+            return "S_BuiltinOverflowOperandType";
+        case DiagnosticCode::S_LibraryBuiltinUnavailable:
+            return "S_LibraryBuiltinUnavailable";
+        case DiagnosticCode::S_IntegerLiteralImplicitlyUnsigned:
+            return "S_IntegerLiteralImplicitlyUnsigned";
+        case DiagnosticCode::S_AttributeNotHonoured:
+            return "S_AttributeNotHonoured";
+        case DiagnosticCode::S_TentativeArrayAssumedOneElement:
+            return "S_TentativeArrayAssumedOneElement";
+        case DiagnosticCode::S_SizeofIncompleteArrayIsZero:
+            return "S_SizeofIncompleteArrayIsZero";
+        case DiagnosticCode::S_SizeofIncompleteType:
+            return "S_SizeofIncompleteType";
+        case DiagnosticCode::S_ArrayElementTypeIncomplete:
+            return "S_ArrayElementTypeIncomplete";
+        case DiagnosticCode::S_SymbolAliasTargetInvalid:
+            return "S_SymbolAliasTargetInvalid";
+        case DiagnosticCode::S_SymbolAliasInitializerIgnored:
+            return "S_SymbolAliasInitializerIgnored";
         case DiagnosticCode::H_StaticInitializerNotFolded:
             return "H_StaticInitializerNotFolded";
+        case DiagnosticCode::H_NonVoidFunctionEndReachable:
+            return "H_NonVoidFunctionEndReachable";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -383,6 +409,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_SehJumpIntoRegion:        return "H_SehJumpIntoRegion";
         case DiagnosticCode::H_SehEarlyExit:             return "H_SehEarlyExit";
         case DiagnosticCode::H_SehLabelAddress:          return "H_SehLabelAddress";
+        case DiagnosticCode::H_SehRegionInsideAFilter:   return "H_SehRegionInsideAFilter";
         case DiagnosticCode::H_WideCharSurrogateUnsupported: return "H_WideCharSurrogateUnsupported";
         case DiagnosticCode::H_Utf8CharLiteralOutOfRange: return "H_Utf8CharLiteralOutOfRange";
         case DiagnosticCode::H_WideCharValueUnrepresentable: return "H_WideCharValueUnrepresentable";
@@ -608,6 +635,16 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_InputSectionSplit";
         case DiagnosticCode::K_ImportReferenceUnbindable:
             return "K_ImportReferenceUnbindable";
+        case DiagnosticCode::K_LinkerDirectiveUnhonourable:
+            return "K_LinkerDirectiveUnhonourable";
+        case DiagnosticCode::K_LinkerDirectiveIgnored:
+            return "K_LinkerDirectiveIgnored";
+        case DiagnosticCode::K_CommonSymbolUnallocatable:
+            return "K_CommonSymbolUnallocatable";
+        case DiagnosticCode::K_ObjectSectionNotModelled:
+            return "K_ObjectSectionNotModelled";
+        case DiagnosticCode::K_CommonSymbolLargerThanItsDefinition:
+            return "K_CommonSymbolLargerThanItsDefinition";
         case DiagnosticCode::K_ExternImportAttributeConflict:
             return "K_ExternImportAttributeConflict";
         case DiagnosticCode::K_FormatLacksProcessExit:

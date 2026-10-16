@@ -35,6 +35,20 @@
 //
 // Front-end feature (semantic expression typing), target/format-agnostic:
 // x86_64 (PE + ELF) and arm64 (ELF under qemu, Mach-O macos leg).
+//
+// ★ P69 (lane lm): THE CONSTRUCT YIELDS A VALUE, AND A STATIC OBJECT MAY BE
+// INITIALIZED BY IT. The value of the last expression is no lvalue: an array is
+// the pointer to its first element and a function the pointer to it (C
+// 6.3.2.1p3-p4). DSS typed the construct as what its last expression DESIGNATES —
+// the array, the function — and laid the conversion over the sequence instead of
+// inside it, so the four static objects of `main` below were each refused ("not
+// folded") where gcc 13, mingw-w64 gcc 13.2, clang 18 and AppleClang 21 build
+// them and run 42 (✔MEASURED 2026-10-12, each form on each of the four). Static
+// objects, because an automatic one was already right: `coerce` rescued it at the
+// use. The refusing halves and `sizeof`'s answers are the unit file's.
+
+static int twice(int x) { return 2 * x; }
+static int table[3] = {5, 6, 7};
 
 int main(void) {
     int  v  = 20;
@@ -51,5 +65,14 @@ int main(void) {
     // that took the first declarator would come back with `double`.
     int c = ({ double d = 0.5; int t = 10; (void)d; t; });   // 10
 
-    return a + b + c;                          // 42
+    // Four static objects initialized by a statement expression's VALUE: a string,
+    // a table of strings, a function, an array. Each term below is 0 when the
+    // object holds the pointer the value converts to.
+    static const char *s = ({ "abc"; });
+    static const char *const names[2] = { ({ "ab"; }), ({ "cd"; }) };
+    static int (*fn)(int) = ({ twice; });
+    static int *q = ({ table; });
+    int d = (s[1] - 'b') + (names[1][0] - 'c') + (fn(3) - 6) + (q[2] - 7);   // 0
+
+    return a + b + c + d;                      // 42
 }

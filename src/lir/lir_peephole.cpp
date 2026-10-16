@@ -138,7 +138,11 @@ isElidableFallthroughBranch(Lir const& src, LirBlockId blk, LirInstId inst,
 peepholeOneFunc(Lir const& src, LirFuncId srcFn, TargetSchema const& schema,
                 lir_pass_util::ClassMoveOpcodeCache& movCache,
                 LirBuilder& b, std::size_t& removed,
-                std::size_t& elided, DiagnosticReporter& reporter) {
+                std::size_t& elided,
+                // `LirPeepholeResult::blockEntryImage`, sized to the source block
+                // arena: this function writes the entry of each of its blocks.
+                std::vector<std::uint32_t>& entryImage,
+                DiagnosticReporter& reporter) {
     (void)b.addFunction(src.funcSymbol(srcFn));
 
     std::unordered_map<std::uint32_t, LirBlockId> srcToDst;
@@ -160,6 +164,9 @@ peepholeOneFunc(Lir const& src, LirFuncId srcFn, TargetSchema const& schema,
                 ? std::optional<LirBlockId>{src.funcBlockAt(srcFn, bi + 1)}
                 : std::nullopt;
         b.beginBlock(srcToDst[srcBlk.v]);
+        // The block image this rebuild publishes: this source block's instructions
+        // begin in the block just begun.
+        entryImage[srcBlk.v] = srcToDst[srcBlk.v].v;
 
         std::uint32_t const instCount = src.blockInstCount(srcBlk);
         for (std::uint32_t ii = 0; ii < instCount; ++ii) {
@@ -236,10 +243,14 @@ runLirPeephole(Lir const&          src,
     lir_pass_util::copyModuleSideStructures(src, b);
 
     std::size_t const funcCount = src.moduleFuncCount();
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: every source
+    // block's entry in the output, one slot per source block id (0 = the sentinel).
+    result.blockEntryImage.assign(src.blockCount(), 0u);
     for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
         if (peepholeOneFunc(src, src.funcAt(fi), schema, movCache, b,
                             result.redundantCopiesRemoved,
-                            result.fallthroughBranchesElided, reporter)) {
+                            result.fallthroughBranchesElided,
+                            result.blockEntryImage, reporter)) {
             continue;
         }
         // Mid-failure the builder holds a half-open function whose current

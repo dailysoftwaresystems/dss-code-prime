@@ -1,0 +1,1 @@
+    if "selftest" in (entry.get("name") or ""):

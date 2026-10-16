@@ -39,6 +39,46 @@
 
 namespace dss::opt {
 
+// ★★ D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS — WHAT THE
+// MODULE BEING OPTIMIZED IS, relative to the link that completes it.
+//
+// A fact of the CALL SITE, never of the MIR: the driver knows whether the
+// module in hand is all the code its image will contain, and the MIR does not.
+// It is relayed exactly as `charIsUnsigned` and `preemptibleDefinitionBindings`
+// are, and it decides ONE question — which definitions DCE may treat as
+// unreachable from outside the module.
+//
+//   * `WholeImage` — the module is ALL the code of its image that can name its
+//     definitions: the Program stage of a sole or merged module whose output
+//     IS an image and whose link takes no object input and no
+//     operator-supplied static archive. Only here
+//     is a definition no other IMAGE can see (`!isExternallyVisible` — hidden
+//     or internal visibility, or Local binding) dead when nothing in the module
+//     reaches it; the image's ENTRY is reached by name from the entry
+//     trampoline, so the caller hands it in as a root (`entryRoots`).
+//   * `LinkInput` — the module is ONE input of a link that completes it: every
+//     CU at the Unit stage (its sibling CUs are the other inputs), a
+//     static-archive member, a relocatable object, a thin-LTO unit optimized
+//     alone, and an image whose link also takes object inputs or operator
+//     archives. Every
+//     definition with EXTERNAL LINKAGE (binding not Local) is a root, whatever
+//     its visibility: a hidden definition is still a link-time definition that
+//     another input resolves by name — hidden means "not exported from the
+//     image", never "unreferenced". gcc and clang never delete one at compile
+//     time (✔MEASURED 2026-10-01: `-O2 -c` keeps a hidden function and a
+//     hidden datum nothing in their unit references, gcc 13.3.0 and clang
+//     18.1.3, probe-reference-cc run 20261001-152924-ba09ffc4).
+//
+// ✔MEASURED before this fact existed, every root read `isExternallyVisible`
+// at every stage: a release static-library member and a release relocatable
+// object lost every hidden definition their unit never called; a release
+// image failed to link
+// (K_SymbolUndefined) when an object input, or a SIBLING CU, called a hidden
+// definition the defining CU never called — release.pipeline.json runs
+// `release-unit`, which holds Dce, on each CU before the merge; and a hidden
+// `main` failed the release link of its own image.
+enum class ModuleExtent : std::uint8_t { WholeImage, LinkInput };
+
 // Closed pass-id vocabulary. Every shipped pass has a stable
 // ordinal that pipelines reference. D-OPT1-PASS-ID-STABILITY:
 // ordinals are part of the pipeline-as-config contract — pipelines
@@ -535,6 +575,21 @@ struct OptResult {
                                             // format that declares none) leaves
                                             // inlining byte-identical.
                                             std::span<SymbolBinding const>
-                                                preemptibleDefinitionBindings = {});
+                                                preemptibleDefinitionBindings = {},
+                                            // ★★ D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS:
+                                            // what this module is to the link
+                                            // that completes it (`ModuleExtent`),
+                                            // and — for a `WholeImage` — the
+                                            // definitions the image's entry
+                                            // reaches by name. The DEFAULT is the
+                                            // hand-built-fixture convention (the
+                                            // module IS the whole program, no
+                                            // entry to keep), byte-identical for
+                                            // every direct caller; the production
+                                            // chokepoint `optimizeModule` takes
+                                            // both with NO default, so every route
+                                            // that optimizes a real build answers.
+                                            ModuleExtent extent = ModuleExtent::WholeImage,
+                                            std::span<SymbolId const> entryRoots = {});
 
 } // namespace dss::opt

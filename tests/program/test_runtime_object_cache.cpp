@@ -74,9 +74,11 @@
 //       33   +      17       + G+1  +    8    + 3+   42  +   6    +  31  + T+1
 //
 // The three biggest components are the SUBJECT and cannot be shrunk: the
-// build-stamp segment is 41 (a dirty tree stamps `0.0.2+g<12>.dirty<16>`), the
-// target slug is 30, and the LONGEST NAME is a temp file — the destination's own
-// name plus `.` plus `.tmp-<pid>-<n>`, thirteen characters more.
+// build-stamp segment is 41 here (a dirty tree stamps `0.0.2+g<12>.dirty<16>`)
+// and AT MOST 62 (a build HANDED its dependencies' sources appends
+// `.deps<16>`, 21 more — ✔RE-MEASURED 2026-10-10, when the stamp gained that
+// component), the target slug is 30, and the LONGEST NAME is a temp file — the
+// destination's own name plus `.` plus `.tmp-<pid>-<n>`, thirteen characters more.
 //
 //   BEFORE (`<stem>-<64 hex>.a`)     artifact 71, longest temp 84
 //   AFTER  (`<stem>-<16 base32>.a`   artifact 23, key document 25,
@@ -94,8 +96,10 @@
 // INSTALLED compiler on Windows, and that is the number that matters. With the
 // default `%LOCALAPPDATA%` root, a 5-character username, a 4-character unit
 // stem, `release` and the arm64 elf slug, the longest composed path was 223
-// (37 characters of headroom) and is now 168 — **92 characters of headroom**.
-// ★ THE LAST 9 OF THOSE 92 WERE BOUGHT BY A RENAME THAT WAS NOT ABOUT PATH
+// (37 characters of headroom) and became 168 with the 41-character stamp. With
+// the LONGEST stamp a build can carry — 62, a dirty work tree handed its
+// dependencies' sources — it is 189: **71 characters of headroom**.
+// ★ THE LAST 9 OF THAT HEADROOM WERE BOUGHT BY A RENAME THAT WAS NOT ABOUT PATH
 // LENGTH AT ALL: the vendor directory went from `dss-code-prime/runtime-cache`
 // to `dsscp/runtime-cache` (2026-08-24, cycle P32), and this case is what
 // MEASURED it — it red on the SHORTENING, which is the direction nobody
@@ -1997,25 +2001,27 @@ TEST(RuntimeObjectCachePathBudget, TheLongestComposedNameFitsWindowsMaxPath) {
            "this file's docblock is now wrong.";
 
     // The INSTALLED worst case, spelled out: the default %LOCALAPPDATA% root,
-    // a 5-character username, the 41-character dirty build stamp, `release`,
-    // and the 30-character arm64 elf slug.
+    // a 5-character username, the LONGEST build stamp — 62 characters, a dirty
+    // work tree that was handed its dependencies' sources
+    // (`0.0.2+g<12>.dirty<16>.deps<16>`) — `release`, and the 30-character
+    // arm64 elf slug.
     std::string const stamp = runtimeCacheBuildStampSegment();
     std::size_t const installed =
         std::string_view{"C:/Users/"}.size() + 5u
         + std::string_view{"/AppData/Local"}.size()
         + std::string_view{"/dsscp/runtime-cache"}.size()
-        + 1u + 41u          // the build-stamp segment
+        + 1u + 62u          // the build-stamp segment
         + 1u + std::string_view{"release"}.size()
         + 1u + std::string_view{"arm64_elf64-aarch64-linux-exec"}.size()
         + 1u + longestName;
-    EXPECT_EQ(installed, 168u);
-    EXPECT_EQ(260u - installed, 92u)
+    EXPECT_EQ(installed, 189u);
+    EXPECT_EQ(260u - installed, 71u)
         << "the Windows MAX_PATH headroom for an installed compiler changed; "
            "re-measure and update this file's docblock.";
 
-    // The stamp segment this host actually renders must not exceed the 41 the
+    // The stamp segment this host actually renders must not exceed the 62 the
     // figure above assumes — a longer one silently eats the headroom.
-    EXPECT_LE(stamp.size(), 41u)
+    EXPECT_LE(stamp.size(), 62u)
         << "the build-stamp segment is longer than the arithmetic assumes: "
         << stamp;
 

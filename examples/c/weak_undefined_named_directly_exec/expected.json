@@ -1,0 +1,20 @@
+{
+  "$comment": "D-LIR-WEAK-FUNCTION-NAMED-DIRECTLY-WHERE-NO-FIELD-REACHES-ZERO (P69 round 4, lane lm) over D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69): DSS's OWN code naming a weak FUNCTION nothing defines -- `if (wf) r += wf();` -- on EVERY image. DSS reads a WEAK import's address out of a slot (MIR->LIR's GOT arm for every weak import: `movq wf@GOTPCREL(%rip)`, `adrp :got:` + `ldr`), which every image link fills with 0 for a name nothing defines (`lowerGotSlotReferences`, `resolvedToNothing`), and calls it THROUGH that address (`call *%reg`, `blr`) -- gcc's own shape for a weak symbol on aarch64 and under -fPIE / -fno-plt, clang's on PE (a slot for the test and the call), ld64's GOT load. So `wf` is NULL and the call, never taken, would jump to 0, the run-time behaviour of the references' PLT entry whose slot ld.so leaves 0. The weak DATUM is read through its slot, as DSS reads every data import (+2), and the control `present` is a defined function in the same shape (+0, +100 if its test fails): 40 + 2 + 0 = 42. MEASURED 2026-10-07 that the references run THIS program to 42 (dssharness probe-reference-cc, this file's code): gcc 13.3.0 + GNU ld 2.42 and clang 18 + ld.lld 18, -no-pie and -pie, and clang + lld-link on PE (run 20261007-081305-8067e92f), aarch64 gcc -no-pie and -pie (run 20261007-081354-4f1e0abe), Apple clang 21 + ld64 told the symbols may stay undefined (-Wl,-U; run 20261007-130113-4f4f1f1c -- by default ld64 refuses them as undefined). UNTIL ROUND 4 only the x86_64 ELF exec arm existed: DSS named `wf` directly (`leaq wf(%rip)`, a page pair on aarch64, `call wf`), which reaches 0 only in an image at its link address, and every other image refused the field by name. The optimized arms prove no pass folds `if (wf)` to true. RED-ON-DISABLE: drop the weak-import routing in MIR->LIR -> the PIE, aarch64, pe64 and Mach-O links refuse `wf`'s direct field by name and produce no artifact, while the x86_64 exec arm (every field reaches 0 there) stays green as the control.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "x86_64:elf64-x86_64-linux-pie", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:elf64-aarch64-linux-pie", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" },
+    { "spec": "x86_64:macho64-x86_64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

@@ -1,0 +1,6 @@
+                        case ffi::ShippedRealizationStatus::ProvidedByShippedSource:
+                            if (real.status == ffi::ShippedRealizationStatus::ProvidedByShippedSource) {
+                                why = "M49";
+                                break;
+                            }
+                            if (!real.isFunction || !real.signature.valid()

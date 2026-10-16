@@ -1,0 +1,1 @@
+                auto const gone = discardedNames.find(ext.mangledName);

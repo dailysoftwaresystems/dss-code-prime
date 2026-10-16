@@ -8,9 +8,9 @@ pinned by CALLING the driver's own functions -- the very function objects produc
 driving the real resume loop, the real ledger and the real gates -- and every pin is proven
 non-vacuous by MUTATING a temporary COPY of the module that owns the guard (red-on-disable):
 
-  DC-01 .. DC-31  green pins; each carries the UNION of both twins' arms for its subject, plus
+  DC-01 .. DC-32  green pins; each carries the UNION of both twins' arms for its subject, plus
                   the negatives neither twin had (report 09, section E.4);
-  RD-01 .. RD-91  red arms (a retired arm's id is never reused, so the range has gaps; the
+  RD-01 .. RD-107 red arms (a retired arm's id is never reused, so the range has gaps; the
                   registry below counts them); each MUTATES a copy of one driver module -- fail-closed: the witness
                   occurs EXACTLY once, the mutant bytes (or AST) differ, the witness is absent,
                   it parses, compiles and IMPORTS under a unique module name kept out of
@@ -2604,16 +2604,20 @@ def pin_dc23(t, x):
 def pin_dc24(t, x):
     real_c = x.M.mod("sqlite_common")
 
-    def drive(failing):
+    def drive(failing, outputs=None, host="windows", harness=True):
+        # The host Step 0 judges the skips FOR is injected (2026-10-01, the P69 review's MINOR 1: the allowance is
+        # keyed by where a skip may happen), so every arm below says the same on every host it runs on.
         ran = []
         fake = types.SimpleNamespace(**dict((k, getattr(real_c, k)) for k in dir(real_c) if not k.startswith("__")))
+        fake.host_os = lambda: host
+        fake.harness_host = lambda: harness
 
         def capture(argv, env_=None, merge=False, **_kw):
             name = next((os.path.basename(a) for a in argv if str(a).endswith(".py")), "?")
             ran.append(name)
             if name in failing:
                 return real_c.Result(1, "  [FAIL] x the pinned failure of %s\npassed=0 failed=1 skipped=0\n" % name, "")
-            return real_c.Result(0, "passed=3 failed=0 skipped=0\n", "")
+            return real_c.Result(0, (outputs or {}).get(name, "passed=3 failed=0 skipped=0\n"), "")
         fake.capture = capture
         bt = x.M.fresh("build_and_test", C=fake)
         res = FakeResolver(lambda a: real_c.Result(0, "passed=5 failed=0\n", "") if a == ["--self-test"]
@@ -2632,6 +2636,42 @@ def pin_dc24(t, x):
          asked)
     every2, ran2, r2, msg2, _a2 = drive(())
     t.ck("Z04", "CONTROL: every suite green -> Step 0 returns, no refusal", not r2 and ran2 == every2, msg2)
+    # ★ SKIPS ARE BOUNDED (2026-09-30, the round-12 audit's S6): every skip a suite prints must be one its declaration
+    # (build_and_test.SKIP_ALLOWANCE) names; an arm nobody declared skippable, or a skip count the printed lines do
+    # not add up to, is an EXCESS that refuses the run like a failing suite -- in every format the suites print.
+    ok_skips = {"sqlite_procs.py": "  skip CL01 — POSIX-only (it runs where the checkout lives)\n"
+                                   "passed=3 failed=0 skipped=1\n",
+                "sqlite_stage.py": "  SKIP [pin_shim] the shim is executable -- no POSIX exec bit on this host\n"
+                                   "passed=3 failed=0 skipped=1\n",
+                "sqlite_coherence.py": "  [SKIP] n18 a SYMLINKED file is scanned — this host cannot create a "
+                                       "symlink here\npassed=3 failed=0 skipped=1\n"}
+    _e5, _ran5, r5, msg5, _a5 = drive((), ok_skips)
+    t.ck("Z05", "CONTROL: skips each suite DECLARES on a Windows harness host (a POSIX-only clone-lock arm, the "
+         "shim's exec bit, a symlink) pass, in all three skip formats", not r5, msg5)
+    # ★ WHERE A SKIP MAY HAPPEN (2026-10-01, the P69 review's MINOR 1): the SAME declared skips on a host the
+    # allowance does not name for them are an excess -- and a test-only skip passes only where the host says so.
+    _e8, _ran8, r8, msg8, _a8 = drive((), ok_skips, host="linux")
+    t.ck("Z08", "a POSIX-only clone-lock arm SKIPPED on a linux host -- where the arm runs -- is an EXCESS naming the "
+         "arm and the host", r8 and "sqlite_procs.py (an excess of skips" in msg8 and "CL01" in msg8
+         and "on a linux harness host" in msg8, msg8)
+    rt_skip = dict(ok_skips, **{"test_driver_contracts.py": "  skip DC-13/RT0 a WSL that translates answers -- "
+                                                            "this host lacks a WSL\npassed=3 failed=0 skipped=1\n"})
+    _e9, _ran9, r9, msg9, _a9 = drive((), rt_skip)
+    t.ck("Z09", "a capability arm (RT0) SKIPPED on a Windows HARNESS host is an excess: there it must FAIL, by name",
+         r9 and "test_driver_contracts.py (an excess of skips" in msg9 and "DC-13/RT0" in msg9, msg9)
+    _e10, _ran10, r10, msg10, _a10 = drive((), rt_skip, harness=False)
+    t.ck("Z10", "CONTROL: the same skip on a Windows host that declares it only runs the tests passes", not r10, msg10)
+    _e6, _ran6, r6, msg6, _a6 = drive((), dict(ok_skips, **{"sqlite_procs.py": "  skip ZZ99 — a skip nobody declared\n"
+                                                                              "passed=3 failed=0 skipped=1\n"}))
+    t.ck("Z06", "a skip NO allowance declares is an EXCESS: ONE refusal names the suite and the arm",
+         r6 and "sqlite_procs.py (an excess of skips" in msg6 and "ZZ99" in msg6 and "1 of Step 0's checks" in msg6,
+         msg6)
+    _e7, _ran7, r7, msg7, _a7 = drive((), dict(ok_skips, **{"sqlite_stage.py": "  SKIP [pin_shim] the shim is "
+                                                                              "executable -- no POSIX exec bit\n"
+                                                                              "passed=3 failed=0 skipped=2\n"}))
+    t.ck("Z07", "a skip COUNT the printed skip lines do not add up to (2 reported, 1 printed) is an excess too -- a "
+         "skip Step 0 cannot see is one it cannot judge", r7 and "sqlite_stage.py (an excess of skips" in msg7
+         and "reported 2 skip(s) and printed 1" in msg7, msg7)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -2911,7 +2951,8 @@ def _dc27_stage(x, root, leg, sb, zinc_mod):
     for k in S.StageResult.POSIX_PATHS:
         d[k] = "/dc27/" + k
     for k in S.StageResult.STRINGS:
-        d.setdefault(k, {"sqlite_head": sb["sqlite_commit"][:10], "sqlite_branch": "DETACHED-HEAD",
+        # the stage RECORDS the full sha of what it compiled (2026-09-30, S2): the pin, for a current stage
+        d.setdefault(k, {"sqlite_head": sb["sqlite_commit"], "sqlite_branch": "DETACHED-HEAD",
                          "tier": "veryquick",
                          "tcl_version": sb.get("tcl_version") or "8.6", "stage_identity": "dc27 identity"}.get(k, ""))
     write_json(os.path.join(st, S.RESULT_FILE), d)
@@ -2935,14 +2976,15 @@ def pin_dc27(t, x):
     d = _dc27_stage(x, root, C.Leg(copy.deepcopy(leg_plan)), sb, zinc)
 
     # ── (A) the currency rule, one drift at a time ─────────────────────────────────
-    def findings(mut=None, leg_build=None, coherent=True):
+    def findings(mut=None, leg_build=None, coherent=True, tracked=None):
         dd = copy.deepcopy(d)
         if mut:
             mut(dd)
         lg = C.Leg(copy.deepcopy(leg_plan))
         lg.build.update(leg_build or {})
         return RC.stage_findings(S.StageResult.from_dict(dd), sb, lg, zinc.verify_guards, zinc.verify_answers,
-                                 lambda dirs: (coherent, "      two identity ids (the contract suite)"))
+                                 lambda dirs: (coherent, "      two identity ids (the contract suite)"),
+                                 tracked_changes=tracked or (lambda _checkout: ([], "")))
 
     t.eq("A01", "a stage CURRENT for the leg yields no reason", [], findings())
     guards = dict(leg_plan["build"].get("zconfGuards") or {})
@@ -2981,6 +3023,10 @@ def pin_dc27(t, x):
         ("A13", "a stage whose Tcl headers are not the Tcl every leg's pinned library declares",
          lambda dd: dd.__setitem__("tcl_version", "9.0" if sb["tcl_version"] != "9.0" else "8.6"),
          None, True, "every leg's pinned library declares Tcl"),
+        # the summary's subject (2026-09-30, S2): a stage recording only an ABBREVIATION of the pin -- what a stage
+        # written before the stage recorded its full sha holds -- is re-staged, never summarised as twelve digits
+        ("A15", "a stage that records the pin only as an abbreviation (a stage written before 2026-09-30)",
+         lambda dd: dd.__setitem__("sqlite_head", sb["sqlite_commit"][:10]), None, True, "only as the abbreviation"),
     )
     tus_text = read_text(d["fixture_recipe"]["tus"])
     for key, label, mut, lb, coherent, needle in cases:
@@ -2997,6 +3043,16 @@ def pin_dc27(t, x):
          and not RC.configure_flags_applied(["b", "a"], ["a", "b"])
          and not RC.configure_flags_applied(["a", "x", "b"], ["a", "b"])
          and not RC.configure_flags_applied(["a"], []), "configure_flags_applied")
+    # an IN-PLACE stage IS its checkout (2026-09-30, S1): a tracked file changed there is compiled as the pin
+    asked_in, asked_cp = [], []
+    got_in = findings(lambda dd: dd.__setitem__("copy_to_stage", False),
+                      tracked=lambda c: (asked_in.append(c), (["src/where.c"], ""))[1])
+    got_cp = findings(tracked=lambda c: (asked_cp.append(c), (["src/where.c"], ""))[1])
+    t.ck("A14", "an IN-PLACE stage whose checkout changed a TRACKED file is NOT current -- EXACTLY ONE reason, "
+         "naming the file, from asking THAT checkout; a staged COPY (self-contained) is not asked and stays "
+         "current (the control)",
+         len(got_in) == 1 and "1 tracked file(s) (src/where.c)" in got_in[0] and asked_in == [d["sqlite_dir"]]
+         and got_cp == [] and asked_cp == [], (got_in, asked_in, got_cp, asked_cp))
 
     # ── (B) the whole mode, through the REAL recompile() ────────────────────────────
     dsscp = write_bytes(os.path.join(root, "dc27_dsscp.py"), DC27_DSSCP)
@@ -3036,8 +3092,10 @@ def pin_dc27(t, x):
             return C.Result(0, json.dumps({"status": "built", "path": exe, "cc": "x86_64-w64-mingw32-gcc",
                                            "triple": "x86_64-w64-mingw32", "log": olog}) + "\n", "")
         if a[:1] == ["--recompile-verdicts"]:
+            census_asked.append(list(a))
             return census(a)
         return None
+    census_asked = []
 
     def resolve_leg(run_, lg, _known):
         lg.tcl_lib = lg.tcl_lib_any = tcl_dll
@@ -3081,10 +3139,35 @@ def pin_dc27(t, x):
         return rc, lines, why, (read_text(clog) if os.path.isfile(clog) else ""), outd, text(log)
 
     rc, lines, why, clog, outd, logtext = drive("clean")
-    t.ck("B01", "a pair that accepts every TU: exit 0, and the LAST line printed is exactly the summary",
+    # ★ B01 PINS WHAT THE STAGE RECORDED (2026-09-30, S2): it compared the summary with the catalogue's pin, the
+    # very value the driver passed as the head -- so it held the defect in place. The summary names the stage's
+    # own full sha (its first twelve digits), and the census is asked with that sha and the pin SEPARATELY.
+    asked = census_asked[-1] if census_asked else []
+
+    def after(flag):
+        return asked[asked.index(flag) + 1] if flag in asked else None
+    t.ck("B01", "a pair that accepts every TU: exit 0, the LAST line printed is exactly the summary, naming the "
+         "sqlite the STAGE recorded -- and the census was handed that full sha as --sqlite-head and the pin as "
+         "--sqlite-pin, separately",
          rc == 0 and lines and lines[-1] == "recompile: %s sqlite=%s tus=3 reference_ok=3 dss_ok=3 blockers=0"
-         % (DC27_LEG, sb["sqlite_commit"][:12]),
-         "rc=%r why=%s\n%s\n%s" % (rc, why, "\n".join(lines[-6:]), logtext[-1500:]))
+         % (DC27_LEG, d["sqlite_head"][:12])
+         and after("--sqlite-head") == d["sqlite_head"] and after("--sqlite-pin") == sb["sqlite_commit"],
+         "rc=%r why=%s asked=%r\n%s\n%s" % (rc, why, asked, "\n".join(lines[-6:]), logtext[-1500:]))
+    # ...and a stage that is NOT the pin makes the census INCOMPLETE: the SAME census, replayed over this run's
+    # own files, with only the stage's head moved off the pin (the control is the census as the driver asked it)
+    off = sb["sqlite_commit"][:11] + ("0" if sb["sqlite_commit"][11] != "0" else "1") + sb["sqlite_commit"][12:]
+    moved = list(asked)
+    if "--sqlite-head" in moved:
+        moved[moved.index("--sqlite-head") + 1] = off
+    as_asked, off_pin = census(asked), census(moved)
+    rec_ok = json.loads(as_asked.out) if as_asked.rc == 0 else {}
+    rec_off = json.loads(off_pin.out) if off_pin.rc == 3 else {}
+    t.ck("B09", "a census whose stage is NOT the pin is INCOMPLETE (rc 3), naming both, and its summary names what "
+         "the stage compiled; the census as the driver asked it is clean (the control)",
+         rec_ok.get("clean") is True and rec_off.get("clean") is False
+         and any("NOT the pinned %s" % sb["sqlite_commit"][:12] in w and off in w for w in rec_off.get("incomplete", []))
+         and (rec_off.get("report") or [""])[-1].startswith("recompile: %s sqlite=%s " % (DC27_LEG, off[:12])),
+         (as_asked.rc, off_pin.rc, rec_off.get("incomplete"), (rec_off.get("report") or [""])[-1:]))
     argv = next((json.loads(ln[len("DTC-DSSCP-ARGV "):]) for ln in clog.splitlines()
                  if ln.startswith("DTC-DSSCP-ARGV ")), [])
     t.ck("B02", "dsscp is asked for its WHOLE diagnostic stream: both caps raised to the driver's one count "
@@ -3100,14 +3183,14 @@ def pin_dc27(t, x):
     rc, lines, why, clog, outd, logtext = drive("blocker", refuse="src/test1.c")
     t.ck("B04", "a TU the reference BUILT and dsscp refused is a BLOCKER: exit 1, and the summary COUNTS it",
          rc == 1 and lines and lines[-1] == "recompile: %s sqlite=%s tus=3 reference_ok=3 dss_ok=2 blockers=1"
-         % (DC27_LEG, sb["sqlite_commit"][:12])
+         % (DC27_LEG, d["sqlite_head"][:12])
          and any("BLOCKER" in ln and ln.endswith("src/test1.c") for ln in lines),
          "rc=%r why=%s\n%s" % (rc, why, "\n".join(lines[-8:])))
     rc, lines, why, clog, outd, logtext = drive("wrapped", refuse="ext/misc/fileio.c")
     t.ck("B05", "a refusal inside a TU compiled through its prelude WRAPPER is placed in that TU (dsscp names the "
          "real file): a BLOCKER, counted",
          rc == 1 and lines and lines[-1] == "recompile: %s sqlite=%s tus=3 reference_ok=3 dss_ok=2 blockers=1"
-         % (DC27_LEG, sb["sqlite_commit"][:12])
+         % (DC27_LEG, d["sqlite_head"][:12])
          and any("BLOCKER" in ln and ln.endswith("ext/misc/fileio.c") for ln in lines),
          "rc=%r why=%s\n%s" % (rc, why, "\n".join(lines[-8:])))
     write_bytes(host_cfg, DC27_CFG)
@@ -3124,12 +3207,12 @@ def pin_dc27(t, x):
     t.ck("B07", "with NO reference on this host (no log written): exit 1, INCOMPLETE says so, and the summary "
          "counts NO TU as accepted by the reference",
          rc == 1 and lines and lines[-1] == "recompile: %s sqlite=%s tus=3 reference_ok=0 dss_ok=3 blockers=0"
-         % (DC27_LEG, sb["sqlite_commit"][:12])
+         % (DC27_LEG, d["sqlite_head"][:12])
          and any("INCOMPLETE: NO REFERENCE RAN" in ln for ln in lines),
          "rc=%r why=%s\n%s" % (rc, why, "\n".join(lines[-6:])))
 
-    # ── an IN-PLACE stage (a POSIX host's: its build reads the shared clone) is HELD -- the clone lock, for
-    # READ, to the recompile's end -- and JUDGED against that clone (the one-vintage gate with --checkout);
+    # ── an IN-PLACE stage (a POSIX host's: its build reads its own checkout in place) is HELD -- the clone lock,
+    # for READ, to the recompile's end -- and JUDGED against that checkout (the one-vintage gate with --checkout);
     # a staged COPY (a Windows host's) is neither. Both read from `<out>/stage/`, the one layout.
     held, asked = [], []
 
@@ -3153,8 +3236,10 @@ def pin_dc27(t, x):
         dd["copy_to_stage"] = copy_to_stage
         sub = x.sub("dc27-%s" % ("copy" if copy_to_stage else "in-place"))
         write_json(os.path.join(S.stage_dir_of(sub), S.RESULT_FILE), dd)
+        # the checkout an in-place stage IS is read for tracked changes (A14 pins the rule); here it holds none
         m = x.M.fresh("sqlite_recompile", coherence_gate=_recording_gate,
-                      P=Proxy(importlib.import_module("sqlite_procs"), CloneLock=_RecordingCloneLock))
+                      P=Proxy(importlib.import_module("sqlite_procs"), CloneLock=_RecordingCloneLock),
+                      S=Proxy(S, tracked_changes=lambda checkout, env=None: ([], "")))
         run = make_run(x, x.log(), os.path.join(sub, "unused"))
         run.stage_root = sub
         run.resolver = FakeResolver(answer, C)
@@ -3413,6 +3498,79 @@ def pin_dc29(t, x):
          on["onPin"] is True and "the pinned revision" in on_md and "NOT the pinned" not in on_md, (on, on_md[:400]))
     # (MS16, "a blocked shared clone exits 5", retired 2026-09-26 with the clone: the benchmark no longer reads or
     # writes the shared corpus clone, and its own checkout is covered by the output tree's run lock -- MS13.)
+    # ★ THE POSIX HALF ENTERS THE WSL LEGS' OWN DISTRIBUTION (2026-09-30, the round-12 audit's S8): the recompile's
+    # re-stage, the corpus's derive and the benchmark's hop all reach WSL through `PosixSide`, which used to enter
+    # `wsl.exe -e` -- the machine's DEFAULT distribution. The distribution the tree's WSL legs declare is read HERE
+    # from the SHIPPED config.json, independently of the code under test, and every door into the POSIX side --
+    # a command, a path in, a path out -- must name it.
+    ot = Cm.owning_tree_module()
+    shipped = ot.load_jsonc(os.path.join(Cm.driver_tree(), ".harness-config", "config.json"))
+    declared = sorted(set(d["wsl"] for d in shipped["legs"].values() if isinstance(d, dict) and d.get("wsl")))
+    asked = []
+    real_capture = Cm.capture
+
+    def spy_capture(argv, **kw):
+        if len(argv) > 1 and os.path.basename(str(argv[1])) == "harness_legs.py":
+            # the distribution itself, asked of the resolver -- the ONE reader, the legs' argvs share it (MS20)
+            return real_capture(argv, **kw)
+        asked.append(list(argv))
+        return Cm.Result(0, "/mnt/c/x\n" if "-u" in argv else "C:/x\n", "")
+    Cs = x.M.fresh("sqlite_common", capture=spy_capture)
+    side = Cs.PosixSide("windows")
+    entry = ["wsl.exe", "-d", declared[0] if len(declared) == 1 else "<the config declares %r>" % declared, "-e"]
+    got_argv = side.argv(["python3", "x.py"])
+    side.to_posix("C:\\x")
+    side.to_host("/mnt/c/x")
+    t.ck("MS18", "every door into the POSIX side on a Windows host -- a command, a path in (wslpath -a -u), a path out "
+         "(wslpath -m) -- enters `wsl.exe -d <the distribution the tree's WSL legs declare> -e`, read from the shipped "
+         "config.json (legs.<leg>.wsl), never the machine's default; a POSIX host enters nothing",
+         len(declared) == 1 and got_argv == entry + ["python3", "x.py"]
+         and asked == [entry + ["wslpath", "-a", "-u", "C:\\x"], entry + ["wslpath", "-m", "/mnt/c/x"]]
+         and Cs.PosixSide("linux").argv(["python3", "x.py"]) == ["python3", "x.py"],
+         (declared, got_argv, asked))
+
+    def tree_with(legs_text):
+        root = x.sub("dc29-wsl-tree")
+        write_bytes(os.path.join(root, ".harness-config", "config.json"),
+                    "{\n  // a JSONC configuration, as DssHarness reads one\n  \"legs\": {%s}\n}\n" % legs_text)
+        return root
+    one = tree_with('"a": {"os": "linux", "wsl": "Distro-A"}, "b": {"os": "linux", "wsl": "Distro-A"}, '
+                    '"c": {"os": "windows"}')
+    two = tree_with('"a": {"os": "linux", "wsl": "Distro-A"}, "b": {"os": "linux", "wsl": "Distro-B"}')
+    none = tree_with('"c": {"os": "windows"}')
+    r_one, got_one = refused(Cm.wsl_distribution, one)
+    r_two, why_two = refused(Cm.wsl_distribution, two)
+    r_none, why_none = refused(Cm.wsl_distribution, none)
+    t.ck("MS19", "the distribution is the ONE the WSL legs declare (control: two legs naming the same one); legs naming "
+         "TWO are refused naming both, and a configuration naming NONE is refused -- never a guess, never the default",
+         not r_one and got_one == "Distro-A" and r_two and "Distro-A" in why_two and "Distro-B" in why_two
+         and r_none and "no WSL distribution" in why_none, (got_one, why_two, why_none))
+    # ★ AND THE LEGS' OWN ARGVS (the same audit item, its resolver half): every argv the resolver hands a Windows
+    # driver that enters WSL -- a launched leg's launcher, its path translator and requirement probes, and its run
+    # directory's launcher, mkdir, rm, copy and kernel entry -- enters that same declared distribution, and none still
+    # holds the template's placeholder. Asked of the resolver's module IN THIS PROCESS (a red arm's mutant is the one
+    # asked), its fact read from the shipped config.json, the declaration MS18 read independently.
+    hl = x.M.mod("harness_legs")
+    catalogue = os.path.join(HERE, "legs.json")
+    legs_argvs = []
+    for d in hl.plan("windows", "x86_64", {"wsl.exe"}, catalogue)["legs"]:
+        lrun = d["run"]
+        if lrun["mode"] != "launched":
+            continue
+        legs_argvs += [lrun["launcher"], lrun["pathTranslator"]]
+        legs_argvs += [row["probe"] for row in lrun.get("requires", []) if row.get("probe")]
+        rd = hl.run_dir_plan(hl.leg_by_label(hl.load_catalogue(catalogue), d["label"], "DC-29"), "windows", "x86_64",
+                             {"wsl.exe"}, "C:\\o\\run")
+        legs_argvs += [rd[k] for k in ("launcher", "mkdirArgv", "rmTreeArgv", "copyArgv", "kernelEntryArgv")]
+    wsl_argvs = [a for a in legs_argvs if a and a[0] == "wsl.exe"]
+    not_declared = [a for a in wsl_argvs
+                    if "-e" not in a or a[a.index("-e") - 2:a.index("-e")] != ["-d"] + declared[:1]]
+    t.ck("MS20", "the resolver's Windows plan enters the SAME declared distribution in every argv that enters WSL -- the "
+         "legs' launchers, the path translator, the probes, the run directory's argvs and the kernel entry -- and "
+         "leaves none holding the `{wslDistribution}` placeholder",
+         len(declared) == 1 and len(wsl_argvs) >= 10 and not not_declared
+         and "{wslDistribution}" not in json.dumps(legs_argvs),
+         (len(wsl_argvs), not_declared[:3]))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -3493,6 +3651,70 @@ def pin_dc30(t, x):
     t.ck("KN12", "build_and_test's OWN Step 5 call hands obtain the run's OWN Config: the compiler --dss named, "
          "and the channel", rc == 0 and ("OBTAIN named=%s by=--dss same=True" % leg_bin) in out,
          (rc, out[-600:]))
+    # ★ STEP MODE (2026-09-30, the round-12 audit's S4 and S6): a step says so on its run line (`--step=<name>`), is
+    # steered by its inputs alone -- any other steering variable set in its environment is refused by name -- and is
+    # strict, so its leg set cannot shrink. `STEERING` is ONE statement, held here to what Config reads.
+    t.ck("KN13", "sqlite_common.STEERING -- what step mode refuses -- names EVERY environment variable Config reads "
+         "(read from Config's own source)", set(x.suite.knobs) <= set(C.STEERING),
+         sorted(set(x.suite.knobs) - set(C.STEERING)))
+    step_knobs = {"tier": "quick", "dss_config": "release", "test_file": "", "dss_bin": leg_bin}
+    with patched_environ(unset=x.suite.knobs, OUT_DIR=x.sub("kn-ambient-out"), DSS_LEGS="elf64-x86_64",
+                         DSS_TIER="quick"):
+        r14, why14 = refused(C.Config, step_knobs, step="build-and-test")
+        r14h, hand14 = refused(C.Config, {"tier": "quick"})
+    t.ck("KN14", "a STEP refuses, by name, each steering variable set in its environment that is no input of it "
+         "(OUT_DIR, DSS_LEGS) -- and not the one restating its own input (DSS_TIER = --tier); by hand the same "
+         "environment is read as before (a leg filter, a warning)",
+         r14 and "`build-and-test` step" in why14 and "OUT_DIR, DSS_LEGS are set" in why14 and "DSS_TIER" not in why14
+         and not r14h and getattr(hand14, "legs_filter", None) == ["elf64-x86_64"], (why14, hand14))
+    with patched_environ(unset=x.suite.knobs):
+        stepped15 = C.Config(step_knobs, step="build-and-test")
+        hand15 = C.Config(step_knobs)
+    t.ck("KN15", "a STEP is STRICT -- an environmental leg skip fails it, since nothing on its command line may "
+         "narrow the catalogue's legs -- and says why; by hand a run is strict only by DSS_STRICT_ARM_VERDICTS=1",
+         stepped15.strict is True and "`build-and-test` harness step" in stepped15.strict_by
+         and hand15.strict is False and hand15.strict_by == "", (stepped15.strict_by, hand15.strict, hand15.strict_by))
+    ok16 = cli(["--step=build-and-test", "--tier=veryquick", "--dss-config=release", "--test-file=", "--dss=/d"])
+    miss16 = cli(["--step=build-and-test", "--tier=veryquick", "--dss-config=release", "--dss=/d"])
+    short16 = cli(["--step=recompile", "--recompile=pe64-x86_64", "--dss=/d"])
+    unknown16 = cli(["--step=corpus", "--dss=/d"])
+    t.ck("KN16", "--step=<name> takes EXACTLY that step's flags (build_and_test.STEP_FLAGS): the full set parses; a "
+         "missing input and an unknown step are each REFUSED by name",
+         isinstance(ok16, dict) and ok16.get("--step") == "build-and-test"
+         and isinstance(miss16, str) and "passes exactly" in miss16 and "--test-file" in miss16
+         and isinstance(short16, str) and "--dss-config" in short16
+         and isinstance(unknown16, str) and "names no step" in unknown16, (ok16, miss16, short16, unknown16))
+    runs = yml_step_runs(read_text(os.path.join(HERE, "sqlite.yml")))
+    drivers = dict((s, lines[0]) for s, lines in runs.items()
+                   if lines and lines[0].startswith("python3 ./build_and_test.py ") and "--self-test" not in lines[0])
+    parsed17 = dict((s, cli(split_run_line(line)[2:])) for s, line in drivers.items())
+    t.ck("KN17", "every sqlite.yml step that runs this driver with knobs leads with --step=<its own name> and passes "
+         "exactly STEP_FLAGS' flags (read from the yml's text, as DssHarness reads it)",
+         sorted(drivers) == sorted(B.STEP_FLAGS)
+         and all(isinstance(p, dict) and p.get("--step") == s for s, p in parsed17.items()), (drivers, parsed17))
+    Sg = x.M.mod("sqlite_stage")
+    decoy = {"GIT_DIR": "/a-decoy/.git", "GIT_WORK_TREE": "/a-decoy", "GIT_INDEX_FILE": "/a-decoy/.git/index",
+             "PATH": "/kept"}
+    genv = Sg._git_env(decoy)
+    t.ck("KN18", "every git the stage runs runs WITHOUT git's repository-local variables (a hook's GIT_DIR, "
+         "GIT_WORK_TREE, GIT_INDEX_FILE), the rest of its environment kept",
+         not any(k in genv for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")) and genv.get("PATH") == "/kept"
+         and genv.get("GIT_TERMINAL_PROMPT") == "0", genv)
+
+
+def yml_step_runs(yml_text):
+    """{step name: its run lines} of an action file, read as TEXT the way the tool reads it: each `- name:` block's
+    `run: |` lines, trimmed, blanks dropped."""
+    out = collections.OrderedDict()
+    for m in re.finditer(r"(?ms)^  - name: ([\w.-]+)[ \t]*\n(.*?)(?=^  - name: |\Z)", yml_text):
+        body = re.search(r"(?m)^    run: \|[ \t]*\n((?:(?:      .*)?\n)+)", m.group(2) + "\n")
+        out[m.group(1)] = [ln.strip() for ln in (body.group(1) if body else "").splitlines() if ln.strip()]
+    return out
+
+
+def split_run_line(line):
+    """A run line as DssHarness splits it: on whitespace, double quotes only, no escapes."""
+    return [tok.replace('"', "") for tok in re.findall(r'(?:[^\s"]|"[^"]*")+', line)]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -3622,6 +3844,104 @@ def pin_dc31(t, x):
          "report nothing for the whole bound); a shorter one, or no stall bound at all, is accepted",
          r_eq and "DSS_PROGRESS_INTERVAL=100" in why and "DSS_SEGMENT_STALL=100" in why and not r_ok and not r_off,
          (r_eq, why, r_ok, r_off))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# DC-32 -- ONE CHECKOUT PER CONSUMER: the driver's Steps 3-4 stage each run from ITS OWN sqlite checkout
+# (2026-09-30, lane p69/hm): the four-leg `dssharness run sqlite` runs its Windows and WSL legs at once, and both
+# staged from ONE clone in WSL's home, so the clone lock refused one of the run's own legs (exit 3) whenever the
+# stage had to refresh. The driver's placement (`build_and_test.sqlite_checkout`, what Steps 3-4 and the recompile's
+# re-stage call) is driven here for BOTH hosts, over the SHIPPED rule, with only the POSIX side's answers scripted.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+def pin_dc32(t, x):
+    C = x.M.mod("sqlite_common")
+    root = x.sub("dc32")
+    wsl_out = C.output_tree(os.path.join(root, "wsl-leg-tree"), "linux")
+    win_out = C.output_tree(os.path.join(root, "win-leg-tree"), "windows")
+    asked = []
+
+    def posix_env(argv, **_kw):
+        """The POSIX side as `printenv` answers inside WSL: HOME set, XDG_CACHE_HOME unset (exit 1)."""
+        asked.append(list(argv))
+        return C.Result(0, "/home/a-wsl-account\n", "") if argv[-1] == "HOME" else C.Result(1, "", "")
+    bt = x.M.fresh("build_and_test", C=Proxy(C, capture=posix_env))
+    S = importlib.import_module("sqlite_stage")
+    win_side = C.PosixSide("windows", distribution="an-injected-distro")
+
+    def run_on(host, out_dir, side, sqlite_dir=""):
+        return types.SimpleNamespace(host=host, out_dir=out_dir, posix=side,
+                                     cfg=types.SimpleNamespace(sqlite_dir=sqlite_dir))
+    mine = bt.sqlite_checkout(run_on("linux", wsl_out, C.PosixSide("linux")))
+    theirs = bt.sqlite_checkout(run_on("windows", win_out, win_side))
+    t.ck("K01", "the WSL leg's run stages from its OWN checkout, INSIDE its output tree (<output tree>/checkout)",
+         mine == os.path.join(wsl_out, S.CONSUMER_CHECKOUT), mine)
+    t.ck("K02", "the Windows leg's run stages from ITS OWN, in WSL's cache keyed by its output tree -- placed by the "
+         "POSIX side's own XDG_CACHE_HOME and HOME, asked THROUGH the POSIX side",
+         theirs == "/home/a-wsl-account/.cache/dsscp/%s/%s/sqlite" % (S.CONSUMERS_DIR, S.consumer_key(win_out))
+         and asked == [win_side.argv(["printenv", "XDG_CACHE_HOME"]), win_side.argv(["printenv", "HOME"])],
+         (theirs, asked))
+    t.ck("K03", "the two consumers of one run stage from DIFFERENT checkouts -- the collision the clone lock met is "
+         "gone -- and a second run of the Windows tree finds its own again",
+         mine != theirs and bt.sqlite_checkout(run_on("windows", win_out, win_side)) == theirs, (mine, theirs))
+    del asked[:]
+    named = bt.sqlite_checkout(run_on("windows", win_out, win_side, sqlite_dir="~/by-hand/sqlite"))
+    t.ck("K04", "CONTROL: a checkout a person NAMES (SQLITE_DIR) is used as named, its `~` the POSIX side's home",
+         named == "/home/a-wsl-account/by-hand/sqlite" and asked == [win_side.argv(["printenv", "HOME"])],
+         (named, asked))
+    # ★ A CONSUMER'S CHECKOUT GOES WITH ITS TREE (2026-10-01, the P69 review's MINOR 2): before its derive, a Windows
+    # run lists the checkouts' records and has removed exactly those whose tree is gone from this host. The POSIX
+    # side is scripted (its path translation too: the real one asks WSL).
+    side = types.SimpleNamespace(needs_wsl=True, argv=win_side.argv,
+                                 to_posix=lambda p: "/mnt/c/fake/" + os.path.basename(p))
+    live = os.path.join(root, "live-tree")
+    os.makedirs(live, exist_ok=True)
+    gone = os.path.join(root, "gone-tree")                                  # never made: its tree is gone
+    own_key, k_live, k_gone, k_bare = S.consumer_key(win_out), "a" * 16, "b" * 16, "c" * 16
+    cache_root = "/home/a-wsl-account/.cache/dsscp/" + S.CONSUMERS_DIR
+
+    def consumers_side(listing):
+        calls = []
+
+        def answer(argv, **_kw):
+            calls.append(list(argv))
+            if "printenv" in argv:
+                return posix_env(argv)
+            if "--prune" in argv:
+                return C.Result(0, json.dumps({"pruned": list(argv[argv.index("--prune") + 1:]), "held": [],
+                                               "missing": []}) + "\n", "")
+            return C.Result(0, json.dumps({"consumers": listing}) + "\n", "")
+        return calls, answer
+    calls, answer = consumers_side([{"key": own_key, "tree": win_out}, {"key": k_live, "tree": live},
+                                    {"key": k_gone, "tree": gone}, {"key": k_bare, "tree": None}])
+    btc = x.M.fresh("build_and_test", C=Proxy(C, capture=answer))
+    prun = run_on("windows", win_out, side)
+    prun.log = C.Log(io.StringIO())
+    removed = btc.prune_gone_consumers(prun)
+    asks = [c for c in calls if "consumers" in c]
+    t.ck("K05", "a Windows run asks the POSIX side for the consumers' records, then has removed ONLY the checkout "
+         "whose tree is gone from this host", removed == [k_gone] and len(asks) == 2
+         and asks[0][-3:] == ["consumers", "--root", cache_root]
+         and asks[1][-5:] == ["consumers", "--root", cache_root, "--prune", k_gone], (removed, asks))
+    t.ck("K06", "...never its own checkout, one whose tree is here, or one with no record of its tree -- which it "
+         "REPORTS, since it cannot be judged",
+         len(asks) == 2 and all(k not in asks[1] for k in (own_key, k_live, k_bare))
+         and k_bare in prun.log.stream.getvalue(), (asks, prun.log.stream.getvalue()[-400:]))
+    calls2, answer2 = consumers_side([{"key": own_key, "tree": win_out}, {"key": k_live, "tree": live}])
+    btc2 = x.M.fresh("build_and_test", C=Proxy(C, capture=answer2))
+    prun2 = run_on("windows", win_out, side)
+    prun2.log = C.Log(io.StringIO())
+    t.ck("K07", "CONTROL: with no tree gone the run asks for the records once and removes nothing",
+         btc2.prune_gone_consumers(prun2) == [] and [c for c in calls2 if "--prune" in c] == [], calls2)
+    drun = run_on("windows", win_out, side)
+    drun.cfg = types.SimpleNamespace(sqlite_dir="", jobs=2, tier="veryquick", tcl_version="", test_file="")
+    drun.stage_dir, drun.sqlite_dir_posix = os.path.join(win_out, "stage"), cache_root + "/" + own_key + "/sqlite"
+    own_argv = bt.derive_argv(drun, os.path.join(win_out, "sb.json"))
+    drun.cfg.sqlite_dir = "~/by-hand/sqlite"
+    named_argv = bt.derive_argv(drun, os.path.join(win_out, "sb.json"))
+    t.ck("K08", "the derive of a run's own checkout names the tree it belongs to (--consumer-of <output tree>); the "
+         "derive of a checkout a person named does not", own_argv[-2:] == ["--consumer-of", win_out]
+         and "--consumer-of" not in named_argv, (own_argv, named_argv))
 
 
 def _read_lines(path):
@@ -3865,7 +4185,8 @@ PINS = (
             "(never searched for, never built)", pin_dc21),
     PinSpec("DC-22", "what a leftover sweep LEARNT reaches the leg's verdict (the REAL run_corpus)", pin_dc22),
     PinSpec("DC-23", "a failed self-test's report carries each failing arm's DETAIL", pin_dc23),
-    PinSpec("DC-24", "Step 0 runs EVERY suite, then names every failure in ONE refusal", pin_dc24),
+    PinSpec("DC-24", "Step 0 runs EVERY suite, then names every failure in ONE refusal; a skip is judged for the "
+            "host it happened on", pin_dc24),
     PinSpec("DC-25", "a leg's declared TU preludes reach the manifest generator, or the leg is POISONED", pin_dc25),
     PinSpec("DC-26", "a declared TU prelude reaches BOTH compilers (dsscp and the same-platform reference)", pin_dc26),
     PinSpec("DC-27", "the round-close RECOMPILE: a current stage only, the whole stream, every blocker COUNTED",
@@ -3878,6 +4199,8 @@ PINS = (
             "from it", pin_dc30),
     PinSpec("DC-31", "the corpus reaches the driver's output AS IT RUNS, nothing is printed while nothing moves, "
             "and a silent fixture meets the driver's bound before the step's", pin_dc31),
+    PinSpec("DC-32", "ONE CHECKOUT PER CONSUMER: Steps 3-4 stage each run from its own sqlite checkout, by the shipped "
+            "rule, on both hosts; a Windows tree's checkout goes with its tree", pin_dc32),
 )
 PIN_BY_ID = dict((p.id, p) for p in PINS)
 
@@ -4323,6 +4646,78 @@ REDS = (
         new="    if value == \"1\":\n        return True\n"
             "    if value is None or value in (\"\", TEST_ONLY_HOST):\n        return False\n",
         expect=("RT2",), stay_green=("D01", "N01")),
+    # ── the recompile's subject, measured and declared separately (2026-09-30, the round-12 audit's S1 and S2)
+    red("RD-93", "DC-27", "sqlite_recompile", "new (P69 hm, S2, 2026-09-30)",
+        "hand the census the catalogue's pin as the stage's head (the defect: the summary restated the declaration)",
+        '                           "--sqlite-head", run.stage.sqlite_head or "",\n',
+        new='                           "--sqlite-head", S.parse_stage_build(run.stage_build)["sqlite_commit"][:12],\n',
+        expect=("B01",), stay_green=("A01", "B04")),
+    red("RD-94", "DC-27", "harness_legs", "new (P69 hm, S2, 2026-09-30)",
+        "let a census over a stage that is NOT the pin stay clean",
+        "    if sqlite_pin and not (sqlite_head and sqlite_pin.startswith(sqlite_head)):\n",
+        new="    if False:\n", expect=("B09",), stay_green=("B01", "B04")),
+    red("RD-95", "DC-27", "sqlite_recompile", "new (P69 hm, S1, 2026-09-30)",
+        "judge an IN-PLACE stage current whatever its checkout's tracked files hold",
+        "        changed, cant = (tracked_changes or S.tracked_changes)(st.sqlite_dir)\n",
+        new="        changed, cant = [], \"\"\n", expect=("A14",), stay_green=("A01", "A12")),
+    red("RD-96", "DC-27", "sqlite_recompile", "new (P69 hm, S2, 2026-09-30)",
+        "accept a stage that records the pin only as an abbreviation",
+        "    elif head != pin:\n", new="    elif False:\n", expect=("A15",), stay_green=("A01", "A12")),
+    # ── one checkout per consumer (2026-09-30, the four-leg run's own leg refused at the shared clone)
+    red("RD-97", "DC-32", "build_and_test", "new (P69 hm, the shared WSL clone, 2026-09-30)",
+        "stage every run from the ONE clone in the POSIX side's home again (the retired `~/src/sqlite`)",
+        "        return S.consumer_checkout(run.host, run.out_dir, env)\n",
+        new="        return (env or {}).get(\"HOME\", os.path.expanduser(\"~\")) + \"/src/sqlite\"\n",
+        expect=("K01", "K02"), stay_green=("K04",)),
+    # ── the WSL legs' own distribution (2026-09-30, the round-12 audit's S8)
+    red("RD-98", "DC-29", "sqlite_common", "new (P69 hm, S8, 2026-09-30)",
+        "enter the machine's DEFAULT WSL distribution again (`wsl.exe -e`)",
+        "        return [\"wsl.exe\", \"-d\", self.distribution, \"-e\"] if self.needs_wsl else []\n",
+        new="        return [\"wsl.exe\", \"-e\"] if self.needs_wsl else []\n",
+        expect=("MS18",), stay_green=("MS01", "MS19")),
+    red("RD-104", "DC-29", "harness_legs", "new (P69 hm, S8's resolver half, 2026-09-30)",
+        "hand a leg's launcher and path translator out with the distribution NOT entered (the template's placeholder "
+        "left in the argv a Windows driver spawns)",
+        "                command, translator = enter_host_facts(command), enter_host_facts(translator)\n",
+        new="                command, translator = list(command), list(translator)\n",
+        expect=("MS20",), stay_green=("MS18", "MS19")),
+    # ── step mode (2026-09-30, the round-12 audit's S4 and S6)
+    red("RD-99", "DC-30", "sqlite_common", "new (P69 hm, S4, 2026-09-30)",
+        "let a step be steered by whatever its environment holds again (no refusal of an ambient variable)",
+        "            if ambient:\n", new="            if False:\n", expect=("KN14",), stay_green=("KN13", "KN15")),
+    red("RD-100", "DC-30", "sqlite_common", "new (P69 hm, S6, 2026-09-30)",
+        "let a step pass with a shrunken leg set (a step no longer strict)",
+        "            self.strict = True\n", new="            self.strict = self.strict\n",
+        expect=("KN15",), stay_green=("KN13", "KN14")),
+    red("RD-101", "DC-30", "build_and_test", "new (P69 hm, S4, 2026-09-30)",
+        "take --step with any flags (a run line that drops a step's input still runs as that step)",
+        "        if passed != sorted(STEP_FLAGS[step]):\n", new="        if False:\n",
+        expect=("KN16",), stay_green=("KN07", "KN17")),
+    red("RD-102", "DC-30", "sqlite_stage", "new (P69 hm, S4, 2026-09-30)",
+        "run the stage's git with the caller's GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE again",
+        "    e = dict((k, v) for k, v in (os.environ if env is None else env).items() if k not in local)\n",
+        new="    e = dict(os.environ if env is None else env)\n", expect=("KN18",), stay_green=("KN01", "KN13")),
+    # ── skips bounded (2026-09-30, the round-12 audit's S6): the ceiling removed
+    red("RD-103", "DC-24", "build_and_test", "new (P69 hm, S6, 2026-09-30)",
+        "remove Step 0's skip ceiling (any skip passes again, declared or not, counted or not)",
+        "            if excess:\n", new="            if False:\n",
+        expect=("Z06", "Z07"), stay_green=("Z01", "Z04", "Z05")),
+    # ── where a skip may happen (2026-10-01, the P69 review's MINOR 1): the host key removed
+    red("RD-105", "DC-24", "build_and_test", "new (P69 hm, MINOR 1, 2026-10-01)",
+        "admit a declared skip on EVERY host again (the allowance no longer keyed by where the arm cannot run)",
+        "    return \"any\" in where or host in where or (\"test-only\" in where and not harness)\n",
+        new="    return True\n", expect=("Z08", "Z09"), stay_green=("Z05", "Z06", "Z10")),
+    # ── a consumer's checkout goes with its tree (2026-10-01, the P69 review's MINOR 2)
+    red("RD-106", "DC-32", "build_and_test", "new (P69 hm, MINOR 2, 2026-10-01)",
+        "remove every recorded checkout but the run's own, whether its tree is gone or not",
+        ("    gone = [e[\"key\"] for e in entries if e.get(\"tree\") and e[\"key\"] != own "
+         "and not is_dir(e[\"tree\"])]\n"),
+        new="    gone = [e[\"key\"] for e in entries if e.get(\"tree\") and e[\"key\"] != own]\n",
+        expect=("K05", "K06", "K07"), stay_green=("K01", "K08")),
+    red("RD-107", "DC-32", "build_and_test", "new (P69 hm, MINOR 2, 2026-10-01)",
+        "derive a run's own checkout without recording the tree it belongs to (so it can never be judged gone)",
+        "        argv += [\"--consumer-of\", run.out_dir]\n", new="        argv += []\n",
+        expect=("K08",), stay_green=("K01", "K05", "K07")),
 )
 
 
@@ -4431,13 +4826,19 @@ MUTATOR_ARMS = (
               "each FAIL; only a pin skip skips", ms_red_verdict),
 )
 
-# Every arm this file registers: 31 pins + 93 red arms + 10 mutator arms. A registry that no longer
+# Every arm this file registers: 32 pins + 108 red arms + 10 mutator arms. A registry that no longer
 # adds up to this -- an arm deleted, or one added without this line -- is a FAILURE. (2026-09-26: five red
 # arms retired with the code they guarded -- RD-26, RD-31, RD-48, RD-49, RD-52 -- and five added, RD-76..RD-80;
 # then, P68 round 13, RD-75 retired with the benchmark's clone lock and four added, RD-81..RD-84; then, the PR
-# exit's X1, DC-31 and its six arms RD-85..RD-90, and RD-91 on DC-27; then its lane ci59b, RD-92 on DC-13; a
-# retired arm's id is never reused.)
-DECLARED_TOTAL = 134
+# exit's X1, DC-31 and its six arms RD-85..RD-90, and RD-91 on DC-27; then its lane ci59b, RD-92 on DC-13; then
+# P69 lane hm, RD-93..RD-96 on DC-27 (the recompile's subject: the stage's own sha, the pin beside it, an in-place
+# stage's tracked files), DC-32 and RD-97 (one checkout per consumer), RD-98 on DC-29 (the WSL legs' own
+# distribution), RD-99..RD-102 on DC-30 (step mode: ambient variables refused, strict, the step's exact flags, the
+# stage's git without a caller's GIT_DIR), RD-103 on DC-24 (Step 0's skip ceiling), RD-104 on DC-29 (the resolver
+# enters the same distribution into the legs' own argvs), RD-105 on DC-24 (Step 0's skip allowance keyed by
+# where a skip may happen), RD-106 and RD-107 on DC-32 (a consumer's checkout goes with its tree: only a gone
+# tree's is removed, and the derive records the tree); a retired arm's id is never reused.)
+DECLARED_TOTAL = 150
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════

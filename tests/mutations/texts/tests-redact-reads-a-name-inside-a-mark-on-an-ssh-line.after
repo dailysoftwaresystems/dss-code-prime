@@ -1,0 +1,1 @@
+        line = rx.sub("<host>", line)

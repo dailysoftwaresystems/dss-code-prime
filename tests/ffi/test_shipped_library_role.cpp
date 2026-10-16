@@ -481,8 +481,9 @@ TEST(ShippedLibraryRole, APerSymbolRoleBesideARealizationIsAlsoTwoOwners) {
         ]
     })JSON", nullptr);
     EXPECT_FALSE(desc.has_value());
-    EXPECT_TRUE(anyDiagMentions(f.rep, "D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R3"))
-        << joinDiags(f.rep);
+    // P69: the symbol-level refusal states R3's CONDITION (its anchor id lives in the
+    // source comment beside it, where anchor ids belong — never in a message literal).
+    EXPECT_TRUE(anyDiagMentions(f.rep, "two owners for one body")) << joinDiags(f.rep);
     EXPECT_TRUE(anyDiagMentions(f.rep, "symbols[0] ('sr_fn')")) << joinDiags(f.rep);
 }
 
@@ -504,6 +505,47 @@ TEST(ShippedLibraryRole, ARoleAndARealizationOnDifferentFormatsIsNotTwoOwners) {
            "stated UNBOUND arm";
     ASSERT_EQ(desc->libraryRoles.size(), 1u);
     EXPECT_EQ(desc->libraryRoles.at("macho"), RuntimeLibraryRole::CLibrary);
+}
+
+// ── R3 BY LEVEL (P69, lane `cs`, review M5(a)) ──────────────────────────────
+// A SYMBOL's realization overrides the DOCUMENT's import for that format — the one
+// merge rule both axes follow, symbol keys win — and every consumer of the row (the
+// realization oracle, the `#include` injector) takes the realization first, so the
+// body has ONE owner. <string.h>'s `memset_explicit` is this shape: the header imports
+// from the C library on every format, and no shipped C library has that body.
+// RED-ON-DISABLE: compare the symbol-level realization against the MERGED import maps
+// again → this reads as two owners (and so does the shipped string.json).
+TEST(ShippedLibraryRole, ADocumentImportBeneathASymbolRealizationIsOneOwner) {
+    Fixture f;
+    auto desc = f.read("doc_role_sym_realization.json", R"JSON({
+        "header": "ds.h",
+        "library": { "macho": { "role": "cLibrary" } },
+        "symbols": [
+            { "name": "ds_imported", "signature": "fn() -> i32" },
+            { "name": "ds_shipped", "signature": "fn() -> i32",
+              "realization": { "macho": { "source": "runtime/platform/src/atomic.c" } } }
+        ]
+    })JSON", nullptr);
+    ASSERT_TRUE(desc.has_value()) << joinDiags(f.rep);
+    EXPECT_EQ(f.rep.errorCount(), 0u) << joinDiags(f.rep);
+}
+
+// ... while a symbol that declares BOTH, itself, for one format is two owners still — the
+// same-level case, which no override rule can settle.
+// RED-ON-DISABLE: drop the symbol-level comparison → this reads clean.
+TEST(ShippedLibraryRole, ASymbolsOwnImportBesideItsOwnRealizationIsTwoOwners) {
+    Fixture f;
+    auto desc = f.read("sym_both.json", R"JSON({
+        "header": "sb.h",
+        "symbols": [
+            { "name": "sb_fn", "signature": "fn() -> i32",
+              "library": { "macho": { "role": "cLibrary" } },
+              "realization": { "macho": { "source": "runtime/platform/src/atomic.c" } } }
+        ]
+    })JSON", nullptr);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(anyDiagMentions(f.rep, "two owners for one body")) << joinDiags(f.rep);
+    EXPECT_TRUE(anyDiagMentions(f.rep, "symbols[0] ('sb_fn')")) << joinDiags(f.rep);
 }
 
 // ── S2: A ROLE THIS BUILD CANNOT ANSWER REACHES THE BUILD'S REPORTER ────────

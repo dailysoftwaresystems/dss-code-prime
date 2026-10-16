@@ -1,0 +1,2 @@
+            problems.append(f"{name}, which build.ninja includes, cannot be read "
+                            f"({exc.strerror or exc})")

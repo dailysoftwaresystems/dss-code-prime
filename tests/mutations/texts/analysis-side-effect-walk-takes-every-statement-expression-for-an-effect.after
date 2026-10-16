@@ -1,0 +1,2 @@
+            if (value.valid() || !value.valid()) return true;
+            stack.push_back(value);

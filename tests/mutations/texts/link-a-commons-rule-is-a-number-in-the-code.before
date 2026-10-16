@@ -1,0 +1,1 @@
+        while (alignment < size && alignment < *alignmentFromSizeAtMost) alignment <<= 1;

@@ -302,6 +302,10 @@ struct DSS_EXPORT ShippedSymbol {
     // `objectFormatKindFromName` vocabulary; an unknown key / non-string value
     // fails loud on read (the SAME `decodeLibraryMap` chokepoint the
     // descriptor-level map uses).
+    // ★ P69 (the R3 precedence): for every format this symbol's OWN `realization`
+    // names while its descriptor declares an import there, the reader adds an EMPTY
+    // image here — the symbol's source supersedes the inherited import, and an
+    // empty image is what every binder fold reads as "no image on this format".
     std::unordered_map<std::string, std::string> library;
     // ★★★ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF (operator ruling, 2026-08-17) —
     // optional per-SYMBOL `realization` OVERRIDE: the per-object-format map
@@ -331,8 +335,11 @@ struct DSS_EXPORT ShippedSymbol {
     //        the descriptor row and the missing path (LOAD time).
     //   R2 — a shipped source file NO descriptor names ⇒ inert config (gate test;
     //        see `validateShippedSourceTree` for why the placement differs).
-    //   R3 — one format carrying BOTH a `library` image AND a `source` ⇒ two
-    //        owners for one body is the defect, not a fallback resolved silently.
+    //   R3 — one format carrying BOTH a `library` image AND a `source` AT ONE LEVEL
+    //        (the descriptor's pair, or this symbol's own pair), or this symbol's
+    //        own import where its descriptor realizes from source ⇒ two owners for
+    //        one body is the defect, not a fallback resolved silently. A symbol's
+    //        OWN source over the import it inherits is ONE owner (P69): see `library`.
     std::unordered_map<std::string, std::string> realization;
     // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: the
     // per-SYMBOL `library` entries that named a ROLE rather than an image,
@@ -340,22 +347,42 @@ struct DSS_EXPORT ShippedSymbol {
     // in hand to turn them into `library` strings. The same contract as the
     // descriptor-level `libraryRoles` below; see it for why both maps exist.
     std::unordered_map<std::string, RuntimeLibraryRole> libraryRoles;
+    // ★ P69 (lane lm) — THE LIBRARY-DATUM ALIAS KEY. The OTHER names the active
+    // format's C library exports THIS object under, as the row's `aliases` map
+    // states them per object format (✔MEASURED per library, never inferred):
+    // glibc exports `environ`, `__environ` and `_environ` at ONE address
+    // (readelf, both ELF arches; dlsym through a handle on libc.so.6), libSystem
+    // exports `environ` alone. ONE ROW PER OBJECT: the loader refuses an alias
+    // that is also its own row on that format, because two rows for one object
+    // are two declarations the linker cannot tell are one — and an alias listed
+    // for a format the row itself is not available on (the document's gate or
+    // the row's own), because an alias is the row under another name and exists
+    // only where the row does. Empty when the row has no alias on the active
+    // format, and on a pair-less read.
+    //
+    // Each alias is ALSO a declared name: the reader appends one row per alias —
+    // the same declaration under the alias's own name, `aliasOf` naming this
+    // row — so a program can write any of them (glibc's <unistd.h> declares
+    // `__environ`) and nothing downstream special-cases an alias. The set is what
+    // a link that copies the object into the image must define at the copy, every
+    // name at once (D-LK-MEMBER-DIRECT-LIBRARY-DATUM-BOUND-TO-THE-SLOT).
+    std::vector<std::string> aliases;
+    // On a row the reader appended for an alias: the canonical row's name. Empty
+    // on every authored row.
+    std::string              aliasOf;
 };
 
-// True iff `id` is a member of the CLOSED synth-recipe vocabulary — 22 recipes spanning
-// TWO families:
-//   * <threads.h> (21): the 18 non-trampoline (Cycle 1) + the 3 trampolines thrd_create/
-//     call_once/thrd_join (Cycle 2). (thrd_sleep + the timed-waits stay elf-FFI-only —
-//     deferred, see the .cpp vocab list.)
-//   * <stdio.h> (1): `sprintf` — the whole shipped printf family for now; each further
-//     recipe lands with its own descriptor row, its UCRT core row, and a runtime witness.
+// True iff `id` is a member of the CLOSED synth-recipe vocabulary — 24 recipes, ONE family
+// since P69: <threads.h> — the 18 single-block recipes (Cycle 1), thrd_create and thrd_join
+// (Cycle 2), and thrd_sleep, mtx_timedlock, cnd_timedwait, thrd_equal (Cycle 3). (P69 retired
+// the <stdio.h> family and `call_once`: each is DSS's runtime source now — see the .cpp
+// vocab list.)
 // The SINGLE source of truth shared by the descriptor loader (which rejects an unknown
 // `synthesize` value fail-loud — F_ShippedLibDescriptorMalformed) AND the driver's multi-CU
-// merged-module recipe reconstruction (program.cpp). Each family's synth pass has the
+// merged-module recipe reconstruction (program.cpp). The family's synth pass has the
 // matching per-recipe body switch — `synthesizeThreadsShim` PER VEHICLE (pe→win32/kernel32,
-// macho→pthread/libSystem), `synthesizeStdioShim` over the UCRT `__stdio_common_v*` cores;
-// a vocab id with no switch arm fails loud at synth (they cannot silently diverge).
-// (D-CSUBSET-C11-THREADS-HEADER / D-FFI-PE-CRT-UCRT-MIGRATION)
+// macho→pthread/libSystem); a vocab id with no switch arm fails loud at synth (they cannot
+// silently diverge). (D-CSUBSET-C11-THREADS-HEADER / D-FFI-PE-CRT-UCRT-MIGRATION)
 [[nodiscard]] DSS_EXPORT bool isKnownSynthesizeRecipe(std::string_view id);
 
 // Which SHIM FAMILY a recipe id belongs to. There is ONE recipe map
@@ -369,9 +396,10 @@ struct DSS_EXPORT ShippedSymbol {
 // an unknown `synthesize` value at READ time (a typo never reaches a pass at all). This
 // split is what keeps each pass's own "no arm for MY family's id" check meaningful.
 // (D-CSUBSET-C11-THREADS-HEADER / D-FFI-PE-CRT-UCRT-MIGRATION)
+// (P69: the <stdio.h> family left — the pe printf/scanf rows are DSS's runtime source,
+// runtime/platform/src/stdio.c — so <threads.h> is the one family today.)
 enum class ShimFamily : std::uint8_t {
     Threads,   // <threads.h> over kernel32 (win32) / libSystem (pthread)
-    Stdio,     // <stdio.h> printf family over the UCRT __stdio_common_v* cores
 };
 
 // nullopt ⇔ !isKnownSynthesizeRecipe(id) — the two are kept in lockstep by construction
@@ -509,14 +537,19 @@ struct DSS_EXPORT ShippedPairFacts {
 // header's float-valued object-like macros (`INFINITY`, `M_PI`, `DBL_MAX`) ship
 // HERE instead. `type` MUST decode to a FLOAT scalar (F32/F64); `value` is the
 // decoded `double` (an F32 constant is stored widened to double and the fold
-// narrows it back at materialization). The semantic phase injects each as a named
-// constant whose HIR Ref folds to a FLOAT literal — the SAME `isInjectedConstant`
-// path as an integer constant, the only difference being the float core/value the
-// shared `constantLiteralForSymbol` builder derives.
+// narrows it back at materialization). For a language that PREPROCESSES, each is a
+// MACRO the preprocessor splices — spelled as the language's own constant of the
+// declared type (P69 round 4, `readShippedLibFloatConstants`) — so `#ifdef
+// INFINITY` holds and `#undef INFINITY` removes it, as every reference's header
+// does; for one that does not, the semantic phase injects it as a named constant
+// whose HIR Ref folds to a FLOAT literal — the SAME `isInjectedConstant` path as an
+// integer constant, the only difference being the float core/value the shared
+// `constantLiteralForSymbol` builder derives.
 //
 // VALUE ENCODING: JSON has no Infinity/NaN, so the descriptor's `value` is a
 // STRING — the special tokens "inf"/"+inf"/"-inf" map to the IEEE-754 ±infinity
-// bit patterns, and any other string is a finite float literal parsed by the ONE
+// bit patterns, "nan"/"+nan"/"-nan" to the quiet NaN with the empty payload (P69
+// round 4: `NAN`), and any other string is a finite float literal parsed by the ONE
 // float decoder (`number_decode.hpp`). A finite literal that OVERFLOWS to ±inf
 // fails loud (only the explicit "inf" tokens may produce an infinity — never a
 // silent overflow).
@@ -557,8 +590,9 @@ struct DSS_EXPORT ShippedTypedef {
 // macho. The descriptor declares `variants` (each `when:{format}` + its own
 // {replacement, params?, variadic?}) INSTEAD of a flat body; the decoder selects
 // the variant matching the active format and produces THIS same flat shape.
-// FORMAT-ONLY — arch is not threaded into the preprocessor (a macro variant's
-// `when` carries `format` alone). A flat-body macro keeps single-replacement behavior.
+// FORMAT-ONLY (a macro variant's `when` carries `format` alone; any other key fails
+// loud). A per-ARCH integer is a `constants` row instead, which the splice selects on
+// the full pair (P69). A flat-body macro keeps single-replacement behavior.
 struct DSS_EXPORT ShippedMacro {
     std::string                             name;
     std::optional<std::vector<std::string>> params;   // nullopt = object-like
@@ -1178,8 +1212,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
 // `activeFormat` (plan-25 extension): a macro entry may carry per-FORMAT
 // `variants` (each `when:{format}` + its own replacement — the errno
 // `__errno_location`/elf vs `__error`/macho case). The active object-format
-// selects the matching variant; macros are FORMAT-ONLY (arch is not threaded
-// into the preprocessor), so this is the only selector. nullopt (a test caller
+// selects the matching variant; macros are FORMAT-ONLY (a per-arch integer is a
+// `constants` row, selected on the full pair), so this is the only selector. nullopt (a test caller
 // / no target) ⇒ a variants-only macro is not injected; a flat macro is
 // unaffected. The single production caller (SynthBuilder::build) passes its
 // active format.
@@ -1239,6 +1273,49 @@ readShippedLibConstants(std::filesystem::path const&    path,
                         std::optional<std::string_view> activeTarget = std::nullopt,
                         std::optional<ObjectFormatKind> activeFormat = std::nullopt,
                         ShippedPairFacts const*         pairFacts    = nullptr);
+
+// One `floatConstants` row PROJECTED into the PREPROCESSOR's vocabulary — the
+// interner-free view `readShippedLibFloatConstants` returns, the float sibling of
+// `ShippedPpConstant` (P69 round 4,
+// D-FFI-DESCRIPTOR-FLOAT-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR). The decoded
+// value and the declared FLOAT scalar's core cross; spelling them back into a
+// source-language constant is the LANGUAGE tier's job (the preprocessor splice,
+// driven by the language's own float-literal typing and builtins), never this one.
+struct DSS_EXPORT ShippedPpFloatConstant {
+    std::string name;
+    double      value = 0.0;             // exactly as ShippedFloatConstant::value
+    TypeKind    core  = TypeKind::Void;  // the declared type's core (F32, F64, ...)
+};
+
+// Read the `floatConstants` surface at `path` WITHOUT a TypeInterner — the float
+// sibling of `readShippedLibConstants`, through the SAME
+// `decodeShippedFloatConstants` chokepoint the semantic read decodes it with, so
+// the splice and the semantic tier cannot disagree on a value or a type. Every
+// float constant a C header defines is a MACRO (C 7.12p3-5: `INFINITY`, `NAN`,
+// `HUGE_VAL`), so every row is preprocessor-visible and no variant selection
+// applies (the surface is flat). EMPTY when the descriptor declares none;
+// std::nullopt on any read the full read would reject. No stricter than the full
+// read: no `header` gate and no other-surface validation.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<ShippedPpFloatConstant>>
+readShippedLibFloatConstants(std::filesystem::path const& path,
+                             DiagnosticReporter&          reporter);
+
+// ══ A FUNCTION TYPE TEXT'S SHAPE, WITHOUT AN INTERNER ═════════════════════════
+// (P69 round 4) The operand cores, the variadic flag and the result core of a
+// function type written in the ONE type-text codec (`fn(ptr<const<char>>) ->
+// f32`), decoded exactly as the semantic tier decodes the same text — through
+// `parseTypeFromText`, on a private lattice whose TypeIds never escape. The
+// preprocessor's float-constant splice reads a language builtin's declared
+// signature with it, so the builtin it spells and the one the semantic tier binds
+// cannot disagree on a type. nullopt ⇒ not a function type that decodes with no
+// named-type bindings.
+struct DSS_EXPORT FunctionTypeShape {
+    std::vector<TypeKind> operandCores;
+    bool                  variadic = false;
+    TypeKind              result   = TypeKind::Void;
+};
+[[nodiscard]] DSS_EXPORT std::optional<FunctionTypeShape>
+readFunctionTypeShape(std::string_view typeText);
 
 // ══ THE LATTICE, ASKED OF ONE TYPE ════════════════════════════════════════════
 // (P68 round 9) A C integer type's LIMIT on a pair — its maximum, minimum or
@@ -1617,6 +1694,26 @@ DSS_EXPORT void forEachDescriptorInClosure(
 std::optional<std::unordered_map<std::string, std::vector<std::string>>>
 collectShippedExternSymbolFormats();
 
+// ★ P69 (lane `cs`, review M3): THE `__has_builtin` ANSWER FOR A LIBRARY BUILTIN — does
+// the platform give the C library function `name` a body on object format `fmt` that the
+// semantic tier's library-function binder binds (its arm (2): the realization oracle
+// below)? True iff the FIRST row of `name`, in the oracle's own candidate order, that
+// passes the document gate AND the symbol gate on `fmt` is a FUNCTION — whatever owns
+// its body there: an image import, a synthesized shim, an image the link tier finds, or
+// DSS's shipped source (which the binder binds as the `#include` path binds it). Read
+// off the SAME corpus index the oracle walks, with its two gates in its order, so
+// `#if __has_builtin(__builtin_cbrt)` and a call of `__builtin_cbrt` cannot disagree
+// about a row. `nullopt` iff the corpus cannot be located (the binder then binds no
+// library builtin, and a caller answers 0 with it).
+//
+// ⚠ TWO THINGS THE BINDER WEIGHS ARE NOT ASKED, BOTH STATED. Its arm (1) — a file-scope
+// declaration of `name` in the translation unit itself — has no preprocessing-time
+// answer, and gcc's `__has_builtin` does not depend on one either; and a descriptor the
+// full reader REFUSES is skipped by the oracle but counted here (this index is lenient by
+// contract) — a malformed corpus, which the corpus-wide decode test refuses.
+[[nodiscard]] DSS_EXPORT std::optional<bool>
+shippedLibraryFunctionProvidedOnFormat(std::string_view name, ObjectFormatKind fmt);
+
 // ── THE PLATFORM REALIZATION ORACLE ──────────────────────────────────────────
 //
 // ★★★ THE DECLARATION SYNTAX HAS NO AUTHORITY OVER REALIZATION, EVER.
@@ -1743,6 +1840,12 @@ struct DSS_EXPORT ShippedSymbolRealization {
     // InvalidType unless `status == Realized`.
     TypeId      signature;
     bool        isFunction = true;   // ExternFunction vs ExternGlobal
+    // P69 (lane `cs`): the row's two CALL facts a declaration of the function carries —
+    // `noreturn` (stdlib.json's `abort`/`exit`) and `returnsTwice` (setjmp.json's
+    // `setjmp`) — copied by the same kernel, so a function minted from a realization (the
+    // library builtin `__builtin_abort`) is the function the `#include` path injects.
+    bool        noreturn     = false;
+    bool        returnsTwice = false;
 };
 
 // ★★★ D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION — THE

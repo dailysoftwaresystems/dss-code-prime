@@ -58,7 +58,7 @@ hit both:
   which is the specific thing that went wrong at 0xD02A.
 
 ★ DEFINE THE COMPLEMENT, NOT THE VARIANTS. Same discipline as
-  `check-anchor-balance.py`'s glyph inversion: a code is UNCOVERED unless a test
+  `anchor-debt.py`'s glyph inversion: a code is UNCOVERED unless a test
   names it. There is no enumeration of "ways a test might reference a code" to
   fall out of date -- a reference shape nobody has thought of yet counts as
   uncovered, which is the safe direction.
@@ -82,11 +82,11 @@ hit both:
    was mid-mutation by design. Same family as two concurrent ctest runs in one
    build directory, which yield no verdict at all.
 
-Usage:
-    python .harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py
-    python .harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py --self-test
-    python .harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py --list-uncovered
-    python .harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py --cross-branch
+Usage -- each a step of the action, the program's own flag after the `#`:
+    dssharness run check-diagnostic-codes                                # verify, then the self-test
+    dssharness run check-diagnostic-codes --manual-step self-test        # --self-test
+    dssharness run check-diagnostic-codes --manual-step list-uncovered   # --list-uncovered
+    dssharness run check-diagnostic-codes-cross-branch                   # --cross-branch, this machine's tree
 
 `--cross-branch` is the ALLOCATION-TIME view across every place this repository can allocate an
 ordinal (the other worktrees' working headers and every ref not merged into HEAD); see

@@ -313,9 +313,11 @@ captureOperand(Tree const& tree, NodeId operandNode, InlineAsmConfig const& ia,
         if (tree.kind(c) == NodeKind::Internal) { internals.push_back(c); continue; }
         // The symbolic name is the ONLY Identifier token an operand can carry:
         // the other three token roles are brackets and parens. Keyed on the
-        // token KIND the host bound to `symbolName`, never on position.
+        // token KIND the host bound to `symbolName`, never on position. Not
+        // Internal is not Token: a parser recovery (Error) child is neither
+        // ([[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]]).
         if (identifierToken.valid() && !f.symbolicNameTok.valid()
-            && tree.tokenKind(c).v == identifierToken.v) {
+            && tree.tokenKindIfToken(c) == identifierToken) {
             f.symbolicNameTok = c;
             f.symbolicName    = tree.text(c);
         }
@@ -1400,7 +1402,12 @@ gatherInlineAsmFacts(Tree const& tree, NodeId asmNode, InlineAsmConfig const& ia
                 seen.emplace_back(kind, cur);
                 continue;
             }
-            if (ia.isTailRule(tree.rule(cur))) continue;   // never enter a section
+            // A parser recovery (Error) node has no rule and no children: its own
+            // ParseDiagnostic speaks for it
+            // ([[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]]).
+            std::optional<RuleId> const scanned = tree.ruleIfInternal(cur);
+            if (!scanned.has_value()) continue;
+            if (ia.isTailRule(*scanned)) continue;   // never enter a section
             pushChildrenReversed(tree, cur, stk);
         }
     }

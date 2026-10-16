@@ -1,0 +1,2 @@
+    touches.insert(emitProbeTouch(b, h.orMem, sp, 0, touch).v);
+    std::array<LirOperand, 2> countOps{

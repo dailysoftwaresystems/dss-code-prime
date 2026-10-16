@@ -1,0 +1,2 @@
+        HirNodeId const obj =
+            track(builder.makeUnnamedObject(init, type, storage, HirFlags::None), clNode);

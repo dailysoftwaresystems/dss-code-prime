@@ -26,10 +26,15 @@
 #include "hir/hir_attrs.hpp"
 #include "hir/hir_literal_pool.hpp"
 #include "hir/hir_text.hpp"
+#include "mir/lowering/hir_to_mir.hpp"
+#include "mir/mir.hpp"
+#include "mir/mir_literal_pool.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -40,7 +45,7 @@ namespace {
 
 // Wrap a body line in a minimal well-formed module.
 [[nodiscard]] std::string moduleWith(std::string_view bodyLine) {
-    return std::string("dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+    return std::string("dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                        "  function %1 : fn() -> void {\n    block {\n      ")
          + std::string(bodyLine) + "\n      return void\n    }\n  }\n}\n";
 }
@@ -152,6 +157,8 @@ TEST(HirTextVocabulary, VariadicAccessKeywordsRouteToTheExpressionParser) {
         {"va_start", "expr va_start : void (lit int 0 : i32)"},
         {"va_arg",   "expr va_arg : i32 (lit int 0 : i32, lit int 1 : i32)"},
         {"va_end",   "expr va_end : void (lit int 0 : i32)"},
+        // P69 (D-C-STDARG-VA-COPY-MISSING): the fourth, [dest, src].
+        {"va_copy",  "expr va_copy : void (lit int 0 : i32, lit int 1 : i32)"},
     };
     for (Case const& c : cases) {
         ParseOutcome const o = parseText(moduleWith(c.line));
@@ -322,6 +329,220 @@ TEST(HirTextAggregateLiteral, UnspelledMarkerIsStillRefusedByName) {
     EXPECT_NE(o.diagnostics.find("was NOT serialized"), std::string::npos) << o.diagnostics;
 }
 
+// ── P69 (lane `cs`): `.dsshir` v8 — A UNION VALUE NAMES ITS MEMBER ───────────
+//
+// `lit agg member N {…} : <union>` — the member a union value's one field
+// initializes. An initializer may designate any member (C 6.7.9p17) and the
+// field's type cannot say which: both members below are `i32`, so ONLY the index
+// tells the second from the first. v7 wrote `agg {…}` for every aggregate, so a
+// module built in memory lost the member on write without a word and no spelling
+// could put it back — while `toMirLiteral` copies the member into the MIR literal
+// and the static-data encoder refuses a union value that names none.
+//
+// ★ THREE THINGS ARE ASSERTED, AND THE BYTE COMPARE IS THE WEAKEST OF THEM.
+// "Nothing" re-emits as "nothing": a writer that drops the member and a reader
+// that never asks for it round-trip byte for byte. So the SPELLING is asserted,
+// then the REBUILT POOL, then the value the NEXT TIER receives.
+//
+// RED-ON-DISABLE: stop writing `member N` → the spelling assertion fails and the
+// reader refuses the member-less union; stop storing it on read → the reader
+// refuses its own writer's output; drop either refusal → the matching row of
+// `AUnionMemberSpellingIsReadOnlyWhereItMeansSomething` reads clean.
+namespace {
+
+struct UnionModule {
+    TypeInterner             in{CompilationUnitId{1}};
+    HirLiteralPool           pool;
+    std::vector<std::string> names{"", "u", "s"};
+    Hir                      hir{};
+};
+
+// `%1`: `union U { i32; i32; }` through its SECOND member. `%2`: the same union
+// NESTED in a structure, through its FIRST member — named too, because absence
+// is not "member 0", and the nesting is what the writer's and the reader's frame
+// stacks walk.
+[[nodiscard]] std::unique_ptr<UnionModule> unionModule() {
+    auto m = std::make_unique<UnionModule>();
+    TypeId const i32 = m->in.primitive(TypeKind::I32);
+    std::vector<TypeId> const twoInts{i32, i32};
+    TypeId const u = m->in.unionType("U", twoInts);
+    std::vector<TypeId> const sFields{i32, u};
+    TypeId const s = m->in.structType("S", sFields);
+
+    auto const unionOf = [](std::int64_t v, std::uint32_t member) {
+        HirAggregateValue a;
+        a.fields.push_back(HirLiteralValue{v, TypeKind::I32});
+        a.unionMember = member;
+        return HirLiteralValue{std::move(a), TypeKind::Union};
+    };
+    HirBuilder b{"toy"};
+    HirNodeId const gu = b.makeGlobal(u, 1, b.makeLiteral(u, m->pool.add(unionOf(7, 1))));
+    HirAggregateValue sa;
+    sa.fields.push_back(HirLiteralValue{std::int64_t{3}, TypeKind::I32});
+    sa.fields.push_back(unionOf(9, 0));
+    HirNodeId const gs = b.makeGlobal(
+        s, 2, b.makeLiteral(s, m->pool.add(HirLiteralValue{std::move(sa), TypeKind::Struct})));
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{gu, gs});
+    m->hir = std::move(b).finish(root);
+    return m;
+}
+
+[[nodiscard]] std::string emitUnionModule(UnionModule const& m) {
+    HirTextContext ctx;
+    ctx.interner = &m.in; ctx.symbolNames = &m.names; ctx.literalPool = &m.pool;
+    DiagnosticReporter w;
+    std::string text = emitHir(m.hir, ctx, w);
+    EXPECT_TRUE(allDiagText(w).empty()) << allDiagText(w) << "\n" << text;
+    return text;
+}
+
+// Every UNION level of a pool's values, in walk order: the member it names, or
+// `nullopt` where it names none.
+[[nodiscard]] std::vector<std::optional<std::uint32_t>>
+unionMembersOf(HirLiteralPool const& pool) {
+    std::vector<std::optional<std::uint32_t>> out;
+    for (std::uint32_t i = 0; i < pool.size(); ++i) {
+        std::vector<HirLiteralValue const*> work{&pool.at(i)};
+        while (!work.empty()) {
+            HirLiteralValue const* const v = work.back();
+            work.pop_back();
+            auto const* a = std::get_if<HirAggregateValue>(&v->value);
+            if (a == nullptr) continue;
+            if (v->core == TypeKind::Union) out.push_back(a->unionMember);
+            for (std::size_t f = a->fields.size(); f-- > 0;) work.push_back(&a->fields[f]);
+        }
+    }
+    return out;
+}
+
+// `text` with its ONE occurrence of `from` replaced by `to` — a text the writer
+// produced, edited at exactly one place, so every refusal row below is about one
+// spelling and nothing else. A `from` that is absent or repeated fails the row.
+[[nodiscard]] std::string withOneEdit(std::string text, std::string_view from,
+                                      std::string_view to) {
+    std::size_t const at = text.find(from);
+    EXPECT_NE(at, std::string::npos) << "'" << from << "' is not in the text:\n" << text;
+    if (at == std::string::npos) return text;
+    EXPECT_EQ(text.find(from, at + 1), std::string::npos)
+        << "'" << from << "' occurs more than once:\n" << text;
+    text.replace(at, from.size(), to);
+    return text;
+}
+
+} // namespace
+
+TEST(HirTextAggregateLiteral, AUnionValueNamesItsMemberAndReadsBackWithIt) {
+    auto const m = unionModule();
+    std::string const first = emitUnionModule(*m);
+    EXPECT_NE(first.find("lit agg member 1 {int 7 : i32} : "), std::string::npos)
+        << "the SECOND member is not named:\n" << first;
+    EXPECT_NE(first.find("agg member 0 {int 9 : i32} : union"), std::string::npos)
+        << "the first member is NAMED too — absence is not member 0:\n" << first;
+
+    DiagnosticReporter r;
+    auto const back = parseHir(first, CompilationUnitId{2}, r);
+    ASSERT_TRUE(back->ok) << allDiagText(r) << "\n" << first;
+    // ★ THE POOL, NOT THE BYTES.
+    EXPECT_EQ(unionMembersOf(back->literalPool),
+              (std::vector<std::optional<std::uint32_t>>{1u, 0u}))
+        << "the value read back without the member its text names\n" << first;
+
+    HirTextContext ctx2;
+    ctx2.interner = &back->interner; ctx2.symbolNames = &back->symbolNames;
+    ctx2.literalPool = &back->literalPool;
+    DiagnosticReporter w2;
+    EXPECT_EQ(emitHir(back->hir, ctx2, w2), first)
+        << "write → read → write is not the identity";
+
+    // ★ AND THE NEXT TIER RECEIVES IT: the MIR literal `toMirLiteral` builds from
+    // the value that was READ is the one the static-data encoder walks against the
+    // union's type. A member lost anywhere on the way is a value with no encoding.
+    DiagnosticReporter mr;
+    HirToMirResult const mir = lowerToMir(back->hir, back->literalPool, back->interner, mr);
+    ASSERT_TRUE(mir.ok) << allDiagText(mr);
+    std::vector<std::optional<std::uint32_t>> lowered;
+    for (std::uint32_t i = 0; i < mir.mir.moduleGlobalCount(); ++i) {
+        std::uint32_t const lit = mir.mir.globalInitLiteralIndex(mir.mir.globalAt(i));
+        ASSERT_NE(lit, UINT32_MAX) << "global " << i << " did not fold to static data";
+        forEachLiteralNode(mir.mir.literalValue(lit), [&](MirLiteralValue const& n) {
+            if (auto const* a = std::get_if<MirAggregateValue>(&n.value);
+                a != nullptr && n.core == TypeKind::Union) {
+                lowered.push_back(a->unionMember);
+            }
+        });
+    }
+    EXPECT_EQ(lowered, (std::vector<std::optional<std::uint32_t>>{1u, 0u}))
+        << "the MIR literal the static-data encoder reads does not name the member";
+}
+
+// What the v8 reader refuses, each AT THE TEXT and by name — `H_TextMalformed`,
+// in words about the input. The alternative for the two member-less rows is the
+// static-data encoder's refusal of an upstream DEFECT in DSS several tiers later,
+// which a malformed `.dsshir` is not. Every row is the writer's own output with
+// ONE spelling edited; the unedited text is the control, and an EMPTY union value
+// (which initializes no member) is the second one.
+TEST(HirTextAggregateLiteral, AUnionMemberSpellingIsReadOnlyWhereItMeansSomething) {
+    auto const m = unionModule();
+    std::string const good = emitUnionModule(*m);
+    {
+        DiagnosticReporter r;
+        ASSERT_TRUE(parseHir(good, CompilationUnitId{3}, r)->ok)
+            << "CONTROL: the unedited text must read\n" << allDiagText(r) << "\n" << good;
+    }
+    struct Case {
+        char const*      name;
+        std::string_view from;
+        std::string_view to;
+        std::string_view needle;
+    };
+    for (Case const& c : {
+             Case{"a top-level union value with a field and no member",
+                  "lit agg member 1 {int 7 : i32}", "lit agg {int 7 : i32}",
+                  "must name the member it initializes"},
+             Case{"a NESTED union value with a field and no member",
+                  "agg member 0 {int 9 : i32} : union", "agg {int 9 : i32} : union",
+                  "must name the member it initializes"},
+             Case{"`member` on a top-level value that is a structure's",
+                  "lit agg {int 3 : i32", "lit agg member 0 {int 3 : i32",
+                  "only a union value names its member"},
+             Case{"`member` on a NESTED value whose core is not `union`",
+                  "agg member 0 {int 9 : i32} : union", "agg member 0 {int 9 : i32} : struct",
+                  "only a union value names its member"},
+             Case{"`member` with a word where the index belongs",
+                  "lit agg member 1 {int 7 : i32}", "lit agg member x {int 7 : i32}",
+                  "expected a member index after `agg member`, got 'x'"},
+             Case{"`member` with no index at all",
+                  "lit agg member 1 {int 7 : i32}", "lit agg member {int 7 : i32}",
+                  "expected a member index after `agg member`"},
+             Case{"a member index past its 32-bit field",
+                  "lit agg member 1 {int 7 : i32}", "lit agg member 4294967297 {int 7 : i32}",
+                  "union member index 4294967297 does not fit its 32-bit field"},
+         }) {
+        std::string const text = withOneEdit(good, c.from, c.to);
+        DiagnosticReporter r;
+        auto const parsed = parseHir(text, CompilationUnitId{4}, r);
+        EXPECT_FALSE(parsed->ok) << c.name << "\n" << text;
+        bool named = false;
+        for (auto const& d : r.all()) {
+            named = named || (d.code == DiagnosticCode::H_TextMalformed
+                              && d.actual.find(c.needle) != std::string::npos);
+        }
+        EXPECT_TRUE(named) << c.name << ": the refusal must say why, at the text\n"
+                           << allDiagText(r);
+    }
+    // The second control: a union value with NO field initializes no member and
+    // names none — it is the value's zero image, and it reads.
+    {
+        std::string const empty =
+            withOneEdit(good, "lit agg member 1 {int 7 : i32}", "lit agg {}");
+        DiagnosticReporter r;
+        auto const parsed = parseHir(empty, CompilationUnitId{5}, r);
+        ASSERT_TRUE(parsed->ok) << allDiagText(r) << "\n" << empty;
+        EXPECT_EQ(unionMembersOf(parsed->literalPool),
+                  (std::vector<std::optional<std::uint32_t>>{std::nullopt, 0u}));
+    }
+}
+
 // ── part (d): `_BitInt(N)` was WRITE-ONLY in the type grammar ────────────────
 
 TEST(HirTextBitIntType, BitIntTypeRoundTripsInBothSignednesses) {
@@ -426,7 +647,7 @@ TEST(HirTextVocabulary, BuiltinCallLoweringSentinelZeroIsRefused) {
 // reason that has nothing to do with the keyword being readable.
 TEST(HirTextVocabulary, LabelAddressKeywordRoundTripsThroughTheReader) {
     std::string const text =
-        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      label L1:\n        return void\n"
         "      expr labeladdr L1 : ptr<void>\n"
@@ -463,11 +684,12 @@ TEST(HirTextVocabulary, ExpressionNodesInStatementPositionAreNotDegradedToError)
         {"va_arg",    "va_arg : i32 (lit int 0 : i32, lit int 1 : i32)"},
         {"va_start",  "va_start : void (lit int 0 : i32)"},
         {"va_end",    "va_end : void (lit int 0 : i32)"},
+        {"va_copy",   "va_copy : void (lit int 0 : i32, lit int 1 : i32)"},
         {"labeladdr", "labeladdr L1 : ptr<void>"},
     };
     for (Case const& c : cases) {
         std::string const text =
-            "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+            "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
             "  function %1 : fn() -> void {\n    block {\n"
             "      label L1:\n        unreachable\n      "
             + std::string(c.line) + "\n      return void\n    }\n  }\n}\n";

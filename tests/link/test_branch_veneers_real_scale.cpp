@@ -1,17 +1,18 @@
 // [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] — the
-// REAL-SCALE end-to-end, OPT-IN (`-DDSS_REAL_SCALE_TESTS=ON`; see
-// tests/link/CMakeLists.txt). It is the subject row's own shape, linked by the
-// real linker: the synthetic entry trampoline, the writer's stub layout, the
-// veneer pass and the format writer, on an image whose `.text` is 144 MiB —
-// past `call26`'s reach — so the entry's call to its process-exit import cannot
-// reach the stub the writer puts past the end of `.text`.
+// REAL-SCALE end-to-end, run on every leg (tests/link/CMakeLists.txt). It is
+// the subject row's own shape, linked by the real linker: the synthetic entry
+// trampoline, the writer's stub layout, the veneer pass and the format writer,
+// on an image whose `.text` is 144 MiB — past `call26`'s reach — so the entry's
+// call to its process-exit import cannot reach the stub the writer puts past
+// the end of `.text`.
 //
-// ⓘ WHY OPT-IN. Each arm holds the 144 MiB module, the linker's copy-on-write
+// ⓘ ITS COST. Each arm holds the 144 MiB module, the linker's copy-on-write
 // clone and the emitted image at once (~600 MB peak) and hashes the image for
-// its build-id. The default gate pins the same decisions through the planner's
-// size-only model (`test_branch_veneers.cpp`) at no such cost; this file exists
-// to prove the whole path end to end and, where an arm64 runner exists, to RUN
-// the result.
+// its build-id; the arms run one after another in this one process. The
+// planner's size-only model (`test_branch_veneers.cpp`) pins the same decisions
+// at no such cost; this file proves the whole path end to end and, where an
+// arm64 runner exists, RUNS the result. Until 2026-10-15 it was opt-in, and no
+// leg turned it on.
 //
 // ✔ Before this change the same shape was refused: a 212 992-statement C
 // program on `arm64:elf64-aarch64-linux-exec` failed with `call26` shifted value

@@ -68,13 +68,23 @@ Refusals (all fail-loud, all exercised by --selftest):
       verdict, and without one a run in which it failed while a reference arm
       did not would exit 0 and read as a benchmark of it
   R10 a plan whose subject names no FULL `sqlitePin` (legs.json
-      stageBuild.sqliteCommit): the report names the sqlite head it measured and
-      whether it IS the pin, in the .json and the .md alike, so an off-pin
-      number cannot pass for an on-pin one
+      stageBuild.sqliteCommit), or no measured head -- `upstreamCommit` UNKNOWN,
+      empty or not a hex sha (2026-09-30): the report names the sqlite head it
+      measured and whether it IS the pin, in the .json and the .md alike, so an
+      off-pin number cannot pass for an on-pin one, and a head nobody could read
+      is neither
+  R11 a measured sqlite that is NOT the pin (2026-09-30, the round-12 audit's
+      S3): the report is still written and says so, and the run exits 6 -- until
+      then it exited 0 and its verdict line said "NOT the pinned", which the
+      step's success pattern accepted
 
-Exit codes: 0 every required arm measured · 1 a refusal · 2 usage · 3 no arm
-produced a binary · 4 a REQUIRED arm was not measured (the report is still
-written, and names every arm's outcome).
+Exit codes: 0 every required arm measured, of the pinned sqlite · 1 a refusal ·
+2 usage · 3 no arm produced a binary · 4 a REQUIRED arm was not measured (the
+report is still written, and names every arm's outcome) · 6 the sqlite measured
+is NOT the pinned revision (R11; the report is still written, and says so). 5 is
+not used: it was the benchmark driver's "another run holds the shared sqlite
+clone" until that clone retired (P68 round 13), and an exit code keeps its
+meaning.
 """
 from __future__ import annotations
 
@@ -709,6 +719,12 @@ def validate_plan(plan: dict) -> None:
     if not isinstance(pin, str) or not re.fullmatch(r"[0-9a-f]{40}", pin):          # R10
         die(f"R10 the plan's subject names no FULL sqlitePin (got {pin!r}): the report says whether the "
             f"measured sqlite IS the pinned revision, and cannot without it. The plan writer names it.")
+    # ...and the head MEASURED: an UNKNOWN one -- what the plan writer records when git could not answer -- is
+    # neither on the pin nor off it, so the report could not say which sqlite its numbers are of (2026-09-30).
+    head = subject.get("upstreamCommit")
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{7,40}", head):       # R10
+        die(f"R10 the plan's subject names no measured sqlite head (got {head!r}): the report says WHICH sqlite "
+            f"it measured, and a head nobody could read is not one. The plan writer reads it from the checkout.")
 
 
 # ── the measurement ──────────────────────────────────────────────────────────
@@ -946,9 +962,12 @@ def render_markdown(report: dict) -> str:
 
 def finish(report: dict, out_json: str, out_md: str) -> int:
     """Write the report -- the raw JSON and the README-ready markdown -- print it, and return the
-    VERDICT (R9) main() exits with: 0 when every required arm was measured, 4 when one was not.
-    The report is written either way: R5 names every arm's outcome, and the reader of a failed
-    benchmark needs exactly that."""
+    VERDICT main() exits with: 0 when every required arm was measured OF THE PINNED sqlite, 4 when a
+    required arm was not (R9), 6 when the sqlite measured is not the pin (R11). The report is written
+    either way: R5 names every arm's outcome, and the reader of a failed benchmark needs exactly that.
+    ★ THE VERDICT LINE IS PRINTED ONLY ON THE PIN (2026-09-30, the round-12 audit's S3): it used to end
+    `sqlite X, NOT the pinned Y` and return 0, and the step's success pattern matched its first half, so an
+    off-pin benchmark passed. The line now ends `, the pin`, and sqlite.yml's pattern requires it."""
     with open(out_json, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(report, fh, indent=2)
         fh.write("\n")
@@ -967,14 +986,32 @@ def finish(report: dict, out_json: str, out_md: str) -> int:
               file=sys.stderr)
         return 4
     subj = report["subject"]
-    print("speedtest1_bench: every required arm measured (%s); sqlite %s, %s"
-          % (", ".join(a["id"] for a in report["arms"] if a.get("required")),
-             subj.get("upstreamCommit") or "unknown",
-             "the pin" if subj["onPin"] else "NOT the pinned " + subj["sqlitePin"][:12]))
+    if not subj["onPin"]:                                                   # R11
+        print("speedtest1_bench: R11 the sqlite measured, %s, is NOT the pinned %s (legs.json "
+              "stageBuild.sqliteCommit) -- the report above says so, and it is no benchmark of the pinned "
+              "revision the corpus and the round-close recompile compile"
+              % (subj.get("upstreamCommit") or "unknown", subj["sqlitePin"][:12]), file=sys.stderr)
+        return 6
+    print("speedtest1_bench: every required arm measured (%s); sqlite %s, the pin"
+          % (", ".join(a["id"] for a in report["arms"] if a.get("required")), subj["upstreamCommit"]))
     return 0
 
 
 # ── self-test ────────────────────────────────────────────────────────────────
+def _step_success_pattern(yml_path: str, step: str):
+    """The `successPattern` one step of an action file declares -- its own block, from its `- name:` line to the
+    next -- read as TEXT, as DssHarness reads the file; None when the file or the key is not there. A single-quoted
+    YAML scalar keeps its backslashes and spells a quote as two."""
+    try:
+        with open(yml_path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    block = re.search(r"(?ms)^  - name: %s[ \t]*\n(.*?)(?=^  - name: |\Z)" % re.escape(step), text)
+    m = block and re.search(r"(?m)^    successPattern:[ \t]*'((?:[^']|'')*)'[ \t]*$", block.group(1))
+    return m.group(1).replace("''", "'") if m else None
+
+
 def selftest() -> int:
     """Prove the normalizer and the refusals actually refuse.
 
@@ -1112,6 +1149,12 @@ def selftest() -> int:
               refuses({**ok_plan, "subject": {k: v for k, v in ok_plan["subject"].items()
                                               if k != "sqlitePin"}}, "R10")
               and refuses({**ok_plan, "subject": {**ok_plan["subject"], "sqlitePin": "0123456789"}}, "R10"))
+        check("R10 refuses a plan whose MEASURED head nobody could read -- UNKNOWN, a branch name, empty, absent "
+              "(the well-formed plan below, whose head is a hex sha, is the control)",
+              all(refuses({**ok_plan, "subject": {**ok_plan["subject"], "upstreamCommit": h}}, "R10")
+                  for h in ("UNKNOWN", "master", ""))
+              and refuses({**ok_plan, "subject": {k: v for k, v in ok_plan["subject"].items()
+                                                  if k != "upstreamCommit"}}, "R10"))
         # The complement that keeps the refusals honest: a well-formed plan must
         # pass. Without this arm, a validate_plan() that refused EVERYTHING would
         # score a perfect self-test.
@@ -1171,6 +1214,32 @@ def selftest() -> int:
               rc_bad == 4 and rc_ok == 0
               and all(os.path.isfile(os.path.join(td, n))
                       for n in ("bad.json", "bad.md", "ok.json", "ok.md")))
+
+    # ★ R11 (2026-09-30, the round-12 audit's S3): a benchmark of a sqlite that is NOT the pin is no benchmark of
+    # the pinned revision -- it exits 6, its report still written and saying so -- and the verdict line the
+    # benchmark step's success pattern (sqlite.yml, read as the tool reads it) requires is printed only on the pin.
+    pattern = _step_success_pattern(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sqlite.yml"),
+                                    "benchmark-speedtest1")
+    off_pin = full(dss_ok)
+    off_pin["subject"] = dict(off_pin["subject"], upstreamCommit="4ebc78674d", onPin=False)
+    with tempfile.TemporaryDirectory() as td:
+        said_off, said_on = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(said_off), contextlib.redirect_stderr(said_off):
+            rc_off = finish(off_pin, os.path.join(td, "off.json"), os.path.join(td, "off.md"))
+        with contextlib.redirect_stdout(said_on), contextlib.redirect_stderr(said_on):
+            rc_on = finish(full(dss_ok), os.path.join(td, "on.json"), os.path.join(td, "on.md"))
+        written = all(os.path.isfile(os.path.join(td, n)) for n in ("off.json", "off.md"))
+        with open(os.path.join(td, "off.md"), encoding="utf-8") as fh:
+            off_md = fh.read()
+
+    def matched(text: str) -> bool:
+        return pattern is not None and any(re.search(pattern, ln) for ln in text.splitlines())
+    check("R11 a benchmark of a sqlite that is NOT the pin exits 6, its report STILL written and saying so, the "
+          "refusal naming the head and the pin -- and no line of it matches the benchmark step's success pattern "
+          "(sqlite.yml); the control, on the pin, exits 0 with the verdict line the pattern matches",
+          rc_off == 6 and written and "NOT the pinned" in off_md
+          and "4ebc78674d, is NOT the pinned 0123456789ab" in said_off.getvalue()
+          and not matched(said_off.getvalue()) and rc_on == 0 and matched(said_on.getvalue()))
 
     # WHICH sqlite (R10): a head is ON the pin only when the pin's full sha begins with it
     pin_fx = "0123456789" + "ab" * 15

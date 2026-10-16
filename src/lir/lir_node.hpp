@@ -319,27 +319,43 @@ enum class LirOperandKind : std::uint8_t {
     // aggregate's BYTE SIZE (`byValueAggBytes`) and ALWAYS immediately
     // FOLLOWS the `Reg` operand holding the aggregate's temp address —
     // mirroring the leading-Reg + trailing-descriptor convention the
-    // memory addressing modes use (Reg + MemBase + MemOffset). The
-    // preceding Reg is a normal register use (liveness/regalloc track it,
-    // keeping the temp address live to the callconv pass); this marker is
-    // invisible to liveness/regalloc (not a Reg) and tells lir_callconv to
-    // pass that aggregate ENTIRELY in the outgoing overflow area by a
-    // byte-wise copy (ceil(size / outgoingSlot) slots), never in a register
-    // and never split (SysV §3.2.3/§3.5.7). CC-neutral: the size is the
-    // only datum.
+    // memory addressing modes use (Reg + MemBase + MemOffset). The marker
+    // says ONE thing: that aggregate is passed ENTIRELY in the outgoing
+    // overflow area by a byte-wise copy (ceil(size / outgoingSlot) slots),
+    // never in a register and never split (SysV §3.2.3/§3.5.7). CC-neutral:
+    // the size is the only datum.
     //
-    // ★★ THE CARRIER IS A TRIPLE ONCE IT HAS BEEN PLACED
-    // (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES):
+    // ★★ WHO PRODUCES IT, AND WHO STILL READS IT (true since P69 round 4).
+    // `MirToLir` emits the PAIR
+    //     Reg (temp address) , ByValueStackAgg (size + exhaust)
+    // because that tier has no calling convention in scope and so cannot
+    // place anything. In the pipeline the pair lives exactly until
+    // `lowerWideCallArgs` — the one pass that walks the call's COMPLETE
+    // argument list, and it walks every Call: it places the aggregate from the
+    // one cursor, COPIES its bytes into the outgoing area before the Call
+    // (virtual temporaries, before register allocation) and REMOVES both
+    // operands. So no Call the pipeline lowers carries this marker past that
+    // pass: liveness, the allocator, the rewrite and `lir_callconv` see none,
+    // and the address register is NOT kept live into the Call.
+    //
+    // The PLACED TRIPLE
     //     Reg (temp address) , ByValueStackAgg (size + exhaust) , MemOffset
-    // where the trailing `MemOffset` states the byte offset WITHIN the
-    // outgoing-argument area that this aggregate occupies. `MirToLir` emits the
-    // PAIR, because that tier has no calling convention in scope and so cannot
-    // place anything; `lowerWideCallArgs` — the one pass that walks the call's
-    // COMPLETE argument list — appends the third operand. A carrier that reaches
-    // `lir_callconv` on a Call whose `kLirInstFlagOutgoingArgsPlaced` is set and
-    // that states no offset is REFUSED, never re-placed: re-placing it from a
-    // second cursor, over a list the first pass had already shortened, is the
-    // silent miscompile this triple exists to make unrepresentable.
+    // — the trailing `MemOffset` stating the byte offset WITHIN the
+    // outgoing-argument area (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES)
+    // — is the form that pass USED to leave on the Call for `lir_callconv` to
+    // copy after allocation. No pass produces it any more, and
+    // `lowerWideCallArgs` refuses an input that states one. Both forms are
+    // still ACCEPTED by the consumers a hand-built module reaches without that
+    // pass (tests/lir, tests/asm): register allocation and the rewrite (the Reg
+    // is an ordinary use, the descriptors are skipped), the text form, the
+    // verifier, and `lir_callconv`, which copies a triple at its stated offset,
+    // places a pair itself on a Call NOT stamped
+    // `kLirInstFlagOutgoingArgsPlaced`, and REFUSES a pair on a stamped one —
+    // re-placing it from a second cursor, over a list the first pass had
+    // already shortened, is the silent miscompile that row records. Dropping
+    // those arms together, with the verifier stating the stage invariant, is
+    // owned by
+    // D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET.
     //
     // ⚠ The trailing `MemOffset` is NOT an addressing mode. It is the same
     // "spread a wide descriptor across uniform 8-byte pool slots" convention the

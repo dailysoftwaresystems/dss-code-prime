@@ -1,0 +1,4 @@
+            out_ += "agg ";
+            if (agg->unionMember.has_value())
+                out_ += std::format("member {} ", *agg->unionMember);
+            out_ += "{";

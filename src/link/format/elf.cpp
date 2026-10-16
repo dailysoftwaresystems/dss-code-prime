@@ -90,6 +90,7 @@ constexpr std::uint8_t STT_SECTION = 3;
 // D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS.
 constexpr std::uint32_t kTextSectionSymIdx = 1;
 constexpr std::uint16_t SHN_UNDEF = 0;
+constexpr std::uint16_t SHN_COMMON = 0xfff2;  // a common (tentative) definition
 
 // The ELF vocabulary for a shared `SymbolBinding` decision (the ONE per-format
 // mapping the `.symtab` / `.dynsym` emitters own; the DECISION itself is
@@ -292,12 +293,12 @@ constexpr std::uint16_t kFirstVersionIndex = 2; // first assignable vna_other
     return h;
 }
 
-// Per-machine ELF reloc type for "write resolved symbol VA into GOT
-// slot at load time" (dyld semantics).
-// x86_64 psABI §4.4.1 — R_X86_64_GLOB_DAT = 6.
-// AArch64 ELF psABI §4.6.3 — R_AARCH64_GLOB_DAT = 1025 (0x401).
-constexpr std::uint32_t R_X86_64_GLOB_DAT   = 6;
-constexpr std::uint32_t R_AARCH64_GLOB_DAT  = 1025;
+// ★ THE DYNAMIC RELOCATION TYPES ARE CONFIG (P69,
+// D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB). GLOB_DAT, JUMP_SLOT and
+// RELATIVE come from the image document's `elf.dynamicRelocationTypes`, by
+// role, where the format's other psABI numbers live; the `e_machine`
+// switches `globDatTypeFor` / `relativeRelocTypeFor` that used to hold them
+// are gone, so this file names no machine to choose a relocation type.
 
 // ── WHY THERE IS NO `R_*_COPY` HERE ────────────────────────────────
 // D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET: DSS used to
@@ -323,15 +324,15 @@ constexpr std::uint32_t R_AARCH64_GLOB_DAT  = 1025;
 // image does not define; got-indirect needs no such constant, so the
 // mechanism's entire reason to exist evaporates with it.
 
-// Closed-enum machine codes the dynamic walker dispatches on.
+// Closed-enum machine codes the dynamic walker dispatches on for the PLT
+// STUB alone (its bytes and size — [[D-PLAN14-PER-MACHINE-SPLIT-FOR-ENCODEELFEXECDYNAMIC-LK6-ADDED-PER]]).
 // EM_X86_64 = 62 (gABI fig 4-2); EM_AARCH64 = 183 (AArch64 ELF psABI).
 // Adding a 3rd ISA (RISC-V = 243, PPC64 = 21, MIPS = 8) requires:
-//   * new `R_*_GLOB_DAT` constant
-//   * new arm in `pltStubSizeFor` / `globDatTypeFor` / `emitPltStub`
+//   * new arm in `pltStubSizeFor` / `emitPltStub`
 //   * relaxed dispatch guard in `elf::encode`
-// All three are localized to this file today; the architect-anchored
-// TU split (D-LK6-8 §post-fold #1) becomes warranted when the 3rd
-// machine arrives.
+//   * the new image documents' `elf.dynamicRelocationTypes` (config)
+// The architect-anchored TU split (D-LK6-8 §post-fold #1) becomes
+// warranted when the 3rd machine arrives.
 constexpr std::uint16_t kEmX86_64  = 62u;
 constexpr std::uint16_t kEmAArch64 = 183u;
 
@@ -351,36 +352,6 @@ pltStubSizeFor(std::uint16_t machine) noexcept {
 // import-bound call
 // ([[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]).
 constexpr std::uint64_t kPltSectionAlign = 16u;
-
-// Per-machine GOT-slot relocation type.
-[[nodiscard]] constexpr std::uint32_t
-globDatTypeFor(std::uint16_t machine) noexcept {
-    switch (machine) {
-        case kEmX86_64:  return R_X86_64_GLOB_DAT;
-        case kEmAArch64: return R_AARCH64_GLOB_DAT;
-    }
-    return 0u;
-}
-
-// Per-machine RELATIVE relocation type (c150, D-LK1-4 — the ET_DYN
-// base-relative fixup): "write load_base + r_addend into the 64-bit
-// slot at r_offset". No symbol lookup — ld.so adds the module's own
-// load bias. Every internal absolute pointer slot in a slid image
-// (a fn-ptr table entry, a `&global` initializer, a jump-table row)
-// carries one of these instead of the exec arm's link-time in-place
-// final VA.
-// x86_64 psABI §4.4.1 — R_X86_64_RELATIVE = 8.
-// AArch64 ELF psABI §4.6.3 — R_AARCH64_RELATIVE = 1027 (0x403).
-constexpr std::uint32_t R_X86_64_RELATIVE  = 8;
-constexpr std::uint32_t R_AARCH64_RELATIVE = 1027;
-[[nodiscard]] constexpr std::uint32_t
-relativeRelocTypeFor(std::uint16_t machine) noexcept {
-    switch (machine) {
-        case kEmX86_64:  return R_X86_64_RELATIVE;
-        case kEmAArch64: return R_AARCH64_RELATIVE;
-    }
-    return 0u;
-}
 
 constexpr std::uint8_t makeStInfo(std::uint8_t bind, std::uint8_t type) {
     return static_cast<std::uint8_t>((bind << 4) | (type & 0xF));
@@ -1129,6 +1100,98 @@ encodeElfExecDynamic(
                    ? numFuncExterns + externSlot[i]
                    : externSlot[i];
     };
+
+    // ── (b.5.1) The dynamic relocation types, and the CANONICAL stubs ──
+    //    D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB (P69)
+    //
+    // The types are the document's (`elf.dynamicRelocationTypes`, by role);
+    // validate() requires them on every image that reaches this writer, and a
+    // hand-built schema that bypassed validation is refused here rather than
+    // written with type 0 — a `.rela.dyn` row of type R_*_NONE is a slot the
+    // loader silently never fills.
+    auto const& dynTypes = fmt.elf().dynamicRelocationTypes;
+    if (!dynTypes.complete()) {
+        // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB (P69): the loader
+        // refuses such a document first; this is the writer's own belt.
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             std::format(
+                 "elf::encodeElfExecDynamic: format '{}' binds imports at load "
+                 "but declares no complete 'elf.dynamicRelocationTypes' "
+                 "(globDat {}, jumpSlot {}, relative {}) - the psABI numbers "
+                 "of its `.rela.dyn` rows have no other source; declare all "
+                 "three in the format document.",
+                 fmt.name(), dynTypes.globDat, dynTypes.jumpSlot,
+                 dynTypes.relative));
+        return {};
+    }
+    // ★ A FUNCTION IMPORT WHOSE ADDRESS IS TAKEN IN AN EXECUTABLE GETS A
+    // CANONICAL STUB. C23 6.5.9 makes every pointer to one function compare
+    // equal across the process, and POSIX `dlsym` answers with the address
+    // the dynamic linker binds for the name. An executable's own stub is the
+    // only address a non-PIC reference can reach (a link-time constant), so
+    // the executable DEFINES the function's address as that stub: `.dynsym`
+    // states the import STT_FUNC with `st_value` = the stub, and every other
+    // module's non-PLT lookup — `dlsym`, a library's GLOB_DAT — resolves to
+    // it, while the stub's OWN slot takes the PLT-class `jumpSlot`, whose
+    // lookup skips this undefined-with-value definition and so binds the
+    // library's function instead of the stub itself. ✔MEASURED 2026-09-30:
+    // gcc -no-pie and clang -no-pie (GNU ld) and clang -fuse-ld=lld in BOTH
+    // -no-pie AND -pie write exactly this for an address-taken import
+    // (x86_64 `R_X86_64_JUMP_SLOT ... 401060 puts`, aarch64 `4005c0`, lld
+    // -pie `17c0`), and each run's `&puts == dlsym(...)`; DSS's image, whose
+    // code and initializers already name the stub, answered 0 and — in a
+    // PIE — disagreed with ITSELF (`sp != &puts`: the initializer's symbolic
+    // row reached the library while the code reached the stub).
+    //   * WHICH IMPORTS: those named by any reference that is not a CALL, the
+    //     role read off the FORMAT's own relocation row (`isCall`, the same
+    //     declaration a reader's call signal comes from — never re-derived
+    //     from a target opcode). That covers a code address (`lea`), a data
+    //     initializer, and a slot `lowerGotSlotReferences` minted for a GOT
+    //     read, whose `abs64` fills it with this very address. An import only
+    //     ever CALLED stays non-canonical, as both reference linkers leave it.
+    //   * WHICH IMAGES: an executable, PIE included — a PIE's `st_value` is
+    //     base-relative like every value it states (lld's -pie answer). A
+    //     shared object never: its definition must not interpose, so its code
+    //     reads the address from a slot instead (`externAddrBinding: got`).
+    bool const imageDefinesCanonicalStubs = !isDyn || isPie;
+    std::vector<bool> canonicalStub(numExterns, false);
+    if (imageDefinesCanonicalStubs) {
+        std::unordered_map<std::uint32_t, std::size_t> funcImportBySym;
+        for (std::size_t i = 0; i < numExterns; ++i) {
+            if (!module.externImports[i].isData) {
+                funcImportBySym.emplace(module.externImports[i].symbol.v, i);
+            }
+        }
+        auto const noteReference = [&](Relocation const& rel) {
+            auto const it = funcImportBySym.find(rel.target.v);
+            if (it == funcImportBySym.end()) return;
+            auto const* row = fmt.relocationByKind(rel.kind);
+            if (row != nullptr && row->isCall) return;   // a call: the stub serves it
+            canonicalStub[it->second] = true;
+        };
+        for (auto const& fn : module.functions) {
+            for (auto const& rel : fn.relocations) noteReference(rel);
+        }
+        for (auto const& di : module.dataItems) {
+            for (auto const& rel : di.relocations) noteReference(rel);
+        }
+        // An import is CANONICAL here or it has an ADDRESS SLOT of its own
+        // (`ExternImport::addressSlotSymbol`, a slot holding its loader-bound
+        // address) — never both: the stub would be the function's address in
+        // this image while the slot handed out the library's. No shipped path
+        // builds both (a slot is minted for a preemptible definition, which an
+        // executable never routes through the loader), and this keeps it so.
+        for (std::size_t i = 0; i < numExterns; ++i) {
+            if (!canonicalStub[i] || !module.externImports[i].addressSlotSymbol.valid()) continue;
+            emit(reporter, DiagnosticCode::K_ImportReferenceUnbindable,
+                 std::format("elf::encodeElfExecDynamic: import '{}' is address-taken, so its stub is "
+                             "this image's canonical address for it, AND it carries an address slot of "
+                             "its own that would hand out a second address — one function would have two "
+                             "addresses in one image.",
+                             module.externImports[i].mangledName));
+            return {};
+        }
+    }
     // The data-import binding is what the FORMAT DECLARES — this
     // walker OBEYS `dataImportBinding`, it does not re-derive the
     // model from the image flavour. (It used to: `required = isDyn ?
@@ -1579,10 +1642,16 @@ encodeElfExecDynamic(
         // through that name were redirected to the exec's copy while
         // its other names for the SAME object were not. An UNDEF
         // reference claims nothing and therefore cannot split anything.
+        // ★ P69: a CANONICAL stub's import is stated STT_FUNC here and its
+        // `st_value` (the stub's VA) is patched after layout — an
+        // undefined-with-value definition is what makes every other
+        // module's non-PLT lookup resolve to this image's stub (b.5.1).
         bool const isData = module.externImports[i].isData;
         appendDynsymEntry(externNameOff[i],
                           makeStInfo(STB_GLOBAL,
-                                     isData ? STT_OBJECT : STT_NOTYPE),
+                                     isData ? STT_OBJECT
+                                            : (canonicalStub[i] ? STT_FUNC
+                                                                : STT_NOTYPE)),
                           SHN_UNDEF, 0, 0);
     }
     // ET_DYN exports (c150): appended AFTER the imports so import
@@ -2139,7 +2208,8 @@ encodeElfExecDynamic(
     // VAs are known. The SIZE (`relaDynSz` — one 24-byte Elf64_Rela per
     // extern, all GLOB_DAT) was already fixed at layout time above;
     // only the byte CONTENT moves down.
-    std::uint32_t const globDatType = globDatTypeFor(machine);
+    std::uint32_t const globDatType  = dynTypes.globDat;
+    std::uint32_t const jumpSlotType = dynTypes.jumpSlot;
 
     // ── (l) Build .dynamic
     std::vector<std::uint8_t> dynamicSec;
@@ -2230,18 +2300,33 @@ encodeElfExecDynamic(
                       : ptLoad2FileSize;
 
     // ── (k, moved) Build the EXTERN half of `.rela.dyn` — one
-    // Elf64_Rela per extern, ALL of type GLOB_DAT against the extern's
-    // own GOT slot: a FUNCTION's slot is the PLT stub's jump target; a
-    // DATA import's slot receives the library object's ADDRESS, which
-    // the shared GotIndirect lowering derefs. IDENTICAL on every ELF
-    // image flavour — this loop has no `isDyn` arm and no per-kind
-    // relocation type, which is exactly what deleting copy-relocation
-    // bought.
+    // Elf64_Rela per extern against the extern's own GOT slot: a FUNCTION's
+    // slot is the PLT stub's jump target; a DATA import's slot receives the
+    // library object's ADDRESS, which the shared GotIndirect lowering derefs.
+    // Every row is the document's `globDat` EXCEPT a canonical stub's, which
+    // is its `jumpSlot` (below). IDENTICAL on every ELF image flavour — this
+    // loop has no `isDyn` arm, which is exactly what deleting
+    // copy-relocation bought.
     // The dyn arm's RELATIVE half is assembled AFTER
     // applyDataItemRelocations (its addends are the base-relative
     // slot values that apply writes); the two halves concatenate —
     // RELATIVE first (the gcc/glibc convention) — into `relaDyn`
     // below, sized against relaDynSz.
+    // ★ P69: the ONE per-kind exception, and it is a ROLE, not a machine: a
+    // CANONICAL stub's own slot takes `jumpSlot`. Its lookup is the PLT class,
+    // which skips this image's own undefined-with-value definition of the
+    // name, so the slot binds the LIBRARY's function; a GLOB_DAT there would
+    // bind the stub to itself and the first call through it would loop.
+    // Under this image's eager binding the row sits in `.rela.dyn` beside the
+    // others (glibc `elf_machine_rela` and musl `do_relocs` apply a JUMP_SLOT
+    // in DT_RELA exactly as in DT_JMPREL, the class taken from its type); lazy
+    // `.rela.plt` binding stays D-LK6-11's.
+    // ⓘ What the eager GLOB_DAT costs a SHARED OBJECT (the P69 review's NIT 4):
+    // its call slot's non-PLT lookup FINDS an executable's canonical stub, so a
+    // `.so` calling a function the executable made canonical reaches it
+    // through that stub — the same function, one extra jump (correct: the
+    // stub's own JUMP_SLOT binds the library). Routing every call slot to the
+    // PLT class is D-LK6-11's item (b), with the lazy `.rela.plt` it belongs to.
     std::vector<std::uint8_t> relaExtern;
     relaExtern.reserve(numExterns * 24);
     for (std::size_t i = 0; i < numExterns; ++i) {
@@ -2249,7 +2334,8 @@ encodeElfExecDynamic(
             gotVa + gotSlotIndexFor(i) * 8;
         std::uint64_t const rInfo =
             (static_cast<std::uint64_t>(dynsymIdx[i]) << 32)
-            | static_cast<std::uint64_t>(globDatType);
+            | static_cast<std::uint64_t>(canonicalStub[i] ? jumpSlotType
+                                                          : globDatType);
         appendU64LE(relaExtern, rOffset);
         appendU64LE(relaExtern, rInfo);
         appendI64LE(relaExtern, 0);
@@ -2671,6 +2757,27 @@ encodeElfExecDynamic(
             }
         }
     }
+    // D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69): a
+    // symbol whose ADDRESS IS 0 — the face a PC-relative or branch field sees of
+    // a weak symbol the link resolved to nothing — takes VA 0 in an ET_EXEC
+    // image, which sits at its link address, so `0 - P` is the constant its
+    // field holds (`writesNullAddressReferences`, the backend's statement of
+    // exactly this). An ET_DYN image's VAs here are relative to a base the
+    // loader picks, so none is inserted: a reference to one would fail loud as
+    // undefined, and the loader refuses a document that would make one first.
+    if (!isDyn) {
+        for (SymbolId const s : module.nullAddressSymbols) {
+            if (!symbolVa.emplace(s, std::uint64_t{0}).second) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"elf::encodeElfExecDynamic: null-address symbol #"}
+                         + std::to_string(s.v)
+                         + " collides with another symbol's VA — it names the "
+                           "address 0 of a weak symbol resolved to nothing and "
+                           "cannot be shared.");
+                return {};
+            }
+        }
+    }
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols (the `&&label`
     // block-address `lea`s) get their interior-block VAs before relocation
     // resolution — sectionVa = textVa, the SAME base as the function
@@ -2945,7 +3052,7 @@ encodeElfExecDynamic(
             }
         }
     }
-    std::uint32_t const relativeType = relativeRelocTypeFor(machine);
+    std::uint32_t const relativeType = dynTypes.relative;
     std::vector<std::uint8_t> relaDyn;
     relaDyn.reserve(relaDynSz);
     if (isDyn) {
@@ -3058,6 +3165,23 @@ encodeElfExecDynamic(
     // a DEFINED OBJECT of this image — the object-identity split
     // D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET names. An
     // import now stays UNDEF/0 exactly as step (e) wrote it.)
+
+    // ── Patch a CANONICAL stub's `st_value` (P69, (b.5.1)) ─────────
+    // The stub's VA — base-relative in a PIE (baseImageVa == 0 there), as
+    // lld's -pie writes it — so every non-PLT lookup of the name, `dlsym`
+    // and a library's GLOB_DAT alike, resolves to the one address this
+    // image's code and initializers already name. `st_shndx` stays
+    // SHN_UNDEF: the function is still the library's, and only its ADDRESS
+    // is defined here.
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        if (!canonicalStub[i]) continue;
+        std::uint64_t const stubVa = pltVa + externSlot[i] * pltStubSize;
+        std::size_t const   off = static_cast<std::size_t>(dynsymIdx[i]) * 24;
+        for (int b = 0; b < 8; ++b) {
+            dynsym[off + 8 + b] =
+                static_cast<std::uint8_t>((stubVa >> (8 * b)) & 0xFF);
+        }
+    }
 
     // ── Patch the ET_DYN exports' dynsym entries (c150) ─────────
     // st_value = the symbol's base-relative VA (baseImageVa == 0, so
@@ -3665,11 +3789,12 @@ encode(AssembledModule const&    module,
                  std::string{"elf::encode: ET_DYN output but ELF "
                              "e_machine="}
                      + std::to_string(elfMachine)
-                     + " has no PLT/GLOB_DAT emitter yet. Supported "
+                     + " has no PLT stub emitter yet. Supported "
                        "machines: x86_64 (62), ARM64 (183) -- add the "
-                       "per-machine arms (pltStubSizeFor / "
-                       "globDatTypeFor / relativeRelocTypeFor / "
-                       "emitPltStub) for a new ISA.");
+                       "per-machine stub arms (pltStubSizeFor / "
+                       "emitPltStub) for a new ISA; its dynamic "
+                       "relocation types are the image document's "
+                       "`elf.dynamicRelocationTypes`.");
             return {};
         }
         auto const* secTextDyn =
@@ -3712,29 +3837,27 @@ encode(AssembledModule const&    module,
                 return {};
             }
             // D-LK-OBJECT-DATA-EXTERN-RELOCATABLE (c144): BOTH function-call
-            // and DATA externs are emitted in a relocatable object. A function
-            // `call` → SHN_UNDEF symbol + PLT32 reloc; a DATA reference (e.g.
-            // sqlite `out = stdout`) → the SAME SHN_UNDEF symbol + a plain PC32
-            // reloc (the .rela.text loop below excludes data from
-            // externCallTargets, so it emits nativeId/PC32, never
-            // pltNativeId/PLT32 — a data symbol bound through a PLT stub would
-            // read jump-stub bytes as the object's value). This is EXACTLY what
-            // gcc emits for `extern FILE *stdout` in a `.o`: a NOTYPE UND
-            // symbol + R_X86_64_PC32, even under default-PIE — and the FINAL
-            // (foreign) linker binds it by a copy relocation IT synthesizes
-            // when the `.o` links into a non-PIE EXECUTABLE (the DSS `.o`
-            // consumer today: sqlite's testfixture). That is ld's contract for
-            // a faithful relocatable object; DSS's OWN images emit no copy
-            // relocation at all
-            // (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET).
-            // The one case a data extern would instead need a GOT-indirect
-            // binding (R_X86_64_GOTPCREL) — the `.o` linked into a SHARED
-            // LIBRARY — is NOT a silent miscompile: ld itself fails loud
-            // ("relocation R_X86_64_PC32 against undefined symbol `stdout' can
-            // not be used when making a shared object; recompile with -fPIC").
-            // A `.o`→`.so` consumer + a got-indirect data binding for the
-            // relocatable ELF format is the pinned future trigger. So both
-            // extern kinds FALL THROUGH to the normal ET_REL writer below.
+            // and DATA externs are emitted in a relocatable object — an
+            // SHN_UNDEF symbol each, which the FINAL linker resolves. A
+            // `call` is R_X86_64_PLT32. ★ What a DATA reference becomes CHANGED
+            // IN P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB, half (2)
+            // of D-LK-MEMBER-DIRECT-LIBRARY-DATUM-BOUND-TO-THE-SLOT): until then
+            // it was a plain PC32 (`movq stdout(%rip)`, the shape gcc emits for
+            // `extern FILE *stdout` in a `.o`), which a foreign linker can only
+            // satisfy with a COPY relocation, which a `.so` cannot carry
+            // ("recompile with -fPIC"), and which DSS's OWN link refused
+            // (it makes no copy relocation,
+            // D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET). The x86_64
+            // relocatable documents now declare `externAddrBinding: got`, so an
+            // extern's address — function or datum — is a GOT load
+            // (R_X86_64_REX_GOTPCRELX). What the foreign linkers make of it is
+            // MEASURED, not assumed: `RelocatableGotLoadReferenceLinkNative`
+            // (tests/link/test_relocatable_got_load_reference_link.cpp) links
+            // DSS's own object with GNU ld, -no-pie and -pie, on both Linux
+            // ISAs (and with ld.lld where the host has one) and runs it against
+            // dlsym; DSS's own link reads it back
+            // (examples/c/staticlib_reads_a_library_datum). Both extern kinds
+            // FALL THROUGH to the normal ET_REL writer below.
         } else {
             if (fmt.elf().interpreter.empty()) {
                 emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
@@ -3748,7 +3871,8 @@ encode(AssembledModule const&    module,
             }
             // Machine-dispatch guard (D-LK6-8 closed 2026-06-01).
             // `encodeElfExecDynamic` now dispatches per-machine to
-            // `emitPltStub` + `globDatTypeFor` + `pltStubSizeFor`.
+            // `emitPltStub` + `pltStubSizeFor` for the stub alone; its
+            // dynamic relocation types are config (`elf.dynamicRelocationTypes`).
             // Supported: x86_64 (62), ARM64 (183). Other machines fail
             // loud — adding RISC-V (243) / PPC64 (21) / MIPS (8) means
             // adding the per-machine arms in this file (see top-level
@@ -3762,7 +3886,8 @@ encode(AssembledModule const&    module,
                            "machines: x86_64 (62), ARM64 (183). Other "
                            "ISAs (RISC-V 243, PPC64 21, MIPS 8) are "
                            "anchored as future work — add a row to "
-                           "pltStubSizeFor / globDatTypeFor / emitPltStub.");
+                           "pltStubSizeFor / emitPltStub, and declare the "
+                           "image documents' `elf.dynamicRelocationTypes`.");
                 return {};
             }
             // Section schema lookup mirrors the existing path so the
@@ -4320,6 +4445,20 @@ encode(AssembledModule const&    module,
                    symbolVa, "elf::encode (ET_EXEC)", reporter)) {
             return {};
         }
+        // D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69):
+        // the null-address symbols take VA 0, as in the dynamic arm's ET_EXEC
+        // half — this image sits at its link address too.
+        for (SymbolId const s : module.nullAddressSymbols) {
+            if (!symbolVa.emplace(s, std::uint64_t{0}).second) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"elf::encode (ET_EXEC): null-address symbol #"}
+                         + std::to_string(s.v)
+                         + " collides with another symbol's VA — it names the "
+                           "address 0 of a weak symbol resolved to nothing and "
+                           "cannot be shared.");
+                return {};
+            }
+        }
         // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols get their
         // interior-block VAs before relocation resolution — sectionVa =
         // secText->virtualAddress, the SAME base as the function symbols
@@ -4401,7 +4540,44 @@ encode(AssembledModule const&    module,
     // (D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS) — an image's
     // `.symtab` resolves nothing and is read by debuggers. Built once from
     // `module` for O(1) per-symbol lookup below.
-    link::format::ObjectSymbolNames const objNames{module};
+    // WHERE THE RECORD OF A WEAK NAME STANDS (THE WEAK-NAME RULE's second half,
+    // `ObjectSymbolNames`). A RELOCATABLE object that holds a body under a weak
+    // name its unit references by row has to say which of the two a relocation
+    // naming that body means, and that follows from what this format's linkers
+    // do with a superseded definition — the document's `supersededDefinition`,
+    // never this writer's opinion: where the bytes are kept they get a record
+    // of their own, so that the object's final linker keeps a relocation
+    // against it on these bytes whoever wins the name. An image re-links
+    // nothing and keeps the one record.
+    std::unordered_set<std::uint32_t> bytesUnderTheirOwnRecord;
+    if (!isExec) {
+        SupersededDefinitionStatement const& superseded = fmt.supersededDefinition();
+        for (ModuleSymbol const* weakName :
+             link::format::ObjectSymbolNames::bodiesUnderAWeakNameReferencedByRow(module)) {
+            auto const answer = superseded.answerFor(weakName->weakKind);
+            if (!answer.has_value()) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("elf::encode (ET_REL): '{}' is a weak definition its unit "
+                                 "references by name. Whether a relocation that names the "
+                                 "definition itself stays on its bytes when another "
+                                 "definition wins the name, or goes to the winner with the "
+                                 "name, decides whether those bytes need a record of their "
+                                 "own, and that is format '{}''s 'supersededDefinition', "
+                                 "which {} -- refusing rather than guess one.",
+                                 weakName->name, fmt.name(),
+                                 superseded.stated()
+                                     ? "it states per kind of weak definition, while this "
+                                       "definition states no kind"
+                                     : "it does not state"));
+                return {};
+            }
+            if (*answer == SupersededDefinition::KeepsItsBytes) {
+                bytesUnderTheirOwnRecord.insert(weakName->symbol.v);
+            }
+        }
+    }
+    link::format::ObjectSymbolNames const objNames{module,
+                                                   std::move(bytesUnderTheirOwnRecord)};
 
     // Helper: emit one Elf64_Sym record (24 bytes).
     auto appendSym = [&](std::uint32_t nameOff, std::uint8_t info,
@@ -4589,6 +4765,9 @@ encode(AssembledModule const&    module,
         std::uint8_t  type  = 0;   // STT_FUNC / STT_OBJECT
     };
     std::vector<AliasSite> aliasSites;
+    // THE WEAK-NAME RULE's writer arm (`object_symbol_names.hpp`): the record
+    // each external-linkage name got, a canonical name's or an alias's.
+    std::unordered_map<std::string, std::uint32_t> recordOfDefinedName;
 
     // Emit one defined FUNCTION symbol (STT_FUNC, shndx=.text).
     //
@@ -4625,6 +4804,9 @@ encode(AssembledModule const&    module,
                   stvForVisibility(objNames.definedVisibility(f.symId)),
                   /*shndx=.text*/ 1, stValue, f.size);
         symIdxBySymbol.emplace(f.symId, idx);
+        if (objNames.definedBinding(f.symId) != SymbolBinding::Local) {
+            recordOfDefinedName.emplace(symName, idx);
+        }
         aliasSites.push_back({f.symId, /*shndx=*/1, stValue, f.size,
                               STT_FUNC});
     };
@@ -4673,6 +4855,7 @@ encode(AssembledModule const&    module,
                           sectionIdx, layout.itemOffsets[j],
                           di.sizeInSection());
                 symIdxBySymbol.emplace(di.symbol, idx);
+                if (bind != SymbolBinding::Local) recordOfDefinedName.emplace(symName, idx);
                 aliasSites.push_back({di.symbol, sectionIdx,
                                       layout.itemOffsets[j],
                                       di.sizeInSection(), STT_OBJECT});
@@ -4727,6 +4910,8 @@ encode(AssembledModule const&    module,
     for (auto const& site : aliasSites) {
         for (ModuleSymbol const* alias : objNames.definedAliases(site.symId)) {
             std::uint32_t const aliasNameOff = strtab.add(alias->name);
+            recordOfDefinedName.emplace(
+                alias->name, static_cast<std::uint32_t>(symtab.size() / 24));
             appendSym(aliasNameOff,
                       makeStInfo(stbForBinding(alias->binding), site.type),
                       stvForVisibility(alias->visibility),
@@ -4774,6 +4959,30 @@ encode(AssembledModule const&    module,
                       0, SHN_UNDEF, 0, 0);
             symIdxBySymbol.emplace(rel.target, idx);
         };
+        // THE WEAK-NAME RULE, this writer's arm
+        // (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME): a plain
+        // reference row naming one of this object's own external-linkage names
+        // gets no SHN_UNDEF record. Its id is the record of the NAME, so a
+        // relocation written through a weak name names the WEAK symbol, as gcc
+        // writes it and `ld -r` hands it on (✔MEASURED 2026-10-08, GNU ld 2.42:
+        // `R_X86_64_PLT32 shared` against `FUNC WEAK shared`). BEFORE the two
+        // loops below, which give every still-unmapped target a record.
+        link::format::pointOwnNameReferencesAtTheirRecords(module, recordOfDefinedName,
+                                                           symIdxBySymbol);
+        // A COMMON row (P69, D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS) is a
+        // DEFINITION handed on to the final linker, so it gets its record
+        // whether or not a relocation names it: `SHN_COMMON`, the alignment in
+        // `st_value` and the size in `st_size` (gABI, "Symbol Values"), as gcc
+        // writes one under -fcommon.
+        for (auto const& e : module.externImports) {
+            if (e.commonSize == 0u || symIdxBySymbol.contains(e.symbol)) continue;
+            std::uint32_t const nameOff = strtab.add(e.mangledName);
+            std::uint32_t const idx = static_cast<std::uint32_t>(symtab.size() / 24);
+            appendSym(nameOff, makeStInfo(STB_GLOBAL, STT_OBJECT),
+                      stvForVisibility(e.commonVisibility), SHN_COMMON,
+                      e.commonAlignment, e.commonSize);
+            symIdxBySymbol.emplace(e.symbol, idx);
+        }
         for (auto const& fn : module.functions)
             for (auto const& rel : fn.relocations) emitExternForReloc(rel);
         for (auto const& di : module.dataItems)
@@ -4846,23 +5055,14 @@ encode(AssembledModule const&    module,
 
     std::vector<std::uint8_t> relaText;
     if (!isExec) {
-        // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: undefined-extern FUNCTION
-        // targets (built once) — a rel32 CALL to one emits the PLT-capable
-        // reloc variant so a foreign PIE link resolves it through a
-        // linker-built PLT. D-LK-OBJECT-DATA-EXTERN-RELOCATABLE (c144): DATA
-        // externs are EXCLUDED — a data reference is not a call and must emit
-        // plain PC32 (the shape gcc emits for `extern FILE *stdout` in a `.o`,
-        // which its own linker then resolves), never PLT32; PLT32 would bind the data symbol to a
-        // linker-built PLT stub and the code would read jump-stub bytes as
-        // the object's value (the silent miscompile the image-path
-        // K_FormatLacksImportSupport reject guards against, here prevented in
-        // the relocatable writer).
-        std::unordered_set<SymbolId> externCallTargets;
-        externCallTargets.reserve(module.externImports.size());
-        for (auto const& e : module.externImports) {
-            if (e.isData) continue;
-            externCallTargets.insert(e.symbol);
-        }
+        // ⓘ The per-target PLT-variant choice that stood here (an undefined
+        // extern FUNCTION's `rel32` written PLT32, a DATA extern's kept PC32 —
+        // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE, D-LK-OBJECT-DATA-EXTERN-RELOCATABLE)
+        // is gone with `pltNativeId` (P69): the ROLE is the row now. A call is
+        // the `rel32` row, R_X86_64_PLT32; an address or memory operand is the
+        // `riprel32` row, R_X86_64_PC32; and an extern's ADDRESS — a datum's
+        // included — is a GOT load under `externAddrBinding: got`, so no data
+        // reference can be written as a call type here any more.
         for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
             auto const& fn = module.functions[fi];
             std::uint64_t const fnStart = funcTextStart[fi];
@@ -4912,19 +5112,15 @@ encode(AssembledModule const&    module,
                     continue;
                 }
                 std::uint32_t const symIdx = it->second;
-                // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: a rel32 CALL to an
-                // UNDEFINED extern emits the PLT-capable variant (PLT32) so a
-                // foreign PIE link routes it through a linker-built PLT — a bare
-                // PC32 against an undefined symbol errors under -pie. Same
-                // S+A-P formula + -4 addend; intra-module (defined) call
-                // targets keep plain PC32 (pltNativeId is used only when the
-                // target is an extern FUNCTION import — data externs are
-                // excluded from externCallTargets and keep plain PC32).
-                std::uint32_t const emittedNativeId =
-                    (fmtReloc->pltNativeId != 0
-                     && externCallTargets.contains(rel.target))
-                        ? fmtReloc->pltNativeId
-                        : fmtReloc->nativeId;
+                // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: a CALL is written
+                // R_X86_64_PLT32 so a foreign PIE link routes it through a
+                // linker-built PLT (a bare PC32 against an undefined symbol
+                // errors under -pie). Since P69 that is simply the call row's
+                // own wire type — x86_64's `rel32` is call-only and its row is
+                // PLT32 for every target, local or not, as gcc has written every
+                // call since binutils 2.31 — so no per-target variant is chosen
+                // here any more (the retired `pltNativeId`).
+                std::uint32_t const emittedNativeId = fmtReloc->nativeId;
                 auto const column = relaAddendColumn(rel, *triReloc);
                 if (!column.has_value()) continue;
                 std::uint64_t const rOffset = fnStart + rel.offset;

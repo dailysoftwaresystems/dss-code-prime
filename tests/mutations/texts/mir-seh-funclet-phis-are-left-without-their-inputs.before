@@ -1,0 +1,2 @@
+            builder.addPhiIncoming(p.newPhi,
+                                   MirPhiIncoming{valueIt->second, blockIt->second});

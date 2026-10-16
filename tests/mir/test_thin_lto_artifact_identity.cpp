@@ -41,6 +41,8 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "program/cli_args.hpp"
 #include "program/program.hpp"
+#include "program/runtime_object_cache.hpp"   // kRuntimeCacheOverrideVariable
+#include "scoped_env.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -57,6 +59,7 @@
 namespace fs = std::filesystem;
 
 using dss::test_support::Location;
+using dss::test_support::ScopedEnv;
 using dss::test_support::ScratchDir;
 
 namespace {
@@ -254,12 +257,37 @@ TEST(ThinLto, ThinRunsMoreOptimizeInvocationsThanFull) {
     scratch.useAsCwd();
     auto const files = chainFiles(scratch.path());
 
+    // ★ THE TWO COUNTS COMPARED ARE OF BUILDS THAT FOUND THE SAME CACHE. The
+    // counter is the process's, and a build that does not find its shipped
+    // runtime in the runtime object cache compiles it inside the same call —
+    // Optimize runs that are not the program's. The full build stood FIRST here,
+    // so on a cache nothing had filled it alone carried the runtime's runs, and
+    // "thin ran more than full" was then decided by what had run before this
+    // case. So the case owns its cache: the override variable names a directory
+    // that is empty when the case begins, and the full build is made TWICE. The
+    // first is the negative — it must read more than the second, or the
+    // directory was not this case's own — and the second and the thin build,
+    // which both find what the first stored, are the ones compared.
+    ScratchDir const  cache{Location::Temp, "mir_thin_lto_runtime_cache"};
+    std::string const variable{dss::runtime::kRuntimeCacheOverrideVariable};
+    ScopedEnv const   ownCache{variable.c_str(), cache.path().string()};
+
     dss::substrate::SynchronousExecutor sync;
+    auto const onAnEmptyCache =
+        compileChain(files, dss::LtoModeArg::Full, &sync,
+                     scratch.path() / "out_full_on_an_empty_cache");
     auto const full = compileChain(files, dss::LtoModeArg::Full, &sync,
                                    scratch.path() / "out_full");
     auto const thin = compileChain(files, dss::LtoModeArg::Thin, &sync,
                                    scratch.path() / "out_thin");
 
+    EXPECT_GT(onAnEmptyCache.optimizeRuns, full.optimizeRuns)
+        << "the full build that found the runtime object cache EMPTY ran no more "
+           "Optimize invocations than the same build made again. The first must "
+           "also compile the shipped runtime this format realizes, so an equal "
+           "count means the cache this case made for itself is not the one the "
+           "build read — and the comparison below is then between builds that "
+           "may not have found the same cache";
     EXPECT_GT(thin.optimizeRuns, full.optimizeRuns)
         << "`--lto=thin` must run MORE optimize invocations than `--lto=full` "
            "— one extra per TU that imported a body. An equal count means the "

@@ -82,6 +82,662 @@ below is IN it.
 
 ## §0.0 — STATE
 
+### ⏳ CYCLE P69, ROUND 1 IS IN FLIGHT — THE NEWEST COMMITS ARE CHECKPOINTS, NOT A ROUND CLOSE (2026-10-08)
+
+Operator ruling 2026-10-08, verbatim: *"please commit + push between waves, It's totally wrong 600+ files without
+push"*. Every lane fold is committed and pushed once its fold checks pass. The eight-run gate stays owed at the
+round's close; each checkpoint's commit message says what was and was not run on it.
+
+- **What checkpoint 1 carries.** ✔MEASURED: four lane folds on top of `71648598` — the C front end, the object
+  writers and the linker, the library and runtime, the harness actions — 666 paths. Anchor balance ✔MEASURED on this
+  tree with `dssharness check-anchor-balance --base 71648598`: **618 open against 620**; 24 closed, 22 opened
+  (1 created, 21 disclosed), so the REAL net is −2. Registry lint: 0 findings.
+- **What it does NOT carry.** ✔MEASURED: the combined tree has been through NO gate run (each lane ran its five legs
+  on its own tree before its fold). Known reds: two regressions the library lane's fold introduced, found by its
+  re-review and fixed in that lane's next fold (a weak reference binding against the runtime archive on pe64; the
+  archive member format on the relocatable documents); that re-review's thirteen findings. **Do not run the pipes
+  on a checkpoint commit.**
+- **The inventory guards are green from the commit after checkpoint 1** (✔MEASURED 2026-10-08 on the two local
+  legs: `check-emitted-anchor-ids`, `check-plan-citations`, `check-doc-census`, and the stale-refusal guard run
+  last). The plan-citations red was NOT new citations: three rows closed this round MOVED to the done registry
+  carrying 25 old `path:line` citations (✔MEASURED per row with the guard's own counter). Their positions were
+  removed from the cells — the ceiling was not raised — and the production registry's ceiling came down 236 → 213.
+  A row is closed with its positional citations removed, or this guard trips at every closure.
+- **Where the round stands.** Four lanes are mid-wave on the same agents. The P0 rows this round found are listed by
+  `dssharness read-anchors --pending --open --band P0`. A disclosed row is OPEN WORK (operator ruling of the same
+  day): the round's remaining waves close them, the largest on their own plans. The orchestrator's ledger is local,
+  not in the repository (`.orchestrators/p69/plans/p69/ledger.md`).
+- **Checkpoint 2 (2026-10-08) = the harness lane's final fold**: the prototype census (its verdict (b) no longer has
+  an escape class, an absent reference compiler is refused in the program's own words, every arm has a mutant), the
+  stale-refusal guard's stated predicate, and the landing log refusing a tree without history in a sentence instead
+  of a traceback. ✔MEASURED on the main tree after the fold, two local legs each: the three inventory guards,
+  `check-line-endings`, `refresh_landing_log` and the stale-refusal guard (last) pass; balance, lint, citations and
+  the registry check pass. Owed before the round's close and labelled per item in the rows: the three censuses and
+  65 census mutants re-read on the final bytes (they were read one edit earlier), and the ctest form of that lane's
+  set on the three local legs (the gate reads it). One harness row stays OPEN on a named blocker outside this
+  repository: a run step cannot be handed the leg's own compiler, so the census has no default reference on the
+  two Windows legs.
+- **Checkpoint 3 (2026-10-08) = the writers-and-linker lane's first fold of this wave, made CODE-FIRST**: 131 paths
+  (79 changed, 52 new). What it fixes, all of it the base's debt: a reference written through a weak name was bound
+  to the body (silent — DSS 7/7/7 where four reference linkers give 9/9/7; one rule now in three readers, three
+  writers and two merge arms); the COFF and Mach-O readers gave record zero the invalid symbol id, so a relinked
+  datum lost its name (silent); Apple `ld -r` products were refused for the relocation pairs in `__eh_frame` and
+  every arm64 Mach-O object carrying that section was refused as corrupted (both loud); the archive search no
+  longer ends at a definition a common outranks; an `/ENTRY:` a named object states and does not define is a
+  required reference. ✔MEASURED by the lane on the folded bytes: the full suite on five legs (three legs 2688
+  passed; the two Windows legs 2713 of 2718, the five reds being repository guards reading that worktree's stale
+  registry and inventory copies). ✔MEASURED on the main tree after the fold, two local legs each: balance, lint,
+  citations, the registry check, the three inventory guards, `check-line-endings`, `refresh_landing_log` and the
+  stale-refusal guard (last) pass. **CODE-FIRST means: of the fold's 98 mutants 5 were read red and 93 are NOT READ
+  YET**, so its four rows (two P0, two P1) are born `disclosed` with "fix folded" in their closing cells and close
+  only when their pins are read — the lane reads them on this commit in three measurement worktrees. Balance on
+  this tree: **622 open against 620** — 24 closed, 26 opened (1 created, 25 disclosed), REAL net +2 until those
+  four close. `link/test_common_symbols` has a NAMED time-budget row from this commit (its weak-name cells ask the
+  reference linkers; 161 s on the slowest debug leg); its sanitized figure is unmeasured.
+- **Checkpoint 4 (2026-10-08) = the library-and-runtime lane's early fold**: 37 paths (9 new). It fixes the two
+  regressions that lane's previous fold introduced (named under "What it does NOT carry" above): a bare relocatable
+  link gets its members' answer, and a document that is not an archive's is refused the archive weak-reference
+  search; a weak reference to a name DSS's runtime realizes binds on every format (the pull asks the corpus by
+  name). And it makes ONE DOOR for a fresh symbol id: the module carries the end of its symbol-id space and five
+  minters ask it — the optimizer's zero constant could take an id the name table or an import already held, a
+  SILENT release miscompile ✔MEASURED on all five targets. **That P0 row stays `disclosed`, "fix folded"**: a sixth
+  minter (the block-symbol minter of the MIR-to-LIR lowering) goes through the same door in the C front end lane's
+  fold, and the row closes then — a row with six minters is not closed on five. Two files that this lane and the
+  writers-and-linker lane both changed were merged three-way BY HAND into the main tree (both merges clean, the
+  merged bytes equal to the lane's own trial merge): **no lane built that composition** — its first full-suite
+  reading, on one leg, follows this commit, and the eight-run gate reads it whole. ✔MEASURED by the lane on its
+  bytes before the merge: the full suite on five legs (three legs 2680 of 2680; the two Windows legs 2707 of 2710,
+  the three reds being repository guards reading that worktree's stale copies), and 28 mutants read, each alone.
+  ✔MEASURED on the main tree after the fold: the same checks and guards as above pass. Balance unchanged: 622 open
+  against 620. Three mutants of an earlier row of that lane need an ELF host and are owed before the round's close.
+  ✔MEASURED after that commit: the merged tree's first full-suite reading, `macos-arm64-debug`, passed — 2694 tests.
+- **Checkpoint 5 (2026-10-08) = the C front end lane's fold, made CODE-FIRST**: 155 paths (25 new). The weak axis
+  (a weak binding states its kind, `selectany`, the tentative mark, four linkage refusals of the verifier);
+  `__declspec` as a second spelling of the attribute specifier; an attribute after a referred tag no longer names
+  ANOTHER tag (a silent wrong type, the base's); a constant's member name is no longer resolved by a scope walk; the
+  reachable end of a non-void function, with a new manifest key `forbidDiagnostics` in both example runners; and a
+  statement whose lowering creates a block that could fault OUTSIDE its `__try`'s guarded range is refused by name
+  instead of compiled. **Of its mutants 145 are NOT READ YET**: three rows (two P0, one P1) are born `disclosed`,
+  "fix folded", and close on read pins; two more are capabilities not built, loud today (the guarded range does not
+  cover the blocks the lowering creates — being built next in that lane; a calling-convention attribute naming
+  another convention). ✔MEASURED by the lane: the full suite BEFORE composing with checkpoint 4 on four legs
+  (`macos-arm64-debug` and `linux-arm64-debug` 2697 of 2697; the two Windows legs 2722 of 2727, the five reds being
+  repository guards on that worktree's stale copies); the COMPOSED tree on a focused set of 243 entries on those two
+  remote legs only. **No MSVC and no MinGW build of the composed tree exists** (the local host admitted no heavy leg
+  that afternoon: its memory was held by other work), and `linux-x86_64-debug` read nothing. Balance on this tree:
+  **627 open against 620** — 24 closed, 31 opened (1 created, 30 disclosed), REAL net +7 until the fix-folded rows'
+  pins are read. Nine NAMED time-budget rows were re-derived from that day's full-suite figures (each had been
+  passed by a passing run). ✔MEASURED after that commit, the composed tree's full suite: `macos-arm64-debug` 2717
+  passed (2026-10-08); `windows-x86_64-release` (MSVC 19.51.36260.0) and `windows-x86_64-debug` (MinGW GNU 13.2.0)
+  2747 passed each (2026-10-10) — the first MSVC and MinGW builds of it. NOT read on that commit: the WSL pair, the
+  arm64 Linux pair, `macos-arm64-release`.
+- **Checkpoint 6 (2026-10-10) = the library lane's P0 fold, the Win64 `__try` family, made CODE-FIRST**: 31 paths
+  (7 new). Register allocation and liveness now know a guarded region (a value read in an `__except` handler body
+  or after the region is the value the program computed — it could be garbage); nested regions reach their OWN
+  handler (they reached the outer one); a filter may read a pure value computed before the region in release; every
+  function states where it saved each whole vector register (`UWOP_SAVE_XMM128`, near and far form), so a register
+  is put back when an exception unwinds THROUGH a frame, and the saved-register area begins at a multiple of the
+  widest register it saves (only a Win64 frame that saves a vector register and whose outgoing area ends off 16
+  moves, by 16 bytes); the 117 `<windows.h>` constants carry the real headers' types (100 were mistyped, 69 in
+  signedness); `_SC_NPROCESSORS_ONLN` has its Mach-O number. Six new examples. ✔MEASURED by the lane on the folded
+  bytes, the full suite unfiltered: `macos-arm64-debug`, `linux-arm64-debug`, `linux-x86_64-debug` 2729 of 2729;
+  `windows-x86_64-debug` (MinGW) and `windows-x86_64-release` (MSVC) 2755 of 2759, the four reds on each being
+  repository guards on that worktree (two anchor guards naming this fold's new ids, the emitted-id inventory, the
+  document census) — all four written at the fold and read green on the main tree with the other guards.
+  **None of its 34 mutants is read**: five rows (three P0) are `disclosed`, "fix folded", and close when their
+  mutants pass as arms of `dssharness check-mutations`. THREE rows are born OPEN and unbuilt, each the base's debt
+  and each closing in a later fold of the same lane in this round: a silent wrong answer in the constant evaluator
+  (below), the refusal beside it, and a `__try` filter holding a branch. Balance on this tree: **635 open against
+  620** — 24 closed, 39 opened (the tool counts 4 created, 35 disclosed; three of the four are that found debt),
+  REAL net +15 until the fix-folded rows' pins are read.
+- **Checkpoint 7 (2026-10-10) = the harness lane's fold: mutants are ARMS of `dssharness check-mutations`**
+  (operator, 2026-10-10: mandatory). 49 paths (28 new): the `mutations` block of `.harness-config/config.json`; the
+  registry `tests/mutations/arms.registry` with its texts (7 arms, one per class the tool drives — a `.cpp` site, a
+  header, a config document, a build-red arm with its control, a leg-scoped arm, a two-file arm, one new arm), pinned
+  to LF in `.gitattributes`; the skill's reference `mutation-arms.md` and eleven changed skill files — an arm's
+  claim is a gtest TEST of a self-contained test binary, an example entry is never a pin, one leg per arm in its
+  `S` row; the hand mutant queue and its measurement worktrees are retired. OURS, fixed in passing: the configure
+  guard refused the dependency directories a worker copy is handed, and the build stamp now digests handed
+  dependency sources (a `.deps` term; its self-test has 44 arms); `dss_use_build_stamp` declares every file under
+  `src/dss-config/` as an input of each includer of the stamp header, the edge the verb's witness reads (the stamp
+  was never stale: ✔MEASURED, one byte of a document recomputes it and rebuilds its three includers); the declared
+  `worktrees.pathLimit` is gone. The fold also carries the runner action `compile-and-keep` as it stood on
+  2026-10-08 (complete; one designed patch is a later fold). ✔MEASURED by the lane on its final bytes: every arm
+  `passed` on the leg its `S` row names (`macos-arm64-debug` 4 arms, `linux-x86_64-debug` 3); the closing control
+  of ten entries green on `macos-arm64-debug`, `linux-x86_64-debug`, `windows-x86_64-debug` (MinGW) and
+  `windows-x86_64-release` (MSVC) — the first MinGW and MSVC configure of the new CMake code; 36 of 36 guards on
+  `windows-x86_64-debug`. Of the stamp's 14 mutants, all are red by hand on copies outside every tree and TWO were
+  read through the harness; they become arms in that lane's next fold (a gtest case per self-test arm driving the
+  same entry). No Windows-leg arm exists yet (a worker of a lane worktree exceeds 260 characters there; a Windows
+  sweep runs from the main checkout). No row written; balance unchanged, 635 against 620. ✔MEASURED after that
+  commit, the composed tree's full suite on the main checkout: `macos-arm64-debug` 2730 passed,
+  `windows-x86_64-release` (MSVC) and `windows-x86_64-debug` (MinGW) 2760 passed each; the verb's own self-test 7 of
+  7 on both Windows legs and on `linux-x86_64-release` (`linux-x86_64-debug`: 6 passed, 1 unmeasured — the WSL
+  distribution's limit of file watchers was reached while other legs ran there; owed again).
+- **Checkpoint 8 (2026-10-10) = the harness lane's second fold: the build stamp's self-test is a gtest binary and
+  its mutants are arms.** 47 paths (43 new). The `cmake -P` entry `build/build_stamp_identity` is replaced under
+  the same ctest name by a binary that starts the entry's own command line once and holds one case per self-test
+  arm (46 cases; it fails, never skips, when cmake cannot be started); 14 arms of the two stamp modules join the
+  registry (21 arms in all). Two of the original fourteen mutants have NO arm by the tool's design — a mutation the
+  tree's own configure refuses has no red kind — and two others pin what those two alone read. ✔MEASURED by the
+  lane on its final bytes: all 14 `passed` on `macos-arm64-debug`, which is NOT the leg their `S` rows name
+  (`linux-x86_64-debug`, owed from the main checkout); the closing control green on `windows-x86_64-debug` (MinGW)
+  and `windows-x86_64-release` (MSVC) 41 of 41, `linux-x86_64-debug` and `macos-arm64-debug` 11 of 11. No row.
+- **Checkpoint 9 (2026-10-10) = the C front end lane's fold A2, made CODE-FIRST**: 48 paths (9 new, 2 removed).
+  The end of a module's symbol ids is a STATED fact carried on the module: the MIR-to-LIR lowering mints through
+  one continuation over the frozen module (the sixth minter), the `.dssir` reader keeps clear of every slot its
+  text declares, and a mint past an end that was only counted is refused by name. A guarded region is a SET OF
+  RUNS — one scope record per run of blocks the lowering creates for a guarded body — so the refusal checkpoint 5
+  put there is gone and its program is a positive example that runs on both Windows legs. The reachable end's two
+  other routes are pinned; `program/test_compile_pipeline` shares its compiles; eleven mutants that only an
+  example read got unit-tier claims, among them the repository's first own C units (two shipped runtime bodies
+  compiled by each leg's own C compiler and called from a test). It answers the review of checkpoint 5's fold
+  (SEND BACK, 14 findings, 2 major: three rows whose cells contradicted the tree — restated here, nine rows
+  amended, none new — and four example manifests that claimed a red-on-disable nobody had read — now "WRITTEN,
+  NOT READ"). ✔MEASURED by the lane on its final bytes: the whole suite 2734 of 2734 on `macos-arm64-debug` and
+  `linux-arm64-debug`; every unit entry and the fold's examples, 671 of 671, on `windows-x86_64-debug` (MinGW) and
+  `windows-x86_64-release` (MSVC). NOT read: `linux-x86_64-debug`, the examples tier on Windows beyond the fold's
+  own, a sanitizer. **No arm of it is written or read**: 313 mutants of this lane are owed as arms. Balance
+  unchanged: 635 against 620. ✔MEASURED after that commit, from the main checkout: ALL 21 arms the registry then
+  held `passed`, each on the leg its `S` row names (17 on `linux-x86_64-debug`, 4 on `macos-arm64-debug`), and the
+  verb's own self-test 7 of 7 on `linux-x86_64-debug` (the reading checkpoint 7 owed).
+- **Checkpoint 10 (2026-10-10) = the harness lane's third fold: `check-ninja-deps` no longer fails a correct
+  `deps = msvc` tree, and any script entry's pins become arms.** 46 paths (35 new). On a `deps = msvc` tree a zero
+  dependency record is correct exactly when every `#include` of the source is answered — by the precompiled header
+  its edge names (read from that header's own record) or by no directory of the edge's command line (the
+  toolchain's own header, an excuse read off the tree twice: the compiler `CMakeCache.txt` names lives under a
+  path ninja's reader drops, and no record of the tree names such a path); everything else is LOST and says why.
+  A new runner `check-ninja-deps-record` prints what ninja holds for an object and builds nothing. The self-test
+  is a test binary under its old ctest name (`ninja_deps_selftest_guard`, 36 cases, now on every leg); the driver
+  both script self-tests share is `tests/test_support/script_selftest.hpp` with `dss_declare_script_selftest` /
+  `dss_use_script_selftest`, and the stamp's test is rewritten onto it with the same 46 case names. 11 arms join
+  the registry (32 in all). A defect of OURS the Mac leg found and this fold fixes: a manifest written on Windows
+  states an include directory with a backslash, which on a POSIX host named nothing, so a LOST record was excused.
+  ✔MEASURED by the lane on its final bytes: the closing control green on four legs (`windows-x86_64-debug` MinGW
+  and `windows-x86_64-release` MSVC 42 of 42, `macos-arm64-debug` and `linux-x86_64-debug` 13 of 13); the real
+  freshness entry on the MSVC tree: 799 objects, 2 excused, each for having no `#include`; all 11 arms `passed` on
+  `macos-arm64-debug`, which is NOT the leg their `S` rows name (`linux-x86_64-debug`, owed from the main
+  checkout). NOT read: the two arm64 Linux legs, the release legs of WSL and the Mac. No row; balance unchanged.
+- **Checkpoint 11 (2026-10-10) = the C front end lane's FIRST ARM BATCH: 177 arms written, NONE swept.** Registry
+  and texts only (493 new texts; the registry holds 209 arms), no path under `src/`, nothing built. The 177 are
+  158 mutants (a mutant red in N binaries is N arms): 129 whose red set was measured by hand before the arm
+  existed — 105 of them on a leg OTHER than the one their `S` row names — and 48 whose unit-tier claim was written
+  after their reading and has never been read red (fold A2's 30 mutants among them). Their `diag`: 126 a text the
+  hand reading's red run said, 51 DECLARED from the claim's assertion and marked so in the `C` row. By leg:
+  `linux-x86_64-debug` 94, `macos-arm64-debug` 82, `windows-x86_64-release` 1. **Every one of the 177 is owed its
+  first sweep from the main checkout; an arm not `passed` goes back to the lane with its text.** NOT written: fold
+  A1's 140 first-sweep mutants and seven several-site mutants. One row, born `disclosed` on the orchestrator's
+  ruling (the measured exception, a codec arc): `D-DSSHIR-NATIVE-SIDE-TABLES-HAVE-NO-TEXT-FORM` — twelve of the
+  thirteen side tables the C lowering binds have no form in the `.dsshir` text; no shipped route compiles from
+  that text. Balance: 636 against 620.
+- **Checkpoint 12 (2026-10-10) = the link lane's SECOND fold, made CODE-FIRST**: 177 paths (114 new), 2 examples,
+  30 arms (the registry holds 239), 3 new rows. It answers the review of its first fold (2 MAJOR): a reference
+  written THROUGH a weak name follows the name, while a relocation written through a `static` name of the same
+  body, or through its section symbol, stays on that unit's BYTES on ELF and for a PE weak external and follows
+  the atom on Mach-O and for a PE COMDAT — ✔MEASURED on the reference linkers first, then DSS made equal
+  (154 / 158 / 158 where it read 154 / 198 / 198: **the silent wrong value of the static-name bullet below is
+  FIXED in this tree**); what becomes of a superseded definition is the link document's key
+  `supersededDefinition`. Its own items: the weak-definition KIND on the link side and in the PE object writer
+  (an overridable definition is a weak external over a default record; the document says which kind takes which
+  spelling) — **the COMPILED origin of the kind is NOT built** (a DSS-compiled `__attribute__((weak))` is still a
+  COMDAT on PE, and `__declspec(selectany) int v = 1;` beside a strong `int v = 2;` in another DSS-compiled unit
+  links in silence); a guarded function's scope ids, the unit's entry and its null-address symbols carried through
+  the merge of units (✔MEASURED before: of 112 labellings of one guarded unit beside another, 22 linked silently
+  wrong); a section no row names refused under its own code. Found and fixed on the way: a one-unit link that did
+  not place its code units; an ELF section group that LOSES to an earlier unit's while a relocation outside it
+  names one of its non-external labels linked and ran in silence — now refused by name (the discard itself is
+  NOT built). ✔MEASURED by the lane on its final bytes, on checkpoint 7's base: the whole suite on all five legs
+  — `macos-arm64-debug`, `linux-arm64-debug` and `linux-x86_64-debug` 2734 passed each; `windows-x86_64-release`
+  (MSVC) and `windows-x86_64-debug` (MinGW) 2760 of 2764, the four reds being repository guards that read the
+  lane worktree's own registry copies and inventories (all four green on this tree after the fold). 16 of its 30
+  arms `passed` on `macos-arm64-debug`; 14 are owed. Rows: `D-LK-MERGE-LEFT-SEH-SCOPE-IDS-AND-UNIT-ENTRY-UNRENUMBERED`
+  born CLOSED on its thirteen passed arms; two born `disclosed` with the fix folded in part
+  (`D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER`,
+  `D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE`). Balance: 638 against 620. The debug ceiling of
+  `link/test_common_symbols` is re-derived (257 s). **⚠ THIS COMPOSITION WAS NEVER BUILT**: the fold was measured
+  on checkpoint 7's base and lands on checkpoints 8 to 11 (the stated end of a module's symbol ids among them,
+  which touches the same id sources this fold widens) — the first full suite of this tree is its first reading.
+  ✔MEASURED after that commit, from the main checkout: `macos-arm64-debug` PASSED, 2739 tests — the first build of
+  checkpoints 8 to 12 together; `linux-arm64-debug` did no work (the host's disk is held by the lanes' builds); the
+  three local legs are NOT read. And a sweep of 14 of this fold's arms on `macos-arm64-debug`: 3 `passed`, 11
+  `violated`, each only for further red cases its claim row does not declare yet (no mutant stayed green).
+- **Checkpoint 13 (2026-10-10) = the library lane's CONSTANT-EVALUATOR fold, made CODE-FIRST**: 217 paths (201 new),
+  2 examples, 68 arms DECLARED AND READ BY NO SWEEP (the registry holds 307), 5 new rows. **It holds the fix of the
+  MERGE BLOCKER this PR created** (`D-C-CONSTANT-AGGREGATE-MEMBER-READ-WITHOUT-ITS-INITIALIZERS-OPERATOR`, P0, OPEN
+  until its eight arms pass): ONE statement of which nodes say something themselves
+  (`nodeSaysSomethingItself`, `src/core/types/decl_prefix_strip.hpp`) is read by every wrapper descent of the
+  analyzer AND by the HIR lowering's own peel — ✔MEASURED on pe64, baseline and release alike: 134 of 247 cells
+  wrong before, 4 after, all four one other construct (`0 ?: -5` does not parse). With it, each the base's debt: a
+  unary result is reduced to its type in both constant walkers, the `#if` evaluator and the optimizer's fold; a
+  cast or a truth test of an unsigned constant above INT64_MAX folds, and unary `+` is a constant operator; `#if`
+  truth results are `intmax_t`; `_Generic` in an enumerator, an array bound or a bit-field width stamps its
+  controlling literals before asking their type, and an unresolved controlling type selects NOTHING; a brace
+  element under an operator is no longer taken for its operand by the lowering; and whether a brace element
+  initializes the WHOLE structure is the analyzer's answer handed over as a fact on the model
+  (`braceElementValueTypeFor`), not a second reading of type stamps. Over the whole measurement: 173 of 390 cells
+  wrong before, 13 of 397 after, none newly wrong; the 13 are other constructs, each SIZED in the lane's hand-back
+  and NOT filed (the orchestrator rules on resume). Three forms accepted wrongly are refused by name. ✔MEASURED by
+  the lane on its final bytes, ON CHECKPOINT 7's BASE: the whole suite — `macos-arm64-debug`, `linux-arm64-debug`
+  and `linux-x86_64-debug` 2735 of 2735; `windows-x86_64-debug` (MinGW) and `windows-x86_64-release` (MSVC) 2762 of
+  2765, the three reds being repository guards reading the lane worktree's own registry copies and census; six
+  references run both examples to 42. Rows: 5 new (1 created by this PR and OPEN, 4 disclosed with the fix
+  folded), 13 amended — two open rows become `disclosed`, "fix folded"; three rows lose a "next cycle" schedule and
+  two gain a measured size. Balance: 643 against 620 (24 closed, 47 opened: 3 created by the tool's count, 44 disclosed), REAL net +23 — the round is CODE-FIRST
+  and its rows close as their arms pass. **⚠ THIS COMPOSITION WAS NEVER BUILT EITHER**: it lands on checkpoints 8
+  to 12; three of its paths were merged by hand over cs's and xa's folds.
+- **The round RESUMED on 2026-10-12 (it was paused at checkpoint 13 on 2026-10-10)**; DssHarness is 0.6.13.
+  ✔MEASURED from the main checkout, the whole suite at checkpoint 13 — the first reading of checkpoints 8 to 13
+  together on every leg it was sent to: `macos-arm64-debug`, `linux-x86_64-debug` and `linux-arm64-debug` PASSED,
+  2744 tests each; `windows-x86_64-release` (MSVC) 2772 of 2773 and `windows-x86_64-debug` (MinGW; a read of the
+  leg's log, its verdict `inputs-moved` because checkpoint 14 was committed under it) 2772 of 2773. No product
+  test is red on any leg.
+- **Checkpoint 14 (2026-10-12)** = the mutation registry only: the link lane's fourteen arms redeclared from their
+  first sweep; swept again from main on `macos-arm64-debug`, 14 of 14 `passed`.
+- **Checkpoint 15 (2026-10-12)** = the C front end lane's SECOND ARM BATCH, registry and texts only: 183
+  first-sweep blocks of 140 mutants of its fold A1 (180 name `linux-x86_64-debug`, 3 `macos-arm64-debug`), every
+  claim EXPECTED AND READ BY NO SWEEP; the registry holds 490 arms. With it the answers to six arms a sweep from
+  main sent back (two whose after-text named a helper the file lost at checkpoint 1 and so never compiled; four
+  whose further red cases are now declared).
+- **Checkpoint 16 (2026-10-12) = the harness lane's fix of `orphan_tests_guard`, the red checkpoint 9 made on the
+  direct Windows legs.** The guard's contract is now "every file a registration can name": the source extensions
+  are stated ONCE (CMake's own C and C++ lists, sixteen spellings) and read by the walk and by the
+  structural-token scan alike, so a `.c` is walked, cleared and accused as a `.cpp` is. Of the 140 `.c` under
+  `tests/`, 2 are test sources and 138 are inputs of the compiler under test or the provenance of prebuilt
+  fixtures: `subjects.json` beside the guard states them in three rows (`corpus`, `ffi/data`, `link/data`), each
+  row verified on every run, and a row that cannot be checked exempts nothing. A registered file that exists and
+  is spelt as no source is `UNWALKED`, no longer "does NOT exist". The entry is a test binary driven through
+  `script_selftest.hpp` (56 cases; the self-test went 40 → 53 arms), with 12 arms in the registry (502 now),
+  DECLARED AND READ BY NO SWEEP. "A registered `.c` is cleared" has no arm, and the guard's docstring says why
+  (that mutant is the program as it stood: the tree's own census reddens first, 55 of 56). ✔MEASURED by the lane
+  on its final bytes, ON CHECKPOINT 14's BASE: the `repo-guard` label on `windows-x86_64-debug` (MinGW) and
+  `windows-x86_64-release` (MSVC), 30 of 30 on each, `orphan_tests_guard` 56 of 56 cases.
+- **Checkpoint 18 (2026-10-12) = the link lane's fold 3a: the weak-definition kind from its COMPILED origin, the
+  tentative definition, and the narrow fix of the link checkpoint 12 began to refuse.** ONE linkage record on every
+  MIR function and global (`MirLinkage`: binding, visibility, weak kind, tentative) and ONE rule
+  (`mirLinkageDefect`) asked by the builders, the verifier, the `.dssir` reader (text version 6) and the summary
+  decoder (stored form 2); ONE fold of a name several units define (`linker::resolveCrossCuDefs`) behind THREE
+  doors — the unit linker, `mergeCuMirs`, `buildSummaryIndex` — each refusing through `linker::refusalOf`; a new
+  root key of 17 link documents, `weakDefinitionBesideStrong` (ELF and Mach-O `"yields"`; PE overridable yields,
+  select-any COLLIDES — the references refuse it 16 of 16). ✔MEASURED by the lane on pe64 and ELF x86_64, 134
+  cells under {debug, release} × {`--lto=full`, `--lto=thin`}: `__declspec(selectany)` beside a strong definition
+  is refused in both orders (it linked in silence before), select-any beside an overridable one gives the
+  select-any in both orders (was link-order), two tentative definitions of one name in two SOURCES of one build
+  are one object (was refused by the merge and by the index). **The refused ELF link is back**: a relocation from
+  inside a losing COMDAT group stays on its unit's kept bytes — the tracked pair runs 44 / 88 as GNU ld and LLD
+  give, debug and release (the discard of the loser's bytes is the lane's next fold). Two defects met and fixed in
+  the fold: a DSS DLL exported a weak definition's default record (this fold's own making); the owner of a body
+  several records name was ranked visible-first (the base's rule) — linkage, then strength, then visibility now.
+  Seven new test binaries, seven examples, 32 arms DECLARED AND READ BY NO SWEEP (the registry holds 534). Rows:
+  none opened or closed; three amended. ✔MEASURED by the lane ON CHECKPOINT 13's BASE: the whole suite on
+  `windows-x86_64-debug`, `linux-x86_64-debug`, `macos-arm64-debug` with one red of its own (a refusal sentence,
+  fixed), re-read on 229 tests at the final bytes. **⚠ NOT a whole reading of this composition**: the fold lands
+  on checkpoints 14 to 17, the whole suite was not run at its final bytes, and no MSVC leg read it. NOT measured:
+  the Mach-O alignment of a merged tentative pair, the Mach-O thread-local tentative pair. STILL OWED by that
+  lane: a DSS unit writes `int v;` as a `.bss` definition, so two DSS OBJECTS with one tentative name do not
+  link (the references link their `-fcommon` and cl's default objects) — ruled built first in its next fold: a
+  compiled tentative definition is stated as a common on every format whose document can state one.
+- **Checkpoint 19 (2026-10-12) = the C front end lane's SEND-BACK fold (the eight findings of the review of its
+  fold A2), merged over checkpoint 18.** (1) The false sentence "no source program puts a created block in a
+  guarded body" is restated in the row, the test header and the case name: `a && b` in a `__try` body IS a split
+  edge inside the region, and its faults are caught — pinned by
+  `GuardedRegionRuns.AShortCircuitInAGuardedBodyIsSplitInARunItsHandlerNeverReads`,
+  `Program_CompileFiles.AGuardedShortCircuitsEdgeSplitIsUnderAScopeRecordOfItsOwn` and the example
+  `examples/c/seh_short_circuit_in_a_guarded_body` (`cl` exits 42 on its bytes at /Od and /O2). (2)
+  `MirLoweringConfig::symbolIdSpace` is OPTIONAL (`MirSymbolIdSpace::endingAt` / `unitIsItsOwnTable`): an absent
+  statement states nothing and the first mint is refused by name. (3) ONE list of the symbol ids a module names
+  (`src/mir/mir_symbols_named.hpp`, `forEachSymbolIdNamed`), read by the `.dssir` writer, the reader and the
+  verifier (`checkSymbolIdsBelowTheStatedEnd`); the reader refuses by name any id its text neither declares nor
+  defines. (4)–(8) row cells restated (arm ids named, what each has read said, a cost on every fork). 70 paths;
+  ten shared with checkpoint 18 merged three-way by the orchestrator (`hir_to_mir.cpp`, `mir_text.cpp`,
+  `mir_verifier.cpp/.hpp`, `compile_pipeline.cpp`, four tests, the arm registry: both-added conflicts united,
+  main's first). 13 new arms on `macos-arm64-debug`, WRITTEN, NOT READ (the registry holds 547); four arms are
+  owed a second reading for the two new cases. Rows: closed 0, new 0; `D-CSUBSET-COMPOSITE-ALIGNED-HIR-TEXT` is
+  fixed since P68 and stays open only until its arm reads `passed`. ✔MEASURED by the lane ON CHECKPOINT 17's
+  BASE, one unfiltered run at the final bytes: `macos-arm64-debug` and `linux-arm64-release` 2746 of 2746,
+  `windows-x86_64-debug` (MinGW gcc) and `windows-x86_64-release` (MSVC) 2774 of 2775, the one red the document
+  census (one example more; rewritten here). **⚠ NOT a reading of this composition**: no leg has built
+  checkpoint 18 and this fold together; the whole suite is read from the main checkout after this commit.
+- **Checkpoint 20 (2026-10-15) = DssHarness 0.6.14's tree layout only**: `dssharness init` keeps a tree's
+  mutation workers in `.mutations/` and a leg's own copy in `.legs/`, both ignored (a sweep is refused in a tree
+  that does not ignore them). ✔MEASURED from the main checkout at checkpoint 20, the first build of checkpoints 18
+  and 19 together: `macos-arm64-debug` (AppleClang 21) and `linux-arm64-debug` (GNU 13.3) PASSED, 2767 tests each.
+  The three local legs were not admitted (the host's memory stayed above the admission ceiling for the hour).
+- **Checkpoint 21 (2026-10-15) = the library lane's BRANCHING-FILTER fold — it FIXES known defect (4)**: a
+  bit-field member of a constant aggregate is read at its WIDTH (truncation and sign extension at the type the
+  run-time read has), a named constant is read at its DECLARED type (both resolvers convert through the cast's own
+  conversion), and an expression's VALUE loses the qualifiers and array/function types of the object it was read
+  from in both tiers (`valueConversion`, the statement expression and the comma alike) — ✔MEASURED on pe64, both
+  pipelines, images run here: every assertion of C's value holds (23 of 23), and the programs that died of an
+  illegal instruction now run (A: 8 of 10 run 42 and none dies — the two others are the promotion below and a
+  `_Bool` bit-field refused loudly; C: 13 of 13). With it: a `__try` filter holding a branch compiles (the filter is
+  a sub-graph of its own funclet) and the release compiler no longer aborts on a filter and handler naming one
+  global; a value only a handler reads no longer holds its register to the function's end (the filter stub is
+  sealed `unreachable`); the driver cases own their runtime cache (the ctest fixture is gone). 159 paths; the arm
+  registry merged by the tool BY ARM (581 arms). ✔MEASURED by the lane ON CHECKPOINT 13's BASE, the whole suite
+  unfiltered: `macos-arm64-debug` 2754 of 2754; `windows-x86_64-debug` (MinGW) and `windows-x86_64-release` (MSVC)
+  2778 of 2783, the five reds repository guards its base predates or this fold's own inventories (written at the
+  fold). Rows: 2 closed, 1 created born closed, 4 disclosed (two fix-folded, closing on their arms; two open for
+  the lane's next fold: the bit-field promotion (P0), a several-item statement expression as a constant).
+  **⚠ NOT a reading of this composition**: the fold lands on checkpoints 14–20. The composition READ from main
+  since: `linux-arm64-debug` (GNU 13.3) and `macos-arm64-debug` (AppleClang 21) PASSED, 2777 tests each. Its review
+  (read-only) is SEND BACK — known defects (7) and (8) below; and three of its rows that the fold applied CLOSED with
+  their arms unswept are REOPENED at checkpoint 22 (a row closes only on arms that read `passed`).
+- **Checkpoint 22 (2026-10-15) = the link lane's FOLD 3b — a compiled unit STATES ITS COMMONS**: a tentative
+  definition is written as the COMMON row every object reader already produces, on every format whose document
+  states how a common is resolved (`ObjectFormatSchema::statesCommons`, one accessor; the merged route passes it
+  too), at the alignment its object STATES (`ExternImport::commonAlignmentStated`); a common larger or more aligned
+  than the definition it yields to is SAID (`K_CommonSymbolLargerThanItsDefinition`, a warning — references split:
+  Apple ld and GNU ld warn, the rest are silent); the superseded-definition key's third answer (`discardedWhole`) and
+  its label rule; a relocation standing in another discarded group of one unit links; a PE DLL no longer exports an
+  overridable weak name; the merged route passes the format's kind; every finding of the review of fold 3a closed
+  (F1: a DSS PE object's `.pdata` names the weak body's bytes, never its weak name — ✔MEASURED, link.exe 14.44,
+  lld-link 19.1.5 and MinGW GNU ld, both orders, baseline and release, 12 of 12 images exit 42). 154 paths; 25 arms
+  + 1 moved, unswept. ✔MEASURED by the lane on checkpoint 21 + its fold, whole suite: `macos-arm64-debug` 2787 of
+  2787, `linux-arm64-debug` 2787 of 2787; the two x86_64 legs were not admitted for the host's memory and are read
+  from main at this checkpoint. Rows: 3 new, disclosed (two fixed, closing on their arms; the template gap below,
+  open). New open work it found: an inline-asm template cannot name ANY symbol of the embedding program
+  (`D-ASM-TEMPLATE-CANNOT-NAME-A-SYMBOL-OF-THE-EMBEDDING-PROGRAM`, P1; the link lane's next item).
+  Read from main since: `linux-x86_64-debug` (GNU 13.3) PASSED, 2787 tests.
+- **Checkpoint 23 (2026-10-15) = the harness lane's FOLD H2**: ONE statement of what a walk of a tree leaves out —
+  the root `.gitignore`, read as git reads it (a Python reader in `owning-tree` and a C++ one in
+  `tests/test_support/tree_ignores.hpp`, one grammar, the same refusals) — asked by the document census, the
+  redactor's two walks and the case-collision scan (its review found five more walkers that keep a list of their
+  own — check-anchor-registry, check-plan-citations, check-scripts-index, check-export-macro-placement,
+  source-census — and the readers diverging from git on POSIX classes, bytes, case and symlinks: the lane's fold
+  H4), and `sync.neverTransfer` reduced to the two secrets (the sync plans MEASURED byte-identical without the 15
+  duplicates FROM ONE LANE TREE, which holds none of the worktree or orchestrator content: for those the tool's
+  documented rule, what git does not ignore crosses, is the evidence, not the measurement); `check-ninja-deps` rewritten by
+  its review (forced includes, PCH makers and `@file` refused per shape; one include reader; 826 objects of the MSVC
+  tree read, 2 excused, each by its edge's precompiled header); a path a program is told to WRITE is refused when it
+  is empty or begins with `-`; a SELF-TEST never carries the `repo-guard` label (it reads its own fixtures and runs
+  on every leg — the rule stated once beside the scan that gives the label, held by `check-repo-guard-label`). 394
+  paths; 119 arms unswept. ✔MEASURED by the lane on checkpoint 21 + its fold: `linux-arm64-debug` whole suite 2789 of
+  2789; `repo-guard` on both Windows legs 22 of 22 each. The lane's arm registry was merged BY ARM by the
+  orchestrator against the lane's real base (the tool's ancestor for that path was the lane's seed): 714 arms.
+  ✔MEASURED from main after the commit: `linux-arm64-debug` whole suite 2799 of 2799 (GNU 13.3.0). Its review:
+  SEND BACK, 15 findings (0 BLOCKER, 0 MAJOR, 8 MINOR, 7 NIT) — the lane's fold H4, after H3.
+- **Checkpoint 24 (2026-10-15) = the C front end lane's ALIAS FOLD**: `__attribute__((alias("t")))` end to end —
+  one pending entry per declarator resolved at the unit's end, an internal alias's uses bound to its target, HIR
+  `HirSymbolAlias`, MIR `MirAlias` (`.dssir` `alias %A [linkage] = %T`), DCE rooting every target, summary v3, the
+  object rows; Mach-O refuses it BY DOCUMENT (all eight macho64 documents); the cross-unit merge reads the link
+  document's `supersededDefinition` for a lost target (its body kept under a module-private id the alias alone
+  names, the winner named, or refused by name — `DiscardedWhole`, checkpoint 22's answer, falls into the refusal
+  until the lane's next fold gives it its meaning); `common`/`nocommon` stated once (the tentative mark, read
+  alone); `section` refused by name; an array of unknown size is an incomplete TYPE on every row (`sizeof` reads 0
+  and is said between `extern int a[];` and `int a[3];`, as cl; a file-scope tentative completed to one element and
+  said); an array below a pointer composes with one of a compatible size (C 6.7.6.2p6), so `int a[n][*]` in a
+  prototype compiles (gcc and clang run it; DSS had pinned the refusal); a structure member with a runtime bound,
+  read before as a flexible member, is refused by name. 239 paths written, 17 merged three-way by the tool, 5
+  settled by the orchestrator (two comments, the census figures, the arm registry merged BY ARM: 760 arms, five
+  arms both sides changed resolved as the lane's rows at main's case count). ✔MEASURED by the lane at its final
+  bytes: `macos-arm64-debug` 2793 and `linux-arm64-release` 2793 passed; `windows-x86_64-release` (before its last
+  two changes) ran the new PE reference-link pin green (link.exe and MinGW ld take DSS's pe64 objects, 42). NOT RUN
+  on the composition before the commit: any build (this host's memory held above the admission line) — main reads
+  both Windows legs on it before any other fold, and the Windows debug reading of the lane's `copy_file` fix is the
+  fold's open risk. Rows: six new, DISCLOSED — four fixed in code (their arms unswept), `section` owed in that
+  lane's next fold, and `D-C-A-MEMBER-WITH-A-RUNTIME-BOUND-IS-READ-AS-A-FLEXIBLE-MEMBER` ruled to the next cycle on
+  its MEASURED size (the layout's constant offsets: `computeLayout(` 41 mentions in 10 files, field offsets 101 in
+  9; gcc alone builds it — clang refuses a variable-length member, cl has no VLA).
+  ✔MEASURED from main on 24f20ed5 (the commit that removed two conflict markers 65799e57 carried — the
+  orchestrator installed an unresolved merge): windows-x86_64-debug and -release 2813 of 2815 each; the two reds
+  are xa's cl arm (its fix fold) and the alias case below (fixed at checkpoint 25). Its review: SEND BACK, 16
+  findings (0 BLOCKER, 1 MAJOR — a `static` object alias refused with a false reason), in the lane's current fold.
+- **Checkpoint 25 (2026-10-15) = the harness lane's FOLD H3**: `check-orphan-tests` judges what CMake EVALUATES (a
+  registration inside a block or an unreached CMakeLists clears nothing; a case-misspelt source is MISSPELT); the
+  real-scale link test runs on every leg (the opt-in option removed; MEASURED 20-26 s); the 130 arms inherited
+  from the C front end lane state what their runs showed (14 withdrawn for that lane's own rewrite); the redactor
+  never reads inside its own marks and names an unreadable file in one sentence; the skill states where the tool
+  keeps workers and leg copies and each area's default sweep leg once. With it, the C front end lane's alias case
+  reads its document (ELF and PE keep a superseded weak body's bytes, Mach-O replaces it whole). The registry: 777
+  arms, the lane's layout kept. OWED and read from main right after the commit: the repo-guard label and the
+  harness self-tests on the Windows and WSL legs.
+  check-orphan-tests READ from main on windows-x86_64-debug and linux-x86_64-debug at checkpoint 26: passed.
+- **Checkpoint 26 (2026-10-15) = the library lane's PROMOTION FOLD** (with the review of checkpoint 21): a
+  bit-field narrower than `int` is promoted (ISO C 6.3.1.1, gcc, clang; cl promotes none — decided for the three
+  that agree) — NOT yet by one rule in every tier: the review of this checkpoint (SEND BACK, 2 BLOCKERs) READ the
+  constant tier promoting every bit-field read, `({ g.b; })` included, where the typer and the run time promote
+  only a bit-field's value, and the evaluator's conditional returning the selected arm unbalanced
+  (`(1 ? 5 : 0u) - 6 < 0` folds true, runs false) — defect (9) below; a plain `char` bit-field's
+  sign is the TARGET's in both tiers (defect (7) above, fixed); a named constant of a type with no constant value is
+  no constant (defect (8), fixed — the complex half of constant evaluation is a row of its own, ruled to the NEXT
+  CYCLE: `D-C-NEITHER-CONSTANT-EVALUATOR-HOLDS-A-COMPLEX-VALUE`); a `__try` filter is left only by its value; a
+  statement expression may end in a labeled statement (`D-C-GNU-STATEMENT-EXPRESSION` reopened from the archive and
+  built). ✔MEASURED by the lane on its bytes: macos-arm64-debug and linux-x86_64-debug 2800 of 2800;
+  windows-x86_64-debug and -release 2828 of 2829 (the one red xa's cl arm). The registry: 822 arms, every section
+  sorted; `unsuppressable_codes.cpp`'s extent 202 (two lanes each added a member — a plain merge kept 201).
+- **Checkpoint 27 (2026-10-16) = the C front end lane's fold f25** (with the review of checkpoint 24): an alias
+  whose target's copy the link discards WHOLE (PE's select-any kind) — its own unit's uses name the winner,
+  another unit's use is refused `K_SymbolUndefined` in the linker's words, an unused declaration is taken (the
+  object route's own-unit half is the linker's, in lane xa's fold 3c); the review's sixteen findings, each
+  reference cell measured first: a `static` object alias with no initializer is admitted (and a static alias's own
+  record is no definition of its name); `nocommon` on a later tentative declaration decided by gcc's reading (a
+  meaning split, recorded in the row); a pointer reads its composite type before the declaration that completes
+  it; a function and an object alias of one another keep ONE storage (clang's address model, its cost recorded);
+  the initializer exemption only for `extern`; `.dssir` v7 (a v6 text refused, pinned); one `locateMingwGcc`. The
+  six arms that died with exit 134 now fail by name. ✔MEASURED by the lane on its 28 affected entries:
+  macos-arm64-debug, windows-x86_64-debug, linux-x86_64-debug passed; NOT run by it: linux-arm64-debug (its host
+  short of disk), windows-x86_64-release. The registry: 834 arms, merged by arm by the tool, 0 out of order.
+  KNOWN RED of our own guard: `check-line-endings` refuses the lane's `m.target.back() == '\r'` (its unanchored
+  verb `rg` matches inside `target`) — the harness lane fixes the guard in H4. ✔MEASURED from the main checkout
+  (2026-10-16): linux-x86_64-debug 2831 passed; macos-arm64-debug 2830 of 2831, the one red
+  `landing_log_git_environment_guard` — the Mac's Apple python 3.9.6 (main's `find_package(Python3)` states no
+  floor) refusing `Path.write_text(newline=)`; the harness lane's H4 states the floor.
+- **Checkpoint 28 (2026-10-16) = the link lane's FIX FOLD** (the re-review of fold 3b): an over-aligned tentative
+  definition on PE is written as the DEFINITION it is wherever it is wider than every linker gives a common of its
+  size and another linker reads the object — the four PE documents state that rule as data
+  (`commonAlignmentFromSizeAtMost: 32`, lld-link's, the least of link.exe's and lld-link's measured placements),
+  since link.exe ignores `-aligncomm:` and one unit's `_Alignas(64) int v;` had landed misaligned in silence; a
+  definition a common yields to is measured at the alignment its offset allows; and a MISCOMPILE older than the
+  cycle, found by the lane's finals and fixed here: all three object readers read a declared section alignment
+  above 256 as ONE byte (`D-LK-OBJECT-READERS-READ-A-SECTION-ALIGNMENT-ABOVE-256-AS-ONE-BYTE`, new, disclosed;
+  every power of two to 2^31 is carried, a field that is no alignment refused by name). ✔MEASURED by the lane on
+  its final bytes, whole suite: macos-arm64-debug and linux-arm64-debug 2788 passed; windows-x86_64-debug (MinGW)
+  2817 passed; windows-x86_64-release (MSVC 19.51) 2815 of 2817, the two reds the App Execution Alias guards below.
+  Folded onto checkpoint 27 with four three-way merges and two settled by hand (`kFormatDocumentKeys` holds 55: two
+  lanes each added one key over 53; the registry merged by arm, 857 arms). NOT YET BUILT as composed: the whole
+  suite of checkpoint 28 is read after this commit.
+- **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
+  (1) `orphan_tests_guard` — FIXED by checkpoint 16;
+  (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
+  (3) `D-C-CONSTANT-AGGREGATE-MEMBER-READ-WITHOUT-ITS-INITIALIZERS-OPERATOR` stays OPEN: of its eight arms swept
+  from main, 3 `passed`, 4 were `violated` for further red cases not declared, and ONE SURVIVED
+  (`core-wrapper-statement-does-not-name-a-statement-expression`: 902 cases, none red) — the library lane probes
+  the references on `({ … })` in a constant initializer before it writes the case or the evaluator arm.
+  (4) ✔MEASURED 2026-10-12 after the review of checkpoint 13, pe64, both pipelines, four references exiting 42:
+  17 of 23 CORRECT programs die of an illegal instruction — a BIT-FIELD member of a constant aggregate is read as
+  a constant without its width (7 of 10 forms; in this PR since checkpoint 1), and a NAMED constant is read at its
+  initializer's type instead of its declared one (10 of 13; the reader is older, the code that acts on a folded
+  condition came with checkpoint 5). FIXED by checkpoint 21;
+  (5) found with them, the BASE's and silent: a bit-field narrower than `int` is NOT promoted (`if (v.b - 6 < 0)`
+  over `unsigned b : 3` goes the wrong way at run time) — BUILT by checkpoint 26, but not yet by one rule in every
+  tier: defect (9);
+  (6) the BASE's, ✔MEASURED 2026-10-12 by the C front end lane, three references exiting 42 (gcc, clang,
+  mingw-w64 gcc; Apple clang refuses `alias` by name, cl has no `__attribute__`): `__attribute__((alias("g")))`
+  is DROPPED with the warning `H_UnknownLinkageSpecifier` — the two plain aliases are then refused at link
+  (loud), and `__attribute__((weak, alias("g")))` COMPILES AND THE IMAGE DIES (0xC0000005 on pe64, signal 11 on
+  ELF). The row is `D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE` (open, restated); its build is the FIRST item of
+  that lane's next wave — BUILT by checkpoint 24 (above); the row closes when its arms read `passed`.
+  (7) A REGRESSION OF CHECKPOINT 21 (the review of that fold, INFERRED by reading; the library lane MEASURED it on
+  pe64, both pipelines): a plain `char` bit-field is read SIGNED by the constant tier on a signed-char target and
+  UNSIGNED by the run time, so a folded condition marks reachable code unreachable and a correct program dies of an
+  illegal instruction — FIXED by checkpoint 26 (both tiers ask the one target-aware char sign);
+  (8) with it: a named constant of `_Complex` type was read at its initializer's type (the same death) — FIXED by
+  checkpoint 26 (no constant; the complex half of constant evaluation is its own row, ruled to the next cycle);
+  (9) IN MAIN SINCE CHECKPOINT 26 (its review, READ; the library lane measures each cell before fixing it): the
+  constant tier promotes every bit-field read while the typer and the run time promote only a bit-field's value,
+  and the evaluator's conditional returns the selected arm without the usual arithmetic conversions — a folded
+  condition marks reachable code unreachable (`if (({ g.b; }) - 6 < 0)`, `(1 ? 5 : 0u) - 6 < 0`); the library
+  lane's P0 fold, one rule for a read's type in all three tiers and the arms balanced in both.
+  (10) OURS, ✔MEASURED by the link lane on windows-x86_64-release: `ninja_deps_selftest_guard` and
+  `orphan_tests_guard` are red there — that build's CMake cache names the WindowsApps App Execution Alias for
+  python3, and the test spawner refuses it as no executable; the harness lane's H4 classifies a candidate by asking
+  the OS. And on the Mac the one red of checkpoint 27 above (no Python floor) — the same fold.
+  (11) An alias of a LOSING select-any copy still competes for its name (the review of checkpoint 27, ✔MEASURED by
+  the C front end lane): the settled-order election is the C front end lane's fold f26 for the merge, and the link
+  lane's next fold adopts it in the linker.
+- **Arm sweeps from the main checkout so far:** the registry held 502 arms at checkpoint 17 (606 at checkpoint 22).
+  The sweep of 340 owed arms at checkpoint 20 (2026-10-15, `macos-arm64-debug`): 155 `passed`; 158 `violated`,
+  18 `survived`, 6 `unattributed`, and 3 `stopped` because their runner's unmutated binary had a red in the worker
+  (at checkpoint 20 it depended on its ctest fixture, which checkpoint 21 removed) — every non-passed arm is back
+  with the lane that declared it, its records pulled into the main checkout. `macos-arm64-debug`: all 147 arms of
+  checkpoint 14's registry are read — 131 `passed`, 15 `violated` (all back with their lanes; six answered in
+  checkpoint 15 and read `passed` since), 1 `stopped`; of three new ones, 2 `violated` and 1 `unattributed` (the
+  mutant aborts the binary). `linux-x86_64-debug`: the eight arms of the open P0 row only. **Checkpoint 17
+  (2026-10-12) moved the sweep leg of 343 arms whose claim is about no platform from `linux-x86_64-debug` to
+  `macos-arm64-debug`** (the areas analysis, core, hir, dss-config, asm, and the harness lane's script-driven
+  ones): a sweep in the WSL distribution runs ONE worker and shares this machine's two heavy slots with every
+  lane's local leg (✔MEASURED: 16 arms in 70 minutes, one arm waiting 24 minutes for a slot), while the Mac runs
+  two (101 arms in about 50 minutes). Only the open P0 row's eight stay on the WSL leg until the library lane has
+  redeclared them. The same commit carries the harness lane's skill fold: who sweeps is stated once (the
+  orchestrator, from the main checkout, whole legs; a fold is never held for a sweep), the area's default leg is
+  a leg with more than one worker that is not this host's, a runner holds no case whose verdict depends on a
+  ctest fixture or on state an earlier run left, and the sentences the tool's help refutes are gone. The one arm that was `stopped` had its runner's
+  UNMUTATED control red in the sweep's fresh worker tree:
+  `DriverArgumentSupply.SingleCuRouteRunsTheProgramStageOptimize` counts a process-wide phase counter across a
+  build that compiles the shipped runtime when the per-user runtime object cache is cold; ctest warms it first
+  through a fixture (so CI and the legs are green), a sweep runs the binary bare — the BASE's debt, fixed in the
+  library lane's current fold (each case owns its cache).
+- **Reviews:** the C front end lane's fold A2 — SEND BACK, 8 findings (its MAJOR measured clean: 78 cells × two
+  pipelines × two compilers, 312 runs, 0 wrong, at checkpoint 13's bytes); the harness lane's three folds — SEND
+  BACK, 21 (1 MAJOR: `check-ninja-deps` ignores a forced include); the link lane's fold 2 — SEND BACK, 14 (1 MAJOR,
+  the refused link above; and its reference tables in `tests/link/test_common_symbols.cpp` must be keyed to the
+  toolchain version measured before the pipes run). All accepted and in the lanes' hands. The library
+  lane's constant-evaluator fold (checkpoint 13) — SEND BACK, 14 (2 BLOCKERS, both silent wrong values INFERRED
+  by reading and being measured first: a bit-field member read as a constant ignoring its width; a named constant
+  read at its initializer's type, not its declared one, now that a folded condition deletes code). Every lane's
+  folded work has been reviewed once; the re-reviews of the send-back folds are owed.
+- **Silent defects found in this round: ALL of those listed below are FIXED in this tree by checkpoint 13** (read
+  the list as history; each row stays open or disclosed until its arms pass): in a STATIC INITIALIZER, an enumerator,
+  an array size or a `_Static_assert`, the unary `~` and `-` of an `unsigned int` constant were not reduced to
+  32 bits, so every widening of the result was wrong (✔MEASURED on pe64, baseline and release:
+  `static const unsigned long long u = ~0U;` held 0xFFFFFFFFFFFFFFFF; and where such a widened value was a
+  CONDITION inside a function body the function died of an illegal instruction); `_Generic` selected `default` in
+  silence where its controlling expression held a literal in an enumerator, a file-scope array bound or a
+  bit-field width (✔MEASURED: `enum { EV = _Generic(0, int: 42, default: 9) };` gave 9). **AND ONE BORN IN THIS
+  PR, a merge blocker:** a member of a constant aggregate whose initializer is a one-operand expression was read
+  WITHOUT its operator (✔MEASURED on pe64: `static const struct S g = {.b = -5}; if (g.b != -5) return 7;` died of
+  an illegal instruction; 134 of 247 measured cells wrong, 4 after, of another construct). LOUD, the base's debt,
+  fixed in the same fold: a brace element under an operator (`char first[] = { *"abc" };` at block scope;
+  `struct S arr[] = { src[i] };`) was refused by the HIR lowering where all six references accept it. Fixed
+  earlier: the reference through a STATIC name following a losing weak alias (checkpoint 12); the two pe64 `__try`
+  defects found on 2026-10-08 (checkpoint 6). **MEASURED CLEAN since (2026-10-12), from the review of checkpoint 9:** a guarded
+  body holding `&&`, `||`, a scalar `?:` or `va_arg` puts the phi-edge split inside the guarded run — 78 cells in
+  both pipelines with both compilers built from checkpoint 13's bytes, 312 runs, 0 wrong, the scope tables
+  byte-identical to the fold's own; its source pin and example come with that lane's send-back fold.
+- **HOW THIS CYCLE ENDS — operator, 2026-10-08, verbatim:** *"on finishing this cycle I'll turn on the pipes and
+  try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and monitor CI until
+  green"*. So P69 is this PR's EXIT: its four lanes finish what they are in (no second round opens in this PR — what
+  is measured and unbuilt goes to the next cycle through the registry and each lane's findings), then every lane
+  re-reviewed clean, every owed mutant read, the eight runs, the sqlite recompile and `veryquick`, the final review,
+  this file rewritten, commit, push — and THEN the session adds the `Run Pipes` label itself and watches CI to
+  green, fixing what is red. The merge is the operator's. `speedtest1` is not owed: the cycle did not aim at compile
+  time or the optimizer pipeline.
+- **Everything below this block describes the tree at `71648598`** and is rewritten at the round's close.
+
+### ★ LANES ARE DSSHARNESS AGENTS — READ THIS FIRST: `lane-fold` and `lane-worktree` are deleted, every lane is a DssHarness agent, and the fold checks every lane row itself
+
+**WHERE WE ARE.** Branch `feature/c23-conformance-burndown-ah-1`, cut from main at `9c4b98f9` (PR #58, merged
+2026-09-29). This commit is the migration the operator asked for on 2026-09-29: *"let's migrate our skills to
+mandatory use dssharness instead of lane-fold.py"* … *"Once it's working, remove lane-fold.py."*
+- **Deleted:** `.harness-config/runner/actions/lane-fold/` and `lane-worktree/`, their `predefinedRunners`, the ctest
+  guards `lane_fold_selftest_guard` and `lane_worktree_guard`, their `cmake/DssTestBudgets.cmake` rows, and their
+  rows in both generated action indexes.
+- **The dss-cycle skill** makes the orchestrator/agent verbs MANDATORY for every lane — a lane is any subagent that
+  changes the repository's files. `references/orchestration.md` is the one statement of the lifecycle: layout, names,
+  aiming a lane's subagent at its worktree (`-C`, absolute paths, never the Agent tool's `isolation: "worktree"`), seed
+  and refresh (the `.plans/**` hold sits on `refresh-agent`), the fold (NOT all or nothing: a file changing under it
+  stops it part way, 21), re-application, the rows directory and the fold's own checks (`--new`, `--accept-lost`),
+  deletion, and the orchestrator's deletion at the cycle's end (the operator's words verbatim, and the five
+  conditions read from them and from the tool). SKILL.md
+  and the other references point to it.
+- **`dssharness init`** rewrote the managed `.gitignore` block (`/.worktrees/*`, `/.orchestrators/*`, each with a
+  tracked `.gitkeep`); `create-orchestrator` refused until it did (seen in the session, not logged).
+- **`check-doc-census`** skips `.orchestrators/`, where an orchestrator keeps copies of documents — made in agent
+  `lfm/dc` and folded with `fold-agent`. New arm 11b; ✔MEASURED red-on-disable: the control (run
+  20260930-011150-c8a36a90) green, the SKIP_DIRS mutant (run 20260930-011209-5e956a21) red on exactly 11b, the
+  source md5 read moved and returned in the session (not in the logs).
+- **FOUND, REPORTED AND FIXED WITHIN THE CYCLE: the orchestration release's `fold-agent` made none of the four row
+  checks — a cut value, a citation of no row, an undeclared new id, a lost cell.**
+  ✔MEASURED 2026-09-29 in a throwaway repository: it stored an id cut after a hyphen, a path cut after its `/` and a
+  citation of no row, and a mistyped existing id carrying a priority became a new CLOSED row while the row it meant
+  stayed open; `read-anchors --lint` found nothing. Sent to the repo-harness session with three smaller findings. The
+  next release, installed 2026-09-30, fixes all four findings — the two wording ones DOCUMENTED by its help, the
+  rest ✔MEASURED 2026-09-30 in a new throwaway repository: the fold
+  refuses an undeclared new id (`--new`, naming the rows that begin the same way), a cut id or path, a citation no
+  row holds, all in one dry run, and `--apply` refuses a lost cell until `--accept-lost` names it, the dry run
+  showing its word diff; the door
+  itself refuses a cut value (exit 10) and a citation of no row (13) for every write; `create-agent` makes `rows/`.
+  A name-filtered run under it before any edit (run 20260930-122132-9a7cb3d3, windows-x86_64-debug, `--no-build`):
+  36 of 36 passed, the 16 `repo-guard` guards among them — to iterate, not to conclude; the gate below concludes. The skill's interim
+  `anchor-rows` pre-check lived one day and was dropped; `anchor-rows` is again the orchestrator's own batch. A fifth
+  finding, sent 2026-09-30 (the dry run's summary pointed at "the last line" while the command is on the line above
+  it), is fixed in repo-harness PR #22, not yet released; the skill names the `to write them:` line, true of both.
+- **Also ✔MEASURED 2026-09-29.** In this checkout: an agent created and seeded, a write and a deletion folded, a rows
+  directory refused on a dry run over the old `crossrefs.txt`, `delete-agent` removing the host copies on WSL, macOS
+  and the arm64 VPS, a recorded subagent session's transcripts kept, a `sync --dry-run` (one host, WSL) listing
+  nothing below either directory. In a throwaway repository: rows applied (a close MOVED to the done registry), a
+  changed declaration applied anew, an unchanged one left alone and one changed over a registry change refusing the
+  whole fold — all three by dry runs (the first by `--apply` on 2026-09-30); `refresh-agent` and `seed-agent` with their refusals and `--force`; a file under each evidence root kept
+  byte-identical by `delete-agent`; a deleted agent's name refused; `delete-orchestrator` refusing without
+  `--delete-evidence`.
+- **Review.** Three independent read-only reviewers (completeness, skill coherence, claims): 0 BLOCKER, 13 MAJOR
+  across them (overlapping), the rest MINOR/NIT; every finding fixed or dispositioned. A final review, paused by the
+  operator mid-run, found 17 more (FR1 the tree was not yet gated; FR2 a finding after the gate must re-flow through
+  it); FR1 answered by the gate below, FR16 made moot by the new release, the rest fixed. The fresh final review: PASS
+  — 0 BLOCKER, 0 MAJOR, 5 MINOR, 9 NIT, all fixed; its re-verification PASS, 5 NIT, fixed after the gate (text only,
+  below).
+- **Gate.** ✔MEASURED, run 20260930-130355-93a72391, on this commit's tree before its last text fixes: OK — 8 legs
+  passed. `windows-x86_64-debug` (GNU 13.2.0, MinGW) 2537/2537 · `windows-x86_64-release` (MSVC 19.51) 2537/2537 ·
+  `linux-x86_64-{debug,release}` (GNU 13.3.0) 2506/2506 each · `linux-arm64-{debug,release}` (GNU 13.3.0, the VPS)
+  2506/2506 each · `macos-arm64-{debug,release}` (AppleClang 21) 2506/2506 each. The six indirect legs skip the
+  `repo-guard` label by design, so every guard ran on the two Windows legs. The gated bytes differ from this commit's
+  only in text that guards alone read — this block's result lines and the re-verification's five wording fixes
+  (dss-harness.md, `anchor-rows`' docstring, this block, the VERBS row) — so the `repo-guard` label re-ran on both
+  Windows legs on this commit's bytes; its run id and counts are in this commit's message. An earlier gate (run
+  20260930-012432-13a4b1de, on the orchestration release and the tree before the review fixes) passed 8/8 too.
+- **Registry.** ✔MEASURED at this commit against `9c4b98f9`: `check-anchor-balance` → "OK - the balance holds: 620
+  open now against 620 at 9c4b98f9" (0 closed, 0 opened, 0 counted); `read-anchors --lint` 0 findings;
+  `check-anchor-citations --current-tree` OK, 18174 citations over 3697 files. Two open rows edited through the door
+  (`anchor-rows` stage/check/apply in four batches, each LOST cell read):
+  `D-HARNESS-ACTION-PROGRAM-VERBS-WITHOUT-A-HARNESS-STEP` (the lane programs' instances retired; stale remedy phrases
+  struck; the evidence claim split into what was measured and what is documented) and
+  `D-AUDIT-P68-ROUND-13-MINOR-FINDINGS` (its `mig` item names `fold-agent` and the door's new refusals).
+- **Hosts.** ✔MEASURED (the first gate's log): the WSL copy kept the retired `lane-fold/` holding an empty `build/`
+  (sync's WARN; both WSL legs, linux-x86_64 Debug and Release, passed with it): removed once with `rmdir`. macOS and
+  the VPS had it removed by the sync ("which the deletion emptied").
+- **What the orchestrator got wrong.** (1) The first mitigation for the unmeasured row path — "every fold is followed
+  by `check-anchor-registry` and `check-anchor-balance`" — covered nothing: neither reads a registry cell's
+  citations; three reviewers caught it. (2) "All or nothing" was copied from `fold-agent --help` over the fuller
+  `help orchestrators`. (3) Three outputs printed an account name unredacted: a Python traceback's interpreter path, a
+  `cut` of the probe's raw jsonl, and an `ls -la` owner column on the WSL host (no secret, host address or key path).
+  (4) A `cd` in the shell twice moved the session's working directory; restored at once. (5) The review dispositions
+  said a guard ran on all eight legs; it ran on the two Windows legs, the only ones that run `repo-guard` (the final
+  review caught it).
+
+**WHERE WE NEED TO GET.** Unchanged from round 13 and the PR exit below — C conformance and the production backend,
+the registry's open rows first. The row checks this cycle found missing are in the tool since 2026-09-30.
+
+**PRIORITIES.**
+1. NEXT — the operator runs the pipes on this branch's PR (never an agent), and merges.
+2. QUEUED — the next cycle, the first under agents: round 13's NEXT list (below) and the three rows the PR exit found
+   (`D-PERF-DSS-FULL-SOURCE-SQLITE-COMPILE-TIME-ROSE-A-FIFTH-TO-A-QUARTER-SINCE-2026-08-28`, the four-leg run refusing
+   its own leg at the shared WSL clone, and read-leg-path's over-masking).
+3. QUEUED — measure `apply-registry-row` through the new door (cut value, citation of no row), then strike the two
+   `mig` items of `D-AUDIT-P68-ROUND-13-MINOR-FINDINGS` it would close (INFERRED today).
+
+**CONCURRENT BRANCHES / PRs.** None in this repository. The repo-harness session shipped the four findings.
+
+**TIMELINE.** 2026-09-29: PR #58 merged (`9c4b98f9`); the orchestration release installed; the migration, its probes,
+the first 8-leg gate and three reviews with their fixes; the final review paused by the operator. 2026-09-30: the
+release with the row checks installed; resumed, re-measured, the pre-check dropped; the fresh final review, the gate
+on the final tree; this commit. The orchestrator `lfm` is deleted with its evidence as the cycle's last act, after
+the push.
+
+**NEXT — THE OPERATOR RUNS THE PIPES ON THIS BRANCH'S PR, THEN MERGES IT.** Then the next cycle takes round 13's NEXT
+list and the three rows the P68 exit found, each lane an agent.
+
+---
+
 ### ★ P68 PR EXIT — READ THIS FIRST: the migrated sqlite action runs its own exit on all four hosts, SQLite's corpus is green everywhere at one pinned revision, and the benchmark found DSS compiling a fifth to a quarter slower than a month ago
 
 **THE PR EXIT, after round 13's commit `737078de`** — the regime of this PR's handoff: units on every leg, `veryquick`
@@ -274,7 +930,7 @@ changed, and the eight `harness/` entries that read them were rebuilt and re-run
 
 **Registry.** ✔MEASURED at this commit against `6181ba84`: `check-anchor-balance` → "OK - the balance holds: 620 open now against 620 at 6181ba84" — 3 rows born closed (the lane tooling's, P2), 0 counted; `read-anchors --lint` 0 findings; `check-anchor-citations --current-tree` OK. At `4a16954a`, against round 13's `737078de`: `check-anchor-balance` → "OK - the balance holds: 620 open now against 617 at 737078de" — 5 new rows: 2 born closed (X1's, P3) and 3 `🔵 DISCLOSED` rows of debt this exit found and did not create (the compile-time rise, P2, measured at round 12's commit; the four-leg run's clone contention, P2; read-leg-path's over-masking, P3), 0 closed, 0 reopened, 0 dropped; counted 611 → 611. Against round 12's `547f316f`, the base of round 13's balance: 615 → 620 raw, 5 closed, 10 opened (1 created, 9 disclosed), counted −4. Banding **P0 0 · P1 62 · P2 211 · P3 332 · P4 11 · P5 4**; `read-anchors --lint` 0 findings.
 
-**NEXT — THE OPERATOR RUNS THE PIPES AGAIN, THEN MERGES PR #58.** Then the next PR takes round 13's NEXT list (above) and three rows this exit
+**NEXT (DONE 2026-09-29: PR #58 merged as `9c4b98f9`) — THE OPERATOR RUNS THE PIPES AGAIN, THEN MERGES PR #58.** Then the next PR takes round 13's NEXT list (above) and three rows this exit
 found: the compile-time rise (`D-PERF-DSS-FULL-SOURCE-SQLITE-COMPILE-TIME-ROSE-A-FIFTH-TO-A-QUARTER-SINCE-2026-08-28`),
 the four-leg run refusing its own leg at the shared WSL clone, and read-leg-path's over-masking.
 

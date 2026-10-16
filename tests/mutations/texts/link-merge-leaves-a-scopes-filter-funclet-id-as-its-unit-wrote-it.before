@@ -1,0 +1,4 @@
+                if (scope.filterFuncletSymbol.valid()) {
+                    scope.filterFuncletSymbol =
+                        SymbolId{mergedIdFor(i, scope.filterFuncletSymbol)};
+                }

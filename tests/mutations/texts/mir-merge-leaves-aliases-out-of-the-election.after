@@ -1,0 +1,1 @@
+            if (true || name.empty() || a.linkage.binding == SymbolBinding::Local) continue;

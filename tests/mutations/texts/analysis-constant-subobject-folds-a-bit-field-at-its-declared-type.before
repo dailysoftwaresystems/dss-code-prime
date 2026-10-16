@@ -1,0 +1,2 @@
+                    valueTy = bitFieldPromotedType(s.lattice.interner(), fact->type,
+                                                   *fact->bitFieldWidth, *rules);

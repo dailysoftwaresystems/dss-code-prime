@@ -227,6 +227,7 @@ TEST(ElfExecFormatJson, InterpreterTypeCheckRejectsNonString) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": 42 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -260,6 +261,7 @@ TEST(ElfExecFormatJson, EmptyInterpreterStringRejectedAtLoad) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -349,6 +351,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -574,7 +577,9 @@ TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingFutureWork) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 2, "jumpSlot": 5, "relative": 3},
         "class":"elf64", "data":"lsb", "machine": 243, "type":"exec",
         "pageAlign": 4096, "interpreter": "/lib/ld-linux-riscv64-lp64d.so.1", "bindNow": true
       },
@@ -1138,7 +1143,8 @@ TEST(ElfExecWriter, EntryPointHonoredOnDynamicPath) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "entryPoint": "sym_42",
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -1183,7 +1189,8 @@ TEST(ElfExecWriter, UnknownEntryPointOnDynamicPathFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "entryPoint": "sym_99",
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -1259,7 +1266,8 @@ TEST(ElfExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": "true" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": "true", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
@@ -1290,7 +1298,8 @@ TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
       "relocationAddends": "explicit",
       "inputSectionPlacement": "unit",
@@ -1320,8 +1329,10 @@ TEST(ElfExecWriter, BindNowFalseFailsLoudCitingDLK611) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "entryPoint": "",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8},
         "class":"elf64","data":"lsb","machine":62,"type":"exec",
         "pageAlign":4096,
         "interpreter":"/lib64/ld-linux-x86-64.so.2",
@@ -1891,6 +1902,7 @@ TEST(ElfExecFormatJson, ExecWithZeroVirtualAddressRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
@@ -1931,6 +1943,7 @@ TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -1959,6 +1972,7 @@ TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 3000 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -2056,6 +2070,7 @@ TEST(ElfExecWriter, EntryPointResolvesSecondFunctionByName) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_42",
       "sections":[
@@ -2107,6 +2122,7 @@ TEST(ElfExecWriter, UnknownEntryPointFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_99",
       "sections":[
@@ -2222,6 +2238,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -2293,7 +2310,8 @@ TEST(ElfExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
       "relocationAddends": "explicit",
       "inputSectionPlacement": "unit",
@@ -2353,7 +2371,8 @@ TEST(ElfExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
       "relocationAddends": "explicit",
       "inputSectionPlacement": "unit",

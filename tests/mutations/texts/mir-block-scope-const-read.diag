@@ -1,0 +1,1 @@
+int f(void) { const int k = 42; static int x = k; return x; }

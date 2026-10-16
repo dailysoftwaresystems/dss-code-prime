@@ -6,6 +6,7 @@
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind
 
 #include <cstdint>
+#include <optional>  // MirAggregateValue::unionMember
 #include <string>
 #include <utility>   // std::pair — the iterative copy's (source, destination) work list
 #include <variant>
@@ -31,6 +32,15 @@ struct MirLiteralValue;
 // `__module_init__` synthesis. The recursive shape mirrors the HIR side.
 struct MirAggregateValue {
     std::vector<MirLiteralValue> fields;
+    // P69 (lane `cs`, D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED): a UNION
+    // value's one field initializes the member this names — its index among the union's members. An
+    // initializer may designate ANY member (C 6.7.9p17), and the field's TYPE cannot say which: two
+    // members may share one (`union { int a; int b; }`). Copied from `HirAggregateValue::unionMember`
+    // by `toMirLiteral`, set from the union `ConstructAggregate`'s payload by
+    // `tryClassifyAggregateConst`, spelled `agg member N` by the `.dssir` text (v5), and read by the
+    // static-data encoder, which encodes the field against THAT member and refuses a union value that
+    // names none, or names a member the union does not have. Absent on every non-union value.
+    std::optional<std::uint32_t> unionMember;
 
     // ★★★ THE TEARDOWN IS PART OF THE WALK, AND IT WAS THE ONE WALK NOBODY
     // WROTE — D-MIR-LITERAL-VALUE-TEARDOWN-RECURSES-PER-AGGREGATE-LEVEL.
@@ -128,6 +138,7 @@ inline MirAggregateValue::MirAggregateValue(MirAggregateValue const& other) {
     while (!pending.empty()) {
         auto const [src, dst] = pending.back();
         pending.pop_back();
+        dst->unionMember = src->unionMember;       // a level's own fact, beside its fields
         dst->fields.reserve(src->fields.size());   // no reallocation below
         for (MirLiteralValue const& f : src->fields) {
             MirLiteralValue& d = dst->fields.emplace_back();

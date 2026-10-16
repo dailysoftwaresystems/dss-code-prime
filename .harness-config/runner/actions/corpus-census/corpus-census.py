@@ -54,8 +54,10 @@
 # manifest per source, carrying that manifest's own defines / includes — and
 # captures each run's exit code DIRECTLY. No TU can mask another, because no
 # two TUs share a reporter or a driver gate. It does this FOR EVERY TARGET LEG
-# (pe / macho / elf by default), because a blocker cleared on one format is
-# routinely still live on another.
+# it is given (`--target`), because a blocker cleared on one format is routinely
+# still live on another -- and by DEFAULT for the manifest's OWN target(s) alone:
+# a manifest is one platform's corpus, and another class cannot compile it at
+# all (`default_targets` below says how that was measured).
 #
 # ★ THE ISOLATION FORMAT. A lone TU cannot form an EXECUTABLE: it has no
 #   `main`, so the exec writer fails loud ("zero functions") and that failure is
@@ -118,11 +120,14 @@
 # and `.ps1` under the actions directory; with no intermediary the exit code IS
 # this process's own, and a missing file is refused by the interpreter itself.
 #
-# Usage:
-#   python3 .harness-config/runner/actions/corpus-census/corpus-census.py [options]   (--help)
+# Usage -- through DssHarness, after `dssharness build` on the leg (the leg's own dsscp is the compiler):
+#   dssharness run corpus-census --legs <leg> --manual-step census --input manifest=<tree path>
+#   dssharness run corpus-census --legs <leg> --manual-step census-self-test --input manifest=<tree path>
 #
 # Exit: 0 = census completed and every manifest TU was attempted on every leg
+#           (under --self-test: every leg that withheld a TU reported it INCOMPLETE)
 #       1 = census ran but coverage was INCOMPLETE somewhere
+#           (under --self-test: a withheld TU went unnoticed)
 #       2 = the census could not run at all (missing corpus, missing binary)
 
 from __future__ import annotations
@@ -192,14 +197,22 @@ def _repo_root() -> Path:
 
 REPO_ROOT = _repo_root()
 
-# The three predefine classes. `availableObjectFormats` keys on format KIND, so
-# the shipped format files collapse to exactly these (same list, same reason, as
-# .harness-config/runner/actions/pragma-profile-census/pragma-profile-census.py).
-DEFAULT_TARGETS = [
-    "x86_64:pe64-x86_64-windows-exec",
-    "arm64:macho64-arm64-darwin-exec",
-    "x86_64:elf64-x86_64-linux-exec",
-]
+def default_targets(manifest: dict) -> list[str]:
+    """The legs a census runs when `--target` names none: the manifest's OWN targets.
+
+    ★ NOT THE THREE PREDEFINE CLASSES (2026-10-06, cycle P69 lane hm; the P69 re-review's MINOR 2). Until then the
+    default was all three (pe, macho, elf), copied from the pragma census's own list -- which that census deleted on
+    2026-10-01 for a measured reason that holds here unchanged: a manifest is ONE platform's corpus (its staged
+    config headers, its defines), and another class cannot compile it at all. ✔MEASURED that day, run
+    20261001-155346-6b59e0da: over the Windows corpus the macho and elf classes stopped on `windows.h` not found in
+    every TU. A default of every class counted the instrument's own mismatch as corpus defects. A manifest naming
+    no target is refused: the platform its corpus was staged for cannot be guessed."""
+    targets = [str(t).strip() for t in (manifest.get("targets") or []) if str(t).strip()]
+    if not targets:
+        die("the manifest names no target and no --target was given: a census runs under the platform its corpus "
+            "was staged for, so name it (--target <arch>:<format>)")
+    return targets
+
 
 ISOLATION_PROFILE = "staticlib"
 
@@ -1137,8 +1150,8 @@ def main(argv: list[str]) -> int:
         prog="corpus-census",
         description="Per-TU isolated diagnostic census of the sqlite corpus.")
     ap.add_argument("--target", action="append", default=None,
-                    help="target spec to census; repeatable "
-                         "(default: the three predefine classes)")
+                    help="target specs to census, comma-separated; repeatable; empty "
+                         "is the default -- the manifest's own target(s)")
     ap.add_argument("--config", default=None,
                     help="compile config passed to DSS (debug|release)")
     ap.add_argument("--jobs", type=int, default=None,
@@ -1149,8 +1162,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--keep-logs", action="store_true",
                     help="keep the per-TU logs beside the report")
     ap.add_argument("--self-test", action="store_true",
-                    help="RED-ON-DISABLE: skip one TU per leg; the run MUST "
-                         "then report INCOMPLETE and exit 1")
+                    help="RED-ON-DISABLE: withhold one TU per leg; it exits 0 when "
+                         "every such leg reported INCOMPLETE, 1 when one did not")
     args = ap.parse_args(argv)
 
     # ── the compiler ──
@@ -1188,6 +1201,10 @@ def main(argv: list[str]) -> int:
     manifest_path = Path(args.manifest or os.environ.get("SQLITE_MANIFEST")
                          or (REPO_ROOT / "build" / "real-examples" / "c"
                              / "sqlite" / "host" / "host.dss-project.json"))
+    # ★ A RELATIVE MANIFEST IS TAKEN FROM THE TREE (2026-09-30), not from the directory the program runs
+    # in: the harness step runs in this action's own directory and names the manifest as a tree path.
+    if not manifest_path.is_absolute():
+        manifest_path = REPO_ROOT / manifest_path
     if not manifest_path.is_file():
         die(f"no corpus manifest at {manifest_path} — run "
             f"`dssharness run sqlite --legs <leg>` first (it writes <OUT_DIR>/<leg>/<leg>.dss-project.json per "
@@ -1210,7 +1227,8 @@ def main(argv: list[str]) -> int:
     corpus_root, corpus_digest, corpus_files, corpus_bytes = \
         corpus_content_digest(manifest["sources"])
 
-    targets = args.target or DEFAULT_TARGETS
+    targets = [t.strip() for given in (args.target or []) for t in given.split(",") if t.strip()] \
+        or default_targets(manifest)
     jobs = args.jobs or max(1, (os.cpu_count() or 4) // 2)
 
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -1296,6 +1314,21 @@ def main(argv: list[str]) -> int:
         shutil.rmtree(scratch, ignore_errors=True)
 
     incomplete = [leg for leg in legs if not leg.covered]
+    if args.self_test:
+        # ★ THE SELF-TEST PASSES WHEN IT PROVES THE INSTRUMENT CAN FAIL (2026-09-30). It used to exit 1 on
+        # success -- "the run MUST report INCOMPLETE and exit 1" -- which no harness step can express: exit
+        # 0 now means every leg that withheld a TU reported it, and exit 1 names the leg that did not.
+        withheld = [leg for leg in legs if leg.slots]
+        unseen = [leg.spec for leg in withheld if leg.covered]
+        if not withheld:
+            loud("SELF-TEST FAILED: no leg had a TU to withhold, so nothing was proven.")
+            return EXIT_INCOMPLETE
+        if unseen:
+            loud(f"SELF-TEST FAILED: the withheld TU went UNNOTICED on {', '.join(unseen)} -- this census "
+                 f"cannot see a missing TU there.")
+            return EXIT_INCOMPLETE
+        info(f"SELF-TEST OK: every leg that withheld a TU ({len(withheld)}) reported its coverage INCOMPLETE.")
+        return EXIT_OK
     if incomplete:
         for leg in incomplete:
             loud(f"COVERAGE INCOMPLETE on {leg.spec}: manifest declares "

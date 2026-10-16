@@ -98,14 +98,21 @@ THE CONTRACT, and every clause is a way a documented figure can lie:
      guard green, so too few claims is a REFUSAL, not a clean run;
   6. at least one document was read at all.
 
-⚠ THE EXCLUSIONS ARE PART OF THE CONTRACT AND ARE TESTED AS SUCH. `.worktrees/`
-holds full checkouts of this repository while lanes are in flight; scanning them
-would red this guard on another lane's half-finished document, and widening the
-exclusion until the red stops is how an exclusion silently swallows the real
-tree. Self-test arm 11 asserts a drifted claim inside `.worktrees/` is IGNORED
-and arm 12 asserts one in the live tree beside it is still CAUGHT, so the
-exclusion is pinned in BOTH directions -- see
-`[[feedback-an-escape-every-row-triggers-disarms-the-guard]]`.
+⚠ THE EXCLUSIONS ARE PART OF THE CONTRACT AND ARE TESTED AS SUCH. The walk leaves
+out what git ignores in the tree, as `owning-tree`'s `TreeIgnores` reads the tree's
+own `.gitignore`: the copies and workers DssHarness keeps in a tree -- `.worktrees/`
+(lane checkouts), `.orchestrators/` (plans, work files, kept evidence), `.legs/` (a
+leg's copy of the whole tree), `.mutations/` (a sweep's mutated workers) -- its run
+records, a session's scratch, a build. Scanning any of them would red this guard on
+a copy's half-finished document, or count it twice, and `--write` would EDIT the
+copy; widening the exclusion until the red stops is how an exclusion silently
+swallows the real tree. Self-test arm 11a asserts a drifted claim in each of the four
+REDS where the tree's `.gitignore` does not leave it out, arms 11, 11b, 11c and 11d
+that each is IGNORED once it does, and arm 12 that one in the live tree beside them
+is still CAUGHT, so the exclusion is pinned in BOTH directions -- see
+`[[feedback-an-escape-every-row-triggers-disarms-the-guard]]`. Nothing tracked can
+leave the scan this way: `owning-tree`'s own self-test holds this repository to
+"git's rules ignore no file git tracks".
 
 ★★★ THE SECOND CLAUSE: A QUANTIFIED CLAIM ABOUT THE CORPUS, IN CONFIG PROSE. A figure
 is one way a document states a measurement; a QUANTIFIER is the other -- "sqlite uses
@@ -139,11 +146,10 @@ to another clause (a value, a call argument, an array bound).
 Exit codes: 0 OK - 1 a document disagrees with the census - 2 the scan or a
 provider collapsed (structural: fix the scan, never lower the floor) - 3 usage.
 
-Usage:
-    python .harness-config/runner/actions/check-doc-census/check-doc-census.py             # verify
-    python .harness-config/runner/actions/check-doc-census/check-doc-census.py --write     # repair figures
-    python .harness-config/runner/actions/check-doc-census/check-doc-census.py --selftest  # prove it fails
-    python .harness-config/runner/actions/check-doc-census/check-doc-census.py --repo <p>  # act on another tree
+Usage -- each a step of the action, the program's own flag after the `#`:
+    dssharness run check-doc-census           # verify, then the self-test (--selftest: prove it fails)
+    dssharness run check-doc-census-write     # --write: repair the figures, this machine's own tree
+  `--repo <p>` acts on another tree: the self-test's fixture trees; no step passes it.
 """
 from __future__ import annotations
 
@@ -180,8 +186,7 @@ EXIT_OK, EXIT_DISAGREE, EXIT_COLLAPSE, EXIT_USAGE = 0, 1, 2, 3
 REPAIR_VERB = "dssharness run check-doc-census-write"
 
 # The tree acted on defaults to the one THIS SCRIPT LIVES IN, never the caller's
-# cwd -- the same rule `.harness-config/runner/actions/lane-worktree/` follows, and for the same reason:
-# a guard that silently measures whichever directory it was launched from is a
+# cwd, because a guard that silently measures whichever directory it was launched from is a
 # guard that can be made green by cd-ing somewhere else.
 def self_repo():
     """The tree THIS FILE lives in, by the owner's walk -- never a count of `..`.
@@ -200,8 +205,14 @@ def self_repo():
         raise SystemExit(EXIT_COLLAPSE)
 
 
+_OWNING_TREE = []
+
+
 def _owning_tree_module():
-    """`owning-tree`, loaded by path from this file's sibling action directory; missing, a collapse."""
+    """`owning-tree`, loaded ONCE by path from this file's sibling action directory; missing, a collapse. It answers
+    which tree this guard reads and what a walk of that tree leaves out."""
+    if _OWNING_TREE:
+        return _OWNING_TREE[0]
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
                         "owning-tree", "owning-tree.py")
     if not os.path.isfile(path):
@@ -211,24 +222,13 @@ def _owning_tree_module():
     spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    _OWNING_TREE.append(mod)
     return mod
 
 
-def remedy_runner_fact():
-    """-> (ok, detail): the runner REPAIR_VERB names is declared in this tree's config.json, runs this action's
-    `write` step ALONE, on ONE leg whose definition names no other host -- this machine's own tree (P68 round 13's
-    audit, F1-A11: the remedy named the two-leg runner, whose `--manual-step write` rewrote the WSL leg's copy
-    too). Read from config, never assumed: a second leg added there reds the self-test."""
-    ot = _owning_tree_module()
-    cfg = ot.load_jsonc(os.path.join(self_repo(), ".harness-config", "config.json"))
-    name = REPAIR_VERB.split()[-1]
-    runner = (cfg.get("predefinedRunners") or {}).get(name) if isinstance(cfg, dict) else None
-    legs = (runner.get("legs") or []) if isinstance(runner, dict) else []
-    leg = (cfg.get("legs") or {}).get(legs[0]) if len(legs) == 1 else None
-    others = [k for k in (cfg.get("hosts") or {}) if k != "local" and isinstance(leg, dict) and k in leg]
-    ok = (isinstance(runner, dict) and runner.get("action") == "check-doc-census/check-doc-census.yml"
-          and runner.get("steps") == ["write"] and isinstance(leg, dict) and not others)
-    return ok, "runner %r: %r; its leg names another host: %r" % (name, runner, others)
+# ⓘ `remedy_runner_fact()` (P68 round 13, F1-A11) retired on 2026-09-30 with its arm: check-scripts-index
+# clause 13 is the ONE statement that a remedy names a runner config.json declares, and that a writer's
+# runner has ONE leg of this machine's own tree -- for every program, not for this one alone.
 
 
 # Where this repository's programs live, relative to a tree root: DssHarness's actions
@@ -270,48 +270,36 @@ PROVIDERS = {
 SCANNED_SUFFIXES = (".md", ".c", ".h", ".cpp", ".hpp", ".inc", ".s", ".py", ".sh",
                     ".ps1", ".cmake", ".txt", ".json", ".yml", ".yaml")
 
-# Directories never scanned. `.worktrees` holds in-flight lane checkouts of this
-# same repository (see the header); the rest are build output and secrets.
-SKIP_DIRS = {".git", ".worktrees", ".secrets", "node_modules", "__pycache__"}
-SKIP_DIR_PREFIXES = ("build",)
-
-# ⚠⚠ AND SO IS EVERY DIRECTORY `.gitignore` DECLARES, FOR THE SAME REASON `.worktrees`
-# IS. ✔MEASURED 2026-09-05 (P62): this guard walked `.temp/` -- 176 markdown files of
-# session scratch -- and one of them was a lane's working COPY of `examples/README.md`,
-# so the run reported 14 phantom divergences against a file that is not a document of
-# this project, and `--write` would have EDITED THAT COPY to "repair" it. The class is
-# identical to the `census-quoted:` story above: a guard biting a document it has no
-# business reading. It had always done this; it only became visible when a scratch file
-# happened to carry the marker.
-# ★ DECLARATION-DRIVEN, NOT A SECOND HAND-KEPT LIST. The set is read from `.gitignore`'s
-#   directory-only entries, so adding a scratch home to the ignore file is the whole
-#   edit and the two cannot drift. A hardcoded twin of `.temp`, `scratchpad`,
-#   `test-scratch`, ... is exactly the duplicate that goes stale on the next one.
-# ★ NAME-KEYED, MATCHING THE HARD LIST'S SEMANTICS: `.temp/` skips a directory called
-#   `.temp` at any depth, which is what os.walk pruning can express. A path-anchored
-#   ignore (`/src/dss-config/runtime/platform/dist/`) contributes its LAST segment
-#   only; over-skipping a same-named directory elsewhere is not a risk this guard runs,
-#   because every such entry names build output.
-# ⚠ It DEGRADES TO THE HARD LIST when there is no `.gitignore` -- the self-test's
-#   synthetic roots rely on that, and arm 24 makes the degradation itself observable.
-def scratch_dirs(repo):
-    """Directory names `.gitignore` declares, so scratch is never read as a document."""
-    out = set()
+# ── WHAT THE WALK LEAVES OUT: WHAT GIT IGNORES IN THE TREE, ASKED OF THE ONE READER ──
+# ★ ONE ANSWER, NOT A LIST OF THIS GUARD'S OWN. `owning-tree`'s `TreeIgnores` reads the
+#   tree's `.gitignore` as git reads it -- every rule, in order, `!` re-including, a bare
+#   name at any depth, a rule with a slash anchored to the root -- and leaves out `.git`.
+#   The copies and workers DssHarness keeps in a tree, run records, a session's scratch
+#   and a build are all ignored there, so a directory the tool or the repository adds to
+#   that file is left out of this walk, of the redactor's vocabulary and of the C++
+#   case-collision scan at once. Until 2026-10-15 this file held its own list (`.git`,
+#   `.worktrees`, `.orchestrators`, `.secrets`, `node_modules`, `__pycache__`, every name
+#   starting `build`) plus `.gitignore`'s directory entries read by a grammar of its own --
+#   which left out neither a leg copy (`.legs/`) nor a sweep's worker (`.mutations/`):
+#   a census `--write` run while one existed would have counted every example twice.
+# ★ WHY THE SCRATCH CLASS MATTERS (✔MEASURED 2026-09-05, P62): this guard walked `.temp/`
+#   -- 176 markdown files of session scratch -- and one of them was a lane's working COPY
+#   of `examples/README.md`, so the run reported 14 phantom divergences against a file
+#   that is not a document of this project, and `--write` would have EDITED THAT COPY to
+#   "repair" it. A guard biting a document it has no business reading.
+# ⓘ A synthetic root with no `.gitignore` declares nothing ignored, so the self-test's
+#   fixtures say what they leave out (arms 11a-11d, 16-19, 43).
+def _walk(repo, top):
+    """`os.walk(top)` of the tree `repo`, sorted, less what the tree's `.gitignore` leaves out. A `.gitignore` the
+    reader cannot read as git does is a Collapse: what this guard would read is unknown."""
+    mod = _owning_tree_module()
     try:
-        text = io.open(os.path.join(repo, ".gitignore"), encoding="utf-8",
-                       errors="replace").read()
-    except OSError:
-        return out
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or line.startswith("!"):
-            continue
-        if not line.endswith("/"):
-            continue                      # a file pattern, not a directory home
-        name = line.rstrip("/").rstrip("/").split("/")[-1]
-        if name and "*" not in name and "?" not in name:
-            out.add(name)
-    return out
+        ignores = mod.TreeIgnores(repo)
+        for dirpath, dirnames, filenames in ignores.walk(top):
+            dirnames.sort()
+            yield dirpath, dirnames, sorted(filenames)
+    except mod.Refusal as exc:
+        raise Collapse("what this tree leaves out of a walk cannot be read: %s" % exc)
 
 # A marker, then optional markdown emphasis / whitespace, then the figure.
 # The figure may carry `,` thousands separators; the separator style is PRESERVED
@@ -366,13 +354,10 @@ class Claim:
 # ── READING THE TREE ───────────────────────────────────────────────────────────
 
 def scanned_docs(repo):
-    """Every file the tree may carry a claim in, excluding the homes listed above."""
+    """Every file the tree may carry a claim in: what git does not ignore there (`_walk`)."""
     out = []
-    skip = SKIP_DIRS | scratch_dirs(repo)
-    for root, dirs, files in os.walk(repo):
-        dirs[:] = sorted(d for d in dirs
-                         if d not in skip and not d.startswith(SKIP_DIR_PREFIXES))
-        for f in sorted(files):
+    for root, _dirs, files in _walk(repo, repo):
+        for f in files:
             if f.lower().endswith(SCANNED_SUFFIXES):
                 out.append(os.path.join(root, f))
     return out
@@ -448,30 +433,60 @@ def provider_values(repo, name):
 # directions plus the window's edge.
 CLAIM_ROT_ROOT = os.path.join("src", "dss-config")
 CLAIM_ROT_WINDOW = 8        # the corpus word, the usage verb and the quantifier within this many words
-CLAIM_ROT_DOC_FLOOR = 1     # a walk that read no config document is a COLLAPSE, never a clean pass
+# ★ A FLOOR WELL BELOW THE LIVE COUNT, NOT AT ONE. ✔MEASURED 2026-09-30 (cycle P69): the walk reads 85 config
+# documents; at a floor of 1 a walk that COLLAPSED to anything from 1 to 84 -- a `.gitignore` directory entry that
+# happened to share a config directory's name was enough -- passed clean. The round-12 pattern of
+# check-plan-citations: a floor far enough below the live count that churn never trips it, and a PARTIAL-collapse
+# arm (41b: CLAIM_ROT_PARTIAL_DOCS documents) that must collapse, so lowering the floor back to 1 reds the self-test.
+# Raise it by MEASURING, never to make a red go away.
+CLAIM_ROT_DOC_FLOOR = 40
+CLAIM_ROT_PARTIAL_DOCS = 10
 
 _CR_WORD = re.compile(r"[\w'`./<>*-]+")
 _CR_USAGE = re.compile(r"^(uses?|used|using|calls?|called|references?|referenced|needs?|needed|"
-                       r"touch(?:es|ed)?|reach(?:es|ed)?|consumes?|consumed|spells?|spelled)$", re.I)
+                       r"touch(?:es|ed)?|reach(?:es|ed)?|consumes?|consumed|spells?|spelled|"
+                       r"includes?|included|including)$", re.I)
 _CR_QUANT_1 = re.compile(r"^(only|solely|exclusively|nothing|none|never|zero|neither|0)$", re.I)
 _CR_QUANT_2 = re.compile(r"\b(exactly (?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)|no other|"
                          r"no (?:consumer|caller|user|use|site|reference)s?|(?:does|do)(?:n't| not) "
                          r"(?:use|call|reference|need|touch|reach|spell|include)|the (?:sole|whole) consumer)\b",
                          re.I)
-_CR_CORPUS = re.compile(r"^(sqlite\w*|amalgamation|testfixture|tclsqlite\w*|os_unix\.c|os_win\.c|shell\.c|"
-                        r"sqlite3\.c|test\d+\.c|mem\d\.c|corpus)$", re.I)
-_CR_MEASURED = re.compile(r"✔\s*(?:RE-)?MEASURED|\bMEASURED\b|re-measured|grep-verified|\bverified\b", re.I)
-_CR_PINNED = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|[0-9a-f]{8,40})\b")
-_CR_ARTICLES = {"the", "a", "an", "this", "that", "each", "every", "its", "their", "one"}
+_CR_CORPUS = re.compile(r"^(sqlite\w*|sqlite\w*\.[ch]|amalgamation|testfixture|tclsqlite\w*|os_unix\.c|os_win\.c|"
+                        r"shell\.c|test\d+\.c|mem\d\.c|corpus)$", re.I)
+# ★ A PIN IS ONE OF THE REPOSITORY'S OWN MEASUREMENT MARKERS BESIDE A DATE OR A REVISION: `✔MEASURED`, the
+# capitalised `MEASURED` / `RE-MEASURED`, and the explicit acts `re-measured` and `grep-verified` -- never an
+# ordinary lower-case "measured" or "verified", never a negated one ("not verified", "NOT MEASURED"), and never a
+# run of digits alone (a revision holds a letter a-f). The round-12 audit found each of those passing an unpinned
+# claim. ✔MEASURED 2026-09-30 over the 85 live config documents: a ✔-only rule refused two sentences that ARE
+# pinned by these conventions (`MEASURED 2026-08-05`, `re-measured ... a790e273e2`), so the markers stay; what
+# goes is the lower-case prose word and the negation.
+_CR_MEASURED = re.compile(r"✔\s*(?:RE-)?MEASURED|(?<![Nn][Oo][Tt] )(?<![A-Za-z-])(?:RE-?MEASURED|MEASURED|"
+                          r"re-measured|grep-verified)(?![A-Za-z-])")
+_CR_PINNED = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|(?=[0-9a-f]*[a-f])[0-9a-f]{7,40})\b")
+# The words after which a usage word is a NOUN ("the reference resolves"). NOT the relative pronoun "that" nor
+# "one": "the only header that uses `_IOWR`" is a claim, and the round-12 audit found it escaping here.
+_CR_ARTICLES = {"the", "a", "an", "this", "each", "every", "its", "their"}
 _CR_HISTORY = re.compile(r"\b(?:note|hand-?off|handover|brief)\b[^.]{0,40}\bsaid\b|used to (?:say|read|assert)|"
                          r"previously read|\bIT READ\b|pre-\w+ comment|RETRACTED|WAS FALSE|asserted '|"
                          r"earlier revision|It previously|this comment used to", re.I)
 _CR_SENTENCE = re.compile(r"(?<=[.!?])(?<!e\.g\.)(?<!i\.e\.)(?<!etc\.)(?<!vs\.)(?<!cf\.)\s+")
 
 
+def _cr_token(raw):
+    """A word as the predicate reads it: its punctuation, backticks and emphasis stripped, a possessive dropped, a
+    path read by its basename -- so `` `os_unix.c` ``, `**sqlite**`, `SQLite's` and `src/os_unix.c` are the corpus
+    words they name (the round-12 audit: each escaped the corpus match)."""
+    t = raw.strip(".,;:()[]{}\"'`*")
+    t = re.sub(r"(?:'|’)s$", "", t)
+    if "/" in t:
+        t = t.rstrip("/").rsplit("/", 1)[-1]
+    return t.strip(".,;:()[]{}\"'`*")
+
+
 def claim_rot_verdict(sentence, window=CLAIM_ROT_WINDOW):
     """None (not a quantified corpus-usage claim), 'PINNED', 'HISTORY' or 'REFUSE'."""
-    toks = [m.group(0).strip(".,;:()[]{}\"'") for m in _CR_WORD.finditer(sentence)]
+    words = list(_CR_WORD.finditer(sentence))
+    toks = [_cr_token(m.group(0)) for m in words]
     # A usage word right after an article is a NOUN ("the reference resolves"), not a
     # claim about the corpus.
     usage = [i for i, t in enumerate(toks) if _CR_USAGE.match(t)
@@ -482,9 +497,13 @@ def claim_rot_verdict(sentence, window=CLAIM_ROT_WINDOW):
         quant.append(len(_CR_WORD.findall(sentence[:m.start()])))
     if not (usage and quant and corpus):
         return None
-    if not any(max(a, b, c) - min(a, b, c) <= window for a in usage for b in quant for c in corpus):
+    starts = [min(a, b, c) for a in usage for b in quant for c in corpus if max(a, b, c) - min(a, b, c) <= window]
+    if not starts:
         return None
-    if _CR_HISTORY.search(sentence):
+    # HISTORY only when the claim is REPORTED: the history phrase opens before the claim does ("this comment used to
+    # say sqlite uses only ..."). One after it ("... ; an earlier revision said otherwise") excuses nothing.
+    claim_at = words[min(starts)].start()
+    if any(h.start() < claim_at for h in _CR_HISTORY.finditer(sentence)):
         return "HISTORY"
     if _CR_MEASURED.search(sentence) and _CR_PINNED.search(sentence):
         return "PINNED"
@@ -508,10 +527,8 @@ def claim_rot_findings(repo):
     root = os.path.join(repo, CLAIM_ROT_ROOT)
     docs = sents = 0
     refused = []
-    skip = SKIP_DIRS | scratch_dirs(repo)
-    for dp, dn, fn in os.walk(root):
-        dn[:] = sorted(d for d in dn if d not in skip)
-        for f in sorted(fn):
+    for dp, _dn, fn in _walk(repo, root):
+        for f in fn:
             if not f.endswith(".json"):
                 continue
             p = os.path.join(dp, f)
@@ -528,9 +545,9 @@ def claim_rot_findings(repo):
                     if claim_rot_verdict(s) == "REFUSE":
                         refused.append((rel, pointer, s.strip()))
     if docs < CLAIM_ROT_DOC_FLOOR:
-        raise Collapse("the claim-rot clause read %d config document(s) under %s -- a walk that "
-                       "reads nothing is a structural failure, not a pass"
-                       % (docs, CLAIM_ROT_ROOT.replace(os.sep, "/")))
+        raise Collapse("the claim-rot clause read %d config document(s) under %s, below its floor of %d -- a walk "
+                       "that collapsed is a structural failure, not a pass (fix the walk, never the floor)"
+                       % (docs, CLAIM_ROT_ROOT.replace(os.sep, "/"), CLAIM_ROT_DOC_FLOOR))
     return docs, sents, refused
 
 
@@ -733,10 +750,14 @@ def _fixture(tmp, name, stub_body=None, doc_body=None, src_body=None,
         os.makedirs(code, exist_ok=True)
         io.open(os.path.join(code, "rebuild.hpp"), "wb").write(src_body.encode("utf-8"))
 
-    # The config document THE SECOND CLAUSE reads. EVERY fixture carries one, because the
-    # clause refuses a walk that reads none (arm 41); its prose makes no claim, so the
-    # figure arms keep measuring exactly what they measured before the clause existed.
+    # The config document THE SECOND CLAUSE reads. EVERY fixture carries one -- and FLOOR-MANY
+    # neutral ones beside it, because the clause refuses a walk that reads fewer than
+    # CLAIM_ROT_DOC_FLOOR documents (arms 41, 41b) and these arms run the guard as a SUBPROCESS,
+    # which cannot lower the floor. Their prose makes no claim, so the figure arms keep measuring
+    # exactly what they measured before the clause existed.
     _say(root, _NEUTRAL_PROSE)
+    for i in range(CLAIM_ROT_DOC_FLOOR):
+        _say(root, _NEUTRAL_PROSE, rel="shippedLibs/neutral/n%02d.json" % i)
     return root
 
 
@@ -778,6 +799,30 @@ def _write(p, s):
     io.open(p, "wb").write(s.encode("utf-8"))
 
 
+# ★ AN EXACT RATCHET (the round-12 audit: this self-test ANDed its verdicts and never counted them, so a deleted arm
+# passed). Every arm -- a subprocess arm, an in-process claim-rot arm, a provider arm, a printed fact -- lands here
+# where it is judged, and `selftest` fails on any count but EXPECTED_ARMS.
+_RAN = []
+EXPECTED_ARMS = 68   # arm 1c retired on 2026-09-30 (M6: check-scripts-index clause 13); 11a, 11c, 11d 2026-10-15
+
+
+# ONE VERDICT LINE PER ARM, in the grammar `tests/test_support/script_selftest.hpp` reads: the ctest entry
+# `doc_census_selftest_guard` is a test binary that runs `--selftest` and holds a case per arm, so a mutation of this
+# guard can be an arm of the mutation sweep. A failing arm's detail is put on ONE line. The opening and closing lines
+# (`check-doc-census --selftest...`) are no arm's verdict.
+SELFTEST_MARKER = "check-doc-census self-test: "
+
+
+def _verdict(label, ok, detail=""):
+    _RAN.append(bool(ok))
+    if ok:
+        print("%sok      %s" % (SELFTEST_MARKER, label))
+    else:
+        said = (detail or "no detail").replace("\r", " ").replace("\n", " ")[:900]
+        print("%sFAILED  %s -- %s" % (SELFTEST_MARKER, label, said))
+    return ok
+
+
 def _arm(label, root, expect_rc, says=None, write=False):
     argv = ["--repo", root] + (["--write"] if write else [])
     p = subprocess.run([sys.executable, os.path.abspath(__file__)] + argv,
@@ -786,10 +831,7 @@ def _arm(label, root, expect_rc, says=None, write=False):
     ok = p.returncode == expect_rc
     if ok and says is not None:
         ok = says in out
-    print("  %-34s rc=%d (want %d) %s" % (label, p.returncode, expect_rc, "OK" if ok else "FAIL"))
-    if not ok:
-        print("      says: %s" % out.strip().replace("\n", "\n      ")[:900])
-    return ok
+    return _verdict(label, ok, "rc=%d (want %d); says: %s" % (p.returncode, expect_rc, out.strip()))
 
 
 def selftest():
@@ -806,12 +848,6 @@ def selftest():
         ok &= _arm("1 FIGURE-DRIFTED", root, EXIT_DISAGREE, says="documented 634, actual 788")
         # 1b -- the refusal names the REPAIR as the harness runs it (the `write` manual step).
         ok &= _arm("1b REMEDY-IS-THE-HARNESS-STEP", root, EXIT_DISAGREE, says=REPAIR_VERB)
-        # 1c -- ...and the runner it names runs that step alone, on ONE leg of this machine's own tree (F1-A11).
-        _fact_ok, _fact_detail = remedy_runner_fact()
-        print("  %-34s %s" % ("1c REMEDY-RUNNER-IS-ONE-LEG", "OK" if _fact_ok else "FAIL"))
-        if not _fact_ok:
-            print("      %s" % _fact_detail[:600])
-        ok &= _fact_ok
 
         # 2 -- --write repairs it, and the repaired tree verifies clean.
         ok &= _arm("2 WRITE-REPAIRS", root, EXIT_OK, says="repaired", write=True)
@@ -824,11 +860,10 @@ def selftest():
         styled = _fixture(tmp, "styled")
         sd = _doc(styled)
         _write(sd, _read(sd).replace("**2678**", "**1,111**", 1))
-        _arm("2c-setup", styled, EXIT_DISAGREE)
-        _arm("2c-write", styled, EXIT_OK, write=True)
+        ok &= _arm("2c-setup", styled, EXIT_DISAGREE)          # a setup step is an arm: its failure is one
+        ok &= _arm("2c-write", styled, EXIT_OK, write=True)
         style_kept = "**2,678**" in _read(sd)
-        print("  %-34s %s" % ("2c SEPARATOR-STYLE", "OK" if style_kept else "FAIL"))
-        ok &= style_kept
+        ok &= _verdict("2c SEPARATOR-STYLE", style_kept, "the repaired claim reads %r" % _read(sd)[:200])
 
         # 3 -- a key the provider does not report. A typo must not read as agreement.
         _write(d, _read(d).replace("census:examples:manifests",
@@ -871,15 +906,31 @@ def selftest():
         os.makedirs(bare, exist_ok=True)
         ok &= _arm("10 NO-DOCUMENTS", bare, EXIT_COLLAPSE, says="no scannable document")
 
-        # 11 + 12 -- THE EXCLUSION, PINNED IN BOTH DIRECTIONS.
+        # 11a-11d + 12 -- THE EXCLUSION, PINNED IN BOTH DIRECTIONS.
+        # ⚠ THE FIXTURE SYNTHESIZES THE *NEGATIVE*: a drifted copy of the document is written
+        #   into each directory DssHarness keeps in a tree FIRST, and arm 11a proves the tree
+        #   REDS while its `.gitignore` does not leave them out -- so 11-11d measure the skip,
+        #   not an empty directory. Then the tree gets the rules the tool's `init` writes.
+        both = _fixture(tmp, "exclusion")
+        for kept, label in ((".worktrees/lane", "lane copy"), (".orchestrators/o/work/a", "work copy"),
+                            (".legs/x", "leg copy"), (".mutations/aw-1", "mutation worker")):
+            copy = os.path.join(both, *(kept.split("/") + ["examples"]))
+            os.makedirs(copy, exist_ok=True)
+            _write(os.path.join(copy, "README.md"), "# %s\n\n%s**1**\n" % (label, _mark("manifests")))
+        ok &= _arm("11a HARNESS-COPIES-UNDECLARED-RED", both, EXIT_DISAGREE,
+                   says="documented 1, actual 788")
+        _write(os.path.join(both, ".gitignore"), "".join(
+            "/%s/*\n!/%s/.gitkeep\n" % (d, d) for d in (".worktrees", ".orchestrators", ".mutations", ".legs")))
         # 11: a drifted claim inside `.worktrees/` is IGNORED (an in-flight lane's
         #     half-edited document must not red this guard) ...
-        both = _fixture(tmp, "exclusion")
-        wt = os.path.join(both, ".worktrees", "lane", "examples")
-        os.makedirs(wt, exist_ok=True)
-        _write(os.path.join(wt, "README.md"),
-               "# lane copy\n\n%s**1**\n" % _mark("manifests"))
         ok &= _arm("11 WORKTREE-IGNORED", both, EXIT_OK, says="every documented figure")
+        # 11b: ... and so is one inside `.orchestrators/` (a lane's work copy of a
+        #      document, which DssHarness keeps beside the lane's plans and evidence) ...
+        ok &= _arm("11b ORCHESTRATORS-IGNORED", both, EXIT_OK, says="every documented figure")
+        # 11c: ... one inside `.legs/` (a leg's own copy of the whole tree) ...
+        ok &= _arm("11c LEG-COPY-IGNORED", both, EXIT_OK, says="every documented figure")
+        # 11d: ... and one inside `.mutations/` (a sweep's worker, a copy holding a mutated site).
+        ok &= _arm("11d MUTATION-WORKER-IGNORED", both, EXIT_OK, says="every documented figure")
         # 12: ... and the SAME drift in the live tree beside it is still CAUGHT, so
         #     the exclusion cannot have widened to swallow the real document.
         _write(os.path.join(both, "examples", "README.md"),
@@ -932,12 +983,14 @@ def selftest():
         _write(_doc(sc), _read(_doc(sc)).replace("**788**", "**1**", 1))
         ok &= _arm("18 LIVE-TREE-STILL-CAUGHT-BESIDE-SCRATCH", sc, EXIT_DISAGREE,
                    says="documented 1, actual 788")
-        # 19: a FILE pattern is not a directory home. `.temp` written without its
-        #     trailing slash must NOT skip anything -- otherwise `*.md`-style entries
-        #     could silence arbitrary documents, and the escape would be unbounded.
+        # 19: a LATER rule decides, as in git: `!/.temp/` after `.temp/` puts the scratch back,
+        #     and its drifted copy REDS again. (Until 2026-10-15 this arm asserted that `.temp`
+        #     without a slash skipped nothing; git reads it as that name, file or directory, and
+        #     so does the one reader. The escape stays bounded another way: `owning-tree`'s
+        #     self-test holds this repository to "git's rules ignore no file git tracks".)
         _write(_doc(sc), _read(_doc(sc)).replace("**1**", "**788**", 1))
-        _write(os.path.join(sc, ".gitignore"), "*.obj\n.temp\nbuild/\n")
-        ok &= _arm("19 FILE-PATTERN-DOES-NOT-SKIP", sc, EXIT_DISAGREE,
+        _write(os.path.join(sc, ".gitignore"), "*.obj\n.temp/\nbuild/\n!/.temp/\n")
+        ok &= _arm("19 LATER-NEGATION-RE-INCLUDES", sc, EXIT_DISAGREE,
                    says="documented 1, actual 788")
 
         # ══ 20-27 -- THE WIDENED SCAN: A SOURCE COMMENT IS A DOCUMENT ═════════════
@@ -967,15 +1020,11 @@ def selftest():
         rep = _fixture(tmp, "sourcewrite", src_body=_SRC_BODY)
         rp = _src(rep)
         _write(rp, _read(rp).replace("**11**", "**9**", 1))
-        _arm("22-setup", rep, EXIT_DISAGREE)
-        _arm("22-write", rep, EXIT_OK, write=True)
+        ok &= _arm("22-setup", rep, EXIT_DISAGREE)
+        ok &= _arm("22-write", rep, EXIT_OK, write=True)
         after = _read(rp)
         prose_kept = (after == _SRC_BODY)
-        print("  %-34s %s" % ("22 WRITE-REPAIRS-SOURCE",
-                              "OK" if prose_kept else "FAIL"))
-        if not prose_kept:
-            print("      got: %r" % after)
-        ok &= prose_kept
+        ok &= _verdict("22 WRITE-REPAIRS-SOURCE", prose_kept, "got: %r" % after)
 
         # 23 -- a marker in a SOURCE file naming an unknown PROVIDER reds. The
         #       vocabulary check is not a markdown privilege.
@@ -1001,10 +1050,14 @@ def selftest():
         # has stopped matching, each produce a tidy zero that a rotted figure agrees with.
         ok &= _source_provider_arms(tmp)
 
-        # 28-42 -- THE SECOND CLAUSE.
+        # 28-52 -- THE SECOND CLAUSE.
         ok &= _claim_rot_arms(tmp)
 
-    print("check-doc-census --selftest: %s" % ("PASS" if ok else "FAIL"))
+    if len(_RAN) != EXPECTED_ARMS:
+        ok = False
+        print("check-doc-census --selftest: ARM COUNT %d, expected %d -- an arm was added or lost; EXPECTED_ARMS is "
+              "the ratchet" % (len(_RAN), EXPECTED_ARMS))
+    print("check-doc-census --selftest: %s (%d arm(s))" % ("PASS" if ok else "FAIL", len(_RAN)))
     return EXIT_OK if ok else EXIT_DISAGREE
 
 
@@ -1027,10 +1080,7 @@ def _rot(label, root, want_refused, says=None):
         text = str(e)
     if good and says is not None:
         good = says in text
-    print("  %-34s %s %s" % (label, got, "OK" if good else "FAIL"))
-    if not good:
-        print("      says: %s" % text[:900])
-    return good
+    return _verdict(label, good, "%s; says: %s" % (got, text))
 
 
 def _claim_rot_arms(tmp):
@@ -1095,11 +1145,53 @@ def _claim_rot_arms(tmp):
     _say(root, "sqlite uses %s only." % " ".join(fill[:edge + 1]))
     ok &= _rot("40 WINDOW-PAST-EDGE-PASSES", root, False)
 
-    # 41 + 42 -- the clause's own collapses: no config document read, and one it cannot read.
+    # 41 + 41b + 42 -- the clause's own collapses: no config document read; a PARTIAL collapse (fewer than the
+    #                  floor, more than none -- at the old floor of 1 this arm passed clean, which is what reds a
+    #                  floor lowered back); and one it cannot read.
     shutil.rmtree(os.path.join(root, CLAIM_ROT_ROOT))
     ok &= _rot("41 NO-CONFIG-COLLAPSES", root, "read 0 config document(s)")
+    for i in range(CLAIM_ROT_PARTIAL_DOCS):
+        _say(root, _NEUTRAL_PROSE, rel="shippedLibs/neutral/n%02d.json" % i)
+    ok &= _rot("41b PARTIAL-COLLAPSE-COLLAPSES", root, "read %d config document(s)" % CLAIM_ROT_PARTIAL_DOCS)
     _say(root, None, doc='{"$comment": "a truncated document"')
     ok &= _rot("42 CONFIG-NOT-JSON-COLLAPSES", root, "is not JSON")
+
+    # 43 -- `.gitignore` READ AS GIT READS IT: an anchored entry skips that one directory, a bare name skips that
+    #       name at any depth, and a directory merely NAMED like an anchored entry's last segment is still read.
+    anch = _fixture(tmp, "claimrot-anchor")
+    _write(os.path.join(anch, ".gitignore"), "/src/dss-config/x/dist/\nscratch/\n")
+    _say(anch, _CR_BARE, rel="y/dist/claim.json")
+    _say(anch, _CR_BARE, rel="x/dist/skip.json")
+    _say(anch, _CR_BARE, rel="z/scratch/skip.json")
+    try:
+        _docs, _s, refused = claim_rot_findings(anch)
+        got = sorted(r[0] for r in refused)
+    except Collapse as e:
+        got = ["COLLAPSE: %s" % e]
+    anchored_ok = got == ["src/dss-config/y/dist/claim.json"]
+    ok &= _verdict("43 ANCHORED-IGNORE-SKIPS-ONE-DIR", anchored_ok, "refused: %r" % got)
+
+    # 44-52 -- THE ESCAPES THE ROUND-12 AUDIT CALLED BROAD, each now a REFUSAL (arms 29, 30, 33 and 35 are their
+    #          green controls: a real pin, a real revision, a reported history, a noun after an article).
+    esc = _fixture(tmp, "claimrot-escapes")
+    for label, sentence in (
+            ("44 RELATIVE-THAT-IS-NO-ARTICLE", "sqlite has one header that uses only `_IOWR`."),
+            ("45 BACKTICKED-CORPUS-WORD", "`os_unix.c` uses only `_IOWR`."),
+            ("46 POSSESSIVE-CORPUS-WORD", "SQLite's shell uses only `_IOWR`."),
+            ("47 PATH-CORPUS-WORD-BY-BASENAME", "src/os_unix.c uses only `_IOWR`."),
+            ("48 EMPHASIZED-CORPUS-WORD", "**sqlite** uses only `_IOWR`."),
+            ("49 INCLUDE-IS-A-USAGE-VERB", "sqlite doesn't include this header."),
+            ("50 HISTORY-AFTER-THE-CLAIM", "sqlite uses only `_IOWR`; an earlier revision said otherwise."),
+            ("51 BARE-VERIFIED-IS-NO-PIN", "sqlite uses only `_IOWR` (verified 2026-09-24)."),
+            ("52 DIGITS-ARE-NO-REVISION", "sqlite uses only `_IOWR` (✔MEASURED 20260924)."),
+            ("53 NEGATED-MEASURED-IS-NO-PIN", "sqlite uses only `_IOWR` (NOT MEASURED 2026-09-24).")):
+        _say(esc, sentence)
+        ok &= _rot(label, esc, True)
+    # 54 + 55 -- the repository's other markers ARE pins (the green halves of 51-53).
+    _say(esc, "sqlite uses only `_IOWR` (MEASURED 2026-09-24).")
+    ok &= _rot("54 CAPITAL-MEASURED-DATE-PASSES", esc, False)
+    _say(esc, "sqlite uses only `_IOWR`, re-measured against a790e273e2.")
+    ok &= _rot("55 RE-MEASURED-REVISION-PASSES", esc, False)
     return ok
 
 
@@ -1129,11 +1221,7 @@ def _source_provider_arms(tmp):
                            errors="replace")
         out = (p.stdout or "") + (p.stderr or "")
         good = p.returncode == expect_rc and says in out
-        print("  %-34s rc=%d (want %d) %s"
-              % (name, p.returncode, expect_rc, "OK" if good else "FAIL"))
-        if not good:
-            print("      says: %s" % out.strip().replace("\n", "\n      ")[:600])
-        return good
+        return _verdict(name, good, "rc=%d (want %d); says: %s" % (p.returncode, expect_rc, out.strip()[:600]))
 
     # 26 -- the CONTROL first: a declaration that resolves must report the real count,
     #       so arm 27's red cannot be "the provider is broken".

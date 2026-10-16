@@ -1,0 +1,81 @@
+{
+  "$comment": "D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE (P69 round 5, lane lm): a RELOCATABLE link that holds `hook` only as a WEAK reference, beside a static library whose member defines it. Each target's `dependsOn` links f.c into the pair's relocatable object, and that entry's own `dependsOn` builds hooklib.c with the pair's -staticlib; the image then links main.c and the object alone (the library is not on the image's link). A relocatable link reads its members' document, the archive-writing sibling's, exactly as an image link does. MEASURED 2026-10-08 (probe-reference-cc, lane lm), `-r` beside the archive, then the artifact linked into an image and run: GNU ld 2.42 through gcc 13.3.0 and clang 18.1.3 and ld.lld 18 on x86_64 (WSL run 20261008-124124-f2e03cd4), GNU ld through gcc on aarch64 (VPS run 20261008-124216-13d4cb48) and GNU ld's PE linker through MinGW gcc 13.2.0 (Windows run 20261008-124341-767eb80d) fetch nothing, the artifact keeps `hook` as a weak undefined name, and the image resolves it to nothing -> f() is 0 -> 19; ld64 through Apple clang 21 on arm64 and x86_64 (Mac run 20261008-124259-d1b23e87) fetches the member, so the artifact defines `hook` -> f() is 23 -> 42 (the per-target exitCode). A STRONG reference is fetched by every one of them (the control of that measurement). BEFORE round 5 the relocatable link was refused on all five pairs, K_NoMatchingObjectFormat: it read its own document, which does not state `archiveWeakReferenceSearch`. RED-ON-DISABLE: make `archiveMemberFormat` answer a bare relocatable link with its own document again -> the dependsOn object build fails on every pair. THE EXAMPLE'S OWN THREE FILES ON THE REFERENCES (MEASURED 2026-10-08, probe-reference-cc; the same four runs as weak_reference_to_a_runtime_realized_name's: WSL 20261008-145211-8c845c0a, VPS 20261008-145235-184527d2, Mac 20261008-145256-c2ad4ac8, Windows 20261008-145314-62d34279): gcc 13.3.0 and clang 18.1.3 on x86_64, gcc on aarch64 and mingw-w64 gcc 13.2.0 + GNU ld PE -- the `-r` artifact keeps `w hook` and the image returns 19; Apple clang 21 -- the artifact defines `T _hook` and the image returns 42. The per-target exitCode is each one's.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 19,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        {
+          "sources": ["f.c"], "spec": "x86_64:pe64-x86_64-windows", "artifact": "f.obj",
+          "dependsOn": [
+            { "sources": ["hooklib.c"], "spec": "x86_64:pe64-x86_64-windows-staticlib", "artifact": "hooklib.lib" }
+          ]
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "dependsOn": [
+        {
+          "sources": ["f.c"], "spec": "x86_64:elf64-x86_64-linux", "artifact": "f.o",
+          "dependsOn": [
+            { "sources": ["hooklib.c"], "spec": "x86_64:elf64-x86_64-linux-staticlib", "artifact": "hooklib.a" }
+          ]
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "dependsOn": [
+        {
+          "sources": ["f.c"], "spec": "arm64:elf64-aarch64-linux", "artifact": "f.o",
+          "dependsOn": [
+            { "sources": ["hooklib.c"], "spec": "arm64:elf64-aarch64-linux-staticlib", "artifact": "hooklib.a" }
+          ]
+        }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "exitCode": 42,
+      "dependsOn": [
+        {
+          "sources": ["f.c"], "spec": "arm64:macho64-arm64-darwin", "artifact": "f.o",
+          "dependsOn": [
+            { "sources": ["hooklib.c"], "spec": "arm64:macho64-arm64-darwin-staticlib", "artifact": "hooklib.a" }
+          ]
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "exitCode": 42,
+      "dependsOn": [
+        {
+          "sources": ["f.c"], "spec": "x86_64:macho64-x86_64-darwin", "artifact": "f.o",
+          "dependsOn": [
+            { "sources": ["hooklib.c"], "spec": "x86_64:macho64-x86_64-darwin-staticlib", "artifact": "hooklib.a" }
+          ]
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

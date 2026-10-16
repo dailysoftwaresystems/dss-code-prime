@@ -25,6 +25,7 @@
 #include <span>     // the per-ARM key vocabularies are selected as spans
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>   // the root key vocabulary is a UNION built at load time
 
@@ -374,7 +375,64 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // 43 -> 44 (P68 round 12, lane `cs`): `enumCompatibleTypeRule`, the integer
     // type an enumeration without a fixed underlying type is compatible with
     // (`EnumCompatibleTypeRule`).
-    static constexpr std::array<std::string_view, 44> kFormatDocumentKeys{
+    // 44 -> 45 (P69, lane `xa`): `importAddressSymbolPrefix`, the spelling an
+    // object gives an import's address slot (COFF `__imp_`,
+    // D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED). OPTIONAL: only the four PE
+    // documents declare it — the two images to read it, the relocatable and the
+    // static library to write it.
+    // 45 -> 46 (P69 review M1 (c) + MINOR 8, lane `xa`): `pcRelativeImportAddress`,
+    // what an image makes of a unit's PC-relative, non-branch reference to an
+    // import (`PcRelativeImportAddress`). OPTIONAL: declared exactly where
+    // `externAddrBinding` is, on an image.
+    // 46 -> 47 (P69 round 3, lane `xa`): `archiveCommonResolution`, what a static
+    // link's archive search does for a name it holds as a COMMON
+    // (`ArchiveCommonResolution`, D-LK-ARCHIVE-SEARCH-FETCHED-A-DEFINITION-FOR-A-COMMON).
+    // OPTIONAL: stated by the archive-member documents whose linkers were measured.
+    // 47 -> 48 (P69, lane `lm`): `entryTransition`, whether the platform's
+    // loader CALLS or JUMPS to the entry
+    // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION). Paired with
+    // `processExit`: the seven exec documents declare it.
+    // 48 -> 49 (P69, lane `lm`): `weakResolvedToNothing`, what a reference naming
+    // a weak symbol the image resolves to nothing computes, per field class
+    // (`WeakResolvedToNothing`, D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO).
+    // OPTIONAL: the ten images that refuse an undefined import declare it.
+    // 49 -> 50 (P69 round 4, lane `xa`): `commonYieldsTo`, which definitions a
+    // COMMON yields to — a strong one only (ELF), or a weak one too (Mach-O, PE)
+    // (`CommonYieldsTo`, D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT).
+    // OPTIONAL: stated by the documents a link resolves units for, an image or a
+    // relocatable artifact; refused on an archive document.
+    // 50 -> 51 (P69 round 4, lane `lm`): `archiveWeakReferenceSearch`, whether a
+    // static link's archive search fetches a member for an undefined weak
+    // reference (`ArchiveWeakReferenceSearch`,
+    // D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE). OPTIONAL:
+    // stated by the five archive-member documents.
+    // 51 -> 52 (P69 fold 2, lane `xa`): `supersededDefinition`, what becomes of a
+    // definition whose name another definition wins — its bytes stay and what
+    // names them stays on them, or it is replaced with every label it carries
+    // (`SupersededDefinition`,
+    // D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME); one answer, or
+    // one per kind of weak definition. OPTIONAL: stated by the 22 documents that
+    // describe relocations — the images and relocatable objects a link resolves
+    // units for, and the archive documents, whose members a relocatable writer
+    // writes.
+    // 52 -> 53 (P69 fold 3, lane `xa`): `weakDefinitionBesideStrong`, what a weak
+    // definition is beside a strong definition of its name — replaced by it, or
+    // a duplicate of it (`WeakBesideStrong`,
+    // D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER);
+    // one answer, or one per kind of weak definition. OPTIONAL: stated by the
+    // documents a link resolves units for, an image or a relocatable artifact —
+    // the documents that state `commonYieldsTo`; refused on an archive document.
+    // 53 -> 54 (P69, lane `cs`, the alias fold): `symbolAliasUnsupportedReason`,
+    // why a program of this format may give no definition a second name (the C
+    // `alias` attribute), a closed verb whose sentence the semantic tier's
+    // refusal carries (`SymbolAliasUnsupportedReason`). OPTIONAL: stated by the
+    // eight Mach-O documents; absent, an alias is supported.
+    // 54 -> 55 (P69, lane `xa`, the re-review of fold 3b, MAJOR 1):
+    // `commonAlignmentFromSizeAtMost`, the alignment every linker gives a COMMON
+    // that states none — its size rounded up to a power of two, at most this
+    // (`CommonsStatement`). OPTIONAL: stated by the four PE documents, whose
+    // commons state their alignment only by a directive one linker ignores.
+    static constexpr std::array<std::string_view, 55> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -404,8 +462,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // WHICH target this format serves — the name half of the pairing
         // check that replaced `kTargetArchMachineCodes`.
         "targetArch",
-        // program-entry cluster
-        "entryPoint", "entryCallingConvention", "processExit", "processArgs",
+        // program-entry cluster (`entryTransition`: how the loader enters the
+        // image — D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION)
+        "entryPoint", "entryCallingConvention", "entryTransition", "processExit", "processArgs",
         // the set of program-entry materialization VERBS this format realizes
         // (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE — a typo here means a verb the format
         // really does realize drops out of the intersection, so every entry that
@@ -416,6 +475,27 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         "entryVerbs",
         // import / link contract
         "externCallDispatch", "dataImportBinding", "externAddrBinding",
+        // D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED: the spelling an
+        // object gives an import's ADDRESS SLOT (`__imp_`). Registered so a
+        // typo is refused at load: a misspelled key would leave every
+        // dllimport-compiled object unlinkable with no sign of why.
+        "importAddressSymbolPrefix",
+        // P69 review M1 (c) + MINOR 8: what a unit's `leaq puts(%rip)` means in
+        // an image of this format. Registered so a typo is refused at load: a
+        // misspelled key would leave the image unable to answer, which the
+        // loader then refuses by its pairing rule — but naming the typo is the
+        // useful refusal.
+        "pcRelativeImportAddress",
+        // P69 (lane `lm`): what a reference naming a weak symbol this image
+        // resolves to nothing computes. Registered so a typo is refused at load:
+        // a misspelled key would leave every direct reference to such a symbol
+        // refused (the safe default) with no sign of why.
+        "weakResolvedToNothing",
+        // P69 round 4 (lane `lm`): whether an archive search fetches a member for
+        // an undefined weak reference. A typo would leave the document unstated,
+        // which a static link refuses only when a weak reference meets an
+        // archive, far from the misspelt file.
+        "archiveWeakReferenceSearch",
         // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT: WHICH
         // symbol bindings `externCallDispatch: indirect-slot` applies to.
         // Registered here so a typo is REFUSED AT LOAD naming the file rather
@@ -451,6 +531,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // ten image documents that declare it recording NOTHING while the gate
         // accepted every request.
         "runpath", "runpathUnsupportedReason",
+        // why a program of this format may give no definition a second name
+        // (the C `alias` attribute); absent = supported. A typo would leave the
+        // Mach-O documents silently ACCEPTING what every compiler of the
+        // platform refuses.
+        "symbolAliasUnsupportedReason",
         // the weak-DEFINITION spelling (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED).
         // A typo here does NOT silently default: the walker refuses
         // an unanswered schema the moment it meets a weak definition, so the
@@ -461,6 +546,26 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // section / relocation description
         "sections", "relocations", "relocationAddends", "inputSectionPlacement",
         "supportedDataSections",
+        // what a static link's archive search does for a COMMON's name — a typo
+        // would leave the document unstated, which a static link then refuses
+        // only when a common meets an archive, far from the misspelt file
+        "archiveCommonResolution",
+        // which definitions a COMMON yields to — a typo would leave the document
+        // unstated, which a link then refuses only when a common meets a weak
+        // definition of its name
+        "commonYieldsTo",
+        // the alignment every linker gives a common that states none — a typo
+        // would leave the document unstated, and an over-aligned tentative
+        // definition would be written as a common a linker misaligns in silence
+        "commonAlignmentFromSizeAtMost",
+        // what becomes of a definition whose name another definition wins — a
+        // typo would leave the document unstated, which a link then refuses only
+        // when a relocation names such a definition
+        "supersededDefinition",
+        // what a weak definition is beside a strong one of its name — a typo
+        // would leave the document unstated, which a link then refuses only
+        // when a weak definition meets a strong one
+        "weakDefinitionBesideStrong",
         // WHO RUNS THE STATIC-INITIALIZER SCHEDULE
         // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN). It sits
         // with the program-entry cluster in spirit — it answers a question about
@@ -1336,6 +1441,28 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION:
+    // `entryTransition` — "called" or "jumped", how the platform's loader
+    // enters the image. Paired with `processExit` (validate() below); an
+    // unknown value fails loud here, naming the closed set.
+    if (doc.contains("entryTransition")) {
+        if (!doc.at("entryTransition").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/entryTransition",
+                      std::format("'entryTransition' must be a string ({})",
+                                  allowedList(allNames(kEntryTransitionTable), " or ")));
+        } else {
+            auto const s = doc.at("entryTransition").get<std::string>();
+            auto const t = entryTransitionFromName(s);
+            if (!t.has_value()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/entryTransition",
+                          std::format("unknown entryTransition '{}' — accepted: {}", s,
+                                      allowedList(allNames(kEntryTransitionTable), ", ")));
+            } else {
+                data.entryTransition = *t;
+            }
+        }
+    }
+
     // D-FFI-EXTERN-CALL-DISPATCH: `externCallDispatch` — the format's
     // extern-call shape ("indirect-slot" / "direct-plt"). Optional in
     // the JSON (a relocatable / WASM / SPIR-V format, or an exec format
@@ -1612,11 +1739,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
 
     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): `externAddrBinding`
     // — the format's extern-ADDRESS materialization binding ("got").
-    // Optional in the JSON (only the arm64 relocatable + static-archive
-    // formats declare it; the DSS-linked exec/pie/dyn formats omit it and
-    // materialize an `&extern` value via the ordinary lea). Present-but-
-    // unknown IS a fail-loud HERE at load (a typo must NOT silently
-    // degrade to "no GOT-address support" — the externCallDispatch /
+    // Optional in the JSON; WHO declares it is stated once, on the field
+    // (`ObjectFormatData::externAddrBinding` — since P69 the relocatable
+    // documents, the ELF `-dyn` and every Mach-O image, and the PE images).
+    // Present-but-unknown IS a fail-loud HERE at load (a typo must NOT
+    // silently degrade to "no GOT-address support" — the externCallDispatch /
     // dataImportBinding discipline).
     if (doc.contains("externAddrBinding")) {
         if (!doc.at("externAddrBinding").is_string()) {
@@ -1640,6 +1767,124 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             } else {
                 data.externAddrBinding = *b;
             }
+        }
+    }
+
+    // D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED (P69):
+    // `importAddressSymbolPrefix` — the spelling an object gives an import's
+    // address slot (COFF: `__imp_`). Optional; a non-string or an EMPTY
+    // string is refused, because an empty prefix would read every name as a
+    // slot.
+    if (doc.contains("importAddressSymbolPrefix")) {
+        auto const& v = doc.at("importAddressSymbolPrefix");
+        if (!v.is_string() || v.get<std::string>().empty()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/importAddressSymbolPrefix",
+                      "'importAddressSymbolPrefix' must be a non-empty string — "
+                      "the spelling an object gives an import's address slot "
+                      "(COFF: \"__imp_\"); an empty one would read every name "
+                      "as a slot");
+        } else {
+            data.importAddressSymbolPrefix = v.get<std::string>();
+        }
+    }
+
+    // P69 review M1 (c) + MINOR 8: `pcRelativeImportAddress` — what an image
+    // makes of a unit's PC-relative, non-branch reference to an import. Read by
+    // name through the closed table; where it may appear is validate()'s.
+    if (doc.contains("pcRelativeImportAddress")) {
+        auto const& v = doc.at("pcRelativeImportAddress");
+        auto const meaning =
+            v.is_string()
+                ? kPcRelativeImportAddressTable.fromName(v.get<std::string>())
+                : std::nullopt;
+        if (!meaning.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/pcRelativeImportAddress",
+                      std::format("expected one of: {}",
+                                  allowedList(
+                                      allNames(kPcRelativeImportAddressTable),
+                                      ", ")));
+        } else {
+            data.pcRelativeImportAddress = *meaning;
+        }
+    }
+
+    // P69 (lane `lm`, D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO):
+    // `weakResolvedToNothing` — what a reference naming a weak symbol this image
+    // resolves to nothing computes, per field class. A PRESENT block is strict:
+    // a closed key vocabulary, every class stated (a class left out would be a
+    // silent `refused` nobody chose), each answer read by name through the
+    // closed table. Where it may appear, and which answer a class may take, is
+    // validate()'s.
+    static constexpr std::array<std::string_view, 3> kWeakResolvedToNothingKeys{
+        "absolute", "pcRelative", "branch"};
+    DSS_CHECK_KEY_VOCABULARY(kWeakResolvedToNothingKeys);
+    if (doc.contains("weakResolvedToNothing")) {
+        auto const& w = doc.at("weakResolvedToNothing");
+        if (!w.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/weakResolvedToNothing",
+                      std::format("'weakResolvedToNothing' must be an object with "
+                                  "key(s) {}",
+                                  allowedList(kWeakResolvedToNothingKeys, ", ")));
+        } else {
+            rejectUnknownKeys(w, kWeakResolvedToNothingKeys, "/weakResolvedToNothing",
+                              "the 'weakResolvedToNothing' block", coll);
+            WeakResolvedToNothing answers;
+            bool complete = true;
+            auto const readClass = [&](std::string const& key, WeakNullReference& out) {
+                std::string const path = std::format("/weakResolvedToNothing/{}", key);
+                if (!w.contains(key)) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("the 'weakResolvedToNothing' block states "
+                                          "no '{}' answer — every class is stated, "
+                                          "one of: {}",
+                                          key,
+                                          allowedList(allNames(kWeakNullReferenceTable),
+                                                      ", ")));
+                    complete = false;
+                    return;
+                }
+                auto const& v = w.at(key);
+                auto const answer =
+                    v.is_string() ? kWeakNullReferenceTable.fromName(v.get<std::string>())
+                                  : std::nullopt;
+                if (!answer.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("expected one of: {}",
+                                          allowedList(allNames(kWeakNullReferenceTable),
+                                                      ", ")));
+                    complete = false;
+                    return;
+                }
+                out = *answer;
+            };
+            readClass("absolute", answers.absolute);
+            readClass("pcRelative", answers.pcRelative);
+            readClass("branch", answers.branch);
+            if (complete) data.weakResolvedToNothing = answers;
+        }
+    }
+
+    // P69 round 4 (lane `lm`, D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE):
+    // `archiveWeakReferenceSearch` — whether a static link's archive search
+    // fetches a member for an undefined weak reference. OPTIONAL; read by name
+    // through the closed table, so a typo in the value is refused naming the
+    // values (and one in the key by the root vocabulary). Where it may appear is
+    // validate()'s.
+    if (doc.contains("archiveWeakReferenceSearch")) {
+        auto const& v = doc.at("archiveWeakReferenceSearch");
+        auto const answer =
+            v.is_string()
+                ? kArchiveWeakReferenceSearchTable.fromName(v.get<std::string>())
+                : std::nullopt;
+        if (!answer.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/archiveWeakReferenceSearch",
+                      std::format("expected one of: {}",
+                                  allowedList(
+                                      allNames(kArchiveWeakReferenceSearchTable),
+                                      ", ")));
+        } else {
+            data.archiveWeakReferenceSearch = *answer;
         }
     }
 
@@ -2791,6 +3036,28 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // P69 (lane `cs`): `symbolAliasUnsupportedReason` — why a program of this
+    // format may give no definition a second name; absent = supported. The
+    // runpath reason's shape: one closed verb, refused by name when it is not one.
+    if (doc.contains("symbolAliasUnsupportedReason")) {
+        auto const& ar = doc.at("symbolAliasUnsupportedReason");
+        std::optional<SymbolAliasUnsupportedReason> reason;
+        if (ar.is_string()) {
+            reason = symbolAliasUnsupportedReasonFromName(ar.get<std::string>());
+        }
+        if (!reason.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/symbolAliasUnsupportedReason",
+                      std::format("'symbolAliasUnsupportedReason' must be one of: "
+                                  "{}",
+                                  allowedList(
+                                      allNames(kSymbolAliasUnsupportedReasonTable),
+                                      ", ")));
+        } else {
+            data.symbolAliasUnsupportedReason = *reason;
+        }
+    }
+
     // D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: `weakDefinition` block —
     // HOW this format spells a weak definition. PRESENCE is the declaration and
     // absence is the ABSENCE OF AN ANSWER, never the claim that the format
@@ -2828,8 +3095,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // A BLOCK with one verb, so a future dialect needing per-arm
             // parameters gains a sibling key here rather than a second root
             // key (the `cSymbolDecoration` precedent).
-            static constexpr std::array<std::string_view, 1>
-                kWeakDefinitionKeys{"dialect"};
+            static constexpr std::array<std::string_view, 2>
+                kWeakDefinitionKeys{"dialect", "byKind"};
             DSS_CHECK_KEY_VOCABULARY(kWeakDefinitionKeys);
             rejectUnknownKeys(wd, kWeakDefinitionKeys, "/weakDefinition",
                               "the 'weakDefinition' block", coll);
@@ -2906,6 +3173,69 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             backendWeakDialectList(backend)));
                 } else {
                     data.weakDefinition = WeakDefinition{*dv};
+                }
+            }
+            // P69: `byKind` — the KINDS of weak definition that take another
+            // dialect than `dialect`, keyed by the kinds' own names. The
+            // sibling key this block was shaped to grow (see `WeakDefinition`).
+            // Each value is checked exactly as `dialect` is: a real spelling,
+            // and one THIS document's backend writes — a per-kind dialect its
+            // walker has no encoder for would be a definition of that kind
+            // refused at its first encode, long after the config was written.
+            if (wd.contains("byKind")) {
+                auto const& bk = wd.at("byKind");
+                if (!bk.is_object() || bk.empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/weakDefinition/byKind",
+                              std::format("'weakDefinition.byKind' must be a "
+                                          "non-empty object keyed by a kind of "
+                                          "weak definition ({}), each value a "
+                                          "dialect ({}). A format with ONE "
+                                          "spelling omits the key.",
+                                          allowedList(allNames(kWeakDefinitionKindTable), " or "),
+                                          allowedList(allNames(kWeakDefinitionDialectTable), " or ")));
+                } else {
+                    for (auto it = bk.begin(); it != bk.end(); ++it) {
+                        std::string const key   = it.key();
+                        auto const&       value = it.value();
+                        std::string const path  = "/weakDefinition/byKind/" + key;
+                        auto const kind = weakDefinitionKindFromName(key);
+                        if (!kind.has_value()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::format("'{}' is not a kind of weak "
+                                                  "definition — accepted: {}",
+                                                  key,
+                                                  allowedList(allNames(kWeakDefinitionKindTable), ", ")));
+                            continue;
+                        }
+                        auto const dv = value.is_string()
+                                            ? weakDefinitionDialectFromName(value.get<std::string>())
+                                            : std::optional<WeakDefinitionDialect>{};
+                        if (!dv.has_value()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::format("the dialect of a '{}' weak "
+                                                  "definition must be one of: "
+                                                  "{}",
+                                                  key,
+                                                  allowedList(allNames(kWeakDefinitionDialectTable), ", ")));
+                            continue;
+                        }
+                        if (!backendSpellsWeakDialect(backend, *dv)) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::format("a '{}' weak definition is "
+                                                  "given the dialect '{}', "
+                                                  "which the '{}' walker does "
+                                                  "not write (it writes: {}) — "
+                                                  "it would refuse the first "
+                                                  "definition of that kind it "
+                                                  "met",
+                                                  key, weakDefinitionDialectName(*dv),
+                                                  backend->configName(),
+                                                  backendWeakDialectList(backend)));
+                            continue;
+                        }
+                        data.weakDefinitionByKind.emplace_back(*kind, *dv);
+                    }
                 }
             }
         }
@@ -3721,26 +4051,22 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 return false;
             }
             info.nativeId = static_cast<std::uint32_t>(v);
-            // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: optional PLT-variant
-            // nativeId (e.g. R_X86_64_PLT32=4) emitted for an undefined-extern
-            // call in a relocatable object. Absent → 0 (no PLT variant).
+            // ★ `pltNativeId` IS RETIRED (P69,
+            // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB) and REFUSED as
+            // inert config: nothing reads it any more, and a key that is
+            // parsed and ignored reads as authority while it drifts. It was a
+            // second wire id emitted instead of `nativeId` when a row reached
+            // an undefined extern function — how ELF x86_64's PC32 row came to
+            // stand for calls too. A call is a row of its own now.
             if (r.contains("pltNativeId")) {
-                if (!r.at("pltNativeId").is_number_integer()) {
-                    c.emit(DiagnosticCode::C_MalformedJson,
-                           std::format("/relocations/{}/pltNativeId", i),
-                           "'pltNativeId' must be an integer");
-                    return false;
-                }
-                std::int64_t const pv =
-                    r.at("pltNativeId").get<std::int64_t>();
-                if (pv <= 0 || pv > 0xFFFFFFFFLL) {
-                    c.emit(DiagnosticCode::C_MalformedJson,
-                           std::format("/relocations/{}/pltNativeId", i),
-                           std::format("'pltNativeId' ({}) must be in (0, 2^32)",
-                                       pv));
-                    return false;
-                }
-                info.pltNativeId = static_cast<std::uint32_t>(pv);
+                c.emit(DiagnosticCode::C_MalformedJson,
+                       std::format("/relocations/{}/pltNativeId", i),
+                       "'pltNativeId' is retired: declare the CALL as a row of "
+                       "its own and mark it `\"isCall\": true` (ELF x86_64: "
+                       "R_X86_64_PLT32 on the `rel32` kind) — a second wire id "
+                       "on an address row is how one relocation kind came to "
+                       "mean both a call and an address");
+                return false;
             }
             // D-LK-MACHO-ISDATA-NO-CALL-SIGNAL: the DECLARED call/branch role.
             // True iff this format's native wire relocation can only target
@@ -3827,6 +4153,21 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             static_cast<std::uint32_t>(v)});
                 }
             }
+            // P69: whether those types ALSO lower the addend by their byte
+            // count (COFF's REL32_1.._5) — see
+            // `ObjectFormatRelocationInfo::bytesAfterFieldLowersTheAddend`.
+            // Absent -> false (Mach-O's SIGNED_1/_2/_4 differ in the type
+            // alone). That it sits beside a family is `validate()`'s.
+            if (r.contains("bytesAfterFieldLowersTheAddend")) {
+                if (!r.at("bytesAfterFieldLowersTheAddend").is_boolean()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/bytesAfterFieldLowersTheAddend", i),
+                           "'bytesAfterFieldLowersTheAddend' must be a boolean");
+                    return false;
+                }
+                info.bytesAfterFieldLowersTheAddend =
+                    r.at("bytesAfterFieldLowersTheAddend").get<bool>();
+            }
             // P68 round 9: the instruction words a SHARED wire type decodes to
             // this row for (Mach-O arm64 ARM64_RELOC_PAGEOFF12) — see
             // `ObjectFormatRelocationInfo::decodeWhenInstruction`. What the
@@ -3908,9 +4249,10 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // (`opt/optimizer_json.cpp`, `ffi/shipped_lib_descriptor.cpp`)
             // missing the `$`-prose carve-out outright. The TABLE stays here,
             // with the fields it describes — only the loop moved.
-            static constexpr std::array<std::string_view, 8> kRelocationRowKeys{
+            static constexpr std::array<std::string_view, 9> kRelocationRowKeys{
                 "name", "kind", "nativeId", "pltNativeId", "isCall", "emitOnly",
-                "nativeIdByBytesAfterField", "decodeWhenInstruction"};
+                "nativeIdByBytesAfterField", "bytesAfterFieldLowersTheAddend",
+                "decodeWhenInstruction"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationRowKeys);
             bool rowClean = true;
             detail::rejectUnknownKeys(r, kRelocationRowKeys, "a relocation row",
@@ -3971,6 +4313,143 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             data.inputSectionPlacement = *placement;
         }
     }
+
+    // archiveCommonResolution — what a static link's archive search does for a
+    // name it holds as a COMMON (`ArchiveCommonResolution`, P69 round 3).
+    // OPTIONAL; read by name through the closed table, so a typo in the value is
+    // refused naming the values (and one in the key by the root vocabulary).
+    if (doc.contains("archiveCommonResolution")) {
+        auto const& v = doc.at("archiveCommonResolution");
+        auto const resolution =
+            v.is_string()
+                ? kArchiveCommonResolutionTable.fromName(v.get<std::string>())
+                : std::nullopt;
+        if (!resolution.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/archiveCommonResolution",
+                      std::format("expected one of: {}",
+                                  allowedList(
+                                      allNames(kArchiveCommonResolutionTable),
+                                      ", ")));
+        } else {
+            data.archiveCommonResolution = *resolution;
+        }
+    }
+
+    // commonYieldsTo — which definitions a COMMON yields to (`CommonYieldsTo`,
+    // P69 round 4). OPTIONAL; read by name through the closed table, as
+    // `archiveCommonResolution` is.
+    if (doc.contains("commonYieldsTo")) {
+        auto const& v = doc.at("commonYieldsTo");
+        auto const yields =
+            v.is_string() ? kCommonYieldsToTable.fromName(v.get<std::string>()) : std::nullopt;
+        if (!yields.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/commonYieldsTo",
+                      std::format("expected one of: {}",
+                                  allowedList(allNames(kCommonYieldsToTable), ", ")));
+        } else {
+            data.commonYieldsTo = *yields;
+        }
+    }
+
+    // commonAlignmentFromSizeAtMost — the alignment every linker gives a COMMON
+    // that states none (`CommonsStatement`). OPTIONAL; a power of two.
+    if (doc.contains("commonAlignmentFromSizeAtMost")) {
+        auto const& v = doc.at("commonAlignmentFromSizeAtMost");
+        std::uint64_t const n = v.is_number_unsigned() ? v.get<std::uint64_t>() : 0u;
+        if (n == 0u || (n & (n - 1u)) != 0u) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/commonAlignmentFromSizeAtMost",
+                      "expected a power of two: the most bytes of alignment every linker "
+                      "gives a common that states none");
+        } else {
+            data.commonAlignmentFromSizeAtMost = n;
+        }
+    }
+
+    // supersededDefinition — what becomes of a definition whose name another
+    // definition wins (`SupersededDefinition`, P69 fold 2). OPTIONAL. A STRING
+    // is the answer for every definition; an OBJECT states one per kind of weak
+    // definition, keyed by the kinds' own names (`kWeakDefinitionKindTable`),
+    // every kind exactly once — a kind left out would be a definition the
+    // document says nothing of, found only when a link meets one. Both
+    // vocabularies are read by name through their closed tables.
+    //
+    // ★ ONE READER FOR EVERY KEY OF THIS SHAPE (P69 fold 3). A second key took
+    // the same two forms — `weakDefinitionBesideStrong` — and the reader below
+    // is the one `supersededDefinition` had, made a function of the key's name
+    // and of its answers' table: its refusals are the same sentences, at the
+    // key's own path.
+    auto const readWeakKindStatement = [&](std::string const& key, auto const& answerTable,
+                                           auto& statement) {
+        if (!doc.contains(key)) return;
+        using Statement = std::remove_cvref_t<decltype(statement)>;
+        using Answer    = typename decltype(statement.forEveryDefinition)::value_type;
+        auto const& v = doc.at(key);
+        auto const answerOf = [&](json const& a) -> std::optional<Answer> {
+            return a.is_string() ? answerTable.fromName(a.get<std::string>())
+                                 : std::nullopt;
+        };
+        auto const expectedAnswer = [&] {
+            return std::format("expected one of: {}",
+                               allowedList(allNames(answerTable), ", "));
+        };
+        if (v.is_string()) {
+            if (auto const answer = answerOf(v); answer.has_value()) {
+                statement.forEveryDefinition = *answer;
+            } else {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/" + key, expectedAnswer());
+            }
+        } else if (v.is_object()) {
+            Statement perKind;
+            bool      ok = true;
+            for (auto const& [kindName, answerJson] : v.items()) {
+                auto const kind   = weakDefinitionKindFromName(kindName);
+                auto const answer = answerOf(answerJson);
+                if (!kind.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/" + key + "/" + kindName,
+                              std::format("'{}' is no kind of weak definition: expected one of: {}",
+                                          kindName,
+                                          allowedList(allNames(kWeakDefinitionKindTable), ", ")));
+                    ok = false;
+                    continue;
+                }
+                if (!answer.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/" + key + "/" + kindName, expectedAnswer());
+                    ok = false;
+                    continue;
+                }
+                perKind.byKind.emplace_back(*kind, *answer);
+            }
+            for (auto const& row : kWeakDefinitionKindTable.rows) {
+                bool listed = false;
+                for (auto const& [of, answer] : perKind.byKind) listed = listed || of == row.first;
+                if (!listed && ok) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, "/" + key,
+                              std::format("an answer per kind of weak definition states one for "
+                                          "EVERY kind, and '{}' is missing (the kinds: {})",
+                                          row.second,
+                                          allowedList(allNames(kWeakDefinitionKindTable), ", ")));
+                    ok = false;
+                }
+            }
+            if (ok) statement = std::move(perKind);
+        } else {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/" + key,
+                      std::format("expected one answer for every definition (a string, one of: "
+                                  "{}), or an object stating one per kind of weak definition "
+                                  "({})",
+                                  allowedList(allNames(answerTable), ", "),
+                                  allowedList(allNames(kWeakDefinitionKindTable), ", ")));
+        }
+    };
+    readWeakKindStatement("supersededDefinition", kSupersededDefinitionTable,
+                          data.supersededDefinition);
+    // weakDefinitionBesideStrong — what a weak definition is beside a strong
+    // definition of its name (`WeakBesideStrong`, P69 fold 3): replaced by it, or
+    // a duplicate of it. OPTIONAL; the same two forms, read by the same reader.
+    readWeakKindStatement("weakDefinitionBesideStrong", kWeakBesideStrongTable,
+                          data.weakDefinitionBesideStrong);
 
     // sections[] — D-LK4-2 schema row. Each entry maps a universal
     // SectionKind to format-native name + structural fields.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# PURPOSE: name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment.
+# PURPOSE: name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment -- and what a walk of that tree leaves out: its own .gitignore, as git reads it.
 """owning-tree.py -- the Python owner of "WHICH DSS TREE DOES THIS SCRIPT BELONG TO?", of
 "WHICH GIT WORKING TREE CONTAINS THIS PATH, AND WHAT IS ITS IDENTITY?", and of asking git
 about a tree without the caller's git environment.
@@ -110,7 +110,7 @@ scratch box a consumer builds its fixtures in. This file's `--self-test` proves 
 answer and proves the arms themselves can fail.
 
 Usage:
-    python .harness-config/runner/actions/owning-tree/owning-tree.py --self-test
+    dssharness run owning-tree      # its one step: --self-test (and ctest's owning_tree_selftest_guard)
 Exit codes: 0 OK · 1 self-test failed · 3 usage.
 """
 from __future__ import annotations
@@ -145,7 +145,7 @@ STEER_DECOY = "zz-owning-tree-steer-decoy.txt"
 STEER_PLANS_DECOY = ".plans/zz-owning-tree-steer-decoy.md"
 
 # ⚠ Raising this is the claim that the arms you added actually RUN.
-EXPECTED_ARMS = 54
+EXPECTED_ARMS = 77
 
 # A `gitdir:` value that is a Windows drive path (`C:/...` or `C:\...`).
 _WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
@@ -157,7 +157,8 @@ class Refusal(Exception):
 
 class UsageRefusal(Refusal):
     """A call that names NOTHING -- an empty path, an empty argv, no identity -- refused
-    before it can answer for whatever the caller happens to stand in."""
+    before it can answer for whatever the caller happens to stand in; and a command line
+    that names an OPTION where a path to write belongs (`written_path`)."""
 
 
 def _require_path(path, what):
@@ -167,6 +168,27 @@ def _require_path(path, what):
                            "is standing in (realpath('') is the working directory, git -C '' "
                            "stays in it)" % what)
     return os.fspath(path)
+
+
+# ── A PATH A COMMAND LINE NAMES FOR A PROGRAM TO WRITE ──────────────────────────────────────────────
+# ★ NEVER ONE THAT BEGINS WITH `-`. A value flag reads the word after it as its value, so `--out --help`
+# hands a program `--help` as the place to write -- a request for help become a file or a directory in
+# the caller's working directory, or in the tree a program resolves its paths from. (2026-10-15: a file
+# named `--help` appeared at the root of a checkout that way.) No path a program is asked to write
+# begins with `-`: one that does is an option taken for a value, and it is refused naming the flag, in
+# either spelling (`--out x`, `--out=x`). A file truly so named is still reachable as `./-x`. An empty
+# value names no place and is refused too. Every program of the repository that takes a path to write
+# from a hand-read command line asks this; argparse already refuses `--out --help` ("expected one
+# argument") on its own.
+def written_path(value, flag):
+    """`value` as the path `flag` names for writing, or `UsageRefusal` when it is empty or begins with `-`."""
+    if value is None or not str(value).strip():
+        raise UsageRefusal("%s names no path to write" % flag)
+    value = str(value)
+    if value.startswith("-"):
+        raise UsageRefusal("%s takes '%s' as the path to write, and it begins with `-`: an option taken for a "
+                           "value. Name the path (`./%s` if that is truly its name)" % (flag, value, value))
+    return value
 
 
 def same_path(a, b):
@@ -692,6 +714,252 @@ def load_jsonc(path):
         raise Refusal("%s is not valid JSONC: %s" % (path, exc))
 
 
+# ── WHAT A WALK OF A TREE LEAVES OUT: what git ignores there (`TreeIgnores`) ─────────────────────
+# ★★ ONE ANSWER FOR EVERY PROGRAM THAT WALKS A TREE FROM ITS ROOT. Such a walk reads the tree's
+# CONTENT, and what git ignores there is not content: the copies and workers DssHarness keeps in
+# a tree (`.legs/`, `.mutations/`, beside `.worktrees/` and `.orchestrators/` -- each a whole tree
+# of its own, `dssharness help layout`), its run records and locks, a session's scratch, a build.
+# A census walking a leg copy counts every example twice and may write those figures; a
+# case-collision scan walking a sweep worker meets files that vanish under it. The statement is
+# the tree's own `.gitignore`: the file the tool's `init` writes its block into and git obeys. No
+# list is kept here, so a directory the tool or the repository adds there is left out by every
+# walker at once. Its readers: `check-doc-census` (both of its walks), the redactor's vocabulary
+# (`redact.py`), and -- in C++, with this grammar and these refusals -- the repository-wide scan
+# of `tests/core/test_header_name_matching.cpp` (`tests/test_support/tree_ignores.hpp`).
+# ★ READ AS GIT READS IT: every rule in order, the last that matches deciding; `!` re-includes;
+# a trailing `/` matches a directory only; a `/` at the start or in the middle anchors the rule
+# to the tree's root, and a rule with none matches that name at any depth; `*` and `?` stay
+# within one name, `[...]` is a class (`!` or `^` first negates it, `a-z` is a range, a `]`
+# right after the opening is itself), and a `**` segment is any number of directories -- one or
+# more at a rule's end. Trailing blanks are dropped, as git drops them. A directory left out
+# takes everything under it: nothing below it can be re-included, as in git. `.git`, git's own,
+# is always left out, as a directory or as a worktree's `.git` file.
+# ★ THE ROOT'S `.gitignore` ALONE: it is the only one git tracks here (✔MEASURED 2026-10-15,
+# `git ls-files`), and git's rules there leave out no tracked file (`git ls-files -ci
+# --exclude-standard` lists none), so a walk loses nothing the tree tracks. One a tool writes
+# inside a directory the root's rules already leave out changes nothing a walk sees.
+# ⚠ A RULE THIS READER CANNOT READ AS GIT DOES IS A REFUSAL NAMING ITS LINE: a backslash (an
+# escape), an unterminated `[`, an empty name between two `/`, a rule that is nothing but `/` or
+# `!`. Read some other way it would leave out another set than git does, in silence.
+# ⓘ Names compare as written, case and all, so the answer is the same on every host.
+# ⓘ A tree with no `.gitignore` declares nothing ignored: only `.git` is left out.
+# ⓘ `keep` names root-relative directories walked WHOLE whatever the rules say. None is kept by
+# default; the redactor keeps the tool's build directory, whose output names its exemption reads.
+
+IGNORE_FILE = ".gitignore"
+GIT_OWN = ".git"
+
+
+class IgnoreRule:
+    """One rule of a `.gitignore`, as git reads it: `pats` are its name patterns, `**` among them."""
+    __slots__ = ("text", "line", "negated", "dir_only", "pats")
+
+    def __init__(self, text, line, negated, dir_only, pats):
+        self.text, self.line, self.negated, self.dir_only, self.pats = text, line, negated, dir_only, pats
+
+    def __repr__(self):
+        return "%s (line %d)" % (self.text, self.line)
+
+
+def _class_end(pat, at):
+    """The index just past the `]` closing the class that opens at `pat[at]` (a `[`), or -1."""
+    i = at + 1
+    if i < len(pat) and pat[i] in "!^":
+        i += 1
+    if i < len(pat) and pat[i] == "]":
+        i += 1
+    while i < len(pat) and pat[i] != "]":
+        i += 1
+    return i + 1 if i < len(pat) else -1
+
+
+def _class_hit(pat, at, ch):
+    """Does the class that opens at `pat[at]` take `ch`?"""
+    end = _class_end(pat, at)
+    i, negate = at + 1, False
+    if pat[i] in "!^":
+        negate, i = True, i + 1
+    hit, first = False, True
+    while i < end - 1 and (pat[i] != "]" or first):
+        if i + 2 < end - 1 and pat[i + 1] == "-":
+            if pat[i] <= ch <= pat[i + 2]:
+                hit = True
+            i += 3
+        else:
+            if pat[i] == ch:
+                hit = True
+            i += 1
+        first = False
+    return hit != negate
+
+
+def name_matches(pat, name):
+    """One NAME against one name pattern: `*` any run, `?` one character, `[...]` a class. Iterative."""
+    p = n = 0
+    star_p = star_n = -1
+    while n < len(name):
+        if p < len(pat) and pat[p] == "*":
+            star_p, star_n, p = p, n, p + 1
+            continue
+        if p < len(pat):
+            c = pat[p]
+            if c == "?":
+                p, n = p + 1, n + 1
+                continue
+            if c == "[":
+                if _class_hit(pat, p, name[n]):
+                    p, n = _class_end(pat, p), n + 1
+                    continue
+            elif c == name[n]:
+                p, n = p + 1, n + 1
+                continue
+        if star_p < 0:
+            return False
+        star_n += 1
+        p, n = star_p + 1, star_n
+    while p < len(pat) and pat[p] == "*":
+        p += 1
+    return p == len(pat)
+
+
+def names_match(pats, names):
+    """A rule's name patterns against a path's names: a `**` pattern is any number of names (one or more when it
+    is the last). The two shapes nearly every rule has are asked directly -- no `**` (one name per pattern) and a
+    rule with no slash (`**` then one pattern: the last name) -- and any other by a table filled from the end: no
+    recursion proportional to the path."""
+    m, n = len(pats), len(names)
+    if "**" not in pats:
+        return m == n and all(name_matches(p, x) for p, x in zip(pats, names))
+    if m == 2 and pats[0] == "**" and pats[1] != "**":
+        return n >= 1 and name_matches(pats[1], names[-1])
+    ok = [[False] * (n + 1) for _ in range(m + 1)]
+    ok[m][n] = True
+    for i in range(m - 1, -1, -1):
+        for j in range(n, -1, -1):
+            if pats[i] == "**":
+                ok[i][j] = (j < n) if i == m - 1 else (ok[i + 1][j] or (j < n and ok[i][j + 1]))
+            else:
+                ok[i][j] = j < n and name_matches(pats[i], names[j]) and ok[i + 1][j + 1]
+    return ok[0][0]
+
+
+def read_ignore_rules(text, source=IGNORE_FILE):
+    """[IgnoreRule] of a `.gitignore`'s text, in order. A rule this reader cannot read as git does is a Refusal
+    naming its line (see the section above)."""
+    rules = []
+    if text.startswith("﻿"):
+        text = text[1:]
+    for number, raw in enumerate(text.split("\n"), 1):
+        line = raw[:-1] if raw.endswith("\r") else raw
+        if not line or line.startswith("#"):
+            continue
+        line = line.rstrip(" ")
+        if not line:
+            continue
+        def refuse(why):
+            return Refusal("%s line %d: the rule %r %s, so it cannot be read as git reads it; every walk of this "
+                           "tree is refused rather than leaving out another set than git does" % (
+                               source, number, line, why))
+        if "\\" in line:
+            raise refuse("holds a backslash (an escape)")
+        negated = line.startswith("!")
+        body = line[1:] if negated else line
+        dir_only = body.endswith("/")
+        if dir_only:
+            body = body[:-1]
+        anchored = "/" in body
+        if body.startswith("/"):
+            body = body[1:]
+        names = body.split("/")
+        if not body or any(not name for name in names):
+            raise refuse("names nothing between two separators" if body else "names nothing")
+        for name in names:
+            at = name.find("[")
+            while at >= 0:
+                end = _class_end(name, at)
+                if end < 0:
+                    raise refuse("opens a `[` class it never closes")
+                at = name.find("[", end)
+        rules.append(IgnoreRule(line, number, negated, dir_only, names if anchored else ["**"] + names))
+    return rules
+
+
+class TreeIgnores:
+    """What a walk of `tree` leaves out: what git ignores there, read from the tree's own `.gitignore`, and `.git`.
+    `keep`: root-relative directories walked whole whatever the rules say."""
+
+    def __init__(self, tree, keep=()):
+        self.tree = os.path.realpath(_require_path(tree, "the tree a walk reads"))
+        path = os.path.join(self.tree, IGNORE_FILE)
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except FileNotFoundError:
+            data = b""
+        except OSError as exc:
+            raise Refusal("%s cannot be read (%s): what a walk of the tree leaves out is unknown" % (path, exc))
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise Refusal("%s is not UTF-8 (%s): what a walk of the tree leaves out is unknown" % (path, exc))
+        self.rules = read_ignore_rules(text, path)
+        self.keep = []
+        for k in keep:
+            names = k.replace("\\", "/").strip("/").split("/")
+            if not k or any(n in ("", ".", "..") for n in names):
+                raise Refusal("a directory walked whole must be named relative to the tree: %r" % (k,))
+            self.keep.append(names)
+
+    def _decide(self, names, is_dir):
+        """The rule that leaves this path out (its ancestors already walked), or None."""
+        if GIT_OWN in names:
+            return GIT_OWN
+        if any(names[:len(k)] == k for k in self.keep):
+            return None
+        decided = None
+        for rule in self.rules:
+            if rule.dir_only and not is_dir:
+                continue
+            if names_match(rule.pats, names):
+                decided = None if rule.negated else rule
+        return decided.text if decided is not None else None
+
+    def rel(self, path):
+        """`path` relative to the tree, `/`-joined ('' for the tree itself); a path outside it is a Refusal."""
+        rel = os.path.relpath(os.path.realpath(path), self.tree).replace(os.sep, "/")
+        if rel == ".":
+            return ""
+        if rel == ".." or rel.startswith("../") or os.path.isabs(rel):
+            raise Refusal("%s is not inside the tree %s: what a walk of it leaves out is that tree's to say"
+                          % (path, self.tree))
+        return rel
+
+    def leaves_out(self, rel, is_dir):
+        """The rule that leaves the tree-relative path `rel` out -- its own, or a parent directory's -- or None."""
+        names = [n for n in rel.replace("\\", "/").split("/") if n]
+        for depth in range(1, len(names)):
+            why = self._decide(names[:depth], True)
+            if why:
+                return why
+        return self._decide(names, is_dir) if names else None
+
+    def walk(self, top=None, onerror=None):
+        """`os.walk(top)`, top-down, less what this tree leaves out: each `(dirpath, dirnames, filenames)` with the
+        directories left out already taken from `dirnames` (the caller may prune or sort it further, in place) and
+        the files left out taken from `filenames`. A `top` the tree leaves out is a Refusal: a walk of nothing."""
+        top = self.tree if top is None else top
+        base = self.rel(top)
+        why = self.leaves_out(base, True) if base else None
+        if why:
+            raise Refusal("the walk's top %s is left out of the tree by %s" % (base, why))
+        for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
+            sub = os.path.relpath(dirpath, top).replace(os.sep, "/")
+            rel = base if sub == "." else (base + "/" + sub if base else sub)
+            names = rel.split("/") if rel else []
+            dirnames[:] = [d for d in dirnames if not self._decide(names + [d], True)]
+            yield dirpath, dirnames, [f for f in filenames if not self._decide(names + [f], False)]
+
+
 def probe_child(argv, cwd=None, env=None, timeout=120):
     """Run a child and ALWAYS return one line describing it -- never raise: an arm that asks
     what a child did must get an answer it can compare, not a traceback."""
@@ -1135,6 +1403,9 @@ def self_test():
     another raised: an exception fails that arm only, by name."""
     ran, failed = [], []
 
+    # ONE VERDICT LINE PER ARM, in the grammar `tests/test_support/script_selftest.hpp` reads: the ctest
+    # entry `owning_tree_selftest_guard` is a test binary that runs this and holds a case per arm, so a
+    # mutation of this file can be an arm of the mutation sweep. A failing arm's detail is put on ONE line.
     def pin(label, fn):
         try:
             res = fn()
@@ -1144,8 +1415,10 @@ def self_test():
         ran.append(label)
         if not ok:
             failed.append(label)
-        print("  %-4s %s%s" % ("ok" if ok else "FAIL", label,
-                               ("   [" + str(detail) + "]") if detail and not ok else ""))
+            said = (str(detail) or "no detail").replace("\r", " ").replace("\n", " ")
+            print("owning-tree self-test: FAILED  %s -- %s" % (label, said))
+        else:
+            print("owning-tree self-test: ok      %s" % label)
 
     def verdicts(resolver):
         return [a[0] for a in root_arms(resolver, (Refusal,), True, __file__)]
@@ -1633,6 +1906,191 @@ def self_test():
             return (isinstance(cfg, dict) and isinstance(cfg.get("worktrees"), dict)
                     and isinstance(cfg.get("legs"), dict), "keys=%r" % sorted(cfg)[:8])
         pin("J4 CONTROL: this tree's own config.json parses, with its worktrees and legs", j4)
+
+        # ── L: what a walk of a tree leaves out (`TreeIgnores`) ────────────────
+        # ONE fixture tree, shaped as this repository's `.gitignore` and the tool's block write it,
+        # holding a leg copy, a mutation worker, a session's scratch and a build beside the real
+        # files. Built on first use INSIDE an arm, so a reader that crashes fails the arms that ask
+        # it, each by name, and no other.
+        w_rules = "\n".join((
+            "# the repository's own rules", "*.o", "!keep.o", ".temp/", "build/", "build-*/",
+            "/src/dss-config/runtime/platform/dist/", ".claude/worktrees/", "[._]*.sw[a-p]",
+            "/gone/", "!/gone/back.md", "/.harness-config/*", "!/.harness-config/config.json",
+            "!/.harness-config/runner/", "/.harness-config/runner/*",
+            "!/.harness-config/runner/actions/",
+            "# >>> dss-harness managed block >>>", "/.harness-config/lock.json",
+            "/.harness-config/runs", "/.worktrees/*", "!/.worktrees/.gitkeep",
+            "/.orchestrators/*", "!/.orchestrators/.gitkeep", "/.mutations/*",
+            "!/.mutations/.gitkeep", "/.legs/*", "!/.legs/.gitkeep",
+            "/.harness-config/runner/actions/**/build/",
+            "# <<< dss-harness managed block <<<", ""))
+        w_kept = ("examples/README.md", "examples/c/x/main.c", "src/a.cpp", "src/dist/x.json",
+                  ".worktrees/.gitkeep", ".orchestrators/.gitkeep", ".mutations/.gitkeep",
+                  ".legs/.gitkeep", ".harness-config/config.json",
+                  ".harness-config/runner/actions/a/a.py", "keep.o", "x.swz", "tests/build",
+                  "docs/.claude/worktrees/z.md", "sub/x.md", ".gitignore")
+        w_out = (".legs/x/examples/README.md", ".mutations/aw-1/src/a.cpp", ".temp/x/notes.md",
+                 "tests/.temp/y.md", "build/v/bin/dss/r", "build-dbg/o",
+                 "src/dss-config/runtime/platform/dist/o.json", ".claude/worktrees/w/x.md",
+                 ".harness-config/runs/r/test.log", ".harness-config/lock.json",
+                 ".worktrees/lane/src/a.cpp", ".orchestrators/o/work/w.md",
+                 ".harness-config/runner/actions/a/build/o.txt",
+                 ".harness-config/runner/actions/a/b/build/o.txt", "a.o", ".x.swp",
+                 "gone/back.md", ".git/HEAD", "sub/.git")
+        w_box = {}
+
+        def w_tree():
+            if "tree" not in w_box:
+                t = os.path.join(box, "w-tree")
+                _touch(os.path.join(t, ".gitignore"), w_rules)
+                for rel in w_kept + w_out:
+                    if rel != ".gitignore":
+                        _touch(os.path.join(t, *rel.split("/")), "x\n")
+                w_box["tree"] = t
+            return w_box["tree"]
+
+        def w_walked(keep=()):
+            ti = TreeIgnores(w_tree(), keep)
+            got = set()
+            for dirpath, _dirnames, filenames in ti.walk():
+                rel = ti.rel(dirpath)
+                got.update((rel + "/" + f) if rel else f for f in filenames)
+            return got
+
+        def w_check(want_kept, want_out, keep=()):
+            got = w_walked(keep)
+            lost = sorted(p for p in want_kept if p not in got)
+            took = sorted(p for p in want_out if p in got)
+            return not lost and not took, "kept but missing=%r; left out but walked=%r" % (lost, took)
+
+        pin("L1 a walk leaves out a leg copy and a mutation worker the tool keeps in the tree, beside "
+            "the real files", lambda: w_check(("examples/README.md", "src/a.cpp"),
+                                              (".legs/x/examples/README.md", ".mutations/aw-1/src/a.cpp")))
+        pin("L2 a later rule decides: the block's placeholders and the re-included harness files stay, "
+            "its run records and its lock go",
+            lambda: w_check((".legs/.gitkeep", ".mutations/.gitkeep", ".worktrees/.gitkeep",
+                             ".harness-config/config.json", ".harness-config/runner/actions/a/a.py"),
+                            (".harness-config/runs/r/test.log", ".harness-config/lock.json",
+                             ".worktrees/lane/src/a.cpp", ".orchestrators/o/work/w.md")))
+        pin("L3 a rule with no slash leaves out that name at any depth, a session's scratch included",
+            lambda: w_check(("examples/c/x/main.c",), (".temp/x/notes.md", "tests/.temp/y.md")))
+        pin("L4 a rule with a slash is anchored to the tree's root: that directory goes, a namesake "
+            "elsewhere stays", lambda: w_check(("src/dist/x.json", "docs/.claude/worktrees/z.md"),
+                                               ("src/dss-config/runtime/platform/dist/o.json",
+                                                ".claude/worktrees/w/x.md")))
+        pin("L5 a rule ending in a slash matches a directory only: a FILE of that name stays",
+            lambda: w_check(("tests/build",), ("build/v/bin/dss/r",)))
+        pin("L6 a double-star segment is any number of directories",
+            lambda: w_check((".harness-config/runner/actions/a/a.py",),
+                            (".harness-config/runner/actions/a/build/o.txt",
+                             ".harness-config/runner/actions/a/b/build/o.txt")))
+        pin("L7 a file rule leaves out files and a later negation keeps one",
+            lambda: w_check(("keep.o",), ("a.o",)))
+        pin("L8 a star, a question mark and a class read as git reads them",
+            lambda: w_check(("x.swz",), (".x.swp", "build-dbg/o")))
+
+        def w9():
+            ti = TreeIgnores(w_tree())
+            asked = ti.leaves_out("gone/back.md", False)
+            walked = "gone/back.md" in w_walked()
+            return asked == "/gone/" and not walked, "leaves_out=%r walked=%r" % (asked, walked)
+        pin("L9 nothing under a directory left out is re-included, asked or walked", w9)
+        pin("L10 git's own directory and a worktree's git file are left out",
+            lambda: w_check(("sub/x.md",), (".git/HEAD", "sub/.git")))
+
+        def w_refused(text, line):
+            ok, msg = _raises(lambda: read_ignore_rules(text, "fixture-ignore"), Refusal)
+            return ok and ("fixture-ignore line %d" % line) in msg, msg[:120]
+        pin("L11 a rule holding a backslash is refused, naming its line",
+            lambda: w_refused("a/\nb\\#c\n", 2))
+        pin("L12 a class opened and never closed is refused, naming its line",
+            lambda: w_refused("x\ny\nz[ab\n", 3))
+
+        def w13():
+            cases = (("a//b\n", 1), ("ok\n/\n", 2), ("!\n", 1))
+            said = [w_refused(text, line) for text, line in cases]
+            return all(ok for ok, _ in said), "%r" % ([m for _, m in said],)
+        pin("L13 a rule naming nothing between two separators, or nothing at all, is refused", w13)
+
+        def w14():
+            t = os.path.join(box, "w14")
+            for rel in ("a/b.md", "build/x", ".git/HEAD"):
+                _touch(os.path.join(t, *rel.split("/")), "x\n")
+            ti = TreeIgnores(t)
+            got = set()
+            for dirpath, _d, filenames in ti.walk():
+                rel = ti.rel(dirpath)
+                got.update((rel + "/" + f) if rel else f for f in filenames)
+            return got == {"a/b.md", "build/x"}, "walked=%r" % sorted(got)
+        pin("L14 a tree with no .gitignore leaves out git's own directory alone", w14)
+        pin("L15 a directory kept is walked whole, whatever the rules say inside it",
+            lambda: w_check(("build/v/bin/dss/r",), ("build-dbg/o", ".temp/x/notes.md"), keep=("build",)))
+
+        def w16():
+            ti = TreeIgnores(w_tree())
+            top, tm = _raises(lambda: list(ti.walk(os.path.join(w_tree(), ".legs", "x"))), Refusal)
+            out, om = _raises(lambda: ti.rel(box), Refusal)
+            return top and "/.legs/*" in tm and out, "%r / %r" % (tm[:80], om[:80])
+        pin("L16 a walk whose top is left out is refused, and so is a path outside the tree", w16)
+
+        def w17():
+            ti = TreeIgnores(w_tree())
+            spelt = ti.leaves_out(".TEMP/x.md", False)
+            named = ti.leaves_out(".temp/x.md", False)
+            return spelt is None and named == ".temp/", "upper=%r lower=%r" % (spelt, named)
+        pin("L17 names compare as written, case and all", w17)
+
+        def w18():
+            ti = TreeIgnores(owning_tree(__file__))
+            answers = {d: (ti.leaves_out(d + "/x", True), ti.leaves_out(d + "/.gitkeep", False))
+                       for d in (".worktrees", ".orchestrators", ".mutations", ".legs")}
+            return (all(out and keep is None for out, keep in answers.values()),
+                    "answers=%r" % (answers,))
+        pin("L18 LIVE: this tree's own .gitignore leaves out every directory the tool keeps in a tree "
+            "and keeps each placeholder", w18)
+
+        def w19():
+            ti = TreeIgnores(w_tree())
+            got = w_walked()
+            disagree = sorted(p for p in w_kept + w_out
+                              if (ti.leaves_out(p, False) is None) != (p in got))
+            return not disagree, "walk and leaves_out disagree on %r" % disagree
+        pin("L19 the walk and the question about one path give one answer on every path", w19)
+
+        def w20():
+            tree = owning_tree(__file__)
+            p = run_git(["ls-files", "-z"], cwd=tree, capture_output=True)
+            if p.returncode != 0:
+                return False, "git ls-files exited %d: %s" % (
+                    p.returncode, p.stderr.decode("utf-8", "replace").strip()[:120])
+            tracked = [t for t in p.stdout.decode("utf-8", "surrogateescape").split("\0") if t]
+            ti = TreeIgnores(tree)
+            out = [(t, ti.leaves_out(t, False)) for t in tracked]
+            out = [o for o in out if o[1]]
+            return len(tracked) > 100 and not out, "%d tracked, left out: %r" % (len(tracked), out[:5])
+        pin("L20 LIVE: no file git tracks in this tree is left out of a walk -- a rule of its .gitignore "
+            "cannot silence a tracked file", w20)
+
+        # ── D: a path a command line names for a program to write (`written_path`) ──
+        def p_refused(value, flag):
+            ok, msg = _raises(lambda: written_path(value, flag), UsageRefusal)
+            return ok and flag in msg, msg[:120]
+
+        def p1():
+            said = [p_refused(v, f) for v, f in (("--help", "--out"), ("-h", "--json"), ("-", "--build-dir"))]
+            return all(ok for ok, _ in said), "%r" % ([m for _, m in said],)
+        pin("D1 a path to write that begins with `-` is an option taken for a value: refused, naming the flag", p1)
+
+        def p2():
+            said = [p_refused(v, "--out") for v in ("", "   ", None)]
+            return all(ok for ok, _ in said), "%r" % ([m for _, m in said],)
+        pin("D2 a path to write that is empty names no place: refused, naming the flag", p2)
+
+        def p3():
+            kept = ("build/compile-bench/x-y", "./-x", "report.json", "a-b")
+            got = [written_path(v, "--out") for v in kept]
+            return got == list(kept), "got %r" % (got,)
+        pin("D3 a path that holds a dash, or spells a leading one as `./-x`, is kept as given (the control)", p3)
 
         # ── X: the fence and the cleanup ──────────────────────────────────────
         def x2():

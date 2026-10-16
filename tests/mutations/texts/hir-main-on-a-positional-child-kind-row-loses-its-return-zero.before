@@ -1,0 +1,5 @@
+        // child decides the kind), with the two keys set on its row.
+        body = maybeAppendImplicitReturnZero(
+            node, body, sym, retType, decl);
+        body = maybeCompleteReachableNonVoidEnd(
+            node, bodyNode, body, sym, retType, decl);

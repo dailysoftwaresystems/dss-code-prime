@@ -47,6 +47,7 @@
 #include "mir/summary/mir_summary.hpp"
 #include "mir/summary/summary_index.hpp"
 #include "opt/optimizer.hpp"
+#include "link_facts.hpp"   // ordinaryLinkFormat (P69: the summary index and the lazy import read the link's document)
 
 #include <gtest/gtest.h>
 
@@ -256,6 +257,7 @@ ImportRun runImporter(std::vector<TestCu>& cus, SummaryIndexPolicy const& policy
                 std::vector<LazyImportCu> const& views) {
     ImportRun r;
     r.outcome = lazyImportOptimize(0, views, summaries, index, policy, "c",
+                                   dss::test_support::ordinaryLinkFormat(),
                                    optimizeOne, rep);
     r.mir = r.outcome.mir.has_value() ? std::move(*r.outcome.mir)
                                       : Mir{};
@@ -285,7 +287,8 @@ TEST(LazyImportEdge, LazyEdgeReachesBodiesThePrefetchPlanNeverOffers) {
     auto const views     = viewsOf(cus);
     DiagnosticReporter rep;
     auto const policy = policyAt(1);
-    auto index = buildSummaryIndex(summaries, policy, rep);
+    auto index = buildSummaryIndex(summaries, policy,
+                                   dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(index.has_value());
     ASSERT_TRUE(summariesDescribeModules(views, summaries, rep));
 
@@ -320,7 +323,8 @@ TEST(LazyImportEdge, PrefetchDepthChangesTheBatchCountAndNothingElse) {
         auto const views     = viewsOf(cus);
         DiagnosticReporter rep;
         auto const policy = policyAt(depth);
-        auto index = buildSummaryIndex(summaries, policy, rep);
+        auto index = buildSummaryIndex(summaries, policy,
+                                       dss::test_support::ordinaryLinkFormat(), rep);
         ASSERT_TRUE(index.has_value());
         ImportRun r = runImporter(cus, policy, noOptimize(), rep, *index, summaries,
                             views);
@@ -365,7 +369,8 @@ TEST(LazyImportEdge, EveryCrossCuCallIsSplicedAfterTheLazyImport) {
     auto const views     = viewsOf(cus);
     DiagnosticReporter rep;
     auto const policy = policyAt(1);
-    auto index = buildSummaryIndex(summaries, policy, rep);
+    auto index = buildSummaryIndex(summaries, policy,
+                                   dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(index.has_value());
 
     EXPECT_EQ(countOpcode(cus[0].mir, MirOpcode::Call), 1u)
@@ -393,7 +398,8 @@ TEST(LazyImportEdge, AnImportedBodyIsDeclaredAvailableExternallyAndNotEmitted) {
     auto const views     = viewsOf(cus);
     DiagnosticReporter rep;
     auto const policy = policyAt(4);
-    auto index = buildSummaryIndex(summaries, policy, rep);
+    auto index = buildSummaryIndex(summaries, policy,
+                                   dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(index.has_value());
 
     ImportRun const r = runImporter(cus, policy, realInliner(**targetR, rep), rep,
@@ -425,7 +431,8 @@ TEST(LazyImportEdge, StrippedBodiesAreNotReImported) {
     auto const views     = viewsOf(cus);
     DiagnosticReporter rep;
     auto const policy = policyAt(2);
-    auto index = buildSummaryIndex(summaries, policy, rep);
+    auto index = buildSummaryIndex(summaries, policy,
+                                   dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(index.has_value());
 
     ImportRun const r = runImporter(cus, policy, realInliner(**targetR, rep), rep,
@@ -477,7 +484,8 @@ TEST(LazyImportEdge, RefusesABodyThatReferencesItsOwnModulePrivateGlobal) {
     auto const views     = viewsOf(cus);
     DiagnosticReporter rep;
     auto const policy = policyAt(4);
-    auto index = buildSummaryIndex(summaries, policy, rep);
+    auto index = buildSummaryIndex(summaries, policy,
+                                   dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(index.has_value());
     ASSERT_TRUE(summariesDescribeModules(views, summaries, rep));
 
@@ -519,7 +527,8 @@ TEST(LazyImportEdge, TheBudgetStillDecidesTheOutcome) {
     DiagnosticReporter rep;
     // Each link is 3 MIR instructions; a budget of 4 admits exactly one body.
     auto const policy = policyAt(4, /*budget=*/4);
-    auto index = buildSummaryIndex(summaries, policy, rep);
+    auto index = buildSummaryIndex(summaries, policy,
+                                   dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(index.has_value());
 
     ImportRun const r = runImporter(cus, policy, noOptimize(), rep, *index, summaries,

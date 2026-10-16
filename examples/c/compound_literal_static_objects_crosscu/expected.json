@@ -1,0 +1,15 @@
+{
+  "$comment": "P69 (lane `cs`, D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT, the design audit's M1 pin): TWO compilation units, each with file-scope compound literals of the same shapes, merged into one program. The MIR tier mints each static unnamed object a nameless internal symbol through the string-literal allocator (`mintSyntheticGlobalSymbol`), and the cross-unit merge must keep all of them apart — never collide two nameless symbols, never fold one literal into its twin (they are not const, C 6.5.2.5p6 lets only const literals share). A write to one unit's object must leave the other's alone. The C meaning is ordinary (distinct static objects); the reference compilers were measured on the one-unit equivalent with the statics renamed, through `dssharness run probe-reference-cc` (it compiles one source): gcc 13.3.0 and clang 18.1.3 at -std=c17 -pedantic-errors and -std=c2x (run 20260930-222707-5281cab3) and MSVC 19.51 /std:clatest (20260930-222734-2b3c832b) all exit 42. The release arm is REPORT-ONLY.",
+  "language": "c",
+  "sources": ["main.c", "def.c"],
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": false }
+  ]
+}

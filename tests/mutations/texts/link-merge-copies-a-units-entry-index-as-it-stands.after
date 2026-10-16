@@ -1,0 +1,2 @@
+        (void)at;
+        combined.imageEntryOverride = *m.imageEntryOverride;   // the unit's own index

@@ -265,6 +265,16 @@ public:
         return d.elf.objectType == ElfObjectType::Rel;
     }
 
+    // D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69): the
+    // ET_EXEC writer places the image at its link address and gives every
+    // `nullAddressSymbols` entry the address 0 (both of its arms in elf.cpp),
+    // so `0 - P` is a constant there. An ET_DYN image's addresses are relative
+    // to a base the loader picks — no displacement from it reaches 0.
+    [[nodiscard]] bool writesNullAddressReferences(
+            detail::ObjectFormatData const& d) const noexcept override {
+        return d.elf.objectType == ElfObjectType::Exec;
+    }
+
     // ★★ THE BYTE PROBE. Three conditions, each DEFINITE:
     //   (1) the file opens with `0x7F 'E' 'L' 'F'` — the gABI magic;
     //   (2) its `e_ident[EI_CLASS]` and `e_ident[EI_DATA]` are the ones THIS
@@ -344,6 +354,19 @@ public:
                 coll.emit(DiagnosticCode::C_MalformedJson, "/elf",
                           "'elf' must be an object when format.kind == 'elf'");
             } else {
+                // CLOSED (P69, D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY):
+                // a misspelled key (`"interpeter"`) loaded clean and left the
+                // field it names at its default.
+                static constexpr std::array<std::string_view, 11> kElfBlockKeys{
+                    "machine", "abiVersion", "class", "data", "osabi", "type",
+                    "pageAlign", "interpreter", "bindNow", "soname",
+                    "dynamicRelocationTypes"};
+                ::dss::detail::rejectUnknownKeys(
+                    e, kElfBlockKeys, "the 'elf' block",
+                    [&](std::string_view key, std::string message) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/elf/{}", key), std::move(message));
+                    });
                 auto readU16 = [&](char const* field, std::uint16_t& out,
                                    std::int64_t max) {
                     if (!e.contains(field) || !e.at(field).is_number_integer())
@@ -517,6 +540,60 @@ public:
                     } else {
                         data.elf.bindNow =
                             e.at("bindNow").get<bool>();
+                    }
+                }
+                // `dynamicRelocationTypes` (P69,
+                // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): the
+                // psABI numbers of GLOB_DAT / JUMP_SLOT / RELATIVE, by role.
+                // A closed vocabulary of its own: a typo'd role would load
+                // clean and leave that role undeclared, which is exactly the
+                // hole the whole-image refusal below exists to close.
+                if (e.contains("dynamicRelocationTypes")) {
+                    auto const& t = e.at("dynamicRelocationTypes");
+                    static constexpr std::array<std::string_view, 3> kRoles{
+                        "globDat", "jumpSlot", "relative"};
+                    if (!t.is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/elf/dynamicRelocationTypes",
+                                  "'dynamicRelocationTypes' must be an object "
+                                  "{\"globDat\", \"jumpSlot\", \"relative\"} of "
+                                  "psABI relocation numbers");
+                    } else {
+                        ::dss::detail::rejectUnknownKeys(
+                            t, kRoles, "the ELF dynamic-relocation-type block",
+                            [&](std::string_view key, std::string message) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format(
+                                              "/elf/dynamicRelocationTypes/{}",
+                                              key),
+                                          std::move(message));
+                            });
+                        auto readRole = [&](std::string_view role,
+                                            std::uint32_t& out) {
+                            std::string const key{role};
+                            if (!t.contains(key)) return;
+                            auto const& v = t.at(key);
+                            std::int64_t const n =
+                                v.is_number_integer() ? v.get<std::int64_t>() : -1;
+                            if (n <= 0
+                                || n > static_cast<std::int64_t>(
+                                           std::numeric_limits<std::uint32_t>::max())) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format(
+                                              "/elf/dynamicRelocationTypes/{}",
+                                              role),
+                                          std::format(
+                                              "'{}' must be a psABI relocation "
+                                              "number in (0, 2^32)",
+                                              role));
+                                return;
+                            }
+                            out = static_cast<std::uint32_t>(n);
+                        };
+                        auto& types = data.elf.dynamicRelocationTypes;
+                        readRole(kRoles[0], types.globDat);
+                        readRole(kRoles[1], types.jumpSlot);
+                        readRole(kRoles[2], types.relative);
                     }
                 }
             }
@@ -797,6 +874,50 @@ public:
                  "R_X86_64_GLOB_DAT) is an exec-image concept; "
                  ".o files do not bind at all — the linker resolves "
                  "at exec build time.");
+        }
+        // `dynamicRelocationTypes` (P69,
+        // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): an image that
+        // CAN carry dynamic relocations — an ET_DYN, or an executable naming
+        // an interpreter — must state all three roles, because its writer
+        // has no other source for them (the `e_machine` switches are gone);
+        // anywhere else the block is inert and refused by name, as `soname`
+        // is on a non-DSO. Two roles sharing one number would make a
+        // canonical stub's own slot resolve to the stub: refused too.
+        {
+            auto const& types = elf.dynamicRelocationTypes;
+            bool const imageCanBind =
+                elf.objectType == ElfObjectType::Dyn
+                || (elf.objectType == ElfObjectType::Exec
+                    && !elf.interpreter.empty());
+            if (imageCanBind && !types.complete()) {
+                // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB (P69): the
+                // types the image writer used to switch on e_machine for.
+                fail("/elf/dynamicRelocationTypes",
+                     "an ELF image that binds imports at load (ET_DYN, or an "
+                     "executable naming an 'interpreter') must declare "
+                     "'elf.dynamicRelocationTypes' with all three roles — "
+                     "'globDat', 'jumpSlot' and 'relative' — the psABI numbers "
+                     "its `.rela.dyn` rows carry.");
+            }
+            if (!imageCanBind && types.anyDeclared()) {
+                fail("/elf/dynamicRelocationTypes",
+                     "'elf.dynamicRelocationTypes' is declared on an ELF image "
+                     "that binds nothing at load (a relocatable object, or an "
+                     "executable with no 'interpreter'), so no writer would "
+                     "ever read it — inert config is refused by name.");
+            }
+            if (types.complete()
+                && (types.globDat == types.jumpSlot
+                    || types.globDat == types.relative
+                    || types.jumpSlot == types.relative)) {
+                fail("/elf/dynamicRelocationTypes",
+                     std::format(
+                         "'elf.dynamicRelocationTypes' gives two roles one "
+                         "number (globDat {}, jumpSlot {}, relative {}); a "
+                         "canonical stub's slot then binds through the "
+                         "non-PLT lookup and resolves to the stub itself",
+                         types.globDat, types.jumpSlot, types.relative));
+            }
         }
         // Conversely, ET_REL must NOT carry virtual addresses (they're
         // set by the LINKER at exec build time, not declared on the

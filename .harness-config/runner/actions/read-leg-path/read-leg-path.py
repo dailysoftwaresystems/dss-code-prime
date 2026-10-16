@@ -12,6 +12,8 @@ WHAT IT READS: `--path`, relative to the leg's tree (`--tree`, filled in from `{
     expression, searched per line; `.` keeps every non-empty line);
   * a DIRECTORY -> its newest `--lines` entries, one per line: modified time, size, name
     (a trailing `/` marks a directory).
+Every option is spelled `--name=value` on the step's run line: a `--match` expression may begin with `-`, and
+argparse reads `--match -x` as a second option (exit 2) -- ✔FOUND 2026-09-30 (cycle P69), the self-test pins it.
 
 WHAT IT REFUSES, by name, exit 2, printing nothing read from the path:
   * an absolute `--path`, and any path that resolves OUTSIDE the tree (`..`, a link leaving it);
@@ -19,51 +21,33 @@ WHAT IT REFUSES, by name, exit 2, printing nothing read from the path:
     component named `.secrets`, `sshItems`, `.env` or `.ssh`, and a file named `.key`, `*.key`,
     `*.pem` or `id_*`;
   * a path that does not exist, and an unreadable `--match`;
-  * a host whose account cannot be named (no `getpass` answer and no home directory), because its
-    name could then not be redacted.
+  * a host whose account cannot be named, because its name could then not be redacted.
 
-REDACTION, applied to every line printed, names included: the tree's absolute path becomes
-`<tree>`, the home directory `~`, the user name `<user>` and the host's name `<host>` (each only
-when at least three characters long, so a one-letter name cannot shred the text). What leaves the
-host names the repository's files, never the machine or the account. ★ A PATH is replaced wherever
-it occurs; a NAME wherever it is not part of a longer run of ASCII letters or digits -- so `_`, `-`,
-`.`, `@`, `/`, a backslash, `:` and blanks all end one, and `<name>_x`, `<name>-mac`, `<name>.local`,
-`<name>@h`, `/home/<name>/` and `C:\\Users\\<name>\\` are all redacted, exactly as the substring rule
-redacted them -- because a name is also a piece of other words: ✔MEASURED 2026-09-24, on the arm64
-VPS a gcc version string came back as `13.3.0-6<user>2`, the account's name cut out of a word. The
-self-test pins both directions: the words a name is part of survive, and no shape the substring rule
-caught leaks. probe-reference-cc loads this redactor by path and adds nothing to the rule.
-★ A HOME DIRECTORY IS ALSO REDACTED BY ITS SHAPE, whatever account it names, at any length: the path
-component after ANY component named `home` or `Users` (any case, either slash, doubled backslashes)
-becomes `<user>` -- one rule for every spelling a home takes on some host: `/home/<name>`,
-`/Users/<name>`, `C:\\Users\\<name>`, `/mnt/c/Users/<name>`, `/c/Users/<name>`,
-`/cygdrive/c/Users/<name>`, `\\\\wsl.localhost\\<distro>\\home\\<name>` and `\\\\wsl$\\...`, Wine's
-`Z:\\home\\<name>`, a share's `\\\\server\\home\\<name>`, `file:///home/<name>`, `-I/home/<name>`.
-✔MEASURED 2026-09-25, twice: read on the WSL leg, a tracked file naming this machine's Windows home
-kept the Windows account name three times out of three (the WSL host knows its own account, which is
-another one); then the list of prefixes that fix enumerated missed the next ones -- the WSL home as
-Windows names it and Wine's -- which a tracked file also holds. So the host's own names are the first
-rule, never the only one, and the shape is keyed on the COMPONENT, not on a list of prefixes. The
-repository tracks no directory named `home` or `Users` (✔MEASURED 2026-09-25, `git ls-files`), so
-the rule costs it nothing; should one appear, its children are over-redacted in what this prints,
-and a word that is not an account (`/Users/Shared`) is too -- over-redacting is the direction a
-redactor may fail in.
+REDACTION: every line printed, names included, passes through the ONE redactor,
+`.harness-config/runner/actions/redact/redact.py`, loaded by path -- the tree becomes `<tree>`, the home `~`, this
+host's account `<user>` and its name `<host>`, a home by its shape `<user>` whatever account it names, and the
+foreign shapes (`<user>@<host>`, a key's path, an ssh command's connection values, addresses, UNC servers, ...)
+are masked too, because a host's copy holds tracked files naming OTHER machines (✔MEASURED 2026-09-25: read on the
+WSL leg, a tracked file kept this machine's Windows account three times out of three). The rules, their order, their
+limits and the exemptions -- a host named like a word the leg's own tree holds, a C++ scope -- are that file's,
+stated once; nothing here restates them.
 
 OUTPUT: the lines, then `read-leg-path: OK <n> line(s) of <path>` -- on stdout, and in `--out`,
 which the runner keeps, so `dssharness sync --pull` can bring it back.
 
-`--selftest` runs the refusal and redaction arms against a scratch tree and exits non-zero if
-any arm fails; each arm prints its name and verdict.
+`--selftest` runs the refusal, reading and redaction-through-the-reader arms against a scratch tree, counted
+against EXPECTED_ARMS, and exits non-zero if any fails or the count differs; each arm prints its name and verdict.
 """
 import argparse
-import getpass
+import importlib.util
 import io
 import os
 import re
-import socket
 import sys
 import tempfile
 import time
+
+sys.dont_write_bytecode = True  # this program loads redact.py by path: no __pycache__ beside another action
 
 # What this program prints is another program's log, so any character can reach the pipe: both streams are UTF-8
 # from IMPORT on (argument errors and --help print before main()), the repository's rule for every guard and action.
@@ -75,6 +59,23 @@ for _stream in (sys.stdout, sys.stderr):
 
 DENIED_COMPONENTS = {".secrets", "sshitems", ".env", ".ssh"}
 MAX_LINES = 5000
+_REDACT = []
+
+
+def redact_module():
+    """`.harness-config/runner/actions/redact/redact.py`, the one owner of the redaction rule, loaded ONCE by path
+    from this file's sibling directory (a hyphen-free name, but an action's program is never on sys.path). It FAILS
+    LOUD when absent rather than falling back to a local copy: a second spelling of what must never leave a host is
+    the drift one owner exists to end."""
+    if not _REDACT:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "redact", "redact.py")
+        if not os.path.isfile(path):
+            raise SystemExit("read-leg-path: cannot find %s -- the redaction rule lives there and nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_redact", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _REDACT.append(mod)
+    return _REDACT[0]
 
 
 def denied(rel):
@@ -88,81 +89,10 @@ def denied(rel):
     return None
 
 
-# The characters that make a NAME part of a LONGER run -- ASCII letters and digits only: a name inside
-# `13.3.0-6ubuntu2` or `dsscp` is a piece of another word, not the account or the machine, while `_`, `-`,
-# `.`, `@`, `/`, a backslash, `:` and blanks all end one, so every shape the substring rule caught is still
-# caught.
-NAME_CHARS = "A-Za-z0-9"
-
-# A HOME DIRECTORY BY ITS SHAPE (see REDACTION above): group 1 -- a separator, `home` or `Users` in any case, and the
-# separator(s) after it -- is kept, and group 2 -- the account -- becomes `<user>`. The account takes every character
-# Windows allows in a user name (so every POSIX name too): not a separator, a blank, `"` `'` `<` `>` `|` `:` `;` `,`
-# `=` `+` `*` `?` `[` `]`, except that a blank or an apostrophe BETWEEN two of those characters belongs to it
-# (`Ann Lee`, `O'Brien`) while a trailing quote does not. It never takes `<`, so `<user>` is never taken for a name a
-# second time.
-_SEP = r"(?:\\|/)"
-_ACCOUNT_CHAR = r"[^\\/\s\"'<>|:;,=+*?\[\]]"
-_ACCOUNT = _ACCOUNT_CHAR + r"+(?:[ ']" + _ACCOUNT_CHAR + r"+)*"
-HOME_SHAPE = re.compile(r"(?i)(" + _SEP + r"(?:home|users)" + _SEP + r"+)(" + _ACCOUNT + r")")
-
-
-class Unredactable(Exception):
-    """This host's account cannot be named, so what this program prints cannot be redacted: a refusal, never a
-    silent pass."""
-
-
-def account_name(home):
-    """This process's account: `getpass` (which reads LOGNAME, USER, LNAME and USERNAME, then the password
-    database), else the last component of `home` -- an account the process table cannot name still owns a home.
-    '' only when both are silent. ✔FOUND 2026-09-25 (the round-12 audit): a `getpass` failure used to leave the
-    account unredacted by name, silently, and the own-host self-test arm then checked nothing."""
-    try:
-        name = getpass.getuser()
-    except Exception:
-        name = ""
-    if not name and home:
-        name = os.path.basename(home.rstrip("/\\"))
-    return name
-
-
-def redactor(tree, user=None, host=None, home=None):
-    """-> apply(text). `user`, `host` and `home` default to this process's account, machine and home directory; a
-    test passes its own, so what it asserts never depends on the host it happens to run on. Raises `Unredactable`
-    when the account cannot be named."""
-    pairs = []
-    if home is None:
-        home = os.path.expanduser("~")
-    if user is None:
-        user = account_name(home)
-        if not user:
-            raise Unredactable("this host's account cannot be named (getpass failed and there is no home directory), "
-                               "so what this program prints cannot be redacted")
-    if host is None:
-        host = socket.gethostname()
-    for value, mark in ((tree, "<tree>"), (home, "~")):
-        if value and len(value) >= 3:
-            pairs.append((value, mark))
-            pairs.append((value.replace("\\", "/"), mark))
-            pairs.append((value.replace("/", "\\"), mark))
-    pairs.sort(key=lambda p: len(p[0]), reverse=True)  # longest first: the tree before the home it sits in
-    names = sorted({(value, mark) for value, mark in ((host, "<host>"), (host.split(".")[0], "<host>"),
-                                                      (user, "<user>")) if value and len(value) >= 3},
-                   key=lambda p: len(p[0]), reverse=True)  # the full host name before its first label
-    words = [(re.compile("(?<![%s])%s(?![%s])" % (NAME_CHARS, re.escape(value), NAME_CHARS)), mark)
-             for value, mark in names]
-
-    def apply(text):
-        for value, mark in pairs:   # a path, wherever it occurs
-            text = text.replace(value, mark)
-        text = HOME_SHAPE.sub(lambda m: m.group(1) + "<user>", text)  # a home by its shape, whatever account
-        for rx, mark in words:      # a name, only as a word or a path component
-            text = rx.sub(mark, text)
-        return text
-    return apply
-
-
-def read(tree, rel, lines, match):
-    """Return (exit code, output lines). Refusals return code 2 and a single explanatory line."""
+def read(tree, rel, lines, match, red=None):
+    """Return (exit code, output lines). Refusals return code 2 and a single explanatory line. `red` replaces this
+    host's redactor (a test's, over the same tree); the OK line says when the redactor walked the tree's vocabulary
+    for its one exemption, how many names it read and in how long."""
     if not rel:
         return 2, ["read-leg-path: REFUSED - --path is empty"]
     if os.path.isabs(rel) or re.match(r"^[A-Za-z]:", rel) or rel.startswith(("/", "\\")):
@@ -184,9 +114,10 @@ def read(tree, rel, lines, match):
         pattern = re.compile(match)
     except re.error as e:
         return 2, ["read-leg-path: REFUSED - --match is not a regular expression: %s" % e]
+    mod = redact_module()
     try:
-        red = redactor(root)
-    except Unredactable as e:
+        red = red or mod.redactor(root)
+    except mod.Unredactable as e:
         return 2, ["read-leg-path: REFUSED - %s" % e]
     out = []
     if os.path.isdir(target):
@@ -208,33 +139,50 @@ def read(tree, rel, lines, match):
         kept = [ln for ln in text.splitlines() if ln.strip() and pattern.search(ln)]
         out = [red(ln) for ln in kept[-lines:]]
         what = "%d line(s) of %s" % (len(out), rel)
-    out.append("read-leg-path: OK %s" % red(what))
+    vocab = red.vocabulary() if hasattr(red, "vocabulary") else None
+    walked = "" if vocab is None else " (tree vocabulary: %d name(s) in %.2f s%s)" % (
+        len(vocab.names), vocab.seconds, "" if vocab.complete else ", cut short -- fewer names kept, never more")
+    out.append("read-leg-path: OK %s%s" % (red(what), walked))
     return 0, out
 
 
+# ★ AN EXACT RATCHET (the round-12 audit: this self-test counted failures and never how many arms ran, so a deleted
+# arm passed). Every arm below is host-independent; the one that reads this host's own names is ONE arm.
+EXPECTED_ARMS = 17
+
+
 def selftest():
-    failures = 0
+    ran, failed = [0], [0]
+
+    def arm(label, ok, detail=""):
+        ran[0] += 1
+        failed[0] += 0 if ok else 1
+        print("read-leg-path selftest: %-40s %s" % (label, "ok" if ok else "FAIL" + (("\n" + detail) if detail
+                                                                                      else "")))
+
     with tempfile.TemporaryDirectory() as tmp:
         tree = os.path.realpath(tmp)
         os.makedirs(os.path.join(tree, "logs"))
         os.makedirs(os.path.join(tree, ".harness-config", "sshItems", "mac"))
         with io.open(os.path.join(tree, "logs", "build.log"), "w", encoding="utf-8") as f:
-            f.write("first\nFAILED: step\nat %s/src/a.cpp\nlast\n" % tree)
+            f.write("first\nFAILED: step\nat %s/src/a.cpp\n-x marks a line\nlast\n" % tree)
         with io.open(os.path.join(tree, ".harness-config", "sshItems", "mac", ".env"), "w", encoding="utf-8") as f:
             f.write("ADDRESS=secret\n")
-        # A home of an account this host has never heard of, as a tracked file carries one (the WSL case below).
+        # A home of an account this host has never heard of, as a tracked file carries one (the WSL case), and the
+        # foreign shapes a host copy's tracked files can hold.
         with io.open(os.path.join(tree, "logs", "homes.log"), "w", encoding="utf-8") as f:
             f.write("//     input : C:\\Users\\winacct\\AppData\\Local\\Temp\\DSS-SC~1\n"
                     "cd /mnt/c/Users/winacct/src && gcc -I/home/lnxacct/include a.c\n"
                     "//     unc   : //wsl.localhost/Ubuntu/home/lnxacct/p44_unc_inc\n"
-                    "wine: Z:\\home\\lnxacct\\test\n")
+                    "wine: Z:\\home\\lnxacct\\test\n"
+                    "ssh lnxacct@buildbox.local 10.20.30.40\n")
         arms = [
             ("absolute path refused", "/etc/passwd", 2, "not absolute"),
             ("parent escape refused", "../outside", 2, "outside the leg's tree"),
             ("connection data refused", ".harness-config/sshItems/mac/.env", 2, "connection data"),
             ("key name refused", "logs/id_ed25519", 2, "key file"),
             ("missing path refused", "logs/none.log", 2, "no such path"),
-            ("tail of a file", "logs/build.log", 0, "OK 4 line(s)"),
+            ("tail of a file", "logs/build.log", 0, "OK 5 line(s)"),
             ("the tree path is redacted", "logs/build.log", 0, "<tree>/src/a.cpp"),
             ("a directory is listed", "logs", 0, "build.log"),
         ]
@@ -244,161 +192,95 @@ def selftest():
             ok = rc == want_rc and want_text in body and (want_rc != 0 or "secret" not in body)
             if name == "the tree path is redacted":
                 ok = ok and tree not in body
-            print("read-leg-path selftest: %-28s %s" % (name, "ok" if ok else "FAIL (rc=%d)\n%s" % (rc, body)))
-            failures += 0 if ok else 1
-        # ★ EVERY NAME SYNTHESIZED, THE HOME INCLUDED -- and on purpose names that COLLIDE: an account named like a
-        # distro word, its home the home rule's own, and a host named like this project's prefix. ✔MEASURED
-        # 2026-09-25: with the home taken from the process, the arm64 VPS -- whose account IS that distro word --
-        # ran the `/home/<name>/` arm red, and only there.
-        red = redactor(tree, user="ubuntu", host="dss.example", home="/home/ubuntu")
-        # KEPT: a name that is part of a longer run of letters or digits is another word.
-        for label, text in (("a name inside a version is KEPT", "gcc 13.3.0-6ubuntu2"),
-                            ("a name inside a program name is KEPT", "dsscp.exe --version")):
-            got = red(text)
-            ok = got == text
-            print("read-leg-path selftest: %-28s %s" % (label, "ok" if ok else "FAIL: %r -> %r" % (text, got)))
-            failures += 0 if ok else 1
-        # NO LEAK: every shape the old substring rule redacted is still redacted.
-        for text in ("ubuntu_x", "ubuntu-mac", "ubuntu.local", "ubuntu@h", "/home/ubuntu/", "C:\\Users\\ubuntu\\",
-                     "dss_x", "dss-mac", "dss.local", "x@dss.example:", "ssh dss"):
-            got = red(text)
-            ok = "ubuntu" not in got and "dss" not in got and ("<user>" in got or "<host>" in got or "~" in got)
-            print("read-leg-path selftest: %-28s %s" % ("no leak in %r" % text,
-                                                     "ok" if ok else "FAIL: %r -> %r" % (text, got)))
-            failures += 0 if ok else 1
-        # COLLISIONS, the same on every leg: the synthesized home is the home rule's, and a host named like the
-        # project's prefix over-redacts that vocabulary -- the direction a redactor may fail in -- never letting it by.
-        for label, text, want in (("the synthesized home is ~", "/home/ubuntu/src/a.cpp", "~/src/a.cpp"),
-                                  ("a host named like the prefix", "bin/dss/dss_examples_runner",
-                                   "bin/<host>/<host>_examples_runner")):
-            got = red(text)
-            ok = got == want
-            print("read-leg-path selftest: %-28s %s" % (label, "ok" if ok else "FAIL: %r -> %r" % (text, got)))
-            failures += 0 if ok else 1
-        # HOME SHAPES, for accounts this redactor was never told about.
-        stranger = redactor(tree, user="someone", host="h.example", home="/home/someone")
-        for text, want in (
-                ("C:\\Users\\winacct\\AppData\\Local\\Temp\\x", "C:\\Users\\<user>\\AppData\\Local\\Temp\\x"),
-                ("path C:\\\\Users\\\\winacct\\\\src", "path C:\\\\Users\\\\<user>\\\\src"),
-                ("c:/users/winacct/x", "c:/users/<user>/x"),
-                ("D:\\Users\\Ann Lee\\AppData", "D:\\Users\\<user>\\AppData"),
-                ("/mnt/c/Users/winacct/AppData", "/mnt/c/Users/<user>/AppData"),
-                ("/mnt/d/users/Ann Lee/x", "/mnt/d/users/<user>/x"),
-                ("cd /c/Users/winacct/src", "cd /c/Users/<user>/src"),
-                ("/Users/macacct/Library/x", "/Users/<user>/Library/x"),
-                ("cd /home/lnxacct/src", "cd /home/<user>/src"),
-                ("HOME=/home/ab", "HOME=/home/<user>"),
-                ("gcc -I/home/lnxacct/include", "gcc -I/home/<user>/include"),
-                ("'/home/lnxacct'", "'/home/<user>'"),
-                # ✔MEASURED 2026-09-25 (the round-12 audit): the WSL home as Windows names it, and Wine's, were kept
-                # by the list of prefixes the first fix enumerated -- and a tracked file holds both.
-                ("//wsl.localhost/Ubuntu/home/lnxacct/p44", "//wsl.localhost/Ubuntu/home/<user>/p44"),
-                ("\\\\wsl.localhost\\Ubuntu\\home\\lnxacct\\x", "\\\\wsl.localhost\\Ubuntu\\home\\<user>\\x"),
-                ("\\\\wsl$\\Ubuntu\\home\\lnxacct", "\\\\wsl$\\Ubuntu\\home\\<user>"),
-                ("C:\\wsl.localhost\\Ubuntu\\home\\lnxacct\\x", "C:\\wsl.localhost\\Ubuntu\\home\\<user>\\x"),
-                ("Z:\\home\\lnxacct\\test", "Z:\\home\\<user>\\test"),
-                ("Z:/home/lnxacct/src", "Z:/home/<user>/src"),
-                ("/cygdrive/c/Users/winacct/x", "/cygdrive/c/Users/<user>/x"),
-                ("\\\\fileserver\\home\\lnxacct\\docs", "\\\\fileserver\\home\\<user>\\docs"),
-                ("file:///home/lnxacct/a.c", "file:///home/<user>/a.c"),
-                ("/HOME/Lnxacct/x", "/HOME/<user>/x"),
-                ("C:\\Users\\O'Brien\\x", "C:\\Users\\<user>\\x"),
-                # OVER-REDACTED, the permitted direction: the repository tracks no `home` or `Users` directory.
-                ("docs/home/guide.md", "docs/home/<user>")):
-            got = stranger(text)
-            ok = got == want
-            print("read-leg-path selftest: %-28s %s" % ("home shape %r" % text, "ok" if ok else "FAIL: -> %r" % got))
-            failures += 0 if ok else 1
-        for text in ("the Users guide", "home/x", "/homework/x", "/users-guide/x", "/myhome/x",
-                     "~/src/a.cpp", "/home/<user>/src"):
-            got = stranger(text)
-            ok = got == text
-            print("read-leg-path selftest: %-28s %s" % ("not a home: %r" % text, "ok" if ok else "FAIL: -> %r" % got))
-            failures += 0 if ok else 1
-        # THROUGH THE REAL INPUT PATH: a stranger's homes in a file, read by read(), which takes this host's names.
+            arm(name, ok, "rc=%d\n%s" % (rc, body))
+        # THROUGH THE REAL INPUT PATH: a stranger's homes and the foreign shapes in a file, read by read(), which
+        # takes this host's names and the one redactor's rules.
         rc, lines = read(tree, "logs/homes.log", 200, ".")
         body = "\n".join(lines)
-        ok = (rc == 0 and "acct" not in body and "C:\\Users\\<user>\\AppData" in body
-              and "/mnt/c/Users/<user>/src" in body and "-I/home/<user>/include" in body
-              and "//wsl.localhost/Ubuntu/home/<user>/p44_unc_inc" in body and "Z:\\home\\<user>\\test" in body)
-        print("read-leg-path selftest: %-28s %s" % ("a stranger's home in a file", "ok" if ok else "FAIL (rc=%d)\n%s"
-                                                     % (rc, body)))
-        failures += 0 if ok else 1
-        # THIS HOST'S OWN NAMES, on whichever leg runs this: its home, and its account in every home shape, never
-        # survive. A failure prints only a length: printing what survived would publish the name.
-        me = redactor(tree)
-        home = os.path.expanduser("~")
-        account = account_name(home)
-        ok = len(account) >= 1
-        print("read-leg-path selftest: %-28s %s" % ("this host's account is named", "ok" if ok else
-                                                 "FAIL: the account cannot be named, so no arm below checks it"))
-        failures += 0 if ok else 1
-        # The ACCOUNT FALLBACK and the REFUSAL, synthesized: getpass made to fail, then the home taken away too.
-        real_getuser = getpass.getuser
+        arm("a stranger's home in a file", rc == 0 and "acct" not in body
+            and "C:\\Users\\<user>\\AppData" in body and "/mnt/c/Users/<user>/src" in body
+            and "-I/home/<user>/include" in body and "//wsl.localhost/Ubuntu/home/<user>/p44_unc_inc" in body
+            and "Z:\\home\\<user>\\test" in body, "rc=%d\n%s" % (rc, body))
+        arm("a foreign host and address in a file", rc == 0 and "ssh <user>@<host> <ip>" in body
+            and "buildbox" not in body and "10.20" not in body, body)
+        rc, lines = read(tree, "logs/build.log", 200, "FAILED")
+        arm("--match filters lines", rc == 0 and lines[0] == "FAILED: step" and "OK 1 line(s)" in lines[-1],
+            "\n".join(lines))
+        # THE ONE EXEMPTION, reached through the reader, with a SYNTHETIC host over this scratch tree: a path the
+        # tree holds keeps the name, and the OK line says the vocabulary was walked; a text without the name walks
+        # nothing and says nothing.
+        os.makedirs(os.path.join(tree, "build", "v1", "bin", "syn"))
+        io.open(os.path.join(tree, "build", "v1", "bin", "syn", "syn_examples_runner"), "w").close()
+        with io.open(os.path.join(tree, "logs", "syn.log"), "w", encoding="utf-8") as f:
+            f.write("ran build/v1/bin/syn/syn_examples_runner on syn\n")
+        synthetic = redact_module().redactor(tree, user="ubuntu", host="syn.example", home="/home/ubuntu",
+                                             os_family="posix")
+        rc, lines = read(tree, "logs/syn.log", 200, ".", red=synthetic)
+        arm("a tree-held name is kept, the walk reported", rc == 0
+            and lines[0] == "ran build/v1/bin/syn/syn_examples_runner on <host>"
+            and "(tree vocabulary: " in lines[-1], "\n".join(lines))
+        rc, lines = read(tree, "logs/build.log", 200, ".", red=redact_module().redactor(
+            tree, user="ubuntu", host="syn.example", home="/home/ubuntu", os_family="posix"))
+        arm("no host name, no walk, no report", rc == 0 and "tree vocabulary" not in lines[-1], lines[-1])
+        # A HOST WHOSE ACCOUNT NOBODY CAN NAME: read() refuses and prints nothing it read.
+        mod = redact_module()
+        real = mod.account_names
+        saved = {v: os.environ.pop(v, None) for v in ("USERNAME", "USER", "LOGNAME")}
+        real_getuser = mod.getpass.getuser
 
         def refuse():
             raise OSError("synthetic: no account in the process table")
-        getpass.getuser = refuse
+        mod.account_names = lambda _home: set()
+        mod.getpass.getuser = refuse
         try:
-            try:
-                got = redactor(tree, host="h.example", home="/home/fbacct")("fbacct@h.example ran")
-            except Unredactable:
-                got = "REFUSED: the home did not name the account"
-            ok = "fbacct" not in got and "<user>" in got
-            print("read-leg-path selftest: %-28s %s" % ("no getpass: the home names it", "ok" if ok else
-                                                     "FAIL: -> %r" % got))
-            failures += 0 if ok else 1
-            try:
-                redactor(tree, host="h.example", home="")
-                ok = False
-            except Unredactable:
-                ok = True
-            print("read-leg-path selftest: %-28s %s" % ("no account at all is refused", "ok" if ok else
-                                                     "FAIL: a redactor was built that cannot redact the account"))
-            failures += 0 if ok else 1
-            real_account_name = globals()["account_name"]
-            globals()["account_name"] = lambda _home: ""
-            try:
-                rc, lines = read(tree, "logs/build.log", 200, ".")
-            finally:
-                globals()["account_name"] = real_account_name
-            ok = rc == 2 and len(lines) == 1 and "account cannot be named" in lines[0]
-            print("read-leg-path selftest: %-28s %s" % ("read() refuses it, prints none", "ok" if ok else
-                                                     "FAIL (rc=%d, %d line(s))" % (rc, len(lines))))
-            failures += 0 if ok else 1
+            rc, lines = read(tree, "logs/build.log", 200, ".")
         finally:
-            getpass.getuser = real_getuser
-        texts = [home + "/x", home.replace("/", "\\") + "\\x"]
-        if len(account) >= 3:
-            texts += ["/home/%s/x" % account, "C:\\Users\\%s\\x" % account, "/Users/%s/x" % account,
-                      "/mnt/c/Users/%s/x" % account, "//wsl.localhost/Ubuntu/home/%s/x" % account,
-                      "\\\\wsl$\\Ubuntu\\home\\%s\\x" % account, "Z:\\home\\%s\\x" % account]
-        gone = re.compile("(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(account)) if account else None
-        for text in texts:
-            got = me(text)
-            unmarked = got.replace("<user>", "").replace("<host>", "").replace("<tree>", "")  # an account named `user`
-            ok = home not in got and not (gone and gone.search(unmarked))
-            print("read-leg-path selftest: %-28s %s" % ("this host's home and account", "ok" if ok else
-                                                     "FAIL: a real name survived (%d characters kept)" % len(got)))
-            failures += 0 if ok else 1
-        rc, lines = read(tree, "logs/build.log", 200, "FAILED")
-        ok = rc == 0 and lines[0] == "FAILED: step" and "OK 1 line(s)" in lines[-1]
-        print("read-leg-path selftest: %-28s %s" % ("--match filters lines", "ok" if ok else "FAIL"))
-        failures += 0 if ok else 1
-    print("read-leg-path selftest: %s" % ("OK" if failures == 0 else "FAIL - %d arm(s)" % failures))
-    return 1 if failures else 0
+            mod.account_names = real
+            mod.getpass.getuser = real_getuser
+            for v, value in saved.items():
+                if value is not None:
+                    os.environ[v] = value
+        arm("read() refuses an unnameable account", rc == 2 and len(lines) == 1
+            and "account cannot be named" in lines[0], "rc=%d, %d line(s)" % (rc, len(lines)))
+        # THIS HOST'S OWN HOME, whichever leg runs this: ONE arm, and a failure prints only a length.
+        home = os.path.expanduser("~")
+        with io.open(os.path.join(tree, "logs", "mine.log"), "w", encoding="utf-8") as f:
+            f.write("%s/x\n%s\\x\n" % (home, home.replace("/", "\\")))
+        rc, lines = read(tree, "logs/mine.log", 200, ".")
+        arm("this host's home never survives", rc == 0 and not any(home in ln for ln in lines),
+            "a real home survived (%d line(s))" % len(lines))
+    # A --match that BEGINS WITH `-`, spelled as the step spells it, reaches the program as its value.
+    a = build_parser().parse_args(["--tree=t", "--path=p", "--match=-x marks", "--lines=3", "--out=o"])
+    arm("a --match beginning with '-' is a value", a.match == "-x marks" and a.lines == 3, repr(vars(a)))
+    yml = os.path.join(os.path.dirname(os.path.realpath(__file__)), "read-leg-path.yml")
+    with io.open(yml, encoding="utf-8") as f:
+        run_line = next((ln for ln in f if "read-leg-path.py" in ln and "--tree" in ln), "")
+    loose = re.findall(r"(--[a-z0-9-]+)(?=\s)", run_line)
+    arm("the .yml spells every option --name=value", bool(run_line) and not loose, "loose options: %r" % loose)
+    total = ran[0]
+    ok = failed[0] == 0 and total == EXPECTED_ARMS
+    if total != EXPECTED_ARMS:
+        print("read-leg-path selftest: ARM COUNT %d, expected %d -- EXPECTED_ARMS is the ratchet"
+              % (total, EXPECTED_ARMS))
+    print("read-leg-path selftest: %s" % ("OK (%d arm(s))" % total if ok else "FAIL - %d of %d arm(s)"
+                                          % (failed[0], total)))
+    return 0 if ok else 1
 
 
-def main(argv):
-    if argv[1:] == ["--selftest"]:
-        return selftest()
-    ap = argparse.ArgumentParser(description="Read one path inside a leg's tree, redacted.")
+def build_parser():
+    ap = argparse.ArgumentParser(description="Read one path inside a leg's tree, redacted.", allow_abbrev=False)
     ap.add_argument("--tree", required=True)
     ap.add_argument("--path", required=True)
     ap.add_argument("--lines", type=int, default=200)
     ap.add_argument("--match", default=".")
     ap.add_argument("--out", required=True)
-    a = ap.parse_args(argv[1:])
+    return ap
+
+
+def main(argv):
+    if argv[1:] == ["--selftest"]:
+        return selftest()
+    a = build_parser().parse_args(argv[1:])
     if not 1 <= a.lines <= MAX_LINES:
         print("read-leg-path: REFUSED - --lines must be between 1 and %d" % MAX_LINES)
         return 2

@@ -1,0 +1,2 @@
+    if (false && !prefixed && rule->decimalPastRange.has_value()) {
+        TypeKind const k = rule->decimalPastRange->resolveCore(dm);

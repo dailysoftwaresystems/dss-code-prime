@@ -4,9 +4,9 @@
 ONE command proves dsscp builds SQLite from its REAL sources into the Tcl `testfixture` and the
 `sqlite3` CLI, and runs SQLite's own `.test` corpus green, for EVERY leg `legs.json` declares, on
 whatever host runs it -- Linux, macOS, an arm64 VPS or Windows (the POSIX half then runs inside
-WSL through `wsl.exe -e`). It replaced `build-and-test.sh` and its Windows twin `build-and-test.ps1`
-on 2026-09-21 (lane mig, part 4: the operator's order that no `.sh`/`.ps1` lives under the actions
-directory), and carries the UNION of both drivers' checks.
+WSL through `wsl.exe -d <the WSL legs' distribution> -e`). It replaced `build-and-test.sh` and its
+Windows twin `build-and-test.ps1` on 2026-09-21 (lane mig, part 4: the operator's order that no
+`.sh`/`.ps1` lives under the actions directory), and carries the UNION of both drivers' checks.
 
 ★★ TARGET-KEYED, NEVER HOST-KEYED. Which legs exist is declared, host-free, in `legs.json` and
 resolved by `harness_legs.py` -- the SAME legs on every host, every one of them BUILT. The only
@@ -21,8 +21,9 @@ The pipeline (each step in its own module beside this file):
   1  identify the host, resolve the leg plan, apply DSS_LEGS / DSS_RUN_FIDELITY, check every
      launcher's DECLARED prerequisites (`sqlite_common`, here);
   2  VERIFY the dsscp checkout (never switched or pulled), take the RUN LOCK;
-  3–4 fetch sqlite, configure it, derive the full-source recipes, build the reference oracles,
-     stage sources and headers (`sqlite_stage`, in WSL on Windows);
+  3–4 put THIS run's own sqlite checkout on the pin (inside the output tree; in WSL's cache, keyed by
+     the output tree, on a Windows host), configure it, derive the full-source recipes, build the
+     reference oracles, stage sources and headers (`sqlite_stage`, in WSL on Windows);
   5  take the dsscp the run was GIVEN (--dss / DSS_BIN; REQUIRED, and a run naming none is refused
      before Step 0), through the ONE Release gate, and prove it current (`sqlite_compiler`);
   6  stage the per-target headers, resolve each leg's DECLARED (tcl, z) libraries
@@ -33,9 +34,10 @@ The pipeline (each step in its own module beside this file):
   9  the ledger and the exit code (`sqlite_report`).
 
 Exit codes: 0 every selected leg verified green; 1 anything else (every reason printed);
-2 a malformed command line; 3 another run holds the shared sqlite clone (first stderr line
-`DSS-CLONE-LOCK-BLOCKED`). The environment knobs are read and validated up front
-(`sqlite_common.Config`).
+2 a malformed command line; 3 another run holds the sqlite checkout this run stages from (first
+stderr line `DSS-CLONE-LOCK-BLOCKED`) -- since 2026-09-30 each run's own is its output tree's
+(`sqlite_stage.consumer_checkout`), so only a checkout a person names for two runs (SQLITE_DIR) meets
+it. The environment knobs are read and validated up front (`sqlite_common.Config`).
 
 The command line (2026-09-25), what sqlite.yml's steps pass from their inputs -- each `--name=value`
 or `--name value`, at most once:
@@ -45,6 +47,10 @@ or `--name value`, at most once:
   --dss PATH       the dsscp this run uses, as named -- never searched for, never rebuilt (DSS_BIN);
                    REQUIRED, one channel or the other; every step passes the leg's own, `{product}`
   --recompile L    the round-close recompile of leg L (below); it takes --dss and --dss-config
+  --step S         THIS RUN IS THE DssHarness STEP S (2026-09-30): its run line passes exactly the flags
+                   `STEP_FLAGS` names for it, and every other steering variable set in the environment is
+                   REFUSED by name (`sqlite_common.STEERING`); a step is strict -- an environmental leg
+                   skip fails it
 A flag and its environment variable naming different values is refused.
 
 `--self-test` runs Step 0 ALONE and exits (0 every check held, 1 not): the gate's entry
@@ -64,6 +70,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -90,6 +97,119 @@ MODULE_SELF_TESTS = ("sqlite_base.py", "sqlite_coherence.py", "sqlite_corpus.py"
 
 
 # ── Step 0 ────────────────────────────────────────────────────────────────────────────
+
+# ★ WHICH ARMS MAY SKIP, AND WHY -- DECLARED PER SUITE (2026-09-30, the round-12 audit's S6). A skip used to be
+# unbounded here: Step 0 read a suite's `skipped=N`, warned, and passed -- so an arm that began to skip (a gate that
+# stopped looking, a guard moved behind a condition) read as a clean suite on every host. Each suite's SKIP lines are
+# read now, BY ARM: every one must match an arm this table declares skippable -- a regex over the arm's id, the
+# first word after the suite's own SKIP marker -- with the reason that is the HOST's, never the code's; a skip no
+# entry declares, or a count of skips the printed lines do not add up to, is an EXCESS that refuses the run exactly
+# as a failing suite does. Declared from the arms' OWN skip sites (every `skip`/`_SKIP` those files hold), never from
+# one host's measurement: a suite runs on every leg's host, and each host skips its own share (a Windows host the
+# POSIX-only arms, a POSIX host the Windows-only ones, a test-only host what it declared it lacks). A new skip site is
+# a new entry here, reviewed with it. (The benchmark's self-test, which Step 0 does not run, keeps its own
+# declaration: `benchmark_speedtest1.SKIPPABLE`.)
+# ★ KEYED BY WHERE THE SKIP MAY HAPPEN (2026-10-01, the P69 review's MINOR 1): an entry declared for every host let
+# a POSIX host skip the POSIX-only clone-lock arms -- the very arms the skip line says run THERE -- and pass. Each
+# entry now names WHERE: a host family (`sqlite_common.host_os()`: linux, darwin, windows) where the arm cannot run;
+# TEST_ONLY, any family, but only on a host that declares it only runs the tree's tests (DSS_SQLITE_HARNESS_HOST=0:
+# a capability arm SKIPS there what it FAILS on a harness host); or ANY_HOST, a gate of the arm's own (git, make, a
+# symlink, process enumeration) that any host may lack. A skip of a declared arm somewhere its entry does not name is
+# an EXCESS like an undeclared one. ✔MEASURED 2026-10-01 against every leg's own skips, `dssharness run
+# sqlite-self-test` run 20261001-182225-33cbdf69: linux (x86_64 and arm64) skipped CL00 DC05 LA04 LK00-LK12 and
+# DC-13/RT0-RT1; darwin the same and `[probe_link]` (no ldconfig there); windows CL01-CL20 with CL10b and CL19b, n17,
+# and `[derive_cli] [find] [orchestration] [pin_exec] [pin_shim] [probe_link] [sourcing] [tcl_choice] [tclsh_real]`.
+# A read of the linux leg's own log through `read-leg-path` (run 20261001-182808-a108eff5) shows its sqlite_procs.py
+# OK (88 assertions) with CL00 the one clone-lock skip, so CL19b and CL20 RAN there.
+POSIX_HOSTS = ("linux", "darwin")
+WINDOWS_HOST = ("windows",)
+TEST_ONLY = ("test-only",)
+ANY_HOST = ("any",)
+SKIP_ALLOWANCE = {
+    "test_confound_scope.py": (
+        (r"(PV|GT)\d\d", ANY_HOST, "an arm over REAL repositories, gated on `git`: a host without git on its PATH"),),
+    "test_driver_contracts.py": (
+        (r"DC-13/RT[01]", POSIX_HOSTS + TEST_ONLY,
+         "the windows-to-wsl translator's arms: that translator exists on a Windows host alone, and a Windows host "
+         "skips it only where it declares it runs the tests alone (RT0's capability judgement)"),
+        (r"DC-20/(D01|REST)", ANY_HOST, "the native decoy and process-chain arms: a host whose process enumeration "
+                                        "cannot run cannot look"),
+        (r"RD-\d+[a-z]?", ANY_HOST, "a red arm whose pin skips on this host: a named skip, never a vacuous pass"),),
+    "sqlite_base.py": (
+        (r"n16", ANY_HOST, "a directory symlink: a host that cannot create one here"),
+        (r"n47", ANY_HOST, "the REAL make: a host without make on its PATH"),
+        (r"n70", ANY_HOST, "an archive this host's own ar wrote from its own gcc's objects: a host without either"),),
+    "sqlite_coherence.py": (
+        (r"n17", ANY_HOST, "an UNREADABLE file: needs a POSIX host, a non-root user and a filesystem that keeps "
+                           "mode bits"),
+        (r"n18", ANY_HOST, "a symlinked file: a host that cannot create a symlink here"),),
+    "sqlite_corpus.py": (),
+    "sqlite_procs.py": (
+        (r"CL(0[1-9]|1\d|20)[a-z]?", WINDOWS_HOST, "the clone lock is POSIX-only: it runs where a checkout lives "
+                                                   "-- inside WSL on a Windows host"),
+        (r"CL00", POSIX_HOSTS, "the Windows refusal of a construction: a POSIX host constructs the lock"),
+        (r"LK\d\d", POSIX_HOSTS, "an image named by the path it was opened by is a Windows kernel's"),
+        (r"LK(0[6-9]|10)", WINDOWS_HOST, "the 8.3 SHORT spelling needs a volume that makes short names"),
+        (r"DC05", POSIX_HOSTS, "the image match's case and separator folding is Windows': a POSIX host matches byte "
+                               "for byte"),
+        (r"LA04", POSIX_HOSTS, "a launched fixture's kernel: on a POSIX host `env` enters its own kernel"),
+        (r"LA0W|LA0[1-7]", TEST_ONLY, "a launched fixture's kernel: a usable WSL, which a Windows harness host "
+                                      "needs (LA0W's capability judgement)"),),
+    "sqlite_stage.py": (
+        (r"\[pin_shim\]", WINDOWS_HOST, "the shim's exec bit: a host with no POSIX exec bit"),
+        (r"\[find\]", WINDOWS_HOST, "a symlinked root: a host where symlinks need privileges"),
+        (r"\[derive_cli\]", WINDOWS_HOST, "a Windows spelling refused on the POSIX side: a host that is not the "
+                                          "POSIX side"),
+        (r"\[(sourcing|tcl_choice|pin_exec)\]", WINDOWS_HOST,
+         "the POSIX half's own arms: a host that is not the POSIX side (they run inside WSL for a Windows host)"),
+        (r"\[(tclsh_real|probe_link|orchestration)\]", WINDOWS_HOST + TEST_ONLY,
+         "the POSIX half's own arms, on a host that is not the POSIX side; a Tcl, cc, make or git a test-only host "
+         "declared it lacks"),
+        (r"\[probe_link\]", ("darwin",), "libm where ldconfig's cache says it is: macOS keeps no ldconfig cache"),
+        (r"\[git\]", TEST_ONLY, "clone_or_update against local repositories: git is a capability, which only a "
+                                "test-only host may lack"),),
+    "gen-pe64-manifest.py": (),
+}
+_SKIP_LINE = re.compile(r"^\s*(?:\[SKIP\]|SKIP|skip)\s+(\S+)")
+
+
+def skip_allowed_here(where, host, harness):
+    """True when an entry's WHERE admits a skip on this host: its family, a test-only host for TEST_ONLY, any for
+    ANY_HOST."""
+    return "any" in where or host in where or ("test-only" in where and not harness)
+
+
+def skip_census(suite, out, reported, host=None, harness=None):
+    """-> (declared, excess): the suite's SKIP lines as (line, why) for each arm SKIP_ALLOWANCE declares
+    skippable ON THIS HOST -- `host` its family (default `sqlite_common.host_os()`), `harness` whether it is a
+    harness host (default `sqlite_common.harness_host()`) -- and a statement of every EXCESS -- a skip no entry
+    declares, or declares only for other hosts, a count the printed skip lines do not add up to, a suite with no
+    declaration at all -- or "" when there is none."""
+    allowed = SKIP_ALLOWANCE.get(suite)
+    if allowed is None:
+        return [], "no skip allowance is declared for %s, so none of its skips can be judged" % suite
+    host = host or C.host_os()
+    harness = C.harness_host() if harness is None else harness
+    lines = [ln.strip() for ln in (out or "").splitlines() if _SKIP_LINE.match(ln)]
+    declared, excess = [], []
+    for ln in lines:
+        arm = _SKIP_LINE.match(ln).group(1)
+        why = next((w for pat, where, w in allowed if re.fullmatch(pat, arm)
+                    and skip_allowed_here(where, host, harness)), None)
+        if why is None:
+            excess.append(ln)
+        else:
+            declared.append((ln, why))
+    problems = []
+    if len(lines) != reported:
+        problems.append("it reported %d skip(s) and printed %d skip line(s) Step 0 can read"
+                        % (reported, len(lines)))
+    if excess:
+        problems.append("%d skip(s) no allowance declares on a %s %s host: %s%s"
+                        % (len(excess), host, "harness" if harness else "test-only", " | ".join(excess[:3]),
+                           " | ..." if len(excess) > 3 else ""))
+    return declared, "; ".join(problems)
+
 
 def _summary(out, strict_zero_failed):
     """The LAST `passed=N failed=N skipped=N` (or `passed=N failed=0`) line -> (passed, skipped)."""
@@ -185,12 +305,19 @@ def step0(run):
                 failed.append("%s (exit 0, no readable result line)" % name)
                 continue
             passed, skipped = got
+            declared, excess = skip_census(name, r.out, skipped)
+            if excess:
+                print(" ✗ driver self-test %s: an EXCESS of skips — %s. Every skip must be one SKIP_ALLOWANCE "
+                      "declares for its suite, with the host's reason: a skip nobody declared is an arm that "
+                      "stopped proving anything." % (name, excess), file=sys.stderr, flush=True)
+                failed.append("%s (an excess of skips: %s)" % (name, excess))
+                continue
             if skipped:
-                log.warn("driver self-test %s: OK (%d assertions) — but %d assertion(s) SKIPPED on this "
-                         "host; those are UNPROVEN for this run." % (name, passed, skipped))
-                for line in r.out.splitlines():
-                    if line.lstrip().upper().startswith("SKIP"):
-                        log.warn("      %s" % line.strip())
+                log.warn("driver self-test %s: OK (%d assertions) — %d assertion(s) SKIPPED on this host, each a "
+                         "skip its suite declares (SKIP_ALLOWANCE); those are UNPROVEN for this run."
+                         % (name, passed, skipped))
+                for line, why in declared:
+                    log.warn("      %s   [declared: %s]" % (line, why))
             else:
                 log.info("driver self-test %s: OK (%d assertions, 0 skipped)" % (name, passed))
         r = run.resolver.call(["--self-test"])
@@ -252,8 +379,8 @@ def step1(run):
                   "the vocabulary." % (lg.label, lg.run_mode))
     select_legs(run)
     if cfg.strict:
-        log.warn("DSS_STRICT_ARM_VERDICTS=1 — every ENVIRONMENTAL skip (a missing launcher, a missing "
-                 "declared build input) will FAIL this run.")
+        log.warn("%s — every ENVIRONMENTAL skip (a missing launcher, a missing declared build input) will "
+                 "FAIL this run." % (getattr(cfg, "strict_by", "") or "DSS_STRICT_ARM_VERDICTS=1"))
     launcher_prereq_gate(run)
     online_check(run)
 
@@ -574,21 +701,104 @@ def _relay(argv, log, env=None):
     return proc.wait(), "\n".join(captured)
 
 
-def posix_sqlite_dir(run):
-    """The shared sqlite clone, spelled on the POSIX side (`~` expanded THERE)."""
-    d = run.cfg.sqlite_dir or "~/src/sqlite"
+def posix_environ(run, names):
+    """{name: value} of the POSIX side's OWN environment for `names`, an unset name absent: this process's on a
+    POSIX host, and inside WSL asked THROUGH the POSIX side (`printenv`, which exits 1 for an unset name) -- the one
+    route into it, no private `wsl.exe` argv here."""
+    if not run.posix.needs_wsl:
+        return dict((n, os.environ[n]) for n in names if n in os.environ)
+    got = {}
+    for n in names:
+        argv = run.posix.argv(["printenv", n])
+        r = C.capture(argv, timeout=60)
+        if r.rc == 1:                               # printenv's answer for a name that is not set
+            continue
+        if r.rc != 0:
+            C.die("could not read %s on the POSIX side (`%s` exited %d: %s)"
+                  % (n, " ".join(argv), r.rc, (r.err or r.out).replace("\0", "").strip()[:200]))
+        got[n] = r.out.replace("\0", "").strip()
+    return got
+
+
+def sqlite_checkout(run):
+    """The sqlite checkout this run stages from, spelled on the POSIX side. Unless a person names one by hand
+    (SQLITE_DIR, `~` expanded THERE), it is THIS consumer's own (`sqlite_stage.consumer_checkout`, 2026-09-30:
+    one checkout per consumer) -- inside this run's output tree on a POSIX host; on a Windows host in the POSIX
+    side's cache, keyed by this run's output tree and placed by that side's own XDG_CACHE_HOME and HOME."""
+    import sqlite_stage as S
+    d = run.cfg.sqlite_dir
+    if not d:
+        env = posix_environ(run, ("XDG_CACHE_HOME", "HOME")) if run.posix.needs_wsl else None
+        return S.consumer_checkout(run.host, run.out_dir, env)
     if not run.posix.needs_wsl:
         return os.path.abspath(os.path.expanduser(d))
     if d.startswith("~"):
-        # Asked THROUGH the POSIX side, the one route into it (no private `wsl.exe` argv here).
-        r = C.capture(run.posix.argv(["printenv", "HOME"]), timeout=60)
-        home = r.out.replace("\0", "").strip()
-        if r.rc != 0 or not home.startswith("/"):
-            C.die("could not read HOME on the POSIX side (`%s` exited %d) to place the sqlite clone; "
-                  "set SQLITE_DIR to its POSIX path." % (" ".join(run.posix.argv(["printenv", "HOME"])),
-                                                         r.rc))
+        home = posix_environ(run, ("HOME",)).get("HOME", "")
+        if not home.startswith("/"):
+            C.die("could not read HOME on the POSIX side to place SQLITE_DIR=%s; set it to its POSIX path." % d)
         d = home + d[1:]
     return d
+
+
+def _posix_stage_cli(run, args, what):
+    """`sqlite_stage.py <args>` on the POSIX side, through the run's one route into it -> its JSON answer."""
+    argv = run.posix.argv(["python3", run.posix.to_posix(os.path.join(C.HERE, "sqlite_stage.py"))] + list(args))
+    r = C.capture(argv, timeout=300)
+    text = (r.out or "").replace("\0", "").strip()
+    if r.rc != 0:
+        C.die("%s FAILED on the POSIX side (`%s` exited %d): %s"
+              % (what, " ".join(argv), r.rc, ((r.err or "") + text).replace("\0", "").strip()[:400]))
+    try:
+        return json.loads(text.splitlines()[-1] if text else "")
+    except ValueError:
+        C.die("%s answered no JSON on the POSIX side (`%s`): %s" % (what, " ".join(argv), text[:400]))
+
+
+def prune_gone_consumers(run, is_dir=os.path.isdir):
+    """A Windows run's housekeeping before its derive (2026-10-01, the P69 review's MINOR 2): the checkouts of
+    Windows trees live in the POSIX side's cache, which nothing else removes, so the run lists their records
+    (`sqlite_stage.py consumers`) and has removed each one whose tree is GONE on this host -- never its own, never
+    one whose tree is here, never one with no record (it cannot be judged: reported) -- each under that checkout's
+    own write lock, where a checkout a live run holds is kept and said so. -> the keys removed."""
+    import sqlite_stage as S
+    log = run.log
+    root = S.consumers_root(posix_environ(run, ("XDG_CACHE_HOME", "HOME")))
+    listing = _posix_stage_cli(run, ["consumers", "--root", root], "listing the sqlite consumers' checkouts")
+    own = S.consumer_key(run.out_dir)
+    entries = listing.get("consumers") or []
+    gone = [e["key"] for e in entries if e.get("tree") and e["key"] != own and not is_dir(e["tree"])]
+    unjudged = [e["key"] for e in entries if not e.get("tree") and e["key"] != own]
+    if unjudged:
+        log.warn("sqlite consumers: %d checkout(s) under %s carry no record of their tree, so none can be judged "
+                 "and none is removed: %s" % (len(unjudged), root, ", ".join(unjudged)))
+    if not gone:
+        return []
+    done = _posix_stage_cli(run, ["consumers", "--root", root, "--prune"] + gone,
+                            "removing the checkouts of trees that are gone")
+    if done.get("held"):
+        log.warn("sqlite consumers: kept %s -- a live run holds it (its tree is gone; the next run removes it)"
+                 % ", ".join(done["held"]))
+    if done.get("pruned"):
+        log.info("sqlite consumers: removed %d checkout(s) whose tree is gone from this host: %s"
+                 % (len(done["pruned"]), ", ".join(done["pruned"])))
+    return list(done.get("pruned") or [])
+
+
+def derive_argv(run, sb_path):
+    """The POSIX side's `sqlite_stage.py derive` command of a Windows run (Steps 3+4): a run staging from its own
+    consumer checkout names the tree it belongs to (`--consumer-of`), a checkout a person named does not."""
+    cfg = run.cfg
+    argv = ["python3", run.posix.to_posix(os.path.join(C.HERE, "sqlite_stage.py")), "derive",
+            "--out", run.posix.to_posix(run.stage_dir), "--sqlite-dir", run.sqlite_dir_posix,
+            "--jobs", str(cfg.jobs), "--stage-build-json", run.posix.to_posix(sb_path),
+            "--tier", cfg.tier]
+    if cfg.tcl_version:
+        argv += ["--tcl-version", cfg.tcl_version]
+    if cfg.test_file:
+        argv += ["--test-file", run.posix.to_posix(cfg.test_file)]
+    if not cfg.sqlite_dir:
+        argv += ["--consumer-of", run.out_dir]
+    return argv
 
 
 def step34(run):
@@ -596,40 +806,37 @@ def step34(run):
     import sqlite_stage as S
     run.stage_build = run.resolver.json(["--stage-build", "--format", "json"],
                                         "the sqlite stage-build configuration (--stage-build)")
-    run.sqlite_dir_posix = posix_sqlite_dir(run)
+    run.sqlite_dir_posix = sqlite_checkout(run)
     if not run.posix.needs_wsl:
         import sqlite_procs as P
-        log.step("3/9  Fetch sqlite/sqlite -> %s (default branch)" % run.sqlite_dir_posix)
+        log.step("3/9  Put sqlite on its pin -> %s (%s)"
+                 % (run.sqlite_dir_posix, "SQLITE_DIR, named by hand" if run.cfg.sqlite_dir
+                    else "this output tree's own checkout"))
         run.clone_lock = P.CloneLock(run.sqlite_dir_posix)
-        run.clone_lock.write("build_and_test.py (fetch/pull + configure + stage)", log)
+        run.clone_lock.write("build_and_test.py (fetch + checkout + configure + stage)", log)
         scfg = S.StageConfig.from_run(run)
         run.stage = S.stage_and_persist(scfg, log=log, lock=run.clone_lock)
         return
-    log.step("3+4/9  Derive full-source testfixture recipe + stage sources/headers (WSL)")
+    log.step("3+4/9  Derive full-source testfixture recipe + stage sources/headers (WSL, from %s: %s)"
+             % (run.sqlite_dir_posix, "SQLITE_DIR, named by hand" if run.cfg.sqlite_dir
+                else "this output tree's own checkout, in WSL's cache"))
+    if not run.cfg.sqlite_dir:
+        prune_gone_consumers(run)
     run.stage_dir = S.stage_dir_of(run.out_dir)
     os.makedirs(run.stage_dir, exist_ok=True)
     fd, sb_path = tempfile.mkstemp(prefix="stage-build-", suffix=".json", dir=run.out_dir)
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(run.stage_build, fh, indent=1, sort_keys=True)
     try:
-        argv = ["python3", run.posix.to_posix(os.path.join(C.HERE, "sqlite_stage.py")), "derive",
-                "--out", run.posix.to_posix(run.stage_dir), "--sqlite-dir", run.sqlite_dir_posix,
-                "--jobs", str(cfg.jobs), "--stage-build-json", run.posix.to_posix(sb_path),
-                "--tier", cfg.tier]
-        if cfg.tcl_version:
-            argv += ["--tcl-version", cfg.tcl_version]
-        if cfg.test_file:
-            argv += ["--test-file", run.posix.to_posix(cfg.test_file)]
-        rc, out = _relay(run.posix.argv(argv), log)
+        rc, out = _relay(run.posix.argv(derive_argv(run, sb_path)), log)
     finally:
         try:
             os.remove(sb_path)
         except OSError:
             pass
     if rc == 3 or "DSS-CLONE-LOCK-BLOCKED" in out:
-        raise C.CloneLockBlocked("DSS-CLONE-LOCK-BLOCKED\n      another harness run holds the shared sqlite "
-                                 "clone %s inside WSL — see the derive's output above."
-                                 % run.sqlite_dir_posix)
+        raise C.CloneLockBlocked("DSS-CLONE-LOCK-BLOCKED\n      another harness run holds the sqlite checkout "
+                                 "%s inside WSL — see the derive's output above." % run.sqlite_dir_posix)
     if rc != 0:
         C.die("the WSL derive FAILED (rc=%d) — see its output above." % rc)
     result = os.path.join(run.stage_dir, S.RESULT_FILE)
@@ -703,7 +910,9 @@ def place_run(run):
     """Where a run's trees are, the ONE rule for every mode: the DSS tree (SRC_DIR, else the tree
     this harness ships in) and the output tree (`sqlite_common.output_tree`: OUT_DIR, else
     `<tree>/build/real-examples/c/sqlite`, under `windows/` on a Windows host). The recompile finds the
-    STAGE a run left there, and the speedtest1 benchmark keeps its pinned checkout there."""
+    STAGE a run left there, a POSIX host's run keeps its own sqlite checkout there (`checkout/`; a Windows
+    host's is in WSL's cache, keyed by this tree), and the speedtest1 benchmark keeps its pinned checkout
+    there."""
     cfg = run.cfg
     run.driver_tree = C.driver_tree()
     run.repo_root = os.path.abspath(cfg.src_dir) if cfg.src_dir else (run.driver_tree or "")
@@ -717,10 +926,19 @@ def place_run(run):
 
 # ── the command line ──────────────────────────────────────────────────────────────────
 # The values a harness STEP hands this driver (sqlite.yml): a run's knobs and the leg's own dsscp, or a
-# recompile's leg. Every other knob of a run stays an environment variable (`sqlite_common.Config`).
-VALUE_FLAGS = ("--tier", "--dss-config", "--test-file", "--dss", "--recompile")
+# recompile's leg. Every other knob of a run stays an environment variable (`sqlite_common.Config`) -- read by
+# hand, and REFUSED when set in a step (`--step`, below).
+VALUE_FLAGS = ("--tier", "--dss-config", "--test-file", "--dss", "--recompile", "--step")
 KNOB_ATTRS = {"--tier": "tier", "--dss-config": "dss_config", "--test-file": "test_file", "--dss": "dss_bin"}
 EMPTY_MEANS_NONE = ("--test-file",)     # an empty test file runs the tier -- the step's default
+# ★ THE STEPS THAT RUN THIS DRIVER, AND WHAT EACH ONE'S RUN LINE PASSES -- ONE STATEMENT (2026-09-30, the round-12
+# audit's S4), which DC-30 holds sqlite.yml to. `--step=<name>` is how the driver knows it runs as a DssHarness step
+# (the run line's own argument: DssHarness sets no variable a program could read it from); the flags after it are
+# exactly that step's inputs and `{product}`, so a run line cannot drop an input, and in that mode every OTHER
+# steering variable set in the environment is refused (`sqlite_common.STEERING`). The `self-test` step runs
+# `--self-test`, Step 0 alone, which no steering variable reaches (DSS_SKIP_SELFTEST is ignored there, and said).
+STEP_FLAGS = {"build-and-test": ("--tier", "--dss-config", "--test-file", "--dss"),
+              "recompile": ("--recompile", "--dss", "--dss-config")}
 
 
 def parse_cli(args):
@@ -747,6 +965,15 @@ def parse_cli(args):
         if idle:
             raise ValueError("%s name%s nothing in a recompile, which runs no corpus"
                              % (" and ".join(idle), "" if len(idle) > 1 else "s"))
+    step = got.get("--step")
+    if step is not None:
+        if step not in STEP_FLAGS:
+            raise ValueError("--step=%s names no step of sqlite.yml that runs this driver (its steps: %s)"
+                             % (step, ", ".join(sorted(STEP_FLAGS))))
+        passed = sorted(f for f in got if f != "--step")
+        if passed != sorted(STEP_FLAGS[step]):
+            raise ValueError("the `%s` step passes exactly %s (sqlite.yml), and this command line passes %s"
+                             % (step, " ".join(STEP_FLAGS[step]), " ".join(passed) or "nothing else"))
     return got
 
 
@@ -762,17 +989,18 @@ def main(argv=None):
     except ValueError as exc:
         print("build_and_test.py: %s.\n      It takes `--self-test` (Step 0 alone); a run with --dss PATH "
               "[--tier T] [--dss-config C] [--test-file F]; or `--recompile <leg> --dss PATH "
-              "[--dss-config C]` -- the compiler REQUIRED, by --dss or DSS_BIN. Every other knob is an "
-              "environment variable (sqlite_common.Config)."
-              % exc, file=sys.stderr)
+              "[--dss-config C]` -- the compiler REQUIRED, by --dss or DSS_BIN. A harness step leads with "
+              "--step=<its name> and passes exactly its inputs; every other knob is an environment variable "
+              "(sqlite_common.Config), read by hand and refused in a step." % exc, file=sys.stderr)
         return 2
     knobs = dict((KNOB_ATTRS[f], v) for f, v in flags.items() if f in KNOB_ATTRS)
+    step = flags.get("--step")
     if "--recompile" in flags:
         import sqlite_recompile as RC
-        return RC.main(flags["--recompile"], sys.modules[__name__], knobs)
+        return RC.main(flags["--recompile"], sys.modules[__name__], knobs, step=step)
     run = None
     try:
-        cfg = C.Config(knobs)
+        cfg = C.Config(knobs, step=step)
         run = C.Run(cfg)
         place_run(run)
         return run_all(run)

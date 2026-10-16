@@ -333,6 +333,25 @@ struct OperandList {
     }
 };
 
+// Is this placeholder the dialect's `asm goto` LABEL alternative? Asked of the
+// CST by RuleId and of the config by name — never of the text. An absent
+// `templateLabelRule` matches nothing, which is the honoured-absence arm every
+// rule landmark in this engine already has (`RuleId{}` is the invalid sentinel,
+// so a bare `.v` comparison would match slot 0). ONE copy: the engine asks it to
+// decode a label placeholder as a branch target, and the template host asks it
+// so a label placeholder in an address or callee position is never read as a
+// name of the embedding program.
+[[nodiscard]] bool templatePlaceholderIsALabelRef(Tree const&           tree,
+                                                  AssemblyConfig const& cfg,
+                                                  NodeId                placeholder) {
+    if (!cfg.templateLabelRule.valid()) return false;
+    for (NodeId const k : visibleChildren(tree, placeholder)) {
+        if (tree.kind(k) != NodeKind::Internal) continue;
+        if (tree.rule(k).v == cfg.templateLabelRule.v) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // ── the engine ────────────────────────────────────────────────────────────
@@ -1335,18 +1354,11 @@ struct AsmInstructionLowering::Impl {
         return AsmOperandRole::Register;
     }
 
-    // Is this placeholder the dialect's `asm goto` LABEL alternative? Asked of
-    // the CST by RuleId and of the config by name — never of the text. An
-    // absent `templateLabelRule` matches nothing, which is the honoured-absence
-    // arm every rule landmark in this engine already has (`RuleId{}` is the
-    // invalid sentinel, so a bare `.v` comparison would match slot 0).
+    // Is this placeholder the dialect's `asm goto` LABEL alternative? The one
+    // rule check (`templatePlaceholderIsALabelRef`), which the template host
+    // asks too.
     [[nodiscard]] bool placeholderIsALabelRef(NodeId placeholder) const {
-        if (!cfg_.templateLabelRule.valid()) return false;
-        for (NodeId const k : visibleChildren(tree_, placeholder)) {
-            if (tree_.kind(k) != NodeKind::Internal) continue;
-            if (tree_.rule(k).v == cfg_.templateLabelRule.v) return true;
-        }
-        return false;
+        return templatePlaceholderIsALabelRef(tree_, cfg_, placeholder);
     }
 
     // ★★★ WHICH DECLARED WIDTH VIEW THIS PLACEHOLDER STATES, OR NULLPTR — the
@@ -4743,10 +4755,13 @@ public:
                  TemplateLabels const*              labels  = nullptr,
                  Tree const*                        tree    = nullptr,
                  LirBuilder*                        builder = nullptr,
-                 std::optional<ObjectFormatKind>    formatKind = std::nullopt)
+                 std::optional<ObjectFormatKind>    formatKind = std::nullopt,
+                 AsmTemplateProgramNames*           programNames = nullptr,
+                 AssemblyConfig const*              assembly = nullptr)
         : target_(target), bindings_(bindings),
           labelBindings_(labelBindings), sink_(sink), labels_(labels),
-          tree_(tree), builder_(builder), formatKind_(formatKind) {}
+          tree_(tree), builder_(builder), formatKind_(formatKind),
+          programNames_(programNames), assembly_(assembly) {}
 
     // The object format the embedding program is built for (P68 round 9) —
     // only a key into the dialect's `symbolParts`; see the interface.
@@ -4755,20 +4770,23 @@ public:
         return formatKind_;
     }
 
-    // ⓘ A TEMPLATE ADDRESSES NO BLOCK IN A FIELD YET: a symbol address inside
-    // a template is refused by `appendSymbolAddress` below, whatever the name,
-    // so there is no block to hand back — nullopt with no diagnostic sends the
-    // name down that one refusal.
+    // ⓘ A TEMPLATE ADDRESSES NO BLOCK IN A FIELD YET: the address of a label
+    // the template defines is refused by `appendSymbolAddress` below, and any
+    // other name is a symbol of the embedding program, never a block — so there
+    // is no block to hand back, and nullopt with no diagnostic sends the name
+    // down the symbol route.
     [[nodiscard]] std::optional<LirBlockId>
     resolveLocalBlock(std::string const&, NodeId) override {
         return std::nullopt;
     }
 
-    // ⓘ Never reached with a meaning: every symbol address in a template is
-    // refused by `appendSymbolAddress` / `resolveDisplacementSymbol` before the
-    // engine asks whether a constant was added to code.
-    [[nodiscard]] bool namesCodeHere(std::string const&, NodeId) const override {
-        return false;
+    // A FUNCTION the embedding unit defines is code: a constant added to its
+    // address is refused by the engine, as in a `.s`. An import is not (its kind
+    // is the definition's, which no unit here holds), and a label of the
+    // template itself never reaches here with a meaning (its address is refused
+    // by `appendSymbolAddress`).
+    [[nodiscard]] bool namesCodeHere(std::string const& symbol, NodeId at) const override {
+        return namesProgramSymbol(symbol, at) && programNames_->definesCode(symbol);
     }
 
     // ── the blocks that begin without a label ─────────────────────────────
@@ -4941,32 +4959,19 @@ public:
     // not derive; ✔MEASURED 2026-09-23 that gcc and clang accept `lea 1f(%rip)`
     // / `adr x9, 1f` + an indirect jump to it (x86_64 and aarch64, run: 42), so
     // this refusal is a divergence reported with the round, not a rule.
+    // ★★ A NAME OF THE EMBEDDING PROGRAM is its symbol — the unit's definition
+    // or the import the caller mints (`AsmTemplateProgramNames`) — exactly the
+    // `[SymbolRef]` the text host gives a data or function label.
     [[nodiscard]] bool appendSymbolAddress(std::string const& symbol, NodeId at,
                                            std::string_view mnemonic,
-                                           std::vector<LirOperand>&) override {
-        bool const ownLabel =
-            labels_ != nullptr
-            && (labels_->named.contains(symbol)
-                || (!labels_->suffixes.backward.empty()
-                    && asm_local_labels::parseReference(symbol, labels_->suffixes)
-                           .has_value()));
-        sink_.fail(at, std::format(
-            "'{}' takes the address of '{}', and this build takes no address "
-            "inside an assembly TEMPLATE: {}. ⓘ If '{}' is an `asm goto` LABEL "
-            "placeholder, it is bound as a BRANCH TARGET and can only be used as "
-            "one — this instruction reads it as an ADDRESS, which is the "
-            "computed-goto construct and not this one. Name the operand through "
-            "this template's operand list instead{}",
-            mnemonic, symbol,
-            ownLabel ? "that label is a block of this statement's own body, and "
-                       "its address would need a symbol bound to the block, "
-                       "which the embedding function's lowering has not minted "
-                       "for it"
-                     : "the blocks around the template belong to the language "
-                       "that embedded it, and a LIR block reference is "
-                       "function-local, so binding one here would name "
-                       "whichever block sits at that index in the caller",
-            symbol, sink_.pairSuffix()));
+                                           std::vector<LirOperand>& out) override {
+        if (namesProgramSymbol(symbol, at)) {
+            auto const sym = programSymbolOf(symbol, at, mnemonic, AsmTemplateNameUse::Address);
+            if (!sym.has_value()) return false;
+            out.push_back(LirOperand::makeSymbolRef(sym->v));
+            return true;
+        }
+        refuseAddressOf(symbol, at, mnemonic, "takes the address of");
         return false;
     }
 
@@ -4977,8 +4982,10 @@ public:
     [[nodiscard]] std::optional<SymbolId>
     resolveDisplacementSymbol(std::string const& symbol, NodeId at,
                               std::string_view mnemonic) override {
-        std::vector<LirOperand> unused;
-        (void)appendSymbolAddress(symbol, at, mnemonic, unused);
+        if (namesProgramSymbol(symbol, at)) {
+            return programSymbolOf(symbol, at, mnemonic, AsmTemplateNameUse::Address);
+        }
+        refuseAddressOf(symbol, at, mnemonic, "addresses memory relative to");
         return std::nullopt;
     }
 
@@ -5087,16 +5094,38 @@ public:
         return std::nullopt;
     }
 
+    // ★★ A FUNCTION OF THE EMBEDDING PROGRAM, or the import a call of a name
+    // the unit does not define (a call states CODE). ⚠ A label the template
+    // defines is a BLOCK of the statement's own body and an `asm goto` label is
+    // a branch target: neither is a function, and calling one would enter a
+    // frame whose prologue never ran — refused by name, never imported.
     [[nodiscard]] std::optional<LirOperand>
     resolveCallee(std::string const& symbol, NodeId at,
                   std::string_view mnemonic) override {
+        if (namesProgramSymbol(symbol, at)) {
+            auto const sym = programSymbolOf(symbol, at, mnemonic, AsmTemplateNameUse::Call);
+            if (!sym.has_value()) return std::nullopt;
+            return LirOperand::makeSymbolRef(sym->v);
+        }
+        if (namesOwnLabel(symbol) || isLabelPlaceholder(at)) {
+            sink_.fail(at, std::format(
+                "'{}' calls '{}', which is {} — not a function: a call needs a "
+                "function symbol, and calling into a block would enter a frame "
+                "whose prologue never ran{}",
+                mnemonic, symbol,
+                isLabelPlaceholder(at)
+                    ? "an `asm goto` label, a BRANCH TARGET of this statement"
+                    : "a label this assembly template defines, a block of the "
+                      "statement's own body",
+                sink_.pairSuffix()));
+            return std::nullopt;
+        }
         sink_.fail(at, std::format(
-            "'{}' calls '{}', and an assembly TEMPLATE cannot mint the import "
-            "that would need — an import states whether its target is CODE or "
-            "DATA, which selects the linker's indirection slot, and that is the "
-            "embedding language's declaration to make rather than this "
-            "template's{}",
-            mnemonic, symbol, sink_.pairSuffix()));
+            "'{}' calls '{}', a name of the program that embeds this assembly "
+            "TEMPLATE, and its caller handed the template no names of that "
+            "program (no `AsmTemplateProgramNames`), so '{}' resolves to no "
+            "symbol here — it is neither imported nor guessed{}",
+            mnemonic, symbol, symbol, sink_.pairSuffix()));
         return std::nullopt;
     }
 
@@ -5120,6 +5149,75 @@ public:
     void onBlockOpened(LirBlockId) override { terminated_ = false; }
 
 private:
+    // Whether `symbol` names a label the TEMPLATE defines (named or numeric).
+    [[nodiscard]] bool namesOwnLabel(std::string const& symbol) const {
+        return labels_ != nullptr
+            && (labels_->named.contains(symbol)
+                || (!labels_->suffixes.backward.empty()
+                    && asm_local_labels::parseReference(symbol, labels_->suffixes)
+                           .has_value()));
+    }
+    // Whether the operand at `at` is an `asm goto` LABEL placeholder — the
+    // engine's own rule check (`templatePlaceholderIsALabelRef`).
+    [[nodiscard]] bool isLabelPlaceholder(NodeId at) const {
+        return assembly_ != nullptr && tree_ != nullptr
+            && templatePlaceholderIsALabelRef(*tree_, *assembly_, at);
+    }
+    // Whether `symbol` is to be answered as a name of the EMBEDDING program:
+    // the caller handed its names, and it is neither a label of the template
+    // nor an `asm goto` label placeholder.
+    [[nodiscard]] bool namesProgramSymbol(std::string const& symbol, NodeId at) const {
+        return programNames_ != nullptr && !namesOwnLabel(symbol) && !isLabelPlaceholder(at);
+    }
+    // The symbol a name of the embedding program stands for: its unit's
+    // definition, else the caller's import of it. nullopt ⇒ reported.
+    [[nodiscard]] std::optional<SymbolId> programSymbolOf(std::string const& symbol, NodeId at,
+                                                          std::string_view   mnemonic,
+                                                          AsmTemplateNameUse use) {
+        if (auto const defined = programNames_->symbolDefinedAs(symbol)) return defined;
+        SymbolId const imported = programNames_->importOf(symbol, use);
+        if (imported.valid()) return imported;
+        // The caller said why; the template's own failure is said here too, so
+        // the run cannot end green with no symbol behind the operand.
+        sink_.fail(at, std::format(
+            "'{}' names '{}', which the program that embeds this assembly "
+            "template neither defines nor could import (its caller said why "
+            "above){}",
+            mnemonic, symbol, sink_.pairSuffix()));
+        return std::nullopt;
+    }
+    // ⓘ If `symbol` is an `asm goto` LABEL placeholder, it is bound as a BRANCH
+    // TARGET and can only be used as one — an ADDRESS of it is the computed-goto
+    // construct, not this one. A label the template defines is a block of the
+    // statement's own body, whose address would need a symbol bound to that
+    // block. Any other name is the embedding program's, refused here only when
+    // the caller handed no names of that program.
+    void refuseAddressOf(std::string const& symbol, NodeId at,
+                         std::string_view mnemonic, std::string_view verb) {
+        std::string why;
+        if (isLabelPlaceholder(at)) {
+            why = "it is an `asm goto` LABEL placeholder, bound as a BRANCH "
+                  "TARGET and usable only as one — this instruction reads it as "
+                  "an ADDRESS, which is the computed-goto construct and not this "
+                  "one";
+        } else if (namesOwnLabel(symbol)) {
+            why = "that label is a block of this statement's own body, and its "
+                  "address would need a symbol bound to the block, which the "
+                  "embedding function's lowering has not minted for it";
+        } else {
+            why = std::format(
+                "'{}' is a name of the program that embeds this template, and "
+                "its caller handed the template no names of that program (no "
+                "`AsmTemplateProgramNames`), so it resolves to no symbol here — "
+                "it is neither imported nor guessed",
+                symbol);
+        }
+        sink_.fail(at, std::format(
+            "'{}' {} '{}' inside an assembly TEMPLATE, which this build refuses: "
+            "{}{}",
+            mnemonic, verb, symbol, why, sink_.pairSuffix()));
+    }
+
     [[nodiscard]] AsmOperandBinding const*
     bindingFor(std::string_view spelling) const {
         for (auto const& b : bindings_) {
@@ -5217,6 +5315,8 @@ private:
     Tree const*                        tree_   = nullptr;   // for a reference's position
     LirBuilder*                        builder_ = nullptr;  // the body's own
     std::optional<ObjectFormatKind>    formatKind_;         // a key, see above
+    AsmTemplateProgramNames*           programNames_ = nullptr;  // the embedding program's
+    AssemblyConfig const*              assembly_     = nullptr;  // its label placeholder rule
     std::optional<LirBlockId>          pendingFallthrough_;
     std::size_t                        emitted_    = 0;
     bool                               terminated_ = false;
@@ -5617,7 +5717,8 @@ bool lowerAsmTemplateToLirRun(Tree const&                        templateTree,
                               DiagnosticReporter&                reporter,
                               std::span<AsmLabelBinding const>   labelBindings,
                               std::vector<LirBlockId>*           syntheticFallthroughs,
-                              std::optional<ObjectFormatKind>    formatKind) {
+                              std::optional<ObjectFormatKind>    formatKind,
+                              AsmTemplateProgramNames*           programNames) {
     AsmDiagnosticSink sink{templateTree, dialect, target, reporter};
     auto const&       cfg = dialect.assembly();
     // ⚠ NOT AN ASSERT, for the reason the standalone entry states: a caller
@@ -5644,7 +5745,8 @@ bool lowerAsmTemplateToLirRun(Tree const&                        templateTree,
         return false;
     }
     TemplateHost           host{target, bindings, labelBindings, sink, &labels,
-                                &templateTree, &builder, formatKind};
+                                &templateTree, &builder, formatKind, programNames,
+                                &cfg};
     AsmInstructionLowering engine{templateTree, dialect, target,
                                   builder,      sink,   host};
     if (!engine.resolveRows()) return false;

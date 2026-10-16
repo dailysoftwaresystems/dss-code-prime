@@ -1,0 +1,1 @@
+        if (ext.commonAlignment > std::max<std::uint64_t>(32u, commons.alignmentEveryLinkerGives(ext.commonSize).value_or(1u))) {

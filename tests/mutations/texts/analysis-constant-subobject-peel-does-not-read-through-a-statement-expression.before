@@ -1,0 +1,2 @@
+            if (NodeId const inside = soleExpressionOfStatementExpression(hirCfg, tree, n);
+                inside.valid()) {

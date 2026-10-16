@@ -1,0 +1,1 @@
+    return [w for w in words if w != "-Xclang"]
