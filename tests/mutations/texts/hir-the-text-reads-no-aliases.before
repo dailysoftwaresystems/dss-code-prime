@@ -1,0 +1,1 @@
+    res->symbolAliases = std::move(parser.pAliases_);

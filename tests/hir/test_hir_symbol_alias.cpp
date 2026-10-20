@@ -10,6 +10,8 @@
 //     (`sizeof.incompleteArraySize`, cl's 0, warned by the semantic tier): the lowering folds it in
 //     a constant initializer and lowers it to that literal in a function body — never a `SizeOf`
 //     node, whose type has no size.
+// (3) the HIR text (`.dsshir` v9) states each alias in its `aliases` section — target and own
+//     linkage — and reads it back as the same alias; a section it cannot read is refused by name.
 //
 // ⚠ MUST run through ctest: the shipped documents are found through `DSS_CONFIG_ROOT`, which only
 // `dss_add_test` sets.
@@ -24,6 +26,7 @@
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
 #include "hir/hir.hpp"
+#include "hir/hir_text.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "repo_root.hpp"
 #include "shipped_schema_or_throw.hpp"
@@ -31,13 +34,16 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <format>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
+#include <vector>
 
 using namespace dss;
 
@@ -144,6 +150,32 @@ using Inspect = std::function<void(SemanticModel const&, CstToHirResult const&, 
     for (std::uint32_t i = 1; i < h.nodeCount(); ++i)
         if (h.kind(HirNodeId{i, tag}) == k) ++n;
     return n;
+}
+
+// The `.dsshir` text of a lowered unit, as the CLI writes it (the source-level names, the literal and inline-asm
+// pools, the aliases); "" with a failure when the writer reported an error.
+[[nodiscard]] std::string textOf(SemanticModel const& m, CstToHirResult const& res) {
+    std::vector<std::string> names;
+    for (std::size_t i = 0; i < m.symbols().size(); ++i) names.push_back(std::string{m.symbols()[i].name});
+    HirTextContext ctx;
+    ctx.interner      = &m.lattice().interner();
+    ctx.symbolNames   = &names;
+    ctx.literalPool   = &res.literalPool;
+    ctx.inlineAsmPool = &res.inlineAsmPool;
+    ctx.symbolAliases = &res.symbolAliases;
+    DiagnosticReporter r;
+    std::string text = emitHir(res.hir, ctx, r);
+    std::string why;
+    appendDiagnostics(why, r);
+    EXPECT_EQ(r.errorCount(), 0u) << "the HIR text writer refused the unit:" << why;
+    return r.errorCount() == 0 ? text : std::string{};
+}
+
+// The handle the text's `symbols` section gives the name `name`, or 0.
+[[nodiscard]] std::uint32_t handleNamed(HirParseResult const& parsed, std::string_view name) {
+    for (std::size_t i = 1; i < parsed.symbolNames.size(); ++i)
+        if (parsed.symbolNames[i] == name) return static_cast<std::uint32_t>(i);
+    return 0;
 }
 
 }  // namespace
@@ -254,4 +286,124 @@ TEST(HirSymbolAliasLowering, SizeofAnArrayOfUnknownSizeIsTheLanguagesStatedValue
         });
         EXPECT_EQ(failed, "");
     }
+}
+
+// cs-28 item 11 (`.dsshir` v9): every alias of a C unit — a weak function alias, a hidden one, a module-private
+// object alias, an external object alias — travels in the text's `aliases` section with its target and its own
+// linkage, and reads back as the same alias; the text written again from what was read is the same text. Before
+// v9 the text had no form for an alias, and the unit read back without its second names.
+TEST(HirSymbolAliasLowering, EachAliasTravelsInTheTextAndReadsBack) {
+    char const* const src = "int g(void) { return 1; }\n"
+                            "int f(void) __attribute__((weak, alias(\"g\")));\n"
+                            "int h(void) __attribute__((alias(\"g\"), visibility(\"hidden\")));\n"
+                            "static int t = 5;\n"
+                            "static int a __attribute__((alias(\"t\")));\n"
+                            "int v = 3;\n"
+                            "extern int w __attribute__((alias(\"v\")));\n"
+                            "int use(void) { return f() + h() + a + w; }\n";
+    std::string const failed = lowerC(src, [&](SemanticModel const& m, CstToHirResult const& res, DiagnosticReporter const&) {
+        ASSERT_EQ(res.symbolAliases.size(), 4u) << "the unit's four aliases were not lowered";
+        std::string const text = textOf(m, res);
+        ASSERT_FALSE(text.empty());
+        EXPECT_NE(text.find("\naliases {\n"), std::string::npos) << "the text states no alias:\n" << text;
+        DiagnosticReporter r;
+        auto const back = parseHir(text, CompilationUnitId{1}, r);
+        std::string why;
+        appendDiagnostics(why, r);
+        ASSERT_TRUE(back != nullptr && back->ok) << "the text did not read back:" << why << "\n" << text;
+        ASSERT_EQ(back->symbolAliases.size(), res.symbolAliases.size()) << "an alias was lost on the way:\n" << text;
+        for (std::size_t i = 0; i < res.symbolAliases.size(); ++i) {
+            HirSymbolAlias const& was = res.symbolAliases[i];
+            HirSymbolAlias const& is  = back->symbolAliases[i];
+            std::string const     name = nameOf(m, was.alias);
+            SCOPED_TRACE(name);
+            ASSERT_LT(is.alias.v, back->symbolNames.size());
+            ASSERT_LT(is.target.v, back->symbolNames.size());
+            EXPECT_EQ(back->symbolNames[is.alias.v], name) << "the alias read back under another name";
+            EXPECT_EQ(back->symbolNames[is.target.v], nameOf(m, was.target)) << "the alias names another target";
+            EXPECT_EQ(is.linkage.binding, was.linkage.binding) << "the alias's own binding";
+            EXPECT_EQ(is.linkage.visibility, was.linkage.visibility) << "the alias's own visibility";
+            EXPECT_EQ(is.linkage.weakKind, was.linkage.weakKind) << "the alias's weak kind";
+        }
+        HirTextContext again;
+        again.interner      = &back->interner;
+        again.symbolNames   = &back->symbolNames;
+        again.literalPool   = &back->literalPool;
+        again.inlineAsmPool = &back->inlineAsmPool;
+        again.symbolAliases = &back->symbolAliases;
+        DiagnosticReporter r2;
+        EXPECT_EQ(emitHir(back->hir, again, r2), text) << "the text written from what was read is another text";
+    });
+    EXPECT_EQ(failed, "");
+}
+
+// The `aliases` section a reader cannot take is refused BY NAME — each case is the text of a real unit with its
+// section replaced — and nothing may follow the last section (a v8 reader stopped at the module's `}`).
+TEST(HirSymbolAliasLowering, AnAliasTheTextCannotStateIsRefusedByName) {
+    char const* const src = "int g(void) { return 1; }\n"
+                            "int f(void) __attribute__((alias(\"g\")));\n"
+                            "int v = 3;\n"
+                            "extern int w __attribute__((alias(\"v\")));\n"
+                            "int use(void) { return f() + w; }\n";
+    std::string const failed = lowerC(src, [&](SemanticModel const& m, CstToHirResult const& res, DiagnosticReporter const&) {
+        std::string const text = textOf(m, res);
+        auto const        at   = text.find("aliases {\n");
+        ASSERT_NE(at, std::string::npos) << text;
+        std::string const head = text.substr(0, at);   // the text up to its module's `}`, and its newline
+        DiagnosticReporter r0;
+        auto const control = parseHir(text, CompilationUnitId{1}, r0);
+        ASSERT_TRUE(control != nullptr && control->ok) << "CONTROL: the unit's own text did not read back";
+        std::string const g = std::format("%{}", handleNamed(*control, "g"));
+        std::string const f = std::format("%{}", handleNamed(*control, "f"));
+        std::string const w = std::format("%{}", handleNamed(*control, "w"));
+        std::string const u = std::format("%{}", handleNamed(*control, "use"));
+        ASSERT_NE(g, "%0");
+        ASSERT_NE(f, "%0");
+        ASSERT_NE(w, "%0");
+        ASSERT_NE(u, "%0");
+        struct Case {
+            std::string    tail;
+            DiagnosticCode code;
+            char const*    says;
+        };
+        auto const section = [](std::string const& items) { return "aliases {\n" + items + "}\n"; };
+        for (Case const& c : {
+                 Case{section("  alias " + f + " [bogus] = " + g + "\n"), DiagnosticCode::H_TextUnknownName,
+                      "unknown word 'bogus'"},
+                 Case{section("  alias " + f + " [local, weak(overridable)] = " + g + "\n"),
+                      DiagnosticCode::H_TextMalformed, "states its binding twice"},
+                 Case{section("  alias " + f + " [hidden, protected] = " + g + "\n"), DiagnosticCode::H_TextMalformed,
+                      "states its visibility twice"},
+                 Case{section("  alias " + f + " [local(overridable)] = " + g + "\n"), DiagnosticCode::H_TextMalformed,
+                      "takes no argument"},
+                 Case{section("  alias " + f + " [weak(sometimes)] = " + g + "\n"), DiagnosticCode::H_TextUnknownName,
+                      "unknown weak-definition kind 'sometimes'"},
+                 Case{section("  alias " + f + " [weak] = " + g + "\n"), DiagnosticCode::H_TextMalformed,
+                      "names no weak-definition kind"},
+                 Case{section("  alias " + f + " = " + f + "\n"), DiagnosticCode::H_TextMalformed, "names itself"},
+                 Case{section("  alias " + f + " = " + g + "\n  alias " + f + " = " + g + "\n"),
+                      DiagnosticCode::H_TextMalformed, "is stated twice"},
+                 Case{section("  alias %999 = " + g + "\n"), DiagnosticCode::H_TextUnknownName, "not declared"},
+                 Case{section("  alias " + w + " = " + f + "\n"), DiagnosticCode::H_TextMalformed,
+                      "which no `function` or `global` of the module defines"},
+                 Case{section("  alias " + u + " = " + g + "\n"), DiagnosticCode::H_TextMalformed,
+                      "is also defined by a `function` or `global`"},
+                 Case{section("  name " + f + " = " + g + "\n"), DiagnosticCode::H_TextMalformed, "expected 'alias'"},
+                 Case{section("  alias " + f + " = " + g + "\n") + "stray\n", DiagnosticCode::H_TextMalformed,
+                      "after the module"},
+                 Case{std::string{"stray\n"}, DiagnosticCode::H_TextMalformed, "after the module"},
+             }) {
+            SCOPED_TRACE(c.tail);
+            DiagnosticReporter r;
+            auto const read = parseHir(head + c.tail, CompilationUnitId{1}, r);
+            EXPECT_FALSE(read != nullptr && read->ok) << "the reader took a section it cannot read";
+            bool said = false;
+            for (auto const& d : r.all()) said = said || (d.code == c.code && d.actual.find(c.says) != std::string::npos);
+            std::string why;
+            appendDiagnostics(why, r);
+            EXPECT_TRUE(said) << "not refused by name (" << diagnosticCodeName(c.code) << ", \"" << c.says << "\"):"
+                              << why;
+        }
+    });
+    EXPECT_EQ(failed, "");
 }

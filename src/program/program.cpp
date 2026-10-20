@@ -1015,6 +1015,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         hirCtx.symbolNames = &hirSymbolNames;
         hirCtx.literalPool   = &front->hir->literalPool;
         hirCtx.inlineAsmPool = &front->hir->inlineAsmPool;
+        // The unit's symbol aliases (`.dsshir` v9's `aliases` section): without them the artifact is the
+        // unit with every second name of its definitions gone.
+        hirCtx.symbolAliases = &front->hir->symbolAliases;
         // Source spans, and the buffer→name table that makes them resolvable
         // OUTSIDE this process. Supplied together, always: `BufferId` is a
         // process-global counter, so `@loc(buf 7, …)` without the table names
@@ -6608,6 +6611,7 @@ std::string hirArtifactRoundTripFailure(std::string_view artifact) {
     back.shaderMap     = &parsed->shaderMap;
     back.transpileMap  = &parsed->transpileMap;
     back.diagnosticMap = &parsed->diagnosticMap;
+    back.symbolAliases = &parsed->symbolAliases;
     std::string const again = emitHir(parsed->hir, back, rep);
     if (again == text) return {};
 

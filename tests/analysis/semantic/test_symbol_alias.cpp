@@ -189,6 +189,7 @@ TEST(SymbolAlias, AnAliasWhereNoSecondNameCanBeIsSaid) {
         char const*    src;
         DiagnosticCode code;
         bool           error;
+        char const*    says = "";   // the reason the diagnostic must state, where the case names one
     };
     for (Case const c : {
              Case{"int g(void) { return 1; }\n__attribute__((alias(\"g\"))) int f(void) { return 2; }\n",
@@ -208,15 +209,25 @@ TEST(SymbolAlias, AnAliasWhereNoSecondNameCanBeIsSaid) {
                   DiagnosticCode::S_SymbolAliasInitializerIgnored, false},
              // ... and without `extern` the declaration is a definition of its own, refused by all: with an
              // initializer (probe rv cell 10), `static` with one (rv2 cell 1), or external with none (al2 cell 10).
-             Case{"int v = 3;\nint w __attribute__((alias(\"v\"))) = 4;\n", DiagnosticCode::S_RedeclaredSymbol, true},
+             Case{"int v = 3;\nint w __attribute__((alias(\"v\"))) = 4;\n", DiagnosticCode::S_RedeclaredSymbol, true,
+                  "is written `extern`, and the initializer is ignored"},
+             // The `static` form with an initializer: the TRUE reason is that it takes none (an alias has no
+             // storage of its own), never "write it `extern`", which would change the alias's linkage (cs-28 item 9).
              Case{"static int v = 3;\nstatic int w __attribute__((alias(\"v\"))) = 4;\n",
-                  DiagnosticCode::S_RedeclaredSymbol, true},
-             Case{"int v = 3;\nint w __attribute__((alias(\"v\")));\n", DiagnosticCode::S_RedeclaredSymbol, true},
+                  DiagnosticCode::S_RedeclaredSymbol, true, "a `static` object alias takes no initializer"},
+             Case{"int v = 3;\nint w __attribute__((alias(\"v\")));\n", DiagnosticCode::S_RedeclaredSymbol, true,
+                  "with external linkage is written `extern`"},
          }) {
         SCOPED_TRACE(c.src);
         SemanticModel const m = analyzeC(c.src);
         EXPECT_EQ(m.hasErrors(), c.error) << everyDiagnostic(m);
         EXPECT_GE(countCode(m.diagnostics(), c.code), 1u) << everyDiagnostic(m);
+        if (*c.says != '\0') {
+            bool said = false;
+            for (auto const& d : m.diagnostics().all())
+                said = said || (d.code == c.code && d.actual.find(c.says) != std::string::npos);
+            EXPECT_TRUE(said) << "the refusal does not state its reason (\"" << c.says << "\"):" << everyDiagnostic(m);
+        }
     }
 }
 

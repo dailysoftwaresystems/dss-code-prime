@@ -1,1 +1,1 @@
-                        if (user.has_value()) {
+                    if (auto const user = otherUnitUsing(ci, name); user.has_value()) {

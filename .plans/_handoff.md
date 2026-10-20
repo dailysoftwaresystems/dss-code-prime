@@ -553,6 +553,21 @@ round's close; each checkpoint's commit message says what was and was not run on
   Python floor, defect (10)); windows-x86_64-debug 2855 of 2857 on the bytes before a census-figures repair (the
   line-endings guard's false positive, and the census, repaired). NOT read by the lane: windows-x86_64-release,
   linux-x86_64-debug — the whole suite of checkpoint 29 is read from the main checkout after this commit.
+  ✔MEASURED from the main checkout (2026-10-20): macos-arm64-debug 2835 of 2836 (the Mac's Python floor). Its
+  review: SEND BACK, 11 findings, 2 BLOCKERs read as regressions (defect (12) below), in the library lane's next fold.
+- **Checkpoint 30 (2026-10-20) = the C front end lane's fold f26a** (the review of checkpoint 27's MAJOR): an alias
+  of a PE select-any copy that LOSES goes with its copy — one function settles a copy's own name first and judges a
+  name the copy carries only then (`resolveSettlingCarriedNames` in `src/link/common_yield.hpp`, which the merge
+  calls and the link lane's next fold adopts in the linker), a name carried by a losing copy is withdrawn and the
+  names are elected again, the withdrawn alias's own unit reads its target's kept copy, another unit's use of a
+  name nothing else defines is refused `K_SymbolUndefined` in the one sentence the merge and the linker share
+  (`refusalOf(DiscardedNameUse)`); `.dsshir` v9 carries a unit's aliases (an `aliases` section; the reader refuses
+  text after the module, which it had dropped in silence); a `static` object alias with an initializer is refused
+  saying it takes none. Two new examples (PE, and its ELF control). ✔MEASURED by the lane on its bytes, the whole
+  suite: macos-arm64-debug 2836 of 2837 (the Mac's Python floor); windows-x86_64-debug 2857 of 2858 (the
+  line-endings false positive); NOT read by it: windows-x86_64-release (MSVC), the MSVC build's link cells. The
+  lane's sweeps on its tree read all 20 of its arms `passed`. Folded onto checkpoint 29 with two clean three-way
+  merges (`semantic_analyzer.cpp`, `c.lang.json`) and the census re-derived over both lanes' examples.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -591,8 +606,15 @@ round's close; each checkpoint's commit message says what was and was not run on
   python3, and the test spawner refuses it as no executable; the harness lane's H4 classifies a candidate by asking
   the OS. And on the Mac the one red of checkpoint 27 above (no Python floor) — the same fold.
   (11) An alias of a LOSING select-any copy still competes for its name (the review of checkpoint 27, ✔MEASURED by
-  the C front end lane): the settled-order election is the C front end lane's fold f26 for the merge, and the link
-  lane's next fold adopts it in the linker.
+  the C front end lane): the settled-order election is the C front end lane's fold f26 for the merge — FIXED IN THE
+  MERGE by checkpoint 30 — and the link lane's next fold (3c) adopts the same function in the linker.
+  (12) IN MAIN SINCE CHECKPOINT 29 (its review, INFERRED by reading; the library lane measures each cell first): the
+  constant conditional's cross-check ABORTS the compiler on valid programs whose arms the constant tier folds at a
+  type other than the typer's (float arithmetic folded as double; `__builtin_types_compatible_p` folded as a 64-bit
+  unsigned value) — `_Static_assert((1 ? 2.0f * 3.0f : 1.0f) > 0, "")`; and a const ARRAY read whole folds to its
+  first element (`static const int z[2] = {0, 7}; if (!z) ...` folds true, so reachable code is marked unreachable).
+  The library lane's next fold, first items: a folded constant states its C type, and braces are stepped through
+  only for a scalar's initializer.
 - **Arm sweeps from the main checkout so far:** the registry held 502 arms at checkpoint 17 (606 at checkpoint 22).
   The sweep of 340 owed arms at checkpoint 20 (2026-10-15, `macos-arm64-debug`): 155 `passed`; 158 `violated`,
   18 `survived`, 6 `unattributed`, and 3 `stopped` because their runner's unmutated binary had a red in the worker

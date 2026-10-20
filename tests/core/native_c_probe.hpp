@@ -383,8 +383,11 @@ namespace internal {
 // ABSENT, and the skip says which target it saw; a `gcc` that cannot answer the question
 // is a broken step and goes RED, like every other locator in this file.
 //
-// It was three private copies (`where gcc` alone in two of them), so a pin passed by any
-// `gcc` at all and the copies could only drift.
+// It was four private copies, each with a rule of its own (`where gcc` alone in two of
+// them), so a pin passed by any `gcc` at all and the copies could only drift. Two still
+// stand beside this one, each its own predicate: `locateMingwGcc` in
+// tests/link/test_coff_object_reader.cpp (any `gcc` that compiles a probe) and the
+// `where gcc` gate of tests/link/test_coff_linker_directives.cpp.
 struct MingwLocation {
     ProbeStatus status = ProbeStatus::ToolAbsent;
     std::string detail;  // human-readable, in BOTH directions

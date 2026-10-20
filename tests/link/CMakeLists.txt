@@ -25,6 +25,10 @@ dss_add_test(NAME link/test_linker               SOURCES test_linker.cpp)
 # Cycle 24 — the pure cross-CU DEFINITION resolver tripwire (shared by the linker
 # today + a future whole-program MIR merge). Direct value-in/value-out policy pins.
 dss_add_test(NAME link/test_cross_cu_resolve     SOURCES test_cross_cu_resolve.cpp)
+# P69 (cs-28) — the election that settles a definition's own name before the
+# other names it carries run (`resolveSettlingCarriedNames`, link/common_yield.hpp),
+# over synthetic elections: withdrawal, the settled order, a cycle left live.
+dss_add_test(NAME link/test_settled_election     SOURCES test_settled_election.cpp)
 dss_add_test(NAME link/test_crosscu_link_formats SOURCES test_crosscu_link_formats.cpp)
 dss_add_test(NAME link/test_elf_writer           SOURCES test_elf_writer.cpp)
 dss_add_test(NAME link/test_pe_writer            SOURCES test_pe_writer.cpp)

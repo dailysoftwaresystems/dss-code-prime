@@ -7,6 +7,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"  // BuiltinLowering / kBuiltinLoweringTable — the `builtincall` payload's closed set
 #include "core/types/source_span.hpp"
+#include "core/types/symbol_attrs.hpp"   // the binding / weak-kind / visibility tables an alias's linkage is spelled in
 #include "core/types/target_schema.hpp"  // callConvName / kCallConvTable
 #include "core/types/type_lattice/composite_definition.hpp"
 #include "core/types/type_lattice/core_type.hpp"
@@ -41,12 +42,16 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // `.dsshir` text format (HR7) — see hir_text.hpp for the contract. Grammar at a
 // glance (whitespace-insignificant; LF only; canonical formatting below):
 //
-//   file       := "dsshir" INT "producer" STR preamble module
+//   file       := "dsshir" INT "producer" STR preamble module aliases?   (then nothing)
+//   aliases    := "aliases" "{" ("alias" SYM ("[" lword ("," lword)* "]")? "=" SYM)* "}"   (v9)
+//   lword      := a binding of `kSymbolBindingTable` — `weak` with its kind, `weak(select-any)` —
+//                 or a visibility of `kSymbolVisibilityTable`
 //   preamble   := ext_kinds? ext_ops? intrinsics? buffers? types? symbols?
 //                 (non-empty sections only)
 //   types      := "types" "{" ("type" INT "=" composite)* "}"
@@ -900,6 +905,14 @@ public:
         // field exists to prevent.
         if (!hir_.root().valid()) { emitHeader(); return std::move(out_); }
         prepass(hir_.root());
+        // v9: each alias's two symbols, numbered AFTER every symbol a node names — a module with no
+        // alias keeps every handle it had.
+        if (ctx_.symbolAliases != nullptr) {
+            for (HirSymbolAlias const& a : *ctx_.symbolAliases) {
+                noteSymbol(a.alias.v);
+                noteSymbol(a.target.v);
+            }
+        }
 
         emitHeader();
         emitExtKinds();
@@ -934,12 +947,15 @@ public:
         std::string body = takeOut();
         emitTypes();
         std::string types = takeOut();
+        emitAliases();
+        std::string aliases = takeOut();
 
-        out_.reserve(head.size() + types.size() + symbols.size() + body.size());
+        out_.reserve(head.size() + types.size() + symbols.size() + body.size() + aliases.size());
         out_ += head;
         out_ += types;
         out_ += symbols;
         out_ += body;
+        out_ += aliases;
         return std::move(out_);
     }
 
@@ -2775,6 +2791,55 @@ private:
         out_ += "}\n";
     }
 
+    // ── `aliases { alias %A [<linkage words>] = %T }` (v9, P69 lane `cs`) ─────
+    //
+    // The unit's second names of its definitions (`HirSymbolAlias`), after the module whose definitions
+    // they name, in the order the lowering stated them. The list holds the alias's OWN linkage in the
+    // shared tables' words — the binding unless it is `global` (a weak one with its kind as its argument),
+    // the visibility unless it is `default` — and is left out when both are the defaults: `.dssir` v7's
+    // `alias` item, word for word, so the two texts spell one alias one way. An alias has no storage, so a
+    // linkage carrying the tentative mark or a static-initializer schedule — and a weak one that names no
+    // kind — is no alias either text can state: it is REFUSED BY NAME here (Error), and written with the
+    // `?` the reader refuses, never written without the fact.
+    void emitAliases() {
+        if (ctx_.symbolAliases == nullptr || ctx_.symbolAliases->empty()) return;
+        out_ += "aliases {\n";
+        for (HirSymbolAlias const& a : *ctx_.symbolAliases) {
+            LinkageAttr const& lk = a.linkage;
+            std::string        words;
+            auto const word = [&](std::string_view w) {
+                if (!words.empty()) words += ", ";
+                words += w;
+            };
+            if (lk.binding != SymbolBinding::Global) {
+                word(symbolBindingName(lk.binding));
+                if (lk.binding == SymbolBinding::Weak) {
+                    words += '(';
+                    words += weakDefinitionKindName(lk.weakKind);
+                    words += ')';
+                }
+            }
+            if (lk.visibility != SymbolVisibility::Default) word(symbolVisibilityName(lk.visibility));
+            std::string_view const unstateable =
+                lk.tentative ? "the tentative-definition mark"
+                : lk.staticInit.any() ? "a static-initializer schedule"
+                : lk.binding == SymbolBinding::Weak && weakDefinitionKindName(lk.weakKind).empty()
+                    ? "the weak binding with no weak-definition kind"
+                    : std::string_view{};
+            if (!unstateable.empty()) {
+                report(std::format("alias %{} of %{} carries {} — an alias has no storage and no kind-less weak "
+                                   "binding, and this text states none for it",
+                                   handleOf(a.alias.v), handleOf(a.target.v), unstateable),
+                       DiagnosticSeverity::Error);
+                word("?");
+            }
+            out_ += std::format("  alias %{}", handleOf(a.alias.v));
+            if (!words.empty()) out_ += std::format(" [{}]", words);
+            out_ += std::format(" = %{}\n", handleOf(a.target.v));
+        }
+        out_ += "}\n";
+    }
+
     // ── `types { … }` — every composite the module mentions, DEFINED ONCE ──────
     //
     // Drains `typeOrder_` IN HANDLE ORDER, and the loop re-reads the size on every
@@ -3155,6 +3220,9 @@ public:
     // Handles are re-minted IN TREE ORDER by `parseInlineAsm`, which is what
     // makes emit(parse(emit(h))) byte-identical without printing the handle.
     HirInlineAsmPool      pInlineAsm_;
+    // v9: the `aliases` section, in file order (`parseAliases`); handed to the result once each target is
+    // known to be a definition of the built module (`refuseAliasesOfNoDefinition`).
+    std::vector<HirSymbolAlias> pAliases_;
 
     // ★★ HOW MANY TIMES THIS READER REFUSED, COUNTED BY THE READER. `parseHir` and
     // `parseTypeFromText` used to decide "did the text read" by the REPORTER's
@@ -3208,7 +3276,18 @@ public:
         }
         producer_ = takeStr();
         parsePreamble();
-        return parseModule();
+        HirNodeId const root = parseModule();
+        if (!root.valid()) return root;
+        if (acceptKeyword("aliases")) parseAliases();
+        // ★ v9: NOTHING FOLLOWS THE LAST SECTION. A reader that stopped at the module's `}` read a text that
+        // went on — a v9 `aliases` section under a v8 reader, or anything else — as if it ended there, and
+        // dropped the rest in silence; what is left now is refused by name.
+        if (!peekIs(Tk::Eof)) {
+            malformed(std::format("unexpected '{}' after the module — a `.dsshir` text ends with its module "
+                                  "and its `aliases` section",
+                                  lex_.peek().text));
+        }
+        return root;
     }
 
     // Entry for `parseTypeFromText`: decode a STANDALONE type string via the same
@@ -3251,6 +3330,31 @@ public:
             *outQual = std::move(qualTop_);
         }
         return t;
+    }
+
+    // v9: each alias of the section must name a DEFINITION of the built module — a `function` or a
+    // `global` declaration binds its target — and its own name must be no such definition (an alias is a
+    // second name, never storage or a body of its own). Asked by `parseHir` once `hir` is built, before
+    // the verdict; refused by name.
+    void refuseAliasesOfNoDefinition(Hir const& hir) {
+        if (pAliases_.empty()) return;
+        std::unordered_set<std::uint32_t> defined;
+        for (HirNodeId const d : hir.moduleDecls(hir.root())) {
+            if (hir.kind(d) == HirKind::Function) defined.insert(hir.functionSymbol(d).v);
+            else if (hir.kind(d) == HirKind::Global) defined.insert(hir.globalSymbol(d).v);
+        }
+        for (HirSymbolAlias const& a : pAliases_) {
+            if (!defined.contains(a.target.v)) {
+                malformed(std::format("alias %{} names %{}, which no `function` or `global` of the module "
+                                      "defines — an alias is a second name of a definition of its own unit",
+                                      a.alias.v, a.target.v));
+            }
+            if (defined.contains(a.alias.v)) {
+                malformed(std::format("alias %{} is also defined by a `function` or `global` of the module — an "
+                                      "alias is the definition of its name, never a second one",
+                                      a.alias.v));
+            }
+        }
     }
 
 private:
@@ -4237,6 +4341,123 @@ private:
             declared[handle] = true;
             symbolNames_[handle] = std::move(name);
         }
+    }
+
+    // ── `aliases { alias %A [<linkage words>] = %T }` (v9, P69 lane `cs`) ──────
+    //
+    // The twin of `Emitter::emitAliases`. Refused, each by name: an item that is not `alias`; a handle
+    // `symbols` does not declare (`parseSymHandle`); a word of the list that no shared table names, a
+    // binding or a visibility stated twice; an argument on a binding that is not `weak`, a kind the table
+    // does not name, and a `weak` with no kind; an alias that names itself; a name stated twice. That the
+    // target is a DEFINITION of the module is asked once the module is built (`refuseAliasesOfNoDefinition`):
+    // the section names symbols, and only the tree says which symbol a `function` or `global` binds.
+    void parseAliases() {
+        expect(Tk::LBrace, "'{'");
+        std::unordered_set<std::uint32_t> stated;
+        while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+            std::uint32_t const off = cursorOff();
+            if (!acceptKeyword("alias")) {
+                malformed(std::format("expected 'alias' in the `aliases` section, got '{}'", lex_.peek().text));
+                if (cursorOff() == off) lex_.take();   // progress guard
+                continue;
+            }
+            std::uint32_t const alias  = parseSymHandle();
+            LinkageAttr         linkage{};
+            bool const          read   = parseAliasLinkage(linkage, alias);
+            expect(Tk::Equal, "'=' before the alias's target");
+            std::uint32_t const target = parseSymHandle();
+            if (alias == 0 || target == 0 || !read) continue;
+            if (alias == target) {
+                malformed(std::format("alias %{} names itself as its target — an alias is a second name of "
+                                      "another definition", alias));
+                continue;
+            }
+            if (!stated.insert(alias).second) {
+                malformed(std::format("alias %{} is stated twice — one name, one statement", alias));
+                continue;
+            }
+            pAliases_.push_back(HirSymbolAlias{SymbolId{alias}, SymbolId{target}, linkage});
+        }
+        expect(Tk::RBrace, "'}'");
+    }
+
+    // The bracketed linkage list of one alias, read into `out`. False ⇒ a word was refused (the alias is
+    // then not built). The binding's kind is read as the source text the shared table spells it with —
+    // `select-any` is a word, a `-` and a word to this lexer.
+    [[nodiscard]] bool parseAliasLinkage(LinkageAttr& out, std::uint32_t alias) {
+        if (!accept(Tk::LBrack)) return true;
+        bool ok            = true;
+        bool sawBinding    = false;
+        bool sawVisibility = false;
+        while (true) {
+            if (!peekIs(Tk::Ident)) {
+                malformed(std::format("expected a linkage word in the attribute list of alias %{}", alias));
+                return false;
+            }
+            std::string const word = lex_.take().text;
+            if (auto const v = symbolVisibilityFromName(word); v.has_value()) {
+                if (sawVisibility) {
+                    malformed(std::format("the attribute list of alias %{} states its visibility twice — '{}' "
+                                          "after '{}'", alias, word, symbolVisibilityName(out.visibility)));
+                    ok = false;
+                }
+                sawVisibility  = true;
+                out.visibility = *v;
+            } else if (auto const b = symbolBindingFromName(word); b.has_value()) {
+                if (sawBinding) {
+                    malformed(std::format("the attribute list of alias %{} states its binding twice — '{}' "
+                                          "after '{}'", alias, word, symbolBindingName(out.binding)));
+                    ok = false;
+                }
+                sawBinding   = true;
+                out.binding  = *b;
+                out.weakKind = WeakDefinitionKind{};
+                if (accept(Tk::LParen)) {
+                    std::string kind;
+                    while (peekIs(Tk::Ident) || peekIs(Tk::Minus)) {
+                        if (accept(Tk::Minus)) kind += '-';
+                        else kind += lex_.take().text;
+                    }
+                    if (!accept(Tk::RParen)) {
+                        malformed(std::format("'{}' in the attribute list of alias %{} opens an argument that is "
+                                              "not closed with ')'", word, alias));
+                        return false;
+                    }
+                    if (*b != SymbolBinding::Weak) {
+                        malformed(std::format("'{}' takes no argument — a weak-definition kind ('{}') is the "
+                                              "argument of '{}' only",
+                                              word, kind, symbolBindingName(SymbolBinding::Weak)));
+                        ok = false;
+                    } else if (auto const k = weakDefinitionKindFromName(kind); k.has_value()) {
+                        out.weakKind = *k;
+                    } else {
+                        unknownName(std::format("unknown weak-definition kind '{}' — accepted: {}", kind,
+                                                detail::renderAllowedList(allNames(kWeakDefinitionKindTable))));
+                        ok = false;
+                    }
+                }
+            } else {
+                unknownName(std::format("unknown word '{}' in the attribute list of alias %{} — accepted: a "
+                                        "binding ({}) or a visibility ({})",
+                                        word, alias,
+                                        detail::renderAllowedList(allNames(kSymbolBindingTable)),
+                                        detail::renderAllowedList(allNames(kSymbolVisibilityTable))));
+                ok = false;
+            }
+            if (accept(Tk::Comma)) continue;
+            if (!accept(Tk::RBrack)) {
+                malformed(std::format("the attribute list of alias %{} is not closed with ']'", alias));
+                return false;
+            }
+            break;
+        }
+        if (ok && out.binding == SymbolBinding::Weak && weakDefinitionKindName(out.weakKind).empty()) {
+            malformed(std::format("alias %{} is '{}' and names no weak-definition kind — accepted: {}", alias,
+                                  symbolBindingName(SymbolBinding::Weak),
+                                  detail::renderAllowedList(allNames(kWeakDefinitionKindTable))));
+            ok = false;
+        }
+        return ok;
     }
 
     // ── module ───────────────────────────────────────────────────────────────
@@ -6826,6 +7047,9 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
         std::move(hir), std::move(*parser.ownedInterner_), std::move(parser.symbolNames_));
     res->producer    = std::move(parser.producer_);
     res->bufferNames = std::move(parser.bufferNames_);
+    // v9: the aliases, each asked whether it names a definition of the module just built.
+    parser.refuseAliasesOfNoDefinition(res->hir);
+    res->symbolAliases = std::move(parser.pAliases_);
 
     // Hand back the rebuilt literal pool (empty if the source used `#index`).
     res->literalPool = std::move(parser.pLiterals_);

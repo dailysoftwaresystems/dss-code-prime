@@ -45,7 +45,7 @@ namespace {
 
 // Wrap a body line in a minimal well-formed module.
 [[nodiscard]] std::string moduleWith(std::string_view bodyLine) {
-    return std::string("dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+    return std::string("dsshir 9\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                        "  function %1 : fn() -> void {\n    block {\n      ")
          + std::string(bodyLine) + "\n      return void\n    }\n  }\n}\n";
 }
@@ -647,7 +647,7 @@ TEST(HirTextVocabulary, BuiltinCallLoweringSentinelZeroIsRefused) {
 // reason that has nothing to do with the keyword being readable.
 TEST(HirTextVocabulary, LabelAddressKeywordRoundTripsThroughTheReader) {
     std::string const text =
-        "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 9\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      label L1:\n        return void\n"
         "      expr labeladdr L1 : ptr<void>\n"
@@ -689,7 +689,7 @@ TEST(HirTextVocabulary, ExpressionNodesInStatementPositionAreNotDegradedToError)
     };
     for (Case const& c : cases) {
         std::string const text =
-            "dsshir 8\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+            "dsshir 9\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
             "  function %1 : fn() -> void {\n    block {\n"
             "      label L1:\n        unreachable\n      "
             + std::string(c.line) + "\n      return void\n    }\n  }\n}\n";

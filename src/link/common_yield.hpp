@@ -8,10 +8,17 @@
 #include "link/cross_cu_resolve.hpp"       // the ranks `CrossCuDef::weakRank` carries
 #include "link/object_format_schema.hpp"   // ObjectFormatSchema, CommonYieldsTo
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace dss::linker {
 
@@ -237,6 +244,151 @@ refusalOf(CrossCuUndecided const& undecided, ObjectFormatSchema const& linkForma
             undecided.name, undecided.definition.cuId.v, undecided.weak.cuId.v,
             linkFormat.name(),
             dss::detail::renderAllowedList(allNames(kCommonYieldsToTable), " | "))};
+}
+
+// A USE OF A NAME ONLY A DISCARDED DEFINITION CARRIED (P69, cs-28). Where the
+// link's document says a superseded definition is discarded WHOLE
+// (`supersededDefinition` discardedWhole: the losing copy's section goes with
+// every label in it), a name that definition alone carried has no definition
+// left, and a unit that uses it is refused — the linkers' own "undefined
+// symbol". Two doors find such a use: the unit linker, on another external name
+// of a losing definition, and the cross-unit merge, on an alias of a losing
+// copy. Both say it in this sentence.
+struct DiscardedNameUse {
+    std::uint32_t user    = 0;   // the unit (CU number) that uses the name
+    std::string   name;          // the name no definition is left to hold
+    std::string   lostName;      // the name the carrying definition lost
+    std::uint32_t carrier = 0;   // the unit (CU number) whose definition carried it
+};
+[[nodiscard]] inline CrossCuRefusal
+refusalOf(DiscardedNameUse const& use, ObjectFormatSchema const& linkFormat) {
+    return CrossCuRefusal{
+        DiagnosticCode::K_SymbolUndefined,
+        std::format(
+            "CU #{} references '{}', which only the definition of '{}' in CU #{} "
+            "carried; that definition lost '{}' to another, and this format's "
+            "linkers discard it with every label it carries ('supersededDefinition' "
+            "of format '{}': discardedWhole), so '{}' has no definition in the link.",
+            use.user, use.name, use.lostName, use.carrier, use.lostName,
+            linkFormat.name(), use.name)};
+}
+
+// ★★ THE ELECTION THAT SETTLES A DEFINITION'S OWN NAME BEFORE ITS OTHER NAMES RUN
+// (P69, cs-28). `resolveCrossCuDefs` elects names one at a time, so a
+// definition that LOSES its own name still runs for every other name it
+// carries — an alias of it, another external label at its address — as a live
+// definition. That is the link's answer only where the link KEEPS a superseded
+// definition's bytes. Where the link's document says a superseded definition of
+// the carrier's kind is DISCARDED WHOLE (`supersededDefinition` discardedWhole —
+// PE's select-any kind: the losing copy's section goes with every label in it),
+// a name such a definition carries is no definition at all once the definition
+// loses: it is WITHDRAWN, and its name is elected without it — a weak or strong
+// definition elsewhere wins the name, and two such names of one copy's name are
+// no longer two definitions. ✔MEASURED 2026-10-16 (lane cs's probe mj1;
+// clang-cl 19.1.5 objects under lld-link 19.1.5 and link.exe 14.51, mingw-w64
+// gcc 13.2 under GNU ld 2.42; each cell in both link orders):
+//   * an alias of a losing select-any copy beside a WEAK definition of the
+//     alias's name: lld-link binds the name to the weak definition (5), GNU ld
+//     refuses (undefined), link.exe links the image base's bytes — one working
+//     reference, and it is the weak definition;
+//   * two units each with an alias of their own copy: GNU ld and lld-link link
+//     (the winning copy's alias holds the name), link.exe refuses (LNK2005);
+//   * the same two beside a third unit's strong definition of the name: all
+//     three refuse — the WINNING copy's alias and the strong one are two
+//     definitions, which the election left in place still reports.
+// THE ORDER. A carried name is decided only once its carrier's OWN name is
+// settled — no undecided carried name runs for it — and the names are elected
+// again after every withdrawal, so a carrier that lost its name only to a name
+// later withdrawn is elected once more before anything it carries is judged.
+// Carried names that wait on each other (each one's carrier is elected under
+// the other's name) stay in the election: every reference linker keeps both
+// sections then — each COMDAT key is seen once — and refuses the doubly defined
+// names, which is the election's own refusal (✔MEASURED, the same probe: LNK2005,
+// lld-link "duplicate symbol", GNU ld "multiple definition", both orders).
+// Agnostic: driven only by the link's `supersededDefinition` and the elected
+// names; a document that discards nothing whole leaves every entry in place and
+// elects once. Iterative, never recursive: at most one election per withdrawal.
+
+// One more NAME a definition carries beside the one it is elected under itself.
+struct CarriedName {
+    std::size_t                       entry = 0;    // index into the definitions handed in: the entry running for the carried name
+    std::string                       carrierName;  // the name the carrying definition is elected under itself
+    LinkedSymbolKey                   carrier{};    // the carrying definition, as it runs for `carrierName`
+    std::optional<WeakDefinitionKind> carrierKind;  // the kind it states there — what the link's document is asked with
+};
+
+struct SettledElection {
+    CrossCuResolution        resolution;   // every name elected, the withdrawn entries left out
+    std::vector<std::size_t> withdrawn;    // indices of the withdrawn entries, ascending
+};
+
+// Elects `defs` as `resolveCrossCuDefs` does, except that an entry named by a
+// `CarriedName` whose carrier's kind the link discards whole is decided only once
+// the carrier's own name is settled, and is WITHDRAWN when the carrier lost that
+// name (an entry with several carriers: when any of them lost). Entries that wait
+// on each other stay. A `CarriedName` whose `entry` is out of range carries nothing.
+[[nodiscard]] inline SettledElection
+resolveSettlingCarriedNames(std::span<CrossCuDef const>  defs,
+                            std::span<CarriedName const> carried,
+                            ObjectFormatSchema const&    linkFormat) {
+    // The carried names that can be withdrawn at all, grouped by the entry they name.
+    std::unordered_map<std::size_t, std::vector<CarriedName const*>> carriersOf;
+    std::vector<std::size_t>                                         pending;
+    for (CarriedName const& c : carried) {
+        if (c.entry >= defs.size()) continue;
+        if (linkFormat.supersededDefinition().answerFor(c.carrierKind)
+            != std::optional<SupersededDefinition>{SupersededDefinition::DiscardedWhole}) continue;
+        auto& carriers = carriersOf[c.entry];
+        if (carriers.empty()) pending.push_back(c.entry);
+        carriers.push_back(&c);
+    }
+    std::sort(pending.begin(), pending.end());   // decisions in the caller's order
+    std::vector<bool> withdrawn(defs.size(), false);
+    bool              anyWithdrawn = false;
+    auto const elect = [&] {
+        if (!anyWithdrawn) return resolveCrossCuDefs(defs);
+        std::vector<CrossCuDef> live;
+        live.reserve(defs.size());
+        for (std::size_t i = 0; i < defs.size(); ++i) {
+            if (!withdrawn[i]) live.push_back(defs[i]);
+        }
+        return resolveCrossCuDefs(std::span<CrossCuDef const>{live});
+    };
+    CrossCuResolution resolution = elect();
+    while (!pending.empty()) {
+        // A name some undecided carried entry still runs for is not settled.
+        std::unordered_set<std::string_view> unsettled;
+        for (std::size_t const e : pending) unsettled.insert(defs[e].name);
+        std::vector<std::size_t> waiting;
+        bool                     withdrewOne = false;
+        for (std::size_t const e : pending) {
+            auto const& carriers = carriersOf.at(e);
+            bool const  waits    = std::any_of(carriers.begin(), carriers.end(), [&](CarriedName const* c) {
+                return unsettled.contains(std::string_view{c->carrierName});
+            });
+            if (waits) {
+                waiting.push_back(e);
+                continue;
+            }
+            bool const lost = std::any_of(carriers.begin(), carriers.end(), [&](CarriedName const* c) {
+                auto const won = resolution.winners.find(c->carrierName);
+                return won != resolution.winners.end() && !(won->second == c->carrier);
+            });
+            if (lost) {
+                withdrawn[e] = true;
+                anyWithdrawn = true;
+                withdrewOne  = true;
+            }
+        }
+        if (waiting.size() == pending.size()) break;   // they wait on each other: they stay
+        pending = std::move(waiting);
+        if (withdrewOne) resolution = elect();
+    }
+    SettledElection out{std::move(resolution), {}};
+    for (std::size_t i = 0; i < defs.size(); ++i) {
+        if (withdrawn[i]) out.withdrawn.push_back(i);
+    }
+    return out;
 }
 
 }  // namespace dss::linker

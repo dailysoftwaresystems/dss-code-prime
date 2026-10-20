@@ -551,6 +551,36 @@ TEST(EmitHirMode, SourceLevelNamesTravelInsideTheArtifact) {
     EXPECT_TRUE(sawScaled) << "the reader could not recover the local's name";
 }
 
+// ── The unit's symbol aliases (v9) ──────────────────────────────────────────
+
+// The driver hands the lowering's aliases to the writer, and its own read-back check carries them home: the
+// artifact of a unit with an `alias("target")` states each alias in its `aliases` section, and the reader holding
+// only the bytes rebuilds them (cs-28 item 11). Before v9 the artifact was the unit without its second names.
+TEST(EmitHirMode, AUnitsAliasesTravelInsideTheArtifactAndReadBack) {
+    auto const r = emitTo("aliases",
+                          "int g(void) { return 1; }\n"
+                          "int f(void) __attribute__((weak, alias(\"g\")));\n"
+                          "static int t = 5;\n"
+                          "static int a __attribute__((alias(\"t\")));\n"
+                          "int use(void) { return f() + a; }\n");
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_NE(r.artifact.find("\naliases {\n"), std::string::npos) << "the artifact states no alias:\n" << r.artifact;
+    DiagnosticReporter rep;
+    auto const parsed = parseHir(r.artifact, CompilationUnitId{1}, rep);
+    ASSERT_TRUE(parsed->ok) << reparse(r.artifact).diagnostics;
+    ASSERT_EQ(parsed->symbolAliases.size(), 2u) << r.artifact;
+    auto const nameOf = [&](SymbolId s) {
+        return s.v < parsed->symbolNames.size() ? parsed->symbolNames[s.v] : std::string{"(no name)"};
+    };
+    EXPECT_EQ(nameOf(parsed->symbolAliases[0].alias), "f");
+    EXPECT_EQ(nameOf(parsed->symbolAliases[0].target), "g");
+    EXPECT_EQ(parsed->symbolAliases[0].linkage.binding, SymbolBinding::Weak);
+    EXPECT_EQ(parsed->symbolAliases[0].linkage.weakKind, WeakDefinitionKind::Overridable);
+    EXPECT_EQ(nameOf(parsed->symbolAliases[1].alias), "a");
+    EXPECT_EQ(nameOf(parsed->symbolAliases[1].target), "t");
+    EXPECT_EQ(parsed->symbolAliases[1].linkage.binding, SymbolBinding::Local);
+}
+
 // ── Version + producer on the artifact's face ───────────────────────────────
 
 TEST(EmitHirMode, VersionAndRealProducerRevisionHeadTheArtifact) {
@@ -558,7 +588,7 @@ TEST(EmitHirMode, VersionAndRealProducerRevisionHeadTheArtifact) {
     ASSERT_EQ(r.rc, 0) << r.err;
     // The version is the FIRST line, so a reader can decide whether to continue
     // before it has parsed anything it might misread.
-    EXPECT_TRUE(r.artifact.starts_with("dsshir 8\n")) << r.artifact.substr(0, 64);
+    EXPECT_TRUE(r.artifact.starts_with("dsshir 9\n")) << r.artifact.substr(0, 64);
     EXPECT_NE(r.artifact.find("\nproducer \""), std::string::npos) << r.artifact;
     // ⚠ NOT MERELY "a producer line exists". The emitter accepts an EMPTY
     // producer (hand-built test modules use it), so a routing defect that never
@@ -592,8 +622,8 @@ TEST(EmitHirMode, AMalformedOrAbsentVersionIsRefusedLoudlyOnRead) {
         {"the superseded v1", "dsshir 1\nsymbols {\n}\nmodule \"toy\" {\n}\n"},
         {"no version at all", "module \"toy\" {\n}\n"},
         {"a non-numeric version", "dsshir vNext\nmodule \"toy\" {\n}\n"},
-        {"no producer line", "dsshir 8\nmodule \"toy\" {\n}\n"},
-        {"an unquoted producer", "dsshir 8\nproducer 7\nmodule \"toy\" {\n}\n"},
+        {"no producer line", "dsshir 9\nmodule \"toy\" {\n}\n"},
+        {"an unquoted producer", "dsshir 9\nproducer 7\nmodule \"toy\" {\n}\n"},
     };
     for (auto const& arm : arms) {
         DiagnosticReporter r;
@@ -606,7 +636,7 @@ TEST(EmitHirMode, AMalformedOrAbsentVersionIsRefusedLoudlyOnRead) {
     // it, six failures are equally consistent with "this parser refuses
     // everything".
     DiagnosticReporter ok;
-    auto good = parseHir(std::string{"dsshir 8\nproducer \"ctl\"\nmodule \"toy\" {\n}\n"},
+    auto good = parseHir(std::string{"dsshir 9\nproducer \"ctl\"\nmodule \"toy\" {\n}\n"},
                          CompilationUnitId{1}, ok);
     EXPECT_TRUE(good->ok);
     EXPECT_EQ(good->producer, "ctl");
@@ -736,7 +766,7 @@ TEST(EmitHirMode, DashWritesTheArtifactToTheGivenStreamAndNoFile) {
     int const rc = p.emitHirText({src.string()}, "c", std::string{kTarget}, "-",
                                  out, err);
     EXPECT_EQ(rc, 0) << err.str();
-    EXPECT_TRUE(out.str().starts_with("dsshir 8\n")) << out.str().substr(0, 64);
+    EXPECT_TRUE(out.str().starts_with("dsshir 9\n")) << out.str().substr(0, 64);
     EXPECT_TRUE(err.str().empty()) << err.str();
     // A file literally named `-` is the failure this arm exists to catch.
     EXPECT_FALSE(fs::exists(fs::path{"-"}));
@@ -751,7 +781,7 @@ TEST(DumpHirKinds, InventoryNamesEveryCoreKindAndIsAttributed) {
     // It reports the format version too, because a consumer generating a
     // build-time coverage table needs to know which artifact grammar these kinds
     // belong to.
-    EXPECT_NE(text.find("dsshir-format-version 8\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("dsshir-format-version 9\n"), std::string::npos) << text;
 
     // ★ THE COUNT LINE MUST AGREE WITH THE ROWS. A truncated enumeration is the
     // dangerous failure here: a consumer treats this list as EXHAUSTIVE and
@@ -843,7 +873,7 @@ TEST(HirArtifactRoundTrip, AnArtifactCarryingATokenTheGrammarHasNoRuleForIsRefus
     // had no token for at all, and four shipped artifacts were refused by name.
     // Reproduced synthetically, because that particular hole is now closed.
     std::string const bad =
-        "dsshir 8\n"
+        "dsshir 9\n"
         "producer \"planted\"\n"
         "module \"C\" {\n"
         "  \x01\x02 not a production this grammar has\n"

@@ -2,8 +2,9 @@
  *
  * Each alias below is one more name on a definition of this unit -- never a body or storage
  * of its own -- so a call, a read, a write and an address taken through it are the target's.
- * gcc, clang and mingw-w64 gcc build every line on ELF and PE (Apple clang refuses an alias on
- * Mach-O, and so does DSS there, by name). */
+ * gcc, clang and mingw-w64 gcc build every line on ELF and PE but ONE: the function name on an object
+ * below, which gcc and mingw-w64 gcc refuse and clang builds (decided clang's; lane cs probes rv and fk).
+ * Apple clang refuses an alias on Mach-O, and so does DSS there, by name. */
 
 int dss_add(int a, int b) { return a + b; }
 int dss_sum(int, int) __attribute__((alias("dss_add")));             /* an external alias of a function */

@@ -150,7 +150,7 @@ int sum_fields(struct Point *p) {
 ```
 
 ```
-dsshir 8
+dsshir 9
 producer "0.5.0+src8d396dcb22f081cf"
 buffers {
   buf 1 "/tmp/ht-doc/doc_example.c"
@@ -194,8 +194,11 @@ Whitespace-insignificant. **LF only** — the writer never emits `\r`, and a `.d
 legitimate carriage return. UTF-8. Strings are double-quoted with `\"` and `\\` escapes.
 
 ```
-file       := "dsshir" INT "producer" STR preamble module
+file       := "dsshir" INT "producer" STR preamble module aliases?   (and nothing after it)
 preamble   := ext_kinds? ext_ops? intrinsics? buffers? types? symbols?   (non-empty sections only)
+aliases    := "aliases" "{" ("alias" SYM ("[" lword ("," lword)* "]")? "=" SYM)* "}"   (§4.8)
+lword      := "local" | "weak" "(" ("overridable" | "select-any") ")"
+            | "hidden" | "protected" | "internal"
 types      := "types" "{" ("type" INT "=" composite)* "}"
 composite  := ("struct" | "union") STR
               ( "opaque"
@@ -249,11 +252,13 @@ by name, rather than building one there.
 ```
 
 Sections are emitted **only when non-empty**, in the order shown. The two header lines are
-**always** emitted, including for an empty module.
+**always** emitted, including for an empty module. **Nothing follows the last section**: a token after
+the module (or after its `aliases` section) is refused by name — a v8 reader stopped at the module's `}`
+and took a text that went on as if it ended there.
 
 ### 4.1 `dsshir <version>` — the format version
 
-The first line. **Currently `8`.** A reader that does not understand the version must **refuse**,
+The first line. **Currently `9`.** A reader that does not understand the version must **refuse**,
 not guess. Our own parser does exactly that: a version it does not know is a hard
 `H_TextVersionMismatch` error and no module is produced.
 
@@ -380,6 +385,39 @@ markers that cannot be combined (explicit offsets with member alignments, with `
 bit-field widths); and, anywhere in the module, an inline `struct "N" { … }` / `union …` or a v3
 `rec <H>` — a module has exactly one spelling of each composite.
 
+### 4.8 `aliases { … }` — second names of the module's definitions (new in v9)
+
+```c
+int g(void) { return 1; }
+int f(void) __attribute__((weak, alias("g")));
+static int t = 5;
+static int a __attribute__((alias("t")));
+```
+```
+aliases {
+  alias %2 [weak(overridable)] = %1
+  alias %4 [local] = %3
+}
+```
+
+Each item is one **alias** — GNU C's `alias("target")`: the name `%A` is one more name of the
+definition `%T`, never a body or storage of its own. It follows the module, whose `function` or
+`global` declaration binds `%T` (the declaration of `%A` itself, when it has external linkage, is an
+`extern_function` / `extern_global` — a reference to its name; a module-private alias has no node at
+all). The list in brackets is the alias's **own** linkage, in the words the MIR text `.dssir` spells
+its `alias %A [linkage] = %T` item with (`src/mir/mir_text.cpp`, since its version 7): its binding
+unless it is `global` — `local` for a module-private alias, `weak(<kind>)` for a weak one, where the
+kind is `overridable` (`__attribute__((weak))`) or `select-any` (one of several interchangeable
+copies) — and its visibility unless it is `default`. Both default ⇒ no list. Items are in the order
+the lowering states them (declaration order), and an alias's two symbols take their `symbols` handles
+after every symbol a node names.
+
+Refused, each by name: an item that is not `alias`; a handle `symbols` does not declare; a word no
+binding or visibility table names, a binding or a visibility stated twice, an argument on a binding
+that is not `weak`, a kind that is neither of the two, and `weak` with no kind; an alias that names
+itself; one name stated twice; a target no `function` or `global` of the module defines; and an alias
+whose own name a `function` or `global` defines.
+
 ---
 
 ## 5. Self-containment: what a reader can reconstruct from the bytes alone
@@ -413,6 +451,7 @@ This is the property the format is built around, so here is exactly how far it g
   ```
   (`packed` is the whole-composite marker, `~N` a per-member alignment, `@N` an explicit offset.)
 - **Every source-level name**, in `symbols`.
+- **Every symbol alias** (`alias("target")`), with its target and its own linkage, in `aliases` (v9).
 - **Every literal value**, inline (`lit int 42 : i32`, `lit str "hi" : arr<char, 3>`). A NaN other
   than the canonical quiet one — a payload, as `__builtin_nan("1")` makes, or a sign — is written by
   its 64-bit pattern, `lit float nanbits 9221120237041090561 : f64` (v7), because `nan` reads back as
@@ -569,7 +608,7 @@ program. Output:
 
 ```
 dsshir-kinds 1
-dsshir-format-version 8
+dsshir-format-version 9
 producer "0.5.0+src8d396dcb22f081cf"
 core-kind-count 56
 kind "Module" position non-expr typed no symbol no
@@ -657,7 +696,11 @@ window.** Concretely:
    the same value. The member decides which bytes the value is: v7 wrote `agg {…}` for every
    aggregate and dropped it, so a union value read back naming no member. A v7 reader meeting
    `member` has no rule for the word, and one that skipped it would rebuild that member-less value;
-   a v8 reader refuses a union-typed `agg` that has a field and names no member.
+   a v8 reader refuses a union-typed `agg` that has a field and names no member. **v9** stated a
+   module's symbol aliases, the `aliases` section after the module (§4.8): v8 had no form for them, so
+   the artifact of a unit with an `alias("target")` read back as the unit without it. A v8 reader stopped
+   at the module's `}` and never read what followed, so it would have taken a v9 text whole and dropped
+   the section in silence — and a v9 reader refuses by name any token after the last section.
 3. **We do not maintain a compatibility window.** This build understands **one** version and refuses
    every other, in both directions — a v1 file is refused by a v2 parser just as a v3 file is. One
    grammar, no conditional parsing, no "mostly works".
@@ -666,7 +709,7 @@ window.** Concretely:
    and plan to re-emit rather than to migrate files.
 5. **After C++ lands the format is expected to stabilise** and bumps to become rare.
 
-**What is stable today** (as stable as anything in an `8`): the mode and its exit-code contract, the
+**What is stable today** (as stable as anything in a `9`): the mode and its exit-code contract, the
 two header lines and their order, the section order, the type syntax (shared with FFI descriptors,
 see [`ir-type-text.md`](./ir-type-text.md) — a module differs only in naming every composite through
 its `types` table), and the self-containment rules in §5.
@@ -705,7 +748,8 @@ Our own parser is `dss::parseHir` ([`src/hir/hir_text.hpp`](../src/hir/hir_text.
 - re-interns every type into a fresh interner — each `types` entry as ONE composite keyed on its
   handle, so two entries with identical bodies stay two types,
 - re-registers extension kinds / ops / intrinsics from the preamble,
-- rebuilds the symbol names, buffer table, literal pool and per-node side-tables,
+- rebuilds the symbol names, buffer table, literal pool, per-node side-tables and the module's
+  aliases (`HirParseResult::symbolAliases`, v9),
 - and runs **`HirVerifier` on load** — on a module it ACCEPTED. A file the reader refuses is refused
   by the reader's own diagnostics alone: the tree its error recovery built is never verified, so no
   verifier line follows the one that names the cause. (Verifying such a tree used to kill the

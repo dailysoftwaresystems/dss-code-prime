@@ -28858,6 +28858,12 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
                                "its own{} — an alias is the definition of its name",
                                sRec.name,
                                definedOtherwise ? ""
+                               : p.wroteInitializer && dRec.isInternalLinkage
+                                   // The `static` form takes no initializer at all: an
+                                   // alias has no storage, so no value, of its own — with
+                                   // none it is the alias (cs-28 item 9).
+                                   ? " (a `static` object alias takes no initializer: an "
+                                     "alias has no storage, and so no value, of its own)"
                                : p.wroteInitializer
                                    ? " (an object alias with an initializer is written "
                                      "`extern`, and the initializer is ignored)"

@@ -153,7 +153,14 @@ class TypeRegistry;
 // aggregate and so dropped it; a v7 reader meeting `member` has no rule for the word, and
 // one that skipped it would hand the encoder a union value initialized through no member.
 // A v8 reader refuses a union-typed `agg` with a field and no member AT THE TEXT.
-inline constexpr std::uint32_t kHirTextFormatVersion = 8;
+// v9 states a module's SYMBOL ALIASES, an `aliases { alias %A [<linkage>] = %T }` section after the module
+// (P69, lane `cs`, the review of the alias folds): the unit's second names of its definitions
+// (`HirSymbolAlias`, `CstToHirResult::symbolAliases`), each with its target and its own linkage, in `.dssir`
+// v7's words. v8 had no form for them — the one side table of the lowering with none, created by the alias
+// fold — so an `--emit-hir` artifact of a unit with an alias read back as the unit without it. A v8 reader
+// stops at the module's `}` and never reads what follows it, so it would take a v9 text whole and drop the
+// section in silence: the number moves, and a v9 reader refuses BY NAME any token after the last section.
+inline constexpr std::uint32_t kHirTextFormatVersion = 9;
 
 // ── kHirTextMaxNodeDepth — THE FORMAT'S DECLARED NESTING LIMIT ────────────────
 //
@@ -299,6 +306,12 @@ struct DSS_EXPORT HirTextContext {
     HirShaderMap     const* shaderMap     = nullptr;
     HirTranspileMap  const* transpileMap  = nullptr;
     HirDiagnosticMap const* diagnosticMap = nullptr;
+
+    // P69 (lane `cs`, v9): the unit's symbol aliases (`CstToHirResult::symbolAliases`), written as the
+    // `aliases` section after the module, in the order given — the lowering's, declaration order. Null or
+    // empty ⇒ no section. An alias's two symbols are numbered in `symbols` AFTER every symbol a node names,
+    // so a module with no alias is spelled byte for byte as it was.
+    std::vector<HirSymbolAlias> const* symbolAliases = nullptr;
 };
 
 // Serialize `hir` to canonical `.dsshir` text. Pure function of (hir, ctx): the
@@ -395,6 +408,10 @@ struct DSS_EXPORT HirParseResult {
     // form (empty when the source used the bare `#<handle>` form). Indexed by an
     // `InlineAsm` node's `payload`, 1-based.
     HirInlineAsmPool inlineAsmPool;
+    // P69 (lane `cs`, v9): the `aliases` section, in file order (empty when the file has none). Each
+    // alias names a definition of the module (a `function` or `global` node binds its target). Feed it
+    // back into `HirTextContext::symbolAliases` to reproduce the bytes.
+    std::vector<HirSymbolAlias> symbolAliases;
 
     // True iff neither the parse nor the verify-on-load pass emitted an
     // Error-severity diagnostic (computed by delta on the reporter, so prior
