@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -390,6 +392,54 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
     return NodeId{};
 }
 
+// THE VALUE STEPS A DESCENT THAT ASKS A VALUE TAKES BY NAME (P69, lane `lm`):
+//   * a statement expression of ONE item that is an expression statement has that
+//     expression's value (`soleExpressionOfStatementExpression`, the one place that says
+//     so); a body ending in anything else has no value, and is no constant;
+//   * a brace list led by an UNDESIGNATED element has that element's value — the
+//     initializer of a scalar, "optionally enclosed in braces" (C 6.7.9p11): the form a
+//     named constant's initializer `constexpr int c = { 5 };` is read in. An element after
+//     the first is EXCESS (C 6.7.9p2's constraint): the lowering warns and drops it
+//     unevaluated, and the scalar holds the first — so the constant is the first too
+//     (P69, lane `lm`, the scalar brace closure: ✔MEASURED 2026-10-16, clang 18.1.3 folds
+//     `static const int c = {5, 7};` and `{{5}, 7}` to 5 in `_Static_assert` and an array
+//     bound, gcc 13.3.0 `constexpr int c = {5, 7};`). An empty list or one led by a
+//     designator takes no step: no constant.
+// The node to step to, or an invalid node. ★ THE DRIVER TAKES THE STEP AS A FRAME (the
+// review's E): the fold that named these steps took them in `evalNode`'s tail, one fresh
+// driver and two host frames per level, so `({ ({ … ({ 0; }) … }); })` or
+// `{{ … { 5 } … }}` nested as deep as the parser admits recursed on the host stack where
+// the peel by count it replaced had been a frame. Shared by the driver and `evalNode`'s
+// tail, so the two never take different steps.
+[[nodiscard]] NodeId
+valueStepChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
+               std::vector<NodeId> const& kids) {
+    if (!expr.valid() || tree.kind(expr) != NodeKind::Internal) return NodeId{};
+    if (NodeId const value = soleExpressionOfStatementExpression(cfg, tree, expr);
+        value.valid()) {
+        return value;
+    }
+    if (!cfg.braceInitListRule.valid() || tree.rule(expr).v != cfg.braceInitListRule.v) {
+        return NodeId{};
+    }
+    NodeId element{};
+    for (NodeId c : kids) {
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        element = c;   // the first element; any after it is excess
+        break;
+    }
+    if (!element.valid()) return NodeId{};
+    NodeId value{};
+    std::size_t parts = 0;
+    for (NodeId c : visibleChildren(tree, element)) {
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        ++parts;
+        value = c;
+    }
+    // A designated element has two parts: the designation and the value.
+    return parts == 1 ? value : NodeId{};
+}
+
 // ── A BIT-FIELD MEMBER IS READ AT ITS WIDTH ───────────────────────────────────────────
 // (cycle P69 round 1, lane `lm`.)
 //
@@ -405,32 +455,28 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
 // the first of them died of an illegal instruction, in seven of the ten forms run.
 //
 // `atDeclaredType` holds the value already converted to the member's declared type
-// (`declared`); the reduced value is then handed on AT THE TYPE ITS VALUE HAS
-// (`valueType`, C 6.3.1.1p2 — `bitFieldPromotedType`, which the tier that resolved the
-// member asked): `int` for a field narrower than `int`, `unsigned int` for an unsigned
-// one of exactly `int`'s width, the declared type for a wider one. The reduced value
-// fits that type, so the conversion keeps it. ★ P69 (lane `lm`,
-// D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT): THE PROMOTION IS THE
-// RUN-TIME READ'S AND THIS ONE'S TOGETHER, and they moved together — the operators of
-// both tiers read a bit-field operand at the same type (`bitFieldValueWidth`,
-// decl_prefix_strip.hpp). Until then this kept the declared type's core, the type the
-// run-time read had: ✔MEASURED 2026-10-15 (pe64, both pipelines), `g.b - 6 < 0` over a
-// constant `unsigned b : 3` holding 5 folded 0 in an enumerator, a static initializer
-// and an `if`, and ran 0, where clang 18 and AppleClang 21 fold 1 and all four GNU
-// references run 1 — one wrong value in every tier, agreeing with itself.
-// A `_Bool` field's value is 0 or 1 at any width; it too is handed on at `valueType`.
+// (`declared`); the reduced value is handed on AT THAT TYPE. ★ THE READ DOES NOT
+// PROMOTE; AN OPERATOR DOES (P69, lane `lm`, the review of the promotion fold). C
+// 6.3.1.1p2 promotes a bit-field by its width where an operator reads it, and WHICH
+// expression is a bit-field's value is the one statement the typer and the lowering ask
+// (`bitFieldValueWidth`, decl_prefix_strip.hpp) — so this engine's operators ask it too,
+// through the tier (`asBitFieldOperand` below), and the read stays at the declared type.
+// The fold before this one converted every read to the promoted type here, and so
+// promoted where the statement does not: ✔MEASURED 2026-10-15 (pe64, both pipelines),
+// `if (({ g.b; }) - 6 < 0)` over a constant `unsigned b : 3` holding 5 folded TRUE and
+// ran FALSE — the code after it marked never reached, the image dying of an illegal
+// instruction — and `_Static_assert(({ g.b; }) - 6 < 0, "")` was accepted, where clang 18
+// returns 7 and fails the assertion (a statement expression's value is its last
+// expression after lvalue conversion: the declared type).
+// A `_Bool` field's value is 0 or 1 at any width; it too is handed on at its type.
 // Refused, as no constant: a field of a bit-precise or 128-bit type, a width the
 // declared type cannot hold, and a plain `char` field whose sign the caller was not
 // told — none of them a shape a reference was measured folding.
 [[nodiscard]] ConstEvalResult
-convertToCastTarget(ConstEvalResult const& inner, CstCastTarget const& target,
-                    EvalOptions const& options, NodeId expr);
-
-[[nodiscard]] ConstEvalResult
 readThroughBitField(ConstEvalResult const& atDeclaredType, CstCastTarget const& declared,
-                    CstBitFieldRead const& field, EvalOptions const& options, NodeId expr) {
+                    CstBitFieldRead const& field, NodeId expr) {
     if (!atDeclaredType.value.has_value()) return atDeclaredType;
-    if (declared.isBool) return convertToCastTarget(atDeclaredType, field.valueType, options, expr);
+    if (declared.isBool) return atDeclaredType;
     std::uint32_t const width = field.width;
     if (!declared.isInteger || declared.intSignednessUnknown || declared.intBits > 64
         || width == 0 || width > static_cast<std::uint32_t>(declared.intBits)) {
@@ -448,7 +494,7 @@ readThroughBitField(ConstEvalResult const& atDeclaredType, CstCastTarget const& 
     } else {
         atField.value = static_cast<std::int64_t>(reduced);
     }
-    return convertToCastTarget(ok(std::move(atField)), field.valueType, options, expr);
+    return ok(std::move(atField));
 }
 
 // ── A FOLDED VALUE CONVERTED TO A CLASSIFIED TARGET ──────────────────────────────
@@ -838,6 +884,204 @@ convertToCastTarget(ConstEvalResult const& inner, CstCastTarget const& target,
     // `_Complex` cast target being non-foldable, and it is — through the
     // classifier's `default`, not through here.
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
+}
+
+// ── AN OPERAND THAT IS A BIT-FIELD'S VALUE, AT ITS PROMOTED TYPE ───────────────────────
+// (cycle P69 round 1, lane `lm`, the review of the promotion fold.)
+//
+// C 6.3.1.1p2: an operator reads a bit-field's value at its type promoted BY ITS WIDTH,
+// and WHICH operand is one is the ONE statement the typer and the lowering ask
+// (`bitFieldValueWidth`) — the tier answers it here (`resolveBitFieldValueType`), so this
+// engine converts an operand exactly where those two convert it. A read that reaches an
+// operator through a statement expression (`({ g.b; })`, no bit-field's value) keeps the
+// member's declared type, as it does at run time. Asked only of an integer operand a
+// promotion can change: a plain `int` never changes, and a floating value or an address
+// is no bit-field's.
+[[nodiscard]] bool
+operandMayBePromoted(ConstEvalResult const& v, CstEvalEnvironment const& env) {
+    return v.value.has_value() && env.resolveBitFieldValueType
+        && v.value->core != TypeKind::I32 && detail::asIntBits(*v.value).has_value();
+}
+
+[[nodiscard]] ConstEvalResult
+asBitFieldOperand(NodeId operandN, ConstEvalResult v, CstEvalEnvironment const& env,
+                  EvalOptions const& options, std::uint32_t scopeOpaque) {
+    if (!operandMayBePromoted(v, env) || !operandN.valid()) return v;
+    auto const promoted = env.resolveBitFieldValueType(operandN, scopeOpaque);
+    if (!promoted.has_value()) return v;
+    return convertToCastTarget(v, *promoted, options, operandN);
+}
+
+// ── A CONDITIONAL'S ARMS, BALANCED ─────────────────────────────────────────────────────
+// (cycle P69 round 1, lane `lm`, the review of the promotion fold.)
+//
+// C 6.5.15p5: when both arms are arithmetic, the conditional has the type the usual
+// arithmetic conversions give the two — `1 ? 5 : 0u` is an `unsigned int`, so
+// `(1 ? 5 : 0u) - 6 < 0` is false. This engine handed on the SELECTED arm at its own type:
+// ✔MEASURED 2026-10-15/16 (pe64, both pipelines), `if ((1 ? 5 : 0u) - 6 < 0)`,
+// `if ((1 ? g.b : 0u) - 6 < 0)` over a constant `unsigned b : 3` holding 5 and
+// `if ((1 ? 5 : xu) - 6 < 0)` over an `unsigned xu` folded TRUE and died of an illegal
+// instruction (the code after them marked never reached), `_Static_assert((1 ? 5 : 0u) -
+// 6 > 0, "")` failed and `_Static_assert((1 ? -1 : 0u) > 0, "")` failed, where clang 18
+// and gcc 13 run 2 and accept both — a non-constant unselected arm balanced by its TYPE.
+// The conversion the pair needs is the TIER's type of the conditional when the tier has
+// one (`resolveExpressionType`: the typer's own answer, the one the run time converts
+// to); else the arms' balance computed here by the verb this engine's binary operators
+// perform in (`bitIntUac`, C 6.3.1.8) — a floating arm by its format's width — the
+// unselected arm's type its folded value's, or, when it does not fold, the tier's type of
+// that arm; else the conditional is no constant. ★ WHERE BOTH ARE KNOWN — every constant
+// conditional the semantic tier folds, before its second pass too (its hook types the
+// literals first), and every one the lowering folds — BOTH ARE COMPUTED, and two different
+// answers stop the process (`failOnDivergentConditionalType`): the balance below is the
+// statement the evaluator stands on where the tier gives no type (no hook, or an expression
+// its typer cannot type), and it is proved against the typer on every conditional the
+// suite folds rather than trusted.
+struct CstArithmeticType {
+    std::optional<detail::BitIntOperandType> integer{};
+    std::optional<TypeKind>                  floating{};
+};
+
+// The type a folded value's CORE states, for the usual arithmetic conversions; nullopt for
+// an address and for a plain `char` whose sign the caller was not told.
+[[nodiscard]] std::optional<CstArithmeticType>
+arithmeticTypeOfValue(HirLiteralValue const& v, EvalOptions const& options) {
+    if (isFloatValue(v)) {
+        if (!floatKindInfo(v.core).has_value()) return std::nullopt;
+        return CstArithmeticType{std::nullopt, v.core};
+    }
+    if (auto const t = detail::bitIntOperandType(v, options.charIsUnsigned); t.has_value()) {
+        return CstArithmeticType{*t, std::nullopt};
+    }
+    return std::nullopt;
+}
+
+// The type a classified target states; nullopt for a pointer and for a `char` of unknown sign.
+[[nodiscard]] std::optional<CstArithmeticType>
+arithmeticTypeOfTarget(CstCastTarget const& t) {
+    if (t.floatKind.has_value()) {
+        if (!floatKindInfo(*t.floatKind).has_value()) return std::nullopt;
+        return CstArithmeticType{std::nullopt, *t.floatKind};
+    }
+    if (t.isBitPrecise) {
+        return CstArithmeticType{detail::BitIntOperandType{t.bitWidth, t.bitSigned, true},
+                                 std::nullopt};
+    }
+    if (t.isBool) return CstArithmeticType{detail::BitIntOperandType{1, false, false}, std::nullopt};
+    if (t.isInteger && !t.intSignednessUnknown && t.intBits > 0) {
+        return CstArithmeticType{
+            detail::BitIntOperandType{static_cast<std::uint32_t>(t.intBits), t.intSigned, false},
+            std::nullopt};
+    }
+    return std::nullopt;
+}
+
+// The usual arithmetic conversions of the pair, as the conversion to make.
+[[nodiscard]] CstCastTarget
+usualArithmeticTarget(CstArithmeticType const& a, CstArithmeticType const& b) {
+    CstCastTarget t;
+    if (a.floating.has_value() || b.floating.has_value()) {
+        TypeKind k = a.floating.has_value() ? *a.floating : *b.floating;
+        if (a.floating.has_value() && b.floating.has_value()
+            && floatKindInfo(*b.floating)->bits > floatKindInfo(*a.floating)->bits) {
+            k = *b.floating;
+        }
+        t.floatKind = k;
+        return t;
+    }
+    detail::BitIntOperandType const r = detail::bitIntUac(*a.integer, *b.integer);
+    if (r.isBitPrecise) {
+        t.isBitPrecise = true;
+        t.bitWidth     = r.width;
+        t.bitSigned    = r.isSigned;
+    } else {
+        t.isInteger = true;
+        t.intBits   = static_cast<int>(r.width);
+        t.intSigned = r.isSigned;
+    }
+    return t;
+}
+
+[[nodiscard]] bool
+sameArithmeticTarget(CstCastTarget const& a, CstCastTarget const& b) {
+    if (a.floatKind.has_value() || b.floatKind.has_value()) return a.floatKind == b.floatKind;
+    if (a.isBitPrecise || b.isBitPrecise) {
+        return a.isBitPrecise == b.isBitPrecise && a.bitWidth == b.bitWidth
+            && a.bitSigned == b.bitSigned;
+    }
+    return a.isInteger == b.isInteger && a.intBits == b.intBits && a.intSigned == b.intSigned;
+}
+
+[[nodiscard]] std::string
+describeArithmeticTarget(CstCastTarget const& t) {
+    if (t.floatKind.has_value()) return std::string{typeKindNameOrEmpty(*t.floatKind)};
+    if (t.isBitPrecise) {
+        return std::string{t.bitSigned ? "_BitInt(" : "unsigned _BitInt("}
+             + std::to_string(t.bitWidth) + ")";
+    }
+    return std::string{t.intSigned ? "a signed " : "an unsigned "} + std::to_string(t.intBits)
+         + "-bit integer";
+}
+
+// The typer's type of a conditional and the arms' balance computed here disagree: one of
+// two statements of C 6.5.15p5 is wrong, and the value folded would be the wrong one's.
+// Never the program's fault, so never a diagnostic: the process stops LOUD, naming the
+// node and both types (the internal-consistency stop of this tree's other walks).
+[[noreturn]] void
+failOnDivergentConditionalType(Tree const& tree, NodeId conditional,
+                               CstCastTarget const& tier, CstCastTarget const& balanced) {
+    std::string text{tree.text(conditional)};
+    if (text.size() > 80) text = text.substr(0, 80) + "...";
+    std::fprintf(stderr,
+                 "dss fatal: the conditional at node %u (`%s`) has two types — the typer's %s "
+                 "and the arms' balance %s — two statements of C 6.5.15p5 disagree\n",
+                 static_cast<unsigned>(conditional.v), text.c_str(),
+                 describeArithmeticTarget(tier).c_str(),
+                 describeArithmeticTarget(balanced).c_str());
+    std::abort();
+}
+
+// The selected arm `arm` (folded, a bit-field's value already promoted) of the conditional
+// `conditional`, converted to the conditional's type; `other` is the unselected arm.
+[[nodiscard]] ConstEvalResult
+balanceConditionalArm(NodeId conditional, NodeId other, ConstEvalResult arm,
+                      CstEvalContext const& ctx, CstEvalEnvironment const& env,
+                      EvalOptions const& options, std::uint32_t scopeOpaque,
+                      std::unordered_set<std::uint32_t>& visitedInitNodes) {
+    std::optional<CstCastTarget> const tierType =
+        env.resolveExpressionType ? env.resolveExpressionType(conditional, scopeOpaque)
+                                  : std::nullopt;
+    if (tierType.has_value() && tierType->isPointer) return arm;   // a pointer conditional
+    bool const armIsAddress = asAddress(*arm.value) != nullptr;
+    // nullopt for an address, and for a `char` of unknown sign (then no balance: refused)
+    std::optional<CstArithmeticType> const armType = arithmeticTypeOfValue(*arm.value, options);
+    // The unselected arm's type: its folded value's, else the tier's type of it.
+    std::optional<CstArithmeticType> otherType;
+    bool otherIsAddress = false;
+    ConstEvalResult const otherValue = asBitFieldOperand(
+        other, evalImpl(other, ctx, env, options, scopeOpaque, visitedInitNodes), env, options,
+        scopeOpaque);
+    if (otherValue.value.has_value()) {
+        otherIsAddress = asAddress(*otherValue.value) != nullptr;
+        if (!otherIsAddress) otherType = arithmeticTypeOfValue(*otherValue.value, options);
+    } else if (!tierType.has_value() && env.resolveExpressionType) {
+        if (auto const t = env.resolveExpressionType(other, scopeOpaque); t.has_value()) {
+            otherIsAddress = t->isPointer;
+            if (!otherIsAddress) otherType = arithmeticTypeOfTarget(*t);
+        }
+    }
+    std::optional<CstCastTarget> const balanced =
+        (armType.has_value() && otherType.has_value())
+            ? std::optional<CstCastTarget>{usualArithmeticTarget(*armType, *otherType)}
+            : std::nullopt;
+    if (tierType.has_value()) {
+        if (balanced.has_value() && !sameArithmeticTarget(*tierType, *balanced)) {
+            failOnDivergentConditionalType(ctx.tree, conditional, *tierType, *balanced);
+        }
+        return convertToCastTarget(arm, *tierType, options, conditional);
+    }
+    if (armIsAddress || otherIsAddress) return arm;   // a pointer conditional
+    if (!balanced.has_value()) return fail(ConstEvalFailure::NotAConstantExpression, conditional);
+    return convertToCastTarget(arm, *balanced, options, conditional);
 }
 
 // Internal per-node fold body. `visitedInitNodes` carries the per-call
@@ -1244,12 +1488,12 @@ evalNode(NodeId                              expr,
                 ? env.resolveConstantSubobject(expr, currentScopeOpaque)
                 : std::nullopt;
         if (sub.has_value()) {
-            // A BIT-FIELD member is read at its width and has its value's type
+            // A BIT-FIELD member is read at its width, at its declared type
             // (`readThroughBitField`) — both returns below, so the one reader stays the
             // one when it gains a step.
             auto const asRead = [&](ConstEvalResult const& atType) -> ConstEvalResult {
                 if (!sub->bitField.has_value() || !atType.value.has_value()) return atType;
-                return readThroughBitField(atType, sub->type, *sub->bitField, options, expr);
+                return readThroughBitField(atType, sub->type, *sub->bitField, expr);
             };
             if (sub->zeroValue) {
                 HirLiteralValue zero;
@@ -1445,7 +1689,10 @@ evalNode(NodeId                              expr,
         // then route through the SHARED epilogue.
         ConstEvalResult a = evalImpl(lhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
         ConstEvalResult b = evalImpl(rhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        return combineBinaryCst(expr, *e, options, std::move(a), std::move(b));
+        return combineBinaryCst(
+            expr, *e, options,
+            asBitFieldOperand(lhsN, std::move(a), env, options, currentScopeOpaque),
+            asBitFieldOperand(rhsN, std::move(b), env, options, currentScopeOpaque));
     }
 
     // Unary expression: [OP-token, operand (internal)].
@@ -1483,7 +1730,9 @@ evalNode(NodeId                              expr,
         // DEAD-VIA-DRIVER fallback: fold the operand then route through the
         // SHARED epilogue.
         ConstEvalResult inner = evalImpl(operandN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        return combineUnaryCst(expr, *e, options, std::move(inner));
+        return combineUnaryCst(
+            expr, *e, options,
+            asBitFieldOperand(operandN, std::move(inner), env, options, currentScopeOpaque));
     }
 
     // Ternary expression: visible children [cond, '?', then, ':', else].
@@ -1504,8 +1753,16 @@ evalNode(NodeId                              expr,
         if (!condTrueOpt.has_value()) {
             return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         }
+        // The selected arm, a bit-field's value promoted, at the conditional's type
+        // (`balanceConditionalArm`, C 6.5.15p5).
         NodeId const selected = *condTrueOpt ? thenN : elseN;
-        return evalImpl(selected, ctx, env, options, currentScopeOpaque, visitedInitNodes);
+        NodeId const other    = *condTrueOpt ? elseN : thenN;
+        ConstEvalResult arm = asBitFieldOperand(
+            selected, evalImpl(selected, ctx, env, options, currentScopeOpaque, visitedInitNodes),
+            env, options, currentScopeOpaque);
+        if (!arm.value.has_value()) return arm;
+        return balanceConditionalArm(expr, other, std::move(arm), ctx, env, options,
+                                     currentScopeOpaque, visitedInitNodes);
     }
 
     // FC17 F2 (D-CSUBSET-CONSTEXPR / the pre-existing `_Static_assert('a'==97)`
@@ -1625,44 +1882,17 @@ evalNode(NodeId                              expr,
     }
 
     // THE VALUE STEPS THE STATEMENT LEAVES TO A DESCENT THAT ASKS A VALUE, each by name
-    // (P69, lane `lm`, the review's B), before the wrapper rule below — which takes its
-    // steps by the statement (`wrapperChild`):
-    //   * a statement expression of ONE item that is an expression statement has that
-    //     expression's value (`soleExpressionOfStatementExpression`, the one place that
-    //     says so); a body ending in anything else has no value, and is no constant;
-    //   * a brace list of ONE undesignated element is that element's value — the
-    //     initializer of a scalar, "optionally enclosed in braces" (C 6.7.9p11): the
-    //     form a named constant's initializer `constexpr int c = { 5 };` is read in;
-    // Every other node that says something itself and reached this tail has no arm above
-    // (a label address, a statement expression of anything else, a brace list of more):
-    // `wrapperChild` declines it, so it is no constant.
-    if (tree.kind(expr) == NodeKind::Internal) {
-        if (NodeId const value = soleExpressionOfStatementExpression(cfg, tree, expr);
-            value.valid()) {
-            return evalImpl(value, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        }
-        if (cfg.braceInitListRule.valid() && tree.rule(expr).v == cfg.braceInitListRule.v) {
-            NodeId element{};
-            std::size_t elements = 0;
-            for (NodeId c : kids) {
-                if (tree.kind(c) != NodeKind::Internal) continue;
-                ++elements;
-                element = c;
-            }
-            if (elements == 1) {
-                NodeId value{};
-                std::size_t parts = 0;
-                for (NodeId c : visibleChildren(tree, element)) {
-                    if (tree.kind(c) != NodeKind::Internal) continue;
-                    ++parts;
-                    value = c;
-                }
-                if (parts == 1) {   // a designated element has two parts: the designation and the value
-                    return evalImpl(value, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-                }
-            }
-            return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        }
+    // (`valueStepChild`), before the wrapper rule below — which takes its steps by the
+    // statement (`wrapperChild`). DEAD-VIA-DRIVER: the driver takes both as frames. Every
+    // other node that says something itself and reached this tail has no arm above (a label
+    // address, a statement expression of anything else, a brace list that is empty or led by
+    // a designator): no constant.
+    if (NodeId const value = valueStepChild(tree, cfg, expr, kids); value.valid()) {
+        return evalImpl(value, ctx, env, options, currentScopeOpaque, visitedInitNodes);
+    }
+    if (tree.kind(expr) == NodeKind::Internal && cfg.braceInitListRule.valid()
+        && tree.rule(expr).v == cfg.braceInitListRule.v) {
+        return fail(ConstEvalFailure::NotAConstantExpression, expr);
     }
     // Wrapper rule: grouping — an internal node with exactly one meaningful child
     // (an Internal) and any number of pure tokens (parens, separators), or a single
@@ -1732,6 +1962,13 @@ evalImpl(NodeId                              expr,
                                 .node = n, .phase = 0, .entry = up->entry});
                 return;
             }
+            // A value step (`valueStepChild`: a statement expression's sole expression, a
+            // braced scalar's element) is a frame too, so its nesting costs heap.
+            if (NodeId const value = valueStepChild(tree, cfg, n, kids); value.valid()) {
+                work.push_back({.kind = CstFoldFrame::Kind::PassThrough,
+                                .node = value, .phase = 0, .entry = nullptr});
+                return;
+            }
             if (NodeId const child = wrapperChild(tree, cfg, n, kids); child.valid()) {
                 work.push_back({.kind = CstFoldFrame::Kind::PassThrough,
                                 .node = child, .phase = 0, .entry = nullptr});
@@ -1769,6 +2006,13 @@ evalImpl(NodeId                              expr,
                 HirOperatorEntry const* e   = f.entry;
                 ConstEvalResult operand = std::move(result);
                 work.pop_back();
+                // The operand, a bit-field's value promoted (`asBitFieldOperand`).
+                if (operandMayBePromoted(operand, env)) {
+                    auto kids = visibleChildren(tree, node2);
+                    NodeId const operandN = unaryPlan(tree, cfg, node2, kids)->operandN;
+                    operand = asBitFieldOperand(operandN, std::move(operand), env, options,
+                                                currentScopeOpaque);
+                }
                 result = combineUnaryCst(node2, *e, options, std::move(operand));
             }
             break;
@@ -1793,6 +2037,15 @@ evalImpl(NodeId                              expr,
                 ConstEvalResult lhs = std::move(f.c0);
                 ConstEvalResult rhs = std::move(result);
                 work.pop_back();
+                // Each operand, a bit-field's value promoted (`asBitFieldOperand`).
+                if (operandMayBePromoted(lhs, env) || operandMayBePromoted(rhs, env)) {
+                    auto kids = visibleChildren(tree, node2);
+                    auto const plan = plainBinaryPlan(tree, cfg, node2, kids);
+                    lhs = asBitFieldOperand(plan->lhsN, std::move(lhs), env, options,
+                                            currentScopeOpaque);
+                    rhs = asBitFieldOperand(plan->rhsN, std::move(rhs), env, options,
+                                            currentScopeOpaque);
+                }
                 result = combineBinaryCst(node2, *e, options,
                                           std::move(lhs), std::move(rhs));
             }

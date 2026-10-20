@@ -1,2 +1,2 @@
-        if (NodeId const value = NodeId{};
-            value.valid()) {
+    if (NodeId const value = NodeId{};
+        value.valid()) {

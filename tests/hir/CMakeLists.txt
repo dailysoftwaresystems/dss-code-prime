@@ -58,6 +58,16 @@ dss_add_test(NAME hir/test_non_void_function_end_reached
              SOURCES test_non_void_function_end_reached.cpp)
 target_link_libraries(dss_hir_test_non_void_function_end_reached
                       PRIVATE nlohmann_json::nlohmann_json)
+# P69 (lane `lm`, the scalar brace closure): a scalar's initializer in more braces than
+# C 6.7.9p11's one pair, or with more than one element — the innermost first value with
+# the warning the language declares, in the lowering, the semantic tier's element walks
+# and the constant evaluator alike; a document that declares none refuses the shape.
+# A binary of its own: it reads the shipped C document with that ONE key rewritten, and
+# `hir/test_hir_lowering_c` is the claim runner of many mutation arms.
+dss_add_test(NAME hir/test_scalar_brace_initializer
+             SOURCES test_scalar_brace_initializer.cpp)
+target_link_libraries(dss_hir_test_scalar_brace_initializer
+                      PRIVATE nlohmann_json::nlohmann_json)
 # D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION. Separate from
 # test_hir_lowering_c.cpp because that file's fixture deliberately pins the
 # long-double axis at `None` ("moving it would silently re-point every one of

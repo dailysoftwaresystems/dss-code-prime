@@ -348,21 +348,45 @@ using CstWideCharCoreResolver = std::function<std::optional<TypeKind>(NodeId)>;
 // the offsetof arm; a non-constant compound literal stays non-constant). The resolver
 // owns WHICH objects count as constants and how a brace list places its elements (the
 // semantic tier's placement cursor), none of which this interner-free engine may know.
-// P69 (lane `lm`): a BIT-FIELD member's read — its width, and the type its VALUE has
-// (C 6.3.1.1p2: `bitFieldPromotedType`, which the tier that resolved the member asks;
-// `int` for a field narrower than `int`), classified as a conversion.
+// P69 (lane `lm`): a BIT-FIELD member's read — its width. The value read has the
+// member's DECLARED type (`type` below); the type an OPERATOR reads it at is asked of the
+// operand, not of the read (`CstBitFieldValueTypeResolver`).
 struct CstBitFieldRead {
     std::uint32_t width = 0;
-    CstCastTarget valueType{};
 };
 struct CstConstantSubobject {
     CstResolvedSymbol init{};        // the initializer value, and its scope
     CstCastTarget     type{};        // the subobject's declared type, as a conversion
     bool              zeroValue = false;
     // P69 (lane `lm`): the member is a BIT-FIELD — the value read is the one converted to
-    // `type`, reduced to the width, at the value's type (`readThroughBitField`).
+    // `type`, reduced to the width, still at `type` (`readThroughBitField`).
     std::optional<CstBitFieldRead> bitField{};
 };
+
+// P69 (lane `lm`, the review of D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT):
+// THE TYPE AN OPERATOR READS AN OPERAND AT WHEN THAT OPERAND IS A BIT-FIELD'S VALUE — C
+// 6.3.1.1p2 promotes a bit-field by its WIDTH (`bitFieldPromotedType`), and WHICH
+// expression is a bit-field's value is the ONE statement both tiers ask
+// (`bitFieldValueWidth`, core/types/decl_prefix_strip.hpp). Given the operand's node and
+// the current scope, the tier answers the promoted type, classified as a conversion;
+// nullopt when the operand is no bit-field's value, or when the promotion leaves its type
+// as it is. The engine asks it at every operator that promotes an operand (the unary and
+// binary arithmetic, bitwise, shift and relational operators) and at each arm of a
+// conditional — exactly where the typer (`subtreeType`) and the lowering
+// (`asBitFieldValue`) promote — and NOWHERE else: a statement expression `({ g.b; })` is
+// not a bit-field's value, so its value keeps the member's declared type.
+using CstBitFieldValueTypeResolver =
+    std::function<std::optional<CstCastTarget>(NodeId, std::uint32_t)>;
+
+// P69 (lane `lm`): THE TYPE THE TIER GAVE AN EXPRESSION, classified as a conversion —
+// asked of a CONDITIONAL (C 6.5.15p5: its arms balanced by the usual arithmetic
+// conversions), whose selected arm the engine converts to it, and of the UNSELECTED arm of
+// one the tier could not type, when that arm does not fold. The semantic tier answers from
+// its expression typer — before its second pass too, the node's literals typed first; the
+// lowering from the type the semantic tier recorded for the conditional, else the node's
+// own stamp. nullopt: the tier holds no type for the node.
+using CstExpressionTypeResolver =
+    std::function<std::optional<CstCastTarget>(NodeId, std::uint32_t)>;
 using CstConstantSubobjectResolver =
     std::function<std::optional<CstConstantSubobject>(NodeId, std::uint32_t)>;
 
@@ -396,6 +420,8 @@ struct CstEvalEnvironment {
     CstWideCharCoreResolver   resolveWideCharCore{};    // P68 — L'…' / u'…' / U'…' / u8'…'
     CstConstantSubobjectResolver resolveConstantSubobject{};   // P69 — C23 6.6p6-p7
     CstBuiltinCallResolver       resolveBuiltinCall{};         // P69 — a constant builtin call
+    CstBitFieldValueTypeResolver resolveBitFieldValueType{};   // P69 — a bit-field operand's type
+    CstExpressionTypeResolver    resolveExpressionType{};      // P69 — a conditional's type
 };
 
 // Static recognition context. All fields are non-owning references

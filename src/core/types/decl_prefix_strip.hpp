@@ -457,10 +457,13 @@ arraySuffixHasModifier(Tree const& tree, NodeId suffix,
 // ★ EVERY DESCENT READS IT (cycle P69 round 1, lane `lm`; a review of the fold found six
 // that took their steps by a list or a count of their own, and this comment saying they
 // did not): the semantic tier's initializer descents, constant-subobject peel, brace walks
-// (`peelSingleChildrenTo`), builtin-operand peel (`peelBuiltinOperand`) and the search of
-// `completeIncompleteArrayFromInit`; the evaluator's `wrapperChild` and `evalNode`'s wrapper
-// tail (`hir/cst_const_eval.cpp`); the lowering's `peelToBraceInitOrCore`, `peelToCore`
-// and `peelToDesignatorLeaf` (`hir/lowering/cst_to_hir.cpp`); and `bitFieldValueWidth`
+// (`peelSingleChildrenTo`), builtin-operand peel (`peelBuiltinOperand`), the search of
+// `completeIncompleteArrayFromInit` and the `typeof` bit-field probe (`resolveTypeNodeImpl`,
+// which a later review found descending every node of one internal child); the evaluator's
+// `wrapperChild`, `valueStepChild` and `evalNode`'s wrapper tail (`hir/cst_const_eval.cpp`),
+// whose operators ask `bitFieldValueWidth` through the tier; the lowering's
+// `peelToBraceInitOrCore`, `peelToCore` and `peelToDesignatorLeaf`
+// (`hir/lowering/cst_to_hir.cpp`); and `bitFieldValueWidth`
 // below. A descent asking a VALUE question takes the steps the statement leaves to it
 // (the statement expression's sole expression, a selection's result) in its own body,
 // by name — never by counting children.
@@ -603,11 +606,7 @@ statementExpressionBody(HirLoweringConfig const& hirCfg, Tree const& tree, NodeI
     NodeId core = last;
     std::size_t const bound = tree.nodeCount() + 1;
     for (std::size_t guard = 0; core.valid() && tree.kind(core) == NodeKind::Internal; ++guard) {
-        if (guard > bound) {
-            std::fprintf(stderr, "dss fatal: the statement expression's item peel took more "
-                                 "steps than its tree has nodes — the node graph is cyclic\n");
-            std::abort();
-        }
+        if (guard > bound) failOnCyclicNodeGraph("the statement expression's item peel");
         std::uint32_t const r = tree.rule(core).v;
         if (HirRuleMapping const* const lm = mappingOf(core);
             lm != nullptr && lm->hirKind == "LabelStmt") {
@@ -715,11 +714,7 @@ bitFieldValueWidth(SemanticConfig const& cfg, HirLoweringConfig const& hirCfg, T
     };
     std::size_t const bound = tree.nodeCount() + 1;
     for (std::size_t guard = 0; n.valid() && tree.kind(n) == NodeKind::Internal; ++guard) {
-        if (guard > bound) {
-            std::fprintf(stderr, "dss fatal: the bit-field value walk took more steps than its "
-                                 "tree has nodes — the node graph is cyclic\n");
-            std::abort();
-        }
+        if (guard > bound) failOnCyclicNodeGraph("the bit-field value walk");
         std::uint32_t const r = tree.rule(n).v;
         auto const is = [r](RuleId rule) { return rule.valid() && rule.v == r; };
         if (is(hirCfg.postfixExprRule)) {

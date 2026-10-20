@@ -189,6 +189,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_SymbolAliasTargetInvalid";
         case DiagnosticCode::S_SymbolAliasInitializerIgnored:
             return "S_SymbolAliasInitializerIgnored";
+        case DiagnosticCode::S_JumpIntoStatementExpression:
+            return "S_JumpIntoStatementExpression";
+        case DiagnosticCode::S_BracesAroundScalarInitializer:
+            return "S_BracesAroundScalarInitializer";
+        case DiagnosticCode::S_ExcessElementsInScalarInitializer:
+            return "S_ExcessElementsInScalarInitializer";
         case DiagnosticCode::H_StaticInitializerNotFolded:
             return "H_StaticInitializerNotFolded";
         case DiagnosticCode::H_NonVoidFunctionEndReachable:

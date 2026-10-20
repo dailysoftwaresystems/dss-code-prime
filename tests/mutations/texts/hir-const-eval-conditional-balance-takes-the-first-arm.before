@@ -1,0 +1,1 @@
+    detail::BitIntOperandType const r = detail::bitIntUac(*a.integer, *b.integer);

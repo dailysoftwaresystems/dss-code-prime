@@ -200,6 +200,24 @@ constexpr std::string_view kBuiltinTokenKindNames[] = {
 
 using Collector = substrate::DiagnosticCollector;
 
+// FC4 c1 (M5): resolve a diagnostic-code NAME ("S_VolatileNotSupported") to its
+// DiagnosticCode via the shared `diagnosticCodeName` table — the same closed-enum linear
+// scan the CLI's `--suppress` parser uses (one name home, no second drifting table). The
+// sentinel names ("Unknown" = un-enumerated hole, "None" = the no-diagnostic zero) are
+// rejected up front: a gate resolving to either would be a wall that never fires.
+// (P69, lane `lm`: out of the `semantics` block, whose gated markers name their codes, so
+// the `hirLowering` block's `scalarBraceInitializer` reads its codes through the same one.)
+[[nodiscard]] std::optional<DiagnosticCode> diagnosticCodeFromConfigName(std::string_view name) {
+    if (name == "Unknown" || name == "None") return std::nullopt;
+    for (std::uint32_t v = 0; v < 0x10000u; ++v) {
+        auto const code = static_cast<DiagnosticCode>(v);
+        auto const n = diagnosticCodeName(code);
+        if (n == "Unknown") continue;
+        if (n == name) return code;
+    }
+    return std::nullopt;
+}
+
 // ★★★ THE ONE CLOSED-KEY CHECK FOR THIS WHOLE LOADER — and it owns no loop of
 // its own. The loop, the `$`-documentation carve-out, the rendered allow-list
 // and the refusal-policy sentence all live in `dss::detail::rejectUnknownKeys`
@@ -9490,24 +9508,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 out = static_cast<std::uint32_t>(v);
             };
 
-            // FC4 c1 (M5): resolve a diagnostic-code NAME ("S_VolatileNotSupported")
-            // to its DiagnosticCode via the shared `diagnosticCodeName` table —
-            // the same closed-enum linear scan the CLI's `--suppress` parser
-            // uses (one name home, no second drifting table). The sentinel
-            // names ("Unknown" = un-enumerated hole, "None" = the no-diagnostic
-            // zero) are rejected up front: a gate resolving to either would be
-            // a wall that never fires.
-            auto const diagnosticCodeFromName =
-                [](std::string_view name) -> std::optional<DiagnosticCode> {
-                if (name == "Unknown" || name == "None") return std::nullopt;
-                for (std::uint32_t v = 0; v < 0x10000u; ++v) {
-                    auto const code = static_cast<DiagnosticCode>(v);
-                    auto const n = diagnosticCodeName(code);
-                    if (n == "Unknown") continue;
-                    if (n == name) return code;
-                }
-                return std::nullopt;
-            };
+            // A diagnostic-code NAME to its code (`diagnosticCodeFromConfigName`).
+            auto const diagnosticCodeFromName = diagnosticCodeFromConfigName;
 
             // ── declarators (FC4 c1) ── the C 6.7.6 declarator role
             // vocabulary (see DeclaratorConfig). Parsed BEFORE `declarations`
@@ -19506,6 +19508,52 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             if (hl.contains("sehFinallyArmRule")) {  // c115 SEH (optional)
                 (void)resolveRuleField(hl, "sehFinallyArmRule", "/hirLowering",
                                        cfg.sehFinallyArmRule, cfg.sehFinallyArmRuleName);
+            }
+
+            // P69 (lane `lm`, the scalar brace closure): scalarBraceInitializer {
+            // nestedBraces?, excessElements? } — each the NAME of the warning the lowering
+            // reports where it admits that shape of a scalar's brace initializer (see
+            // `HirLoweringConfig::ScalarBraceInitializer`). Optional, and so is each key: an
+            // absent one leaves the shape refused. Closed keys; an unknown code name is
+            // refused, never a wall that never fires.
+            if (hl.contains("scalarBraceInitializer")) {
+                json const& sb = hl.at("scalarBraceInitializer");
+                std::string const sbPath = "/hirLowering/scalarBraceInitializer";
+                if (!sb.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, sbPath,
+                              "'scalarBraceInitializer' must be an object");
+                } else {
+                    static constexpr std::array<std::string_view, 2> kScalarBraceKeys{
+                        "nestedBraces", "excessElements"};
+                    (void)checkKeysAgainst(sb, kScalarBraceKeys, sbPath,
+                                           "hirLowering.scalarBraceInitializer",
+                                           DiagnosticCode::C_InvalidHirLowering, coll);
+                    auto const readCode = [&](char const* key, DiagnosticCode& code,
+                                              std::string& name) {
+                        if (!sb.contains(key)) return;
+                        std::string const path = std::format("{}/{}", sbPath, key);
+                        if (!sb.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      std::format("'scalarBraceInitializer.{}' must be a "
+                                                  "diagnostic-code name string", key));
+                            return;
+                        }
+                        name = sb.at(key).get<std::string>();
+                        std::optional<DiagnosticCode> const c =
+                            diagnosticCodeFromConfigName(name);
+                        if (!c.has_value()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      std::format("'scalarBraceInitializer.{}' names unknown "
+                                                  "diagnostic code '{}'", key, name));
+                            return;
+                        }
+                        code = *c;
+                    };
+                    readCode("nestedBraces", cfg.scalarBraceInitializer.nestedBraces,
+                             cfg.scalarBraceInitializer.nestedBracesName);
+                    readCode("excessElements", cfg.scalarBraceInitializer.excessElements,
+                             cfg.scalarBraceInitializer.excessElementsName);
+                }
             }
 
             // Char / string literal lowering blocks:

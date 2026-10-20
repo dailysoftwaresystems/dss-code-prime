@@ -2714,6 +2714,47 @@ enum class DiagnosticCode : std::uint16_t {
     // WARNING says so. `.actual` names the object.
     S_SymbolAliasInitializerIgnored       = 0xE097,
 
+    // P69 (lane `lm`, a review of the statement-expression fold, its C): a `goto`, or a
+    // `case` / `default` label of a `switch`, whose target stands inside a GNU statement
+    // expression the jump is not inside — or the address `&&L` of a label inside one, taken
+    // outside it. The GNU C manual (Statement Exprs) does not permit a jump into a
+    // statement expression by `goto`, nor a `case` or `default` label inside one for a
+    // `switch` outside it, and documents a computed goto into one as undefined behavior.
+    // ✔MEASURED 2026-10-16 (clang 18.1.3, gcc 13.3.0): both refuse every such goto and
+    // label, the statement expression a value or discarded alike, and both accept a jump
+    // inside one and out of one; clang refuses `&&L` taken outside ("cannot jump from this
+    // indirect goto statement to one of its possible targets"), gcc builds it — a
+    // construct no reference makes work, so refused too, and `&&L` taken and used inside
+    // the same statement expression stands. DSS accepted all of it — and the labeled last
+    // item lands the jump on the computation of the value, past whatever the other path
+    // computed before the construct. Refused by the construct, in the lowering's own walks
+    // of the source (a discarded statement expression lowers to a plain block, which the
+    // HIR verifier cannot tell apart). `.actual` names the label.
+    S_JumpIntoStatementExpression         = 0xE098,
+    // P69 (lane `lm`, the scalar brace closure): a scalar's initializer stands in MORE
+    // braces than the one pair C 6.7.9p11 allows it ("a single expression, optionally
+    // enclosed in braces") — `int v = {{42}};` — or, as the initializer of a scalar
+    // SUBOBJECT of an aggregate, in braces at all (`struct S s = {{42}};`). ✔MEASURED
+    // 2026-10-16 (clang 18.1.3, gcc 13.3.0, every program RUN): both build every such
+    // shape, initialize the scalar from the innermost value (`{{}}` is zero), and warn once
+    // per brace level — at top level only the levels beyond the first, inside an aggregate
+    // from the first. A WARNING, suppressible, declared by the language
+    // (`hirLowering.scalarBraceInitializer.nestedBraces`); a language that declares none
+    // refuses the shape (S_InvalidScalarInitializer). A designator in a scalar's braces stays
+    // refused, as both refuse it.
+    S_BracesAroundScalarInitializer       = 0xE099,
+    // P69 (lane `lm`, the scalar brace closure): a scalar's brace initializer holds more
+    // than one element — `int v = {42, 7};`. C 6.7.9p2 makes it a constraint violation (no
+    // initializer may provide a value for an object not contained in the entity
+    // initialized). ✔MEASURED 2026-10-16 (clang 18.1.3, gcc 13.3.0, every program RUN):
+    // both build it with the warning, initialize the scalar from the FIRST element, and
+    // drop the rest UNEVALUATED — a call in it never runs, whatever its type or constness,
+    // in a static object too. Said once per brace list, at its first excess element (as
+    // S_ExcessInitializerElements is for an aggregate). A WARNING, suppressible, declared by
+    // the language (`hirLowering.scalarBraceInitializer.excessElements`); a language that
+    // declares none refuses the shape (S_InvalidScalarInitializer).
+    S_ExcessElementsInScalarInitializer   = 0xE09A,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

@@ -1,1 +1,1 @@
-                if (parts == 1) {   // a designated element has two parts: the designation and the value
+    return parts == 1 ? value : NodeId{};

@@ -1226,19 +1226,27 @@ struct Lowerer {
     // AppleClang 21 and mingw-w64 gcc 13.2 run 1 and -2. A selection's winner is the one
     // the semantic tier recorded (`selectedGenericExpr`, both `_Generic` and
     // `__builtin_choose_expr`).
+    // The walk is `bitFieldValueWidthOf`'s, which the constant evaluator's operators ask
+    // too (`evalCstConstInt`'s `resolveBitFieldValueType`, promoting from the field's
+    // declared type it hands out through `fieldTypeOut`).
+    [[nodiscard]] std::optional<std::uint32_t>
+    bitFieldValueWidthOf(NodeId operandN, TypeId* fieldTypeOut = nullptr) {
+        return bitFieldValueWidth(
+            sem, cfg, tree(), operandN,
+            [this, fieldTypeOut](NodeId m) -> std::optional<std::uint32_t> {
+                auto const rf = resolveMemberField(m);
+                if (!rf || rf->frec == nullptr) return std::nullopt;
+                if (fieldTypeOut != nullptr) *fieldTypeOut = rf->fieldType;
+                return rf->frec->bitFieldWidth;
+            },
+            [this](NodeId sel) -> NodeId { return model.selectedGenericExpr(sel); });
+    }
     [[nodiscard]] E asBitFieldValue(NodeId operandN, E v) {
         if (!arith_.has_value() || !v.type.valid() || !operandN.valid()) return v;
         // No width changes a plain `int`, a floating, a pointer or an aggregate type:
         // the walk is asked only of a type a bit-field's promotion can change.
         if (bitFieldPromotedType(interner, v.type, 1, *arith_).v == v.type.v) return v;
-        auto const width = bitFieldValueWidth(
-            sem, cfg, tree(), operandN,
-            [this](NodeId m) -> std::optional<std::uint32_t> {
-                auto const rf = resolveMemberField(m);
-                if (!rf || rf->frec == nullptr) return std::nullopt;
-                return rf->frec->bitFieldWidth;
-            },
-            [this](NodeId sel) -> NodeId { return model.selectedGenericExpr(sel); });
+        auto const width = bitFieldValueWidthOf(operandN);
         if (!width.has_value()) return v;
         TypeId const t = bitFieldPromotedType(interner, v.type, *width, *arith_);
         return (t.valid() && t.v != v.type.v) ? coerce(v, t) : v;
@@ -8526,10 +8534,27 @@ struct Lowerer {
         // — reproducing the prior recursive descent's pre-order EXACTLY, so label
         // ordinals (insertion order) and the S_DuplicateLabel first-definition-wins
         // order are byte-identical.
-        std::vector<NodeId> stack;
-        if (root.valid()) stack.push_back(root);
+        //
+        // ★ P69 (lane `lm`, a review of the statement-expression fold, its C): NO JUMP
+        // ENTERS A GNU STATEMENT EXPRESSION (S_JumpIntoStatementExpression). Each entry
+        // carries the innermost statement expression around it; every `goto L` and every
+        // `&&L` is checked, once the labels are known, against the statement expressions
+        // around `L`: each must be around the jump too. GNU C 6.1 forbids the goto, and
+        // documents a computed goto into one as undefined; ✔MEASURED 2026-10-16, clang
+        // 18.1.3 and gcc 13.3.0 refuse every goto into one (a value or discarded alike),
+        // clang refuses `&&L` of a label inside one taken outside it and gcc builds it —
+        // a construct no reference makes work, so refused too. A jump inside one and a
+        // jump out of one stand. The case and default labels are the switch's prescan's.
+        struct PrescanEntry { NodeId node; NodeId stmtExpr; };
+        struct LabelJump    { NodeId nameTok; NodeId stmtExpr; bool address; };
+        std::unordered_map<std::uint32_t, NodeId> stmtExprAround;   // a statement expression -> the one around it
+        std::unordered_map<std::string, NodeId>   labelStmtExpr;    // a label -> the innermost one around it
+        std::vector<LabelJump>                    jumps;
+        std::vector<PrescanEntry> stack;
+        if (root.valid()) stack.push_back({root, NodeId{}});
         while (!stack.empty()) {
-            NodeId const node = stack.back();
+            PrescanEntry const entry = stack.back();
+            NodeId const node = entry.node;
             stack.pop_back();
             HirRuleMapping const* m = mappingFor(node);
             if (m != nullptr && m->hirKind == "LabelStmt") {
@@ -8540,19 +8565,54 @@ struct Lowerer {
                     auto const [it, inserted] = labelOrdinals_.try_emplace(
                         std::string{tree().text(nameTok)}, nextLabelOrdinal_);
                     if (inserted) ++nextLabelOrdinal_;
+                    if (inserted) labelStmtExpr.emplace(it->first, entry.stmtExpr);
                     if (!inserted) {   // C 6.8.1: a label name has function scope
                         emitH(DiagnosticCode::S_DuplicateLabel, nameTok,
                               std::format("duplicate label '{}' in this function",
                                           tree().text(nameTok)));
                     }
                 }
+            } else if (m != nullptr && m->hirKind == "GotoStmt") {
+                if (NodeId const nameTok = firstIdentifierToken(node); nameTok.valid())
+                    jumps.push_back({nameTok, entry.stmtExpr, /*address=*/false});
+            } else if (cfg.labelAddressRule.valid() && tree().kind(node) == NodeKind::Internal
+                       && tree().rule(node).v == cfg.labelAddressRule.v) {
+                if (NodeId const nameTok = firstIdentifierToken(node); nameTok.valid())
+                    jumps.push_back({nameTok, entry.stmtExpr, /*address=*/true});
+            }
+            NodeId around = entry.stmtExpr;
+            if (cfg.stmtExprRule.valid() && tree().kind(node) == NodeKind::Internal
+                && tree().rule(node).v == cfg.stmtExprRule.v) {
+                stmtExprAround.emplace(node.v, entry.stmtExpr);
+                around = node;
             }
             // Push this node's non-token children, then REVERSE just that new
             // segment so they pop left-to-right (the recursive pre-order).
             std::size_t const mark = stack.size();
             for (NodeId c : visible(node))
-                if (!isToken(c)) stack.push_back(c);
+                if (!isToken(c)) stack.push_back({c, around});
             std::reverse(stack.begin() + static_cast<std::ptrdiff_t>(mark), stack.end());
+        }
+        for (LabelJump const& j : jumps) {
+            auto const target = labelStmtExpr.find(std::string{tree().text(j.nameTok)});
+            if (target == labelStmtExpr.end() || !target->second.valid()) continue;
+            std::unordered_set<std::uint32_t> aroundJump;
+            for (NodeId se = j.stmtExpr; se.valid(); se = stmtExprAround.at(se.v))
+                aroundJump.insert(se.v);
+            for (NodeId se = target->second; se.valid(); se = stmtExprAround.at(se.v)) {
+                if (aroundJump.contains(se.v)) continue;
+                emitH(DiagnosticCode::S_JumpIntoStatementExpression, j.nameTok,
+                      j.address
+                          ? std::format("'&&{}' takes the address of a label inside a "
+                                        "statement expression from outside it — a computed "
+                                        "goto would enter the statement expression (GNU C "
+                                        "6.1)",
+                                        tree().text(j.nameTok))
+                          : std::format("goto '{}' jumps into a statement expression it is "
+                                        "not inside (GNU C 6.1)",
+                                        tree().text(j.nameTok)));
+                break;
+            }
         }
     }
 
@@ -10864,20 +10924,39 @@ struct Lowerer {
             if (f == nullptr) return std::nullopt;
             auto const t = classifyCstCastTarget(interner, f->type, charIsUnsigned_);
             if (!t.has_value()) return std::nullopt;
-            // P69 (lane `lm`): a bit-field's value at its PROMOTED type — the semantic
-            // tier's twin of this lambda (`buildConstEvalEnv`) says why.
+            // P69 (lane `lm`): a bit-field is read at its width, at its declared type; an
+            // operator promotes it where it is a bit-field's value
+            // (`resolveBitFieldValueType` below).
             std::optional<CstBitFieldRead> bitField;
             if (f->bitFieldWidth.has_value()) {
-                TypeId const valueTy = arith_.has_value()
-                    ? bitFieldPromotedType(interner, f->type, *f->bitFieldWidth, *arith_)
-                    : f->type;
-                auto const vt = classifyCstCastTarget(interner, valueTy, charIsUnsigned_);
-                if (!vt.has_value()) return std::nullopt;
-                bitField = CstBitFieldRead{*f->bitFieldWidth, *vt};
+                bitField = CstBitFieldRead{*f->bitFieldWidth};
             }
             return CstConstantSubobject{
                 CstResolvedSymbol{f->initExpr, f->initScope.v, std::nullopt}, *t,
                 f->zeroValue, bitField};
+        };
+        // P69 (lane `lm`, the review of the promotion fold): an operand that IS a bit-field's
+        // value, at its promoted type — the walk `asBitFieldValue` takes
+        // (`bitFieldValueWidthOf`), the promotion by width from the field's declared type.
+        env.resolveBitFieldValueType = [this](NodeId operand, std::uint32_t /*curScope*/)
+            -> std::optional<CstCastTarget> {
+            if (!arith_.has_value()) return std::nullopt;
+            TypeId fieldType{};
+            auto const width = bitFieldValueWidthOf(operand, &fieldType);
+            if (!width.has_value() || !fieldType.valid()) return std::nullopt;
+            TypeId const promoted = bitFieldPromotedType(interner, fieldType, *width, *arith_);
+            if (!promoted.valid() || promoted.v == fieldType.v) return std::nullopt;
+            return classifyCstCastTarget(interner, promoted, charIsUnsigned_);
+        };
+        // P69 (lane `lm`): the type the semantic tier gave an expression — a conditional's
+        // as its Pass 2 recorded it (`conditionalTypeFor`), else the node's own stamp. The
+        // engine converts a folded conditional's selected arm to it (C 6.5.15p5).
+        env.resolveExpressionType = [this](NodeId node, std::uint32_t /*curScope*/)
+            -> std::optional<CstCastTarget> {
+            TypeId t = reprOf(model.conditionalTypeFor(node));
+            if (!t.valid()) t = semTypeAt(node);
+            if (!t.valid()) return std::nullopt;
+            return classifyCstCastTarget(interner, t, charIsUnsigned_);
         };
         // P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION):
         // a wide/UTF character constant's element core, read back off the body
@@ -11242,10 +11321,10 @@ struct Lowerer {
     //     lowers + coerces through `lowerExprOrBraceInit` — byte-identical to
     //     the plain `= expr` init path (6.7.10p12: the object's value is that
     //     of the expression);
-    //   • anything else — >1 elements, a designator (`{.x=1}` / `{[0]=1}` on
-    //     a scalar), or a NESTED brace list `{{42}}` (audit N2: 6.7.10p12
-    //     requires a SINGLE expression; a brace list is not one) —
-    //     → S_InvalidScalarInitializer (0xE03F), never a silent guess.
+    //   • a designator (`{.x=1}` / `{[0]=1}` on a scalar), at any brace level
+    //     → S_InvalidScalarInitializer (0xE03F), never a silent guess;
+    //   • MORE BRACES (`{{42}}`) and MORE ELEMENTS (`{42, 7}`) — what the
+    //     language declares (`lowerScalarBraceInit`, P69).
     // The TOP-LEVEL element count of a brace list, through the SAME
     // `initElementRule` filter every brace-init path in this file uses (the
     // `{`/`}`/`,` tokens are not elements). Its one caller is the runtime-sized
@@ -11262,72 +11341,117 @@ struct Lowerer {
         return n;
     }
 
+    // ★ P69 (lane `lm`, the scalar brace closure): MORE BRACES AND MORE ELEMENTS ARE WHAT THE
+    // LANGUAGE DECLARES (`HirLoweringConfig::scalarBraceInitializer`). C 6.7.9p11 gives a scalar
+    // "a single expression, optionally enclosed in braces", and C 6.7.9p2 makes a second element
+    // a constraint violation; this arm refused both — `{{42}}` (audit N2) and `{42, 7}` —
+    // where gcc 13.3.0 and clang 18.1.3 build each with a warning (✔MEASURED 2026-10-16, every
+    // program RUN): the innermost value initializes (`{{42}}`, `{{{42}}}`, `{{42}, 7}`, `{{42, 7}}`
+    // are 42; `{{}}` is zero), an excess element is dropped UNEVALUATED (a call in it never
+    // runs), and a designator at any level is refused. So the levels are stepped through ONE BY
+    // ONE in a loop — 8192 levels cost no host frame each — each taking its FIRST element:
+    //   • a brace level beyond the first, and the first itself around a scalar SUBOBJECT of an
+    //     aggregate (`subobject`, the driver's statement: gcc and clang warn `struct S s =
+    //     {{42}};` and `int a[2] = {{40}, {2}};` at the first pair), warns `nestedBraces` —
+    //     once per level, as both references count; with none declared a level beyond the
+    //     first is refused and a subobject's one pair stands, unwarned;
+    //   • a list of more than one element warns `excessElements` once, at its first excess
+    //     element (as S_ExcessInitializerElements is said for an aggregate), and the excess is
+    //     never lowered; with none declared the list is refused.
+    // The semantic tier walks the same levels to the same value (`forEachPlacedBraceValue`),
+    // and so does the constant evaluator (`valueStepChild`): three tiers, one value.
     [[nodiscard]] HirNodeId lowerScalarBraceInit(NodeId braceInitListNode,
-                                                 TypeId contextType) {
-        // Collect the initElement children — the SAME rule filter the
-        // aggregate loop below uses (tokens `{`/`}`/`,` skip; a grammar
-        // without initElement configured has no brace-init surface at all).
-        std::vector<NodeId> elems;
-        for (NodeId elem : visible(braceInitListNode)) {
-            if (isToken(elem)) continue;
-            if (tree().kind(elem) != NodeKind::Internal) continue;
-            if (!cfg.initElementRule.valid()
-             || tree().rule(elem).v != cfg.initElementRule.v) continue;
-            elems.push_back(elem);
-        }
-        if (elems.empty()) {
-            return synthZeroOrError(braceInitListNode, contextType);
-        }
-        if (elems.size() > 1) {
-            emitH(DiagnosticCode::S_InvalidScalarInitializer,
-                  braceInitListNode,
-                  "a scalar brace initializer takes at most ONE expression "
-                  "(C23 6.7.10p12) — excess elements");
-            return errorNode(braceInitListNode, contextType);
-        }
-        // Exactly one initElement: it must be a bare (undesignated) value.
-        // Mirror the aggregate loop's designator discrimination so `{.x=1}` /
-        // `{[0]=1}` on a scalar is the constraint violation C makes it.
-        NodeId valueExprCst{};
-        for (NodeId c : visible(elems[0])) {
-            if (isToken(c)) continue;
-            if (tree().kind(c) != NodeKind::Internal) continue;
-            auto const [designatorCore, r] = peelToDesignatorLeaf(c);
-            (void)designatorCore;
-            bool const isDesignator =
-                (cfg.designatedFieldRule.valid()
-                 && r == cfg.designatedFieldRule.v)
-                || (cfg.designatedIndexRule.valid()
-                    && r == cfg.designatedIndexRule.v);
-            if (isDesignator) {
-                emitH(DiagnosticCode::S_InvalidScalarInitializer, c,
-                      "a designator is not valid in a SCALAR brace "
-                      "initializer (C23 6.7.10p12)");
-                return errorNode(braceInitListNode, contextType);
+                                                 TypeId contextType, bool subobject) {
+        HirLoweringConfig::ScalarBraceInitializer const& admits = cfg.scalarBraceInitializer;
+        // The initElement children of one brace list — the SAME rule filter the aggregate
+        // loop below uses (tokens `{`/`}`/`,` skip; a grammar without initElement configured
+        // has no brace-init surface at all).
+        auto const elementsOf = [&](NodeId list) {
+            std::vector<NodeId> out;
+            for (NodeId elem : visible(list)) {
+                if (isToken(elem)) continue;
+                if (tree().kind(elem) != NodeKind::Internal) continue;
+                if (!cfg.initElementRule.valid()
+                 || tree().rule(elem).v != cfg.initElementRule.v) continue;
+                out.push_back(elem);
             }
-            valueExprCst = c;   // the value expression (last non-designator)
+            return out;
+        };
+        NodeId list = braceInitListNode;
+        std::size_t const bound = tree().nodeCount() + 1;   // each level is a strict descendant
+        for (std::size_t level = 0;; ++level) {
+            if (level > bound) failOnCyclicNodeGraph("the lowering's scalar brace levels");
+            if (level > 0 || subobject) {
+                if (admits.nestedBraces != DiagnosticCode::None) {
+                    emitHAt(admits.nestedBraces, DiagnosticSeverity::Warning, list,
+                            level > 0
+                                ? std::string{"a scalar's initializer stands in a further pair "
+                                              "of braces (C 6.7.9p11 allows one); the value "
+                                              "inside initializes it"}
+                                : std::string{"braces around the initializer of a scalar member "
+                                              "or element of an aggregate (C 6.7.9p11)"});
+                } else if (level > 0) {
+                    emitH(DiagnosticCode::S_InvalidScalarInitializer, list,
+                          "a scalar brace initializer must contain a single "
+                          "EXPRESSION, not a nested brace list (C23 6.7.10p12)");
+                    return errorNode(braceInitListNode, contextType);
+                }
+            }
+            std::vector<NodeId> const elems = elementsOf(list);
+            if (elems.empty()) {
+                return synthZeroOrError(braceInitListNode, contextType);
+            }
+            if (elems.size() > 1) {
+                if (admits.excessElements == DiagnosticCode::None) {
+                    emitH(DiagnosticCode::S_InvalidScalarInitializer, list,
+                          "a scalar brace initializer takes at most ONE expression "
+                          "(C23 6.7.10p12) — excess elements");
+                    return errorNode(braceInitListNode, contextType);
+                }
+                emitHAt(admits.excessElements, DiagnosticSeverity::Warning, elems[1],
+                        "this scalar brace initializer has more than one element; the "
+                        "excess is a constraint violation (C 6.7.9p2) and is dropped, not "
+                        "evaluated");
+            }
+            // The first element: it must be a bare (undesignated) value. Mirror the
+            // aggregate loop's designator discrimination so `{.x=1}` / `{[0]=1}` on a
+            // scalar is the constraint violation C makes it.
+            NodeId valueExprCst{};
+            for (NodeId c : visible(elems[0])) {
+                if (isToken(c)) continue;
+                if (tree().kind(c) != NodeKind::Internal) continue;
+                auto const [designatorCore, r] = peelToDesignatorLeaf(c);
+                (void)designatorCore;
+                bool const isDesignator =
+                    (cfg.designatedFieldRule.valid()
+                     && r == cfg.designatedFieldRule.v)
+                    || (cfg.designatedIndexRule.valid()
+                        && r == cfg.designatedIndexRule.v);
+                if (isDesignator) {
+                    emitH(DiagnosticCode::S_InvalidScalarInitializer, c,
+                          "a designator is not valid in a SCALAR brace "
+                          "initializer (C23 6.7.10p12)");
+                    return errorNode(braceInitListNode, contextType);
+                }
+                valueExprCst = c;   // the value expression (last non-designator)
+            }
+            if (!valueExprCst.valid()) {
+                // An initElement with no expression child is a malformed parse —
+                // fail loud rather than silently zero-fill (`{,}` cannot parse,
+                // so this is recovery-tree territory).
+                return reportedError(list,
+                    "scalar brace initializer element carries no expression");
+            }
+            // A brace list standing as the element: the next level.
+            if (NodeId const inner = peelToBraceInitOrCore(valueExprCst); isBraceInitList(inner)) {
+                list = inner;
+                continue;
+            }
+            // The value — lower + coerce exactly like `= expr`, and, being a brace ELEMENT,
+            // report its own diagnosed conversion (P68 round 9; a pair no rule admits was
+            // refused by the semantic tier, P69).
+            return lowerBraceElementValue(valueExprCst, contextType);
         }
-        if (!valueExprCst.valid()) {
-            // An initElement with no expression child is a malformed parse —
-            // fail loud rather than silently zero-fill (`{,}` cannot parse,
-            // so this is recovery-tree territory).
-            return reportedError(braceInitListNode,
-                "scalar brace initializer element carries no expression");
-        }
-        // Audit N2: `{{42}}` — the single element is itself a brace list.
-        // C23 6.7.10p12 requires a SINGLE EXPRESSION; a nested brace list is
-        // a constraint violation for a scalar target (only aggregates recurse).
-        if (isBraceInitList(peelToBraceInitOrCore(valueExprCst))) {
-            emitH(DiagnosticCode::S_InvalidScalarInitializer, valueExprCst,
-                  "a scalar brace initializer must contain a single "
-                  "EXPRESSION, not a nested brace list (C23 6.7.10p12)");
-            return errorNode(braceInitListNode, contextType);
-        }
-        // The single-expression form — lower + coerce exactly like `= expr`, and,
-        // being a brace ELEMENT, report its own diagnosed conversion (P68 round 9;
-        // a pair no rule admits was refused by the semantic tier, P69; the
-        // brace-list arm is unreachable after the N2 gate above).
-        return lowerBraceElementValue(valueExprCst, contextType);
     }
 
     // D5.3 brace-init lowering. Takes a `braceInitList` CST node and a
@@ -11545,7 +11669,8 @@ struct Lowerer {
     [[nodiscard]] HirNodeId lowerBraceInit(NodeId braceInitListNode,
                                            TypeId contextType) {
         std::vector<BraceLevel> stack;
-        if (auto imm = openBraceLevel(braceInitListNode, contextType, stack);
+        if (auto imm = openBraceLevel(braceInitListNode, contextType, stack,
+                                      /*subobject=*/false);
             imm.has_value()) {
             return *imm;
         }
@@ -11593,7 +11718,8 @@ struct Lowerer {
             // frame BEFORE the push, because a push can REALLOCATE `stack` and
             // leave `f` dangling — nothing may touch `f` after this point.
             f.pendingPath = std::move(d->path);
-            if (auto imm = openBraceLevel(core, d->valueTargetType, stack);
+            if (auto imm = openBraceLevel(core, d->valueTargetType, stack,
+                                          /*subobject=*/true);
                 imm.has_value()) {
                 // The child answered without needing a level of its own (an
                 // empty union, a scalar target, a diagnostic): nothing was
@@ -11707,9 +11833,12 @@ struct Lowerer {
     // type — no value is lowered — which is what lets the driver treat a level as
     // a suspendable loop. Returns a node when the list needs no level (and pushes
     // nothing); returns nullopt having pushed exactly one level otherwise.
+    // `subobject`: the list initializes a subobject of an enclosing brace level — the
+    // driver's one statement of it (a scalar's braces warn there from the first pair,
+    // `lowerScalarBraceInit`).
     [[nodiscard]] std::optional<HirNodeId> openBraceLevel(
             NodeId braceInitListNode, TypeId contextType,
-            std::vector<BraceLevel>& stack) {
+            std::vector<BraceLevel>& stack, bool subobject) {
         if (!contextType.valid()) {
             return reportedError(braceInitListNode,
                 "brace-init requires a known context type");
@@ -11724,7 +11853,7 @@ struct Lowerer {
         // fail-loud reject — `(void){}` admitted here would corrupt the type
         // system with a Void-typed literal.
         if (isScalarBraceInitKind(containerKind)) {
-            return lowerScalarBraceInit(braceInitListNode, contextType);
+            return lowerScalarBraceInit(braceInitListNode, contextType, subobject);
         }
         bool const isArray  = (containerKind == TypeKind::Array);
         bool const isStruct = (containerKind == TypeKind::Struct);
@@ -13780,9 +13909,16 @@ struct Lowerer {
     // descend into a NESTED switch (its cases belong to that switch's own dispatch);
     // a nested switch is opaque here.
     void switchPrescanDispatch(SwitchCtx& ctx) {
-        std::vector<NodeId> stack(ctx.items.rbegin(), ctx.items.rend());
+        // ★ P69 (lane `lm`): each entry says whether a GNU statement expression stands
+        // between it and the switch — a case or default label below one is a jump INTO
+        // it (S_JumpIntoStatementExpression; `prescanLabels` says why).
+        struct DispatchEntry { NodeId node; bool insideStmtExpr; };
+        std::vector<DispatchEntry> stack;
+        for (auto it = ctx.items.rbegin(); it != ctx.items.rend(); ++it)
+            stack.push_back({*it, false});
         while (!stack.empty()) {
-            NodeId const n = stack.back();
+            NodeId const n = stack.back().node;
+            bool const insideStmtExpr = stack.back().insideStmtExpr;
             stack.pop_back();
             if (tree().kind(n) != NodeKind::Internal) continue;   // token
             NodeId const core = peelToCore(n);
@@ -13793,15 +13929,24 @@ struct Lowerer {
                 continue;
             }
             if (switchIsRuleNode(core, cfg.caseLabelRule)) {
+                if (insideStmtExpr) {
+                    emitH(DiagnosticCode::S_JumpIntoStatementExpression, core,
+                          "this case or default label is inside a statement expression "
+                          "its switch is not inside — the switch would jump into the "
+                          "statement expression (GNU C 6.1)");
+                }
                 switchAssignCaseOrdinal(ctx, core);
                 // a bare caseLabel has only its value-expr child — nothing more to
                 // walk for cases.
                 continue;
             }
+            bool const below = insideStmtExpr
+                || (cfg.stmtExprRule.valid() && tree().rule(core).v == cfg.stmtExprRule.v)
+                || (cfg.stmtExprRule.valid() && tree().rule(n).v == cfg.stmtExprRule.v);
             // Push children (reverse → pop left-to-right pre-order). Use the PEELED
             // core's children so a caseStmt's caseLabel + body are both visited.
             std::size_t const mark = stack.size();
-            for (NodeId c : visible(core)) if (!isToken(c)) stack.push_back(c);
+            for (NodeId c : visible(core)) if (!isToken(c)) stack.push_back({c, below});
             std::reverse(stack.begin() + static_cast<std::ptrdiff_t>(mark), stack.end());
         }
     }
@@ -13902,7 +14047,12 @@ struct Lowerer {
                         continue;
                     }
                 }
-                disc = promoteSubIntArith(raw).id; continue;
+                // ★ P69 (lane `lm`): a discriminant that is a bit-field's value is promoted
+                // by its width (`asBitFieldValue`, C 6.3.1.1p2 — "the integer promotions
+                // are performed on the controlling expression", 6.8.4.2p5): `switch (v.q)`
+                // over an `unsigned long long q : 3` is an `int`, and so are its case
+                // constants once converted.
+                disc = promoteSubIntArith(asBitFieldValue(c, raw)).id; continue;
             }
             ctx.items.push_back(c);   // switchBodyItem wrappers (caseLabel | statement)
         }

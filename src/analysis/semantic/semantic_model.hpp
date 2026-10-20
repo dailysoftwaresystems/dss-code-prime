@@ -1119,6 +1119,7 @@ public:
                   UnitAttribute<NanPayload>              nanPayloads,
                   UnitAttribute<TypeId>                  overflowPredicateTargets,
                   UnitAttribute<TypeId>                  braceElementValueTypes,
+                  UnitAttribute<TypeId>                  conditionalTypes,
                   UnitAttribute<bool>                    attributeNamesIgnoredForKind,
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   std::unordered_map<std::string, SuppressedShippedSymbol>
@@ -1163,6 +1164,7 @@ public:
           nanPayloads_(std::move(nanPayloads)),
           overflowPredicateTargets_(std::move(overflowPredicateTargets)),
           braceElementValueTypes_(std::move(braceElementValueTypes)),
+          conditionalTypes_(std::move(conditionalTypes)),
           attributeNamesIgnoredForKind_(std::move(attributeNamesIgnoredForKind)),
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
@@ -1307,6 +1309,15 @@ public:
     // its own from the type stamps, which an operator's node does not carry.
     [[nodiscard]] TypeId braceElementValueTypeFor(NodeId id) const {
         TypeId const* t = braceElementValueTypes_.tryGet(id);
+        return t != nullptr ? *t : InvalidType;
+    }
+    // P69 (lane `lm`): the type the analyzer's Pass 2 gave the conditional expression `id`
+    // (C 6.5.15p5: its arms, each promoted, balanced by the usual arithmetic conversions);
+    // InvalidType where Pass 2 typed none. The lowering's constant evaluator converts a
+    // folded conditional's selected arm to it — the type the run time converts to — since
+    // an operator's node carries no type stamp of its own.
+    [[nodiscard]] TypeId conditionalTypeFor(NodeId id) const {
+        TypeId const* t = conditionalTypes_.tryGet(id);
         return t != nullptr ? *t : InvalidType;
     }
     [[nodiscard]] ConstantSubobjectFact const* constantSubobjectFor(NodeId id) const {
@@ -1493,6 +1504,7 @@ private:
     UnitAttribute<NanPayload>                             nanPayloads_;
     UnitAttribute<TypeId>                                 overflowPredicateTargets_;
     UnitAttribute<TypeId>                                 braceElementValueTypes_;
+    UnitAttribute<TypeId>                                 conditionalTypes_;
     UnitAttribute<bool>                                   attributeNamesIgnoredForKind_;
     // FF11: descriptor externs minted from resolved shipped-lib JSON
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the

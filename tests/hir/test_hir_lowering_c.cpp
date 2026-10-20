@@ -1349,35 +1349,38 @@ TEST(HirLoweringC, CheckedArithmeticOverSignedOperandsIsComputedWideEnoughForThe
     }
 }
 
-// FC17.5 (S_InvalidScalarInitializer 0xE03F): the three malformed scalar
-// brace shapes stay LOUD — excess elements (`{1,2}`), a designator on a
-// scalar (`{.x=1}`), and the audit-N2 nested brace list (`{{42}}` — C23
-// 6.7.10p12 requires a SINGLE expression). Each is a distinct arm of the
-// scalar lowering's reject path; a silent guess would ship wrong bytes.
-TEST(HirLoweringC, ScalarBraceInitMalformedShapesFailLoud) {
-    struct Arm { char const* src; char const* what; };
+// FC17.5, turned around by P69 (lane `lm`, the scalar brace closure): the two scalar
+// brace shapes C does not allow are the LANGUAGE's statement — excess elements
+// (`{1,2}`, C 6.7.9p2) and the audit-N2 nested brace list (`{{42}}`, more braces than
+// C 6.7.9p11's one pair) lower to the first value with the warning c.lang.json
+// declares, as gcc 13.3.0 and clang 18.1.3 build both with a warning (✔MEASURED
+// 2026-10-16, every program RUN). A designator on a scalar stays refused — by the
+// semantic tier now, before any lowering (S_InvalidScalarInitializer 0xE03F), as both
+// references refuse it. Every shape, the values, and the document that declares no
+// warning are tests/hir/test_scalar_brace_initializer.cpp's.
+TEST(HirLoweringC, ScalarBraceInitShapesAreTheLanguagesDeclaration) {
+    struct Arm { char const* src; char const* what; DiagnosticCode warning; };
     Arm const arms[] = {
-        {"int main() { int v = {1, 2}; return v; }\n",   "excess elements"},
-        {"int main() { int v = {.x = 1}; return v; }\n", "designator on scalar"},
-        {"int main() { int v = {{42}}; return v; }\n",   "nested brace list (N2)"},
+        {"int main() { int v = {1, 2}; return v; }\n", "excess elements",
+         DiagnosticCode::S_ExcessElementsInScalarInitializer},
+        {"int main() { int v = {{42}}; return v; }\n", "nested brace list (N2)",
+         DiagnosticCode::S_BracesAroundScalarInitializer},
     };
     for (auto const& arm : arms) {
         SemanticModel model = analyzeC(arm.src);
-        ASSERT_FALSE(model.hasErrors())
-            << arm.what << ": the semantic tier admits the parse (the "
-                            "constraint is enforced at HIR lowering)";
+        ASSERT_FALSE(model.hasErrors()) << arm.what;
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_FALSE(res->ok)
-            << arm.what << " must fail loud at the scalar brace-init arm";
-        bool sawCode = false;
-        for (auto const& d : r.all()) {
-            if (d.code == DiagnosticCode::S_InvalidScalarInitializer)
-                sawCode = true;
-        }
-        EXPECT_TRUE(sawCode)
-            << arm.what << " must report S_InvalidScalarInitializer (0xE03F)";
+        EXPECT_TRUE(res->ok) << arm.what << " lowers to the first value";
+        EXPECT_EQ(countCode(r, arm.warning), 1u) << arm.what;
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_InvalidScalarInitializer), 0u) << arm.what;
     }
+    SemanticModel designated = analyzeC("int main() { int v = {.x = 1}; return v; }\n");
+    std::size_t refused = 0;
+    for (auto const& d : designated.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_InvalidScalarInitializer) ++refused;
+    }
+    EXPECT_EQ(refused, 1u) << "a designator on a scalar is refused by the semantic tier";
 }
 
 // FC17.5 F4 (the CLOSED allowlist): `(void){}` stays LOUD — Void is not

@@ -536,6 +536,23 @@ round's close; each checkpoint's commit message says what was and was not run on
   Folded onto checkpoint 27 with four three-way merges and two settled by hand (`kFormatDocumentKeys` holds 55: two
   lanes each added one key over 53; the registry merged by arm, 857 arms). NOT YET BUILT as composed: the whole
   suite of checkpoint 28 is read after this commit.
+- **Checkpoint 29 (2026-10-20) = the library lane's fold lm-27** (the send-back of the promotion fold, a P0: defect
+  (9) below): a bit-field read has ONE type in all three tiers — the constant tier reads it at its declared type and
+  an operator promotes it, as the typer and the run time do (`({ g.b; }) - 6 < 0` now runs as clang's); the
+  evaluator's conditional balances its arms by the usual arithmetic conversions and is cross-checked against the
+  typer's recorded conditional type, its literals stamped first (so a file-scope `int a[(1 ? 5 : 1 / 0) == 5 ? 1 :
+  -1];` still builds); a jump or `case` label into a statement expression is refused
+  (`S_JumpIntoStatementExpression`, 0xE098); a scalar initializer in more braces or with more elements takes its
+  first value with a warning, as gcc and clang do (0xE099, 0xE09A, the language key
+  `hirLowering.scalarBraceInitializer`; cl refuses it, C2078 — a reference that fails); a `__try` filter left by
+  `break`, `goto` or a computed `goto` is refused by the HIR verifier. TWO NEW DISCLOSED ROWS: the scalar-brace row,
+  and the constant evaluator recursing per conditional / logical level (base debt; the lane's next wave measures
+  the reachable depth in every tier and removes each recursion first). ✔MEASURED by the lane: 163 programs on pe64,
+  both pipelines, against gcc and clang — every cell agrees but the two ruled ones (`&&L`; a comma in a constant
+  expression, the lane's next wave); macos-arm64-debug 2835 of 2836 on the fold's bytes (the one red the Mac's
+  Python floor, defect (10)); windows-x86_64-debug 2855 of 2857 on the bytes before a census-figures repair (the
+  line-endings guard's false positive, and the census, repaired). NOT read by the lane: windows-x86_64-release,
+  linux-x86_64-debug — the whole suite of checkpoint 29 is read from the main checkout after this commit.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -566,8 +583,9 @@ round's close; each checkpoint's commit message says what was and was not run on
   (9) IN MAIN SINCE CHECKPOINT 26 (its review, READ; the library lane measures each cell before fixing it): the
   constant tier promotes every bit-field read while the typer and the run time promote only a bit-field's value,
   and the evaluator's conditional returns the selected arm without the usual arithmetic conversions — a folded
-  condition marks reachable code unreachable (`if (({ g.b; }) - 6 < 0)`, `(1 ? 5 : 0u) - 6 < 0`); the library
-  lane's P0 fold, one rule for a read's type in all three tiers and the arms balanced in both.
+  condition marks reachable code unreachable (`if (({ g.b; }) - 6 < 0)`, `(1 ? 5 : 0u) - 6 < 0`) — FIXED by
+  checkpoint 29 (one rule for a read's type in all three tiers, the arms balanced in both; its rows close when
+  their arms read `passed`).
   (10) OURS, ✔MEASURED by the link lane on windows-x86_64-release: `ninja_deps_selftest_guard` and
   `orphan_tests_guard` are red there — that build's CMake cache names the WindowsApps App Execution Alias for
   python3, and the test spawner refuses it as no executable; the harness lane's H4 classifies a candidate by asking

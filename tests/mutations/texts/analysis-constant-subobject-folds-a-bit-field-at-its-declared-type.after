@@ -1,1 +1,1 @@
-                    valueTy = fact->type;
+            TypeId const promoted = fieldType;

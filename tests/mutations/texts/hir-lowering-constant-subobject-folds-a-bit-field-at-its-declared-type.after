@@ -1,1 +1,1 @@
-                    ? f->type
+            TypeId const promoted = fieldType;

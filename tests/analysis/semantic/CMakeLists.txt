@@ -189,6 +189,17 @@ dss_add_test(NAME analysis/semantic/test_bit_field_value_is_promoted_by_its_widt
 target_include_directories(dss_analysis_semantic_test_bit_field_value_is_promoted_by_its_width
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P69 (lane `lm`, a review of the promotion fold, its BLOCKER B): a constant conditional's
+# selected arm has the conditional's type (C 6.5.15p5) — the tier's, or the arms' balance the
+# evaluator computes where the tier has none — and wherever both exist they are proved to
+# agree (a disagreement stops the process). Every case runs in a child process, so the stop
+# is a case's red. A binary of its own: a mutation of either statement stops every binary
+# that folds such a conditional. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_constant_conditional_is_balanced
+             SOURCES test_constant_conditional_is_balanced.cpp)
+target_include_directories(dss_analysis_semantic_test_constant_conditional_is_balanced
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # P69 (lane `lm`, a review's finding B): every descent takes its steps by the ONE statement
 # of what a wrapper is (`nodeSaysSomethingItself`) — the constant evaluator's statement
 # expression and braced scalar, the builtins' operand value through a selection and a

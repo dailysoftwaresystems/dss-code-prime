@@ -1,1 +1,1 @@
-                    ? bitFieldPromotedType(interner, f->type, *f->bitFieldWidth, *arith_)
+            TypeId const promoted = bitFieldPromotedType(interner, fieldType, *width, *arith_);

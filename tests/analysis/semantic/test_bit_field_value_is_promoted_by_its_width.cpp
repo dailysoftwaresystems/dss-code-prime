@@ -41,6 +41,7 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -325,7 +326,8 @@ TEST(BitFieldValueIsPromotedByItsWidth, NotACast) {
 
 // ── THE CONSTANT IS FOLDED AT THE SAME TYPE ─────────────────────────────────────────
 // A fold must not know more C than the run time computes, nor less: the constant read of
-// a bit-field has its promoted type (`readThroughBitField`), as the operators read it.
+// a bit-field has its declared type (`readThroughBitField`), and the evaluator's operators
+// promote it exactly where the typer and the lowering do (`asBitFieldOperand`).
 // clang 18 and AppleClang 21 fold each of these; gcc 13 refuses the enumerator form (a
 // member of a `const` object is no constant there), and all four build and run the
 // static initializers at these values.
@@ -337,7 +339,6 @@ TEST(BitFieldValueIsPromotedByItsWidth, TheConstantIsFoldedAtThePromotedType) {
         "    _Static_assert(g.b - 6 < 0, \"unsigned : 3\");\n"
         "    _Static_assert((long long)(g.b - 6) == -1, \"unsigned : 3, widened\");\n"
         "    _Static_assert(-g.b < 0 && ~g.b < 0, \"unary\");\n"
-        "    _Static_assert((1 ? g.b : g.b) - 6 < 0, \"the conditional\");\n"
         "    _Static_assert((long long)(g.q - 6) == -1, \"unsigned long long : 3\");\n"
         "    _Static_assert((long long)(g.x - 6) == 4294967295ll, \"unsigned : 32 stays unsigned\");\n"
         "    _Static_assert((long long)(g.big - 6) == -1, \"unsigned long long : 33, as declared\");\n"
@@ -363,4 +364,96 @@ TEST(BitFieldValueIsPromotedByItsWidth, TheLoweringFoldsAtThePromotedType) {
         << "the condition C makes false was folded true";
     EXPECT_EQ(positionsMarkedNeverReached("    if (g.q - 6 < 0) return 7;\n    return 42;"), 1u)
         << "unsigned long long : 3 did not fold as an int";
+}
+
+// ── THE CONSTANT READ HAS THE DECLARED TYPE; AN OPERATOR PROMOTES IT ────────────────
+// (a review of the fold that promoted the read itself, its BLOCKER A.) The fold converted
+// every constant read of a bit-field to its promoted type, while the run time and the typer
+// promote only where the one statement says the expression IS a bit-field's value — and a
+// statement expression is not one (the fork above). ✔MEASURED 2026-10-15 (WSL clang 18.1.3,
+// gcc 13.3.0, -O0 and -O2): `if (({ g.b; }) - 6 < 0)` runs false on clang (the fork's
+// source; a statement expression's value is its last expression after lvalue conversion)
+// and true on gcc; DSS folded it TRUE and ran it FALSE — the code after it marked never
+// reached, the image dying of an illegal instruction — and accepted the static assertion
+// clang fails. The forms that ARE a bit-field's value promote in the fold too: a cast names
+// its own type, and a compound literal constant's member is promoted.
+TEST(BitFieldValueIsPromotedByItsWidth, AStatementExpressionsConstantKeepsTheDeclaredType) {
+    std::string actuals;
+    EXPECT_EQ(failedAssertions(
+        "    _Static_assert(!(({ g.b; }) - 6 < 0), \"({ g.b; }) is an unsigned int\");\n"
+        "    _Static_assert(!(({ g.q; }) - 6 < 0), \"({ g.q; }) is an unsigned long long\");\n"
+        "    _Static_assert(!(({ g.b; }) * -1 < 0), \"unsigned times -1\");\n"
+        "    _Static_assert(({ g.n; }) - 6 < 0, \"a signed field stays negative\");\n"
+        "    _Static_assert((unsigned)g.b - 6 > 0, \"a cast names its type\");\n"
+        "    _Static_assert((int)g.b - 6 < 0, \"a cast names its type\");\n"
+        "    _Static_assert(((const struct S){ 0, 5 }).b - 6 < 0, \"a member of a compound literal\");\n",
+        &actuals), 0u) << actuals;
+    EXPECT_EQ(failedAssertions("    _Static_assert(({ g.b; }) - 6 < 0, \"m\");\n", nullptr), 1u)
+        << "the statement expression's value was promoted";
+    EXPECT_EQ(positionsMarkedNeverReached("    if (({ g.b; }) - 6 < 0) return 7;\n    return 42;"), 0u)
+        << "the condition C makes false was folded true";
+    EXPECT_EQ(positionsMarkedNeverReached("    if (({ g.b; }) - 6 >= 0) return 7;\n    return 42;"), 1u)
+        << "the condition C makes true did not fold true";
+}
+
+// ── `typeof` REFUSES A BIT-FIELD, AND ONLY A BIT-FIELD ──────────────────────────────
+// (the review's D.) C 6.7.2.5: `typeof` of a bit-field member is a constraint violation —
+// through a wrapper or a selection's result too. Every other expression has a type to
+// declare by, the promoted ones included. ✔MEASURED 2026-10-16 (clang 18.1.3, gcc 13.3.0,
+// `typeof` and `__typeof__`): both refuse the five refused below and accept every accepted
+// one; the probe descended any node of one internal child and refused `-v.b`, `+v.b`,
+// `++v.b` and `({ v.b; })`.
+TEST(BitFieldValueIsPromotedByItsWidth, TypeofRefusesABitFieldAndOnlyABitField) {
+    constexpr char const* kRefused[] = {
+        "v.b", "(v.b)", "__extension__ v.b", "_Generic(0, int: v.b)",
+        "__builtin_choose_expr(1, v.b, 0)",
+    };
+    for (char const* e : kRefused) {
+        auto const m = analyzeC(std::string{kObjects} + "int main(void) {\n    typeof(" + e +
+                                ") x = 1;\n    return (int)x;\n}\n");
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeofBitfieldOperand), 1u) << e;
+    }
+    std::string actuals;
+    EXPECT_EQ(failedAssertions(
+        "    typeof(-v.b) neg = 0;\n    typeof(+v.b) pos = 0;\n    typeof(~v.b) inv = 0;\n"
+        "    typeof(v.b + 0) sum = 0;\n    typeof(({ v.b; })) stmt = 0;\n"
+        "    typeof((0, v.b)) comma = 0;\n    typeof(++v.b) pre = 0;\n    typeof(v.b++) post = 0;\n"
+        "    typeof((v.b = 1)) asg = 0;\n    typeof(1 ? v.b : v.b) cond = 0;\n"
+        "    _Static_assert(IS_INT(neg) && IS_INT(pos) && IS_INT(inv) && IS_INT(sum), \"promoted\");\n"
+        "    _Static_assert(IS_INT(cond), \"the conditional of two promoted arms\");\n"
+        "    _Static_assert(IS_UINT(stmt) && IS_UINT(post), \"the declared type\");\n"
+        "    (void)comma; (void)pre; (void)asg;\n",
+        &actuals), 0u) << actuals;
+}
+
+// ── THE `switch` CONTROLLING EXPRESSION IS PROMOTED BY THE WIDTH ────────────────────
+// (the review's N1.) C 6.8.4.2p5: "The integer promotions are performed on the controlling
+// expression" — a bit-field by its width, so `switch (v.q)` over an `unsigned long long
+// q : 3` is an `int`, and a case constant is converted to it. ✔MEASURED 2026-10-16 (clang
+// 18.1.3 and gcc 13.3.0, -O0/-O2): `case 0x100000005ull:` matches v.q holding 5 on both.
+TEST(BitFieldValueIsPromotedByItsWidth, TheSwitchControllingExpressionIsPromotedByTheWidth) {
+    std::string const src = std::string{kObjects} +
+        "int f(int y) {\n    (void)y;\n    switch (v.q) { case 0x100000005ull: return 1; }\n"
+        "    return 2;\n}\nint main(void) { return f(-1); }\n";
+    EXPECT_EQ(parseErrorsFor(src), 0u) << src;
+    auto cu = buildShippedUnit("c", {src});
+    SemanticModel model =
+        analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    ASSERT_FALSE(model.hasErrors()) << allActuals(model, DiagnosticCode::S_StaticAssertFailed);
+    DiagnosticReporter reporter{};
+    auto lowered = lowerToHir(model, reporter);
+    ASSERT_NE(lowered, nullptr);
+    Hir const& hir = lowered->hir;
+    auto const& in = model.lattice().interner();
+    std::size_t switches = 0;
+    for (std::uint32_t i = 1; i < hir.nodeCount(); ++i) {
+        HirNodeId const id{i, hir.id().v};
+        if (hir.kind(id) != HirKind::SwitchStmt) continue;
+        ++switches;
+        HirNodeId const disc = hir.children(id)[0];
+        EXPECT_EQ(static_cast<int>(in.kind(hir.typeId(disc))), static_cast<int>(TypeKind::I32))
+            << "the discriminant is the promoted bit-field, an int";
+    }
+    EXPECT_EQ(switches, 1u);
 }

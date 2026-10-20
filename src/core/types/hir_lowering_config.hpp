@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/enum_name_table.hpp"           // EnumNameTable (kChildLowerTable)
 #include "core/types/object_format_kind.hpp"        // ObjectFormatKind (per-format element core)
+#include "core/types/parse_diagnostic.hpp"          // DiagnosticCode (scalarBraceInitializer)
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind (LiteralPrefixEntry.elementCore)
 
@@ -415,6 +416,25 @@ struct DSS_EXPORT HirLoweringConfig {
     // Invalid ⇒ the language has no statement-expression surface (unset; the
     // operand dispatch skips it).
     RuleId      stmtExprRule{};        std::string stmtExprRuleName;
+
+    // P69 (lane `lm`, the scalar brace closure): what the language makes of a scalar's
+    // brace initializer beyond C 6.7.9p11's "single expression, optionally enclosed in
+    // braces" — each a WARNING the lowering reports where it admits the shape:
+    //   `nestedBraces`   — a brace level beyond the one pair (`int v = {{42}};`; the
+    //                      innermost value initializes, `{{}}` is zero), and the one pair
+    //                      itself around a scalar SUBOBJECT of an aggregate (`struct S s =
+    //                      {{42}};`), which C allows and gcc and clang warn;
+    //   `excessElements` — more than one element (`int v = {42, 7};`; the first
+    //                      initializes, the rest are dropped unevaluated — C 6.7.9p2's
+    //                      constraint, which gcc and clang build with a warning).
+    // `DiagnosticCode::None` (the key absent) ⇒ the language refuses the shape
+    // (S_InvalidScalarInitializer) — and a subobject's one pair stands, unwarned. A
+    // designator in a scalar's braces is refused whatever this says.
+    struct ScalarBraceInitializer {
+        DiagnosticCode nestedBraces   = DiagnosticCode::None;   std::string nestedBracesName;
+        DiagnosticCode excessElements = DiagnosticCode::None;   std::string excessElementsName;
+    };
+    ScalarBraceInitializer scalarBraceInitializer{};
 
     // Per-language MIR-globals const-evaluation policy. The shared
     // const-eval engine (plan 12.5) supports a float-folding gate via

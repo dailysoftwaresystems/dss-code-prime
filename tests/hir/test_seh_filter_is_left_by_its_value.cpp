@@ -5,9 +5,10 @@
 // The filter is compiled as a function of its own, called by the dispatcher while it
 // searches for a handler, with no scope table of its own — so a statement that leaves
 // the filter otherwise than by its value (a `return`, a `goto` to a label outside it, a
-// `break` or `continue` of a loop around it) and a `__try` inside it have nothing to be
-// compiled to. They were refused by the MIR verifier, as `I_SehStructure` naming MIR
-// block numbers (✔MEASURED 2026-10-15, pe64, both pipelines, all five shapes). They are
+// `break` or `continue` of a loop around it, a computed `goto *`) and a `__try` inside it
+// have nothing to be compiled to. They were refused by the MIR verifier, as
+// `I_SehStructure` naming MIR block numbers (✔MEASURED 2026-10-15, pe64, both pipelines,
+// the five shapes other than the computed goto, which no case read then). They are
 // refused by the HIR verifier now, by the construct the source wrote: a jump out as
 // `H_SehEarlyExit` — the guarded body's own rule, a second way out — and a region inside
 // as `H_SehRegionInsideAFilter`.
@@ -95,6 +96,13 @@ TEST(SehFilterStatements, AJumpOutOfAFilterIsRefusedByItsConstruct) {
          "int f(volatile int *p) {\n    for (int i = 0; i < 2; ++i) {\n        __try { touch(p); }\n"
          "        __except (({ if (g) continue; 1; })) { return 2; }\n    }\n    return 0;\n}\n",
          "'continue' leaving a __except filter expression"},
+        // ★ (a review of the fold that refused the first four: its F) a computed goto to a
+        // label outside the filter — the fifth branch, which no case read.
+        {"computed goto",
+         "int f(volatile int *p) {\n    __try { touch(p); }\n"
+         "    __except (({ void *t = &&out; if (g) goto *t; 1; })) { return 2; }\n    return 0;\n"
+         "out:\n    return 3;\n}\n",
+         "computed goto inside a __except filter expression"},
     };
     for (Shape const& s : kShapes) {
         SCOPED_TRACE(s.what);

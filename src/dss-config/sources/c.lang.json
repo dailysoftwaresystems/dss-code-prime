@@ -3213,6 +3213,12 @@
 
     "globalsConstEval": { "allowFloat": true },
 
+    "$scalarBraceInitializerComment": "P69 (lane `lm`, the scalar brace closure): C 6.7.9p11 gives a scalar \"a single expression, optionally enclosed in braces\", and C 6.7.9p2 makes an element beyond the first a constraint violation. gcc 13.3.0 and clang 18.1.3 build both with a warning (✔MEASURED 2026-10-16, every program RUN): more braces — the innermost value initializes, `{{}}` is zero, one warning per brace level beyond the first, and inside an aggregate already at the first; more elements — the first initializes, the rest are dropped UNEVALUATED. Each key names the WARNING the lowering reports where it admits that shape; a language that names none refuses it (S_InvalidScalarInitializer). A designator in a scalar's braces is refused either way, as both references refuse it.",
+    "scalarBraceInitializer": {
+      "nestedBraces":   "S_BracesAroundScalarInitializer",
+      "excessElements": "S_ExcessElementsInScalarInitializer"
+    },
+
 
     "binaryOps": [
       { "token": "PlusOp",   "target": "Add"    },

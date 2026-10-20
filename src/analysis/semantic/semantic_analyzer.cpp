@@ -275,6 +275,7 @@ struct EngineState {
           nanPayloads{cu},
           overflowPredicateTargets{cu},
           braceElementValueTypes{cu},
+          conditionalTypes{cu},
           attributeNamesIgnoredForKind{cu},
           deprecatedTypeUseWarned{cu},
           typedefNamedByToken{cu},
@@ -444,6 +445,11 @@ struct EngineState {
     // moved into the model for the HIR lowering, which asks the cursor the same question
     // (see the model's `braceElementValueTypeFor`).
     UnitAttribute<TypeId> braceElementValueTypes;
+    // P69 (lane `lm`): the type Pass 2 gave each conditional expression it typed (C
+    // 6.5.15p5) — moved into the model for the HIR lowering's constant evaluator, which
+    // converts a folded conditional's selected arm to it (see the model's
+    // `conditionalTypeFor`).
+    UnitAttribute<TypeId> conditionalTypes;
     // P69 (lane `cs`): the NAME token of every attribute clause the declaration-kind
     // gate ignored (see the model's `attributeNameIgnoredForKind`).
     UnitAttribute<bool> attributeNamesIgnoredForKind;
@@ -1247,8 +1253,15 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
 [[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
                                  NodeId node, ScopeId scope = {});
 [[nodiscard]] std::optional<std::uint32_t>
-semanticBitFieldValueWidth(EngineState const& s, SemanticConfig const& sem, Tree const& tree,
-                           NodeId n, ScopeId scope);
+semanticBitFieldValueWidth(EngineState& s, SemanticConfig const& sem, Tree const& tree,
+                           NodeId n, ScopeId scope, TypeId* fieldTypeOut = nullptr);
+[[nodiscard]] bool nodeIsASelection(SemanticConfig const& sem, Tree const& tree, NodeId n);
+[[nodiscard]] NodeId selectionResultOf(EngineState& s, SemanticConfig const& sem,
+                                       Tree const& tree, NodeId sel, ScopeId scope);
+void forEachPlacedBraceValue(EngineState& s, Tree const& tree, NodeId braceList, TypeId object,
+                             ScopeId scope,
+                             std::function<void(NodeId value, TypeId slot)> const& onValue,
+                             std::function<void(NodeId element)> const& onScalarDesignator);
 // C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION / -GENERIC-RESULT-TYPE-DEDUCTION):
 // the ONE generic-selection chokepoint. Given a `_Generic` node and its ALREADY-
 // COMPUTED controlling type, decide which association WINS from the typed/
@@ -4095,10 +4108,22 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                               specifierDiagnosed);
                 } else {
                     // EXPRESSION operand (UNEVALUATED, 6.7.2.5p2). C 6.7.2.5
-                    // constraint: a bit-field member has no nameable type. Bounded
-                    // transparent descent to the innermost member-access node
-                    // (mirrors the nullptr operator-gate walk); resolveMemberAccess
-                    // exposes a bit-field field via `bitFieldWidth`.
+                    // constraint: a bit-field member has no nameable type. The descent
+                    // to the member access the operand IS; resolveMemberAccess exposes a
+                    // bit-field field via `bitFieldWidth`.
+                    // ★ P69 (lane `lm`, the review of the promotion fold, its D): THE
+                    // OPERAND IS A BIT-FIELD ONLY THROUGH A WRAPPER OR A SELECTION — the
+                    // steps of the one statement (`nodeSaysSomethingItself`; a
+                    // selection's result by name, `selectionResultOf`), a subset of
+                    // those `bitFieldValueWidth` takes. This descended EVERY node with one
+                    // internal child, so it walked through a unary operator, a prefix
+                    // `++` and a statement expression to the member below and refused
+                    // them; and it stopped at a selection. ✔MEASURED 2026-10-16 (clang
+                    // 18.1.3 and gcc 13.3.0, `typeof` and `__typeof__` alike): both
+                    // refuse `v.b`, `(v.b)`, `__extension__ v.b`, `_Generic(0, int: v.b)`
+                    // and `__builtin_choose_expr(1, v.b, 0)`, and both ACCEPT `-v.b`,
+                    // `+v.b`, `++v.b`, `v.b++`, `(0, v.b)`, `(v.b = 1)`, `(v.b += 1)`,
+                    // `({ v.b; })` and `(1 ? v.b : v.b)` — no split to decide.
                     NodeId probe = operandNode;
                     // ★ P68 round 13 (lane `cs`): no cap. This stopped after 64 wrappers
                     // and never saw a member access below them, so a bit-field operand
@@ -4140,9 +4165,18 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             }
                             break;   // resolved (bit-field or not) — stop descent
                         }
-                        // Descend ONE transparent wrapper (a single Internal child);
-                        // a real operator/comma (≥2 Internal children) is not a
-                        // transparent member operand — stop.
+                        if (tree.kind(probe) != NodeKind::Internal) break;
+                        // A selection: its result, by name.
+                        if (nodeIsASelection(cfg, tree, probe)) {
+                            probe = selectionResultOf(s, cfg, tree, probe, scope);
+                            continue;
+                        }
+                        // A wrapper (the statement's): its ONE internal child. Every node
+                        // that says something itself is no bit-field — stop.
+                        if (nodeSaysSomethingItself(cfg, tree.schema().hirLowering(), tree,
+                                                    probe)) {
+                            break;
+                        }
                         NodeId next{};
                         int internals = 0;
                         for (NodeId c : visibleChildren(tree, probe)) {
@@ -4958,25 +4992,68 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
             auto const type = classifyCstCastTarget(s.lattice.interner(), fact->type,
                                                     s.charIsUnsigned);
             if (!type.has_value()) return std::nullopt;
-            // P69 (lane `lm`): a bit-field's value has its PROMOTED type (C 6.3.1.1p2,
-            // `bitFieldPromotedType` — the one the operators read it at), so the fold and
-            // the run-time read compute in the same type. A value type that is no
-            // conversion target is no constant, never a guessed one.
+            // P69 (lane `lm`): a bit-field is read at its width, at its declared type; an
+            // operator promotes it where it is a bit-field's value
+            // (`resolveBitFieldValueType` below).
             std::optional<CstBitFieldRead> bitField;
             if (fact->bitFieldWidth.has_value()) {
-                TypeId valueTy = fact->type;
-                if (auto const& rules = s.arithRulesFor(*cfg); rules.has_value()) {
-                    valueTy = bitFieldPromotedType(s.lattice.interner(), fact->type,
-                                                   *fact->bitFieldWidth, *rules);
-                }
-                auto const vt = classifyCstCastTarget(s.lattice.interner(), valueTy,
-                                                      s.charIsUnsigned);
-                if (!vt.has_value()) return std::nullopt;
-                bitField = CstBitFieldRead{*fact->bitFieldWidth, *vt};
+                bitField = CstBitFieldRead{*fact->bitFieldWidth};
             }
             return CstConstantSubobject{
                 CstResolvedSymbol{fact->initExpr, fact->initScope.v, std::nullopt}, *type,
                 fact->zeroValue, bitField};
+        };
+        // P69 (lane `lm`, the review of the promotion fold): the type an operator reads an
+        // operand at when that operand IS a bit-field's value — the ONE statement
+        // (`semanticBitFieldValueWidth` → `bitFieldValueWidth`) the typer's
+        // `bitFieldOperandType` asks, the promotion by width from the field's declared type
+        // (`bitFieldPromotedType`). nullopt where the operand is no bit-field's value or the
+        // promotion keeps its type. Asked of the field's own type, so it answers before
+        // Pass 2 has typed a single expression.
+        env.resolveBitFieldValueType = [&s, &tree, cfg](NodeId operand,
+                                                        std::uint32_t curScopeOpaque)
+            -> std::optional<CstCastTarget> {
+            auto const& rules = s.arithRulesFor(*cfg);
+            if (!rules.has_value()) return std::nullopt;
+            TypeId fieldType{};
+            auto const width = semanticBitFieldValueWidth(s, *cfg, tree, operand,
+                                                          ScopeId{curScopeOpaque}, &fieldType);
+            if (!width.has_value() || !fieldType.valid()) return std::nullopt;
+            auto& interner = s.lattice.interner();
+            TypeId const promoted = bitFieldPromotedType(interner, fieldType, *width, *rules);
+            if (!promoted.valid() || promoted.v == fieldType.v) return std::nullopt;
+            return classifyCstCastTarget(interner, promoted, s.charIsUnsigned);
+        };
+        // P69 (lane `lm`): the type the typer gives an expression (`subtreeType`) — asked of
+        // a conditional, whose selected arm the engine converts to it (C 6.5.15p5), and of
+        // the unselected arm of one it could not type. Its LITERAL leaves are stamped first,
+        // through the one walk every `subtreeType` caller before Pass 2 takes
+        // (`preStampLiteralLeaves`): unstamped, a literal is typed as nothing there, and
+        // `int a[(1 ? 5 : 1 / 0) == 5 ? 1 : -1];` at file scope — its unselected arm neither
+        // folds nor had a type — was refused S_NonConstantArrayLength, where clang 18 and
+        // gcc 13 build it (✔MEASURED 2026-10-16, with an enumerator, a bit-field width and a
+        // file-scope static assertion over such an arm). InvalidType is no answer — nor is a
+        // conditional's type when an arm is untyped: the typer then hands on the other arm's
+        // type (`combineTernary`'s last fallback), which is no statement of C 6.5.15p5.
+        env.resolveExpressionType = [&s, &tree, cfg](NodeId node, std::uint32_t curScopeOpaque)
+            -> std::optional<CstCastTarget> {
+            ScopeId const scope{curScopeOpaque};
+            preStampLiteralLeaves(s, *cfg, tree, node);
+            auto const& hirCfg = tree.schema().hirLowering();
+            if (node.valid() && tree.kind(node) == NodeKind::Internal
+                && hirCfg.ternaryExprRule.valid()
+                && tree.rule(node).v == hirCfg.ternaryExprRule.v) {
+                std::size_t operands = 0;
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) == NodeKind::Token) continue;
+                    if (operands++ > 0 && !subtreeType(s, tree, c, scope).valid())
+                        return std::nullopt;
+                }
+                if (operands != 3) return std::nullopt;
+            }
+            TypeId const t = subtreeType(s, tree, node, scope);
+            if (!t.valid()) return std::nullopt;
+            return classifyCstCastTarget(s.lattice.interner(), t, s.charIsUnsigned);
         };
         // FC6: fold `sizeof(T)` in an array dimension (`int a[sizeof(T)]`). The
         // engine dispatches the `sizeofRule` node here (ahead of its wrapper-
@@ -6062,10 +6139,12 @@ void validateConstexprObject(EngineState& s, SemanticConfig const& cfg, Tree con
     // zero = the null pointer constant). `constExprValue` cannot fold a brace
     // list (it is not an expression), so without this arm the HIR-side scalar
     // `{}` lift would stay S_ConstexprNonConstantInitializer-rejected under
-    // constexpr. ONLY the truly-empty list is admitted here; `{5}` folds via
-    // the normal single-child-descent path below, and a malformed multi-element
-    // `{1,2}` falls through to the arithmetic/pointer arms' loud rejection
-    // (the HIR lowering also rejects it — S_InvalidScalarInitializer). The
+    // constexpr. ONLY the truly-empty list is admitted here; any other scalar
+    // brace list is folded by the arithmetic arm below through the constant
+    // evaluator, which reads a scalar's braces as their FIRST undesignated
+    // element, level by level (`valueStepChild`, P69 lane `lm`) — so `{5}`,
+    // `{{5}}` and `{5, 7}` are 5, as gcc 13.3.0 -std=c2x folds them (✔MEASURED
+    // 2026-10-16), and the lowering warns for the extra braces and the excess. The
     // descent skips TOKEN children (`{`/`}` are the brace list's own tokens)
     // and stops at the first node with 0 or 2+ Internal children, so a
     // compound literal `(int){}` (two Internal children) is NOT admitted — a
@@ -12071,13 +12150,23 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
     return out;
 }
 
-// The declaration-level hook: walk every element of `initNode` (brace lists iteratively; a
-// string literal for a character array is a string literal) and report each element's first
-// provably non-constant construct, or its first admitted comma operator. `fileScope`: the
-// declaration is at file scope (its compound literals are static, C 6.5.2.5p5).
+// The declaration-level hook: walk every element of `initNode` that initializes something of
+// `object`, the declared type (`forEachPlacedBraceValue`; a string literal for a character
+// array is a string literal), and report each one's first provably non-constant construct, or
+// its first admitted comma operator. `fileScope`: the declaration is at file scope (its
+// compound literals are static, C 6.5.2.5p5).
+// ★ P69 (lane `lm`, the scalar brace closure): AN ELEMENT THAT INITIALIZES NOTHING IS NO
+// CONSTNESS QUESTION. This walked every element of every brace list, blind to the type, so an
+// EXCESS element — dropped unevaluated by the lowering (C 6.7.9p2's constraint, warned) — was
+// refused as not constant. ✔MEASURED 2026-10-16 (clang 18.1.3, gcc 13.3.0, every program
+// RUN): both build `static int v = {42, g()};`, `static int v = {{42, g()}};`, `static int
+// a[1] = {42, g()};`, `static struct S s = {42, g()};`, `static union U u = {42, g()};`,
+// `static int a[1][1] = {{42, g()}};` and `static struct S s = {{40, g()}, 2};` with the
+// excess warning alone, `g()` never called; clang builds `static char s[] = {"*", g()};` too
+// (gcc refuses it). Both refuse a call where it INITIALIZES something: `{g(), 42}`.
 void validateStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-                               NodeId initNode, ScopeId here, StaticInitializerRule const& rule,
-                               bool fileScope) {
+                               NodeId initNode, TypeId object, ScopeId here,
+                               StaticInitializerRule const& rule, bool fileScope) {
     auto const report = [&](DiagnosticCode code, DiagnosticSeverity sev, NodeId at,
                             std::string message) {
         ParseDiagnostic d;
@@ -12088,29 +12177,9 @@ void validateStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tree c
         d.actual   = std::move(message);
         s.reporter.report(std::move(d));
     };
-    std::vector<NodeId> pending{initNode};
-    std::size_t const bound = tree.nodeCount() + 1;   // strict descendants of one declaration
-    for (std::size_t guard = 0; !pending.empty(); ++guard) {
-        if (guard > bound) failOnCyclicTree("the static initializer element walk");
-        NodeId const raw = pending.back();
-        pending.pop_back();
-        NodeId const v = descendInitWrappers(s, tree, raw);
-        if (!v.valid()) continue;
-        if (tree.kind(v) == NodeKind::Internal && s.idx().braceInitListRule.valid()
-            && tree.rule(v).v == s.idx().braceInitListRule.v) {
-            for (NodeId el : visibleChildren(tree, v)) {
-                if (tree.kind(el) != NodeKind::Internal) continue;
-                if (s.idx().initElementRule.valid() && tree.rule(el).v != s.idx().initElementRule.v)
-                    continue;
-                // An element's VALUE is its last Internal child (a designator precedes it; a
-                // designator's own constant expression is the designator machinery's).
-                NodeId last{};
-                for (NodeId c : visibleChildren(tree, el))
-                    if (tree.kind(c) == NodeKind::Internal) last = c;
-                if (last.valid()) pending.push_back(last);
-            }
-            continue;
-        }
+    // One value that initializes something: its first provably non-constant construct, or its
+    // first admitted comma operator.
+    auto const check = [&](NodeId raw) {
         StaticInitializerFinding const f =
             findNonConstantInStaticInitializer(s, cfg, tree, raw, here, rule.otherConstantForms,
                                                fileScope);
@@ -12127,7 +12196,18 @@ void validateStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tree c
                                "names it; the language admits it as a constant)",
                                tree.text(f.comma)));
         }
+    };
+    NodeId const v = descendInitWrappers(s, tree, initNode);
+    if (!v.valid()) return;
+    if (tree.kind(v) == NodeKind::Internal && s.idx().braceInitListRule.valid()
+        && tree.rule(v).v == s.idx().braceInitListRule.v) {
+        // A designator in a scalar's braces is the element judge's refusal
+        // (`checkBraceInitializerElements`); its value initializes nothing.
+        forEachPlacedBraceValue(s, tree, v, object, here,
+                                [&](NodeId value, TypeId) { check(value); }, [](NodeId) {});
+        return;
     }
+    check(initNode);
 }
 
 // D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE + c33
@@ -14097,16 +14177,13 @@ private:
         || (sem.builtinChooseExprRule.valid() && r == sem.builtinChooseExprRule.v);
 }
 
-[[nodiscard]] NodeId selectionResultOf(EngineState const& s, SemanticConfig const& sem,
+[[nodiscard]] NodeId selectionResultOf(EngineState& s, SemanticConfig const& sem,
                                        Tree const& tree, NodeId sel, ScopeId scope) {
     if (NodeId const* rec = s.nodeToSelectedExpr.tryGet(sel); rec != nullptr && rec->valid())
         return *rec;
-    // The const_cast is `subtreeType`'s `__builtin_choose_expr` arm's: the selectors memoize
-    // in the interner, and no caller holds a genuinely const EngineState.
-    EngineState& mutS = const_cast<EngineState&>(s);   // NOLINT
     if (sem.genericRule.valid() && tree.rule(sel).v == sem.genericRule.v)
-        return genericSelectedArm(mutS, sem, tree, sel, scope);
-    return chooseExprSelectedArm(mutS, sem, tree, sel, scope, /*loud=*/false);
+        return genericSelectedArm(s, sem, tree, sel, scope);
+    return chooseExprSelectedArm(s, sem, tree, sel, scope, /*loud=*/false);
 }
 
 // The node of `rule` that `n` IS — `n` itself, or what stands under its wrappers — else an
@@ -14566,6 +14643,116 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
     }
 }
 
+// ── THE VALUES A BRACE LIST GIVES ITS OBJECT (cycle P69 round 1, lane `lm`) ──────────────
+// Every element VALUE of `braceList` that initializes something of `object`, handed to
+// `onValue` with the type of the subobject it initializes — placed exactly where the HIR
+// lowering places it: the ONE placement cursor (`initializer_cursor.hpp`) over the declared
+// types, the designator resolver and the whole-value test the array sizing uses. What
+// initializes nothing is never handed on: an EXCESS element (C 6.7.9p2's constraint — the
+// lowering warns and drops it unevaluated, as gcc and clang do), an out-of-range or
+// unresolved designation (the lowering refuses each loudly), an element after the string
+// literal that initializes a character array (C 6.7.9p14; that string is the value).
+// A SCALAR's braces (C 6.7.9p11: "a single expression, optionally enclosed in braces") give
+// their FIRST element, and a brace list standing as that element is stepped through, level by
+// level, to the value; `{}` at any level gives nothing — the zero value. gcc and clang build
+// every such shape with a warning and initialize the scalar from that first value
+// (✔MEASURED 2026-10-16, clang 18.1.3 and gcc 13.3.0, every program RUN: `{{42}}`, `{{{42}}}`,
+// `{42, 7}`, `{{42}, 7}`, `{{42, 7}}` are 42, `{{}}` is 0, an excess call never runs); the
+// lowering takes the same steps and warns where they warn. A DESIGNATOR met in a scalar's
+// braces, at any level, is handed to `onScalarDesignator` (the element it designates in) and
+// ends that scalar's walk: C 6.7.9p6-p7 give designators to arrays, structures and unions.
+// One statement for the two walks that ask it — the element judge
+// (`checkBraceInitializerElements`) and the static-initializer check
+// (`validateStaticInitializer`) — so neither can judge an element the other skips.
+// NOT RECURSIVE: one heap frame per aggregate level, one loop for a scalar's levels
+// (feedback-no-input-proportional-recursion); a nested list is walked before the element
+// after it, so the values come in source order.
+void forEachPlacedBraceValue(EngineState& s, Tree const& tree, NodeId braceList, TypeId object,
+                             ScopeId scope,
+                             std::function<void(NodeId value, TypeId slot)> const& onValue,
+                             std::function<void(NodeId element)> const& onScalarDesignator) {
+    SchemaIndexes const& idx = s.idx();
+    if (!braceList.valid() || !object.valid() || !idx.braceInitListRule.valid()
+        || !idx.initElementRule.valid())
+        return;
+    SemanticBraceView const view{s};
+    auto const elementsOf = [&](NodeId list) {
+        std::vector<NodeId> out;
+        for (NodeId e : visibleChildren(tree, list))
+            if (tree.kind(e) == NodeKind::Internal && tree.rule(e).v == idx.initElementRule.v)
+                out.push_back(e);
+        return out;
+    };
+
+    struct Level {
+        TypeId                     object;
+        std::vector<NodeId>        elements;
+        std::size_t                next = 0;
+        initializer_cursor::Cursor cursor;
+    };
+    std::vector<Level> stack;
+    std::size_t const bound = tree.nodeCount() + 1;   // each level is a strict descendant
+    // Open one brace list against the type it initializes: a scalar's is walked to its value
+    // at once; a character array's list led by the string literal that initializes it IS that
+    // string; any other aggregate's list opens a level.
+    auto const open = [&](NodeId list, TypeId t) {
+        if (!t.valid()) return;
+        std::vector<NodeId> elements = elementsOf(list);
+        if (view.shape(t) == initializer_cursor::Shape::Scalar) {
+            for (std::size_t guard = 0; !elements.empty(); ++guard) {
+                if (guard > bound) failOnCyclicTree("the scalar brace levels");
+                auto const parts = internalChildrenOf(tree, elements.front());
+                if (parts.size() > 1) {   // a designation and its value
+                    onScalarDesignator(elements.front());
+                    return;
+                }
+                if (parts.size() != 1) return;   // no value: a malformed tree the lowering refuses
+                NodeId const inner = peelSingleChildrenTo(tree, parts.front(),
+                                                          idx.braceInitListRule);
+                if (!inner.valid()) {
+                    onValue(parts.front(), t);
+                    return;
+                }
+                elements = elementsOf(inner);
+            }
+            return;   // `{}` at some level: the zero value
+        }
+        if (elements.empty()) return;
+        if (view.shape(t) == initializer_cursor::Shape::Array) {
+            if (auto const lead = internalChildrenOf(tree, elements.front());
+                lead.size() == 1
+                && stringLiteralInitializingArray(s, idx, tree, lead.front(), t).valid()) {
+                onValue(lead.front(), t);
+                return;
+            }
+        }
+        stack.push_back(Level{t, std::move(elements), 0, initializer_cursor::Cursor{t, view}});
+    };
+
+    open(braceList, object);
+    while (!stack.empty()) {
+        Level& lv = stack.back();
+        if (lv.next >= lv.elements.size()) {
+            stack.pop_back();
+            continue;
+        }
+        NodeId const e = lv.elements[lv.next++];
+        ResolvedBraceElement const el = resolveBraceElement(s, tree, e, lv.object, scope);
+        if (!el.resolved) continue;   // an unresolved designation: the lowering refuses it
+        NodeId const list = peelSingleChildrenTo(tree, el.value, idx.braceInitListRule);
+        initializer_cursor::Placement const placed = lv.cursor.place(
+            std::span<std::uint64_t const>{el.designator}, list.valid(), [&](TypeId t) {
+                return braceValueInitializesWhole(s, idx, tree, el.value, t, scope);
+            });
+        if (placed.kind != initializer_cursor::Placement::Kind::Assign) continue;
+        if (list.valid()) {
+            open(list, placed.type);   // may push a level: `lv` is not read after this
+            continue;
+        }
+        onValue(el.value, placed.type);
+    }
+}
+
 // ── P69 (lane `cs`): THE SIMPLE-ASSIGNMENT CONSTRAINT OF A BRACE ELEMENT ──────────────
 // (D-C-A-INCOMPATIBLE-BRACE-ELEMENT-IS-REFUSED-BY-AN-INTERNAL-VERIFIER-FAILURE)
 //
@@ -14590,14 +14777,15 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
 // placement cursor (`initializer_cursor.hpp`) over the declared types, the designator
 // resolver and the whole-value test the array sizing uses. A conversion admitted WITH a
 // diagnostic is left to the lowering, which reports it where it realizes it
-// (`reportDiagnosedBraceElement`) — each element is judged ONCE. What this walk cannot
-// place — an unresolved designator, an excess or out-of-range element, a designator or
-// a nested list where a scalar takes one expression — it leaves to the lowering too,
-// which refuses each loudly in its own words.
-//
-// NOT RECURSIVE: one heap frame per brace level (feedback-no-input-proportional-recursion),
-// and a nested list is judged before the element after it, so the reports come in source
-// order.
+// (`reportDiagnosedBraceElement`) — each element is judged ONCE. The elements come from
+// `forEachPlacedBraceValue`: a scalar's braces are judged by their first value, through
+// every level (P69, lane `lm`, the scalar brace closure — `int x = {{ s }};` puts a
+// structure in an `int`, and gcc 13.3.0 and clang 18.1.3 refuse it at the element,
+// ✔MEASURED 2026-10-16), and what initializes nothing is not judged — an excess element,
+// as gcc and clang judge none (`int v = {42, "x"};` builds on both), and an unresolved or
+// out-of-range designator, which the lowering refuses loudly in its own words. A
+// DESIGNATOR in a scalar's braces, at any level, is refused here (S_InvalidScalarInitializer):
+// both references refuse `{.x = 42}`, `{[0] = 42}` and `{{[0] = 42}}` on an `int`.
 void checkBraceInitializerElements(EngineState& s, SemanticConfig const& cfg,
                                    Tree const& tree, NodeId braceList, TypeId object,
                                    ScopeId scope) {
@@ -14607,7 +14795,6 @@ void checkBraceInitializerElements(EngineState& s, SemanticConfig const& cfg,
         return;
     TypeInterner& interner = s.lattice.interner();
     auto const& rules = tree.schema().semantics().pointerConversions;
-    SemanticBraceView const view{s};
     auto const category = [&](TypeId t) -> std::string_view {
         switch (interner.kind(t)) {
             case TypeKind::Struct: return "a structure";
@@ -14647,69 +14834,20 @@ void checkBraceInitializerElements(EngineState& s, SemanticConfig const& cfg,
             tree.text(value), category(vt), category(slot));
         s.reporter.report(std::move(d));
     };
-    auto const elementsOf = [&](NodeId list) {
-        std::vector<NodeId> out;
-        for (NodeId e : visibleChildren(tree, list))
-            if (tree.kind(e) == NodeKind::Internal && tree.rule(e).v == idx.initElementRule.v)
-                out.push_back(e);
-        return out;
+    // C 6.7.9p6-p7: a designator names a subobject of an array, a structure or a union.
+    auto const refuseScalarDesignator = [&](NodeId element) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_InvalidScalarInitializer;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(element);
+        d.actual   = std::format(
+            "`{}` designates a subobject of what it initializes, and that is a scalar: a "
+            "designator names a member of a structure or a union, or an element of an array "
+            "(C 6.7.9p6-p7)", tree.text(element));
+        s.reporter.report(std::move(d));
     };
-
-    struct Level {
-        TypeId                     object;
-        std::vector<NodeId>        elements;
-        std::size_t                next = 0;
-        initializer_cursor::Cursor cursor;
-    };
-    std::vector<Level> stack;
-    // Open one brace list against the type it initializes. A scalar's braced initializer
-    // is its ONE undesignated expression, judged at once; a character array's list led by
-    // the string literal that initializes it IS that string (C 6.7.9p14) and has no
-    // element to judge; any other aggregate's list opens a level.
-    auto const open = [&](NodeId list, TypeId t) {
-        if (!t.valid()) return;
-        std::vector<NodeId> elements = elementsOf(list);
-        if (elements.empty()) return;
-        initializer_cursor::Shape const shape = view.shape(t);
-        if (shape == initializer_cursor::Shape::Scalar) {
-            auto const parts = internalChildrenOf(tree, elements.front());
-            if (parts.size() != 1) return;   // a designated element: the lowering refuses it
-            if (peelSingleChildrenTo(tree, parts.front(), idx.braceInitListRule).valid())
-                return;                      // `{ { e } }`: the lowering refuses it
-            judge(parts.front(), t);
-            return;
-        }
-        if (shape == initializer_cursor::Shape::Array) {
-            if (auto const lead = internalChildrenOf(tree, elements.front());
-                lead.size() == 1
-                && stringLiteralInitializingArray(s, idx, tree, lead.front(), t).valid())
-                return;
-        }
-        stack.push_back(Level{t, std::move(elements), 0, initializer_cursor::Cursor{t, view}});
-    };
-
-    open(braceList, object);
-    while (!stack.empty()) {
-        Level& lv = stack.back();
-        if (lv.next >= lv.elements.size()) {
-            stack.pop_back();
-            continue;
-        }
-        NodeId const e = lv.elements[lv.next++];
-        ResolvedBraceElement const el = resolveBraceElement(s, tree, e, lv.object, scope);
-        if (!el.resolved) continue;   // an unresolved designation: the lowering refuses it
-        NodeId const list = peelSingleChildrenTo(tree, el.value, idx.braceInitListRule);
-        initializer_cursor::Placement const placed = lv.cursor.place(
-            std::span<std::uint64_t const>{el.designator}, list.valid(), [&](TypeId t) {
-                return braceValueInitializesWhole(s, idx, tree, el.value, t, scope);
-            });
-        if (placed.kind != initializer_cursor::Placement::Kind::Assign) continue;
-        if (list.valid()) {
-            open(list, placed.type);   // may push a level: `lv` is not read after this
-            continue;
-        }
-        judge(el.value, placed.type);
-    }
+    forEachPlacedBraceValue(s, tree, braceList, object, scope, judge, refuseScalarDesignator);
 }
 
 // P68 round 9 (lane `cs`): THE TYPE OF A COMPOUND LITERAL `( type-name ) { … }` — the
@@ -22454,7 +22592,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         } else if (facts.storage != CompoundLiteralFacts::Storage::Automatic
                                    && cfg.staticInitializers.has_value()) {
                             validateStaticInitializer(
-                                s, cfg, tree, braceNode, here, *cfg.staticInitializers,
+                                s, cfg, tree, braceNode, target, here, *cfg.staticInitializers,
                                 /*fileScope=*/!scopeIsInsideAFunctionBody(s, here));
                         }
                         // P69 (lane `cs`): each element against the subobject it
@@ -22714,8 +22852,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             bool const staticStorage = fileScope || rec.isThreadLocal
                                 || scanSpecifierPrefixStorage(cfg, tree, node, decl).staticStorage;
                             if (staticStorage && (fileScope || !rec.isExternDeclaration)) {
-                                validateStaticInitializer(s, cfg, tree, initNode, here,
-                                                          *cfg.staticInitializers, fileScope);
+                                validateStaticInitializer(s, cfg, tree, initNode, rec.type,
+                                                          here, *cfg.staticInitializers,
+                                                          fileScope);
                             }
                         }
                         // The init's type = the first stamped type along
@@ -23071,6 +23210,17 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             std::vector<NodeId> arms;
             for (NodeId c : visibleChildren(tree, node)) {
                 if (tree.kind(c) != NodeKind::Token) arms.push_back(c);
+            }
+            // P69 (lane `lm`): the conditional's type as the typer gives it, recorded for
+            // the lowering's constant evaluator (the model's `conditionalTypeFor`) — only
+            // when the typer typed BOTH arms: with one untyped it hands on the other arm's
+            // type (`combineTernary`'s last fallback), which is no balance of the two.
+            if (arms.size() == 3 && subtreeType(s, tree, arms[1], here).valid()
+                && subtreeType(s, tree, arms[2], here).valid()) {
+                if (TypeId const conditionalT = subtreeType(s, tree, node, here);
+                    conditionalT.valid()) {
+                    s.conditionalTypes.set(node, conditionalT);
+                }
             }
             // The cheap pre-filter (see `stampedOperandMayBePointer`): this
             // constraint needs ONE arm to contribute a pointer, so a definitive
@@ -24721,16 +24871,19 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
 // Pass 2's record or, before Pass 2 has made one, by the ONE selector. Every semantic
 // question of "is this a bit-field's value" asks HERE: the operators' typing
 // (`subtreeType`, C 6.3.1.1p2's promotion by width) and the third operand of the overflow
-// predicates (`overflowPredicateTarget`: a bit-field's value is checked at its width).
+// predicates (`overflowPredicateTarget`: a bit-field's value is checked at its width) — and
+// the constant evaluator's operators (`buildConstEvalEnv`'s `resolveBitFieldValueType`),
+// which promote from the field's DECLARED type: `fieldTypeOut`, when given, receives it.
 [[nodiscard]] std::optional<std::uint32_t>
-semanticBitFieldValueWidth(EngineState const& s, SemanticConfig const& sem, Tree const& tree,
-                           NodeId n, ScopeId scope) {
+semanticBitFieldValueWidth(EngineState& s, SemanticConfig const& sem, Tree const& tree,
+                           NodeId n, ScopeId scope, TypeId* fieldTypeOut) {
     return bitFieldValueWidth(
         sem, tree.schema().hirLowering(), tree, n,
         [&](NodeId m) -> std::optional<std::uint32_t> {
             auto const mr = resolveMemberAccess(s, sem, tree, m, scope);
             if (mr.status != MemberResolution::Status::Ok || !mr.fieldSym.valid())
                 return std::nullopt;
+            if (fieldTypeOut != nullptr) *fieldTypeOut = s.symbols.at(mr.fieldSym).type;
             return s.symbols.at(mr.fieldSym).bitFieldWidth;
         },
         [&](NodeId sel) -> NodeId { return selectionResultOf(s, sem, tree, sel, scope); });
@@ -24803,7 +24956,7 @@ semanticBitFieldValueWidth(EngineState const& s, SemanticConfig const& sem, Tree
 // `__builtin_nan(({ "1"; }))` folds on gcc and mingw-w64 gcc (both clangs refuse it: one
 // working reference makes it required). Every step is to a strict descendant: the node count
 // bounds it, LOUD past it.
-[[nodiscard]] NodeId builtinOperandValueCore(EngineState const& s, SemanticConfig const& cfg,
+[[nodiscard]] NodeId builtinOperandValueCore(EngineState& s, SemanticConfig const& cfg,
                                              Tree const& tree, NodeId n, ScopeId scope) {
     auto const& hc = tree.schema().hirLowering();
     std::size_t const bound = tree.nodeCount() + 1;
@@ -26292,7 +26445,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // No width changes a plain `int`, a floating, a pointer or an aggregate type:
         // the walk is asked only of a type a bit-field's promotion can change.
         if (bitFieldPromotedType(interner, t, 1, *arith).v == t.v) return t;
-        auto const width = semanticBitFieldValueWidth(s, sem, tree, operandN, scope);
+        auto const width = semanticBitFieldValueWidth(
+            const_cast<EngineState&>(s), sem, tree, operandN, scope);   // NOLINT — const note above
         if (!width.has_value()) return t;
         return bitFieldPromotedType(interner, t, *width, *arith);
     };
@@ -31889,6 +32043,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(s.nanPayloads),
         std::move(s.overflowPredicateTargets),
         std::move(s.braceElementValueTypes),
+        std::move(s.conditionalTypes),
         std::move(s.attributeNamesIgnoredForKind),
         std::move(shippedExterns),
         std::move(suppressedShippedLibraries),

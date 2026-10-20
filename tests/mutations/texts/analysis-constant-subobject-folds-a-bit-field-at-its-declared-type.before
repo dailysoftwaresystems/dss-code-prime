@@ -1,2 +1,1 @@
-                    valueTy = bitFieldPromotedType(s.lattice.interner(), fact->type,
-                                                   *fact->bitFieldWidth, *rules);
+            TypeId const promoted = bitFieldPromotedType(interner, fieldType, *width, *rules);
