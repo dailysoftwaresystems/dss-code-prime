@@ -651,6 +651,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_ObjectSectionNotModelled";
         case DiagnosticCode::K_CommonSymbolLargerThanItsDefinition:
             return "K_CommonSymbolLargerThanItsDefinition";
+        case DiagnosticCode::K_SymbolBindingNotModelled:
+            return "K_SymbolBindingNotModelled";
         case DiagnosticCode::K_ExternImportAttributeConflict:
             return "K_ExternImportAttributeConflict";
         case DiagnosticCode::K_FormatLacksProcessExit:

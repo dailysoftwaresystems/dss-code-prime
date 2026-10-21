@@ -1,1 +1,1 @@
-            && !standsInADiscardedGroup(modIdx, from)) {
+            if (!groupOf(fn.inputSection).empty()) continue;   // discarded with its group: no linker reads it

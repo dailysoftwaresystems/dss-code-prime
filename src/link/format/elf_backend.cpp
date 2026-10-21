@@ -357,10 +357,10 @@ public:
                 // CLOSED (P69, D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY):
                 // a misspelled key (`"interpeter"`) loaded clean and left the
                 // field it names at its default.
-                static constexpr std::array<std::string_view, 11> kElfBlockKeys{
+                static constexpr std::array<std::string_view, 12> kElfBlockKeys{
                     "machine", "abiVersion", "class", "data", "osabi", "type",
                     "pageAlign", "interpreter", "bindNow", "soname",
-                    "dynamicRelocationTypes"};
+                    "dynamicRelocationTypes", "uniqueBinding"};
                 ::dss::detail::rejectUnknownKeys(
                     e, kElfBlockKeys, "the 'elf' block",
                     [&](std::string_view key, std::string message) {
@@ -596,6 +596,84 @@ public:
                         readRole(kRoles[2], types.relative);
                     }
                 }
+                // `uniqueBinding` (P69 fold 3c): the binding of a definition of
+                // which a process holds ONE instance, the OS ABI it requires,
+                // and the binding a link reads it as (`ElfUniqueBinding`). All
+                // three, or the block is refused: a statement short of one would
+                // write the binding under an OS ABI, or read it as a binding,
+                // that nobody stated.
+                if (e.contains("uniqueBinding")) {
+                    auto const& u = e.at("uniqueBinding");
+                    static constexpr std::array<std::string_view, 3> kUniqueKeys{
+                        "value", "osabi", "readAs"};
+                    if (!u.is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/elf/uniqueBinding",
+                                  "'uniqueBinding' must be an object {\"value\", "
+                                  "\"osabi\", \"readAs\"}: the binding of a "
+                                  "definition of which a process holds one "
+                                  "instance, the OS ABI it requires, and the "
+                                  "binding a link reads it as");
+                    } else {
+                        ::dss::detail::rejectUnknownKeys(
+                            u, kUniqueKeys, "the ELF unique-binding block",
+                            [&](std::string_view key, std::string message) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("/elf/uniqueBinding/{}", key),
+                                          std::move(message));
+                            });
+                        // Every part refused is EMITTED, and an emitted problem
+                        // fails the load: a statement short of a part never
+                        // reaches a reader or a writer.
+                        ElfUniqueBinding stated{};
+                        auto refuse = [&](std::string_view key, std::string message) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("/elf/uniqueBinding/{}", key),
+                                      std::move(message));
+                        };
+                        std::int64_t const value =
+                            u.contains("value") && u.at("value").is_number_integer()
+                                ? u.at("value").get<std::int64_t>()
+                                : -1;
+                        if (value < 3 || value > 15) {
+                            refuse("value",
+                                   "'value' must be the st_info binding (an "
+                                   "integer in [3, 15]) -- none of local (0), "
+                                   "global (1) and weak (2), which every format "
+                                   "shares, and within the field's four bits");
+                        } else {
+                            stated.value = static_cast<std::uint8_t>(value);
+                        }
+                        std::optional<std::uint8_t> osabi;
+                        if (u.contains("osabi") && u.at("osabi").is_string()) {
+                            osabi = elfHeaderVerbValue(
+                                kElfOsAbiRows, u.at("osabi").get<std::string>());
+                        }
+                        if (!osabi.has_value()) {
+                            refuse("osabi",
+                                   std::format("'osabi' must name the OS ABI the "
+                                               "binding requires, one of {}",
+                                               elfHeaderVerbList(kElfOsAbiRows)));
+                        } else {
+                            stated.osabi = *osabi;
+                        }
+                        std::optional<SymbolBinding> readAs;
+                        if (u.contains("readAs") && u.at("readAs").is_string()) {
+                            readAs = symbolBindingFromName(
+                                u.at("readAs").get<std::string>());
+                        }
+                        if (!readAs.has_value() || *readAs == SymbolBinding::Local) {
+                            refuse("readAs",
+                                   "'readAs' must be 'global' or 'weak': the "
+                                   "binding a link reads such a definition as. "
+                                   "Read as 'local', each unit's definition of "
+                                   "one name is an object of its own");
+                        } else {
+                            stated.readAs = *readAs;
+                        }
+                        data.elf.uniqueBinding = stated;
+                    }
+                }
             }
         }
     }
@@ -629,6 +707,11 @@ public:
                                  "(EM_* value, e.g. 62 for x86_64, "
                                  "183 for aarch64)");
         }
+        // `uniqueBinding` (P69 fold 3c) is NOT related to the header's
+        // `osabi`: GNU ld 2.42 and ld.lld 18.1.3 read the binding whatever OS
+        // ABI an object's header states, and ld.lld writes it under a FreeBSD or
+        // a SYSV header unchanged (✔MEASURED), so a document of any OS ABI
+        // loads, and its writer writes the binding under the header it states.
         // e_type — all three closed-enum members now have walker
         // arms: ET_REL (LK1 cycle 1), ET_EXEC (LK1 cycle 2 + the
         // LK6 dynamic arm), ET_DYN (c150 — the D-LK1-4 shared-

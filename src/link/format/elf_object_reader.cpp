@@ -67,6 +67,7 @@ constexpr std::uint64_t kShfAlloc     = 0x2;
 constexpr std::uint64_t kShfExecInstr = 0x4;
 constexpr std::uint64_t kShfTls       = 0x400;
 
+constexpr std::uint8_t kStbLocal  = 0;
 constexpr std::uint8_t kStbGlobal = 1;
 constexpr std::uint8_t kStbWeak   = 2;
 constexpr std::uint8_t kSttNoType  = 0;
@@ -145,13 +146,34 @@ constexpr std::string_view kGotBaseSymbolName = "_GLOBAL_OFFSET_TABLE_";
         default: return SymbolVisibility::Default;    // STV_DEFAULT
     }
 }
-// STB_* -> SymbolBinding.
-[[nodiscard]] constexpr SymbolBinding stbToBinding(std::uint8_t b) noexcept {
+// THE BINDING A SYMBOL IS READ AS (P69 fold 3c). The three bindings every
+// format shares, by the gABI's values; the one the FORMAT DOCUMENT states for a
+// definition of which a process holds one instance (`elf.uniqueBinding`), as
+// the binding the document says it is read as, with the property carried
+// (`ModuleSymbol::oneInstancePerProcess`) — whatever OS ABI the object's header
+// states, as GNU ld 2.42 and ld.lld 18.1.3 both read it (✔MEASURED 2026-10-20,
+// headers patched to NONE and FreeBSD); and NOTHING ELSE: nullopt, and the
+// caller refuses the object by name, as ld.lld refuses it ("has invalid
+// binding"). GNU ld links such a symbol, by falling through to no meaning at all
+// (✔MEASURED, bindings 3, 11 and 13); no producer writes one.
+// Until fold 3c every other value read as LOCAL, so g++'s STB_GNU_UNIQUE inline
+// variable of two units linked to two objects (✔MEASURED 2026-10-20: the
+// program 5 where GNU ld's and ld.lld's is 41).
+struct ReadBinding {
+    SymbolBinding binding               = SymbolBinding::Local;
+    bool          oneInstancePerProcess = false;
+};
+[[nodiscard]] std::optional<ReadBinding> readBinding(std::uint8_t b, ElfIdentity const& id) noexcept {
     switch (b) {
-        case kStbGlobal: return SymbolBinding::Global;
-        case kStbWeak:   return SymbolBinding::Weak;
-        default:         return SymbolBinding::Local;
+        case kStbLocal:  return ReadBinding{SymbolBinding::Local, false};
+        case kStbGlobal: return ReadBinding{SymbolBinding::Global, false};
+        case kStbWeak:   return ReadBinding{SymbolBinding::Weak, false};
+        default:         break;
     }
+    if (id.uniqueBinding.has_value() && b == id.uniqueBinding->value) {
+        return ReadBinding{id.uniqueBinding->readAs, true};
+    }
+    return std::nullopt;
 }
 
 // ── THE "EXTERN IS A FUNCTION" SIGNAL IS DECLARED, NOT DERIVED ──────────
@@ -480,6 +502,38 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         sy.size    = rdU64(bytes, so + 16);
         sy.name    = rdName(bytes, strOff, strEnd, sy.nameIdx);
     }
+    // Every symbol's binding, read ONCE through the document (`readBinding`). A
+    // value the document states no meaning for refuses the object here, naming
+    // the symbol, before any row is built from it.
+    std::vector<ReadBinding> bindingOf(numSyms);
+    for (std::size_t i = 0; i < numSyms; ++i) {
+        std::uint8_t const b  = stBind(syms[i].info);
+        auto const         rb = readBinding(b, objectFormatSchema.elf());
+        if (!rb.has_value()) {
+            auto const& stated = objectFormatSchema.elf().uniqueBinding;
+            return fail(DiagnosticCode::K_SymbolBindingNotModelled,
+                "elf::readRelocatableObject: symbol #" + std::to_string(i) + " ('" + syms[i].name
+                + "') has binding " + std::to_string(b) + ", which format '"
+                + std::string{objectFormatSchema.name()} + "' states no meaning for: it is none of local (0), "
+                  "global (1) and weak (2), and "
+                + (stated.has_value()
+                       ? "not the binding " + std::to_string(stated->value)
+                             + " the document states for a definition of which a process holds one instance"
+                       : std::string{"the document states no binding for a definition of which a process holds "
+                                     "one instance ('elf.uniqueBinding')"})
+                + ". Refused rather than read as a binding nobody stated: read as local, two units' "
+                  "definitions of one name were two objects.");
+        }
+        bindingOf[i] = *rb;
+    }
+    // A DEFINED symbol's row: its id and name, and the binding, visibility and
+    // one-instance property record `rec` states.
+    auto definitionRow = [&](std::size_t rec, SymbolId id, std::string name) {
+        ModuleSymbol row{id, std::move(name), bindingOf[rec].binding,
+                         stvToVisibility(stVis(syms[rec].other))};
+        row.oneInstancePerProcess = bindingOf[rec].oneInstancePerProcess;
+        return row;
+    };
 
     // -- (5) Reverse reloc maps (nativeId -> RelocationKind), from the
     //         FORMAT SCHEMA -- no hardcoded R_X86_64 numbers here -----
@@ -634,7 +688,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         return link::format::AtomStartCandidate{
             /*sectionKey=*/sy.shndx, /*offset=*/sy.value,
             /*declaredExtent=*/sy.size, /*symbolId=*/static_cast<std::uint32_t>(i),
-            /*binding=*/stbToBinding(stBind(sy.info)),
+            /*binding=*/bindingOf[i].binding,
             /*visibility=*/stvToVisibility(stVis(sy.other)),
             /*name=*/sy.name, /*sectionName=*/sec.name};
     };
@@ -720,7 +774,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 ext.isData     = (type != kSttFunc);
             }
             // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the REFERENCE
-            // binding, through the SAME `stbToBinding` every DEFINED symbol in
+            // binding, through the SAME `readBinding` every DEFINED symbol in
             // this reader uses -- ELF spells a weak reference and a weak
             // definition in the one `st_info` field, so there is nothing extra
             // to decode. Reading it as Global (what this arm did until the
@@ -730,10 +784,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // and DSS's own writer now does too, so the round trip closes.
             // ⚠ A STB_LOCAL undefined symbol is not a shape any producer emits
             // (an undefined LOCAL names nothing any linker could resolve);
-            // `stbToBinding` maps it to `SymbolBinding::Local`, which the
+            // `readBinding` reads it as `SymbolBinding::Local`, which the
             // link-tier fold `strongerReferenceBinding` treats as contributing
             // nothing rather than as a third kind of reference.
-            ext.binding     = stbToBinding(stBind(sy.info));
+            ext.binding     = bindingOf[i].binding;
             externBySym.emplace(static_cast<std::uint32_t>(i), mod.externImports.size());
             mod.externImports.push_back(std::move(ext));
             continue;
@@ -807,9 +861,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // section-backed body. Recorded as a ModuleSymbol so a reloc
             // target still resolves by identity.
             if (!sy.name.empty() && type != kSttSection) {
-                mod.symbols.push_back(ModuleSymbol{symbolIds.of(static_cast<std::uint32_t>(i)),
-                                                   sy.name, stbToBinding(stBind(sy.info)),
-                                                   stvToVisibility(stVis(sy.other))});
+                mod.symbols.push_back(definitionRow(i, symbolIds.of(static_cast<std::uint32_t>(i)), sy.name));
             }
             continue;
         }
@@ -841,9 +893,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // (`rk` -- exact name, then `.text.`/`.data.`-style prefix, then flags).
         auto pushModuleSym = [&] {
             if (!sy.name.empty())
-                mod.symbols.push_back(ModuleSymbol{symbolIds.of(static_cast<std::uint32_t>(i)),
-                                                   sy.name, stbToBinding(stBind(sy.info)),
-                                                   stvToVisibility(stVis(sy.other))});
+                mod.symbols.push_back(definitionRow(i, symbolIds.of(static_cast<std::uint32_t>(i)), sy.name));
         };
         // Stage a BODILESS defined symbol for the shared coverage guard
         // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM) --
@@ -892,9 +942,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         if (std::uint32_t const owner = ownerOf(static_cast<std::uint32_t>(i));
             owner != static_cast<std::uint32_t>(i)) {
             if (!sy.name.empty()) {
-                aliasRows.push_back(ModuleSymbol{symbolIds.of(owner), sy.name,
-                                                 stbToBinding(stBind(sy.info)),
-                                                 stvToVisibility(stVis(sy.other))});
+                aliasRows.push_back(definitionRow(i, symbolIds.of(owner), sy.name));
             }
             aliasOwners.push_back(owner);
             continue;
@@ -1037,17 +1085,16 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // is what makes a relocation left on its atom a reference to the BYTES.
     weakNames.stateOn(mod.symbols);
 
-    // SECTION GROUPS (P69 fold 2): every definition whose section is a member of
-    // a COMDAT group says under which SIGNATURE (`ModuleSymbol::sectionGroup`).
-    // This reader still carries a group's sections as ordinary ones and discards
-    // nothing; the signature is stated so that the link can refuse the one thing
-    // it would otherwise answer wrongly — keeping bytes a group's loser does not
-    // have (`linker.cpp`, `supersededInADiscardedGroup`). `SHT_GROUP` is a flag
-    // word followed by the member sections' indices, and `sh_info` is the
-    // signature's symbol-table index; only a `GRP_COMDAT` group is one of
-    // several that a link keeps one of. A signature that is a section symbol is
-    // named by its section; one with no name at all can match no other group
-    // and states nothing.
+    // SECTION GROUPS (P69 folds 2 and 3c): the unit states, for every input
+    // section that is a member of a COMDAT group, the group's SIGNATURE
+    // (`AssembledModule::sectionGroupOfInputSection`) — the one statement the
+    // link's discard reads (`linker.cpp`, `discardLaterSectionGroups`): the first
+    // unit that carries a signature keeps its group, and every later unit's goes
+    // with all it holds. `SHT_GROUP` is a flag word followed by the member
+    // sections' indices, and `sh_info` is the signature's symbol-table index;
+    // only a `GRP_COMDAT` group is one of several that a link keeps one of. A
+    // signature that is a section symbol is named by its section; one with no
+    // name at all can match no other group and states nothing.
     {
         std::unordered_map<std::uint16_t, std::string> signatureOfSection;
         for (std::uint16_t g = 0; g < eShnum; ++g) {
@@ -1088,25 +1135,11 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 }
             }
         }
-        // The same statement for the unit's ITEMS, which is where a member with
-        // no named definition can be asked (`AssembledModule::
-        // sectionGroupOfInputSection`): a member section is named by its index,
-        // the key every atom cut from it carries (`InputSectionSlice::section`,
-        // set from that index when the atoms are tied to their sections below).
+        // A member section is named by its index, the key every atom cut from it
+        // carries (`InputSectionSlice::section`, set from that index when the
+        // atoms are tied to their sections below).
         for (auto const& [section, signature] : signatureOfSection) {
             mod.sectionGroupOfInputSection.emplace(section, signature);
-        }
-        if (!signatureOfSection.empty()) {
-            std::unordered_map<std::uint32_t, std::string const*> signatureOfId;
-            for (std::size_t i = 0; i < numSyms; ++i) {
-                auto const it = signatureOfSection.find(syms[i].shndx);
-                if (it == signatureOfSection.end()) continue;
-                signatureOfId.emplace(symbolIds.of(static_cast<std::uint32_t>(i)).v, &it->second);
-            }
-            for (ModuleSymbol& ms : mod.symbols) {
-                auto const it = signatureOfId.find(ms.symbol.v);
-                if (it != signatureOfId.end()) ms.sectionGroup = *it->second;
-            }
         }
     }
 

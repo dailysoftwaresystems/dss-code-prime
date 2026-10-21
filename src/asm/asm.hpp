@@ -178,6 +178,41 @@ struct DSS_EXPORT SehScopeEntry {
     SymbolId      personalitySymbol{};       // __C_specific_handler extern (its thunk RVA = the UNWIND handler field)
 };
 
+// P69 fold 3c: THE ROUTINE AN EXCEPTION DISPATCHER CALLS FOR A FUNCTION'S FRAME,
+// AND THE DATA THAT ROUTINE READS, as a FOREIGN object states them — carried
+// with the function, never re-typed.
+//
+// A compiler that guards a frame names a handler routine (a "personality") and
+// hands it a block of data whose layout is the routine's own: cl's
+// `__C_specific_handler` reads a scope table, its `__GSHandlerCheck` a stack
+// cookie's frame offset, and gcc's `__gcc_personality_seh0` an exception table.
+// ✔MEASURED P69 fold 3c in 31 objects from cl 19.44, clang-cl 19.1.5 and mingw-w64
+// gcc 13.2.0: those three routines and `__GSHandlerCheck_SEH`, each with data of
+// its own shape. DSS states what it must to place the function in an image —
+// which routine, in which phases, and where the data holds an address — and
+// carries the rest as bytes, so a routine it has never seen still reads what its
+// compiler wrote. That is why a foreign `__try` is NOT re-read into `sehScopes`:
+// a scope table read into DSS's own model and written back would be the
+// routine's data interpreted by a reader that is not the routine.
+//
+// Engaged only on a function a relocatable-object reader brought, and then
+// always beside `cfi` (the handler is reached through the frame description).
+// A DSS-compiled function's `__try` scopes are `sehScopes`; a function never
+// carries both.
+struct DSS_EXPORT LanguageHandler {
+    // The routine: an import, or a function a unit of the link defines.
+    SymbolId personality{};
+    // Which dispatch phases call it: while a handler is searched for, and while
+    // frames are unwound. At least one.
+    bool exceptionPhase = false;
+    bool unwindPhase    = false;
+    // The routine's data, exactly as the object wrote it.
+    std::vector<std::uint8_t> data;
+    // Each address the data holds, as a relocation whose `offset` is a byte
+    // offset into `data`.
+    std::vector<Relocation> relocations;
+};
+
 // ★★★ THE PRODUCER'S INPUT SECTION AN ATOM WAS CUT FROM, when that section is
 // the UNIT OF PLACEMENT. A relocatable-object reader cuts a section into
 // symbol-bounded atoms; the object's FORMAT decides whether those atoms may then
@@ -246,8 +281,9 @@ struct DSS_EXPORT AssembledFunction {
     // quoted verbatim -- as "AssembledFunction::unwind is nullopt on the object
     // path by construction" -- inside the `$sehPersonalityOmittedComment` of
     // BOTH `pe64-x86_64-windows.format.json` and
-    // `pe64-x86_64-windows-staticlib.format.json`, where it is the stated
-    // reason those two formats decline `sehPersonality`, and again in
+    // `pe64-x86_64-windows-staticlib.format.json`, where it WAS the stated
+    // reason those two formats declined `sehPersonality` (both state it since
+    // P69 fold 3c, and that comment is gone with its premise), and again in
     // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO's evidence chain. A reader who
     // believes it concludes the unwind data does not EXIST on the object path
     // and looks upstream for a producer to fix. It does exist.
@@ -288,6 +324,9 @@ struct DSS_EXPORT AssembledFunction {
     // is a source-language construct (`__try`), not a statement about where a
     // register was spilled, and no other format's unwind encoder wants it.
     std::vector<SehScopeEntry> sehScopes;
+    // P69 fold 3c: the handler a FOREIGN object named for this function, and its
+    // data (`LanguageHandler` above). nullopt for every function DSS compiled.
+    std::optional<LanguageHandler> languageHandler;
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols this
     // function's block-address `lea`s reference, each paired with the
     // target block's byte offset within `bytes`. The encoder records a
@@ -577,21 +616,24 @@ struct DSS_EXPORT ModuleSymbol {
     // where it is replaced whole the relocation goes to the winner as the name
     // does.
     bool             referencedByName = false;
-    // P69 fold 2: THE SIGNATURE OF THE SECTION GROUP THIS DEFINITION'S STORAGE
-    // BELONGS TO, where its producer's form states one — an ELF `SHT_GROUP`
-    // marked `GRP_COMDAT`, whose signature is a symbol's name. Empty everywhere
-    // else: a unit DSS compiles, and every form that has no such group.
-    //
-    // A group is kept or discarded WHOLE by its format's linkers: the first
-    // unit that carries a signature keeps its group, every later unit's goes,
-    // bytes and all (✔MEASURED 2026-10-10, GNU ld 2.42 and ld.lld 18.1). DSS
-    // does NOT discard section groups yet — a reader carries a group's sections
-    // as ordinary ones — and ONE thing reads this field: the merge's refusal of
-    // a relocation that names the BYTES of a superseded definition whose group
-    // an earlier unit also carries (`linker.cpp`, `supersededInADiscardedGroup`),
-    // which those linkers refuse and "keeps its bytes" would link around a copy
-    // they drop. Not handed on by a relocatable writer (none writes a group).
-    std::string      sectionGroup;
+    // P69 fold 3c: THE ONE INSTANCE OF ITS NAME IN THE PROCESS. True when the
+    // unit states that every image a process loads binds this name to ONE
+    // definition — images that would each keep a copy of an ordinary global (a
+    // library loaded `RTLD_LOCAL`) included. g++ states it for a C++ inline
+    // variable and a template's static data member (ELF's STB_GNU_UNIQUE,
+    // ✔MEASURED 2026-10-20, g++ 13.3). A static link reads such a definition as
+    // its `binding` says — the binding the format document says it is read AS
+    // (`elf.uniqueBinding`) — so two of one name are one definition or a
+    // duplicate exactly as two of that binding are; the property is CARRIED, and a
+    // writer spells it back with the binding its document states and refuses it
+    // under a document that states none (`requireOneInstancePerProcessSpelling`).
+    // An object READER states it, through its document; nothing else does.
+    bool             oneInstancePerProcess = false;
+    // ⓘ A definition's SECTION GROUP is not stated here: membership is a fact
+    // of the definition's input SECTION, stated once for the unit
+    // (`AssembledModule::sectionGroupOfInputSection`). Until P69 fold 3c a
+    // second copy of it lived on the row (`sectionGroup`); it was removed with
+    // the merge refusal that was its one reader of its own.
 };
 
 struct DSS_EXPORT AssembledModule {
@@ -644,24 +686,23 @@ struct DSS_EXPORT AssembledModule {
     //
     // Key: an input section of the unit, as its items name it
     // (`InputSectionSlice::section`). Value: the signature of the COMDAT group
-    // that section is a member of — the text `ModuleSymbol::sectionGroup` states
-    // on the ROW of a definition stored there. Stated by an object reader whose
-    // form has such groups (ELF's `SHT_GROUP` marked `GRP_COMDAT`); empty
-    // everywhere else.
+    // that section is a member of — a symbol's name. Stated by an object reader
+    // whose form has such groups (ELF's `SHT_GROUP` marked `GRP_COMDAT`); empty
+    // everywhere else, a unit DSS compiles included.
     //
-    // ★ WHY THE ROWS' STATEMENT WAS NOT ENOUGH. Membership is a fact of a
-    // SECTION, and a member section need hold no named definition at all: the
-    // jump table gcc writes for a function of a group is `.rodata.<f>`, whose
-    // only symbol is the section's own, and it reaches the link as an item with
-    // no row. Asked through rows, "is the item this relocation stands in a
-    // member of the group its target is in?" had no answer for exactly the
-    // relocation every such table holds (`R_X86_64_PC32 .text.<f> + offset`), and
-    // the merge refused the pair of objects every reference linker links
-    // (✔MEASURED 2026-10-12, GNU ld 2.42 and ld.lld 18.1: 44 and 88 in the two
-    // orders). One reader today: that refusal (`linker.cpp`,
-    // `supersededInADiscardedGroup`), which asks it of the relocating item.
-    // Not carried into a merged module: nothing reads it there, and no
-    // relocatable writer writes a group.
+    // ★ THE ONE STATEMENT OF MEMBERSHIP, AND WHY IT IS A SECTION'S. A group is
+    // kept or discarded WHOLE by its format's linkers — the first unit that
+    // carries a signature keeps its group, every later unit's goes, bytes and all
+    // — and a member section need hold no named definition at all: the jump
+    // table gcc writes for a function of a group is `.rodata.<f>`, whose only
+    // symbol is the section's own, and it reaches the link as an item with no
+    // row. Until P69 fold 3c a definition's row carried a second copy
+    // (`ModuleSymbol::sectionGroup`); two statements of one fact can disagree,
+    // and the row's could not speak for the table. Read by the link's discard
+    // (`linker.cpp`, `discardLaterSectionGroups`), which drops every later
+    // unit's member sections before any name is resolved; a merged module
+    // carries the statement of each group it keeps, for the relocatable writer,
+    // which writes the group back.
     std::unordered_map<std::uint32_t, std::string> sectionGroupOfInputSection;
 
     // ── D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69) ──

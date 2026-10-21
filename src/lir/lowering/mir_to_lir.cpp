@@ -5137,7 +5137,7 @@ struct Lowerer {
         // with the fall-off-the-end one.
         std::vector<LirBlockId> fellIntoLabel;
         if (!lowerAsmTemplateToLirRun(tree, dialect, target, bindings, body,
-                                      reporter, stubBindings, &fellIntoLabel,
+                                      reporter, nullptr, stubBindings, &fellIntoLabel,
                                       assemblyFormatKind_)) {
             return false;
         }

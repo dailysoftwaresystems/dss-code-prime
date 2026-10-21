@@ -1,1 +1,1 @@
-                    objectFormatSchema.commonsStatement().alignmentEveryLinkerGives(s.value).value_or(1u);
+                auto const fromSize = objectFormatSchema.commonsStatement().alignmentFromSize(s.value);

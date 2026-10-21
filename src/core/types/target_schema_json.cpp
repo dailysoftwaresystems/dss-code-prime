@@ -1686,10 +1686,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             // belongs HERE rather than in the substrate — `ObjectFormatSchema`
             // drives the same substrate loader with a DIFFERENT extension set,
             // so a set placed there would reject the other family's keys.
-            static constexpr std::array<std::string_view, 10> kRelocationKeys{
+            static constexpr std::array<std::string_view, 11> kRelocationKeys{
                 "name", "kind", "formula", "widthBytes", "pcRelative",
                 "addendBias", "tls", "imageRelative", "scaleLog2",
-                "gotSlotTwin"};
+                "gotSlotTwin", "fieldRange"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationKeys);
             rejectUnknownKeys(r, kRelocationKeys,
                               std::format("/relocations/{}", i),
@@ -1797,6 +1797,28 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     return false;
                 }
                 info.imageRelative = r.at("imageRelative").get<bool>();
+            }
+            // P69 fold 3c: `fieldRange` — the values a narrow Linear field
+            // holds (`RelocFieldRange`). Read here; WHICH rows must state it
+            // and which may not is `TargetSchema::validate()`'s, which a
+            // programmatically-built schema also reaches.
+            if (r.contains("fieldRange")) {
+                auto const path = std::format("/relocations/{}/fieldRange", i);
+                if (!r.at("fieldRange").is_string()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           "'fieldRange' must be a string: 'signed', 'unsigned' "
+                           "or 'either'");
+                    return false;
+                }
+                auto const spelled = r.at("fieldRange").get<std::string>();
+                auto const range = kRelocFieldRangeTable.fromName(spelled);
+                if (!range.has_value()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           std::format("'fieldRange' '{}' is none of 'signed', "
+                                       "'unsigned', 'either'", spelled));
+                    return false;
+                }
+                info.fieldRange = *range;
             }
             // P68 round 9: `scaleLog2` — the access size a SCALED page-offset
             // field is measured in (`TargetRelocationInfo::scaleLog2`). The

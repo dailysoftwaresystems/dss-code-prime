@@ -71,6 +71,14 @@ relocationTargetIds(AssembledModule const& m) {
     std::unordered_set<std::uint32_t> targets;
     for (auto const& fn : m.functions) {
         for (auto const& rel : fn.relocations) targets.insert(rel.target.v);
+        // A carried handler's routine, and each address its data holds, are uses
+        // like a relocation's (P69 fold 3c): the routine is named by the
+        // function's unwind data alone, so a module that reads only the code
+        // would drop the routine's import and leave the handler naming nothing.
+        if (fn.languageHandler.has_value()) {
+            targets.insert(fn.languageHandler->personality.v);
+            for (auto const& rel : fn.languageHandler->relocations) targets.insert(rel.target.v);
+        }
     }
     for (auto const& di : m.dataItems) {
         for (auto const& rel : di.relocations) targets.insert(rel.target.v);

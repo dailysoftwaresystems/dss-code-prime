@@ -5,6 +5,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
 #include "link/format/dwarf_cfi.hpp"
+#include "link/format/eh_frame_handler_refusal.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
@@ -1591,6 +1592,18 @@ encode(AssembledModule const&    module,
     // an entry no carrier can hold is refused whichever door it came through.
     // A pure predicate on success, so the linker path reports nothing twice.
     if (!enforceImageRequest(request, fmt, "macho::encode", reporter)) {
+        return {};
+    }
+    // P69 fold 3c: a definition its unit states is the ONE instance of its name
+    // in the process is refused by name where the document states no binding
+    // that spells one (`weak_definition_gate.hpp`) — never written as a plain
+    // definition, one instance per image.
+    if (!link::format::requireOneInstancePerProcessSpelling(module, fmt, "macho::encode", reporter)) {
+        return {};
+    }
+    // P69 fold 3c: a carried handler is stated by no `__eh_frame` this writer
+    // builds yet — refused by name, one gate for every Mach-O flavor.
+    if (link::format::refuseAHandlerTheEhFrameCannotState(module.functions, "macho::encode", reporter)) {
         return {};
     }
 

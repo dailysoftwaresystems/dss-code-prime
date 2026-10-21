@@ -147,7 +147,7 @@ linkWritesWeakNullConstant(WeakNullReferenceClass c, WeakNullReference a) noexce
 //   * an ABSOLUTE field from S = 0 holds A plus the row's declared bias, written
 //     exactly as the shared kernel writes a Linear field (`applyExecRelocations`):
 //     little-endian, `widthBytes` wide, a narrower field checked to hold the value
-//     as a signed one;
+//     in the row's declared `fieldRange` (`linearFieldHolds`);
 //   * a BRANCH to the next instruction: its displacement is the instruction word's
 //     own width (`widthBytes`, 4 for every instruction-word formula), scaled and
 //     placed by the target's branch geometry (`branchRelocGeometry`) into a field
@@ -175,8 +175,11 @@ writeWeakNullConstant(std::vector<std::uint8_t>&  bytes,
             return false;
         }
         std::int64_t const value = rel.addend + tri.addendBias;
-        if (width < 8 && !fitsSigned(value, 8u * width)) {
-            why = "the field cannot hold its own addend";
+        // P69 fold 3c: the field's range is the row's (`linearFieldHolds`, the
+        // one check every Linear writer asks).
+        if (std::string range; !linearFieldHolds(tri, value, range)) {
+            why = "the field cannot hold its own addend (" + std::to_string(value)
+                + " is outside " + range + ")";
             return false;
         }
         auto const u = static_cast<std::uint64_t>(value);

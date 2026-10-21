@@ -161,7 +161,7 @@ void expectRefused(std::string_view insn, std::string_view word, std::string_vie
         bindings.push_back(std::move(ob));
     }
     out.lowered = lowerAsmTemplateToLirRun(*tree, **grammar, **target, bindings,
-                                           builder, rep);
+                                           builder, rep, nullptr);
     for (auto const& diag : rep.all()) out.diagnostics += diag.actual + "\n";
     if (!out.lowered) return out;
     auto const retOp = (*target)->opcodeByMnemonic("ret");

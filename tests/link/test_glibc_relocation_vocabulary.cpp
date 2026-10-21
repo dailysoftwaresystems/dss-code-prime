@@ -154,6 +154,7 @@ injectGotPcRelKind(nlohmann::json& targetDoc, std::string const& formula) {
                 r["pcRelative"] = true;
                 r["addendBias"] = 0;
                 r["widthBytes"] = 4;
+                r["fieldRange"] = "signed";
             } else {
                 r["gotSlotTwin"] = "pcrel32";
             }
@@ -173,6 +174,7 @@ injectGotPcRelKind(nlohmann::json& targetDoc, std::string const& formula) {
         row["pcRelative"] = true;
         row["addendBias"] = 0;
         row["widthBytes"] = 4;
+        row["fieldRange"] = "signed";
     } else {
         row["gotSlotTwin"] = "pcrel32";
     }

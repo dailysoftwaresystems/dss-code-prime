@@ -1,1 +1,1 @@
-        while (alignment < size && alignment < *alignmentFromSizeAtMost) alignment <<= 1;
+        return sizeRoundedUpAtMost(size, *alignmentFromSizeAtMost);

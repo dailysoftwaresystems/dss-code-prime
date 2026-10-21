@@ -634,11 +634,11 @@ namespace {
       "opcodes": [ {"mnemonic":"invalid","result":"none"} ],
       "relocations": [
         { "name":"rel32", "kind":1, "pcRelative":true, "addendBias":-4,
-          "widthBytes":4 },
+          "widthBytes":4, "fieldRange":"signed" },
         { "name":"abs64", "kind":2, "pcRelative":false, "addendBias":0,
           "widthBytes":8 },
         { "name":"abs32", "kind":3, "pcRelative":false, "addendBias":0,
-          "widthBytes":4 }
+          "widthBytes":4, "fieldRange":"unsigned" }
       ]
     })";
 }

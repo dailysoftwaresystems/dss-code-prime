@@ -797,6 +797,29 @@ public:
                                 "(IMAGE_FILE_MACHINE_* value, e.g. "
                                 "0x8664 for x86_64, 0xAA64 for arm64)");
         }
+        // P69 fold 3c (the review of the fix fold, A3): A COFF COMMON CANNOT STATE
+        // ITS ALIGNMENT IN ITS SYMBOL — it is an undefined external whose value is
+        // its size — so a PE document that states commons states how its linkers
+        // align one (`CommonsStatement`): both size rules (and so, where its object
+        // reaches another linker, what a tentative definition too wide for a
+        // common becomes — `validate()` asks that of every document stating the
+        // size rule). Without them a COFF common would be written and read as if
+        // it stated its own alignment, which is how an over-aligned tentative
+        // definition once landed misaligned under link.exe in silence.
+        if (d.commonYieldsTo.has_value() || d.archiveCommonResolution.has_value()) {
+            for (auto const& [key, stated] :
+                 {std::pair{"commonAlignmentFromSizeAtMost", d.commonAlignmentFromSizeAtMost.has_value()},
+                  std::pair{"commonAlignmentEveryLinkerGivesAtMost",
+                            d.commonAlignmentEveryLinkerGivesAtMost.has_value()}}) {
+                if (stated) continue;
+                fail(std::string{"/"} + key,
+                     std::format("a PE document that states commons must state '{}': a COFF "
+                                 "common is an undefined external whose value is its size, so "
+                                 "the alignment its linkers give it is the document's to say — "
+                                 "and the writer and the reader of every common ask it",
+                                 key));
+            }
+        }
         // P69: the COFF linker-directive vocabulary (`PeLinkerDirectives`).
         // A RELOCATABLE document's alone: an image neither writes a member
         // nor reads one through its own document (a member is read through

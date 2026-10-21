@@ -159,9 +159,9 @@
 //   * an EXTERNAL UNDEF symbol with a non-zero Value is a COMMON (PE/COFF
 //     5.4.2: the Value is its size; cl writes every plain C tentative definition
 //     so) and becomes a COMMON row (`ExternImport::commonSize`), aligned as
-//     every COFF linker aligns it (the document's
-//     `CommonsStatement::alignmentEveryLinkerGives`, widened by a
-//     `-aligncomm:` directive), which the link allocates once per name
+//     link.exe and lld-link align it (the document's
+//     `CommonsStatement::alignmentFromSize`, widened by a `-aligncomm:`
+//     directive), which the link allocates once per name
 //     (P69, D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS).
 //   * the directive section's requests are read through the format's
 //     vocabulary (`coff_linker_directives.hpp`) and applied against what the

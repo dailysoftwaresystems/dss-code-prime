@@ -1298,15 +1298,21 @@ private:
     // somewhere that is not the label, with nothing to notice. They are
     // excluded by NAMING THE PROPERTY, never by trusting that the right row
     // happens to be declared first.
+    //
+    // ★ P69 fold 3c: THIS SCAN READ NO FORMULA, AND ON arm64 THAT WAS A
+    // MISCOMPILE. Every non-Linear arm64 row is 4 bytes and not pc-relative by
+    // its row, so `.long main` took `call26` — the first such row — and became
+    // R_AARCH64_CALL26 in `.rela.data` (✔MEASURED 2026-10-20), a branch
+    // displacement ORed into a data word at link. And since `fieldRange` a
+    // width can carry several absolute rows (x86_64: `abs32`, `abs32s`,
+    // `addr32`). The slot's row is now `addressSlotRelocationKind`'s answer —
+    // Linear, absolute, by RANGE — the one rule the linker's pointer-slot scan
+    // asks too.
     [[nodiscard]] std::optional<RelocationKind>
     absoluteRelocKind(std::uint32_t widthBytes) const {
-        for (auto const& r : target_.relocations()) {
-            if (r.widthBytes == widthBytes && !r.pcRelative && !r.tls
-                && !r.imageRelative) {
-                return r.kind;
-            }
-        }
-        return std::nullopt;
+        if (widthBytes > 8) return std::nullopt;
+        return addressSlotRelocationKind(target_.relocations(),
+                                         static_cast<std::uint8_t>(widthBytes));
     }
 
     // Reserve a symbol-valued slot in data item `itemIdx` and record the
@@ -1325,12 +1331,14 @@ private:
             sink_.fail(operand.node,
                  std::format("'.{}' names '{}', which needs an ABSOLUTE "
                              "{}-byte relocation to write that address at link "
-                             "time, and this target declares none (its "
-                             "relocations are matched by the width/pc-relative "
-                             "FORMULA, never by name). Emitting the slot "
-                             "without one would store whatever the address "
-                             "happened to be at compile time{}",
-                             spelling, operand.symbol, unitBytes,
+                             "time, and target '{}' declares none: a Linear, "
+                             "absolute row of that width, neither thread-local "
+                             "nor image-relative, whose range holds every "
+                             "address (rows are matched by these properties, "
+                             "never by name). Emitting the slot without one "
+                             "would store whatever the address happened to be "
+                             "at compile time{}",
+                             spelling, operand.symbol, unitBytes, target_.name(),
                              sink_.pairSuffix()));
             return false;
         }

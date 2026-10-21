@@ -461,15 +461,27 @@ TEST(CoffLinkerDirectives, OneRequestIsHandedOnAsOneTokenOrRefusedInWordsTrueOfI
     }
 }
 
-// The alignment EVERY COFF linker gives a common no `-aligncomm:` names is the DOCUMENT's
-// (`commonAlignmentFromSizeAtMost`, read through `ObjectFormatSchema::commonsStatement`): the size rounded up to a power
-// of two, at most 32 — the MINIMUM of the two linkers' rules. ✔MEASURED 2026-10-15 (cl 19.44's commons, no directive,
-// the least of three placements): link.exe 14.44 gives 4 to a common of 4 bytes or fewer and 32 to every larger one;
-// lld-link 19.1.5 gives the size rounded up to a power of two, at most 32. Every PE document states it; a document that
-// states none (ELF: the common states its own alignment) gives nothing, and admits every alignment.
-TEST(CoffLinkerDirectives, TheAlignmentEveryLinkerGivesACommonIsTheDocuments) {
-    std::pair<std::uint64_t, std::uint64_t> const kMinimum[] = {
-        {1, 1}, {2, 2}, {3, 4}, {4, 4}, {5, 8}, {8, 8}, {12, 16}, {16, 16}, {17, 32}, {33, 32}, {64, 32}, {4096, 32}};
+// The alignments the COFF linkers give a common no `-aligncomm:` names are the DOCUMENT's, two rules, each the size
+// rounded up to a power of two and capped (`CommonsStatement`, read through `ObjectFormatSchema::commonsStatement`):
+//   * `commonAlignmentFromSizeAtMost` (32) — what a linker that IGNORES the directive gives (link.exe; lld-link given
+//     none): the bound of a DSS common, and the alignment DSS's reader gives a common its object states none for;
+//   * `commonAlignmentEveryLinkerGivesAtMost` (4) — what EVERY linker gives one (GNU ld's cap): above it the writer
+//     states the alignment (`statesItsAlignment`).
+// ✔MEASURED 2026-10-20 (P69 fold 3c, lane xa's `sb11/probes/a1`: one cl 19.44 /std:c11 /Zl object of 126 directive-less
+// commons, 6 of each size beside odd-sized fillers, the least alignment over every copy, both object orders):
+// link.exe 14.44 and lld-link 19.1.5 give 1, 2, 3, 4, 5, 8, 9, 12, 16, 17, 24 and 32+ bytes 1, 2, 4, 4, 8, 8, 16, 16,
+// 16, 32, 32 and 32 (link.exe 14.51 the same on 2026-10-06, run 20261006-225314-2e577758: 1, 3, 5, 17 -> 1, 4, 8, 32);
+// GNU ld 2.42 gives 1, 2, 4, 4 and then 4 to every size from 5 to 4096. The 2026-10-15 statement this replaces ("link.exe
+// 14.44 gives 4 to a common of 4 bytes or fewer and 32 to every larger one") was read off a placement that discriminated
+// nothing. Every PE document states both rules, and each object document what a tentative definition too wide for a
+// common becomes (`select-any`); a document that states none (ELF: the common states its own alignment) gives nothing,
+// admits every alignment, and states none of them.
+TEST(CoffLinkerDirectives, TheAlignmentsTheLinkersGiveACommonAreTheDocuments) {
+    std::pair<std::uint64_t, std::uint64_t> const kFromSize[] = {
+        {1, 1},   {2, 2},   {3, 4},   {4, 4},   {5, 8},   {8, 8},    {9, 16},
+        {12, 16}, {16, 16}, {17, 32}, {24, 32}, {33, 32}, {64, 32},  {4096, 32}};
+    std::pair<std::uint64_t, std::uint64_t> const kEveryLinker[] = {
+        {1, 1}, {2, 2}, {3, 4}, {4, 4}, {5, 4}, {8, 4}, {9, 4}, {16, 4}, {17, 4}, {64, 4}, {4096, 4}};
     for (char const* stem : {"pe64-x86_64-windows", "pe64-x86_64-windows-exec", "pe64-x86_64-windows-dll",
                              "pe64-x86_64-windows-staticlib"}) {
         SCOPED_TRACE(stem);
@@ -478,30 +490,53 @@ TEST(CoffLinkerDirectives, TheAlignmentEveryLinkerGivesACommonIsTheDocuments) {
         CommonsStatement const commons = l.format->commonsStatement();
         EXPECT_TRUE(commons.states);
         ASSERT_EQ(commons.alignmentFromSizeAtMost, std::optional<std::uint64_t>{32u});
-        for (auto const& [size, alignment] : kMinimum) {
-            EXPECT_EQ(commons.alignmentEveryLinkerGives(size), std::optional<std::uint64_t>{alignment}) << "size " << size;
+        ASSERT_EQ(commons.everyLinkerGivesAtMost, std::optional<std::uint64_t>{4u});
+        for (auto const& [size, alignment] : kFromSize) {
+            EXPECT_EQ(commons.alignmentFromSize(size), std::optional<std::uint64_t>{alignment}) << "size " << size;
         }
-        EXPECT_TRUE(commons.admitsCommon(40, 32)) << "every linker gives a 40-byte common 32";
+        for (auto const& [size, alignment] : kEveryLinker) {
+            EXPECT_EQ(commons.alignmentEveryLinkerGivesUnstated(size), std::optional<std::uint64_t>{alignment})
+                << "size " << size;
+        }
+        // Where a common must STATE its alignment: wider than GNU ld gives one that states none.
+        EXPECT_TRUE(commons.statesItsAlignment(8, 8)) << "`double d;`: GNU ld would give it 4";
+        EXPECT_TRUE(commons.statesItsAlignment(16, 16)) << "`_Alignas(16) char c[16];`";
+        EXPECT_FALSE(commons.statesItsAlignment(4, 4)) << "`int i;`: every linker gives it 4";
+        EXPECT_FALSE(commons.statesItsAlignment(2, 2)) << "`short s;`";
+        EXPECT_FALSE(commons.statesItsAlignment(3, 1)) << "`char a[3];`: every linker gives it 4";
+        EXPECT_FALSE(commons.statesItsAlignment(40, 4)) << "`int a[10];`: every linker gives it 4";
+        EXPECT_TRUE(commons.admitsCommon(40, 32)) << "link.exe gives a 40-byte common 32";
         // `_Alignas(64) int v;`: link.exe would give its common 4 — where another linker reads the object; an image
         // document is linked by DSS itself, at every common's stated alignment.
         EXPECT_EQ(commons.objectReadByAnotherLinker, !l.format->isImageFlavor());
         EXPECT_EQ(commons.admitsCommon(4, 64), l.format->isImageFlavor())
             << "a 4-byte common of 64 is written only where DSS links the image itself";
+        EXPECT_EQ(commons.beyondTheRule, l.format->isImageFlavor()
+                                             ? std::nullopt
+                                             : std::optional<TentativeBeyondCommonAlignment>{
+                                                   TentativeBeyondCommonAlignment::SelectAny})
+            << "an object document writes a tentative definition too wide for a common as a select-any definition";
     }
     auto const elf = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
     ASSERT_TRUE(elf.has_value());
-    EXPECT_FALSE((*elf)->commonsStatement().alignmentEveryLinkerGives(4).has_value()) << "an ELF document states no rule";
-    EXPECT_TRUE((*elf)->commonsStatement().admitsCommon(4, 4096)) << "an ELF common states its own alignment";
-    // A document whose rule differs is read as it states, never as a number of the code's.
+    CommonsStatement const elfCommons = (*elf)->commonsStatement();
+    EXPECT_FALSE(elfCommons.alignmentFromSize(4).has_value()) << "an ELF document states no rule";
+    EXPECT_FALSE(elfCommons.alignmentEveryLinkerGivesUnstated(4).has_value()) << "an ELF document states no rule";
+    EXPECT_FALSE(elfCommons.statesItsAlignment(4, 4096)) << "an ELF common states its own alignment in its symbol";
+    EXPECT_TRUE(elfCommons.admitsCommon(4, 4096)) << "an ELF common states its own alignment";
+    EXPECT_FALSE(elfCommons.beyondTheRule.has_value());
+    // A document whose rules differ is read as it states, never as a number of the code's.
     auto const text = shippedText("pe64-x86_64-windows");
     ASSERT_FALSE(text.empty());
     nlohmann::json doc = nlohmann::json::parse(text);
-    doc["commonAlignmentFromSizeAtMost"] = 8;
-    auto const eight = ObjectFormatSchema::loadFromText(doc.dump(), "pe64-x86_64-windows stating 8");
+    doc["commonAlignmentFromSizeAtMost"]         = 8;
+    doc["commonAlignmentEveryLinkerGivesAtMost"] = 2;
+    auto const eight = ObjectFormatSchema::loadFromText(doc.dump(), "pe64-x86_64-windows stating 8 and 2");
     ASSERT_TRUE(eight.has_value()) << rejectSummary(eight);
-    EXPECT_EQ((*eight)->commonsStatement().alignmentEveryLinkerGives(40), std::optional<std::uint64_t>{8u})
+    EXPECT_EQ((*eight)->commonsStatement().alignmentFromSize(40), std::optional<std::uint64_t>{8u})
         << "a document stating 8 gives a 40-byte common 8";
     EXPECT_FALSE((*eight)->commonsStatement().admitsCommon(40, 16)) << "a document stating 8 admits no common of 16";
+    EXPECT_TRUE((*eight)->commonsStatement().statesItsAlignment(4, 4)) << "a document stating 2 states an int's";
 }
 
 // ══ The writer and the reader ════════════════════════════════════════════════
@@ -844,11 +879,16 @@ TEST(CoffLinkerDirectivesNative, ADssLinkHonoursAClObjectsAlternateNameAndInclud
 }
 
 TEST(CoffLinkerDirectivesNative, GnuLdHonoursTheDirectiveDssWrites) {
-    if (std::system("where gcc >nul 2>&1") != 0) {
-        GTEST_SKIP() << "no MinGW `gcc` on PATH -- the GNU ld arm is inert on this host";
-    }
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-directives-gnu"};
     auto const dir = scratch.path();
+    // MinGW-w64's x86-64 gcc, as the ONE locator identifies it (P69 fold 3c, review csf25 finding 7: `where gcc` alone
+    // took any gcc on PATH): absent — no gcc, or one for another runtime — is a skip by name; one that cannot answer is
+    // RED.
+    auto const gcc = test_support::native_probe::locateMingwGcc(dir);
+    if (!gcc.ok()) {
+        ASSERT_TRUE(gcc.toolAbsent()) << gcc.describe();
+        GTEST_SKIP() << gcc.describe();
+    }
     writeText(dir / "member.c", kMember);
     auto const out = dir / "obj";
     fs::create_directories(out);
@@ -1022,6 +1062,58 @@ TEST(CoffLinkerDirectives, TheLoaderRefusesEveryMalformedOrMisplacedVocabulary) 
              d.erase("$weakDefinitionBesideStrongComment");
          },
          "/commonAlignmentFromSizeAtMost", "states no common"},
+        // P69 fold 3c (the review of the fix fold, A3): a PE document that states commons states both rules, and an
+        // object document what a tentative definition too wide for a common becomes — refused by name when absent,
+        // never read as an alignment of 1 or as "the common states its own".
+        {"a PE object document that states commons and no size rule", "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d.erase("commonAlignmentFromSizeAtMost");
+             d.erase("$commonAlignmentFromSizeAtMostComment");
+         },
+         "/commonAlignmentFromSizeAtMost", "a PE document that states commons must state"},
+        {"a PE object document that states commons and not what every linker gives", "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d.erase("commonAlignmentEveryLinkerGivesAtMost");
+             d.erase("$commonAlignmentEveryLinkerGivesAtMostComment");
+         },
+         "/commonAlignmentEveryLinkerGivesAtMost", "a PE document that states commons must state"},
+        {"a PE archive document that states commons and not what every linker gives", "pe64-x86_64-windows-staticlib",
+         [](nlohmann::json& d) {
+             d.erase("commonAlignmentEveryLinkerGivesAtMost");
+             d.erase("$commonAlignmentEveryLinkerGivesAtMostComment");
+         },
+         "/commonAlignmentEveryLinkerGivesAtMost", "a PE document that states commons must state"},
+        {"a PE image document that states commons and not what every linker gives", "pe64-x86_64-windows-exec",
+         [](nlohmann::json& d) {
+             d.erase("commonAlignmentEveryLinkerGivesAtMost");
+             d.erase("$commonAlignmentEveryLinkerGivesAtMostComment");
+         },
+         "/commonAlignmentEveryLinkerGivesAtMost", "a PE document that states commons must state"},
+        {"a PE object document that states commons and not what a too-wide tentative definition becomes",
+         "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d.erase("tentativeDefinitionBeyondCommonAlignment");
+             d.erase("$tentativeDefinitionBeyondCommonAlignmentComment");
+         },
+         "/tentativeDefinitionBeyondCommonAlignment", "must state 'tentativeDefinitionBeyondCommonAlignment'"},
+        {"the size rule on an ELF object document, and not what a too-wide tentative definition becomes",
+         "elf64-x86_64-linux", [](nlohmann::json& d) { d["commonAlignmentFromSizeAtMost"] = 16; },
+         "/tentativeDefinitionBeyondCommonAlignment", "must state 'tentativeDefinitionBeyondCommonAlignment'"},
+        {"every linker's rule wider than the size rule", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["commonAlignmentEveryLinkerGivesAtMost"] = 64; },
+         "/commonAlignmentEveryLinkerGivesAtMost", "exceeds"},
+        {"every linker's rule that is no power of two", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["commonAlignmentEveryLinkerGivesAtMost"] = 6; },
+         "/commonAlignmentEveryLinkerGivesAtMost", "expected a power of two"},
+        {"every linker's rule without the size rule", "elf64-x86_64-linux",
+         [](nlohmann::json& d) { d["commonAlignmentEveryLinkerGivesAtMost"] = 4; },
+         "/commonAlignmentEveryLinkerGivesAtMost", "without 'commonAlignmentFromSizeAtMost'"},
+        {"a too-wide tentative definition's spelling that is none", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["tentativeDefinitionBeyondCommonAlignment"] = "select_any"; },
+         "/tentativeDefinitionBeyondCommonAlignment", "expected one of"},
+        {"a too-wide tentative definition's spelling on an image document", "pe64-x86_64-windows-exec",
+         [](nlohmann::json& d) { d["tentativeDefinitionBeyondCommonAlignment"] = "select-any"; },
+         "/tentativeDefinitionBeyondCommonAlignment", "IMAGE flavor"},
     };
     for (auto const& c : kCases) {
         SCOPED_TRACE(c.label);

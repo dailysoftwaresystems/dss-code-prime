@@ -380,8 +380,14 @@ TEST(CoffObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
     ASSERT_NE(eEnv, nullptr);
     EXPECT_FALSE(ePuts->isData)
         << "puts is a FUNCTION extern -> the DTYPE_FUNCTION hint round-trips isData=false";
-    EXPECT_TRUE(eEnv->isData)
-        << "env is a DATA extern -> Type=0 round-trips isData=true";
+    EXPECT_EQ(ePuts->kindOrigin, ExternKindOrigin::Stated);
+    // ⚠ P69 fold 3c (D-LK-COFF-READER-TAKES-AN-UNTYPED-UNDEFINED-SYMBOL-AS-DATA):
+    // this line asserted "Type=0 round-trips isData=true" -- the reading that
+    // refused clang-cl's `puts`, which clang-cl writes with type 0 like every
+    // undefined symbol. Type 0 states no kind; the definition decides (here,
+    // kernel32.dll's `env` would be decided by the binder from the library).
+    EXPECT_EQ(eEnv->kindOrigin, ExternKindOrigin::Pending)
+        << "env's Type=0 states no kind -- its definition decides";
 
     // -- the module is well-formed for the merge --
     EXPECT_EQ(got.expectedFuncCount, 2u);
@@ -604,8 +610,11 @@ TEST(CoffObjectReader, ExternDtypeFunctionInfersFunction) {
     }
 
     // CLEAR the extern `g`'s IMAGE_SYMBOL Type (u16 @ record+14) to 0 and
-    // re-read: with no derived-type hint the reader reconstructs isData=true
-    // (data) -- the other direction of the same mask.
+    // re-read: with no derived-type hint the row states NO kind (`Pending`).
+    // ⚠ P69 fold 3c (D-LK-COFF-READER-TAKES-AN-UNTYPED-UNDEFINED-SYMBOL-AS-DATA):
+    // this half asserted the hint-less extern was DATA. clang-cl 19.1.5 writes
+    // type 0 on EVERY undefined symbol, its functions included (✔MEASURED
+    // 2026-10-20), so a type 0 is no statement, and the definition decides.
     std::size_t const gRec = findExternSymbolRecord(obj, "g");
     ASSERT_NE(gRec, 0u) << "must locate the extern `g` symbol record";
     wr16(obj, gRec + 14u, 0x0000);   // clear DTYPE_FUNCTION
@@ -615,8 +624,8 @@ TEST(CoffObjectReader, ExternDtypeFunctionInfersFunction) {
     ASSERT_TRUE(got.has_value()) << "errors=" << rep.errorCount();
     auto const* eg = externNamed(*got, "g");
     ASSERT_NE(eg, nullptr);
-    EXPECT_TRUE(eg->isData)
-        << "a Type=0 extern reconstructs isData=true (data) -- no hint";
+    EXPECT_EQ(eg->kindOrigin, ExternKindOrigin::Pending)
+        << "a Type=0 extern states no kind -- no hint";
 }
 
 // -- 5b. A DECLARED `isCall` ROLE UPGRADES A HINT-LESS EXTERN ---------
@@ -681,8 +690,9 @@ TEST(CoffObjectReader, DeclaredIsCallRoleUpgradesAnExternWithNoTypeHint) {
         ASSERT_TRUE(got.has_value()) << "errors=" << rep.errorCount();
         auto const* eg = externNamed(*got, "g");
         ASSERT_NE(eg, nullptr);
-        EXPECT_TRUE(eg->isData)
-            << "control: no type hint and no declared call role -> DATA";
+        // P69 fold 3c: no type hint states no kind (it read DATA until the fold).
+        EXPECT_EQ(eg->kindOrigin, ExternKindOrigin::Pending)
+            << "control: no type hint and no declared call role -> no kind stated";
     }
 
     // The SAME document plus exactly one key on the row the object's
@@ -707,6 +717,7 @@ TEST(CoffObjectReader, DeclaredIsCallRoleUpgradesAnExternWithNoTypeHint) {
            "target executable code, so it is a FUNCTION even with no type hint "
            "-- the COFF reader reads the declared role, it does not re-derive "
            "it from the target's arithmetic formula";
+    EXPECT_EQ(eg->kindOrigin, ExternKindOrigin::Stated) << "a call STATES the kind";
 }
 
 // AN EMISSION ALIAS IS A FORMAT-AGNOSTIC ESCAPE HATCH, and this reader used to
@@ -1422,16 +1433,23 @@ TEST(CoffForeignObject, KindResolvedDataSectionWithRelocButNoSymbolGapFills) {
 TEST(CoffForeignObject, UnmodeledMetadataSectionWithRelocSkipped) {
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
-    // A `.xdata` (base name absent from the schema -> kind nullopt) carrying a
+    // A `.debug$S` (base name absent from the schema -> kind nullopt) carrying a
     // reloc but no atom -> SKIPPED whole (metadata), reads cleanly.
+    // ⚠ P69 fold 3c: THIS SECTION WAS `.xdata`, AND THE SKIP IT PINNED WAS
+    // D-LK-COFF-FOREIGN-UNWIND-DROP: every foreign function lost its unwind
+    // description here. `.xdata` is read now (the unwind carry), and a
+    // relocation of it no record reads is refused by name
+    // (`CoffForeignUnwind.ARelocationOfTheUnwindSectionsNoRecordReadsIsRefused`).
+    // `.debug$S` is what really takes this path: cl's CodeView symbols, whose
+    // relocations name the functions they describe.
     auto const obj = buildCoff(
-        {BSec{".xdata", kScnXData, std::vector<std::uint8_t>(8, 0),
+        {BSec{".debug$S", kScnXData, std::vector<std::uint8_t>(8, 0),
               {BReloc{0u, "g", kRelAddr64}}}},
         {BSym{"g", 0, 0, 0, kClassExternal, std::nullopt}});
     DiagnosticReporter rep;
     auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
     ASSERT_TRUE(got.has_value())
-        << "an unmodeled `.xdata` metadata section (+ its reloc) must be skipped, "
+        << "an unmodeled `.debug$S` metadata section (+ its reloc) must be skipped, "
            "not fail loud; errs=" << rep.errorCount();
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_NE(externNamed(*got, "g"), nullptr) << "the extern g is still decoded";
@@ -3345,13 +3363,15 @@ TEST(CoffDirectiveRead, ADirectiveRowAndAGapAtomNeverShareAnId) {
 namespace {
 
 #if defined(_WIN32)
-// A mingw gcc on PATH, or nothing. LOCATE, then PROVE IT BUILDS -- the same
-// skip-vs-fail discipline as `native_probe::locateMsvcToolchain`: a tool that is
-// ABSENT is a skip, a tool that is PRESENT and fails is a RED. Gating on
-// `where gcc` alone would call a broken install "absent" and quietly retire the
-// witness.
+// MinGW-w64's x86-64 gcc, as the ONE locator identifies it
+// (`test_support::native_probe::locateMingwGcc`: the gcc on PATH that reports an
+// x86_64-*-mingw32 target). ABSENT -- no gcc, or one for another runtime -- is a
+// skip that names what was seen; a gcc that cannot answer is a RED, never read
+// as absent (P69 fold 3c, review csf25 finding 7: this file's own copy took any
+// gcc that compiled a probe, and read a broken one as absent).
 struct MingwGcc {
     bool        usable = false;
+    bool        absent = true;   // the one state a witness may skip on
     std::string detail;
     std::filesystem::path work;
 
@@ -3371,29 +3391,16 @@ struct MingwGcc {
     }
 };
 
-[[nodiscard]] MingwGcc locateMingwGcc(std::filesystem::path const& work) {
+[[nodiscard]] MingwGcc mingwGccFor(std::filesystem::path const& work) {
     MingwGcc g;
     g.work = work;
-#if defined(_WIN32)
-    if (std::system("where gcc >nul 2>&1") != 0) {
-        g.detail = "no gcc on PATH -- the mingw witness is inert on this host";
+    auto const located = test_support::native_probe::locateMingwGcc(work);
+    if (!located.ok()) {
+        g.absent = located.toolAbsent();
+        g.detail = located.describe();
         return g;
     }
-#else
-    // `where` and `nul` are cmd.exe's: on a POSIX shell `>nul` creates a FILE
-    // named `nul` in the working directory (P69, found in passing).
-    g.detail = "not a Windows host -- the mingw witness is inert here";
-    return g;
-#endif
-    // PRESENT: prove it can build before promising a red on failure.
-    std::filesystem::path probe;
-    MingwGcc probeGcc; probeGcc.work = work;
-    if (!probeGcc.compile("int p(void){return 0;}\n", "gcc_toolchain_check", probe)) {
-        g.detail = "gcc is on PATH but could not compile "
-                   "`int p(void){return 0;}` -- a shim with no toolchain behind "
-                   "it counts as ABSENT, not broken";
-        return g;
-    }
+    g.absent = false;
     g.usable = true;
     return g;
 }
@@ -3409,8 +3416,11 @@ TEST(CoffWeakExternalNative, RealMingwWeakDefinitionBindsTheBodyToItsRealName) {
     GTEST_SKIP() << "compiles a mingw-gcc COFF object; Windows only";
 #else
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-weak"};
-    auto const gcc = locateMingwGcc(scratch.path());
-    if (!gcc.usable) GTEST_SKIP() << gcc.detail;
+    auto const gcc = mingwGccFor(scratch.path());
+    if (!gcc.usable) {
+        ASSERT_TRUE(gcc.absent) << gcc.detail;   // present and broken: RED
+        GTEST_SKIP() << gcc.detail;
+    }
 
     std::filesystem::path obj;
     ASSERT_TRUE(gcc.compile(
@@ -3481,8 +3491,11 @@ TEST(CoffWeakExternalNative, RealMingwWeakAliasBindsBothNamesToOneBody) {
     GTEST_SKIP() << "compiles a mingw-gcc COFF object; Windows only";
 #else
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-weak"};
-    auto const gcc = locateMingwGcc(scratch.path());
-    if (!gcc.usable) GTEST_SKIP() << gcc.detail;
+    auto const gcc = mingwGccFor(scratch.path());
+    if (!gcc.usable) {
+        ASSERT_TRUE(gcc.absent) << gcc.detail;   // present and broken: RED
+        GTEST_SKIP() << gcc.detail;
+    }
 
     std::filesystem::path obj;
     ASSERT_TRUE(gcc.compile(
@@ -3570,8 +3583,11 @@ TEST(CoffWeakExternalNative, RealMingwWeakUndefinedReferenceNoLongerRefusesOnWea
     GTEST_SKIP() << "compiles a mingw-gcc COFF object; Windows only";
 #else
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-weak"};
-    auto const gcc = locateMingwGcc(scratch.path());
-    if (!gcc.usable) GTEST_SKIP() << gcc.detail;
+    auto const gcc = mingwGccFor(scratch.path());
+    if (!gcc.usable) {
+        ASSERT_TRUE(gcc.absent) << gcc.detail;   // present and broken: RED
+        GTEST_SKIP() << gcc.detail;
+    }
 
     std::filesystem::path obj;
     ASSERT_TRUE(gcc.compile(
@@ -3654,8 +3670,11 @@ TEST(CoffWeakExternalNative, ForeignLinkerConsumesADssReEmittedWeakAlias) {
 #else
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-weak"};
     auto const dir = scratch.path();
-    auto const gcc = locateMingwGcc(dir);
-    if (!gcc.usable) GTEST_SKIP() << gcc.detail;
+    auto const gcc = mingwGccFor(dir);
+    if (!gcc.usable) {
+        ASSERT_TRUE(gcc.absent) << gcc.detail;   // present and broken: RED
+        GTEST_SKIP() << gcc.detail;
+    }
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
@@ -3745,8 +3764,11 @@ TEST(CoffWeakExternalNative, RealMingwWeakDataDefinitionBindsToItsRealName) {
     GTEST_SKIP() << "compiles a mingw-gcc COFF object; Windows only";
 #else
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-weak"};
-    auto const gcc = locateMingwGcc(scratch.path());
-    if (!gcc.usable) GTEST_SKIP() << gcc.detail;
+    auto const gcc = mingwGccFor(scratch.path());
+    if (!gcc.usable) {
+        ASSERT_TRUE(gcc.absent) << gcc.detail;   // present and broken: RED
+        GTEST_SKIP() << gcc.detail;
+    }
 
     std::filesystem::path obj;
     ASSERT_TRUE(gcc.compile(
@@ -4370,13 +4392,12 @@ TEST(CoffForeignObject, AnAlignmentAboveTwoHundredFiftySixIsCarried) {
     // ✔MEASURED 2026-10-15, a DSS `.bss` definition declared 2**12 linked by
     // DSS at an address no multiple of 4096 (the policy's note,
     // `link/format/foreign_section_alignment.hpp`). Class 15, which the format
-    // does not define, reads as GNU objdump 2.42 was measured reading it: the
-    // unspecified 16.
+    // does not define, is refused: `AnAlignClassTheFormatDoesNotDefineIsRefusedByName`.
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
     struct AlignCase { std::uint32_t cls; std::uint32_t bytes; };
     for (auto const& c : std::vector<AlignCase>{{10u, 512u}, {12u, 2048u}, {13u, 4096u},
-                                                {14u, 8192u}, {15u, 16u}}) {
+                                                {14u, 8192u}}) {
         SCOPED_TRACE("IMAGE_SCN_ALIGN class " + std::to_string(c.cls));
         std::string why;
         auto const got = readOneObject(
@@ -4387,6 +4408,46 @@ TEST(CoffForeignObject, AnAlignmentAboveTwoHundredFiftySixIsCarried) {
         ASSERT_NE(item, nullptr);
         EXPECT_EQ(item->alignment.bytes(), c.bytes)
             << "a declared alignment is carried as declared, never read as less";
+    }
+}
+
+TEST(CoffForeignObject, AnAlignClassTheFormatDoesNotDefineIsRefusedByName) {
+    // Class 15 is no IMAGE_SCN_ALIGN_* value (they stop at 14, 8192 bytes), and
+    // the references part on it: ✔MEASURED 2026-10-15, GNU objdump 2.42 reads a
+    // section of class 15 as 2**4, the unspecified 16; DOCUMENTED, LLVM's
+    // `coff_section::getAlignment()` computes 16384. Until P69 fold 3c DSS read
+    // the 16, the under-aligning one. Refused by name, on a data section and on
+    // a section no symbol names alike (the field is read at the header); class
+    // 14 beside it reads (the control).
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    for (auto const named : {true, false}) {
+        SCOPED_TRACE(named ? "a section a symbol names" : "a section no symbol names");
+        for (auto const cls : {15u, 14u}) {
+            SCOPED_TRACE("IMAGE_SCN_ALIGN class " + std::to_string(cls));
+            auto const obj = named
+                ? objWithRdataChars(rdataWithAlignClass(cls), {5, 5, 5, 5})
+                : buildCoff({BSec{".rdata", rdataWithAlignClass(6u), {6, 6, 6, 6}, {}},
+                             BSec{".data", 0xC0000040u | (cls << 20), {7, 7, 7, 7}, {}}},
+                            {BSym{"datum", 0, 1, 0, kClassExternal, std::nullopt}});
+            DiagnosticReporter rep;
+            auto const got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format,
+                                                       rep, CompilationUnitId{1});
+            std::string why;
+            for (auto const& d : rep.all()) { why += d.actual; why += '\n'; }
+            if (cls == 14u) {
+                EXPECT_TRUE(got.has_value()) << "CONTROL: class 14 (8192 bytes) is a class of the format\n" << why;
+                continue;
+            }
+            EXPECT_FALSE(got.has_value()) << "class 15 read as some alignment:\n" << why;
+            std::size_t corrupt = 0;
+            for (auto const& d : rep.all()) {
+                if (d.code == DiagnosticCode::F_CorruptedBinary) ++corrupt;
+            }
+            EXPECT_EQ(corrupt, 1u) << why;
+            EXPECT_NE(why.find("alignment class 15"), std::string::npos) << why;
+            EXPECT_NE(why.find("16384"), std::string::npos) << "the refusal names the split\n" << why;
+        }
     }
 }
 

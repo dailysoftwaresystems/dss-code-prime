@@ -2,7 +2,9 @@
 
 #include "asm/asm.hpp"                     // AssembledModule, AssembledData, Relocation
 #include "core/types/alignment.hpp"        // Alignment
+#include "core/types/diagnostic_reporter.hpp"   // DiagnosticReporter — the no-slot refusal
 #include "core/types/extern_import.hpp"    // ExternImport, ExternKindOrigin
+#include "core/types/parse_diagnostic.hpp"      // ParseDiagnostic, DiagnosticCode
 #include "core/types/section_kind.hpp"     // DataSectionKind
 #include "core/types/target_schema.hpp"    // TargetSchema
 #include "core/types/type_lattice/type_layout.hpp"   // scalarByteSize — the format's pointer width
@@ -11,6 +13,7 @@
 #include "link/pointer_reloc.hpp"          // absolutePointerRelocKind
 
 #include <cstddef>
+#include <format>
 #include <optional>
 #include <span>
 #include <string>
@@ -60,17 +63,21 @@ struct ImportAddressFoldCounts {
 };
 
 // The local pointer is one pointer of the format's data model, filled through
-// the target's absolute pointer relocation of that width. Returns what it
-// rewrote; a local definition with no such relocation on the target is left
-// untouched (the link then refuses `__imp_X` by name). So is one whose format
-// states no pointer width — never a guessed one: the data model is required and
-// closed at load, and the link that follows refuses a format without a width by
-// name before it sizes any slot (`linker::link`).
-inline ImportAddressFoldCounts foldImportAddressReferences(
+// the target's address-slot relocation of that width (`absolutePointerRelocKind`).
+// Returns what it rewrote, or nullopt with the refusal reported. A local
+// definition whose target declares no such relocation is REFUSED by name, the
+// target and the width named (P69 fold 3c): it used to be left untouched, and the
+// link then refused "`__imp_X` undefined", which named neither — a pointer with
+// no fixup would hold zero. A local definition whose format states no pointer
+// width is left untouched — never a guessed width: the data model is required
+// and closed at load, and the link that follows refuses a format without a width
+// by name before it sizes any slot (`linker::link`).
+[[nodiscard]] inline std::optional<ImportAddressFoldCounts> foldImportAddressReferences(
         std::span<AssembledModule>             modules,
         ObjectFormatSchema const&              format,
         TargetSchema const&                    target,
-        std::unordered_set<std::string> const& definedNames) {
+        std::unordered_set<std::string> const& definedNames,
+        DiagnosticReporter&                    reporter) {
     ImportAddressFoldCounts counts;
     std::string_view const prefix = format.importAddressSymbolPrefix();
     if (prefix.empty()) return counts;
@@ -78,6 +85,7 @@ inline ImportAddressFoldCounts foldImportAddressReferences(
     std::optional<RelocationKind> const absPtr =
         width.has_value() ? absolutePointerRelocKind(target, static_cast<std::uint8_t>(*width))
                           : std::nullopt;
+    std::string const targetName{target.name()};
     for (auto& mod : modules) {
         std::uint32_t maxV = maxExistingSymbolIdV(mod);
         std::vector<AssembledData> localPointers;
@@ -99,7 +107,22 @@ inline ImportAddressFoldCounts foldImportAddressReferences(
                 ++it;
                 continue;
             }
-            if (!absPtr.has_value()) { ++it; continue; }
+            if (!width.has_value()) { ++it; continue; }   // refused by name by the link (above)
+            if (!absPtr.has_value()) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_AbsolutePointerRelocMissing;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "linker: '{}' names the address slot of '{}', which a linked unit defines, so "
+                    "the slot is a pointer of the image's own holding that definition's address "
+                    "(link.exe's LNK4217) -- and target '{}' declares no relocation that fills a "
+                    "{}-byte address slot (Linear, absolute, neither thread-local nor "
+                    "image-relative, of a range that holds every address). A pointer with no "
+                    "fixup would hold zero.",
+                    name, target, targetName, *width);
+                reporter.report(std::move(d));
+                return std::nullopt;
+            }
             auto const pointerBytes = static_cast<std::uint8_t>(*width);   // engaged: `absPtr` is
             // The local pointer: the old `__imp_X` symbol names it now.
             ExternImport def;

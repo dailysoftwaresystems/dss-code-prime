@@ -194,8 +194,34 @@ struct CrossCuRefusal {
 //   definition won in silence (✔MEASURED 2026-10-12 on cl's, clang's and MinGW
 //   gcc's objects: `__declspec(selectany) int v = 1;` beside `int v = 2;`
 //   linked and exited 22 where all three reference linkers refuse).
+//   ★ AND WHY THE WEAK ONE MAY BE A TENTATIVE DEFINITION (P69 fold 3c, the
+//   review of the fix fold, A4): where the link's document aligns a common by its
+//   size (`commonAlignmentFromSizeAtMost`), a unit's tentative definition wider
+//   than a common of its size may be is written into its object as a SELECT-ANY
+//   definition (`CommonsStatement::beyondTheRule`) — so a select-any copy beside
+//   a strong definition may be `_Alignas(64) int v;` beside another unit's
+//   `int v = 7;`, one object given two alignment specifiers, which ISO C 6.7.5p7
+//   leaves undefined and link.exe, lld-link and GNU ld all refuse (✔MEASURED
+//   2026-10-20). The sentence says so, with the document's rule, wherever that
+//   can be the reason.
 [[nodiscard]] inline CrossCuRefusal
 refusalOf(CrossCuCollision const& collision, ObjectFormatSchema const& linkFormat) {
+    // Where the document aligns a common by its size, the collision is a
+    // select-any one: that is the kind a strong definition does not replace
+    // there (`weakDefinitionBesideStrong` on the PE documents).
+    auto const     rule = linkFormat.commonsStatement().alignmentFromSizeAtMost;
+    std::string    why;
+    if (rule.has_value()) {
+        why = std::format(
+            " A weak copy is also what an object of this format holds for a "
+            "TENTATIVE definition wider than a common of its size may be (a common "
+            "is aligned by its size alone, at most {} bytes: "
+            "`commonAlignmentFromSizeAtMost`): if one unit declared the object "
+            "wider-aligned than the other unit defines it, the two units give one "
+            "object different alignment specifiers, which ISO C 6.7.5p7 leaves "
+            "undefined.",
+            *rule);
+    }
     return CrossCuRefusal{
         DiagnosticCode::K_SymbolRedefinedAcrossUnits,
         std::format(
@@ -204,10 +230,10 @@ refusalOf(CrossCuCollision const& collision, ObjectFormatSchema const& linkForma
             "definition replace — its document states `weakDefinitionBesideStrong` "
             "as '{}' for that kind. The two are a duplicate definition: a "
             "definition the link may keep one copy of is one of several COPIES, "
-            "and a strong definition is not one of them.",
+            "and a strong definition is not one of them.{}",
             collision.name, collision.strong.cuId.v, collision.weak.cuId.v,
             linkFormat.name(),
-            kWeakBesideStrongTable.name(WeakBesideStrong::Collides))};
+            kWeakBesideStrongTable.name(WeakBesideStrong::Collides), why)};
 }
 
 // The link's document was ASKED and does not say — refused by the key's name

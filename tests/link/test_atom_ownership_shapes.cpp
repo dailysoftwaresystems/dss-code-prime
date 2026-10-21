@@ -348,6 +348,24 @@ std::vector<std::uint8_t> const kOtherWinningBody{0xB8, 0x0D, 0x00, 0x00, 0x00, 
     return m;
 }
 
+// Unit `cu`: a function that names nothing (`ret`) beside a row for the extern `name` no code or data of the unit uses
+// — the shape of `extern int m;` declared and never read.
+[[nodiscard]] AssembledModule declarerOf(std::uint32_t cu, std::string name) {
+    AssembledModule m;
+    m.cuId              = CompilationUnitId{cu};
+    m.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    m.functions.push_back(std::move(fn));
+    ExternImport ext;
+    ext.symbol      = SymbolId{2};
+    ext.mangledName = std::move(name);
+    m.externImports.push_back(std::move(ext));
+    m.symbols.push_back(ModuleSymbol{SymbolId{1}, "declarer", SymbolBinding::Global, SymbolVisibility::Default});
+    return m;
+}
+
 // The shipped ELF x86_64 image document with `supersededDefinition` set to `answer` — the key, and nothing else.
 [[nodiscard]] std::shared_ptr<ObjectFormatSchema const> imageDocumentAnswering(char const* answer) {
     auto const    path = dss::test::configRoot() / "object-formats" / "elf64-x86_64-linux-exec.format.json";
@@ -356,6 +374,18 @@ std::vector<std::uint8_t> const kOtherWinningBody{0xB8, 0x0D, 0x00, 0x00, 0x00, 
     doc["supersededDefinition"] = answer;
     auto const loaded = ObjectFormatSchema::loadFromText(doc.dump(), std::string{"elf64-x86_64-linux-exec, "} + answer);
     EXPECT_TRUE(loaded.has_value()) << answer;
+    return loaded.has_value() ? *loaded : nullptr;
+}
+
+// The same document answering PER KIND, as every shipped PE document states it: an overridable definition another
+// definition supersedes keeps its bytes, a select-any one is discarded whole.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const> imageDocumentAnsweringPerKind() {
+    auto const    path = dss::test::configRoot() / "object-formats" / "elf64-x86_64-linux-exec.format.json";
+    std::ifstream in{path};
+    auto          doc            = nlohmann::json::parse(in);
+    doc["supersededDefinition"] = {{"overridable", "keepsItsBytes"}, {"select-any", "discardedWhole"}};
+    auto const loaded = ObjectFormatSchema::loadFromText(doc.dump(), "elf64-x86_64-linux-exec, per kind");
+    EXPECT_TRUE(loaded.has_value()) << "per kind";
     return loaded.has_value() ? *loaded : nullptr;
 }
 
@@ -460,6 +490,42 @@ TEST(AtomOwnershipShapes, ASupersededDefinitionsOtherNameFollowsItsDocument) {
         ASSERT_TRUE(img2.ok()) << diagnosticsOf(rep2);
         EXPECT_FALSE(img2.resolvedGlobalDefs.contains("kept_name")) << "discardedWhole: the name has no definition";
         EXPECT_FALSE(holds(img2.bytes, kLosingBody));
+
+        // A unit that DECLARES the name and never uses it is no importer of it (P69 fold 3c): ✔MEASURED 2026-10-20,
+        // `extern int m;` unread beside a select-any copy carrying `m` that loses — gcc 13.2 and clang 19.1.5 write
+        // no `m` into the declaring unit's object, and GNU ld 2.42 and link.exe 14.44 link and run the program
+        // (lld-link 19.1.5 refuses it, naming the discarding object itself). The row is judged by the reference gate
+        // before the refusal reads it.
+        std::vector<AssembledModule> declared{loser(), winner(true), declarerOf(3, "kept_name")};
+        DiagnosticReporter           rep3;
+        LinkedImage const            img3 = linker::link(std::span<AssembledModule const>{declared}, **t, *f, rep3);
+        EXPECT_TRUE(img3.ok()) << "a declaration nothing in its unit uses is no reference to the discarded name:"
+                               << diagnosticsOf(rep3);
+        EXPECT_FALSE(reported(rep3, DiagnosticCode::K_SymbolUndefined, "'kept_name'")) << diagnosticsOf(rep3);
+        EXPECT_FALSE(img3.resolvedGlobalDefs.contains("kept_name")) << "discardedWhole: the name has no definition";
+
+        // A copy that HOLDS its own name (`own_name`, its first row) and loses one it carries (`contested`) is
+        // discarded for it all the same (P69 fold 3c): the election withdraws nothing here — the copy did not lose
+        // the name it is a copy under — so the name it holds is taken after the election, and its importer refused.
+        auto const carriedLost = [] {
+            return definerOf(1, kLosingBody, {{"own_name", SymbolBinding::Global}, {"contested", SymbolBinding::Weak}},
+                             false);
+        };
+        std::vector<AssembledModule> needed{carriedLost(), winner(false), importerOf(3, "own_name")};
+        DiagnosticReporter           rep4;
+        LinkedImage const            img4 = linker::link(std::span<AssembledModule const>{needed}, **t, *f, rep4);
+        EXPECT_FALSE(img4.ok());
+        EXPECT_TRUE(reported(rep4, DiagnosticCode::K_SymbolUndefined,
+                             "references 'own_name', which only the definition of 'contested'"))
+            << diagnosticsOf(rep4);
+        EXPECT_TRUE(img4.withdrawnNames.empty()) << "the copy held its own name: the election withdrew nothing";
+        std::vector<AssembledModule> unneededToo{carriedLost(), winner(true)};
+        DiagnosticReporter           rep5;
+        LinkedImage const            img5 = linker::link(std::span<AssembledModule const>{unneededToo}, **t, *f, rep5);
+        ASSERT_TRUE(img5.ok()) << diagnosticsOf(rep5);
+        EXPECT_FALSE(img5.resolvedGlobalDefs.contains("own_name"))
+            << "the copy lost a name it carries, and is discarded with the name it holds";
+        EXPECT_FALSE(holds(img5.bytes, kLosingBody));
     }
     // A RELOCATABLE link keeps the definition under its other name whatever the document answers: ✔MEASURED
     // 2026-10-15, `ld -r` of a `.weak_definition` with a visible strong label beside an override of the weak name
@@ -478,5 +544,262 @@ TEST(AtomOwnershipShapes, ASupersededDefinitionsOtherNameFollowsItsDocument) {
         ASSERT_TRUE(obj.resolvedGlobalDefs.contains("kept_name"));
         EXPECT_EQ(obj.resolvedGlobalDefs.at("kept_name"), losing) << "a relocatable link keeps the label on its body";
         EXPECT_TRUE(holds(obj.bytes, kLosingBody));
+    }
+}
+
+// ══ A COPY THE LINK DISCARDS WHOLE: the names it carries are elected without it (P69 fold 3c) ══════════════════════
+//
+// The unit linker's half of the settled election (`linker::resolveSettlingCarriedNames`, link/common_yield.hpp, where
+// its measurement is stated; the cross-unit merge calls the same function). A copy (`contested`, weak) that loses the
+// name it is a copy under takes every other name it carries (`kept_name`) with it, and each such name is elected
+// again WITHOUT it: another unit's definition of it wins it, or nothing does. Its own unit's uses of such a name read
+// the copy that won the copy's own name. One document, `discardedWhole`, in-process on every leg.
+namespace {
+
+// Unit `cu`: the copy `definerOf` makes (SymbolId 1, under `names`), and `user_<cu>` (SymbolId 3, `call rel32 ; ret`),
+// which reaches it through the extern `byName` (SymbolId 2) — the unit's own row of that name says so — or, when
+// `byName` is empty, through the copy's own id, as a unit DSS compiles reads its own definition.
+[[nodiscard]] AssembledModule copyAndUserOf(std::uint32_t cu, std::vector<std::uint8_t> bytes,
+                                            std::vector<std::pair<std::string, SymbolBinding>> const& names,
+                                            std::string byName, bool entry) {
+    AssembledModule m = definerOf(cu, std::move(bytes), names, false);
+    for (auto& row : m.symbols) {
+        if (row.name == byName) row.referencedByName = true;
+    }
+    AssembledFunction user;
+    user.symbol = SymbolId{3};
+    user.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = byName.empty() ? SymbolId{1} : SymbolId{2};
+    rel.kind   = RelocationKind{1};   // the x86_64 target's rel32
+    rel.addend = 0;
+    user.relocations.push_back(rel);
+    m.functions.push_back(std::move(user));
+    m.expectedFuncCount = 2;
+    if (!byName.empty()) {
+        ExternImport ext;
+        ext.symbol      = SymbolId{2};
+        ext.mangledName = std::move(byName);
+        m.externImports.push_back(std::move(ext));
+    }
+    m.symbols.push_back(
+        ModuleSymbol{SymbolId{3}, "user_" + std::to_string(cu), SymbolBinding::Global, SymbolVisibility::Default});
+    if (entry) m.userEntrySymbol = SymbolId{3};
+    return m;
+}
+
+[[nodiscard]] bool withdrew(LinkedImage const& img, LinkedSymbolKey const& from, std::string_view name) {
+    return std::any_of(img.withdrawnNames.begin(), img.withdrawnNames.end(),
+                       [&](LinkedImage::WithdrawnName const& w) { return w.definition == from && w.name == name; });
+}
+
+}  // namespace
+
+TEST(AtomOwnershipShapes, ANameALosingCopyCarriesIsElectedWithoutIt) {
+    auto const t = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(t.has_value());
+    auto const f = imageDocumentAnswering("discardedWhole");
+    ASSERT_NE(f, nullptr);
+    LinkedSymbolKey const losing{CompilationUnitId{1}, SymbolId{1}};
+    LinkedSymbolKey const other{CompilationUnitId{3}, SymbolId{1}};
+
+    // Beside a WEAK definition of the carried name in a third unit: before the election settled the copy's own name
+    // first, the copy's strong `kept_name` beat it and then went with the copy — the importer was refused. ✔MEASURED
+    // by lane cs (probe mj1, the alias of a losing select-any copy beside a weak definition of the alias's name):
+    // lld-link 19.1.5 binds the name to the weak definition, the one working reference.
+    {
+        std::vector<AssembledModule> mods{
+            definerOf(1, kLosingBody, {{"contested", SymbolBinding::Weak}, {"kept_name", SymbolBinding::Global}}, false),
+            definerOf(2, kWinningBody, {{"contested", SymbolBinding::Global}}, false),
+            definerOf(3, kOtherWinningBody, {{"kept_name", SymbolBinding::Weak}}, false), importerOf(4, "kept_name")};
+        DiagnosticReporter rep;
+        LinkedImage const  img = linker::link(std::span<AssembledModule const>{mods}, **t, *f, rep);
+        ASSERT_TRUE(img.ok()) << "a name a losing copy carried is elected without it:" << diagnosticsOf(rep);
+        ASSERT_TRUE(img.resolvedGlobalDefs.contains("kept_name"));
+        EXPECT_EQ(img.resolvedGlobalDefs.at("kept_name"), other) << "the third unit's weak definition wins it";
+        EXPECT_EQ(definitionOfTheReference(img, 4), std::optional{other});
+        EXPECT_TRUE(withdrew(img, losing, "kept_name"));
+        EXPECT_FALSE(holds(img.bytes, kLosingBody)) << "the copy is discarded whole";
+        EXPECT_TRUE(holds(img.bytes, kOtherWinningBody));
+    }
+    // Two copies, each carrying `kept_name`: the losing copy's is withdrawn, so the name has ONE definition, the
+    // winning copy's — not two strong ones. ✔MEASURED by lane cs (probe mj1, two units each with an alias of its own
+    // select-any copy): GNU ld 2.42 and lld-link 19.1.5 link it, the winning copy's alias holding the name.
+    {
+        std::vector<AssembledModule> mods{
+            definerOf(1, kLosingBody, {{"contested", SymbolBinding::Weak}, {"kept_name", SymbolBinding::Global}}, false),
+            definerOf(2, kWinningBody, {{"contested", SymbolBinding::Weak}, {"kept_name", SymbolBinding::Global}}, false),
+            importerOf(3, "kept_name")};
+        DiagnosticReporter rep;
+        LinkedImage const  img = linker::link(std::span<AssembledModule const>{mods}, **t, *f, rep);
+        ASSERT_TRUE(img.ok()) << "a name a losing copy carried is elected without it:" << diagnosticsOf(rep);
+        ASSERT_TRUE(img.resolvedGlobalDefs.contains("contested") && img.resolvedGlobalDefs.contains("kept_name"));
+        LinkedSymbolKey const copy = img.resolvedGlobalDefs.at("contested");
+        EXPECT_EQ(img.resolvedGlobalDefs.at("kept_name"), copy) << "the name stays with the copy that won";
+        EXPECT_EQ(definitionOfTheReference(img, 3), std::optional{copy});
+        EXPECT_EQ(img.withdrawnNames.size(), 1u) << "the losing copy's name, and only it";
+    }
+    // A select-any copy's SECOND label — weak, and of the copy's own kind, as a COFF reader reads a COMDAT section's
+    // other external label — goes with the copy under the document PE states per kind: withdrawn when the copy loses,
+    // so nothing defines it and an importer is refused naming the name the copy was a copy under.
+    {
+        auto const perKind = imageDocumentAnsweringPerKind();
+        ASSERT_NE(perKind, nullptr);
+        auto const selectAny = [](AssembledModule m) {
+            for (auto& row : m.symbols) row.weakKind = WeakDefinitionKind::SelectAny;
+            return m;
+        };
+        std::vector<AssembledModule> mods{
+            selectAny(definerOf(1, kLosingBody, {{"contested", SymbolBinding::Weak}, {"label_two", SymbolBinding::Weak}},
+                                false)),
+            definerOf(2, kWinningBody, {{"contested", SymbolBinding::Global}}, false), importerOf(3, "label_two")};
+        DiagnosticReporter rep;
+        LinkedImage const  img = linker::link(std::span<AssembledModule const>{mods}, **t, *perKind, rep);
+        EXPECT_FALSE(img.ok()) << "a select-any copy's second label goes with it";
+        EXPECT_TRUE(reported(rep, DiagnosticCode::K_SymbolUndefined,
+                             "references 'label_two', which only the definition of 'contested'"))
+            << "a select-any copy's second label goes with it:" << diagnosticsOf(rep);
+        EXPECT_TRUE(withdrew(img, losing, "label_two")) << "a select-any copy's second label goes with it";
+    }
+}
+
+TEST(AtomOwnershipShapes, ALosingCopysOwnUnitReadsTheCopyThatWonThroughTheNameItCarried) {
+    auto const t = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(t.has_value());
+    auto const f = imageDocumentAnswering("discardedWhole");
+    ASSERT_NE(f, nullptr);
+    LinkedSymbolKey const winning{CompilationUnitId{2}, SymbolId{1}};
+    LinkedSymbolKey const other{CompilationUnitId{3}, SymbolId{1}};
+    // ✔MEASURED 2026-10-20 (lane xa's probe f3a; the cell: `f` an alias of a select-any `g`, read by its own unit,
+    // whose copy of `g` loses): clang -O2 + link.exe 14.44 reads the winner (22); GNU ld 2.42 and lld-link 19.1.5
+    // refuse it, link.exe after clang -O0 reads garbage — one working reference. Nothing else defines the name...
+    {
+        std::vector<AssembledModule> mods{
+            copyAndUserOf(1, kLosingBody, {{"contested", SymbolBinding::Weak}, {"kept_name", SymbolBinding::Global}},
+                          "kept_name", true),
+            definerOf(2, kWinningBody, {{"contested", SymbolBinding::Global}}, false)};
+        DiagnosticReporter rep;
+        LinkedImage const  img = linker::link(std::span<AssembledModule const>{mods}, **t, *f, rep);
+        ASSERT_TRUE(img.ok()) << "its own unit's use reads the copy that won the name it is a copy under:"
+                              << diagnosticsOf(rep);
+        EXPECT_EQ(definitionOfTheReference(img, 1), std::optional{winning})
+            << "its own unit's use reads the copy that won the name it is a copy under";
+        EXPECT_FALSE(img.resolvedGlobalDefs.contains("kept_name")) << "no other unit may use the name";
+        EXPECT_FALSE(holds(img.bytes, kLosingBody));
+        EXPECT_TRUE(holds(img.bytes, kWinningBody));
+    }
+    // ...and where another unit's definition wins the name, the copy's own unit still reads the copy that won,
+    // as the merge binds it.
+    {
+        std::vector<AssembledModule> mods{
+            copyAndUserOf(1, kLosingBody, {{"contested", SymbolBinding::Weak}, {"kept_name", SymbolBinding::Global}},
+                          "kept_name", true),
+            definerOf(2, kWinningBody, {{"contested", SymbolBinding::Global}}, false),
+            definerOf(3, kOtherWinningBody, {{"kept_name", SymbolBinding::Weak}}, false)};
+        DiagnosticReporter rep;
+        LinkedImage const  img = linker::link(std::span<AssembledModule const>{mods}, **t, *f, rep);
+        ASSERT_TRUE(img.ok()) << "its own unit's use reads the copy that won the name it is a copy under:"
+                              << diagnosticsOf(rep);
+        EXPECT_EQ(definitionOfTheReference(img, 1), std::optional{winning})
+            << "its own unit's use reads the copy that won the name it is a copy under";
+        ASSERT_TRUE(img.resolvedGlobalDefs.contains("kept_name"));
+        EXPECT_EQ(img.resolvedGlobalDefs.at("kept_name"), other);
+    }
+}
+
+// The case `LinkedImage::withdrawnNames` exists for: the losing copy's own unit reaches the copy through its id (as a
+// unit DSS compiles reads its own definition), and its withdrawn name went to another unit's definition. The merge
+// folds the copy onto the copy that won its OWN name; folded through the withdrawn one as well, it would be one
+// definition under two winners — refused as no retarget being right for both.
+TEST(AtomOwnershipShapes, ALosingCopyIsNeverFoldedThroughANameTheLinkTookFromIt) {
+    auto const t = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(t.has_value());
+    auto const f = imageDocumentAnswering("discardedWhole");
+    ASSERT_NE(f, nullptr);
+    LinkedSymbolKey const losing{CompilationUnitId{1}, SymbolId{1}};
+    LinkedSymbolKey const other{CompilationUnitId{3}, SymbolId{1}};
+    std::vector<AssembledModule> mods{
+        copyAndUserOf(1, kLosingBody, {{"contested", SymbolBinding::Weak}, {"kept_name", SymbolBinding::Global}}, "",
+                      false),
+        definerOf(2, kWinningBody, {{"contested", SymbolBinding::Global}}, false),
+        definerOf(3, kOtherWinningBody, {{"kept_name", SymbolBinding::Weak}}, false), importerOf(4, "kept_name")};
+    DiagnosticReporter rep;
+    LinkedImage const  img = linker::link(std::span<AssembledModule const>{mods}, **t, *f, rep);
+    EXPECT_FALSE(reported(rep, DiagnosticCode::K_CrossCuMergeUnsupported, "is one definition carrying the names"))
+        << "a losing copy is never folded through a name the link took from it:" << diagnosticsOf(rep);
+    ASSERT_TRUE(img.ok()) << diagnosticsOf(rep);
+    ASSERT_TRUE(withdrew(img, losing, "kept_name"));
+    EXPECT_EQ(img.resolvedGlobalDefs.at("kept_name"), other);
+    EXPECT_EQ(definitionOfTheReference(img, 4), std::optional{other});
+    EXPECT_FALSE(holds(img.bytes, kLosingBody));
+}
+
+// A WEAK alias of the copy (`weak_name`, here the kind a weak external with a default states on PE) is a weak
+// definition of its OWN name, never withdrawn with the copy. ✔MEASURED by lane cs (probe wk1, 2026-10-20; five PE
+// cells in both orders: clang-cl /Od and /O2 under link.exe 14.51 and lld-link, mingw-w64 gcc -O0 and -O2 under GNU
+// ld 2.42): clang writes such an alias as a weak external whose default is the target's NAME, which survives the
+// discard. Where it holds its name, every read of it — another unit's and the copy's own — reads the copy that won
+// the target's name (7, with no other `m`); where another definition wins the name, every read follows the name
+// (a strong `m = 1` elsewhere: 1). gcc writes a label in the target's COMDAT, which goes with the copy, and wherever
+// the two differ gcc's does not link: the one working reading is clang's.
+TEST(AtomOwnershipShapes, AWeakAliasOfALosingCopyIsAWeakDefinitionOfItsOwnName) {
+    auto const t = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(t.has_value());
+    // The document PE states per kind: the alias's kind keeps its bytes, the copy's is discarded whole.
+    auto const f = imageDocumentAnsweringPerKind();
+    ASSERT_NE(f, nullptr);
+    LinkedSymbolKey const winning{CompilationUnitId{2}, SymbolId{1}};
+    LinkedSymbolKey const other{CompilationUnitId{3}, SymbolId{1}};
+    auto const kinds = [](AssembledModule m) {
+        for (auto& row : m.symbols) {
+            if (row.name == "contested") row.weakKind = WeakDefinitionKind::SelectAny;
+            if (row.name == "weak_name") row.weakKind = WeakDefinitionKind::Overridable;
+        }
+        return m;
+    };
+    std::vector<std::pair<std::string, SymbolBinding>> const names{{"contested", SymbolBinding::Weak},
+                                                                   {"weak_name", SymbolBinding::Weak}};
+    // Another unit reads it, and nothing else defines it: it names the copy that won `contested`, and the link links
+    // (clang's objects under link.exe and under lld-link).
+    {
+        std::vector<AssembledModule> mods{kinds(definerOf(1, kLosingBody, names, false)),
+                                          definerOf(2, kWinningBody, {{"contested", SymbolBinding::Global}}, false),
+                                          importerOf(3, "weak_name")};
+        DiagnosticReporter rep;
+        LinkedImage const  img = linker::link(std::span<AssembledModule const>{mods}, **t, *f, rep);
+        ASSERT_TRUE(img.ok()) << "a weak alias of a losing copy is a weak definition of its own name:"
+                              << diagnosticsOf(rep);
+        EXPECT_TRUE(img.withdrawnNames.empty()) << "a weak alias is never withdrawn with its copy";
+        ASSERT_TRUE(img.resolvedGlobalDefs.contains("weak_name"));
+        EXPECT_EQ(img.resolvedGlobalDefs.at("weak_name"), winning)
+            << "holding its name, the weak alias names the copy that won its target's name";
+        EXPECT_EQ(definitionOfTheReference(img, 3), std::optional{winning});
+        EXPECT_FALSE(holds(img.bytes, kLosingBody)) << "the losing copy is discarded whole";
+    }
+    // The copy's own unit reads it: the same copy.
+    {
+        std::vector<AssembledModule> mods{kinds(copyAndUserOf(1, kLosingBody, names, "weak_name", true)),
+                                          definerOf(2, kWinningBody, {{"contested", SymbolBinding::Global}}, false)};
+        DiagnosticReporter rep;
+        LinkedImage const  img = linker::link(std::span<AssembledModule const>{mods}, **t, *f, rep);
+        ASSERT_TRUE(img.ok()) << "a weak alias of a losing copy is a weak definition of its own name:"
+                              << diagnosticsOf(rep);
+        EXPECT_EQ(definitionOfTheReference(img, 1), std::optional{winning})
+            << "holding its name, the weak alias names the copy that won its target's name";
+        EXPECT_FALSE(holds(img.bytes, kLosingBody));
+    }
+    // Another unit's STRONG definition wins the name: the copy's own unit's read follows the name.
+    {
+        std::vector<AssembledModule> mods{kinds(copyAndUserOf(1, kLosingBody, names, "weak_name", true)),
+                                          definerOf(2, kWinningBody, {{"contested", SymbolBinding::Global}}, false),
+                                          definerOf(3, kOtherWinningBody, {{"weak_name", SymbolBinding::Global}}, false)};
+        DiagnosticReporter rep;
+        LinkedImage const  img = linker::link(std::span<AssembledModule const>{mods}, **t, *f, rep);
+        ASSERT_TRUE(img.ok()) << diagnosticsOf(rep);
+        EXPECT_TRUE(img.withdrawnNames.empty()) << "a weak alias is never withdrawn with its copy";
+        EXPECT_EQ(img.resolvedGlobalDefs.at("weak_name"), other);
+        EXPECT_EQ(definitionOfTheReference(img, 1), std::optional{other})
+            << "every read of a weak alias another definition wins follows the name, its own unit's included";
     }
 }

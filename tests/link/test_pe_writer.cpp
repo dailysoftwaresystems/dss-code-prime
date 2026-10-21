@@ -2266,9 +2266,10 @@ TEST(PeFormatJson, ObjDeclaresDataSectionRowsAndExternDispatch) {
     }
 }
 
-// (6) A reloc-bearing RODATA item stays fail-loud (allow=false — the
-// RodataDataItemWithRelocationFailsLoud discipline shared with
-// ELF/Mach-O): a relocated slot cannot live in never-written rodata.
+// (6) A reloc-bearing RODATA item stays fail-loud (allow=false): the COFF
+// object reader puts a read-only item that carries relocations in relro,
+// so this writer is never handed one and refuses it, naming that rule (as
+// Mach-O's does; ELF's writers take one, since ELF's reader produces it).
 TEST(PeWriter, ObjRodataItemWithRelocationFailsLoud) {
     auto loaded = loadShipped();
     AssembledModule mod;
@@ -6533,9 +6534,10 @@ TEST(PeExecWriter, StackReserveBoundsAreInclusiveAtBothEnds) {
 // nothing. These pins are that arm's equivalent.
 //
 // ⚠ THE PREMISE THAT KEPT IT UNGUARDED IS MEASURABLY FALSE. Three documents
-// state "AssembledFunction::unwind is nullopt on the object path by
+// stated "AssembledFunction::unwind is nullopt on the object path by
 // construction" — `src/asm/asm.hpp`'s `cfi` comment and the
-// `$sehPersonalityOmittedComment` of both PE object formats. ✔MEASURED
+// `$sehPersonalityOmittedComment` of both PE object formats (that comment is
+// gone since P69 fold 3c, with the omission it argued). ✔MEASURED
 // 2026-08-27, one non-leaf source with NO `__try`, three targets off the same
 // front end: `elf64-x86_64-linux` (an OBJECT) emits `.eh_frame` 68 B +
 // `.rela.eh_frame` 24 B; `pe64-x86_64-windows-exec` emits `.xdata` 32 B +
@@ -6545,13 +6547,15 @@ TEST(PeExecWriter, StackReserveBoundsAreInclusiveAtBothEnds) {
 namespace {
 
 // A pe **Obj** schema identical in shape to the shipped `pe64-x86_64-windows`
-// except that it DECLARES `sehPersonality`. That declaration is exactly the
-// trap both shipped format documents warn about: the `synthesizeSehFunclets`
-// diagnostic used to end with "Add the block", and adding it makes the compile
-// SUCCEED while `.pdata`/`.xdata` vanish. It is synthesized HERE rather than
-// taken from the shipped tree precisely because no shipped format may carry it
-// — `tests/link/test_runtime_library_roles.cpp` asserts that — so the only way
-// to drive the writer with it is to build one.
+// except that it DECLARES `sehPersonality` and NOT the image-relative relocation
+// row. That declaration was the trap the shipped documents once warned about:
+// the `synthesizeSehFunclets` diagnostic used to end with "Add the block", and
+// adding it made the compile SUCCEED while `.pdata`/`.xdata` vanished. Since P69
+// fold 3c the shipped object documents state the personality themselves (the
+// writer relocates a scope table — `ATryRegionCarriesItsScopeTableIntoTheObject`
+// below — and a `__try` cl compiles into an object must compile into DSS's:
+// `PeObjSeh`), and they state the image-relative row too; this one is
+// synthesized to keep the WITHOUT-the-row refusal pinned.
 //
 // ★ SYNTHESIZED IN THE **REMOVE-FROM-CORRECT** DIRECTION, not the add-a-feature
 // one: the fixture takes the shipped Obj format and adds the key whose ABSENCE
@@ -6559,7 +6563,7 @@ namespace {
 // when it stops supporting something.
 [[nodiscard]] char const* peObjSchemaWithPersonalityJson() {
     return R"({
-      "$comment": "SYNTHETIC pe64 OBJ schema that declares sehPersonality. No shipped PE object format may carry this key (test_runtime_library_roles.cpp enforces it); this exists only to drive pe::encode's Obj arm with the declaration that would otherwise silently drop unwind tables.",
+      "$comment": "SYNTHETIC pe64 OBJ schema that declares sehPersonality and maps no COFF type to the image-relative relocation kind. The shipped PE object formats state the personality AND that row (P69 fold 3c); this exists only to drive pe::encode's Obj arm with the declaration minus the row, which it must refuse.",
       "dssObjectFormatVersion": 1,
       "stackReserveUnsupportedReason": "no-image-field",
       "format": {"name": "pe64-x86_64-windows-personality-synthetic", "version": "1.0", "kind": "pe"},
@@ -6800,7 +6804,7 @@ peObjSectionDefAux(std::vector<std::uint8_t> const& obj,
 // sibling above deliberately WITHOUT that row is the refusal fixture.
 [[nodiscard]] char const* peObjSchemaWithPersonalityAndRvaRelocJson() {
     return R"({
-      "$comment": "SYNTHETIC pe64 OBJ schema declaring BOTH sehPersonality and the image-relative relocation row. No shipped PE object format declares the personality (test_runtime_library_roles.cpp enforces it), so this is the only way to drive pe::encode's Obj arm through a __try scope table.",
+      "$comment": "SYNTHETIC pe64 OBJ schema declaring BOTH sehPersonality and the image-relative relocation row, as the shipped PE object formats do since P69 fold 3c; kept minimal so the scope table's relocations are read on a module built by hand (PeObjSeh drives the shipped document through the CLI's object door).",
       "dssObjectFormatVersion": 1,
       "stackReserveUnsupportedReason": "no-image-field",
       "format": {"name": "pe64-x86_64-windows-personality-rva-synthetic", "version": "1.0", "kind": "pe"},

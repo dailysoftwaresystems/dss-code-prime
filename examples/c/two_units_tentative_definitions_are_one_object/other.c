@@ -12,8 +12,9 @@ static int overlaps(void const *p, unsigned long long size) {
     return a < hi && lo < b;
 }
 
-/* 21 when pair is ten words of its own; 0 when another object lies inside them, 1 when filling them changed a
-   neighbour, 2 when it changed the counter. */
+/* 0 when an object either unit names lies inside pair's ten words, 1 when filling them changed a neighbour,
+   2 when it changed the counter, and 21 otherwise -- which an object of one word with nothing named in its ten
+   words also gives, the filling then writing storage no unit names (C leaves that undefined). */
 int last(int const *guard_main, unsigned long long guardSize) {
     if (overlaps(&shared_counter, sizeof shared_counter) || overlaps(guard_main, guardSize)
         || overlaps(guard_other, sizeof guard_other)) {

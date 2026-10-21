@@ -269,7 +269,7 @@ runTemplateWith(std::shared_ptr<GrammarSchema> dialect, ShippedPair const& p,
 
     run->ok = lowerAsmTemplateToLirRun(*run->tree, *run->dialect,
                                        *run->target, bindings, builder,
-                                       run->reporter, labelBindings);
+                                       run->reporter, nullptr, labelBindings);
 
     // ★ A REFUSED TEMPLATE's BODY IS DISCARDED, EXACTLY AS THE REAL CALLER
     // DISCARDS IT (`mir_to_lir` returns on a false lowering and never finishes

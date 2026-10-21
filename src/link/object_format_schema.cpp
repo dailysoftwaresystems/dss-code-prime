@@ -1033,6 +1033,58 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "is read only where a common is written or resolved, so the "
                  "declaration would never be read.");
         }
+        // P69 fold 3c (the review of the fix fold, A1): what EVERY linker gives a
+        // common that states none is the lesser of the two rules — it says where a
+        // common must state its alignment, so it is read only beside the rule a
+        // linker that ignores that statement keeps, and never above it.
+        if (commonAlignmentEveryLinkerGivesAtMost.has_value()) {
+            if (!commonAlignmentFromSizeAtMost.has_value()) {
+                fail("/commonAlignmentEveryLinkerGivesAtMost",
+                     "'commonAlignmentEveryLinkerGivesAtMost' is declared without "
+                     "'commonAlignmentFromSizeAtMost': it says where a common must state "
+                     "its alignment, which is asked only of a format whose commons a "
+                     "linker aligns by their size alone, so the declaration would never "
+                     "be read.");
+            } else if (*commonAlignmentEveryLinkerGivesAtMost > *commonAlignmentFromSizeAtMost) {
+                fail("/commonAlignmentEveryLinkerGivesAtMost",
+                     std::format("'commonAlignmentEveryLinkerGivesAtMost' ({}) exceeds "
+                                 "'commonAlignmentFromSizeAtMost' ({}): what EVERY linker "
+                                 "gives a common is never more than what one of them gives "
+                                 "it.",
+                                 *commonAlignmentEveryLinkerGivesAtMost,
+                                 *commonAlignmentFromSizeAtMost));
+            }
+        }
+        // P69 fold 3c (the review of the fix fold, A4): what a tentative definition
+        // too wide for a common becomes is read only where `admitsCommon` can
+        // refuse one — an OBJECT another linker reads, under a size rule. An image
+        // allocates every common itself.
+        // And where it CAN, it is required: a document whose objects another
+        // linker reads and that states the size rule says what a tentative
+        // definition too wide for a common is written as, or a unit's tentative
+        // definition would meet a question its document never answered.
+        if (!tentativeDefinitionBeyondCommonAlignment.has_value() && !image
+            && commonAlignmentFromSizeAtMost.has_value()) {
+            fail("/tentativeDefinitionBeyondCommonAlignment",
+                 "'commonAlignmentFromSizeAtMost' is stated on a document whose OBJECTS "
+                 "another linker reads, which must state "
+                 "'tentativeDefinitionBeyondCommonAlignment': a tentative definition wider "
+                 "than that rule lets a common of its size be is written as something "
+                 "else, and which is the document's to say.");
+        }
+        if (tentativeDefinitionBeyondCommonAlignment.has_value()
+            && (image || !commonAlignmentFromSizeAtMost.has_value())) {
+            fail("/tentativeDefinitionBeyondCommonAlignment",
+                 image ? "'tentativeDefinitionBeyondCommonAlignment' is declared on an "
+                         "IMAGE flavor: DSS's own link allocates every common of an image "
+                         "at the alignment its unit states, so no tentative definition is "
+                         "ever too wide for a common there and the declaration would never "
+                         "be read."
+                       : "'tentativeDefinitionBeyondCommonAlignment' is declared without "
+                         "'commonAlignmentFromSizeAtMost': only that rule makes a tentative "
+                         "definition too wide for a common, so the declaration would never "
+                         "be read.");
+        }
         // P69 fold 3: `weakDefinitionBesideStrong` is read where `commonYieldsTo`
         // is — by a link that sets one unit's weak definition beside another
         // unit's strong one — and for the same reason never from an archive

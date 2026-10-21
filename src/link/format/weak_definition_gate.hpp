@@ -183,4 +183,66 @@ requireWeakDefinitionDialect(AssembledModule const&    module,
         module, fmt, std::span<WeakDefinitionDialect const>{&spelled, 1}, where, reporter);
 }
 
+// ── A DEFINITION THAT IS THE ONE INSTANCE OF ITS NAME IN THE PROCESS ───────
+//    (P69 fold 3c)
+//
+// A row whose unit states it (`ModuleSymbol::oneInstancePerProcess` — g++'s
+// STB_GNU_UNIQUE inline variables, as the ELF reader reads them through its
+// document) is written with the binding the OUTPUT document states for it. Two
+// ways to get that wrong, two refusals by name (`K_SymbolBindingNotModelled`),
+// both before any byte:
+//   * the document states no such binding
+//     (`ObjectFormatSchema::oneInstancePerProcessReadAs`): written under a plain
+//     binding the definition is one instance per IMAGE, and a library loaded
+//     beside the program keeps a copy of its own;
+//   * the row's binding is not the one the document reads such a definition AS:
+//     written with the document's binding, the next read takes it for a
+//     definition it is not.
+// EVERY writer asks it — ELF, which spells the binding, and PE and Mach-O,
+// whose documents state none — so no writer drops the property in silence.
+[[nodiscard]] inline bool
+moduleStatesOneInstancePerProcess(AssembledModule const& module) noexcept {
+    for (auto const& s : module.symbols) {
+        if (s.oneInstancePerProcess) return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool
+requireOneInstancePerProcessSpelling(AssembledModule const&    module,
+                                     ObjectFormatSchema const& fmt,
+                                     std::string_view          where,
+                                     DiagnosticReporter&       reporter) {
+    auto const readAs = fmt.oneInstancePerProcessReadAs();
+    for (auto const& s : module.symbols) {
+        if (!s.oneInstancePerProcess) continue;
+        if (!readAs.has_value()) {
+            detail::emit(
+                reporter, DiagnosticCode::K_SymbolBindingNotModelled,
+                std::format(
+                    "{}: '{}' is a definition its unit states is the ONE instance "
+                    "of its name in the process (what g++ writes for a C++ inline "
+                    "variable or a template's static data member), and format "
+                    "'{}' states no binding that spells one. Refused rather than "
+                    "written under a plain binding, which would make it one "
+                    "instance per image.",
+                    where, s.name, fmt.name()));
+            return false;
+        }
+        if (s.binding != *readAs) {
+            detail::emit(
+                reporter, DiagnosticCode::K_SymbolBindingNotModelled,
+                std::format(
+                    "{}: '{}' is the one instance of its name in the process, "
+                    "bound '{}', and format '{}' reads such a definition as "
+                    "'{}'. Refused rather than written with a binding the next "
+                    "read takes for a definition it is not.",
+                    where, s.name, symbolBindingName(s.binding), fmt.name(),
+                    symbolBindingName(*readAs)));
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace dss::link::format

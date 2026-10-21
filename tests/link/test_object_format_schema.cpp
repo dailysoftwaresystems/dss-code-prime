@@ -3340,6 +3340,76 @@ TEST(ObjectFormatSchemaLoader, DynamicRelocationTypesRefusesEveryMalformedOrMisp
     for (auto const& c : kCases) expectRefusal(c);
 }
 
+// P69 fold 3c: `elf.uniqueBinding` — the binding of a definition of which a process holds ONE instance (g++'s
+// STB_GNU_UNIQUE), the OS ABI it requires, the binding a link reads it as. Stated whole or refused, each refusal in its
+// own words at its own pointer; every shipped ELF document states it (10, gnu, global), a PE or Mach-O one none.
+TEST(ObjectFormatSchemaLoader, UniqueBindingIsStatedWholeOrRefused) {
+    RefusalCase const kCases[] = {
+        {"not an object", "elf64-x86_64-linux",
+         [](nlohmann::json& d) { d["elf"]["uniqueBinding"] = 10; },
+         "/elf/uniqueBinding", "'uniqueBinding' must be an object"},
+        {"an unknown key", "elf64-x86_64-linux",
+         [](nlohmann::json& d) { d["elf"]["uniqueBinding"]["meaning"] = "unique"; },
+         "/elf/uniqueBinding/meaning", "unknown key 'meaning'"},
+        {"no value", "elf64-aarch64-linux-exec",
+         [](nlohmann::json& d) { d["elf"]["uniqueBinding"].erase("value"); },
+         "/elf/uniqueBinding/value", "'value' must be the st_info binding"},
+        {"a value every format shares", "elf64-x86_64-linux-dyn",
+         [](nlohmann::json& d) { d["elf"]["uniqueBinding"]["value"] = 1; },
+         "/elf/uniqueBinding/value", "'value' must be the st_info binding"},
+        {"a value past the field", "elf64-x86_64-linux",
+         [](nlohmann::json& d) { d["elf"]["uniqueBinding"]["value"] = 16; },
+         "/elf/uniqueBinding/value", "'value' must be the st_info binding"},
+        {"no OS ABI", "elf64-aarch64-linux",
+         [](nlohmann::json& d) { d["elf"]["uniqueBinding"].erase("osabi"); },
+         "/elf/uniqueBinding/osabi", "'osabi' must name the OS ABI the binding requires"},
+        {"an OS ABI no row names", "elf64-x86_64-linux-pie",
+         [](nlohmann::json& d) { d["elf"]["uniqueBinding"]["osabi"] = "plan9"; },
+         "/elf/uniqueBinding/osabi", "'osabi' must name the OS ABI the binding requires"},
+        {"read as local", "elf64-x86_64-linux",
+         [](nlohmann::json& d) { d["elf"]["uniqueBinding"]["readAs"] = "local"; },
+         "/elf/uniqueBinding/readAs", "Read as 'local', each unit's definition"},
+        {"no readAs", "elf64-x86_64-linux-staticlib",
+         [](nlohmann::json& d) { d["elf"]["uniqueBinding"].erase("readAs"); },
+         "/elf/uniqueBinding/readAs", "'readAs' must be 'global' or 'weak'"},
+    };
+    for (auto const& c : kCases) expectRefusal(c);
+    for (char const* arch : {"x86_64", "aarch64"}) {
+        for (char const* flavour : {"", "-staticlib", "-exec", "-pie", "-dyn"}) {
+            std::string const stem = std::string{"elf64-"} + arch + "-linux" + flavour;
+            SCOPED_TRACE(stem);
+            auto const doc = ObjectFormatSchema::loadShipped(stem);
+            ASSERT_TRUE(doc.has_value());
+            auto const& stated = (*doc)->elf().uniqueBinding;
+            ASSERT_TRUE(stated.has_value()) << "every ELF document states the binding g++ writes";
+            EXPECT_EQ(stated->value, 10u);
+            EXPECT_EQ(stated->osabi, 3u);
+            EXPECT_EQ(stated->readAs, SymbolBinding::Global);
+            EXPECT_EQ((*doc)->oneInstancePerProcessReadAs(), std::optional<SymbolBinding>{SymbolBinding::Global});
+        }
+    }
+    {
+        // The LOADER relates the binding to no header: a document whose header states another OS ABI loads with its
+        // statement whole, as both reference linkers read the binding whatever an object's header states, and its writer
+        // writes the binding under that header, as ld.lld does
+        // (`OneInstancePerProcess.ARelocatableLinkWritesTheDocumentsBindingBackAndRefusesWhereItCannot`). It is read
+        // AFTER the shipped documents: a shipped document that states no binding is named by their check, not here.
+        SCOPED_TRACE("a header that states another OS ABI");
+        auto const text = mutatedDocument("elf64-x86_64-linux", [](nlohmann::json& d) { d["elf"]["osabi"] = "freebsd"; });
+        ASSERT_FALSE(text.empty());
+        auto const r = ObjectFormatSchema::loadFromText(text, "elf64-x86_64-linux");
+        ASSERT_TRUE(r.has_value()) << rejectSummary(r);
+        EXPECT_EQ((*r)->elf().osabi, 9u);
+        ASSERT_TRUE((*r)->elf().uniqueBinding.has_value());
+        EXPECT_EQ((*r)->elf().uniqueBinding->osabi, 3u);
+    }
+    for (char const* stem : {"pe64-x86_64-windows", "macho64-arm64-darwin"}) {
+        auto const doc = ObjectFormatSchema::loadShipped(stem);
+        ASSERT_TRUE(doc.has_value()) << stem;
+        EXPECT_FALSE((*doc)->oneInstancePerProcessReadAs().has_value()) << stem << " states no such binding";
+    }
+}
+
 TEST(ObjectFormatSchemaLoader, TheRetiredPltNativeIdIsRefusedAsInertConfig) {
     // P69 retired `pltNativeId` (a second wire id on a row, the way ELF x86_64's
     // PC32 row once stood for calls too): a call is a row of its own, `isCall`.

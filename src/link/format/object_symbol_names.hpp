@@ -374,6 +374,23 @@ public:
         return SymbolVisibility::Default;
     }
 
+    // ── Whether the DEFINED symbol is the ONE instance of its name in the
+    //    process (P69 fold 3c) ──────────────────────────────────────────────
+    // The fourth answer of the lockstep, for the row `definedBinding` answers
+    // for: same lookup, same predicate, so a name carved to `<prefix><id>` and
+    // `Local` is no such instance. A writer spells it with the binding its
+    // document states (`ModuleSymbol::oneInstancePerProcess`); an ALIAS carries
+    // its own (`definedAliases` yields the rows).
+    [[nodiscard]] bool
+    definedOneInstancePerProcess(SymbolId id) const {
+        if (auto const it = definedBySym_.find(id.v); it != definedBySym_.end()) {
+            if (hasExternalLinkage(*it->second) && !bytesUnderTheirOwnRecord_.contains(id.v)) {
+                return it->second->oneInstancePerProcess;
+            }
+        }
+        return false;
+    }
+
     // Every ADDITIONAL name bound to `id` beyond the canonical one, in
     // `module.symbols` order, each carrying its OWN binding.
     // D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB.

@@ -1819,9 +1819,11 @@ TEST(MachOFormatJson, Arm64ObjectDeclaresDataSectionRows) {
     EXPECT_EQ(bss->type, 1u);                // S_ZEROFILL
 }
 
-// (6) A reloc-bearing RODATA item stays fail-loud (allow=false — the
-// RodataDataItemWithRelocationFailsLoud discipline shared with ELF): a
-// relocated slot cannot live in never-written `__TEXT,__const`.
+// (6) A reloc-bearing RODATA item stays fail-loud (allow=false): Mach-O's
+// object reader puts a read-only item that carries relocations in relro
+// (`__DATA,__const`), so this writer is never handed one and refuses it,
+// naming that rule. (ELF's reader does produce one — a jump table — and the
+// ELF writers take it: ElfExecWriter.RodataDataItemWithRelocationIsPatchedInPlace.)
 TEST(MachOWriter, Arm64ObjectRodataItemWithRelocationFailsLoud) {
     auto loaded = loadShippedArm64();
     AssembledModule mod;

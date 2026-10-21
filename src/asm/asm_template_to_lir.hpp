@@ -866,6 +866,12 @@ lowerAsmTemplateToLirRun(Tree const&                        templateTree,
                          std::span<AsmOperandBinding const> bindings,
                          LirBuilder&                        builder,
                          DiagnosticReporter&                reporter,
+                         // ★★ THE EMBEDDING PROGRAM'S NAMES (the class above). Null
+                         // ⇒ the caller hands none, and every name of the program
+                         // the template writes is REFUSED by name, saying so —
+                         // never imported, never guessed. NO DEFAULT: every caller
+                         // states which it does.
+                         AsmTemplateProgramNames*           programNames,
                          std::span<AsmLabelBinding const>   labelBindings = {},
                          // ★ THE TEMPLATE'S OWN LABELS (P68 round 8): every label
                          // it defines is a block created in `builder` (in text
@@ -882,11 +888,6 @@ lowerAsmTemplateToLirRun(Tree const&                        templateTree,
                          // nullopt ⇒ the caller states no format, and every such
                          // operator is refused by name rather than read under a
                          // guessed one.
-                         std::optional<ObjectFormatKind>    formatKind = std::nullopt,
-                         // ★★ THE EMBEDDING PROGRAM'S NAMES (the class above). Null
-                         // ⇒ the caller hands none, and every name of the program
-                         // the template writes is REFUSED by name, saying so —
-                         // never imported, never guessed.
-                         AsmTemplateProgramNames*           programNames = nullptr);
+                         std::optional<ObjectFormatKind>    formatKind = std::nullopt);
 
 } // namespace dss

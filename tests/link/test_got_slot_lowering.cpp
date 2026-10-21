@@ -592,10 +592,10 @@ targetWithGotRows(std::string const& rows) {
       "target": {"name":"x86_64-got-twins"},
       "opcodes": [ {"mnemonic":"invalid","result":"none"} ],
       "relocations": [
-        { "name":"rel32", "kind":1, "formula":"linear", "pcRelative":true, "addendBias":-4, "widthBytes":4 },
+        { "name":"rel32", "kind":1, "formula":"linear", "pcRelative":true, "addendBias":-4, "widthBytes":4, "fieldRange":"signed" },
         { "name":"abs64", "kind":2, "formula":"linear", "pcRelative":false, "addendBias":0, "widthBytes":8 },
-        { "name":"pcrel32", "kind":5, "formula":"linear", "pcRelative":true, "addendBias":0, "widthBytes":4 },
-        { "name":"riprel32", "kind":8, "formula":"linear", "pcRelative":true, "addendBias":-4, "widthBytes":4 })"}
+        { "name":"pcrel32", "kind":5, "formula":"linear", "pcRelative":true, "addendBias":0, "widthBytes":4, "fieldRange":"signed" },
+        { "name":"riprel32", "kind":8, "formula":"linear", "pcRelative":true, "addendBias":-4, "widthBytes":4, "fieldRange":"signed" })"}
         + rows + R"(
       ]
     })");
@@ -639,7 +639,7 @@ TEST(GotSlotLowering, AGotRowMustNameATwinThatHasItsArithmetic) {
 
     // (d) A row that addresses no slot names no twin.
     auto const stray = targetWithGotRows(
-        R"(, { "name":"abs32", "kind":3, "formula":"linear", "pcRelative":false, "addendBias":0, "widthBytes":4, "gotSlotTwin":"pcrel32" })");
+        R"(, { "name":"abs32", "kind":3, "formula":"linear", "pcRelative":false, "addendBias":0, "widthBytes":4, "fieldRange":"unsigned", "gotSlotTwin":"pcrel32" })");
     ASSERT_FALSE(stray.has_value()) << "a twin nothing reads is refused";
     EXPECT_NE(loadErrors(stray).find("abs32"), std::string::npos) << loadErrors(stray);
 

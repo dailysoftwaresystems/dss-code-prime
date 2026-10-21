@@ -35,6 +35,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/alignment.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/format/unwind_pointer_reloc.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "program/program.hpp"
@@ -366,6 +367,39 @@ constexpr std::size_t   kFramedTailAt  = 7;
     m.symbols.push_back(ModuleSymbol{SymbolId{2}, "decoy", SymbolBinding::Global,
                                      SymbolVisibility::Default});
     m.userEntrySymbol = SymbolId{1};
+    return m;
+}
+
+// The guarded unit above as a FOREIGN object brings it (P69 fold 3c): the scope
+// table is not `sehScopes` but the data of a carried handler (`LanguageHandler`),
+// four image-relative addresses the unit's relocations state — its own range, its
+// filter funclet, its `__except` body — read by the routine, never by DSS. The
+// routine's import is not eager, as the COFF reader states it: the handler field
+// is its only use.
+[[nodiscard]] AssembledModule makeCarriedUnit(std::uint32_t cu, char which, std::uint32_t funcletId,
+                                              std::uint32_t personalityId, RelocationKind imageRelative) {
+    AssembledModule m = makeGuardedUnit(cu, which, funcletId, personalityId);
+    AssembledFunction& carrying = m.functions.front();
+    carrying.sehScopes.clear();
+    LanguageHandler handler;
+    handler.personality    = SymbolId{personalityId};
+    handler.exceptionPhase = true;
+    handler.data           = Bytes(20, 0x00);
+    handler.data[0]        = 0x01;   // one scope record: {Begin, End, Handler, JumpTarget}
+    auto const address = [&](std::uint32_t at, std::uint32_t target, std::int64_t addend) {
+        Relocation rel;
+        rel.offset = at;
+        rel.target = SymbolId{target};
+        rel.kind   = imageRelative;
+        rel.addend = addend;
+        handler.relocations.push_back(rel);
+    };
+    address(4, 1, kGuardedBegin);
+    address(8, 1, kGuardedEnd);
+    address(12, funcletId, 0);
+    address(16, 1, kExceptBody);
+    carrying.languageHandler = std::move(handler);
+    for (auto& e : m.externImports) e.isEagerImport = false;
     return m;
 }
 
@@ -742,6 +776,76 @@ TEST(MergeSehScopes, TwoGuardedUnitsShareThePersonalityAndKeepTheirOwnFunclets) 
     EXPECT_EQ(a.handlerRva, b.handlerRva)
         << "the two units' rows of the personality are ONE import of the image, so both "
            "handler fields hold the one thunk's address";
+}
+
+// ── A CARRIED handler through the merge (P69 fold 3c) ────────────────────────
+//
+// THE PROPERTY: a function a foreign object brought with its handler reaches the
+// image naming ITS routine, and its handler's data naming ITS OWN range, ITS filter
+// and ITS `__except` body, whatever numbers its unit gave them. The merge renumbers
+// the routine as a scope's personality and each address of the data as a data
+// item's relocation; the extern gate counts the routine's one use; the PE writer
+// writes the field and the data with an image-relative patch per address. The
+// sweep is the one above, for the reason given there.
+TEST(MergeSehScopes, ACarriedHandlerNamesItsRoutineAndItsDataAddressesWhateverNumbersItsUnitGaveThem) {
+    Loaded const L = loadShippedPair("x86_64", "pe64-x86_64-windows-exec");
+    ASSERT_NE(L.target, nullptr);
+    ASSERT_NE(L.format, nullptr);
+    std::string relocErr;
+    auto const* imageRelative = link::format::unwindPointerRelocationOf(
+        *L.target, link::format::kWin64RuntimeFunctionPointerField, relocErr);
+    ASSERT_NE(imageRelative, nullptr) << relocErr;
+
+    std::size_t links = 0, right = 0;
+    std::vector<std::string> firstWrong;
+    for (bool const carriedFirst : {true, false}) {
+        for (std::uint32_t funcletId = 2; funcletId <= 9; ++funcletId) {
+            for (std::uint32_t personalityId = 2; personalityId <= 9; ++personalityId) {
+                if (personalityId == funcletId) continue;
+                std::vector<AssembledModule> mods;
+                if (carriedFirst) {
+                    mods.push_back(makeCarriedUnit(1, 'A', funcletId, personalityId, imageRelative->kind));
+                    mods.push_back(makeProgramEntryWithDecoys(2));
+                } else {
+                    mods.push_back(makeProgramEntryWithDecoys(1));
+                    mods.push_back(makeCarriedUnit(2, 'A', funcletId, personalityId, imageRelative->kind));
+                }
+                DiagnosticReporter rep;
+                LinkedImage const img = linker::link(std::span<AssembledModule const>{mods},
+                                                     *L.target, *L.format, rep);
+                ++links;
+                std::string wrong;
+                if (!img.ok()) {
+                    wrong = "REFUSED" + diagnosticsOf(rep);
+                } else if (auto const view = viewPe(img.bytes); !view.has_value()) {
+                    wrong = "linked, and the artifact is not a PE32+ image";
+                } else {
+                    ScopeReading const r = readScope(img.bytes, *view, 'A', "A");
+                    if (!r.read) {
+                        wrong = "linked, and " + r.why;
+                    } else if (!r.rangeRight) {
+                        wrong = "LINKED with no diagnostic, and the data's range is not the function's own";
+                    } else if (!r.filterRight || !r.handlerRight) {
+                        wrong = "LINKED with no diagnostic, and the data's filter is " + r.filterIs
+                              + "; the handler field reaches " + r.handlerIs;
+                    }
+                }
+                if (wrong.empty()) {
+                    ++right;
+                } else if (firstWrong.size() < 6) {
+                    firstWrong.push_back(std::string{carriedFirst ? "carrying unit first" : "carrying unit second"}
+                                         + ", funclet #" + std::to_string(funcletId) + ", routine #"
+                                         + std::to_string(personalityId) + ": " + wrong);
+                }
+            }
+        }
+    }
+    std::string firsts;
+    for (auto const& line : firstWrong) firsts += "\n  " + line;
+    EXPECT_EQ(right, links)
+        << "a carried handler must name its own routine, and its data its own range and its filter, "
+           "whatever numbers its unit gave them. Of "
+        << links << " labellings, " << (links - right) << " did not. The first of them:" << firsts;
 }
 
 // ── Through the PROGRAM: regions beside a member the archive search pulls ────

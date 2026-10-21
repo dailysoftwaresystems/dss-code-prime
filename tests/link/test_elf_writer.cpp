@@ -1051,6 +1051,54 @@ TEST(ElfWriter, RelRoConstDataItemEmitsDataRelRoSectionAndRelaDataRelRo) {
     EXPECT_TRUE(sawVtable) << "the relro data global must have a .symtab entry";
 }
 
+// D-LK1-ELF-RODATA-DATAITEM-RELOC (closed in P69 fold 3c): a READ-ONLY item carrying its own relocation — gcc's
+// jump table, as the ELF reader reads it (`.rodata`, `R_X86_64_PC32 .text.<f> + offset`) — is written to `.rodata`
+// with its relocations in a `.rela.rodata` of its own, `sh_info` naming `.rodata`, as gcc writes it. Until fold 3c the
+// relocatable arm refused it, and a DSS `-r` of any gcc object with a jump table was refused (MEASURED 2026-10-20 on
+// the tracked jump-table pair).
+TEST(ElfWriter, RodataItemWithRelocationsWritesItsOwnRelaRodata) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);   // one `ret` fn, sym 1
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};
+    d.alignment = Alignment::of<8>();
+    Relocation r;
+    r.offset = 0;
+    r.target = SymbolId{1};
+    r.kind   = RelocationKind{2};    // abs64 → R_X86_64_64
+    r.addend = 0;
+    d.relocations.push_back(r);
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << "a read-only item with a relocation is written, not refused";
+    ASSERT_FALSE(bytes.empty());
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    int const rodataIdx = findSectionByName(bytes, ".rodata");
+    ASSERT_GE(rodataIdx, 0);
+    EXPECT_EQ(readU64LE(bytes, shoff + rodataIdx * 64 + 8), 2u) << "SHF_ALLOC only: `.rodata` stays read-only";
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const relaIdx   = findSectionByName(bytes, ".rela.rodata");
+    ASSERT_GE(symtabIdx, 0);
+    ASSERT_GE(relaIdx, 0) << ".rela.rodata must be emitted";
+    EXPECT_EQ(readU32LE(bytes, shoff + relaIdx * 64 + 4), 4u) << "SHT_RELA";
+    EXPECT_EQ(static_cast<int>(readU32LE(bytes, shoff + relaIdx * 64 + 40)), symtabIdx) << "sh_link names .symtab";
+    EXPECT_EQ(static_cast<int>(readU32LE(bytes, shoff + relaIdx * 64 + 44)), rodataIdx)
+        << "sh_info names .rodata";
+    std::uint64_t const relaOff  = readU64LE(bytes, shoff + relaIdx * 64 + 24);
+    ASSERT_EQ(readU64LE(bytes, shoff + relaIdx * 64 + 32), 24u) << "exactly one Elf64_Rela";
+    EXPECT_EQ(readU64LE(bytes, relaOff + 0), 0u) << "r_offset = 0";
+    std::uint64_t const rInfo = readU64LE(bytes, relaOff + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo), 1u) << "R_X86_64_64";
+    std::uint32_t const relSymIdx = static_cast<std::uint32_t>(rInfo >> 32);
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + symtabIdx * 64 + 24);
+    EXPECT_EQ(readU16LE(bytes, symtabOff + relSymIdx * 24 + 6), 1u) << "the relocation names the function (.text)";
+}
+
 TEST(ElfWriter, RelRoConstDataRelocIsMachineAgnosticOnAarch64) {
     // AGNOSTIC pin: the SAME machine-neutral ELF ET_REL writer emits the relro
     // reloc for arm64 with the arm64 native id — R_AARCH64_ABS64 (257), read from

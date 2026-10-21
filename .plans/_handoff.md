@@ -594,6 +594,32 @@ round's close; each checkpoint's commit message says what was and was not run on
   macros predefined without `<windows.h>`, GNU nested functions, GNU local labels — and the release-unit fixpoint
   warning that tells a third of release compiles to raise a cap the design fixes), and the corpus's four probes added
   to the existing open row on a string literal after a declarator (`D-CSUBSET-EXTERN-LIBRARY-SYNTAX-IS-NOT-VALID-C`).
+  ✔MEASURED from the main checkout (2026-10-21), the whole suite of checkpoint 31 on all five legs: passed 2846 on
+  each of linux-x86_64-debug, linux-arm64-debug, macos-arm64-debug, windows-x86_64-debug (MinGW-w64) and
+  windows-x86_64-release (MSVC) — the seven App Execution Alias reds and the Mac's Python floor are gone. Of the
+  lane's arms swept from main: the 13 on macos-arm64-debug — 11 `passed`, 2 `violated` (a declared case count; a
+  mutant that also decides a FIFO case), back with the lane; `D-PP-HEADER-CASE-DANGLING-SYMLINK-ASYMMETRY` CLOSED on its
+  three arms; the 15 Windows arms were not admitted (both heavy slots held by a lane's finals for the hour) and are
+  swept after the lane's next fold, which changes their sites. Its review: SEND BACK, 14 findings (1 MAJOR: the guard
+  sees only part of the class — walks, removals, `is_symlink` / `equivalent` / `relative`, every spelling, and
+  `integrated_tests/`), in that lane's fold H4b with the release-unit fixpoint row.
+- **Checkpoint 32 (2026-10-21) = the link lane's fold 3c**: a 32-bit absolute relocation's field is range-checked by
+  the kind the target document states (signed or unsigned), never as signed for every kind; a data word's relocation
+  kind is the one the reference assembler picks, not the first declared; the relocation types the reference compilers
+  emit for C are declared; ELF's `STB_GNU_UNIQUE` is read as one instance per process under any header OS ABI (as
+  ld.lld reads and writes it) and section groups are written back; the COFF reader honours the relocation-count
+  overflow and takes an untyped undefined symbol as pending until its definition says what it is; every unwind form a
+  reference compiler writes into a PE object, and its language handler, is carried into the image (the ELF and
+  Mach-O half is the lane's fold 3d); a foreign object named on the command line binds its library imports; the unit
+  linker lets an unused declaration of a discarded name through the reference gate, as the merged route does; the
+  `ar` reader takes the COFF longnames member. Six rows born CLOSED (the base's debt, three of them P0), two NEW
+  DISCLOSED (the PE platform runtime's `__chkstk` and `/GS` routines, the harness lane's fold H5), one reopened (it
+  closes on its sweep). ✔MEASURED by the lane on its final bytes, one invocation: windows-x86_64-debug and
+  windows-x86_64-release 2875 of 2877 (the two reds the anchor guards naming the six ids this commit applies),
+  macos-arm64-debug and linux-arm64-debug 2855 of 2855. Folded onto checkpoint 31 with the arm registry SETTLED by the
+  orchestrator: the tool's by-arm merge reported a conflict on an arm both sides held byte-equal (a section header
+  that had moved off it), so the lane's copy was proved to be main's registry plus only the lane's own deltas
+  (1024 arms, 0 out of order) before it was taken.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -644,16 +670,22 @@ round's close; each checkpoint's commit message says what was and was not run on
   The library lane's next fold, first items: a folded constant states its C type, and braces are stepped through
   only for a scalar's initializer.
 - **FOUND THIS ROUND, NOT YET IN MAIN — the BASE's debt each lane found while closing rows and is closing in its next
-  fold** (each ✔MEASURED against the references; the lane's fold names its rows): SILENT miscompiles — a 32-bit
-  absolute relocation range-checked as signed for every kind (`R_X86_64_32` with −1 linked as 0xffffffff); arm64
-  `.long main` assembled as a branch relocation; two g++ objects' `inline` variable kept as TWO objects (STB_GNU_UNIQUE
-  read as local); a parenthesised name that an inner tag or a later declarator hides read as a CAST through an outer
-  typedef (`(T) - 2` runs −2 where the references run 42); `case 0, 42:` and `case y:` compiled without a diagnostic
-  (the comma's right operand; a run-time compare); a tentative `__declspec(dllimport) int x;` made a DEFINITION where
-  the references import. P0 — any foreign object named on DSS's command line bound no library import; a parenthesised
-  call chain parsed in time exponential in its depth. LOUD — every foreign PE object's unwind information dropped (a
-  `__try` object linked and crashed); the PE platform runtime has no `__chkstk` and no `/GS` family; `typeof` of a
-  variable-length array not lowered; no attribute may lead a block-scope `extern`.
+  fold** (each ✔MEASURED against the references; the lane's fold names its rows). IN MAIN SINCE CHECKPOINT 32 (the
+  link lane's 3c): the 32-bit relocation range, arm64 `.long main`, the g++ `inline` variable kept as two objects, the
+  foreign object that bound no library import (P0), every foreign PE object's unwind information dropped. STILL IN THE
+  LANES — SILENT miscompiles: a name used in a block BEFORE the block declares its own binds to the LATER declaration
+  (`int r = y; int y = 2;` under a file-scope `y = 40` runs 2, not 42, at checkpoint 31 — P0, the C front end lane's
+  fold f26c, on the order-aware test the library lane's L2a adds for type names); `sizeof` of an operand of
+  variable-length-array type skips the operand's side effects (`sizeof v[k++]` over a 2-D VLA leaves k alone: 10 forms
+  wrong at checkpoint 31 — the library lane's L2a); a parenthesised name that an inner tag or a later declarator
+  hides read as a CAST through an outer typedef (`(T) - 2` runs −2 where the references run 42); `case 0, 42:` and
+  `case y:` compiled without a diagnostic (the comma's right operand; a run-time compare); a tentative
+  `__declspec(dllimport) int x;` made a DEFINITION where the references import. P0 — a parenthesised call chain
+  parsed in time exponential in its depth, and past a binding speculation-depth ceiling ANY such chain is (the
+  library lane's L2a). LOUD — the PE platform runtime has no `__chkstk` and no `/GS` family (H5); `typeof` of a
+  variable-length array not lowered; no attribute may lead a block-scope `extern`; a shared library holding only data
+  (DLL, `.so`, `.dylib`) refused as "an exec with no instructions" on all three formats (the link lane's 3d); a call
+  to an undeclared function (C89's implicit declaration, which every reference still compiles) — f26c.
 - **Arm sweeps from the main checkout so far:** the registry held 502 arms at checkpoint 17 (606 at checkpoint 22).
   The sweep of 340 owed arms at checkpoint 20 (2026-10-15, `macos-arm64-debug`): 155 `passed`; 158 `violated`,
   18 `survived`, 6 `unattributed`, and 3 `stopped` because their runner's unmutated binary had a red in the worker

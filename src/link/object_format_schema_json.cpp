@@ -25,6 +25,7 @@
 #include <span>     // the per-ARM key vocabularies are selected as spans
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>   // the root key vocabulary is a UNION built at load time
@@ -432,7 +433,17 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // that states none — its size rounded up to a power of two, at most this
     // (`CommonsStatement`). OPTIONAL: stated by the four PE documents, whose
     // commons state their alignment only by a directive one linker ignores.
-    static constexpr std::array<std::string_view, 55> kFormatDocumentKeys{
+    // 55 -> 57 (P69 fold 3c, lane `xa`, the review of the fix fold, A1 and A4):
+    // `commonAlignmentFromSizeAtMost` is now what a linker that IGNORES that
+    // directive gives (link.exe, 32), and `commonAlignmentEveryLinkerGivesAtMost`
+    // what EVERY linker gives a common that states none (GNU ld's cap, 4) — above
+    // it the writer states the alignment; and
+    // `tentativeDefinitionBeyondCommonAlignment`, what a tentative definition
+    // wider than a common may be is written as in an object another linker reads
+    // (`TentativeBeyondCommonAlignment`). OPTIONAL: the first stated by the four
+    // PE documents, the second by the two PE object documents; the PE backend
+    // refuses a PE document that states commons without them.
+    static constexpr std::array<std::string_view, 57> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -554,10 +565,12 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // unstated, which a link then refuses only when a common meets a weak
         // definition of its name
         "commonYieldsTo",
-        // the alignment every linker gives a common that states none — a typo
-        // would leave the document unstated, and an over-aligned tentative
-        // definition would be written as a common a linker misaligns in silence
-        "commonAlignmentFromSizeAtMost",
+        // the two alignments a COFF common that states none is given, and what a
+        // tentative definition wider than a common may be becomes — a typo would
+        // leave the document unstated, which the PE backend refuses at load
+        // (an unstated rule once wrote a common a linker misaligns in silence)
+        "commonAlignmentFromSizeAtMost", "commonAlignmentEveryLinkerGivesAtMost",
+        "tentativeDefinitionBeyondCommonAlignment",
         // what becomes of a definition whose name another definition wins — a
         // typo would leave the document unstated, which a link then refuses only
         // when a relocation names such a definition
@@ -4351,17 +4364,41 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
-    // commonAlignmentFromSizeAtMost — the alignment every linker gives a COMMON
-    // that states none (`CommonsStatement`). OPTIONAL; a power of two.
-    if (doc.contains("commonAlignmentFromSizeAtMost")) {
-        auto const& v = doc.at("commonAlignmentFromSizeAtMost");
+    // commonAlignmentFromSizeAtMost — the alignment a linker that ignores a
+    // COMMON's stated alignment gives it — and commonAlignmentEveryLinkerGivesAtMost
+    // — the alignment every linker gives one that states none
+    // (`CommonsStatement`). OPTIONAL; each a power of two.
+    for (auto const& [key, slot, what] :
+         {std::tuple{"commonAlignmentFromSizeAtMost", &data.commonAlignmentFromSizeAtMost,
+                     "the most bytes of alignment a linker that ignores a common's stated "
+                     "alignment gives it"},
+          std::tuple{"commonAlignmentEveryLinkerGivesAtMost", &data.commonAlignmentEveryLinkerGivesAtMost,
+                     "the most bytes of alignment every linker gives a common that states none"}}) {
+        if (!doc.contains(key)) continue;
+        auto const& v = doc.at(key);
         std::uint64_t const n = v.is_number_unsigned() ? v.get<std::uint64_t>() : 0u;
         if (n == 0u || (n & (n - 1u)) != 0u) {
-            coll.emit(DiagnosticCode::C_MalformedJson, "/commonAlignmentFromSizeAtMost",
-                      "expected a power of two: the most bytes of alignment every linker "
-                      "gives a common that states none");
+            coll.emit(DiagnosticCode::C_MalformedJson, std::string{"/"} + key,
+                      std::string{"expected a power of two: "} + what);
         } else {
-            data.commonAlignmentFromSizeAtMost = n;
+            *slot = n;
+        }
+    }
+
+    // tentativeDefinitionBeyondCommonAlignment — what a tentative definition
+    // wider than a common may be is written as in an object another linker reads
+    // (`TentativeBeyondCommonAlignment`). OPTIONAL.
+    if (doc.contains("tentativeDefinitionBeyondCommonAlignment")) {
+        auto const& v = doc.at("tentativeDefinitionBeyondCommonAlignment");
+        auto const beyond = v.is_string()
+                                ? kTentativeBeyondCommonAlignmentTable.fromName(v.get<std::string>())
+                                : std::nullopt;
+        if (!beyond.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/tentativeDefinitionBeyondCommonAlignment",
+                      std::format("expected one of: {}",
+                                  allowedList(allNames(kTentativeBeyondCommonAlignmentTable), ", ")));
+        } else {
+            data.tentativeDefinitionBeyondCommonAlignment = *beyond;
         }
     }
 

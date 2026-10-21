@@ -148,8 +148,8 @@ struct Run {
             labelBlocks.push_back(block);
             labelBindings.push_back(AsmLabelBinding{s, block});
         }
-        run.ok = lowerAsmTemplateToLirRun(*tree, *dialect, *run.target, bindings, builder, rep, labelBindings,
-                                          nullptr, kind, names);
+        run.ok = lowerAsmTemplateToLirRun(*tree, *dialect, *run.target, bindings, builder, rep, names,
+                                          labelBindings, nullptr, kind);
         if (run.ok) {
             auto const retOp = run.target->opcodeByMnemonic("ret");
             if (!retOp.has_value()) throw std::runtime_error{"the target has no `ret`"};
@@ -274,7 +274,8 @@ TEST(AsmTemplateProgramNames, AnAsmGotoLabelIsNeverAProgramNameInAnAddressOrACal
 }
 
 // A constant added to a FUNCTION the unit defines is refused, as in a `.s`; added to data it is the
-// symbol plus the constant.
+// symbol plus the constant — CARRIED in the relocation's addend, read against the same template without
+// the constant (the control: whatever bias the ISA folds into a RIP-relative field, the two differ by 4).
 TEST(AsmTemplateProgramNames, AConstantAddedToADefinedFunctionIsRefusedAndToDataIsCarried) {
     auto names = aUnitDefiningGAndF();
     auto const code = lower(kX86, "leaq f+4(%%rip), %0", &names, ObjectFormatKind::Elf);
@@ -286,6 +287,17 @@ TEST(AsmTemplateProgramNames, AConstantAddedToADefinedFunctionIsRefusedAndToData
     ASSERT_TRUE(data.parsed) << data.messages;
     ASSERT_TRUE(data.ok) << data.messages;
     EXPECT_EQ(data.targets(), (std::vector<std::uint32_t>{77u})) << data.messages;
+
+    auto const control = lower(kX86, "leaq g(%%rip), %0", &names, ObjectFormatKind::Elf);
+    ASSERT_TRUE(control.parsed) << control.messages;
+    ASSERT_TRUE(control.ok) << control.messages;
+    ASSERT_EQ(control.relocations.size(), 1u) << control.messages;
+    ASSERT_EQ(data.relocations.size(), 1u) << data.messages;
+    EXPECT_EQ(data.relocations[0].addend - control.relocations[0].addend, 4)
+        << "`g+4` must reach the relocation as `g`'s addend plus 4 (control addend "
+        << control.relocations[0].addend << ", `g+4`'s " << data.relocations[0].addend
+        << "): a constant dropped here addresses `g` itself";
+    EXPECT_EQ(data.relocations[0].kind, control.relocations[0].kind) << "the constant changes no relocation kind";
 }
 
 // ══ no names handed in: every name of the program is REFUSED, loudly, by name ═══════════════════════════

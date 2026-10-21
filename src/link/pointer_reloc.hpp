@@ -19,16 +19,17 @@ namespace dss::linker {
 // round 11: the first two had each spelled `widthBytes == 8 && !pcRelative`
 // for themselves, without the two exclusions), and — since P69 — the PE
 // writer's loader-bound import slots (design c2), which used to re-spell it.
+//
+// ★ P69 fold 3c: THE PREDICATE MOVED INTO CORE, with the assembler's twin of it.
+// Since `fieldRange` a target may declare several 4-byte absolute rows (x86_64:
+// `abs32`, `abs32s`, `addr32`), so "the first Linear absolute row of that width"
+// stopped being an answer; `addressSlotRelocationKind` (core/types/
+// target_schema.hpp) picks by RANGE, and both this scan and the assembler's
+// `absoluteRelocKind` ask it, so the two can no longer disagree.
 [[nodiscard]] inline std::optional<RelocationKind>
 absolutePointerRelocKind(TargetSchema const& targetSchema,
                          std::uint8_t        widthBytes) {
-    for (auto const& r : targetSchema.relocations()) {
-        if (r.formulaKind == RelocFormulaKind::Linear && r.widthBytes == widthBytes
-            && !r.pcRelative && !r.tls && !r.imageRelative) {
-            return r.kind;
-        }
-    }
-    return std::nullopt;
+    return addressSlotRelocationKind(targetSchema.relocations(), widthBytes);
 }
 
 }  // namespace dss::linker

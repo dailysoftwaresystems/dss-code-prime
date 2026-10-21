@@ -1189,10 +1189,15 @@ bindBlockSymbol(AssembledFunction& outFn, std::uint32_t lirBlockV,
 // re-review of fold 3b, MAJOR 1; `CommonsStatement::admitsCommon`): on COFF a
 // common states its alignment only by `-aligncomm:`, which link.exe ignores, so
 // `_Alignas(64) int v;` written as a common lands at 4 under it — in silence —
-// where the definition cl and clang-msvc write lands at 64 under every linker
-// (✔MEASURED 2026-10-15). The definition it keeps is the item and the row as
-// built. Only where the unit's OBJECT reaches another linker: under an image
-// document DSS's own link allocates the common at its stated alignment.
+// where a definition lands at 64 under every linker (✔MEASURED 2026-10-15).
+// WHICH definition is the document's (`CommonsStatement::beyondTheRule`, P69
+// fold 3c — the review of the fix fold, A4): `select-any` makes the row a weak
+// definition of that kind, which the PE writer spells as a COMDAT `.bss` section
+// at the item's alignment, so two units' copies fold under link.exe, lld-link and
+// GNU ld as MinGW gcc's commons do, aligned (✔MEASURED 2026-10-20); `definition`
+// keeps the item and the row as built. Only where the unit's OBJECT reaches
+// another linker: under an image document DSS's own link allocates the common at
+// its stated alignment.
 // ⓘ Each table is indexed ONCE and the converted globals leave both in one pass
 // each (the re-review, NIT 8: a find and a count per global, then an erase, was
 // quadratic in a module of many tentative definitions).
@@ -1249,9 +1254,31 @@ stateTentativeDefinitionsAsCommons(Mir const& mir, AssembledModule& assembled,
                                     rows));
             return false;
         }
-        // Wider than every linker gives a common of its size: it stays the
-        // definition it is (see the docblock).
-        if (!commons.admitsCommon(item->reservedSize, item->alignment.bytes())) continue;
+        // Wider than every linker gives a common of its size: the definition the
+        // document says it is (see the docblock).
+        if (!commons.admitsCommon(item->reservedSize, item->alignment.bytes())) {
+            if (!commons.beyondTheRule.has_value()) {
+                // The PE backend refuses such a document (`validateIdentity`); a
+                // schema built around it is refused here, by the key's name.
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "the tentative definition '{}' ({} bytes, aligned {}) is wider than a "
+                    "common of its size may be in this format's objects, and the document "
+                    "states no 'tentativeDefinitionBeyondCommonAlignment' to say what it is "
+                    "written as instead",
+                    row->name, item->reservedSize, item->alignment.bytes());
+                reporter.report(std::move(d));
+                return false;
+            }
+            if (*commons.beyondTheRule == TentativeBeyondCommonAlignment::SelectAny) {
+                ModuleSymbol& mutableRow = assembled.symbols[rowIt->second.at];
+                mutableRow.binding  = SymbolBinding::Weak;
+                mutableRow.weakKind = WeakDefinitionKind::SelectAny;
+            }
+            continue;
+        }
         ExternImport common;
         common.symbol           = sym;
         common.mangledName      = row->name;
@@ -1795,15 +1822,20 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         globalsLayout->bitFieldStrategy = bitFieldStrategy;
         globalsLayout->unnamedBitFieldAlignment = unnamedBitFieldAlignment;
     }
-    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): find the target's ABSOLUTE-64 pointer
-    // relocation kind by FORMULA (widthBytes==8 && !pcRelative), never by name —
-    // agnosticism (the same scan the linker uses for cross-CU thunk slots). A
-    // symbol-address global (`char* g="..."`, `int* p=&x`) emits this reloc; if
-    // the target declares none, the assembler fails loud.
-    std::optional<RelocationKind> absPtrRelocKind;
-    for (auto const& r : target.relocations()) {
-        if (r.widthBytes == 8 && !r.pcRelative) { absPtrRelocKind = r.kind; break; }
-    }
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): the target's 8-byte ADDRESS-SLOT row,
+    // found by its properties, never by name — agnosticism — and never by its
+    // place in the list: `addressSlotRelocationKind`, the one rule the assembler's
+    // `.quad sym` and the linker's pointer slots ask too. A symbol-address global
+    // (`char* g="..."`, `int* p=&x`) and a jump table's slots carry it; if the
+    // target declares none, each refuses loud where it needs one.
+    // ★ P69 fold 3c: this scan was `widthBytes == 8 && !pcRelative`, FIRST ROW
+    // WINS, with no formula, thread-local or image-relative exclusion — a
+    // `tls-dtpoff64` declared before `abs64` would have been written into
+    // `char *p = "x"`. ✔MEASURED harmless on the shipped targets (abs64 is the
+    // only 8-byte non-pc-relative row of x86_64 and of arm64), so the defect was
+    // latent: D-ASM-DATA-WORD-RELOCATION-KIND-PICKED-BY-DECLARATION-ORDER.
+    std::optional<RelocationKind> const absPtrRelocKind =
+        addressSlotRelocationKind(target.relocations(), 8);
     auto dataItems = lowerMirGlobalsToDataItems(
         mir, interner, globalsLayout, dataModel, reporter, absPtrRelocKind);
     if (!tierClean(reporter, asmEntry)) {
@@ -1855,9 +1887,9 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // is one `AssembledData{Data, span*8 bytes, abs64 reloc per slot}` — the same
     // proven shape as a c67 symbol-address global (writable-at-load `.data` so
     // Mach-O dyld can PIE-rebase it; ELF ET_EXEC / PE `.reloc` handle the abs64
-    // in-place / via base-relocations). `absPtrRelocKind` is the target's abs64
-    // pointer reloc (found by the widthBytes==8 && !pcRelative formula above); if
-    // the target declares none, a jump table cannot be emitted → fail loud.
+    // in-place / via base-relocations). `absPtrRelocKind` is the target's 8-byte
+    // address-slot row (`addressSlotRelocationKind`, above); if the target
+    // declares none, a jump table cannot be emitted → fail loud.
     for (auto const& desc : lir.jumpTableDescriptors) {
         if (!absPtrRelocKind.has_value()) {
             ParseDiagnostic d;
@@ -3391,6 +3423,248 @@ namespace {
 // Defined with the `.s` binder below; the archive-member binder asks the same question of the same
 // definition (a `Pending` row's kind comes from what the library says it is).
 void decideKindFromTheDefinition(ExternImport& e, ffi::SymbolKind definition);
+
+// ★★★ THE BINDING OF A FOREIGN MODULE'S IMPORTS (P69 fold 3c,
+// D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT). A module this build did not compile —
+// an archive member the search pulled, or an object named to the link — names the libraries it calls by
+// NAME alone, and both kinds are bound here, by the same three arms, in the same order. Until the fold only
+// the pulled members were: an object named on the command line kept every library reference unbound, so
+// ✔MEASURED 2026-10-20 a cl /MD, clang-cl, cl /MT or mingw-w64 gcc object calling `puts` (directly or
+// through `__imp_puts`) was refused "undefined symbol" though the same object in an archive linked and ran.
+// `definedNames` is every external-linkage definition and common of the link: a name some linked module
+// defines is bound by the merge to that definition, never to a library. Returns false when it reported.
+[[nodiscard]] bool bindForeignImports(std::span<AssembledModule>             foreign,
+                                      std::unordered_set<std::string> const& definedNames,
+                                      std::span<ResolveLibrarySpec const>    dynamicLibraries,
+                                      TargetSchema const&                    target,
+                                      ObjectFormatSchema const&              format,
+                                      DiagnosticReporter&                    reporter) {
+    // ── D-LK-ARCHIVE-MEMBER-EXTERN-LOSES-ITS-LIBRARY ─────────────────────────
+    //
+    // ★★★ REBIND EVERY FOREIGN MODULE'S LIBRARY IMPORTS (a pulled member's, a
+    // named object's), BECAUSE THE OBJECT FILE COULD NOT CARRY THEM AND THAT IS
+    // NOT A DSS GAP.
+    //
+    // ✔MEASURED (shipped CLI, this host, baseline config) with a discriminating
+    // pair over ONE pair of sources — a TU calling `puts` plus a `main` calling
+    // it — compiled DIRECTLY as a multi-TU exec vs. routed through
+    // `-staticlib` + `--resolve-library`: the direct build returned rc=0 on all
+    // five legs, and the archive round trip returned rc=1 on all five with
+    // `K_SymbolUndefined` naming `puts`. So the member read back CLEANLY and
+    // then failed to LINK.
+    //
+    // WHY, AND WHY THE FIX IS NOT AT READ TIME. On the direct path the owning
+    // image is decided at the SEMANTIC tier: `suppressedShippedSymbolFor` folds
+    // the shipped descriptor's per-format `library` map into the extern's
+    // `libraryPath` (UCRT-P4 Decision 1 — the corpus is the single owner of
+    // "which image owns this name here"). An OBJECT FILE has nowhere to record
+    // that: an undefined symbol in ELF/COFF/Mach-O is a NAME, and nothing else.
+    // ✔MEASURED by dumping the emitted archives — the pe64 `.lib` and the elf64
+    // `.a` contain the string `puts` and NO library string at all, no
+    // `ucrtbase.dll` and no `libc.so.6`. Teaching a reader to recover it would
+    // mean inventing a DSS-private extension to a format whose whole value is
+    // that a foreign linker reads it, so the binding must be RE-DERIVED, from
+    // the same authority that derived it the first time.
+    //
+    // ★★ AND IT MUST HAPPEN BEFORE THE MERGE, WHICH IS WHY IT IS HERE AND NOT IN
+    // THE LINKER. `linker::link`'s dedup key is the FULL import identity
+    // (mangledName, libraryPath, version), so a member's `puts` and the client's
+    // `puts` fold into ONE import only if both are already bound to the same
+    // image when the merge runs. Binding after the merge would leave two rows
+    // that agree on the name and disagree on the library — two import
+    // descriptors for one C runtime, which is precisely the split-CRT defect
+    // UCRT-P4 exists to prevent. (The linker could not do this anyway: `link`
+    // declares no dependency on `ffi`, and it never sees `CompileOptions`.)
+    //
+    // ★★ THE FAT-ARCHIVE PATH DELIBERATELY DOES **NOT** GET THIS, and the
+    // asymmetry is the point rather than an omission.
+    // `extractStaticArchiveMembers` repacks members into another RELOCATABLE
+    // archive, and a relocatable object's whole contract is that it DEFERS "who
+    // owns this name" to a later link — `allowsUndefinedImports()` keeps such a
+    // row as a legal undefined symbol. Answering the question there would bind
+    // an import the repacked member cannot even record. This path is the one
+    // producing an IMAGE, so it is the one that must answer.
+    //
+    // ★ WHAT IS DELIBERATELY LEFT UNBOUND, so a genuinely undefined symbol still
+    // fails LOUD with `K_SymbolUndefined` and its present message:
+    //   * a name the client or another foreign member DEFINES — the merge binds
+    //     that reference to the definition, and it is not a library import at
+    //     all. Filtering it here also keeps the corpus query off the names that
+    //     dominate an ordinary static link.
+    //   * a name the corpus does not answer for on this (target, format) — a
+    //     typo, a missing library, an ordinary program symbol. Absent ⇒ untouched
+    //     ⇒ judged by the link tier exactly as today.
+    //   * a `synthesize` RECIPE row (pe's bare `printf`). The body that realizes
+    //     it is emitted by MIR synthesis, which already ran when the member was
+    //     COMPILED — a member DSS built carries the shim and imports the UCRT
+    //     cores, so this arm is reached only by a FOREIGN member that references
+    //     `printf` directly. Binding it would request a symbol `ucrtbase.dll`
+    //     does not export: the image would link clean and die at LOAD with
+    //     0xC0000139. Leaving it unbound yields a build error instead, which is
+    //     strictly the better failure.
+    //   * a `linkName` row reached by its C spelling (a foreign member writing
+    //     `time` where this platform exports `_time64`). DSS will not silently
+    //     re-spell a reference the member's own relocations already name.
+    // ⓘ `isEagerImport` is NOT set: an unreferenced row must still be DROPPED by
+    // the reference gate, so binding a library here can never resurrect a dead
+    // declaration as a real import.
+
+    // ── (0) D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED: a member compiled against a
+    // `dllimport` declaration names an import only through its ADDRESS SLOT (`__imp_X` on COFF — every
+    // MSVC /MD object). Make each such row an import of X whose address slot is that symbol, before
+    // either arm binds X — or, when a linked unit DEFINES X, a pointer of the image's own holding
+    // X's address (link.exe's LNK4217). The spelling is the format's (`importAddressSymbolPrefix`).
+    // See `link/import_address_references.hpp`.
+    if (!linker::foldImportAddressReferences(foreign, format, target, definedNames, reporter).has_value()) {
+        return false;   // reported: a pointer of the image's own the target cannot fill
+    }
+
+    // ── (1) D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY ─────────
+    //
+    // ★★★ THE OPERATOR-NAMED BINARIES FIRST, BECAUSE THE OPERATOR OUTRANKS THE
+    // PLATFORM DEFAULT. Everything the arm below says about WHY the rebinding
+    // must happen here applies verbatim; this arm answers the half of the
+    // question the shipped-descriptor corpus structurally CANNOT. The corpus
+    // knows the platform's own images (`ucrtbase.dll`, `libc.so.6`); it has
+    // never heard of `dynsrc.dll`, a library the operator built five seconds ago
+    // and named on the command line. An object file records a symbol NAME and
+    // nothing else, so a member that referenced that library lost the binding at
+    // archive-write time and only the build that names the library again can
+    // restore it.
+    //
+    // ★★ ORDER IS PRECEDENCE, AND IT IS THE SAME ORDER `bindAsmExternImports`
+    // USES. Both arms skip a row whose `libraryPath` is already set, so running
+    // this one first IS the statement "an operator-named binary wins". Reversing
+    // them would let a platform default silently claim a name the operator had
+    // explicitly pointed the build at.
+    //
+    // ★★ AND — like the corpus arm — IT MUST HAPPEN BEFORE THE MERGE. See that
+    // arm's note: `linker::link`'s dedup key is the FULL import identity
+    // (mangledName, libraryPath, version), so a member's reference and the
+    // client's reference to one symbol fold into ONE import only if both are
+    // already bound to the same image when the merge runs.
+    //
+    // ⚠ `dynamicLibraries` is the DYNAMIC half of `--resolve-library` — the
+    // driver has already partitioned the `ar` archives out of it (they are
+    // `archivePaths` here, merged INTO the image, recording no import at all).
+    // Handing the un-partitioned list over would feed an archive to the export
+    // reader, which correctly refuses it and would fail an otherwise good build.
+    //
+    // The skip set is this producer's own, identical to the corpus arm's: a name
+    // the client or another foreign member DEFINES is bound by the merge to that
+    // definition and is not a library import at all.
+    if (!foreign.empty() && !dynamicLibraries.empty()) {
+        auto const bySymbol = resolveOperatorNamedLibraryImports(
+            dynamicLibraries, format, reporter);
+        // nullopt ⇒ a named binary could not be read; the chokepoint already
+        // reported the structural cause loud. Refuse WITHOUT a second
+        // diagnostic rather than continue with the flag quietly ineffective.
+        if (!bySymbol.has_value()) return false;
+        for (auto& mod : foreign) {
+            for (auto& ext : mod.externImports) {
+                if (ext.mangledName.empty()) continue;
+                if (!ext.libraryPath.empty()) continue;
+                // A COMMON row is the member's own DEFINITION
+                // (`ExternImport::commonSize`), never a library's import.
+                if (ext.commonSize != 0u) continue;
+                if (definedNames.count(ext.mangledName) != 0) continue;
+                auto const it = bySymbol->find(ext.mangledName);
+                if (it == bySymbol->end()) continue;
+                // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: the foreign
+                // member's reference must agree with the library's storage
+                // duration for the same name, exactly as a C source reference
+                // must. ONE rule, one implementation (ffi/ingest.hpp) — the
+                // member arrives from an object reader rather than from HIR,
+                // and that must not decide whether the rule applies.
+                if (ffi::reportLibraryThreadStorageDisagreement(
+                        ext.mangledName, it->second.library, it->second.kind,
+                        ext.isThreadLocal, reporter)) {
+                    continue;   // left unbound behind a reported Error
+                }
+                ext.libraryPath = it->second.library;
+                ext.version     = it->second.version;
+                decideKindFromTheDefinition(ext, it->second.kind);
+            }
+        }
+    }
+
+    // ── (2) THE PLATFORM REALIZATION ORACLE ─────────────────────────────────
+    if (!foreign.empty()) {
+        std::vector<std::string> names;
+        for (auto const& mod : foreign) {
+            for (auto const& ext : mod.externImports) {
+                if (ext.mangledName.empty()) continue;
+                if (!ext.libraryPath.empty()) continue;
+                if (ext.commonSize != 0u) continue;   // a definition (see arm (1))
+                if (definedNames.count(ext.mangledName) != 0) continue;
+                names.push_back(ext.mangledName);
+            }
+        }
+        if (!names.empty()) {
+            // The lattice label is the throwaway interner's, not a claim about
+            // the member's source language — an archive member has none in this
+            // process. `format.name()` is the one fact that is actually true of
+            // every member being bound here.
+            // D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED:
+            // the oracle reports a cross-descriptor realization disagreement on
+            // THIS reporter and still answers the name (omitting it would route
+            // it unbound and file the config's fault against the user's program).
+            // The refusal is therefore the caller's, off the errorCount snapshot
+            // — and it must be spelled here rather than left to a later tier,
+            // because the enclosing `entry` snapshot was taken before this
+            // function ran and nothing between here and the link would compare.
+            auto const corpusEntry = reporter.errorCount();
+            auto const realized = realizePlatformExternsByOnBinaryName(
+                names, target, format,
+                substrate::mintMonotonicId<CompilationUnitId>(), format.name(),
+                reporter);
+            if (!tierClean(reporter, corpusEntry)) return false;
+            // nullopt ⇒ the shippedLibs directory could not be located: a
+            // statement about the ENVIRONMENT, never about the user's program.
+            // Every name stays unbound and the link tier judges the reference,
+            // exactly as it did before this binder existed.
+            if (realized.has_value()) {
+                std::string const formatKey{objectFormatKindName(format.kind())};
+                for (auto& mod : foreign) {
+                    for (auto& ext : mod.externImports) {
+                        if (ext.mangledName.empty()) continue;
+                        if (!ext.libraryPath.empty()) continue;
+                        if (ext.commonSize != 0u) continue;   // a definition (see arm (1))
+                        if (definedNames.count(ext.mangledName) != 0) continue;
+                        auto const found = realized->find(ext.mangledName);
+                        if (found == realized->end()) continue;
+                        auto const& row = found->second.row;
+                        if (!row.recipeId.empty()) continue;   // see ★ above
+                        if (!row.linkName.empty()
+                            && ffi::linkNameFor(found->second.canonicalName,
+                                                /*asmLabel=*/{},
+                                                format.cSymbolDecoration().scheme,
+                                                row.linkName)
+                                   != ext.mangledName) {
+                            continue;   // see ★ above
+                        }
+                        // Fold the row's per-object-format `library` map on the
+                        // active format — the identical fold `buildCuMir`
+                        // performs for the C path and the asm binder performs
+                        // for a `.s`, keyed on the same `objectFormatKindName`.
+                        // A key ABSENT means the platform states no image for
+                        // this name on this format: leave it unbound.
+                        auto const lib = row.library.find(formatKey);
+                        if (lib == row.library.end() || lib->second.empty()) {
+                            continue;
+                        }
+                        ext.libraryPath = lib->second;
+                        ext.version     = row.version;
+                        decideKindFromTheDefinition(
+                            ext, row.isFunction ? ffi::SymbolKind::Function
+                                                : ffi::SymbolKind::Object);
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
 }  // namespace
 
 std::optional<std::vector<AssembledModule>>
@@ -4009,226 +4283,11 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     // one named on its command line (`linker::dropPulledMemberEntryRequests`).
     for (auto& member : pulled) linker::dropPulledMemberEntryRequests(member.linkerRequests);
 
-    // ── D-LK-ARCHIVE-MEMBER-EXTERN-LOSES-ITS-LIBRARY ─────────────────────────
-    //
-    // ★★★ REBIND EVERY PULLED MEMBER'S LIBRARY IMPORTS, BECAUSE THE OBJECT FILE
-    // COULD NOT CARRY THEM AND THAT IS NOT A DSS GAP.
-    //
-    // ✔MEASURED (shipped CLI, this host, baseline config) with a discriminating
-    // pair over ONE pair of sources — a TU calling `puts` plus a `main` calling
-    // it — compiled DIRECTLY as a multi-TU exec vs. routed through
-    // `-staticlib` + `--resolve-library`: the direct build returned rc=0 on all
-    // five legs, and the archive round trip returned rc=1 on all five with
-    // `K_SymbolUndefined` naming `puts`. So the member read back CLEANLY and
-    // then failed to LINK.
-    //
-    // WHY, AND WHY THE FIX IS NOT AT READ TIME. On the direct path the owning
-    // image is decided at the SEMANTIC tier: `suppressedShippedSymbolFor` folds
-    // the shipped descriptor's per-format `library` map into the extern's
-    // `libraryPath` (UCRT-P4 Decision 1 — the corpus is the single owner of
-    // "which image owns this name here"). An OBJECT FILE has nowhere to record
-    // that: an undefined symbol in ELF/COFF/Mach-O is a NAME, and nothing else.
-    // ✔MEASURED by dumping the emitted archives — the pe64 `.lib` and the elf64
-    // `.a` contain the string `puts` and NO library string at all, no
-    // `ucrtbase.dll` and no `libc.so.6`. Teaching a reader to recover it would
-    // mean inventing a DSS-private extension to a format whose whole value is
-    // that a foreign linker reads it, so the binding must be RE-DERIVED, from
-    // the same authority that derived it the first time.
-    //
-    // ★★ AND IT MUST HAPPEN BEFORE THE MERGE, WHICH IS WHY IT IS HERE AND NOT IN
-    // THE LINKER. `linker::link`'s dedup key is the FULL import identity
-    // (mangledName, libraryPath, version), so a member's `puts` and the client's
-    // `puts` fold into ONE import only if both are already bound to the same
-    // image when the merge runs. Binding after the merge would leave two rows
-    // that agree on the name and disagree on the library — two import
-    // descriptors for one C runtime, which is precisely the split-CRT defect
-    // UCRT-P4 exists to prevent. (The linker could not do this anyway: `link`
-    // declares no dependency on `ffi`, and it never sees `CompileOptions`.)
-    //
-    // ★★ THE FAT-ARCHIVE PATH DELIBERATELY DOES **NOT** GET THIS, and the
-    // asymmetry is the point rather than an omission.
-    // `extractStaticArchiveMembers` repacks members into another RELOCATABLE
-    // archive, and a relocatable object's whole contract is that it DEFERS "who
-    // owns this name" to a later link — `allowsUndefinedImports()` keeps such a
-    // row as a legal undefined symbol. Answering the question there would bind
-    // an import the repacked member cannot even record. This path is the one
-    // producing an IMAGE, so it is the one that must answer.
-    //
-    // ★ WHAT IS DELIBERATELY LEFT UNBOUND, so a genuinely undefined symbol still
-    // fails LOUD with `K_SymbolUndefined` and its present message:
-    //   * a name the client or another pulled member DEFINES — the merge binds
-    //     that reference to the definition, and it is not a library import at
-    //     all. Filtering it here also keeps the corpus query off the names that
-    //     dominate an ordinary static link.
-    //   * a name the corpus does not answer for on this (target, format) — a
-    //     typo, a missing library, an ordinary program symbol. Absent ⇒ untouched
-    //     ⇒ judged by the link tier exactly as today.
-    //   * a `synthesize` RECIPE row (pe's bare `printf`). The body that realizes
-    //     it is emitted by MIR synthesis, which already ran when the member was
-    //     COMPILED — a member DSS built carries the shim and imports the UCRT
-    //     cores, so this arm is reached only by a FOREIGN member that references
-    //     `printf` directly. Binding it would request a symbol `ucrtbase.dll`
-    //     does not export: the image would link clean and die at LOAD with
-    //     0xC0000139. Leaving it unbound yields a build error instead, which is
-    //     strictly the better failure.
-    //   * a `linkName` row reached by its C spelling (a foreign member writing
-    //     `time` where this platform exports `_time64`). DSS will not silently
-    //     re-spell a reference the member's own relocations already name.
-    // ⓘ `isEagerImport` is NOT set: an unreferenced row must still be DROPPED by
-    // the reference gate, so binding a library here can never resurrect a dead
-    // declaration as a real import.
-
-    // ── (0) D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED: a member compiled against a
-    // `dllimport` declaration names an import only through its ADDRESS SLOT (`__imp_X` on COFF — every
-    // MSVC /MD object). Make each such row an import of X whose address slot is that symbol, before
-    // either arm binds X — or, when a linked unit DEFINES X, a pointer of the image's own holding
-    // X's address (link.exe's LNK4217). The spelling is the format's (`importAddressSymbolPrefix`).
-    // See `link/import_address_references.hpp`.
-    (void)linker::foldImportAddressReferences(pulled, format, target, definedNames);
-
-    // ── (1) D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY ─────────
-    //
-    // ★★★ THE OPERATOR-NAMED BINARIES FIRST, BECAUSE THE OPERATOR OUTRANKS THE
-    // PLATFORM DEFAULT. Everything the arm below says about WHY the rebinding
-    // must happen here applies verbatim; this arm answers the half of the
-    // question the shipped-descriptor corpus structurally CANNOT. The corpus
-    // knows the platform's own images (`ucrtbase.dll`, `libc.so.6`); it has
-    // never heard of `dynsrc.dll`, a library the operator built five seconds ago
-    // and named on the command line. An object file records a symbol NAME and
-    // nothing else, so a member that referenced that library lost the binding at
-    // archive-write time and only the build that names the library again can
-    // restore it.
-    //
-    // ★★ ORDER IS PRECEDENCE, AND IT IS THE SAME ORDER `bindAsmExternImports`
-    // USES. Both arms skip a row whose `libraryPath` is already set, so running
-    // this one first IS the statement "an operator-named binary wins". Reversing
-    // them would let a platform default silently claim a name the operator had
-    // explicitly pointed the build at.
-    //
-    // ★★ AND — like the corpus arm — IT MUST HAPPEN BEFORE THE MERGE. See that
-    // arm's note: `linker::link`'s dedup key is the FULL import identity
-    // (mangledName, libraryPath, version), so a member's reference and the
-    // client's reference to one symbol fold into ONE import only if both are
-    // already bound to the same image when the merge runs.
-    //
-    // ⚠ `dynamicLibraries` is the DYNAMIC half of `--resolve-library` — the
-    // driver has already partitioned the `ar` archives out of it (they are
-    // `archivePaths` here, merged INTO the image, recording no import at all).
-    // Handing the un-partitioned list over would feed an archive to the export
-    // reader, which correctly refuses it and would fail an otherwise good build.
-    //
-    // The skip set is this producer's own, identical to the corpus arm's: a name
-    // the client or another pulled member DEFINES is bound by the merge to that
-    // definition and is not a library import at all.
-    if (!pulled.empty() && !dynamicLibraries.empty()) {
-        auto const bySymbol = resolveOperatorNamedLibraryImports(
-            dynamicLibraries, format, reporter);
-        // nullopt ⇒ a named binary could not be read; the chokepoint already
-        // reported the structural cause loud. Refuse WITHOUT a second
-        // diagnostic rather than continue with the flag quietly ineffective.
-        if (!bySymbol.has_value()) return std::nullopt;
-        for (auto& mod : pulled) {
-            for (auto& ext : mod.externImports) {
-                if (ext.mangledName.empty()) continue;
-                if (!ext.libraryPath.empty()) continue;
-                // A COMMON row is the member's own DEFINITION
-                // (`ExternImport::commonSize`), never a library's import.
-                if (ext.commonSize != 0u) continue;
-                if (definedNames.count(ext.mangledName) != 0) continue;
-                auto const it = bySymbol->find(ext.mangledName);
-                if (it == bySymbol->end()) continue;
-                // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: the pulled
-                // member's reference must agree with the library's storage
-                // duration for the same name, exactly as a C source reference
-                // must. ONE rule, one implementation (ffi/ingest.hpp) — the
-                // member arrives from an object reader rather than from HIR,
-                // and that must not decide whether the rule applies.
-                if (ffi::reportLibraryThreadStorageDisagreement(
-                        ext.mangledName, it->second.library, it->second.kind,
-                        ext.isThreadLocal, reporter)) {
-                    continue;   // left unbound behind a reported Error
-                }
-                ext.libraryPath = it->second.library;
-                ext.version     = it->second.version;
-                decideKindFromTheDefinition(ext, it->second.kind);
-            }
-        }
-    }
-
-    // ── (2) THE PLATFORM REALIZATION ORACLE ─────────────────────────────────
-    if (!pulled.empty()) {
-        std::vector<std::string> names;
-        for (auto const& mod : pulled) {
-            for (auto const& ext : mod.externImports) {
-                if (ext.mangledName.empty()) continue;
-                if (!ext.libraryPath.empty()) continue;
-                if (ext.commonSize != 0u) continue;   // a definition (see arm (1))
-                if (definedNames.count(ext.mangledName) != 0) continue;
-                names.push_back(ext.mangledName);
-            }
-        }
-        if (!names.empty()) {
-            // The lattice label is the throwaway interner's, not a claim about
-            // the member's source language — an archive member has none in this
-            // process. `format.name()` is the one fact that is actually true of
-            // every member being bound here.
-            // D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED:
-            // the oracle reports a cross-descriptor realization disagreement on
-            // THIS reporter and still answers the name (omitting it would route
-            // it unbound and file the config's fault against the user's program).
-            // The refusal is therefore the caller's, off the errorCount snapshot
-            // — and it must be spelled here rather than left to a later tier,
-            // because the enclosing `entry` snapshot was taken before this
-            // function ran and nothing between here and the link would compare.
-            auto const corpusEntry = reporter.errorCount();
-            auto const realized = realizePlatformExternsByOnBinaryName(
-                names, target, format,
-                substrate::mintMonotonicId<CompilationUnitId>(), format.name(),
-                reporter);
-            if (!tierClean(reporter, corpusEntry)) return std::nullopt;
-            // nullopt ⇒ the shippedLibs directory could not be located: a
-            // statement about the ENVIRONMENT, never about the user's program.
-            // Every name stays unbound and the link tier judges the reference,
-            // exactly as it did before this binder existed.
-            if (realized.has_value()) {
-                std::string const formatKey{objectFormatKindName(format.kind())};
-                for (auto& mod : pulled) {
-                    for (auto& ext : mod.externImports) {
-                        if (ext.mangledName.empty()) continue;
-                        if (!ext.libraryPath.empty()) continue;
-                        if (ext.commonSize != 0u) continue;   // a definition (see arm (1))
-                        if (definedNames.count(ext.mangledName) != 0) continue;
-                        auto const found = realized->find(ext.mangledName);
-                        if (found == realized->end()) continue;
-                        auto const& row = found->second.row;
-                        if (!row.recipeId.empty()) continue;   // see ★ above
-                        if (!row.linkName.empty()
-                            && ffi::linkNameFor(found->second.canonicalName,
-                                                /*asmLabel=*/{},
-                                                format.cSymbolDecoration().scheme,
-                                                row.linkName)
-                                   != ext.mangledName) {
-                            continue;   // see ★ above
-                        }
-                        // Fold the row's per-object-format `library` map on the
-                        // active format — the identical fold `buildCuMir`
-                        // performs for the C path and the asm binder performs
-                        // for a `.s`, keyed on the same `objectFormatKindName`.
-                        // A key ABSENT means the platform states no image for
-                        // this name on this format: leave it unbound.
-                        auto const lib = row.library.find(formatKey);
-                        if (lib == row.library.end() || lib->second.empty()) {
-                            continue;
-                        }
-                        ext.libraryPath = lib->second;
-                        ext.version     = row.version;
-                        decideKindFromTheDefinition(
-                            ext, row.isFunction ? ffi::SymbolKind::Function
-                                                : ffi::SymbolKind::Object);
-                    }
-                }
-            }
-        }
+    // ── THE BINDING, `bindForeignImports`: the `__imp_X` fold, the operator-named binaries, the platform
+    // realization oracle. The objects NAMED to the link ask the same function, after this search
+    // (`linkAndWriteWithStaticArchives`).
+    if (!bindForeignImports(pulled, definedNames, dynamicLibraries, target, format, reporter)) {
+        return std::nullopt;   // reported
     }
     return pulled;
 }
@@ -4387,6 +4446,33 @@ bool linkAndWriteWithStaticArchives(AssembledModule                        clien
     // pulled the span is the client alone -- the single-CU path, unchanged.
     combined.reserve(combined.size() + pulled->size());
     for (auto& member_mod : *pulled) combined.push_back(std::move(member_mod));
+
+    // ── THE NAMED OBJECTS' LIBRARY IMPORTS (P69 fold 3c,
+    // D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT). An object named to the link is as foreign as
+    // a pulled member — it names the libraries it calls by NAME alone — and it is bound by the members' own function
+    // (`bindForeignImports`). AFTER the search: an archive member that defines a name an object calls answers it
+    // before any library does, as under link.exe and GNU ld. Until the fold nothing bound them, so ✔MEASURED
+    // 2026-10-20 every object of cl /MD, clang-cl, cl /MT and mingw-w64 gcc that calls `puts` — directly or through
+    // `__imp_puts` — was refused "undefined symbol" here, though the same object in an archive linked and ran.
+    std::size_t const objectCount = objects->size();
+    if (objectCount != 0u) {
+        // Every name the link defines — external-linkage definitions and commons, of every module — is bound by
+        // the merge to its definition, never to a library (the search's own `definedNames`, asked of the whole
+        // link now that the search is done).
+        std::unordered_set<std::string> definedNames;
+        for (auto const& m : combined) {
+            for (auto const& ms : m.symbols) {
+                if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) definedNames.insert(ms.name);
+            }
+            for (auto const& ext : m.externImports) {
+                if (ext.commonSize != 0u && !ext.mangledName.empty()) definedNames.insert(ext.mangledName);
+            }
+        }
+        if (!bindForeignImports(std::span<AssembledModule>{combined.data() + 1, objectCount}, definedNames,
+                                dynamicLibraries, target, format, reporter)) {
+            return false;   // reported
+        }
+    }
     return linkAndWrite(std::span<AssembledModule const>{combined.data(), combined.size()},
                         target, format, outPath, reporter, request);
 }

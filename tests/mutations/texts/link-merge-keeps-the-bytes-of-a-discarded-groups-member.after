@@ -1,1 +1,1 @@
-                    if (auto const member = discardedGroupOf(modIdx, sym); false && member.has_value()) {
+            if (false && first != firstCarrier.end() && first->second < i) lost[i].emplace(section, group);

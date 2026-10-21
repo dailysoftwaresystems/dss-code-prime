@@ -9,7 +9,7 @@ int pair[1];
 static int guard_main[4];
 
 int bump(void);                                            /* other.c: ++shared_counter */
-int last(int const *guard, unsigned long long guardSize);  /* other.c: 21 when pair is ten words of its own */
+int last(int const *guard, unsigned long long guardSize);  /* other.c: 21 unless it sees pair smaller */
 
 int main(void) {
     shared_counter = 20;

@@ -112,6 +112,17 @@ maxExistingSymbolIdV(AssembledModule const& mod) noexcept {
     for (auto const& row : mod.symbols) {
         if (row.symbol.v > maxV) maxV = row.symbol.v;
     }
+    // ★ AND A CARRIED HANDLER'S — the SEVENTH widening (P69 fold 3c): its routine
+    // and the targets of its data's relocations are references no function's
+    // relocation list carries, so an id one of them names that nothing else
+    // holds is passed for the reason the scope's two ids are above.
+    for (auto const& fn : mod.functions) {
+        if (!fn.languageHandler.has_value()) continue;
+        if (fn.languageHandler->personality.v > maxV) maxV = fn.languageHandler->personality.v;
+        for (auto const& rel : fn.languageHandler->relocations) {
+            if (rel.target.v > maxV) maxV = rel.target.v;
+        }
+    }
     return maxV;
 }
 

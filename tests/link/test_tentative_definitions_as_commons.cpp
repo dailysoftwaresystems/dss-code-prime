@@ -45,6 +45,7 @@
 #include "program/compile_pipeline.hpp"
 #include "program/program.hpp"
 #include "arm_verdict_ledger.hpp"
+#include "reference_control.hpp"
 #include "repo_root.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
@@ -105,15 +106,15 @@ void writeText(fs::path const& p, std::string_view text) { std::ofstream(p, std:
     return loaded.has_value() ? *loaded : nullptr;
 }
 
-// The document `name` as shipped with the root key `key` set to `value`: a document whose stated rule differs.
-[[nodiscard]] std::shared_ptr<ObjectFormatSchema const> documentWith(std::string const& name, std::string const& key,
-                                                                      nlohmann::json const& value) {
+// The document `name` as shipped with each root key of `keys` (a JSON object) set to its value: a document whose
+// stated rule differs.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const> documentWith(std::string const& name, nlohmann::json const& keys) {
     auto const path = dss::test::configRoot() / "object-formats" / (name + ".format.json");
     std::ifstream in{path};
     auto doc = nlohmann::json::parse(in);
-    doc[key] = value;
-    auto const loaded = ObjectFormatSchema::loadFromText(doc.dump(), name + " with its " + key + " set");
-    EXPECT_TRUE(loaded.has_value()) << name;
+    for (auto const& [key, value] : keys.items()) doc[key] = value;
+    auto const loaded = ObjectFormatSchema::loadFromText(doc.dump(), name + " with " + keys.dump());
+    EXPECT_TRUE(loaded.has_value()) << name << " with " << keys.dump();
     return loaded.has_value() ? *loaded : nullptr;
 }
 
@@ -260,9 +261,10 @@ TEST(TentativeDefinitionForms, AUnitWritesEachFoldableTentativeDefinitionAsAComm
         auto const f = shipped(d.format);
         ASSERT_NE(f, nullptr);
         ASSERT_TRUE(f->statesCommons());
-        // (and the rule of a common's alignment, which a document that states no common may not state)
+        // (and the rules of a common's alignment, which a document that states no common may not state)
         auto const without = documentWithout(
-            d.format, {"commonYieldsTo", "archiveCommonResolution", "commonAlignmentFromSizeAtMost"});
+            d.format, {"commonYieldsTo", "archiveCommonResolution", "commonAlignmentFromSizeAtMost",
+                       "commonAlignmentEveryLinkerGivesAtMost", "tentativeDefinitionBeyondCommonAlignment"});
         ASSERT_NE(without, nullptr);
         ASSERT_FALSE(without->statesCommons());
         DiagnosticReporter rep, repWithout;
@@ -286,6 +288,12 @@ TEST(TentativeDefinitionForms, AUnitWritesEachFoldableTentativeDefinitionAsAComm
                     << "wider than every linker gives a common of its size: it stays a definition";
                 ModuleSymbol const* const row = rowNamed(*m, n);
                 ASSERT_NE(row, nullptr) << "the definition row stays";
+                // ...of the kind the document states (P69 fold 3c, A4): a SELECT-ANY definition on the PE object
+                // documents, so two units' copies fold under every linker as the commons would.
+                ASSERT_EQ(f->commonsStatement().beyondTheRule,
+                          std::optional<TentativeBeyondCommonAlignment>{TentativeBeyondCommonAlignment::SelectAny});
+                EXPECT_EQ(row->binding, SymbolBinding::Weak) << "a select-any definition";
+                EXPECT_EQ(row->weakKind, std::optional<WeakDefinitionKind>{WeakDefinitionKind::SelectAny});
                 AssembledData const* const item = itemOf(*m, row->symbol);
                 ASSERT_NE(item, nullptr) << "and its storage";
                 EXPECT_EQ(item->section, DataSectionKind::Bss);
@@ -331,6 +339,9 @@ TEST(TentativeDefinitionForms, AUnitWritesEachFoldableTentativeDefinitionAsAComm
 // a32[64];` and `_Alignas(64) char a64[64];` as a common exactly where every linker gives a 64-byte common that much.
 // The ELF document stating the key behaves as the PE one does: the rule is read, never a format. And under the PE
 // IMAGE document both are commons: DSS links the image itself, at every common's stated alignment.
+// ★ AND WHAT ONE TOO WIDE BECOMES IS THE DOCUMENT'S TOO (P69 fold 3c, A4): `tentativeDefinitionBeyondCommonAlignment`
+// — a select-any definition where it says `select-any` (the shipped PE object documents), a plain one where it says
+// `definition` (the same PE document stating that, and the ELF one).
 TEST(TentativeDefinitionForms, TheWidthACommonMayHaveIsItsDocumentsRule) {
     constexpr char const* kWide = "_Alignas(32) char a32[64];\n_Alignas(64) char a64[64];\n"
                                   "int main(void) { return a32[1] + a64[1]; }\n";
@@ -340,18 +351,29 @@ TEST(TentativeDefinitionForms, TheWidthACommonMayHaveIsItsDocumentsRule) {
         std::shared_ptr<ObjectFormatSchema const> doc;
         bool                                      a32Common;
         bool                                      a64Common;
+        bool                                      selectAny;   // what a too-wide one is: select-any, or plain
     };
     std::vector<Case> const cases{
-        {"PE relocatable as shipped", "x86_64", shipped("pe64-x86_64-windows"), true, false},
+        {"PE relocatable as shipped", "x86_64", shipped("pe64-x86_64-windows"), true, false, true},
         {"PE relocatable stating 16", "x86_64",
-         documentWith("pe64-x86_64-windows", "commonAlignmentFromSizeAtMost", 16), false, false},
+         documentWith("pe64-x86_64-windows", {{"commonAlignmentFromSizeAtMost", 16}}), false, false, true},
+        {"PE relocatable stating 16 and a plain definition", "x86_64",
+         documentWith("pe64-x86_64-windows", {{"commonAlignmentFromSizeAtMost", 16},
+                                              {"tentativeDefinitionBeyondCommonAlignment", "definition"}}),
+         false, false, false},
         {"PE relocatable stating 64", "x86_64",
-         documentWith("pe64-x86_64-windows", "commonAlignmentFromSizeAtMost", 64), true, true},
+         documentWith("pe64-x86_64-windows", {{"commonAlignmentFromSizeAtMost", 64}}), true, true, true},
         {"PE image as shipped: DSS links the image itself", "x86_64", shipped("pe64-x86_64-windows-exec"), true,
-         true},
-        {"ELF relocatable as shipped", "x86_64", shipped("elf64-x86_64-linux"), true, true},
-        {"ELF relocatable stating 16", "x86_64",
-         documentWith("elf64-x86_64-linux", "commonAlignmentFromSizeAtMost", 16), false, false},
+         true, false},
+        {"ELF relocatable as shipped", "x86_64", shipped("elf64-x86_64-linux"), true, true, false},
+        {"ELF relocatable stating 16 and a plain definition", "x86_64",
+         documentWith("elf64-x86_64-linux", {{"commonAlignmentFromSizeAtMost", 16},
+                                             {"tentativeDefinitionBeyondCommonAlignment", "definition"}}),
+         false, false, false},
+        {"ELF relocatable stating 16 and a select-any definition", "x86_64",
+         documentWith("elf64-x86_64-linux", {{"commonAlignmentFromSizeAtMost", 16},
+                                             {"tentativeDefinitionBeyondCommonAlignment", "select-any"}}),
+         false, false, true},
     };
     for (Case const& c : cases) {
         SCOPED_TRACE(c.label);
@@ -375,6 +397,10 @@ TEST(TentativeDefinitionForms, TheWidthACommonMayHaveIsItsDocumentsRule) {
                 AssembledData const* const item = itemOf(*m, row->symbol);
                 ASSERT_NE(item, nullptr);
                 EXPECT_EQ(item->alignment.bytes(), alignment);
+                EXPECT_EQ(row->binding, c.selectAny ? SymbolBinding::Weak : SymbolBinding::Global)
+                    << "the definition is the kind the document says";
+                EXPECT_EQ(row->weakKind, c.selectAny ? std::optional<WeakDefinitionKind>{WeakDefinitionKind::SelectAny}
+                                                     : std::nullopt);
             }
         }
     }
@@ -499,6 +525,35 @@ constexpr Family kFamilies[] = {
 // a link gives by PLACEMENT alone — the one object at the start of its section — is not read as one it honoured: the
 // shape whose CONTROL (the larger object alone) reads 12 under Apple's ld (✔MEASURED 2026-10-12, `gref2_macho.log`;
 // without pads it read 42).
+// The small-wide cell's commons: six of each, a double and an explicitly 16-aligned char[16] among fillers that
+// leave a placement by size alone off 8 and off 16 (✔MEASURED 2026-10-20: cl's directive-less commons of this text
+// read 43 under GNU ld 2.42 — A1's measurement).
+[[nodiscard]] std::string smallWideCommons() {
+    std::string s;
+    for (int k = 0; k < 6; ++k) {
+        auto const n = std::to_string(k);
+        s += "char dss_f" + n + "[" + (k % 2 != 0 ? "1" : "3") + "];\nint dss_i" + n + ";\nchar dss_t" + n
+           + "[12];\ndouble dss_d" + n + ";\n_Alignas(16) char dss_c" + n + "[16];\n";
+    }
+    return s;
+}
+// 40 + 1 (a double off 8) + 2 (a char[16] off 16). The objects are named as char arrays: as a `double` the compiler
+// may fold `&d % 8` to 0 by the type's alignment.
+[[nodiscard]] std::string smallWideMain() {
+    std::string s;
+    for (int k = 0; k < 6; ++k) {
+        auto const n = std::to_string(k);
+        s += "extern char dss_d" + n + "[];\nextern char dss_c" + n + "[];\n";
+    }
+    s += "int main(void) {\n  int bits = 0;\n";
+    for (int k = 0; k < 6; ++k) {
+        auto const n = std::to_string(k);
+        s += "  if ((unsigned long long)dss_d" + n + " % 8u) bits |= 1;\n  if ((unsigned long long)dss_c" + n
+           + " % 16u) bits |= 2;\n";
+    }
+    return s + "  return 40 + bits;\n}\n";
+}
+
 [[nodiscard]] std::string mainChecking(unsigned wide) {
     return "extern void *addr_a(void);\nextern void *addr_b(void);\n"
            "char a_dss_pad[3];\nchar z_dss_pad[5];\nchar dss_data_pad[3] = {1, 2, 3};\n"
@@ -545,6 +600,12 @@ TEST(TentativeDefinitionObjects, EachWriterHandsTheCommonsOnAndItsReaderReadsThe
                 EXPECT_FALSE(f->commonsStatement().admitsCommon(item->reservedSize, item->alignment.bytes()))
                     << "the unit must state `" << n << "` as a COMMON: the document admits it";
                 EXPECT_EQ(read, nullptr) << "a definition the unit kept is no common in its object";
+                // ...and its object holds it as the kind of definition the unit made of it (P69 fold 3c, A4): a
+                // select-any one is a COMDAT the reader reads back as a select-any definition.
+                ModuleSymbol const* const backRow = rowNamed(back->front(), n);
+                ASSERT_NE(backRow, nullptr) << "the kept definition is in the object";
+                EXPECT_EQ(backRow->binding, row->binding);
+                EXPECT_EQ(backRow->weakKind, row->weakKind);
                 continue;
             }
             ASSERT_NE(said, nullptr);
@@ -556,16 +617,23 @@ TEST(TentativeDefinitionObjects, EachWriterHandsTheCommonsOnAndItsReaderReadsThe
             //   * Mach-O: its log2 in four bits of `n_desc`, where 0 reads as "the size rounded up to a power of
             //     two, at most 2^15" (ld64's reading, which the reader shares) — a 1-byte alignment has no spelling
             //     of its own and comes back as that wider one;
-            //   * COFF: nothing below what every linker gives a common of its size (the document's
-            //     `CommonsStatement::alignmentEveryLinkerGives`), and a directive above it — so the reader aligns it
-            //     at least that much.
+            //   * COFF: nothing below what link.exe gives a common of its size (the document's
+            //     `CommonsStatement::alignmentFromSize`, the reader's alignment for a common that states none), and a
+            //     directive exactly where the alignment is wider than EVERY linker gives one that states none
+            //     (`CommonsStatement::statesItsAlignment`; GNU ld gives at most 4, P69 fold 3c, A1) — read back as the
+            //     alignment the object STATES.
             std::string_view const format{d.format};
             std::uint64_t          expected = said->commonAlignment;
             if (format.starts_with("macho") && said->commonAlignment == 1u) {
                 expected = std::min<std::uint64_t>(std::bit_ceil(said->commonSize), std::uint64_t{1} << 15);
             }
-            if (auto const gives = f->commonsStatement().alignmentEveryLinkerGives(said->commonSize)) {
+            CommonsStatement const commons = f->commonsStatement();
+            if (auto const gives = commons.alignmentFromSize(said->commonSize)) {
                 expected = std::max<std::uint64_t>(said->commonAlignment, *gives);
+                EXPECT_EQ(read->commonAlignmentStated,
+                          commons.statesItsAlignment(said->commonSize, said->commonAlignment) ? said->commonAlignment
+                                                                                              : 0u)
+                    << "the object states its alignment exactly where GNU ld would give the common less";
             }
             EXPECT_GE(read->commonAlignment, said->commonAlignment) << "the unit's alignment holds";
             EXPECT_EQ(read->commonAlignment, expected);
@@ -585,6 +653,9 @@ TEST(TentativeDefinitionObjects, EachWriterHandsTheCommonsOnAndItsReaderReadsThe
 // 40-byte common yields to it at 4096, as cl's pair does; and a SOURCE beside a DSS object of the name, likewise
 // (the shape refused by name as two strong definitions). Every family is built on every leg; each image runs where
 // its family runs.
+// ★ AND TWO UNITS' OVER-ALIGNED TENTATIVE DEFINITIONS (P69 fold 3c, A4): `_Alignas(64) int v;` in two DSS objects is
+// ONE object at 64 — commons on ELF and Mach-O, SELECT-ANY definitions on PE (the document's
+// `tentativeDefinitionBeyondCommonAlignment`), where the fix fold's plain definitions were refused as duplicates.
 TEST(TentativeDefinitionLinks, TwoDssObjectsOfOneNameAreOneObject) {
     test_support::ScratchDir scratch{test_support::Location::Temp, "tentative-links"};
     auto const dir = scratch.path();
@@ -592,7 +663,10 @@ TEST(TentativeDefinitionLinks, TwoDssObjectsOfOneNameAreOneObject) {
     writeText(dir / "b_plain.c", accessor("int v;", 'b'));
     writeText(dir / "a_small.c", accessor("_Alignas(4096) char v;", 'a'));
     writeText(dir / "b_large.c", accessor("char v[40];", 'b'));
+    writeText(dir / "a_wide.c", accessor("_Alignas(64) int v;", 'a'));
+    writeText(dir / "b_wide.c", accessor("_Alignas(64) int v;", 'b'));
     writeText(dir / "main4.c", mainChecking(4));
+    writeText(dir / "main64.c", mainChecking(64));
     writeText(dir / "main4096.c", mainChecking(4096));
     for (Family const& fam : kFamilies) {
         SCOPED_TRACE(fam.label);
@@ -609,7 +683,9 @@ TEST(TentativeDefinitionLinks, TwoDssObjectsOfOneNameAreOneObject) {
         };
         std::string const aPlain = objOf("a_plain"), bPlain = objOf("b_plain");
         std::string const aSmall = objOf("a_small"), bLarge = objOf("b_large");
-        ASSERT_FALSE(aPlain.empty() || bPlain.empty() || aSmall.empty() || bLarge.empty());
+        std::string const aWide = objOf("a_wide"), bWide = objOf("b_wide");
+        ASSERT_FALSE(aPlain.empty() || bPlain.empty() || aSmall.empty() || bLarge.empty() || aWide.empty()
+                     || bWide.empty());
         struct Cell {
             char const*              name;
             std::vector<std::string> inputs;
@@ -618,7 +694,9 @@ TEST(TentativeDefinitionLinks, TwoDssObjectsOfOneNameAreOneObject) {
                                       {"pair_other_order", {"main4.c", bPlain, aPlain}},
                                       {"larger_wider", {"main4096.c", aSmall, bLarge}},
                                       {"larger_wider_other_order", {"main4096.c", bLarge, aSmall}},
-                                      {"source_beside_object", {"main4.c", "a_plain.c", bPlain}}};
+                                      {"source_beside_object", {"main4.c", "a_plain.c", bPlain}},
+                                      {"wide_pair", {"main64.c", aWide, bWide}},
+                                      {"wide_pair_other_order", {"main64.c", bWide, aWide}}};
         for (Cell const& cell : cells) {
             SCOPED_TRACE(cell.name);
             DiagnosticReporter rep;
@@ -629,6 +707,66 @@ TEST(TentativeDefinitionLinks, TwoDssObjectsOfOneNameAreOneObject) {
                 EXPECT_EQ(*exit, 42u) << "10 = two objects, 12 = one object NOT at the alignment the cell asks";
             }
         }
+    }
+}
+
+// THE ONE REFUSAL A4 LEAVES, SAID WITH ITS REASON (P69 fold 3c, the review of the fix fold, A4): on PE a DSS object's
+// `_Alignas(64) int v;` is a select-any definition (wider than a common of 4 bytes may be under link.exe), so beside
+// another unit's `int v = 7;` it is a duplicate — as link.exe, lld-link and GNU ld all refuse the same pair of
+// objects (✔MEASURED 2026-10-20, lane xa's `sb11/probes/a4`, both orders) — and the refusal names the document's rule
+// and why the tentative definition became a definition: the two units give one object different alignment
+// specifiers, which ISO C 6.7.5p7 leaves undefined. Both orders. CONTROL: `int v;` (a common) beside the same
+// definition links, the common yielding to it.
+TEST(TentativeDefinitionLinks, AnOverAlignedTentativeDefinitionBesideADefinitionIsRefusedNamingTheRule) {
+    test_support::ScratchDir scratch{test_support::Location::Temp, "tentative-wide-beside-def"};
+    auto const dir = scratch.path();
+    writeText(dir / "a_wide.c", accessor("_Alignas(64) int v;", 'a'));
+    writeText(dir / "a_plain.c", accessor("int v;", 'a'));
+    writeText(dir / "b_init.c", accessor("int v = 7;", 'b'));
+    writeText(dir / "main4.c", mainChecking(4));
+    Family const& fam = kFamilies[3];
+    ASSERT_EQ(std::string_view{fam.object}, "pe64-x86_64-windows");
+    auto const objOf = [&](char const* stem) {
+        DiagnosticReporter rep;
+        auto const o = dssBuilds(dir, {std::string{stem} + ".c"}, specOf(fam.target, fam.object),
+                                 std::string{"obj-"} + stem, fam.objExt, rep);
+        EXPECT_FALSE(o.empty()) << stem << diagnosticsOf(rep);
+        if (o.empty()) return std::string{};
+        auto const local = std::string{stem} + fam.objExt;
+        fs::copy_file(o, dir / local, fs::copy_options::overwrite_existing);
+        return local;
+    };
+    std::string const aWide = objOf("a_wide"), aPlain = objOf("a_plain"), bInit = objOf("b_init");
+    ASSERT_FALSE(aWide.empty() || aPlain.empty() || bInit.empty());
+    for (bool const wideFirst : {true, false}) {
+        SCOPED_TRACE(wideFirst ? "the tentative definition's object first" : "the definition's object first");
+        DiagnosticReporter rep;
+        auto const image =
+            dssBuilds(dir, wideFirst ? std::vector<std::string>{"main4.c", aWide, bInit}
+                                     : std::vector<std::string>{"main4.c", bInit, aWide},
+                      specOf(fam.target, fam.image), std::string{"img-wide-"} + (wideFirst ? "1" : "2"), fam.exeExt,
+                      rep);
+        EXPECT_TRUE(image.empty()) << "a select-any definition beside a strong one is a duplicate";
+        std::size_t said = 0;
+        for (auto const& d : rep.all()) {
+            if (d.code != DiagnosticCode::K_SymbolRedefinedAcrossUnits) continue;
+            ++said;
+            EXPECT_NE(d.actual.find("\"v\""), std::string::npos) << d.actual;
+            EXPECT_NE(d.actual.find("commonAlignmentFromSizeAtMost"), std::string::npos)
+                << "the refusal names the document's rule: " << d.actual;
+            EXPECT_NE(d.actual.find("TENTATIVE"), std::string::npos) << d.actual;
+            EXPECT_NE(d.actual.find("6.7.5p7"), std::string::npos) << d.actual;
+        }
+        EXPECT_EQ(said, 1u) << diagnosticsOf(rep);
+        // CONTROL: the plain tentative definition (a common) beside the same definition yields to it.
+        DiagnosticReporter repPlain;
+        auto const plain =
+            dssBuilds(dir, wideFirst ? std::vector<std::string>{"main4.c", aPlain, bInit}
+                                     : std::vector<std::string>{"main4.c", bInit, aPlain},
+                      specOf(fam.target, fam.image), std::string{"img-plain-"} + (wideFirst ? "1" : "2"), fam.exeExt,
+                      repPlain);
+        ASSERT_FALSE(plain.empty()) << diagnosticsOf(repPlain);
+        if (auto const exit = ranTo(fam, plain)) EXPECT_EQ(*exit, 42u);
     }
 }
 
@@ -707,8 +845,10 @@ TEST(TentativeDefinitionLinks, DssArchivesOfCommonsLinkAsTheReferencesDo) {
 // THE ROUND TRIP THAT MATTERS TO A USER: a DSS object holding `v` as a common, linked by the host's REFERENCE linker
 // beside that reference compiler's own object of `v`, in both link orders. Every cell is asserted against the TABLE
 // (what the reference's own objects gave in that cell when it was measured, with the versions it names); the
-// reference's own objects in the same cell are its CONTROL, and a control that moved is said as the reference's
-// change, never as DSS's (`reference moved:`, with the live tools' version lines).
+// reference's own objects in the same cell are its CONTROL, and a control that disagrees is said as the reference's,
+// never as DSS's (`test_support::controlDisagrees`: `reference moved:` on the measured toolchain, a counted line on
+// another, `measure it:` in a strict run — P69 fold 3c, the review of fold 2, F2; a reference link that refuses is
+// such a disagreement, F3).
 //   pair        — `int v;` beside the reference's `int v;`: ONE object (42) under every linker.
 //   dss_pair    — TWO DSS objects of `int v;` under the reference linker: ONE object (42), as its own pair is.
 //   definition  — `int v;` beside the reference's `int v = 7;`: the common yields to it (42).
@@ -728,6 +868,14 @@ TEST(TentativeDefinitionLinks, DssArchivesOfCommonsLinkAsTheReferencesDo) {
 //                 linker — the shape the re-review of fold 3b found misaligned: DSS's common with `-aligncomm:v,6`
 //                 landed at 4 under link.exe, which ignores the directive (12; ✔MEASURED 2026-10-15, cl's own object
 //                 42 — a `.bss` definition — under link.exe and lld-link). The reference's own pair is its control.
+//   small_wide  — six of each: `double d;` and `_Alignas(16) char c[16];` among 1-, 3-, 4- and 12-byte fillers, all
+//                 tentative, beside a main that reads 40 + 1 (a double off 8) + 2 (a char[16] off 16): 40 under every
+//                 linker, both orders. The cell GNU ld on PE decides: a COFF common states its alignment only by
+//                 `-aligncomm:`, and GNU ld gives a directive-less common at most 4 — cl's commons of the same source
+//                 (no directive) read 43 under it, MinGW gcc's (each with its directive) 40 (✔MEASURED 2026-10-20, cl
+//                 19.44 objects and MinGW gcc 13.2.0 under GNU ld 2.42, both orders; P69 fold 3c, the review of the
+//                 fix fold, A1). DSS's PE writer states the directive wherever the alignment exceeds what EVERY linker
+//                 gives (`commonAlignmentEveryLinkerGivesAtMost`); stated only above link.exe's 32, its object read 43.
 namespace {
 
 struct NativeArm {
@@ -838,7 +986,12 @@ struct NativeArms {
         };
         found.arms.push_back(std::move(a));
     }
-    if (std::system("where gcc >nul 2>&1") == 0) {
+    // MinGW-w64's x86-64 gcc, as the ONE locator identifies it (P69 fold 3c, the review of the fix fold, N5: `where
+    // gcc` alone took whatever `gcc` the host's PATH holds): absent is the arm not run, said; one that cannot answer is
+    // a failure here and now.
+    auto const mingw = np::locateMingwGcc(work);
+    if (!mingw.toolAbsent() && !mingw.ok()) ADD_FAILURE() << mingw.describe();
+    if (mingw.ok()) {
         auto a = gnuStyle("MinGW gcc -fcommon (GNU ld, PE)", "gcc", "x86_64", "x86_64:pe64-x86_64-windows", ".exe", 42);
         a.measuredWith    = "MinGW gcc 13.2.0 with GNU ld 2.42";
         a.versionCommands = {"gcc --version", "ld -v"};
@@ -846,8 +999,8 @@ struct NativeArms {
             return std::system(np::captureCmd("cd /d \"" + dir.string() + "\" && " + cmd, dir / log).c_str()) == 0;
         };
         found.arms.push_back(std::move(a));
-    } else {
-        found.absent.push_back("MinGW gcc (GNU ld, PE): no `gcc` on PATH");
+    } else if (mingw.toolAbsent()) {
+        found.absent.push_back("MinGW gcc (GNU ld, PE): " + mingw.detail);
     }
 #else
     (void)work;
@@ -935,8 +1088,12 @@ TEST(TentativeDefinitionsNative, ADssCommonBesideTheReferencesOwnObjectLinksUnde
         writeText(d / "main4.c", mainChecking(4));
         writeText(d / "main4096.c", mainChecking(4096));
         writeText(d / "main64.c", mainChecking(64));
+        writeText(d / "ref_small_wide.c", smallWideCommons());
+        writeText(d / "dss_small_wide.c", smallWideCommons());
+        writeText(d / "main_small_wide.c", smallWideMain());
         for (char const* stem : {"ref_plain_a", "ref_small_a", "ref_wide_a", "ref_large_a", "ref_plain", "ref_defined",
-                                 "ref_large", "ref_echo", "main4", "main4096", "main64"}) {
+                                 "ref_large", "ref_echo", "main4", "main4096", "main64", "ref_small_wide",
+                                 "main_small_wide"}) {
             std::string const log = std::string{stem} + "-cc.txt";
             ASSERT_TRUE(arm.run(d, arm.compile(stem), log)) << np::tailOf(d / log, 20, arm.label);
         }
@@ -947,19 +1104,26 @@ TEST(TentativeDefinitionsNative, ADssCommonBesideTheReferencesOwnObjectLinksUnde
         auto const dssFormat = shipped(arm.dssSpec.substr(arm.dssSpec.find(':') + 1));
         ASSERT_NE(dssFormat, nullptr) << arm.dssSpec;
         std::string const dssObj{dssFormat->outputExtension()};
-        for (char const* stem : {"dss_plain", "dss_plain_b", "dss_small", "dss_wide"}) {
+        for (char const* stem : {"dss_plain", "dss_plain_b", "dss_small", "dss_wide", "dss_small_wide"}) {
             DiagnosticReporter rep;
             auto const o =
                 dssBuilds(d, {std::string{stem} + ".c"}, arm.dssSpec, std::string{"out-"} + stem, dssObj, rep);
             ASSERT_FALSE(o.empty()) << stem << diagnosticsOf(rep);
             fs::copy_file(o, d / (std::string{stem} + arm.obj), fs::copy_options::overwrite_existing);
         }
-        // The reference's link of `inputs` into `out`, run: its exit code, or nullopt after saying why not.
-        auto const linkAndRun = [&](std::string const& out,
-                                    std::vector<std::string> const& inputs) -> std::optional<unsigned> {
+        // The reference's link of `inputs` into `out`, run: its exit code, or nullopt after saying why not — the
+        // CONTROL's refusal (`tableSays` given) is the control's disagreement, a DSS object's is a failure.
+        auto const linkAndRun = [&](std::string const& out, std::vector<std::string> const& inputs,
+                                    std::optional<unsigned> tableSays) -> std::optional<unsigned> {
             std::string const log = out + "-link.txt";
             if (!arm.run(d, arm.link(out, inputs), log)) {
-                ADD_FAILURE() << arm.label << " refused `" << out << "`" << np::tailOf(d / log, 20, arm.label);
+                if (tableSays.has_value()) {
+                    test_support::controlDisagrees(arm.label, arm.measuredWith, liveVersions(arm, d),
+                                                   "REFUSES `" + out + "`:" + np::tailOf(d / log, 20, arm.label),
+                                                   "it links it (" + std::to_string(*tableSays) + ")");
+                } else {
+                    ADD_FAILURE() << arm.label << " refused `" << out << "`" << np::tailOf(d / log, 20, arm.label);
+                }
                 return std::nullopt;
             }
             auto const r = test_support::runBinary(d / (out + arm.exe), test_support::kRunBudget,
@@ -990,23 +1154,24 @@ TEST(TentativeDefinitionsNative, ADssCommonBesideTheReferencesOwnObjectLinksUnde
             {"large_alone", 12u, {o("main4096"), o("ref_large_a"), o("ref_echo")}, {}, {}},
             {"aligned_alone", 42u, {o("main64"), o("ref_wide_a"), o("ref_echo")},
              {o("main64"), o("dss_wide"), o("ref_echo")}, {o("main64"), o("ref_echo"), o("dss_wide")}},
+            {"small_wide", 40u, {o("main_small_wide"), o("ref_small_wide")},
+             {o("main_small_wide"), o("dss_small_wide")}, {o("dss_small_wide"), o("main_small_wide")}},
         };
         for (Cell const& cell : cells) {
             SCOPED_TRACE(cell.name);
-            if (auto const control = linkAndRun(std::string{"ref_"} + cell.name, cell.reference)) {
-                EXPECT_EQ(*control, cell.table)
-                    << "reference moved: " << arm.label << " " << liveVersions(arm, d) << " answered " << *control
-                    << " in the cell `" << cell.name << "`, the table (measured with " << arm.measuredWith
-                    << ") says " << cell.table
-                    << " — the REFERENCE's answer changed under the table, which is NOT DSS differing from the "
-                       "reference: read what the live tool does, then restate the table and the row";
+            if (auto const control = linkAndRun(std::string{"ref_"} + cell.name, cell.reference, cell.table)) {
+                if (*control != cell.table) {
+                    test_support::controlDisagrees(arm.label, arm.measuredWith, liveVersions(arm, d),
+                                                   std::to_string(*control) + " in the cell `" + cell.name + "`",
+                                                   std::to_string(cell.table));
+                }
             }
             int order = 0;
             for (auto const* inputs : {&cell.dss, &cell.dssReversed}) {
                 ++order;
                 if (inputs->empty()) continue;
                 std::string const out = std::string{"dss_"} + cell.name + "_" + std::to_string(order);
-                if (auto const exit = linkAndRun(out, *inputs)) {
+                if (auto const exit = linkAndRun(out, *inputs, std::nullopt)) {
                     EXPECT_EQ(*exit, cell.table)
                         << "a DSS object's common under " << arm.label << " in the cell `" << cell.name
                         << "` (order " << order << ") answered " << *exit << ", the table says " << cell.table

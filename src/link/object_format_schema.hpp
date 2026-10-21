@@ -425,67 +425,130 @@ inline constexpr EnumNameTable<CommonYieldsTo, 3> kCommonYieldsToTable{{{
 // fold 3b, MAJOR 1; D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED):
 //   * `states` — whether the document states commons at all
 //     (`ObjectFormatSchema::statesCommons`);
-//   * `alignmentFromSizeAtMost` — the root key `commonAlignmentFromSizeAtMost`:
-//     where a format's COMMON cannot state its alignment to EVERY linker its
-//     objects reach, the alignment every one of them gives a common that states
-//     none — its size rounded up to a power of two, at most this many bytes.
-//     COFF: a common is an undefined external whose value is its size, and the
-//     only way to state its alignment is the `-aligncomm:` directive, which GNU
-//     ld and lld-link honour and link.exe IGNORES (LNK4229). ✔MEASURED
-//     2026-10-15 (min of three placements, no directive): link.exe 14.44 gives 4
-//     to a common of 4 bytes or fewer and 32 to every larger one; lld-link 19.1.5
-//     gives the size rounded up to a power of two, at most 32 — the MINIMUM of
-//     the two is lld-link's rule, which the PE documents state. Absent (ELF,
-//     Mach-O), the common states its own alignment in its symbol and every
-//     linker honours it.
-// A tentative definition wider than that for its size, in a unit whose OBJECT
-// another linker reads (`objectReadByAnotherLinker`: a relocatable or archive
-// document), is NOT written as a common (`admitsCommon`): it stays the
-// zero-filled DEFINITION it is, as the MSVC-environment references write every
-// explicitly aligned tentative definition (✔MEASURED 2026-10-15: cl 19.44 /std:c11 and /std:c17, and clang
-// 19.1.5 --target=x86_64-pc-windows-msvc -fcommon — `_Alignas(4) int v;` to
-// `_Alignas(4096) char v;`, each a `.bss` definition; one unit's `_Alignas(64)
-// int v;` lands at 64 under link.exe and lld-link). Written as a common it lands
-// at the size's alignment under link.exe — the silent misalignment the review
-// found. THE COST: two units' over-aligned tentative definitions of one name are
-// two definitions, refused as duplicates — as cl's are under link.exe (LNK2005)
-// — where MinGW gcc's commons with `-aligncomm:` fold under GNU ld. One no wider
-// than every linker gives (`_Alignas(4) int v;`) stays a common, folding where
-// cl writes a definition. UNDER AN IMAGE DOCUMENT the rule writes nothing: DSS
-// links the unit itself, and its own link allocates every common at the
-// alignment its unit states (`linker::allocateCommonDefinitions`), so two units'
-// over-aligned tentative definitions, or one beside a definition of its name,
-// fold as one program's (✔MEASURED 2026-10-15: written as a definition there, the
-// sources of `_Alignas(64) char w;` and `char w = 1;` compiled together were
-// refused as two definitions, Mac leg host run 20261015-222515-3b081ea3).
+//   * where a format's COMMON cannot state its alignment in its own symbol, the
+//     two facts of how its linkers align one, each the size rounded up to a power
+//     of two and capped (P69 fold 3c, lane `xa`; the review of the fix fold, A1
+//     and N3). COFF: a common is an undefined external whose value is its size,
+//     and its alignment can be stated only by the `-aligncomm:` directive, which
+//     GNU ld and lld-link honour and link.exe IGNORES (LNK4229). ✔MEASURED
+//     2026-10-20 (one object of 126 directive-less commons from cl 19.44 /std:c11
+//     /Zl, 6 of each size beside odd-sized fillers, the minimum over every copy's
+//     address, both object orders): link.exe 14.44 and lld-link 19.1.5 give the
+//     size rounded up to a power of two, AT MOST 32 (1, 2, 3, 5, 9, 17 bytes land
+//     at 1, 2, 4, 8, 16, 32), as link.exe 14.51 did on 2026-10-06 (run
+//     20261006-225314-2e577758: 1, 3, 5, 17 -> 1, 4, 8, 32); GNU ld 2.42 gives the
+//     size rounded up AT MOST 4 (5 to 4096 bytes all at 4). The fix fold's
+//     "link.exe 14.44 gives 4 to 4 bytes or fewer and 32 above" was read off a
+//     placement that discriminated nothing (one common alone in its section):
+//       - `alignmentFromSizeAtMost` — the root key `commonAlignmentFromSizeAtMost`
+//         (32): what a linker that IGNORES a stated alignment gives a common
+//         (link.exe; lld-link given none). The most a common may need with no
+//         linker misaligning it, so the bound of `admitsCommon` — and the
+//         alignment a COFF object's maker relied on, so the alignment DSS's own
+//         link gives a common the object states none for (the COFF reader);
+//       - `everyLinkerGivesAtMost` — the root key
+//         `commonAlignmentEveryLinkerGivesAtMost` (4): what EVERY linker gives a
+//         common that states none (GNU ld's cap, the least of the three). Above
+//         it a common states its alignment (`statesItsAlignment`: the PE writer's
+//         `-aligncomm:`), which GNU ld and lld-link honour and link.exe needs no
+//         more of; at or below it no directive is written, so link.exe's LNK4229
+//         stays off the ordinary case. A plain `double d;` (8 bytes, aligned 8)
+//         written with none lands at 4 under GNU ld.
+//     Absent (ELF, Mach-O), the common states its own alignment in its symbol
+//     and every linker honours it for ONE common; how the alignments of TWO
+//     commons of one name merge is each linker's (Apple's ld keeps the larger
+//     common's alignment, GNU ld the widest — `TentativeDefinitionsNative`). A
+//     document whose commons cannot state their alignment states both keys or is
+//     refused at load (the PE backend's `validateIdentity`).
+//   * `beyondTheRule` — the root key `tentativeDefinitionBeyondCommonAlignment`:
+//     what a tentative definition wider than `admitsCommon` lets a common be is
+//     written as, in a unit whose OBJECT another linker reads
+//     (`objectReadByAnotherLinker`: a relocatable or archive document). Written
+//     as a common it lands at the size's alignment under link.exe — the silent
+//     misalignment the re-review of fold 3b found. ✔MEASURED 2026-10-20 (lane
+//     xa's `sb11/probes/a4`: `_Alignas(64) int v;` and `_Alignas(16) int v;` in
+//     COFF objects assembled by clang 19.1.5, each spelling under link.exe 14.44,
+//     lld-link 19.1.5 and GNU ld 2.42, alone, as a pair, beside cl's common
+//     `int v;`, beside cl's `int v = 7;` and beside MinGW gcc's common with its
+//     `-aligncomm:`, both orders): a SELECT-ANY definition (a COMDAT `.bss`
+//     section, selection ANY, at the alignment) links alone, as a pair, beside
+//     either common, one object and aligned, under all three, and is refused
+//     beside an initialized definition by all three — a program whose units give
+//     one object different alignment specifiers, which ISO C 6.7.5p7 leaves
+//     undefined; a plain DEFINITION (cl's and clang-msvc's spelling) links the
+//     same except the pair, refused as a duplicate by all three, where MinGW
+//     gcc's commons fold; a common with the directive, or one whose size is
+//     raised to its alignment, is misaligned by link.exe in every shape. So the
+//     PE object documents state `select-any` — DSS's existing weak kind of that
+//     name, which its own reader and link already read and fold — and
+//     `definition` names the other spelling. UNDER AN IMAGE DOCUMENT the rule
+//     writes nothing: DSS links the unit itself, and its own link allocates every
+//     common at the alignment its unit states (`linker::allocateCommonDefinitions`),
+//     so two units' over-aligned tentative definitions, or one beside a
+//     definition of its name, fold as one program's (✔MEASURED 2026-10-15: written
+//     as a definition there, the sources of `_Alignas(64) char w;` and
+//     `char w = 1;` compiled together were refused as two definitions, Mac leg
+//     host run 20261015-222515-3b081ea3).
+enum class TentativeBeyondCommonAlignment : std::uint8_t {
+    Definition,
+    SelectAny,
+};
+
+inline constexpr EnumNameTable<TentativeBeyondCommonAlignment, 2> kTentativeBeyondCommonAlignmentTable{{{
+    { TentativeBeyondCommonAlignment::Definition, "definition" },
+    { TentativeBeyondCommonAlignment::SelectAny,  "select-any" },
+}}};
+
 struct DSS_EXPORT CommonsStatement {
-    bool                         states = false;
-    std::optional<std::uint64_t> alignmentFromSizeAtMost;
+    bool                                          states = false;
+    std::optional<std::uint64_t>                  alignmentFromSizeAtMost;
+    std::optional<std::uint64_t>                  everyLinkerGivesAtMost;
+    std::optional<TentativeBeyondCommonAlignment> beyondTheRule;
     // Whether the unit's commons reach a linker other than DSS's own: the
     // document writes an OBJECT (a relocatable or an archive document), not an
     // image DSS links itself (`ObjectFormatSchema::isImageFlavor`).
-    bool                         objectReadByAnotherLinker = true;
+    bool                                          objectReadByAnotherLinker = true;
 
-    // The alignment every linker gives a common of `size` bytes that states
-    // none, or nullopt where the common states its own.
-    [[nodiscard]] std::optional<std::uint64_t>
-    alignmentEveryLinkerGives(std::uint64_t size) const noexcept {
-        if (!alignmentFromSizeAtMost.has_value()) return std::nullopt;
+    [[nodiscard]] static constexpr std::uint64_t
+    sizeRoundedUpAtMost(std::uint64_t size, std::uint64_t atMost) noexcept {
         std::uint64_t alignment = 1;
-        while (alignment < size && alignment < *alignmentFromSizeAtMost) alignment <<= 1;
+        while (alignment < size && alignment < atMost) alignment <<= 1;
         return alignment;
+    }
+    // What a linker that ignores a stated alignment gives a common of `size`
+    // bytes, or nullopt where the common states its own.
+    [[nodiscard]] std::optional<std::uint64_t> alignmentFromSize(std::uint64_t size) const noexcept {
+        if (!alignmentFromSizeAtMost.has_value()) return std::nullopt;
+        return sizeRoundedUpAtMost(size, *alignmentFromSizeAtMost);
+    }
+    // What EVERY linker gives a common of `size` bytes that states none, or
+    // nullopt where the common states its own.
+    [[nodiscard]] std::optional<std::uint64_t>
+    alignmentEveryLinkerGivesUnstated(std::uint64_t size) const noexcept {
+        if (!everyLinkerGivesAtMost.has_value()) return std::nullopt;
+        return sizeRoundedUpAtMost(size, *everyLinkerGivesAtMost);
     }
     // Whether a tentative definition of `size` bytes aligned to `alignment` may
     // be written as a common: the document states commons, and DSS's own link
-    // allocates it (an image document) or every linker its object reaches gives
-    // the common at least `alignment`.
+    // allocates it (an image document) or no linker its object reaches gives the
+    // common less than `alignment` (`alignmentFromSize`, the directive stated
+    // where `statesItsAlignment` asks).
     [[nodiscard]] bool admitsCommon(std::uint64_t size, std::uint64_t alignment) const noexcept {
         if (!states) return false;
         if (!objectReadByAnotherLinker) return true;
-        auto const gives = alignmentEveryLinkerGives(size);
+        auto const gives = alignmentFromSize(size);
         return !gives.has_value() || alignment <= *gives;
     }
+    // Whether a common of `size` bytes aligned to `alignment` must STATE its
+    // alignment where its format spells it apart from the symbol (COFF's
+    // `-aligncomm:`): wider than every linker gives one that states none. False
+    // where the common states its own in its symbol (no rule).
+    [[nodiscard]] bool statesItsAlignment(std::uint64_t size, std::uint64_t alignment) const noexcept {
+        auto const gives = alignmentEveryLinkerGivesUnstated(size);
+        return gives.has_value() && alignment > *gives;
+    }
 };
+DSS_CHECK_ENUM_NAME_TABLE(kTentativeBeyondCommonAlignmentTable);
 DSS_CHECK_ENUM_NAME_TABLE(kCommonYieldsToTable);
 
 // ★★★ WHAT BECOMES OF A DEFINITION WHOSE NAME ANOTHER DEFINITION WINS — a FORMAT
@@ -1045,6 +1108,33 @@ struct DSS_EXPORT ElfDynamicRelocationTypes {
     }
 };
 
+// P69 fold 3c: the BINDING an ELF document states for a definition of which a
+// process holds ONE instance (`elf.uniqueBinding`; gcc's STB_GNU_UNIQUE). Three
+// facts, stated whole or refused at load:
+//   * `value` — the `st_info` binding nibble; none of the three every format
+//     shares. The reader reads it whatever OS ABI the object's header states, as
+//     GNU ld 2.42 and ld.lld 18.1.3 both read it (✔MEASURED 2026-10-20, headers
+//     patched to NONE and to FreeBSD: one object per name under both);
+//   * `osabi` — the OS ABI its meaning is: a writer that writes the binding
+//     states it in a header that states none, as GNU ld does in an image and on
+//     `-r` (✔MEASURED; ld.lld leaves SYSV in an image); under a header that
+//     states ANOTHER OS ABI it writes the binding all the same, as ld.lld 18.1.3
+//     writes binding 10 under SYSV and FreeBSD headers (✔MEASURED 2026-10-21;
+//     GNU ld 2.42 as Ubuntu ships it carries no output format of another OS ABI
+//     to measure). The LOADER relates it to no header: a document of any OS ABI
+//     loads, and its reader reads the binding whatever an object's header states;
+//   * `readAs` — the binding a static link reads such a definition AS; never
+//     `local`, which is how two units' copies became two objects until P69.
+// ✔MEASURED 2026-10-20 (g++ 13.3.0, GNU ld 2.42, ld.lld 18.1.3): value 10 under
+// ELFOSABI_GNU; both linkers keep one definition per name through its section
+// group in both orders, refuse two outside a group as two STB_GLOBAL
+// definitions, and keep the binding on `-r`.
+struct DSS_EXPORT ElfUniqueBinding {
+    std::uint8_t  value  = 0;
+    std::uint8_t  osabi  = 0;
+    SymbolBinding readAs = SymbolBinding::Global;
+};
+
 struct DSS_EXPORT ElfIdentity {
     std::uint8_t   fileClass = 0;    // ELFCLASS64=2 / ELFCLASS32=1
     std::uint8_t   dataEncoding = 0; // ELFDATA2LSB=1 / ELFDATA2MSB=2
@@ -1108,6 +1198,10 @@ struct DSS_EXPORT ElfIdentity {
     bool           bindNow = true;
     // The dynamic relocation types by role — see `ElfDynamicRelocationTypes`.
     ElfDynamicRelocationTypes dynamicRelocationTypes;
+    // The binding of a definition of which a process holds one instance — see
+    // `ElfUniqueBinding`. Absent: the document states none, its reader refuses
+    // such a symbol and its writer such a definition, by name.
+    std::optional<ElfUniqueBinding> uniqueBinding;
 };
 
 // ── PE/COFF-specific identity block (loaded only when kind == Pe) ──
@@ -2550,12 +2644,23 @@ struct DSS_EXPORT ObjectFormatData {
     // weak definition of its name; refused on an ARCHIVE document (`validate()`),
     // whose members are each linked alone.
     std::optional<CommonYieldsTo> commonYieldsTo;
-    // The alignment every linker gives a COMMON that states none: its size
-    // rounded up to a power of two, at most this (the
+    // The alignment a linker that ignores a COMMON's stated alignment gives it:
+    // its size rounded up to a power of two, at most this (the
     // `commonAlignmentFromSizeAtMost` root key — see `CommonsStatement`).
     // OPTIONAL: absent, the format's common states its own alignment. A power of
     // two, and only where the document states commons (`validate()`).
     std::optional<std::uint64_t> commonAlignmentFromSizeAtMost;
+    // The alignment EVERY linker gives a COMMON that states none: its size
+    // rounded up to a power of two, at most this (the
+    // `commonAlignmentEveryLinkerGivesAtMost` root key — see `CommonsStatement`).
+    // OPTIONAL, with the key above: a power of two no larger than it, and only
+    // where the document states commons (`validate()`).
+    std::optional<std::uint64_t> commonAlignmentEveryLinkerGivesAtMost;
+    // What a tentative definition wider than a common may be is written as, in
+    // an object another linker reads (the `tentativeDefinitionBeyondCommonAlignment`
+    // root key — see `CommonsStatement`). OPTIONAL: only on a relocatable or
+    // archive document that states `commonAlignmentFromSizeAtMost` (`validate()`).
+    std::optional<TentativeBeyondCommonAlignment> tentativeDefinitionBeyondCommonAlignment;
     // What becomes of a definition whose name another definition wins (the
     // `supersededDefinition` root key — see `SupersededDefinition`). OPTIONAL:
     // unstated, a link refuses when a relocation names such a definition, and a
@@ -3594,12 +3699,15 @@ public:
 
     // The facts a unit compiled for this document writes its tentative
     // definitions by (`CommonsStatement`): whether the document states commons,
-    // and the alignment every linker gives one that states none. Captured by
-    // both routes' lower halves (`compile_pipeline.cpp`, `program.cpp`), and read
-    // by the COFF reader and the PE writer, which align and spell a common by the
-    // same rule.
+    // the two alignments its linkers give one that states none, and what a
+    // tentative definition wider than a common may be becomes. Captured by both
+    // routes' lower halves (`compile_pipeline.cpp`, `program.cpp`), and read by
+    // the COFF reader and the PE writer, which align and spell a common by the
+    // same rules.
     [[nodiscard]] CommonsStatement commonsStatement() const noexcept {
-        return CommonsStatement{statesCommons(), d_.commonAlignmentFromSizeAtMost, !isImageFlavor()};
+        return CommonsStatement{statesCommons(), d_.commonAlignmentFromSizeAtMost,
+                                d_.commonAlignmentEveryLinkerGivesAtMost,
+                                d_.tentativeDefinitionBeyondCommonAlignment, !isImageFlavor()};
     }
 
     // What this document states of a definition whose name another definition
@@ -3673,6 +3781,15 @@ public:
     // `kind()` matches that arm. Walker reads the relevant block
     // when it runs.
     [[nodiscard]] ElfIdentity      const& elf()              const noexcept { return d_.elf; }
+    // P69 fold 3c: the binding a static link reads a definition AS when its unit
+    // states it is the ONE instance of its name in the process
+    // (`ModuleSymbol::oneInstancePerProcess`); present only where the document
+    // states how such a definition is spelled (ELF's `elf.uniqueBinding`). Asked
+    // by every writer (`requireOneInstancePerProcessSpelling`), whatever its kind.
+    [[nodiscard]] std::optional<SymbolBinding> oneInstancePerProcessReadAs() const noexcept {
+        if (!d_.elf.uniqueBinding.has_value()) return std::nullopt;
+        return d_.elf.uniqueBinding->readAs;
+    }
     [[nodiscard]] PeIdentity       const& pe()               const noexcept { return d_.pe; }
     [[nodiscard]] PeOptionalHeader const& peOptionalHeader() const noexcept { return d_.peOptionalHeader; }
     [[nodiscard]] MachOIdentity    const& macho()            const noexcept { return d_.macho; }

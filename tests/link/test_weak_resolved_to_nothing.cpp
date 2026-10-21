@@ -500,20 +500,39 @@ TEST(WeakResolvedToNothingRule, TheLinkWritesAnAbsoluteFieldFromZero) {
         << why;
     EXPECT_EQ(b, (std::vector<std::uint8_t>{16, 0, 0, 0, 0, 0, 0, 0})) << "0 + A";
 
-    std::vector<std::uint8_t> c{0xB8, 0xEE, 0xEE, 0xEE, 0xEE};
-    ASSERT_TRUE(linker::writeWeakNullConstant(
-        c, Relocation{1, SymbolId{kWeak}, kindNamed(*s.target, "abs32"), -8},
-        rowNamed(*s.target, "abs32"), linker::WeakNullReferenceClass::Absolute, why))
-        << why;
-    EXPECT_EQ(c, (std::vector<std::uint8_t>{0xB8, 0xF8, 0xFF, 0xFF, 0xFF}));
-
-    // A 32-bit field cannot hold an addend of 2^31: refused, nothing written.
-    std::vector<std::uint8_t> d{0xB8, 0xEE, 0xEE, 0xEE, 0xEE};
-    EXPECT_FALSE(linker::writeWeakNullConstant(
-        d, Relocation{1, SymbolId{kWeak}, kindNamed(*s.target, "abs32"), std::int64_t{1} << 31},
-        rowNamed(*s.target, "abs32"), linker::WeakNullReferenceClass::Absolute, why));
-    EXPECT_NE(why.find("cannot hold its own addend"), std::string::npos) << why;
-    EXPECT_EQ(d, (std::vector<std::uint8_t>{0xB8, 0xEE, 0xEE, 0xEE, 0xEE}));
+    // ★ P69 fold 3c: A NARROW FIELD HOLDS ITS ROW'S RANGE, AND THIS TEST USED TO PIN THE DEFECT. It wrote `abs32`
+    // (R_X86_64_32, read back zero-extended) with A = -8 as 0xfffffff8 and refused A = 2^31 — the SIGNED range every
+    // narrow Linear field was checked against, which is R_X86_64_32S's. GNU ld 2.42 and ld.lld 18.1.3 do the
+    // opposite on R_X86_64_32 (✔MEASURED 2026-10-20: 0x80000000 links, -1 is "relocation truncated to fit"), and a
+    // `movl $weak-8, %eax` written 0xfffffff8 reads back as 2^32 - 8. Each kind now writes and refuses by its own
+    // range (`linearFieldHolds`): the zero-extending `abs32`, the sign-extending `abs32s`, and `addr32` — COFF's
+    // ADDR32, which holds both halves.
+    struct Case {
+        char const*  kind;
+        std::int64_t addend;
+        bool         holds;
+    };
+    for (Case const c : {Case{"abs32", -8, false}, Case{"abs32", std::int64_t{1} << 31, true},
+                         Case{"abs32s", -8, true}, Case{"abs32s", std::int64_t{1} << 31, false},
+                         Case{"addr32", -8, true}, Case{"addr32", std::int64_t{1} << 31, true},
+                         Case{"addr32", std::int64_t{1} << 32, false}}) {
+        SCOPED_TRACE(std::string{c.kind} + " + " + std::to_string(c.addend));
+        std::vector<std::uint8_t> f{0xB8, 0xEE, 0xEE, 0xEE, 0xEE};
+        why.clear();
+        bool const wrote = linker::writeWeakNullConstant(
+            f, Relocation{1, SymbolId{kWeak}, kindNamed(*s.target, c.kind), c.addend},
+            rowNamed(*s.target, c.kind), linker::WeakNullReferenceClass::Absolute, why);
+        EXPECT_EQ(wrote, c.holds) << why;
+        if (c.holds) {
+            auto const u = static_cast<std::uint32_t>(c.addend);
+            EXPECT_EQ(f, (std::vector<std::uint8_t>{0xB8, static_cast<std::uint8_t>(u), static_cast<std::uint8_t>(u >> 8),
+                                                    static_cast<std::uint8_t>(u >> 16), static_cast<std::uint8_t>(u >> 24)}));
+        } else {
+            EXPECT_NE(why.find("cannot hold its own addend"), std::string::npos) << why;
+            EXPECT_NE(why.find(std::string{"range"}), std::string::npos) << "the refusal names the range: " << why;
+            EXPECT_EQ(f, (std::vector<std::uint8_t>{0xB8, 0xEE, 0xEE, 0xEE, 0xEE})) << "nothing written";
+        }
+    }
 }
 
 TEST(WeakResolvedToNothingRule, TheLinkWritesABranchToTheNextInstruction) {

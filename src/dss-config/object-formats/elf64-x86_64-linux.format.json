@@ -75,7 +75,9 @@
     "data": "lsb",
     "osabi": "sysv",
     "abiVersion": 0,
-    "machine": 62
+    "machine": 62,
+    "$uniqueBindingComment": "P69 fold 3c (D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE): the BINDING of a definition of which a process holds ONE instance -- gcc's STB_GNU_UNIQUE, which g++ writes for a C++ inline variable and a template's static data member, each in a COMDAT group named by the symbol. `value`: the st_info binding, 10, of the OS-specific range. `osabi`: the OS ABI its meaning is -- a writer that writes the binding states it in a header that states none, as GNU ld 2.42 does in an image and on `-r` (ld.lld 18.1 leaves SYSV in an image); under a header that states ANOTHER OS ABI it writes the binding all the same, as ld.lld 18.1.3 writes binding 10 under SYSV and FreeBSD headers (MEASURED 2026-10-21; GNU ld 2.42 as Ubuntu ships it carries no output format of another OS ABI to measure), and the loader relates the binding to no header. `readAs`: the binding a static link reads it as -- `global`: two such definitions of one name are one through their section group and a duplicate outside one, as two STB_GLOBAL definitions are. MEASURED 2026-10-20 (g++ 13.3.0, GNU ld 2.42, ld.lld 18.1.3): one object per name in both orders; `multiple definition` / `duplicate symbol` with the groups removed; both linkers read the value whatever OS ABI the object's header states (headers patched to NONE and FreeBSD). A binding no format shares and this block does not state is refused by name (K_SymbolBindingNotModelled), as ld.lld refuses it. Until P69 the reader read every such binding as LOCAL, and two units' `inline int counter` linked to TWO objects (the program 5 where both references' is 41).",
+    "uniqueBinding": { "value": 10, "osabi": "gnu", "readAs": "global" }
   },
 
   "sections": [
@@ -223,6 +225,12 @@
       "name": "R_X86_64_32",
       "kind": 3,
       "nativeId": 10
+    },
+    {
+      "$comment": "P69 fold 3c (D-LK-RELOCATION-TYPES-REFERENCE-COMPILERS-EMIT-FOR-C-UNDECLARED): absolute 32-bit, SIGN-extended. ELF type R_X86_64_32S = 11. `kind` = 13 matches x86_64.target.json's `abs32s` row (its field holds [-2^31, 2^31), as GNU ld 2.42 links it). gcc and clang write it for every -fno-pic `movq $sym, %rax` and `sym(,%reg,n)` operand (MEASURED 2026-10-20, the class census).",
+      "name": "R_X86_64_32S",
+      "kind": 13,
+      "nativeId": 11
     },
     {
       "$comment": "D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS: the DWARF FDE `initial_location` pointer in a relocatable `.eh_frame` (DW_EH_PE_pcrel|sdata4) -- the target's `pcrel32` (kind 5, addend bias 0: a DATA word whose displacement is measured from the word itself). SAME ELF wire type as the kind-8 `R_X86_64_PC32` row below (r_type 2), which OWNS it: a reader decodes every r_type 2 as kind 8 `riprel32` (addend bias -4, a memory operand's displacement from the NEXT instruction), and this row is `emitOnly`, the emission alias through which the writer reaches the same type with an unbiased addend -- the two kinds differ ONLY in that implicit bias, which the wire format does not carry. The `_UNBIASED` suffix is a DSS-side disambiguator, NOT a psABI spelling (the format loader requires row names to be unique). The CALL kind (kind 1 `rel32`) no longer shares the type: since P69 it is R_X86_64_PLT32. Not `isCall`: an FDE pointer never names an extern call, and routing it through a PLT stub would make the unwinder's PC lookup land on jump-stub bytes. ✔MEASURED 2026-08-13 against `gcc -c`: `readelf -r` shows `R_X86_64_PC32  .text + <fnOffset>` on every FDE.",

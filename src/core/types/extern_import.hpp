@@ -487,11 +487,12 @@ struct DSS_EXPORT ExternImport {
     // fold 3b, lane `xa`). `commonAlignment` is what the link allocates at,
     // and on two formats it can be the FORMAT's derivation from the size
     // rather than anything the unit asked for: a COFF common carries no
-    // alignment (every COFF linker gives it at least the document's rule for
-    // its size — `CommonsStatement::alignmentEveryLinkerGives` — and only GNU
+    // alignment (link.exe gives it its size's, by the document's rule —
+    // `CommonsStatement::alignmentFromSize` — GNU ld at most 4, and only GNU
     // ld and lld-link honour an `-aligncomm:` directive asking for more;
     // link.exe ignores it, so a unit DSS compiles writes no common wider than
-    // that rule — `CommonsStatement::admitsCommon`), and a Mach-O
+    // link.exe's rule — `CommonsStatement::admitsCommon` — and states the
+    // alignment of one wider than GNU ld's), and a Mach-O
     // common whose `n_desc` alignment is 0 is aligned as its size (ld64). A
     // unit's code relies on the alignment it STATED and never on a derived
     // one, so whatever compares a common with what it needs reads this: ELF's

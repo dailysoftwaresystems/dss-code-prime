@@ -16,6 +16,7 @@
 // code-pointer field" — shared with `dwarf_cfi.hpp`'s FDE pointer
 // (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO).
 #include "link/format/unwind_pointer_reloc.hpp"
+#include "link/format/win64_unwind_decode.hpp"   // the x64 unwind vocabulary, read and written as one
 #include "link/format/weak_definition_gate.hpp"
 #include "link/fresh_symbol_ids.hpp" // maxExistingSymbolIdV — the residue runner's symbols
 #include "link/load_time_fixups.hpp" // synthesizeLoadTimeFixupRunner — the import-slot residue runner
@@ -127,6 +128,24 @@ constexpr std::uint16_t IMAGE_SYM_DTYPE_FUNCTION = 0x20;
 // (Object Only)" + "Auxiliary Format 5: Section Definitions").
 constexpr std::uint32_t kScnLnkComdat          = 0x00001000u;
 constexpr std::uint8_t  IMAGE_COMDAT_SELECT_ANY = 2;
+// IMAGE_SCN_LNK_NRELOC_OVFL (PE Format spec, "Section Flags"): a section with
+// more relocations than the u16 NumberOfRelocations holds sets this flag, writes
+// 0xFFFF in the field, and puts the real count — itself included — in the
+// VirtualAddress of a FIRST record that is not a relocation (symbol 0, type 0).
+// The reader's mirror is coff_object_reader.cpp's `kScnLnkNrelocOvfl`; the
+// round trip of a table past the field's capacity rides the pair.
+constexpr std::uint32_t kScnLnkNrelocOvfl         = 0x01000000u;
+constexpr std::uint32_t kMostRelocationsInTheField = 0xFFFEu;
+// The u16 NumberOfRelocations a header (and its section-definition auxiliary
+// record) states for `count` relocations: the count itself, or 0xFFFF once the
+// count lives in the table's first record.
+[[nodiscard]] constexpr std::uint16_t numberOfRelocationsField(std::uint32_t count) noexcept {
+    return count > kMostRelocationsInTheField ? std::uint16_t{0xFFFFu}
+                                              : static_cast<std::uint16_t>(count);
+}
+[[nodiscard]] constexpr std::uint32_t relocationOverflowFlag(std::uint32_t count) noexcept {
+    return count > kMostRelocationsInTheField ? kScnLnkNrelocOvfl : 0u;
+}
 // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: "The section is linked only if the
 // associated section is linked" — the Selection a section that DESCRIBES
 // another section carries, with its aux record's `Number` naming the associated
@@ -329,12 +348,26 @@ peThunkSizeFor(std::uint16_t machine) noexcept {
 //
 // The mapping is direct because the two formats describe the same physical fact:
 // a DWARF-style CFA rule change at PC X is a Win64 UNWIND_CODE with CodeOffset X.
+//   * CFA offset grows by 8 and a general register R is stated at the new top
+//     of the stack, at one PC        -> UWOP_PUSH_NONVOL (R)
 //   * CFA offset grows by N          -> UWOP_ALLOC_{SMALL,LARGE} of N
 //   * CFA base becomes register R    -> UWOP_SET_FPREG (R, offset 0)
+//   * CFA becomes R + K              -> UWOP_SET_FPREG (R, FrameOffset (C - K)/16),
+//                                       C the stack-pointer-based offset there
 //   * general register R saved at CFA+K
-//                                    -> UWOP_SAVE_NONVOL (R, (K + cfaOffset)/8)
+//                                    -> UWOP_SAVE_NONVOL (R, (K + B)/8)
 //   * 16-byte vector register X saved at CFA+K, a multiple of 16 from RSP
-//                                    -> UWOP_SAVE_XMM128 (X, (K + cfaOffset)/16)
+//                                    -> UWOP_SAVE_XMM128 (X, (K + B)/16)
+// B is the CFA's distance above the ESTABLISHER FRAME every save code is
+// measured from: RSP after the prologue's allocation, or the frame register's
+// base once UWOP_SET_FPREG has run (`win64_unwind_decode.hpp` states the rule
+// both directions share). ✔MEASURED P69 fold 3c: cl /O2's `_alloca` frame sets
+// `rbp` 32 bytes above RSP and then states `SAVE_NONVOL rbx` at 64, measured
+// from `rbp` minus those 32 bytes — never from `rbp` itself. Every save code of
+// the census is stated at or after the prologue's last allocation, where B is
+// also the stack-pointer-based offset at the save; the decoder reads a save
+// stated earlier from the frame's base, as the unwinder does in the body, and
+// this encoder is its inverse.
 //                                       while the quotient fits one node, else
 //                                       UWOP_SAVE_XMM128_FAR (X, K + cfaOffset,
 //                                       UNSCALED, in two nodes) -- the far REACH;
@@ -347,12 +380,15 @@ peThunkSizeFor(std::uint16_t machine) noexcept {
 // the array must be emitted SORTED DESCENDING by CodeOffset. `SizeOfProlog` is a
 // separate header byte. All offsets are single bytes -- a prologue > 255 B is
 // undescribable (fails loud -> D-WIN64-CHKSTK-LARGE-PROLOGUE).
-constexpr std::uint8_t kUwopAllocLarge  = 1;  // 2 nodes (opinfo 0, size/8 as u16) — frames ≤ 512 KiB
-constexpr std::uint8_t kUwopAllocSmall  = 2;  // 1 node, opinfo = size/8 - 1 — frames 8..128 B
-constexpr std::uint8_t kUwopSetFpReg    = 3;  // 1 node, opinfo 0 — CFA base becomes the frame register
-constexpr std::uint8_t kUwopSaveNonvol  = 4;  // 2 nodes (opinfo=reg, offset/8 as u16)
-constexpr std::uint8_t kUwopSaveXmm128    = 8;  // 2 nodes (opinfo=vector register number, offset/16 as u16)
-constexpr std::uint8_t kUwopSaveXmm128Far = 9;  // 3 nodes (opinfo=vector register number, offset UNSCALED as u32, low word first)
+// The operation numbers are the format's, stated once beside the decoder
+// (`win64_unwind_decode.hpp`), so the two directions cannot disagree on one.
+constexpr std::uint8_t kUwopPushNonvol  = link::format::win64::kUwopPushNonvol;  // 1 node, opinfo = register
+constexpr std::uint8_t kUwopAllocLarge  = link::format::win64::kUwopAllocLarge;  // 2 nodes (opinfo 0, size/8 as u16) — frames ≤ 512 KiB
+constexpr std::uint8_t kUwopAllocSmall  = link::format::win64::kUwopAllocSmall;  // 1 node, opinfo = size/8 - 1 — frames 8..128 B
+constexpr std::uint8_t kUwopSetFpReg    = link::format::win64::kUwopSetFpReg;    // 1 node, opinfo 0 — CFA base becomes the frame register
+constexpr std::uint8_t kUwopSaveNonvol  = link::format::win64::kUwopSaveNonvol;  // 2 nodes (opinfo=reg, offset/8 as u16)
+constexpr std::uint8_t kUwopSaveXmm128    = link::format::win64::kUwopSaveXmm128;    // 2 nodes (opinfo=vector register number, offset/16 as u16)
+constexpr std::uint8_t kUwopSaveXmm128Far = link::format::win64::kUwopSaveXmm128Far; // 3 nodes (opinfo=vector register number, offset UNSCALED as u32, low word first)
 // The width of the one vector save the format can state: UWOP_SAVE_XMM128 and
 // its FAR form each say "all 128 bits of this register are in that slot".
 constexpr std::uint16_t kUwopVectorSaveBytes = 16;
@@ -420,6 +456,12 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                         // kind of address.
                         std::vector<SehHandlerPatch>&   handlerPatches,
                         std::vector<XdataRvaPatch>&     rvaPatches,
+                        // The routine a FOREIGN object named as this function's
+                        // handler and the data it reads
+                        // (`AssembledFunction::languageHandler`), written after the
+                        // codes as the object wrote them. Null for a function DSS
+                        // compiled, whose `__try` scopes are `sehScopes`.
+                        LanguageHandler const*          languageHandler,
                         DiagnosticReporter&             reporter) {
     auto fail = [&](std::string msg) -> std::optional<std::vector<std::uint8_t>> {
         emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
@@ -456,10 +498,40 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
     // the representation guarantees is sorted by PC) and are emitted REVERSED.
     std::vector<Code> codes;
     bool const guardsSeh = !sehScopes.empty();
+    if (guardsSeh && languageHandler != nullptr) {
+        return fail("the function guards `__try` scopes of its own and carries a foreign "
+                    "object's handler too; UNWIND_INFO names one handler");
+    }
+    if (languageHandler != nullptr && !languageHandler->exceptionPhase
+        && !languageHandler->unwindPhase) {
+        return fail("the function carries a handler called in neither phase of a "
+                    "dispatch; UNWIND_INFO states a handler only through the phases "
+                    "that call it");
+    }
     std::uint8_t frameRegisterByte = 0x00u;   // FrameRegister nibble | FrameOffset nibble
     std::int64_t cfaOffset = cfi.initial.cfaOffset;
-
+    // Set once the CFA's base is a frame register: from there on, a change of
+    // the CFA's offset has no code (the unwinder takes RSP back from the frame
+    // register), and a second frame register has none either.
+    bool framed = false;
+    // ★ THE ESTABLISHER FRAME, read before any code is written: a save code is
+    // measured from it, and a save may be stated before the allocation it is
+    // measured after (cl's home-area saves). See B in the table above.
+    std::int64_t frameBase = cfi.initial.cfaOffset;
     for (auto const& op : cfi.ops) {
+        if (op.pcOffset > prologueEnd) break;
+        bool const stackBased =
+            op.kind == CfiOpKind::DefCfaOffset
+            || (op.kind == CfiOpKind::DefCfa && op.reg.ordinal == cfi.initial.cfaRegister);
+        if (stackBased) {
+            frameBase = op.offset;
+            continue;
+        }
+        if (op.kind == CfiOpKind::DefCfa || op.kind == CfiOpKind::DefCfaRegister) break;
+    }
+
+    for (std::size_t oi = 0; oi < cfi.ops.size(); ++oi) {
+        auto const& op = cfi.ops[oi];
         if (op.pcOffset > prologueEnd) {
             // ── Post-prologue. Win64 does NOT describe epilogues in
             // UNWIND_INFO: the OS reconstructs them by pattern-scanning for the
@@ -485,8 +557,17 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                                   "carry it");
             }
         }
-        switch (op.kind) {
+        bool const definesAStackBasedCfa =
+            op.kind == CfiOpKind::DefCfa && op.reg.ordinal == cfi.initial.cfaRegister;
+        switch (definesAStackBasedCfa ? CfiOpKind::DefCfaOffset : op.kind) {
         case CfiOpKind::DefCfaOffset: {
+            if (framed) {
+                return fail("the prologue moves the canonical frame address's offset from "
+                            "its frame register at byte offset "
+                            + std::to_string(op.pcOffset)
+                            + "; Win64 UNWIND_INFO fixes that offset when the frame register "
+                              "is set and has no code that moves it");
+            }
             std::int64_t const delta = op.offset - cfaOffset;
             cfaOffset = op.offset;
             if (delta == 0) continue;
@@ -500,6 +581,34 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
             if (delta % 8 != 0) {
                 return fail("frame allocation " + std::to_string(delta)
                             + " is not 8-byte aligned — x64 UWOP_ALLOC requires /8");
+            }
+            // ★ A PUSH: one slot more, and a general register stated at the new
+            // top of the stack AT THE SAME PC — one instruction did both.
+            // UWOP_PUSH_NONVOL is the only code that says it. An allocation of 8
+            // and a save at offset 0 would put the register at the establisher
+            // frame, which is the top of the stack only while no allocation
+            // follows — and the references allocate after their pushes
+            // (✔MEASURED P69 fold 3c, cl /O2: `@2 PUSH_NONVOL rbx`, then
+            // `@6 ALLOC_SMALL 112`).
+            if (delta == 8 && oi + 1 < cfi.ops.size()) {
+                auto const& pushed = cfi.ops[oi + 1];
+                auto const* pr = pushed.reg.isReturnAddress
+                                     ? nullptr
+                                     : targetSchema.registerInfo(pushed.reg.ordinal);
+                bool const isPush =
+                    pushed.pcOffset == op.pcOffset && pushed.kind == CfiOpKind::RegAtCfaOffset
+                    && pushed.offset == -cfaOffset && pr != nullptr
+                    && pr->regClass == TargetRegClass::GPR && pr->widthBytes == 8u
+                    && pr->hwEncoding <= 0x0Fu
+                    && (pushed.savedBytes == 0u || pushed.savedBytes == pr->widthBytes);
+                if (isPush) {
+                    codes.push_back(Code{static_cast<std::uint8_t>(op.pcOffset),
+                                         static_cast<std::uint8_t>(
+                                             kUwopPushNonvol | (pr->hwEncoding << 4)),
+                                         {}, 0u});
+                    ++oi;   // the save is the push's own statement
+                    break;
+                }
             }
             std::uint64_t const slots = static_cast<std::uint64_t>(delta) / 8u;
             if (delta <= 128) {
@@ -519,13 +628,32 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
             }
             break;
         }
+        case CfiOpKind::DefCfa:
         case CfiOpKind::DefCfaRegister: {
-            // The CFA base moved to a register that, at this PC, holds exactly
-            // the value the offset was measured against — so the Win64 frame
-            // register's scaled offset from RSP is zero. That is precisely
-            // UWOP_SET_FPREG, and it is what makes a variable-length-array
-            // function describable: after it, the runtime `sub rsp,<vla>` moves
-            // RSP freely and the frame register still locates the frame.
+            // The CFA base moved to a register. For `def_cfa_register` it holds,
+            // at this PC, exactly the value the offset was measured against — so
+            // the Win64 frame register's scaled offset from RSP is zero. That is
+            // precisely UWOP_SET_FPREG, and it is what makes a
+            // variable-length-array function describable: after it, the runtime
+            // `sub rsp,<vla>` moves RSP freely and the frame register still
+            // locates the frame. For `def_cfa R, K` the register is RSP + (C - K),
+            // which the format states as FrameOffset (C - K)/16 — a multiple of
+            // 16 from 0 to 240, or no code at all (cl and mingw-w64 gcc both set
+            // `rbp` 32 bytes above RSP for an `_alloca` frame, ✔MEASURED P69
+            // fold 3c).
+            if (framed) {
+                return fail("the prologue sets a second frame register at byte offset "
+                            + std::to_string(op.pcOffset)
+                            + "; Win64 UNWIND_INFO names one");
+            }
+            std::int64_t const scaledFrom = op.kind == CfiOpKind::DefCfa ? cfaOffset - op.offset : 0;
+            if (scaledFrom < 0 || scaledFrom % 16 != 0 || scaledFrom / 16 > 0x0F) {
+                return fail("the frame register is set " + std::to_string(scaledFrom)
+                            + " bytes above the stack pointer at byte offset "
+                            + std::to_string(op.pcOffset)
+                            + "; UWOP_SET_FPREG states a multiple of 16 from 0 to 240");
+            }
+            framed = true;
             auto const* ri = targetSchema.registerInfo(op.reg.ordinal);
             if (ri == nullptr) {
                 return fail("frame-pointer rule names register ordinal "
@@ -539,7 +667,8 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                             "encoding 0, which UNWIND_INFO reserves for "
                             "\"no frame register\"");
             }
-            frameRegisterByte = static_cast<std::uint8_t>(ri->hwEncoding & 0x0Fu);
+            frameRegisterByte = static_cast<std::uint8_t>(
+                (ri->hwEncoding & 0x0Fu) | ((scaledFrom / 16) << 4));
             codes.push_back(Code{static_cast<std::uint8_t>(op.pcOffset),
                                  kUwopSetFpReg, {}, 0u});
             break;
@@ -558,9 +687,10 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                             + std::to_string(op.reg.ordinal)
                             + ", which the target schema does not declare");
             }
-            // CFA = RSP + cfaOffset at this PC, and the register sits at
-            // CFA + op.offset, so its RSP-relative slot is the sum.
-            std::int64_t const slotFromSp = op.offset + cfaOffset;
+            // The register sits at CFA + op.offset, and the CFA is frameBase
+            // above the establisher frame the code is measured from, so its slot
+            // is the sum.
+            std::int64_t const slotFromSp = op.offset + frameBase;
             if (ri->regClass != TargetRegClass::GPR) {
                 // ── A SAVED VECTOR REGISTER — D-WIN64-XMM-UNWIND-RESTORE.
                 //
@@ -709,8 +839,14 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
     // UNW_FLAG_EHANDLER (bit 0 of the Flags nibble ⇒ (1<<3) in byte0's high nibble)
     // and carries a trailing handler-RVA + SCOPE_TABLE after the DWORD-aligned
     // codes. `__C_specific_handler` (the x64 C personality) walks the scope table.
-    std::uint8_t const byte0 = guardsSeh ? 0x09u  // Version=1 | Flags(EHANDLER=1)<<3
-                                         : 0x01u; // Version=1, Flags=0
+    // A carried handler states its own phases, as its object did.
+    std::uint8_t handlerFlags = guardsSeh ? link::format::win64::kUnwFlagEHandler : 0u;
+    if (languageHandler != nullptr) {
+        handlerFlags = static_cast<std::uint8_t>(
+            (languageHandler->exceptionPhase ? link::format::win64::kUnwFlagEHandler : 0u)
+            | (languageHandler->unwindPhase ? link::format::win64::kUnwFlagUHandler : 0u));
+    }
+    std::uint8_t const byte0 = static_cast<std::uint8_t>(0x01u | (handlerFlags << 3));  // Version=1
 
     std::vector<std::uint8_t> out;
     out.push_back(byte0);
@@ -764,6 +900,48 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
             pushRvaField(ownFunctionSymbol, sc.jumpTargetByteOffset);  // JumpTarget
         }
         // The blob already ends u32-aligned (every appended field is a u32).
+    }
+    if (languageHandler != nullptr) {
+        // ★ A FOREIGN OBJECT'S HANDLER, CARRIED AND NEVER RE-TYPED: the handler
+        // field, then the data exactly as the object wrote it — a
+        // `__C_specific_handler` scope table (cl's constant `__except(1)`
+        // filter included), a GS cookie's frame offset, a gcc exception table.
+        // Only the handler routine reads that layout, so DSS states nothing
+        // about it but where its addresses are: each relocation of the data is
+        // an image-relative field, resolved by the caller like the scope
+        // table's.
+        std::string relocErr;
+        auto const* rvaRow = link::format::unwindPointerRelocationOf(
+            targetSchema, link::format::kWin64RuntimeFunctionPointerField, relocErr);
+        if (rvaRow == nullptr) return fail(relocErr);
+        std::uint32_t const handlerFieldOff =
+            xdataBaseOffset + static_cast<std::uint32_t>(out.size());
+        handlerPatches.push_back(SehHandlerPatch{handlerFieldOff, languageHandler->personality});
+        out.insert(out.end(), 4u, 0x00u);   // the handler's address, patched by the caller
+        std::uint32_t const dataOff = static_cast<std::uint32_t>(out.size());
+        out.insert(out.end(), languageHandler->data.begin(), languageHandler->data.end());
+        for (auto const& rel : languageHandler->relocations) {
+            if (rel.kind != rvaRow->kind) {
+                return fail("the data of its handler holds a relocation of kind "
+                            + std::to_string(rel.kind.v) + " at byte "
+                            + std::to_string(rel.offset)
+                            + "; an UNWIND_INFO's data is written with image-relative "
+                              "fields ('" + rvaRow->name + "') alone");
+            }
+            if (static_cast<std::size_t>(rel.offset) + 4u > languageHandler->data.size()
+                || rel.addend < 0 || rel.addend > 0xFFFFFFFFll) {
+                return fail("the data of its handler holds a relocation at byte "
+                            + std::to_string(rel.offset) + " with addend "
+                            + std::to_string(rel.addend) + ", which its "
+                            + std::to_string(languageHandler->data.size())
+                            + "-byte data cannot hold as a 32-bit field");
+            }
+            rvaPatches.push_back(XdataRvaPatch{
+                xdataBaseOffset + dataOff + rel.offset, rel.target,
+                static_cast<std::uint32_t>(rel.addend)});
+        }
+        // The next UNWIND_INFO starts on a 4-byte boundary.
+        while (out.size() % 4u != 0u) out.push_back(0x00u);
     }
     return out;
 }
@@ -943,6 +1121,13 @@ encode(AssembledModule const&    module,
     if (!enforceImageRequest(request, fmt, "pe::encode", reporter)) {
         return {};
     }
+    // P69 fold 3c: a definition its unit states is the ONE instance of its name
+    // in the process is refused by name where the document states no binding
+    // that spells one (`weak_definition_gate.hpp`) — never written as a plain
+    // definition, one instance per image.
+    if (!link::format::requireOneInstancePerProcessSpelling(module, fmt, "pe::encode", reporter)) {
+        return {};
+    }
     // The vehicle assertion is the one PE-specific part, and it belongs to
     // the walker rather than the shared validator: it says "I implement THIS
     // vehicle". Today the loader's vehicle-to-kind coherence rule makes a
@@ -993,7 +1178,9 @@ encode(AssembledModule const&    module,
     // ★★ THIS ARM NOW EMITS `.pdata` + `.xdata`. It did not until 2026-08-27,
     // and the sentence that kept the gap invisible was written down in three
     // places — `src/asm/asm.hpp`'s `cfi` comment and BOTH PE object formats'
-    // `$sehPersonalityOmittedComment` — each claiming
+    // `$sehPersonalityOmittedComment` (gone since P69 fold 3c, when both
+    // formats stated `sehPersonality`: this arm relocates a `__try`'s scope
+    // table too) — each claiming
     // "AssembledFunction::unwind is nullopt on the object path by
     // construction". ✔MEASURED 2026-08-27, one non-leaf source with NO `__try`,
     // off one front end: `elf64-x86_64-linux` (an OBJECT) emitted `.eh_frame`
@@ -1716,10 +1903,10 @@ encode(AssembledModule const&    module,
             auto makeGroup =
                 [&](std::optional<std::size_t> assoc) -> std::size_t {
                 UnwindSectionRecord x;
-                x.name = ".xdata";
+                x.name = std::string{link::format::win64::kUnwindInfoSection};
                 x.associatedComdat = assoc;
                 UnwindSectionRecord p;
-                p.name = ".pdata";
+                p.name = std::string{link::format::win64::kFunctionTableSection};
                 p.associatedComdat = assoc;
                 unwindSections.push_back(std::move(x));
                 unwindSections.push_back(std::move(p));
@@ -1799,6 +1986,7 @@ encode(AssembledModule const&    module,
                 auto uwOpt = buildFunctionUnwindInfo(
                     *fn.cfi, fn.sehScopes, targetSchema, "pe::encode (Obj)",
                     fi, fn.symbol, xdataOff, handlerPatches, rvaPatches,
+                    fn.languageHandler.has_value() ? &*fn.languageHandler : nullptr,
                     reporter);
                 if (!uwOpt.has_value()) return {};
                 unwindSections[groupBase].bytes.insert(
@@ -1919,14 +2107,17 @@ encode(AssembledModule const&    module,
     // (`/alternatename:`). DSS's own front end makes neither.
     std::vector<std::string>            requiredImports;
     std::vector<pe::CoffAlternateName>  fallbackImports;
-    // ...and of each COMMON the object hands on (P69,
+    // ...and of each COMMON the object holds (P69,
     // D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS): a hidden one is a hidden
-    // definition like any other, and an alignment wider than the one every
-    // linker gives a common of its size (the document's
-    // `CommonsStatement::alignmentEveryLinkerGives`) is stated, as gcc states
-    // it, or the final linker would align it less. A DSS unit writes no such
-    // common (`CommonsStatement::admitsCommon` keeps it a definition); a
-    // foreign one handed on keeps the alignment its object asked.
+    // definition like any other, and an alignment wider than EVERY linker gives
+    // a common of its size that states none (the document's
+    // `CommonsStatement::statesItsAlignment`) is stated, as gcc states it, or the
+    // final linker would align it less — a DSS unit's own `double d;` (8 bytes,
+    // aligned 8) included: GNU ld gives a common that states none at most 4
+    // (✔MEASURED 2026-10-20, P69 fold 3c). link.exe ignores the statement and
+    // gives the size's own alignment, which `CommonsStatement::admitsCommon`
+    // bounds every DSS common by; a foreign one handed on keeps the alignment its
+    // object asked.
     std::vector<pe::CoffCommonAlignment> commonAlignments;
     CommonsStatement const               commons = fmt.commonsStatement();
     // An export's internal name the unit does not define is a REQUIRED row too
@@ -1946,7 +2137,18 @@ encode(AssembledModule const&    module,
         if (!isExternallyVisible(SymbolBinding::Global, ext.commonVisibility)) {
             hiddenDefinitions.push_back(ext.mangledName);
         }
-        if (ext.commonAlignment > commons.alignmentEveryLinkerGives(ext.commonSize).value_or(1u)) {
+        if (!commons.everyLinkerGivesAtMost.has_value()) {
+            // The PE backend refuses a document that states commons without the
+            // rule (`validateIdentity`); a schema built around it states none.
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): '{}' is a COMMON, and format '{}' states no "
+                             "'commonAlignmentEveryLinkerGivesAtMost' — the alignment every "
+                             "linker gives a COFF common that states none — so whether its "
+                             "alignment must be stated cannot be said.",
+                             ext.mangledName, fmt.name()));
+            return {};
+        }
+        if (commons.statesItsAlignment(ext.commonSize, ext.commonAlignment)) {
             commonAlignments.push_back(pe::CoffCommonAlignment{
                 ext.mangledName, static_cast<std::uint8_t>(std::countr_zero(ext.commonAlignment))});
         }
@@ -3183,7 +3385,7 @@ encode(AssembledModule const&    module,
     // kind of disagreement a linker reads as corruption.
     for (auto const& rec : comdats) {
         symEntries[rec.sectionDefEntry].auxNumRelocs =
-            static_cast<std::uint16_t>(rec.relocCount);
+            numberOfRelocationsField(rec.relocCount);
     }
 
     // ── `.pdata` IMAGE_RELOCATION tables — D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO ──
@@ -3234,39 +3436,49 @@ encode(AssembledModule const&    module,
             ++rec.relocCount;
         }
         symEntries[rec.sectionDefEntry].auxNumRelocs =
-            static_cast<std::uint16_t>(rec.relocCount);
+            numberOfRelocationsField(rec.relocCount);
     }
 
-    // Silent-failure C1 guard: PE/COFF spec §4 says when a section's
-    // relocation count > 65534, the writer must set
-    // IMAGE_SCN_LNK_NRELOC_OVFL (0x01000000) in section Characteristics
-    // AND put the real count in the first IMAGE_RELOCATION's
-    // VirtualAddress field. That path is not implemented; emit a hard
-    // diagnostic rather than silently truncating to u16. Anchored at
-    // plan 14 §3.1 as a deferred item (overflow path arrives with the
-    // first module that needs it). Applied PER SECTION — the u16
-    // NumberOfRelocations is a per-header field.
-    auto const checkRelocCountFits = [&](char const* sectionLabel,
-                                         std::uint32_t count) -> bool {
-        if (count <= 0xFFFEu) return true;
-        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-             std::string{"PE writer: "} + sectionLabel
-                 + " relocation count " + std::to_string(count)
-                 + " exceeds u16 capacity; PE/COFF NRELOC_OVFL overflow "
-                   "path is anchored as plan 14 §3.1 D-LK2-3 (LK6 trigger). "
-                   "Module too large for cycle-1 PE writer.");
-        return false;
+    // ── A TABLE PAST THE u16 FIELD (`kScnLnkNrelocOvfl`) ──────────────────
+    // Per section, because NumberOfRelocations is a per-header field: a table of
+    // more than 65534 relocations gets the count record in front — its
+    // VirtualAddress the count PLUS the record itself, symbol 0, type 0 — and
+    // its header the flag and 0xFFFF (`numberOfRelocationsField`,
+    // `relocationOverflowFlag`, where the headers are written). It used to be
+    // REFUSED here as a capacity this writer did not have; ✔MEASURED
+    // 2026-10-20, mingw-w64 gcc -O0 writes a 98306-relocation `.text` for one
+    // example of this corpus, and GNU ld links it. The count record is laid
+    // out with the table, so every pointer computed from `relocs.size()` below
+    // already counts it. `count` keeps the RELOCATIONS' number.
+    auto const prependCountRecord = [&](std::vector<std::uint8_t>& relocs,
+                                        std::uint32_t count,
+                                        std::string_view sectionLabel) -> bool {
+        if (count <= kMostRelocationsInTheField) return true;
+        if (count == 0xFFFFFFFFu) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("PE writer: section '{}' carries {} relocations, and "
+                             "the count record that states them counts itself too "
+                             "- one more than its 32-bit VirtualAddress holds.",
+                             sectionLabel, count));
+            return false;
+        }
+        std::vector<std::uint8_t> head;
+        appendU32LE(head, count + 1u);   // the records, the count record included
+        appendU32LE(head, 0u);           // SymbolTableIndex
+        appendU16LE(head, 0u);           // Type: IMAGE_REL_AMD64_ABSOLUTE
+        relocs.insert(relocs.begin(), head.begin(), head.end());
+        return true;
     };
-    if (!checkRelocCountFits(".text", textRelocCount)
-        || !checkRelocCountFits(".data", dataRelocCount)
-        || !checkRelocCountFits("relro", relroRelocCount)) {
+    if (!prependCountRecord(textRelocs, textRelocCount, ".text")
+        || !prependCountRecord(dataRelocs, dataRelocCount, ".data")
+        || !prependCountRecord(relroRelocs, relroRelocCount, "relro")) {
         return {};
     }
-    for (auto const& rec : comdats) {
-        if (!checkRelocCountFits("COMDAT", rec.relocCount)) return {};
+    for (auto& rec : comdats) {
+        if (!prependCountRecord(rec.relocs, rec.relocCount, rec.sectionName)) return {};
     }
-    for (auto const& rec : unwindSections) {
-        if (!checkRelocCountFits(rec.name.c_str(), rec.relocCount)) return {};
+    for (auto& rec : unwindSections) {
+        if (!prependCountRecord(rec.relocs, rec.relocCount, rec.name)) return {};
     }
 
     // ── Build string table + symbol table records ─────────────
@@ -3542,14 +3754,13 @@ encode(AssembledModule const&    module,
         hText.pointerToRawData      = textRawPointer;
         hText.pointerToRelocations  = textRelocPointer;
         hText.pointerToLinenumbers  = 0;
-        hText.numberOfRelocations   = static_cast<std::uint16_t>(textRelocCount);
+        hText.numberOfRelocations   = numberOfRelocationsField(textRelocCount);
         hText.numberOfLinenumbers   = 0;
-        hText.characteristics       = secText->type;  // PE uses substrate
-                                                       // `type` field for
-                                                       // Characteristics
-                                                       // (.text row carries
-                                                       // its align bits
-                                                       // statically)
+        // PE uses the substrate `type` field for Characteristics (the .text
+        // row carries its align bits statically), plus the overflow flag of a
+        // table past the u16 count.
+        hText.characteristics       = secText->type
+                                    | relocationOverflowFlag(textRelocCount);
         sectionHeaders.push_back(hText);
     }
     // Data-section headers. VirtualSize/VirtualAddress = 0 (.obj);
@@ -3573,9 +3784,9 @@ encode(AssembledModule const&    module,
         h.pointerToRawData     = zeroFill ? 0u : rawPointer;
         h.pointerToRelocations = relocPointer;
         h.pointerToLinenumbers = 0;
-        h.numberOfRelocations  = static_cast<std::uint16_t>(relocCount);
+        h.numberOfRelocations  = numberOfRelocationsField(relocCount);
         h.numberOfLinenumbers  = 0;
-        h.characteristics      = row.type | alignBits;
+        h.characteristics      = row.type | alignBits | relocationOverflowFlag(relocCount);
         sectionHeaders.push_back(h);
     };
     if (hasRodata) {
@@ -3613,12 +3824,12 @@ encode(AssembledModule const&    module,
         h.pointerToRawData     = rec.rawPointer;
         h.pointerToRelocations = rec.relocPointer;
         h.pointerToLinenumbers = 0;
-        h.numberOfRelocations  =
-            static_cast<std::uint16_t>(rec.relocCount);
+        h.numberOfRelocations  = numberOfRelocationsField(rec.relocCount);
         h.numberOfLinenumbers  = 0;
         h.characteristics =
             kUnwindObjCharacteristics
-            | (rec.associatedComdat.has_value() ? kScnLnkComdat : 0u);
+            | (rec.associatedComdat.has_value() ? kScnLnkComdat : 0u)
+            | relocationOverflowFlag(rec.relocCount);
         sectionHeaders.push_back(h);
     };
     forEachUnwindSection(/*associative=*/false, pushUnwindSectionHeader);
@@ -3636,10 +3847,9 @@ encode(AssembledModule const&    module,
         h.pointerToRawData     = rec.rawPointer;
         h.pointerToRelocations = rec.relocPointer;
         h.pointerToLinenumbers = 0;
-        h.numberOfRelocations  =
-            static_cast<std::uint16_t>(rec.relocCount);
+        h.numberOfRelocations  = numberOfRelocationsField(rec.relocCount);
         h.numberOfLinenumbers  = 0;
-        h.characteristics      = rec.characteristics;
+        h.characteristics      = rec.characteristics | relocationOverflowFlag(rec.relocCount);
         sectionHeaders.push_back(h);
     }
     forEachUnwindSection(/*associative=*/true, pushUnwindSectionHeader);
@@ -5044,7 +5254,7 @@ encodeExec(AssembledModule const&    module,
             // against whichever came last. That was unrepresentable while the
             // builder took a precomputed `funcBeginRva`; the check keeps it
             // unrepresentable now that it does not.
-            if (!fn.sehScopes.empty()
+            if ((!fn.sehScopes.empty() || fn.languageHandler.has_value())
                 && symbolToRva(fn.symbol) != funcBeginRva) {
                 emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
                      std::format(
@@ -5061,7 +5271,8 @@ encodeExec(AssembledModule const&    module,
             auto uwOpt = buildFunctionUnwindInfo(
                 *fn.cfi, fn.sehScopes, targetSchema, "pe::encodeExec", fi,
                 fn.symbol, static_cast<std::uint32_t>(xdataBytes.size()),
-                sehHandlerPatches, sehRvaPatches, reporter);
+                sehHandlerPatches, sehRvaPatches,
+                fn.languageHandler.has_value() ? &*fn.languageHandler : nullptr, reporter);
             if (!uwOpt.has_value()) return {};
             pdataEntries.push_back(
                 {fi, static_cast<std::uint32_t>(xdataBytes.size())});
@@ -5073,11 +5284,11 @@ encodeExec(AssembledModule const&    module,
             if (rva == 0u) {
                 emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
                      std::format(
-                         "pe::encodeExec: a SEH scope-table field at `.xdata` "
+                             "pe::encodeExec: an address field of a handler's data "
+                         "(a scope table's, or a carried handler's) at `.xdata` "
                          "offset {} names symbol #{}, which is not a defined "
-                         "function in this image - an unresolved filter "
-                         "funclet leaves the scope table pointing at RVA 0 "
-                         "(D-WIN64-SEH-FUNCLETS).",
+                         "function in this image - an unresolved address "
+                         "leaves the handler's data pointing at RVA 0.",
                          p.xdataOffset, p.symbol.v));
                 return {};
             }
@@ -6621,7 +6832,7 @@ encodeExec(AssembledModule const&    module,
     constexpr std::uint32_t kUnwindCharacteristics = 0x40000040u;
     if (xdata.has_value()) {
         PeSectionHeader hXData{};
-        hXData.name            = encodeSectionName(".xdata", 0);
+        hXData.name            = encodeSectionName(link::format::win64::kUnwindInfoSection, 0);
         hXData.virtualSize     = static_cast<std::uint32_t>(xdataBytes.size());
         hXData.virtualAddress  = xdata->rva;
         hXData.characteristics = kUnwindCharacteristics;
@@ -6630,7 +6841,7 @@ encodeExec(AssembledModule const&    module,
     }
     if (pdata.has_value()) {
         PeSectionHeader hPData{};
-        hPData.name            = encodeSectionName(".pdata", 0);
+        hPData.name            = encodeSectionName(link::format::win64::kFunctionTableSection, 0);
         hPData.virtualSize     = static_cast<std::uint32_t>(pdataBytes.size());
         hPData.virtualAddress  = pdata->rva;
         hPData.characteristics = kUnwindCharacteristics;

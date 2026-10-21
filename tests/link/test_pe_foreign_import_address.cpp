@@ -16,9 +16,12 @@
 // Tier 1 (every host): the fold, on hand-built modules. Tier 2 (Windows with cl/lib and MinGW gcc/ar): the run.
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/parse_diagnostic.hpp"
 #include "link/import_address_references.hpp"
 #include "link/object_format_schema.hpp"
+#include "link/pointer_reloc.hpp"
 #include "program/program.hpp"
+#include "mutate_target_schema.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
 #include "../core/native_c_probe.hpp"
@@ -67,9 +70,11 @@ TEST(ImportAddressReferences, AnUnboundPrefixedReferenceBecomesTheImportsAddress
     m.externImports.push_back(unboundImport(10, "__imp_"));      // the bare prefix names nothing
     m.externImports.push_back(unboundImport(11, "printf"));
     std::vector<AssembledModule> mods{m};
-    auto const counts = linker::foldImportAddressReferences(mods, **fmt, **tgt, {});
-    EXPECT_EQ(counts.importedSlots, 1u);
-    EXPECT_EQ(counts.localPointers, 0u);
+    DiagnosticReporter rep;
+    auto const counts = linker::foldImportAddressReferences(mods, **fmt, **tgt, {}, rep);
+    ASSERT_TRUE(counts.has_value());
+    EXPECT_EQ(counts->importedSlots, 1u);
+    EXPECT_EQ(counts->localPointers, 0u);
     auto const& r = mods[0].externImports[0];
     EXPECT_EQ(r.mangledName, "puts") << "the row imports the function itself";
     EXPECT_EQ(r.addressSlotSymbol, SymbolId{7})
@@ -100,9 +105,11 @@ TEST(ImportAddressReferences, ALinkedDefinitionGetsAPointerOfTheImagesOwn) {
     m.externImports.push_back(unboundImport(9, "__imp_mine"));
     std::vector<AssembledModule> mods{m};
     std::unordered_set<std::string> const defined{"mine"};
-    auto const counts = linker::foldImportAddressReferences(mods, **fmt, **tgt, defined);
-    EXPECT_EQ(counts.localPointers, 1u);
-    EXPECT_EQ(counts.importedSlots, 0u);
+    DiagnosticReporter rep;
+    auto const counts = linker::foldImportAddressReferences(mods, **fmt, **tgt, defined, rep);
+    ASSERT_TRUE(counts.has_value());
+    EXPECT_EQ(counts->localPointers, 1u);
+    EXPECT_EQ(counts->importedSlots, 0u);
     for (auto const& e : mods[0].externImports) {
         EXPECT_NE(e.mangledName, "__imp_mine") << "the prefixed name is no import any more";
     }
@@ -127,6 +134,47 @@ TEST(ImportAddressReferences, ALinkedDefinitionGetsAPointerOfTheImagesOwn) {
     EXPECT_TRUE(def->libraryPath.empty());
 }
 
+// P69 fold 3c: the pointer of the image's own is filled through the target's 8-byte address-slot row. A target that
+// declares none is REFUSED by name, the target and the width named. Until the fold the row was left as it was, and the
+// link then refused "`__imp_mine` undefined", which named neither: the pin's synthetic target is the shipped x86_64
+// one with its `abs64` row removed.
+TEST(ImportAddressReferences, ALinkedDefinitionOnATargetWithNoAddressSlotIsRefusedByName) {
+    auto fmt = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(fmt.has_value());
+    auto const tgt = test_support::mutateShippedTargetSchemaDoc("x86_64", [](nlohmann::json& doc) {
+        auto& rows = doc.at("relocations");
+        for (auto it = rows.begin(); it != rows.end(); ++it) {
+            if (it->is_object() && it->value("name", "") == "abs64") {
+                rows.erase(it);
+                return;
+            }
+        }
+    });
+    ASSERT_TRUE(tgt.has_value()) << "the x86_64 target without its abs64 row loads";
+    ASSERT_FALSE(linker::absolutePointerRelocKind(**tgt, 8).has_value());
+    AssembledModule m;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{3};
+    m.functions.push_back(fn);
+    m.externImports.push_back(unboundImport(9, "__imp_mine"));
+    std::vector<AssembledModule> mods{m};
+    std::unordered_set<std::string> const defined{"mine"};
+    DiagnosticReporter rep;
+    EXPECT_FALSE(linker::foldImportAddressReferences(mods, **fmt, **tgt, defined, rep).has_value());
+    ASSERT_EQ(rep.errorCount(), 1u);
+    auto const& d = rep.all().front();
+    EXPECT_EQ(d.code, DiagnosticCode::K_AbsolutePointerRelocMissing);
+    EXPECT_NE(d.actual.find("'__imp_mine'"), std::string::npos) << d.actual;
+    EXPECT_NE(d.actual.find("target 'x86_64'"), std::string::npos) << "the target is named: " << d.actual;
+    EXPECT_NE(d.actual.find("8-byte address slot"), std::string::npos) << "the width is named: " << d.actual;
+    // A name no linked unit defines needs no pointer of the image's own: it is still the import's slot.
+    std::vector<AssembledModule> imported{m};
+    DiagnosticReporter rep2;
+    auto const counts = linker::foldImportAddressReferences(imported, **fmt, **tgt, {}, rep2);
+    ASSERT_TRUE(counts.has_value()) << (rep2.all().empty() ? "" : rep2.all().front().actual);
+    EXPECT_EQ(counts->importedSlots, 1u);
+}
+
 TEST(ImportAddressReferences, AFormatThatStatesNoPrefixRewritesNothing) {
     // `__imp_` is COFF's convention, read from the PE documents; an ELF document states none, so a symbol
     // that merely begins with those six characters is an ordinary name there.
@@ -138,8 +186,10 @@ TEST(ImportAddressReferences, AFormatThatStatesNoPrefixRewritesNothing) {
     AssembledModule m;
     m.externImports.push_back(unboundImport(7, "__imp_puts"));
     std::vector<AssembledModule> mods{m};
-    auto const counts = linker::foldImportAddressReferences(mods, **fmt, **tgt, {});
-    EXPECT_EQ(counts.importedSlots + counts.localPointers, 0u);
+    DiagnosticReporter rep;
+    auto const counts = linker::foldImportAddressReferences(mods, **fmt, **tgt, {}, rep);
+    ASSERT_TRUE(counts.has_value());
+    EXPECT_EQ(counts->importedSlots + counts->localPointers, 0u);
     EXPECT_EQ(mods[0].externImports[0].mangledName, "__imp_puts");
 }
 

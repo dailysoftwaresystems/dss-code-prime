@@ -5589,7 +5589,20 @@ enum class DiagnosticCode : std::uint16_t {
     //   and MinGW's GNU ld are silent), so the link proceeds — and says so.
     //   Suppressible: the build proceeds with the meaning the references give it.
     K_CommonSymbolLargerThanItsDefinition = 0x802F,
-    // K-NEXT-SLOT: 0x8030 — grep this marker before adding a K_* code.
+    // K_SymbolBindingNotModelled (P69 fold 3c) — ERROR, by name. A symbol BINDING
+    //   no document of the link states a meaning for. Read: an object symbol whose
+    //   binding is none of the three every format shares (local, global, weak) and
+    //   not the one its format document states for a definition of which a process
+    //   holds ONE instance (`elf.uniqueBinding`, gcc's STB_GNU_UNIQUE) — as ld.lld
+    //   refuses it ("has invalid binding"). Written: a definition its unit states is
+    //   that one instance, handed to a writer whose document states no binding that
+    //   spells one, or bound otherwise than the document reads such a definition.
+    //   Until P69 the ELF reader read every such binding as LOCAL, and two g++
+    //   units' `inline int counter` linked to TWO objects (✔MEASURED 2026-10-20: the
+    //   program 5 where GNU ld's and ld.lld's is 41). Always an Error, so it needs
+    //   no row in the unsuppressable table.
+    K_SymbolBindingNotModelled     = 0x8030,
+    // K-NEXT-SLOT: 0x8031 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

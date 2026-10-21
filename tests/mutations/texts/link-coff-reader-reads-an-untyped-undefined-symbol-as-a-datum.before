@@ -1,0 +1,2 @@
+                ext.isData     = false;   // meaningless while Pending
+                ext.kindOrigin = ExternKindOrigin::Pending;

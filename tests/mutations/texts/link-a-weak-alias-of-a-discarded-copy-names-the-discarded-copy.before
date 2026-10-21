@@ -1,0 +1,1 @@
+                            winners[name] = resolution.winners.at(discardedFor->name);

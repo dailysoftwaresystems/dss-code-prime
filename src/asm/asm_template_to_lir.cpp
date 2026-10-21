@@ -5715,10 +5715,10 @@ bool lowerAsmTemplateToLirRun(Tree const&                        templateTree,
                               std::span<AsmOperandBinding const> bindings,
                               LirBuilder&                        builder,
                               DiagnosticReporter&                reporter,
+                              AsmTemplateProgramNames*           programNames,
                               std::span<AsmLabelBinding const>   labelBindings,
                               std::vector<LirBlockId>*           syntheticFallthroughs,
-                              std::optional<ObjectFormatKind>    formatKind,
-                              AsmTemplateProgramNames*           programNames) {
+                              std::optional<ObjectFormatKind>    formatKind) {
     AsmDiagnosticSink sink{templateTree, dialect, target, reporter};
     auto const&       cfg = dialect.assembly();
     // ⚠ NOT AN ASSERT, for the reason the standalone entry states: a caller

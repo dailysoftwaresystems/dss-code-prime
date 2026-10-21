@@ -1,1 +1,1 @@
-                if (first != firstCarrierOfGroup.end()) {
+            if (first != firstCarrier.end() && first->second <= i) lost[i].emplace(section, group);

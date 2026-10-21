@@ -7,6 +7,7 @@
 #include "core/types/symbol_attrs.hpp"  // isExternallyVisible (ET_DYN exports)
 #include "link/format/byte_emit.hpp"
 #include "link/format/dwarf_cfi.hpp"
+#include "link/format/eh_frame_handler_refusal.hpp"
 #include "link/format/elf_symtab_partition.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
@@ -106,6 +107,33 @@ constexpr std::uint16_t SHN_COMMON = 0xfff2;  // a common (tentative) definition
     return STB_GLOBAL;  // unreachable: SymbolBinding is a closed 3-value enum
 }
 
+// THE BINDING A DEFINITION IS WRITTEN WITH, AND THE HEADER'S OS ABI (P69 fold
+// 3c). A definition its unit states is the ONE instance of its name in the
+// process (`ModuleSymbol::oneInstancePerProcess`) takes the binding value the
+// document states for it (`elf.uniqueBinding`), never the binding it is read
+// as; and a header that states no OS ABI then states the one that binding
+// requires, as GNU ld 2.42 writes it (✔MEASURED 2026-10-20: OS/ABI GNU in the
+// image and on `-r`). `requireOneInstancePerProcessSpelling` refused, before any
+// byte, a module whose document states no such binding, so the statement is
+// there whenever the property is.
+// A header that states an OS ABI — the binding's own or ANOTHER — keeps it, and
+// the definition takes the document's binding all the same, as ld.lld 18.1.3
+// writes it under a FreeBSD or a SYSV header (✔MEASURED 2026-10-21); GNU ld 2.42
+// and ld.lld both READ the binding as one instance whatever the header states
+// (✔MEASURED 2026-10-20), and GNU ld 2.42 as Ubuntu ships it carries no output
+// format of another OS ABI to measure its writer by.
+[[nodiscard]] std::uint8_t stbForDefinition(SymbolBinding b, bool oneInstancePerProcess,
+                                            ElfIdentity const& id) noexcept {
+    if (oneInstancePerProcess && id.uniqueBinding.has_value()) return id.uniqueBinding->value;
+    return stbForBinding(b);
+}
+[[nodiscard]] std::uint8_t elfHeaderOsAbi(ElfIdentity const& id, bool writesOneInstancePerProcess) noexcept {
+    if (writesOneInstancePerProcess && id.osabi == 0 && id.uniqueBinding.has_value()) {
+        return id.uniqueBinding->osabi;
+    }
+    return id.osabi;
+}
+
 // ── st_other: the VISIBILITY axis, which is NOT the binding axis ──────────
 //    D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL
 //
@@ -148,6 +176,11 @@ constexpr std::uint32_t SHT_DYNSYM   = 11;
 constexpr std::uint64_t SHF_WRITE     = 1;
 constexpr std::uint64_t SHF_ALLOC     = 2;
 constexpr std::uint64_t SHF_EXECINSTR = 4;
+// A COMDAT section group (gABI, "Section Groups"): the SHT_GROUP record, its GRP_COMDAT flag word, and the flag every
+// member section carries. Written by the relocatable arm of `encode` for each group its unit states.
+constexpr std::uint32_t SHT_GROUP  = 17;
+constexpr std::uint32_t GRP_COMDAT = 1;
+constexpr std::uint64_t SHF_GROUP  = 0x200;
 
 // The dynamic walker's `.got` slot width. ELF64 throughout this walker
 // (`Elf64_Ehdr`, `Elf64_Shdr`).
@@ -1501,7 +1534,7 @@ encodeElfExecDynamic(
             if (ms.name.empty()) continue;
             if (!isExternallyVisible(ms.binding, ms.visibility)) continue;
             std::uint8_t const bind =
-                ms.binding == SymbolBinding::Weak ? STB_WEAK : STB_GLOBAL;
+                stbForDefinition(ms.binding, ms.oneInstancePerProcess, elfId);
             if (auto const fit = funcIdxBySym.find(ms.symbol.v);
                 fit != funcIdxBySym.end()) {
                 dynExports.push_back(DynExportRec{
@@ -2483,14 +2516,15 @@ encodeElfExecDynamic(
             if ((binding == SymbolBinding::Local) == localPass) {
                 appendSymtabEntry(
                     strtab.add(imgNames.imageName(fn.symbol, "sym_")),
-                    makeStInfo(stbForBinding(binding), STT_FUNC),
+                    makeStInfo(stbForDefinition(binding, imgNames.definedOneInstancePerProcess(fn.symbol), elfId),
+                               STT_FUNC),
                     stvForVisibility(imgNames.definedVisibility(fn.symbol)),
                     IDX_TEXT, symVa, fn.bytes.size());
             }
             if (localPass) continue;
             for (ModuleSymbol const* alias : imgNames.definedAliases(fn.symbol)) {
                 appendSymtabEntry(strtab.add(alias->name),
-                                  makeStInfo(stbForBinding(alias->binding),
+                                  makeStInfo(stbForDefinition(alias->binding, alias->oneInstancePerProcess, elfId),
                                              STT_FUNC),
                                   stvForVisibility(alias->visibility),
                                   IDX_TEXT, symVa, fn.bytes.size());
@@ -3586,7 +3620,7 @@ encodeElfExecDynamic(
     ehdr.push_back(elfId.fileClass);
     ehdr.push_back(elfId.dataEncoding);
     ehdr.push_back(static_cast<std::uint8_t>(EV_CURRENT));
-    ehdr.push_back(elfId.osabi);
+    ehdr.push_back(elfHeaderOsAbi(elfId, link::format::moduleStatesOneInstancePerProcess(module)));
     ehdr.push_back(elfId.abiVersion);
     for (int i = 0; i < 7; ++i) ehdr.push_back(0);
     appendU16LE(ehdr, isDyn ? 3 : 2);  // e_type: ET_DYN / ET_EXEC
@@ -3745,7 +3779,9 @@ encode(AssembledModule const&    module,
     // the alias pass"*. ✔MEASURED FALSE — `encodeElfExecDynamic`'s `.dynsym`
     // export loop open-codes `binding == Weak ? STB_WEAK : STB_GLOBAL` and
     // never calls `stbForBinding` at all. Coverage was complete anyway, by
-    // position rather than by the stated mechanism.
+    // position rather than by the stated mechanism. (Since P69 fold 3c the loop
+    // spells through `stbForDefinition`, as every definition site of this file
+    // does; the gate stays here for the reason above.)
     // ★ That second open-coded ternary is precisely the hazard
     // `weak_definition_gate.hpp` cites as its own justification, so the
     // sentence was recommending the shape it exists to eliminate. Keep the
@@ -3758,6 +3794,18 @@ encode(AssembledModule const&    module,
     if (!link::format::requireWeakDefinitionDialect(
             module, fmt, WeakDefinitionDialect::SymbolBinding, "elf::encode",
             reporter)) {
+        return {};
+    }
+    // P69 fold 3c: a definition that is the ONE instance of its name in the
+    // process is written only with the binding the document states for it — one
+    // gate for every ELF flavor, here for the reason the weak-dialect gate is.
+    if (!link::format::requireOneInstancePerProcessSpelling(module, fmt, "elf::encode",
+                                                            reporter)) {
+        return {};
+    }
+    // P69 fold 3c: a carried handler is stated by no `.eh_frame` this writer
+    // builds yet — refused by name, one gate for every ELF flavor.
+    if (link::format::refuseAHandlerTheEhFrameCannotState(module.functions, "elf::encode", reporter)) {
         return {};
     }
 
@@ -3963,10 +4011,11 @@ encode(AssembledModule const&    module,
     // guarded by a hasRodata bool), so a module carrying ONLY
     // Data/Bss items cannot slip past the gate via a dropped scan.
     // Data/Bss arms remain anchored under D-LK4-RODATA-PRODUCER.
-    // A data item carrying its OWN relocations (data→data references —
-    // a vtable / pointer table) is deferred this cycle: this writer
-    // does not yet patch dataItem relocations into `.rodata`
-    // (D-LK1-ELF-RODATA-DATAITEM-RELOC). `int g=42;` produces neither.
+    // A READ-ONLY item carrying its OWN relocations — gcc's jump table, whose
+    // entries are `R_X86_64_PC32 .text.<f> + offset` in `.rodata`, as the ELF
+    // object reader reads it — is laid out WITH them since P69 fold 3c
+    // (D-LK1-ELF-RODATA-DATAITEM-RELOC): an image patches them in place, a
+    // relocatable object writes them to `.rela.rodata`. `int g=42;` carries none.
     using link::format::detail::alignUp;
     // ── Validate + lay out `.rodata` via the shared exec data-section
     // substrate (`exec_data_section.hpp`) — the SAME helper the Mach-O
@@ -4028,35 +4077,123 @@ encode(AssembledModule const&    module,
         secBssPeek != nullptr ? secBssPeek->addrAlign : 1;
     std::uint64_t const relroAlignFloor =
         secRelRoPeek != nullptr ? secRelRoPeek->addrAlign : 1;
+    // ── SECTION GROUPS, WRITTEN BACK (P69 fold 3c;
+    //    D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE) ─────────
+    // A RELOCATABLE object hands a COMDAT group on AS A GROUP, so that the link
+    // that consumes it keeps the first unit's copy of the group and discards
+    // every later one: `ld -r` and `ld.lld -r` write the kept group back
+    // (✔MEASURED 2026-10-20, `readelf -g` on their output). Membership is the
+    // unit's statement per input section
+    // (`AssembledModule::sectionGroupOfInputSection`, which the link's merge
+    // carries for every unit it keeps). Each group's members are written in
+    // sections of their own — `.text.<signature>`, `.rodata.<signature>` and the
+    // rest, as gcc names them — each with its own relocation table, every one
+    // flagged SHF_GROUP, after every other section, the group's SHT_GROUP record
+    // ahead of its members (the gABI's order). An IMAGE has no group to write: the
+    // link that made it kept one copy of each already.
+    constexpr std::size_t kNoGroup = static_cast<std::size_t>(-1);
+    std::vector<std::string_view> groupSignatures;
+    std::vector<std::size_t>      groupOfFunction(module.functions.size(), kNoGroup);
+    std::vector<std::size_t>      groupOfDataItem(module.dataItems.size(), kNoGroup);
+    if (!isExec && !module.sectionGroupOfInputSection.empty()) {
+        std::unordered_map<std::string_view, std::size_t> indexOfSignature;
+        auto const groupOfSlice = [&](std::optional<InputSectionSlice> const& slice) -> std::size_t {
+            if (!slice.has_value()) return kNoGroup;
+            auto const it = module.sectionGroupOfInputSection.find(slice->section);
+            if (it == module.sectionGroupOfInputSection.end() || it->second.empty()) return kNoGroup;
+            auto const [at, fresh] = indexOfSignature.try_emplace(it->second, groupSignatures.size());
+            if (fresh) groupSignatures.push_back(it->second);
+            return at->second;
+        };
+        for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+            groupOfFunction[fi] = groupOfSlice(module.functions[fi].inputSection);
+        }
+        for (std::size_t di = 0; di < module.dataItems.size(); ++di) {
+            groupOfDataItem[di] = groupOfSlice(module.dataItems[di].inputSection);
+        }
+    }
+    // The data items a section must SKIP: every item of another group, or, for the
+    // object's own sections, every item of any group (ascending, as
+    // `buildExecDataSection` requires).
+    auto const itemsNotIn = [&](std::size_t group) {
+        std::vector<std::size_t> excluded;
+        for (std::size_t di = 0; di < module.dataItems.size(); ++di) {
+            if (groupOfDataItem[di] != group) excluded.push_back(di);
+        }
+        return excluded;
+    };
+    std::vector<std::size_t> const groupedDataItems =
+        groupSignatures.empty() ? std::vector<std::size_t>{} : itemsNotIn(kNoGroup);
+
     // Lay out each data section kind via the shared kind-parameterized helper
     // (D-LK1-ELF-EXEC-DATA-SECTIONS for rodata; D-LK4-DATA-PRODUCER for the
     // writable `.data` + zero-fill `.bss`; D-LK-RELRO-CONST-DATA-RELOCATABLE for
-    // the reloc-bearing const `relro`). `.data` + `relro` ALLOW item relocations
-    // (a reloc-bearing MUTABLE pointer global lands in `.data`; a reloc-bearing
-    // CONST one in `relro`) — ET_EXEC applies them in place below; ET_REL emits
-    // `.rela.data` / `.rela.data.rel.ro`. `.rodata` does NOT allow them (a
-    // reloc-bearing rodata item is a producer-contract breach — kept failing loud,
-    // the RodataDataItemWithRelocationFailsLoud pin).
-    auto const rodataLayoutOpt = link::format::buildExecDataSection(
+    // the reloc-bearing const `relro`). `.rodata`, `.data` and `relro` ALLOW item
+    // relocations — ET_EXEC applies them in place below; ET_REL emits
+    // `.rela.rodata` / `.rela.data` / `.rela.data.rel.ro`. A READ-ONLY item with
+    // relocations is what the ELF reader makes of gcc's jump table (`.rodata`,
+    // `R_X86_64_PC32 .text.<f> + offset`), and until P69 fold 3c this arm refused
+    // it (D-LK1-ELF-RODATA-DATAITEM-RELOC): ✔MEASURED 2026-10-20, a DSS `-r` of
+    // the tracked jump-table pair was refused.
+    auto rodataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Rodata, rodataAlignFloor,
-        elfDataWriterName, reporter);
+        elfDataWriterName, reporter, /*allowItemRelocations=*/true, groupedDataItems);
     if (!rodataLayoutOpt.has_value()) return {};
-    auto const& rodataLayout = *rodataLayoutOpt;
+    auto& rodataLayout = *rodataLayoutOpt;
     auto dataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Data, dataAlignFloor,
-        elfDataWriterName, reporter, /*allowItemRelocations=*/true);
+        elfDataWriterName, reporter, /*allowItemRelocations=*/true, groupedDataItems);
     if (!dataLayoutOpt.has_value()) return {};
     auto& dataLayout = *dataLayoutOpt;
     auto const bssLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Bss, bssAlignFloor,
-        elfDataWriterName, reporter);
+        elfDataWriterName, reporter, /*allowItemRelocations=*/false, groupedDataItems);
     if (!bssLayoutOpt.has_value()) return {};
     auto const& bssLayout = *bssLayoutOpt;
     auto relroLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::RelRoConst, relroAlignFloor,
-        elfDataWriterName, reporter, /*allowItemRelocations=*/true);
+        elfDataWriterName, reporter, /*allowItemRelocations=*/true, groupedDataItems);
     if (!relroLayoutOpt.has_value()) return {};
     auto& relroLayout = *relroLayoutOpt;
+    // Each group's own sections: its members of each kind, laid out alone.
+    struct GroupSections {
+        std::string_view                    signature;
+        std::vector<std::uint8_t>           text;
+        link::format::ExecDataSectionLayout rodata, data, relro, bss;
+        std::vector<std::uint8_t>           relaText, relaRodata, relaData, relaRelRo;
+        bool hasText = false, hasRelaText = false, hasRelaRodata = false, hasRelaData = false,
+             hasRelaRelRo = false;
+        std::uint16_t idxGroup = 0, idxText = 0, idxRelaText = 0, idxRodata = 0, idxRelaRodata = 0,
+                      idxData = 0, idxRelaData = 0, idxRelRo = 0, idxRelaRelRo = 0, idxBss = 0;
+        std::uint32_t             textSectionSym = 0;   // its `.text.<signature>`'s STT_SECTION symbol
+        std::uint32_t             signatureSym   = 0;   // the symbol the SHT_GROUP record names
+        std::vector<std::uint8_t> groupBody;            // GRP_COMDAT + the member indices
+        SectionHeader hGroup{}, hText{}, hRelaText{}, hRodata{}, hRelaRodata{}, hData{}, hRelaData{},
+                      hRelRo{}, hRelaRelRo{}, hBss{};
+    };
+    std::vector<GroupSections> groups(groupSignatures.size());
+    for (std::size_t g = 0; g < groups.size(); ++g) {
+        GroupSections& G = groups[g];
+        G.signature = groupSignatures[g];
+        std::vector<std::size_t> const excluded = itemsNotIn(g);
+        auto rodataG = link::format::buildExecDataSection(
+            module.dataItems, DataSectionKind::Rodata, rodataAlignFloor, elfDataWriterName, reporter,
+            /*allowItemRelocations=*/true, excluded);
+        auto dataG = link::format::buildExecDataSection(
+            module.dataItems, DataSectionKind::Data, dataAlignFloor, elfDataWriterName, reporter,
+            /*allowItemRelocations=*/true, excluded);
+        auto relroG = link::format::buildExecDataSection(
+            module.dataItems, DataSectionKind::RelRoConst, relroAlignFloor, elfDataWriterName, reporter,
+            /*allowItemRelocations=*/true, excluded);
+        auto bssG = link::format::buildExecDataSection(
+            module.dataItems, DataSectionKind::Bss, bssAlignFloor, elfDataWriterName, reporter,
+            /*allowItemRelocations=*/false, excluded);
+        if (!rodataG.has_value() || !dataG.has_value() || !relroG.has_value() || !bssG.has_value()) return {};
+        G.rodata = std::move(*rodataG);
+        G.data   = std::move(*dataG);
+        G.relro  = std::move(*relroG);
+        G.bss    = std::move(*bssG);
+    }
     // ET_EXEC: FOLD relro into `.data` (the exec decision — "treat relro like
     // .data"; the loader writes the resolved target VA into each slot, then a
     // foreign linker's GNU_RELRO seals it — a hardening nicety, not required for
@@ -4146,12 +4283,14 @@ encode(AssembledModule const&    module,
     //
     // Concatenate every AssembledFunction's bytes into one .text
     // section, recording each function's start offset for its
-    // symbol's `st_value`.
+    // symbol's `st_value` — a function of a section group into its group's
+    // `.text.<signature>` instead, its offset then within that section.
     std::vector<std::uint8_t> text;
     struct FuncSymRecord {
         SymbolId     symId{};
         std::uint64_t valueInText = 0;
         std::uint64_t size = 0;
+        std::size_t   group = static_cast<std::size_t>(-1);   // kNoGroup: `.text` itself
     };
     std::vector<FuncSymRecord> funcSyms;
     funcSyms.reserve(module.functions.size());
@@ -4159,12 +4298,16 @@ encode(AssembledModule const&    module,
     std::vector<std::uint64_t> funcTextStart;
     funcTextStart.reserve(module.functions.size());
 
-    for (auto const& fn : module.functions) {
-        std::uint64_t const start = text.size();
+    for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+        auto const&                fn    = module.functions[fi];
+        std::size_t const          group = groupOfFunction[fi];
+        std::vector<std::uint8_t>& sink  = group == kNoGroup ? text : groups[group].text;
+        std::uint64_t const start = sink.size();
         funcTextStart.push_back(start);
-        text.insert(text.end(), fn.bytes.begin(), fn.bytes.end());
+        sink.insert(sink.end(), fn.bytes.begin(), fn.bytes.end());
         funcSyms.push_back({fn.symbol, start,
-                            static_cast<std::uint64_t>(fn.bytes.size())});
+                            static_cast<std::uint64_t>(fn.bytes.size()), group});
+        if (group != kNoGroup) groups[group].hasText = true;
     }
 
     // ── `.eh_frame` + `.rela.eh_frame` (ET_REL) ────────────────
@@ -4480,9 +4623,16 @@ encode(AssembledModule const&    module,
         // bearing items — a MUTABLE pointer global's abs64, and the relro CONST
         // pointers FOLDED in above. Patch each in place with its target's
         // absolute VA via the SAME shared kernel the dynamic arm + PE/Mach-O use.
-        // (`.rodata` carries none — allow=false; `.bss` is zero-fill.) A static
-        // ET_EXEC is non-PIE with resolved VAs, so there is no `.rela`/base-reloc
-        // table — `siteVasOut` is nullptr.
+        // `.rodata` too, since P69 fold 3c (a jump table's entries; `.bss` is
+        // zero-fill). A static ET_EXEC is non-PIE with resolved VAs, so there is
+        // no `.rela`/base-reloc table — `siteVasOut` is nullptr.
+        if (hasRodata
+            && !link::format::applyDataItemRelocations(
+                   rodataLayout.bytes, module.dataItems, rodataLayout,
+                   rodataSectionVa, symbolVa, targetSchema,
+                   "elf::encode (ET_EXEC)", reporter)) {
+            return {};
+        }
         if (hasData
             && !link::format::applyDataItemRelocations(
                    dataLayout.bytes, module.dataItems, dataLayout,
@@ -4527,6 +4677,57 @@ encode(AssembledModule const&    module,
                      2u + (hasRodata ? 1u : 0u) + (hasData ? 1u : 0u)
                      + (hasRelRo ? 1u : 0u))
                : 0u;
+
+    // Which object sections carry relocations, decided HERE from the layouts:
+    // the section count below needs it before any table is built (each table is
+    // checked against it once built).
+    auto const layoutRelocates = [&](link::format::ExecDataSectionLayout const& layout) {
+        for (std::size_t const i : layout.itemIndices) {
+            if (!module.dataItems[i].relocations.empty()) return true;
+        }
+        return false;
+    };
+    bool const hasRelaRodata = !isExec && hasRodata && layoutRelocates(rodataLayout);
+    bool const hasRelaData   = !isExec && hasData && layoutRelocates(dataLayout);
+    bool const hasRelaRelRo  = hasRelRo && layoutRelocates(relroLayout);
+    // Every section group's sections follow every other section, so their
+    // indices start at the count of those: NULL, .text, [.rodata], [.data],
+    // [.data.rel.ro], [.bss], [.rela.text], [.rela.rodata], [.rela.data],
+    // [.rela.data.rel.ro], .symtab, .strtab, .shstrtab, [note], [.eh_frame +
+    // .rela.eh_frame] — the push order below, which checks it.
+    std::uint16_t const groupSectionBase = static_cast<std::uint16_t>(
+        2u + (hasRodata ? 1u : 0u) + (hasData ? 1u : 0u) + (hasRelRo ? 1u : 0u) + (hasBss ? 1u : 0u)
+        + (!isExec ? 1u : 0u) + (hasRelaRodata ? 1u : 0u) + (hasRelaData ? 1u : 0u)
+        + (hasRelaRelRo ? 1u : 0u) + 3u + (hasNote ? 1u : 0u) + (hasEhFrame ? 2u : 0u));
+    {
+        std::uint16_t next = groupSectionBase;
+        for (auto& G : groups) {
+            bool relocates = false;
+            for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+                if (groupOfFunction[fi] == static_cast<std::size_t>(&G - groups.data())
+                    && !module.functions[fi].relocations.empty()) {
+                    relocates = true;
+                }
+            }
+            G.hasRelaText   = G.hasText && relocates;
+            G.hasRelaRodata = !G.rodata.empty() && layoutRelocates(G.rodata);
+            G.hasRelaData   = !G.data.empty() && layoutRelocates(G.data);
+            G.hasRelaRelRo  = !G.relro.empty() && layoutRelocates(G.relro);
+            G.idxGroup = next++;
+            if (G.hasText)          G.idxText       = next++;
+            if (G.hasRelaText)      G.idxRelaText   = next++;
+            if (!G.rodata.empty())  G.idxRodata     = next++;
+            if (G.hasRelaRodata)    G.idxRelaRodata = next++;
+            if (!G.data.empty())    G.idxData       = next++;
+            if (G.hasRelaData)      G.idxRelaData   = next++;
+            if (!G.relro.empty())   G.idxRelRo      = next++;
+            if (G.hasRelaRelRo)     G.idxRelaRelRo  = next++;
+            if (!G.bss.empty())     G.idxBss        = next++;
+        }
+    }
+    auto const textSectionOf = [&](std::size_t group) -> std::uint16_t {
+        return group == kNoGroup ? std::uint16_t{1} : groups[group].idxText;
+    };
 
     StringTable strtab;
     std::vector<std::uint8_t> symtab;
@@ -4649,6 +4850,13 @@ encode(AssembledModule const&    module,
                          symtab.size() / 24 - 1, kTextSectionSymIdx));
         return {};
     }
+    // Each group's `.text.<signature>` has its own STT_SECTION symbol: the FDEs
+    // of the group's functions are relocated against it, as against `.text`'s.
+    for (auto& G : groups) {
+        if (!G.hasText) continue;
+        G.textSectionSym = static_cast<std::uint32_t>(symtab.size() / 24);
+        appendSym(0, makeStInfo(STB_LOCAL, STT_SECTION), 0, G.idxText, 0, 0);
+    }
 
     // Map each SymbolId to its symtab index (for relocs).
     std::unordered_map<SymbolId, std::uint32_t> symIdxBySymbol;
@@ -4679,7 +4887,7 @@ encode(AssembledModule const&    module,
             std::uint32_t const idx =
                 static_cast<std::uint32_t>(symtab.size() / 24);
             appendSym(nameOff, makeStInfo(STB_LOCAL, STT_NOTYPE), 0,
-                      /*shndx=.text*/ 1,
+                      textSectionOf(groupOfFunction[fi]),
                       symtabValueBase + funcTextStart[fi] + bs.blockByteOffset,
                       0);
             symIdxBySymbol.emplace(bs.symbol, idx);
@@ -4799,15 +5007,16 @@ encode(AssembledModule const&    module,
         // `symtabValueBase`.
         std::uint64_t const stValue = symtabValueBase + f.valueInText;
         appendSym(nameOff,
-                  makeStInfo(stbForBinding(objNames.definedBinding(f.symId)),
+                  makeStInfo(stbForDefinition(objNames.definedBinding(f.symId),
+                                              objNames.definedOneInstancePerProcess(f.symId), fmt.elf()),
                              STT_FUNC),
                   stvForVisibility(objNames.definedVisibility(f.symId)),
-                  /*shndx=.text*/ 1, stValue, f.size);
+                  textSectionOf(f.group), stValue, f.size);
         symIdxBySymbol.emplace(f.symId, idx);
         if (objNames.definedBinding(f.symId) != SymbolBinding::Local) {
             recordOfDefinedName.emplace(symName, idx);
         }
-        aliasSites.push_back({f.symId, /*shndx=*/1, stValue, f.size,
+        aliasSites.push_back({f.symId, textSectionOf(f.group), stValue, f.size,
                               STT_FUNC});
     };
 
@@ -4849,7 +5058,10 @@ encode(AssembledModule const&    module,
                 std::uint32_t const nameOff = strtab.add(symName);
                 std::uint32_t const idx =
                     static_cast<std::uint32_t>(symtab.size() / 24);
-                appendSym(nameOff, makeStInfo(stbForBinding(bind), STT_OBJECT),
+                appendSym(nameOff,
+                          makeStInfo(stbForDefinition(bind, objNames.definedOneInstancePerProcess(di.symbol),
+                                                      fmt.elf()),
+                                     STT_OBJECT),
                           stvForVisibility(
                               objNames.definedVisibility(di.symbol)),
                           sectionIdx, layout.itemOffsets[j],
@@ -4873,6 +5085,30 @@ encode(AssembledModule const&    module,
         if (hasRelRo)  emitDataSyms(relroLayout,  IDX_RELRO,  /*wantLocal=*/true);  // c145
         if (hasBss)    emitDataSyms(bssLayout,    IDX_BSS,    /*wantLocal=*/true);
     }
+    for (auto const& G : groups) {
+        if (!G.rodata.empty()) emitDataSyms(G.rodata, G.idxRodata, /*wantLocal=*/true);
+        if (!G.data.empty())   emitDataSyms(G.data,   G.idxData,   /*wantLocal=*/true);
+        if (!G.relro.empty())  emitDataSyms(G.relro,  G.idxRelRo,  /*wantLocal=*/true);
+        if (!G.bss.empty())    emitDataSyms(G.bss,    G.idxBss,    /*wantLocal=*/true);
+    }
+    // A group's SHT_GROUP record names its signature by a SYMBOL. Where no
+    // external-linkage name of the unit is the signature, a local symbol of that
+    // name stands in, at the start of the group's first member — what GNU as
+    // writes for a signature nothing in the object defines.
+    for (auto& G : groups) {
+        bool named = false;
+        for (ModuleSymbol const& ms : module.symbols) {
+            if (ms.binding != SymbolBinding::Local && ms.name == G.signature) named = true;
+        }
+        if (named) continue;
+        std::uint16_t const first = G.hasText          ? G.idxText
+                                    : !G.rodata.empty() ? G.idxRodata
+                                    : !G.data.empty()   ? G.idxData
+                                    : !G.relro.empty()  ? G.idxRelRo
+                                                        : G.idxBss;
+        G.signatureSym = static_cast<std::uint32_t>(symtab.size() / 24);
+        appendSym(strtab.add(std::string{G.signature}), makeStInfo(STB_LOCAL, STT_NOTYPE), 0, first, 0, 0);
+    }
 
     // ── GLOBAL pass — externally-visible (Global/Weak) funcs + data, after the
     //    sh_info boundary. An ET_EXEC image reaches here too: since
@@ -4886,6 +5122,12 @@ encode(AssembledModule const&    module,
         if (hasData)   emitDataSyms(dataLayout,   IDX_DATA,   /*wantLocal=*/false);
         if (hasRelRo)  emitDataSyms(relroLayout,  IDX_RELRO,  /*wantLocal=*/false);  // c145
         if (hasBss)    emitDataSyms(bssLayout,    IDX_BSS,    /*wantLocal=*/false);
+    }
+    for (auto const& G : groups) {
+        if (!G.rodata.empty()) emitDataSyms(G.rodata, G.idxRodata, /*wantLocal=*/false);
+        if (!G.data.empty())   emitDataSyms(G.data,   G.idxData,   /*wantLocal=*/false);
+        if (!G.relro.empty())  emitDataSyms(G.relro,  G.idxRelRo,  /*wantLocal=*/false);
+        if (!G.bss.empty())    emitDataSyms(G.bss,    G.idxBss,    /*wantLocal=*/false);
     }
 
     // Extra names bound to an already-emitted atom, at the SAME shndx /
@@ -4913,7 +5155,8 @@ encode(AssembledModule const&    module,
             recordOfDefinedName.emplace(
                 alias->name, static_cast<std::uint32_t>(symtab.size() / 24));
             appendSym(aliasNameOff,
-                      makeStInfo(stbForBinding(alias->binding), site.type),
+                      makeStInfo(stbForDefinition(alias->binding, alias->oneInstancePerProcess, fmt.elf()),
+                                 site.type),
                       stvForVisibility(alias->visibility),
                       site.shndx, site.value, site.size);
         }
@@ -4987,6 +5230,20 @@ encode(AssembledModule const&    module,
             for (auto const& rel : fn.relocations) emitExternForReloc(rel);
         for (auto const& di : module.dataItems)
             for (auto const& rel : di.relocations) emitExternForReloc(rel);
+    }
+
+    for (auto& G : groups) {
+        if (G.signatureSym != 0) continue;
+        auto const named = recordOfDefinedName.find(std::string{G.signature});
+        if (named == recordOfDefinedName.end()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::format("elf::encode (ET_REL): section group '{}' is named by an external-linkage name "
+                             "of the unit, and no record of the object carries that name -- the group's "
+                             "SHT_GROUP record would name no signature.",
+                             G.signature));
+            return {};
+        }
+        G.signatureSym = named->second;
     }
 
     // `.symtab.sh_info` = index of the first non-LOCAL symbol = the length of
@@ -5066,6 +5323,8 @@ encode(AssembledModule const&    module,
         for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
             auto const& fn = module.functions[fi];
             std::uint64_t const fnStart = funcTextStart[fi];
+            std::vector<std::uint8_t>& relaSink =
+                groupOfFunction[fi] == kNoGroup ? relaText : groups[groupOfFunction[fi]].relaText;
             for (auto const& rel : fn.relocations) {
                 auto const* fmtReloc = fmt.relocationByKind(rel.kind);
                 if (fmtReloc == nullptr) {
@@ -5124,9 +5383,9 @@ encode(AssembledModule const&    module,
                 auto const column = relaAddendColumn(rel, *triReloc);
                 if (!column.has_value()) continue;
                 std::uint64_t const rOffset = fnStart + rel.offset;
-                appendU64LE(relaText, rOffset);
-                appendU64LE(relaText, makeRelaInfo(symIdx, emittedNativeId));
-                appendI64LE(relaText, *column);
+                appendU64LE(relaSink, rOffset);
+                appendU64LE(relaSink, makeRelaInfo(symIdx, emittedNativeId));
+                appendI64LE(relaSink, *column);
             }
         }
     }
@@ -5186,17 +5445,38 @@ encode(AssembledModule const&    module,
         }
         return rela;
     };
-    // `.rela.data` for reloc-bearing MUTABLE `.data` items; `.rela.data.rel.ro`
-    // for the const relro items. Both ET_REL-only (on the exec path relro was
-    // merged into `.data` + applied in place, so these layouts hold no relocs).
+    // `.rela.rodata` for the read-only items' relocations (a jump table's,
+    // P69 fold 3c); `.rela.data` for reloc-bearing MUTABLE `.data` items;
+    // `.rela.data.rel.ro` for the const relro items. All ET_REL-only (on the exec
+    // path they were applied in place). Each group's tables the same, from its
+    // own layouts.
+    std::vector<std::uint8_t> relaRodata;
     std::vector<std::uint8_t> relaData;
     std::vector<std::uint8_t> relaRelRo;
     if (!isExec) {
-        if (hasData)  relaData  = buildDataRela(dataLayout);
-        if (hasRelRo) relaRelRo = buildDataRela(relroLayout);
+        if (hasRodata) relaRodata = buildDataRela(rodataLayout);
+        if (hasData)   relaData   = buildDataRela(dataLayout);
+        if (hasRelRo)  relaRelRo  = buildDataRela(relroLayout);
+        for (auto& G : groups) {
+            G.relaRodata = buildDataRela(G.rodata);
+            G.relaData   = buildDataRela(G.data);
+            G.relaRelRo  = buildDataRela(G.relro);
+        }
     }
-    bool const hasRelaData  = !relaData.empty();
-    bool const hasRelaRelRo = !relaRelRo.empty();
+    // Each table against the decision the section indices were counted from.
+    bool tablesAgree = relaRodata.empty() == !hasRelaRodata && relaData.empty() == !hasRelaData
+                       && relaRelRo.empty() == !hasRelaRelRo;
+    for (auto const& G : groups) {
+        tablesAgree = tablesAgree && G.relaText.empty() == !G.hasRelaText
+                      && G.relaRodata.empty() == !G.hasRelaRodata && G.relaData.empty() == !G.hasRelaData
+                      && G.relaRelRo.empty() == !G.hasRelaRelRo;
+    }
+    if (!tablesAgree) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "elf::encode (ET_REL): a relocation table came out empty where its section's items carry "
+             "relocations, or the reverse -- every section index after it would name the wrong section.");
+        return {};
+    }
 
     // ── Build `.rela.eh_frame` ─────────────────────────────────
     //
@@ -5235,9 +5515,12 @@ encode(AssembledModule const&    module,
             return {};
         }
         for (auto const& p : ehFrameOpt->patches) {
+            std::size_t const group = groupOfFunction[p.funcIndex];
             appendU64LE(relaEhFrame, p.byteOffset);
             appendU64LE(relaEhFrame,
-                        makeRelaInfo(kTextSectionSymIdx, fdePtrNativeId));
+                        makeRelaInfo(group == kNoGroup ? kTextSectionSymIdx
+                                                       : groups[group].textSectionSym,
+                                     fdePtrNativeId));
             appendI64LE(relaEhFrame,
                         static_cast<std::int64_t>(funcTextStart[p.funcIndex]));
         }
@@ -5274,6 +5557,7 @@ encode(AssembledModule const&    module,
     SectionHeader hBss{};
     SectionHeader hRelRo{};        // c145: .data.rel.ro (ET_REL)
     SectionHeader hRela{};
+    SectionHeader hRelaRodata{};   // P69 fold 3c: .rela.rodata (ET_REL)
     SectionHeader hRelaData{};     // c145: .rela.data (ET_REL)
     SectionHeader hRelaRelRo{};    // c145: .rela.data.rel.ro (ET_REL)
     SectionHeader hSymtab{};
@@ -5288,8 +5572,10 @@ encode(AssembledModule const&    module,
     // `.rela.text` row (secRela) by stripping the `.text` suffix — schema-driven,
     // no hardcoded `.rela` literal (a `.rel`/SHT_REL format derives `.rel` the
     // same way). ET_REL only (secRela is null on the exec path).
+    std::string relaRodataName;
     std::string relaDataName;
     std::string relaRelRoName;
+    std::string relaPrefixName;   // the format's rela prefix, for every group's tables
     // `.eh_frame` / `.rela.eh_frame` — writer-owned names, for the reason the
     // build block above documents. The rela name uses the SAME derived prefix
     // as the data tables, so a `.rel`/SHT_REL format would get `.rel.eh_frame`
@@ -5305,6 +5591,9 @@ encode(AssembledModule const&    module,
             relaPrefix =
                 relaPrefix.substr(0, relaPrefix.size() - textName.size());
         }
+        relaPrefixName = std::string{relaPrefix};
+        if (hasRelaRodata)
+            relaRodataName = std::string{relaPrefix} + std::string{secRodata->name};
         if (hasData)
             relaDataName = std::string{relaPrefix} + std::string{secData->name};
         if (hasRelRo)
@@ -5329,6 +5618,9 @@ encode(AssembledModule const&    module,
     if (secRela != nullptr) {
         hRela.name_offset  = shstrtab.add(secRela->name);
     }
+    if (hasRelaRodata) {
+        hRelaRodata.name_offset = shstrtab.add(relaRodataName);
+    }
     if (hasRelaData) {
         hRelaData.name_offset = shstrtab.add(relaDataName);
     }
@@ -5344,6 +5636,36 @@ encode(AssembledModule const&    module,
     if (hasEhFrame) {
         hEhFrame.name_offset     = shstrtab.add(std::string{kEhFrameName});
         hRelaEhFrame.name_offset = shstrtab.add(relaEhFrameName);
+    }
+    // Every group's sections, named as gcc names them: `<section>.<signature>`,
+    // and `<rela prefix><section>.<signature>` for each table. The rows of the
+    // kinds a group holds are the format's, required as the object's own are.
+    ObjectFormatSectionInfo const* secRodataRow = secRodata;
+    ObjectFormatSectionInfo const* secDataRow   = secData;
+    ObjectFormatSectionInfo const* secRelRoRow  = secRelRo;
+    ObjectFormatSectionInfo const* secBssRow    = secBss;
+    for (auto& G : groups) {
+        auto const rowFor = [&](ObjectFormatSectionInfo const*& row, SectionKind kind) {
+            if (row == nullptr) row = requireSection(fmt, kind, "ELF writer", reporter);
+            return row != nullptr;
+        };
+        if ((!G.rodata.empty() && !rowFor(secRodataRow, SectionKind::Rodata))
+            || (!G.data.empty() && !rowFor(secDataRow, SectionKind::Data))
+            || (!G.relro.empty() && !rowFor(secRelRoRow, SectionKind::RelRoConst))
+            || (!G.bss.empty() && !rowFor(secBssRow, SectionKind::Bss))) {
+            return {};
+        }
+        std::string const suffix = "." + std::string{G.signature};
+        G.hGroup.name_offset = shstrtab.add(".group");
+        auto const named = [&](SectionHeader& h, SectionHeader& rela, bool hasRela, std::string_view base) {
+            h.name_offset = shstrtab.add(std::string{base} + suffix);
+            if (hasRela) rela.name_offset = shstrtab.add(relaPrefixName + std::string{base} + suffix);
+        };
+        if (G.hasText)         named(G.hText, G.hRelaText, G.hasRelaText, secText->name);
+        if (!G.rodata.empty()) named(G.hRodata, G.hRelaRodata, G.hasRelaRodata, secRodataRow->name);
+        if (!G.data.empty())   named(G.hData, G.hRelaData, G.hasRelaData, secDataRow->name);
+        if (!G.relro.empty())  named(G.hRelRo, G.hRelaRelRo, G.hasRelaRelRo, secRelRoRow->name);
+        if (!G.bss.empty())    G.hBss.name_offset = shstrtab.add(std::string{secBssRow->name} + suffix);
     }
 
     // Section indices — IDX_TEXT==1 is pinned (the STT_SECTION sym
@@ -5388,6 +5710,7 @@ encode(AssembledModule const&    module,
     if (hasRelRo)  { (void)nextIdxS(); }           // .data.rel.ro (ET_REL) c145
     if (hasBss)    { (void)nextIdxS(); }
     if (!isExec) { (void)nextIdxS(); }            // .rela.text slot (ET_REL)
+    if (hasRelaRodata) { (void)nextIdxS(); }      // .rela.rodata (ET_REL, P69 fold 3c)
     // c145: `.rela.data` / `.rela.data.rel.ro` follow `.rela.text` (ET_REL only,
     // each present only when its data section carries reloc-bearing items).
     if (hasRelaData)  { (void)nextIdxS(); }
@@ -5477,6 +5800,15 @@ encode(AssembledModule const&    module,
     // properties are format-owned), but sh_info names the TARGET data section
     // (IDX_DATA / IDX_RELRO) whose items these relocations patch. sh_link =
     // .symtab. ET_REL only; each present only when its blob is non-empty.
+    if (hasRelaRodata) {
+        hRelaRodata.type       = secRela->type;
+        hRelaRodata.flags      = secRela->flags;
+        hRelaRodata.addr_align = secRela->addrAlign;
+        hRelaRodata.entry_size = secRela->entrySize;
+        hRelaRodata.link       = IDX_SYMTAB;
+        hRelaRodata.info       = IDX_RODATA;
+        hRelaRodata.size       = relaRodata.size();
+    }
     if (hasRelaData) {
         hRelaData.type       = secRela->type;
         hRelaData.flags      = secRela->flags;
@@ -5559,6 +5891,71 @@ encode(AssembledModule const&    module,
         hRelaEhFrame.link       = IDX_SYMTAB;
         hRelaEhFrame.info       = IDX_EH_FRAME;
         hRelaEhFrame.size       = relaEhFrame.size();
+    }
+    // A group: its SHT_GROUP record — GRP_COMDAT, then every member's index —
+    // linked to `.symtab` and naming its signature's symbol; every member flagged
+    // SHF_GROUP, a table's `sh_info` naming the section it patches.
+    for (auto& G : groups) {
+        auto const member = [&](SectionHeader& h, ObjectFormatSectionInfo const& row, std::uint64_t align,
+                                std::uint64_t size) {
+            h.type       = row.type;
+            h.flags      = row.flags | SHF_GROUP;
+            h.addr_align = align;
+            h.entry_size = row.entrySize;
+            h.size       = size;
+        };
+        auto const table = [&](SectionHeader& h, std::uint16_t patches, std::uint64_t size) {
+            h.type       = secRela->type;
+            h.flags      = secRela->flags | SHF_GROUP;
+            h.addr_align = secRela->addrAlign;
+            h.entry_size = secRela->entrySize;
+            h.link       = IDX_SYMTAB;
+            h.info       = patches;
+            h.size       = size;
+        };
+        appendU32LE(G.groupBody, GRP_COMDAT);
+        if (G.hasText) {
+            member(G.hText, *secText, secText->addrAlign, G.text.size());
+            appendU32LE(G.groupBody, G.idxText);
+        }
+        if (G.hasRelaText) {
+            table(G.hRelaText, G.idxText, G.relaText.size());
+            appendU32LE(G.groupBody, G.idxRelaText);
+        }
+        if (!G.rodata.empty()) {
+            member(G.hRodata, *secRodataRow, G.rodata.maxAlign, G.rodata.bytes.size());
+            appendU32LE(G.groupBody, G.idxRodata);
+        }
+        if (G.hasRelaRodata) {
+            table(G.hRelaRodata, G.idxRodata, G.relaRodata.size());
+            appendU32LE(G.groupBody, G.idxRelaRodata);
+        }
+        if (!G.data.empty()) {
+            member(G.hData, *secDataRow, G.data.maxAlign, G.data.bytes.size());
+            appendU32LE(G.groupBody, G.idxData);
+        }
+        if (G.hasRelaData) {
+            table(G.hRelaData, G.idxData, G.relaData.size());
+            appendU32LE(G.groupBody, G.idxRelaData);
+        }
+        if (!G.relro.empty()) {
+            member(G.hRelRo, *secRelRoRow, G.relro.maxAlign, G.relro.bytes.size());
+            appendU32LE(G.groupBody, G.idxRelRo);
+        }
+        if (G.hasRelaRelRo) {
+            table(G.hRelaRelRo, G.idxRelRo, G.relaRelRo.size());
+            appendU32LE(G.groupBody, G.idxRelaRelRo);
+        }
+        if (!G.bss.empty()) {
+            member(G.hBss, *secBssRow, G.bss.maxAlign, G.bss.spanSize);
+            appendU32LE(G.groupBody, G.idxBss);
+        }
+        G.hGroup.type       = SHT_GROUP;
+        G.hGroup.link       = IDX_SYMTAB;
+        G.hGroup.info       = G.signatureSym;
+        G.hGroup.addr_align = 4;
+        G.hGroup.entry_size = 4;
+        G.hGroup.size       = G.groupBody.size();
     }
 
     // ── Layout pass: compute sh_offset for each section ────────
@@ -5764,6 +6161,7 @@ encode(AssembledModule const&    module,
         hBss.offset = bytes.size();
     }
     if (secRela != nullptr) layoutSection(hRela, relaText);
+    if (hasRelaRodata) layoutSection(hRelaRodata, relaRodata);
     // `.rela.data` / `.rela.data.rel.ro` (c145) follow `.rela.text` (ET_REL only).
     if (hasRelaData)  layoutSection(hRelaData, relaData);
     if (hasRelaRelRo) layoutSection(hRelaRelRo, relaRelRo);
@@ -5785,6 +6183,21 @@ encode(AssembledModule const&    module,
     if (hasEhFrame) {
         layoutSection(hEhFrame, ehFrameOpt->bytes);
         layoutSection(hRelaEhFrame, relaEhFrame);
+    }
+    for (auto& G : groups) {
+        layoutSection(G.hGroup, G.groupBody);
+        if (G.hasText)         layoutSection(G.hText, G.text);
+        if (G.hasRelaText)     layoutSection(G.hRelaText, G.relaText);
+        if (!G.rodata.empty()) layoutSection(G.hRodata, G.rodata.bytes);
+        if (G.hasRelaRodata)   layoutSection(G.hRelaRodata, G.relaRodata);
+        if (!G.data.empty())   layoutSection(G.hData, G.data.bytes);
+        if (G.hasRelaData)     layoutSection(G.hRelaData, G.relaData);
+        if (!G.relro.empty())  layoutSection(G.hRelRo, G.relro.bytes);
+        if (G.hasRelaRelRo)    layoutSection(G.hRelaRelRo, G.relaRelRo);
+        if (!G.bss.empty()) {
+            if (G.hBss.addr_align > 1) padTo(bytes, G.hBss.addr_align);
+            G.hBss.offset = bytes.size();   // NOBITS: no file bytes
+        }
     }
 
     padTo(bytes, 8);  // SHT alignment
@@ -5814,6 +6227,7 @@ encode(AssembledModule const&    module,
     if (hasRelRo) headers.push_back(&hRelRo);
     if (hasBss) headers.push_back(&hBss);
     if (!isExec) headers.push_back(&hRela);
+    if (hasRelaRodata) headers.push_back(&hRelaRodata);
     // `.rela.data` / `.rela.data.rel.ro` (c145) after `.rela.text` (ET_REL only).
     if (hasRelaData) headers.push_back(&hRelaData);
     if (hasRelaRelRo) headers.push_back(&hRelaRelRo);
@@ -5829,6 +6243,32 @@ encode(AssembledModule const&    module,
     if (hasEhFrame) {
         headers.push_back(&hEhFrame);
         headers.push_back(&hRelaEhFrame);
+    }
+    // Every group's record ahead of its members, at the indices the symbols and
+    // the records already name — checked, as the cursor is below.
+    bool groupIndicesAgree = headers.size() == groupSectionBase;
+    for (auto& G : groups) {
+        auto const push = [&](SectionHeader const& h, std::uint16_t idx) {
+            groupIndicesAgree = groupIndicesAgree && headers.size() == idx;
+            headers.push_back(&h);
+        };
+        push(G.hGroup, G.idxGroup);
+        if (G.hasText)         push(G.hText, G.idxText);
+        if (G.hasRelaText)     push(G.hRelaText, G.idxRelaText);
+        if (!G.rodata.empty()) push(G.hRodata, G.idxRodata);
+        if (G.hasRelaRodata)   push(G.hRelaRodata, G.idxRelaRodata);
+        if (!G.data.empty())   push(G.hData, G.idxData);
+        if (G.hasRelaData)     push(G.hRelaData, G.idxRelaData);
+        if (!G.relro.empty())  push(G.hRelRo, G.idxRelRo);
+        if (G.hasRelaRelRo)    push(G.hRelaRelRo, G.idxRelaRelRo);
+        if (!G.bss.empty())    push(G.hBss, G.idxBss);
+    }
+    if (!groupIndicesAgree) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "elf::encode (ET_REL): the section indices counted for the section groups' sections disagree "
+             "with the header table -- a group member's symbols and its group record would name another "
+             "section.");
+        return {};
     }
     std::uint16_t const sectionCount =
         static_cast<std::uint16_t>(headers.size());
@@ -5898,7 +6338,7 @@ encode(AssembledModule const&    module,
     ehdr.push_back(id.fileClass);
     ehdr.push_back(id.dataEncoding);
     ehdr.push_back(static_cast<std::uint8_t>(EV_CURRENT));
-    ehdr.push_back(id.osabi);
+    ehdr.push_back(elfHeaderOsAbi(id, link::format::moduleStatesOneInstancePerProcess(module)));
     ehdr.push_back(id.abiVersion);
     for (int i = 0; i < 7; ++i) ehdr.push_back(0);  // EI_PAD
     // e_type, e_machine, e_version

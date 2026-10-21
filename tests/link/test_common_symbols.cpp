@@ -54,6 +54,7 @@
 #include "program/program.hpp"
 #include "host_translations.hpp"
 #include "repo_root.hpp"
+#include "reference_control.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
 #include "../core/native_c_probe.hpp"
@@ -968,15 +969,17 @@ TEST(CommonSymbols, AMachOObjectsCommonReadsBackAsTheSameCommon) {
     EXPECT_EQ(hidden->commonVisibility, SymbolVisibility::Hidden) << "a private-extern common";
 }
 
-// COFF states a common's alignment only in a directive, and only where a linker would align the common less (the
-// document's `CommonsStatement::alignmentEveryLinkerGives`); a hidden common is hidden the way any hidden definition
-// is.
+// COFF states a common's alignment only in a directive, and only where some linker would align the common less (the
+// document's `commonAlignmentEveryLinkerGivesAtMost`: GNU ld gives a directive-less common at most 4, link.exe and
+// lld-link up to 32 — `CommonsStatement::statesItsAlignment`); a hidden common is hidden the way any hidden
+// definition is.
 TEST(CommonSymbols, ACoffObjectsCommonReadsBackAsTheSameCommon) {
     auto const L = load("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(L.target && L.format);
-    AssembledModule m = unitWithCommon(1, "reader_fn", 40, 32, /*entry=*/false);   // 32 is link.exe's own
-    m.externImports.push_back(commonRow(3, "cwide", 4, 64));                         // wider than link.exe's 4
-    m.externImports.push_back(commonRow(4, "chidden", 8, 8, SymbolVisibility::Hidden));
+    AssembledModule m = unitWithCommon(1, "reader_fn", 40, 32, /*entry=*/false);   // link.exe's 32, GNU ld's 4: said
+    m.externImports.push_back(commonRow(3, "cwide", 4, 64));                         // wider than any linker's: said
+    m.externImports.push_back(commonRow(4, "chidden", 8, 8, SymbolVisibility::Hidden));   // 8 above 4: said
+    m.externImports.push_back(commonRow(5, "cfour", 4, 4));                          // what every linker gives: unsaid
     DiagnosticReporter rep;
     auto const obj = pe::encode(m, *L.target, *L.format, rep);
     ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
@@ -992,7 +995,7 @@ TEST(CommonSymbols, ACoffObjectsCommonReadsBackAsTheSameCommon) {
         directive.assign(obj.begin() + static_cast<std::ptrdiff_t>(raw),
                          obj.begin() + static_cast<std::ptrdiff_t>(raw + size));
     }
-    EXPECT_EQ(directive, " -exclude-symbols:chidden -aligncomm:cwide,6");
+    EXPECT_EQ(directive, " -exclude-symbols:chidden -aligncomm:shared,5 -aligncomm:cwide,6 -aligncomm:chidden,3");
     auto const back = pe::readRelocatableObject(obj, *L.target, *L.format, rep);
     ASSERT_TRUE(back.has_value()) << diagnosticsOf(rep);
     auto const* shared = rowNamed(*back, "shared");
@@ -1010,20 +1013,28 @@ TEST(CommonSymbols, ACoffObjectsCommonReadsBackAsTheSameCommon) {
     EXPECT_EQ(hidden->commonVisibility, SymbolVisibility::Hidden);
 }
 
-// The COFF writer and reader read the alignment every linker gives a common from the DOCUMENT (the re-review of fold
-// 3b, MAJOR 1): under the PE document stating 16 instead of the shipped 32, a 40-byte common aligned to 32 is WIDER
-// than the rule gives it, so the writer states it in a directive (`-aligncomm:shared,5`) where under the shipped
-// document it states none; and the object written under the shipped document — no directive — reads back aligned to
-// 32 under the shipped document and to 16 under the one stating 16. No number of the rule lives in the code.
+// The COFF writer and reader read the alignments the linkers give a common from the DOCUMENT, two rules (the re-review
+// of fold 3b, MAJOR 1, and of the fix fold, A1). The WRITER states a common's alignment wherever it exceeds what EVERY
+// linker gives (`commonAlignmentEveryLinkerGivesAtMost`, GNU ld's 4 as shipped): a 40-byte common aligned to 32 is
+// written with `-aligncomm:shared,5` under the shipped document and with no directive under one stating 32. The
+// READER aligns a directive-less common as link.exe and lld-link do (`commonAlignmentFromSizeAtMost`, 32 as shipped):
+// the object written with no directive reads back aligned to 32 under the shipped document and to 16 under one
+// stating 16. No number of either rule lives in the code.
 TEST(CommonSymbols, TheCoffWriterAndReaderReadTheDocumentsCommonAlignment) {
     auto const L = load("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(L.target && L.format);
     auto const path = dss::test::configRoot() / "object-formats" / "pe64-x86_64-windows.format.json";
     std::ifstream in{path};
-    auto doc = nlohmann::json::parse(in);
+    auto const shippedDoc = nlohmann::json::parse(in);
+    auto doc = shippedDoc;
     doc["commonAlignmentFromSizeAtMost"] = 16;
     auto const sixteen = ObjectFormatSchema::loadFromText(doc.dump(), "pe64-x86_64-windows stating 16");
     ASSERT_TRUE(sixteen.has_value());
+    auto everyLinkerDoc = shippedDoc;
+    everyLinkerDoc["commonAlignmentEveryLinkerGivesAtMost"] = 32;
+    auto const everyLinker32 =
+        ObjectFormatSchema::loadFromText(everyLinkerDoc.dump(), "pe64-x86_64-windows: every linker gives 32");
+    ASSERT_TRUE(everyLinker32.has_value());
     AssembledModule const m = unitWithCommon(1, "reader_fn", 40, 32, /*entry=*/false);
     // The directive section's text, read off the file.
     auto const directiveOf = [](std::vector<std::uint8_t> const& obj) {
@@ -1042,15 +1053,16 @@ TEST(CommonSymbols, TheCoffWriterAndReaderReadTheDocumentsCommonAlignment) {
     };
     DiagnosticReporter rep;
     auto const shippedObj = pe::encode(m, *L.target, *L.format, rep);
-    auto const sixteenObj = pe::encode(m, *L.target, **sixteen, rep);
-    ASSERT_FALSE(shippedObj.empty() || sixteenObj.empty()) << diagnosticsOf(rep);
-    EXPECT_EQ(directiveOf(shippedObj).find("-aligncomm:"), std::string::npos)
-        << "every linker gives a 40-byte common 32 under the shipped document: " << directiveOf(shippedObj);
-    EXPECT_NE(directiveOf(sixteenObj).find("-aligncomm:shared,5"), std::string::npos)
-        << "under a document stating 16 the common's 32 is said: " << directiveOf(sixteenObj);
+    auto const unsaidObj  = pe::encode(m, *L.target, **everyLinker32, rep);
+    ASSERT_FALSE(shippedObj.empty() || unsaidObj.empty()) << diagnosticsOf(rep);
+    EXPECT_NE(directiveOf(shippedObj).find("-aligncomm:shared,5"), std::string::npos)
+        << "the shipped document's every-linker 4 is below the common's 32, so it is said: "
+        << directiveOf(shippedObj);
+    EXPECT_EQ(directiveOf(unsaidObj).find("-aligncomm:"), std::string::npos)
+        << "under a document stating every linker gives 32 the common's 32 is unsaid: " << directiveOf(unsaidObj);
     for (auto const& [doc16, want] : {std::pair{false, 32u}, std::pair{true, 16u}}) {
         SCOPED_TRACE(doc16 ? "read under the document stating 16" : "read under the shipped document");
-        auto const back = pe::readRelocatableObject(shippedObj, *L.target, doc16 ? **sixteen : *L.format, rep);
+        auto const back = pe::readRelocatableObject(unsaidObj, *L.target, doc16 ? **sixteen : *L.format, rep);
         ASSERT_TRUE(back.has_value()) << diagnosticsOf(rep);
         auto const* shared = rowNamed(*back, "shared");
         ASSERT_NE(shared, nullptr);
@@ -1119,15 +1131,16 @@ void writeText(fs::path const& p, std::string_view text) { std::ofstream(p, std:
 // ══ "THE REFERENCE'S ANSWER MOVED" IS ITS OWN FAILURE (P69 fold 2) ═══════════════════════════════════════════════
 //
 // A native cell of this file asserts two different things, and they must never read as the same red:
-//   * the CONTROL: the host's reference toolchain still answers what the table says it answered when the row was
-//     measured — an exit code, a refusal, a refusal's words, a symbol table's layout. When it does not, the
-//     REFERENCE moved (a newer tool on the leg); DSS did nothing. That failure opens with `reference moved:` and
-//     states the live tools' own version lines, what they answered, the versions the table was measured with and
-//     what the table says;
-//   * DSS against the reference: compared with the LIVE answer wherever DSS's expected value is "what the
-//     reference does", so a moved reference reds its control alone and DSS's cell still says whether DSS agrees.
-// The live version is asked only inside a failure's message — which gtest evaluates only when the assertion
-// fails — so a green run pays nothing for it.
+//   * DSS against the TABLE — what the reference toolchain answered when the row was measured (P69 fold 3c, the
+//     review of fold 2, F2: until then DSS was compared with the LIVE answer, so a CI image's toolchain that nobody
+//     measured decided what DSS had to answer);
+//   * the CONTROL: the host's reference toolchain still answers what the table says — an exit code, a refusal, a
+//     refusal's words, a symbol table's layout. A disagreement is judged by `test_support::controlDisagrees`
+//     (`tests/test_support/reference_control.hpp`): RED, `reference moved:`, on the toolchain the table was measured
+//     with; a counted `[reference-unmeasured]` line on another (the run's last line gives the count); RED, `measure
+//     it:`, on another in a strict run. A reference LINK that refuses is such a disagreement too, never a fatal
+//     assertion: the cell goes on to DSS's answer (F3).
+// The live version is asked only when a control disagrees, so a green run pays nothing for it.
 struct ReferenceTool {
     std::string                  label;          // as the [native-arm] lines name the arm
     std::string                  measuredWith;   // the versions the table was measured with
@@ -1158,13 +1171,11 @@ liveVersionBy(std::function<bool(fs::path const&, std::string const&, std::strin
     };
 }
 
-[[nodiscard]] std::string referenceMoved(ReferenceTool const& tool, std::string const& answered,
-                                         std::string const& tableSays) {
-    return "reference moved: " + tool.label + " "
-           + (tool.liveVersion ? tool.liveVersion() : std::string{"[version not asked]"}) + " answered " + answered
-           + ", the table (measured with " + tool.measuredWith + ") says " + tableSays
-           + " — the REFERENCE's answer changed under the table, which is NOT DSS differing from the reference: read "
-             "what the live tool does, then restate the table and the row it was measured for";
+// The control of `tool` disagreed with its table: judged as the comment above states.
+void controlDisagrees(ReferenceTool const& tool, std::string const& answered, std::string const& tableSays) {
+    test_support::controlDisagrees(tool.label, tool.measuredWith,
+                                   tool.liveVersion ? tool.liveVersion() : std::string{"[version not asked]"},
+                                   answered, tableSays);
 }
 
 // An arm of a table as a reference tool (`Arm`: its `label`, `measuredWith`, `versionCommands` and `run`).
@@ -1180,8 +1191,9 @@ template <typename Arm>
     EXPECT_TRUE(ran.spawned) << tool.label << ": " << ran.diagnostic;
     EXPECT_FALSE(ran.timedOut) << tool.label;
     if (!ran.spawned || ran.timedOut) return std::nullopt;
-    EXPECT_EQ(static_cast<unsigned>(ran.exitCode), tableSays)
-        << referenceMoved(tool, std::to_string(ran.exitCode), std::to_string(tableSays));
+    if (static_cast<unsigned>(ran.exitCode) != tableSays) {
+        controlDisagrees(tool, std::to_string(ran.exitCode), std::to_string(tableSays));
+    }
     return static_cast<unsigned>(ran.exitCode);
 }
 
@@ -1309,9 +1321,13 @@ TEST(CommonSymbolsNative, ClTentativeDefinitionsLinkUnderDssAsUnderLinkExe) {
     writeText(dir / "main.c", kClMain);
     ASSERT_TRUE(runCapturing(&tools, dir, "cl /nologo /c /O2 /MD tu1.c tu3.c main.c", "cl.txt"))
         << test_support::native_probe::tailOf(dir / "cl.txt", 30, "cl");
-    ASSERT_TRUE(runCapturing(&tools, dir, "link /nologo /OUT:ref.exe main.obj tu1.obj tu3.obj", "link.txt"))
-        << test_support::native_probe::tailOf(dir / "link.txt", 30, "link.exe");
-    (void)controlExit(clWithLinkExe(tools, dir), test_support::runBinary(dir / "ref.exe"), 42u);
+    if (!runCapturing(&tools, dir, "link /nologo /OUT:ref.exe main.obj tu1.obj tu3.obj", "link.txt")) {
+        controlDisagrees(clWithLinkExe(tools, dir),
+                         "REFUSES the program:" + test_support::native_probe::tailOf(dir / "link.txt", 30, "link.exe"),
+                         "it links it (42)");
+    } else {
+        (void)controlExit(clWithLinkExe(tools, dir), test_support::runBinary(dir / "ref.exe"), 42u);
+    }
     DiagnosticReporter rep;
     auto const exe = dssLinks(dir, {"main.obj", "tu1.obj", "tu3.obj"}, rep);
     ASSERT_FALSE(exe.empty()) << "DSS must link cl's tentative definitions:" << diagnosticsOf(rep);
@@ -1324,8 +1340,11 @@ TEST(CommonSymbolsNative, MingwCommonsLinkUnderDss) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "common-gnu"};
     auto const dir = scratch.path();
 #if defined(_WIN32)
-    if (std::system("where gcc >nul 2>&1") != 0) {
-        GTEST_SKIP() << "no MinGW `gcc` on PATH -- the mingw arm is inert on this host";
+    // MinGW-w64's x86-64 gcc, as the ONE locator identifies it (P69 fold 3c: `where gcc` alone took any gcc on PATH):
+    // absent is a skip by name; one that cannot answer is RED.
+    if (auto const gcc = test_support::native_probe::locateMingwGcc(dir); !gcc.ok()) {
+        ASSERT_TRUE(gcc.toolAbsent()) << gcc.describe();
+        GTEST_SKIP() << gcc.describe();
     }
 #else
     GTEST_SKIP() << "not a Windows host -- the mingw arm is inert here";
@@ -2324,10 +2343,15 @@ TEST(CommonSymbolsNative, GccCommonsLinkUnderDssAsUnderGnuLd) {
     // CONTROL: GNU ld's program of the same objects.
     std::string const ref = "cc -O2 -fcommon -o \"" + (dir / "ref").string() + "\" \"" + (dir / "main.c").string()
                           + "\" \"" + (dir / "tu1.o").string() + "\" \"" + (dir / "tu3.o").string() + "\"";
-    ASSERT_EQ(std::system(np::captureCmd(ref, dir / "ref.txt").c_str()), 0) << ref << np::tailOf(dir / "ref.txt", 20);
-    auto const refRun = test_support::runBinary(dir / "ref");
-    ASSERT_TRUE(refRun.spawned) << refRun.diagnostic;
-    EXPECT_EQ(refRun.exitCode, 42u) << referenceMoved(reference, std::to_string(refRun.exitCode), "42");
+    if (std::system(np::captureCmd(ref, dir / "ref.txt").c_str()) != 0) {
+        controlDisagrees(reference, "REFUSES the program:" + np::tailOf(dir / "ref.txt", 20), "it links it (42)");
+    } else {
+        auto const refRun = test_support::runBinary(dir / "ref");
+        EXPECT_TRUE(refRun.spawned) << refRun.diagnostic;
+        if (refRun.spawned && refRun.exitCode != 42u) {
+            controlDisagrees(reference, std::to_string(refRun.exitCode), "42");
+        }
+    }
 #if defined(__x86_64__)
     std::vector<char const*> const specs{"x86_64:elf64-x86_64-linux-exec", "x86_64:elf64-x86_64-linux-pie"};
 #else
@@ -2406,21 +2430,23 @@ TEST(CommonSymbolsNative, ACommonAgainstAThreadLocalMemberIsRefusedByName) {
     bool const tlsLinked =
         sh("cc -O2 -o " + at("ref_tls") + " " + at("main.c") + " " + at("tu_common.o") + " " + at("libtls.a"),
            "ref_tls.txt");
-    EXPECT_FALSE(tlsLinked) << referenceMoved(reference, "LINKS the common against the thread-local member",
-                                              "it refuses the link");
-    if (!tlsLinked) {
-        EXPECT_NE(np::tailOf(dir / "ref_tls.txt", 20).find("mismatches non-TLS reference"), std::string::npos)
-            << referenceMoved(reference, "a refusal in other words:" + np::tailOf(dir / "ref_tls.txt", 20),
-                              "a refusal that says `mismatches non-TLS reference` (read under LC_ALL=C)");
+    if (tlsLinked) {
+        controlDisagrees(reference, "LINKS the common against the thread-local member", "it refuses the link");
+    } else if (np::tailOf(dir / "ref_tls.txt", 20).find("mismatches non-TLS reference") == std::string::npos) {
+        controlDisagrees(reference, "a refusal in other words:" + np::tailOf(dir / "ref_tls.txt", 20),
+                         "a refusal that says `mismatches non-TLS reference` (read under LC_ALL=C)");
     }
-    ASSERT_TRUE(sh("cc -O2 -o " + at("ref_plain") + " " + at("main.c") + " " + at("tu_common.o") + " "
-                       + at("libplain.a"),
-                   "ref_plain.txt"))
-        << np::tailOf(dir / "ref_plain.txt", 20);
-    auto const refRun = test_support::runBinary(dir / "ref_plain");
-    ASSERT_TRUE(refRun.spawned) << refRun.diagnostic;
-    EXPECT_EQ(refRun.exitCode, 7u) << referenceMoved(reference, std::to_string(refRun.exitCode), "7")
-                                   << " (the ordinary member)";
+    if (!sh("cc -O2 -o " + at("ref_plain") + " " + at("main.c") + " " + at("tu_common.o") + " " + at("libplain.a"),
+            "ref_plain.txt")) {
+        controlDisagrees(reference, "REFUSES the ordinary member:" + np::tailOf(dir / "ref_plain.txt", 20),
+                         "it links it (7)");
+    } else {
+        auto const refRun = test_support::runBinary(dir / "ref_plain");
+        EXPECT_TRUE(refRun.spawned) << refRun.diagnostic;
+        if (refRun.spawned && refRun.exitCode != 7u) {
+            controlDisagrees(reference, std::to_string(refRun.exitCode), "7 (the ordinary member)");
+        }
+    }
 #if defined(__x86_64__)
     char const* const spec = "x86_64:elf64-x86_64-linux-exec";
 #else
@@ -2648,7 +2674,11 @@ struct YieldArms {
         };
         arms.push_back(std::move(a));
     }
-    if (std::system("where gcc >nul 2>&1") == 0) {
+    // MinGW-w64's x86-64 gcc, as the ONE locator identifies it (P69 fold 3c): absent is the arm not run, said; one
+    // that cannot answer is a failure here and now.
+    auto const mingw = test_support::native_probe::locateMingwGcc(work);
+    if (!mingw.toolAbsent() && !mingw.ok()) ADD_FAILURE() << mingw.describe();
+    if (mingw.ok()) {
         auto a = gnuStyleArm("MinGW gcc (GNU ld, PE)", "", "x86_64:pe64-x86_64-windows-exec", {0, 0, 0, 0, 0, 0, 0, 0},
                              ".exe", false);
         a.run = [](fs::path const& dir, std::string const& cmd, std::string const& log) {
@@ -2657,8 +2687,8 @@ struct YieldArms {
         a.measuredWith    = "MinGW gcc 13.2.0 with GNU ld 2.42";
         a.versionCommands = {"gcc --version", "ld -v"};
         arms.push_back(std::move(a));
-    } else {
-        found.absent.push_back("MinGW gcc (GNU ld, PE): no `gcc` on PATH");
+    } else if (mingw.toolAbsent()) {
+        found.absent.push_back("MinGW gcc (GNU ld, PE): " + mingw.detail);
     }
 #else
     (void)work;
@@ -2772,21 +2802,28 @@ TEST(CommonSymbolsNative, ACommonBesideWeakAndArchivedDefinitionsResolvesAsTheRe
             if (!library.empty()) refInputs.push_back(library);
             std::string const refStem = std::string{"ref_"} + cell.name;
             std::string const mainObject = std::string{cell.callsHelper ? "main_helper" : "main"} + arm.obj;
-            ASSERT_TRUE(arm.run(d, arm.link(refStem, mainObject, refInputs), refStem + ".txt"))
-                << np::tailOf(d / (refStem + ".txt"), 20, arm.label);
-            auto const ref = runImage(d / (refStem + arm.exe));
-            ASSERT_TRUE(ref.spawned) << ref.diagnostic;
-            EXPECT_EQ(ref.exitCode, arm.expected[c])
-                << referenceMoved(tool, std::to_string(ref.exitCode), std::to_string(arm.expected[c]));
+            std::string referenceSaid = "REFUSES";
+            if (!arm.run(d, arm.link(refStem, mainObject, refInputs), refStem + ".txt")) {
+                controlDisagrees(tool, "REFUSES the cell:" + np::tailOf(d / (refStem + ".txt"), 20, arm.label),
+                                 "it links it (" + std::to_string(arm.expected[c]) + ")");
+            } else {
+                auto const ref = runImage(d / (refStem + arm.exe));
+                EXPECT_TRUE(ref.spawned) << ref.diagnostic;
+                if (ref.spawned && ref.exitCode != arm.expected[c]) {
+                    controlDisagrees(tool, std::to_string(ref.exitCode), std::to_string(arm.expected[c]));
+                }
+                referenceSaid = ref.spawned ? std::to_string(ref.exitCode) : std::string{"(did not run)"};
+            }
             DiagnosticReporter rep;
             auto const image = dssLink(cell.name, mainSource, direct, library, rep);
             ASSERT_TRUE(image.has_value()) << "DSS must link the cell:" << diagnosticsOf(rep);
             auto const r = runImage(*image);
             ASSERT_TRUE(r.spawned) << r.diagnostic;
             EXPECT_FALSE(r.timedOut);
-            EXPECT_EQ(r.exitCode, ref.exitCode) << "DSS must give the reference linker's answer";
-            std::cout << "[native-arm] " << arm.label << " " << cell.name << ": reference linker " << ref.exitCode
-                      << ", DSS " << r.exitCode << "\n";
+            EXPECT_EQ(r.exitCode, arm.expected[c])
+                << "DSS must give the table's answer: the reference linker's, as measured with " << arm.measuredWith;
+            std::cout << "[native-arm] " << arm.label << " " << cell.name << ": reference linker " << referenceSaid
+                      << " (table " << arm.expected[c] << "), DSS " << r.exitCode << "\n";
         }
         if (arm.tlsCell) {
             SCOPED_TRACE("tls_member");
@@ -4444,7 +4481,11 @@ struct WnArms {
     withoutArmsThisPosixHostCannotRun(arms, found.absent);
 #elif defined(_WIN32)
     namespace np = test_support::native_probe;
-    if (std::system("where gcc >nul 2>&1") == 0) {
+    // MinGW-w64's x86-64 gcc, as the ONE locator identifies it (P69 fold 3c): absent is the arm not run, said; one
+    // that cannot answer is a failure here and now.
+    auto const mingw = np::locateMingwGcc(work);
+    if (!mingw.toolAbsent() && !mingw.ok()) ADD_FAILURE() << mingw.describe();
+    if (mingw.ok()) {
         auto a = gnuStyleWnArm("MinGW gcc (GNU ld, PE)", WnFamily::GnuPe, "gcc", ".exe", "x86_64:pe64-x86_64-windows-exec",
                                "x86_64:pe64-x86_64-windows");
         a.run = [](fs::path const& dir, std::string const& cmd, std::string const& log) {
@@ -4456,8 +4497,8 @@ struct WnArms {
         // relocatable link (✔MEASURED 2026-10-08, gcc 13.2 with binutils 2.42).
         a.withoutLocals = [](std::string const& out, std::string const& in) { return "ld -r -x -o " + out + " " + in; };
         arms.push_back(std::move(a));
-    } else {
-        found.absent.push_back("MinGW gcc (GNU ld, PE): no `gcc` on PATH");
+    } else if (mingw.toolAbsent()) {
+        found.absent.push_back("MinGW gcc (GNU ld, PE): " + mingw.detail);
     }
     auto const msvc = np::locateMsvcToolchain(work);
     // A toolchain that is absent is this host's fact, recorded for the caller to judge (a strict run fails on it);
@@ -4643,18 +4684,25 @@ TEST(WeakNameReferencesNative, AReferenceThroughAWeakNameResolvesAsTheReferenceL
             for (char const* o : cell.inputs) objects.push_back(std::string{o} + arm.obj);
             std::string const       refStem = "ref" + std::to_string(k) + "_" + cell.name;
             bool const              linked  = arm.run(d, arm.link(refStem, objects), refStem + ".txt");
-            std::optional<unsigned> reference;
+            std::optional<unsigned> reference;   // the LIVE answer: the control's, and the [native-arm] line's
             if (expected == kWnRefuses) {
-                EXPECT_FALSE(linked) << referenceMoved(tool, "LINKS the cell", "it refuses it")
-                                     << " — read what its program answers and revisit the decision DSS records for "
-                                        "the cell";
+                if (linked) {
+                    controlDisagrees(tool, "LINKS the cell",
+                                     "it refuses it — read what its program answers and revisit the decision DSS "
+                                     "records for the cell");
+                }
+            } else if (!linked) {
+                controlDisagrees(tool, "REFUSES the cell:" + np::tailOf(d / (refStem + ".txt"), 20, arm.label),
+                                 "it links it (" + std::to_string(expected) + ")");
             } else {
-                ASSERT_TRUE(linked) << np::tailOf(d / (refStem + ".txt"), 20, arm.label);
                 auto const ref = runImage(d / (refStem + arm.exe));
-                ASSERT_TRUE(ref.spawned) << ref.diagnostic;
-                EXPECT_EQ(static_cast<unsigned>(ref.exitCode), static_cast<unsigned>(expected))
-                    << referenceMoved(tool, std::to_string(ref.exitCode), std::to_string(expected));
-                reference = static_cast<unsigned>(ref.exitCode);
+                EXPECT_TRUE(ref.spawned) << ref.diagnostic;
+                if (ref.spawned) {
+                    if (static_cast<unsigned>(ref.exitCode) != static_cast<unsigned>(expected)) {
+                        controlDisagrees(tool, std::to_string(ref.exitCode), std::to_string(expected));
+                    }
+                    reference = static_cast<unsigned>(ref.exitCode);
+                }
             }
             // DSS's answer for the cell: linked and run once per directory of objects.
             auto const answerKey = std::make_pair(owner, std::string{cell.name});
@@ -4669,8 +4717,10 @@ TEST(WeakNameReferencesNative, AReferenceThroughAWeakNameResolvesAsTheReferenceL
                 answered = dssAnswers.emplace(answerKey, static_cast<unsigned>(r.exitCode)).first;
             }
             unsigned const dssExit = answered->second;
-            if (reference.has_value()) {
-                EXPECT_EQ(dssExit, *reference) << "DSS must give the reference linker's answer";
+            if (expected != kWnRefuses) {
+                EXPECT_EQ(dssExit, static_cast<unsigned>(expected))
+                    << "DSS must give the table's answer: the reference linker's, as measured with "
+                    << arm.measuredWith;
             } else {
                 EXPECT_EQ(dssExit, static_cast<unsigned>(cell.dssWhereRefused))
                     << "where the reference refuses, DSS gives the recorded decision: the first unit's body";
@@ -5309,11 +5359,16 @@ TEST(RecordSymbolIdsNative, AnObjectWhoseFirstRecordIsADefinitionRelinksWhole) {
                 if (definitionIsFirst) (object.referenceWritten ? referenceWroteItFirst : dssWroteItFirst) = true;
                 // CONTROL: the reference linker's program of the reference's main and the object.
                 std::string const refStem = "ref" + std::to_string(k) + "_" + object.stem;
-                ASSERT_TRUE(arm.run(d, arm.link(refStem, {mainStem + arm.obj, object.stem + arm.obj}), refStem + ".txt"))
-                    << "CONTROL: " << np::tailOf(d / (refStem + ".txt"), 20, arm.label);
-                auto const reference = exitOf(d / (refStem + arm.exe), "CONTROL: the reference linker's program");
-                ASSERT_TRUE(reference.has_value());
-                EXPECT_EQ(*reference, 42u) << referenceMoved(tool, std::to_string(*reference), "42");
+                std::optional<unsigned> reference;
+                if (!arm.run(d, arm.link(refStem, {mainStem + arm.obj, object.stem + arm.obj}), refStem + ".txt")) {
+                    controlDisagrees(tool, "REFUSES the program:" + np::tailOf(d / (refStem + ".txt"), 20, arm.label),
+                                     "it links it (42)");
+                } else {
+                    reference = exitOf(d / (refStem + arm.exe), "CONTROL: the reference linker's program");
+                    if (reference.has_value() && *reference != 42u) {
+                        controlDisagrees(tool, std::to_string(*reference), "42");
+                    }
+                }
                 // DSS's relocatable artifact of the object ALONE...
                 std::string const artifactStem = "r_" + object.stem;
                 if (owner == k) {
@@ -5379,12 +5434,13 @@ TEST(RecordSymbolIdsNative, AnObjectWhoseFirstRecordIsADefinitionRelinksWhole) {
                               << "arm64 datum) — the DSS-written object is this arm's cell"
                               << (referenceWroteItFirst ? "; TODAY one does, and its cells ran" : "") << "\n";
                 } else if (arm.withoutLocals) {
-                    EXPECT_TRUE(referenceWroteItFirst)
-                        << referenceMoved(tool,
-                                          "with no object — as compiled, or without its local symbols — whose FIRST "
-                                          "record is the definition",
-                                          "one of the arm's objects has it there")
-                        << ": the cell did not run on a reference's object";
+                    if (!referenceWroteItFirst) {
+                        controlDisagrees(tool,
+                                         "with no object — as compiled, or without its local symbols — whose FIRST "
+                                         "record is the definition",
+                                         "one of the arm's objects has it there (the cell did not run on a "
+                                         "reference's object)");
+                    }
                 }
             }
         }
@@ -5768,17 +5824,25 @@ TEST(ArchiveSearchRoundOrderNative, AppleLdAnswersAReferenceBeforeACommonAndSoDo
                 std::string const refStem = "ref_" + tag;
                 bool const linked = arm.run(d, arm.link(refStem, "main" + arm.obj, {std::string{unit} + arm.obj, lib + arm.lib}),
                                             refStem + ".txt");
-                std::optional<unsigned> reference;
+                std::optional<unsigned> reference;   // Apple's ld's LIVE answer: the control's
                 if (cell.expected < 0) {
-                    EXPECT_FALSE(linked) << referenceMoved(tool, "LINKS the cell", "it refuses it for a duplicate `_w`")
-                                         << " — read what its program answers and revisit the order";
+                    if (linked) {
+                        controlDisagrees(tool, "LINKS the cell",
+                                         "it refuses it for a duplicate `_w` — read what its program answers and "
+                                         "revisit the order");
+                    }
+                } else if (!linked) {
+                    controlDisagrees(tool, "REFUSES the cell:" + np::tailOf(d / (refStem + ".txt"), 20, arm.label),
+                                     "it links it (" + std::to_string(cell.expected) + ")");
                 } else {
-                    ASSERT_TRUE(linked) << np::tailOf(d / (refStem + ".txt"), 20, arm.label);
                     auto const ref = runImage(d / (refStem + arm.exe));
-                    ASSERT_TRUE(ref.spawned) << ref.diagnostic;
-                    EXPECT_EQ(static_cast<unsigned>(ref.exitCode), static_cast<unsigned>(cell.expected))
-                        << referenceMoved(tool, std::to_string(ref.exitCode), std::to_string(cell.expected));
-                    reference = static_cast<unsigned>(ref.exitCode);
+                    EXPECT_TRUE(ref.spawned) << ref.diagnostic;
+                    if (ref.spawned) {
+                        if (static_cast<unsigned>(ref.exitCode) != static_cast<unsigned>(cell.expected)) {
+                            controlDisagrees(tool, std::to_string(ref.exitCode), std::to_string(cell.expected));
+                        }
+                        reference = static_cast<unsigned>(ref.exitCode);
+                    }
                 }
                 // DSS: its own main, Apple's object, Apple's archive.
                 auto const out = d / ("dss_" + tag);
@@ -5811,10 +5875,11 @@ TEST(ArchiveSearchRoundOrderNative, AppleLdAnswersAReferenceBeforeACommonAndSoDo
                 auto const r = runImage(image);
                 ASSERT_TRUE(r.spawned) << r.diagnostic;
                 EXPECT_FALSE(r.timedOut);
-                ASSERT_TRUE(reference.has_value());
-                EXPECT_EQ(static_cast<unsigned>(r.exitCode), *reference) << "DSS must give Apple's ld's answer";
-                std::cout << "[native-arm] " << arm.label << " " << tag << ": Apple's ld " << *reference << ", DSS "
-                          << r.exitCode << "\n";
+                EXPECT_EQ(static_cast<unsigned>(r.exitCode), static_cast<unsigned>(cell.expected))
+                    << "DSS must give the table's answer: Apple's ld's, as measured with " << arm.measuredWith;
+                std::cout << "[native-arm] " << arm.label << " " << tag << ": Apple's ld "
+                          << (reference.has_value() ? std::to_string(*reference) : std::string{"(did not answer)"})
+                          << " (table " << cell.expected << "), DSS " << r.exitCode << "\n";
             }
         }
         ++ran;
@@ -5910,25 +5975,31 @@ TEST(ArchiveSearchRoundOrderNative, GnuLdsAnswersOnElfAndTheOneCellWhereDssLinks
                 std::string const refStem = "ref_" + tag;
                 bool const linked = arm.run(d, arm.link(refStem, "main" + arm.obj, {unit + arm.obj, lib + arm.lib}),
                                             refStem + ".txt");
-                std::optional<unsigned> reference;   // GNU ld's LIVE answer, where it links
+                std::optional<unsigned> reference;   // GNU ld's LIVE answer, where it links: the control's
                 if (gnuLd < 0) {
                     std::string const twice = std::string{"`"} + cell.gnuLdDuplicate + "` defined twice";
-                    EXPECT_FALSE(linked) << referenceMoved(tool, "LINKS the cell", "it refuses it for " + twice)
-                                         << " — read what its program answers and revisit the table";
-                    std::string const said = np::tailOf(d / (refStem + ".txt"), 40);
-                    if (!linked) {
-                        EXPECT_TRUE(saysDefinedTwice(said, cell.gnuLdDuplicate))
-                            << referenceMoved(tool, "a refusal in other words:" + said,
-                                              "a refusal for " + twice + " (`multiple definition of`, read under LC_ALL=C)");
+                    std::string const said  = np::tailOf(d / (refStem + ".txt"), 40);
+                    if (linked) {
+                        controlDisagrees(tool, "LINKS the cell",
+                                         "it refuses it for " + twice + " — read what its program answers and revisit "
+                                         "the table");
+                    } else if (!saysDefinedTwice(said, cell.gnuLdDuplicate)) {
+                        controlDisagrees(tool, "a refusal in other words:" + said,
+                                         "a refusal for " + twice + " (`multiple definition of`, read under LC_ALL=C)");
                     }
+                } else if (!linked) {
+                    controlDisagrees(tool, "REFUSES the cell:" + np::tailOf(d / (refStem + ".txt"), 20, arm.label),
+                                     "it links it (" + std::to_string(gnuLd) + ")");
                 } else {
-                    ASSERT_TRUE(linked) << np::tailOf(d / (refStem + ".txt"), 20, arm.label);
                     auto const ref = test_support::runBinary(d / (refStem + arm.exe));
-                    ASSERT_TRUE(ref.spawned) << ref.diagnostic;
+                    EXPECT_TRUE(ref.spawned) << ref.diagnostic;
                     EXPECT_FALSE(ref.timedOut);
-                    EXPECT_EQ(static_cast<unsigned>(ref.exitCode), static_cast<unsigned>(gnuLd))
-                        << referenceMoved(tool, std::to_string(ref.exitCode), std::to_string(gnuLd));
-                    reference = static_cast<unsigned>(ref.exitCode);
+                    if (ref.spawned && !ref.timedOut) {
+                        if (static_cast<unsigned>(ref.exitCode) != static_cast<unsigned>(gnuLd)) {
+                            controlDisagrees(tool, std::to_string(ref.exitCode), std::to_string(gnuLd));
+                        }
+                        reference = static_cast<unsigned>(ref.exitCode);
+                    }
                 }
                 // DSS: its own main, gcc's object, `ar`'s archive.
                 auto const out = d / ("dss_" + tag);
@@ -5962,9 +6033,11 @@ TEST(ArchiveSearchRoundOrderNative, GnuLdsAnswersOnElfAndTheOneCellWhereDssLinks
                 auto const r = test_support::runBinary(image);
                 ASSERT_TRUE(r.spawned) << r.diagnostic;
                 EXPECT_FALSE(r.timedOut);
-                if (reference.has_value()) {
-                    // Where GNU ld links, DSS's answer is DEFINED as GNU ld's: the LIVE one, not the table's.
-                    EXPECT_EQ(static_cast<unsigned>(r.exitCode), *reference) << "DSS must give GNU ld's answer";
+                if (gnuLd >= 0) {
+                    // Where GNU ld links, DSS's answer is GNU ld's — the TABLE's, as measured (P69 fold 3c, F2: no
+                    // longer the live one, which is the control's alone).
+                    EXPECT_EQ(static_cast<unsigned>(r.exitCode), static_cast<unsigned>(gnuLd))
+                        << "DSS must give GNU ld's answer, as measured with " << arm.measuredWith;
                 } else {
                     EXPECT_EQ(static_cast<unsigned>(r.exitCode), static_cast<unsigned>(dss))
                         << "where GNU ld refuses for a second definer of the common's name, DSS links the "
@@ -6150,19 +6223,23 @@ TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRec
         bool const linked = sh(ref, std::string{"ref_"} + cell.name + ".txt");
         if (cell.refused) {
             std::string const said = np::tailOf(dir / (std::string{"ref_"} + cell.name + ".txt"), 20);
-            EXPECT_FALSE(linked) << referenceMoved(reference, "LINKS the pair",
-                                                   "it refuses a common nothing reads against a thread-local definition");
-            if (!linked) {
-                EXPECT_NE(said.find("mismatches non-TLS reference"), std::string::npos)
-                    << referenceMoved(reference, "a refusal in other words:" + said,
-                                      "a refusal that says `mismatches non-TLS reference` (read under LC_ALL=C)");
+            if (linked) {
+                controlDisagrees(reference, "LINKS the pair",
+                                 "it refuses a common nothing reads against a thread-local definition");
+            } else if (said.find("mismatches non-TLS reference") == std::string::npos) {
+                controlDisagrees(reference, "a refusal in other words:" + said,
+                                 "a refusal that says `mismatches non-TLS reference` (read under LC_ALL=C)");
             }
+        } else if (!linked) {
+            controlDisagrees(reference,
+                             "REFUSES the pair:" + np::tailOf(dir / (std::string{"ref_"} + cell.name + ".txt"), 20),
+                             "it links it (0)");
         } else {
-            ASSERT_TRUE(linked) << np::tailOf(dir / (std::string{"ref_"} + cell.name + ".txt"), 20);
             auto const r = test_support::runBinary(dir / (std::string{"ref_"} + cell.name));
-            ASSERT_TRUE(r.spawned) << r.diagnostic;
-            EXPECT_EQ(r.exitCode, 0u) << referenceMoved(reference, std::to_string(r.exitCode), "0")
-                                      << " (the ordinary definition)";
+            EXPECT_TRUE(r.spawned) << r.diagnostic;
+            if (r.spawned && r.exitCode != 0u) {
+                controlDisagrees(reference, std::to_string(r.exitCode), "0 (the ordinary definition)");
+            }
         }
         // DSS: its own main, gcc's objects.
         auto const out = dir / (std::string{"dss-"} + cell.name);
@@ -6224,7 +6301,7 @@ TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRec
     ASSERT_TRUE(runCapturing(&tools, dir, "cl /nologo /c /O2 /MD /GS- unread.c tls.c reader.c main0.c main5.c", "cl.txt"))
         << np::tailOf(dir / "cl.txt", 30, "cl");
     auto const reference = clWithLinkExe(tools, dir);
-    std::map<std::string, unsigned> liveAnswer;   // link.exe's LIVE answer, by cell
+    std::map<std::string, unsigned> liveAnswer;   // link.exe's LIVE answer, by cell: the control's, and the lines'
     struct RefCell {
         char const*              name;
         char const*              main;
@@ -6237,14 +6314,16 @@ TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRec
         SCOPED_TRACE(std::string{"link.exe, "} + cell.name);
         std::string ref = std::string{"link /nologo /OUT:ref_"} + cell.name + ".exe " + cell.main + ".obj";
         for (auto const& o : cell.objects) ref += " " + o;
-        ASSERT_TRUE(runCapturing(&tools, dir, ref, std::string{"ref_"} + cell.name + ".txt"))
-            << referenceMoved(reference,
-                              "REFUSES the pair:"
-                                  + np::tailOf(dir / (std::string{"ref_"} + cell.name + ".txt"), 30, "link.exe"),
-                              "it links it");
+        if (!runCapturing(&tools, dir, ref, std::string{"ref_"} + cell.name + ".txt")) {
+            controlDisagrees(reference,
+                             "REFUSES the pair:"
+                                 + np::tailOf(dir / (std::string{"ref_"} + cell.name + ".txt"), 30, "link.exe"),
+                             "it links it (" + std::to_string(cell.expected) + ")");
+            continue;
+        }
         auto const live = controlExit(reference, test_support::runBinary(dir / (std::string{"ref_"} + cell.name + ".exe")),
                                       cell.expected);
-        ASSERT_TRUE(live.has_value());
+        if (!live.has_value()) continue;   // controlExit said why
         liveAnswer[cell.name] = *live;
         std::cout << "[native-arm] cl (link.exe) " << cell.name << ": link.exe " << *live << "\n";
     }
@@ -6276,8 +6355,8 @@ TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRec
         char const* name;
         char const* main;
         bool        besideTheCommon;
-        unsigned    expected;      // what the program is: the table's answer
-        char const* linkExeCell;   // link.exe's cell of the same program, whose LIVE answer DSS must give; null: DSS alone
+        unsigned    expected;      // what the program is: the table's answer, link.exe's as measured where it has a cell
+        char const* linkExeCell;   // link.exe's cell of the same program (its live answer is the control's); null: DSS alone
     };
     for (DssCell const& cell :
          {DssCell{"the_common_beside_the_definition", "dmain0", true, 0u, "unread_then_tls"},
@@ -6302,11 +6381,13 @@ TEST(CommonSymbolsNative, AnUnreadCommonBesideAThreadLocalDefinitionIsWhatItsRec
         auto const r = test_support::runBinary(image);
         ASSERT_TRUE(r.spawned) << r.diagnostic;
         EXPECT_FALSE(r.timedOut);
-        // Beside the common DSS's answer is DEFINED as link.exe's — the LIVE one; alone, as what the program is.
-        unsigned const want = cell.linkExeCell != nullptr ? liveAnswer.at(cell.linkExeCell) : cell.expected;
-        EXPECT_EQ(r.exitCode, want) << "DSS must give link.exe's answer";
+        // Beside the common DSS's answer is link.exe's — the TABLE's, as measured (P69 fold 3c, F2: no longer the live
+        // one, which is the control's alone); alone, what the program is.
+        EXPECT_EQ(r.exitCode, cell.expected) << "DSS must give the table's answer (link.exe's, as measured)";
+        auto const live = cell.linkExeCell != nullptr ? liveAnswer.find(cell.linkExeCell) : liveAnswer.end();
         std::cout << "[native-arm] cl's unread common, DSS's thread-local definition, " << cell.name << ": DSS "
-                  << r.exitCode << " (link.exe: " << cell.expected << ")\n";
+                  << r.exitCode << " (table: " << cell.expected << ", link.exe live: "
+                  << (live != liveAnswer.end() ? std::to_string(live->second) : std::string{"-"}) << ")\n";
     }
 #else
     GTEST_SKIP() << "the native cells are gcc's objects on the Linux legs and cl's on the Windows legs; on Apple's ld "
@@ -6942,9 +7023,10 @@ TEST(WeakNameReferencesOnReferenceObjects, EachReaderStatesBothReferencesAndTheM
 //                                                         "relocation refers to a [symbol in a] discarded section")
 //     the label object beside the strong definition       79, either order   (a definition in NO group discards
 //                                                                             nothing: the bytes stay)
-// DSS reads a group's sections as ordinary ones and discards nothing, so the rule's second half alone would keep the
-// loser's bytes in the refused cell and link it (79). It refuses that cell BY NAME, at the relocation that asks for
-// the discarded bytes, and keeps the bytes — as measured — where the group is beside a definition in no group.
+// DSS discards a later unit's group whole before the link resolves a name (P69 fold 3c, `discardLaterSectionGroups`
+// in link/linker.cpp), so in the refused cell the relocation names bytes that are not in the link and is refused BY
+// NAME, as the references refuse it; a group beside a definition in no group discards nothing and keeps its bytes —
+// as measured. (Folds 2 to 3b discarded no group and refused that cell at the merge instead.)
 // (DSS before fold 2, `dsscp`, the same day: 77, 77, 99, 99, 99 — the refused cell linked, and both "79" cells read
 // the other object's datum through the label.)
 // Fixtures (x86_64 ELF; each `elf_group_*.source.s` beside them is its source and states its rebuild command; each
@@ -6960,14 +7042,49 @@ TEST(WeakNameReferencesOnReferenceObjects, EachReaderStatesBothReferencesAndTheM
 
 namespace {
 
-// Every row of the body `name` names in `m` states the section group `signature`.
+// The body `name` names in `m` moves into an input section of its own, at its start, and the unit states that section
+// a member of the section group `signature` — what gcc writes for a COMDAT function or datum (`.text.<f>`,
+// `.data.<x>`). DSS's own writer puts every function of a unit in one `.text`, so the hand-built unit, read back, holds
+// the body beside the unit's other functions until this moves it.
 void stateGroupOn(AssembledModule& m, std::string const& name, std::string const& signature) {
     auto const* def = definitionNamed(m, name);
     ASSERT_NE(def, nullptr) << name;
-    SymbolId const id = def->symbol;
-    for (auto& s : m.symbols) {
-        if (s.symbol == id) s.sectionGroup = signature;
+    SymbolId const id    = def->symbol;
+    std::uint32_t  fresh = 0;
+    for (auto const& [section, group] : m.sectionGroupOfInputSection) fresh = std::max(fresh, section + 1u);
+    for (auto const& fn : m.functions) {
+        if (fn.inputSection.has_value()) fresh = std::max(fresh, fn.inputSection->section + 1u);
     }
+    for (auto const& di : m.dataItems) {
+        if (di.inputSection.has_value()) fresh = std::max(fresh, di.inputSection->section + 1u);
+    }
+    std::size_t moved = 0;
+    for (auto& fn : m.functions) {
+        if (fn.symbol != id) continue;
+        fn.inputSection = InputSectionSlice{fresh, 0};
+        ++moved;
+    }
+    for (auto& di : m.dataItems) {
+        if (di.symbol != id) continue;
+        di.inputSection = InputSectionSlice{fresh, 0};
+        ++moved;
+    }
+    ASSERT_EQ(moved, 1u) << "'" << name << "' names one body";
+    m.sectionGroupOfInputSection.emplace(fresh, signature);
+}
+
+// The section group the unit states for the input section of the definition `id`; empty where it states none.
+[[nodiscard]] std::string groupOfTheDefinition(AssembledModule const& m, SymbolId id) {
+    std::optional<InputSectionSlice> section;
+    for (auto const& fn : m.functions) {
+        if (fn.symbol == id) section = fn.inputSection;
+    }
+    for (auto const& di : m.dataItems) {
+        if (di.symbol == id) section = di.inputSection;
+    }
+    if (!section.has_value()) return {};
+    auto const it = m.sectionGroupOfInputSection.find(section->section);
+    return it == m.sectionGroupOfInputSection.end() ? std::string{} : it->second;
 }
 
 [[nodiscard]] bool refusedForADiscardedGroup(DiagnosticReporter const& rep, std::string_view group,
@@ -7003,13 +7120,15 @@ TEST(SectionGroupLosers, TheElfReaderStatesTheSignatureOfEveryGroupMember) {
         for (auto const& s : object->symbols) {
             if (s.symbol != weakRow->symbol) continue;
             ++members;
-            EXPECT_EQ(s.sectionGroup, "shared_g") << "'" << s.name << "' is a name of the group's member";
+            EXPECT_EQ(groupOfTheDefinition(*object, s.symbol), "shared_g")
+                << "'" << s.name << "' is a name of the group's member";
         }
         EXPECT_GE(members, 1u);
         for (char const* outside : {"direct_g", "through_g"}) {
             auto const* fn = definitionNamed(*object, outside);
             ASSERT_NE(fn, nullptr) << outside;
-            EXPECT_TRUE(fn->sectionGroup.empty()) << outside << " lies in `.text`, which is in no group";
+            EXPECT_TRUE(groupOfTheDefinition(*object, fn->symbol).empty())
+                << outside << " lies in `.text`, which is in no group";
         }
         // Both references, as the weak-name rule reads them: the one through the label is left on the BODY.
         auto const* row = rowNamed(*object, "shared_g");
@@ -7023,18 +7142,16 @@ TEST(SectionGroupLosers, TheElfReaderStatesTheSignatureOfEveryGroupMember) {
         ASSERT_TRUE(copy.has_value()) << diagnosticsOf(rep);
         auto const* def = definitionNamed(*copy, "shared_g");
         ASSERT_NE(def, nullptr);
-        EXPECT_EQ(def->sectionGroup, "shared_g");
+        EXPECT_EQ(groupOfTheDefinition(*copy, def->symbol), "shared_g");
         auto const strong = readObject(rf->fam, L, referenceObject("elf_group_strong_x86_64_elf_gas.o"), 1, rep);
         ASSERT_TRUE(strong.has_value()) << diagnosticsOf(rep);
-        for (auto const& s : strong->symbols) {
-            EXPECT_TRUE(s.sectionGroup.empty()) << "CONTROL: '" << s.name << "' of an object with no group";
-        }
+        EXPECT_TRUE(strong->sectionGroupOfInputSection.empty()) << "CONTROL: an object with no group states none";
     }
     // CONTROL: a unit DSS's own writer wrote states no group on any row — the writer writes none.
     auto const own = asRead(rf->fam, L,
                             weakNameOfABody(1, true, 7, "impl", SymbolBinding::Local, "shared", "direct", "through"), 1);
     ASSERT_TRUE(own.has_value());
-    for (auto const& s : own->symbols) EXPECT_TRUE(s.sectionGroup.empty()) << s.name;
+    EXPECT_TRUE(own->sectionGroupOfInputSection.empty()) << "DSS's writer writes no group for a unit that states none";
 }
 
 TEST(SectionGroupLosers, ARelocationNamingADiscardedGroupsBytesIsRefusedByNameAndAGroupBesideANonGroupKeepsThem) {
@@ -7232,4 +7349,282 @@ TEST(ObjectSectionsNoRowNames, EachReaderCarriesTheBodyOrRefusesItUnderACodeThat
         EXPECT_FALSE(sawCode(rep, DiagnosticCode::F_CorruptedBinary))
             << "the object is well-formed: it must not be refused as a damaged file" << diagnosticsOf(rep);
     }
+}
+
+// ══ A section group DSS's relocatable writer hands on, natively (P69 fold 3c) ══════════════════════════════════════
+//
+// D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE, part (2). DSS's `-r` of a unit carrying COMDAT group `h`
+// (a strong, hidden `h`, what a C++ compiler writes for an inline function of a hidden class) writes the group BACK —
+// an SHT_GROUP record, its member SHF_GROUP — so the host's linker, handed that artifact beside a second unit carrying
+// the same group, keeps ONE group and discards the other, as it does for the assembler's own object (the CONTROL): 77
+// with unit A first, 99 with unit B first, under GNU ld and under ld.lld where the host has it (✔MEASURED 2026-10-20 on
+// the assembler's objects, x86_64, GNU ld 2.42 and ld.lld 18.1.3). Written without its group, DSS's `h` is a second
+// strong definition of a name the other unit's group defines, which both linkers refuse.
+TEST(SectionGroupsNative, ARelocatableArtifactsGroupIsKeptOrDiscardedBesideTheSameGroupAsTheAssemblersIs) {
+#if !defined(__linux__) || !(defined(__x86_64__) || defined(__aarch64__))
+    GTEST_SKIP() << "not a Linux x86_64 or aarch64 host -- the GNU ld arm runs on the Linux legs";
+#else
+    if (!posixReferenceArmCanRun("gas section groups (GNU ld)")) {
+        if (HasFailure()) return;
+        GTEST_SKIP() << "the reference toolchain is not on this host (see the [native-arm] lines)";
+    }
+    test_support::ScratchDir scratch{test_support::Location::Temp, "section-group-native"};
+    auto const dir = scratch.path();
+    namespace np = test_support::native_probe;
+#if defined(__x86_64__)
+    char const* const target      = "x86_64";
+    char const* const relocatable = "elf64-x86_64-linux";
+    auto const unitAsm = [](std::string const& caller, std::string const& body) {
+        return "    .text\n    .globl  " + caller + "\n    .type   " + caller + ", @function\n" + caller
+             + ":\n    jmp     h\n    .size   " + caller + ", .-" + caller + "\n\n"
+             + "    .section .text.h,\"axG\",@progbits,h,comdat\n    .globl  h\n    .hidden h\n"
+             + "    .type   h, @function\nh:\n" + body + "    ret\n    .size   h, .-h\n\n"
+             + "    .section .note.GNU-stack,\"\",@progbits\n";
+    };
+    std::string const bodyA = "    movl    $7, %eax\n";
+    std::string const bodyB = "    nop\n    movl    $9, %eax\n";
+#else
+    char const* const target      = "arm64";
+    char const* const relocatable = "elf64-aarch64-linux";
+    auto const unitAsm = [](std::string const& caller, std::string const& body) {
+        return "    .text\n    .globl  " + caller + "\n    .type   " + caller + ", %function\n" + caller
+             + ":\n    b       h\n    .size   " + caller + ", .-" + caller + "\n\n"
+             + "    .section .text.h,\"axG\",%progbits,h,comdat\n    .globl  h\n    .hidden h\n"
+             + "    .type   h, %function\nh:\n" + body + "    ret\n    .size   h, .-h\n\n"
+             + "    .section .note.GNU-stack,\"\",%progbits\n";
+    };
+    std::string const bodyA = "    mov     w0, #7\n";
+    std::string const bodyB = "    nop\n    mov     w0, #9\n";
+#endif
+    writeText(dir / "ga.s", unitAsm("group_hidden_a", bodyA));
+    writeText(dir / "gb.s", unitAsm("group_hidden_b", bodyB));
+    writeText(dir / "main.c", "int group_hidden_a(void);\nint group_hidden_b(void);\n"
+                              "int main(void) { return group_hidden_a() * 10 + group_hidden_b(); }\n");
+    for (char const* u : {"ga", "gb"}) {
+        std::string const as = "cc -c -o \"" + (dir / (std::string{u} + ".o")).string() + "\" \""
+                             + (dir / (std::string{u} + ".s")).string() + "\"";
+        ASSERT_EQ(std::system(np::captureCmd(as, dir / (std::string{u} + ".txt")).c_str()), 0)
+            << as << np::tailOf(dir / (std::string{u} + ".txt"), 20, "cc");
+    }
+    // DSS's relocatable artifact of unit A alone: read by DSS, written back by DSS's `-r`.
+    auto const tgt = TargetSchema::loadShipped(target);
+    auto const doc = ObjectFormatSchema::loadShipped(relocatable);
+    ASSERT_TRUE(tgt.has_value() && doc.has_value());
+    DiagnosticReporter rep;
+    auto unitA = elf::readRelocatableObject(fileBytes(dir / "ga.o"), **tgt, **doc, rep, CompilationUnitId{1});
+    ASSERT_TRUE(unitA.has_value()) << diagnosticsOf(rep);
+    std::vector<AssembledModule> one;
+    one.push_back(std::move(*unitA));
+    auto const artifact = linker::link(std::span<AssembledModule const>{one}, **tgt, **doc, rep);
+    ASSERT_TRUE(artifact.ok()) << diagnosticsOf(rep);
+    {
+        std::ofstream out(dir / "dss_a.o", std::ios::binary);
+        out.write(reinterpret_cast<char const*>(artifact.bytes.data()),
+                  static_cast<std::streamsize>(artifact.bytes.size()));
+    }
+    std::uint64_t const shoff = rdLE(artifact.bytes, 0x28, 8);
+    std::uint64_t const shnum = rdLE(artifact.bytes, 0x3C, 2);
+    std::size_t         groupRecords = 0;
+    for (std::uint64_t i = 0; i < shnum; ++i) groupRecords += rdLE(artifact.bytes, static_cast<std::size_t>(shoff + i * 64 + 4), 4) == 17u ? 1u : 0u;
+    ASSERT_EQ(groupRecords, 1u) << "DSS's -r writes the group back: one SHT_GROUP record";
+    struct LinkerArm {
+        std::string label;
+        std::string flag;
+        std::string measuredWith;
+    };
+    std::vector<LinkerArm> arms{{"gas section groups (GNU ld)", "", "gcc 13.3.0 with GNU ld 2.42"}};
+    if (std::system("command -v ld.lld >/dev/null 2>&1") == 0) {
+        arms.push_back({"gas section groups (ld.lld)", " -fuse-ld=lld", "gcc 13.3.0 with ld.lld 18.1.3"});
+    }
+    struct Order {
+        std::string first, second;
+        unsigned    exit;
+    };
+    for (auto const& arm : arms) {
+        SCOPED_TRACE(arm.label);
+        auto const tool = posixCc(dir, arm.label, arm.measuredWith);
+        for (bool const control : {true, false}) {
+            std::string const a = control ? "ga.o" : "dss_a.o";
+            for (Order const& o : {Order{a, "gb.o", 77u}, Order{"gb.o", a, 99u}}) {
+                std::string const stem = std::string{control ? "ref" : "dss"} + (arm.flag.empty() ? "-ld-" : "-lld-")
+                                       + std::to_string(o.exit);
+                std::string const exe = (dir / stem).string();
+                std::string const cmd = "cc" + arm.flag + " -o \"" + exe + "\" \"" + (dir / "main.c").string()
+                                      + "\" \"" + (dir / o.first).string() + "\" \"" + (dir / o.second).string() + "\"";
+                bool const linked = std::system(np::captureCmd(cmd, dir / (stem + ".txt")).c_str()) == 0;
+                if (control) {
+                    if (!linked) {
+                        controlDisagrees(tool, "REFUSES the assembler's pair:" + np::tailOf(dir / (stem + ".txt"), 20),
+                                         "it links it (" + std::to_string(o.exit) + ")");
+                        continue;
+                    }
+                    (void)controlExit(tool, test_support::runBinary(exe), o.exit);
+                    continue;
+                }
+                ASSERT_TRUE(linked) << arm.label << " must link DSS's artifact beside the other unit's group, as it "
+                                    << "links the assembler's object:" << np::tailOf(dir / (stem + ".txt"), 20);
+                auto const r = test_support::runBinary(exe);
+                ASSERT_TRUE(r.spawned) << r.diagnostic;
+                EXPECT_FALSE(r.timedOut);
+                EXPECT_EQ(r.exitCode, o.exit) << "one group kept: the first unit's `h` answers both callers";
+            }
+        }
+    }
+#endif
+}
+
+// ══ The one instance of its name in the process, natively (P69 fold 3c) ═══════════════════════════════════════════
+//
+// g++ writes a C++ inline variable as STB_GNU_UNIQUE in a COMDAT group named by it (✔MEASURED 2026-10-20, g++ 13.3.0,
+// x86_64; the host's own objects are read below, so the aarch64 leg states its g++'s). Two units each take `&counter`;
+// main writes 40 through the first and returns `(a == b) + *b`: ONE object 41, two copies 5. CONTROL: GNU ld's program,
+// and ld.lld's where the host has it, both orders — 41 (✔MEASURED, x86_64). DSS links the same objects under the same
+// main, exec and PIE, both orders: 41. Until fold 3c DSS read the binding as LOCAL and its program returned 5, silently
+// (✔MEASURED 2026-10-20 on the 2026-10-16 build). And DSS's `-r` of u1a under a FreeBSD header, linked by each
+// reference beside g++'s u2a, both orders: 41.
+TEST(OneInstancePerProcessNative, TwoUnitsInlineVariableIsOneObjectAsUnderGnuLdAndLld) {
+#if !defined(__linux__) || !(defined(__x86_64__) || defined(__aarch64__))
+    GTEST_SKIP() << "not a Linux x86_64 or aarch64 host -- the g++ arm runs on the Linux legs";
+#else
+    if (!posixReferenceArmCanRun("g++ inline variables (GNU ld)")) {
+        if (HasFailure()) return;
+        GTEST_SKIP() << "the reference toolchain is not on this host (see the [native-arm] lines)";
+    }
+    test_support::ScratchDir scratch{test_support::Location::Temp, "unique-gxx-native"};
+    auto const dir = scratch.path();
+    namespace np = test_support::native_probe;
+    if (std::system(np::captureCmd("c++ --version", dir / "cxx.txt").c_str()) != 0) {
+        auto const strict = test_support::readStrictArmVerdicts();
+        if (strict.on || strict.malformed) {
+            FAIL() << "[native-arm] g++ inline variables: no working `c++` on this host, and "
+                   << test_support::kStrictArmVerdictsEnv << " makes that a failure";
+        }
+        std::cout << "[native-arm] g++ inline variables: not run — no working `c++` on this host\n";
+        GTEST_SKIP() << "no c++ on this host";
+    }
+    writeText(dir / "u1a.cpp", "inline int counter = 5;\nextern \"C\" int *addr1(void) { return &counter; }\n");
+    writeText(dir / "u2a.cpp", "inline int counter = 5;\nextern \"C\" int *addr2(void) { return &counter; }\n");
+    writeText(dir / "main.c", "int *addr1(void);\nint *addr2(void);\nint main(void) {\n"
+                              "    int *a = addr1(), *b = addr2();\n    *a = 40;\n    return (a == b) + *b;\n}\n");
+    for (char const* tu : {"u1a", "u2a"}) {
+        std::string const cxx = "c++ -std=c++17 -O1 -c -o \"" + (dir / (std::string{tu} + ".o")).string() + "\" \""
+                              + (dir / (std::string{tu} + ".cpp")).string() + "\"";
+        ASSERT_EQ(std::system(np::captureCmd(cxx, dir / (std::string{tu} + ".txt")).c_str()), 0)
+            << cxx << np::tailOf(dir / (std::string{tu} + ".txt"), 20, "c++");
+        auto const counter = elfSymbolsNamed(fileBytes(dir / (std::string{tu} + ".o")), "counter");
+        ASSERT_EQ(counter.size(), 1u) << tu;
+        EXPECT_EQ(counter[0].bind, 10u) << tu << ": g++ writes an inline variable as STB_GNU_UNIQUE, what this arm "
+                                                 "is about";
+    }
+    struct LinkerArm {
+        std::string label;
+        std::string flag;
+        std::string measuredWith;
+    };
+    std::vector<LinkerArm> arms{{"g++ inline variables (GNU ld)", "", "g++ 13.3.0 with GNU ld 2.42"}};
+    if (std::system("command -v ld.lld >/dev/null 2>&1") == 0) {
+        arms.push_back({"g++ inline variables (ld.lld)", " -fuse-ld=lld", "g++ 13.3.0 with ld.lld 18.1.3"});
+    }
+    for (auto const& arm : arms) {
+        auto const tool = posixCc(dir, arm.label, arm.measuredWith);
+        for (bool const aFirst : {true, false}) {
+            std::string const exe = (dir / (std::string{"ref"} + (arm.flag.empty() ? "-ld" : "-lld")
+                                            + (aFirst ? "-a" : "-b"))).string();
+            std::string const cmd = "cc" + arm.flag + " -o \"" + exe + "\" \"" + (dir / "main.c").string() + "\" \""
+                                  + (dir / (aFirst ? "u1a.o" : "u2a.o")).string() + "\" \""
+                                  + (dir / (aFirst ? "u2a.o" : "u1a.o")).string() + "\"";
+            if (std::system(np::captureCmd(cmd, dir / "ref.txt").c_str()) != 0) {
+                controlDisagrees(tool, "REFUSES the program:" + np::tailOf(dir / "ref.txt", 20), "it links it (41)");
+            } else {
+                (void)controlExit(tool, test_support::runBinary(exe), 41u);
+            }
+        }
+    }
+#if defined(__x86_64__)
+    std::vector<char const*> const specs{"x86_64:elf64-x86_64-linux-exec", "x86_64:elf64-x86_64-linux-pie"};
+#else
+    std::vector<char const*> const specs{"arm64:elf64-aarch64-linux-exec", "arm64:elf64-aarch64-linux-pie"};
+#endif
+    for (char const* spec : specs) {
+        for (bool const aFirst : {true, false}) {
+            SCOPED_TRACE(std::string{spec} + (aFirst ? ", u1a first" : ", u2a first"));
+            auto const out = dir / (std::string{"dss-"} + (std::string_view{spec}.ends_with("pie") ? "pie" : "exec")
+                                    + (aFirst ? "-a" : "-b"));
+            fs::create_directories(out);
+            Program p;
+            p.setOutputDir(out);
+            DiagnosticReporter rep;
+            int const rc = p.compileFiles(
+                std::vector<std::string>{(dir / "main.c").string(), (dir / (aFirst ? "u1a.o" : "u2a.o")).string(),
+                                         (dir / (aFirst ? "u2a.o" : "u1a.o")).string()},
+                "c", std::vector<std::string>{spec}, rep);
+            ASSERT_EQ(rc, 0) << "DSS must link g++'s inline variables:" << diagnosticsOf(rep);
+            fs::path image;
+            for (auto const& e : fs::directory_iterator(out)) {
+                if (e.is_regular_file() && e.path().extension().empty()) image = e.path();
+            }
+            ASSERT_FALSE(image.empty()) << "no image under " << out.string();
+            auto const r = test_support::runBinary(image);
+            ASSERT_TRUE(r.spawned) << r.diagnostic;
+            EXPECT_FALSE(r.timedOut);
+            EXPECT_EQ(r.exitCode, 41u) << "41: one object; 5: each unit kept a copy of its own";
+        }
+    }
+    // THE ONE INSTANCE UNDER A HEADER OF ANOTHER OS ABI (P69 fold 3c, the orchestrator's amended ruling of 2026-10-21):
+    // DSS's `-r` of unit u1a under its relocatable document with the header respelled FreeBSD writes `counter` with the
+    // document's binding under OS/ABI FreeBSD, as ld.lld 18.1.3 `-r -m elf_x86_64_fbsd` writes it (✔MEASURED
+    // 2026-10-21), and each reference linker links that artifact beside g++'s u2a to ONE object, both orders: 41.
+#if defined(__x86_64__)
+    char const* const relTarget = "x86_64";
+    char const* const relStem   = "elf64-x86_64-linux";
+#else
+    char const* const relTarget = "arm64";
+    char const* const relStem   = "elf64-aarch64-linux";
+#endif
+    auto const relTgt = TargetSchema::loadShipped(relTarget);
+    auto const relDoc = ObjectFormatSchema::loadShipped(relStem);
+    ASSERT_TRUE(relTgt.has_value() && relDoc.has_value());
+    std::ifstream docIn{dss::test::repoRoot() / "src" / "dss-config" / "object-formats" / (std::string{relStem} + ".format.json"),
+                        std::ios::binary};
+    nlohmann::json fbsdJson = nlohmann::json::parse(
+        std::string{std::istreambuf_iterator<char>{docIn}, std::istreambuf_iterator<char>{}});
+    fbsdJson["elf"]["osabi"] = "freebsd";
+    auto const fbsdDoc = ObjectFormatSchema::loadFromText(fbsdJson.dump(), relStem);
+    ASSERT_TRUE(fbsdDoc.has_value()) << "the FreeBSD-header document loads whole";
+    DiagnosticReporter relRep;
+    auto relUnit = elf::readRelocatableObject(fileBytes(dir / "u1a.o"), **relTgt, **relDoc, relRep, CompilationUnitId{1});
+    ASSERT_TRUE(relUnit.has_value()) << diagnosticsOf(relRep);
+    std::vector<AssembledModule> relOne;
+    relOne.push_back(std::move(*relUnit));
+    auto const fbsdArtifact = linker::link(std::span<AssembledModule const>{relOne}, **relTgt, **fbsdDoc, relRep);
+    ASSERT_TRUE(fbsdArtifact.ok()) << diagnosticsOf(relRep);
+    ASSERT_GE(fbsdArtifact.bytes.size(), 8u);
+    EXPECT_EQ(fbsdArtifact.bytes[7], 9u) << "the header the document states: FreeBSD";
+    auto const fbsdCounter = elfSymbolsNamed(fbsdArtifact.bytes, "counter");
+    ASSERT_EQ(fbsdCounter.size(), 1u);
+    EXPECT_EQ(fbsdCounter[0].bind, 10u) << "the document's binding under the FreeBSD header";
+    {
+        std::ofstream out(dir / "dss_u1a_fbsd.o", std::ios::binary);
+        out.write(reinterpret_cast<char const*>(fbsdArtifact.bytes.data()),
+                  static_cast<std::streamsize>(fbsdArtifact.bytes.size()));
+    }
+    for (auto const& arm : arms) {
+        SCOPED_TRACE(arm.label + ", DSS's FreeBSD-header artifact");
+        for (bool const dssFirst : {true, false}) {
+            std::string const exe = (dir / (std::string{"fbsd"} + (arm.flag.empty() ? "-ld" : "-lld")
+                                            + (dssFirst ? "-a" : "-b"))).string();
+            std::string const first  = (dir / (dssFirst ? "dss_u1a_fbsd.o" : "u2a.o")).string();
+            std::string const second = (dir / (dssFirst ? "u2a.o" : "dss_u1a_fbsd.o")).string();
+            std::string const cmd = "cc" + arm.flag + " -o \"" + exe + "\" \"" + (dir / "main.c").string() + "\" \""
+                                  + first + "\" \"" + second + "\"";
+            ASSERT_EQ(std::system(np::captureCmd(cmd, dir / "fbsd.txt").c_str()), 0)
+                << arm.label << " must link DSS's FreeBSD-header artifact beside g++'s unit:"
+                << np::tailOf(dir / "fbsd.txt", 20);
+            auto const r = test_support::runBinary(exe);
+            ASSERT_TRUE(r.spawned) << r.diagnostic;
+            EXPECT_FALSE(r.timedOut);
+            EXPECT_EQ(r.exitCode, 41u) << "41: one object; 5: the reference linker kept two copies";
+        }
+    }
+#endif
 }

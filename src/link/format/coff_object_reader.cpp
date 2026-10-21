@@ -6,6 +6,8 @@
 #include "link/format/object_format_backends.hpp"
 #include "link/format/relocation_addend.hpp"
 #include "link/format/section_relative_target.hpp"
+#include "link/format/unwind_pointer_reloc.hpp"
+#include "link/format/win64_unwind_decode.hpp"   // (7.5) the unwind carry
 
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
@@ -207,6 +209,23 @@ constexpr std::uint16_t kSymDtypeFunction = 0x20u;
 // exemption; the section KIND is resolved from the schema name map.
 constexpr std::uint32_t kScnCntUninitializedData = 0x00000080u;
 
+// IMAGE_SCN_LNK_NRELOC_OVFL (PE Format spec, "Section Flags"): the section
+// carries more relocations than the u16 NumberOfRelocations holds. The field
+// then reads 0xFFFF and the FIRST IMAGE_RELOCATION is not a relocation: its
+// VirtualAddress is the record count INCLUDING itself, and the relocations are
+// the records after it — as LLVM's COFFObjectFile reads it ("-1 to exclude
+// this first relocation entry") and both GNU ld and LLVM's writer emit it.
+// ✔MEASURED 2026-10-20: x86_64-w64-mingw32-gcc -O0 of
+// examples/c/long_branch_imm19_escape writes `.text` with Characteristics
+// 0x61500020, NumberOfRelocations 0xFFFF and a first record (VirtualAddress
+// 98307, symbol 0, type 0) followed by exactly 98306 relocations; GNU ld links
+// the object and the program exits 42. Until this flag was read, DSS took the
+// count record for a relocation of type 0 and refused the object as corrupted
+// (`relocation Type 0 in section '.text' is not declared`) — and, had type 0
+// been declared, would have read 65535 records and silently dropped the rest.
+constexpr std::uint32_t kScnLnkNrelocOvfl = 0x01000000u;
+constexpr std::uint32_t kNumberOfRelocationsOverflowed = 0xFFFFu;
+
 // -- IMAGE_SCN_ALIGN_*BYTES: COFF's spelling of the declared section
 //    alignment (PE Format spec, "Section Flags") -----------------------------
 //
@@ -265,23 +284,32 @@ constexpr std::uint32_t kScnTypeNoPad  = 0x00000008u;
 // Byte alignment the producer declared for `chars`, as the shared read-side
 // policy carries it (`link/format/foreign_section_alignment.hpp`) -- every
 // class as declared, 1 through 8192 (until P69 everything above 256 was read
-// as ONE byte, a miscompile the policy's note measures).
+// as ONE byte, a miscompile the policy's note measures). Decoded ONCE, where
+// the section header is read; every consumer reads `Section::alignment`.
 //
-// ★ CLASS 15 IS NO CLASS OF THE FORMAT: the IMAGE_SCN_ALIGN_* values stop at
-// 8192BYTES (class 14), and the references' arithmetic parts on it --
-// ✔MEASURED 2026-10-15, GNU objdump 2.42 (MinGW-w64) reads a `.bss` of class
-// 13 as 2**12, 14 as 2**13 and 15 as 2**4, the unspecified default. DSS takes
-// the reading a reference was measured giving: class 15 is class 0.
-[[nodiscard]] Alignment
+// ★ CLASS 15 IS NO CLASS OF THE FORMAT, AND THE REFERENCES SPLIT ON IT --
+// nullopt here, refused by name at the header (`F_CorruptedBinary`). The
+// IMAGE_SCN_ALIGN_* values stop at 8192BYTES (class 14), and the readers'
+// arithmetic parts past it: ✔MEASURED 2026-10-15, GNU objdump 2.42 (MinGW-w64)
+// reads a `.bss` of class 13 as 2**12, 14 as 2**13 and 15 as 2**4, the
+// unspecified default; DOCUMENTED, LLVM's `coff_section::getAlignment()`
+// (`llvm/Object/COFF.h`, the reader `lld-link` uses and this file cites for
+// class 0) computes 1 << (15 - 1) = 16384. Until P69 fold 3c DSS took the 16 --
+// the UNDER-aligning reading, the direction class 0's note above calls the one
+// that miscompiles -- where a datum `lld-link` places at 16384 would have been
+// placed at 16. A field that states no alignment of the format is refused, as
+// the ELF and Mach-O readers refuse theirs, rather than placed at an alignment
+// nothing declared.
+[[nodiscard]] std::optional<Alignment>
 alignFromCharacteristics(std::uint32_t chars) noexcept {
-    if ((chars & kScnTypeNoPad) != 0u) return Alignment{};
     std::uint32_t const cls = (chars & kScnAlignMask) >> kScnAlignShift;
-    // Class 0 (and 15) = unspecified = the references' 16-byte default =
-    // exponent 4. Otherwise the class ordinal is one MORE than the log2
-    // exponent, at most 13 -- which an `Alignment` always holds, so the
-    // policy's answer is engaged by construction.
-    std::uint32_t const log2 = cls == 0u || cls == 15u ? 4u : cls - 1u;
-    return *link::format::foreignSectionAlignmentFromLog2(log2);
+    if (cls == 15u) return std::nullopt;
+    if ((chars & kScnTypeNoPad) != 0u) return Alignment{};
+    // Class 0 = unspecified = the references' 16-byte default = exponent 4.
+    // Otherwise the class ordinal is one MORE than the log2 exponent, at most
+    // 13 -- which an `Alignment` always holds.
+    std::uint32_t const log2 = cls == 0u ? 4u : cls - 1u;
+    return link::format::foreignSectionAlignmentFromLog2(log2);
 }
 
 // IMAGE_SCN_LNK_COMDAT: this section participates in COMDAT
@@ -456,6 +484,10 @@ struct Section {
     std::uint64_t relocPtr  = 0;   // PointerToRelocations
     std::uint32_t relocCount = 0;  // NumberOfRelocations
     std::uint32_t chars     = 0;   // Characteristics
+    // The alignment `chars` declares (`alignFromCharacteristics`), decoded
+    // where the header is read; a class the format does not define is refused
+    // there, so every section that reaches a consumer carries one.
+    Alignment     alignment{};
     bool          zeroFill  = false;
     std::optional<SectionKind> kind;  // resolved from the name via the schema
 };
@@ -722,6 +754,52 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         sec.chars      = rdU32(bytes, so + kShCharsOff);
         sec.zeroFill   = (sec.chars & kScnCntUninitializedData) != 0u;
         sec.name       = rdCoffSectionName(bytes, so + kShNameOff, strTabStart, strTabEnd);
+        if (auto const a = alignFromCharacteristics(sec.chars); a.has_value()) {
+            sec.alignment = *a;
+        } else {
+            return fail(DiagnosticCode::F_CorruptedBinary,
+                "pe::readRelocatableObject: section '" + sec.name
+                + "' declares alignment class 15 (IMAGE_SCN_ALIGN field 0xF), "
+                "which is no class of the format -- the classes stop at 14, "
+                "8192 bytes -- and the reference readers part on it: GNU "
+                "objdump reads it as the unspecified 16 bytes, LLVM's COFF "
+                "reader as 16384. DSS refuses it rather than place the "
+                "section's bytes at an alignment its producer never stated.");
+        }
+        // The relocation count past the u16 field (`kScnLnkNrelocOvfl`): the
+        // first record holds the real count, itself included, and is skipped.
+        // The two halves of the convention must agree — the flag beside a
+        // count other than 0xFFFF, or a count record of 0 (which cannot count
+        // even itself), is a section whose producer did not say how many
+        // relocations it has, and is refused by name rather than guessed.
+        if ((sec.chars & kScnLnkNrelocOvfl) != 0u) {
+            if (sec.relocCount != kNumberOfRelocationsOverflowed) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: section '" + sec.name
+                    + "' sets IMAGE_SCN_LNK_NRELOC_OVFL beside a "
+                    "NumberOfRelocations of " + std::to_string(sec.relocCount)
+                    + " -- the flag says the count is in the first relocation "
+                    "record, and a count the field could hold says it is not; "
+                    "the two halves of the overflow convention disagree.");
+            }
+            if (rangeExceedsBuffer(sec.relocPtr, kRelocSz, bytes.size())) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: section '" + sec.name
+                    + "' sets IMAGE_SCN_LNK_NRELOC_OVFL but its count record at "
+                    "PointerToRelocations=" + std::to_string(sec.relocPtr)
+                    + " runs past EOF.");
+            }
+            std::uint32_t const total = rdU32(bytes, static_cast<std::size_t>(sec.relocPtr));
+            if (total == 0u) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: section '" + sec.name
+                    + "' sets IMAGE_SCN_LNK_NRELOC_OVFL and its count record "
+                    "says 0 -- the count includes the count record itself, so "
+                    "it is at least 1.");
+            }
+            sec.relocPtr  += kRelocSz;
+            sec.relocCount = total - 1u;
+        }
         // A file-backed section's body must lie within the file. A zero-fill
         // (bss) section carries no file bytes (PointerToRawData == 0), so it
         // is exempt -- exactly like the ELF reader exempts SHT_NOBITS and the
@@ -1523,19 +1601,32 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // MSVC C object with a file-scope `int x;`. mingw gcc 13.2.0 writes
             // the same record under -fcommon.
             //
-            // THE ALIGNMENT is the final linker's to choose: every COFF linker
-            // gives a common at least the document's rule for its size
-            // (`commonAlignmentFromSizeAtMost`: the size rounded up to a power of
-            // two, at most 32 — the minimum of link.exe's and lld-link's,
-            // ✔MEASURED 2026-10-15), and GNU ld and lld-link take the object's
-            // `-aligncomm:` (`LinkerDirectiveMeaning::CommonAlignment`;
+            // THE ALIGNMENT is the final linker's to choose, and DSS gives the
+            // WIDEST any of them gives, since the object's maker may have relied
+            // on it: link.exe and lld-link give a common that states none its
+            // size rounded up to a power of two, at most 32
+            // (`commonAlignmentFromSizeAtMost`; GNU ld gives at most 4,
+            // `CommonsStatement`, ✔MEASURED 2026-10-20 — cl's `double v;` is
+            // aligned 8 by the linker cl writes for), and GNU ld and lld-link take
+            // the object's `-aligncomm:` (`LinkerDirectiveMeaning::CommonAlignment`;
             // ✔MEASURED, run 20261006-222413-52787563: a common named in one is
             // aligned as it asks), which link.exe ignores. DSS takes the WIDER
-            // of the two. A document that states no such rule gives no
-            // alignment beyond the directive's.
+            // of the two. The PE backend refuses a document that states commons
+            // without the rule (`validateIdentity`); a schema built around it is
+            // refused here, by the key's name, rather than read as alignment 1.
             if (isExt && s.value != 0u) {
-                std::uint64_t alignment =
-                    objectFormatSchema.commonsStatement().alignmentEveryLinkerGives(s.value).value_or(1u);
+                auto const fromSize = objectFormatSchema.commonsStatement().alignmentFromSize(s.value);
+                if (!fromSize.has_value()) {
+                    return fail(DiagnosticCode::K_NoMatchingObjectFormat,
+                        "pe::readRelocatableObject: '" + s.name + "' is a COMMON of "
+                        + std::to_string(s.value) + " bytes, and format '"
+                        + std::string{objectFormatSchema.name()}
+                        + "' states no 'commonAlignmentFromSizeAtMost' -- a COFF common "
+                          "states no alignment of its own, so the alignment its linkers "
+                          "give it is the document's to say, and an unstated one would be "
+                          "read as 1.");
+                }
+                std::uint64_t alignment = *fromSize;
                 std::uint64_t stated    = 0;   // the object states none but by a directive
                 if (auto const asked = commonAlignmentLog2.find(s.name);
                     asked != commonAlignmentLog2.end()) {
@@ -1563,14 +1654,27 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // isData from the COFF derived-type hint: the canonical function
             // test is `(type & DTYPE_MASK) == DTYPE_FUNCTION` (bits 4..5 = the
             // derived type; DT_ARY=0x30 is DATA, not a function -- a plain
-            // `& 0x20` would misread it). A DTYPE_FUNCTION extern -> isData
-            // =false, else DATA. COFF carries this hint (UNLIKE Mach-O x86_64,
-            // which cannot distinguish call from data by reloc formula), and
-            // the c170 writer fold now EMITS it on function externs, so the
-            // function/data class round-trips FAITHFULLY -- no silent default.
-            // An extern that reaches the walker unresolved is rejected loud by
-            // the linker's unbound-extern gate regardless.
-            ext.isData      = !declaresFunction(s);
+            // `& 0x20` would misread it). A DTYPE_FUNCTION extern is a STATED
+            // function (the c170 writer fold emits it on DSS's own function
+            // externs, as cl and gcc do).
+            // ★ ANY OTHER TYPE STATES NOTHING (P69 fold 3c,
+            //   D-LK-COFF-READER-TAKES-AN-UNTYPED-UNDEFINED-SYMBOL-AS-DATA).
+            //   ✔MEASURED 2026-10-20: cl 19.44 and mingw-w64 gcc 13.2.0 write
+            //   0x20 on an undefined function and 0 on a datum, but clang-cl
+            //   19.1.5 writes 0 on EVERY undefined symbol, `puts` included. Read
+            //   as a stated datum, clang-cl's default /MT `puts()` was refused
+            //   "binds as a DATA import" where link.exe links it (42). So a type
+            //   0 is no statement: the row is `Pending`, and its DEFINITION
+            //   decides -- a sibling unit's, or the library the binder matches
+            //   (`decideKindFromTheDefinition`) -- as the ELF reader reads
+            //   STT_NOTYPE (D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA). A row no
+            //   definition decides is refused by name at the link.
+            if (declaresFunction(s)) {
+                ext.isData = false;
+            } else {
+                ext.isData     = false;   // meaningless while Pending
+                ext.kindOrigin = ExternKindOrigin::Pending;
+            }
             externBySym.emplace(i, mod.externImports.size());
             mod.externImports.push_back(std::move(ext));
             continue;
@@ -2304,7 +2408,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             AssembledData di;
             di.symbol    = symbolIds.of(defs[k].symIdx);
             di.section   = *dk;
-            di.alignment = alignFromCharacteristics(sec.chars);  // section-granular
+            di.alignment = sec.alignment;  // section-granular
             di.inputSection = sliceOf(ordinal, off);
             if (isZeroFill(*dk)) {
                 di.reservedSize = len;
@@ -2405,7 +2509,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // The gap's bytes belong to the SAME section, so they carry the
                 // same declared alignment as the named atoms around them --
                 // exactly as the ELF gap arm does.
-                di.alignment = alignFromCharacteristics(sec.chars);
+                di.alignment = sec.alignment;
                 // ...and the same unit: an anonymous gap sits between named
                 // atoms of the section, so the unit is not contiguous without it.
                 di.inputSection = sliceOf(ordinal, g.start);
@@ -2491,6 +2595,242 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         return nullptr;
     };
 
+    // ★ ONE READ OF ONE RELOCATION RECORD, in four steps — the record, the kind
+    // it states, the addend in its field, and the identity it names — shared by
+    // (7) below and by the unwind carry (7.5), whose fields are relocations of
+    // the same wire. (P69 fold 3c: written inline in (7) until the carry needed
+    // the same read; every line is (7)'s own, moved.) Each step reports its
+    // refusal and returns nothing.
+    auto const refuse = [&](DiagnosticCode code, std::string detail) {
+        report(reporter, code, DiagnosticSeverity::Error, std::move(detail));
+        return std::nullopt;
+    };
+    struct RelocationRecord {
+        std::uint64_t va       = 0;
+        std::uint32_t symIdx   = 0;
+        std::uint32_t nativeId = 0;
+    };
+    struct KindRead {
+        RelocationKind              kind{};
+        TargetRelocationInfo const* tri = nullptr;
+    };
+    struct Bound {
+        SymbolId     target{};
+        std::int64_t addend = 0;
+    };
+    auto const recordOf = [&](Section const& sec, std::uint32_t e) -> std::optional<RelocationRecord> {
+        std::size_t const ro = static_cast<std::size_t>(sec.relocPtr)
+                             + static_cast<std::size_t>(e) * kRelocSz;
+        std::uint64_t const va       = rdU32(bytes, ro + kRelVirtAddrOff);
+        std::uint32_t const symIdx   = rdU32(bytes, ro + kRelSymIdxOff);
+        std::uint32_t const nativeId = rdU16(bytes, ro + kRelTypeOff);
+
+        if (symIdx >= numSymbols) {
+            return refuse(DiagnosticCode::F_CorruptedBinary,
+                "pe::readRelocatableObject: relocation in section '"
+                + sec.name + "' names symbol #" + std::to_string(symIdx)
+                + " past the symbol table (" + std::to_string(numSymbols)
+                + ").");
+        }
+        if (auxSlot[symIdx]) {
+            return refuse(DiagnosticCode::F_CorruptedBinary,
+                "pe::readRelocatableObject: relocation in section '"
+                + sec.name + "' names symbol #" + std::to_string(symIdx)
+                + " which is an AUXILIARY record slot, not a symbol.");
+        }
+        return RelocationRecord{va, symIdx, nativeId};
+    };
+    auto const kindOf = [&](Section const& sec, RelocationRecord const& record) -> std::optional<KindRead> {
+        std::uint64_t const va       = record.va;
+        std::uint32_t const nativeId = record.nativeId;
+        // The ONE decode (`RelocationDecodeTable::decode`); a COFF type
+        // names one kind, so the site is read only by a format that
+        // declares a wire type decoded by instruction.
+        std::span<std::uint8_t const> site{};
+        if (sec.rawPtr != 0u && !rangeExceedsBuffer(va, 4, sec.rawSize)
+            && !rangeExceedsBuffer(sec.rawPtr, sec.rawSize, bytes.size())) {
+            site = std::span<std::uint8_t const>{
+                bytes.data() + static_cast<std::size_t>(sec.rawPtr + va), 4};
+        }
+        auto const decoded = decode->decode(nativeId, site);
+        if (!decoded.has_value()) {
+            return refuse(DiagnosticCode::F_CorruptedBinary,
+                "pe::readRelocatableObject: relocation Type "
+                + std::to_string(nativeId) + " in section '" + sec.name
+                + (decoded.error() == RelocationDecodeTable::Miss::Undeclared
+                       ? "' is not declared by PE format '"
+                             + std::string{objectFormatSchema.name()}
+                             + "' -- cannot map it back to a universal "
+                               "RelocationKind."
+                       : "' is decoded by the instruction it patches, and "
+                         "no row of PE format '"
+                             + std::string{objectFormatSchema.name()}
+                             + "' decodes the word at offset "
+                             + std::to_string(va) + "."));
+        }
+        RelocationKind const kind = *decoded;
+        auto const* tri = targetSchema.relocationInfo(kind);
+        if (tri == nullptr) {
+            return refuse(DiagnosticCode::F_CorruptedBinary,
+                "pe::readRelocatableObject: RelocationKind "
+                + std::to_string(kind.v) + " has no TargetRelocationInfo on '"
+                + std::string{targetSchema.name()}
+                + "' -- cannot resolve its addend width / bias.");
+        }
+        return KindRead{kind, tri};
+    };
+    auto const addendOf = [&](Section const& sec, RelocationRecord const& record,
+                              TargetRelocationInfo const* tri) -> std::optional<std::int64_t> {
+        std::uint64_t const va       = record.va;
+        std::uint32_t const nativeId = record.nativeId;
+        // Addend. COFF has no addend column: the format declares
+        // `relocationAddends: inPlace`, and the addend is read out of the
+        // patched field by the ONE owner of that rule
+        // (`link/format/relocation_addend.hpp`) — in `.text` exactly as in
+        // data. ⚠ THIS USED TO READ 0 FOR EVERY `.text` RELOCATION "because
+        // the writer rejects a non-zero `.text` addend", which was true of
+        // DSS's writer alone: ✔MEASURED 2026-09-23, clang 18.1.3 writes
+        // `fc ff ff ff` into `movl $5, counter(%rip)`'s field, and that
+        // object linked by DSS ran to 32 where the mingw link ran to 42.
+        auto const storage = objectFormatSchema.relocationAddendStorage();
+        if (!storage.has_value()) {
+            return refuse(DiagnosticCode::F_CorruptedBinary,
+                "pe::readRelocatableObject: PE format '"
+                + std::string{objectFormatSchema.name()}
+                + "' declares no 'relocationAddends', so where a "
+                  "relocation's addend lives is unstated.");
+        }
+        std::size_t const fieldWidth =
+            link::format::relocationFieldHoldsAnAddend(*tri)
+                ? tri->widthBytes : 0u;
+        if (rangeExceedsBuffer(va, fieldWidth, sec.rawSize)
+            || rangeExceedsBuffer(sec.rawPtr, sec.rawSize, bytes.size())) {
+            return refuse(DiagnosticCode::F_CorruptedBinary,
+                "pe::readRelocatableObject: relocation at section offset "
+                + std::to_string(va) + " in '" + sec.name + "' has a "
+                + std::to_string(fieldWidth) + "-byte field that runs past "
+                "the section -- cannot read the in-place addend.");
+        }
+        // cl's REL32_1.._5 lower the addend by their type as well
+        // (`bytesAfterFieldLowersTheAddend`): their field holds the offset
+        // from the symbol, measured from the instruction's end.
+        auto const recovered = link::format::recoverRelocationAddend(
+            *storage, *tri, std::nullopt,
+            std::span<std::uint8_t const>{
+                bytes.data() + static_cast<std::size_t>(sec.rawPtr + va),
+                fieldWidth},
+            decode->addendLoweringOf(nativeId));
+        if (!recovered.has_value()) {
+            return refuse(DiagnosticCode::F_CorruptedBinary,
+                "pe::readRelocatableObject: relocation at section offset "
+                + std::to_string(va) + " in '" + sec.name + "': "
+                + recovered.error());
+        }
+        std::int64_t const addend = *recovered;
+        return addend;
+    };
+    // `referenceIsInData`: the relocation patches a data item (or a record that
+    // is no function); `itemStart`: where that item begins in its section.
+    auto const boundOf = [&](Section const& sec, RelocationRecord const& record, TargetRelocationInfo const* tri,
+                             std::int64_t addend, bool referenceIsInData,
+                             std::uint64_t itemStart) -> std::optional<Bound> {
+        std::uint64_t const va          = record.va;
+        std::uint32_t const symIdx      = record.symIdx;
+        std::uint32_t const nativeId    = record.nativeId;
+        bool const          patchesText = !referenceIsInData;
+        // (6.44): a target naming an ALIAS binds to the atom that owns the
+        // body, because only the owner is a declared definition -- an id
+        // that owns no body is `K_SymbolUndefined` at the linker's compound
+        // index. The addend needs no adjustment: an alias shares its owner's
+        // offset exactly, so the same S makes the same address.
+        std::uint32_t const targetIdx = ownerOf(symIdx);
+        SymbolId     relTarget = symbolIds.of(targetIdx);
+        std::int64_t relAddend = addend;
+
+        // SECTION-RELATIVE: a target DEFINED in a section that owns no body
+        // names an offset in its section, not an identity. Two producers
+        // write that shape. (1) gas, through the SECTION-DEFINITION symbol,
+        // for EVERY same-file symbol on PE, globals included. ✔MEASURED
+        // 2026-09-23, mingw gcc 13.2.0 -O2: `counter = 5` with a global
+        // `counter` at `.data+0x10` is `IMAGE_REL_AMD64_REL32 .data` with 0xc
+        // in place. (2) DSS's own writer, and cl.exe, through an INTERIOR
+        // LABEL in `.text`: each jump-table slot is an ADDR64 to a class-
+        // STATIC type-0 block label (`pe.cpp`'s synthetic per-block symbols;
+        // cl.exe's `$LN` case targets are class LABEL). Both used to keep the
+        // unbodied symbol as the target, which no atom owns and the linker's
+        // compound index never declares, so the link refused it
+        // (`K_SymbolUndefined`) -- for (2) once per slot of every dense switch
+        // in a DSS static library
+        // (D-LINK-OBJECT-READERS-DROP-INTERIOR-SYMBOL-OFFSET;
+        // ✔MEASURED P69: a 12-case switch, 12 refusals, where the same
+        // library links on ELF). Each is rebound to the atom that holds the
+        // offset, with the residual, by the rule every reader shares
+        // (`section_relative_target.hpp`) -- including why any atom of a unit
+        // section is exact.
+        Sym const& tsym = syms[targetIdx];
+        bool const definedInASection =
+            tsym.sectNum >= 1u && tsym.sectNum <= numSections;
+        if (definedInASection && !atomSymIdx.contains(targetIdx)) {
+            std::int64_t const bindBase =
+                static_cast<std::int64_t>(tsym.value) + addend;
+            std::int64_t const searchOff = link::format::sectionRelativeSearchOffset(
+                bindBase, tri->pcRelative, /*referenceIsInData=*/!patchesText,
+                static_cast<std::int64_t>(tri->addendBias),
+                static_cast<std::int64_t>(va) - static_cast<std::int64_t>(itemStart));
+            auto const bound = link::format::bindSectionRelativeReference(
+                link::format::sectionAtomSpans(funcIntervalsBySec, tsym.sectNum),
+                link::format::sectionAtomSpans(dataIntervalsBySec, tsym.sectNum),
+                bindBase, searchOff, sectionsAreUnits);
+            if (!bound.has_value()) {
+                return refuse(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: relocation at section offset "
+                    + std::to_string(va) + " in '" + sec.name + "' targets '"
+                    + tsym.name + "' (defined in section #"
+                    + std::to_string(tsym.sectNum) + " with no body of its own) "
+                    "+ offset " + std::to_string(searchOff) + ", which "
+                    + bound.error() + ".");
+            }
+            relTarget = bound->isFunction
+                            ? mod.functions[bound->outIdx].symbol
+                            : mod.dataItems[bound->outIdx].symbol;
+            relAddend = bound->residual;
+        }
+
+        // THE WEAK-NAME RULE (`object_atom_coverage.hpp`): a relocation
+        // written through a WEAK name keeps the NAME, whatever else names
+        // the body -- a plain reference row the link resolves by name, to an
+        // override where one is linked and to this very body otherwise --
+        // instead of the atom (6.44) chose for it. What this pass leaves on
+        // an atom is then a reference to its BYTES: one written through a
+        // static name of the body, or through its section. The addend is
+        // the name's own: the name sits at the atom's start.
+        if (auto const weakName = weakNames.referenceFor(symIdx, symbolIds)) {
+            if (weakName->fresh) {
+                mod.externImports.push_back(
+                    link::format::referenceRowOfAWeakName(*weakName, mod.dataItems));
+            }
+            relTarget = weakName->id;
+        }
+
+        // isData inference: an extern reached through a relocation the
+        // FORMAT declares `"isCall": true` on is a FUNCTION -- force
+        // isData=false. On every shipped PE document callSignalNativeIds
+        // is EMPTY (COFF x86_64 has no branch-only relocation), so this is
+        // a no-op and the type-hint seed (step 6) stands -- NO fail-loud,
+        // which is the COFF-vs-Mach-O difference: COFF carries the hint,
+        // Mach-O does not. Reads the declared role so a PE document that
+        // does have a branch-only wire type (IMAGE_REL_ARM64_BRANCH26)
+        // is honoured here untouched.
+        if (auto ex = externBySym.find(symIdx); ex != externBySym.end()) {
+            if (callSignalNativeIds.contains(nativeId)) {
+                // A call STATES a function, so a type-0 row stops being `Pending`.
+                mod.externImports[ex->second].isData     = false;
+                mod.externImports[ex->second].kindOrigin = ExternKindOrigin::Stated;
+            }
+        }
+        return Bound{relTarget, relAddend};
+    };
+
     for (std::size_t si = 0; si < sections.size(); ++si) {
         Section const& sec = sections[si];
         if (sec.relocCount == 0u) continue;
@@ -2510,11 +2850,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // their OWN relocations (`.pdata`/`.xdata` are 0x40000040, NOT
                 // discardable -- so the DISCARDABLE bit alone cannot gate this)
                 // but hold no reconstructable code/data body the AssembledModule
-                // models. SKIP the section AND its reloc table: DSS has no
-                // representation for CodeView / SEH-unwind / linker-directive
-                // metadata. Dropping `.pdata`/`.xdata` drops unwind for a
-                // foreign function (fine for a leaf/exit-42 link; a general
-                // limitation -- D-LK-COFF-FOREIGN-UNWIND-DROP).
+                // models. SKIP the section AND its reloc table HERE: DSS has no
+                // representation for CodeView / linker-directive metadata, and
+                // the unwind pair is read by (7.5) below, which accounts for
+                // every relocation the two carry.
                 continue;
             }
             // A KIND-RESOLVED section that reconstructed NO atom. Since (6.45)
@@ -2539,59 +2878,12 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         std::vector<Interval> const& ivs = patchesText ? fIt->second : dIt->second;
 
         for (std::uint32_t e = 0; e < sec.relocCount; ++e) {
-            std::size_t const ro = static_cast<std::size_t>(sec.relocPtr)
-                                 + static_cast<std::size_t>(e) * kRelocSz;
-            std::uint64_t const va       = rdU32(bytes, ro + kRelVirtAddrOff);
-            std::uint32_t const symIdx   = rdU32(bytes, ro + kRelSymIdxOff);
-            std::uint32_t const nativeId = rdU16(bytes, ro + kRelTypeOff);
-
-            if (symIdx >= numSymbols) {
-                return fail(DiagnosticCode::F_CorruptedBinary,
-                    "pe::readRelocatableObject: relocation in section '"
-                    + sec.name + "' names symbol #" + std::to_string(symIdx)
-                    + " past the symbol table (" + std::to_string(numSymbols)
-                    + ").");
-            }
-            if (auxSlot[symIdx]) {
-                return fail(DiagnosticCode::F_CorruptedBinary,
-                    "pe::readRelocatableObject: relocation in section '"
-                    + sec.name + "' names symbol #" + std::to_string(symIdx)
-                    + " which is an AUXILIARY record slot, not a symbol.");
-            }
-            // The ONE decode (`RelocationDecodeTable::decode`); a COFF type
-            // names one kind, so the site is read only by a format that
-            // declares a wire type decoded by instruction.
-            std::span<std::uint8_t const> site{};
-            if (sec.rawPtr != 0u && !rangeExceedsBuffer(va, 4, sec.rawSize)
-                && !rangeExceedsBuffer(sec.rawPtr, sec.rawSize, bytes.size())) {
-                site = std::span<std::uint8_t const>{
-                    bytes.data() + static_cast<std::size_t>(sec.rawPtr + va), 4};
-            }
-            auto const decoded = decode->decode(nativeId, site);
-            if (!decoded.has_value()) {
-                return fail(DiagnosticCode::F_CorruptedBinary,
-                    "pe::readRelocatableObject: relocation Type "
-                    + std::to_string(nativeId) + " in section '" + sec.name
-                    + (decoded.error() == RelocationDecodeTable::Miss::Undeclared
-                           ? "' is not declared by PE format '"
-                                 + std::string{objectFormatSchema.name()}
-                                 + "' -- cannot map it back to a universal "
-                                   "RelocationKind."
-                           : "' is decoded by the instruction it patches, and "
-                             "no row of PE format '"
-                                 + std::string{objectFormatSchema.name()}
-                                 + "' decodes the word at offset "
-                                 + std::to_string(va) + "."));
-            }
-            RelocationKind const kind = *decoded;
-            auto const* tri = targetSchema.relocationInfo(kind);
-            if (tri == nullptr) {
-                return fail(DiagnosticCode::F_CorruptedBinary,
-                    "pe::readRelocatableObject: RelocationKind "
-                    + std::to_string(kind.v) + " has no TargetRelocationInfo on '"
-                    + std::string{targetSchema.name()}
-                    + "' -- cannot resolve its addend width / bias.");
-            }
+            auto const record = recordOf(sec, e);
+            if (!record.has_value()) return std::nullopt;
+            std::uint64_t const va = record->va;
+            auto const kindRead = kindOf(sec, *record);
+            if (!kindRead.has_value()) return std::nullopt;
+            RelocationKind const kind = kindRead->kind;
 
             Interval const* iv = findInterval(ivs, va);
             if (iv == nullptr) {
@@ -2603,124 +2895,14 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + " -- refusing to silently drop it.");
             }
 
-            // Addend. COFF has no addend column: the format declares
-            // `relocationAddends: inPlace`, and the addend is read out of the
-            // patched field by the ONE owner of that rule
-            // (`link/format/relocation_addend.hpp`) — in `.text` exactly as in
-            // data. ⚠ THIS USED TO READ 0 FOR EVERY `.text` RELOCATION "because
-            // the writer rejects a non-zero `.text` addend", which was true of
-            // DSS's writer alone: ✔MEASURED 2026-09-23, clang 18.1.3 writes
-            // `fc ff ff ff` into `movl $5, counter(%rip)`'s field, and that
-            // object linked by DSS ran to 32 where the mingw link ran to 42.
-            auto const storage = objectFormatSchema.relocationAddendStorage();
-            if (!storage.has_value()) {
-                return fail(DiagnosticCode::F_CorruptedBinary,
-                    "pe::readRelocatableObject: PE format '"
-                    + std::string{objectFormatSchema.name()}
-                    + "' declares no 'relocationAddends', so where a "
-                      "relocation's addend lives is unstated.");
-            }
-            std::size_t const fieldWidth =
-                link::format::relocationFieldHoldsAnAddend(*tri)
-                    ? tri->widthBytes : 0u;
-            if (rangeExceedsBuffer(va, fieldWidth, sec.rawSize)
-                || rangeExceedsBuffer(sec.rawPtr, sec.rawSize, bytes.size())) {
-                return fail(DiagnosticCode::F_CorruptedBinary,
-                    "pe::readRelocatableObject: relocation at section offset "
-                    + std::to_string(va) + " in '" + sec.name + "' has a "
-                    + std::to_string(fieldWidth) + "-byte field that runs past "
-                    "the section -- cannot read the in-place addend.");
-            }
-            // cl's REL32_1.._5 lower the addend by their type as well
-            // (`bytesAfterFieldLowersTheAddend`): their field holds the offset
-            // from the symbol, measured from the instruction's end.
-            auto const recovered = link::format::recoverRelocationAddend(
-                *storage, *tri, std::nullopt,
-                std::span<std::uint8_t const>{
-                    bytes.data() + static_cast<std::size_t>(sec.rawPtr + va),
-                    fieldWidth},
-                decode->addendLoweringOf(nativeId));
-            if (!recovered.has_value()) {
-                return fail(DiagnosticCode::F_CorruptedBinary,
-                    "pe::readRelocatableObject: relocation at section offset "
-                    + std::to_string(va) + " in '" + sec.name + "': "
-                    + recovered.error());
-            }
-            std::int64_t const addend = *recovered;
+            auto const addend = addendOf(sec, *record, kindRead->tri);
+            if (!addend.has_value()) return std::nullopt;
+            auto const bound = boundOf(sec, *record, kindRead->tri, *addend, /*referenceIsInData=*/!patchesText,
+                                       iv->start);
+            if (!bound.has_value()) return std::nullopt;
+            SymbolId const     relTarget = bound->target;
+            std::int64_t const relAddend = bound->addend;
 
-            // (6.44): a target naming an ALIAS binds to the atom that owns the
-            // body, because only the owner is a declared definition -- an id
-            // that owns no body is `K_SymbolUndefined` at the linker's compound
-            // index. The addend needs no adjustment: an alias shares its owner's
-            // offset exactly, so the same S makes the same address.
-            std::uint32_t const targetIdx = ownerOf(symIdx);
-            SymbolId     relTarget = symbolIds.of(targetIdx);
-            std::int64_t relAddend = addend;
-
-            // SECTION-RELATIVE: a target DEFINED in a section that owns no body
-            // names an offset in its section, not an identity. Two producers
-            // write that shape. (1) gas, through the SECTION-DEFINITION symbol,
-            // for EVERY same-file symbol on PE, globals included. ✔MEASURED
-            // 2026-09-23, mingw gcc 13.2.0 -O2: `counter = 5` with a global
-            // `counter` at `.data+0x10` is `IMAGE_REL_AMD64_REL32 .data` with 0xc
-            // in place. (2) DSS's own writer, and cl.exe, through an INTERIOR
-            // LABEL in `.text`: each jump-table slot is an ADDR64 to a class-
-            // STATIC type-0 block label (`pe.cpp`'s synthetic per-block symbols;
-            // cl.exe's `$LN` case targets are class LABEL). Both used to keep the
-            // unbodied symbol as the target, which no atom owns and the linker's
-            // compound index never declares, so the link refused it
-            // (`K_SymbolUndefined`) -- for (2) once per slot of every dense switch
-            // in a DSS static library
-            // (D-LINK-OBJECT-READERS-DROP-INTERIOR-SYMBOL-OFFSET;
-            // ✔MEASURED P69: a 12-case switch, 12 refusals, where the same
-            // library links on ELF). Each is rebound to the atom that holds the
-            // offset, with the residual, by the rule every reader shares
-            // (`section_relative_target.hpp`) -- including why any atom of a unit
-            // section is exact.
-            Sym const& tsym = syms[targetIdx];
-            bool const definedInASection =
-                tsym.sectNum >= 1u && tsym.sectNum <= numSections;
-            if (definedInASection && !atomSymIdx.contains(targetIdx)) {
-                std::int64_t const bindBase =
-                    static_cast<std::int64_t>(tsym.value) + addend;
-                std::int64_t const searchOff = link::format::sectionRelativeSearchOffset(
-                    bindBase, tri->pcRelative, /*referenceIsInData=*/!patchesText,
-                    static_cast<std::int64_t>(tri->addendBias),
-                    static_cast<std::int64_t>(va) - static_cast<std::int64_t>(iv->start));
-                auto const bound = link::format::bindSectionRelativeReference(
-                    link::format::sectionAtomSpans(funcIntervalsBySec, tsym.sectNum),
-                    link::format::sectionAtomSpans(dataIntervalsBySec, tsym.sectNum),
-                    bindBase, searchOff, sectionsAreUnits);
-                if (!bound.has_value()) {
-                    return fail(DiagnosticCode::F_CorruptedBinary,
-                        "pe::readRelocatableObject: relocation at section offset "
-                        + std::to_string(va) + " in '" + sec.name + "' targets '"
-                        + tsym.name + "' (defined in section #"
-                        + std::to_string(tsym.sectNum) + " with no body of its own) "
-                        "+ offset " + std::to_string(searchOff) + ", which "
-                        + bound.error() + ".");
-                }
-                relTarget = bound->isFunction
-                                ? mod.functions[bound->outIdx].symbol
-                                : mod.dataItems[bound->outIdx].symbol;
-                relAddend = bound->residual;
-            }
-
-            // THE WEAK-NAME RULE (`object_atom_coverage.hpp`): a relocation
-            // written through a WEAK name keeps the NAME, whatever else names
-            // the body -- a plain reference row the link resolves by name, to an
-            // override where one is linked and to this very body otherwise --
-            // instead of the atom (6.44) chose for it. What this pass leaves on
-            // an atom is then a reference to its BYTES: one written through a
-            // static name of the body, or through its section. The addend is
-            // the name's own: the name sits at the atom's start.
-            if (auto const weakName = weakNames.referenceFor(symIdx, symbolIds)) {
-                if (weakName->fresh) {
-                    mod.externImports.push_back(
-                        link::format::referenceRowOfAWeakName(*weakName, mod.dataItems));
-                }
-                relTarget = weakName->id;
-            }
             Relocation rel;
             rel.offset = static_cast<std::uint32_t>(va - iv->start);
             rel.target = relTarget;
@@ -2728,20 +2910,351 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             rel.addend = relAddend;
             if (patchesText) mod.functions[iv->outIdx].relocations.push_back(rel);
             else             mod.dataItems[iv->outIdx].relocations.push_back(rel);
+        }
+    }
 
-            // isData inference: an extern reached through a relocation the
-            // FORMAT declares `"isCall": true` on is a FUNCTION -- force
-            // isData=false. On every shipped PE document callSignalNativeIds
-            // is EMPTY (COFF x86_64 has no branch-only relocation), so this is
-            // a no-op and the type-hint seed (step 6) stands -- NO fail-loud,
-            // which is the COFF-vs-Mach-O difference: COFF carries the hint,
-            // Mach-O does not. Reads the declared role so a PE document that
-            // does have a branch-only wire type (IMAGE_REL_ARM64_BRANCH26)
-            // is honoured here untouched.
-            if (auto ex = externBySym.find(symIdx); ex != externBySym.end()) {
-                if (callSignalNativeIds.contains(nativeId)) {
-                    mod.externImports[ex->second].isData = false;
+    // -- (7.5) THE UNWIND CARRY: `.pdata` and `.xdata`, read into each function --
+    //
+    // (P69 fold 3c.) A COFF object describes each framed function with a
+    // RUNTIME_FUNCTION in a `.pdata` section — the function's start and end and
+    // where its UNWIND_INFO is, three image-relative relocations — and an
+    // UNWIND_INFO in an `.xdata` section: the prologue's codes and, for a
+    // function a handler guards, the handler routine's address and the data the
+    // routine reads. Until this pass both sections were skipped with their
+    // relocations, so a foreign function reached the image with no unwind
+    // description at all: ✔MEASURED P69 fold 3c, cl /O2's `__try` object linked
+    // by DSS beside a C `main` faulted out of the program instead of reaching its
+    // `__except`, and so did DSS's own `__try` object read back (`PeObjSeh`).
+    //
+    // ★ THE CODES ARE DECODED (`win64_unwind_decode.hpp`, which also states why a
+    //   verbatim copy was rejected); the handler's DATA is carried as bytes with
+    //   its relocations (`LanguageHandler`), because only the handler routine
+    //   reads its layout.
+    // ★ EVERY RELOCATION OF THE TWO FAMILIES IS ACCOUNTED FOR: three per
+    //   RUNTIME_FUNCTION, one per handler field, and each inside a handler's data.
+    //   One that is none of these is refused by name, never dropped.
+    // ★ THE DESCRIBED EXTENT. A RUNTIME_FUNCTION may stop short of its function:
+    //   the references end it at the function's last instruction and pad to the
+    //   next function past it (✔MEASURED P69 fold 3c: mingw-w64 gcc 13.2.0 -O2
+    //   pads to the section's 16-byte alignment, `leaf` described as 5 bytes of a
+    //   16-byte atom; cl 19.44 /Od writes `int3` bytes PAST that alignment,
+    //   `guarded` 43 bytes of a 64-byte atom and 64 of an 80-byte one, so a rule
+    //   bounded by the section's alignment refused what link.exe links). The
+    //   carried description covers the function's bytes whole, as every PE
+    //   writer here describes a function: the x64 unwinder reads a PC past the
+    //   prologue in the body's state and recognizes an epilogue by its
+    //   instructions, so the tail is stated as nothing a PC of the function
+    //   contradicts, where a PC outside every record would be read as a leaf's.
+    //   A record that runs PAST its function describes another's bytes, and is
+    //   refused.
+    // ★ THE ROUTINE THE FORMAT DOCUMENT DECLARES (`sehPersonality`) is imported
+    //   from the image its role names, as the compile pipeline binds a DSS
+    //   `__try`'s: an object names `__C_specific_handler` by name only. Any other
+    //   routine stays a name the link resolves, or refuses.
+    {
+        namespace win64 = link::format::win64;
+        std::vector<std::size_t> tableSections;
+        std::vector<bool>        inEitherFamily(sections.size(), false);
+        std::vector<bool>        holdsUnwindInfo(sections.size(), false);
+        for (std::size_t si = 0; si < sections.size(); ++si) {
+            bool const table = win64::isSectionOf(sections[si].name, win64::kFunctionTableSection);
+            bool const info  = win64::isSectionOf(sections[si].name, win64::kUnwindInfoSection);
+            if (table) tableSections.push_back(si);
+            holdsUnwindInfo[si] = info;
+            inEitherFamily[si]  = table || info;
+        }
+        // Each relocation of the two families by its VirtualAddress, so a field
+        // finds its own; and the set this pass has read.
+        std::unordered_map<std::size_t, std::unordered_map<std::uint64_t, std::uint32_t>> relocationAt;
+        for (std::size_t si = 0; si < sections.size(); ++si) {
+            if (!inEitherFamily[si]) continue;
+            Section const& sec = sections[si];
+            auto&          byVa = relocationAt[si];
+            for (std::uint32_t e = 0; e < sec.relocCount; ++e) {
+                std::uint64_t const va = rdU32(bytes, static_cast<std::size_t>(sec.relocPtr)
+                                                          + static_cast<std::size_t>(e) * kRelocSz + kRelVirtAddrOff);
+                if (!byVa.emplace(va, e).second) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "pe::readRelocatableObject: two relocations of '" + sec.name + "' patch the field at offset "
+                        + std::to_string(va) + "; one of them is wrong and nothing here can tell which.");
                 }
+            }
+        }
+        std::unordered_set<std::uint64_t> consumed;   // (section index << 32) | VirtualAddress
+        auto const keyOf = [](std::size_t si, std::uint64_t va) {
+            return (static_cast<std::uint64_t>(si) << 32) | (va & 0xFFFFFFFFull);
+        };
+
+        if (!tableSections.empty()) {
+            // The frame every record describes starts where a CALL of the format's
+            // C convention leaves it — the facts the compile pipeline derives a DSS
+            // function's entry state from.
+            std::string const& ccName = objectFormatSchema.cCallingConvention().convention;
+            auto const*        cc     = targetSchema.callingConventionByName(ccName);
+            if (cc == nullptr || !cc->stackPointer.has_value() || cc->callPushBytes == 0u) {
+                return fail(DiagnosticCode::K_UnwindRuleUnrepresentable,
+                    "pe::readRelocatableObject: the object describes its functions' frames, and the C calling "
+                    "convention '" + ccName + "' its format names "
+                    + (cc == nullptr ? "is no convention of target '" + std::string{targetSchema.name()} + "'"
+                                     : std::string{"states no stack pointer, or no return address a call pushes"})
+                    + " -- the entry state every such description starts from.");
+            }
+            CfiInitialState entry;
+            entry.cfaRegister              = cc->stackPointer->ordinal;
+            entry.cfaOffset                = static_cast<std::int64_t>(cc->callPushBytes);
+            entry.returnAddressAtCfaOffset = -static_cast<std::int64_t>(cc->callPushBytes);
+            std::string rowError;
+            auto const* rvaRow = link::format::unwindPointerRelocationOf(
+                targetSchema, link::format::kWin64RuntimeFunctionPointerField, rowError);
+            if (rvaRow == nullptr) {
+                return fail(DiagnosticCode::K_RelocationKindMismatch, "pe::readRelocatableObject: " + rowError);
+            }
+            auto const regs = link::format::Win64UnwindRegisters::of(targetSchema);
+
+            // One image-relative field of the two families: its relocation, of the
+            // kind a RUNTIME_FUNCTION field is, read as the section and offset it
+            // names. ★ An ADDRESS, not an identity: a record names where a
+            // function begins and ends and where its UNWIND_INFO is.
+            struct FieldAddress {
+                std::uint16_t section = 0;   // 1-based ordinal
+                std::uint64_t offset  = 0;
+            };
+            auto const fieldAt = [&](std::size_t si, std::uint64_t at,
+                                     std::string_view what) -> std::optional<FieldAddress> {
+                Section const& sec = sections[si];
+                auto const     it  = relocationAt[si].find(at);
+                if (it == relocationAt[si].end()) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
+                        "pe::readRelocatableObject: the " + std::string{what} + " field at offset "
+                        + std::to_string(at) + " of '" + sec.name + "' carries no relocation; in a relocatable "
+                        "object that field has no address to hold, and the relocation is the reference.");
+                }
+                auto const record = recordOf(sec, it->second);
+                if (!record.has_value()) return std::nullopt;
+                auto const kindRead = kindOf(sec, *record);
+                if (!kindRead.has_value()) return std::nullopt;
+                if (kindRead->kind != rvaRow->kind) {
+                    return refuse(DiagnosticCode::K_RelocationKindMismatch,
+                        "pe::readRelocatableObject: the " + std::string{what} + " field at offset "
+                        + std::to_string(at) + " of '" + sec.name + "' is relocated with kind "
+                        + std::to_string(kindRead->kind.v) + "; the format states such a field image-relative ('"
+                        + rvaRow->name + "').");
+                }
+                auto const addend = addendOf(sec, *record, kindRead->tri);
+                if (!addend.has_value()) return std::nullopt;
+                Sym const& s = syms[record->symIdx];
+                if (s.sectNum < 1u || s.sectNum > numSections) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
+                        "pe::readRelocatableObject: the " + std::string{what} + " field at offset "
+                        + std::to_string(at) + " of '" + sec.name + "' names '" + s.name
+                        + "', which no section of this object defines.");
+                }
+                std::int64_t const offset = static_cast<std::int64_t>(s.value) + *addend;
+                if (offset < 0) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
+                        "pe::readRelocatableObject: the " + std::string{what} + " field at offset "
+                        + std::to_string(at) + " of '" + sec.name + "' names an offset before its section.");
+                }
+                consumed.insert(keyOf(si, at));
+                return FieldAddress{s.sectNum, static_cast<std::uint64_t>(offset)};
+            };
+
+            // Every RUNTIME_FUNCTION, read into the function it describes.
+            struct Described {
+                std::size_t   function;   // index into mod.functions
+                std::uint64_t length;     // the function's bytes, the described extent
+                std::size_t   infoSection;
+                std::uint64_t infoOffset;
+            };
+            std::vector<Described>                                     described;
+            std::unordered_set<std::size_t>                            describedFunctions;
+            std::unordered_map<std::size_t, std::vector<std::uint64_t>> recordStarts;
+            for (std::size_t const si : tableSections) {
+                Section const& table = sections[si];
+                if (table.rawSize % 12u != 0u) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "pe::readRelocatableObject: '" + table.name + "' holds " + std::to_string(table.rawSize)
+                        + " bytes, which is no whole number of 12-byte RUNTIME_FUNCTIONs.");
+                }
+                for (std::uint64_t at = 0; at < table.rawSize; at += 12u) {
+                    auto const begin = fieldAt(si, at, "BeginAddress");
+                    if (!begin.has_value()) return std::nullopt;
+                    auto const end = fieldAt(si, at + 4u, "EndAddress");
+                    if (!end.has_value()) return std::nullopt;
+                    auto const info = fieldAt(si, at + 8u, "UnwindInfoAddress");
+                    if (!info.has_value()) return std::nullopt;
+                    Interval const* fn = nullptr;
+                    if (auto const fIt = funcIntervalsBySec.find(begin->section); fIt != funcIntervalsBySec.end()) {
+                        for (auto const& iv : fIt->second) {
+                            if (iv.start == begin->offset) fn = &iv;
+                        }
+                    }
+                    std::string const where = "the RUNTIME_FUNCTION at offset " + std::to_string(at) + " of '"
+                                            + table.name + "'";
+                    if (fn == nullptr) {
+                        return fail(DiagnosticCode::K_UnwindRuleUnrepresentable,
+                            "pe::readRelocatableObject: " + where + " begins at offset "
+                            + std::to_string(begin->offset) + " of '" + sections[begin->section - 1u].name
+                            + "', where no function of this object begins. A record for part of a function is "
+                              "the fragment form the format chains, which no reference compiler wrote for any C "
+                              "function measured, and an unwind record that cannot be attached to a function "
+                              "would have to be dropped.");
+                    }
+                    if (end->section != begin->section || end->offset <= begin->offset) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "pe::readRelocatableObject: " + where + " ends at or before where it begins.");
+                    }
+                    std::uint64_t const length = end->offset - begin->offset;
+                    if (length > fn->len) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "pe::readRelocatableObject: " + where + " describes " + std::to_string(length)
+                            + " bytes of a function that runs " + std::to_string(fn->len)
+                            + " bytes; a record past its function's end describes another function's bytes.");
+                    }
+                    if (!holdsUnwindInfo[info->section - 1u]) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "pe::readRelocatableObject: " + where + " names its UNWIND_INFO in '"
+                            + sections[info->section - 1u].name + "', which holds no unwind records.");
+                    }
+                    if (!describedFunctions.insert(fn->outIdx).second) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "pe::readRelocatableObject: two RUNTIME_FUNCTIONs describe the function at offset "
+                            + std::to_string(fn->start) + " of '" + sections[begin->section - 1u].name
+                            + "'; one of them is wrong and nothing here can tell which.");
+                    }
+                    described.push_back(Described{fn->outIdx, fn->len, info->section - 1u, info->offset});
+                    recordStarts[info->section - 1u].push_back(info->offset);
+                }
+            }
+            for (auto& [si, starts] : recordStarts) {
+                std::sort(starts.begin(), starts.end());
+                starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+            }
+
+            for (Described const& d : described) {
+                Section const& xs = sections[d.infoSection];
+                if (xs.zeroFill || rangeExceedsBuffer(xs.rawPtr, xs.rawSize, bytes.size())) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "pe::readRelocatableObject: '" + xs.name + "' holds no bytes in the file to read an "
+                        "UNWIND_INFO from.");
+                }
+                std::span<std::uint8_t const> const unwindBytes{bytes.data() + static_cast<std::size_t>(xs.rawPtr),
+                                                                 static_cast<std::size_t>(xs.rawSize)};
+                auto decoded = link::format::decodeWin64UnwindInfo(
+                    unwindBytes, static_cast<std::uint32_t>(d.infoOffset), regs, entry,
+                    "pe::readRelocatableObject: '" + xs.name + "'", reporter);
+                if (!decoded.has_value()) return std::nullopt;
+                decoded->cfi.codeLength = static_cast<std::uint32_t>(d.length);
+                if (auto const why = validateCfiFunction(decoded->cfi); !why.empty()) {
+                    return fail(DiagnosticCode::K_UnwindRuleUnrepresentable,
+                        "pe::readRelocatableObject: the UNWIND_INFO at offset " + std::to_string(d.infoOffset)
+                        + " of '" + xs.name + "' reads as malformed call-frame information -- " + why);
+                }
+                AssembledFunction& fn = mod.functions[d.function];
+                fn.cfi = std::move(decoded->cfi);
+                if (!decoded->exceptionPhase && !decoded->unwindPhase) continue;
+
+                // The handler: its address field, then its data, to the next
+                // UNWIND_INFO of the section or the section's end.
+                std::uint64_t const handlerField = decoded->afterCodes;
+                auto const          hIt          = relocationAt[d.infoSection].find(handlerField);
+                if (hIt == relocationAt[d.infoSection].end()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "pe::readRelocatableObject: the UNWIND_INFO at offset " + std::to_string(d.infoOffset)
+                        + " of '" + xs.name + "' names a handler, and its address field carries no relocation.");
+                }
+                auto const record = recordOf(xs, hIt->second);
+                if (!record.has_value()) return std::nullopt;
+                auto const kindRead = kindOf(xs, *record);
+                if (!kindRead.has_value()) return std::nullopt;
+                if (kindRead->kind != rvaRow->kind) {
+                    return fail(DiagnosticCode::K_RelocationKindMismatch,
+                        "pe::readRelocatableObject: the handler field of the UNWIND_INFO at offset "
+                        + std::to_string(d.infoOffset) + " of '" + xs.name + "' is relocated with kind "
+                        + std::to_string(kindRead->kind.v) + "; the format states it image-relative ('"
+                        + rvaRow->name + "').");
+                }
+                auto const addend = addendOf(xs, *record, kindRead->tri);
+                if (!addend.has_value()) return std::nullopt;
+                auto const routine = boundOf(xs, *record, kindRead->tri, *addend, /*referenceIsInData=*/true,
+                                             handlerField);
+                if (!routine.has_value()) return std::nullopt;
+                if (routine->addend != 0) {
+                    return fail(DiagnosticCode::K_UnwindRuleUnrepresentable,
+                        "pe::readRelocatableObject: the handler of the UNWIND_INFO at offset "
+                        + std::to_string(d.infoOffset) + " of '" + xs.name + "' is " + std::to_string(routine->addend)
+                        + " bytes into the routine it names; a handler is a routine's own address.");
+                }
+                consumed.insert(keyOf(d.infoSection, handlerField));
+
+                std::vector<std::uint64_t> const& starts    = recordStarts.at(d.infoSection);
+                auto const                        next      = std::upper_bound(starts.begin(), starts.end(), d.infoOffset);
+                std::uint64_t const               dataStart = handlerField + 4u;
+                std::uint64_t const               dataEnd   = next == starts.end() ? xs.rawSize : *next;
+                if (dataStart > dataEnd) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "pe::readRelocatableObject: the handler of the UNWIND_INFO at offset "
+                        + std::to_string(d.infoOffset) + " of '" + xs.name + "' runs into the next record.");
+                }
+                LanguageHandler handler;
+                handler.personality    = routine->target;
+                handler.exceptionPhase = decoded->exceptionPhase;
+                handler.unwindPhase    = decoded->unwindPhase;
+                handler.data.assign(unwindBytes.begin() + static_cast<std::ptrdiff_t>(dataStart),
+                                    unwindBytes.begin() + static_cast<std::ptrdiff_t>(dataEnd));
+                std::vector<std::pair<std::uint64_t, std::uint32_t>> inData;
+                for (auto const& [va, e] : relocationAt[d.infoSection]) {
+                    if (va >= dataStart && va < dataEnd) inData.emplace_back(va, e);
+                }
+                std::sort(inData.begin(), inData.end());
+                for (auto const& [va, e] : inData) {
+                    auto const dataRecord = recordOf(xs, e);
+                    if (!dataRecord.has_value()) return std::nullopt;
+                    auto const dataKind = kindOf(xs, *dataRecord);
+                    if (!dataKind.has_value()) return std::nullopt;
+                    auto const dataAddend = addendOf(xs, *dataRecord, dataKind->tri);
+                    if (!dataAddend.has_value()) return std::nullopt;
+                    auto const named = boundOf(xs, *dataRecord, dataKind->tri, *dataAddend,
+                                               /*referenceIsInData=*/true, dataStart);
+                    if (!named.has_value()) return std::nullopt;
+                    Relocation rel;
+                    rel.offset = static_cast<std::uint32_t>(va - dataStart);
+                    rel.target = named->target;
+                    rel.kind   = dataKind->kind;
+                    rel.addend = named->addend;
+                    handler.relocations.push_back(rel);
+                    consumed.insert(keyOf(d.infoSection, va));
+                }
+                // The handler field names a ROUTINE the system calls — a statement of
+                // its kind as plain as a call's, whatever the symbol record's type
+                // says. ✔MEASURED P69 fold 3c: clang-cl 19.1.5 writes type 0 on every
+                // undefined symbol, `__C_specific_handler` among them (cl 19.44 writes
+                // 0x20), and the type-0 record read as a DATUM bound the personality
+                // as a data import: no thunk, and the PE writer refused the handler
+                // field ("SEH personality symbol #5 has no import thunk").
+                for (auto& ext : mod.externImports) {
+                    if (ext.symbol != handler.personality) continue;
+                    ext.isData     = false;
+                    ext.kindOrigin = ExternKindOrigin::Stated;
+                    if (auto const& declared = objectFormatSchema.sehPersonality();
+                        declared.has_value() && ext.libraryPath.empty()
+                        && ext.mangledName == declared->mangledName) {
+                        ext.libraryPath = declared->libraryPath;
+                    }
+                }
+                fn.languageHandler = std::move(handler);
+            }
+        }
+
+        for (std::size_t si = 0; si < sections.size(); ++si) {
+            if (!inEitherFamily[si]) continue;
+            for (auto const& [va, e] : relocationAt[si]) {
+                (void)e;
+                if (consumed.contains(keyOf(si, va))) continue;
+                return fail(DiagnosticCode::K_UnwindRuleUnrepresentable,
+                    "pe::readRelocatableObject: the relocation at offset " + std::to_string(va) + " of '"
+                    + sections[si].name + "' is part of no RUNTIME_FUNCTION and of no handler this reader "
+                      "reads; dropping it would lose what it says about a function's unwinding.");
             }
         }
     }

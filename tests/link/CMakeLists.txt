@@ -809,6 +809,34 @@ target_link_libraries(dss_link_test_page_offset_relocations
 dss_add_test(NAME link/test_pe_object_unwind_reference_link
              SOURCES test_pe_object_unwind_reference_link.cpp)
 
+# D-LK-COFF-FOREIGN-UNWIND-DROP -- a reference compiler's COFF object read with its `.pdata`/`.xdata`: each
+# RUNTIME_FUNCTION's UNWIND_INFO decoded into its function's frame rules and a handler carried with its data, both
+# written back by the shipped PE writer byte for byte, on the committed objects of cl, clang-cl and mingw-w64 gcc
+# (`tests/link/data/win64_unwind_*`). Every leg reads and links them; on Windows x86_64 a `__try` object linked by
+# DSS beside a C `main` runs and catches its fault.
+dss_add_test(NAME link/test_coff_foreign_unwind
+             SOURCES test_coff_foreign_unwind.cpp)
+
+# P69 fold 3c (lane `xa`) — [[D-LK-LINEAR-RELOCATION-FIELD-RANGE-CHECKED-AS-SIGNED-FOR-EVERY-KIND]],
+# [[D-ASM-DATA-WORD-RELOCATION-KIND-PICKED-BY-DECLARATION-ORDER]] and
+# [[D-LK-RELOCATION-TYPES-REFERENCE-COMPILERS-EMIT-FOR-C-UNDECLARED]]: each narrow Linear field's declared range, the
+# address slot's row picked by range, and the references' JUMP26 / R_X86_64_32S objects read, linked and run.
+dss_add_test(NAME link/test_linear_field_range
+             SOURCES test_linear_field_range.cpp)
+
+# P69 fold 3c (lane `xa`) — [[D-LK-COFF-READER-IGNORES-THE-RELOCATION-COUNT-OVERFLOW]] and [[D-LK2-3]]: a COFF
+# section past the u16 NumberOfRelocations, written and read through IMAGE_SCN_LNK_NRELOC_OVFL's count record.
+dss_add_test(NAME link/test_coff_relocation_count_overflow
+             SOURCES test_coff_relocation_count_overflow.cpp)
+
+# P69 fold 3c (lane `xa`) — [[D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT]],
+# [[D-LK-COFF-READER-TAKES-AN-UNTYPED-UNDEFINED-SYMBOL-AS-DATA]] and
+# [[D-FF1-AR-READER-REFUSES-THE-COFF-LONGNAMES-MEMBER]]: a foreign object that calls the C library, named to the link
+# or archived by lib.exe under a long name, bound to the library's image as the archive-pulled member is
+# (`tests/link/data/foreign_object_library_binding.*`). Every leg links them; on Windows x86_64 each image runs.
+dss_add_test(NAME link/test_foreign_object_library_binding
+             SOURCES test_foreign_object_library_binding.cpp)
+
 # P69 (lane `cs`) — a GLOBAL alias of a `static` body (`alias("target")`) in a DSS pe64 relocatable object, as
 # link.exe and MinGW's linker take it: a second DSS object calls the alias by its global name and the image RUNS,
 # the objects compiled at the baseline and at release. Windows-only; each arm skips naming the absent toolchain.
@@ -828,6 +856,10 @@ dss_add_test(NAME link/test_library_function_address
 # image, every `&puts` each takes compared with GetProcAddress, and a call through `__imp_puts`.
 dss_add_test(NAME link/test_pe_foreign_import_address
              SOURCES test_pe_foreign_import_address.cpp)
+# P69 fold 3c: its no-address-slot pin builds its synthetic target with `mutate_target_schema.hpp`, an nlohmann
+# consumer.
+target_link_libraries(dss_link_test_pe_foreign_import_address
+    PRIVATE nlohmann_json::nlohmann_json)
 
 # D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE (P69 review M1, MINOR 8) — what an image makes of a unit's PC-relative, non-branch
 # reference to an import (`pcRelativeImportAddress`: the unit binds every address of it to the call entry on PE, and

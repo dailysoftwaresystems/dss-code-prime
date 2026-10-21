@@ -11,7 +11,7 @@
   },
   {
     "root": "link/data",
-    "extensions": [".c"],
-    "reason": "The PROVENANCE of the prebuilt object and archive fixtures the link tests read: each *.source.c is the text a reference toolchain built a fixture from. The tests read the built files; no target of this build compiles the sources."
+    "extensions": [".c", ".cpp"],
+    "reason": "The PROVENANCE of the prebuilt object and archive fixtures the link tests read: each *.source.c (C) and *.source.cpp (C++, the g++-built fixtures) is the text a reference toolchain built a fixture from. The tests read the built files; no target of this build compiles the sources."
   }
 ]

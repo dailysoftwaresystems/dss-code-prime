@@ -103,11 +103,13 @@ struct CoffDirectiveRequests {
 // alignment a COFF section header can state (IMAGE_SCN_ALIGN_8192BYTES).
 inline constexpr std::uint8_t kMaxCoffCommonAlignmentLog2 = 13;
 
-// ⓘ The alignment every COFF linker gives a COMMON that no `-aligncomm:` names
-// is the DOCUMENT's (`commonAlignmentFromSizeAtMost`, read through
-// `ObjectFormatSchema::commonsStatement`): the COFF reader aligns a common at
-// least that much, and the COFF writer states a common's alignment in a
-// directive only where it exceeds it. No number of it lives here.
+// ⓘ The alignment the COFF linkers give a COMMON that no `-aligncomm:` names is
+// the DOCUMENT's (`commonAlignmentFromSizeAtMost` — link.exe's and lld-link's —
+// and `commonAlignmentEveryLinkerGivesAtMost` — GNU ld's, the least — read
+// through `ObjectFormatSchema::commonsStatement`): the COFF reader aligns a
+// common at least as the first, and the COFF writer states a common's alignment
+// in a directive exactly where it exceeds the second. No number of either lives
+// here.
 
 // The meanings whose requests ONE LINK DECIDES ACROSS ITS UNITS: the nine image
 // settings, each held once by an image, and the exports, one per exported name.
@@ -752,7 +754,7 @@ unspellableName(std::string_view what, std::string_view name, std::string_view o
 // can carry): the definitions its visibility hides, the names an `/INCLUDE:`
 // required of the object it was read from, the fallbacks it carries, and the
 // alignment of each COMMON it hands on that the final linker would otherwise
-// align less (`CommonsStatement::alignmentEveryLinkerGives`); and, VERBATIM, every other
+// align less (`CommonsStatement::statesItsAlignment`); and, VERBATIM, every other
 // directive of a foreign unit it holds (`UnitLinkerRequests::handOn`: an
 // export, an image request, an ignored or warned option), so its final linker
 // is asked what the unit asked.
